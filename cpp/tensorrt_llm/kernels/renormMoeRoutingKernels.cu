@@ -368,9 +368,12 @@ void invokeRenormMoeRouting(InputT* routerLogits, OutputT* topkValues, IdxT* top
         cudaStream_t const stream);
 
 INSTANTIATE_RENORM_MOE_ROUTING(float, float, int32_t);
+INSTANTIATE_RENORM_MOE_ROUTING(float, __nv_bfloat16, int32_t);
 INSTANTIATE_RENORM_MOE_ROUTING(half, float, int32_t);
+INSTANTIATE_RENORM_MOE_ROUTING(half, __nv_bfloat16, int32_t);
 #ifdef ENABLE_BF16
 INSTANTIATE_RENORM_MOE_ROUTING(__nv_bfloat16, float, int32_t);
+INSTANTIATE_RENORM_MOE_ROUTING(__nv_bfloat16, __nv_bfloat16, int32_t);
 #endif
 
 } // namespace tensorrt_llm::kernels

@@ -232,8 +232,16 @@ __device__ void routingPermutation(KernelParams params, PackedScoreIdx<BaseType>
         TypePacked scoreIdx;
         if constexpr (LoadExpertIdxFromGlobal)
         {
-            scoreIdx = TypePacked{static_cast<BaseType>(params.mPtrExpertIdx[expandedIdx].score),
-                static_cast<int16_t>(params.mPtrExpertIdx[expandedIdx].idx)};
+            if (params.mPtrTopKIds != nullptr)
+            {
+                scoreIdx = TypePacked{static_cast<BaseType>(params.mPtrTopKWeights[expandedIdx]),
+                    static_cast<int16_t>(params.mPtrTopKIds[expandedIdx])};
+            }
+            else
+            {
+                scoreIdx = TypePacked{static_cast<BaseType>(params.mPtrTopKPacked[expandedIdx].score),
+                    static_cast<int16_t>(params.mPtrTopKPacked[expandedIdx].idx)};
+            }
         }
         else
         {
@@ -248,9 +256,9 @@ __device__ void routingPermutation(KernelParams params, PackedScoreIdx<BaseType>
         auto isLocalExpert = localExpertIdx >= 0 && localExpertIdx < localExpertExtent
             && (localExpertIdx & params.mLocalExpertsStrideLog2) == 0;
         expertOffsets[ii] = isLocalExpert ? atomicAdd(smemExpertCount + scoreIdx.idx, 1) : 0;
-        if (params.mPtrExpertWeights != nullptr)
+        if (params.mPtrTopKWeights != nullptr && params.mPtrTopKIds == nullptr)
         {
-            params.mPtrExpertWeights[expandedIdx] = OutputT{scoreIdx.score};
+            params.mPtrTopKWeights[expandedIdx] = OutputT{scoreIdx.score};
         }
     };
 
@@ -459,19 +467,29 @@ __global__ void __launch_bounds__(NumThreadsHist) routingIndicesHistogramKernel(
     // Define a lambda to avoid code duplication in branches.
     auto loopBody = [&](int expandedIdx)
     {
-        PackedScoreIdx<OutputT> scoreIdx = params.mPtrExpertIdx[expandedIdx];
+        PackedScoreIdx<OutputT> scoreIdx;
+        int idx;
+        if (params.mPtrTopKIds != nullptr)
+        {
+            idx = params.mPtrTopKIds[expandedIdx];
+        }
+        else
+        {
+            // If params.mPtrTopKIds != nullptr, we don't need to store the weights
+            if (params.mPtrTopKWeights != nullptr)
+            {
+                scoreIdx = params.mPtrTopKPacked[expandedIdx];
+                idx = scoreIdx.idx;
+                params.mPtrTopKWeights[expandedIdx] = static_cast<OutputT>(scoreIdx.score);
+            }
+        }
         // check whether this expert is local to our GPU at all and ignore if not
-        auto localExpertIdx = scoreIdx.idx - params.mLocalExpertsStartIdx;
+        auto localExpertIdx = idx - params.mLocalExpertsStartIdx;
         auto isLocalExpert = localExpertIdx >= 0 && localExpertIdx < localExpertExtent
             && (localExpertIdx & params.mLocalExpertsStrideLog2) == 0;
         if (isLocalExpert)
         {
-            atomicAdd(&smemExpertCount[scoreIdx.idx], 1);
-        }
-
-        if (params.mPtrExpertWeights != nullptr)
-        {
-            params.mPtrExpertWeights[expandedIdx] = static_cast<OutputT>(scoreIdx.score);
+            atomicAdd(&smemExpertCount[idx], 1);
         }
     };
 
@@ -625,13 +643,13 @@ __global__ void __launch_bounds__(NumThreadsHist) routingIndicesOffsetsKernel(Ke
         // Define a lambda to avoid code duplication in branches.
         auto loopBody = [&](int ii, int expandedIdx)
         {
-            PackedScoreIdx<OutputT> scoreIdx = params.mPtrExpertIdx[expandedIdx];
-            expertIndexes[ii] = scoreIdx.idx;
+            expertIndexes[ii]
+                = params.mPtrTopKIds ? params.mPtrTopKIds[expandedIdx] : params.mPtrTopKPacked[expandedIdx].idx;
             // check whether this expert is local to our GPU at all and ignore if not
-            auto localExpertIdx = scoreIdx.idx - params.mLocalExpertsStartIdx;
+            auto localExpertIdx = expertIndexes[ii] - params.mLocalExpertsStartIdx;
             auto isLocalExpert = localExpertIdx >= 0 && localExpertIdx < localExpertExtent
                 && (localExpertIdx & params.mLocalExpertsStrideLog2) == 0;
-            expertOffsets[ii] = isLocalExpert ? atomicAdd(smemExpertCount + scoreIdx.idx, 1) : 0;
+            expertOffsets[ii] = isLocalExpert ? atomicAdd(smemExpertCount + expertIndexes[ii], 1) : 0;
         };
 
         // For all tiles but the last, all indices are in bounds.
@@ -769,5 +787,33 @@ __global__ void __launch_bounds__(NumThreadsHist) routingIndicesOffsetsKernel(Ke
 #endif // if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
 }
 
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <typename KernelParams>
+__global__ void __launch_bounds__(NumThreadsHist) routingInitExpertCounts(KernelParams params)
+{
+    // initialize the mPtrExpertCounts
+    int32_t expertCountsNum = 2 * params.mNumExperts;
+    int32_t globalThreadIdx = blockIdx.x * NumThreadsHist + threadIdx.x;
+    int32_t globalThreadStride = gridDim.x * NumThreadsHist;
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    // Wait on primary grid.
+    if constexpr (KernelParams::UsePdl)
+    {
+        cudaGridDependencySynchronize();
+    }
+#endif // if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+
+    initArr(globalThreadIdx, expertCountsNum, globalThreadStride, params.mPtrExpertCounts, 0);
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    // Wait on primary grid.
+    if constexpr (KernelParams::UsePdl)
+    {
+        cudaTriggerProgrammaticLaunchCompletion();
+    }
+#endif // if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+}
 } // namespace routing
 } // namespace moe::dev

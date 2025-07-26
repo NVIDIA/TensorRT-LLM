@@ -111,7 +111,19 @@ __global__ void __cluster_dims__(NumBlocksPerCluster, 1, 1) __launch_bounds__(Nu
         cudaGridDependencySynchronize();
     }
 
-    if (params.mPtrScores != nullptr)
+    if (params.mPtrTopKIds != nullptr)
+    {
+        if (validToken)
+        {
+            if (laneIdx < params.mTopK)
+            {
+                smemPackedScoreIdx[warpIdx * params.mTopK + laneIdx]
+                    = TypePacked{static_cast<BaseType>(params.mPtrTopKWeights[warpTokenIdx * params.mTopK + laneIdx]),
+                        static_cast<int16_t>(params.mPtrTopKIds[warpTokenIdx * params.mTopK + laneIdx])};
+            }
+        }
+    }
+    else if (params.mPtrScores != nullptr)
     {
         // in this case, each warp represents a token
         BaseType score[VecSize];
@@ -133,11 +145,11 @@ __global__ void __cluster_dims__(NumBlocksPerCluster, 1, 1) __launch_bounds__(Nu
                     = TypePacked{warpTopKScore[laneIdx], static_cast<int16_t>(warpTopKExpertIdx[laneIdx])};
             }
         } // end if (validToken)
-
-        // make packed scores available to all threads in cluster
-        __cluster_barrier_arrive();
-        __cluster_barrier_wait();
     }
+
+    // make packed scores available to all threads in cluster
+    __cluster_barrier_arrive();
+    __cluster_barrier_wait();
 
     routingPermutation<KernelParams, BaseType, NumThreads, NumWarps, MaxNumTopExperts,
         /*LoadExpertIdxFromGlobal=*/false>(params, smemPackedScoreIdx, warpIdx, clusterBlockRank);
@@ -180,8 +192,8 @@ __global__ void __launch_bounds__(NumThreadsHist) routingIndicesHistogramScoresK
 
     // initialize the mPtrExpertCounts
     int32_t expertCountsNum = 2 * params.mNumExperts;
-    int32_t globalThreadIdx = blockIdx.x * NumThreads + threadIdx.x;
-    int32_t globalThreadStride = gridDim.x * NumThreads;
+    int32_t globalThreadIdx = blockIdx.x * NumThreadsHist + threadIdx.x;
+    int32_t globalThreadStride = gridDim.x * NumThreadsHist;
     initArr(globalThreadIdx, expertCountsNum, globalThreadStride, params.mPtrExpertCounts, 0);
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
@@ -210,7 +222,7 @@ __global__ void __launch_bounds__(NumThreadsHist) routingIndicesHistogramScoresK
         {
             PackedScoreIdx<OutputT> packedScore{
                 static_cast<OutputT>(warpTopKScore[laneIdx]), static_cast<int16_t>(warpTopKExpertIdx[laneIdx])};
-            params.mPtrExpertIdx[tokenIdx * params.mTopK + laneIdx] = packedScore;
+            params.mPtrTopKPacked[tokenIdx * params.mTopK + laneIdx] = packedScore;
         }
     }
 }
@@ -219,28 +231,29 @@ __global__ void __launch_bounds__(NumThreadsHist) routingIndicesHistogramScoresK
 
 void run(Data const& data, void* stream)
 {
-    TLLM_CHECK_WITH_INFO(data.mPtrExpertIdx != nullptr || data.mPtrScores != nullptr,
+    TLLM_CHECK_WITH_INFO(data.mPtrTopKPacked != nullptr || data.mPtrScores != nullptr || data.mPtrTopKIds != nullptr,
         "Routing kernel requires at least one input parameter");
     TLLM_CHECK_WITH_INFO(data.mPtrPermutedIdxSize != nullptr && data.mPtrCtaIdxXyToBatchIdx != nullptr
             && data.mPtrCtaIdxXyToMnLimit != nullptr && data.mPtrNumNonExitingCtas != nullptr,
         "Llama4 routing kernel expects permuted idx and grouped Gemm launch config buffers");
     TLLM_CHECK_WITH_INFO(data.mTopK <= MaxNumTopExperts, "Routing kernel expects topK experts <= %d, got %d",
         MaxNumTopExperts, data.mTopK);
-    TLLM_CHECK_WITH_INFO(data.mNumExperts <= MaxNumExperts,
-        "Routing kernel expects #experts %d to be at most max #experts %d", data.mNumExperts, MaxNumExperts);
+    TLLM_CHECK_WITH_INFO(data.mNumExperts <= MaxNumExperts, "Routing kernel expects #experts %d to be no more than %d",
+        data.mNumExperts, MaxNumExperts);
     static_assert(MaxNumExperts <= NumThreads, "#experts must be bounded by #threads");
     static_assert(MaxNumExperts <= NumThreadsHist, "#experts must be bounded by #threads");
     TLLM_CHECK_WITH_INFO(
         data.mNumExperts % 4 == 0, "Routing kernel expects #experts %d to be a multiple of 4.", data.mNumExperts);
     TLLM_CHECK_WITH_INFO(data.mPaddingLog2 < 8, "Routing kernel expects padding log2 < 8, got %d", data.mPaddingLog2);
 
-    bool const useSingleCluster
-        = data.mNumTokens <= (data.mPtrScores != nullptr ? MaxNumTokensSingleClusterScores : MaxNumTokensSingleCluster);
+    bool const useSingleCluster = data.mNumTokens <= ((data.mPtrScores != nullptr || data.mPtrTopKIds != nullptr)
+                                          ? MaxNumTokensSingleClusterScores
+                                          : MaxNumTokensSingleCluster);
 
     if (!useSingleCluster)
     {
-        TLLM_CHECK_WITH_INFO(
-            data.mPtrExpertIdx != nullptr, "When #tokens is large, `mPtrExpertIdx` is a required input.");
+        TLLM_CHECK_WITH_INFO((data.mPtrTopKPacked != nullptr || data.mPtrTopKIds != nullptr),
+            "When #tokens is large, `mPtrTopKPacked` or `mPtrTopKIds` is a required input.");
         TLLM_CHECK_WITH_INFO(
             data.mPtrExpertCounts != nullptr, "When #tokens is large, `mPtrExpertCounts` is a required input.");
     }
@@ -266,7 +279,7 @@ void run(Data const& data, void* stream)
         int const numBlocksOffsets
             = std::min((expandedIdxSize + offsetEltsPerBlock - 1) / offsetEltsPerBlock, maxNumBlocks);
 
-        if (data.mPtrScores != nullptr)
+        if (data.mPtrScores != nullptr && data.mPtrTopKIds == nullptr)
         {
             LAUNCH_ROUTING_WITH_EXTRA_FLAG(data, false, routingIndicesHistogramScoresKernel, maxNumBlocks,
                 NumThreadsHist,
@@ -276,8 +289,10 @@ void run(Data const& data, void* stream)
         else
         {
             // Reset the global histograms.
-            TLLM_CUDA_CHECK(cudaMemsetAsync(data.mPtrExpertCounts, 0,
-                static_cast<size_t>(2 * NumThreads) * sizeof(int32_t), (cudaStream_t) stream));
+            LAUNCH_ROUTING_WITH_EXTRA_FLAG(data, false, routingInitExpertCounts,
+                (2 * data.mNumExperts - 1) / NumThreadsHist + 1, NumThreadsHist,
+                /*smemSize=*/0, // No dynamic smem
+                stream, data.mDoSoftmaxBeforeTopK, /*forceFloatInput=*/false);
         }
         LAUNCH_ROUTING_WITH_EXTRA_FLAG(data, false, routingIndicesHistogramKernel, numBlocksHistogram, NumThreadsHist,
             /*smemSize=*/0, // No dynamic smem
