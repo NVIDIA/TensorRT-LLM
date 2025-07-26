@@ -998,6 +998,12 @@ class BaseLlmArgs(BaseModel):
         description="The format to load the model.",
         json_schema_extra={"type": "Literal['auto', 'dummy']"})
 
+    fail_fast_on_attention_window_too_large: bool = Field(
+        default=False,
+        description=
+        "Fail fast when attention window is too large to fit even a single sequence in the KV cache."
+    )
+
     # LoRA arguments
     enable_lora: bool = Field(default=False, description="Enable LoRA.")
 
