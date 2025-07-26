@@ -32,8 +32,6 @@ from .library import (
     match_rope_layout,
     match_rope_pattern,
     optimize_rope,
-    quantize,
-    quantize_moe,
     resize_kv_cache,
     sharding_transform_executor,
     update_in_out_nodes,
@@ -70,9 +68,6 @@ class InferenceOptimizer:
         ############################################################################################
         # RUN PATTERN MATCHER TRANSFORMATIONS TO STANDARDIZE GRAPH REPRESENTATION
         ############################################################################################
-        # quantization
-        quantize(egm, self.factory.get_quant_config())
-        quantize_moe(egm, self.factory.get_quant_config())
 
         # Match MoE pattern
         match_moe_pattern(egm)
