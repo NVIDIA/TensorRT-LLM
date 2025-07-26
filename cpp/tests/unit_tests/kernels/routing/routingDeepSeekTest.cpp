@@ -73,40 +73,49 @@ private:
                 expWeightsIdx[ie] = si;
             }
 
-            // Calculate the group score
-            int32_t expertsPerGroup = param.numExperts / param.nGroup;
-            PackedFloat groupScoresCandidate[param.nGroup][2];
-            PackedFloat groupScores[param.nGroup];
-            for (int ig = 0; ig < param.nGroup; ++ig)
-            {
-                std::partial_sort_copy(expWeightsIdx + ig * expertsPerGroup, expWeightsIdx + (ig + 1) * expertsPerGroup,
-                    groupScoresCandidate[ig], groupScoresCandidate[ig] + 2, comp);
-                PackedFloat si{
-                    static_cast<float>(groupScoresCandidate[ig][0].score + groupScoresCandidate[ig][1].score),
-                    static_cast<int16_t>(ig)};
-                groupScores[ig] = si;
-            }
-
-            // Get the topkGroup group score
-            PackedFloat topGroupScores[param.topkGroup];
-            std::partial_sort_copy(
-                groupScores, groupScores + param.nGroup, topGroupScores, topGroupScores + param.topkGroup, comp);
-
-            // Prepare the data for the final topk experts selection
-            PackedFloat topkExpertsCandidate[param.topkGroup * expertsPerGroup];
             PackedFloat finalTopkExperts[param.topK];
-
-            for (int ig = 0; ig < param.topkGroup; ++ig)
+            if (param.nGroup != 0)
             {
-                for (int ie = 0; ie < expertsPerGroup; ++ie)
+                // Calculate the group score
+                int32_t expertsPerGroup = param.numExperts / param.nGroup;
+                PackedFloat groupScoresCandidate[param.nGroup][2];
+                PackedFloat groupScores[param.nGroup];
+                for (int ig = 0; ig < param.nGroup; ++ig)
                 {
-                    topkExpertsCandidate[ig * expertsPerGroup + ie]
-                        = expWeightsIdx[topGroupScores[ig].idx * expertsPerGroup + ie];
+                    std::partial_sort_copy(expWeightsIdx + ig * expertsPerGroup,
+                        expWeightsIdx + (ig + 1) * expertsPerGroup, groupScoresCandidate[ig],
+                        groupScoresCandidate[ig] + 2, comp);
+                    PackedFloat si{
+                        static_cast<float>(groupScoresCandidate[ig][0].score + groupScoresCandidate[ig][1].score),
+                        static_cast<int16_t>(ig)};
+                    groupScores[ig] = si;
                 }
-            }
 
-            std::partial_sort_copy(topkExpertsCandidate, topkExpertsCandidate + param.topkGroup * expertsPerGroup,
-                finalTopkExperts, finalTopkExperts + param.topK, comp);
+                // Get the topkGroup group score
+                PackedFloat topGroupScores[param.topkGroup];
+                std::partial_sort_copy(
+                    groupScores, groupScores + param.nGroup, topGroupScores, topGroupScores + param.topkGroup, comp);
+
+                // Prepare the data for the final topk experts selection
+                PackedFloat topkExpertsCandidate[param.topkGroup * expertsPerGroup];
+
+                for (int ig = 0; ig < param.topkGroup; ++ig)
+                {
+                    for (int ie = 0; ie < expertsPerGroup; ++ie)
+                    {
+                        topkExpertsCandidate[ig * expertsPerGroup + ie]
+                            = expWeightsIdx[topGroupScores[ig].idx * expertsPerGroup + ie];
+                    }
+                }
+
+                std::partial_sort_copy(topkExpertsCandidate, topkExpertsCandidate + param.topkGroup * expertsPerGroup,
+                    finalTopkExperts, finalTopkExperts + param.topK, comp);
+            }
+            else
+            {
+                std::partial_sort_copy(expWeightsIdx, expWeightsIdx + param.numExperts, finalTopkExperts,
+                    finalTopkExperts + param.topK, comp);
+            }
 
             // Normalize the score
             float sumScore = 0.0f;
@@ -120,16 +129,24 @@ private:
                 finalTopkExperts[ie].score = finalScore;
             }
 
-            // Convert back to io_dtype and store the topk expert results in hostData.mPtrExpertIdx
+            // Convert back to io_dtype and store the topk expert results in hostData.mPtrTopKPacked
             for (int ie = 0; ie < param.topK; ++ie)
             {
-                if (param.getExpWeights)
+                if (param.useTopKAsInput)
                 {
-                    bufferCast<T>(*this->mPtrExpertWeightsHost)[it * param.topK + ie]
+                    bufferCast<int32_t>(*this->mPtrTopKIdsHost)[it * param.topK + ie]
+                        = static_cast<int32_t>(finalTopkExperts[ie].idx);
+                    bufferCast<T>(*this->mPtrTopKWeightsHost)[it * param.topK + ie]
                         = static_cast<T>(finalTopkExperts[ie].score);
                 }
+                else if (param.getExpWeights)
+                {
+                    bufferCast<T>(*this->mPtrTopKWeightsHost)[it * param.topK + ie]
+                        = static_cast<T>(finalTopkExperts[ie].score);
+                }
+
                 PackedType si{static_cast<T>(finalTopkExperts[ie].score), finalTopkExperts[ie].idx};
-                reinterpret_cast<PackedType*>(bufferCast<int8_t>(*this->mPtrExpertIdxHost))[it * param.topK + ie] = si;
+                reinterpret_cast<PackedType*>(bufferCast<int8_t>(*this->mPtrTopKPackedHost))[it * param.topK + ie] = si;
             }
         }
     }
@@ -163,13 +180,24 @@ private:
     {
         RoutingKernelTest<T>::setCommonParams(param, routingData);
         routingData.mDtypeExpW = btg::Dtype::Bfloat16;
-        routingData.mPtrScores = bufferCast<float>(*this->mPtrScoresDevice);
+
         routingData.mPtrRoutingBias = bufferCast<T>(*this->mPtrRoutingBiasDevice);
 
         routingData.mNumExpertGroups = param.nGroup;
         routingData.mNumLimitedGroups = param.topkGroup;
         routingData.mRouteScale = param.routedScalingFactor;
         routingData.mUseRoutingSoftmax = false;
+
+        if (param.useTopKAsInput)
+        {
+            routingData.mPtrTopKIds = bufferCast<int32_t>(*this->mPtrTopKIdsDevice);
+            routingData.mPtrScores = nullptr;
+        }
+        else
+        {
+            routingData.mPtrTopKIds = nullptr;
+            routingData.mPtrScores = bufferCast<float>(*this->mPtrScoresDevice);
+        }
     }
 
     void callTestedFunction(
@@ -189,7 +217,18 @@ TYPED_TEST(RoutingDeepSeekKernelTest, ClusterLevelParallelization)
         /*numExperts=*/128, /*topK=*/8,
         /*expertParallelization=*/1, /*expertParallelizationId=*/0,
         /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
-        /*usePdl=*/true, /*getExpWeights=*/true,
+        /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/false,
+        /*nGroup*/ 8, /*topkGroup*/ 4, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 9);
+    this->runTest(param);
+};
+
+TYPED_TEST(RoutingDeepSeekKernelTest, ClusterLevelParallelizationWithTopKAsInput)
+{
+    RoutingKernelTestParam param(RoutingMethodType::DeepSeekV3, /*numTokens=*/1024, // 10
+        /*numExperts=*/128, /*topK=*/8,
+        /*expertParallelization=*/1, /*expertParallelizationId=*/0,
+        /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
+        /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/true,
         /*nGroup*/ 8, /*topkGroup*/ 4, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 9);
     this->runTest(param);
 };
@@ -200,7 +239,7 @@ TYPED_TEST(RoutingDeepSeekKernelTest, ClusterLevelParallelizationWithExpertParal
         /*numExperts=*/128, /*topK=*/8,
         /*expertParallelization=*/2, /*expertParallelizationId=*/1,
         /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
-        /*usePdl=*/true, /*getExpWeights=*/true,
+        /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/false,
         /*nGroup*/ 8, /*topkGroup*/ 4, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 9);
     this->runTest(param);
 };
@@ -211,7 +250,7 @@ TYPED_TEST(RoutingDeepSeekKernelTest, CooperativeLevelParallelization)
         /*numExperts=*/128, /*topK=*/8,
         /*expertParallelization=*/1, /*expertParallelizationId=*/0,
         /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
-        /*usePdl=*/true, /*getExpWeights=*/true,
+        /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/false,
         /*nGroup*/ 8, /*topkGroup*/ 4, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 10);
     this->runTest(param);
 };
@@ -222,7 +261,7 @@ TYPED_TEST(RoutingDeepSeekKernelTest, CooperativeLevelParallelization)
 //         /*numExperts=*/128, /*topK=*/8,
 //         /*expertParallelization=*/1, /*expertParallelizationId=*/0,
 //         /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
-//         /*usePdl=*/true, /*getExpWeights=*/true,
+//         /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/false,
 //         /*nGroup*/ 8, /*topkGroup*/ 4, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 10);
 //     this->runTest(param);
 // };
@@ -233,7 +272,7 @@ TYPED_TEST(RoutingDeepSeekKernelTest, ClusterLevelParallelizationTop2)
         /*numExperts=*/128, /*topK=*/2,
         /*expertParallelization=*/1, /*expertParallelizationId=*/0,
         /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
-        /*usePdl=*/true, /*getExpWeights=*/true,
+        /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/false,
         /*nGroup*/ 8, /*topkGroup*/ 4, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 9);
     this->runTest(param);
 };
@@ -244,7 +283,7 @@ TYPED_TEST(RoutingDeepSeekKernelTest, ClusterLevelParallelizationWithExpertParal
         /*numExperts=*/128, /*topK=*/2,
         /*expertParallelization=*/2, /*expertParallelizationId=*/1,
         /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
-        /*usePdl=*/true, /*getExpWeights=*/true,
+        /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/false,
         /*nGroup*/ 8, /*topkGroup*/ 4, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 9);
     this->runTest(param);
 };
@@ -255,7 +294,7 @@ TYPED_TEST(RoutingDeepSeekKernelTest, CooperativeLevelParallelizationTop2)
         /*numExperts=*/128, /*topK=*/2,
         /*expertParallelization=*/1, /*expertParallelizationId=*/0,
         /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
-        /*usePdl=*/true, /*getExpWeights=*/true,
+        /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKExpertsAsInput=*/false,
         /*nGroup*/ 8, /*topkGroup*/ 4, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 10);
     this->runTest(param);
 };
