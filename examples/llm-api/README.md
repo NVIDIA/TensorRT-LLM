@@ -47,7 +47,7 @@ python3 quickstart_advanced.py \
 ```
 
 ```bash
-# Draft Taret
+# Draft Target
 python3 quickstart_advanced.py \
     --model_dir meta-llama/Llama-3.1-8B-Instruct \
     --spec_decode_algo draft_target \
