@@ -967,7 +967,7 @@ class _TorchLLM(BaseLLM):
         # With concurrency <= 4, max_draft_len = 5, max_matching_ngram_size = 3
         # With concurrency <= 32, max_draft_len = 3, max_matching_ngram_size = 5
         # With concurrency > 32, speculative decoding is disabled.
-        if spec_config is not None and spec_config.decoding_type == "AUTO" and max_batch_size <= 32:
+        if spec_config is not None and spec_config.decoding_type == "AUTO":
             if not self.args.disable_overlap_scheduler:
                 logger.info(
                     "Disable overlap scheduler to enable Auto speculative decoding with Ngram."
@@ -982,6 +982,8 @@ class _TorchLLM(BaseLLM):
                 is_keep_all=True,
                 is_use_oldest=True,
                 is_public_pool=True,
+                # Flag to indicate the NGramDecodingConfig is instantiated by auto heuristic.
+                is_auto_heuristic=True,
             )
 
             logger.info(

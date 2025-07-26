@@ -376,6 +376,9 @@ class NGramDecodingConfig(DecodingBaseConfig):
     is_keep_all: bool = True
     is_use_oldest: bool = True
     is_public_pool: bool = True
+    # Flag to indicate the NGramDecodingConfig is instantiated by auto heuristic.
+    # User should not set this flag. Use AutoDecodingConfig instead.
+    is_auto_heuristic: bool = False
 
     @classmethod
     def from_dict(cls, data: dict):
