@@ -88,7 +88,7 @@ class MoERunner(TunableRunner):
     ):
         x, fc1_expert_weights, fc1_expert_biases, fc2_expert_weights, fc2_expert_biases = inputs
         self.fused_moe_runner.run_gemm_profile(
-            x.contiguous(),
+            x,
             fc1_expert_weights,
             fc1_expert_biases,
             fc2_expert_weights,
@@ -148,6 +148,8 @@ def fused_moe(
     tuner = AutoTuner.get()
     MoERunner.refine_tuning_config(tune_max_num_tokens)
 
+    # Only the non-alltoall case is considered for profiling in the warmup phase.
+    # Therefore, to get the correct tactics during the actual inference, the inputs to the tuner should be the same as when not using alltoall.
     if enable_alltoall:
         assert tuner_num_tokens is not None
         assert tuner_top_k is not None
