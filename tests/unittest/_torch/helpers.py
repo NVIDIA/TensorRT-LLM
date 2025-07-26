@@ -75,6 +75,18 @@ def calc_diff(x, y):
     return 1 - sim
 
 
+def calc_woq_tolerence(x: torch.Tensor, weight_dtype: torch.dtype):
+    if weight_dtype == torch.int8:
+        bits_in_type = 8
+    elif weight_dtype == torch.quint4x2:
+        bits_in_type = 4
+    quant_range_scale = 1.0 / float(1 << (bits_in_type - 1))
+    max_val = torch.max(abs(x)).item()
+    atol = (max_val * quant_range_scale) * 1.5  # allow for rounding
+
+    return atol
+
+
 def reference_moe_torch(x: torch.Tensor, selected_experts: torch.Tensor,
                         final_scales: torch.Tensor, num_experts: int,
                         weights: Dict[str, torch.Tensor]) -> torch.Tensor:
