@@ -210,10 +210,21 @@ void initRequestBindings(nb::module_& m)
             nb::cast<std::optional<std::vector<tle::AdditionalModelOutput>>>(state[6]));
     };
     nb::class_<tle::OutputConfig>(m, "OutputConfig")
-        .def(nb::init<bool, bool, bool, bool, bool, bool, std::optional<std::vector<tle::AdditionalModelOutput>>>(),
-            nb::arg("return_log_probs").none() = false, nb::arg("return_context_logits") = false,
-            nb::arg("return_generation_logits") = false, nb::arg("exclude_input_from_output") = false,
-            nb::arg("return_encoder_output") = false, nb::arg("return_perf_metrics") = false,
+        .def(
+            "__init__",
+            [](tle::OutputConfig& self, std::optional<bool> return_log_probs, std::optional<bool> return_context_logits,
+                std::optional<bool> return_generation_logits, std::optional<bool> exclude_input_from_output,
+                std::optional<bool> return_encoder_output, std::optional<bool> return_perf_metrics,
+                std::optional<std::vector<tle::AdditionalModelOutput>> additional_model_outputs)
+            {
+                new (&self) tle::OutputConfig(return_log_probs.value_or(false), return_context_logits.value_or(false),
+                    return_generation_logits.value_or(false), exclude_input_from_output.value_or(false),
+                    return_encoder_output.value_or(false), return_perf_metrics.value_or(false),
+                    additional_model_outputs);
+            },
+            nb::arg("return_log_probs") = nb::none(), nb::arg("return_context_logits") = nb::none(),
+            nb::arg("return_generation_logits") = nb::none(), nb::arg("exclude_input_from_output") = nb::none(),
+            nb::arg("return_encoder_output") = nb::none(), nb::arg("return_perf_metrics") = nb::none(),
             nb::arg("additional_model_outputs") = nb::none())
         .def_rw("return_log_probs", &tle::OutputConfig::returnLogProbs)
         .def_rw("return_context_logits", &tle::OutputConfig::returnContextLogits)
