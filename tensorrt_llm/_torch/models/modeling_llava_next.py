@@ -221,8 +221,7 @@ class LlavaNextInputProcessor(InputProcessor):
         input_ids = self.tokenizer(
             text_prompt, return_tensors="pt").input_ids[0].to(self.device)
         mm_features = torch.stack(multimodal_embedding['image'])
-        fused_input_ids, mm_features = self._postprocess(
-            input_ids, mm_features)
+        fused_input_ids, mm_features = self._postprocess(input_ids, mm_features)
         multimodal_data = {}
         multimodal_data["multimodal_embedding"] = mm_features
         return fused_input_ids.to(torch.int32).tolist(), {

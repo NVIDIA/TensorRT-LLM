@@ -512,7 +512,9 @@ def default_multimodal_input_loader(
                 ]
         elif modality == "video":
             if is_embedding:
-                raise ValueError("External embedding is not supported for video modality yet.")
+                raise ValueError(
+                    "External embedding is not supported for video modality yet."
+                )
             mm_data = [
                 MultimodalData(modality=modality,
                                data=load_video(i,
@@ -522,14 +524,18 @@ def default_multimodal_input_loader(
             ]
         elif modality == "audio":
             if is_embedding:
-                raise ValueError("External embedding is not supported for audio modality yet.")
+                raise ValueError(
+                    "External embedding is not supported for audio modality yet."
+                )
             mm_data = [
                 MultimodalData(modality=modality,
                                data=load_audio(i, device=device)) for i in media
             ]
         elif modality == "image_audio":
             if is_embedding:
-                raise ValueError("External embedding is not supported for image_audio modality yet.")
+                raise ValueError(
+                    "External embedding is not supported for image_audio modality yet."
+                )
             # Use different load_xxx functions to match the modality.
             mm_data = []
             for m in media:
@@ -564,7 +570,8 @@ def default_multimodal_input_loader(
     if len(media_or_embeddings) > len(prompts) and len(prompts) == 1:
         # 1 prompt + N media
         assert not isinstance(
-            media_or_embeddings[0], list)  # media cannot be a list of lists in this case
+            media_or_embeddings[0],
+            list)  # media cannot be a list of lists in this case
         media_or_embeddings = [media_or_embeddings]
     assert len(media_or_embeddings) == len(prompts)
 
@@ -578,7 +585,8 @@ def default_multimodal_input_loader(
                                                   trust_remote_code=True)
 
     inputs = []
-    for prompt_idx, (prompt, media) in enumerate(zip(prompts, media_or_embeddings)):
+    for prompt_idx, (prompt,
+                     media) in enumerate(zip(prompts, media_or_embeddings)):
         conv = convert_to_conversation_message(prompt, media, modality,
                                                is_embedding)
         mm_data_tracker = MultimodalDataTracker(model_type)
