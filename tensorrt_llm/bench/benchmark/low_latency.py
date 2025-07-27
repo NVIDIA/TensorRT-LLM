@@ -180,23 +180,23 @@ def latency_command(
     logger.info("Preparing to run latency benchmark...")
     # Parameters from CLI
     # Model, experiment, and engine params
-    dataset_path: Path = params.pop("dataset")
-    num_requests: int = params.pop("num_requests")
+    dataset_path: Path = params.get("dataset")
+    num_requests: int = params.get("num_requests")
     model: str = bench_env.model
     checkpoint_path: Path = bench_env.checkpoint_path or bench_env.model
-    engine_dir: Path = params.pop("engine_dir")
-    concurrency: int = params.pop("concurrency")
-    beam_width: int = params.pop("beam_width")
+    engine_dir: Path = params.get("engine_dir")
+    concurrency: int = params.get("concurrency")
+    beam_width: int = params.get("beam_width")
     warmup: int = params.get("warmup")
-    modality: str = params.pop("modality")
-    max_input_len: int = params.pop("max_input_len")
-    max_seq_len: int = params.pop("max_seq_len")
+    modality: str = params.get("modality")
+    max_input_len: int = params.get("max_input_len")
+    max_seq_len: int = params.get("max_seq_len")
     backend: str = params.get("backend")
     model_type = get_model_config(model, checkpoint_path).model_type
 
     # Runtime Options
-    kv_cache_percent = params.pop("kv_cache_free_gpu_mem_fraction")
-    medusa_choices = params.pop("medusa_choices")
+    kv_cache_percent = params.get("kv_cache_free_gpu_mem_fraction")
+    medusa_choices = params.get("medusa_choices")
 
     # Reporting Options
     report_json: Path = params.pop("report_json")

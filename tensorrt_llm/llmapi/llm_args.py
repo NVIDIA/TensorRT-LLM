@@ -30,6 +30,7 @@ if TYPE_CHECKING:
 # isort: off
 from ..bindings.executor import (
                                  BatchingType as _BatchingType,
+                                 CacheTransceiverBackendType as _CacheTransceiverBackendType,
                                  CacheTransceiverConfig as _CacheTransceiverConfig,
                                  CapacitySchedulerPolicy as _CapacitySchedulerPolicy,
                                  ContextChunkingPolicy as _ContextChunkingPolicy,
@@ -871,7 +872,7 @@ class CacheTransceiverConfig(BaseModel, PybindMirror):
 
     def _to_pybind(self):
         return _CacheTransceiverConfig(
-            backend=self.backend,
+            backend=_CacheTransceiverBackendType.from_string(self.backend),
             max_tokens_in_buffer=self.max_tokens_in_buffer)
 
 
@@ -996,6 +997,12 @@ class BaseLlmArgs(BaseModel):
         default='auto',
         description="The format to load the model.",
         json_schema_extra={"type": "Literal['auto', 'dummy']"})
+
+    fail_fast_on_attention_window_too_large: bool = Field(
+        default=False,
+        description=
+        "Fail fast when attention window is too large to fit even a single sequence in the KV cache."
+    )
 
     # LoRA arguments
     enable_lora: bool = Field(default=False, description="Enable LoRA.")
