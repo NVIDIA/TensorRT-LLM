@@ -17,7 +17,7 @@ import torch
 from torch._ops import OpOverloadPacket
 from torch.export import Dim
 from torch.fx import Node
-
+from tensorrt_llm._utils import nvtx_range
 
 @dataclass
 class CacheConfig:
@@ -122,7 +122,7 @@ class SequenceInfo:
             self.max_batch_size,
             (total_tokens) // self.page_size + (total_tokens % self.page_size > 0),
         )
-        self.input_ids = torch.ones(self.max_batch_size, 1, dtype=torch.int)
+        self.input_ids = torch.ones(self.max_num_tokens, dtype=torch.int, device=self.device)
         self.position_ids = torch.zeros(self.max_batch_size, 1, dtype=torch.long)
         self.seq_len = torch.empty(self.max_batch_size, dtype=torch.int)
         self.input_pos = torch.empty_like(self.seq_len)
@@ -336,7 +336,7 @@ class SequenceInfo:
         self.input_pos.zero_()
 
         # set a dummy sequence corresponding to a generate-only batch (will also reset position_ids)
-        self.nest_sequences(torch.zeros(self.max_batch_size, 1, dtype=torch.int))
+        self.nest_sequences([[1]] * self.max_batch_size)
 
         # reset cache information
         self.cache_loc[:] = torch.arange(self.num_pages, dtype=torch.int, device=self.device)
@@ -381,6 +381,7 @@ class SequenceInfo:
         self.reset()
         self.nest_sequences([[1]] * self.max_batch_size)
 
+    @nvtx_range("ad_update_position_ids")
     def _update_position_ids(self) -> None:
         # set new position_ids as new tensor from input_pos and seq_len via torch.arange
         position_ids_list = [
@@ -388,7 +389,7 @@ class SequenceInfo:
             for in_pos, seq_len in zip(self.input_positions, self.sequence_lengths)
             for num in range(in_pos, in_pos + seq_len)
         ]
-        self.position_ids = torch.tensor(position_ids_list, dtype=torch.long).to(self.device)
+        self.position_ids = torch.tensor(position_ids_list, dtype=torch.long, pin_memory=True).to(self.device)
 
         # use [b,1] shape to indicate generate-only batch, otherwise use [1,total_len]
         if self.is_generate:
@@ -396,7 +397,8 @@ class SequenceInfo:
         else:
             self.position_ids = self.position_ids.view(1, -1)
 
-    def nest_sequences(self, input_ids: Sequence[Sequence[int]]) -> None:
+    @nvtx_range("ad_nest_sequences")
+    def nest_sequences(self, input_ids: Sequence[Sequence[int]], previous_batch_indices: List[int] = [], new_tokens: Optional[torch.Tensor] = None) -> None:
         """Create and store a flattened list of input_ids from the provided list of sequences.
 
         This i/f will also update any relevant sequence information.
@@ -413,8 +415,10 @@ class SequenceInfo:
             for lst in input_ids
             for val in (lst.detach().tolist() if isinstance(lst, torch.Tensor) else lst)
         ]
-        self.input_ids = torch.tensor(ids_list, dtype=dtype).to(self.device)
-
+        self.input_ids = torch.tensor(ids_list, dtype=dtype, pin_memory=True).to(self.device)
+        if new_tokens is not None:
+            self.input_ids[self.input_ids == -1] = new_tokens[0,previous_batch_indices,0]
+        
         # set derivative properties
         self._sequence_lengths = seq_lens
 
@@ -431,6 +435,7 @@ class SequenceInfo:
         t_squeezed = t_nested.squeeze(1) if self.is_generate else t_nested.squeeze(0)
         return list(torch.split(t_squeezed, self.sequence_lengths))
 
+    @nvtx_range("ad_update_pos")
     def update_pos(self, seq_len: Union[torch.Tensor, List[int], int], reset: bool = False) -> None:
         """Update the starting position for each sequence in the cache.
 
@@ -448,10 +453,11 @@ class SequenceInfo:
         # update position_ids
         self._update_position_ids()
 
+    @nvtx_range("ad_assign_cache_loc")
     def assign_cache_loc(self, page_assignments: Sequence[Sequence[int]]) -> None:
         """Set the cache location and pages_per_seq tensors from page assignments."""
         cache_loc_flat = torch.tensor(
-            [p_idx for pages in page_assignments for p_idx in pages], dtype=torch.int
+            [p_idx for pages in page_assignments for p_idx in pages], dtype=torch.int, pin_memory=True
         )
         self.cache_loc[: len(cache_loc_flat)].copy_(cache_loc_flat, non_blocking=True)
 

@@ -101,7 +101,7 @@ class ADEngine(ModelEngine):
             page_size=attn_page_size,
             max_num_tokens=max_num_tokens,
         )
-
+        print(" in seq_info for device: ", torch.cuda.current_device())
         # update device to contain the current default device if it's in cuda
         device = torch.device(ad_config.device)
         if device.type == "cuda" and device.index is None:
@@ -167,16 +167,12 @@ class ADEngine(ModelEngine):
         context_requests = scheduled_requests.context_requests
         gen_requests = [r for r in scheduled_requests.generation_requests if not r.draft_tokens]
 
-        # new_tokens is a tensor on the device, we need to convert it to a list of lists.
-        # can we avoid this additional gpu->cpu transfer?
-        new_tokens_list = new_tokens.flatten().cpu().tolist() if new_tokens is not None else None
-
         # info to be extracted
         input_ids: List[List[int]] = []
         input_pos: List[int] = []
         last_logit_only: List[bool] = []
         page_assignments: List[List[int]] = []
-
+        previous_batch_indices: List[int] = []
         # look at context requests first
         for request in context_requests:
             # store input ids and pos of first token in sequence
@@ -190,11 +186,13 @@ class ADEngine(ModelEngine):
         # TODO: we should also handle extend requests (for speculative decoding) here
         for request in gen_requests:
             # new_tokens are provided when the overlap scheduler is enabled.
-            if new_tokens_list is None or request.is_dummy or request.py_batch_idx is None:
+            if new_tokens is None or request.is_dummy or request.py_batch_idx is None:
                 input_ids.append([request.get_token(0, request.get_num_tokens(0) - 1)])
                 input_pos.append(request.max_beam_num_tokens - 1)
             else:
-                input_ids.append([new_tokens_list[request.py_batch_idx]])
+                # insert a dummy token to indicate the new tokens
+                input_ids.append([-1])
+                previous_batch_indices.append(request.py_batch_idx)
                 input_pos.append(request.max_beam_num_tokens)
 
             request.py_batch_idx = request.seq_slot
@@ -207,10 +205,9 @@ class ADEngine(ModelEngine):
             # get cache indices
             cache_indices = kv_cache_manager.get_cache_indices(request)
             page_assignments.append(cache_indices)
-
         # update the sequence info object now
         si = self.cache_seq_interface.info
-        si.nest_sequences(input_ids)
+        si.nest_sequences(input_ids, previous_batch_indices, new_tokens)
         si.update_pos(input_pos, reset=True)
         si.assign_cache_loc(page_assignments)
         return last_logit_only
