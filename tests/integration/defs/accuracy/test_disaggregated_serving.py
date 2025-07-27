@@ -422,6 +422,74 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @pytest.mark.skip_less_device(4)
+    def test_ctxtp2_genpp2(self):
+        ctx_server_config = {
+            "tensor_parallel_size": 1,
+            "pipeline_parallel_size": 2,
+            "disable_overlap_scheduler": True,
+            "cache_transceiver_config": {
+                "backend": "default"
+            }
+        }
+        gen_server_config = {
+            "tensor_parallel_size": 1,
+            "pipeline_parallel_size": 2,
+            "disable_overlap_scheduler": True,
+            "cache_transceiver_config": {
+                "backend": "default"
+            }
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "port": 8000,
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1,
+                "urls": ["localhost:8001"]
+            },
+            "generation_servers": {
+                "num_instances": 1,
+                "urls": ["localhost:8002"]
+            }
+        }
+        with launch_disaggregated_llm(disaggregated_server_config,
+                                      ctx_server_config, gen_server_config,
+                                      self.MODEL_PATH) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @pytest.mark.skip_less_device(4)
+    def test_ctxpp2_gentp2(self):
+        ctx_server_config = {
+            "pipeline_parallel_size": 2,
+            "disable_overlap_scheduler": True,
+            "cache_transceiver_config": {
+                "backend": "default"
+            }
+        }
+        gen_server_config = {
+            "tensor_parallel_size": 2,
+            "pipeline_parallel_size": 1,
+            "disable_overlap_scheduler": True,
+            "cache_transceiver_config": {
+                "backend": "default"
+            }
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "port": 8000,
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1,
+                "urls": ["localhost:8001"]
+            },
+            "generation_servers": {
+                "num_instances": 1,
+                "urls": ["localhost:8002"]
+            }
+        }
+
 
 @pytest.mark.skip_less_device_memory(140000)
 @pytest.mark.timeout(3600)
