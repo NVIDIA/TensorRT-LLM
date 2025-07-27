@@ -186,21 +186,26 @@ class MLPBlock(torch.nn.Module):
         self.swiglu_limit = torch.tensor(
             [7.0] * (self.num_experts // config.mapping.moe_ep_size),
             dtype=torch.float32).cuda()
-        self.experts = create_moe(
-            routing_method=self.routing_method,
-            num_experts=pretrained_config.num_experts,
-            hidden_size=pretrained_config.hidden_size,
-            intermediate_size=pretrained_config.intermediate_size,
-            dtype=pretrained_config.torch_dtype,
-            reduce_results=not self.enable_attention_dp
-            and reduce_results,  # Don't allreduce when using attention_dp
-            model_config=config,
-            weight_loading_mode=MoEWeightLoadingMode.FUSED_GATE_UP_PROJ,
-            bias=True,
-            swiglu_alpha=self.swiglu_alpha,
-            swiglu_beta=self.swiglu_beta,
-            swiglu_limit=self.swiglu_limit,
-        )
+        # Prepare MoE creation parameters
+        moe_params = {
+            'routing_method': self.routing_method,
+            'num_experts': pretrained_config.num_experts,
+            'hidden_size': pretrained_config.hidden_size,
+            'intermediate_size': pretrained_config.intermediate_size,
+            'dtype': pretrained_config.torch_dtype,
+            'reduce_results': not self.enable_attention_dp and reduce_results,
+            'model_config': config,
+            'weight_loading_mode': MoEWeightLoadingMode.FUSED_GATE_UP_PROJ,
+            'bias': True,
+            'swiglu_alpha': self.swiglu_alpha,
+            'swiglu_beta': self.swiglu_beta,
+        }
+
+        # Only add swiglu_limit for TRITON backend
+        if config.moe_backend.upper() == "TRITON":
+            moe_params['swiglu_limit'] = self.swiglu_limit
+
+        self.experts = create_moe(**moe_params)
 
         # Perfect router caching - precompute common logits if enabled
         if os.environ.get('ENABLE_PERFECT_ROUTER', '0') == '1':
