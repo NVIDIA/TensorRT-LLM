@@ -782,7 +782,7 @@ class KVCacheManager(BaseResourceManager):
         # Respect max_gpu_total_bytes if provided
         primary_pool_memory_bytes = kv_cache_config.max_gpu_total_bytes if kv_cache_config.max_gpu_total_bytes > 0 else int(
             free_mem * kv_cache_config.free_gpu_memory_fraction)
-        secondary_pool_memory_bytes = 0
+        secondary_pool_memory_bytes = kv_cache_config.host_cache_size if kv_cache_config.host_cache_size else 0
         logger.debug(
             f"primary_pool_memory_bytes is set to {primary_pool_memory_bytes/1024**3}GB, \n"
             f"secondary_pool_memory_bytes is set to {secondary_pool_memory_bytes/1024**3}GB"
