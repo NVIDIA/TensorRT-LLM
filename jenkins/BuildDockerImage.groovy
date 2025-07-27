@@ -193,8 +193,8 @@ def createKubernetesPodConfig(type, arch = "amd64", build_wheel = false)
 
 
 def prepareWheelFromBuildStage(dockerfileStage, arch) {
-    if (TRIGGER_TYPE == "manual") {
-        echo "Trigger type is manual, skip preparing wheel from build stage"
+    if (TRIGGER_TYPE != "post-merge") {
+        echo "Trigger type is not post-merge, skip preparing wheel from build stage"
         return ""
     }
 
@@ -209,7 +209,7 @@ def prepareWheelFromBuildStage(dockerfileStage, arch) {
     }
 
     def wheelScript = 'scripts/get_wheel_from_package.py'
-    def wheelArgs = "--arch ${arch} --timeout ${WAIT_TIME_FOR_BUILD_STAGE} --upload_path " + env.uploadPath
+    def wheelArgs = "--arch ${arch} --timeout ${WAIT_TIME_FOR_BUILD_STAGE} --artifact_path " + env.uploadPath
     return " BUILD_WHEEL_SCRIPT=${wheelScript} BUILD_WHEEL_ARGS='${wheelArgs}'"
 }
 

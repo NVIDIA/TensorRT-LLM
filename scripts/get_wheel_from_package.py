@@ -31,11 +31,11 @@ def add_arguments(parser: ArgumentParser):
     parser.add_argument("--arch",
                         "-a",
                         required=True,
-                        help="Architecture to build for")
-    parser.add_argument("--upload_path",
+                        help="Architecture of the built package")
+    parser.add_argument("--artifact_path",
                         "-u",
                         required=True,
-                        help="Upload path")
+                        help="the path of the built package")
     parser.add_argument("--timeout",
                         "-t",
                         type=int,
@@ -43,13 +43,13 @@ def add_arguments(parser: ArgumentParser):
                         help="Timeout in minutes")
 
 
-def get_wheel_from_package(arch, upload_path, timeout):
+def get_wheel_from_package(arch, artifact_path, timeout):
     if arch == "x86_64":
         tarfile_name = "TensorRT-LLM.tar.gz"
     else:
         tarfile_name = "TensorRT-LLM-GH200.tar.gz"
 
-    tarfile_link = f"https://urm.nvidia.com/artifactory/{upload_path}/{tarfile_name}"
+    tarfile_link = f"https://urm.nvidia.com/artifactory/{artifact_path}/{tarfile_name}"
     for attempt in range(timeout):
         try:
             subprocess.run(["wget", "-nv", tarfile_link], check=True)
