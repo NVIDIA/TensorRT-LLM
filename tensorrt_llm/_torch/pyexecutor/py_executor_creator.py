@@ -1,5 +1,6 @@
 import copy
 import enum
+import importlib
 from contextlib import contextmanager
 from dataclasses import dataclass
 from itertools import chain
@@ -11,7 +12,8 @@ import tensorrt_llm
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.bindings.executor import ContextChunkingPolicy, ExecutorConfig
-from tensorrt_llm.bindings.internal.batch_manager import ContextChunkingConfig
+from tensorrt_llm.bindings.internal.batch_manager import (
+    ContextChunkingConfig, KvCacheConnectorManager)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_manager import LoraConfig
 from tensorrt_llm.mapping import Mapping
@@ -344,16 +346,48 @@ def create_py_executor(
                 executor_config.max_batch_size,
                 model_engine.model.vocab_size_padded)
 
+    if kv_connector_config is not None:
+        logger.info(
+            f"Initializing kv connector with config: {kv_connector_config}")
+
+        try:
+            module = importlib.import_module(
+                kv_connector_config.connector_module)
+            worker_cls = getattr(module,
+                                 kv_connector_config.connector_worker_class)
+            scheduler_cls = getattr(
+                module, kv_connector_config.connector_scheduler_class)
+
+            connector_worker = worker_cls()
+
+            # Only initialize the scheduler on rank 0.
+            rank = tensorrt_llm.mpi_rank()
+            if rank == 0:
+                connector_scheduler = scheduler_cls()
+            else:
+                connector_scheduler = None
+
+            kv_connector_manager = KvCacheConnectorManager(
+                connector_worker, connector_scheduler)
+
+        except Exception as e:
+            logger.error(f"Error instantiating connector: {e}")
+            raise e
+    else:
+        kv_connector_manager = None
+
     resources = {}
     estimating_kv_cache = False
     kv_cache_creator = None
     if model_engine.model.model_config.is_generation:
         #NOTE: non-generation models do not have kv cache
-        kv_cache_creator = KvCacheCreator(executor_config=executor_config,
-                                          model_engine=model_engine,
-                                          draft_model_engine=draft_model_engine,
-                                          mapping=mapping,
-                                          net_max_seq_len=net_max_seq_len)
+        kv_cache_creator = KvCacheCreator(
+            executor_config=executor_config,
+            model_engine=model_engine,
+            draft_model_engine=draft_model_engine,
+            mapping=mapping,
+            net_max_seq_len=net_max_seq_len,
+            kv_connector_manager=kv_connector_manager)
         estimating_kv_cache = kv_cache_creator.try_prepare_estimation()
         with mem_monitor.observe_creation_stage(
                 _ExecutorCreationStage.INIT_KV_CACHE
@@ -391,7 +425,7 @@ def create_py_executor(
             guided_decoder=guided_decoder,
             lora_config=lora_config,
             garbage_collection_gen0_threshold=garbage_collection_gen0_threshold,
-            kv_connector_config=kv_connector_config
+            kv_connector_manager=kv_connector_manager
             if not estimating_kv_cache else None,
         )
 
@@ -436,7 +470,7 @@ def create_py_executor(
                 lora_config=lora_config,
                 garbage_collection_gen0_threshold=
                 garbage_collection_gen0_threshold,
-                kv_connector_config=kv_connector_config,
+                kv_connector_manager=kv_connector_manager,
             )
 
     _adjust_torch_mem_fraction(executor_config.pytorch_backend_config)

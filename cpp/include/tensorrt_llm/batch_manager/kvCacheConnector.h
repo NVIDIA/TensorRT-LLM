@@ -30,11 +30,6 @@ using namespace tensorrt_llm::batch_manager;
 
 namespace tensorrt_llm::batch_manager::kv_connector
 {
-enum KvCacheConnectorRole : std::int8_t
-{
-    Scheduler,
-    Worker
-};
 
 struct NewRequestData
 {
@@ -126,20 +121,29 @@ private:
     std::vector<SizeType32> mLayerToPoolMapping;
 };
 
-class KvCacheConnector
+class KvCacheConnectorScheduler
 {
 public:
-    explicit KvCacheConnector(KvCacheConnectorRole role);
-    virtual ~KvCacheConnector() = default;
+    explicit KvCacheConnectorScheduler() = default;
+    virtual ~KvCacheConnectorScheduler() = default;
 
-    [[nodiscard]] KvCacheConnectorRole role() const;
+    virtual std::tuple<SizeType32, bool> getNumNewMatchedTokens(LlmRequest const& request, SizeType32 numComputedTokens)
+        = 0;
 
-    //
-    // WORKER SIDE METHODS
-    //
+    // TODO(jothomson): Need arguments here. Also, is this even needed?
+    virtual void updateStateAfterAlloc();
+
+    virtual bool requestFinished(LlmRequest const& request);
+};
+
+class KvCacheConnectorWorker
+{
+public:
+    explicit KvCacheConnectorWorker() = default;
+    virtual ~KvCacheConnectorWorker() = default;
 
     // TODO(jothomson): Need arguments here.
-    virtual void registerKvCaches();
+    virtual void registerKvCaches(KvCacheConnectorPoolsData const& kvCacheConnectorPoolsData);
 
     // TODO(jothomson): Need arguments here.
     virtual void startLoadKv() = 0;
@@ -153,20 +157,34 @@ public:
 
     virtual std::tuple<std::vector<RequestIdType>, std::vector<RequestIdType>> getFinished(
         std::vector<RequestIdType> const& finishedReqIds);
+};
 
-    //
-    // SCHEDULER SIDE METHODS
-    //
+class KvCacheConnectorManager
+{
+public:
+    KvCacheConnectorManager(std::shared_ptr<KvCacheConnectorWorker> const& worker,
+        std::optional<std::shared_ptr<KvCacheConnectorScheduler>> const& scheduler)
+        : mWorker(worker)
+        , mScheduler(scheduler)
+    {
+    }
 
     virtual std::tuple<SizeType32, bool> getNumNewMatchedTokens(LlmRequest const& request, SizeType32 numComputedTokens)
         = 0;
 
-    // TODO(jothomson): Need arguments here. Also, is this even needed?
-    virtual void updateStateAfterAlloc();
+    std::optional<std::shared_ptr<KvCacheConnectorScheduler>> getScheduler() const
+    {
+        return mScheduler;
+    }
 
-    virtual bool requestFinished(LlmRequest const& request);
+    std::shared_ptr<KvCacheConnectorWorker> getWorker() const
+    {
+        return mWorker;
+    }
 
 private:
-    KvCacheConnectorRole mRole;
+    std::shared_ptr<KvCacheConnectorWorker> mWorker;
+    std::optional<std::shared_ptr<KvCacheConnectorScheduler>> mScheduler;
 };
+
 } // namespace tensorrt_llm::batch_manager::kv_connector

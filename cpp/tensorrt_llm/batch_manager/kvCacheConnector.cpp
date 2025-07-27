@@ -3,27 +3,17 @@
 namespace tensorrt_llm::batch_manager::kv_connector
 {
 
-KvCacheConnector::KvCacheConnector(KvCacheConnectorRole role)
-    : mRole(role)
-{
-}
+void KvCacheConnectorWorker::registerKvCaches(KvCacheConnectorPoolsData const& kvCacheConnectorPoolsData) {}
 
-KvCacheConnectorRole KvCacheConnector::role() const
-{
-    return mRole;
-}
-
-void KvCacheConnector::registerKvCaches() {}
-
-std::tuple<std::vector<RequestIdType>, std::vector<RequestIdType>> KvCacheConnector::getFinished(
+std::tuple<std::vector<RequestIdType>, std::vector<RequestIdType>> KvCacheConnectorWorker::getFinished(
     std::vector<RequestIdType> const& finishedReqIds)
 {
     return std::make_tuple(std::vector<RequestIdType>(), std::vector<RequestIdType>());
 }
 
-void KvCacheConnector::updateStateAfterAlloc() {}
+void KvCacheConnectorScheduler::updateStateAfterAlloc() {}
 
-bool KvCacheConnector::requestFinished(LlmRequest const& request)
+bool KvCacheConnectorScheduler::requestFinished(LlmRequest const& request)
 {
     return false;
 }
