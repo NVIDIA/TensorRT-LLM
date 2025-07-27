@@ -12,7 +12,7 @@ import tensorrt_llm.bindings
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 from tensorrt_llm.sampling_params import SamplingParams
 
-from ..._utils import binding_dtype_size, nvtx_range
+from ..._utils import binding_dtype_size, mpi_rank, nvtx_range
 from ...logger import logger
 from ...mapping import Mapping
 from .llm_request import LlmRequest, LlmRequestState, SamplingConfig
@@ -275,7 +275,9 @@ class KVCacheManager(BaseResourceManager):
             'enable_partial_reuse': kv_cache_config.enable_partial_reuse,
             'copy_on_partial_reuse': kv_cache_config.copy_on_partial_reuse,
         }
-        if self.event_buffer_max_size > 0:
+
+        # We only want to be generating events on rank 0.
+        if self.event_buffer_max_size > 0 and mpi_rank() == 0:
             kwargs['event_manager'] = KVCacheEventManagerCpp(
                 max_kv_event_entries=self.event_buffer_max_size)
 
