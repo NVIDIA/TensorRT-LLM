@@ -1,19 +1,19 @@
-from typing import List, Optional
+from typing import List
 
-from tensorrt_llm._torch.pyexecutor.connector import KvCacheConnector
-from tensorrt_llm.bindings.internal.batch_manager import (KvCacheConnectorRole,
-                                                          LlmRequest)
+from tensorrt_llm.bindings.internal.batch_manager import (
+    KvCacheConnectorPoolsData, KvCacheConnectorScheduler,
+    KvCacheConnectorWorker, LlmRequest)
 
 
-class BasicConnector(KvCacheConnector):
+class BasicConnectorWorker(KvCacheConnectorWorker):
 
-    def __init__(self, role: KvCacheConnectorRole):
-        super().__init__(role)
-
-    def build_connector_metadata(self) -> Optional[object]:
-        return {"test": "test"}
+    def register_kv_caches(self, kv_cache_data: KvCacheConnectorPoolsData):
+        pass
 
     def start_load_kv(self):
+        pass
+
+    def wait_for_save(self):
         pass
 
     def wait_for_layer_load(self, layer_idx: int):
@@ -22,31 +22,30 @@ class BasicConnector(KvCacheConnector):
     def save_kv_layer(self, layer_idx: int):
         pass
 
-    def wait_for_save(self):
-        pass
-
     def get_finished(
             self, finished_req_ids: List[int]) -> tuple[List[int], List[int]]:
         return [42], [7]
+
+
+class BasicConnectorScheduler(KvCacheConnectorScheduler):
 
     def get_num_new_matched_tokens(
             self, request: LlmRequest,
             num_computed_tokens: int) -> tuple[int, bool]:
         return 16, True
 
+    def update_state_after_alloc(self):
+        pass
+
 
 def test_basic_init():
-    connector = BasicConnector(KvCacheConnectorRole.Scheduler)
+    connector_scheduler = BasicConnectorScheduler()
 
-    assert connector.role == KvCacheConnectorRole.Scheduler
+    connector_scheduler.update_state_after_alloc()
 
-    assert connector.build_connector_metadata() == {"test": "test"}
+    connector_worker = BasicConnectorWorker()
 
-    assert connector.get_finished([]) == ([42], [7])
+    assert connector_worker.get_finished([]) == ([42], [7])
 
-    connector.save_kv_layer(0)
-    connector.wait_for_save()
-
-    connector_worker = BasicConnector(KvCacheConnectorRole.Worker)
-
-    assert connector_worker.role == KvCacheConnectorRole.Worker
+    connector_worker.save_kv_layer(0)
+    connector_worker.wait_for_save()

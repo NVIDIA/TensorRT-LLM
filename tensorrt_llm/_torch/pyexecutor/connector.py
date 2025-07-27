@@ -1,23 +1,27 @@
 from typing import Optional
 
+from tensorrt_llm._utils import mpi_broadcast, mpi_rank
 from tensorrt_llm.bindings.internal.batch_manager import \
-    KvCacheConnector as KvCacheConnectorCpp
-from tensorrt_llm.bindings.internal.batch_manager import (KvCacheConnectorRole,
-                                                          SchedulerOutput)
+    KvCacheConnectorManager as KvCacheConnectorManagerCpp
+from tensorrt_llm.bindings.internal.batch_manager import (
+    KvCacheConnectorScheduler, KvCacheConnectorWorker, LlmRequest)
 
 
-class KvCacheConnector(KvCacheConnectorCpp):
+class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
 
-    def __init__(self, role: KvCacheConnectorRole):
-        super().__init__(role)
-        self.connector_metadata = None
+    def __init__(self, worker: KvCacheConnectorWorker,
+                 scheduler: Optional[KvCacheConnectorScheduler]):
+        assert (scheduler is not None) == (
+            mpi_rank() == 0), "The scheduler may only exist on rank 0!"
+        super().__init__(worker, scheduler)
 
-    def bind_connector_metadata(self, metadata: object):
-        self.connector_metadata = metadata
+    def get_num_new_matched_tokens(
+            self, request: LlmRequest,
+            num_computed_tokens: int) -> tuple[int, bool]:
+        if self.scheduler is not None:
+            result = self.scheduler.getNumNewMatchedTokens(
+                request, num_computed_tokens)
+        else:
+            result = None
 
-    def _get_connector_metadata(self) -> object:
-        return self.connector_metadata
-
-    def build_connector_metadata(
-            self, scheduler_output: SchedulerOutput) -> Optional[object]:
-        return None
+        return mpi_broadcast(result, root=0)

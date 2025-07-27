@@ -17,12 +17,12 @@ from tensorrt_llm.lora_manager import (LoraConfig,
                                        get_default_trtllm_modules_to_hf_modules,
                                        load_torch_lora)
 from tensorrt_llm.mapping import Mapping
-from tensorrt_llm.models.modeling_utils import KvCacheConnectorConfig
 
 from ..model_config import ModelConfig
 from ..speculative import get_num_extra_kv_tokens, get_spec_decoder
 from .config import PyTorchConfig
 from .config_utils import is_mla, is_nemotron_hybrid
+from .connector import KvCacheConnectorManager
 from .guided_decoder import GuidedDecoder
 from .kv_cache_transceiver import AttentionTypeCpp, create_kv_cache_transceiver
 from .llm_request import ExecutorResponse
@@ -45,7 +45,8 @@ class KvCacheCreator:
     def __init__(self, *, executor_config: ExecutorConfig,
                  model_engine: PyTorchModelEngine,
                  draft_model_engine: Optional[PyTorchModelEngine],
-                 mapping: Mapping, net_max_seq_len: int):
+                 mapping: Mapping, net_max_seq_len: int,
+                 kv_connector_manager: Optional[KvCacheConnectorManager]):
         self._executor_config = executor_config
         self._model_engine = model_engine
         self._draft_model_engine = draft_model_engine
@@ -53,6 +54,7 @@ class KvCacheCreator:
         self._max_kv_tokens_in = self._executor_config.kv_cache_config.max_tokens
         self._dummy_reqs = self._create_dummy_context_requests(net_max_seq_len -
                                                                1)
+        self._kv_connector_manager = kv_connector_manager
 
     @staticmethod
     def _get_cache_size_per_token(model_config: ModelConfig,
@@ -315,12 +317,19 @@ class KvCacheCreator:
                 dtype=kv_cache_dtype,
                 spec_config=spec_config,
                 max_beam_width=executor_config.max_beam_width,
+                kv_connector_manager=self._kv_connector_manager,
             )
         elif is_nemotron_hybrid(config):
             if executor_config.max_beam_width > 1:
                 raise ValueError(
                     "MambaHybridCacheManager + beam search is not supported yet."
                 )
+
+            if self._kv_connector_manager is not None:
+                raise ValueError(
+                    "Connector manager is not supported for MambaHybridCacheManager."
+                )
+
             config = model_engine.model.model_config.pretrained_config
             num_layers = config.hybrid_override_pattern.count("*")
             layer_mask = [
@@ -377,6 +386,7 @@ class KvCacheCreator:
                 max_num_tokens=executor_config.max_num_tokens,
                 model_config=binding_model_config,
                 max_beam_width=executor_config.max_beam_width,
+                kv_connector_manager=self._kv_connector_manager,
             )
         # KVCacheManager (Non-draft) modifies the max_seq_len field, update it to executor_config
         if model_engine.kv_cache_manager_key == ResourceManagerType.KV_CACHE_MANAGER:
@@ -387,9 +397,15 @@ class KvCacheCreator:
     def build_managers(self, resources: Dict) -> None:
         """Construct KV caches for model and draft model (if applicable)."""
         kv_cache_manager = self._create_kv_cache_manager(self._model_engine)
+
+        if self._kv_connector_manager is not None and self._draft_model_engine is not None:
+            raise ValueError(
+                "Connector manager is not supported for draft model.")
+
         draft_kv_cache_manager = self._create_kv_cache_manager(
             self._draft_model_engine
         ) if self._draft_model_engine is not None else None
+
         resources[ResourceManagerType.KV_CACHE_MANAGER] = kv_cache_manager
         resources[
             ResourceManagerType.DRAFT_KV_CACHE_MANAGER] = draft_kv_cache_manager
@@ -420,7 +436,7 @@ def create_py_executor_instance(
         guided_decoder: Optional[GuidedDecoder] = None,
         lora_config: Optional[LoraConfig] = None,
         garbage_collection_gen0_threshold: Optional[int] = None,
-        kv_connector_config: Optional[KvCacheConnectorConfig] = None
+        kv_connector_manager: Optional[KvCacheConnectorManager] = None
 ) -> PyExecutor:
     kv_cache_manager = resources.get(ResourceManagerType.KV_CACHE_MANAGER, None)
 
@@ -562,7 +578,7 @@ def create_py_executor_instance(
         guided_decoder=guided_decoder,
         start_worker=start_worker,
         garbage_collection_gen0_threshold=garbage_collection_gen0_threshold,
-        kv_connector_config=kv_connector_config)
+        kv_connector_manager=kv_connector_manager)
 
 
 def create_torch_sampler_args(executor_config: ExecutorConfig, mapping: Mapping,

@@ -2,7 +2,6 @@ import dataclasses
 import datetime
 import functools
 import gc
-import importlib
 import os
 import threading
 import time
@@ -28,16 +27,15 @@ from tensorrt_llm.bindings.executor import (DisServingRequestStats,
                                             RequestStage, RequestStats,
                                             SpecDecodingStats,
                                             StaticBatchingStats)
-from tensorrt_llm.bindings.internal.batch_manager import (KvCacheConnectorRole,
-                                                          LlmRequestType,
+from tensorrt_llm.bindings.internal.batch_manager import (LlmRequestType,
                                                           ReqIdsSet)
 from tensorrt_llm.logger import logger
-from tensorrt_llm.models.modeling_utils import KvCacheConnectorConfig
 from tensorrt_llm.runtime.generation import CUASSERT
 
 from ..distributed import Distributed
 from ..models.modeling_utils import DecoderModelForCausalLM
 from ..speculative.drafter import Drafter
+from .connector import KvCacheConnectorManager
 from .executor_request_queue import ExecutorRequestQueue, RequestQueueItem
 from .guided_decoder import GuidedDecoder
 from .kv_cache_transceiver import KvCacheTransceiver
@@ -154,7 +152,7 @@ class PyExecutor:
                  guided_decoder: Optional[GuidedDecoder] = None,
                  garbage_collection_gen0_threshold: Optional[int] = None,
                  start_worker: bool = True,
-                 kv_connector_config: Optional[KvCacheConnectorConfig] = None):
+                 kv_connector_manager: Optional[KvCacheConnectorManager] = None):
         super(PyExecutor, self).__init__()
         self.device_id = torch.cuda.current_device()
         self.global_rank = global_mpi_rank()
@@ -268,28 +266,12 @@ class PyExecutor:
         self.worker_started = False
         self.worker_lock = threading.Lock()
 
-        if kv_connector_config is not None:
-            logger.info(
-                f"Initializing kv connector with config: {kv_connector_config}")
-            module_name = kv_connector_config.connector_module
-            class_name = kv_connector_config.connector_class
+        self.kv_connector_manager = kv_connector_manager
 
-            try:
-                module = importlib.import_module(module_name)
-                connector_cls = getattr(module, class_name)
-                self.connector_worker = connector_cls(
-                    KvCacheConnectorRole.Worker)
-
-                # Only initialize the scheduler on rank 0.
-                if global_mpi_rank() == 0:
-                    self.connector_scheduler = connector_cls(
-                        KvCacheConnectorRole.Scheduler)
-            except Exception as e:
-                logger.error(f"Error instantiating connector: {e}")
-                raise e
+        if self.kv_connector_manager is not None:
             kv_cache_data = self.kv_cache_manager.get_kv_cache_connector_pools_data(
             )
-            self.connector_worker.register_kv_caches(kv_cache_data)
+            self.kv_connector_manager.worker.register_kv_caches(kv_cache_data)
 
         if start_worker:
             self.start_worker()

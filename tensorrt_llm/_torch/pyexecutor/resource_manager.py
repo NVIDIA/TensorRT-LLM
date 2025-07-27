@@ -18,6 +18,7 @@ from tensorrt_llm.sampling_params import SamplingParams
 from ..._utils import binding_dtype_size, binding_to_str_dtype, nvtx_range
 from ...logger import logger
 from ...mapping import Mapping
+from .connector import KvCacheConnectorManager
 from .llm_request import (LlmRequest, LlmRequestState, SamplingConfig,
                           get_draft_token_length)
 from .scheduler import ScheduledRequests
@@ -134,6 +135,7 @@ class KVCacheManager(BaseResourceManager):
         max_num_tokens: int = 8192,
         model_config: Optional[ModelConfig] = None,
         max_beam_width: int = 1,
+        kv_connector_manager: Optional[KvCacheConnectorManager] = None,
     ) -> None:
         self.mapping = mapping
         self.dtype = dtype
@@ -149,6 +151,8 @@ class KVCacheManager(BaseResourceManager):
             idx: offset
             for offset, idx in enumerate(self.pp_layers)
         }
+
+        self.kv_connector_manager = kv_connector_manager
 
         tp_size = mapping.tp_size
         if mapping.enable_attention_dp:
