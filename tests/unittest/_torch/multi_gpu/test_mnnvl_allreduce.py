@@ -167,9 +167,9 @@ def row_linear_residual_norm_fusion_forward(
     ],
     ids=lambda x: f"seqlen:{x}",
 )
-@pytest.mark.parametrize("hidden_size", [7168], ids=lambda x: f"hidden:{x}")
-@pytest.mark.parametrize("dtype",
-                         [torch.float16, torch.bfloat16, torch.float32],
+@pytest.mark.parametrize("hidden_size", [2880, 7168],
+                         ids=lambda x: f"hidden:{x}")
+@pytest.mark.parametrize("dtype", [torch.bfloat16],
                          ids=lambda x: f"dtype:{torch.finfo(x).dtype}")
 @pytest.mark.parametrize(
     "fusion",

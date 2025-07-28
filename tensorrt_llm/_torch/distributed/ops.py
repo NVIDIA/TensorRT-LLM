@@ -63,11 +63,10 @@ def get_allreduce_mnnvl_workspace(
     if mapping not in allreduce_mnnvl_workspaces:
         # buffer shape: [3, 2, buffer_tokens, hidden_dim]
         stride = 3 * 2 * dtype.itemsize
-        # LCM for hidden_dim: 2048, 4096, 5120, 7168, 8192 = 286720
-        # max_num_elements must be a multiple of 286720
-        lcm_hidden_dim = 286720
+        # Max hidden_size_to_support
+        max_hidden_dim = 16384
         buffer_size_in_bytes = math.ceil(
-            12_000_000 / (lcm_hidden_dim * stride)) * (lcm_hidden_dim * stride)
+            12_000_000 / (max_hidden_dim * stride)) * (max_hidden_dim * stride)
         max_num_elements = buffer_size_in_bytes // stride
 
         mcast_buffer = McastGPUBuffer(
@@ -88,8 +87,8 @@ def get_allreduce_mnnvl_workspace(
 
         # This is a buffer to maintain the state of this allreduce Op
         # Should have the same lifetime with self._buffer
-        # [Buffer_ptr, Clear_ptr, Buffer_size, num_tokens_to_clear,atomic access counter]
-        buffer_flags = torch.tensor([0, 2, max_num_elements, 0, 0],
+        # [Buffer_ptr, Clear_ptr, num_tokens_to_clear,atomic access counter]
+        buffer_flags = torch.tensor([0, 2, 0, 0],
                                     dtype=torch.uint32,
                                     device=torch.device("cuda",
                                                         mapping.local_rank))
@@ -291,6 +290,8 @@ class MNNVLAllReduce(nn.Module):
     for certain operations when using NVLink for multi-node communication.
     """
 
+    SUPPORTED_FUSION_HIDDEN_DIMS = [2048, 2880, 4096, 5120, 7168, 8192]
+
     def __init__(self, mapping: Mapping, dtype: torch.dtype):
         super().__init__()
         self.mapping = mapping
@@ -321,40 +322,51 @@ class MNNVLAllReduce(nn.Module):
         Returns:
             Union[torch.Tensor, Tuple[torch.Tensor, ...]]: Reduced tensor(s)
         """
-        if input.numel() > self.max_num_elements_mnnvl:
-            return None
 
         fusion_op = all_reduce_params.fusion_op
-
         shape = input.shape
+        hidden_dim = shape[-1]
 
-        if self.buffer_mnnvl.shape[-1] % shape[-1] != 0:
+        # Slice the buffer according to the hidden size, need to pass this numel as the new buffer size
+        num_elements_in_use = self.max_num_elements_mnnvl // hidden_dim * hidden_dim
+        if num_elements_in_use > self.max_num_elements_mnnvl:
             return None
 
-        input = input.view(-1, shape[-1])
+        input = input.view(-1, hidden_dim)
         output = torch.empty_like(input)
-        buffer_mnnvl = self.buffer_mnnvl.view(3, 2, -1, shape[-1])
+        buffer_mnnvl = self.buffer_mnnvl.view(-1)[:(3 * 2 *
+                                                    num_elements_in_use)].view(
+                                                        3, 2, -1, hidden_dim)
 
         if fusion_op == AllReduceFusionOp.NONE:
             output = torch.ops.trtllm.mnnvl_twoshot_allreduce(
                 input,
                 buffer_mnnvl,
                 self.buffer_flags_mnnvl,
+                num_elements_in_use,
                 True,
             )
             return output.view(shape)
-        elif fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM:
+        # Fallback to use other allreduce if hidden_size is not supported
+        elif (fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM
+              and shape[-1] in MNNVLAllReduce.SUPPORTED_FUSION_HIDDEN_DIMS):
             torch.ops.trtllm.mnnvl_twoshot_allreduce(
                 input,
                 buffer_mnnvl,
                 self.buffer_flags_mnnvl,
+                num_elements_in_use,
                 False,
             )
             residual_in = all_reduce_params.residual
 
             output, residual_out = torch.ops.trtllm.mnnvl_twoshot_rmsnorm(
-                buffer_mnnvl, all_reduce_params.norm_weight,
-                all_reduce_params.eps, residual_in, self.buffer_flags_mnnvl)
+                buffer_mnnvl,
+                all_reduce_params.norm_weight,
+                all_reduce_params.eps,
+                residual_in,
+                self.buffer_flags_mnnvl,
+                num_elements_in_use,
+            )
             return output.view(shape), residual_out.view(shape)
         return None
 

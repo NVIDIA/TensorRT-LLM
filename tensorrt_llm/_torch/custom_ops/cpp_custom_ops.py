@@ -57,12 +57,12 @@ def _register_fake():
 
     #MNNVL Allreduce
     @torch.library.register_fake("trtllm::mnnvl_twoshot_allreduce")
-    def _(input, buffer, buffer_flags, wait_for_results):
+    def _(input, buffer, buffer_flags, buffer_size, wait_for_results):
         output = input.new_empty(input.shape)
         return output
 
     @torch.library.register_fake("trtllm::mnnvl_twoshot_rmsnorm")
-    def _(comm_buf, gamma, eps, residual, buffer_flags):
+    def _(comm_buf, gamma, eps, residual, buffer_flags, buffer_size):
         output = residual.new_empty(residual.shape)
         residual_out = residual.new_empty(residual.shape)
         return [output, residual_out]
