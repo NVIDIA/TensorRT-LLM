@@ -143,6 +143,8 @@ class KvCacheCreator:
                                      end_id=-1)
             requests.append(request)
             remaining_tokens -= input_seq_len
+        if self._mapping.enable_attention_dp:
+            requests = requests * self._mapping.tp_size
         return requests
 
     def _get_token_num_for_estimation(self) -> int:
