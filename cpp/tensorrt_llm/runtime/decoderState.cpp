@@ -296,8 +296,8 @@ void DecoderState::reshapeBuffers(SizeType32 maxNumSequences, SizeType32 maxBeam
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void DecoderState::setupCacheIndirection(
-    SizeType32 maxNumSequences, SizeType32 maxBeamWidth, SizeType32 maxAttentionWindow, BufferManager const& bufferManager)
+void DecoderState::setupCacheIndirection(SizeType32 maxNumSequences, SizeType32 maxBeamWidth,
+    SizeType32 maxAttentionWindow, BufferManager const& bufferManager)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     setupCacheIndirectionBuffers(bufferManager);
