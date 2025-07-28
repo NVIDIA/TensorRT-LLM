@@ -24,8 +24,6 @@ def model_path():
 
 def create_llm(model_dir):
     """Create LLM with specific overlap scheduler setting"""
-    pytorch_config = dict(enable_torch_sampler=False)
-
     trt_kv_cache_config = TRT_KvCacheConfig(enable_block_reuse=False)
 
     return LLM(
@@ -34,7 +32,6 @@ def create_llm(model_dir):
         trust_remote_code=True,
         enable_chunked_prefill=True,
         cuda_graph_config=CudaGraphConfig(),
-        **pytorch_config,
         kv_cache_config=trt_kv_cache_config,
         max_num_tokens=
         128  # Only one request longer than max_num_tokens is required to test chunked prefill
