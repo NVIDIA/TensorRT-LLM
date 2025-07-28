@@ -1864,20 +1864,19 @@ def test_ptp_quickstart_advanced_8gpus(llm_root, llm_venv, model_name,
 @pytest.mark.skip_less_device(8)
 @pytest.mark.parametrize("cuda_graph", [False, True])
 @pytest.mark.parametrize("model_name,model_path", [
-    ("Llama4-Maverick-17B-128E-FP8",
-     "llama4-models/nvidia/Llama-4-Maverick-17B-128E-FP8"),
+    ("Llama-4-Maverick-17B-128E-Instruct-FP8",
+     "llama4-models/nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8"),
     ("Llama-4-Scout-17B-16E-Instruct-FP8",
      "llama4-models/Llama-4-Scout-17B-16E-Instruct-FP8"),
     pytest.param('Llama-4-Scout-17B-16E-Instruct-FP4',
                  'llama4-models/Llama-4-Scout-17B-16E-Instruct-FP4',
                  marks=skip_pre_blackwell),
 ])
-def test_ptp_quickstart_advanced_8gpus_chunked_prefill(llm_root, llm_venv,
-                                                       model_name, model_path,
-                                                       cuda_graph):
-    print(f"Testing {model_name} on 8 GPUs (SM120+).")
-    example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
-    llm_venv.run_cmd([
+def test_ptp_quickstart_advanced_8gpus_chunked_prefill_sq_22k(
+        llm_root, llm_venv, model_name, model_path, cuda_graph):
+    print(f"Testing {model_name} on 8 GPUs.")
+    example_root = Path(os.path.join(llm_root, "examples", "pytorch"))
+    cmd = [
         str(example_root / "quickstart_advanced.py"),
         "--enable_chunked_prefill",
         "--model_dir",
@@ -1886,9 +1885,13 @@ def test_ptp_quickstart_advanced_8gpus_chunked_prefill(llm_root, llm_venv,
         "--moe_ep_size=8",
         "--max_seq_len=22000",
         "--kv_cache_fraction=0.85",
-        "--use_cuda_graph" if cuda_graph else None,
-        "--cuda_graph_padding_enabled" if cuda_graph else None,
-    ])
+    ]
+    if cuda_graph:
+        cmd.extend([
+            "--use_cuda_graph",
+            "--cuda_graph_padding_enabled",
+        ])
+    llm_venv.run_cmd(cmd)
 
 
 # This test is specifically to be run on 2 GPUs on Blackwell RTX 6000 Pro (SM120) architecture
