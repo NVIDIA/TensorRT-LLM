@@ -31,7 +31,8 @@
             "sfLayoutC": "8x4",
             "batch": "N",
             "numExperts": 128,
-            "useCudaGraph": true
+            "useCudaGraph": true,
+            "clampLimit": 2
         },
         "BatchedGemmPerTensorScalingFp8LowLatency": {
             "dtypeA": "e4m3",
@@ -62,7 +63,8 @@
             "gridWaitForPrimaryB": true,
             "batch": "N",
             "numExperts": 128,
-            "useCudaGraph": true
+            "useCudaGraph": true,
+            "clampLimit": 2
         },
         "BatchedGemmDeepSeekFp8LowLatency": {
             "dtypeA": "e4m3",
@@ -96,7 +98,8 @@
             "numStagesMma": 4,
             "batch": "N",
             "numExperts": 128,
-            "useCudaGraph": true
+            "useCudaGraph": true,
+            "clampLimit": 2
         },
         "BatchedGemmMxE2m1E4m3LowLatency": {
             "dtypeA": "mxe2m1",
@@ -133,7 +136,8 @@
             "numExperts": 128,
             "useCudaGraph": true,
             "biasType": "m",
-            "act": "swiglu"
+            "act": "swiglu",
+            "clampLimit": 2
         },
         "BatchedGemmMxE2m1MxE4m3LowLatency": {
             "dtypeA": "mxe2m1",
@@ -169,7 +173,8 @@
             "numExperts": 128,
             "useCudaGraph": true,
             "biasType": "m",
-            "act": "swiglu"
+            "act": "swiglu",
+            "clampLimit": 2
         },
         "BatchedGemmMxE2m1Bf16LowLatency": {
             "dtypeA": "mxe2m1",
@@ -208,7 +213,8 @@
             "useCudaGraph": true,
             "biasType": "m",
             "act": "swiglu",
-            "patchF2fp": true
+            "patchF2fp": true,
+            "clampLimit": 2
         }
     },
     "configs": [

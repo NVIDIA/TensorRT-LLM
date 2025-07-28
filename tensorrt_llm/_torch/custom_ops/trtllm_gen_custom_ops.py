@@ -576,6 +576,7 @@ class MxE4m3MxE2m1BlockScaleMoEInputs:
     gemm1_bias: Optional[torch.Tensor]
     gemm1_alpha: Optional[torch.Tensor]
     gemm1_beta: Optional[torch.Tensor]
+    gemm1_clamp_limit: Optional[torch.Tensor]
     gemm2_weights: torch.Tensor
     gemm2_weights_scale: torch.Tensor
     gemm2_bias: Optional[torch.Tensor]
@@ -662,12 +663,12 @@ class MxE4m3MxE2m1BlockScaleMoERunner(TunableRunner):
             args.routing_logits, args.routing_bias, args.hidden_states,
             args.hidden_states_scale, args.gemm1_weights,
             args.gemm1_weights_scale, args.gemm1_bias, args.gemm1_alpha,
-            args.gemm1_beta, args.gemm2_weights, args.gemm2_weights_scale,
-            args.gemm2_bias, None, None, None, self.num_experts, self.top_k,
-            self.n_group, self.topk_group, self.intermediate_size,
-            self.hidden_size_output, self.local_expert_offset,
-            self.local_num_experts, self.routed_scaling_factor,
-            self.routing_method_type, tactic)
+            args.gemm1_beta, args.gemm1_clamp_limit, args.gemm2_weights,
+            args.gemm2_weights_scale, args.gemm2_bias, None, None, None,
+            self.num_experts, self.top_k, self.n_group, self.topk_group,
+            self.intermediate_size, self.hidden_size_output,
+            self.local_expert_offset, self.local_num_experts,
+            self.routed_scaling_factor, self.routing_method_type, tactic)
 
     def get_valid_tactics(
         self,
@@ -760,7 +761,8 @@ def mxe4m3_mxe2m1_block_scale_moe_runner(
         hidden_states: torch.Tensor, hidden_states_scale: torch.Tensor,
         gemm1_weights: torch.Tensor, gemm1_weights_scale: torch.Tensor,
         gemm1_bias: Optional[torch.Tensor], gemm1_alpha: Optional[torch.Tensor],
-        gemm1_beta: Optional[torch.Tensor], gemm2_weights: torch.Tensor,
+        gemm1_beta: Optional[torch.Tensor],
+        gemm1_clamp_limit: Optional[torch.Tensor], gemm2_weights: torch.Tensor,
         gemm2_weights_scale: torch.Tensor, gemm2_bias: Optional[torch.Tensor],
         num_experts: int, top_k: int, n_group: Optional[int],
         topk_group: Optional[int], intermediate_size: int,
@@ -786,6 +788,7 @@ def mxe4m3_mxe2m1_block_scale_moe_runner(
         gemm1_bias,
         gemm1_alpha,
         gemm1_beta,
+        gemm1_clamp_limit,
         gemm2_weights,
         gemm2_weights_scale,
         gemm2_bias,
@@ -811,6 +814,7 @@ class E4m3MxE2m1BlockScaleMoEInputs:
     gemm1_bias: Optional[torch.Tensor]
     gemm1_alpha: Optional[torch.Tensor]
     gemm1_beta: Optional[torch.Tensor]
+    gemm1_clamp_limit: Optional[torch.Tensor]
     gemm2_weights: torch.Tensor
     gemm2_weights_scale: torch.Tensor
     gemm2_bias: Optional[torch.Tensor]
@@ -895,8 +899,8 @@ class E4m3MxE2m1BlockScaleMoERunner(TunableRunner):
         return self.kernel_runner.run_moe(
             args.routing_logits, args.routing_bias, args.hidden_states, None,
             args.gemm1_weights, args.gemm1_weights_scale, args.gemm1_bias,
-            args.gemm1_alpha, args.gemm1_beta, args.gemm2_weights,
-            args.gemm2_weights_scale, args.gemm2_bias,
+            args.gemm1_alpha, args.gemm1_beta, args.gemm1_clamp_limit,
+            args.gemm2_weights, args.gemm2_weights_scale, args.gemm2_bias,
             args.output1_scale_scalar, args.output1_scale_gate_scalar,
             args.output2_scale_scalar, self.num_experts, self.top_k,
             self.n_group, self.topk_group, self.intermediate_size, None,
@@ -974,8 +978,9 @@ def e4m3_mxe2m1_block_scale_moe_runner(
         hidden_states: torch.Tensor, gemm1_weights: torch.Tensor,
         gemm1_weights_scale: torch.Tensor, gemm1_bias: Optional[torch.Tensor],
         gemm1_alpha: Optional[torch.Tensor], gemm1_beta: Optional[torch.Tensor],
-        gemm2_weights: torch.Tensor, gemm2_weights_scale: torch.Tensor,
-        gemm2_bias: Optional[torch.Tensor], output1_scale_scalar: torch.Tensor,
+        gemm1_clamp_limit: Optional[torch.Tensor], gemm2_weights: torch.Tensor,
+        gemm2_weights_scale: torch.Tensor, gemm2_bias: Optional[torch.Tensor],
+        output1_scale_scalar: torch.Tensor,
         output1_scale_gate_scalar: torch.Tensor,
         output2_scale_scalar: torch.Tensor, num_experts: int, top_k: int,
         n_group: Optional[int], topk_group: Optional[int],
@@ -1000,6 +1005,7 @@ def e4m3_mxe2m1_block_scale_moe_runner(
         gemm1_bias,
         gemm1_alpha,
         gemm1_beta,
+        gemm1_clamp_limit,
         gemm2_weights,
         gemm2_weights_scale,
         gemm2_bias,
@@ -1028,6 +1034,7 @@ class Bf16MxE2m1BlockScaleMoEInputs:
     gemm1_bias: Optional[torch.Tensor]
     gemm1_alpha: Optional[torch.Tensor]
     gemm1_beta: Optional[torch.Tensor]
+    gemm1_clamp_limit: Optional[torch.Tensor]
     gemm2_weights: torch.Tensor
     gemm2_weights_scale: torch.Tensor
     gemm2_bias: Optional[torch.Tensor]
@@ -1109,11 +1116,12 @@ class Bf16MxE2m1BlockScaleMoERunner(TunableRunner):
         return self.kernel_runner.run_moe(
             args.routing_logits, args.routing_bias, args.hidden_states,
             args.gemm1_weights, args.gemm1_weights_scale, args.gemm1_bias,
-            args.gemm1_alpha, args.gemm1_beta, args.gemm2_weights,
-            args.gemm2_weights_scale, args.gemm2_bias, self.num_experts,
-            self.top_k, self.n_group, self.topk_group, self.intermediate_size,
-            self.local_expert_offset, self.local_num_experts,
-            self.routed_scaling_factor, self.routing_method_type, tactic)
+            args.gemm1_alpha, args.gemm1_beta, args.gemm1_clamp_limit,
+            args.gemm2_weights, args.gemm2_weights_scale, args.gemm2_bias,
+            self.num_experts, self.top_k, self.n_group, self.topk_group,
+            self.intermediate_size, self.local_expert_offset,
+            self.local_num_experts, self.routed_scaling_factor,
+            self.routing_method_type, tactic)
 
     def get_valid_tactics(
         self,
@@ -1186,13 +1194,13 @@ def bf16_mxe2m1_block_scale_moe_runner(
         hidden_states: torch.Tensor, gemm1_weights: torch.Tensor,
         gemm1_weights_scale: torch.Tensor, gemm1_bias: Optional[torch.Tensor],
         gemm1_alpha: Optional[torch.Tensor], gemm1_beta: Optional[torch.Tensor],
-        gemm2_weights: torch.Tensor, gemm2_weights_scale: torch.Tensor,
-        gemm2_bias: Optional[torch.Tensor], num_experts: int, top_k: int,
-        n_group: Optional[int], topk_group: Optional[int],
-        intermediate_size: int, local_expert_offset: int,
-        local_num_experts: int, routed_scaling_factor: Optional[float],
-        tile_tokens_dim: int, routing_method_type: int,
-        act_type: int) -> torch.Tensor:
+        gemm1_clamp_limit: Optional[torch.Tensor], gemm2_weights: torch.Tensor,
+        gemm2_weights_scale: torch.Tensor, gemm2_bias: Optional[torch.Tensor],
+        num_experts: int, top_k: int, n_group: Optional[int],
+        topk_group: Optional[int], intermediate_size: int,
+        local_expert_offset: int, local_num_experts: int,
+        routed_scaling_factor: Optional[float], tile_tokens_dim: int,
+        routing_method_type: int, act_type: int) -> torch.Tensor:
 
     tuner = AutoTuner.get()
 
@@ -1210,6 +1218,7 @@ def bf16_mxe2m1_block_scale_moe_runner(
         gemm1_bias,
         gemm1_alpha,
         gemm1_beta,
+        gemm1_clamp_limit,
         gemm2_weights,
         gemm2_weights_scale,
         gemm2_bias,

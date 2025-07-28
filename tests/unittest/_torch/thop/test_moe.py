@@ -62,6 +62,7 @@ class moe_args:
                  gemm1_bias=None,
                  gemm1_alpha=None,
                  gemm1_beta=None,
+                 gemm1_clamp_limit=None,
                  gemm2_bias=None,
                  act_type=ActType.SwiGlu):
         self.num_tokens = num_tokens
@@ -85,6 +86,7 @@ class moe_args:
         self.gemm1_bias = gemm1_bias
         self.gemm1_alpha = gemm1_alpha
         self.gemm1_beta = gemm1_beta
+        self.gemm1_clamp_limit = gemm1_clamp_limit
         self.gemm2_bias = gemm2_bias
         self.act_type = act_type
 
@@ -107,6 +109,7 @@ class moe_args_dequant:
                  gemm1_bias=None,
                  gemm1_alpha=None,
                  gemm1_beta=None,
+                 gemm1_clamp_limit=None,
                  gemm2_bias=None,
                  act_type=ActType.SwiGlu):
         self.num_tokens = num_tokens
@@ -124,6 +127,7 @@ class moe_args_dequant:
         self.gemm1_bias = gemm1_bias
         self.gemm1_alpha = gemm1_alpha
         self.gemm1_beta = gemm1_beta
+        self.gemm1_clamp_limit = gemm1_clamp_limit
         self.gemm2_bias = gemm2_bias
         self.act_type = act_type
 
@@ -394,6 +398,15 @@ def run_moe_dequant(args,
                 expert_idx] if args.gemm1_alpha is not None else 1.0
             beta = args.gemm1_beta[
                 expert_idx] if args.gemm1_beta is not None else 0.0
+
+            clamp_limit = float('inf')
+            if args.gemm1_clamp_limit is not None:
+                clamp_limit = args.gemm1_clamp_limit[expert_idx]
+            # Clamp my_x2 (x_glu) to max=clamp_limit
+            my_x2 = my_x2.clamp(max=clamp_limit)
+            # Clamp my_x1 (x_linear) to min=-clamp_limit, max=clamp_limit
+            my_x1 = my_x1.clamp(min=-clamp_limit, max=clamp_limit)
+
             act = my_x2 * F.sigmoid(my_x2 * alpha)
             activation_output[i:i + my_num_tokens] = act * (beta + my_x1)
         i += my_num_tokens
@@ -607,7 +620,8 @@ def run_moe_reference_mxe4m3_mxe2m1(args):
         args.intermediate_size, args.top_k, args.padding, hidden_states_dequant,
         args.expert_logits, gemm1_weights_dequant, gemm2_weights_dequant,
         args.permute_info, args.use_routing_scales_on_input, args.gemm1_bias,
-        args.gemm1_alpha, args.gemm1_beta, args.gemm2_bias, args.act_type)
+        args.gemm1_alpha, args.gemm1_beta, args.gemm1_clamp_limit,
+        args.gemm2_bias, args.act_type)
 
     return run_moe_dequant(args_dequant, "mxe4m3"), args_dequant
 
@@ -627,7 +641,8 @@ def run_moe_reference_e4m3_mxe2m1(args):
         args.intermediate_size, args.top_k, args.padding, hidden_states_dequant,
         args.expert_logits, gemm1_weights_dequant, gemm2_weights_dequant,
         args.permute_info, args.use_routing_scales_on_input, args.gemm1_bias,
-        args.gemm1_alpha, args.gemm1_beta, args.gemm2_bias, args.act_type)
+        args.gemm1_alpha, args.gemm1_beta, args.gemm1_clamp_limit,
+        args.gemm2_bias, args.act_type)
 
     return run_moe_dequant(args_dequant, "perTensorFp8"), args_dequant
 
@@ -644,7 +659,8 @@ def run_moe_reference_bf16_mxe2m1(args):
         args.intermediate_size, args.top_k, args.padding, args.hidden_states,
         args.expert_logits, gemm1_weights_dequant, gemm2_weights_dequant,
         args.permute_info, args.use_routing_scales_on_input, args.gemm1_bias,
-        args.gemm1_alpha, args.gemm1_beta, args.gemm2_bias, args.act_type)
+        args.gemm1_alpha, args.gemm1_beta, args.gemm1_clamp_limit,
+        args.gemm2_bias, args.act_type)
 
     return run_moe_dequant(args_dequant, "bf16"), args_dequant
 
@@ -1526,6 +1542,11 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
     if act_type_str == "SwiGlu":
         gemm1_alpha = torch.randn(num_experts, device='cuda', dtype=torch.float)
         gemm1_beta = torch.randn(num_experts, device='cuda', dtype=torch.float)
+
+    gemm1_clamp_limit = torch.full((num_experts, ),
+                                   7.0,
+                                   device='cuda',
+                                   dtype=torch.float)
     gemm2_bias = 50 * torch.randn(
         num_experts, hidden_size, device='cuda', dtype=torch.float)
 
@@ -1594,8 +1615,8 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
         if dtype_activation == "mxfp8" else None, input_hidden_global_scale,
         scores, gemm1_weights_mxe2m1_bytes, gemm1_scales_mxe2m1_bytes, None,
         gemm2_weights_mxe2m1_bytes, gemm2_scales_mxe2m1_bytes, None,
-        permute_info, False, gemm1_bias, gemm1_alpha, gemm1_beta, gemm2_bias,
-        act_type)
+        permute_info, False, gemm1_bias, gemm1_alpha, gemm1_beta,
+        gemm1_clamp_limit, gemm2_bias, act_type)
 
     if dtype_activation == "mxfp8":
         output_dequant_reference, args_dequant = run_moe_reference_mxe4m3_mxe2m1(
@@ -1705,10 +1726,11 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
         scale_c_fc2 = (1.0 / args_dequant.c_global_sf).expand(num_experts).to(
             torch.float).cuda().contiguous()
 
-        # NOTE: correct the beta to account for the global scale factor
+        # NOTE: correct the beta and clamp to account for the global scale factor
         # Check cpp/tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/trtllmGen_bmm_export/GemmGatedActOptions.h
         # for more details
         gemm1_beta = gemm1_beta * args.hidden_states_scale_global
+        gemm1_clamp_limit = gemm1_clamp_limit * args.hidden_states_scale_global
         # Check cpp/tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/trtllmGen_bmm_export/BatchedGemmInterface.h
         # for more details
         gemm1_bias_shuffled = gemm1_bias_shuffled * args.hidden_states_scale_global
@@ -1728,7 +1750,8 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
                 hidden_states_scale_linear_mxe4m3.cuda(),
                 gemm1_weights_mxe2m1_shuffled.cuda(),
                 gemm1_scales_mxe2m1_shuffled.cuda(), gemm1_bias_shuffled.cuda(),
-                gemm1_alpha, gemm1_beta, gemm2_weights_mxe2m1_shuffled.cuda(),
+                gemm1_alpha, gemm1_beta, gemm1_clamp_limit,
+                gemm2_weights_mxe2m1_shuffled.cuda(),
                 gemm2_scales_mxe2m1_shuffled.cuda(), gemm2_bias_shuffled.cuda(),
                 num_experts, top_k, n_groups, top_k_groups, intermediate_size,
                 unpadded_hidden_size, 0, num_experts, routed_scaling,
@@ -1739,7 +1762,8 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
                 hidden_states.cuda().to(torch.bfloat16),
                 gemm1_weights_mxe2m1_shuffled.cuda(),
                 gemm1_scales_mxe2m1_shuffled.cuda(), gemm1_bias_shuffled.cuda(),
-                gemm1_alpha, gemm1_beta, gemm2_weights_mxe2m1_shuffled.cuda(),
+                gemm1_alpha, gemm1_beta, gemm1_clamp_limit,
+                gemm2_weights_mxe2m1_shuffled.cuda(),
                 gemm2_scales_mxe2m1_shuffled.cuda(), gemm2_bias_shuffled.cuda(),
                 num_experts, top_k, n_groups, top_k_groups, intermediate_size,
                 0, num_experts, routed_scaling, tile_tokens_dim,
@@ -1750,7 +1774,8 @@ def test_moe_mxe2m1_weights(num_tokens, hidden_size, intermediate_size,
                 input_hidden_states.cuda().to(torch.float8_e4m3fn),
                 gemm1_weights_mxe2m1_shuffled.cuda(),
                 gemm1_scales_mxe2m1_shuffled.cuda(), gemm1_bias_shuffled.cuda(),
-                gemm1_alpha, gemm1_beta, gemm2_weights_mxe2m1_shuffled.cuda(),
+                gemm1_alpha, gemm1_beta, gemm1_clamp_limit,
+                gemm2_weights_mxe2m1_shuffled.cuda(),
                 gemm2_scales_mxe2m1_shuffled.cuda(), gemm2_bias_shuffled.cuda(),
                 scale_c_fc1, scale_gate_fc1, scale_c_fc2, num_experts, top_k,
                 n_groups, top_k_groups, intermediate_size, 0, num_experts,

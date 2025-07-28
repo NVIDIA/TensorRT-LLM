@@ -201,8 +201,8 @@ class MLPBlock(torch.nn.Module):
             'swiglu_beta': self.swiglu_beta,
         }
 
-        # Only add swiglu_limit for TRITON backend
-        if config.moe_backend.upper() == "TRITON":
+        # Only add swiglu_limit for TRITON and TRTLLM backends
+        if config.moe_backend.upper() in ["TRITON", "TRTLLM"]:
             moe_params['swiglu_limit'] = self.swiglu_limit
 
         self.experts = create_moe(**moe_params)

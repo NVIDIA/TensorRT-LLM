@@ -96,7 +96,7 @@ struct BatchedGemmOptions : public gemmGatedAct::GemmGatedActOptions
         int tileK, bool useUnrollLoop2xForMma, bool useCustomMmaSchedule, bool useHoistTryWaitForCustomMmaSchedule,
         bool useDeepSeekFp8, bool usePerTokenSfA, bool usePerTokenSfB, bool useTmaStore, bool useTwoTmaLoadWarps,
         bool useTwoMmaWarps, tg::SfLayout sfLayoutA, tg::SfLayout sfLayoutB, tg::SfLayout sfLayoutC,
-        int32_t sfReshapeFactor, gemm::TileScheduler tileScheduler, gemmGatedAct::ActType actType,
+        int32_t sfReshapeFactor, gemm::TileScheduler tileScheduler, gemmGatedAct::ActType actType, bool clampBeforeAct,
         std::vector<int> batchedM, std::vector<int> batchedN, BatchMode batchMode, int numBatches, bool isStaticBatch,
         int numTokens, RouteImpl routeImpl, bool gridWaitForPrimaryRouting, bool fusedAct,
         int numRegsPerThreadNonEpilogueWarp, int numRegsPerThreadEpilogueWarp, int numRegsCastAWarps)
@@ -112,7 +112,7 @@ struct BatchedGemmOptions : public gemmGatedAct::GemmGatedActOptions
                 useCustomMmaSchedule, useHoistTryWaitForCustomMmaSchedule, useDeepSeekFp8, usePerTokenSfA,
                 usePerTokenSfB, useTmaStore, useTwoTmaLoadWarps, useTwoMmaWarps, sfLayoutA, sfLayoutB, sfLayoutC,
                 sfReshapeFactor, tileScheduler),
-            actType)
+            actType, clampBeforeAct)
         , mBatchedM(batchedM)
         , mBatchedN(batchedN)
         , mBatchMode(BatchMode(batchMode))
