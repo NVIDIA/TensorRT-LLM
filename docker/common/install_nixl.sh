@@ -19,12 +19,14 @@ pip3 install --no-cache-dir meson ninja pybind11
 git clone --depth 1 -b ${NIXL_VERSION} ${NIXL_REPO}
 cd nixl
 
-CUDA_SO_PATH=$(find "/usr/local" -path "*/cuda*/compat/*/libcuda.so.1" 2>/dev/null | head -n1| xargs dirname)
+CUDA_SO_PATH=$(find "/usr/local" -name "libcuda.so.1" 2>/dev/null | head -n1)
 
-if [[ -z "$CUDA_SO_PATH" ]] || [[ ! -f "$CUDA_SO_PATH/libcuda.so.1" ]]; then
+if [[ -z "$CUDA_SO_PATH" ]]; then
     echo "libcuda.so.1 not found"
     exit 1
 fi
+
+CUDA_SO_PATH=$(dirname $CUDA_SO_PATH)
 
 export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:$CUDA_SO_PATH
 meson setup builddir \
