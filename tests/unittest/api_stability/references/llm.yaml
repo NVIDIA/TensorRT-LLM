@@ -71,7 +71,7 @@ methods:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.CudaGraphConfig]
         default: null
       checkpoint_loader:
-        annotation: Optional[tensorrt_llm._torch.BaseCheckpointLoader]
+        annotation: Optional[tensorrt_llm._torch.models.checkpoints.BaseCheckpointLoader]
         default: null
       checkpoint_format:
         annotation: Optional[str]
