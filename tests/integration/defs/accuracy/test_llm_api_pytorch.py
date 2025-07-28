@@ -230,7 +230,9 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                           extra_acc_spec="beam_width=4")
 
     @skip_pre_hopper
-    def test_eagle3(self):
+    @pytest.mark.parametrize("eagle3_one_model", [True, False],
+                             ids=["one_model", "two_model"])
+    def test_eagle3(self, eagle3_one_model):
         pytorch_config = dict(
             disable_overlap_scheduler=True,
             cuda_graph_config=CudaGraphConfig(batch_sizes=[1]),
@@ -242,13 +244,16 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
 
         draft_len = 4
         spec_config = EagleDecodingConfig(max_draft_len=draft_len,
-                                          speculative_model_dir=eagle_model_dir)
+                                          speculative_model_dir=eagle_model_dir,
+                                          eagle3_one_model=eagle3_one_model)
 
         with LLM(model=target_model_dir,
                  **pytorch_config,
                  kv_cache_config=kv_cache_config,
                  speculative_config=spec_config,
                  build_config=None) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
