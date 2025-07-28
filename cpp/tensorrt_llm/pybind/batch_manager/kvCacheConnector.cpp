@@ -31,7 +31,7 @@ using NumNewMatchedTokens = std::tuple<SizeType32, bool>;
 
 namespace tb = tensorrt_llm::batch_manager;
 
-class PyKvCacheConnectorScheduler : public KvCacheConnectorScheduler
+class PyKvCacheConnectorScheduler : public KvCacheConnectorScheduler, py::trampoline_self_life_support
 {
 public:
     using KvCacheConnectorScheduler::KvCacheConnectorScheduler;
@@ -44,23 +44,23 @@ public:
 
     void updateStateAfterAlloc() override
     {
-        PYBIND11_OVERRIDE_PURE(void, KvCacheConnectorScheduler, updateStateAfterAlloc);
+        PYBIND11_OVERRIDE(void, KvCacheConnectorScheduler, updateStateAfterAlloc);
     }
 
     bool requestFinished(LlmRequest const& request) override
     {
-        PYBIND11_OVERRIDE_PURE(bool, KvCacheConnectorScheduler, requestFinished, request);
+        PYBIND11_OVERRIDE(bool, KvCacheConnectorScheduler, requestFinished, request);
     }
 };
 
-class PyKvCacheConnectorWorker : public KvCacheConnectorWorker
+class PyKvCacheConnectorWorker : public KvCacheConnectorWorker, py::trampoline_self_life_support
 {
 public:
     using KvCacheConnectorWorker::KvCacheConnectorWorker;
 
     void registerKvCaches(kv_connector::KvCacheConnectorPoolsData const& kvCacheConnectorPoolsData) override
     {
-        PYBIND11_OVERRIDE_PURE(void, KvCacheConnectorWorker, registerKvCaches, kvCacheConnectorPoolsData);
+        PYBIND11_OVERRIDE(void, KvCacheConnectorWorker, registerKvCaches, kvCacheConnectorPoolsData);
     }
 
     void startLoadKv() override
@@ -87,19 +87,19 @@ public:
 
     FinishedReqs getFinished(std::vector<RequestIdType> const& finishedReqIds) override
     {
-        PYBIND11_OVERRIDE_PURE(FinishedReqs, KvCacheConnectorWorker, getFinished, finishedReqIds);
+        PYBIND11_OVERRIDE(FinishedReqs, KvCacheConnectorWorker, getFinished, finishedReqIds);
     }
 };
 
-class PyKvCacheConnectorManager : public KvCacheConnectorManager
+class PyKvCacheConnectorManager : public KvCacheConnectorManager, py::trampoline_self_life_support
 {
 public:
     using KvCacheConnectorManager::KvCacheConnectorManager;
 
-    NumNewMatchedTokens getNumNewMatchedTokens(LlmRequest const& request, SizeType32 numComputedTokens) override
+    SizeType32 getNumNewMatchedTokens(LlmRequest const& request, SizeType32 numComputedTokens) override
     {
-        PYBIND11_OVERRIDE_PURE(
-            NumNewMatchedTokens, KvCacheConnectorManager, getNumNewMatchedTokens, request, numComputedTokens);
+        PYBIND11_OVERRIDE_PURE_NAME(SizeType32, KvCacheConnectorManager, "get_num_new_matched_tokens",
+            getNumNewMatchedTokens, request, numComputedTokens);
     }
 };
 
