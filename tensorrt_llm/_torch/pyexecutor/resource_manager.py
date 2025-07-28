@@ -375,11 +375,12 @@ class KVCacheManager(BaseResourceManager):
                         req.py_request_id,
                         seq_len + (len(req.query_id) if self.mapping.cp_rank
                                    == self.mapping.cp_size - 1 else 0),
-                        req_beam_width, req)
+                        req_beam_width, req, self.kv_connector_manager)
             else:
                 if req.is_first_context_chunk:
                     self.impl.add_sequence(req.py_request_id, req.prompt_len,
-                                           req_beam_width, req)
+                                           req_beam_width, req,
+                                           self.kv_connector_manager)
                     for _ in range(self.num_extra_kv_tokens):
                         self.impl.add_token(req.py_request_id)
                     for _ in range(get_draft_token_length(req)):
