@@ -21,13 +21,14 @@ def main():
         tokenizer=AutoTokenizer.from_pretrained("Dream-org/Dream-v0-Instruct-7B", trust_remote_code=True),
         backend="pytorch",
         enable_block_prediction=True,
+        disable_overlap_scheduler=True,
         block_size=8,  # Number of tokens to predict in each block
         keep_threshold=0.6,  # Confidence threshold for keeping tokens
         mask_token_id=151666,  # Token ID to use as mask
         max_iterations=10,  # Maximum number of iterations
         max_batch_size=1,
-        max_num_tokens=1024,  # Reasonable value for block prediction
-        max_seq_len=2048,  # Reasonable value for block prediction
+        max_num_tokens=4096,
+        max_seq_len=4104,
     )
     
     print("=== Block Prediction Example ===\n")
@@ -47,8 +48,8 @@ def main():
     # Define sample prompts
     prompts = [
         "The future of artificial intelligence is not the"+"<|mask|>"*8,
-        "In a world where technology advances rapidly,",
-        "The most important thing to remember is",
+        # "In a world where technology advances rapidly,",
+        # "The most important thing to remember is",
     ]
     
     # Create sampling parameters

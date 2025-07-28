@@ -20,8 +20,11 @@ class ScheduledRequests:
     # to be aligned with ScheduledRequests in cpp/tensorrt_llm/batch_manager/common.h
     def __init__(self):
         self.context_requests: RequestList = []
+        "context phase requests (for decoder-only models) or encoder phase requests (for encoder-decoder models and encoder-only models)"
         self.generation_requests: RequestList = []
+        "generation phase requests (for decoder-only models) or empty for others"
         self.paused_requests: RequestList = []
+        "???"
 
     @property
     def is_generation_only(self) -> bool:

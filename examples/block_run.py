@@ -15,7 +15,19 @@ def main():
 
     # Model could accept HF model name, a path to local HF model,
     # or TensorRT Model Optimizer's quantized checkpoints like nvidia/Llama-3.1-8B-Instruct-FP8 on HF.
-    llm = LLM(model="Dream-org/Dream-v0-Instruct-7B", trust_remote_code=True, backend="pytorch")
+    llm = LLM(
+        model="Dream-org/Dream-v0-Instruct-7B",
+        trust_remote_code=True,
+        backend="pytorch",
+        enable_block_prediction=True,
+        disable_overlap_scheduler=True,
+        block_size=8,
+        keep_threshold=0.6,
+        mask_token_id=151666,
+        max_iterations=10,
+        max_batch_size=1,
+        max_num_tokens=4096,
+        )
 
     # You can save the engine to disk and load it back later, the LLM class can accept either a HF model or a TRT-LLM engine.
     # llm.save(tempfile.mkdtemp())

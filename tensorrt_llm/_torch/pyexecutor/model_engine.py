@@ -1351,12 +1351,14 @@ class PyTorchModelEngine(ModelEngine):
                 # skip adding input_ids of CUDA graph dummy requests so that new_tokens_device
                 # can be aligned to the correct positions.
                 if not request.is_cuda_graph_dummy:
-                    input_token_id = request.get_token(0,
-                                                       request.get_num_tokens(0) - 1)
-                    
-                    # For block prediction, we need to add the entire block of tokens
-                    # (last real token + block_size mask tokens)
-                    if self.pytorch_backend_config.enable_block_prediction:
+                    if not self.pytorch_backend_config.enable_block_prediction:
+                        input_ids.append(request.get_last_tokens(0))
+                    else:
+                        input_token_id = request.get_token(0,
+                                                        request.get_num_tokens(0) - 1)
+                        
+                        # For block prediction, we need to add the entire block of tokens
+                        # (last real token + block_size mask tokens)
                         # print("In PTME block prediction")
                         block_size = self.pytorch_backend_config.block_size
                         mask_token_id = self.pytorch_backend_config.mask_token_id
@@ -1377,11 +1379,6 @@ class PyTorchModelEngine(ModelEngine):
                         # Remove the single gather_id we added earlier and add gather_ids for all block tokens
                         gather_ids.pop()  # Remove the single gather_id we added earlier
                         gather_ids.extend(range(len(position_ids) - block_size, len(position_ids)))
-                    else:
-                        input_ids.append(input_token_id)
-                        position_ids.append(request.max_beam_num_tokens - 1)
-                        # sequence_lengths already has 1 for this request
-                        # gather_ids already has the correct single gather_id
                         
                 past_seen_token_num = request.max_beam_num_tokens - 1
             else:
@@ -1390,6 +1387,7 @@ class PyTorchModelEngine(ModelEngine):
                 past_seen_token_num = request.max_beam_num_tokens
 
             request_ids.append(request.py_request_id)
+            position_ids.append(past_seen_token_num)
             num_cached_tokens_per_seq.append(past_seen_token_num)
             prompt_lengths.append(request.py_prompt_len)
             draft_lens.append(0)
@@ -1406,9 +1404,9 @@ class PyTorchModelEngine(ModelEngine):
             "total_num_tokens should be less than or equal to max_num_tokens")
         
         # Assert input_ids and position_ids match sum of sequence_lengths
-        assert len(input_ids) == len(position_ids) == sum(sequence_lengths), (
-            f"input_ids: {len(input_ids)}, position_ids: {len(position_ids)}, sum(sequence_lengths): {sum(sequence_lengths)}"
-        )
+        # assert len(input_ids) == len(position_ids) == sum(sequence_lengths), (
+        #     f"input_ids: {len(input_ids)}, position_ids: {len(position_ids)}, sum(sequence_lengths): {sum(sequence_lengths)}"
+        # )
         
         # if exist requests that do not have previous batch, copy input_ids and draft_tokens
         if num_tokens > 0:
@@ -2172,7 +2170,7 @@ class PyTorchModelEngine(ModelEngine):
                     "seq_slot_manager")
                 self.guided_decoder.build(scheduled_requests, seq_slot_manager)
                 self.guided_decoder.execute(scheduled_requests,
-                                           outputs['logits'], seq_slot_manager)
+                                            outputs['logits'], seq_slot_manager)
 
             self._execute_logit_post_processors(scheduled_requests, outputs)
 

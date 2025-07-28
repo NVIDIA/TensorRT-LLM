@@ -365,7 +365,8 @@ def executor_request_to_llm_request(
     
     # If block prediction is enabled, append masked tokens to the input
     if block_prediction_config and block_prediction_config.get('enable_block_prediction', False):
-        block_size = block_prediction_config.get('block_size', 8)
+        # block_size = block_prediction_config.get('block_size', 8)
+        block_size = 0
         mask_token_id = block_prediction_config.get('mask_token_id', 151666)
         # Append block_size masked tokens to the input
         input_tokens = list(input_tokens) + [mask_token_id] * block_size
