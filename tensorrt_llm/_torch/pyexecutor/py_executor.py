@@ -832,10 +832,10 @@ class PyExecutor:
                     "num_fitting_reqs=0 and fitting_disagg_gen_init_requests is empty, may not have enough kvCache"
                 )
                 self.kv_cache_transceiver.check_context_transfer_status(1)
-            else:
-                assert scheduled_batch.batch_size > 0, (
-                    "fail to schedule any pending request, "
-                    "probably run out of resource.")
+        else:
+            assert scheduled_batch.batch_size > 0, (
+                "fail to schedule any pending request, "
+                "probably run out of resource.")
 
         self.num_scheduled_requests = scheduled_batch.batch_size
         logger.debug(
