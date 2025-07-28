@@ -29,6 +29,7 @@ import torch.nn as nn
 from pydantic import BaseModel, ConfigDict, Field
 from torch.fx import GraphModule, Node
 
+from ...custom_ops.quant import QUANT_BMM_OPS
 from ...utils.logger import ad_logger
 from ...utils.node_utils import (
     extract_param_names_from_lin_node,
@@ -670,7 +671,7 @@ def detect_dp_bmm_shard(
     num_bmm_shards = 0
 
     for node in gm.graph.nodes:
-        if not is_op(node, {torch.ops.aten.bmm}):
+        if not is_op(node, {torch.ops.aten.bmm}.union(QUANT_BMM_OPS)):
             continue
 
         ad_logger.debug(f"Found BMM node: {node}")
