@@ -644,6 +644,7 @@ class PyExecutor:
         return False
 
     def _executor_loop_pp(self):
+        logger.info(f"Starting executor loop for pp_rank {self.dist.pp_rank}")
         torch.cuda.set_device(self.device_id)
         microbatch_id = 0
         with self._profiler() as profile_step:
@@ -672,7 +673,6 @@ class PyExecutor:
                 )
 
                 if self.kv_cache_transceiver:
-
                     # For requests that are fitting disagg gen init, also prepare resources for KV cache manager
                     self._prepare_disagg_gen_init(
                         fitting_disagg_gen_init_requests)
