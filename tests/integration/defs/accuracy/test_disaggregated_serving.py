@@ -394,7 +394,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     @parametrize_with_ids("gen_tp", [1, 2])
     @pytest.mark.parametrize("testset", ["GSM8K", "MMLU"])
     def test_ctx_pp_gen_tp_asymmetric(self, ctx_pp, gen_tp, testset):
-        return self.run_parallel_test(ctx_pp, 1, gen_tp,
+        return self.run_parallel_test(ctx_pp, 1, 1, gen_tp,
                                       get_accuracy_task(testset))
 
 

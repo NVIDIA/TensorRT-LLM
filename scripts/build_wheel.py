@@ -73,8 +73,8 @@ def clear_folder(folder_path):
         else:
             try:
                 os.remove(item_path)
-            except:
-                print(f"failed to remove {item_path}")
+            except (OSError, IOError) as e:
+                print(f"Failed to remove {item_path}: {e}", file=sys.stderr)
 
 
 def sysconfig_scheme(override_vars=None):

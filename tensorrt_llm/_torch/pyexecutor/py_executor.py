@@ -831,8 +831,7 @@ class PyExecutor:
 
                         if self.kv_cache_transceiver and previous_batch.scheduled_ctx_reqs:
                             self._send_disagg_ctx_cache(
-                                previous_batch.scheduled_ctx_reqs
-                            ) if self.kv_cache_transceiver else []
+                                previous_batch.scheduled_ctx_reqs)
 
                         self._handle_canceled_requests()
                         finished_requests = self._handle_responses()
