@@ -244,11 +244,23 @@ struct BatchedGemmData
         // Shape is [B].
         float const* mPtrScaleGate{nullptr};
 
+        // The clamp limit for the accumulator before applying the activation.
+        // Shape is [B].
+        // Clamp is INF if nullptr.
+        // If applied on SwiGlu, it will be:
+        //
+        //   x_glu    = x_glu.clamp(min=None, max=limit)
+        //   x_linear = x_linear.clamp(min=-limit, max=limit)
+        float const* mPtrClampLimit{nullptr};
+
         // The alpha and beta for SwiGlu.
         // gatedActivation <- (x0 + beta) * activation(x1, alpha)
         // Shape is [B].
         // Alpha is 1.f if nullptr.
         // Beta is 0.f if nullptr.
+        // The formula:
+        //
+        //   out_glu  = x_glu * torch.sigmoid(alpha * x_glu) + (x_linear + beta)
         float const* mPtrSwiGluAlpha{nullptr};
         float const* mPtrSwiGluBeta{nullptr};
 
@@ -643,17 +655,17 @@ int32_t BatchedGemmInterface::run(BatchedGemmConfig const& config, void* workspa
     auto const numCtaZ = options.mNumSlicesForSplitK;
     mNumCtas = numCtaX * numCtaY * numCtaZ;
 
-    auto kernelParams = KernelParams::setKernelParams(options, batchM, batchedGemmData.mInputBuffers.mPtrA,
+    auto kernelParams = KernelParamsSetup::setKernelParams(options, batchM, batchedGemmData.mInputBuffers.mPtrA,
         batchedGemmData.mInputBuffers.mPtrB, batchedGemmData.mOutputBuffers.mPtrC,
         batchedGemmData.mInputBuffers.mPtrSfA, batchedGemmData.mInputBuffers.mPtrSfB,
         batchedGemmData.mInputBuffers.mPtrPerTokenSfA, batchedGemmData.mInputBuffers.mPtrPerTokenSfB,
         batchedGemmData.mInputBuffers.mPtrBias, batchedGemmData.mOutputBuffers.mPtrSfC,
         batchedGemmData.mInputBuffers.mPtrScaleC, batchedGemmData.mInputBuffers.mPtrScaleGate,
-        batchedGemmData.mInputBuffers.mPtrSwiGluAlpha, batchedGemmData.mInputBuffers.mPtrSwiGluBeta,
-        batchedGemmData.mInputBuffers.mPtrRouteMap, dPtrRowMax, dPtrRowMaxBars,
-        batchedGemmData.mInputBuffers.mPtrNumNonExitingCtas, batchedGemmData.mInputBuffers.mPtrTotalNumPaddedTokens,
-        batchedGemmData.mInputBuffers.mPtrCtaIdxXyToBatchIdx, batchedGemmData.mInputBuffers.mPtrCtaIdxXyToMnLimit,
-        maxNumCtasInBatchDim);
+        batchedGemmData.mInputBuffers.mPtrClampLimit, batchedGemmData.mInputBuffers.mPtrSwiGluAlpha,
+        batchedGemmData.mInputBuffers.mPtrSwiGluBeta, batchedGemmData.mInputBuffers.mPtrRouteMap, dPtrRowMax,
+        dPtrRowMaxBars, batchedGemmData.mInputBuffers.mPtrNumNonExitingCtas,
+        batchedGemmData.mInputBuffers.mPtrTotalNumPaddedTokens, batchedGemmData.mInputBuffers.mPtrCtaIdxXyToBatchIdx,
+        batchedGemmData.mInputBuffers.mPtrCtaIdxXyToMnLimit, maxNumCtasInBatchDim);
 
     // The size of the grid.
     std::vector<int32_t> grid{numCtaX, numCtaY, numCtaZ};

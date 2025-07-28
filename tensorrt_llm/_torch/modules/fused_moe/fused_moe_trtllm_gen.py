@@ -62,6 +62,7 @@ class TRTLLMGenFusedMoE(MoE):
         bias: bool = False,
         swiglu_alpha: Optional[torch.Tensor] = None,
         swiglu_beta: Optional[torch.Tensor] = None,
+        swiglu_limit: Optional[torch.Tensor] = None,
     ):
         super().__init__(
             routing_method=routing_method,
@@ -75,6 +76,7 @@ class TRTLLMGenFusedMoE(MoE):
             bias=bias,
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
+            swiglu_limit=swiglu_limit,
         )
 
         assert not self.smart_router, "Smart router is not supported in TRTLLMGenFusedMoE."
@@ -102,8 +104,8 @@ class TRTLLMGenFusedMoE(MoE):
             or self.has_nvfp4 or self.has_w4a16_mxfp4 \
             or self.has_w4a8_mxfp4_fp8 or self.has_w4a8_mxfp4_mxfp8, "TRTLLMGenFusedMoE only supports fp8_block_scaling, nvfp4, w4a16_mxfp4, w4a8_mxfp4_fp8 and w4a8_mxfp4_mxfp8 dtypes."
 
-        if self.bias or self.swiglu_alpha is not None or self.swiglu_beta is not None:
-            assert self.has_w4a16_mxfp4 or self.has_w4a8_mxfp4_fp8 or self.has_w4a8_mxfp4_mxfp8, "TRTLLMGenFusedMoE only supports mxfp4 quantization with bias, swiglu_alpha and swiglu_beta."
+        if self.bias or self.swiglu_alpha is not None or self.swiglu_beta is not None or self.swiglu_limit is not None:
+            assert self.has_w4a16_mxfp4 or self.has_w4a8_mxfp4_fp8 or self.has_w4a8_mxfp4_mxfp8, "TRTLLMGenFusedMoE only supports mxfp4 quantization with bias, swiglu_alpha, swiglu_beta and swiglu_limit."
 
     def _get_tile_tokens_dim(self, x: torch.Tensor):
         top_k = self.routing_method.top_k
@@ -285,6 +287,7 @@ class TRTLLMGenFusedMoE(MoE):
                 self.w3_w1_bias,
                 self.swiglu_alpha,
                 self.swiglu_beta,
+                self.swiglu_limit,
                 self.w2_weight,
                 self.w2_weight_scale,
                 self.w2_bias,
@@ -315,6 +318,7 @@ class TRTLLMGenFusedMoE(MoE):
                 self.w3_w1_bias,
                 self.swiglu_alpha,
                 self.swiglu_beta,
+                self.swiglu_limit,
                 self.w2_weight,
                 self.w2_weight_scale,
                 self.w2_bias,
@@ -352,6 +356,7 @@ class TRTLLMGenFusedMoE(MoE):
                 self.w3_w1_bias,
                 self.swiglu_alpha,
                 self.swiglu_beta,
+                self.swiglu_limit,
                 self.w2_weight,
                 self.w2_weight_scale,
                 self.w2_bias,

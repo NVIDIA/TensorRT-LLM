@@ -71,10 +71,10 @@ public:
     void run(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens, int32_t numTokens,
         int32_t numBatches, int32_t maxNumCtasInBatchDim, void const* a, void const* sfA, void const* b,
         void const* sfB, void const* perTokensSfA, void const* perTokensSfB, float const* scaleC,
-        float const* scaleGateC, float const* bias, float const* swiGluAlpha, float const* swiGluBeta, void* c,
-        void* outSfC, int32_t const* routeMap, int32_t const* totalNumPaddedTokens, int32_t const* ctaIdxXyToBatchIdx,
-        int32_t const* ctaIdxXyToMnLimit, int32_t const* numNonExitingCtas, void* workspace, CUstream stream,
-        int device, int32_t configIndex);
+        float const* scaleGateC, float const* bias, float const* swiGluAlpha, float const* swiGluBeta,
+        float const* clampLimit, void* c, void* outSfC, int32_t const* routeMap, int32_t const* totalNumPaddedTokens,
+        int32_t const* ctaIdxXyToBatchIdx, int32_t const* ctaIdxXyToMnLimit, int32_t const* numNonExitingCtas,
+        void* workspace, CUstream stream, int device, int32_t configIndex);
 
     // NVFP4 per-block scaling GEMM
     void run(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens, void const* a, void const* sfA,
@@ -82,8 +82,9 @@ public:
         int32_t configIndex);
 
     void run(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens, void const* a, void const* sfA,
-        void const* b, void const* sfB, float const* bias, float const* swiGluAlpha, float const* swiGluBeta, void* c,
-        void* outSfC, void* workspace, CUstream stream, int device, int32_t configIndex);
+        void const* b, void const* sfB, float const* bias, float const* swiGluAlpha, float const* swiGluBeta,
+        float const* clampLimit, void* c, void* outSfC, void* workspace, CUstream stream, int device,
+        int32_t configIndex);
 
     // FP8 per-tensor scaling GEMM
     void run(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens, void const* a, void const* b,

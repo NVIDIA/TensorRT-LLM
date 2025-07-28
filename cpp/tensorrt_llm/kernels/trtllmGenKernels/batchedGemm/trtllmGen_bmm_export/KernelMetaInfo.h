@@ -28,8 +28,8 @@ namespace kernels
 {
 // clang-format off
 
-#define TLLM_GEN_COMMIT "1def716a-dirty"
-#define TLLM_GEN_EXPORT_VERSION "6.0.3.0.2.1"
+#define TLLM_GEN_COMMIT "018762ca-dirty"
+#define TLLM_GEN_EXPORT_VERSION "7.0.3.0.3.0"
 
 static constexpr size_t tllmGenBatchedGemmListLen = 288;
 
@@ -618,7 +618,7 @@ extern unsigned int Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_
 
 static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 #ifndef EXCLUDE_SM_100
-{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x256_et128x16_m128x16x64_cga1x1x1_16dp256b_s6_TN_transOut_schedP_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x256_et128x16_m128x16x64_cga1x1x1_16dp256b_s6_TN_transOut_schedP_bN_dynBatch_sm100a_cubin_len, 136192, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x256_et128x16_m128x16x64_cga1x1x1_16dp256b_s6_TN_transOut_schedP_bN_dynBatch_sm100a", 480, "19a628c54ca2b4fedfc6bdc48e9d0352f85817fa5760a4cf874e8b35449216c6", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x256_et128x16_m128x16x64_cga1x1x1_16dp256b_s6_TN_transOut_schedP_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x256_et128x16_m128x16x64_cga1x1x1_16dp256b_s6_TN_transOut_schedP_bN_dynBatch_sm100a_cubin_len, 136192, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x256_et128x16_m128x16x64_cga1x1x1_16dp256b_s6_TN_transOut_schedP_bN_dynBatch_sm100a", 480, "dcd13f84a37c44fd9ba2672e0776f4cbcacc998022748a931c209ee227a38097", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -686,6 +686,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -699,7 +700,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x256_et128x16_m128x16x64_cga1x1x1_16dp256b_s6_TN_transOut_schedS_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x256_et128x16_m128x16x64_cga1x1x1_16dp256b_s6_TN_transOut_schedS_bN_dynBatch_sm100a_cubin_len, 136192, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x256_et128x16_m128x16x64_cga1x1x1_16dp256b_s6_TN_transOut_schedS_bN_dynBatch_sm100a", 448, "01dabae6333d63bc9d1594fb92aed59f9ca68af80a5171bf57e87b936956d68f", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x256_et128x16_m128x16x64_cga1x1x1_16dp256b_s6_TN_transOut_schedS_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x256_et128x16_m128x16x64_cga1x1x1_16dp256b_s6_TN_transOut_schedS_bN_dynBatch_sm100a_cubin_len, 136192, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x256_et128x16_m128x16x64_cga1x1x1_16dp256b_s6_TN_transOut_schedS_bN_dynBatch_sm100a", 448, "1e68104f4cc4a1f5a2b12d4ea0c910e9ae795f672b53c23f7a6d5e14a4af0600", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -767,6 +768,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -780,7 +782,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x256u2_et128x16_m128x16x64_cga1x1x1_16dp256b_s6_TN_transOut_schedP_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x256u2_et128x16_m128x16x64_cga1x1x1_16dp256b_s6_TN_transOut_schedP_bN_dynBatch_sm100a_cubin_len, 136192, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x256u2_et128x16_m128x16x64_cga1x1x1_16dp256b_s6_TN_transOut_schedP_bN_dynBatch_sm100a", 480, "40a8a7ae991b744e1af9a0ea055966a79b282921414bec9b780fee173c69a16d", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x256u2_et128x16_m128x16x64_cga1x1x1_16dp256b_s6_TN_transOut_schedP_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x256u2_et128x16_m128x16x64_cga1x1x1_16dp256b_s6_TN_transOut_schedP_bN_dynBatch_sm100a_cubin_len, 136192, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x256u2_et128x16_m128x16x64_cga1x1x1_16dp256b_s6_TN_transOut_schedP_bN_dynBatch_sm100a", 480, "113498b9badea7f3a222bea985f32c4caddccaa43ae146f4b0e15bced239bd5f", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -848,6 +850,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -861,7 +864,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x256u2_et128x16_m128x16x64_cga1x1x1_16dp256b_s6_TN_transOut_schedS_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x256u2_et128x16_m128x16x64_cga1x1x1_16dp256b_s6_TN_transOut_schedS_bN_dynBatch_sm100a_cubin_len, 136192, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x256u2_et128x16_m128x16x64_cga1x1x1_16dp256b_s6_TN_transOut_schedS_bN_dynBatch_sm100a", 448, "c68fb6ee708583caeb90b11729f93f38aecdec08ccf3745f24556718c4ad8c65", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x256u2_et128x16_m128x16x64_cga1x1x1_16dp256b_s6_TN_transOut_schedS_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x256u2_et128x16_m128x16x64_cga1x1x1_16dp256b_s6_TN_transOut_schedS_bN_dynBatch_sm100a_cubin_len, 136192, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x256u2_et128x16_m128x16x64_cga1x1x1_16dp256b_s6_TN_transOut_schedS_bN_dynBatch_sm100a", 448, "be4715e44609995676ef38df904a28f0979e1d4e5e46ba1af95dfa8b65df3daf", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -929,6 +932,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -942,7 +946,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x512_et128x16_m128x16x64_cga1x1x1_16dp256b_s4_TN_transOut_schedP_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x512_et128x16_m128x16x64_cga1x1x1_16dp256b_s4_TN_transOut_schedP_bN_dynBatch_sm100a_cubin_len, 178176, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x512_et128x16_m128x16x64_cga1x1x1_16dp256b_s4_TN_transOut_schedP_bN_dynBatch_sm100a", 480, "fc0844d7d6244934a7ad878091dcc9bc40ec049c3b261947b76096ec0910764f", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x512_et128x16_m128x16x64_cga1x1x1_16dp256b_s4_TN_transOut_schedP_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x512_et128x16_m128x16x64_cga1x1x1_16dp256b_s4_TN_transOut_schedP_bN_dynBatch_sm100a_cubin_len, 178176, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x512_et128x16_m128x16x64_cga1x1x1_16dp256b_s4_TN_transOut_schedP_bN_dynBatch_sm100a", 480, "e5576e97179bfed8e8e7bed2270c0c78c6b09d83d0fc64d5996b89d37f3565ea", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -1010,6 +1014,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -1023,7 +1028,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x512_et128x16_m128x16x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x512_et128x16_m128x16x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_dynBatch_sm100a_cubin_len, 178176, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x512_et128x16_m128x16x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_dynBatch_sm100a", 448, "1b56d2c9b4a0da5730b8c890f3a22c9cb363d6b7c206ef91665342f4642784e7", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x512_et128x16_m128x16x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x512_et128x16_m128x16x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_dynBatch_sm100a_cubin_len, 178176, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x512_et128x16_m128x16x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_dynBatch_sm100a", 448, "2d42200e86b01b530fcddc9ea1db1d0692ff90352c46a112605544749fa54f38", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -1091,6 +1096,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -1104,7 +1110,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x512u2_et128x16_m128x16x64_cga1x1x1_16dp256b_s4_TN_transOut_schedP_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x512u2_et128x16_m128x16x64_cga1x1x1_16dp256b_s4_TN_transOut_schedP_bN_dynBatch_sm100a_cubin_len, 178176, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x512u2_et128x16_m128x16x64_cga1x1x1_16dp256b_s4_TN_transOut_schedP_bN_dynBatch_sm100a", 480, "897de29015ed651dfd7538ddef1ca935ae9bf93a18c55bbea66e945b9ac74619", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x512u2_et128x16_m128x16x64_cga1x1x1_16dp256b_s4_TN_transOut_schedP_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x512u2_et128x16_m128x16x64_cga1x1x1_16dp256b_s4_TN_transOut_schedP_bN_dynBatch_sm100a_cubin_len, 178176, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x512u2_et128x16_m128x16x64_cga1x1x1_16dp256b_s4_TN_transOut_schedP_bN_dynBatch_sm100a", 480, "40f54da044cd96cf53159887a0403146b311961223fd7c5fc5951eb5ee6755ab", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -1172,6 +1178,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -1185,7 +1192,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x512u2_et128x16_m128x16x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x512u2_et128x16_m128x16x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_dynBatch_sm100a_cubin_len, 178176, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x512u2_et128x16_m128x16x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_dynBatch_sm100a", 448, "e9d970bbdcc4d7f29596a67042022b75aafa052940cabfe2745bf3893914aa17", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x512u2_et128x16_m128x16x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x512u2_et128x16_m128x16x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_dynBatch_sm100a_cubin_len, 178176, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x16x512u2_et128x16_m128x16x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_dynBatch_sm100a", 448, "71873a5224fafe04d2b873c4a662d180b522e64bcc97ced54be68c381a865ced", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -1253,6 +1260,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -1266,7 +1274,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x256_et128x32_m128x32x64_cga1x1x1_16dp256b_s6_TN_transOut_schedP_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x256_et128x32_m128x32x64_cga1x1x1_16dp256b_s6_TN_transOut_schedP_bN_dynBatch_sm100a_cubin_len, 154624, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x256_et128x32_m128x32x64_cga1x1x1_16dp256b_s6_TN_transOut_schedP_bN_dynBatch_sm100a", 480, "5135f52f540116058f986a6cf69e2ae3e425f94a3999e27d2004f8d4d2631573", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x256_et128x32_m128x32x64_cga1x1x1_16dp256b_s6_TN_transOut_schedP_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x256_et128x32_m128x32x64_cga1x1x1_16dp256b_s6_TN_transOut_schedP_bN_dynBatch_sm100a_cubin_len, 154624, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x256_et128x32_m128x32x64_cga1x1x1_16dp256b_s6_TN_transOut_schedP_bN_dynBatch_sm100a", 480, "d33facd7f87429fca3369d0c58b3f942e79fc930be3882ab12520aa7d7da60b7", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -1334,6 +1342,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -1347,7 +1356,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x256_et128x32_m128x32x64_cga1x1x1_16dp256b_s6_TN_transOut_schedS_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x256_et128x32_m128x32x64_cga1x1x1_16dp256b_s6_TN_transOut_schedS_bN_dynBatch_sm100a_cubin_len, 154624, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x256_et128x32_m128x32x64_cga1x1x1_16dp256b_s6_TN_transOut_schedS_bN_dynBatch_sm100a", 448, "660012af20a4c575e630d5d8eb3503132c817067b45257990724f9c75ae5f9f0", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x256_et128x32_m128x32x64_cga1x1x1_16dp256b_s6_TN_transOut_schedS_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x256_et128x32_m128x32x64_cga1x1x1_16dp256b_s6_TN_transOut_schedS_bN_dynBatch_sm100a_cubin_len, 154624, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x256_et128x32_m128x32x64_cga1x1x1_16dp256b_s6_TN_transOut_schedS_bN_dynBatch_sm100a", 448, "b8b5e5ccbb44ee2044473acb61e7c3fad95b36d1972505017d8d35ff5e593d00", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -1415,6 +1424,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -1428,7 +1438,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x256u2_et128x32_m128x32x64_cga1x1x1_16dp256b_s6_TN_transOut_schedP_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x256u2_et128x32_m128x32x64_cga1x1x1_16dp256b_s6_TN_transOut_schedP_bN_dynBatch_sm100a_cubin_len, 154624, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x256u2_et128x32_m128x32x64_cga1x1x1_16dp256b_s6_TN_transOut_schedP_bN_dynBatch_sm100a", 480, "4f0476aa2e0cfe31ee92dbe8e140d1f3ae8837c42521837d72ed4cbddd4be649", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x256u2_et128x32_m128x32x64_cga1x1x1_16dp256b_s6_TN_transOut_schedP_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x256u2_et128x32_m128x32x64_cga1x1x1_16dp256b_s6_TN_transOut_schedP_bN_dynBatch_sm100a_cubin_len, 154624, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x256u2_et128x32_m128x32x64_cga1x1x1_16dp256b_s6_TN_transOut_schedP_bN_dynBatch_sm100a", 480, "389aefd66505a590d1f5dc792693e91faa40df35d8c37e816d082661a9f44256", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -1496,6 +1506,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -1509,7 +1520,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x256u2_et128x32_m128x32x64_cga1x1x1_16dp256b_s6_TN_transOut_schedS_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x256u2_et128x32_m128x32x64_cga1x1x1_16dp256b_s6_TN_transOut_schedS_bN_dynBatch_sm100a_cubin_len, 154624, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x256u2_et128x32_m128x32x64_cga1x1x1_16dp256b_s6_TN_transOut_schedS_bN_dynBatch_sm100a", 448, "d9ba6bae5901d53719548167398e154f983ca2f13b5ca92c3d7e73bd1f15e239", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x256u2_et128x32_m128x32x64_cga1x1x1_16dp256b_s6_TN_transOut_schedS_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x256u2_et128x32_m128x32x64_cga1x1x1_16dp256b_s6_TN_transOut_schedS_bN_dynBatch_sm100a_cubin_len, 154624, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x256u2_et128x32_m128x32x64_cga1x1x1_16dp256b_s6_TN_transOut_schedS_bN_dynBatch_sm100a", 448, "28022d9891f75b55fec5245c93e9b076631c0004661ecda452e8901822d160ac", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -1577,6 +1588,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -1590,7 +1602,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x512_et128x32_m128x32x64_cga1x1x1_16dp256b_s4_TN_transOut_schedP_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x512_et128x32_m128x32x64_cga1x1x1_16dp256b_s4_TN_transOut_schedP_bN_dynBatch_sm100a_cubin_len, 200704, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x512_et128x32_m128x32x64_cga1x1x1_16dp256b_s4_TN_transOut_schedP_bN_dynBatch_sm100a", 480, "c942db88c48cd885a568fcfa8cbf590e6bb95bd00efe84672dbd5ba5540c11ee", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x512_et128x32_m128x32x64_cga1x1x1_16dp256b_s4_TN_transOut_schedP_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x512_et128x32_m128x32x64_cga1x1x1_16dp256b_s4_TN_transOut_schedP_bN_dynBatch_sm100a_cubin_len, 200704, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x512_et128x32_m128x32x64_cga1x1x1_16dp256b_s4_TN_transOut_schedP_bN_dynBatch_sm100a", 480, "410025847d05c7264d40413d15af0d3c9d71ba42fda96d392d3509b58a2f4f21", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -1658,6 +1670,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -1671,7 +1684,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x512_et128x32_m128x32x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x512_et128x32_m128x32x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_dynBatch_sm100a_cubin_len, 200704, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x512_et128x32_m128x32x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_dynBatch_sm100a", 448, "53a2eedf47b2575c2cc88797136ffa11347fc150513c1cda5742092760089e8a", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x512_et128x32_m128x32x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x512_et128x32_m128x32x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_dynBatch_sm100a_cubin_len, 200704, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x512_et128x32_m128x32x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_dynBatch_sm100a", 448, "009532ad75e4498d137d6f9ac513f77b96289796e94eb16f1bd295ed2a354b43", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -1739,6 +1752,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -1752,7 +1766,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x512u2_et128x32_m128x32x64_cga1x1x1_16dp256b_s4_TN_transOut_schedP_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x512u2_et128x32_m128x32x64_cga1x1x1_16dp256b_s4_TN_transOut_schedP_bN_dynBatch_sm100a_cubin_len, 200704, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x512u2_et128x32_m128x32x64_cga1x1x1_16dp256b_s4_TN_transOut_schedP_bN_dynBatch_sm100a", 480, "5f9842cc9172020e6f13b819257def365f5ac5a2128c1faee4283719e3fca4ea", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x512u2_et128x32_m128x32x64_cga1x1x1_16dp256b_s4_TN_transOut_schedP_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x512u2_et128x32_m128x32x64_cga1x1x1_16dp256b_s4_TN_transOut_schedP_bN_dynBatch_sm100a_cubin_len, 200704, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x512u2_et128x32_m128x32x64_cga1x1x1_16dp256b_s4_TN_transOut_schedP_bN_dynBatch_sm100a", 480, "d910ab811882f9c380923ce2c45f08b2aacfaaf4183735fda114883e481184be", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -1820,6 +1834,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -1833,7 +1848,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x512u2_et128x32_m128x32x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x512u2_et128x32_m128x32x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_dynBatch_sm100a_cubin_len, 200704, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x512u2_et128x32_m128x32x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_dynBatch_sm100a", 448, "4c0bef35fa3f4d71df5ca06a04b3fde94c662012f577a61c51ad30cc6e4e6990", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x512u2_et128x32_m128x32x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x512u2_et128x32_m128x32x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_dynBatch_sm100a_cubin_len, 200704, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x32x512u2_et128x32_m128x32x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_dynBatch_sm100a", 448, "f1a46a74d334aec0eb8a258e293023ce0f92527de23a1336b6cfba78912d3b87", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -1901,6 +1916,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -1914,7 +1930,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x64x256_et128x64_m128x64x64_cga1x1x1_16dp256b_s6_TN_transOut_schedP_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x64x256_et128x64_m128x64x64_cga1x1x1_16dp256b_s6_TN_transOut_schedP_bN_dynBatch_sm100a_cubin_len, 190464, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x64x256_et128x64_m128x64x64_cga1x1x1_16dp256b_s6_TN_transOut_schedP_bN_dynBatch_sm100a", 480, "a9735d086843c86a9b35b714333c61508903a33c2f756421b7be6905b54bff09", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x64x256_et128x64_m128x64x64_cga1x1x1_16dp256b_s6_TN_transOut_schedP_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x64x256_et128x64_m128x64x64_cga1x1x1_16dp256b_s6_TN_transOut_schedP_bN_dynBatch_sm100a_cubin_len, 190464, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x64x256_et128x64_m128x64x64_cga1x1x1_16dp256b_s6_TN_transOut_schedP_bN_dynBatch_sm100a", 480, "0937e122abc610bd41b90a7474c6dc30be0b07e010a451576bf128dbccec6b11", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -1982,6 +1998,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -1995,7 +2012,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x64x256_et128x64_m128x64x64_cga1x1x1_16dp256b_s6_TN_transOut_schedS_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x64x256_et128x64_m128x64x64_cga1x1x1_16dp256b_s6_TN_transOut_schedS_bN_dynBatch_sm100a_cubin_len, 190464, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x64x256_et128x64_m128x64x64_cga1x1x1_16dp256b_s6_TN_transOut_schedS_bN_dynBatch_sm100a", 448, "8c75dfb121a8da2ec73ebc9d57dc14ed7b7ac41492ac75268491c704aa50367e", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x64x256_et128x64_m128x64x64_cga1x1x1_16dp256b_s6_TN_transOut_schedS_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x64x256_et128x64_m128x64x64_cga1x1x1_16dp256b_s6_TN_transOut_schedS_bN_dynBatch_sm100a_cubin_len, 190464, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x64x256_et128x64_m128x64x64_cga1x1x1_16dp256b_s6_TN_transOut_schedS_bN_dynBatch_sm100a", 448, "d54c0f92a03f62002fff4c5f9e3915a183137a66421be8571f19b2ed3f16c4bc", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -2063,6 +2080,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -2076,7 +2094,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x64x256u2_et128x64_m128x64x64_cga1x1x1_16dp256b_s6_TN_transOut_schedP_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x64x256u2_et128x64_m128x64x64_cga1x1x1_16dp256b_s6_TN_transOut_schedP_bN_dynBatch_sm100a_cubin_len, 190464, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x64x256u2_et128x64_m128x64x64_cga1x1x1_16dp256b_s6_TN_transOut_schedP_bN_dynBatch_sm100a", 480, "a102a044c11d7287312ac425ed40dc03a647d5394ebc657ae4ecebe21ae9729e", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x64x256u2_et128x64_m128x64x64_cga1x1x1_16dp256b_s6_TN_transOut_schedP_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x64x256u2_et128x64_m128x64x64_cga1x1x1_16dp256b_s6_TN_transOut_schedP_bN_dynBatch_sm100a_cubin_len, 190464, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x64x256u2_et128x64_m128x64x64_cga1x1x1_16dp256b_s6_TN_transOut_schedP_bN_dynBatch_sm100a", 480, "2e09c69e28b99da68ab8551673306a4eef46d805b26eda1490d454ad30e33d95", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -2144,6 +2162,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -2157,7 +2176,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x64x256u2_et128x64_m128x64x64_cga1x1x1_16dp256b_s6_TN_transOut_schedS_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x64x256u2_et128x64_m128x64x64_cga1x1x1_16dp256b_s6_TN_transOut_schedS_bN_dynBatch_sm100a_cubin_len, 190464, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x64x256u2_et128x64_m128x64x64_cga1x1x1_16dp256b_s6_TN_transOut_schedS_bN_dynBatch_sm100a", 448, "9844a870e85ee6f8652bb3ce85be92c2dc08f4af7cf4089dd3b845266197dc79", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x64x256u2_et128x64_m128x64x64_cga1x1x1_16dp256b_s6_TN_transOut_schedS_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x64x256u2_et128x64_m128x64x64_cga1x1x1_16dp256b_s6_TN_transOut_schedS_bN_dynBatch_sm100a_cubin_len, 190464, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x64x256u2_et128x64_m128x64x64_cga1x1x1_16dp256b_s6_TN_transOut_schedS_bN_dynBatch_sm100a", 448, "7f087ba5797c3995c9da864031b21368dedbfdbeb44703fd40f1a83f2d2d063d", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -2225,6 +2244,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -2238,169 +2258,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x64x512_et128x64_m128x64x64_cga1x1x1_16dp256b_s3_TN_transOut_schedP_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x64x512_et128x64_m128x64x64_cga1x1x1_16dp256b_s3_TN_transOut_schedP_bN_dynBatch_sm100a_cubin_len, 190464, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x64x512_et128x64_m128x64x64_cga1x1x1_16dp256b_s3_TN_transOut_schedP_bN_dynBatch_sm100a", 480, "55543e3d0a20cd4868d392d7418c50501af78a844fa930bfa556b826d3f3fe55", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
-, /* mBiasType */ gemm::BiasType(0)
-, /* mBlockK */ -1
-, /* mClusterDimX */ 1
-, /* mClusterDimY */ 1
-, /* mClusterDimZ */ 1
-, /* mDtypeAcc */ trtllm::gen::Dtype(1056776)
-, /* mDtypeA */ trtllm::gen::Dtype(17826818)
-, /* mDtypeB */ trtllm::gen::Dtype(17826818)
-, /* mDtypeC */ trtllm::gen::Dtype(1052672)
-, /* mDtypeMmaA */ trtllm::gen::Dtype(17826818)
-, /* mDtypeMmaB */ trtllm::gen::Dtype(17826818)
-, /* mEnablesEarlyExit */ 1
-, /* mEnablesDelayedEarlyExit */ 0
-, /* mEnablesGlobalPtxKnobs */ 1
-, /* mEpilogueLdtmDps */ 16
-, /* mEpilogueLdtmBits */ 256
-, /* mEpilogueTileM */ 128
-, /* mEpilogueTileN */ 64
-, /* mGridTriggerSecondaryA */ 0
-, /* mGridTriggerSecondaryB */ 1
-, /* mGridWaitForPrimaryEarlyExit */ 1
-, /* mGridWaitForPrimaryA */ 0
-, /* mGridWaitForPrimaryB */ 1
-, /* mHoistLoadTaskInit */ 1
-, /* mHoistMmaTaskTryWaits */ 0
-, /* mK */ 2048
-, /* mKernelTraits */ {}
-, /* mLayoutA */ gemm::MatrixLayout(0)
-, /* mLayoutB */ gemm::MatrixLayout(0)
-, /* mM */ 256
-, /* mMmaK */ 64
-, /* mMmaKind */ trtllm::gen::MmaKind(4)
-, /* mMmaM */ 128
-, /* mMmaN */ 64
-, /* mMockAllReduce */ 0
-, /* mN */ 256
-, /* mNumSlicesForSplitK */ 1
-, /* mNumSlicesForSliceK */ 1
-, /* mNumStages */ 3
-, /* mNumStagesMma */ 2
-, /* mNumStagesMmaWithinWorkTile */ 1
-, /* mNumStagesMmaAcrossWorkTile */ 2
-, /* mNumStagesWorkId */ 3
-, /* mOutputDebugTensors */ 0
-, /* mPatchF2fp */ 0
-, /* mUseShuffledMatrixA */ 1
-, /* mSliceK */ 0
-, /* mSplitK */ gemm::SplitK(0)
-, /* mTransposeMmaOutput */ 1
-, /* mTileM */ 128
-, /* mTileN */ 64
-, /* mTileK */ 512
-, /* mUseUnrollLoop2xForMma */ 0
-, /* mUseCustomMmaSchedule */ 1
-, /* mUseHoistTryWaitForCustomMmaSchedule */ 0
-, /* mUseDeepSeekFp8 */ 0
-, /* mUsePerTokenSfA */ 0
-, /* mUsePerTokenSfB */ 0
-, /* mUseTmaStore */ 1
-, /* mUseTwoTmaLoadWarps */ 1
-, /* mUseTwoMmaWarps */ 0
-, /* mSfLayoutA */ trtllm::gen::SfLayout(3)
-, /* mSfLayoutB */ trtllm::gen::SfLayout(1)
-, /* mSfLayoutC */ trtllm::gen::SfLayout(1)
-, /* mSfReshapeFactor */ 1
-, /* mTileScheduler */ gemm::TileScheduler(1)
-, /* mActType */ gemmGatedAct::ActType(0)
-, /* mBatchedM */ {}
-, /* mBatchedN */ {}
-, /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
-, /* mNumBatches */ 2
-, /* mIsStaticBatch */ 0
-, /* mNumTokens */ 2
-, /* mRouteImpl */ batchedGemm::RouteImpl(0)
-, /* mGridWaitForPrimaryRouting */ 0
-, /* mFusedAct */ 0
-, /* mNumRegsPerThreadNonEpilogueWarp */ 0
-, /* mNumRegsPerThreadEpilogueWarp */ 0
-, /* mNumRegsCastAWarps */ 0
- }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x64x512_et128x64_m128x64x64_cga1x1x1_16dp256b_s3_TN_transOut_schedS_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x64x512_et128x64_m128x64x64_cga1x1x1_16dp256b_s3_TN_transOut_schedS_bN_dynBatch_sm100a_cubin_len, 190464, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x64x512_et128x64_m128x64x64_cga1x1x1_16dp256b_s3_TN_transOut_schedS_bN_dynBatch_sm100a", 448, "8d8741f310a7dc32d359505b1838d7712ca1dd14f0cc0a8a5af0f7302716bc65", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
-, /* mBiasType */ gemm::BiasType(0)
-, /* mBlockK */ -1
-, /* mClusterDimX */ 1
-, /* mClusterDimY */ 1
-, /* mClusterDimZ */ 1
-, /* mDtypeAcc */ trtllm::gen::Dtype(1056776)
-, /* mDtypeA */ trtllm::gen::Dtype(17826818)
-, /* mDtypeB */ trtllm::gen::Dtype(17826818)
-, /* mDtypeC */ trtllm::gen::Dtype(1052672)
-, /* mDtypeMmaA */ trtllm::gen::Dtype(17826818)
-, /* mDtypeMmaB */ trtllm::gen::Dtype(17826818)
-, /* mEnablesEarlyExit */ 1
-, /* mEnablesDelayedEarlyExit */ 0
-, /* mEnablesGlobalPtxKnobs */ 1
-, /* mEpilogueLdtmDps */ 16
-, /* mEpilogueLdtmBits */ 256
-, /* mEpilogueTileM */ 128
-, /* mEpilogueTileN */ 64
-, /* mGridTriggerSecondaryA */ 0
-, /* mGridTriggerSecondaryB */ 1
-, /* mGridWaitForPrimaryEarlyExit */ 1
-, /* mGridWaitForPrimaryA */ 0
-, /* mGridWaitForPrimaryB */ 1
-, /* mHoistLoadTaskInit */ 1
-, /* mHoistMmaTaskTryWaits */ 0
-, /* mK */ 2048
-, /* mKernelTraits */ {}
-, /* mLayoutA */ gemm::MatrixLayout(0)
-, /* mLayoutB */ gemm::MatrixLayout(0)
-, /* mM */ 256
-, /* mMmaK */ 64
-, /* mMmaKind */ trtllm::gen::MmaKind(4)
-, /* mMmaM */ 128
-, /* mMmaN */ 64
-, /* mMockAllReduce */ 0
-, /* mN */ 256
-, /* mNumSlicesForSplitK */ 1
-, /* mNumSlicesForSliceK */ 1
-, /* mNumStages */ 3
-, /* mNumStagesMma */ 1
-, /* mNumStagesMmaWithinWorkTile */ 1
-, /* mNumStagesMmaAcrossWorkTile */ 1
-, /* mNumStagesWorkId */ 3
-, /* mOutputDebugTensors */ 0
-, /* mPatchF2fp */ 0
-, /* mUseShuffledMatrixA */ 1
-, /* mSliceK */ 0
-, /* mSplitK */ gemm::SplitK(0)
-, /* mTransposeMmaOutput */ 1
-, /* mTileM */ 128
-, /* mTileN */ 64
-, /* mTileK */ 512
-, /* mUseUnrollLoop2xForMma */ 0
-, /* mUseCustomMmaSchedule */ 1
-, /* mUseHoistTryWaitForCustomMmaSchedule */ 0
-, /* mUseDeepSeekFp8 */ 0
-, /* mUsePerTokenSfA */ 0
-, /* mUsePerTokenSfB */ 0
-, /* mUseTmaStore */ 1
-, /* mUseTwoTmaLoadWarps */ 1
-, /* mUseTwoMmaWarps */ 0
-, /* mSfLayoutA */ trtllm::gen::SfLayout(3)
-, /* mSfLayoutB */ trtllm::gen::SfLayout(1)
-, /* mSfLayoutC */ trtllm::gen::SfLayout(1)
-, /* mSfReshapeFactor */ 1
-, /* mTileScheduler */ gemm::TileScheduler(0)
-, /* mActType */ gemmGatedAct::ActType(0)
-, /* mBatchedM */ {}
-, /* mBatchedN */ {}
-, /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
-, /* mNumBatches */ 2
-, /* mIsStaticBatch */ 0
-, /* mNumTokens */ 2
-, /* mRouteImpl */ batchedGemm::RouteImpl(0)
-, /* mGridWaitForPrimaryRouting */ 0
-, /* mFusedAct */ 0
-, /* mNumRegsPerThreadNonEpilogueWarp */ 0
-, /* mNumRegsPerThreadEpilogueWarp */ 0
-, /* mNumRegsCastAWarps */ 0
- }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x64x512u2_et128x64_m128x64x64_cga1x1x1_16dp256b_s3_TN_transOut_schedP_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x64x512u2_et128x64_m128x64x64_cga1x1x1_16dp256b_s3_TN_transOut_schedP_bN_dynBatch_sm100a_cubin_len, 190464, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x64x512u2_et128x64_m128x64x64_cga1x1x1_16dp256b_s3_TN_transOut_schedP_bN_dynBatch_sm100a", 480, "b3667be3e4f2c67551fda5064c9b218e2aabe8b164fe2785a9d569e563ce3b22", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x64x512_et128x64_m128x64x64_cga1x1x1_16dp256b_s3_TN_transOut_schedP_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x64x512_et128x64_m128x64x64_cga1x1x1_16dp256b_s3_TN_transOut_schedP_bN_dynBatch_sm100a_cubin_len, 190464, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x64x512_et128x64_m128x64x64_cga1x1x1_16dp256b_s3_TN_transOut_schedP_bN_dynBatch_sm100a", 480, "a1a6bb42f366836d4a9e6daaf96b8af89f911b3106dcc0b7222513f30e9ba3ec", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -2453,6 +2311,170 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mTileM */ 128
 , /* mTileN */ 64
 , /* mTileK */ 512
+, /* mUseUnrollLoop2xForMma */ 0
+, /* mUseCustomMmaSchedule */ 1
+, /* mUseHoistTryWaitForCustomMmaSchedule */ 0
+, /* mUseDeepSeekFp8 */ 0
+, /* mUsePerTokenSfA */ 0
+, /* mUsePerTokenSfB */ 0
+, /* mUseTmaStore */ 1
+, /* mUseTwoTmaLoadWarps */ 1
+, /* mUseTwoMmaWarps */ 0
+, /* mSfLayoutA */ trtllm::gen::SfLayout(3)
+, /* mSfLayoutB */ trtllm::gen::SfLayout(1)
+, /* mSfLayoutC */ trtllm::gen::SfLayout(1)
+, /* mSfReshapeFactor */ 1
+, /* mTileScheduler */ gemm::TileScheduler(1)
+, /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
+, /* mBatchedM */ {}
+, /* mBatchedN */ {}
+, /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
+, /* mNumBatches */ 2
+, /* mIsStaticBatch */ 0
+, /* mNumTokens */ 2
+, /* mRouteImpl */ batchedGemm::RouteImpl(0)
+, /* mGridWaitForPrimaryRouting */ 0
+, /* mFusedAct */ 0
+, /* mNumRegsPerThreadNonEpilogueWarp */ 0
+, /* mNumRegsPerThreadEpilogueWarp */ 0
+, /* mNumRegsCastAWarps */ 0
+ }, gemm::SmVersion::Sm100a },
+{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x64x512_et128x64_m128x64x64_cga1x1x1_16dp256b_s3_TN_transOut_schedS_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x64x512_et128x64_m128x64x64_cga1x1x1_16dp256b_s3_TN_transOut_schedS_bN_dynBatch_sm100a_cubin_len, 190464, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x64x512_et128x64_m128x64x64_cga1x1x1_16dp256b_s3_TN_transOut_schedS_bN_dynBatch_sm100a", 448, "5eac77766bcc959bdb459108c244e70464a1ae048a01214483f75c02e8de297c", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+, /* mBiasType */ gemm::BiasType(0)
+, /* mBlockK */ -1
+, /* mClusterDimX */ 1
+, /* mClusterDimY */ 1
+, /* mClusterDimZ */ 1
+, /* mDtypeAcc */ trtllm::gen::Dtype(1056776)
+, /* mDtypeA */ trtllm::gen::Dtype(17826818)
+, /* mDtypeB */ trtllm::gen::Dtype(17826818)
+, /* mDtypeC */ trtllm::gen::Dtype(1052672)
+, /* mDtypeMmaA */ trtllm::gen::Dtype(17826818)
+, /* mDtypeMmaB */ trtllm::gen::Dtype(17826818)
+, /* mEnablesEarlyExit */ 1
+, /* mEnablesDelayedEarlyExit */ 0
+, /* mEnablesGlobalPtxKnobs */ 1
+, /* mEpilogueLdtmDps */ 16
+, /* mEpilogueLdtmBits */ 256
+, /* mEpilogueTileM */ 128
+, /* mEpilogueTileN */ 64
+, /* mGridTriggerSecondaryA */ 0
+, /* mGridTriggerSecondaryB */ 1
+, /* mGridWaitForPrimaryEarlyExit */ 1
+, /* mGridWaitForPrimaryA */ 0
+, /* mGridWaitForPrimaryB */ 1
+, /* mHoistLoadTaskInit */ 1
+, /* mHoistMmaTaskTryWaits */ 0
+, /* mK */ 2048
+, /* mKernelTraits */ {}
+, /* mLayoutA */ gemm::MatrixLayout(0)
+, /* mLayoutB */ gemm::MatrixLayout(0)
+, /* mM */ 256
+, /* mMmaK */ 64
+, /* mMmaKind */ trtllm::gen::MmaKind(4)
+, /* mMmaM */ 128
+, /* mMmaN */ 64
+, /* mMockAllReduce */ 0
+, /* mN */ 256
+, /* mNumSlicesForSplitK */ 1
+, /* mNumSlicesForSliceK */ 1
+, /* mNumStages */ 3
+, /* mNumStagesMma */ 1
+, /* mNumStagesMmaWithinWorkTile */ 1
+, /* mNumStagesMmaAcrossWorkTile */ 1
+, /* mNumStagesWorkId */ 3
+, /* mOutputDebugTensors */ 0
+, /* mPatchF2fp */ 0
+, /* mUseShuffledMatrixA */ 1
+, /* mSliceK */ 0
+, /* mSplitK */ gemm::SplitK(0)
+, /* mTransposeMmaOutput */ 1
+, /* mTileM */ 128
+, /* mTileN */ 64
+, /* mTileK */ 512
+, /* mUseUnrollLoop2xForMma */ 0
+, /* mUseCustomMmaSchedule */ 1
+, /* mUseHoistTryWaitForCustomMmaSchedule */ 0
+, /* mUseDeepSeekFp8 */ 0
+, /* mUsePerTokenSfA */ 0
+, /* mUsePerTokenSfB */ 0
+, /* mUseTmaStore */ 1
+, /* mUseTwoTmaLoadWarps */ 1
+, /* mUseTwoMmaWarps */ 0
+, /* mSfLayoutA */ trtllm::gen::SfLayout(3)
+, /* mSfLayoutB */ trtllm::gen::SfLayout(1)
+, /* mSfLayoutC */ trtllm::gen::SfLayout(1)
+, /* mSfReshapeFactor */ 1
+, /* mTileScheduler */ gemm::TileScheduler(0)
+, /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
+, /* mBatchedM */ {}
+, /* mBatchedN */ {}
+, /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
+, /* mNumBatches */ 2
+, /* mIsStaticBatch */ 0
+, /* mNumTokens */ 2
+, /* mRouteImpl */ batchedGemm::RouteImpl(0)
+, /* mGridWaitForPrimaryRouting */ 0
+, /* mFusedAct */ 0
+, /* mNumRegsPerThreadNonEpilogueWarp */ 0
+, /* mNumRegsPerThreadEpilogueWarp */ 0
+, /* mNumRegsCastAWarps */ 0
+ }, gemm::SmVersion::Sm100a },
+{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x64x512u2_et128x64_m128x64x64_cga1x1x1_16dp256b_s3_TN_transOut_schedP_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x64x512u2_et128x64_m128x64x64_cga1x1x1_16dp256b_s3_TN_transOut_schedP_bN_dynBatch_sm100a_cubin_len, 190464, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x64x512u2_et128x64_m128x64x64_cga1x1x1_16dp256b_s3_TN_transOut_schedP_bN_dynBatch_sm100a", 480, "fdccf72f527a1c70236993d8f2f951ecaf971808014fa2afad8479bcc7bc28fd", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+, /* mBiasType */ gemm::BiasType(0)
+, /* mBlockK */ -1
+, /* mClusterDimX */ 1
+, /* mClusterDimY */ 1
+, /* mClusterDimZ */ 1
+, /* mDtypeAcc */ trtllm::gen::Dtype(1056776)
+, /* mDtypeA */ trtllm::gen::Dtype(17826818)
+, /* mDtypeB */ trtllm::gen::Dtype(17826818)
+, /* mDtypeC */ trtllm::gen::Dtype(1052672)
+, /* mDtypeMmaA */ trtllm::gen::Dtype(17826818)
+, /* mDtypeMmaB */ trtllm::gen::Dtype(17826818)
+, /* mEnablesEarlyExit */ 1
+, /* mEnablesDelayedEarlyExit */ 0
+, /* mEnablesGlobalPtxKnobs */ 1
+, /* mEpilogueLdtmDps */ 16
+, /* mEpilogueLdtmBits */ 256
+, /* mEpilogueTileM */ 128
+, /* mEpilogueTileN */ 64
+, /* mGridTriggerSecondaryA */ 0
+, /* mGridTriggerSecondaryB */ 1
+, /* mGridWaitForPrimaryEarlyExit */ 1
+, /* mGridWaitForPrimaryA */ 0
+, /* mGridWaitForPrimaryB */ 1
+, /* mHoistLoadTaskInit */ 1
+, /* mHoistMmaTaskTryWaits */ 0
+, /* mK */ 2048
+, /* mKernelTraits */ {}
+, /* mLayoutA */ gemm::MatrixLayout(0)
+, /* mLayoutB */ gemm::MatrixLayout(0)
+, /* mM */ 256
+, /* mMmaK */ 64
+, /* mMmaKind */ trtllm::gen::MmaKind(4)
+, /* mMmaM */ 128
+, /* mMmaN */ 64
+, /* mMockAllReduce */ 0
+, /* mN */ 256
+, /* mNumSlicesForSplitK */ 1
+, /* mNumSlicesForSliceK */ 1
+, /* mNumStages */ 3
+, /* mNumStagesMma */ 2
+, /* mNumStagesMmaWithinWorkTile */ 1
+, /* mNumStagesMmaAcrossWorkTile */ 2
+, /* mNumStagesWorkId */ 3
+, /* mOutputDebugTensors */ 0
+, /* mPatchF2fp */ 0
+, /* mUseShuffledMatrixA */ 1
+, /* mSliceK */ 0
+, /* mSplitK */ gemm::SplitK(0)
+, /* mTransposeMmaOutput */ 1
+, /* mTileM */ 128
+, /* mTileN */ 64
+, /* mTileK */ 512
 , /* mUseUnrollLoop2xForMma */ 1
 , /* mUseCustomMmaSchedule */ 1
 , /* mUseHoistTryWaitForCustomMmaSchedule */ 0
@@ -2468,6 +2490,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -2481,7 +2504,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x64x512u2_et128x64_m128x64x64_cga1x1x1_16dp256b_s3_TN_transOut_schedS_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x64x512u2_et128x64_m128x64x64_cga1x1x1_16dp256b_s3_TN_transOut_schedS_bN_dynBatch_sm100a_cubin_len, 190464, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x64x512u2_et128x64_m128x64x64_cga1x1x1_16dp256b_s3_TN_transOut_schedS_bN_dynBatch_sm100a", 448, "4c427a3541477d0f20fcf2a771858d6aa34505c7f28d2db1efd784a058b3d881", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x64x512u2_et128x64_m128x64x64_cga1x1x1_16dp256b_s3_TN_transOut_schedS_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x64x512u2_et128x64_m128x64x64_cga1x1x1_16dp256b_s3_TN_transOut_schedS_bN_dynBatch_sm100a_cubin_len, 190464, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x64x512u2_et128x64_m128x64x64_cga1x1x1_16dp256b_s3_TN_transOut_schedS_bN_dynBatch_sm100a", 448, "83cde2971a937a02642b018c2dc62a3d098b032d2961c4c15ecf23d94c6f4759", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -2549,6 +2572,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -2562,7 +2586,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x256_et128x8_m128x8x64_cga1x1x1_16dp256b_s6_TN_transOut_schedP_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x256_et128x8_m128x8x64_cga1x1x1_16dp256b_s6_TN_transOut_schedP_bN_dynBatch_sm100a_cubin_len, 126976, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x256_et128x8_m128x8x64_cga1x1x1_16dp256b_s6_TN_transOut_schedP_bN_dynBatch_sm100a", 480, "1bf11de0e9acedab08b27218081fed4b408e068dae9687da653f55aa20cd7286", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x256_et128x8_m128x8x64_cga1x1x1_16dp256b_s6_TN_transOut_schedP_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x256_et128x8_m128x8x64_cga1x1x1_16dp256b_s6_TN_transOut_schedP_bN_dynBatch_sm100a_cubin_len, 126976, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x256_et128x8_m128x8x64_cga1x1x1_16dp256b_s6_TN_transOut_schedP_bN_dynBatch_sm100a", 480, "004915fae60a35731038e2af4aebf70f7fa0facf0e2c923df209086c3e5ae115", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -2630,6 +2654,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -2643,7 +2668,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x256_et128x8_m128x8x64_cga1x1x1_16dp256b_s6_TN_transOut_schedS_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x256_et128x8_m128x8x64_cga1x1x1_16dp256b_s6_TN_transOut_schedS_bN_dynBatch_sm100a_cubin_len, 126976, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x256_et128x8_m128x8x64_cga1x1x1_16dp256b_s6_TN_transOut_schedS_bN_dynBatch_sm100a", 448, "1f01b78e689c6df0db3fdcdbf59c46a7f75dca1a27bc65030df8b423c76a01aa", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x256_et128x8_m128x8x64_cga1x1x1_16dp256b_s6_TN_transOut_schedS_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x256_et128x8_m128x8x64_cga1x1x1_16dp256b_s6_TN_transOut_schedS_bN_dynBatch_sm100a_cubin_len, 126976, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x256_et128x8_m128x8x64_cga1x1x1_16dp256b_s6_TN_transOut_schedS_bN_dynBatch_sm100a", 448, "2ebbbcba52b8b00c94571b04afc99c47f27a141529707096a82ee146dd0f7485", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -2711,6 +2736,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -2724,7 +2750,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x256u2_et128x8_m128x8x64_cga1x1x1_16dp256b_s6_TN_transOut_schedP_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x256u2_et128x8_m128x8x64_cga1x1x1_16dp256b_s6_TN_transOut_schedP_bN_dynBatch_sm100a_cubin_len, 126976, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x256u2_et128x8_m128x8x64_cga1x1x1_16dp256b_s6_TN_transOut_schedP_bN_dynBatch_sm100a", 480, "8950dfeb3f9b34296ddb6b6505375b985a7baa30a3181de26606147b6f016f60", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x256u2_et128x8_m128x8x64_cga1x1x1_16dp256b_s6_TN_transOut_schedP_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x256u2_et128x8_m128x8x64_cga1x1x1_16dp256b_s6_TN_transOut_schedP_bN_dynBatch_sm100a_cubin_len, 126976, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x256u2_et128x8_m128x8x64_cga1x1x1_16dp256b_s6_TN_transOut_schedP_bN_dynBatch_sm100a", 480, "800e3f410f62345b1dcbd66f321ba3d9e16d323c45930a1fb4b9b31eaebfde87", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -2792,6 +2818,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -2805,7 +2832,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x256u2_et128x8_m128x8x64_cga1x1x1_16dp256b_s6_TN_transOut_schedS_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x256u2_et128x8_m128x8x64_cga1x1x1_16dp256b_s6_TN_transOut_schedS_bN_dynBatch_sm100a_cubin_len, 126976, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x256u2_et128x8_m128x8x64_cga1x1x1_16dp256b_s6_TN_transOut_schedS_bN_dynBatch_sm100a", 448, "106236ae5fee131891ccd270830e032a78b2b4f204f39bb1479246a66d6a8923", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x256u2_et128x8_m128x8x64_cga1x1x1_16dp256b_s6_TN_transOut_schedS_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x256u2_et128x8_m128x8x64_cga1x1x1_16dp256b_s6_TN_transOut_schedS_bN_dynBatch_sm100a_cubin_len, 126976, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x256u2_et128x8_m128x8x64_cga1x1x1_16dp256b_s6_TN_transOut_schedS_bN_dynBatch_sm100a", 448, "614a29b92801de07c8b36f071b051fc71025b10db57b1b72b31c71f578da74b6", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -2873,6 +2900,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -2886,7 +2914,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedP_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedP_bN_dynBatch_sm100a_cubin_len, 166912, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedP_bN_dynBatch_sm100a", 480, "461b867c2333bc9b18b35c560346af9270fff69a8b1a5ca2ef5c8446ea3f3185", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedP_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedP_bN_dynBatch_sm100a_cubin_len, 166912, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedP_bN_dynBatch_sm100a", 480, "10b05da0f3ae183ca9749281c961fd61ac7e5f33ccaadc9584db5f705aeab879", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -2954,6 +2982,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -2967,7 +2996,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_dynBatch_sm100a_cubin_len, 166912, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_dynBatch_sm100a", 448, "289632d23acd75c19ff37bedee4e649cafa895fd302470c054ea0d3c3ef9595e", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_dynBatch_sm100a_cubin_len, 166912, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_dynBatch_sm100a", 448, "35f66e3d559e2ed5e28c60fafbdb670b97cb4e5a1a1aaec46a46246db644b3ef", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -3035,6 +3064,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -3048,7 +3078,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_sm100a_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_sm100a_cubin_len, 166912, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_sm100a", 448, "4e539fd1e629100faa3822fd0fb1034940e94dbda2f9ed34e1dbbd06721a3ed1", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_sm100a_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_sm100a_cubin_len, 166912, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_sm100a", 448, "c579bf5faa33ac5febee73279e2d49e4ad1001a3d360999bcf8b323b820c5649", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -3116,6 +3146,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -3129,7 +3160,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512u2_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedP_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512u2_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedP_bN_dynBatch_sm100a_cubin_len, 166912, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512u2_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedP_bN_dynBatch_sm100a", 480, "fed7077e77e7082ceefcc1ed917e59b4ba0082f0950238c9955f1c441835ae4f", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512u2_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedP_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512u2_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedP_bN_dynBatch_sm100a_cubin_len, 166912, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512u2_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedP_bN_dynBatch_sm100a", 480, "d173dd09116ccf1f0afcda70c3d79ac29e20120c31eea2a1dcea587c48efe25d", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -3197,6 +3228,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -3210,7 +3242,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512u2_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512u2_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_dynBatch_sm100a_cubin_len, 166912, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512u2_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_dynBatch_sm100a", 448, "439a0646d358caa93cf8a2f2db698f5eae487fd019b97471eec069afa67be8b1", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512u2_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512u2_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_dynBatch_sm100a_cubin_len, 166912, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512u2_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_dynBatch_sm100a", 448, "99b92263c3e83a77c500fd2a2200cfdf68380d652092a586ef4863fa0de56f18", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -3278,6 +3310,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -3291,7 +3324,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512u2_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_sm100a_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512u2_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_sm100a_cubin_len, 166912, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512u2_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_sm100a", 448, "711bbf71201a99679119cdf9bcfead1514f2f52644048b47613bece74b10cbd6", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512u2_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_sm100a_cubin, Bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512u2_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_sm100a_cubin_len, 166912, "bmm_Bfloat16_E2m1E2m1_Fp32_t128x8x512u2_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_sm100a", 448, "379be03f3d7bb8a714c2c288c7c3ec5916d3d59e46958c331ce43a4cd5c01ccb", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -3359,6 +3392,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -3372,7 +3406,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x16x128_et64x16_m64x16x32_cga1x1x1_16dp256b_s6_TN_transOut_noShflA_dsFp8_schedP_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x16x128_et64x16_m64x16x32_cga1x1x1_16dp256b_s6_TN_transOut_noShflA_dsFp8_schedP_bN_dynBatch_sm100a_cubin_len, 121856, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x16x128_et64x16_m64x16x32_cga1x1x1_16dp256b_s6_TN_transOut_noShflA_dsFp8_schedP_bN_dynBatch_sm100a", 416, "643feb5ce7f302adef11f946f2acc465a42ea80dce84d36a29350e29b2fa3ba8", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x16x128_et64x16_m64x16x32_cga1x1x1_16dp256b_s6_TN_transOut_noShflA_dsFp8_schedP_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x16x128_et64x16_m64x16x32_cga1x1x1_16dp256b_s6_TN_transOut_noShflA_dsFp8_schedP_bN_dynBatch_sm100a_cubin_len, 121856, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x16x128_et64x16_m64x16x32_cga1x1x1_16dp256b_s6_TN_transOut_noShflA_dsFp8_schedP_bN_dynBatch_sm100a", 416, "db1d6a3775ac8b4cd988507b5a1ca47349ae56faee8b9a9809f6498cbd805c6f", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -3440,6 +3474,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -3453,7 +3488,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x16x128_et64x16_m64x16x32_cga1x1x1_16dp256b_s6_TN_transOut_noShflA_dsFp8_schedS_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x16x128_et64x16_m64x16x32_cga1x1x1_16dp256b_s6_TN_transOut_noShflA_dsFp8_schedS_bN_dynBatch_sm100a_cubin_len, 121856, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x16x128_et64x16_m64x16x32_cga1x1x1_16dp256b_s6_TN_transOut_noShflA_dsFp8_schedS_bN_dynBatch_sm100a", 384, "7a8c5da0ece356d9f234bd3fc7879a53028075546645b92a671e012459673878", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x16x128_et64x16_m64x16x32_cga1x1x1_16dp256b_s6_TN_transOut_noShflA_dsFp8_schedS_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x16x128_et64x16_m64x16x32_cga1x1x1_16dp256b_s6_TN_transOut_noShflA_dsFp8_schedS_bN_dynBatch_sm100a_cubin_len, 121856, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x16x128_et64x16_m64x16x32_cga1x1x1_16dp256b_s6_TN_transOut_noShflA_dsFp8_schedS_bN_dynBatch_sm100a", 384, "1d9f64edf31656d8742eec78363b91fb9b3911971ccf51d32969a7a245509274", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -3521,6 +3556,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -3534,7 +3570,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x16x128u2_et64x16_m64x16x32_cga1x1x1_16dp256b_s6_TN_transOut_noShflA_dsFp8_schedP_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x16x128u2_et64x16_m64x16x32_cga1x1x1_16dp256b_s6_TN_transOut_noShflA_dsFp8_schedP_bN_dynBatch_sm100a_cubin_len, 121856, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x16x128u2_et64x16_m64x16x32_cga1x1x1_16dp256b_s6_TN_transOut_noShflA_dsFp8_schedP_bN_dynBatch_sm100a", 416, "b84f27d36e27e618b9db625e91816fe34308208c6fc114e9bae896e1ce721a46", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x16x128u2_et64x16_m64x16x32_cga1x1x1_16dp256b_s6_TN_transOut_noShflA_dsFp8_schedP_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x16x128u2_et64x16_m64x16x32_cga1x1x1_16dp256b_s6_TN_transOut_noShflA_dsFp8_schedP_bN_dynBatch_sm100a_cubin_len, 121856, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x16x128u2_et64x16_m64x16x32_cga1x1x1_16dp256b_s6_TN_transOut_noShflA_dsFp8_schedP_bN_dynBatch_sm100a", 416, "d570d48f01aeba2ca9976fc64e5673347cd4aead9db8cc5bf4f284519e51ea9b", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -3602,6 +3638,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -3615,7 +3652,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x16x128u2_et64x16_m64x16x32_cga1x1x1_16dp256b_s6_TN_transOut_noShflA_dsFp8_schedS_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x16x128u2_et64x16_m64x16x32_cga1x1x1_16dp256b_s6_TN_transOut_noShflA_dsFp8_schedS_bN_dynBatch_sm100a_cubin_len, 121856, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x16x128u2_et64x16_m64x16x32_cga1x1x1_16dp256b_s6_TN_transOut_noShflA_dsFp8_schedS_bN_dynBatch_sm100a", 384, "26c83cd05ab077ad34a3911be575ef55a4939ab41dcaf47d948e9109038c34c1", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x16x128u2_et64x16_m64x16x32_cga1x1x1_16dp256b_s6_TN_transOut_noShflA_dsFp8_schedS_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x16x128u2_et64x16_m64x16x32_cga1x1x1_16dp256b_s6_TN_transOut_noShflA_dsFp8_schedS_bN_dynBatch_sm100a_cubin_len, 121856, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x16x128u2_et64x16_m64x16x32_cga1x1x1_16dp256b_s6_TN_transOut_noShflA_dsFp8_schedS_bN_dynBatch_sm100a", 384, "cc5ab7c76ce7cbf7a2695742322c2123e30998c626dedd1a204785d0556e18ac", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -3683,6 +3720,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -3696,7 +3734,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x32x128_et64x32_m64x32x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedP_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x32x128_et64x32_m64x32x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedP_bN_dynBatch_sm100a_cubin_len, 97280, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x32x128_et64x32_m64x32x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedP_bN_dynBatch_sm100a", 416, "d7dea5f8631dfc12d9311200238080feebe502875ae5d0324581270d850cf408", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x32x128_et64x32_m64x32x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedP_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x32x128_et64x32_m64x32x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedP_bN_dynBatch_sm100a_cubin_len, 97280, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x32x128_et64x32_m64x32x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedP_bN_dynBatch_sm100a", 416, "4bd1321a78b142af51405c66058f8acad5d3ff1e3cada9e4dedd59617117c11d", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -3764,6 +3802,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -3777,7 +3816,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x32x128_et64x32_m64x32x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedS_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x32x128_et64x32_m64x32x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedS_bN_dynBatch_sm100a_cubin_len, 97280, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x32x128_et64x32_m64x32x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedS_bN_dynBatch_sm100a", 384, "fb8402698912b70fd7f9f94f26cb4acf4ae4c9511d5f3e50c5d6911736981d75", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x32x128_et64x32_m64x32x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedS_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x32x128_et64x32_m64x32x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedS_bN_dynBatch_sm100a_cubin_len, 97280, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x32x128_et64x32_m64x32x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedS_bN_dynBatch_sm100a", 384, "903da0851e9494530288a986c6c8d94a4a04525bf927cd359db68fefce9f4615", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -3845,6 +3884,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -3858,7 +3898,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x32x128u2_et64x32_m64x32x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedP_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x32x128u2_et64x32_m64x32x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedP_bN_dynBatch_sm100a_cubin_len, 97280, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x32x128u2_et64x32_m64x32x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedP_bN_dynBatch_sm100a", 416, "6d585646e70beec348a0c49d0bf418127f55e0368321e9e0508ebae8c507832c", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x32x128u2_et64x32_m64x32x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedP_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x32x128u2_et64x32_m64x32x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedP_bN_dynBatch_sm100a_cubin_len, 97280, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x32x128u2_et64x32_m64x32x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedP_bN_dynBatch_sm100a", 416, "28351355d8e51420290ab29001b4d4d3ad8befabe81d997beb44b094dc7d1670", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -3926,6 +3966,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -3939,7 +3980,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x32x128u2_et64x32_m64x32x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedS_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x32x128u2_et64x32_m64x32x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedS_bN_dynBatch_sm100a_cubin_len, 97280, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x32x128u2_et64x32_m64x32x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedS_bN_dynBatch_sm100a", 384, "003a89ab0332557a77193cc52787641c6b86b419ed7e931b37a1421da180d2b1", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x32x128u2_et64x32_m64x32x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedS_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x32x128u2_et64x32_m64x32x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedS_bN_dynBatch_sm100a_cubin_len, 97280, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x32x128u2_et64x32_m64x32x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedS_bN_dynBatch_sm100a", 384, "6ffb84a95c2803867a0492ee024e16fc32d0986514b04fc43c36bfb62d3e92db", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -4007,6 +4048,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -4020,7 +4062,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x64x128_et64x64_m64x64x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedP_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x64x128_et64x64_m64x64x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedP_bN_dynBatch_sm100a_cubin_len, 123904, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x64x128_et64x64_m64x64x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedP_bN_dynBatch_sm100a", 416, "c4fa780c31d2b57c906f2664e7a84963c0430f13f8ca1d6a8adb229b7f84113f", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x64x128_et64x64_m64x64x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedP_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x64x128_et64x64_m64x64x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedP_bN_dynBatch_sm100a_cubin_len, 123904, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x64x128_et64x64_m64x64x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedP_bN_dynBatch_sm100a", 416, "318ee60c00683bfc467e7c81cab73ee79743cc4d7029bef6e6f1f3a651efc7c7", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -4088,6 +4130,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -4101,7 +4144,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x64x128_et64x64_m64x64x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedS_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x64x128_et64x64_m64x64x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedS_bN_dynBatch_sm100a_cubin_len, 123904, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x64x128_et64x64_m64x64x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedS_bN_dynBatch_sm100a", 384, "9fb51db3a3cdda2ac2e0b6238f64702a55f75aef5178cbe4c9c607d443a32007", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x64x128_et64x64_m64x64x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedS_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x64x128_et64x64_m64x64x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedS_bN_dynBatch_sm100a_cubin_len, 123904, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x64x128_et64x64_m64x64x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedS_bN_dynBatch_sm100a", 384, "d508ca1ee96c46570f2ea499fe06125d7d731eda1c07fff1523ff45b6b24b024", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -4169,6 +4212,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -4182,7 +4226,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x64x128u2_et64x64_m64x64x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedP_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x64x128u2_et64x64_m64x64x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedP_bN_dynBatch_sm100a_cubin_len, 123904, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x64x128u2_et64x64_m64x64x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedP_bN_dynBatch_sm100a", 416, "5dd9e87932796c6d22c7054ed907ba2840495d388ba0d9cd1cd9d2aa7f582f07", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x64x128u2_et64x64_m64x64x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedP_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x64x128u2_et64x64_m64x64x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedP_bN_dynBatch_sm100a_cubin_len, 123904, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x64x128u2_et64x64_m64x64x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedP_bN_dynBatch_sm100a", 416, "abc85e11c4481af85cbbcf640da574a8054267c92c8fcba8aa03f85736ae1498", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -4250,6 +4294,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -4263,7 +4308,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x64x128u2_et64x64_m64x64x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedS_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x64x128u2_et64x64_m64x64x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedS_bN_dynBatch_sm100a_cubin_len, 123904, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x64x128u2_et64x64_m64x64x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedS_bN_dynBatch_sm100a", 384, "a83999426543a22c7c426f2771400ef4839fe2d86b2adcde62d45c512cec82e2", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x64x128u2_et64x64_m64x64x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedS_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x64x128u2_et64x64_m64x64x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedS_bN_dynBatch_sm100a_cubin_len, 123904, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x64x128u2_et64x64_m64x64x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedS_bN_dynBatch_sm100a", 384, "cd6d0249dfa2c85e631efe1068d09e38db0e26cdf4914edcff5448bcdfcf190e", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -4331,6 +4376,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -4344,7 +4390,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x128_et64x8_m64x8x32_cga1x1x1_16dp256b_s3_TN_transOut_noShflA_dsFp8_schedS_bN_sm100a_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x128_et64x8_m64x8x32_cga1x1x1_16dp256b_s3_TN_transOut_noShflA_dsFp8_schedS_bN_sm100a_cubin_len, 61440, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x128_et64x8_m64x8x32_cga1x1x1_16dp256b_s3_TN_transOut_noShflA_dsFp8_schedS_bN_sm100a", 384, "09cac9e0a40b4e2171c955bf9781126aab1eeb622a329c17dbc402cf14a318d3", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x128_et64x8_m64x8x32_cga1x1x1_16dp256b_s3_TN_transOut_noShflA_dsFp8_schedS_bN_sm100a_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x128_et64x8_m64x8x32_cga1x1x1_16dp256b_s3_TN_transOut_noShflA_dsFp8_schedS_bN_sm100a_cubin_len, 61440, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x128_et64x8_m64x8x32_cga1x1x1_16dp256b_s3_TN_transOut_noShflA_dsFp8_schedS_bN_sm100a", 384, "28ebc984a3ac52fc2bee2959af1788fe9037fd70b762ff675856eb4efb2be9da", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -4412,6 +4458,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -4425,7 +4472,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x128_et64x8_m64x8x32_cga1x1x1_16dp256b_s8_TN_transOut_noShflA_dsFp8_schedP_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x128_et64x8_m64x8x32_cga1x1x1_16dp256b_s8_TN_transOut_noShflA_dsFp8_schedP_bN_dynBatch_sm100a_cubin_len, 149504, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x128_et64x8_m64x8x32_cga1x1x1_16dp256b_s8_TN_transOut_noShflA_dsFp8_schedP_bN_dynBatch_sm100a", 416, "289dfd6451db297608146a446e9dac9e3febc338f59e35bc43c67c0272b16718", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x128_et64x8_m64x8x32_cga1x1x1_16dp256b_s8_TN_transOut_noShflA_dsFp8_schedP_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x128_et64x8_m64x8x32_cga1x1x1_16dp256b_s8_TN_transOut_noShflA_dsFp8_schedP_bN_dynBatch_sm100a_cubin_len, 149504, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x128_et64x8_m64x8x32_cga1x1x1_16dp256b_s8_TN_transOut_noShflA_dsFp8_schedP_bN_dynBatch_sm100a", 416, "eef8766fd9007de7ac4d11c2e6f641c7e965bbf48b7298c9c4a4945168549826", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -4493,6 +4540,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -4506,7 +4554,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x128_et64x8_m64x8x32_cga1x1x1_16dp256b_s8_TN_transOut_noShflA_dsFp8_schedS_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x128_et64x8_m64x8x32_cga1x1x1_16dp256b_s8_TN_transOut_noShflA_dsFp8_schedS_bN_dynBatch_sm100a_cubin_len, 149504, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x128_et64x8_m64x8x32_cga1x1x1_16dp256b_s8_TN_transOut_noShflA_dsFp8_schedS_bN_dynBatch_sm100a", 384, "342b1b480c1e22b28e3dfedefebf38a0b08dd933003e408960f4a49e7cac4ac0", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x128_et64x8_m64x8x32_cga1x1x1_16dp256b_s8_TN_transOut_noShflA_dsFp8_schedS_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x128_et64x8_m64x8x32_cga1x1x1_16dp256b_s8_TN_transOut_noShflA_dsFp8_schedS_bN_dynBatch_sm100a_cubin_len, 149504, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x128_et64x8_m64x8x32_cga1x1x1_16dp256b_s8_TN_transOut_noShflA_dsFp8_schedS_bN_dynBatch_sm100a", 384, "52229774c9dfeeadbf9cc21df823fe932d75d08a1f7efcd7dbef384911472038", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -4574,6 +4622,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -4587,7 +4636,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x128u2_et64x8_m64x8x32_cga1x1x1_16dp256b_s3_TN_transOut_noShflA_dsFp8_schedS_bN_sm100a_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x128u2_et64x8_m64x8x32_cga1x1x1_16dp256b_s3_TN_transOut_noShflA_dsFp8_schedS_bN_sm100a_cubin_len, 61440, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x128u2_et64x8_m64x8x32_cga1x1x1_16dp256b_s3_TN_transOut_noShflA_dsFp8_schedS_bN_sm100a", 384, "77a0ef3e945fe766bcead734a1cd72d5eaf44f529b48e0d3c9cadd169cfeef02", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x128u2_et64x8_m64x8x32_cga1x1x1_16dp256b_s3_TN_transOut_noShflA_dsFp8_schedS_bN_sm100a_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x128u2_et64x8_m64x8x32_cga1x1x1_16dp256b_s3_TN_transOut_noShflA_dsFp8_schedS_bN_sm100a_cubin_len, 61440, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x128u2_et64x8_m64x8x32_cga1x1x1_16dp256b_s3_TN_transOut_noShflA_dsFp8_schedS_bN_sm100a", 384, "7339a9b452379a2d29ffbc8c814c51e0ab7f653a9b28cdc12c0f84b84c86e07c", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -4655,6 +4704,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -4668,7 +4718,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x128u2_et64x8_m64x8x32_cga1x1x1_16dp256b_s8_TN_transOut_noShflA_dsFp8_schedP_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x128u2_et64x8_m64x8x32_cga1x1x1_16dp256b_s8_TN_transOut_noShflA_dsFp8_schedP_bN_dynBatch_sm100a_cubin_len, 149504, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x128u2_et64x8_m64x8x32_cga1x1x1_16dp256b_s8_TN_transOut_noShflA_dsFp8_schedP_bN_dynBatch_sm100a", 416, "0527b94e8165bd191f2e61138510b708242607b8ed372def546d4ee0b35ea3c5", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x128u2_et64x8_m64x8x32_cga1x1x1_16dp256b_s8_TN_transOut_noShflA_dsFp8_schedP_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x128u2_et64x8_m64x8x32_cga1x1x1_16dp256b_s8_TN_transOut_noShflA_dsFp8_schedP_bN_dynBatch_sm100a_cubin_len, 149504, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x128u2_et64x8_m64x8x32_cga1x1x1_16dp256b_s8_TN_transOut_noShflA_dsFp8_schedP_bN_dynBatch_sm100a", 416, "45c3270f9b05e3830942473e363dacc7f68a92f44b3c4215d0ed82d38787823b", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -4736,6 +4786,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -4749,7 +4800,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x128u2_et64x8_m64x8x32_cga1x1x1_16dp256b_s8_TN_transOut_noShflA_dsFp8_schedS_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x128u2_et64x8_m64x8x32_cga1x1x1_16dp256b_s8_TN_transOut_noShflA_dsFp8_schedS_bN_dynBatch_sm100a_cubin_len, 149504, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x128u2_et64x8_m64x8x32_cga1x1x1_16dp256b_s8_TN_transOut_noShflA_dsFp8_schedS_bN_dynBatch_sm100a", 384, "dd506e854e6fe9335e0939d28032cb0c1a123bed30ca9a66992ab7b266f7a838", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x128u2_et64x8_m64x8x32_cga1x1x1_16dp256b_s8_TN_transOut_noShflA_dsFp8_schedS_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x128u2_et64x8_m64x8x32_cga1x1x1_16dp256b_s8_TN_transOut_noShflA_dsFp8_schedS_bN_dynBatch_sm100a_cubin_len, 149504, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x128u2_et64x8_m64x8x32_cga1x1x1_16dp256b_s8_TN_transOut_noShflA_dsFp8_schedS_bN_dynBatch_sm100a", 384, "d6ffa84613e870260260388e2d158f13a7844c0adb9cfb6b392665a185ed7ac8", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -4817,6 +4868,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -4830,7 +4882,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_bN_dynBatch_sm100a_cubin_len, 217088, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_bN_dynBatch_sm100a", 256, "8e254f0689db0d0f78656994361562867f1002dbae54f4927907154a94415c15", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_bN_dynBatch_sm100a_cubin_len, 217088, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_bN_dynBatch_sm100a", 256, "1da73ca97ad2e6c64d3d1d1f3ae5f35cb354f89a9ce0a33302e21e37dbb8af93", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -4898,6 +4950,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -4911,7 +4964,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_bN_dynBatch_sm100a_cubin_len, 217088, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_bN_dynBatch_sm100a", 224, "4054b80b7eeb49ad936e1171a3aca4982e1d7c77f2fd4b7363c4c771b00093a5", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_bN_dynBatch_sm100a_cubin_len, 217088, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_bN_dynBatch_sm100a", 224, "9ea86e655333b9c1221c54ba75b24c1a1f980c9994f7b61e7508e4b9d5ad231a", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -4979,6 +5032,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -4992,250 +5046,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_bN_sm100a_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_bN_sm100a_cubin_len, 217088, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_bN_sm100a", 224, "567756c6a0124e9cf6b07bb9b81bf8ec17e22fcc48ff5d8ad54b3d7a9f18d899", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
-, /* mBiasType */ gemm::BiasType(0)
-, /* mBlockK */ -1
-, /* mClusterDimX */ 1
-, /* mClusterDimY */ 1
-, /* mClusterDimZ */ 1
-, /* mDtypeAcc */ trtllm::gen::Dtype(1056776)
-, /* mDtypeA */ trtllm::gen::Dtype(1050629)
-, /* mDtypeB */ trtllm::gen::Dtype(1050629)
-, /* mDtypeC */ trtllm::gen::Dtype(1052672)
-, /* mDtypeMmaA */ trtllm::gen::Dtype(1050629)
-, /* mDtypeMmaB */ trtllm::gen::Dtype(1050629)
-, /* mEnablesEarlyExit */ 0
-, /* mEnablesDelayedEarlyExit */ 0
-, /* mEnablesGlobalPtxKnobs */ 1
-, /* mEpilogueLdtmDps */ 16
-, /* mEpilogueLdtmBits */ 256
-, /* mEpilogueTileM */ 128
-, /* mEpilogueTileN */ 8
-, /* mGridTriggerSecondaryA */ 0
-, /* mGridTriggerSecondaryB */ 1
-, /* mGridWaitForPrimaryEarlyExit */ 1
-, /* mGridWaitForPrimaryA */ 0
-, /* mGridWaitForPrimaryB */ 1
-, /* mHoistLoadTaskInit */ 1
-, /* mHoistMmaTaskTryWaits */ 0
-, /* mK */ 2048
-, /* mKernelTraits */ {}
-, /* mLayoutA */ gemm::MatrixLayout(0)
-, /* mLayoutB */ gemm::MatrixLayout(0)
-, /* mM */ 256
-, /* mMmaK */ 32
-, /* mMmaKind */ trtllm::gen::MmaKind(2)
-, /* mMmaM */ 128
-, /* mMmaN */ 8
-, /* mMockAllReduce */ 0
-, /* mN */ 256
-, /* mNumSlicesForSplitK */ 1
-, /* mNumSlicesForSliceK */ 1
-, /* mNumStages */ 3
-, /* mNumStagesMma */ 1
-, /* mNumStagesMmaWithinWorkTile */ 1
-, /* mNumStagesMmaAcrossWorkTile */ 1
-, /* mNumStagesWorkId */ 3
-, /* mOutputDebugTensors */ 0
-, /* mPatchF2fp */ 0
-, /* mUseShuffledMatrixA */ 1
-, /* mSliceK */ 0
-, /* mSplitK */ gemm::SplitK(0)
-, /* mTransposeMmaOutput */ 1
-, /* mTileM */ 128
-, /* mTileN */ 8
-, /* mTileK */ 512
-, /* mUseUnrollLoop2xForMma */ 0
-, /* mUseCustomMmaSchedule */ 1
-, /* mUseHoistTryWaitForCustomMmaSchedule */ 0
-, /* mUseDeepSeekFp8 */ 0
-, /* mUsePerTokenSfA */ 0
-, /* mUsePerTokenSfB */ 0
-, /* mUseTmaStore */ 1
-, /* mUseTwoTmaLoadWarps */ 1
-, /* mUseTwoMmaWarps */ 0
-, /* mSfLayoutA */ trtllm::gen::SfLayout(3)
-, /* mSfLayoutB */ trtllm::gen::SfLayout(3)
-, /* mSfLayoutC */ trtllm::gen::SfLayout(3)
-, /* mSfReshapeFactor */ 1
-, /* mTileScheduler */ gemm::TileScheduler(0)
-, /* mActType */ gemmGatedAct::ActType(0)
-, /* mBatchedM */ {}
-, /* mBatchedN */ {}
-, /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
-, /* mNumBatches */ 2
-, /* mIsStaticBatch */ 1
-, /* mNumTokens */ 0
-, /* mRouteImpl */ batchedGemm::RouteImpl(0)
-, /* mGridWaitForPrimaryRouting */ 1
-, /* mFusedAct */ 0
-, /* mNumRegsPerThreadNonEpilogueWarp */ 0
-, /* mNumRegsPerThreadEpilogueWarp */ 0
-, /* mNumRegsCastAWarps */ 0
- }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_bN_dynBatch_sm100a_cubin_len, 217088, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_bN_dynBatch_sm100a", 256, "d5ca84c4d6724802fc008bcca7f930e6c67ea446793564ece7c6dedcfc4e4358", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
-, /* mBiasType */ gemm::BiasType(0)
-, /* mBlockK */ -1
-, /* mClusterDimX */ 1
-, /* mClusterDimY */ 1
-, /* mClusterDimZ */ 1
-, /* mDtypeAcc */ trtllm::gen::Dtype(1056776)
-, /* mDtypeA */ trtllm::gen::Dtype(1050629)
-, /* mDtypeB */ trtllm::gen::Dtype(1050629)
-, /* mDtypeC */ trtllm::gen::Dtype(1052672)
-, /* mDtypeMmaA */ trtllm::gen::Dtype(1050629)
-, /* mDtypeMmaB */ trtllm::gen::Dtype(1050629)
-, /* mEnablesEarlyExit */ 1
-, /* mEnablesDelayedEarlyExit */ 0
-, /* mEnablesGlobalPtxKnobs */ 1
-, /* mEpilogueLdtmDps */ 16
-, /* mEpilogueLdtmBits */ 256
-, /* mEpilogueTileM */ 128
-, /* mEpilogueTileN */ 8
-, /* mGridTriggerSecondaryA */ 0
-, /* mGridTriggerSecondaryB */ 1
-, /* mGridWaitForPrimaryEarlyExit */ 1
-, /* mGridWaitForPrimaryA */ 0
-, /* mGridWaitForPrimaryB */ 1
-, /* mHoistLoadTaskInit */ 1
-, /* mHoistMmaTaskTryWaits */ 0
-, /* mK */ 2048
-, /* mKernelTraits */ {}
-, /* mLayoutA */ gemm::MatrixLayout(0)
-, /* mLayoutB */ gemm::MatrixLayout(0)
-, /* mM */ 256
-, /* mMmaK */ 32
-, /* mMmaKind */ trtllm::gen::MmaKind(2)
-, /* mMmaM */ 128
-, /* mMmaN */ 8
-, /* mMockAllReduce */ 0
-, /* mN */ 256
-, /* mNumSlicesForSplitK */ 1
-, /* mNumSlicesForSliceK */ 1
-, /* mNumStages */ 3
-, /* mNumStagesMma */ 2
-, /* mNumStagesMmaWithinWorkTile */ 1
-, /* mNumStagesMmaAcrossWorkTile */ 2
-, /* mNumStagesWorkId */ 3
-, /* mOutputDebugTensors */ 0
-, /* mPatchF2fp */ 0
-, /* mUseShuffledMatrixA */ 1
-, /* mSliceK */ 0
-, /* mSplitK */ gemm::SplitK(0)
-, /* mTransposeMmaOutput */ 1
-, /* mTileM */ 128
-, /* mTileN */ 8
-, /* mTileK */ 512
-, /* mUseUnrollLoop2xForMma */ 1
-, /* mUseCustomMmaSchedule */ 1
-, /* mUseHoistTryWaitForCustomMmaSchedule */ 0
-, /* mUseDeepSeekFp8 */ 0
-, /* mUsePerTokenSfA */ 0
-, /* mUsePerTokenSfB */ 0
-, /* mUseTmaStore */ 1
-, /* mUseTwoTmaLoadWarps */ 1
-, /* mUseTwoMmaWarps */ 0
-, /* mSfLayoutA */ trtllm::gen::SfLayout(3)
-, /* mSfLayoutB */ trtllm::gen::SfLayout(3)
-, /* mSfLayoutC */ trtllm::gen::SfLayout(3)
-, /* mSfReshapeFactor */ 1
-, /* mTileScheduler */ gemm::TileScheduler(1)
-, /* mActType */ gemmGatedAct::ActType(0)
-, /* mBatchedM */ {}
-, /* mBatchedN */ {}
-, /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
-, /* mNumBatches */ 2
-, /* mIsStaticBatch */ 0
-, /* mNumTokens */ 2
-, /* mRouteImpl */ batchedGemm::RouteImpl(0)
-, /* mGridWaitForPrimaryRouting */ 0
-, /* mFusedAct */ 0
-, /* mNumRegsPerThreadNonEpilogueWarp */ 0
-, /* mNumRegsPerThreadEpilogueWarp */ 0
-, /* mNumRegsCastAWarps */ 0
- }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_bN_dynBatch_sm100a_cubin_len, 217088, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_bN_dynBatch_sm100a", 224, "b1bdb1572bfffe522135062244500fc440d2174d47ccde212cb728de995a7817", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
-, /* mBiasType */ gemm::BiasType(0)
-, /* mBlockK */ -1
-, /* mClusterDimX */ 1
-, /* mClusterDimY */ 1
-, /* mClusterDimZ */ 1
-, /* mDtypeAcc */ trtllm::gen::Dtype(1056776)
-, /* mDtypeA */ trtllm::gen::Dtype(1050629)
-, /* mDtypeB */ trtllm::gen::Dtype(1050629)
-, /* mDtypeC */ trtllm::gen::Dtype(1052672)
-, /* mDtypeMmaA */ trtllm::gen::Dtype(1050629)
-, /* mDtypeMmaB */ trtllm::gen::Dtype(1050629)
-, /* mEnablesEarlyExit */ 1
-, /* mEnablesDelayedEarlyExit */ 0
-, /* mEnablesGlobalPtxKnobs */ 1
-, /* mEpilogueLdtmDps */ 16
-, /* mEpilogueLdtmBits */ 256
-, /* mEpilogueTileM */ 128
-, /* mEpilogueTileN */ 8
-, /* mGridTriggerSecondaryA */ 0
-, /* mGridTriggerSecondaryB */ 1
-, /* mGridWaitForPrimaryEarlyExit */ 1
-, /* mGridWaitForPrimaryA */ 0
-, /* mGridWaitForPrimaryB */ 1
-, /* mHoistLoadTaskInit */ 1
-, /* mHoistMmaTaskTryWaits */ 0
-, /* mK */ 2048
-, /* mKernelTraits */ {}
-, /* mLayoutA */ gemm::MatrixLayout(0)
-, /* mLayoutB */ gemm::MatrixLayout(0)
-, /* mM */ 256
-, /* mMmaK */ 32
-, /* mMmaKind */ trtllm::gen::MmaKind(2)
-, /* mMmaM */ 128
-, /* mMmaN */ 8
-, /* mMockAllReduce */ 0
-, /* mN */ 256
-, /* mNumSlicesForSplitK */ 1
-, /* mNumSlicesForSliceK */ 1
-, /* mNumStages */ 3
-, /* mNumStagesMma */ 1
-, /* mNumStagesMmaWithinWorkTile */ 1
-, /* mNumStagesMmaAcrossWorkTile */ 1
-, /* mNumStagesWorkId */ 3
-, /* mOutputDebugTensors */ 0
-, /* mPatchF2fp */ 0
-, /* mUseShuffledMatrixA */ 1
-, /* mSliceK */ 0
-, /* mSplitK */ gemm::SplitK(0)
-, /* mTransposeMmaOutput */ 1
-, /* mTileM */ 128
-, /* mTileN */ 8
-, /* mTileK */ 512
-, /* mUseUnrollLoop2xForMma */ 1
-, /* mUseCustomMmaSchedule */ 1
-, /* mUseHoistTryWaitForCustomMmaSchedule */ 0
-, /* mUseDeepSeekFp8 */ 0
-, /* mUsePerTokenSfA */ 0
-, /* mUsePerTokenSfB */ 0
-, /* mUseTmaStore */ 1
-, /* mUseTwoTmaLoadWarps */ 1
-, /* mUseTwoMmaWarps */ 0
-, /* mSfLayoutA */ trtllm::gen::SfLayout(3)
-, /* mSfLayoutB */ trtllm::gen::SfLayout(3)
-, /* mSfLayoutC */ trtllm::gen::SfLayout(3)
-, /* mSfReshapeFactor */ 1
-, /* mTileScheduler */ gemm::TileScheduler(0)
-, /* mActType */ gemmGatedAct::ActType(0)
-, /* mBatchedM */ {}
-, /* mBatchedN */ {}
-, /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
-, /* mNumBatches */ 2
-, /* mIsStaticBatch */ 0
-, /* mNumTokens */ 2
-, /* mRouteImpl */ batchedGemm::RouteImpl(0)
-, /* mGridWaitForPrimaryRouting */ 0
-, /* mFusedAct */ 0
-, /* mNumRegsPerThreadNonEpilogueWarp */ 0
-, /* mNumRegsPerThreadEpilogueWarp */ 0
-, /* mNumRegsCastAWarps */ 0
- }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_bN_sm100a_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_bN_sm100a_cubin_len, 217088, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_bN_sm100a", 224, "14255ba12ff91968597be3610e53e078c65f480e73dff52d08d7a23589b52faf", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_bN_sm100a_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_bN_sm100a_cubin_len, 217088, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_bN_sm100a", 224, "7e32ec83f90269537c5849999bbf3b35f22b7c533f19a3d32adaf6e97c6bc367", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -5288,6 +5099,170 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mTileM */ 128
 , /* mTileN */ 8
 , /* mTileK */ 512
+, /* mUseUnrollLoop2xForMma */ 0
+, /* mUseCustomMmaSchedule */ 1
+, /* mUseHoistTryWaitForCustomMmaSchedule */ 0
+, /* mUseDeepSeekFp8 */ 0
+, /* mUsePerTokenSfA */ 0
+, /* mUsePerTokenSfB */ 0
+, /* mUseTmaStore */ 1
+, /* mUseTwoTmaLoadWarps */ 1
+, /* mUseTwoMmaWarps */ 0
+, /* mSfLayoutA */ trtllm::gen::SfLayout(3)
+, /* mSfLayoutB */ trtllm::gen::SfLayout(3)
+, /* mSfLayoutC */ trtllm::gen::SfLayout(3)
+, /* mSfReshapeFactor */ 1
+, /* mTileScheduler */ gemm::TileScheduler(0)
+, /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
+, /* mBatchedM */ {}
+, /* mBatchedN */ {}
+, /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
+, /* mNumBatches */ 2
+, /* mIsStaticBatch */ 1
+, /* mNumTokens */ 0
+, /* mRouteImpl */ batchedGemm::RouteImpl(0)
+, /* mGridWaitForPrimaryRouting */ 1
+, /* mFusedAct */ 0
+, /* mNumRegsPerThreadNonEpilogueWarp */ 0
+, /* mNumRegsPerThreadEpilogueWarp */ 0
+, /* mNumRegsCastAWarps */ 0
+ }, gemm::SmVersion::Sm100a },
+{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_bN_dynBatch_sm100a_cubin_len, 217088, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_bN_dynBatch_sm100a", 256, "c52912cf605631efdd07851260e37c6823c2c4fe0517d4205ec3e0e6fba8e9b1", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+, /* mBiasType */ gemm::BiasType(0)
+, /* mBlockK */ -1
+, /* mClusterDimX */ 1
+, /* mClusterDimY */ 1
+, /* mClusterDimZ */ 1
+, /* mDtypeAcc */ trtllm::gen::Dtype(1056776)
+, /* mDtypeA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeB */ trtllm::gen::Dtype(1050629)
+, /* mDtypeC */ trtllm::gen::Dtype(1052672)
+, /* mDtypeMmaA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeMmaB */ trtllm::gen::Dtype(1050629)
+, /* mEnablesEarlyExit */ 1
+, /* mEnablesDelayedEarlyExit */ 0
+, /* mEnablesGlobalPtxKnobs */ 1
+, /* mEpilogueLdtmDps */ 16
+, /* mEpilogueLdtmBits */ 256
+, /* mEpilogueTileM */ 128
+, /* mEpilogueTileN */ 8
+, /* mGridTriggerSecondaryA */ 0
+, /* mGridTriggerSecondaryB */ 1
+, /* mGridWaitForPrimaryEarlyExit */ 1
+, /* mGridWaitForPrimaryA */ 0
+, /* mGridWaitForPrimaryB */ 1
+, /* mHoistLoadTaskInit */ 1
+, /* mHoistMmaTaskTryWaits */ 0
+, /* mK */ 2048
+, /* mKernelTraits */ {}
+, /* mLayoutA */ gemm::MatrixLayout(0)
+, /* mLayoutB */ gemm::MatrixLayout(0)
+, /* mM */ 256
+, /* mMmaK */ 32
+, /* mMmaKind */ trtllm::gen::MmaKind(2)
+, /* mMmaM */ 128
+, /* mMmaN */ 8
+, /* mMockAllReduce */ 0
+, /* mN */ 256
+, /* mNumSlicesForSplitK */ 1
+, /* mNumSlicesForSliceK */ 1
+, /* mNumStages */ 3
+, /* mNumStagesMma */ 2
+, /* mNumStagesMmaWithinWorkTile */ 1
+, /* mNumStagesMmaAcrossWorkTile */ 2
+, /* mNumStagesWorkId */ 3
+, /* mOutputDebugTensors */ 0
+, /* mPatchF2fp */ 0
+, /* mUseShuffledMatrixA */ 1
+, /* mSliceK */ 0
+, /* mSplitK */ gemm::SplitK(0)
+, /* mTransposeMmaOutput */ 1
+, /* mTileM */ 128
+, /* mTileN */ 8
+, /* mTileK */ 512
+, /* mUseUnrollLoop2xForMma */ 1
+, /* mUseCustomMmaSchedule */ 1
+, /* mUseHoistTryWaitForCustomMmaSchedule */ 0
+, /* mUseDeepSeekFp8 */ 0
+, /* mUsePerTokenSfA */ 0
+, /* mUsePerTokenSfB */ 0
+, /* mUseTmaStore */ 1
+, /* mUseTwoTmaLoadWarps */ 1
+, /* mUseTwoMmaWarps */ 0
+, /* mSfLayoutA */ trtllm::gen::SfLayout(3)
+, /* mSfLayoutB */ trtllm::gen::SfLayout(3)
+, /* mSfLayoutC */ trtllm::gen::SfLayout(3)
+, /* mSfReshapeFactor */ 1
+, /* mTileScheduler */ gemm::TileScheduler(1)
+, /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
+, /* mBatchedM */ {}
+, /* mBatchedN */ {}
+, /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
+, /* mNumBatches */ 2
+, /* mIsStaticBatch */ 0
+, /* mNumTokens */ 2
+, /* mRouteImpl */ batchedGemm::RouteImpl(0)
+, /* mGridWaitForPrimaryRouting */ 0
+, /* mFusedAct */ 0
+, /* mNumRegsPerThreadNonEpilogueWarp */ 0
+, /* mNumRegsPerThreadEpilogueWarp */ 0
+, /* mNumRegsCastAWarps */ 0
+ }, gemm::SmVersion::Sm100a },
+{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_bN_dynBatch_sm100a_cubin_len, 217088, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_bN_dynBatch_sm100a", 224, "42dccf4301719f8d55ac6faaf37be64ad2dd60ee1b080303c8a48eb4053f8992", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+, /* mBiasType */ gemm::BiasType(0)
+, /* mBlockK */ -1
+, /* mClusterDimX */ 1
+, /* mClusterDimY */ 1
+, /* mClusterDimZ */ 1
+, /* mDtypeAcc */ trtllm::gen::Dtype(1056776)
+, /* mDtypeA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeB */ trtllm::gen::Dtype(1050629)
+, /* mDtypeC */ trtllm::gen::Dtype(1052672)
+, /* mDtypeMmaA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeMmaB */ trtllm::gen::Dtype(1050629)
+, /* mEnablesEarlyExit */ 1
+, /* mEnablesDelayedEarlyExit */ 0
+, /* mEnablesGlobalPtxKnobs */ 1
+, /* mEpilogueLdtmDps */ 16
+, /* mEpilogueLdtmBits */ 256
+, /* mEpilogueTileM */ 128
+, /* mEpilogueTileN */ 8
+, /* mGridTriggerSecondaryA */ 0
+, /* mGridTriggerSecondaryB */ 1
+, /* mGridWaitForPrimaryEarlyExit */ 1
+, /* mGridWaitForPrimaryA */ 0
+, /* mGridWaitForPrimaryB */ 1
+, /* mHoistLoadTaskInit */ 1
+, /* mHoistMmaTaskTryWaits */ 0
+, /* mK */ 2048
+, /* mKernelTraits */ {}
+, /* mLayoutA */ gemm::MatrixLayout(0)
+, /* mLayoutB */ gemm::MatrixLayout(0)
+, /* mM */ 256
+, /* mMmaK */ 32
+, /* mMmaKind */ trtllm::gen::MmaKind(2)
+, /* mMmaM */ 128
+, /* mMmaN */ 8
+, /* mMockAllReduce */ 0
+, /* mN */ 256
+, /* mNumSlicesForSplitK */ 1
+, /* mNumSlicesForSliceK */ 1
+, /* mNumStages */ 3
+, /* mNumStagesMma */ 1
+, /* mNumStagesMmaWithinWorkTile */ 1
+, /* mNumStagesMmaAcrossWorkTile */ 1
+, /* mNumStagesWorkId */ 3
+, /* mOutputDebugTensors */ 0
+, /* mPatchF2fp */ 0
+, /* mUseShuffledMatrixA */ 1
+, /* mSliceK */ 0
+, /* mSplitK */ gemm::SplitK(0)
+, /* mTransposeMmaOutput */ 1
+, /* mTileM */ 128
+, /* mTileN */ 8
+, /* mTileK */ 512
 , /* mUseUnrollLoop2xForMma */ 1
 , /* mUseCustomMmaSchedule */ 1
 , /* mUseHoistTryWaitForCustomMmaSchedule */ 0
@@ -5303,6 +5278,89 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
+, /* mBatchedM */ {}
+, /* mBatchedN */ {}
+, /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
+, /* mNumBatches */ 2
+, /* mIsStaticBatch */ 0
+, /* mNumTokens */ 2
+, /* mRouteImpl */ batchedGemm::RouteImpl(0)
+, /* mGridWaitForPrimaryRouting */ 0
+, /* mFusedAct */ 0
+, /* mNumRegsPerThreadNonEpilogueWarp */ 0
+, /* mNumRegsPerThreadEpilogueWarp */ 0
+, /* mNumRegsCastAWarps */ 0
+ }, gemm::SmVersion::Sm100a },
+{Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_bN_sm100a_cubin, Bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_bN_sm100a_cubin_len, 217088, "bmm_Bfloat16_E4m3E4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_bN_sm100a", 224, "2f571039709449bae6b168c12e1b8971bfbbc0ef18085cb34f76b0d65cb505d1", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+, /* mBiasType */ gemm::BiasType(0)
+, /* mBlockK */ -1
+, /* mClusterDimX */ 1
+, /* mClusterDimY */ 1
+, /* mClusterDimZ */ 1
+, /* mDtypeAcc */ trtllm::gen::Dtype(1056776)
+, /* mDtypeA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeB */ trtllm::gen::Dtype(1050629)
+, /* mDtypeC */ trtllm::gen::Dtype(1052672)
+, /* mDtypeMmaA */ trtllm::gen::Dtype(1050629)
+, /* mDtypeMmaB */ trtllm::gen::Dtype(1050629)
+, /* mEnablesEarlyExit */ 0
+, /* mEnablesDelayedEarlyExit */ 0
+, /* mEnablesGlobalPtxKnobs */ 1
+, /* mEpilogueLdtmDps */ 16
+, /* mEpilogueLdtmBits */ 256
+, /* mEpilogueTileM */ 128
+, /* mEpilogueTileN */ 8
+, /* mGridTriggerSecondaryA */ 0
+, /* mGridTriggerSecondaryB */ 1
+, /* mGridWaitForPrimaryEarlyExit */ 1
+, /* mGridWaitForPrimaryA */ 0
+, /* mGridWaitForPrimaryB */ 1
+, /* mHoistLoadTaskInit */ 1
+, /* mHoistMmaTaskTryWaits */ 0
+, /* mK */ 2048
+, /* mKernelTraits */ {}
+, /* mLayoutA */ gemm::MatrixLayout(0)
+, /* mLayoutB */ gemm::MatrixLayout(0)
+, /* mM */ 256
+, /* mMmaK */ 32
+, /* mMmaKind */ trtllm::gen::MmaKind(2)
+, /* mMmaM */ 128
+, /* mMmaN */ 8
+, /* mMockAllReduce */ 0
+, /* mN */ 256
+, /* mNumSlicesForSplitK */ 1
+, /* mNumSlicesForSliceK */ 1
+, /* mNumStages */ 3
+, /* mNumStagesMma */ 1
+, /* mNumStagesMmaWithinWorkTile */ 1
+, /* mNumStagesMmaAcrossWorkTile */ 1
+, /* mNumStagesWorkId */ 3
+, /* mOutputDebugTensors */ 0
+, /* mPatchF2fp */ 0
+, /* mUseShuffledMatrixA */ 1
+, /* mSliceK */ 0
+, /* mSplitK */ gemm::SplitK(0)
+, /* mTransposeMmaOutput */ 1
+, /* mTileM */ 128
+, /* mTileN */ 8
+, /* mTileK */ 512
+, /* mUseUnrollLoop2xForMma */ 1
+, /* mUseCustomMmaSchedule */ 1
+, /* mUseHoistTryWaitForCustomMmaSchedule */ 0
+, /* mUseDeepSeekFp8 */ 0
+, /* mUsePerTokenSfA */ 0
+, /* mUsePerTokenSfB */ 0
+, /* mUseTmaStore */ 1
+, /* mUseTwoTmaLoadWarps */ 1
+, /* mUseTwoMmaWarps */ 0
+, /* mSfLayoutA */ trtllm::gen::SfLayout(3)
+, /* mSfLayoutB */ trtllm::gen::SfLayout(3)
+, /* mSfLayoutC */ trtllm::gen::SfLayout(3)
+, /* mSfReshapeFactor */ 1
+, /* mTileScheduler */ gemm::TileScheduler(0)
+, /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -5316,7 +5374,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x16x256_et128x16_m128x16x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x16x256_et128x16_m128x16x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 88064, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x16x256_et128x16_m128x16x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 416, "f1b88701a65da28a9349a60a5f4b23cfcc73c5e5915c0ace6dbe01507e99d707", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x16x256_et128x16_m128x16x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x16x256_et128x16_m128x16x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 88064, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x16x256_et128x16_m128x16x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 416, "e96578c3444c8cd0eb6aabdb39819274f8df0525513d6a5387d01bfc73f5a97a", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -5384,6 +5442,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -5397,7 +5456,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x16x256_et128x16_m128x16x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x16x256_et128x16_m128x16x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 88064, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x16x256_et128x16_m128x16x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 448, "93622ce596dabdacfecefea470727ec9523348b62cbb0d62ce3bffd0fedaafe5", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x16x256_et128x16_m128x16x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x16x256_et128x16_m128x16x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 88064, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x16x256_et128x16_m128x16x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 448, "427e31447b632d50c306c99701874ab2d6d0a490556a66091177bc162a272109", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -5465,6 +5524,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -5478,7 +5538,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x16x256_et128x16_m128x16x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x16x256_et128x16_m128x16x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 88064, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x16x256_et128x16_m128x16x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 384, "b127699db63793d4040c00863800717efe1b525ec58556f2674d315d944d5254", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x16x256_et128x16_m128x16x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x16x256_et128x16_m128x16x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 88064, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x16x256_et128x16_m128x16x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 384, "5161b585e08b5f805d6bd51bfa44beab9eca8026d3f2cb676251b30770b18412", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -5546,6 +5606,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -5559,7 +5620,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x16x256_et128x16_m128x16x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x16x256_et128x16_m128x16x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 88064, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x16x256_et128x16_m128x16x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 416, "063b3c6150783908ae684bfc8f7a87efbdc0dc906dd19f650ee7131cd73f0154", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x16x256_et128x16_m128x16x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x16x256_et128x16_m128x16x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 88064, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x16x256_et128x16_m128x16x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 416, "ba2f9978b7b7ffcb3fd39d84280dc39b29537f61f204c06ad4712d6cfb662faa", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -5627,6 +5688,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -5640,7 +5702,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x16x256u2_et128x16_m128x16x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x16x256u2_et128x16_m128x16x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 88064, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x16x256u2_et128x16_m128x16x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 416, "f2d2c245e3b0fcf337a7c89de4704fbc10c6799c76e741e4f6de27678a726184", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x16x256u2_et128x16_m128x16x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x16x256u2_et128x16_m128x16x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 88064, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x16x256u2_et128x16_m128x16x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 416, "23d1464a07d486390a6db8ba1bb259eaff46df4fd8763334a95b940c11b822f8", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -5708,6 +5770,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -5721,7 +5784,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x16x256u2_et128x16_m128x16x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x16x256u2_et128x16_m128x16x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 88064, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x16x256u2_et128x16_m128x16x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 448, "6c41a17ae38529865b71c5f593d205e9517627dd8c5bba926e7ec3cd9050ce15", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x16x256u2_et128x16_m128x16x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x16x256u2_et128x16_m128x16x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 88064, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x16x256u2_et128x16_m128x16x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 448, "a5a067f8574ab087e7efd6101c38316caf1c1738de37844ab8dcc70f1a9b0571", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -5789,6 +5852,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -5802,7 +5866,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x16x256u2_et128x16_m128x16x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x16x256u2_et128x16_m128x16x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 88064, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x16x256u2_et128x16_m128x16x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 384, "933cb246e26664339e5e5f1a2461a3b450009c48fbabaa904081fdb0665af95e", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x16x256u2_et128x16_m128x16x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x16x256u2_et128x16_m128x16x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 88064, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x16x256u2_et128x16_m128x16x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 384, "5ed78f6bb035ab4e60e91c3604e4a364d5f042e8d70eecef37789c60b2f7d91a", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -5870,6 +5934,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -5883,7 +5948,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x16x256u2_et128x16_m128x16x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x16x256u2_et128x16_m128x16x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 88064, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x16x256u2_et128x16_m128x16x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 416, "435a3b702b58c2e70431739af0513e815c6f0367f5bcdfc4eab6b1fd94bd6d17", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x16x256u2_et128x16_m128x16x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x16x256u2_et128x16_m128x16x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 88064, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x16x256u2_et128x16_m128x16x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 416, "ecf6abaeb1c673d59c003a173a5154be6341d417bbb38b87020eb0fdc346c54f", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -5951,6 +6016,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -5964,7 +6030,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x32x256_et128x32_m128x32x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x32x256_et128x32_m128x32x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 116736, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x32x256_et128x32_m128x32x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 416, "d6015fd0b1d390df33d69f0e20697d5642037e960b44f42ff09b02d71041c30b", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x32x256_et128x32_m128x32x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x32x256_et128x32_m128x32x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 116736, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x32x256_et128x32_m128x32x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 416, "ad9f76c9b6b674ef1e1223babdf20bd09865424cc21a2f57f6061df2d3adc847", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -6032,6 +6098,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -6045,7 +6112,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x32x256_et128x32_m128x32x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x32x256_et128x32_m128x32x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 116736, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x32x256_et128x32_m128x32x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 448, "142e4d89aecffd4eca45c04d609dd1c78f19a525e67c99b477e7a0e38ce55e62", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x32x256_et128x32_m128x32x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x32x256_et128x32_m128x32x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 116736, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x32x256_et128x32_m128x32x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 448, "7961c6301a165be223063baff2b348dd65d335c92f0b8dadbd23f2e42c677b3b", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -6113,6 +6180,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -6126,7 +6194,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x32x256_et128x32_m128x32x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x32x256_et128x32_m128x32x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 116736, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x32x256_et128x32_m128x32x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 384, "67b77485ab470d237f7814cfa0df90ed19ed10cb9a625cae30c5214f3638a7ac", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x32x256_et128x32_m128x32x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x32x256_et128x32_m128x32x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 116736, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x32x256_et128x32_m128x32x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 384, "37ba57822f0f9c45aca92e9ab2a0f83e0c96755d8cdf1238e2db5a7e08043efa", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -6194,6 +6262,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -6207,7 +6276,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x32x256_et128x32_m128x32x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x32x256_et128x32_m128x32x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 116736, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x32x256_et128x32_m128x32x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 416, "cb98f19f9bc167adebbb5dbfbca7e251dba212dc2063ca71b0573d7722ebfacd", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x32x256_et128x32_m128x32x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x32x256_et128x32_m128x32x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 116736, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x32x256_et128x32_m128x32x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 416, "83af9d72593eeb32d5e765d38b8cc288494e9c7a2bb077c914e1f6850f9d6d2e", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -6275,6 +6344,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -6288,7 +6358,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x32x256u2_et128x32_m128x32x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x32x256u2_et128x32_m128x32x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 116736, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x32x256u2_et128x32_m128x32x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 416, "ac38dc51c1dee20eca015c799498d521c8540db502f709ca284f74b68e0ff824", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x32x256u2_et128x32_m128x32x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x32x256u2_et128x32_m128x32x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 116736, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x32x256u2_et128x32_m128x32x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 416, "b6df5dc66b3ef8f14f05af4765edac53bf40d8be5b8d315aa86c78e0650acb65", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -6356,6 +6426,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -6369,7 +6440,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x32x256u2_et128x32_m128x32x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x32x256u2_et128x32_m128x32x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 116736, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x32x256u2_et128x32_m128x32x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 448, "e7892475875a42c965a035f18d60b6b2174b1896a4c1c20224e72d36de52b937", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x32x256u2_et128x32_m128x32x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x32x256u2_et128x32_m128x32x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 116736, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x32x256u2_et128x32_m128x32x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 448, "e0b4c122d8d65a95e142ce4f70f228400a44b1ef7b828a84767f8163646df302", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -6437,6 +6508,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -6450,7 +6522,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x32x256u2_et128x32_m128x32x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x32x256u2_et128x32_m128x32x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 116736, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x32x256u2_et128x32_m128x32x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 384, "07523e9c336ff3823ad29286be393aa6f155c4a5f33c94127c032ba7764a6b2a", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x32x256u2_et128x32_m128x32x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x32x256u2_et128x32_m128x32x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 116736, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x32x256u2_et128x32_m128x32x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 384, "00f94d2fdd1c95f044f1cc68b7f4d5b44521c6b5ea2835e73598181400140b0d", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -6518,6 +6590,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -6531,7 +6604,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x32x256u2_et128x32_m128x32x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x32x256u2_et128x32_m128x32x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 116736, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x32x256u2_et128x32_m128x32x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 416, "6060970d1187814575696bf586cf7eac2452b228a50f4eb8907c6a40b1b1a331", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x32x256u2_et128x32_m128x32x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x32x256u2_et128x32_m128x32x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 116736, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x32x256u2_et128x32_m128x32x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 416, "0fff8ff7967dfaa1f418bc2be3cd53c76cf63330eb5a5d70067288cebd3faa67", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -6599,6 +6672,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -6612,7 +6686,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x64x256_et128x64_m128x64x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x64x256_et128x64_m128x64x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 175104, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x64x256_et128x64_m128x64x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 416, "5f2dfe86151856c3e852ba67af5880a9d681b5485f0f206991499a261880f763", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x64x256_et128x64_m128x64x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x64x256_et128x64_m128x64x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 175104, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x64x256_et128x64_m128x64x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 416, "fed579bfab38ca7f85fc8256cb7ec6f4680b5fffce8f444190868f917681ab2a", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -6680,6 +6754,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -6693,7 +6768,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x64x256_et128x64_m128x64x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x64x256_et128x64_m128x64x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 175104, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x64x256_et128x64_m128x64x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 448, "98c78ad003389da4b727c14d9f95f72062ecccd55de8f895c1f9dc14b3a0878d", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x64x256_et128x64_m128x64x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x64x256_et128x64_m128x64x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 175104, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x64x256_et128x64_m128x64x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 448, "c900a1555ae014b7b825ea96636f6d51c405b1e5806bdf4900aa82548cb5db52", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -6761,6 +6836,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -6774,7 +6850,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x64x256_et128x64_m128x64x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x64x256_et128x64_m128x64x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 175104, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x64x256_et128x64_m128x64x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 384, "59b639da80587eddb44acdb216aec98d250511b0fae7cd9c939883cd2a932960", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x64x256_et128x64_m128x64x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x64x256_et128x64_m128x64x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 175104, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x64x256_et128x64_m128x64x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 384, "d02e30e5618fd611ad1992dc7f95c936a739108cb591995dd9651f571fc3e017", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -6842,6 +6918,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -6855,7 +6932,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x64x256_et128x64_m128x64x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x64x256_et128x64_m128x64x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 175104, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x64x256_et128x64_m128x64x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 416, "db69d7cf87fff87a5c8ccbd39a55700169249b04429a0d64add648a7561f49d8", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x64x256_et128x64_m128x64x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x64x256_et128x64_m128x64x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 175104, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x64x256_et128x64_m128x64x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 416, "087d0217b71e5813a71732f7b2187d296c0baab61a53830d413e8698a79de66a", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -6923,6 +7000,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -6936,7 +7014,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x64x256u2_et128x64_m128x64x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x64x256u2_et128x64_m128x64x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 175104, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x64x256u2_et128x64_m128x64x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 416, "ee8b0f7c6533c04c6e83480c8ca4adbf07ee1ae3b399c386e67df096a2cf7125", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x64x256u2_et128x64_m128x64x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x64x256u2_et128x64_m128x64x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 175104, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x64x256u2_et128x64_m128x64x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 416, "80fbe3f75b6b33f20fee695f00bf66eb744303eada09b6acba45713b20337e7a", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -7004,6 +7082,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -7017,7 +7096,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x64x256u2_et128x64_m128x64x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x64x256u2_et128x64_m128x64x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 175104, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x64x256u2_et128x64_m128x64x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 448, "486834fb9b22637720cbf9094fa88e1d87e15c05654290095eea671a8ccce901", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x64x256u2_et128x64_m128x64x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x64x256u2_et128x64_m128x64x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 175104, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x64x256u2_et128x64_m128x64x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 448, "62e2b0a34de2566d69571c94a7235e3cdad99b204944ee74527c8915b44dfbc0", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -7085,6 +7164,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -7098,7 +7178,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x64x256u2_et128x64_m128x64x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x64x256u2_et128x64_m128x64x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 175104, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x64x256u2_et128x64_m128x64x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 384, "1645ed434f078dcd0be6419ebbb71636536243b3fa047d6e8456210fffca5af4", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x64x256u2_et128x64_m128x64x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x64x256u2_et128x64_m128x64x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 175104, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x64x256u2_et128x64_m128x64x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 384, "9e46bdbd3f22c22deb7579945d49429dc6855dad6c6775ccddd0bc2bdeb14cf7", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -7166,6 +7246,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -7179,7 +7260,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x64x256u2_et128x64_m128x64x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x64x256u2_et128x64_m128x64x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 175104, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x64x256u2_et128x64_m128x64x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 416, "44143329f59ab086d245a008c5271fd0a28b36496ad02e53b581c435ac21cdbd", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x64x256u2_et128x64_m128x64x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x64x256u2_et128x64_m128x64x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 175104, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x64x256u2_et128x64_m128x64x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 416, "be32940a00f0fa07a5f1f78b76880459299dd6d27d9d72e618fb3694f29e6917", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -7247,6 +7328,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -7260,7 +7342,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x8x256_et128x8_m128x8x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x8x256_et128x8_m128x8x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 73728, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x8x256_et128x8_m128x8x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 416, "6e9129e4e8b147d3d07222d144de57b96b9f2a93bbebbb557f376b99adf5f2b1", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x8x256_et128x8_m128x8x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x8x256_et128x8_m128x8x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 73728, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x8x256_et128x8_m128x8x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 416, "7367037d729f69ad78f378a45475db110e93a471e4db932ba34a1cc9ae1e715b", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -7328,6 +7410,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -7341,7 +7424,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x8x256_et128x8_m128x8x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x8x256_et128x8_m128x8x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 73728, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x8x256_et128x8_m128x8x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 448, "420906f84cb4a4470e1037b6db173d8637395f90a2305a4d6e09fbebaa613f6f", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x8x256_et128x8_m128x8x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x8x256_et128x8_m128x8x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 73728, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x8x256_et128x8_m128x8x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 448, "065cc8ffceb97f61866a4d200895cac1d20a06aa49f68f5f811bd6589cd6061e", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -7409,6 +7492,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -7422,7 +7506,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x8x256_et128x8_m128x8x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x8x256_et128x8_m128x8x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 73728, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x8x256_et128x8_m128x8x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 384, "fde5cbcb6c73419f23092e188d6665bd6f8bf893ee5763b58799ec9a273f6026", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x8x256_et128x8_m128x8x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x8x256_et128x8_m128x8x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 73728, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x8x256_et128x8_m128x8x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 384, "59438173979e8a11bb188964d8b8bd50d72d37e7475097d619914c7301393bc2", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -7490,6 +7574,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -7503,7 +7588,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x8x256_et128x8_m128x8x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x8x256_et128x8_m128x8x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 73728, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x8x256_et128x8_m128x8x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 416, "6f42fc5df7d712504e12ad5c9b2c55289279941387cfd9c946a56f11f85d7054", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x8x256_et128x8_m128x8x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x8x256_et128x8_m128x8x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 73728, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x8x256_et128x8_m128x8x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 416, "26392ac248f0073a4c3e08b8356e0272b88b021234172a11c39f405e7602e65e", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -7571,6 +7656,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -7584,7 +7670,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x8x256u2_et128x8_m128x8x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x8x256u2_et128x8_m128x8x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 73728, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x8x256u2_et128x8_m128x8x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 416, "9796735965fb16d779772cf5c615c25b5aaf39ac3512f3ed7f06d405100d0433", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x8x256u2_et128x8_m128x8x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x8x256u2_et128x8_m128x8x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 73728, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x8x256u2_et128x8_m128x8x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 416, "b77ef9f4f1af44c284bb993f9e912b9bd34ea7a0886dece220585268ede59b9b", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -7652,6 +7738,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -7665,7 +7752,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x8x256u2_et128x8_m128x8x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x8x256u2_et128x8_m128x8x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 73728, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x8x256u2_et128x8_m128x8x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 448, "e90e65413aa14e671b38c741db68d63138dd7e673cc6d00264f16320d0ce01a0", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x8x256u2_et128x8_m128x8x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x8x256u2_et128x8_m128x8x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 73728, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x8x256u2_et128x8_m128x8x16_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 448, "e9c1792527ad8992c85e97bfa5c397fcff48bfe20fa3633421f2e55d694f9bac", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -7733,6 +7820,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -7746,7 +7834,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x8x256u2_et128x8_m128x8x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x8x256u2_et128x8_m128x8x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 73728, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x8x256u2_et128x8_m128x8x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 384, "0786f87e175084ffcbaee3abc184daf0a004ee413a4833aaca5d3edc5f2fb4fe", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x8x256u2_et128x8_m128x8x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x8x256u2_et128x8_m128x8x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 73728, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x8x256u2_et128x8_m128x8x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 384, "69e49961b7a5f0dd8fb31b2d88244588f6b64b97fc9908a4e4b884718d4f0ec6", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -7814,6 +7902,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -7827,7 +7916,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x8x256u2_et128x8_m128x8x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x8x256u2_et128x8_m128x8x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 73728, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x8x256u2_et128x8_m128x8x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 416, "5886f64461ab20bcbb465bee5a265d2b4a3a1916d6e2dc3668dbd3290c24d09a", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x8x256u2_et128x8_m128x8x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x8x256u2_et128x8_m128x8x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 73728, "bmm_Bfloat16_MxE2m1Bfloat16_castBfloat16_patch_Fp32_t128x8x256u2_et128x8_m128x8x16_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 416, "ef88202a4083d632f2685a2762db0e1b991c7f66f47a379a528d7ff3846f9b14", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -7895,6 +7984,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -7908,7 +7998,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256_et128x16_m128x16x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256_et128x16_m128x16x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 201728, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256_et128x16_m128x16x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 320, "2ae2c0ed5abeaa51cad4cc3a40c627bb8195e76b34ee1687672990ce735c93bd", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256_et128x16_m128x16x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256_et128x16_m128x16x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 201728, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256_et128x16_m128x16x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 320, "80b7e6dae68028114ed485e5e0f33d8c6c2873c19d23308db7e593c13c2a5ec6", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -7976,6 +8066,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -7989,7 +8080,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256_et128x16_m128x16x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256_et128x16_m128x16x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 201728, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256_et128x16_m128x16x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 288, "d2f45dc717eab4165f7525d1d6a89c96f4dee2f127581411c5b8831144d2325f", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256_et128x16_m128x16x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256_et128x16_m128x16x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 201728, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256_et128x16_m128x16x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 288, "07639d69c0c1a72138b2d5f3662cf08fb65da88ada484aa19f4fcdceeed468b1", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -8057,6 +8148,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -8070,7 +8162,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256u2_et128x16_m128x16x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256u2_et128x16_m128x16x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 201728, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256u2_et128x16_m128x16x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 320, "eadb6ca14a5f25a3ed6a656b899c50e6cd4fc15f0052d059dbf6b2e2ec753d37", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256u2_et128x16_m128x16x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256u2_et128x16_m128x16x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 201728, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256u2_et128x16_m128x16x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 320, "3fe162fcc943fb65da67f06e97ab25cf4fd23108abd8eaf85379713d16a1db6b", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -8138,6 +8230,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -8151,7 +8244,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256u2_et128x16_m128x16x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256u2_et128x16_m128x16x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 201728, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256u2_et128x16_m128x16x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 288, "66911d47ed3fd620595c9d42061e73f9b80eb8b85db758b64d1f0e0dacff9234", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256u2_et128x16_m128x16x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256u2_et128x16_m128x16x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 201728, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256u2_et128x16_m128x16x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 288, "98c0b1aa9ab6142c3ed3609f7786ea4846b99b9fa2c38cb1caf30ea92a48f3f9", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -8219,6 +8312,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -8232,7 +8326,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256_et128x32_m128x32x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256_et128x32_m128x32x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 226304, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256_et128x32_m128x32x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 320, "11a21faaaa76409d262d475772f53fb9105cc3b201b85e45b29d6be1251f76c6", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256_et128x32_m128x32x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256_et128x32_m128x32x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 226304, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256_et128x32_m128x32x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 320, "b25c9225357591e379058f33307506e6a55c7a9b5204dddb69da133e1eba9962", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -8300,6 +8394,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -8313,7 +8408,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256_et128x32_m128x32x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256_et128x32_m128x32x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 226304, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256_et128x32_m128x32x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 288, "d03a8c4a44147cf2e55f5a378c430be4562b0baafcf33aa4b370e68149439123", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256_et128x32_m128x32x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256_et128x32_m128x32x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 226304, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256_et128x32_m128x32x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 288, "87898c8325062914de9feb49d24f145355f43702762f0f492023e49fe1e7e9ca", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -8381,6 +8476,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -8394,7 +8490,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256u2_et128x32_m128x32x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256u2_et128x32_m128x32x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 226304, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256u2_et128x32_m128x32x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 320, "e882377c0851ecb817ba4f93c92a8d235eaa4fbf869ac38ebe6a8c6559c8187e", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256u2_et128x32_m128x32x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256u2_et128x32_m128x32x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 226304, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256u2_et128x32_m128x32x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 320, "1891d1e081176c3662f4bcd17650c087427715b28239d7602740eb6403e8ae62", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -8462,6 +8558,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -8475,7 +8572,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256u2_et128x32_m128x32x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256u2_et128x32_m128x32x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 226304, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256u2_et128x32_m128x32x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 288, "1c6ecfc02b40864b8637c47dd1a1e6e76d23705214bc903ca7c1c2920e9d53ee", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256u2_et128x32_m128x32x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256u2_et128x32_m128x32x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 226304, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256u2_et128x32_m128x32x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 288, "c1e13621767a488961d8d7b53e2527ef5baf9d609fe9b0d4473d6c6231a8bcd9", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -8543,6 +8640,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -8556,169 +8654,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 225280, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 320, "0211b29555297f36806cda95f5702667251d64aa85f8a60e1ab6e54bed27dcb0", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
-, /* mBiasType */ gemm::BiasType(1)
-, /* mBlockK */ -1
-, /* mClusterDimX */ 1
-, /* mClusterDimY */ 1
-, /* mClusterDimZ */ 1
-, /* mDtypeAcc */ trtllm::gen::Dtype(1056776)
-, /* mDtypeA */ trtllm::gen::Dtype(17826828)
-, /* mDtypeB */ trtllm::gen::Dtype(1050629)
-, /* mDtypeC */ trtllm::gen::Dtype(1052672)
-, /* mDtypeMmaA */ trtllm::gen::Dtype(17826828)
-, /* mDtypeMmaB */ trtllm::gen::Dtype(17827853)
-, /* mEnablesEarlyExit */ 1
-, /* mEnablesDelayedEarlyExit */ 0
-, /* mEnablesGlobalPtxKnobs */ 1
-, /* mEpilogueLdtmDps */ 16
-, /* mEpilogueLdtmBits */ 256
-, /* mEpilogueTileM */ 128
-, /* mEpilogueTileN */ 64
-, /* mGridTriggerSecondaryA */ 0
-, /* mGridTriggerSecondaryB */ 1
-, /* mGridWaitForPrimaryEarlyExit */ 1
-, /* mGridWaitForPrimaryA */ 0
-, /* mGridWaitForPrimaryB */ 1
-, /* mHoistLoadTaskInit */ 1
-, /* mHoistMmaTaskTryWaits */ 0
-, /* mK */ 2048
-, /* mKernelTraits */ {}
-, /* mLayoutA */ gemm::MatrixLayout(0)
-, /* mLayoutB */ gemm::MatrixLayout(0)
-, /* mM */ 256
-, /* mMmaK */ 32
-, /* mMmaKind */ trtllm::gen::MmaKind(5)
-, /* mMmaM */ 128
-, /* mMmaN */ 64
-, /* mMockAllReduce */ 0
-, /* mN */ 256
-, /* mNumSlicesForSplitK */ 1
-, /* mNumSlicesForSliceK */ 1
-, /* mNumStages */ 4
-, /* mNumStagesMma */ 2
-, /* mNumStagesMmaWithinWorkTile */ 1
-, /* mNumStagesMmaAcrossWorkTile */ 2
-, /* mNumStagesWorkId */ 3
-, /* mOutputDebugTensors */ 0
-, /* mPatchF2fp */ 0
-, /* mUseShuffledMatrixA */ 1
-, /* mSliceK */ 0
-, /* mSplitK */ gemm::SplitK(0)
-, /* mTransposeMmaOutput */ 1
-, /* mTileM */ 128
-, /* mTileN */ 64
-, /* mTileK */ 256
-, /* mUseUnrollLoop2xForMma */ 0
-, /* mUseCustomMmaSchedule */ 1
-, /* mUseHoistTryWaitForCustomMmaSchedule */ 0
-, /* mUseDeepSeekFp8 */ 0
-, /* mUsePerTokenSfA */ 0
-, /* mUsePerTokenSfB */ 0
-, /* mUseTmaStore */ 1
-, /* mUseTwoTmaLoadWarps */ 1
-, /* mUseTwoMmaWarps */ 0
-, /* mSfLayoutA */ trtllm::gen::SfLayout(3)
-, /* mSfLayoutB */ trtllm::gen::SfLayout(1)
-, /* mSfLayoutC */ trtllm::gen::SfLayout(1)
-, /* mSfReshapeFactor */ 1
-, /* mTileScheduler */ gemm::TileScheduler(1)
-, /* mActType */ gemmGatedAct::ActType(0)
-, /* mBatchedM */ {}
-, /* mBatchedN */ {}
-, /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
-, /* mNumBatches */ 2
-, /* mIsStaticBatch */ 0
-, /* mNumTokens */ 2
-, /* mRouteImpl */ batchedGemm::RouteImpl(0)
-, /* mGridWaitForPrimaryRouting */ 0
-, /* mFusedAct */ 0
-, /* mNumRegsPerThreadNonEpilogueWarp */ 0
-, /* mNumRegsPerThreadEpilogueWarp */ 0
-, /* mNumRegsCastAWarps */ 0
- }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 225280, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 288, "3b1f8c1f007ae110964fef92bd3bfa9a7f0a7a42bd1e6b87e06c4729ff912a3f", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
-, /* mBiasType */ gemm::BiasType(1)
-, /* mBlockK */ -1
-, /* mClusterDimX */ 1
-, /* mClusterDimY */ 1
-, /* mClusterDimZ */ 1
-, /* mDtypeAcc */ trtllm::gen::Dtype(1056776)
-, /* mDtypeA */ trtllm::gen::Dtype(17826828)
-, /* mDtypeB */ trtllm::gen::Dtype(1050629)
-, /* mDtypeC */ trtllm::gen::Dtype(1052672)
-, /* mDtypeMmaA */ trtllm::gen::Dtype(17826828)
-, /* mDtypeMmaB */ trtllm::gen::Dtype(17827853)
-, /* mEnablesEarlyExit */ 1
-, /* mEnablesDelayedEarlyExit */ 0
-, /* mEnablesGlobalPtxKnobs */ 1
-, /* mEpilogueLdtmDps */ 16
-, /* mEpilogueLdtmBits */ 256
-, /* mEpilogueTileM */ 128
-, /* mEpilogueTileN */ 64
-, /* mGridTriggerSecondaryA */ 0
-, /* mGridTriggerSecondaryB */ 1
-, /* mGridWaitForPrimaryEarlyExit */ 1
-, /* mGridWaitForPrimaryA */ 0
-, /* mGridWaitForPrimaryB */ 1
-, /* mHoistLoadTaskInit */ 1
-, /* mHoistMmaTaskTryWaits */ 0
-, /* mK */ 2048
-, /* mKernelTraits */ {}
-, /* mLayoutA */ gemm::MatrixLayout(0)
-, /* mLayoutB */ gemm::MatrixLayout(0)
-, /* mM */ 256
-, /* mMmaK */ 32
-, /* mMmaKind */ trtllm::gen::MmaKind(5)
-, /* mMmaM */ 128
-, /* mMmaN */ 64
-, /* mMockAllReduce */ 0
-, /* mN */ 256
-, /* mNumSlicesForSplitK */ 1
-, /* mNumSlicesForSliceK */ 1
-, /* mNumStages */ 4
-, /* mNumStagesMma */ 1
-, /* mNumStagesMmaWithinWorkTile */ 1
-, /* mNumStagesMmaAcrossWorkTile */ 1
-, /* mNumStagesWorkId */ 3
-, /* mOutputDebugTensors */ 0
-, /* mPatchF2fp */ 0
-, /* mUseShuffledMatrixA */ 1
-, /* mSliceK */ 0
-, /* mSplitK */ gemm::SplitK(0)
-, /* mTransposeMmaOutput */ 1
-, /* mTileM */ 128
-, /* mTileN */ 64
-, /* mTileK */ 256
-, /* mUseUnrollLoop2xForMma */ 0
-, /* mUseCustomMmaSchedule */ 1
-, /* mUseHoistTryWaitForCustomMmaSchedule */ 0
-, /* mUseDeepSeekFp8 */ 0
-, /* mUsePerTokenSfA */ 0
-, /* mUsePerTokenSfB */ 0
-, /* mUseTmaStore */ 1
-, /* mUseTwoTmaLoadWarps */ 1
-, /* mUseTwoMmaWarps */ 0
-, /* mSfLayoutA */ trtllm::gen::SfLayout(3)
-, /* mSfLayoutB */ trtllm::gen::SfLayout(1)
-, /* mSfLayoutC */ trtllm::gen::SfLayout(1)
-, /* mSfReshapeFactor */ 1
-, /* mTileScheduler */ gemm::TileScheduler(0)
-, /* mActType */ gemmGatedAct::ActType(0)
-, /* mBatchedM */ {}
-, /* mBatchedN */ {}
-, /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
-, /* mNumBatches */ 2
-, /* mIsStaticBatch */ 0
-, /* mNumTokens */ 2
-, /* mRouteImpl */ batchedGemm::RouteImpl(0)
-, /* mGridWaitForPrimaryRouting */ 0
-, /* mFusedAct */ 0
-, /* mNumRegsPerThreadNonEpilogueWarp */ 0
-, /* mNumRegsPerThreadEpilogueWarp */ 0
-, /* mNumRegsCastAWarps */ 0
- }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256u2_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256u2_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 225280, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256u2_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 320, "fcb6690e734be2bbf7592a76c6f962c080ecf71c46895ebdd59244ed6c7b54c5", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 225280, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 320, "2ea013b7bfac8afc017b2ea59c711990c63a4e11f90bf6990dec837ba1106ca0", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -8771,6 +8707,170 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mTileM */ 128
 , /* mTileN */ 64
 , /* mTileK */ 256
+, /* mUseUnrollLoop2xForMma */ 0
+, /* mUseCustomMmaSchedule */ 1
+, /* mUseHoistTryWaitForCustomMmaSchedule */ 0
+, /* mUseDeepSeekFp8 */ 0
+, /* mUsePerTokenSfA */ 0
+, /* mUsePerTokenSfB */ 0
+, /* mUseTmaStore */ 1
+, /* mUseTwoTmaLoadWarps */ 1
+, /* mUseTwoMmaWarps */ 0
+, /* mSfLayoutA */ trtllm::gen::SfLayout(3)
+, /* mSfLayoutB */ trtllm::gen::SfLayout(1)
+, /* mSfLayoutC */ trtllm::gen::SfLayout(1)
+, /* mSfReshapeFactor */ 1
+, /* mTileScheduler */ gemm::TileScheduler(1)
+, /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
+, /* mBatchedM */ {}
+, /* mBatchedN */ {}
+, /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
+, /* mNumBatches */ 2
+, /* mIsStaticBatch */ 0
+, /* mNumTokens */ 2
+, /* mRouteImpl */ batchedGemm::RouteImpl(0)
+, /* mGridWaitForPrimaryRouting */ 0
+, /* mFusedAct */ 0
+, /* mNumRegsPerThreadNonEpilogueWarp */ 0
+, /* mNumRegsPerThreadEpilogueWarp */ 0
+, /* mNumRegsCastAWarps */ 0
+ }, gemm::SmVersion::Sm100a },
+{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 225280, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 288, "d4a05e73dc6f5f90e0fb1bc43a05cf077ccfd45d38279066390d788ed11a5471", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+, /* mBiasType */ gemm::BiasType(1)
+, /* mBlockK */ -1
+, /* mClusterDimX */ 1
+, /* mClusterDimY */ 1
+, /* mClusterDimZ */ 1
+, /* mDtypeAcc */ trtllm::gen::Dtype(1056776)
+, /* mDtypeA */ trtllm::gen::Dtype(17826828)
+, /* mDtypeB */ trtllm::gen::Dtype(1050629)
+, /* mDtypeC */ trtllm::gen::Dtype(1052672)
+, /* mDtypeMmaA */ trtllm::gen::Dtype(17826828)
+, /* mDtypeMmaB */ trtllm::gen::Dtype(17827853)
+, /* mEnablesEarlyExit */ 1
+, /* mEnablesDelayedEarlyExit */ 0
+, /* mEnablesGlobalPtxKnobs */ 1
+, /* mEpilogueLdtmDps */ 16
+, /* mEpilogueLdtmBits */ 256
+, /* mEpilogueTileM */ 128
+, /* mEpilogueTileN */ 64
+, /* mGridTriggerSecondaryA */ 0
+, /* mGridTriggerSecondaryB */ 1
+, /* mGridWaitForPrimaryEarlyExit */ 1
+, /* mGridWaitForPrimaryA */ 0
+, /* mGridWaitForPrimaryB */ 1
+, /* mHoistLoadTaskInit */ 1
+, /* mHoistMmaTaskTryWaits */ 0
+, /* mK */ 2048
+, /* mKernelTraits */ {}
+, /* mLayoutA */ gemm::MatrixLayout(0)
+, /* mLayoutB */ gemm::MatrixLayout(0)
+, /* mM */ 256
+, /* mMmaK */ 32
+, /* mMmaKind */ trtllm::gen::MmaKind(5)
+, /* mMmaM */ 128
+, /* mMmaN */ 64
+, /* mMockAllReduce */ 0
+, /* mN */ 256
+, /* mNumSlicesForSplitK */ 1
+, /* mNumSlicesForSliceK */ 1
+, /* mNumStages */ 4
+, /* mNumStagesMma */ 1
+, /* mNumStagesMmaWithinWorkTile */ 1
+, /* mNumStagesMmaAcrossWorkTile */ 1
+, /* mNumStagesWorkId */ 3
+, /* mOutputDebugTensors */ 0
+, /* mPatchF2fp */ 0
+, /* mUseShuffledMatrixA */ 1
+, /* mSliceK */ 0
+, /* mSplitK */ gemm::SplitK(0)
+, /* mTransposeMmaOutput */ 1
+, /* mTileM */ 128
+, /* mTileN */ 64
+, /* mTileK */ 256
+, /* mUseUnrollLoop2xForMma */ 0
+, /* mUseCustomMmaSchedule */ 1
+, /* mUseHoistTryWaitForCustomMmaSchedule */ 0
+, /* mUseDeepSeekFp8 */ 0
+, /* mUsePerTokenSfA */ 0
+, /* mUsePerTokenSfB */ 0
+, /* mUseTmaStore */ 1
+, /* mUseTwoTmaLoadWarps */ 1
+, /* mUseTwoMmaWarps */ 0
+, /* mSfLayoutA */ trtllm::gen::SfLayout(3)
+, /* mSfLayoutB */ trtllm::gen::SfLayout(1)
+, /* mSfLayoutC */ trtllm::gen::SfLayout(1)
+, /* mSfReshapeFactor */ 1
+, /* mTileScheduler */ gemm::TileScheduler(0)
+, /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
+, /* mBatchedM */ {}
+, /* mBatchedN */ {}
+, /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
+, /* mNumBatches */ 2
+, /* mIsStaticBatch */ 0
+, /* mNumTokens */ 2
+, /* mRouteImpl */ batchedGemm::RouteImpl(0)
+, /* mGridWaitForPrimaryRouting */ 0
+, /* mFusedAct */ 0
+, /* mNumRegsPerThreadNonEpilogueWarp */ 0
+, /* mNumRegsPerThreadEpilogueWarp */ 0
+, /* mNumRegsCastAWarps */ 0
+ }, gemm::SmVersion::Sm100a },
+{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256u2_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256u2_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 225280, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256u2_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 320, "d80cad89d57eee85ac6a0c5e1c6c7bff979418f69717337fc42b4e4665cf82ad", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+, /* mBiasType */ gemm::BiasType(1)
+, /* mBlockK */ -1
+, /* mClusterDimX */ 1
+, /* mClusterDimY */ 1
+, /* mClusterDimZ */ 1
+, /* mDtypeAcc */ trtllm::gen::Dtype(1056776)
+, /* mDtypeA */ trtllm::gen::Dtype(17826828)
+, /* mDtypeB */ trtllm::gen::Dtype(1050629)
+, /* mDtypeC */ trtllm::gen::Dtype(1052672)
+, /* mDtypeMmaA */ trtllm::gen::Dtype(17826828)
+, /* mDtypeMmaB */ trtllm::gen::Dtype(17827853)
+, /* mEnablesEarlyExit */ 1
+, /* mEnablesDelayedEarlyExit */ 0
+, /* mEnablesGlobalPtxKnobs */ 1
+, /* mEpilogueLdtmDps */ 16
+, /* mEpilogueLdtmBits */ 256
+, /* mEpilogueTileM */ 128
+, /* mEpilogueTileN */ 64
+, /* mGridTriggerSecondaryA */ 0
+, /* mGridTriggerSecondaryB */ 1
+, /* mGridWaitForPrimaryEarlyExit */ 1
+, /* mGridWaitForPrimaryA */ 0
+, /* mGridWaitForPrimaryB */ 1
+, /* mHoistLoadTaskInit */ 1
+, /* mHoistMmaTaskTryWaits */ 0
+, /* mK */ 2048
+, /* mKernelTraits */ {}
+, /* mLayoutA */ gemm::MatrixLayout(0)
+, /* mLayoutB */ gemm::MatrixLayout(0)
+, /* mM */ 256
+, /* mMmaK */ 32
+, /* mMmaKind */ trtllm::gen::MmaKind(5)
+, /* mMmaM */ 128
+, /* mMmaN */ 64
+, /* mMockAllReduce */ 0
+, /* mN */ 256
+, /* mNumSlicesForSplitK */ 1
+, /* mNumSlicesForSliceK */ 1
+, /* mNumStages */ 4
+, /* mNumStagesMma */ 2
+, /* mNumStagesMmaWithinWorkTile */ 1
+, /* mNumStagesMmaAcrossWorkTile */ 2
+, /* mNumStagesWorkId */ 3
+, /* mOutputDebugTensors */ 0
+, /* mPatchF2fp */ 0
+, /* mUseShuffledMatrixA */ 1
+, /* mSliceK */ 0
+, /* mSplitK */ gemm::SplitK(0)
+, /* mTransposeMmaOutput */ 1
+, /* mTileM */ 128
+, /* mTileN */ 64
+, /* mTileK */ 256
 , /* mUseUnrollLoop2xForMma */ 1
 , /* mUseCustomMmaSchedule */ 1
 , /* mUseHoistTryWaitForCustomMmaSchedule */ 0
@@ -8786,6 +8886,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -8799,7 +8900,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256u2_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256u2_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 225280, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256u2_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 288, "51470a12bd557d7241f5436b127131d2309612538d32ea9d00d48486ecb424ea", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256u2_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256u2_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 225280, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256u2_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 288, "77cc7529c6f37b3dec1c063a9824cfea25fe94f53bd43f43801767ced25a744d", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -8867,6 +8968,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -8880,7 +8982,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 189440, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 320, "fb85bf83174a9680116a105317230bd6a9f7bccd14cf3e0580724a85b3b9e68f", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 189440, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 320, "9f01d68fa4680d1a4cb69b8fce80e058fc69117a954a208cf4dbd47981d2bdb3", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -8948,6 +9050,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -8961,7 +9064,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 189440, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 288, "1be9132d1ea95fdfe60c1d8d045a40da8e5d467dc1caedf02b0daeee7aea24b6", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 189440, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 288, "fb020c5d4a7fe5419e04fbfc52b2dae40cc7187809b163df089efa0ac1196d03", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -9029,6 +9132,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -9042,7 +9146,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 189440, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 320, "cac576746c3990fd9894217c24a8182630da908083f54a9e075f4fd56cdae4cf", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 189440, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 320, "42305021ccca834763052664b8d80aa95d75c5d537ad59f1a234753fb216b418", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -9110,6 +9214,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -9123,7 +9228,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 189440, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 288, "1358a69a2163db67aaaf461d12e26ede64906ee4c0aa18b3aba3dc90027405f7", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 189440, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 288, "95bca146bcbcd3e0b1eeb76e6aaa12752b8bb9a6ed2fa2cf27da5e2a625741b2", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -9191,6 +9296,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -9204,7 +9310,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 225280, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 320, "c27554cb459a4d584123fe63bf8f6cb0f3b37fbebf1909999216da9cb6dfd51c", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 225280, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 320, "e6ec3c422e856d61045cd503c3364c63e86ea844d23fa29a9082262125b62340", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -9272,6 +9378,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -9285,7 +9392,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 225280, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 288, "bae15b96558049b88c3ed3f167c6e2b6232d05caa88c4bacbfe1db96110327ee", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 225280, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 288, "c59efadb84de8811f4c257cb0d89c36ee6bc1a0bda49aa5fe290d5b377218754", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -9353,6 +9460,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -9366,7 +9474,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 225280, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 320, "ef772531d1c15b1cee21cb5c3ca17a787981ca5fd939ad746dfb31be7b415213", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 225280, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 320, "f550e8bcf5c4d3b10bdd5b842f6f681b493eaacef07ccdd02900902c2dd2da89", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -9434,6 +9542,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -9447,7 +9556,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 225280, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 288, "68f10d3ed0388ea5904eca07111f75bc46e41d94a2774d7269428e8f85dca310", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 225280, "bmm_Bfloat16_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 288, "bef98c26bee0af506e4a134dd6a974bdc33c1ffb09f5555c1c04eccec6bd3e6e", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -9515,6 +9624,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -9528,7 +9638,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256_et128x16_m128x16x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256_et128x16_m128x16x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 125952, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256_et128x16_m128x16x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 480, "3be276a1e034e179e8a4ec415bf8ac0f416ea4b1afe9a503ec25565057685acf", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256_et128x16_m128x16x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256_et128x16_m128x16x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 125952, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256_et128x16_m128x16x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 480, "1dd886c46f49e7634b13bed151c89bc39c3eb0ecb0a50251acb3d98b6dfd8bb2", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -9596,6 +9706,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -9609,7 +9720,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256_et128x16_m128x16x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256_et128x16_m128x16x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 125952, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256_et128x16_m128x16x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 448, "1755e53f38acdb06416a3a36e11613e785501b8757a1fb5c32acb9a0e2d15eaa", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256_et128x16_m128x16x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256_et128x16_m128x16x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 125952, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256_et128x16_m128x16x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 448, "2391817e2b783dda84fae2a98e369231e4cc5adacac8050d4964057091926acb", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -9677,6 +9788,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -9690,7 +9802,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256_et128x16_m128x16x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256_et128x16_m128x16x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 163840, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256_et128x16_m128x16x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 480, "e6b3c0b82b0fde0f19a1ac601841c2430396cc5aca839e300cabe84db79ed9ea", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256_et128x16_m128x16x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256_et128x16_m128x16x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 163840, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256_et128x16_m128x16x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 480, "5be76c0bee34f45382984a49d1e2f4079ba6563fcc90e1718f272c46250fb657", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -9758,6 +9870,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -9771,7 +9884,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256_et128x16_m128x16x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256_et128x16_m128x16x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 163840, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256_et128x16_m128x16x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 448, "8723888b5009613fb3c96a7fd2f42085449c73cf73dd0eb932bcae07e3ecda71", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256_et128x16_m128x16x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256_et128x16_m128x16x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 163840, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256_et128x16_m128x16x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 448, "f84b0785a6c44d1a172314a1bc47e96033cdbabc0f60b6d8430478465a7ea07f", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -9839,6 +9952,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -9852,7 +9966,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256u2_et128x16_m128x16x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256u2_et128x16_m128x16x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 125952, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256u2_et128x16_m128x16x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 480, "1c8eefdec5c5fcf92a98f21aa463f920fa1b786a0636ba01e2713be464426a37", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256u2_et128x16_m128x16x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256u2_et128x16_m128x16x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 125952, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256u2_et128x16_m128x16x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 480, "232e0743ec76b2f621b4ca846a7aa31bc2443ae2aa573e407878044dc93682f1", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -9920,6 +10034,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -9933,7 +10048,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256u2_et128x16_m128x16x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256u2_et128x16_m128x16x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 125952, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256u2_et128x16_m128x16x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 448, "a0c53e999025dd7e474eba4053a438c9d1b7a08e8bd7263a1ce21c90d52253ec", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256u2_et128x16_m128x16x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256u2_et128x16_m128x16x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 125952, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256u2_et128x16_m128x16x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 448, "d409fa0f4fcbd7ff19cd043f710d90f78b7f5662656c3ee82d9320513df099ab", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -10001,6 +10116,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -10014,7 +10130,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256u2_et128x16_m128x16x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256u2_et128x16_m128x16x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 163840, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256u2_et128x16_m128x16x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 480, "5755fe9cd330342ea4952389e0e90425fa98fc60da54a1cc9dcba136b4a4e4d0", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256u2_et128x16_m128x16x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256u2_et128x16_m128x16x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 163840, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256u2_et128x16_m128x16x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 480, "325169814fc8c4f8a138160ec98f4369f124055fef360fad20c3892afbd1d211", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -10082,6 +10198,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -10095,7 +10212,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256u2_et128x16_m128x16x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256u2_et128x16_m128x16x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 163840, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256u2_et128x16_m128x16x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 448, "72ba77cf63922ed73627033da6512504e63851feab6076e93a4e401c004c04af", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256u2_et128x16_m128x16x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256u2_et128x16_m128x16x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 163840, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x16x256u2_et128x16_m128x16x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 448, "98503846cdb753846286489bf3cfd826beaaac709504687910249f086400d6d9", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -10163,6 +10280,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -10176,7 +10294,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256_et128x32_m128x32x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256_et128x32_m128x32x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 142336, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256_et128x32_m128x32x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 480, "4d951d402adf714cd51c118283642b260adef986640e63fd3135cd0583935793", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256_et128x32_m128x32x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256_et128x32_m128x32x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 142336, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256_et128x32_m128x32x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 480, "06684ff5dc0a8228e70b3b210471e053703354ea4da00513f0140ecc85b7d344", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -10244,6 +10362,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -10257,7 +10376,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256_et128x32_m128x32x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256_et128x32_m128x32x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 142336, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256_et128x32_m128x32x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 448, "6e953b37eac1a51aefceef6a32fd2d4eb812ea6e95c0ec669f637486093b042a", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256_et128x32_m128x32x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256_et128x32_m128x32x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 142336, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256_et128x32_m128x32x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 448, "9b8e0c96d0299072f75d2d25f5144d9152f85f0c4c76fc21f8c57b3fb9fc149d", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -10325,6 +10444,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -10338,7 +10458,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256_et128x32_m128x32x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256_et128x32_m128x32x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 185344, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256_et128x32_m128x32x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 480, "8ed86814b58d91ff5c69a479370673cb7092834e3e34e8ca181b047774a2f3ea", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256_et128x32_m128x32x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256_et128x32_m128x32x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 185344, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256_et128x32_m128x32x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 480, "b4581de6077ce5cdf9ec89f471712cda5461112d9d291be84efb15e0a7fd90a9", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -10406,6 +10526,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -10419,7 +10540,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256_et128x32_m128x32x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256_et128x32_m128x32x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 185344, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256_et128x32_m128x32x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 448, "c784f5cf5826a91d9e724455be9dae4223e526da93fb7e44a07689f5ca94f4d2", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256_et128x32_m128x32x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256_et128x32_m128x32x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 185344, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256_et128x32_m128x32x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 448, "5face2201c47b9e7e39bd25665a565a9ab060dea17c1a447d5655d36f817c7e9", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -10487,6 +10608,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -10500,7 +10622,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256u2_et128x32_m128x32x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256u2_et128x32_m128x32x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 142336, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256u2_et128x32_m128x32x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 480, "5ba8516480247a988f3ac9ee480ffebec5a07ecb8729666fbf0f34d01cd7965e", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256u2_et128x32_m128x32x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256u2_et128x32_m128x32x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 142336, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256u2_et128x32_m128x32x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 480, "1f502efb591936ec18bca1cb98958ef7f9e61d35695e31f91033178f1b84ae06", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -10568,6 +10690,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -10581,7 +10704,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256u2_et128x32_m128x32x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256u2_et128x32_m128x32x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 142336, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256u2_et128x32_m128x32x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 448, "1795a2f4a18a38deb8d155d884056e0ebc12daca4832d70094175473e40c2dce", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256u2_et128x32_m128x32x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256u2_et128x32_m128x32x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 142336, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256u2_et128x32_m128x32x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 448, "d4a7fbd8d97e192622e78deb9d6e29808fe8c20315b92a5d8282868ef4ddd49d", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -10649,6 +10772,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -10662,7 +10786,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256u2_et128x32_m128x32x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256u2_et128x32_m128x32x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 185344, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256u2_et128x32_m128x32x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 480, "9cc971353360592aad4f96794f30e68c7287785c48d56ac1f546da61e42ecce2", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256u2_et128x32_m128x32x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256u2_et128x32_m128x32x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 185344, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256u2_et128x32_m128x32x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 480, "b362cd22bfe5f02d0f50810bbe32cede78b064686cec40fd6171664e12703484", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -10730,6 +10854,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -10743,7 +10868,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256u2_et128x32_m128x32x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256u2_et128x32_m128x32x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 185344, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256u2_et128x32_m128x32x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 448, "763b735378e6628105bf4e10d784b303bebe3125534bfc4735665eaaf1708b6c", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256u2_et128x32_m128x32x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256u2_et128x32_m128x32x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 185344, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x32x256u2_et128x32_m128x32x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 448, "eb7fe5801ecb61eb5eecfecaa551511a89d99c83256f0d0d8b7ecd74cee1f1db", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -10811,6 +10936,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -10824,7 +10950,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x64x256_et128x64_m128x64x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x64x256_et128x64_m128x64x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 177152, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x64x256_et128x64_m128x64x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 480, "d1af1ab7fc54642d09875d10704cb2d39e41b63664e68b8b50ed151ad9c22e11", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x64x256_et128x64_m128x64x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x64x256_et128x64_m128x64x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 177152, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x64x256_et128x64_m128x64x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 480, "fccddd52aa24457529fd60ebea542736416eba3cad140fb56f46fdf4cf803d1a", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -10892,6 +11018,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -10905,7 +11032,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x64x256_et128x64_m128x64x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x64x256_et128x64_m128x64x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 177152, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x64x256_et128x64_m128x64x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 448, "fe9e5ddbda30d75b750f2b68c24e201e78b38b758573968caee504501d2a1901", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x64x256_et128x64_m128x64x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x64x256_et128x64_m128x64x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 177152, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x64x256_et128x64_m128x64x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 448, "9ca668d46c5260d257621784fe30f831d0929e152c314c395b0b6ab713b65f77", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -10973,6 +11100,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -10986,7 +11114,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x64x256_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x64x256_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 228352, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x64x256_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 480, "0b5737dc255fc02d9048c5be5c3732709a79e35059a57506f1079ad662113f20", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x64x256_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x64x256_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 228352, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x64x256_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 480, "450291d4661183f7b8083d8b6aefcb86cdbc153e5f866bea898606760f743fe1", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -11054,6 +11182,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -11067,7 +11196,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x64x256_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x64x256_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 228352, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x64x256_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 448, "e7fda728b2995f11e17c17e7a9e23b5baedb08cf4e9b12033a52e68085d0e843", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x64x256_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x64x256_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 228352, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x64x256_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 448, "779e1d33522dde4022fbbe984140522999d422d6bbd8f12bb5f33c82c06cf6e4", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -11135,6 +11264,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -11148,7 +11278,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x64x256u2_et128x64_m128x64x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x64x256u2_et128x64_m128x64x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 177152, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x64x256u2_et128x64_m128x64x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 480, "f1df6c8ee0c67f05497c86f2e78c4b0fe4631b76dffc4fc2faa88905b8a1c768", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x64x256u2_et128x64_m128x64x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x64x256u2_et128x64_m128x64x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 177152, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x64x256u2_et128x64_m128x64x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 480, "ecfd46bed256ba455f9b3057243ecb4bcbe0b6e486c5a5b71d4e4199d24ecf36", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -11216,6 +11346,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -11229,7 +11360,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x64x256u2_et128x64_m128x64x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x64x256u2_et128x64_m128x64x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 177152, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x64x256u2_et128x64_m128x64x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 448, "6b0423cbce6c78a86c6d873eb03e09eeb4040a51e2bc919b2cac294c1ed3b9e0", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x64x256u2_et128x64_m128x64x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x64x256u2_et128x64_m128x64x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 177152, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x64x256u2_et128x64_m128x64x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 448, "bdc1d45e29b39f894e990693c935d2c8a8b16fb36a298e5acba41956e168492a", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -11297,6 +11428,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -11310,7 +11442,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x64x256u2_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x64x256u2_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 228352, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x64x256u2_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 480, "598b54536a8bec2fbd87008947628c834f522644a16fc8107cb69cdec04d159c", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x64x256u2_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x64x256u2_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 228352, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x64x256u2_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 480, "b20b1b0ec3067aeee05866d120d87e68e4cdc6bab03f20f2ed0a5538fe9f13f0", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -11378,6 +11510,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -11391,7 +11524,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x64x256u2_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x64x256u2_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 228352, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x64x256u2_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 448, "24933a86526a207319e4e2bbd5442719861d32dabd1b22c3270eb0f2e40dfc27", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x64x256u2_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x64x256u2_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 228352, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x64x256u2_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 448, "9df59210c235eb0b19230c45917140a3a5722f22f456f5ec3586aa8a75eff4fa", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -11459,6 +11592,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -11472,7 +11606,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 153600, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 480, "2935b50d47146f664fe061c1225c64d07cfb3bae8a6b005f4daeabd68bfc8274", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 153600, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 480, "e354ae366b75d8f8c0ac169c420a6dcabd296a276ed48ceac5975a638947feef", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -11540,6 +11674,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -11553,7 +11688,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 153600, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 448, "99c18068d30859ba744aa29ae42e3820204f8d94ec379b3d5e596e001ffdef4a", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 153600, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 448, "ccb819c4907a8e7a314c3f9c347ef65448d7690e8b546df0d3bd0aeeccf881af", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -11621,6 +11756,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -11634,7 +11770,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 189440, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 480, "3ea5bdab281969b1531d83bec61f589ddfe8647a7f2a615a628ef005db955d8f", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 189440, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 480, "de755e7f119531f6bcdb5ed0b7c322206053f47a82066aabbacd936030acec56", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -11702,6 +11838,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -11715,7 +11852,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 189440, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 448, "d1b97d86d41bfd91e01d23e5b8a63cdf3783e88cb74825d321b5b97140c9c41c", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 189440, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 448, "f49d0dd316f7fb020e7935b964f47f274532b2e9272c481f98875478ab8e294b", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -11783,6 +11920,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -11796,7 +11934,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s6_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s6_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 225280, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s6_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 480, "0ef4e1f48a9abfdb23d1b58b0605d5ce7d94fa3ec0026c6b551eba4bc52f6039", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s6_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s6_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 225280, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s6_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 480, "24451361a2afb48a415b024c1eaea68ac425149d152b67a4df0b26d9e2eb718f", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -11864,6 +12002,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -11877,7 +12016,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s6_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s6_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 225280, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s6_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 448, "725b4fa234f23387f75dc84e3595abd7e2d61cc1d3173cfda6a72df985da792b", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s6_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s6_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 225280, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s6_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 448, "7e0cc5d50cd472fc73f1b625301bf12c4360943bba3ed13a6982dcce40b88eff", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -11945,6 +12084,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -11958,7 +12098,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x2_16dp256b_s4_splitK2_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x2_16dp256b_s4_splitK2_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 159744, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x2_16dp256b_s4_splitK2_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 480, "7602b8280cd50fdaa772c468e0db6c8a3adf1d0c3e4be39e7077903f1f29c17b", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x2_16dp256b_s4_splitK2_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x2_16dp256b_s4_splitK2_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 159744, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x2_16dp256b_s4_splitK2_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 480, "d3ad5c1a681187a9ab8fe466a841b71f1a485cc9fecf9fa8e3efb0cbcae320ab", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -12026,6 +12166,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -12039,7 +12180,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x2_16dp256b_s4_splitK2_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x2_16dp256b_s4_splitK2_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 151552, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x2_16dp256b_s4_splitK2_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 448, "ce946b3fd39d51eb1c2e0e04c5f7c74e786ac5345d21a0633a85f352ac7e80d7", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x2_16dp256b_s4_splitK2_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x2_16dp256b_s4_splitK2_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 151552, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x2_16dp256b_s4_splitK2_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 448, "089c16d27c78df52f119bbc313a991489ec27f82e86d5d5e6bf6ec7c9b42bc75", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -12107,6 +12248,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -12120,7 +12262,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x2_16dp256b_s5_splitK2_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x2_16dp256b_s5_splitK2_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 195584, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x2_16dp256b_s5_splitK2_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 480, "dd23e8182e683aaed0066adc6734113e8917f795a90ac0a98b033fdd5477568c", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x2_16dp256b_s5_splitK2_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x2_16dp256b_s5_splitK2_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 195584, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x2_16dp256b_s5_splitK2_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 480, "0ecd8bc7fef312561bdf50ae2311790419cdf70f4fe1dbb58587f1e0779cf1c7", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -12188,6 +12330,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -12201,7 +12344,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x2_16dp256b_s5_splitK2_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x2_16dp256b_s5_splitK2_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 187392, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x2_16dp256b_s5_splitK2_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 448, "f7ea0a6c60c3e4a6894ba3e434e9c9a388def091475f3a19da025f2f5e135e36", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x2_16dp256b_s5_splitK2_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x2_16dp256b_s5_splitK2_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 187392, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x2_16dp256b_s5_splitK2_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 448, "62593ff687342b4bc11c11deae17bb18797bd377079994aaa82c6deeedb67539", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -12269,6 +12412,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -12282,7 +12426,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x2_16dp256b_s6_splitK2_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x2_16dp256b_s6_splitK2_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 231424, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x2_16dp256b_s6_splitK2_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 480, "085615d2b6ebb776fa299831d151b9b0b3d1eae00a0e29c1a3fb3134abc3cbaf", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x2_16dp256b_s6_splitK2_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x2_16dp256b_s6_splitK2_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 231424, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x2_16dp256b_s6_splitK2_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 480, "5a9417173b4851635aac29bef61a283ced5ac9065b7eeb11f80e7b5133cf708d", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -12350,6 +12494,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -12363,7 +12508,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x2_16dp256b_s6_splitK2_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x2_16dp256b_s6_splitK2_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 223232, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x2_16dp256b_s6_splitK2_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 448, "12c80c9a4e567a08bda4a1506aef870f0634603bb466e094acec3bfad3b99157", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x2_16dp256b_s6_splitK2_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x2_16dp256b_s6_splitK2_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 223232, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x2_16dp256b_s6_splitK2_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 448, "0117ee0c2d1de9525b6d70c1817372a4eca43d4c171402af2ce106cd6668f6ad", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -12431,6 +12576,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -12444,7 +12590,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 153600, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 480, "1440cddd372e9d3051efe9d3d3c734e884fd7d610336b47b73203b0516a3ef78", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 153600, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 480, "85a96f3ef4d4fb87fe6410e0282f583c304f57bef50ecf8efd8a10b14e887d15", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -12512,6 +12658,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -12525,7 +12672,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 153600, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 448, "12858e34f7aaf5f4242124ca57286d15357114283fee191522b5f47223a1edea", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 153600, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 448, "aeb36fa1063a5ade516b0c45efeee854b534077127f88864041f5ba26d09e6db", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -12593,6 +12740,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -12606,7 +12754,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 189440, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 480, "25fccbcc9a0f54fa126769f2b2d9f59bde44ce3098fff55cb5b26e3590031ec4", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 189440, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 480, "27f69561d213d2a5fd27df38abcd43d91fd6c7241df6aaf5069d67888ea119b3", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -12674,6 +12822,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -12687,7 +12836,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 189440, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 448, "4c34d924e854a9a10c6b49d38a9c2f93aabae1ca8dce7cbc85568a0a5d1881be", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 189440, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 448, "e2731f35767261d005b6c37f10ca462ca518727c4f97781f3aa731ef60f0d1b1", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -12755,6 +12904,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -12768,7 +12918,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s6_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s6_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 225280, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s6_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 480, "2a66dc0142c43f525d3255d4ae933bce1473b2f9c0bfd93aa77ae1639757842d", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s6_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s6_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 225280, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s6_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 480, "600d2fcff96773f9fb9472077482028d15f7ca7e10b75133ad210550db7c655c", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -12836,6 +12986,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -12849,7 +13000,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s6_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s6_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 225280, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s6_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 448, "2a2792aedf9409a15d9c710a3a8e6cffdcdd642eae1b2c4dc43b5933368b9fa8", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s6_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s6_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 225280, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s6_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 448, "b8f92e2e5cb8e22f285a31dcf392e4df3211f6e3fe3bbe8e17b9d2a26984bf9f", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -12917,6 +13068,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -12930,7 +13082,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s4_splitK2_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s4_splitK2_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 159744, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s4_splitK2_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 480, "5f82ca6bef5b238ff31a6068536acaaeafeff0719e36f8a1f3290a4400147835", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s4_splitK2_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s4_splitK2_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 159744, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s4_splitK2_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 480, "c9073b5f74b349203e3ef78ced433724da133d0d7e82cee630def987664ea67c", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -12998,6 +13150,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -13011,7 +13164,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s4_splitK2_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s4_splitK2_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 151552, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s4_splitK2_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 448, "0a8d53d6b43560bf3a04f556c68b991327925635b09c209622cccfbeaebe3b3e", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s4_splitK2_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s4_splitK2_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 151552, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s4_splitK2_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 448, "297f52ced099c894b755b3b14c9ab1b863455a4c3449bd53dfde39feef1abe0c", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -13079,6 +13232,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -13092,7 +13246,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s5_splitK2_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s5_splitK2_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 195584, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s5_splitK2_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 480, "be544476395e469cd211fb9066e67a2f873c051f04dfb8a36869fdd62dd2ba7e", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s5_splitK2_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s5_splitK2_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 195584, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s5_splitK2_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 480, "38f22a3aabb4013ab208d60d881e58b973773cb38e2ccb5e16c5f4e8d77bfdf5", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -13160,6 +13314,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -13173,7 +13328,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s5_splitK2_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s5_splitK2_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 187392, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s5_splitK2_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 448, "336c2f53f28634a942fe497d9f96b00561c33b64be198f2c526189b93f93c1ef", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s5_splitK2_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s5_splitK2_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 187392, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s5_splitK2_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 448, "da33c0bd8a973244d48e50a78f6ce85325c87406837bb0271e3b4f6d759f2fe4", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -13241,6 +13396,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -13254,7 +13410,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s6_splitK2_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s6_splitK2_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 231424, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s6_splitK2_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 480, "c6716edc98c7a8861eb01630d32d59c8dd9147ebe83962978de1c288ec9d55cb", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s6_splitK2_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s6_splitK2_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 231424, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s6_splitK2_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 480, "44c6d5f44ed248f39307d8a8b30f2b760ae049648c3b6606c77cc7a969f29b74", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -13322,6 +13478,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -13335,7 +13492,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s6_splitK2_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s6_splitK2_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 223232, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s6_splitK2_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 448, "28d96afbe4f2a830662698aa4a7e2d0fe832722998af6faf1d087d0e3413903d", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s6_splitK2_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s6_splitK2_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 223232, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s6_splitK2_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 448, "164b83e48704f0d21be219593f4e45890dff2fab76df7fe862cd31a7efdbd46c", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -13403,6 +13560,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -13416,7 +13574,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 225280, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 480, "f9ac4019fddc47c20a920f8706ec1bb70fe9fde924e47fdb37ce4f44ae2639c6", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 225280, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 480, "4233d4ddf70384fde3c422015a3ab1a784da950b768ab3a3a70821d46bb2d733", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -13484,6 +13642,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -13497,7 +13656,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 225280, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 448, "44b754f2ae6de5e6c234f46233de1af3b23f99e633e83a0d14a3fad482fe1cca", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 225280, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 448, "d74d46c6278dbb75d370d2239d747b8553bbd3c7907f9463d3b64199542776fa", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -13565,6 +13724,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -13578,7 +13738,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x2_16dp256b_s3_splitK2_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x2_16dp256b_s3_splitK2_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 231424, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x2_16dp256b_s3_splitK2_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 480, "8789367aab5b444d4c244c9decc9cf5a4922b0a8b79cb95fb05b9d1128863816", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x2_16dp256b_s3_splitK2_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x2_16dp256b_s3_splitK2_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 231424, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x2_16dp256b_s3_splitK2_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 480, "d5776b4cebfb8879769ed4503cc36baa5b60daa6134c4bcb9fc71a9a541f006c", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -13646,6 +13806,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -13659,7 +13820,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x2_16dp256b_s3_splitK2_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x2_16dp256b_s3_splitK2_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 223232, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x2_16dp256b_s3_splitK2_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 448, "07f79ae5c50e705d1aaed8730acfb01c0871c5df7a41dd16cb00cc0340819fde", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x2_16dp256b_s3_splitK2_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x2_16dp256b_s3_splitK2_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 223232, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x2_16dp256b_s3_splitK2_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 448, "f7e8d887ec639b53cf3c168e5c04ac3f2337769267225b7a85f53e0eb024dbee", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -13727,6 +13888,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -13740,7 +13902,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 225280, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 480, "cdbd849b6ab2929e09e339a7863cdb68b41de17fda204fd1c2b1c70ab35279bf", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 225280, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 480, "a000741ed0c0119824cc9fc15c2d1d30e567b27141f64ee5a6fc615762f49605", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -13808,6 +13970,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -13821,7 +13984,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 225280, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 448, "5a3f2bf4e5633471f659b565924f88fea3b37d268a3a89d33a6538fc5a08a55d", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 225280, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 448, "e8ddd496ec2d4d23fafa850073d1a89eeb80ed015f4b2644c253567944af56fc", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -13889,6 +14052,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -13902,7 +14066,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s3_splitK2_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s3_splitK2_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 231424, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s3_splitK2_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 480, "8a5baea2f5cb554271046a9348ea191e5b130411e59e53eae9c861b439a795e9", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s3_splitK2_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s3_splitK2_TN_transOut_schedP_biasM_bN_dynBatch_sm100a_cubin_len, 231424, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s3_splitK2_TN_transOut_schedP_biasM_bN_dynBatch_sm100a", 480, "2847fae3901bc983b75eab52daa3abfce95c3c651b27a2beb4c100e654e5caed", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -13970,6 +14134,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -13983,7 +14148,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s3_splitK2_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s3_splitK2_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 223232, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s3_splitK2_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 448, "196b3510ae2af6f4c8abce3f0f0ed52d6b5d57f434a367bc44968911d8a92449", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s3_splitK2_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin, Bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s3_splitK2_TN_transOut_schedS_biasM_bN_dynBatch_sm100a_cubin_len, 223232, "bmm_Bfloat16_MxE2m1MxE4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s3_splitK2_TN_transOut_schedS_biasM_bN_dynBatch_sm100a", 448, "db43a484bcc9b97e8e1c7e33ee46f5871d622f331905aa62d1d14b5dff68dcb4", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -14051,6 +14216,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -14064,7 +14230,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x16x512_et128x16_m128x16x64_cga1x1x1_16dp256b_s4_TN_transOut_schedP_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x16x512_et128x16_m128x16x64_cga1x1x1_16dp256b_s4_TN_transOut_schedP_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 175104, "bmm_E2m1_E2m1E2m1_Fp32_t128x16x512_et128x16_m128x16x64_cga1x1x1_16dp256b_s4_TN_transOut_schedP_bN_ldgsts_swiGlu_dynBatch_sm100a", 512, "d6a110e8b1c97bd6617ef97d5d76d7f9f69892d9343c859c244c94e2d08c877f", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x16x512_et128x16_m128x16x64_cga1x1x1_16dp256b_s4_TN_transOut_schedP_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x16x512_et128x16_m128x16x64_cga1x1x1_16dp256b_s4_TN_transOut_schedP_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 175104, "bmm_E2m1_E2m1E2m1_Fp32_t128x16x512_et128x16_m128x16x64_cga1x1x1_16dp256b_s4_TN_transOut_schedP_bN_ldgsts_swiGlu_dynBatch_sm100a", 512, "f9201b4a07e1e8140f76d5f6dfa29dc39f22b025ce1e262ea288072c88a2683f", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -14132,6 +14298,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -14145,7 +14312,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x16x512_et128x16_m128x16x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x16x512_et128x16_m128x16x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 175104, "bmm_E2m1_E2m1E2m1_Fp32_t128x16x512_et128x16_m128x16x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_ldgsts_swiGlu_dynBatch_sm100a", 480, "4b0da472f81c62cecce027675117139bab9eb1d789c59c1d40112f1cf2e881e8", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x16x512_et128x16_m128x16x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x16x512_et128x16_m128x16x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 175104, "bmm_E2m1_E2m1E2m1_Fp32_t128x16x512_et128x16_m128x16x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_ldgsts_swiGlu_dynBatch_sm100a", 480, "fcf92f36d289d249334f0487a4bcdd737c47ffba9f2b93e6dfaccedfe88a8d8b", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -14213,6 +14380,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -14226,7 +14394,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x16x512u2_et128x16_m128x16x64_cga1x1x1_16dp256b_s4_TN_transOut_schedP_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x16x512u2_et128x16_m128x16x64_cga1x1x1_16dp256b_s4_TN_transOut_schedP_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 175104, "bmm_E2m1_E2m1E2m1_Fp32_t128x16x512u2_et128x16_m128x16x64_cga1x1x1_16dp256b_s4_TN_transOut_schedP_bN_ldgsts_swiGlu_dynBatch_sm100a", 512, "fd7870bfeef70e9de6ecd93976b895b8856105f0ae99208a64618f5b7bd05227", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x16x512u2_et128x16_m128x16x64_cga1x1x1_16dp256b_s4_TN_transOut_schedP_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x16x512u2_et128x16_m128x16x64_cga1x1x1_16dp256b_s4_TN_transOut_schedP_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 175104, "bmm_E2m1_E2m1E2m1_Fp32_t128x16x512u2_et128x16_m128x16x64_cga1x1x1_16dp256b_s4_TN_transOut_schedP_bN_ldgsts_swiGlu_dynBatch_sm100a", 512, "8fe3b288869c583d508b813e9f3125d197d2f149a11b588507556daadbb26f2e", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -14294,6 +14462,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -14307,7 +14476,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x16x512u2_et128x16_m128x16x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x16x512u2_et128x16_m128x16x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 175104, "bmm_E2m1_E2m1E2m1_Fp32_t128x16x512u2_et128x16_m128x16x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_ldgsts_swiGlu_dynBatch_sm100a", 480, "d302e010416851d5b4965f20b7a838c7a3f81ea3d34e1b8fcff794f6623107dd", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x16x512u2_et128x16_m128x16x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x16x512u2_et128x16_m128x16x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 175104, "bmm_E2m1_E2m1E2m1_Fp32_t128x16x512u2_et128x16_m128x16x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_ldgsts_swiGlu_dynBatch_sm100a", 480, "ccd86d8e1f164fb730575996a4309aa05f01bb59deeeaf3e4f191d5279e2809d", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -14375,6 +14544,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -14388,7 +14558,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x32x512_et128x32_m128x32x64_cga1x1x1_16dp256b_s4_TN_transOut_schedP_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x32x512_et128x32_m128x32x64_cga1x1x1_16dp256b_s4_TN_transOut_schedP_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 194560, "bmm_E2m1_E2m1E2m1_Fp32_t128x32x512_et128x32_m128x32x64_cga1x1x1_16dp256b_s4_TN_transOut_schedP_bN_ldgsts_swiGlu_dynBatch_sm100a", 512, "a4c00feaf7ef215361ac464b06404adba6509c2d8e535ea050530cffb63b7553", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x32x512_et128x32_m128x32x64_cga1x1x1_16dp256b_s4_TN_transOut_schedP_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x32x512_et128x32_m128x32x64_cga1x1x1_16dp256b_s4_TN_transOut_schedP_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 194560, "bmm_E2m1_E2m1E2m1_Fp32_t128x32x512_et128x32_m128x32x64_cga1x1x1_16dp256b_s4_TN_transOut_schedP_bN_ldgsts_swiGlu_dynBatch_sm100a", 512, "ad0624cf622d2b2753e7ad558cca0bc92618023cdfd480689fc00a0238d89b81", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -14456,6 +14626,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -14469,7 +14640,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x32x512_et128x32_m128x32x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x32x512_et128x32_m128x32x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 194560, "bmm_E2m1_E2m1E2m1_Fp32_t128x32x512_et128x32_m128x32x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_ldgsts_swiGlu_dynBatch_sm100a", 480, "a68b4f813e60ad1bfcf5c550d66cb0017a157cba76912cd712c8e7e43e115075", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x32x512_et128x32_m128x32x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x32x512_et128x32_m128x32x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 194560, "bmm_E2m1_E2m1E2m1_Fp32_t128x32x512_et128x32_m128x32x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_ldgsts_swiGlu_dynBatch_sm100a", 480, "77d87f528d6e7e138d3b0e47b7b6f2108fc32f109c16bb03e898016b363ba4bd", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -14537,6 +14708,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -14550,7 +14722,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x32x512u2_et128x32_m128x32x64_cga1x1x1_16dp256b_s4_TN_transOut_schedP_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x32x512u2_et128x32_m128x32x64_cga1x1x1_16dp256b_s4_TN_transOut_schedP_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 194560, "bmm_E2m1_E2m1E2m1_Fp32_t128x32x512u2_et128x32_m128x32x64_cga1x1x1_16dp256b_s4_TN_transOut_schedP_bN_ldgsts_swiGlu_dynBatch_sm100a", 512, "db14eb89a282f3786b7a2966921101b492748bddcd626eebdbfb47487762da7d", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x32x512u2_et128x32_m128x32x64_cga1x1x1_16dp256b_s4_TN_transOut_schedP_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x32x512u2_et128x32_m128x32x64_cga1x1x1_16dp256b_s4_TN_transOut_schedP_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 194560, "bmm_E2m1_E2m1E2m1_Fp32_t128x32x512u2_et128x32_m128x32x64_cga1x1x1_16dp256b_s4_TN_transOut_schedP_bN_ldgsts_swiGlu_dynBatch_sm100a", 512, "5413bfaa6fc81dec10753107df13beeed455c9a2583995c5b3c16a5c4d93300d", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -14618,6 +14790,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -14631,7 +14804,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x32x512u2_et128x32_m128x32x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x32x512u2_et128x32_m128x32x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 194560, "bmm_E2m1_E2m1E2m1_Fp32_t128x32x512u2_et128x32_m128x32x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_ldgsts_swiGlu_dynBatch_sm100a", 480, "9735a7d44c71afd6d9add832fec656dcf6fcd1e49d592072e1e35908a078d591", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x32x512u2_et128x32_m128x32x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x32x512u2_et128x32_m128x32x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 194560, "bmm_E2m1_E2m1E2m1_Fp32_t128x32x512u2_et128x32_m128x32x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_ldgsts_swiGlu_dynBatch_sm100a", 480, "913d5bbdf477ed35c8ab729a7bb120b501b454804aead123a3cf6d0f139969af", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -14699,6 +14872,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -14712,7 +14886,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x64x256_et128x64_m128x64x64_cga1x1x1_16dp256b_s6_TN_transOut_schedP_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x64x256_et128x64_m128x64x64_cga1x1x1_16dp256b_s6_TN_transOut_schedP_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 178176, "bmm_E2m1_E2m1E2m1_Fp32_t128x64x256_et128x64_m128x64x64_cga1x1x1_16dp256b_s6_TN_transOut_schedP_bN_ldgsts_swiGlu_dynBatch_sm100a", 512, "03f4a2bd6f451accfa392949632ca2114d1d96fd5f9d3097c89bfbce3ef7857d", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x64x256_et128x64_m128x64x64_cga1x1x1_16dp256b_s6_TN_transOut_schedP_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x64x256_et128x64_m128x64x64_cga1x1x1_16dp256b_s6_TN_transOut_schedP_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 178176, "bmm_E2m1_E2m1E2m1_Fp32_t128x64x256_et128x64_m128x64x64_cga1x1x1_16dp256b_s6_TN_transOut_schedP_bN_ldgsts_swiGlu_dynBatch_sm100a", 512, "6cd2dfc20f9c6845d5ab3072c74d1797e55a5dad9c189c3ee304e730f81e18bc", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -14780,6 +14954,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -14793,7 +14968,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x64x256_et128x64_m128x64x64_cga1x1x1_16dp256b_s6_TN_transOut_schedS_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x64x256_et128x64_m128x64x64_cga1x1x1_16dp256b_s6_TN_transOut_schedS_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 178176, "bmm_E2m1_E2m1E2m1_Fp32_t128x64x256_et128x64_m128x64x64_cga1x1x1_16dp256b_s6_TN_transOut_schedS_bN_ldgsts_swiGlu_dynBatch_sm100a", 480, "c9e47cfbdd51f4e2581af1dfcd0e1430a435448f663904d2acc129952438baa7", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x64x256_et128x64_m128x64x64_cga1x1x1_16dp256b_s6_TN_transOut_schedS_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x64x256_et128x64_m128x64x64_cga1x1x1_16dp256b_s6_TN_transOut_schedS_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 178176, "bmm_E2m1_E2m1E2m1_Fp32_t128x64x256_et128x64_m128x64x64_cga1x1x1_16dp256b_s6_TN_transOut_schedS_bN_ldgsts_swiGlu_dynBatch_sm100a", 480, "51126ae7438ddb5a64d38db1f73a3c31f8c6761433217938fdfdbdd938fcbad6", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -14861,6 +15036,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -14874,7 +15050,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x64x256u2_et128x64_m128x64x64_cga1x1x1_16dp256b_s6_TN_transOut_schedP_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x64x256u2_et128x64_m128x64x64_cga1x1x1_16dp256b_s6_TN_transOut_schedP_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 178176, "bmm_E2m1_E2m1E2m1_Fp32_t128x64x256u2_et128x64_m128x64x64_cga1x1x1_16dp256b_s6_TN_transOut_schedP_bN_ldgsts_swiGlu_dynBatch_sm100a", 512, "95ad42592494767dc5701d9578c0cae1c724326ed054f54424035a1b032da56d", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x64x256u2_et128x64_m128x64x64_cga1x1x1_16dp256b_s6_TN_transOut_schedP_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x64x256u2_et128x64_m128x64x64_cga1x1x1_16dp256b_s6_TN_transOut_schedP_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 178176, "bmm_E2m1_E2m1E2m1_Fp32_t128x64x256u2_et128x64_m128x64x64_cga1x1x1_16dp256b_s6_TN_transOut_schedP_bN_ldgsts_swiGlu_dynBatch_sm100a", 512, "cc7d6e878b8b4efc5acdf8a819cc6f7c747959acab2d59b5b00888030e9feec7", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -14942,6 +15118,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -14955,7 +15132,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x64x256u2_et128x64_m128x64x64_cga1x1x1_16dp256b_s6_TN_transOut_schedS_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x64x256u2_et128x64_m128x64x64_cga1x1x1_16dp256b_s6_TN_transOut_schedS_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 178176, "bmm_E2m1_E2m1E2m1_Fp32_t128x64x256u2_et128x64_m128x64x64_cga1x1x1_16dp256b_s6_TN_transOut_schedS_bN_ldgsts_swiGlu_dynBatch_sm100a", 480, "6d0169445d9c333d20f7b9f506a3b93d0f66d29790650737ede2db1d8c02609c", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x64x256u2_et128x64_m128x64x64_cga1x1x1_16dp256b_s6_TN_transOut_schedS_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x64x256u2_et128x64_m128x64x64_cga1x1x1_16dp256b_s6_TN_transOut_schedS_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 178176, "bmm_E2m1_E2m1E2m1_Fp32_t128x64x256u2_et128x64_m128x64x64_cga1x1x1_16dp256b_s6_TN_transOut_schedS_bN_ldgsts_swiGlu_dynBatch_sm100a", 480, "472450ff9e60666626228881697af489820ad8d665ed4a786a3e781e291f04a0", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -15023,6 +15200,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -15036,7 +15214,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedP_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedP_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 165888, "bmm_E2m1_E2m1E2m1_Fp32_t128x8x512_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedP_bN_ldgsts_swiGlu_dynBatch_sm100a", 512, "a854453fd08104395085fc04bf7f70e0d8e8212fca33ab054f547e8a4bec0ea4", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedP_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedP_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 165888, "bmm_E2m1_E2m1E2m1_Fp32_t128x8x512_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedP_bN_ldgsts_swiGlu_dynBatch_sm100a", 512, "56a15e9c8027e0542f04694c33352ad76ea38fbdec785002224bb9c6b3ae6731", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -15104,6 +15282,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -15117,7 +15296,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 165888, "bmm_E2m1_E2m1E2m1_Fp32_t128x8x512_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_ldgsts_swiGlu_dynBatch_sm100a", 480, "d775b34a4015d5cabc0b04a970fea1946faa011498a476581c959c9bf80708df", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 165888, "bmm_E2m1_E2m1E2m1_Fp32_t128x8x512_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_ldgsts_swiGlu_dynBatch_sm100a", 480, "81888d0b169e38fb2c3e5cbe675daa37d189cbbfe2697502975b59e4ce4cdb4d", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -15185,6 +15364,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -15198,7 +15378,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_sm100a_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_sm100a_cubin_len, 165888, "bmm_E2m1_E2m1E2m1_Fp32_t128x8x512_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_sm100a", 448, "b7f70963c18dc3e620eb4c816ee84cb22c2ca2f5e93bbd9ca67201350aad9638", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_sm100a_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_sm100a_cubin_len, 165888, "bmm_E2m1_E2m1E2m1_Fp32_t128x8x512_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_sm100a", 448, "1264399a1042b63c62da0801d993ed4a247b5a34f256f2f88d0d08238b6c491a", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -15266,6 +15446,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -15279,7 +15460,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512u2_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedP_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512u2_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedP_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 165888, "bmm_E2m1_E2m1E2m1_Fp32_t128x8x512u2_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedP_bN_ldgsts_swiGlu_dynBatch_sm100a", 512, "364a305ba2c6f602d38a65090ec191aff7cb7c2133dbd7dcd8828fc481f0b95a", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512u2_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedP_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512u2_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedP_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 165888, "bmm_E2m1_E2m1E2m1_Fp32_t128x8x512u2_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedP_bN_ldgsts_swiGlu_dynBatch_sm100a", 512, "4b0e08e3fbf6fa5664e9b68b459593fa3e90c6f7bfeb21fad320c8be6de6bf3e", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -15347,6 +15528,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -15360,7 +15542,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512u2_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512u2_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 165888, "bmm_E2m1_E2m1E2m1_Fp32_t128x8x512u2_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_ldgsts_swiGlu_dynBatch_sm100a", 480, "5781835f5664b0850e1c4b3b6ff0f2d578467457e56ea888bbcf84be5a3496b3", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512u2_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512u2_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 165888, "bmm_E2m1_E2m1E2m1_Fp32_t128x8x512u2_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_ldgsts_swiGlu_dynBatch_sm100a", 480, "0504df6db869e2034e687dc9fc180d5ce94f6c6197f892009b5fefb74518e09f", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -15428,6 +15610,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -15441,7 +15624,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512u2_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_sm100a_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512u2_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_sm100a_cubin_len, 165888, "bmm_E2m1_E2m1E2m1_Fp32_t128x8x512u2_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_sm100a", 448, "e61834b17938ad8cb4055659fdde0613b46af8fa84e41ea14369c0c770d9e5b8", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512u2_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_sm100a_cubin, Bmm_E2m1_E2m1E2m1_Fp32_t128x8x512u2_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_sm100a_cubin_len, 165888, "bmm_E2m1_E2m1E2m1_Fp32_t128x8x512u2_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_sm100a", 448, "52128f053973f0d167be7d30f47730f9f95bf3d94273860287ded9c5c5d1a162", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -15509,6 +15692,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -15522,7 +15706,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_E4m3_E4m3E4m3_Fp32_t128x16x128_et64x16_m64x16x32_cga1x1x1_16dp256b_s6_TN_transOut_noShflA_dsFp8_schedP_bN_ldgsts_dynBatch_sm100a_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x16x128_et64x16_m64x16x32_cga1x1x1_16dp256b_s6_TN_transOut_noShflA_dsFp8_schedP_bN_ldgsts_dynBatch_sm100a_cubin_len, 119808, "bmm_E4m3_E4m3E4m3_Fp32_t128x16x128_et64x16_m64x16x32_cga1x1x1_16dp256b_s6_TN_transOut_noShflA_dsFp8_schedP_bN_ldgsts_dynBatch_sm100a", 448, "9278942d16e27fcef053084b8be7ff7005121944ba8d6565d64e9011dbbab0f1", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E4m3E4m3_Fp32_t128x16x128_et64x16_m64x16x32_cga1x1x1_16dp256b_s6_TN_transOut_noShflA_dsFp8_schedP_bN_ldgsts_dynBatch_sm100a_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x16x128_et64x16_m64x16x32_cga1x1x1_16dp256b_s6_TN_transOut_noShflA_dsFp8_schedP_bN_ldgsts_dynBatch_sm100a_cubin_len, 119808, "bmm_E4m3_E4m3E4m3_Fp32_t128x16x128_et64x16_m64x16x32_cga1x1x1_16dp256b_s6_TN_transOut_noShflA_dsFp8_schedP_bN_ldgsts_dynBatch_sm100a", 448, "6e903584077011be3ed6601075491a0c7c08a1555a02d81b590d4f6ed6520963", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -15590,6 +15774,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -15603,7 +15788,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_E4m3_E4m3E4m3_Fp32_t128x16x128_et64x16_m64x16x32_cga1x1x1_16dp256b_s6_TN_transOut_noShflA_dsFp8_schedS_bN_ldgsts_dynBatch_sm100a_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x16x128_et64x16_m64x16x32_cga1x1x1_16dp256b_s6_TN_transOut_noShflA_dsFp8_schedS_bN_ldgsts_dynBatch_sm100a_cubin_len, 119808, "bmm_E4m3_E4m3E4m3_Fp32_t128x16x128_et64x16_m64x16x32_cga1x1x1_16dp256b_s6_TN_transOut_noShflA_dsFp8_schedS_bN_ldgsts_dynBatch_sm100a", 416, "0ef661c79d8d6b345050047f9deecc0bfb1897785264f7a2ed2f97b6685f17ba", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E4m3E4m3_Fp32_t128x16x128_et64x16_m64x16x32_cga1x1x1_16dp256b_s6_TN_transOut_noShflA_dsFp8_schedS_bN_ldgsts_dynBatch_sm100a_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x16x128_et64x16_m64x16x32_cga1x1x1_16dp256b_s6_TN_transOut_noShflA_dsFp8_schedS_bN_ldgsts_dynBatch_sm100a_cubin_len, 119808, "bmm_E4m3_E4m3E4m3_Fp32_t128x16x128_et64x16_m64x16x32_cga1x1x1_16dp256b_s6_TN_transOut_noShflA_dsFp8_schedS_bN_ldgsts_dynBatch_sm100a", 416, "a33e5bee58bf10d73c19e5745a110f56975a3e2c25a02019c2e2322c5b22235b", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -15671,6 +15856,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -15684,7 +15870,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_E4m3_E4m3E4m3_Fp32_t128x16x128u2_et64x16_m64x16x32_cga1x1x1_16dp256b_s6_TN_transOut_noShflA_dsFp8_schedP_bN_ldgsts_dynBatch_sm100a_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x16x128u2_et64x16_m64x16x32_cga1x1x1_16dp256b_s6_TN_transOut_noShflA_dsFp8_schedP_bN_ldgsts_dynBatch_sm100a_cubin_len, 119808, "bmm_E4m3_E4m3E4m3_Fp32_t128x16x128u2_et64x16_m64x16x32_cga1x1x1_16dp256b_s6_TN_transOut_noShflA_dsFp8_schedP_bN_ldgsts_dynBatch_sm100a", 448, "974c9304a597c94b3899d13a349469d53efcf18a40a0c25b54e0122b2df5cbbb", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E4m3E4m3_Fp32_t128x16x128u2_et64x16_m64x16x32_cga1x1x1_16dp256b_s6_TN_transOut_noShflA_dsFp8_schedP_bN_ldgsts_dynBatch_sm100a_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x16x128u2_et64x16_m64x16x32_cga1x1x1_16dp256b_s6_TN_transOut_noShflA_dsFp8_schedP_bN_ldgsts_dynBatch_sm100a_cubin_len, 119808, "bmm_E4m3_E4m3E4m3_Fp32_t128x16x128u2_et64x16_m64x16x32_cga1x1x1_16dp256b_s6_TN_transOut_noShflA_dsFp8_schedP_bN_ldgsts_dynBatch_sm100a", 448, "4082e2b82d8eac9aa80e3e51911aac1cb32121a3b7920ddda66deb2189778b29", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -15752,6 +15938,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -15765,7 +15952,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_E4m3_E4m3E4m3_Fp32_t128x16x128u2_et64x16_m64x16x32_cga1x1x1_16dp256b_s6_TN_transOut_noShflA_dsFp8_schedS_bN_ldgsts_dynBatch_sm100a_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x16x128u2_et64x16_m64x16x32_cga1x1x1_16dp256b_s6_TN_transOut_noShflA_dsFp8_schedS_bN_ldgsts_dynBatch_sm100a_cubin_len, 119808, "bmm_E4m3_E4m3E4m3_Fp32_t128x16x128u2_et64x16_m64x16x32_cga1x1x1_16dp256b_s6_TN_transOut_noShflA_dsFp8_schedS_bN_ldgsts_dynBatch_sm100a", 416, "ee39d002f287da1c6a9580b14a026840f110e87208e88d704dfccc8500fcfeab", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E4m3E4m3_Fp32_t128x16x128u2_et64x16_m64x16x32_cga1x1x1_16dp256b_s6_TN_transOut_noShflA_dsFp8_schedS_bN_ldgsts_dynBatch_sm100a_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x16x128u2_et64x16_m64x16x32_cga1x1x1_16dp256b_s6_TN_transOut_noShflA_dsFp8_schedS_bN_ldgsts_dynBatch_sm100a_cubin_len, 119808, "bmm_E4m3_E4m3E4m3_Fp32_t128x16x128u2_et64x16_m64x16x32_cga1x1x1_16dp256b_s6_TN_transOut_noShflA_dsFp8_schedS_bN_ldgsts_dynBatch_sm100a", 416, "62d66554997f9c5cbd5c987f5ce6fab48466c599b97916391082c019b70b0f91", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -15833,6 +16020,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -15846,7 +16034,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_E4m3_E4m3E4m3_Fp32_t128x32x128_et64x32_m64x32x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedP_bN_ldgsts_dynBatch_sm100a_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x32x128_et64x32_m64x32x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedP_bN_ldgsts_dynBatch_sm100a_cubin_len, 93184, "bmm_E4m3_E4m3E4m3_Fp32_t128x32x128_et64x32_m64x32x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedP_bN_ldgsts_dynBatch_sm100a", 448, "032027c552adc9e2e15f657628217c8c6f5e83d36514da86058566ca04e6eedf", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E4m3E4m3_Fp32_t128x32x128_et64x32_m64x32x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedP_bN_ldgsts_dynBatch_sm100a_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x32x128_et64x32_m64x32x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedP_bN_ldgsts_dynBatch_sm100a_cubin_len, 93184, "bmm_E4m3_E4m3E4m3_Fp32_t128x32x128_et64x32_m64x32x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedP_bN_ldgsts_dynBatch_sm100a", 448, "dce9a0dce5842e44165a325870e6226e18637c38ed80f917213322ca3e9453ea", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -15914,6 +16102,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -15927,7 +16116,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_E4m3_E4m3E4m3_Fp32_t128x32x128_et64x32_m64x32x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedS_bN_ldgsts_dynBatch_sm100a_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x32x128_et64x32_m64x32x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedS_bN_ldgsts_dynBatch_sm100a_cubin_len, 93184, "bmm_E4m3_E4m3E4m3_Fp32_t128x32x128_et64x32_m64x32x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedS_bN_ldgsts_dynBatch_sm100a", 416, "b66bcb2fdc34b54fe4cb6fc41cde003810593aab2b7821c995872896c0716fdb", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E4m3E4m3_Fp32_t128x32x128_et64x32_m64x32x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedS_bN_ldgsts_dynBatch_sm100a_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x32x128_et64x32_m64x32x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedS_bN_ldgsts_dynBatch_sm100a_cubin_len, 93184, "bmm_E4m3_E4m3E4m3_Fp32_t128x32x128_et64x32_m64x32x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedS_bN_ldgsts_dynBatch_sm100a", 416, "ad54a27256cfef3e505cd36fc7597248198a542937c4c3abf596652cbbd8456b", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -15995,6 +16184,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -16008,7 +16198,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_E4m3_E4m3E4m3_Fp32_t128x32x128u2_et64x32_m64x32x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedP_bN_ldgsts_dynBatch_sm100a_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x32x128u2_et64x32_m64x32x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedP_bN_ldgsts_dynBatch_sm100a_cubin_len, 93184, "bmm_E4m3_E4m3E4m3_Fp32_t128x32x128u2_et64x32_m64x32x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedP_bN_ldgsts_dynBatch_sm100a", 448, "0c90e66de529b66f9fd393b3da85c47f5701d7178716e5fae0778ebaf10a6a21", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E4m3E4m3_Fp32_t128x32x128u2_et64x32_m64x32x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedP_bN_ldgsts_dynBatch_sm100a_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x32x128u2_et64x32_m64x32x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedP_bN_ldgsts_dynBatch_sm100a_cubin_len, 93184, "bmm_E4m3_E4m3E4m3_Fp32_t128x32x128u2_et64x32_m64x32x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedP_bN_ldgsts_dynBatch_sm100a", 448, "0eb9278105296a59046d6ea6150f4a9ac2a106ba954c1755fb5627703d799f1e", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -16076,6 +16266,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -16089,7 +16280,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_E4m3_E4m3E4m3_Fp32_t128x32x128u2_et64x32_m64x32x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedS_bN_ldgsts_dynBatch_sm100a_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x32x128u2_et64x32_m64x32x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedS_bN_ldgsts_dynBatch_sm100a_cubin_len, 93184, "bmm_E4m3_E4m3E4m3_Fp32_t128x32x128u2_et64x32_m64x32x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedS_bN_ldgsts_dynBatch_sm100a", 416, "6da5cb66dcf547aebfead94ad544c18768041f298dc41c14d8f67176a2f85d08", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E4m3E4m3_Fp32_t128x32x128u2_et64x32_m64x32x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedS_bN_ldgsts_dynBatch_sm100a_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x32x128u2_et64x32_m64x32x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedS_bN_ldgsts_dynBatch_sm100a_cubin_len, 93184, "bmm_E4m3_E4m3E4m3_Fp32_t128x32x128u2_et64x32_m64x32x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedS_bN_ldgsts_dynBatch_sm100a", 416, "6b0f6bbbfde874c0a70a64ba3aabb8a59e28506a91650d1d7fbccf1b13ad38a4", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -16157,6 +16348,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -16170,7 +16362,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_E4m3_E4m3E4m3_Fp32_t128x64x128_et64x64_m64x64x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedP_bN_ldgsts_dynBatch_sm100a_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x64x128_et64x64_m64x64x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedP_bN_ldgsts_dynBatch_sm100a_cubin_len, 115712, "bmm_E4m3_E4m3E4m3_Fp32_t128x64x128_et64x64_m64x64x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedP_bN_ldgsts_dynBatch_sm100a", 448, "b90307f27bc752b8c1ae901338288cec2837b06924b8285181e6842fc4c34607", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E4m3E4m3_Fp32_t128x64x128_et64x64_m64x64x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedP_bN_ldgsts_dynBatch_sm100a_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x64x128_et64x64_m64x64x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedP_bN_ldgsts_dynBatch_sm100a_cubin_len, 115712, "bmm_E4m3_E4m3E4m3_Fp32_t128x64x128_et64x64_m64x64x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedP_bN_ldgsts_dynBatch_sm100a", 448, "d923d9394d4d4c415ece025f169420527a183624e79efc788fc8210243934ab3", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -16238,6 +16430,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -16251,7 +16444,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_E4m3_E4m3E4m3_Fp32_t128x64x128_et64x64_m64x64x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedS_bN_ldgsts_dynBatch_sm100a_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x64x128_et64x64_m64x64x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedS_bN_ldgsts_dynBatch_sm100a_cubin_len, 115712, "bmm_E4m3_E4m3E4m3_Fp32_t128x64x128_et64x64_m64x64x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedS_bN_ldgsts_dynBatch_sm100a", 416, "b29544672eea1231975ed481cc567eb41ec7c440841811fbac82f61f2f367884", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E4m3E4m3_Fp32_t128x64x128_et64x64_m64x64x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedS_bN_ldgsts_dynBatch_sm100a_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x64x128_et64x64_m64x64x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedS_bN_ldgsts_dynBatch_sm100a_cubin_len, 115712, "bmm_E4m3_E4m3E4m3_Fp32_t128x64x128_et64x64_m64x64x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedS_bN_ldgsts_dynBatch_sm100a", 416, "45264435d756b616dd667f1f3843f65c3ae126d6bc3051216aeebfbdf1c19f5e", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -16319,6 +16512,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -16332,7 +16526,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_E4m3_E4m3E4m3_Fp32_t128x64x128u2_et64x64_m64x64x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedP_bN_ldgsts_dynBatch_sm100a_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x64x128u2_et64x64_m64x64x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedP_bN_ldgsts_dynBatch_sm100a_cubin_len, 115712, "bmm_E4m3_E4m3E4m3_Fp32_t128x64x128u2_et64x64_m64x64x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedP_bN_ldgsts_dynBatch_sm100a", 448, "cf7c73bb6ccbe1bb64213534ba4e7173d625f8f23d1f2ffead4fec1c906d8c78", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E4m3E4m3_Fp32_t128x64x128u2_et64x64_m64x64x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedP_bN_ldgsts_dynBatch_sm100a_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x64x128u2_et64x64_m64x64x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedP_bN_ldgsts_dynBatch_sm100a_cubin_len, 115712, "bmm_E4m3_E4m3E4m3_Fp32_t128x64x128u2_et64x64_m64x64x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedP_bN_ldgsts_dynBatch_sm100a", 448, "bcdbb85503d191634c6905f89c3950b6c049d488b40e7af6bfd44dafb85cdca8", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -16400,6 +16594,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -16413,7 +16608,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_E4m3_E4m3E4m3_Fp32_t128x64x128u2_et64x64_m64x64x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedS_bN_ldgsts_dynBatch_sm100a_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x64x128u2_et64x64_m64x64x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedS_bN_ldgsts_dynBatch_sm100a_cubin_len, 115712, "bmm_E4m3_E4m3E4m3_Fp32_t128x64x128u2_et64x64_m64x64x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedS_bN_ldgsts_dynBatch_sm100a", 416, "93ac9a075cd49e37ac5be5e0aefb2e3ed7d27055aabfe198fb7ba545e6de01bb", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E4m3E4m3_Fp32_t128x64x128u2_et64x64_m64x64x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedS_bN_ldgsts_dynBatch_sm100a_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x64x128u2_et64x64_m64x64x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedS_bN_ldgsts_dynBatch_sm100a_cubin_len, 115712, "bmm_E4m3_E4m3E4m3_Fp32_t128x64x128u2_et64x64_m64x64x32_cga1x1x1_16dp256b_s4_TN_transOut_noShflA_dsFp8_schedS_bN_ldgsts_dynBatch_sm100a", 416, "190991fd067583e81e7940bfbf72bad68728d1d07c7a8523f56228d3b31cb626", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -16481,6 +16676,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -16494,7 +16690,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_E4m3_E4m3E4m3_Fp32_t128x8x128_et64x8_m64x8x32_cga1x1x1_16dp256b_s3_TN_transOut_noShflA_dsFp8_schedS_bN_sm100a_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x8x128_et64x8_m64x8x32_cga1x1x1_16dp256b_s3_TN_transOut_noShflA_dsFp8_schedS_bN_sm100a_cubin_len, 61440, "bmm_E4m3_E4m3E4m3_Fp32_t128x8x128_et64x8_m64x8x32_cga1x1x1_16dp256b_s3_TN_transOut_noShflA_dsFp8_schedS_bN_sm100a", 384, "a828660125c5c84b12a2bfce49e56a3687adf724f75c8293f46247b61fbae216", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E4m3E4m3_Fp32_t128x8x128_et64x8_m64x8x32_cga1x1x1_16dp256b_s3_TN_transOut_noShflA_dsFp8_schedS_bN_sm100a_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x8x128_et64x8_m64x8x32_cga1x1x1_16dp256b_s3_TN_transOut_noShflA_dsFp8_schedS_bN_sm100a_cubin_len, 61440, "bmm_E4m3_E4m3E4m3_Fp32_t128x8x128_et64x8_m64x8x32_cga1x1x1_16dp256b_s3_TN_transOut_noShflA_dsFp8_schedS_bN_sm100a", 384, "615e30e9b473531ecf56ec9eab7138f81ad151ca55be42b8a0281a19661c4426", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -16562,6 +16758,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -16575,7 +16772,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_E4m3_E4m3E4m3_Fp32_t128x8x128_et64x8_m64x8x32_cga1x1x1_16dp256b_s8_TN_transOut_noShflA_dsFp8_schedP_bN_ldgsts_dynBatch_sm100a_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x8x128_et64x8_m64x8x32_cga1x1x1_16dp256b_s8_TN_transOut_noShflA_dsFp8_schedP_bN_ldgsts_dynBatch_sm100a_cubin_len, 149504, "bmm_E4m3_E4m3E4m3_Fp32_t128x8x128_et64x8_m64x8x32_cga1x1x1_16dp256b_s8_TN_transOut_noShflA_dsFp8_schedP_bN_ldgsts_dynBatch_sm100a", 448, "6121231419041f45ff4366fadb59d02ebca35e350d52cf253fea9197574a670a", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E4m3E4m3_Fp32_t128x8x128_et64x8_m64x8x32_cga1x1x1_16dp256b_s8_TN_transOut_noShflA_dsFp8_schedP_bN_ldgsts_dynBatch_sm100a_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x8x128_et64x8_m64x8x32_cga1x1x1_16dp256b_s8_TN_transOut_noShflA_dsFp8_schedP_bN_ldgsts_dynBatch_sm100a_cubin_len, 149504, "bmm_E4m3_E4m3E4m3_Fp32_t128x8x128_et64x8_m64x8x32_cga1x1x1_16dp256b_s8_TN_transOut_noShflA_dsFp8_schedP_bN_ldgsts_dynBatch_sm100a", 448, "1856e55a275018c2115770abdd9d1fe34fa38d6af10b1307d9fdf35552eeee9b", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -16643,6 +16840,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -16656,7 +16854,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_E4m3_E4m3E4m3_Fp32_t128x8x128_et64x8_m64x8x32_cga1x1x1_16dp256b_s8_TN_transOut_noShflA_dsFp8_schedS_bN_ldgsts_dynBatch_sm100a_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x8x128_et64x8_m64x8x32_cga1x1x1_16dp256b_s8_TN_transOut_noShflA_dsFp8_schedS_bN_ldgsts_dynBatch_sm100a_cubin_len, 149504, "bmm_E4m3_E4m3E4m3_Fp32_t128x8x128_et64x8_m64x8x32_cga1x1x1_16dp256b_s8_TN_transOut_noShflA_dsFp8_schedS_bN_ldgsts_dynBatch_sm100a", 416, "a3656636d8aae0bcff139afd14197592a1da67a1123aaf1ddeaa8135552b9105", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E4m3E4m3_Fp32_t128x8x128_et64x8_m64x8x32_cga1x1x1_16dp256b_s8_TN_transOut_noShflA_dsFp8_schedS_bN_ldgsts_dynBatch_sm100a_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x8x128_et64x8_m64x8x32_cga1x1x1_16dp256b_s8_TN_transOut_noShflA_dsFp8_schedS_bN_ldgsts_dynBatch_sm100a_cubin_len, 149504, "bmm_E4m3_E4m3E4m3_Fp32_t128x8x128_et64x8_m64x8x32_cga1x1x1_16dp256b_s8_TN_transOut_noShflA_dsFp8_schedS_bN_ldgsts_dynBatch_sm100a", 416, "e29c3356a2500f376c9bf8a3293a1b08b7abe138f79408f814658666e4be5b59", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -16724,6 +16922,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -16737,7 +16936,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_E4m3_E4m3E4m3_Fp32_t128x8x128u2_et64x8_m64x8x32_cga1x1x1_16dp256b_s3_TN_transOut_noShflA_dsFp8_schedS_bN_sm100a_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x8x128u2_et64x8_m64x8x32_cga1x1x1_16dp256b_s3_TN_transOut_noShflA_dsFp8_schedS_bN_sm100a_cubin_len, 61440, "bmm_E4m3_E4m3E4m3_Fp32_t128x8x128u2_et64x8_m64x8x32_cga1x1x1_16dp256b_s3_TN_transOut_noShflA_dsFp8_schedS_bN_sm100a", 384, "30cac5fadfb397501aa550ddd97143aeb9d4198438b2dc6974faa801cae99773", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E4m3E4m3_Fp32_t128x8x128u2_et64x8_m64x8x32_cga1x1x1_16dp256b_s3_TN_transOut_noShflA_dsFp8_schedS_bN_sm100a_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x8x128u2_et64x8_m64x8x32_cga1x1x1_16dp256b_s3_TN_transOut_noShflA_dsFp8_schedS_bN_sm100a_cubin_len, 61440, "bmm_E4m3_E4m3E4m3_Fp32_t128x8x128u2_et64x8_m64x8x32_cga1x1x1_16dp256b_s3_TN_transOut_noShflA_dsFp8_schedS_bN_sm100a", 384, "30c631e69db4c3d4dd9ef7d5efb3aa2fbc058d8e6409b021c7264f3023bcd8cc", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -16805,6 +17004,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -16818,7 +17018,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_E4m3_E4m3E4m3_Fp32_t128x8x128u2_et64x8_m64x8x32_cga1x1x1_16dp256b_s8_TN_transOut_noShflA_dsFp8_schedP_bN_ldgsts_dynBatch_sm100a_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x8x128u2_et64x8_m64x8x32_cga1x1x1_16dp256b_s8_TN_transOut_noShflA_dsFp8_schedP_bN_ldgsts_dynBatch_sm100a_cubin_len, 149504, "bmm_E4m3_E4m3E4m3_Fp32_t128x8x128u2_et64x8_m64x8x32_cga1x1x1_16dp256b_s8_TN_transOut_noShflA_dsFp8_schedP_bN_ldgsts_dynBatch_sm100a", 448, "f7989d32063e2c85a12d65260497847bafb99b1ba6332feda41ae46250eb4b8b", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E4m3E4m3_Fp32_t128x8x128u2_et64x8_m64x8x32_cga1x1x1_16dp256b_s8_TN_transOut_noShflA_dsFp8_schedP_bN_ldgsts_dynBatch_sm100a_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x8x128u2_et64x8_m64x8x32_cga1x1x1_16dp256b_s8_TN_transOut_noShflA_dsFp8_schedP_bN_ldgsts_dynBatch_sm100a_cubin_len, 149504, "bmm_E4m3_E4m3E4m3_Fp32_t128x8x128u2_et64x8_m64x8x32_cga1x1x1_16dp256b_s8_TN_transOut_noShflA_dsFp8_schedP_bN_ldgsts_dynBatch_sm100a", 448, "8f7ef98484ecdb6e16977d707cce581e07059bb073c15af060d1f49ff54936cb", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -16886,6 +17086,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -16899,7 +17100,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_E4m3_E4m3E4m3_Fp32_t128x8x128u2_et64x8_m64x8x32_cga1x1x1_16dp256b_s8_TN_transOut_noShflA_dsFp8_schedS_bN_ldgsts_dynBatch_sm100a_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x8x128u2_et64x8_m64x8x32_cga1x1x1_16dp256b_s8_TN_transOut_noShflA_dsFp8_schedS_bN_ldgsts_dynBatch_sm100a_cubin_len, 149504, "bmm_E4m3_E4m3E4m3_Fp32_t128x8x128u2_et64x8_m64x8x32_cga1x1x1_16dp256b_s8_TN_transOut_noShflA_dsFp8_schedS_bN_ldgsts_dynBatch_sm100a", 416, "88773866a382be8789266a88f1a987f7a5287b003b310ab7def1c3008ca19fb9", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E4m3E4m3_Fp32_t128x8x128u2_et64x8_m64x8x32_cga1x1x1_16dp256b_s8_TN_transOut_noShflA_dsFp8_schedS_bN_ldgsts_dynBatch_sm100a_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x8x128u2_et64x8_m64x8x32_cga1x1x1_16dp256b_s8_TN_transOut_noShflA_dsFp8_schedS_bN_ldgsts_dynBatch_sm100a_cubin_len, 149504, "bmm_E4m3_E4m3E4m3_Fp32_t128x8x128u2_et64x8_m64x8x32_cga1x1x1_16dp256b_s8_TN_transOut_noShflA_dsFp8_schedS_bN_ldgsts_dynBatch_sm100a", 416, "291c2f215974dec6ac1b5518a2ff145070ae32b1748182babec9c28c9732cf8b", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -16967,6 +17168,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -16980,7 +17182,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_E4m3_E4m3E4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_bN_sm100a_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_bN_sm100a_cubin_len, 216064, "bmm_E4m3_E4m3E4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_bN_sm100a", 224, "152ab844aa48284102fcacb895ed55b56843eb3c837c3cd5c3789f7886cf05bd", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E4m3E4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_bN_sm100a_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_bN_sm100a_cubin_len, 216064, "bmm_E4m3_E4m3E4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_bN_sm100a", 224, "4973310b9ec962fd2f5585ed23cf0d1c45235c30df7ebecaa8147710a43d2c9a", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -17048,6 +17250,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -17061,7 +17264,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_E4m3_E4m3E4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_tokSfB_schedS_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_tokSfB_schedS_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 216064, "bmm_E4m3_E4m3E4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_tokSfB_schedS_bN_ldgsts_swiGlu_dynBatch_sm100a", 256, "482f24c99be92e43f8cdd4a18cfa55f2adf606db20fbbd55f36ff8b70e8aacc7", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E4m3E4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_tokSfB_schedS_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_tokSfB_schedS_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 216064, "bmm_E4m3_E4m3E4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_tokSfB_schedS_bN_ldgsts_swiGlu_dynBatch_sm100a", 256, "91563530f04990e31c8cd5d7ccee5cdcea655c1b4ecfd73cd0683b46d48521f6", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -17129,6 +17332,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -17142,7 +17346,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_E4m3_E4m3E4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_bN_sm100a_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_bN_sm100a_cubin_len, 216064, "bmm_E4m3_E4m3E4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_bN_sm100a", 224, "3869f9dca39d557adbb1bfd50d308b85bc8903ca46b92c2ec76da7a3fa34b2a9", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E4m3E4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_bN_sm100a_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_bN_sm100a_cubin_len, 216064, "bmm_E4m3_E4m3E4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_bN_sm100a", 224, "e7763784a95c16a64f62e8ad4469f40917ded2dad062e9ce6b4885988890db36", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -17210,6 +17414,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -17223,7 +17428,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_E4m3_E4m3E4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_tokSfB_schedS_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_tokSfB_schedS_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 216064, "bmm_E4m3_E4m3E4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_tokSfB_schedS_bN_ldgsts_swiGlu_dynBatch_sm100a", 256, "8a74a24334a51920941da36e7c242e00cd32d4a9ed6152e3516bf5bd2867fe79", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_E4m3E4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_tokSfB_schedS_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_E4m3E4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_tokSfB_schedS_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 216064, "bmm_E4m3_E4m3E4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_tokSfB_schedS_bN_ldgsts_swiGlu_dynBatch_sm100a", 256, "afaf369c24d661e85cbcb99c65752567f91fe54cc6ce8cda0cb36be3f1ed1eb9", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -17291,6 +17496,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -17304,7 +17510,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256_et128x16_m128x16x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256_et128x16_m128x16x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 199680, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256_et128x16_m128x16x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 352, "ab54325f477b56b5920e200a7ad8da36c9f4b806a77020b625f4291d65074e72", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256_et128x16_m128x16x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256_et128x16_m128x16x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 199680, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256_et128x16_m128x16x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 352, "aa3bc06ff914d5fa7baebb60f104cc02d5306a48bc5d596c24df457a57b7bbe5", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -17372,6 +17578,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -17385,7 +17592,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256_et128x16_m128x16x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256_et128x16_m128x16x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 199680, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256_et128x16_m128x16x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 320, "14450db25b7b8b9002177122a064d2afb1d3265a9c6f42c1cf1fc6258f3756f6", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256_et128x16_m128x16x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256_et128x16_m128x16x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 199680, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256_et128x16_m128x16x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 320, "f27509119e9341e333e243743fbc42346f1aa8953d512a42b9c2b4826b5b52bd", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -17453,6 +17660,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -17466,7 +17674,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256u2_et128x16_m128x16x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256u2_et128x16_m128x16x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 199680, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256u2_et128x16_m128x16x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 352, "12e8a3d1a29b77151948f0eff04dcf7761fb006e1d0e2bff131d73603eec6660", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256u2_et128x16_m128x16x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256u2_et128x16_m128x16x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 199680, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256u2_et128x16_m128x16x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 352, "cab7e0887c19d49dfb7823e8eff72ca08ccf283fb6b90ee50ec5d67cca6b178c", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -17534,6 +17742,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -17547,7 +17756,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256u2_et128x16_m128x16x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256u2_et128x16_m128x16x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 199680, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256u2_et128x16_m128x16x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 320, "e9922e3b3ff2b2e347a5e640e367a5e1fac4611d1cbecadaeb9ad347616aa213", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256u2_et128x16_m128x16x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256u2_et128x16_m128x16x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 199680, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x16x256u2_et128x16_m128x16x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 320, "06591472d49fd68f8fc88a436ccd0cd7cb2ea3b66437e6c47bf1b943deea0124", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -17615,6 +17824,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -17628,7 +17838,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256_et128x32_m128x32x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256_et128x32_m128x32x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 222208, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256_et128x32_m128x32x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 352, "fc65dde13bc699012775f3051144b88566d19be90062474c69d02264566aee64", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256_et128x32_m128x32x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256_et128x32_m128x32x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 222208, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256_et128x32_m128x32x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 352, "a1820b52790c9453b1a8426325ddf68aa1ee0aa4aa14c5585f3898c61fedfa03", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -17696,6 +17906,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -17709,7 +17920,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256_et128x32_m128x32x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256_et128x32_m128x32x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 222208, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256_et128x32_m128x32x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 320, "eac51373fc9147ab74085fad9a32ec6d8c4c9fac50df43fb8379cd65676c3c73", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256_et128x32_m128x32x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256_et128x32_m128x32x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 222208, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256_et128x32_m128x32x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 320, "7fb5c548a1d2e94f8ffcf61889b4317f349b5572cab8faf3a7347797c186543b", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -17777,6 +17988,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -17790,7 +18002,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256u2_et128x32_m128x32x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256u2_et128x32_m128x32x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 222208, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256u2_et128x32_m128x32x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 352, "22cd5b8b381eafd1c899572e8d0da096003bd7bc467304bfeae6b5a6cd384eb2", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256u2_et128x32_m128x32x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256u2_et128x32_m128x32x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 222208, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256u2_et128x32_m128x32x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 352, "f1288f5ca6fc863004f946834eab0e1812187ed532e55ef011fdde8dec07a38e", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -17858,6 +18070,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -17871,7 +18084,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256u2_et128x32_m128x32x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256u2_et128x32_m128x32x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 222208, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256u2_et128x32_m128x32x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 320, "52e08cb277b2862b1ebb84a5e715116c0c81153c022334d03446eb024b649d0b", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256u2_et128x32_m128x32x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256u2_et128x32_m128x32x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 222208, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x32x256u2_et128x32_m128x32x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 320, "ac3a07b6adf6965ee43d451b7008757c9f827529947bd6dddf1132c34e1de5d1", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -17939,6 +18152,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -17952,7 +18166,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 217088, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 352, "9d97644b76b315363b3ba70529ea9e4867034c4e1a200b27c00fa16b20a00fa9", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 217088, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 352, "3d6a2c284b71ab1a9e4bbc1f14ba18aed44838b0d60f5de7a3442e771c4d6f39", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -18020,6 +18234,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -18033,7 +18248,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 217088, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 320, "ca8fc2002df6d923ef929d92f9ba865d47215b248f42cf93b33dbaf638491d91", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 217088, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 320, "b8eaf9fa419b40b1ff9f095abd428d2a63e934a18643b3b0bc5303fd986e1fbe", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -18101,6 +18316,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -18114,7 +18330,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256u2_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256u2_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 217088, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256u2_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 352, "e0a626a967effefd1c66d226bb202180c297ae43f5baa9608ba78bd2043e23f7", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256u2_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256u2_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 217088, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256u2_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 352, "a3eee3ebb194fe171e30e320b973cd9771bcb84a008061d3215af237a2b6c417", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -18182,6 +18398,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -18195,7 +18412,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256u2_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256u2_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 217088, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256u2_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 320, "1a5d33d09c8edc4cfed5668483d3a6e967234c079261f3daea875479ea341ac5", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256u2_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256u2_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 217088, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x64x256u2_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 320, "8e0362ce10207421300589dc3793978c0157ed59ac63afc3a67410577f854538", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -18263,6 +18480,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -18276,7 +18494,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 188416, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 352, "b98c6787f3a534fa77e99624910ab9318120a20500e1962098c73c68d75f050d", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 188416, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 352, "5a9eb70094903767ca8fb09c5b3c907c48e428146ab3f8e693fbc649a1634d3c", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -18344,6 +18562,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -18357,7 +18576,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 188416, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 320, "604321730a733a8a4eb97d8c79d65ba182bba7a7af14b3b092fa4f3761b9d441", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 188416, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 320, "444d88d4a67d0ccaa3884b5e42c9ddf010c3adb9711e745604accd51671ee589", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -18425,6 +18644,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -18438,7 +18658,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 188416, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 352, "e1d647c2707ae8cfac752e717432cb7aacc879f056f70f79222b86bc5150bd33", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 188416, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 352, "4cb907d0a2a145e769658234d551c3d94d8c449fa74c52bca210337c4c670302", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -18506,6 +18726,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -18519,7 +18740,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 188416, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 320, "323d1be1e79e42cd56ffcc75e2b6e1baaabd8cf5823f064aae198c27d8867a2f", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 188416, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 320, "0520b88c899688b49f740cfa9a7a268f541ecfc26264257d59bbb9b116f84013", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -18587,6 +18808,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -18600,7 +18822,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 224256, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 352, "fe3c362576bffd3b3d113069de6bad503945c390689e86225e21f72624d91632", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 224256, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 352, "b565edc3dd1c735a12b19803fe13c1721d2a7f2f9c18d9ce8570e6a37a3771ad", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -18668,6 +18890,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -18681,7 +18904,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 224256, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 320, "60a5eadf5ef0d8d7de011189892ef652f3bf8af71c4e4e2e8f5c4107c7861851", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 224256, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 320, "da16b182217b177236df0365b40f2d0a3c118a6d07a9d02ef99a3f33c4245ca0", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -18749,6 +18972,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -18762,7 +18986,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 224256, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 352, "242ab4d7e83ea6de9412f0db8029b5ffd05161e7446be394a090ddbd44cbf6db", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 224256, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 352, "03548184b958f9911abc4230146e367d4c1a373ddd898a37e75f47adaa52f2dd", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -18830,6 +19054,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -18843,7 +19068,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 224256, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 320, "aefaa29af725f241a8ea19ced6f52ca2a66ba749a64522ebac8b535b9dc4ce2d", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 224256, "bmm_E4m3_MxE2m1E4m3_castMxE4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 320, "6feca0e87cd971c33d0e893193dd779a70effdc80457b4e6b234ee7307b358a7", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -18911,6 +19136,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -18924,7 +19150,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Fp16_E2m1E2m1_Fp32_t128x8x512_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_sm100a_cubin, Bmm_Fp16_E2m1E2m1_Fp32_t128x8x512_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_sm100a_cubin_len, 166912, "bmm_Fp16_E2m1E2m1_Fp32_t128x8x512_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_sm100a", 448, "67a74b1bf921bab5f00ceb9123439db1dc01908db2f4fae2d3e1dabfa6b49e16", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Fp16_E2m1E2m1_Fp32_t128x8x512_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_sm100a_cubin, Bmm_Fp16_E2m1E2m1_Fp32_t128x8x512_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_sm100a_cubin_len, 166912, "bmm_Fp16_E2m1E2m1_Fp32_t128x8x512_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_sm100a", 448, "c5ed3ae4029acd951a85d5f8677238ba3dd49d589fecbaf578017e60a1651eb7", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -18992,6 +19218,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -19005,7 +19232,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Fp16_E2m1E2m1_Fp32_t128x8x512u2_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_sm100a_cubin, Bmm_Fp16_E2m1E2m1_Fp32_t128x8x512u2_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_sm100a_cubin_len, 166912, "bmm_Fp16_E2m1E2m1_Fp32_t128x8x512u2_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_sm100a", 448, "3ae73a1f456ad0d558c2bb82c59bfc30b8a25f7a23a84fc63398039614bea7f3", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Fp16_E2m1E2m1_Fp32_t128x8x512u2_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_sm100a_cubin, Bmm_Fp16_E2m1E2m1_Fp32_t128x8x512u2_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_sm100a_cubin_len, 166912, "bmm_Fp16_E2m1E2m1_Fp32_t128x8x512u2_et128x8_m128x8x64_cga1x1x1_16dp256b_s4_TN_transOut_schedS_bN_sm100a", 448, "eb3c978b692e8a741f87252d19b919b9a41f5d5f668928be1f87a580afb6d360", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -19073,6 +19300,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -19086,7 +19314,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Fp16_E4m3E4m3_Fp32_t128x8x128_et64x8_m64x8x32_cga1x1x1_16dp256b_s3_TN_transOut_noShflA_dsFp8_schedS_bN_sm100a_cubin, Bmm_Fp16_E4m3E4m3_Fp32_t128x8x128_et64x8_m64x8x32_cga1x1x1_16dp256b_s3_TN_transOut_noShflA_dsFp8_schedS_bN_sm100a_cubin_len, 61440, "bmm_Fp16_E4m3E4m3_Fp32_t128x8x128_et64x8_m64x8x32_cga1x1x1_16dp256b_s3_TN_transOut_noShflA_dsFp8_schedS_bN_sm100a", 384, "f802b9e2abb8aeac78ea3ff09ddea4ca0139c524814842297677d9c82f7b91b6", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Fp16_E4m3E4m3_Fp32_t128x8x128_et64x8_m64x8x32_cga1x1x1_16dp256b_s3_TN_transOut_noShflA_dsFp8_schedS_bN_sm100a_cubin, Bmm_Fp16_E4m3E4m3_Fp32_t128x8x128_et64x8_m64x8x32_cga1x1x1_16dp256b_s3_TN_transOut_noShflA_dsFp8_schedS_bN_sm100a_cubin_len, 61440, "bmm_Fp16_E4m3E4m3_Fp32_t128x8x128_et64x8_m64x8x32_cga1x1x1_16dp256b_s3_TN_transOut_noShflA_dsFp8_schedS_bN_sm100a", 384, "0021520de6ed1a41176410ce74fc6daf2479d59f896d129bf261cdf77d73390c", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -19154,6 +19382,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -19167,7 +19396,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Fp16_E4m3E4m3_Fp32_t128x8x128u2_et64x8_m64x8x32_cga1x1x1_16dp256b_s3_TN_transOut_noShflA_dsFp8_schedS_bN_sm100a_cubin, Bmm_Fp16_E4m3E4m3_Fp32_t128x8x128u2_et64x8_m64x8x32_cga1x1x1_16dp256b_s3_TN_transOut_noShflA_dsFp8_schedS_bN_sm100a_cubin_len, 61440, "bmm_Fp16_E4m3E4m3_Fp32_t128x8x128u2_et64x8_m64x8x32_cga1x1x1_16dp256b_s3_TN_transOut_noShflA_dsFp8_schedS_bN_sm100a", 384, "711c92dce3a3b2215b1656a1369fdbce35cbad626978930ea76ed21303f5c580", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Fp16_E4m3E4m3_Fp32_t128x8x128u2_et64x8_m64x8x32_cga1x1x1_16dp256b_s3_TN_transOut_noShflA_dsFp8_schedS_bN_sm100a_cubin, Bmm_Fp16_E4m3E4m3_Fp32_t128x8x128u2_et64x8_m64x8x32_cga1x1x1_16dp256b_s3_TN_transOut_noShflA_dsFp8_schedS_bN_sm100a_cubin_len, 61440, "bmm_Fp16_E4m3E4m3_Fp32_t128x8x128u2_et64x8_m64x8x32_cga1x1x1_16dp256b_s3_TN_transOut_noShflA_dsFp8_schedS_bN_sm100a", 384, "5466aebbc701240fbdec082f2c221da33724e36e9cc37244e1c663351237d3e5", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -19235,6 +19464,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -19248,7 +19478,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Fp16_E4m3E4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_bN_sm100a_cubin, Bmm_Fp16_E4m3E4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_bN_sm100a_cubin_len, 217088, "bmm_Fp16_E4m3E4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_bN_sm100a", 224, "49ed916f4258056bd5b8368ad5369ee36dd73c22adfcf17d10092dce5e2ed81c", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Fp16_E4m3E4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_bN_sm100a_cubin, Bmm_Fp16_E4m3E4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_bN_sm100a_cubin_len, 217088, "bmm_Fp16_E4m3E4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_bN_sm100a", 224, "799f43658600a41c4e2818cb4b7b4bbc21671579203965fa7c22bba8807bd20d", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -19316,6 +19546,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -19329,7 +19560,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_Fp16_E4m3E4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_bN_sm100a_cubin, Bmm_Fp16_E4m3E4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_bN_sm100a_cubin_len, 217088, "bmm_Fp16_E4m3E4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_bN_sm100a", 224, "4269270d52237abe11b492c549fd747c67b69a1ac8fbecfbb4664a714c40b2cb", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_Fp16_E4m3E4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_bN_sm100a_cubin, Bmm_Fp16_E4m3E4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_bN_sm100a_cubin_len, 217088, "bmm_Fp16_E4m3E4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_bN_sm100a", 224, "c84c730baba847e750182a60ae41edaf2f9a0ea0411edd2c026c9e12947edab1", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(0)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -19397,6 +19628,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -19410,7 +19642,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256_et128x16_m128x16x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256_et128x16_m128x16x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 123904, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256_et128x16_m128x16x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 512, "40696877da9e1b7d05ce9b019165ffbc29bb6078772b0e4c92de2f8a7cdf9755", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256_et128x16_m128x16x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256_et128x16_m128x16x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 123904, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256_et128x16_m128x16x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 512, "c2cfbc6044bd82ef42dfe764e9c643a45425d772accdc03b5d8377fa6d632cf8", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -19478,6 +19710,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -19491,7 +19724,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256_et128x16_m128x16x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256_et128x16_m128x16x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 123904, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256_et128x16_m128x16x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 480, "c3bf2438b521547fbd896c1c4300fb177097ca65a5cf68a22ec7b4844ab17056", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256_et128x16_m128x16x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256_et128x16_m128x16x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 123904, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256_et128x16_m128x16x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 480, "3fde5d47184b17a6af71422d4daf94641e796f735a8a7693bb9e94100204c173", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -19559,6 +19792,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -19572,7 +19806,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256_et128x16_m128x16x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256_et128x16_m128x16x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 161792, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256_et128x16_m128x16x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 512, "3f1884dec8a7cc9456018d4d97a14e188d4d2e82a7654f722f405da99e572705", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256_et128x16_m128x16x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256_et128x16_m128x16x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 161792, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256_et128x16_m128x16x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 512, "29837084d85e9b1c9fbc8dd727b650f97e9410ef263c0691fb2ad72f275b0811", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -19640,6 +19874,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -19653,7 +19888,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256_et128x16_m128x16x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256_et128x16_m128x16x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 161792, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256_et128x16_m128x16x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 480, "7010abe875caa166037d0710d9159386c85fe194db4c3f3a66c191365f0e3c73", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256_et128x16_m128x16x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256_et128x16_m128x16x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 161792, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256_et128x16_m128x16x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 480, "07707a930b5a3993c338e678c6ea245a7a26a36872fa2b42da288a762b68daae", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -19721,6 +19956,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -19734,7 +19970,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256u2_et128x16_m128x16x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256u2_et128x16_m128x16x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 123904, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256u2_et128x16_m128x16x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 512, "c0c79b551e88422e2ead076d96bd9996d77edc399de04fa93317d7870af7e4f7", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256u2_et128x16_m128x16x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256u2_et128x16_m128x16x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 123904, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256u2_et128x16_m128x16x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 512, "1632e3669c9c1476469d702551d80408462a570d59133ddea4038b15aa4bdd92", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -19802,6 +20038,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -19815,7 +20052,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256u2_et128x16_m128x16x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256u2_et128x16_m128x16x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 123904, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256u2_et128x16_m128x16x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 480, "7b57a3aaef30fff278c6e2bac041643279159503391787098472b7b596ab46c2", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256u2_et128x16_m128x16x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256u2_et128x16_m128x16x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 123904, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256u2_et128x16_m128x16x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 480, "02f8829ceeef6300573b6b3f1df1039f3562e553902bacf07f40dd3afb67fd14", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -19883,6 +20120,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -19896,7 +20134,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256u2_et128x16_m128x16x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256u2_et128x16_m128x16x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 161792, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256u2_et128x16_m128x16x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 512, "eebe33d868fb4bc2154ac957368a12c67600abbc17a8974d7f3b4b61266e92f2", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256u2_et128x16_m128x16x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256u2_et128x16_m128x16x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 161792, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256u2_et128x16_m128x16x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 512, "50de36ba81043b68eb60f5cfcf788971fe1f0baaac95a5dd530d8414279cf23d", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -19964,6 +20202,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -19977,7 +20216,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256u2_et128x16_m128x16x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256u2_et128x16_m128x16x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 161792, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256u2_et128x16_m128x16x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 480, "c8361d6f470b8ede87edc26f9941f0e4eed16dd0b9874e8d11207dd266e0b11b", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256u2_et128x16_m128x16x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256u2_et128x16_m128x16x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 161792, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x16x256u2_et128x16_m128x16x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 480, "052f40c1bc9596a042e6f0c67323329dc7e14db3a124a480cb51c6eee6cdf49d", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -20045,6 +20284,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -20058,7 +20298,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256_et128x32_m128x32x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256_et128x32_m128x32x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 138240, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256_et128x32_m128x32x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 512, "da48c2bd2ac7efb1dfd0f2aec4603f73dd5bfd6b22088f5903d8b532d706f750", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256_et128x32_m128x32x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256_et128x32_m128x32x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 138240, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256_et128x32_m128x32x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 512, "96b6e482109df2f684c6e557e881e31e596ce94834e91498c63cb5e64b6243f5", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -20126,6 +20366,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -20139,7 +20380,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256_et128x32_m128x32x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256_et128x32_m128x32x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 138240, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256_et128x32_m128x32x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 480, "d60fbad583f1578fd2d4eabd1fc2f0966b1a769f3ce1a37e42d5e71747b8ad58", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256_et128x32_m128x32x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256_et128x32_m128x32x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 138240, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256_et128x32_m128x32x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 480, "d9bd6253fb5083a8affbe592d8de646de77f4a9747df3a34cc4396b512bdfcde", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -20207,6 +20448,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -20220,7 +20462,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256_et128x32_m128x32x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256_et128x32_m128x32x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 181248, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256_et128x32_m128x32x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 512, "7c640b43f23ce1e73a21634e9b937515b418da881ab8d3b5e419d030321bc314", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256_et128x32_m128x32x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256_et128x32_m128x32x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 181248, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256_et128x32_m128x32x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 512, "55ad7ffe4032ba284a929b0a7d6212b612722fe006f0e4441b5205d8de103b24", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -20288,6 +20530,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -20301,7 +20544,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256_et128x32_m128x32x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256_et128x32_m128x32x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 181248, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256_et128x32_m128x32x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 480, "3c640831a62649fd27224ca458044a88c98478c92746b83c79cde23b86dfe01c", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256_et128x32_m128x32x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256_et128x32_m128x32x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 181248, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256_et128x32_m128x32x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 480, "e6ce1fb072df08f8d12fe96d53796c78bdb836ee058f9bde7b5ced2278fc90c1", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -20369,6 +20612,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -20382,7 +20626,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256u2_et128x32_m128x32x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256u2_et128x32_m128x32x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 138240, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256u2_et128x32_m128x32x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 512, "1ddb4ee50b017bcadc272d8f41f7643ffea7596b4cdb8da361ad426e84a7407d", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256u2_et128x32_m128x32x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256u2_et128x32_m128x32x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 138240, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256u2_et128x32_m128x32x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 512, "0d577bd2ee65de048e5250f3c7d9128aef0db168ff7d231fbd832fc122cab47a", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -20450,6 +20694,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -20463,7 +20708,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256u2_et128x32_m128x32x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256u2_et128x32_m128x32x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 138240, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256u2_et128x32_m128x32x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 480, "3e359d28a9e6081054557cf0576e006d27731c8d454a4172dd6664aba95a1a4b", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256u2_et128x32_m128x32x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256u2_et128x32_m128x32x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 138240, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256u2_et128x32_m128x32x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 480, "40628f518c6ec0bfb6134def0ad8198d2faff2ae309099bee4a35763818016ba", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -20531,6 +20776,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -20544,7 +20790,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256u2_et128x32_m128x32x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256u2_et128x32_m128x32x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 181248, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256u2_et128x32_m128x32x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 512, "34c5a467424a49ba59786762eec320ac9e03dda8c3bf5cd529dd4fca8b9ec6e6", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256u2_et128x32_m128x32x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256u2_et128x32_m128x32x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 181248, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256u2_et128x32_m128x32x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 512, "a74ed7009c8c4033fc0f02a2ac0ea2464a8829141eb7433e1a4d9d3d8b692d82", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -20612,6 +20858,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -20625,7 +20872,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256u2_et128x32_m128x32x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256u2_et128x32_m128x32x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 181248, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256u2_et128x32_m128x32x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 480, "590293510c4bb49006d93b6b72ed3f2b578bc54a313d2f3f0561ab57cddeb5dc", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256u2_et128x32_m128x32x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256u2_et128x32_m128x32x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 181248, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x32x256u2_et128x32_m128x32x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 480, "515a9a9f96a1fb15d4662c2cc9c87525c5da9b6bb268b6f8c2fe0b37623a97e5", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -20693,6 +20940,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -20706,7 +20954,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x256_et128x64_m128x64x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x256_et128x64_m128x64x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 168960, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x256_et128x64_m128x64x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 512, "0dbb8a039ebfa3c7dc048d953469d83489a44d458967e9c11941fea5de6fc058", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x256_et128x64_m128x64x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x256_et128x64_m128x64x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 168960, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x256_et128x64_m128x64x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 512, "934e0e149a2b20c7cec7a15916bd15d21074ee9d3855fd3f1c18a411ac6c657b", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -20774,6 +21022,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -20787,7 +21036,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x256_et128x64_m128x64x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x256_et128x64_m128x64x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 168960, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x256_et128x64_m128x64x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 480, "7b3c8ec9289a1d2207cf1b19748e9a75f077b4167f714349e4011d9fee8fadad", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x256_et128x64_m128x64x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x256_et128x64_m128x64x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 168960, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x256_et128x64_m128x64x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 480, "97e4193bc73ba4834bd92d6b938040d0cc77edfc2385931636fe26ca735b3bc3", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -20855,6 +21104,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -20868,7 +21118,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x256_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x256_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 220160, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x256_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 512, "58d1c98122caf005d271ab88a34f855e325e8f0f2d66f876cdd76e20ff3ce369", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x256_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x256_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 220160, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x256_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 512, "14887d0f230c05da6b55e19b2605115c1585429fa7e034546ad20cb212b340c8", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -20936,6 +21186,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -20949,7 +21200,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x256_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x256_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 220160, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x256_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 480, "1457034e7c9e92cb09300fb6ba6795d6b84fb4342f4edf7c19643b9b65052a6d", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x256_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x256_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 220160, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x256_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 480, "344a897c696a28b14b4e452e9b190da1a4b9f6cbd9ca41472eeec348dfeaa9d6", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -21017,6 +21268,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -21030,7 +21282,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x256u2_et128x64_m128x64x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x256u2_et128x64_m128x64x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 168960, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x256u2_et128x64_m128x64x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 512, "a40eeca15f4f552f307b91e9a22c8a5197e5c3d4919477f697301a98378f8101", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x256u2_et128x64_m128x64x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x256u2_et128x64_m128x64x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 168960, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x256u2_et128x64_m128x64x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 512, "cf26f5247795cb73af7165eace750a99d1f69904fc05c65aab0a7cdbc53b36c0", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -21098,6 +21350,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -21111,7 +21364,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x256u2_et128x64_m128x64x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x256u2_et128x64_m128x64x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 168960, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x256u2_et128x64_m128x64x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 480, "99dcc2d0798749b46b12961a2d201943512f52b6667809b858edc06df7a8b42a", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x256u2_et128x64_m128x64x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x256u2_et128x64_m128x64x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 168960, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x256u2_et128x64_m128x64x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 480, "e86aad17b6dd651f5599b02f794c83efb4c78005736bf0fad5e237eb85c05033", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -21179,6 +21432,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -21192,7 +21446,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x256u2_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x256u2_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 220160, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x256u2_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 512, "9fa342cfd5d3879311a08f25bf618c49fdfab7e8cf91103caed313ee9d2f150c", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x256u2_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x256u2_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 220160, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x256u2_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 512, "6d0836d883e8fa30cc6dc3e1dbfdbea14e459d47d3387ccea49e05cedbc2e811", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -21260,6 +21514,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -21273,7 +21528,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x256u2_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x256u2_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 220160, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x256u2_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 480, "cc5b0046bdc3b04df55bf8ce07ab3544c15b0144d8130a4241db5da8a6dbee34", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x256u2_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x256u2_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 220160, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x64x256u2_et128x64_m128x64x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 480, "6e02f2ec03e0c7264b291928e5c63b2e5ef1f85441757f10bf28242cab842625", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -21341,6 +21596,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -21354,7 +21610,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 152576, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 512, "bae727288bb8b680c8bad571eff70ff26aade368dec271a53362ca4422960431", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 152576, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 512, "f665ef60036d58f1875c6630fd3c36b4a4690fb6da50f8445ae134b82ea04e68", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -21422,6 +21678,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -21435,7 +21692,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 152576, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 480, "192be1a3c8b60f0c88f34fca391eb2cf2b38a8029a111fe2cdc8c05efacd6941", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 152576, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 480, "ca51982e110248abd0d4bdfbb70c6d76d1fbc23036cc441581de5b943ee5198d", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -21503,6 +21760,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -21516,7 +21774,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 188416, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 512, "e770ab2272624e84866170eddb21f56ff64a4f62b8600e44fa8ece370642dc4c", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 188416, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 512, "db78c26c8ea7e5bfa589444923b52abfa2a7a8a0351159e049c9267a738ea987", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -21584,6 +21842,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -21597,7 +21856,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 188416, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 480, "ea4bffd88d39c0867a1637f29ae3f566805f33e942b84a734279cacc0ed8aae5", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 188416, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 480, "953c318c76da83038f52b569de1c06088d3306f12a7b479bbffdb2245735d732", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -21665,6 +21924,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -21678,7 +21938,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s6_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s6_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 224256, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s6_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 512, "de9562649802b018e6a0210dd7d074f13e26d0339da546abb29b76b76cfeb781", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s6_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s6_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 224256, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s6_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 512, "5e2434ec5d835069d5f781550ec344ccbed4989bfa925c8d4697e33d0f38cc74", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -21746,6 +22006,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -21759,7 +22020,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s6_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s6_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 224256, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s6_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 480, "d919fdb097601e186d87c4a56bb37e748995a29ec654fa335ec2f93539cfa88a", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s6_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s6_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 224256, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x1_16dp256b_s6_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 480, "ec444c21c52a58becd398afbcf546418d9e114daf3f8a8dce715bd9397a857ef", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -21827,6 +22088,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -21840,7 +22102,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x2_16dp256b_s4_splitK2_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x2_16dp256b_s4_splitK2_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 159744, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x2_16dp256b_s4_splitK2_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 512, "0a00167ad8fd6cdb974164bd7f805b8986627f30ae24a1dc95f328ded2195dc0", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x2_16dp256b_s4_splitK2_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x2_16dp256b_s4_splitK2_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 159744, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x2_16dp256b_s4_splitK2_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 512, "24b9797e2a03dac8ef9db0cb7a3f29e0665d0f3195bdc12d3e97301a6b763373", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -21908,6 +22170,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -21921,7 +22184,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x2_16dp256b_s4_splitK2_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x2_16dp256b_s4_splitK2_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 151552, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x2_16dp256b_s4_splitK2_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 480, "d6f7a20d0450ea922101672831732a2906daa15336944d56b22ec417b232cc36", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x2_16dp256b_s4_splitK2_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x2_16dp256b_s4_splitK2_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 151552, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x2_16dp256b_s4_splitK2_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 480, "ec3f5bb314b51d1c68dfd5676b56744bcfce161e13ec56118daa6b37dfec6b5b", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -21989,6 +22252,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -22002,7 +22266,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x2_16dp256b_s5_splitK2_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x2_16dp256b_s5_splitK2_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 195584, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x2_16dp256b_s5_splitK2_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 512, "6bc6ef770ab53785cdc5238cd8fd4e07edda9b41563513355081c0eb184caff1", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x2_16dp256b_s5_splitK2_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x2_16dp256b_s5_splitK2_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 195584, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x2_16dp256b_s5_splitK2_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 512, "6f9aa51781f908a895e69467f9a498b9ddf0f8ca4eb3ff7588c5d716431aaca6", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -22070,6 +22334,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -22083,7 +22348,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x2_16dp256b_s5_splitK2_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x2_16dp256b_s5_splitK2_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 187392, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x2_16dp256b_s5_splitK2_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 480, "a4a7ded3221473e59a069e60eb98d8485f81edcca5ef3736b4170d9fd315e751", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x2_16dp256b_s5_splitK2_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x2_16dp256b_s5_splitK2_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 187392, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x2_16dp256b_s5_splitK2_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 480, "ba484fdf619a6072f398a18c3cc4c5dd01c4068c55b08e364b9122c5233e2cd7", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -22151,6 +22416,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -22164,7 +22430,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x2_16dp256b_s6_splitK2_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x2_16dp256b_s6_splitK2_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 231424, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x2_16dp256b_s6_splitK2_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 512, "ba5508ee343f4186933f2fae1a565e71c8ebc33b8e025501e05f7705d70fc82a", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x2_16dp256b_s6_splitK2_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x2_16dp256b_s6_splitK2_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 231424, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x2_16dp256b_s6_splitK2_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 512, "dcba9f175b64e4998dfe660c72a3a076c8da9288b225256d3792dde4c56c1a48", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -22232,6 +22498,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -22245,7 +22512,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x2_16dp256b_s6_splitK2_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x2_16dp256b_s6_splitK2_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 223232, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x2_16dp256b_s6_splitK2_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 480, "542a69a0fb053fb9dde558ba9811d93fb910eef1f029bc4cb145475322096c7f", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x2_16dp256b_s6_splitK2_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x2_16dp256b_s6_splitK2_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 223232, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256_et128x8_m128x8x32_cga1x1x2_16dp256b_s6_splitK2_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 480, "b225fbe8816438e48428b707e2ba6a205c67acc4adcb01a118bda00418ff406c", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -22313,6 +22580,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -22326,7 +22594,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 152576, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 512, "ba31fae8f41fef0470754c0d230afceaebd909a73557afc2978410762e907ce7", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 152576, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s4_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 512, "2b2ec120e9059aea37f17bd0f345173ca19ef3ddb7f0769a441c4672b01eaf08", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -22394,6 +22662,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -22407,7 +22676,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 152576, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 480, "79098fe9a2930ebcd2514d718c8ab379a841023fc16e7241c937558ff678d211", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 152576, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s4_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 480, "2462903bfe90426892b69393811f8ce0f3209794e1512164c0cd8329d6a85cdb", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -22475,6 +22744,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -22488,7 +22758,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 188416, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 512, "5993032d9966db0695e30da4a061dc641b19f379db817236d63762f18903a427", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 188416, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 512, "cf97903c46cbb0c86bc8b80d195304e94adf293ad8f75208749a5c2dc45e4e4a", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -22556,6 +22826,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -22569,7 +22840,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 188416, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 480, "81dbc468cf5870dc682c64f0c31f4a6ec4dff35b46018842fb7ed69c0a99246b", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 188416, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s5_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 480, "9aa4db4b49aad5da17d2379ca887aa9b07a9d0391953ac211001cee1b234a73c", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -22637,6 +22908,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -22650,7 +22922,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s6_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s6_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 224256, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s6_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 512, "f3383a63225f6190390823dacc2df222535f502ab837ba3e6e09739510168d13", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s6_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s6_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 224256, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s6_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 512, "92f4423ee6acb3636ac296af153218f1c42f5ef1d805a11fa58acc9944700c8e", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -22718,6 +22990,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -22731,7 +23004,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s6_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s6_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 224256, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s6_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 480, "f720403d4bd3fa450baffd4a4dd8fdcbe27f8d88afaf994cff0957b868fd0186", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s6_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s6_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 224256, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s6_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 480, "465b71c6f744c338beb22fa0bfaa9eee39cdb9acb7651544a9a2294dcb2d453e", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -22799,6 +23072,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -22812,7 +23086,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s4_splitK2_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s4_splitK2_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 159744, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s4_splitK2_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 512, "e4dbfccf38dfa054190a164f32708d2ca75d45deea55577e14d6f36a402315b5", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s4_splitK2_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s4_splitK2_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 159744, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s4_splitK2_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 512, "f54e9c36437932b25597cf9d7ccf7a29c9724bc4ae0309079cf4d2e29d9a6dce", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -22880,6 +23154,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -22893,7 +23168,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s4_splitK2_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s4_splitK2_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 151552, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s4_splitK2_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 480, "917e88fbd0ea3a39b678f12c90b4b2edf4898ba2fea9bbd6cee7bb2311d73b6e", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s4_splitK2_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s4_splitK2_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 151552, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s4_splitK2_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 480, "a45e0c9705504596a77df89917e740e6a1cde5b343e0514573b42ea196086375", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -22961,6 +23236,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -22974,7 +23250,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s5_splitK2_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s5_splitK2_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 195584, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s5_splitK2_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 512, "26dbc00a264bc2e4891a36312b671ca6c5fb8214b7299f27c86f37d04fd34e22", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s5_splitK2_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s5_splitK2_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 195584, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s5_splitK2_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 512, "8ef260af8dbd618bbaff3e5a0915e90b074d0ce8a4c6c956ce37049b0200aa02", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -23042,6 +23318,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -23055,7 +23332,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s5_splitK2_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s5_splitK2_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 187392, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s5_splitK2_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 480, "9d64861d57c2e5aa04f09692e2e47094ef1780b081cc0cdb05e083eea040c278", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s5_splitK2_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s5_splitK2_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 187392, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s5_splitK2_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 480, "619863210983a9841e0c7bf748ec2b8f32d99b14e4fc25f202fb1fbf76486601", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -23123,6 +23400,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -23136,7 +23414,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s6_splitK2_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s6_splitK2_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 231424, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s6_splitK2_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 512, "c0f9ab2f214521a9f018a136227ea517f56dcf9c28e8a2f38032544271d57d5e", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s6_splitK2_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s6_splitK2_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 231424, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s6_splitK2_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 512, "e9966f2eb459f6516f279dd530a740da25b97f98306426862882ef261994b178", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -23204,6 +23482,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -23217,7 +23496,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s6_splitK2_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s6_splitK2_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 223232, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s6_splitK2_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 480, "3d8b8923d12914dc795a5a554a6365d913962e456a5f999871f06a9f08bc9e16", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s6_splitK2_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s6_splitK2_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 223232, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x256u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s6_splitK2_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 480, "e2d318df8eb6a40e08a341ac6af1e10481702ca8fc9170f0443a96f4b6d490e8", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -23285,6 +23564,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -23298,7 +23578,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 224256, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 512, "74812879817f6be2e602ff192c2396daf301adabc3ac85969fc4745bf7c27ccf", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 224256, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 512, "9633c5cbaf70db0ee900e52ea2eac701cdbf2e3e0f7808e153ef2a70e89c6d97", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -23366,6 +23646,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -23379,7 +23660,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 224256, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 480, "98cfe4cb76962a20e51dda89677e8100164ea9658dc2bf9b5c9f60c8f5d808d7", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 224256, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 480, "a130653f7ad081a498b99bd007ed51be3c7cb16abffa071b91e36502a3307a65", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -23447,6 +23728,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -23460,7 +23742,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x2_16dp256b_s3_splitK2_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x2_16dp256b_s3_splitK2_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 231424, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x2_16dp256b_s3_splitK2_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 512, "f7f1853f3e647394ec2edcce104abb2bd6839278c24eb4d1e513e99e8547420f", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x2_16dp256b_s3_splitK2_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x2_16dp256b_s3_splitK2_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 231424, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x2_16dp256b_s3_splitK2_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 512, "4fb3656258c3d98d3f5fd6969a4209d63e93239b41ca980b04debe2e53106b02", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -23528,6 +23810,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -23541,7 +23824,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x2_16dp256b_s3_splitK2_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x2_16dp256b_s3_splitK2_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 223232, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x2_16dp256b_s3_splitK2_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 480, "f23d10758fd530484b8850f61510b30a3505cec02a2b0c54b11ad004e7116ca0", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x2_16dp256b_s3_splitK2_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x2_16dp256b_s3_splitK2_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 223232, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512_et128x8_m128x8x32_cga1x1x2_16dp256b_s3_splitK2_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 480, "7f4692ea596508b3ef3db1f36f678f04089df32e3288354bf5c2c136bf65c188", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -23609,6 +23892,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -23622,7 +23906,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 224256, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 512, "614536a5b0951c0cc5c5529416563abd95d35249ddd51884fe23adc8435b6abf", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 224256, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 512, "4e4ea1a60167567c6bfb4158863a37128d287aa9b36b375d58faee8219a56171", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -23690,6 +23974,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -23703,7 +23988,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 224256, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 480, "be2e971fa7ad0128bd4ba9be89a31d902726f627e64634863ecbf4f63cf8c251", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 224256, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x1_16dp256b_s3_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 480, "3a7a0740f2e48c242086cb7af3f8b88a21edd1dd75e44a2bc555d430d02158a9", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -23771,6 +24056,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -23784,7 +24070,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s3_splitK2_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s3_splitK2_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 231424, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s3_splitK2_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 512, "28143ca89515b1a9912d8bc6c80676ddbae7a068f263da7319c17617fd6aa8db", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s3_splitK2_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s3_splitK2_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 231424, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s3_splitK2_TN_transOut_schedP_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 512, "3ae741f0da39d883451c619222bc39b1fc4c9cb314609a7dbb77b3efb9e1cd89", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -23852,6 +24138,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(1)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)
@@ -23865,7 +24152,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mNumRegsPerThreadEpilogueWarp */ 0
 , /* mNumRegsCastAWarps */ 0
  }, gemm::SmVersion::Sm100a },
-{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s3_splitK2_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s3_splitK2_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 223232, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s3_splitK2_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 480, "58a08a5ca64b5a511b26d5f26adb3cc430d0d9bc654a3eb5f95b7ae84ba80e5c", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
+{Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s3_splitK2_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin, Bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s3_splitK2_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a_cubin_len, 223232, "bmm_MxE4m3_MxE2m1MxE4m3_Fp32_t128x8x512u2_et128x8_m128x8x32_cga1x1x2_16dp256b_s3_splitK2_TN_transOut_schedS_biasM_bN_ldgsts_swiGlu_dynBatch_sm100a", 480, "8197034c8314acff20cee4599db0d371f4096651380693fbce04ecb097efe96d", { /* mAllReduceAlgo */ gemm::AllReduceAlgo(0)
 , /* mBiasType */ gemm::BiasType(1)
 , /* mBlockK */ -1
 , /* mClusterDimX */ 1
@@ -23933,6 +24220,7 @@ static const batchedGemm::BatchedGemmConfig tllmGenBatchedGemmList[] = {
 , /* mSfReshapeFactor */ 1
 , /* mTileScheduler */ gemm::TileScheduler(0)
 , /* mActType */ gemmGatedAct::ActType(0)
+, /* mClampBeforeAct */ 1
 , /* mBatchedM */ {}
 , /* mBatchedN */ {}
 , /* mBatchMode */ batchedGemm::BatchedGemmOptions::BatchMode(1)

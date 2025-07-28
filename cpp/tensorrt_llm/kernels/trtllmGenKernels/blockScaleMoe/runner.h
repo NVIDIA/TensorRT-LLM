@@ -136,7 +136,7 @@ public:
 
     void run(void* hiddenState, void* hiddenStateScale, void* weight, void* weightScale, void* expertWeights,
         float* outputScalesScalar, float* outputScalesGateScalar, float* ptrBias, float* ptrSwiGluAlpha,
-        float* ptrSwiGluBeta, void* output, void* outputScale, int32_t topK, int32_t hiddenSize,
+        float* ptrSwiGluBeta, float* ptrClampLimit, void* output, void* outputScale, int32_t topK, int32_t hiddenSize,
         int32_t intermediateSize, int32_t numExperts, int32_t numTokens, int32_t* permutedIdxToTokenIdx,
         int32_t* ptrNumNonExitingCtas, int32_t* ptrTotalNumPaddedTokens, int32_t* ptrCtaIdxXyToBatchIdx,
         int32_t* ptrCtaIdxXyToMnLimit, void* bmm1Workspace, bool useRoutingScalesOnInput, int device,
@@ -207,6 +207,7 @@ struct MoERunnerArgs
     float* gemm1_bias = nullptr;
     float* gemm1_alpha = nullptr;
     float* gemm1_beta = nullptr;
+    float* gemm1_clamp_limit = nullptr;
     float* gemm2_bias = nullptr;
 
     int32_t num_tokens{0};

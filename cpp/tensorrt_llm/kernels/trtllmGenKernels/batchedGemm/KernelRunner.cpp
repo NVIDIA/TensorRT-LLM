@@ -162,9 +162,10 @@ size_t TrtllmGenBatchedGemmRunner::getWorkspaceSizeInBytes(int32_t m, int32_t n,
 void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens,
     int32_t numTokens, int32_t numBatches, int32_t maxNumCtasInBatchDim, void const* a, void const* sfA, void const* b,
     void const* sfB, void const* perTokensSfA, void const* perTokensSfB, float const* scaleC, float const* scaleGateC,
-    float const* ptrBias, float const* ptrAlpha, float const* ptrBeta, void* c, void* outSfC, int32_t const* routeMap,
-    int32_t const* totalNumPaddedTokens, int32_t const* ctaIdxXyToBatchIdx, int32_t const* ctaIdxXyToMnLimit,
-    int32_t const* numNonExitingCtas, void* workspace, CUstream stream, int device, int32_t configIndex)
+    float const* ptrBias, float const* ptrAlpha, float const* ptrBeta, float const* ptrClampLimit, void* c,
+    void* outSfC, int32_t const* routeMap, int32_t const* totalNumPaddedTokens, int32_t const* ctaIdxXyToBatchIdx,
+    int32_t const* ctaIdxXyToMnLimit, int32_t const* numNonExitingCtas, void* workspace, CUstream stream, int device,
+    int32_t configIndex)
 {
     auto bmm = BatchedGemmInterface();
 
@@ -219,6 +220,7 @@ void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k, std::vecto
     gemmData.mInputBuffers.mPtrBias = ptrBias;
     gemmData.mInputBuffers.mPtrSwiGluAlpha = ptrAlpha;
     gemmData.mInputBuffers.mPtrSwiGluBeta = ptrBeta;
+    gemmData.mInputBuffers.mPtrClampLimit = ptrClampLimit;
 
     gemmData.mInputBuffers.mPtrRouteMap = routeMap;
 
@@ -262,7 +264,7 @@ void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k, std::vecto
     run(m, n, k, batchedTokens, /* numTokens */ 0, batchedTokens.size(), /* maxNumCtasInBatchDim */ 0, a, sfA, b, sfB,
         /* perTokensSfA */ nullptr, /* perTokensSfB */ nullptr,
         /* scaleC */ nullptr, /* scaleGateC */ nullptr, /* ptrBias */ nullptr, /* ptrAlpha */ nullptr,
-        /* ptrBeta */ nullptr, c, outSfC,
+        /* ptrBeta */ nullptr, /* ptrClampLimit */ nullptr, c, outSfC,
         /* routeMap */ nullptr, /* totalNumPaddedTokens */ nullptr,
         /* ctaIdxXyToBatchIdx */ nullptr, /* ctaIdxXyToMnLimit */ nullptr,
         /* numNonExitingCtas */ nullptr, workspace, stream, device, configIndex);
@@ -270,12 +272,13 @@ void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k, std::vecto
 
 void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens,
     void const* a, void const* sfA, void const* b, void const* sfB, float const* ptrBias, float const* ptrAlpha,
-    float const* ptrBeta, void* c, void* outSfC, void* workspace, CUstream stream, int device, int32_t configIndex)
+    float const* ptrBeta, float const* ptrClampLimit, void* c, void* outSfC, void* workspace, CUstream stream,
+    int device, int32_t configIndex)
 {
     // Dispatch with block scaling factors and with static batching.
     run(m, n, k, batchedTokens, /* numTokens */ 0, batchedTokens.size(), /* maxNumCtasInBatchDim */ 0, a, sfA, b, sfB,
         /* perTokensSfA */ nullptr, /* perTokensSfB */ nullptr,
-        /* scaleC */ nullptr, /* scaleGateC */ nullptr, ptrBias, ptrAlpha, ptrBeta, c, outSfC,
+        /* scaleC */ nullptr, /* scaleGateC */ nullptr, ptrBias, ptrAlpha, ptrBeta, ptrClampLimit, c, outSfC,
         /* routeMap */ nullptr, /* totalNumPaddedTokens */ nullptr,
         /* ctaIdxXyToBatchIdx */ nullptr, /* ctaIdxXyToMnLimit */ nullptr,
         /* numNonExitingCtas */ nullptr, workspace, stream, device, configIndex);
@@ -288,7 +291,8 @@ void TrtllmGenBatchedGemmRunner::run(int32_t m, int32_t n, int32_t k, std::vecto
     // Dispatch with block scaling factors and with static batching.
     run(m, n, k, batchedTokens, /* numTokens */ 0, batchedTokens.size(), /* maxNumCtasInBatchDim */ 0, a,
         /* sfA */ nullptr, b, /* sfB */ nullptr, /* perTokensSfA */ nullptr, /* perTokensSfB */ nullptr, scaleC,
-        scaleGateC, /* ptrBias */ nullptr, /* ptrAlpha */ nullptr, /* ptrBeta */ nullptr, c,
+        scaleGateC, /* ptrBias */ nullptr, /* ptrAlpha */ nullptr, /* ptrBeta */ nullptr, /* ptrClampLimit */ nullptr,
+        c,
         /* outSfC */ nullptr,
         /* routeMap */ nullptr, /* totalNumPaddedTokens */ nullptr,
         /* ctaIdxXyToBatchIdx */ nullptr, /* ctaIdxXyToMnLimit */ nullptr,
