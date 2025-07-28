@@ -21,8 +21,8 @@ cd nixl
 
 CUDA_SO_PATH=$(find "/usr/local" -path "*/cuda*/compat/*/libcuda.so.1" 2>/dev/null | head -n1| xargs dirname)
 
-if [[ -z "$CUDA_SO_PATH/libcuda.so.1" ]]; then
-    echo "libcuda.so.1 not found "
+if [[ -z "$CUDA_SO_PATH" ]] || [[ ! -f "$CUDA_SO_PATH/libcuda.so.1" ]]; then
+    echo "libcuda.so.1 not found"
     exit 1
 fi
 
