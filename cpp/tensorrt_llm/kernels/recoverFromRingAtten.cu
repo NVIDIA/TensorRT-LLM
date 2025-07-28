@@ -50,6 +50,7 @@ __global__ void reduce4ring_attention(
     int64_t output_start_offset = batchid * s_block * d + block_s_start * d;
     int64_t lm_start_offset = batchid * s_block + block_s_start;
 
+    #pragma nv_diag_suppress static_var_with_dynamic_init
     __shared__ cuda::barrier<cuda::thread_scope::thread_scope_block> barrier;
     if (block.thread_rank() == 0)
     {
