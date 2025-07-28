@@ -16,10 +16,10 @@ global_kvcache_config = KvCacheConfig(max_tokens=10000)
 @pytest.mark.parametrize("return_log_probs", [False, True])
 @pytest.mark.parametrize("gather_generation_logits", [False, True])
 @pytest.mark.parametrize("gather_context_logits", [False, True])
-@pytest.mark.parametrize("enable_torch_sampler", [False, True])
+@pytest.mark.parametrize("use_torch_sampler", [False, True])
 @pytest.mark.parametrize("disable_overlap_scheduler", [False, True])
 def test_generate_with_return_logits(disable_overlap_scheduler: bool,
-                                     enable_torch_sampler: bool,
+                                     use_torch_sampler: bool,
                                      gather_context_logits: bool,
                                      gather_generation_logits: bool,
                                      return_log_probs: bool):
@@ -27,7 +27,7 @@ def test_generate_with_return_logits(disable_overlap_scheduler: bool,
             or return_log_probs):  # prune space
         pytest.skip("Nothing to test")
 
-    if enable_torch_sampler and gather_context_logits:
+    if use_torch_sampler and gather_context_logits:
         pytest.skip("TorchSampler does not support gather_context_logits")
 
     build_config = BuildConfig()
@@ -41,7 +41,7 @@ def test_generate_with_return_logits(disable_overlap_scheduler: bool,
         gather_generation_logits=gather_generation_logits,
         max_batch_size=
         128,  # reduce buffer sizes, specially for generation logits
-        enable_torch_sampler=enable_torch_sampler,
+        use_torch_sampler=use_torch_sampler,
         disable_overlap_scheduler=disable_overlap_scheduler,
     )
 
@@ -83,10 +83,10 @@ def test_generate_with_return_logits(disable_overlap_scheduler: bool,
 @pytest.mark.parametrize("return_log_probs", [False, True])
 @pytest.mark.parametrize("gather_generation_logits", [False, True])
 @pytest.mark.parametrize("gather_context_logits", [False, True])
-@pytest.mark.parametrize("enable_torch_sampler", [False, True])
+@pytest.mark.parametrize("use_torch_sampler", [False, True])
 @pytest.mark.parametrize("disable_overlap_scheduler", [False, True])
 def test_generate_async_with_return_logits(disable_overlap_scheduler: bool,
-                                           enable_torch_sampler: bool,
+                                           use_torch_sampler: bool,
                                            gather_context_logits: bool,
                                            gather_generation_logits: bool,
                                            return_log_probs: bool):
@@ -94,7 +94,7 @@ def test_generate_async_with_return_logits(disable_overlap_scheduler: bool,
             or return_log_probs):  # prune space
         pytest.skip("Nothing to test")
 
-    if enable_torch_sampler and gather_context_logits:
+    if use_torch_sampler and gather_context_logits:
         pytest.skip("TorchSampler does not support gather_context_logits")
 
     build_config = BuildConfig()
@@ -108,7 +108,7 @@ def test_generate_async_with_return_logits(disable_overlap_scheduler: bool,
         gather_generation_logits=gather_generation_logits,
         max_batch_size=
         128,  # reduce buffer sizes, specially for generation logits
-        enable_torch_sampler=enable_torch_sampler,
+        use_torch_sampler=use_torch_sampler,
         disable_overlap_scheduler=disable_overlap_scheduler,
     )
     sampling_params = SamplingParams(
