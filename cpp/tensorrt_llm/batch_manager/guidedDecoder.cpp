@@ -18,6 +18,7 @@
 #include "tensorrt_llm/batch_manager/guidedDecoder.h"
 #include "tensorrt_llm/batch_manager/decoderBuffers.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
+#include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/kernels/logitsBitmask.h"
 
 #include <nlohmann/json.hpp>
@@ -49,20 +50,16 @@ GuidedDecoder::GuidedDecoder(executor::GuidedDecodingConfig const& guidedDecodin
         {
             auto const& metadata = xgrammar::TokenizerInfo::DetectMetadataFromHF(tokenizerStr.value());
             auto const& metadataJson = nlohmann::json::parse(metadata);
-            vocabType = metadataJson["vocab_type"].template get<xgrammar::VocabType>();
-            addPrefixSpace = metadataJson["add_prefix_space"].template get<bool>();
+            vocabType = metadataJson.at("vocab_type").template get<xgrammar::VocabType>();
+            addPrefixSpace = metadataJson.at("add_prefix_space").template get<bool>();
         }
         auto const& tokenizerInfo = xgrammar::TokenizerInfo(guidedDecodingConfig.getEncodedVocab().value(), vocabType,
             mVocabSizePadded, guidedDecodingConfig.getStopTokenIds(), addPrefixSpace);
 
-        float cacheLimitGb = 1.0f;
-        if (std::getenv("XGRAMMAR_CACHE_LIMIT_GB"))
-        {
-            cacheLimitGb = std::stof(std::getenv("XGRAMMAR_CACHE_LIMIT_GB"));
-        }
-
+        auto const cacheLimitGb = common::getFloatEnv("XGRAMMAR_CACHE_LIMIT_GB");
         mXGrammarCompiler = std::make_shared<xgrammar::GrammarCompiler>(tokenizerInfo, /*max_threads=*/8,
-            /*cache_enabled=*/true, /*cache_limit_bytes=*/static_cast<long long>(cacheLimitGb * 1024 * 1024 * 1024));
+            /*cache_enabled=*/true,
+            /*cache_limit_bytes=*/static_cast<long long>(cacheLimitGb.value_or(1.0f) * 1024 * 1024 * 1024));
 
         auto const logitsPtrDtype = BufferDataType{mLogitsDtype, false, true};
         auto constexpr bitmaskDtype = TRTDataType<BitmaskT>::value;
@@ -97,27 +94,56 @@ void GuidedDecoder::build(ScheduledRequests const& scheduledRequests)
                     // The request is in the first context forward step (considering kv cache reuse).
                     auto const& guideType = guidedDecodingParams->getGuideType();
                     auto const& guide = guidedDecodingParams->getGuide();
-                    if (guideType == executor::GuidedDecodingParams::GuideType::kJSON)
+                    switch (guideType)
+                    {
+                    case executor::GuidedDecodingParams::GuideType::kJSON:
                     {
                         mXGrammarMatchers.at(seqSlot) = std::make_shared<xgrammar::GrammarMatcher>(
                             mXGrammarCompiler->CompileBuiltinJSONGrammar());
+                        break;
                     }
-                    else if (guideType == executor::GuidedDecodingParams::GuideType::kJSON_SCHEMA)
+                    case executor::GuidedDecodingParams::GuideType::kJSON_SCHEMA:
                     {
                         mXGrammarMatchers.at(seqSlot) = std::make_shared<xgrammar::GrammarMatcher>(
                             mXGrammarCompiler->CompileJSONSchema(guide.value()));
+                        break;
                     }
-                    else if (guideType == executor::GuidedDecodingParams::GuideType::kREGEX)
+                    case executor::GuidedDecodingParams::GuideType::kREGEX:
                     {
                         auto const& grammar = xgrammar::Grammar::FromRegex(guide.value());
                         mXGrammarMatchers.at(seqSlot)
                             = std::make_shared<xgrammar::GrammarMatcher>(mXGrammarCompiler->CompileGrammar(grammar));
+                        break;
                     }
-                    else if (guideType == executor::GuidedDecodingParams::GuideType::kEBNF_GRAMMAR)
+                    case executor::GuidedDecodingParams::GuideType::kEBNF_GRAMMAR:
                     {
                         auto const& grammar = xgrammar::Grammar::FromEBNF(guide.value());
                         mXGrammarMatchers.at(seqSlot)
                             = std::make_shared<xgrammar::GrammarMatcher>(mXGrammarCompiler->CompileGrammar(grammar));
+                        break;
+                    }
+                    case executor::GuidedDecodingParams::GuideType::kSTRUCTURAL_TAG:
+                    {
+                        auto const& structuralTagParametersJson = nlohmann::json::parse(guide.value());
+                        auto const& structuralTagItemsJson
+                            = structuralTagParametersJson.at("structures").template get<std::vector<nlohmann::json>>();
+                        std::vector<xgrammar::StructuralTagItem> structuralTagItems;
+                        for (auto const& s : structuralTagItemsJson)
+                        {
+                            structuralTagItems.emplace_back(
+                                xgrammar::StructuralTagItem{s.at("begin").template get<std::string>(),
+                                    s.at("schema").dump(), s.at("end").template get<std::string>()});
+                        }
+                        auto const& triggers
+                            = structuralTagParametersJson.at("triggers").template get<std::vector<std::string>>();
+                        mXGrammarMatchers.at(seqSlot) = std::make_shared<xgrammar::GrammarMatcher>(
+                            mXGrammarCompiler->CompileStructuralTag(structuralTagItems, triggers));
+                        break;
+                    }
+                    default:
+                    {
+                        TLLM_THROW("Unsupported guide type.");
+                    }
                     }
                 }
                 else if (llmReq->isGenerationInProgressState())
