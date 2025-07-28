@@ -60,7 +60,7 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
         # in this test.
         max_seq_len=8192,
         enable_chunked_prefill=enable_chunked_prefill,
-        enable_torch_sampler=True,
+        use_torch_sampler=True,
     )
     if enable_chunked_prefill:
         # Use a small max_num_tokens so that the chunked prefill path gets exercised.

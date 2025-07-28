@@ -107,7 +107,7 @@ methods:
         annotation: bool
         default: False
         status: beta
-      enable_torch_sampler:
+      use_torch_sampler:
         annotation: bool
         default: False
         status: beta

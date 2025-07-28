@@ -227,7 +227,7 @@ def setup_llm(args, **kwargs):
                 args.use_piecewise_cuda_graph)
         if args.use_torch_compile else None,
         moe_config=MoeConfig(backend=args.moe_backend),
-        enable_torch_sampler=args.enable_torch_sampler,
+        use_torch_sampler=args.use_torch_sampler,
         max_seq_len=args.max_seq_len,
         max_batch_size=args.max_batch_size,
         max_num_tokens=args.max_num_tokens,

@@ -40,7 +40,7 @@ def create_nemotron_h_llm(use_cuda_graph, disable_overlap_scheduler,
         cuda_graph_config=CudaGraphConfig() if use_cuda_graph else None,
         disable_overlap_scheduler=disable_overlap_scheduler,
         kv_cache_config=KvCacheConfig(enable_block_reuse=False),
-        enable_torch_sampler=False,
+        use_torch_sampler=False,
     )
 
 

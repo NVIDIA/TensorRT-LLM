@@ -41,7 +41,7 @@ def test_llama_draft_target(use_cuda_graph: bool, attn_backend: str):
         max_batch_size=max_batch_size,
         kv_cache_config=kv_cache_config,
         max_num_tokens=2048,
-        enable_torch_sampler=True,
+        use_torch_sampler=True,
     )
 
     spec_config = DraftTargetDecodingConfig(

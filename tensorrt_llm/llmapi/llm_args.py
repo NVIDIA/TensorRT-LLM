@@ -2038,7 +2038,7 @@ class TorchLlmArgs(BaseLlmArgs):
         "If true, will iterate over sampling_params of each request and use the corresponding sampling strategy, e.g. top-k, top-p, etc.",
         status="beta")
 
-    enable_torch_sampler: bool = Field(
+    use_torch_sampler: bool = Field(
         default=False,
         description=
         "If true, will use the Torch sampler instead of the TRTLLM sampler.",
@@ -2329,7 +2329,7 @@ class TorchLlmArgs(BaseLlmArgs):
             attn_backend=self.attn_backend,
             moe_backend=self.moe_config.backend,
             enable_mixed_sampler=self.enable_mixed_sampler,
-            enable_torch_sampler=self.enable_torch_sampler,
+            use_torch_sampler=self.use_torch_sampler,
             kv_cache_dtype=self.kv_cache_config.dtype,
             enable_iter_perf_stats=self.enable_iter_perf_stats,
             enable_iter_req_stats=self.enable_iter_req_stats,
