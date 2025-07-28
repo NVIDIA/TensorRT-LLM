@@ -157,8 +157,11 @@ Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor> refAttenti
     }
 #if SPEC_DEC && SLIDING_WINDOW
     // In Spec-dec + SLIDING WINDOW mode, only allow linear tree or !rtIsReallySliding.
-    assert(!IS_SPEC_DEC_TREE || seqLen < slidingWinSize);
-    uint32_t const seqBeg = (seqLen < (slidingWinSize - q_len) ? 0 : seqLen - (slidingWinSize - q_len));
+    // the token starting position is seqLen - qSeqLen + 1
+    assert(!IS_SPEC_DEC_TREE || seqLen - qSeqLen + 1 < slidingWinSize);
+    uint32_t const tok0SeqLen = seqLen - qSeqLen + 1 + q_len;
+    uint32_t const seqBeg
+        = (int32_t(tok0SeqLen) < int32_t(slidingWinSize) ? 0 : int32_t(tok0SeqLen) - int32_t(slidingWinSize));
 #else
     uint32_t const seqBeg = (seqLen < slidingWinSize ? 0 : seqLen - slidingWinSize);
 #endif
