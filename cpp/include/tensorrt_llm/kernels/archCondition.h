@@ -24,7 +24,22 @@ namespace detail
 
 #ifdef __CUDA_ARCH__
 
-#ifdef __CUDA_ARCH_SPECIFIC__
+// __CUDA_ARCH_SPECIFIC__ is only available starting from CUDA 12.9
+#if (__CUDACC_VER_MAJOR__ > 12 || (__CUDACC_VER_MAJOR__ == 12 && __CUDACC_VER_MINOR__ >= 9))
+#define HAS_CUDA_SPECIFIC_MACRO 1
+
+#if __CUDA_ARCH__ >= 900
+#if !defined(__CUDA_ARCH_SPECIFIC__) && !defined(__CUDA_ARCH_FAMILY_SPECIFIC__)
+#error "Compiling for SM90 or newer architectures must use Arch specific or Arch Family specific target"
+#endif
+#endif
+
+#else
+#define HAS_CUDA_SPECIFIC_MACRO 0
+#endif
+
+// For CUDA < 12.9, we assume that sm90 or newer architectures are always built with arch specific.
+#if defined(__CUDA_ARCH_SPECIFIC__) || (!HAS_CUDA_SPECIFIC_MACRO && __CUDA_ARCH__ >= 900)
 static constexpr bool isArchSpecific = true;
 #else
 static constexpr bool isArchSpecific = false;
@@ -50,12 +65,6 @@ struct arch_info
     static constexpr int mArch = 0;
 };
 
-#endif
-
-#if __CUDA_ARCH__ >= 900
-#if !defined(__CUDA_ARCH_SPECIFIC__) && !defined(__CUDA_ARCH_FAMILY_SPECIFIC__)
-#error "Compiling for SM90 or newer architectures must use Arch specific or Arch Family specific target"
-#endif
 #endif
 
 } // namespace detail
