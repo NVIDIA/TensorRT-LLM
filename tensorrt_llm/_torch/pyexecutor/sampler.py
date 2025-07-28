@@ -241,9 +241,9 @@ class TorchSampler(Sampler):
         self.enable_mixed_sampler = args.enable_mixed_sampler
         self.max_tokens = args.max_draft_len + 1
         assert args.max_beam_width == self.MAX_BEAM_WIDTH, "TorchSampler only supports beam_width = 1"
-        self.num_seq_slots = args.max_num_sequences
+        self.max_num_sequences = args.max_num_sequences
 
-        self.NEW_TOKENS_SHAPE = (self.max_tokens, self.num_seq_slots,
+        self.NEW_TOKENS_SHAPE = (self.max_tokens, self.max_num_sequences,
                                  self.MAX_BEAM_WIDTH)
         # AutoDeploy build creates the sampler in inference mode,
         # which would disallow in-place mutating of new_tokens.
@@ -440,14 +440,14 @@ class TorchSampler(Sampler):
         """Shape: In lockstep with TRTLLMSampler: https://github.com/NVIDIA/TensorRT-LLM/blob/cea5dd1e3883b18bf50901a7f196f50a9544c28c/cpp/include/tensorrt_llm/runtime/decoderState.h#L103"""
         if any(req.py_return_log_probs for req in requests):
             return torch.empty(
-                (self.num_seq_slots, self.MAX_BEAM_WIDTH, self.max_tokens),
+                (self.max_num_sequences, self.MAX_BEAM_WIDTH, self.max_tokens),
                 device="cpu",
                 pin_memory=True)
         return None
 
     def gen_logits_host(self, requests: Iterable[LlmRequest], vocab_size: int):
         if any(req.py_return_generation_logits for req in requests):
-            return torch.empty((self.max_tokens, self.num_seq_slots,
+            return torch.empty((self.max_tokens, self.max_num_sequences,
                                 self.MAX_BEAM_WIDTH, vocab_size),
                                device="cpu",
                                pin_memory=True)

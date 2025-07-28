@@ -348,6 +348,7 @@ def create_py_executor(
     with mem_monitor.observe_creation_stage(_ExecutorCreationStage.SAMPLER):
         sampler = instantiate_sampler(model_engine, executor_config,
                                       pytorch_backend_config, mapping)
+        logger.info(f"Using Sampler: {type(sampler).__name__}")
 
     resources = {}
     estimating_kv_cache = False
