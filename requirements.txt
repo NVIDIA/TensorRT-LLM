@@ -61,4 +61,4 @@ etcd3
 blake3
 llguidance==0.7.29
 soundfile
-deep_gemm @ git+https://github.com/yuxianq/DeepGEMM.git@417c5924b0a2a9410b4a1368f06f63a195081911
+deep_gemm @ git+https://github.com/deepseek-ai/DeepGEMM.git@dd6ed14acbc7445dcef224248a77ab4d22b5f240
