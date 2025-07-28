@@ -280,6 +280,13 @@ def deepgemm_fp8_group_blockwise_gemm(
     assert d.stride(-1) == 1
 
     # Transform SFA and SFB into compute-required layout
+    recipe = (1, 128, 128)
+    sfa = fp8_utils.transform_sf_into_required_layout(sfa,
+                                                      mn=m,
+                                                      k=k,
+                                                      recipe=recipe,
+                                                      num_groups=num_groups,
+                                                      is_sfa=True)
 
     deep_gemm.fp8_m_grouped_gemm_nt_masked((a, sfa), (b, sfb),
                                            d,
@@ -446,8 +453,22 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
             masked_m=masked_m,
             expected_m=expected_m,
         )
-        act_input_fp8, act_input_sf = fp8_utils.silu_and_mul_masked_post_quant_fwd(
-            input=h1, quant_group_size=128, masked_m=masked_m, scale_ue8m0=True)
+        act_input_fp8 = torch.empty(h1.shape[0],
+                                    h1.shape[1],
+                                    h1.shape[2] // 2,
+                                    dtype=torch.float8_e4m3fn,
+                                    device='cuda')
+        act_input_sf = torch.empty(h1.shape[0],
+                                   h1.shape[1],
+                                   h1.shape[2] // 256,
+                                   dtype=torch.float32,
+                                   device='cuda')
+        fp8_utils.silu_and_mul_masked_post_quant_fwd(input=h1,
+                                                     output=act_input_fp8,
+                                                     output_scale=act_input_sf,
+                                                     quant_group_size=128,
+                                                     masked_m=masked_m,
+                                                     scale_ue8m0=True)
         h3 = deepgemm_fp8_group_blockwise_gemm(
             a=act_input_fp8,
             b=self.w2_weight,

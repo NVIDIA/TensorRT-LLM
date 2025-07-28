@@ -574,7 +574,13 @@ class FP8BlockScalesLinearMethod(LinearMethodBase):
 
         if get_sm_version() == 100:
             import deep_gemm
-            a, a_sf = fp8_utils.per_token_quant_and_transform(input)
+            a, a_sf = fp8_utils.per_token_cast_to_fp8_e8m0(input)
+            a_sf = fp8_utils.transform_sf_into_required_layout(a_sf,
+                                                               mn=a.shape[0],
+                                                               k=a.shape[1],
+                                                               recipe=(1, 128,
+                                                                       128),
+                                                               is_sfa=True)
             output = torch.empty((input.shape[0], module.weight.shape[0]),
                                  device=input.device,
                                  dtype=torch.bfloat16)

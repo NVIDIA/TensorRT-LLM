@@ -234,10 +234,10 @@ def _silu_and_mul_post_quant_kernel(
     stride_output_scale_1,
     stride_output_scale_2,
     masked_m_ptr,
-    size_k,
+    size_n,
     fp8_max,
     fp8_min,
-    BLOCK: tl.constexpr,
+    BLOCK_N: tl.constexpr,
     NUM_STAGE: tl.constexpr,
     SCALE_UE8M0: tl.constexpr,
 ):
@@ -254,110 +254,95 @@ def _silu_and_mul_post_quant_kernel(
     stride_input_1 = tl.cast(stride_input_1, dtype=tl.int64)
     stride_output_1 = tl.cast(stride_output_1, dtype=tl.int64)
 
-    offs_in_d = hidden_dim_block_index * BLOCK + tl.arange(0, BLOCK // 4)
+    offs_in_d = hidden_dim_block_index * BLOCK_N + tl.arange(0, BLOCK_N)
     input_ptr_offs = input_ptr + expert_id * stride_input_0 + offs_in_d
     output_ptr_offs = output_ptr + expert_id * stride_output_0 + offs_in_d
     output_scale_offs = (output_scale_ptr + expert_id * stride_output_scale_0 +
-                         hidden_dim_block_index * stride_output_scale_1)
+                         hidden_dim_block_index * stride_output_scale_2)
 
     for token_index in tl.range(token_id,
                                 token_num_cur_expert,
                                 block_num_per_expert,
                                 num_stages=NUM_STAGE):
-        output_s_int32 = 0
-        for pack_index in tl.range(4):
-            local_mask = offs_in_d + pack_index * 128
-            up = tl.load(
-                input_ptr_offs + token_index * stride_input_1 +
-                pack_index * 128,
-                mask=local_mask < size_k,
-                other=0.0,
-            )
-            gate = tl.load(
-                input_ptr_offs + token_index * stride_input_1 + size_k +
-                pack_index * 128,
-                mask=local_mask < size_k,
-                other=0.0,
-            ).to(tl.float32)
-            gate = gate / (1 + tl.exp(-gate))
-            gate = gate.to(input_ptr.dtype.element_ty)
-            gate_up = up * gate
-            _absmax = tl.maximum(tl.max(tl.abs(gate_up)), 1e-10)
-            output_s = _absmax / fp8_max
-            if SCALE_UE8M0:
-                output_s = tl.exp2(tl.ceil(tl.log2(tl.abs(output_s))))
-            output_q = tl.clamp(gate_up / output_s, fp8_min,
-                                fp8_max).to(output_ptr.dtype.element_ty)
-            output_s_int32 += ((output_s.to(tl.int32, bitcast=True) >> 23) <<
-                               (8 * pack_index))
-            tl.store(
-                output_ptr_offs + token_index * stride_output_1 +
-                pack_index * 128,
-                output_q,
-                mask=local_mask < size_k,
-            )
+        up = tl.load(
+            input_ptr_offs + token_index * stride_input_1,
+            mask=offs_in_d < size_n,
+            other=0.0,
+        )
+        gate = tl.load(
+            input_ptr_offs + token_index * stride_input_1 + size_n,
+            mask=offs_in_d < size_n,
+            other=0.0,
+        ).to(tl.float32)
+        gate = gate / (1 + tl.exp(-gate))
+        gate = gate.to(input_ptr.dtype.element_ty)
+        gate_up = up * gate
+        _absmax = tl.maximum(tl.max(tl.abs(gate_up)), 1e-10)
+        output_s = _absmax / fp8_max
+        if SCALE_UE8M0:
+            output_s = tl.exp2(tl.ceil(tl.log2(tl.abs(output_s))))
+        output_q = tl.clamp(gate_up / output_s, fp8_min,
+                            fp8_max).to(output_ptr.dtype.element_ty)
         tl.store(
-            output_scale_offs + token_index * stride_output_scale_2,
-            output_s_int32,
+            output_ptr_offs + token_index * stride_output_1,
+            output_q,
+            mask=offs_in_d < size_n,
+        )
+        tl.store(
+            output_scale_offs + token_index * stride_output_scale_1,
+            output_s,
         )
 
 
 def silu_and_mul_masked_post_quant_fwd(
     input: torch.Tensor,
+    output: torch.Tensor,
+    output_scale: torch.Tensor,
     quant_group_size: int,
     masked_m: torch.Tensor,
     scale_ue8m0: bool = False,
 ):
     """
-    input shape [g, m, k]
-    output shape [g, m, k // 2], dtype fp8
-    output_scale [g, k // 4, m // 2 // 128], dtype int32
-    quant_group_size int
-    masked_m shape [g]
+    input shape [expert_num, token_num_padded, hidden_dim]
+    output shape [expert_num, token_num_padded, hidden_dim // 2], dtype fp8
+    output_scale [expert_num token_num_paddded, hidden_dim // 2 // 128] dtype float32
+    quant_group_size  int,
+    masked_m shape [expert_num],
     """
 
     assert input.is_contiguous()
+    assert output.dtype == torch.float8_e4m3fn
+    assert output.is_contiguous()
     assert len(input.shape) == 3
     assert input.shape[0] == masked_m.shape[0]
     assert input.shape[-1] % 2 == 0
 
-    # FP8 quantization parameters
-    finfo = torch.finfo(torch.float8_e4m3fn)
-    fp8_max = finfo.max
-    fp8_min = finfo.min
+    size_n = input.shape[-1] // 2
+    assert size_n % quant_group_size == 0
 
-    g, m, k = input.shape
-    k = k // 2
-
-    # Create output
-    output = torch.empty((g, m, k), dtype=torch.float8_e4m3fn, device="cuda")
-
-    # Create output scale
-    alignment = 4
-    scale_k = ceil_div(k, quant_group_size)
-    m_padded = align(m, alignment)
-    scale_k_padded = align(scale_k, alignment)
-    output_scale = torch.zeros((g, scale_k_padded // 4, m_padded),
-                               dtype=torch.int32,
-                               device='cuda')
-
-    # Get block/grid/stage/warp
     expert_num = len(masked_m)
 
     if expert_num < 4:
         BLOCK_NUM_PER_EXPERT = 64
     else:
-        BLOCK_NUM_PER_EXPERT = 128
+        BLOCK_NUM_PER_EXPERT = 32
 
-    BLOCK = quant_group_size * 4
+    BLOCK_N = quant_group_size
     num_warps = 1
     NUM_STAGES = 6
-    hidden_dim_split_block_num = triton.cdiv(k, BLOCK)
+    hidden_dim_split_block_num = triton.cdiv(size_n, BLOCK_N)
+    assert BLOCK_N % quant_group_size == 0
+
     grid = (
         hidden_dim_split_block_num,
         BLOCK_NUM_PER_EXPERT,
         expert_num,
     )
+
+    finfo = torch.finfo(torch.float8_e4m3fn)
+    fp8_max = finfo.max
+    fp8_min = -fp8_max
+
     _silu_and_mul_post_quant_kernel[grid](
         input,
         *input.stride(),
@@ -366,166 +351,12 @@ def silu_and_mul_masked_post_quant_fwd(
         output_scale,
         *output_scale.stride(),
         masked_m,
-        k,
+        size_n,
         fp8_max,
         fp8_min,
-        BLOCK=BLOCK,
+        BLOCK_N=BLOCK_N,
         NUM_STAGE=NUM_STAGES,
         num_warps=num_warps,
         SCALE_UE8M0=scale_ue8m0,
     )
-    output_scale = output_scale.transpose(1, 2)[:, :m, :]
-    check_sf_layout(
-        output_scale,
-        m,
-        k,
-        (1, 128),
-        g,
-        tma_stride_check=True,
-    )
-    return output, output_scale
-
-
-@triton.jit
-def _per_token_quant_and_transform_kernel(
-    input_ptr,
-    stride_input_0,
-    stride_input_1,
-    output_ptr,
-    stride_output_0,
-    stride_output_1,
-    output_scale_ptr,
-    stride_output_scale_0,
-    stride_output_scale_1,
-    token_num_cur_expert,
-    size_k,
-    fp8_max,
-    fp8_min,
-    BLOCK: tl.constexpr,
-    NUM_STAGE: tl.constexpr,
-    SCALE_UE8M0: tl.constexpr,
-):
-    tl.program_id(2)
-    token_id = tl.program_id(1)
-    hidden_dim_block_index = tl.program_id(0)
-
-    block_num_per_expert = tl.num_programs(1)
-
-    stride_input_0 = tl.cast(stride_input_0, dtype=tl.int64)
-    stride_output_0 = tl.cast(stride_output_0, dtype=tl.int64)
-    stride_input_1 = tl.cast(stride_input_1, dtype=tl.int64)
-    stride_output_1 = tl.cast(stride_output_1, dtype=tl.int64)
-
-    offs_in_d = hidden_dim_block_index * BLOCK + tl.arange(0, BLOCK // 4)
-    input_ptr_offs = input_ptr + offs_in_d
-    output_ptr_offs = output_ptr + offs_in_d
-    output_scale_offs = (output_scale_ptr +
-                         hidden_dim_block_index * stride_output_scale_0)
-
-    for token_index in tl.range(token_id,
-                                token_num_cur_expert,
-                                block_num_per_expert,
-                                num_stages=NUM_STAGE):
-        output_s_int32 = 0
-        for pack_index in tl.range(4):
-            local_mask = offs_in_d + pack_index * 128
-            act = tl.load(
-                input_ptr_offs + token_index * stride_input_0 +
-                pack_index * 128,
-                mask=local_mask < size_k,
-                other=0.0,
-            ).to(tl.float32)
-            _absmax = tl.maximum(tl.max(tl.abs(act)), 1e-10)
-            output_s = _absmax / fp8_max
-            if SCALE_UE8M0:
-                output_s = tl.exp2(tl.ceil(tl.log2(tl.abs(output_s))))
-            output_q = tl.clamp(act / output_s, fp8_min,
-                                fp8_max).to(output_ptr.dtype.element_ty)
-            output_s_int32 += ((output_s.to(tl.int32, bitcast=True) >> 23) <<
-                               (8 * pack_index))
-            tl.store(
-                output_ptr_offs + token_index * stride_output_0 +
-                pack_index * 128,
-                output_q,
-                mask=local_mask < size_k,
-            )
-        tl.store(
-            output_scale_offs + token_index * stride_output_scale_1,
-            output_s_int32,
-        )
-
-
-def per_token_quant_and_transform(
-    input: torch.Tensor,
-    quant_group_size: int = 128,
-    scale_ue8m0: bool = True,
-):
-    """
-    input shape [g, m, k]
-    output shape [g, m, k // 2], dtype fp8
-    output_scale [g, k // 4, m // 2 // 128], dtype int32
-    quant_group_size int
-    masked_m shape [g]
-    """
-
-    assert input.is_contiguous()
-    assert len(input.shape) == 2
-    assert input.shape[-1] % 2 == 0
-
-    # FP8 quantization parameters
-    finfo = torch.finfo(torch.float8_e4m3fn)
-    fp8_max = finfo.max
-    fp8_min = -fp8_max
-
-    m, k = input.shape
-
-    # Create output
-    output = torch.empty((m, k), dtype=torch.float8_e4m3fn, device="cuda")
-
-    # Create output scale
-    alignment = 4
-    scale_k = ceil_div(k, quant_group_size)
-    m_padded = align(m, alignment)
-    scale_k_padded = align(scale_k, alignment)
-    output_scale = torch.zeros((scale_k_padded // 4, m_padded),
-                               dtype=torch.int32,
-                               device='cuda')
-
-    # Get block/grid/stage/warp
-    BLOCK_NUM_PER_EXPERT = 64
-
-    BLOCK = quant_group_size * 4
-    num_warps = 1
-    NUM_STAGES = 6
-    hidden_dim_split_block_num = triton.cdiv(k, BLOCK)
-    grid = (
-        hidden_dim_split_block_num,
-        BLOCK_NUM_PER_EXPERT,
-        1,
-    )
-    _per_token_quant_and_transform_kernel[grid](
-        input,
-        *input.stride(),
-        output,
-        *output.stride(),
-        output_scale,
-        *output_scale.stride(),
-        m,
-        k,
-        fp8_max,
-        fp8_min,
-        BLOCK=BLOCK,
-        NUM_STAGE=NUM_STAGES,
-        num_warps=num_warps,
-        SCALE_UE8M0=scale_ue8m0,
-    )
-    output_scale = output_scale.transpose(0, 1)[:m, :]
-    check_sf_layout(
-        output_scale,
-        m,
-        k,
-        (1, 128),
-        num_groups=None,
-        tma_stride_check=True,
-    )
-    return output, output_scale
+    return
