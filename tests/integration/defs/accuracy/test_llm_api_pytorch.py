@@ -800,10 +800,6 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
-    @pytest.mark.skip(
-        reason=
-        "remove this skip after the kernel support mentioned in this nvbug is fixed: https://nvbugspro.nvidia.com/bug/5338620"
-    )
     def test_auto_dtype_chunked_prefill(self):
         # # NOTE: Test with VSWA kv cache config.
         # self.kv_cache_config.max_attention_window = [

@@ -1850,7 +1850,7 @@ __device__ inline GMemKVCacheHead& KVTilePartLoader::getHead(uint32_t pos)
 #if SPEC_DEC
 __device__ inline void warpGrpApplyMask(Gemm0Acc& acc, SpecDec const& specDec,
 #if SLIDING_WINDOW && !IS_SPEC_DEC_TREE
-    uint32_t nbTotalSkipTokens, uint32_t slidingWinSize,
+    int32_t tok0WinBeg,
 #endif
     uint32_t cacheSeqLen, uint32_t idxTile, uint32_t warpRank)
 {
