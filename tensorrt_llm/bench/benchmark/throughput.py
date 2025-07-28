@@ -183,11 +183,20 @@ from tensorrt_llm.sampling_params import SamplingParams
     help=
     "Desired concurrency rate (number of requests processing at the same time), <=0 for no concurrency limit.",
 )
-@click.option(
+@optgroup.group("Streaming Options", help="Options for streaming mode.")
+@optgroup.option(
     "--streaming",
     is_flag=True,
     default=False,
     help="Enable streaming mode for requests.",
+)
+@optgroup.option(
+    "--stream_interval",
+    type=int,
+    default=None,
+    help=
+    "The iteration interval to create responses under the streaming mode (only useful if --streaming is enabled)."
+    "If the batch_size/concurrency is getting too large, streaming will make bubbles in GPU execution between iterations because of too large CPU overhead. Increase stream_interval could alleviate this situation.",
 )
 @optgroup.group("Reporting Options",
                 help="Options for reporting benchmark results.",
@@ -347,6 +356,7 @@ def throughput_command(
     kv_cache_percent = params.pop("kv_cache_free_gpu_mem_fraction")
     beam_width = params.pop("beam_width")
     streaming: bool = params.pop("streaming")
+    stream_interval: int = params.pop("stream_interval")
     enable_chunked_context: bool = params.pop("enable_chunked_context")
     scheduler_policy: str = params.pop("scheduler_policy")
 
@@ -385,6 +395,8 @@ def throughput_command(
         logger.info("Setting up throughput benchmark.")
         kwargs = kwargs | runtime_config.get_llm_args()
         kwargs['backend'] = backend
+        if stream_interval is not None:
+            kwargs['stream_interval'] = stream_interval
 
         if backend == "pytorch" and iteration_log is not None:
             kwargs["enable_iter_perf_stats"] = True
