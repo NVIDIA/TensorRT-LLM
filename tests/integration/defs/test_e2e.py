@@ -1628,6 +1628,8 @@ def test_ptp_quickstart_advanced(llm_root, llm_venv, model_name, model_path):
             ]
             if "Qwen3" in model_name:
                 cmds.append(f"--kv_cache_fraction=0.6")
+            if "Llama3.1-70B" in model_name:
+                cmds.append(f"--max_num_tokens=1024")
             llm_venv.run_cmd(cmds, stdout=running_log)
             if model_name in mapping:
                 _check_mem_usage(running_log, [mapping[model_name], 0, 0, 0])
