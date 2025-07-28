@@ -60,29 +60,25 @@ EXAONE4_SINGLE_LAYER_CONFIG = {
     "torch_dtype": "bfloat16",
     "transformers_version": "4.54.0.dev0",
     "use_cache": True,
-    "vocab_size": 102400
+    "vocab_size": 102400,
+    "attn_implementation": "flash_attention_2"
 }
 
 
 @dataclass(repr=False)
 class Scenario:
     backend: str
+    input_len: int = WINDOW_SIZE - 1
     use_cuda_graph: bool = False
-    input_len: int = 4
 
     def __repr__(self) -> str:
-        return f"backend:{self.backend.lower()}-use_cuda_graph:{self.use_cuda_graph}"
+        return f"backend:{self.backend.lower()}-input_len:{self.input_len}-use_cuda_graph:{self.use_cuda_graph}"
 
 
 class TestExaone4(unittest.TestCase):
 
     @parameterized.expand([None, "FP8"])
     def test_exaone4_sanity(self, quant_algo):
-
-        # TODO: Remove this once we have a proper transformers version for Exaone4
-        if SKIP_EXAONE4_TEST:
-            self.skipTest("Exaone4 is not supported in this environment")
-
         config_dict = deepcopy(EXAONE4_SINGLE_LAYER_CONFIG)
         # TODO: Change to PretrainedConfig if we don't have the transformers version
         exaone4_config = Exaone4Config.from_dict(config_dict)
@@ -189,10 +185,9 @@ class TestExaone4(unittest.TestCase):
         kv_cache_manager.shutdown()
 
     @parameterized.expand([
-        Scenario(backend="TRTLLM", input_len=2),
-        Scenario(backend="TRTLLM", input_len=4),
-        Scenario(backend="TRTLLM", input_len=8),
-        Scenario(backend="TRTLLM", use_cuda_graph=True, input_len=8),
+        Scenario(backend="TRTLLM", input_len=WINDOW_SIZE - 2),
+        Scenario(
+            backend="TRTLLM", input_len=WINDOW_SIZE - 2, use_cuda_graph=True),
     ], lambda testcase_func, param_num, param:
                           f"{testcase_func.__name__}[{param.args[0]}]")
     @torch.no_grad()
@@ -366,7 +361,10 @@ class TestExaone4(unittest.TestCase):
                 input_ids=gen_input_ids.unsqueeze(0),  #hf_gen_input_ids,
                 position_ids=gen_position_ids,
                 past_key_values=ref.past_key_values,
-                use_cache=True)
+                use_cache=True,
+                cache_position=torch.LongTensor([input_ids.size(-1)
+                                                 ]).to(device),
+                last_cache_position=input_ids.size(-1) + 1)
 
         torch.testing.assert_close(logits,
                                    ref.logits[:, -1].float(),

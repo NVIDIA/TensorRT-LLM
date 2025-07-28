@@ -3,7 +3,6 @@ from typing import Optional, Tuple
 import torch
 from torch import nn
 
-from tensorrt_llm._torch.distributed import AllReduceParams
 from tensorrt_llm.functional import PositionEmbeddingType
 
 from ..attention_backend import AttentionMetadata
@@ -152,7 +151,6 @@ class Exaone4Attention(Attention):
         attn_metadata: AttentionMetadata,
         attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.
         CAUSAL,
-        all_reduce_params: Optional[AllReduceParams] = None,
         lora_params: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor:
@@ -165,7 +163,6 @@ class Exaone4Attention(Attention):
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
             attention_mask=attention_mask,
-            all_reduce_params=all_reduce_params,
             lora_params=lora_params,
             attention_window_size=self.attention_window_size,
             **kwargs,
@@ -226,8 +223,6 @@ class Exaone4DecoderLayer(DecoderLayer):
             position_ids=position_ids,
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
-            all_reduce_params=AllReduceParams(
-                enable_allreduce=not (self.mapping.tp_size == 1)),
             **kwargs,
         )
 
@@ -235,11 +230,7 @@ class Exaone4DecoderLayer(DecoderLayer):
         hidden_states = residual + hidden_states
         residual = hidden_states
 
-        hidden_states = self.mlp(
-            hidden_states,
-            final_all_reduce_params=AllReduceParams(
-                enable_allreduce=not (self.mapping.tp_size == 1)),
-        )
+        hidden_states = self.mlp(hidden_states)
         hidden_states = self.post_feedforward_layernorm(hidden_states)
 
         hidden_states = hidden_states + residual
