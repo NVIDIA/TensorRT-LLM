@@ -1884,7 +1884,7 @@ def test_ptp_quickstart_advanced_8gpus_chunked_prefill_sq_22k(
         "--tp_size=8",
         "--moe_ep_size=8",
         "--max_seq_len=22000",
-        "--kv_cache_fraction=0.85",
+        "--kv_cache_fraction=0.1",
     ]
     if cuda_graph:
         cmd.extend([
