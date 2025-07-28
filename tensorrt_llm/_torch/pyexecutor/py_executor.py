@@ -193,11 +193,10 @@ class PyExecutor:
         self.disable_overlap_scheduler = disable_overlap_scheduler
         
         # Initialize block prediction sampler if needed
-        self.block_prediction_sampler = None
+        self.block_prediction_sampler: Optional[BlockPredictionSampler] = None
         block_prediction_enabled = False
         pytorch_backend_config = getattr(model_engine, 'pytorch_backend_config', None)
         if pytorch_backend_config and getattr(pytorch_backend_config, 'enable_block_prediction', False):
-            from .sampler import BlockPredictionSampler
             config = pytorch_backend_config
             self.block_prediction_sampler = BlockPredictionSampler(
                 max_seq_len=max_input_len,
@@ -1059,7 +1058,7 @@ class PyExecutor:
                     self._process_block_prediction_batch(scheduled_batch)
 
                     self._update_request_states(scheduled_batch)
-                    self._update_requests(sample_state)
+                    # self._update_requests(sample_state)
 
                     ctx_transmission_reqs = self._send_disagg_ctx_cache(
                         scheduled_batch.context_requests
@@ -2015,8 +2014,10 @@ class PyExecutor:
     @nvtx_range("_update_requests")
     def _update_requests(self, sample_state: SampleState):
         try:
-            if isinstance(self.sampler, BlockPredictionSampler):  # Split like this to enable go-to-definition
-                self.sampler.update_requests(sample_state)
+            if self.block_prediction_sampler is not None:
+                self.block_prediction_sampler.update_requests(sample_state)
+            # elif isinstance(self.sampler, BlockPredictionSampler):  # Split like this to enable go-to-definition
+            #     self.sampler.update_requests(sample_state)
             elif isinstance(self.sampler, TorchSampler):
                 self.sampler.update_requests(sample_state)
             else:
