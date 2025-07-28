@@ -317,9 +317,14 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(4)
     def test_ctxpp2_genpp2(self):
+        kv_cache_config = {
+            "free_gpu_memory_fraction": 0.5,
+            "enable_block_reuse": False
+        }
         ctx_server_config = {
             "pipeline_parallel_size": 2,
             "disable_overlap_scheduler": True,
+            "kv_cache_config": kv_cache_config,
             "cache_transceiver_config": {
                 "backend": "default"
             }
@@ -327,78 +332,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
         gen_server_config = {
             "pipeline_parallel_size": 2,
             "disable_overlap_scheduler": True,
-            "cache_transceiver_config": {
-                "backend": "default"
-            }
-        }
-        disaggregated_server_config = {
-            "hostname": "localhost",
-            "port": 8000,
-            "backend": "pytorch",
-            "context_servers": {
-                "num_instances": 1,
-                "urls": ["localhost:8001"]
-            },
-            "generation_servers": {
-                "num_instances": 1,
-                "urls": ["localhost:8002"]
-            }
-        }
-        with launch_disaggregated_llm(disaggregated_server_config,
-                                      ctx_server_config, gen_server_config,
-                                      self.MODEL_PATH) as llm:
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-
-    @pytest.mark.skip_less_device(8)
-    def test_ctxtp2pp2_gentp2pp2(self):
-        ctx_server_config = {
-            "tensor_parallel_size": 2,
-            "pipeline_parallel_size": 2,
-            "disable_overlap_scheduler": True,
-            "cache_transceiver_config": {
-                "backend": "default"
-            }
-        }
-        gen_server_config = {
-            "tensor_parallel_size": 2,
-            "pipeline_parallel_size": 2,
-            "disable_overlap_scheduler": True,
-            "cache_transceiver_config": {
-                "backend": "default"
-            }
-        }
-        disaggregated_server_config = {
-            "hostname": "localhost",
-            "port": 8000,
-            "backend": "pytorch",
-            "context_servers": {
-                "num_instances": 1,
-                "urls": ["localhost:8001"]
-            },
-            "generation_servers": {
-                "num_instances": 1,
-                "urls": ["localhost:8002"]
-            }
-        }
-        with launch_disaggregated_llm(disaggregated_server_config,
-                                      ctx_server_config, gen_server_config,
-                                      self.MODEL_PATH) as llm:
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-
-    @pytest.mark.skip_less_device(8)
-    def test_ctxpp4_genpp4(self):
-        ctx_server_config = {
-            "pipeline_parallel_size": 4,
-            "disable_overlap_scheduler": True,
-            "cache_transceiver_config": {
-                "backend": "default"
-            }
-        }
-        gen_server_config = {
-            "pipeline_parallel_size": 4,
-            "disable_overlap_scheduler": True,
+            "kv_cache_config": kv_cache_config,
             "cache_transceiver_config": {
                 "backend": "default"
             }
@@ -424,10 +358,15 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(4)
     def test_ctxtp2_genpp2(self):
+        kv_cache_config = {
+            "free_gpu_memory_fraction": 0.5,
+            "enable_block_reuse": False
+        }
         ctx_server_config = {
             "tensor_parallel_size": 1,
             "pipeline_parallel_size": 2,
             "disable_overlap_scheduler": True,
+            "kv_cache_config": kv_cache_config,
             "cache_transceiver_config": {
                 "backend": "default"
             }
@@ -436,6 +375,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             "tensor_parallel_size": 1,
             "pipeline_parallel_size": 2,
             "disable_overlap_scheduler": True,
+            "kv_cache_config": kv_cache_config,
             "cache_transceiver_config": {
                 "backend": "default"
             }
@@ -461,9 +401,14 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(4)
     def test_ctxpp2_gentp2(self):
+        kv_cache_config = {
+            "free_gpu_memory_fraction": 0.5,
+            "enable_block_reuse": False
+        }
         ctx_server_config = {
             "pipeline_parallel_size": 2,
             "disable_overlap_scheduler": True,
+            "kv_cache_config": kv_cache_config,
             "cache_transceiver_config": {
                 "backend": "default"
             }
@@ -472,6 +417,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             "tensor_parallel_size": 2,
             "pipeline_parallel_size": 1,
             "disable_overlap_scheduler": True,
+            "kv_cache_config": kv_cache_config,
             "cache_transceiver_config": {
                 "backend": "default"
             }
@@ -489,6 +435,95 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                 "urls": ["localhost:8002"]
             }
         }
+        with launch_disaggregated_llm(disaggregated_server_config,
+                                      ctx_server_config, gen_server_config,
+                                      self.MODEL_PATH) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @pytest.mark.skip_less_device(8)
+    def test_ctxtp2pp2_gentp2pp2(self):
+        kv_cache_config = {
+            "free_gpu_memory_fraction": 0.5,
+            "enable_block_reuse": False
+        }
+        ctx_server_config = {
+            "tensor_parallel_size": 2,
+            "pipeline_parallel_size": 2,
+            "disable_overlap_scheduler": True,
+            "kv_cache_config": kv_cache_config,
+            "cache_transceiver_config": {
+                "backend": "default"
+            }
+        }
+        gen_server_config = {
+            "tensor_parallel_size": 2,
+            "pipeline_parallel_size": 2,
+            "disable_overlap_scheduler": True,
+            "kv_cache_config": kv_cache_config,
+            "cache_transceiver_config": {
+                "backend": "default"
+            }
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "port": 8000,
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1,
+                "urls": ["localhost:8001"]
+            },
+            "generation_servers": {
+                "num_instances": 1,
+                "urls": ["localhost:8002"]
+            }
+        }
+        with launch_disaggregated_llm(disaggregated_server_config,
+                                      ctx_server_config, gen_server_config,
+                                      self.MODEL_PATH) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @pytest.mark.skip_less_device(8)
+    def test_ctxpp4_genpp4(self):
+        kv_cache_config = {
+            "free_gpu_memory_fraction": 0.5,
+            "enable_block_reuse": False
+        }
+        ctx_server_config = {
+            "pipeline_parallel_size": 4,
+            "disable_overlap_scheduler": True,
+            "kv_cache_config": kv_cache_config,
+            "cache_transceiver_config": {
+                "backend": "default"
+            }
+        }
+        gen_server_config = {
+            "pipeline_parallel_size": 4,
+            "disable_overlap_scheduler": True,
+            "kv_cache_config": kv_cache_config,
+            "cache_transceiver_config": {
+                "backend": "default"
+            }
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "port": 8000,
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1,
+                "urls": ["localhost:8001"]
+            },
+            "generation_servers": {
+                "num_instances": 1,
+                "urls": ["localhost:8002"]
+            }
+        }
+        with launch_disaggregated_llm(disaggregated_server_config,
+                                      ctx_server_config, gen_server_config,
+                                      self.MODEL_PATH) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
 
 
 @pytest.mark.skip_less_device_memory(140000)

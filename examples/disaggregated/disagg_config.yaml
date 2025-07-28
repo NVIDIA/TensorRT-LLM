@@ -1,13 +1,13 @@
 hostname: localhost
 port: 8000
-model: /home/scratch.trt_llm_data/llm-models/llama-3.1-model/Meta-Llama-3.1-8B
+model: TinyLlama/TinyLlama-1.1B-Chat-v1.0
 free_gpu_memory_fraction: 0.25
 backend: "pytorch"
 disable_overlap_scheduler: True
 context_servers:
   num_instances: 1
   tensor_parallel_size: 1
-  pipeline_parallel_size: 2
+  pipeline_parallel_size: 1
   kv_cache_config:
     free_gpu_memory_fraction: 0.2
   cache_transceiver_config:
