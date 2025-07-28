@@ -1108,7 +1108,7 @@ std::vector<torch::Tensor> moe_finalize_allreduce(torch::Tensor const& input, to
 }
 
 at::Tensor mnnvlTwoShotAllReduce(
-    at::Tensor& input, at::Tensor& comm_buffer, at::Tensor& buffer_flags, bool wait_for_results)
+    at::Tensor& input, at::Tensor& comm_buffer, at::Tensor& buffer_flags, int64_t buffer_size, bool wait_for_results)
 {
     auto* mcast_mem = tensorrt_llm::common::findMcastDevMemBuffer(comm_buffer.data_ptr());
     TORCH_CHECK(mcast_mem != nullptr, "two_shot_all_reduce: comm_buffer must be obtained from a mcastBuffer instance.");
@@ -1120,6 +1120,7 @@ at::Tensor mnnvlTwoShotAllReduce(
     allreduce_params.dtype = dtype;
     allreduce_params.output = output.data_ptr();
     allreduce_params.input = input.data_ptr();
+    allreduce_params.buffer_size = static_cast<uint32_t>(buffer_size);
     allreduce_params.buffer_flags = buffer_flags.data_ptr();
     allreduce_params.wait_for_results = wait_for_results;
     allreduce_params.stream = at::cuda::getCurrentCUDAStream(output.get_device());
@@ -1137,7 +1138,7 @@ at::Tensor mnnvlTwoShotAllReduce(
 }
 
 std::vector<torch::Tensor> twoShotRMSNorm(torch::Tensor const& comm_buf, torch::Tensor const& gamma, double epsilon,
-    torch::Tensor const& residual, torch::Tensor& buffer_flags)
+    torch::Tensor const& residual, torch::Tensor& buffer_flags, int64_t buffer_size)
 {
     auto const dtype = tensorrt_llm::runtime::TorchUtils::dataType(comm_buf.scalar_type());
     auto rmsnorm_params = tensorrt_llm::kernels::mnnvl::RMSNormParams();
@@ -1153,6 +1154,7 @@ std::vector<torch::Tensor> twoShotRMSNorm(torch::Tensor const& comm_buf, torch::
     rmsnorm_params.gamma = gamma.data_ptr();
     rmsnorm_params.epsilon = epsilon;
     rmsnorm_params.residual = residual.data_ptr();
+    rmsnorm_params.buffer_size = static_cast<uint32_t>(buffer_size);
     rmsnorm_params.buffer_flags = reinterpret_cast<uint32_t*>(buffer_flags.data_ptr());
     rmsnorm_params.batch = normed_output.size(0);
     rmsnorm_params.hidden_dim = normed_output.size(1);
@@ -1168,10 +1170,10 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
         "mnnvl_twoshot_allreduce(Tensor(input!) input, Tensor(comm_buf!) comm_buffer, "
-        "Tensor(buffer_flags!) buffer_flags, bool wait_for_result) -> Tensor");
+        "Tensor(buffer_flags!) buffer_flags, int buffer_size, bool wait_for_result) -> Tensor");
     m.def(
         "mnnvl_twoshot_rmsnorm(Tensor comm_buf, Tensor gamma, "
-        "float epsilon, Tensor residual, Tensor buffer_flags) -> Tensor[]");
+        "float epsilon, Tensor residual, Tensor buffer_flags, int buffer_size) -> Tensor[]");
     m.def(
         "allreduce("
         "Tensor input,"
