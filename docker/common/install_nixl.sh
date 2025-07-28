@@ -19,13 +19,13 @@ pip3 install --no-cache-dir meson ninja pybind11
 git clone --depth 1 -b ${NIXL_VERSION} ${NIXL_REPO}
 cd nixl
 
-cuda_so_path=$(find "/usr/local/cuda/compat/lib.real" -name "libcuda.so.1" 2>/dev/null | head -n1)
+cuda_so_path=$(find "/usr/local" -path "*/cuda*/compat/lib.real/libcuda.so.1" 2>/dev/null | head -n1)
 if [[ -z "$cuda_so_path" ]]; then
     echo "libcuda.so.1 not found "
     exit 1
 fi
 
-echo "export LD_LIBRARY_PATH=\$LD_LIBRARY_PATH:/usr/local/cuda/compat/lib.real" >> "${ENV}"
+echo "export LD_LIBRARY_PATH=\$LD_LIBRARY_PATH:\$cuda_so_path" >> "${ENV}"
 
 meson setup builddir \
     -Ducx_path=$UCX_INSTALL_PATH \
