@@ -169,8 +169,7 @@ public:
     {
     }
 
-    virtual std::tuple<SizeType32, bool> getNumNewMatchedTokens(LlmRequest const& request, SizeType32 numComputedTokens)
-        = 0;
+    virtual SizeType32 getNumNewMatchedTokens(LlmRequest const& request, SizeType32 numComputedTokens) = 0;
 
     std::optional<std::shared_ptr<KvCacheConnectorScheduler>> getScheduler() const
     {

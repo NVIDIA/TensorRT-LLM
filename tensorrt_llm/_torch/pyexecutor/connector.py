@@ -15,13 +15,17 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             mpi_rank() == 0), "The scheduler may only exist on rank 0!"
         super().__init__(worker, scheduler)
 
-    def get_num_new_matched_tokens(
-            self, request: LlmRequest,
-            num_computed_tokens: int) -> tuple[int, bool]:
+    def get_num_new_matched_tokens(self,
+                                   request: LlmRequest = None,
+                                   num_computed_tokens: int = None) -> int:
         if self.scheduler is not None:
-            result = self.scheduler.getNumNewMatchedTokens(
+            num_tokens, load_kv_async = self.scheduler.get_num_new_matched_tokens(
                 request, num_computed_tokens)
-        else:
-            result = None
 
-        return mpi_broadcast(result, root=0)
+            mpi_broadcast((num_tokens, load_kv_async), root=0)
+        else:
+            num_tokens, load_kv_async = mpi_broadcast(None, root=0)
+
+        # TODO: Do some stuff in the future to handle load_kv_async.
+
+        return num_tokens
