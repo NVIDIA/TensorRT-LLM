@@ -20,6 +20,7 @@
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/kernels/logitsBitmask.h"
 
+#include <nlohmann/json.hpp>
 #include <xgrammar/xgrammar.h>
 
 using namespace tensorrt_llm::runtime;
@@ -41,20 +42,27 @@ GuidedDecoder::GuidedDecoder(executor::GuidedDecodingConfig const& guidedDecodin
     if (mGuidedDecodingBackend == executor::GuidedDecodingConfig::GuidedDecodingBackend::kXGRAMMAR)
     {
         mXGrammarMatchers.resize(mMaxNumSequences);
+        xgrammar::VocabType vocabType = xgrammar::VocabType::RAW;
+        bool addPrefixSpace = false;
         auto const& tokenizerStr = guidedDecodingConfig.getTokenizerStr();
         if (tokenizerStr)
         {
-            auto const& tokenizerInfo = xgrammar::TokenizerInfo::FromHuggingFace(
-                guidedDecodingConfig.getEncodedVocab().value(), guidedDecodingConfig.getTokenizerStr().value(),
-                mVocabSizePadded, guidedDecodingConfig.getStopTokenIds());
-            mXGrammarCompiler = std::make_shared<xgrammar::GrammarCompiler>(tokenizerInfo);
+            auto const& metadata = xgrammar::TokenizerInfo::DetectMetadataFromHF(tokenizerStr.value());
+            auto const& metadataJson = nlohmann::json::parse(metadata);
+            vocabType = metadataJson["vocab_type"].template get<xgrammar::VocabType>();
+            addPrefixSpace = metadataJson["add_prefix_space"].template get<bool>();
         }
-        else
+        auto const& tokenizerInfo = xgrammar::TokenizerInfo(guidedDecodingConfig.getEncodedVocab().value(), vocabType,
+            mVocabSizePadded, guidedDecodingConfig.getStopTokenIds(), addPrefixSpace);
+
+        float cacheLimitGb = 1.0f;
+        if (std::getenv("XGRAMMAR_CACHE_LIMIT_GB"))
         {
-            auto const& tokenizerInfo = xgrammar::TokenizerInfo(guidedDecodingConfig.getEncodedVocab().value(),
-                xgrammar::VocabType::RAW, mVocabSizePadded, guidedDecodingConfig.getStopTokenIds());
-            mXGrammarCompiler = std::make_shared<xgrammar::GrammarCompiler>(tokenizerInfo);
+            cacheLimitGb = std::stof(std::getenv("XGRAMMAR_CACHE_LIMIT_GB"));
         }
+
+        mXGrammarCompiler = std::make_shared<xgrammar::GrammarCompiler>(tokenizerInfo, /*max_threads=*/8,
+            /*cache_enabled=*/true, /*cache_limit_bytes=*/static_cast<long long>(cacheLimitGb * 1024 * 1024 * 1024));
 
         auto const logitsPtrDtype = BufferDataType{mLogitsDtype, false, true};
         auto constexpr bitmaskDtype = TRTDataType<BitmaskT>::value;
