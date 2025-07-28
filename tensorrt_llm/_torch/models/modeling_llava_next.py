@@ -216,7 +216,16 @@ class LlavaNextInputProcessor(InputProcessor):
             - extra_processed_inputs: Optional dictionary containing multimodal embeddings
         """
         text_prompt = inputs.get("prompt")
-        assert 'image' in multimodal_embedding
+        if not text_prompt:
+            raise ValueError("Text prompt is required but not provided")
+
+        if not isinstance(multimodal_embedding, dict):
+            raise ValueError("multimodal_embedding must be a dictionary")
+
+        if 'image' not in multimodal_embedding:
+            raise ValueError(
+                "Only image modality is supported for external multimodal embedding"
+            )
 
         input_ids = self.tokenizer(
             text_prompt, return_tensors="pt").input_ids[0].to(self.device)

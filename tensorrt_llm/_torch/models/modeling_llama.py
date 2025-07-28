@@ -849,7 +849,9 @@ class Llama4InputProcessor(InputProcessor):
             raise ValueError("multimodal_embedding must be a dictionary")
 
         if 'image' not in multimodal_embedding:
-            raise ValueError("Only image modality is supported for now")
+            raise ValueError(
+                "Only image modality is supported for external multimodal embedding"
+            )
 
         mm_embedding_info = multimodal_embedding['image']
         if not mm_embedding_info or not isinstance(mm_embedding_info[0], dict):
