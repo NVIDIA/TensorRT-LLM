@@ -217,22 +217,6 @@ class Qwen2VLInputProcessorBase(InputProcessor):
             mrope_position_deltas, device=input_ids.device).unsqueeze(1)
         return position_ids, mrope_position_deltas
 
-    def _post_init_(self):
-        _, rotary_cos_sin = RopeEmbeddingUtils.create_sinusoidal_positions_for_attention_plugin(
-            num_pos=self.model_config.max_position_embeddings,
-            dim=int(self.model_config.hidden_size /
-                    self.model_config.num_attention_heads),
-            theta=float(self.model_config.rope_theta),
-            scale_type=RotaryScalingType.mrope)
-        self.rotary_cos_sin = torch.from_numpy(rotary_cos_sin)
-        self.rotary_cos_sin = self.rotary_cos_sin.reshape(
-            self.model_config.max_position_embeddings,
-            int(self.model_config.hidden_size /
-                self.model_config.num_attention_heads / 2), 2)
-
-        self.cos_ori = self.rotary_cos_sin[:, :, 0]
-        self.sin_ori = self.rotary_cos_sin[:, :, 1]
-
     def get_num_tokens_per_image(
         self,
         *,
