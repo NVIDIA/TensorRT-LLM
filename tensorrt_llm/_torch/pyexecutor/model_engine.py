@@ -693,15 +693,16 @@ class PyTorchModelEngine(ModelEngine):
                             # No KV cache space!
                             pass
                         else:
-                            logger.info(
-                                f"Run autotuning warmup for batch size={1}")
                             self.forward(batch,
                                          new_tensors_device=None,
                                          resource_manager=resource_manager)
                             torch.cuda.synchronize()
 
-                    logger.info(f"Autotuner Cache size after warmup " +
-                                str(len(AutoTuner.get().profiling_cache)))
+                    logger.info(
+                        f"[Autotuner] Cache size after warmup is {len(AutoTuner.get().profiling_cache)}"
+                    )
+
+                AutoTuner.get().print_profiling_cache()
 
             if not (self._run_cuda_graphs
                     or self._torch_compile_piecewise_cuda_graph):
