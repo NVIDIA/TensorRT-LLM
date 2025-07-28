@@ -45,7 +45,7 @@ cleanup() {
 init_ubuntu() {
   apt-get update
   # libibverbs-dev is installed but libmlx5.so is missing, reinstall the package
-  apt-get --reinstall install libibverbs-dev
+  apt-get --reinstall install -y libibverbs-dev
   apt-get install -y --no-install-recommends \
     ccache \
     gdb \
