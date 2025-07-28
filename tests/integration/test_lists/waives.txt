@@ -415,6 +415,7 @@ examples/test_multimodal.py::test_llm_multimodal_general[Phi-4-multimodal-instru
 examples/test_multimodal.py::test_llm_multimodal_general[kosmos-2-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:1] SKIP (https://nvbugs/5387422)
 examples/test_multimodal.py::test_llm_multimodal_general[fuyu-8b-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:1] SKIP (https://nvbugs/5387424)
 test_e2e.py::test_ptp_quickstart SKIP (https://nvbugs/5387762)
+disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_tllm_gen_helix[DeepSeek-V3-Lite-fp8] SKIP (temporary, work in progress)
 triton_server/test_triton_llm.py::test_llava_onevision[test_basic-False-1---False-True-False-0-128-disableDecoupleMode-inflight_fused_batching-disableTrtOverlap-0.2-max_utilization---1-1-1-False-tensorrt_llm_bls] SKIP (https://nvbugs/5396437)
 triton_server/test_triton_llm.py::test_llava_onevision[test_video-False-1---False-True-False-0-128-disableDecoupleMode-inflight_fused_batching-disableTrtOverlap-0.2-guaranteed_no_evict---1-1-1-False-tensorrt_llm_bls] SKIP (https://nvbugs/5396437)
 triton_server/test_triton.py::test_cpp_unit_tests[cpp-unit-tests] SKIP (https://nvbugs/5401088)

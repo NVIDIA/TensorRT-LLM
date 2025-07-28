@@ -87,6 +87,9 @@ struct MlaParams
     void* context_paged_kv_ptr = nullptr;
     void* context_kv_cache_block_offsets_ptr = nullptr;
     int32_t context_paged_kv_max_blocks_per_seq = 0;
+
+    // for Helix parallelism: the rotary position offsets (for each token)
+    int32_t const* helix_position_offsets{nullptr};
 };
 
 template <typename T, typename KVCacheBuffer>

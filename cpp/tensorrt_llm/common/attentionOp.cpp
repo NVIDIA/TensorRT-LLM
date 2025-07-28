@@ -1013,6 +1013,9 @@ int AttentionOp::mlaGeneration(
         tllmRunnerParams.oPtr = reinterpret_cast<void*>(params.context_buf);
         tllmRunnerParams.oSfPtr = generation_params.context_buf_sf;
 
+        // softmax stats if needed
+        tllmRunnerParams.softmaxStatsPtr = generation_params.softmax_stats;
+
         // MLA uses different head dimensions for Qk and V.
         tllmRunnerParams.mHeadDimQk = mMLAParams.kv_lora_rank + mMLAParams.qk_rope_head_dim;
         tllmRunnerParams.mHeadDimV = mMLAParams.kv_lora_rank;
@@ -1713,7 +1716,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         fmhaParams.oSfScalePtr = params.attention_output_sf_scale;
         fmhaParams.stream = stream;
         fmhaParams.forceFp32Acc = mFMHAForceFP32Acc;
-        fmhaParams.softmaxStatsPtr = params.softmaxStatsPtr;
+        fmhaParams.softmaxStatsPtr = params.softmax_stats;
 
         if (mAttentionChunkSize)
         {

@@ -40,6 +40,7 @@ add_library(
   mlaPreprocessOp.cpp
   allgatherOp.cpp
   allreduceOp.cpp
+  alltoallOp.cpp
   attentionOp.cpp
   causalConv1dOp.cpp
   convertSpecDecodingMaskToPackedMaskOp.cpp
