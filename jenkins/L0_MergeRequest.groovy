@@ -954,17 +954,17 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                 echo "requireMultiGpuTesting: ${requireMultiGpuTesting}"
                 if (!requireMultiGpuTesting) {
                     if (singleGpuTestFailed) {
-                        error "Single-GPU test failed"
+                        error "x86_64 single-GPU test failed"
                     }
                     return
                 }
 
                 if (singleGpuTestFailed) {
                     if (env.JOB_NAME ==~ /.*PostMerge.*/) {
-                        echo "In the official post-merge pipeline, single-GPU test failed, whereas multi-GPU test is still kept running."
+                        echo "In the official post-merge pipeline, x86_64 single-GPU test failed, whereas multi-GPU test is still kept running."
                     } else {
                         stage("[Test-x86_64-Multi-GPU] Blocked") {
-                            error "This pipeline requires running multi-GPU test, but single-GPU test has failed."
+                            error "This pipeline requires running multi-GPU test, but x86_64 single-GPU test has failed."
                         }
                         return
                     }
@@ -1058,7 +1058,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                 echo "requireMultiGpuTesting: ${requireMultiGpuTesting}"
                 if (!requireMultiGpuTesting) {
                     if (singleGpuTestFailed) {
-                        error "Single-GPU test failed"
+                        error "SBSA single-GPU test failed"
                     }
                     return
                 }
@@ -1068,7 +1068,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         echo "In the official post-merge pipeline, SBSA single-GPU test failed, whereas multi-GPU test is still kept running."
                     } else {
                         stage("[Test-SBSA-Multi-GPU] Blocked") {
-                            error "This pipeline requires running SBSA multi-GPU test, but single-GPU test has failed."
+                            error "This pipeline requires running SBSA multi-GPU test, but SBSA single-GPU test has failed."
                         }
                         return
                     }
