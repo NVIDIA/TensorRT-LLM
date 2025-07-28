@@ -636,7 +636,8 @@ class SampleStateTensorsHostTRTLLM(SampleStateTensors):
 
 @dataclass(kw_only=True)
 class SampleStateTRTLLM(SampleState):
-    finalize_events: dict[str, CudaEvent]
+    finalize_events: dict[str, CudaEvent] | None = None
+    """`Optional` to accommodate `_forward_step_inter_pp` which creates a `SampleState` without `finalize_events`"""
     host: SampleStateTensorsHostTRTLLM
 
 
@@ -1048,7 +1049,7 @@ class TRTLLMSampler(Sampler):
             if finished_sum_host[seq_slot] == beam_width:
                 request.state = LlmRequestState.GENERATION_COMPLETE
         for request in reqs:
-            if request.request_id in finalize_events:
+            if finalize_events is not None and request.request_id in finalize_events:
                 self._post_process_request(request, state)
 
     def _finalize_request(self, request: LlmRequest, streaming: bool):
