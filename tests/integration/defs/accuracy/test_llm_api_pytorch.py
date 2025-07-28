@@ -367,9 +367,11 @@ class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
     @skip_pre_hopper
     def test_fp8_tp4(self):
         model_path = f"{llm_models_root()}/modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp8"
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5)
         with LLM(model_path,
                  tensor_parallel_size=4,
+                 max_seq_len=8192,
+                 max_batch_size=32,
                  kv_cache_config=kv_cache_config) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
             task = MMLU(self.MODEL_NAME)
