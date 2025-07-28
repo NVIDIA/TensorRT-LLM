@@ -94,19 +94,22 @@ class ADEngine(ModelEngine):
             f"{max_seq_len=}, {max_batch_size=}, {attn_page_size=}, {max_num_tokens=}, {max_beam_width=}"
         )
 
+        # update device to contain the current default device if it's in cuda
+        device = torch.device(ad_config.device)
+        if device.type == "cuda" and device.index is None:
+            device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        device = str(device)
+        
         # initialize seq info object
         seq_info = SequenceInfo(
             max_seq_len=max_seq_len,
             max_batch_size=max_batch_size,
             page_size=attn_page_size,
             max_num_tokens=max_num_tokens,
+            device=device,
         )
         print(" in seq_info for device: ", torch.cuda.current_device())
-        # update device to contain the current default device if it's in cuda
-        device = torch.device(ad_config.device)
-        if device.type == "cuda" and device.index is None:
-            device = torch.device(f"cuda:{torch.cuda.current_device()}")
-        device = str(device)
+
 
         # construct inference optimizer
         build_and_optimize = InferenceOptimizer(
@@ -212,6 +215,7 @@ class ADEngine(ModelEngine):
         si.assign_cache_loc(page_assignments)
         return last_logit_only
 
+    @nvtx_range("ad_compute_logits")
     def _compute_logits(self) -> List[torch.Tensor]:
         # run the model
         logits: torch.Tensor = self.model(*self.cache_seq_interface.args)[0]
