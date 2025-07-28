@@ -551,7 +551,7 @@ class BenchRunner:
         if self.use_pytorch_backend:
             benchmark_cmd += " --backend pytorch"
         else:
-            benchmark_cmd += " --backend trt"
+            benchmark_cmd += " --backend tensorrt"
 
         if self.extra_llm_api_options:
             benchmark_cmd += f" --extra_llm_api_options {self.extra_llm_api_options}"
