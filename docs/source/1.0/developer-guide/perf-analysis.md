@@ -58,9 +58,9 @@ Use [chrome://tracing/](chrome://tracing/) to inspect the saved profile.
 ## Examples
 Consult the Nsight Systems User Guide for full overview of MPI-related options.
 
-### Profiling specific iterations on a trtllm-bench/trtllm-serve run
+### Profiling specific iterations on a `trtllm-bench`/`trtllm-serve` run
 
-Say we want to profile iterations 100 to 150 on a trtllm-bench/trtllm-serve run, we want to collect as much information as possible for debugging, such as GIL, debugging NVTX markers, etc:
+Say we want to profile iterations 100 to 150 on a `trtllm-bench`/`trtllm-serve` run, we want to collect as much information as possible for debugging, such as GIL, debugging NVTX markers, etc:
 
 ```bash
 #!/bin/bash
