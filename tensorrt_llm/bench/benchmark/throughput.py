@@ -369,6 +369,18 @@ def throughput_command(
     # Construct the runtime configuration dataclass.
     runtime_config = RuntimeConfig(**exec_settings)
     llm = None
+
+    def ignore_trt_only_args(kwargs: dict):
+        trt_only_args = [
+            "batching_type",
+            "normalize_log_probs",
+            "extended_runtime_perf_knob_config",
+        ]
+        for arg in trt_only_args:
+            if kwargs.pop(arg, None):
+                logger.warning(
+                    f"Ignore {arg} for {runtime_config.backend} backend.")
+
     try:
         logger.info("Setting up throughput benchmark.")
         kwargs = kwargs | runtime_config.get_llm_args()
@@ -378,18 +390,11 @@ def throughput_command(
             kwargs["enable_iter_perf_stats"] = True
 
         if runtime_config.backend == 'pytorch':
-            if kwargs.pop("extended_runtime_perf_knob_config", None):
-                logger.warning(
-                    "Ignore extended_runtime_perf_knob_config for pytorch backend."
-                )
+            ignore_trt_only_args(kwargs)
             llm = PyTorchLLM(**kwargs)
         elif runtime_config.backend == "_autodeploy":
-            if kwargs.pop("extended_runtime_perf_knob_config", None):
-                logger.warning(
-                    "Ignore extended_runtime_perf_knob_config for _autodeploy backend."
-                )
+            ignore_trt_only_args(kwargs)
             kwargs["world_size"] = kwargs.pop("tensor_parallel_size", None)
-            kwargs.pop("pipeline_parallel_size", None)
 
             llm = AutoDeployLLM(**kwargs)
         else:
