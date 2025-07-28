@@ -67,7 +67,8 @@ class MTPHiddenStatesManager(BaseResourceManager):
             if req.is_first_context_chunk:
                 slot_id = self.slot_manager.add_slot(req.request_id)
                 if self.use_relaxed_acceptance_for_thinking:
-                    self.mtp_relaxed_delta_pool[slot_id] = 0.
+                    self.mtp_relaxed_delta_pool[slot_id].copy_(
+                        0, non_blocking=True)
 
     def update_resources(self, scheduled_batch: ScheduledRequests):
         pass
@@ -75,7 +76,8 @@ class MTPHiddenStatesManager(BaseResourceManager):
     def free_resources(self, request: LlmRequest):
         free_slot_id = self.slot_manager.get_slot(request.request_id)
         if self.use_relaxed_acceptance_for_thinking:
-            self.mtp_relaxed_delta_pool[free_slot_id] = 0.
+            self.mtp_relaxed_delta_pool[free_slot_id].copy_(0,
+                                                            non_blocking=True)
         self.slot_manager.remove_slot(request.request_id)
 
     def add_dummy_requests(self, request_ids: List[int]):

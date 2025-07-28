@@ -204,6 +204,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                           sampling_params=sampling_params,
                           extra_acc_spec="temperature=0.8,top_p=0.95")
 
+    @skip_pre_hopper
     def test_fp8_beam_search(self):
         model_path = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct-FP8"
         pytorch_config = dict(disable_overlap_scheduler=True)
@@ -228,6 +229,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                           sampling_params=sampling_params,
                           extra_acc_spec="beam_width=4")
 
+    @skip_pre_hopper
     def test_eagle3(self):
         pytorch_config = dict(
             disable_overlap_scheduler=True,
@@ -250,15 +252,18 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @skip_pre_hopper
     def test_ngram(self):
-        pytorch_config = dict(disable_overlap_scheduler=True)
+        pytorch_config = dict(
+            disable_overlap_scheduler=True,
+            cuda_graph_config=CudaGraphConfig(batch_sizes=[1]),
+        )
 
         kv_cache_config = KvCacheConfig(enable_block_reuse=False)
 
-        draft_len = 4
         spec_config = NGramDecodingConfig(
-            max_draft_len=draft_len,
-            max_matching_ngram_size=draft_len,
+            max_draft_len=4,
+            max_matching_ngram_size=2,
             is_keep_all=True,
             is_use_oldest=True,
             is_public_pool=True,
@@ -267,7 +272,8 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
         with LLM(model=self.MODEL_PATH,
                  **pytorch_config,
                  kv_cache_config=kv_cache_config,
-                 speculative_config=spec_config) as llm:
+                 speculative_config=spec_config,
+                 max_batch_size=16) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
@@ -307,7 +313,7 @@ class TestLlama3_2_1B(LlmapiAccuracyTestHarness):
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
 
-    @skip_pre_hopper
+    @skip_pre_ada
     def test_fp8_prequantized(self):
         model_path = f"{llm_models_root()}/llama-3.2-models/Llama-3.2-1B-FP8"
         with LLM(model_path) as llm:
@@ -361,9 +367,11 @@ class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
     @skip_pre_hopper
     def test_fp8_tp4(self):
         model_path = f"{llm_models_root()}/modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp8"
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5)
         with LLM(model_path,
                  tensor_parallel_size=4,
+                 max_seq_len=8192,
+                 max_batch_size=32,
                  kv_cache_config=kv_cache_config) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
             task = MMLU(self.MODEL_NAME)

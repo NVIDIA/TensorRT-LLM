@@ -39,7 +39,6 @@ class MoERunner(TunableRunner):
         ep_rank: int,
         cluster_size: int,
         cluster_rank: int,
-        enable_alltoall: bool,
         use_deepseek_fp8_block_scale: bool,
         use_w4a8_group_scaling: bool,
         use_mxfp8_act_scaling: bool,
@@ -55,7 +54,8 @@ class MoERunner(TunableRunner):
         self.ep_rank = ep_rank
         self.cluster_size = cluster_size
         self.cluster_rank = cluster_rank
-        self.enable_alltoall = enable_alltoall
+        # The best tactic is estimated as if alltoall is disabled
+        self.enable_alltoall = False
         self.use_deepseek_fp8_block_scale = use_deepseek_fp8_block_scale
         self.use_w4a8_group_scaling = use_w4a8_group_scaling
         self.use_mxfp8_act_scaling = use_mxfp8_act_scaling
@@ -141,24 +141,37 @@ def fused_moe(
     use_mxfp8_act_scaling: bool = False,
     min_latency_mode: bool = False,
     tune_max_num_tokens: int = 8192,
+    tuner_num_tokens: Optional[int] = None,
+    tuner_top_k: Optional[int] = None,
 ) -> List[torch.Tensor]:
 
     tuner = AutoTuner.get()
     MoERunner.refine_tuning_config(tune_max_num_tokens)
+
+    # Only the non-alltoall case is considered for profiling in the warmup phase.
+    # Therefore, to get the correct tactics during the actual inference, the inputs to the tuner should be the same as when not using alltoall.
+    if enable_alltoall:
+        assert tuner_num_tokens is not None
+        assert tuner_top_k is not None
+        tuner_input = input[:tuner_num_tokens]
+    else:
+        assert tuner_num_tokens is None
+        assert tuner_top_k is None
+        tuner_input = input
+        tuner_top_k = token_selected_experts.size(1)
 
     # allocate workspace for profiling
     moe_runner = MoERunner(
         x_dtype=input.dtype,
         weight_dtype=fc1_expert_weights.dtype,
         output_dtype=output_dtype,
-        top_k=token_selected_experts.size(1),
+        top_k=tuner_top_k,
         tp_size=tp_size,
         tp_rank=tp_rank,
         ep_size=ep_size,
         ep_rank=ep_rank,
         cluster_size=cluster_size,
         cluster_rank=cluster_rank,
-        enable_alltoall=enable_alltoall,
         use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
         use_w4a8_group_scaling=use_w4a8_group_scaling,
         use_mxfp8_act_scaling=use_mxfp8_act_scaling,
@@ -170,8 +183,8 @@ def fused_moe(
         [moe_runner],
         MoERunner.tuning_config,
         [
-            input, fc1_expert_weights, fc1_expert_biases, fc2_expert_weights,
-            fc2_expert_biases
+            tuner_input, fc1_expert_weights, fc1_expert_biases,
+            fc2_expert_weights, fc2_expert_biases
         ],
         gemm_idx=1,
     )
@@ -181,8 +194,8 @@ def fused_moe(
         [moe_runner],
         MoERunner.tuning_config,
         [
-            input, fc1_expert_weights, fc1_expert_biases, fc2_expert_weights,
-            fc2_expert_biases
+            tuner_input, fc1_expert_weights, fc1_expert_biases,
+            fc2_expert_weights, fc2_expert_biases
         ],
         gemm_idx=2,
     )
