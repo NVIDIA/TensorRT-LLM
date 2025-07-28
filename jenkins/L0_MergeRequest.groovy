@@ -1057,6 +1057,9 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                 def requireMultiGpuTesting = currentBuild.description?.contains("Require SBSA Multi-GPU Testing") ?: false
                 echo "requireMultiGpuTesting: ${requireMultiGpuTesting}"
                 if (!requireMultiGpuTesting) {
+                    if (singleGpuTestFailed) {
+                        error "Single-GPU test failed"
+                    }
                     return
                 }
 
@@ -1065,11 +1068,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         echo "In the official post-merge pipeline, SBSA single-GPU test failed, whereas multi-GPU test is still kept running."
                     } else {
                         stage("[Test-SBSA-Multi-GPU] Blocked") {
-                            catchError(
-                                buildResult: 'FAILURE',
-                                stageResult: 'FAILURE') {
-                                error "This pipeline requires running SBSA multi-GPU test, but single-GPU test has failed."
-                            }
+                            error "This pipeline requires running SBSA multi-GPU test, but single-GPU test has failed."
                         }
                         return
                     }
