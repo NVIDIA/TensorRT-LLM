@@ -12,7 +12,7 @@ from .openai_server import RemoteOpenAIServer
 
 @pytest.fixture(scope="module")
 def model_name():
-    return "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
+    return "Qwen3/Qwen3-0.6B-Base"
 
 
 @pytest.fixture(scope="module", params=["trt", "pytorch"])
@@ -25,7 +25,9 @@ def max_batch_size(request):
     return request.param
 
 
-@pytest.fixture(scope="module", params=["80000"])
+# Note: In the model Qwen3-0.6B-Base, "max_position_embeddings" is 32768,
+# so the inferred max_seq_len is 32768.
+@pytest.fixture(scope="module", params=["32768"])
 def max_seq_len(request):
     return request.param
 
