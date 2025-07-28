@@ -40,7 +40,7 @@ from .tokenizer import (TokenizerBase, _llguidance_tokenizer_info,
                         _xgrammar_tokenizer_info)
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
 from .utils import (append_docstring, exception_handler, get_device_count,
-                    print_colored_debug)
+                    print_colored_debug, set_api_status)
 
 
 class RequestOutput(DetokenizedGenerationResultBase, GenerationResult):
@@ -212,6 +212,7 @@ class BaseLLM:
         atexit.register(LLM._shutdown_wrapper, weakref.ref(self))
 
     @property
+    @set_api_status("beta")
     def llm_id(self) -> str:
         if self._llm_id is None:
             hostname = socket.gethostname()
@@ -334,9 +335,9 @@ class BaseLLM:
         # With pytorch backend, py_executor has logic to handle max_tokens of 1,
         # so set to 1 to avoid allocating unnecessary KV cache blocks for single request
         # TODO: Also support for trt backend
-        if (disaggregated_params is not None
-                and disaggregated_params.request_type == "context_only"
-                and not self._on_trt_backend):
+        is_ctx_only = disaggregated_params is not None and disaggregated_params.request_type == "context_only"
+        is_gen_only = disaggregated_params is not None and disaggregated_params.request_type == "generation_only"
+        if is_ctx_only and not self._on_trt_backend:
             sampling_params.max_tokens = 1
 
         inputs = prompt_inputs(inputs)
@@ -401,7 +402,8 @@ class BaseLLM:
         self._check_arguments(
             len(prompt_token_ids),
             len(query_token_ids) if query_token_ids is not None else 0,
-            sampling_params)
+            sampling_params,
+            is_gen_only=is_gen_only)
         if _postproc_params:
             _postproc_params.postproc_args.num_prompt_tokens = len(
                 prompt_token_ids)
@@ -421,6 +423,7 @@ class BaseLLM:
         return RequestOutput._from_generation_result(result, prompt,
                                                      self.tokenizer)
 
+    @set_api_status("beta")
     def get_stats(self, timeout: Optional[float] = 2) -> List[dict]:
         '''Get iteration statistics from the runtime.
         To collect statistics, call this function after prompts have been submitted with LLM().generate().
@@ -434,6 +437,7 @@ class BaseLLM:
         '''
         return self._executor.get_stats(timeout=timeout)
 
+    @set_api_status("beta")
     def get_stats_async(self, timeout: Optional[float] = 2) -> IterationResult:
         '''Get iteration statistics from the runtime.
         To collect statistics, you can call this function in an async coroutine or the /metrics endpoint (if you're using trtllm-serve)
@@ -447,6 +451,7 @@ class BaseLLM:
         '''
         return self._executor.aget_stats(timeout=timeout)
 
+    @set_api_status("beta")
     def get_kv_cache_events(self, timeout: Optional[float] = 2) -> List[dict]:
         '''Get iteration KV events from the runtime.
 
@@ -468,6 +473,7 @@ class BaseLLM:
         '''
         return self._executor.get_kv_events(timeout=timeout)
 
+    @set_api_status("beta")
     def get_kv_cache_events_async(self,
                                   timeout: Optional[float] = 2
                                   ) -> IterationResult:
@@ -529,7 +535,8 @@ class BaseLLM:
         return sampling_params
 
     def _check_arguments(self, prompt_len: int, query_len: int,
-                         sampling_params: SamplingParams) -> None:
+                         sampling_params: SamplingParams,
+                         is_gen_only: bool) -> None:
 
         if self.args.backend in ["pytorch", "_autodeploy"]:
             # TODO: remove these checks after PyTorch backend
@@ -657,6 +664,7 @@ class BaseLLM:
     def tokenizer(self, tokenizer: TokenizerBase):
         self._tokenizer = tokenizer
 
+    @set_api_status("beta")
     def shutdown(self) -> None:
         if hasattr(self, "_executor") and self._executor is not None:
             self._executor.shutdown()
@@ -777,7 +785,9 @@ class _TrtLLM(BaseLLM):
             or tllm.BatchingType.INFLIGHT,
             max_batch_size=max_batch_size,
             max_num_tokens=max_num_tokens,
-            gather_generation_logits=self.args.gather_generation_logits)
+            gather_generation_logits=self.args.gather_generation_logits,
+            fail_fast_on_attention_window_too_large=getattr(
+                self.args, 'fail_fast_on_attention_window_too_large', False))
 
         # also set executor_config.max_seq_len in TRT workflow, to deduce default max_tokens
         if max_seq_len is not None:
@@ -910,15 +920,21 @@ class _TorchLLM(BaseLLM):
         max_num_tokens = self.args.max_num_tokens
         max_seq_len = self.args.max_seq_len
 
+        kwargs = {}
+        if self._on_trt_backend:
+            kwargs[
+                "batching_type"] = self.args.batching_type or tllm.BatchingType.INFLIGHT
+
         self._executor_config = tllm.ExecutorConfig(
             max_beam_width=self.args.max_beam_width,
             scheduler_config=PybindMirror.maybe_to_pybind(
                 self.args.scheduler_config),
-            batching_type=PybindMirror.maybe_to_pybind(self.args.batching_type)
-            or tllm.BatchingType.INFLIGHT,
             max_batch_size=max_batch_size,
             max_num_tokens=max_num_tokens,
-            gather_generation_logits=self.args.gather_generation_logits)
+            gather_generation_logits=self.args.gather_generation_logits,
+            fail_fast_on_attention_window_too_large=getattr(
+                self.args, 'fail_fast_on_attention_window_too_large', False),
+            **kwargs)
 
         if self.args.kv_cache_config is not None:
             self._executor_config.kv_cache_config = PybindMirror.maybe_to_pybind(
@@ -947,7 +963,8 @@ class _TorchLLM(BaseLLM):
                 f"Unsupported guided decoding backend {self.args.guided_decoding_backend}"
             )
 
-        self._executor_config.normalize_log_probs = self.args.normalize_log_probs
+        if self._on_trt_backend:
+            self._executor_config.normalize_log_probs = self.args.normalize_log_probs
         self._executor_config.enable_chunked_context = self.args.enable_chunked_prefill
         self._executor_config.max_beam_width = self.args.max_beam_width
         if self.args.cache_transceiver_config is not None:
@@ -963,7 +980,11 @@ class _TorchLLM(BaseLLM):
             speculative_config=self.args.speculative_config,
             hf_model_dir=self._hf_model_dir,
             max_input_len=self.args.max_input_len,
-            max_seq_len=max_seq_len)
+            max_seq_len=max_seq_len,
+            checkpoint_format=None if self.args.backend == "_autodeploy" else
+            self.args.checkpoint_format,
+            checkpoint_loader=None if self.args.backend == "_autodeploy" else
+            self.args.checkpoint_loader)
 
         # TODO: revisit gather_context_logits
         return_logits = self.args.gather_generation_logits
@@ -1026,13 +1047,11 @@ class LLM(_TorchLLM):
                          revision, tokenizer_revision, **kwargs)
 
 
-_LLM_REPR = "TorchLLM"
-
 # sphinx will ignore the LLM's docstring if it is not explicitly set
 LLM.__doc__ = \
     f"""LLM class is the main class for running a LLM model.
 
-    This class is an alias of {_LLM_REPR}.
+    For more details about the arguments, please refer to :class:`TorchLlmArgs`.
 
     Parameters:
 """ + TORCH_LLM_DOCSTRING

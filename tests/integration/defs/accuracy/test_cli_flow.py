@@ -211,6 +211,7 @@ class TestLlama3_3NemotronSuper49Bv1(CliFlowAccuracyTestHarness):
     def test_auto_dtype_tp2(self):
         self.run(tasks=[MMLU(self.MODEL_NAME)], tp_size=2, dtype='auto')
 
+    @skip_pre_hopper
     @pytest.mark.skip(
         reason="nemotron-nas scripts have to accommodate fp8 flags")
     @pytest.mark.skip_less_device(2)
@@ -366,6 +367,13 @@ class TestPhi4MiniInstruct(CliFlowAccuracyTestHarness):
 
     def test_auto_dtype(self):
         self.run(tasks=[MMLU(self.MODEL_NAME)], dtype='auto')
+
+    @pytest.mark.skip_less_device(2)
+    def test_tp2(self):
+        # Created a dummy accuracy to track tp_size=2 for phi4-mini model.
+        # TODO: update once https://nvbugs/5393849 is fixed.
+        MODEL_NAME = "microsoft/Phi-4-mini-instruct-tp2"
+        self.run(tasks=[MMLU(MODEL_NAME)], tp_size=2)
 
 
 # Long sequence length test:
@@ -804,14 +812,14 @@ class TestLlama3_1_8BInstruct(CliFlowAccuracyTestHarness):
     def test_auto_dtype(self):
         self.run(dtype='auto')
 
-    @skip_pre_ada
+    @skip_pre_hopper
     def test_fp8_prequantized(self, mocker):
         mocker.patch.object(
             self.__class__, "MODEL_PATH",
             f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct-FP8")
         self.run(quant_algo=QuantAlgo.FP8, kv_cache_quant_algo=QuantAlgo.FP8)
 
-    @skip_pre_ada
+    @skip_pre_hopper
     @skip_post_blackwell
     def test_medusa_fp8_prequantized(self, mocker):
         # nvidia/Llama-3.1-8B-Medusa-FP8
@@ -951,6 +959,7 @@ class TestLlama3_3_70BInstruct(CliFlowAccuracyTestHarness):
     def test_auto_dtype_tp8(self):
         self.run(tasks=[MMLU(self.MODEL_NAME)], tp_size=8, dtype='auto')
 
+    @skip_pre_hopper
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_device_not_contain(["H100", "H200", "B200"])
     def test_fp8_prequantized_tp4(self, mocker):

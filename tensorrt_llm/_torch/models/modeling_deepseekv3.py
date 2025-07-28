@@ -38,6 +38,7 @@ from torch import nn
 from tqdm import tqdm
 from transformers import PretrainedConfig
 
+from tensorrt_llm._ipc_utils import can_access_peer
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.llmapi.utils import enable_llm_debug
@@ -53,8 +54,8 @@ from ..models.modeling_utils import ModelConfig, QuantConfig
 from ..modules.attention import MLA
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import (CutlassFusedMoE, DeepSeekV3MoeRoutingMethod,
-                                 TRTLLMGenFusedMoE, WideEPMoE, create_moe,
+from ..modules.fused_moe import (DeepSeekV3MoeRoutingMethod, TRTLLMGenFusedMoE,
+                                 create_moe,
                                  moe_load_balancer_set_repeated_for_next_layer)
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode, WeightsLoadingConfig
@@ -62,8 +63,7 @@ from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..peft.lora.layer import LoraLayer
 from ..speculative import MTPEagleWorker, MTPSpecMetadata, MTPWorker
-from ..utils import (AuxStreamType, EventType, Fp4QuantizedTensor,
-                     disable_fp4_allgather)
+from ..utils import AuxStreamType, EventType, Fp4QuantizedTensor
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              EagerFusionConfig, filter_weights,
                              register_auto_model)
@@ -131,10 +131,20 @@ class DeepseekV3MTPHead(nn.Module):
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
         super().__init__()
         config = model_config.pretrained_config
+        self.model_config = model_config
 
         self.norm = RMSNorm(hidden_size=config.hidden_size,
                             eps=config.rms_norm_eps,
                             dtype=config.torch_dtype)
+
+    @torch.compile(options={"max-autotune": True})
+    def get_last_token_states(self, hidden_states, attn_metadata):
+        last_tokens = torch.cumsum(
+            attn_metadata.seq_lens_cuda,
+            dim=0,
+            dtype=torch.long,
+        ) - 1
+        return hidden_states[last_tokens]
 
     def forward(self,
                 hidden_states: torch.Tensor,
@@ -143,16 +153,16 @@ class DeepseekV3MTPHead(nn.Module):
                 return_context_logits: bool = False) -> torch.Tensor:
         if not return_context_logits:
             if attn_metadata is not None:
-                last_tokens = torch.cumsum(
-                    attn_metadata.seq_lens_cuda,
-                    dim=0,
-                    dtype=torch.long,
-                ) - 1
-                hidden_states = hidden_states[last_tokens]
+                hidden_states = self.get_last_token_states(
+                    hidden_states, attn_metadata)
             else:
                 hidden_states = hidden_states[-1].unsqueeze(0)
 
+        if not (self.model_config.mapping.enable_attention_dp):
+            lm_head.gather_output = False
         logits = lm_head(hidden_states)
+        if not (self.model_config.mapping.enable_attention_dp):
+            lm_head.gather_output = True
         return logits
 
 
@@ -512,22 +522,11 @@ class Deepseekv3MoE(nn.Module):
         # max-throughput
         use_dp_padding = False
         if self.use_dp and self.mapping.tp_size > 1:
-            # FP4 all_gather moves this bf16 allgather in to after topk and fp4 quantization
-            # to reduce allreduce BW
-            if (disable_fp4_allgather()
-                    and not self.experts.enable_alltoall) or isinstance(
-                        self.experts, TRTLLMGenFusedMoE):
+            if isinstance(self.experts, TRTLLMGenFusedMoE):
                 hidden_states = allgather(hidden_states,
                                           self.mapping,
                                           dim=0,
                                           sizes=all_rank_num_tokens)
-            elif not isinstance(self.experts, (CutlassFusedMoE, WideEPMoE)) or (
-                    not self.experts.has_fp8_qdq and self.experts.has_nvfp4):
-                # Use padding when not using the cutlass path or when x_sf in self.experts is not None
-                use_dp_padding = True
-                hidden_states = torch.nn.functional.pad(
-                    hidden_states,
-                    (0, 0, 0, all_rank_max_num_tokens - hidden_states.shape[0]))
 
         router_logits = self.gate(hidden_states)
 
@@ -614,6 +613,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         self.enable_attention_dp = mapping.enable_attention_dp
 
         self.mlp_tp_size = mapping.tp_size
+        self.is_p2p_supported = can_access_peer(mapping)
 
         self.fusion_config = EagerFusionConfig()
         self.enable_fusion = os.environ.get(
@@ -803,12 +803,12 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual)
 
-        # Note: this fusion pattern is only supported for TRTLLM-nvfp4 backend now
-        do_finalize = not (hidden_states.shape[0]
-                           <= self.moe_allreduce.max_token
-                           and self.fusion_config.POST_MOE_FUSION
-                           and self.model_config.moe_backend == 'TRTLLM'
-                           and self.mlp.experts.has_nvfp4)
+        # Note: this fusion pattern is only supported for single-node TRTLLM-nvfp4 backend now
+        do_finalize = self.mapping.is_multi_node() or (
+            not (hidden_states.shape[0] <= self.moe_allreduce.max_token
+                 and self.fusion_config.POST_MOE_FUSION
+                 and self.model_config.moe_backend == "TRTLLM"
+                 and self.mlp.experts.has_nvfp4 and self.is_p2p_supported))
 
         hidden_states = _run_MoE(hidden_states,
                                  hidden_states_fp4=None,
@@ -913,6 +913,12 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
         self.num_shared_experts = config.n_shared_experts
         self.top_k = config.num_experts_per_tok
 
+        self.aux_stream = aux_stream_dict[AuxStreamType.MoeShared]
+        self.event_dict = {
+            key: torch.cuda.Event()
+            for key in [EventType.Main, EventType.MoeShared]
+        }
+
         self.enorm = RMSNorm(hidden_size=config.hidden_size,
                              eps=config.rms_norm_eps,
                              dtype=config.torch_dtype)
@@ -920,15 +926,27 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
         self.hnorm = RMSNorm(hidden_size=config.hidden_size,
                              eps=config.rms_norm_eps,
                              dtype=config.torch_dtype)
-
-        self.eh_proj = Linear(
-            config.hidden_size * 2,
-            config.hidden_size,
-            bias=False,
-            dtype=config.torch_dtype,
-            skip_create_weights_in_init=model_config.
-            skip_create_weights_in_init,
-        )
+        if model_config.mapping.enable_attention_dp:
+            self.eh_proj = Linear(
+                config.hidden_size * 2,
+                config.hidden_size,
+                bias=False,
+                dtype=config.torch_dtype,
+                skip_create_weights_in_init=model_config.
+                skip_create_weights_in_init,
+            )
+        else:
+            self.eh_proj = Linear(
+                config.hidden_size * 2,
+                config.hidden_size,
+                bias=False,
+                dtype=config.torch_dtype,
+                tensor_parallel_mode=TensorParallelMode.ROW,
+                mapping=model_config.mapping,
+                reduce_output=True,
+                skip_create_weights_in_init=model_config.
+                skip_create_weights_in_init,
+            )
 
         self.shared_head = DeepseekV3MTPHead(model_config)
 
@@ -944,9 +962,26 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
         **kwargs,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
 
-        inputs_embeds = self.enorm(embed_tokens(input_ids))
-        hidden_states = self.hnorm(hidden_states)
+        def norm_embeds():
+            return self.enorm(embed_tokens(input_ids))  #emdedding
+
+        def norm_hidden():
+            return self.hnorm(hidden_states)
+
+        inputs_embeds, hidden_states = maybe_execute_in_parallel(
+            norm_embeds,
+            norm_hidden,
+            self.event_dict[EventType.Main],
+            self.event_dict[EventType.MoeShared],
+            self.aux_stream,
+        )
         hidden_states = torch.concat([inputs_embeds, hidden_states], dim=-1)
+        # Split hidden_states columnwise based on TP
+        tp_size = self.model_config.mapping.tp_size
+        tp_rank = self.model_config.mapping.tp_rank
+
+        if tp_size > 1 and not (self.model_config.mapping.enable_attention_dp):
+            hidden_states = torch.chunk(hidden_states, tp_size, dim=-1)[tp_rank]
         hidden_states = self.eh_proj(hidden_states)
 
         # Input layer norm
@@ -1084,7 +1119,8 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
                                           self.model.aux_stream_dict)
                 self.model.layers.append(mtp_layer)
                 self.epilogue.append(mtp_layer)
-                self.mtp_worker = MTPEagleWorker(model_config.spec_config)
+                self.mtp_worker = MTPEagleWorker(model_config.spec_config,
+                                                 model_config)
             else:
                 mtp_layers = nn.ModuleList([
                     DeepseekV3MTP(model_config,
@@ -1094,7 +1130,8 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
                 ])
                 self.model.layers.extend(mtp_layers)
                 self.epilogue.extend(mtp_layers)
-                self.mtp_worker = MTPWorker(model_config.spec_config)
+                self.mtp_worker = MTPWorker(model_config.spec_config,
+                                            model_config)
                 # modify the QuantConfig to support duplicated mtp layers
                 if model_config.quant_config.exclude_modules is not None:
                     extend_exclude_modules = []

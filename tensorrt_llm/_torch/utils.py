@@ -1,5 +1,4 @@
 import contextlib
-import os
 import threading
 from dataclasses import dataclass
 from enum import Enum
@@ -100,13 +99,6 @@ class Fp4QuantizedTensor:
         return self.fp4_tensor.shape
 
 
-_disable_fp4_allgather = os.getenv("TLLM_DISABLE_FP4_ALLGATHER", "0") == "1"
-
-
-def disable_fp4_allgather():
-    return _disable_fp4_allgather
-
-
 def compute_swizzled_sf_shape(row: int, col: int):
     padded_row = pad_up(row, 128)
     padded_col = pad_up(col, 4)
@@ -204,7 +196,17 @@ def next_positive_power_of_2(x: int) -> int:
     if x < 1:
         return 1
 
-    return 1 << (x - 1).bit_length()
+    # Following code is equivalent to 1 << (x - 1).bit_length()
+    # But this impl does not contain bit_length() so can be used by torch compile.
+    # It can correctly handle 64bit number which should be enough for now.
+    n = x - 1
+    n |= n >> 1
+    n |= n >> 2
+    n |= n >> 4
+    n |= n >> 8
+    n |= n >> 16
+    n |= n >> 32
+    return n + 1
 
 
 def last_positive_power_of_2(x: int) -> int:
@@ -227,7 +229,7 @@ def get_power_of_2_num_tokens_buckets(max_num_tokens) -> List[int]:
         num_token_buckets.append(m)
         m //= 2
 
-    return tuple(num_token_buckets)
+    return tuple(num_token_buckets[::-1])
 
 
 def get_last_power_of_2_num_tokens_buckets(max_num_tokens) -> List[int]:
@@ -237,7 +239,7 @@ def get_last_power_of_2_num_tokens_buckets(max_num_tokens) -> List[int]:
     while m >= 1:
         num_token_buckets.append(m)
         m //= 2
-    return tuple(num_token_buckets)
+    return tuple(num_token_buckets[::-1])
 
 
 def fp4_scale_infer_shape(input_shapes: List[List[int]]):

@@ -135,6 +135,9 @@ class AttentionMetadata:
     _num_ctx_tokens: int = field(init=False, default=0, repr=False)
     _num_tokens: int = field(init=False, default=0, repr=False)
 
+    # This buffer is currently only used for TrtllmAttentionMetadata.
+    cache_indirection: Optional[torch.Tensor] = None
+
     def __post_init__(self) -> None:
         if self.is_cross:
             assert self.cross is None or self.cross is self, "Cross attention metadata should not have sub metadata"
@@ -351,6 +354,8 @@ class RopeParams:
     beta_slow: int = 1
     mscale: float = 1.0
     mscale_all_dim: float = 0.0
+    short_factor: Optional[Tuple[float]] = None
+    long_factor: Optional[Tuple[float]] = None
 
     @staticmethod
     def from_config(config) -> "RopeParams":
@@ -386,12 +391,18 @@ class RopeParams:
                 "low_freq_factor", 1.0)
             rope_params.high_freq_factor = rope_scaling.get(
                 "high_freq_factor", 4.0)
-            rope_params.original_max_positions = rope_scaling.get(
-                "original_max_position_embeddings", 1024)
+            rope_params.original_max_positions = getattr(
+                config,
+                "original_max_position_embeddings", None) or rope_scaling.get(
+                    "original_max_position_embeddings", None) or 1024
             rope_params.beta_fast = rope_scaling.get("beta_fast", 32)
             rope_params.beta_slow = rope_scaling.get("beta_slow", 1)
             rope_params.mscale = rope_scaling.get("mscale", 1.0)
             rope_params.mscale_all_dim = rope_scaling.get("mscale_all_dim", 0.0)
+            if "short_factor" in rope_scaling:
+                rope_params.short_factor = tuple(rope_scaling["short_factor"])
+            if "long_factor" in rope_scaling:
+                rope_params.long_factor = tuple(rope_scaling["long_factor"])
         # Workaround for DeepSeek V3 Lite since its rope_scaling is null in config.json.
         elif config.model_type == "deepseek_v3":
             rope_params.scale_type = RotaryScalingType.yarn
@@ -428,7 +439,14 @@ class RopeParams:
                 self.mscale_all_dim,
             )
         elif self.scale_type == RotaryScalingType.longrope:
-            raise NotImplementedError("Long RoPE is not supported.")
+            rope_inv_freq, rope_cos_sin = RopeEmbeddingUtils.create_sinusoidal_positions_long_rope_for_attention_plugin(
+                num_pos=self.max_positions,
+                dim=self.dim,
+                theta=self.theta,
+                original_max_pos=self.original_max_positions,
+                short_factor=self.short_factor,
+                long_factor=self.long_factor,
+            )
         else:
             rope_inv_freq, rope_cos_sin = RopeEmbeddingUtils.create_sinusoidal_positions_for_attention_plugin(
                 self.max_positions,

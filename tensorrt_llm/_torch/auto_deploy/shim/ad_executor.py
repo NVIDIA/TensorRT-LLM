@@ -25,7 +25,7 @@ from ...pyexecutor.scheduler import (
 )
 from ..custom_ops.attention_interface import SequenceInfo
 from ..distributed import common as dist
-from ..llm_args import LlmArgs
+from ..llm_args import AutoDeployConfig, LlmArgs
 from ..transformations.transform import InferenceOptimizer
 from ..utils.logger import ad_logger
 from .interface import CachedSequenceInterface, GetInferenceModel
@@ -82,14 +82,17 @@ class ADEngine(ModelEngine):
         return self.cache_seq_interface.device
 
     @classmethod
-    def build_from_config(cls, ad_config: LlmArgs):
-        """Build the ADEngine using the AD LlmArgs that gets passed through from the LLM."""
+    def build_from_config(cls, ad_config: AutoDeployConfig):
+        """Build the ADEngine using the AutoDeployConfig that gets passed through from the LLM."""
 
         max_batch_size = ad_config.max_batch_size
         max_seq_len = ad_config.max_seq_len
         attn_page_size = ad_config.attn_page_size
         max_num_tokens = ad_config.max_num_tokens
-        ad_logger.info(f"{max_seq_len=}, {max_batch_size=}, {attn_page_size=}, {max_num_tokens=}")
+        max_beam_width = ad_config.max_beam_width
+        ad_logger.info(
+            f"{max_seq_len=}, {max_batch_size=}, {attn_page_size=}, {max_num_tokens=}, {max_beam_width=}"
+        )
 
         # initialize seq info object
         seq_info = SequenceInfo(
@@ -111,7 +114,7 @@ class ADEngine(ModelEngine):
         )
 
         # construct engine
-        return cls(build_and_optimize, seq_info, device)
+        return cls(build_and_optimize, seq_info, device, max_beam_width)
 
     @torch.inference_mode()
     def __init__(
@@ -119,6 +122,7 @@ class ADEngine(ModelEngine):
         get_inference_model: GetInferenceModel,
         seq_info: SequenceInfo,
         device: DeviceLikeType,
+        max_beam_width: int = 1,
     ) -> None:
         """Initialize the engine with model and sequence information."""
         # NOTE (lucaslie): create a fake Namespace to satisfy PyExecutor requirements...
@@ -131,6 +135,7 @@ class ADEngine(ModelEngine):
         self.iter_counter = 0
 
         # NOTE (lucaslie): not a declared base member in the base class; required by PyExecutor...
+        self.max_beam_width = max_beam_width
         self.enable_attention_dp = False
 
         # construct cache sequence interface
@@ -147,18 +152,24 @@ class ADEngine(ModelEngine):
 
     @nvtx_range("ad_prepare_inputs")
     def _prepare_inputs(
-        self, scheduled_requests: ScheduledRequests, resource_manager: ResourceManager
-    ) -> bool:
+        self,
+        scheduled_requests: ScheduledRequests,
+        resource_manager: ResourceManager,
+        new_tokens: Optional[torch.Tensor] = None,
+    ) -> List[bool]:
         """Prepare inputs for AD Model from scheduled requests."""
         # cache manager
         kv_cache_manager = resource_manager.get_resource_manager(
             ResourceManagerType.KV_CACHE_MANAGER
         )
 
-        # requests in order of context, extend (generate with draft), generate
+        # requests in order of context, generate
         context_requests = scheduled_requests.context_requests
-        extend_requests = [r for r in scheduled_requests.generation_requests if r.draft_tokens]
         gen_requests = [r for r in scheduled_requests.generation_requests if not r.draft_tokens]
+
+        # new_tokens is a tensor on the device, we need to convert it to a list of lists.
+        # can we avoid this additional gpu->cpu transfer?
+        new_tokens_list = new_tokens.flatten().cpu().tolist() if new_tokens is not None else None
 
         # info to be extracted
         input_ids: List[List[int]] = []
@@ -172,24 +183,27 @@ class ADEngine(ModelEngine):
             input_ids.append(request.get_tokens(0))
             input_pos.append(request.context_current_position)
 
-            # only return last logit
+            request.py_batch_idx = request.seq_slot
             last_logit_only.append(True)
 
-        # look at extend+generate requests next
-        for request in chain(extend_requests, gen_requests):
-            # store input ids and pos of first token in sequence
-            input_ids.append([request.get_token(0, request.get_num_tokens(0) - 1)])
-            input_pos.append(request.max_beam_num_tokens - 1)
+        # look at generate requests next
+        # TODO: we should also handle extend requests (for speculative decoding) here
+        for request in gen_requests:
+            # new_tokens are provided when the overlap scheduler is enabled.
+            if new_tokens_list is None or request.is_dummy or request.py_batch_idx is None:
+                input_ids.append([request.get_token(0, request.get_num_tokens(0) - 1)])
+                input_pos.append(request.max_beam_num_tokens - 1)
+            else:
+                input_ids.append([new_tokens_list[request.py_batch_idx]])
+                input_pos.append(request.max_beam_num_tokens)
 
-            # check for draft tokens
-            if request.draft_tokens:
-                input_ids[-1].extend([t for t in request.draft_tokens])
+            request.py_batch_idx = request.seq_slot
 
             # return all logits
             last_logit_only.append(False)
 
         # extract cache information for all requests
-        for request in chain(context_requests, extend_requests, gen_requests):
+        for request in chain(context_requests, gen_requests):
             # get cache indices
             cache_indices = kv_cache_manager.get_cache_indices(request)
             page_assignments.append(cache_indices)
@@ -199,7 +213,6 @@ class ADEngine(ModelEngine):
         si.nest_sequences(input_ids)
         si.update_pos(input_pos, reset=True)
         si.assign_cache_loc(page_assignments)
-
         return last_logit_only
 
     def _compute_logits(self) -> List[torch.Tensor]:
@@ -224,7 +237,8 @@ class ADEngine(ModelEngine):
     ):
         """Run forward from scheduled requests; main entrypoint that gets called by the executor."""
         # convert requests and store in sequence info object
-        last_logit_only = self._prepare_inputs(scheduled_requests, resource_manager)
+        new_tokens = getattr(new_tokens_device, "new_tokens", None)
+        last_logit_only = self._prepare_inputs(scheduled_requests, resource_manager, new_tokens)
 
         # compute all logits
         logits = self._compute_logits()
@@ -286,7 +300,9 @@ def create_autodeploy_executor(executor_config: ExecutorConfig, checkpoint_dir: 
     resource_manager.resource_managers.move_to_end(ResourceManagerType.KV_CACHE_MANAGER, last=True)
 
     # scheduling
-    capacitor_scheduler = BindCapacityScheduler(ad_config.max_batch_size, kv_cache_manager.impl)
+    capacitor_scheduler = BindCapacityScheduler(
+        ad_config.max_batch_size, kv_cache_manager.impl, peft_cache_manager=None
+    )
     mb_scheduler = BindMicroBatchScheduler(
         ad_config.max_batch_size, engine.cache_seq_interface.info.max_num_tokens
     )
@@ -301,7 +317,7 @@ def create_autodeploy_executor(executor_config: ExecutorConfig, checkpoint_dir: 
         max_seq_len=ad_config.max_seq_len,
         max_draft_len=max_draft_len,
         max_num_sequences=max_num_sequences,
-        max_beam_width=executor_config.max_beam_width,
+        max_beam_width=ad_config.max_beam_width,
         enable_mixed_sampler=ad_config.enable_mixed_sampler,
     )
     sampler = TorchSampler(sampler_args)

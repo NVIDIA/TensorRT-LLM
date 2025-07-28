@@ -77,7 +77,7 @@ git clone https://huggingface.co/deepseek-ai/DeepSeek-V3 <YOUR_MODEL_DIR>
 ## Quick Start
 
 ### Run a single inference
-To quickly run DeepSeek-V3, [examples/llm-api/quickstart_advanced.py](../pytorch/quickstart_advanced.py):
+To quickly run DeepSeek-V3, [examples/llm-api/quickstart_advanced.py](../llm-api/quickstart_advanced.py):
 
 ```bash
 cd examples/llm-api
@@ -94,10 +94,10 @@ Prompt: 'The future of AI is', Generated text: ' a topic of great interest and s
 ```
 
 ### Multi-Token Prediction (MTP)
-To run with MTP, use [examples/llm-api/quickstart_advanced.py](../pytorch/quickstart_advanced.py) with additional options, see
+To run with MTP, use [examples/llm-api/quickstart_advanced.py](../../../llm-api/quickstart_advanced.py) with additional options, see
 ```bash
 cd examples/llm-api
-python quickstart_advanced.py --model_dir <YOUR_MODEL_DIR> --spec_decode_algo MTP --spec_decode_nextn N
+python quickstart_advanced.py --model_dir <YOUR_MODEL_DIR> --spec_decode_algo MTP --spec_decode_max_draft_len N
 ```
 
 `N` is the number of MTP modules. When `N` is equal to `0`, which means that MTP is not used (default). When `N` is greater than `0`, which means that `N` MTP modules are enabled. In the current implementation, the weight of each MTP module is shared.
@@ -124,7 +124,7 @@ When verifying and receiving draft tokens, there are two ways:
 
   ```bash
   cd examples/llm-api
-  python quickstart_advanced.py --model_dir <YOUR_MODEL_DIR> --spec_decode_algo MTP --spec_decode_nextn N --use_relaxed_acceptance_for_thinking --relaxed_topk 15 --relaxed_delta 0.5
+  python quickstart_advanced.py --model_dir <YOUR_MODEL_DIR> --spec_decode_algo MTP --spec_decode_max_draft_len N --use_relaxed_acceptance_for_thinking --relaxed_topk 15 --relaxed_delta 0.5
   ```
 
 ### Long context support
@@ -142,7 +142,7 @@ python /app/tensorrt_llm/benchmarks/cpp/prepare_dataset.py \
 
 cat <<EOF > /tmp/extra-llm-api-config.yml
 cuda_graph_config:
-  padding_enabled: true
+  enable_padding: true
   batch_sizes: [1, 4, 8, 12]
 EOF
 
@@ -169,9 +169,10 @@ python /app/tensorrt_llm/benchmarks/cpp/prepare_dataset.py \
 
 cat <<EOF > /tmp/extra-llm-api-config.yml
 cuda_graph_config:
-  padding_enabled: true
+  enable_padding: true
   batch_sizes: [1, 2]
-moe_max_num_tokens: 16384
+moe_config:
+  max_num_tokens: 16384
 EOF
 
 trtllm-bench -m deepseek-ai/DeepSeek-R1 --model_path ${DS_R1_NVFP4_MODEL_PATH} throughput \
@@ -192,7 +193,6 @@ Evaluate the model accuracy using `trtllm-eval`.
 1. (Optional) Prepare an advanced configuration file:
 ```bash
 cat >./extra-llm-api-config.yml <<EOF
-cuda_graph_config: {}
 enable_attention_dp: true
 EOF
 ```
@@ -237,7 +237,7 @@ To serve the model using `trtllm-serve`:
 ```bash
 cat >./extra-llm-api-config.yml <<EOF
 cuda_graph_config:
-  padding_enabled: true
+  enable_padding: true
   batch_sizes:
     - 1
     - 2
@@ -316,7 +316,7 @@ export TRTLLM_USE_UCX_KVCACHE=1
 
 cat >./gen-extra-llm-api-config.yml <<EOF
 cuda_graph_config:
-  padding_enabled: true
+  enable_padding: true
   batch_sizes:
     - 1
     - 2
@@ -539,7 +539,7 @@ python3 /path/to/TensorRT-LLM/benchmarks/cpp/prepare_dataset.py \
 
 cat >/path/to/TensorRT-LLM/extra-llm-api-config.yml <<EOF
 cuda_graph_config:
-  padding_enabled: true
+  enable_padding: true
   batch_sizes:
     - 1
     - 2

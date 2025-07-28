@@ -17,6 +17,17 @@
 Model pytorch yaml config for trtllm-bench perf tests
 """
 
+from tensorrt_llm.llmapi import KvCacheConfig
+
+
+def recursive_update(d, u):
+    for k, v in u.items():
+        if isinstance(v, dict) and isinstance(d.get(k), dict):
+            recursive_update(d[k], v)
+        else:
+            d[k] = v
+    return d
+
 
 def get_model_yaml_config(model_label: str,
                           lora_dirs: list[str] = None) -> dict:
@@ -30,7 +41,7 @@ def get_model_yaml_config(model_label: str,
     base_config = {
         'print_iter_log': True,
         'cuda_graph_config': {
-            'padding_enabled': True,
+            'enable_padding': True,
         },
     }
     if 'kv_cache_dtype' in model_label:
@@ -45,8 +56,8 @@ def get_model_yaml_config(model_label: str,
         # DeepSeek R1 models with MTP speculative decoding
         {
             'patterns': [
-                'deepseek_r1-bench-pytorch-float16-maxbs:1-maxnt:8192-input_output_len:1000,2000-quant:fp8-reqs:10-ep:4-gpus:8',
-                'deepseek_r1_nvfp4-bench-pytorch-float16-maxbs:1-maxnt:8192-input_output_len:1000,2000-quant:nvfp4-reqs:10-ep:4-tp:8-gpus:8'
+                'deepseek_r1-bench-pytorch-float16-maxbs:1-maxnt:8192-input_output_len:1000,2000-reqs:10-ep:4-gpus:8',
+                'deepseek_r1_nvfp4-bench-pytorch-float16-maxbs:1-maxnt:8192-input_output_len:1000,2000-reqs:10-ep:4-tp:8-gpus:8'
             ],
             'config': {
                 'enable_attention_dp': True,
@@ -60,13 +71,13 @@ def get_model_yaml_config(model_label: str,
         # DeepSeek R1 models with large batch sizes and cuda graph padding
         {
             'patterns': [
-                'deepseek_r1-bench-pytorch-float16-maxbs:384-maxnt:1536-input_output_len:1000,2000-quant:nvfp4-reqs:49152-con:3072-ep:8-gpus:8',
-                'deepseek_r1_nvfp4-bench-pytorch-float16-maxbs:384-maxnt:1536-input_output_len:1000,2000-quant:nvfp4-reqs:49152-con:3072-ep:8-gpus:8'
+                'deepseek_r1_fp8-bench-pytorch-float16-maxbs:384-maxnt:1536-input_output_len:1000,2000-reqs:49152-con:3072-ep:8-gpus:8',
+                'deepseek_r1_nvfp4-bench-pytorch-float16-maxbs:384-maxnt:1536-input_output_len:1000,2000-reqs:49152-con:3072-ep:8-gpus:8'
             ],
             'config': {
                 'enable_attention_dp': True,
                 'cuda_graph_config': {
-                    'padding_enabled': True,
+                    'enable_padding': True,
                     'batch_sizes': [1, 2, 4, 8, 16, 32, 64, 128, 256, 384]
                 }
             }
@@ -74,7 +85,7 @@ def get_model_yaml_config(model_label: str,
         # DeepSeek R1 model with specific batch size 128
         {
             'patterns':
-            'deepseek_r1-bench-pytorch-float16-maxbs:128-maxnt:1127-input_output_len:1000,2000-quant:fp8-reqs:5120-con:1024-ep:8-gpus:8',
+            'deepseek_r1_fp8-bench-pytorch-float16-maxbs:128-maxnt:1127-input_output_len:1000,2000-reqs:5120-con:1024-ep:8-gpus:8',
             'config': {
                 'enable_attention_dp': True,
                 'cuda_graph_config': {
@@ -89,7 +100,7 @@ def get_model_yaml_config(model_label: str,
             'config': {
                 'print_iter_log': True,
                 'cuda_graph_config': {
-                    'padding_enabled': True,
+                    'enable_padding': True,
                     'batch_sizes': [1, 512, 1024, 2048]
                 }
             }
@@ -130,7 +141,32 @@ def get_model_yaml_config(model_label: str,
             ],
             'config': {
                 'enable_attention_dp': False,
-                'moe_backend': 'TRTLLM'
+                'moe_config': {
+                    'backend': 'TRTLLM'
+                }
+            }
+        },
+        # Llama-v3.3 models with fp8 quantization
+        {
+            'patterns': [
+                'llama_v3.3_70b_instruct_fp8-bench-pytorch-float8-maxbs:512-maxnt:2048-input_output_len:500,2000-gpus:4',
+                'llama_v3.3_70b_instruct_fp8-bench-pytorch-float8-maxbs:512-maxnt:2048-input_output_len:1000,1000-gpus:4',
+                'llama_v3.3_70b_instruct_fp8-bench-pytorch-float8-maxbs:512-maxnt:2048-input_output_len:2000,500-gpus:4',
+                'llama_v3.3_70b_instruct_fp8-bench-pytorch-float8-maxbs:512-maxnt:2048-input_output_len:128,128-gpus:4',
+                'llama_v3.3_70b_instruct_fp8-bench-pytorch-bfloat16-maxbs:512-maxnt:2048-input_output_len:512,32-gpus:4',
+                'llama_v3.1_405b_instruct_fp4',
+                'llama_v4_scout_17b_16e_instruct_fp4',
+                'llama_v4_maverick_17b_128e_instruct_fp8'
+            ],
+            'config': {
+                'use_cuda_graph':
+                True,
+                'cuda_graph_padding_enabled':
+                True,
+                'cuda_graph_batch_sizes': [
+                    1, 2, 4, 8, 16, 32, 64, 128, 256, 384, 512, 1024, 2048,
+                    4096, 8192
+                ]
             }
         }
     ]
@@ -142,7 +178,7 @@ def get_model_yaml_config(model_label: str,
             patterns = [patterns]
         for pattern in patterns:
             if pattern in model_label.lower():
-                base_config.update(pattern_config['config'])
+                recursive_update(base_config, pattern_config['config'])
                 break  # Stop checking other patterns for this config once we find a match
 
     # lora-specific change for pytorch
@@ -153,6 +189,22 @@ def get_model_yaml_config(model_label: str,
                 'max_lora_rank': 64
             }
         }
+        if 'phi_4_multimodal_instruct' in model_label:
+            lora_config['lora_config']['lora_target_modules'] = [
+                "attn_qkv", "attn_dense", "mlp_h_to_4h", "mlp_4h_to_h"
+            ]
+            lora_config['lora_config']['trtllm_modules_to_hf_modules'] = {
+                "attn_qkv": "qkv_proj",
+                "attn_dense": "o_proj",
+                "mlp_h_to_4h": "gate_up_proj",
+                "mlp_4h_to_h": "down_proj"
+            }
+            lora_config['lora_config']['max_lora_rank'] = 64
         base_config.update(lora_config)
+
+    kv_cache_config = base_config.get('kv_cache_config', KvCacheConfig())
+    if 'kv_cache_dtype' in base_config:
+        kv_cache_config.dtype = base_config.pop('kv_cache_dtype', 'auto')
+        base_config.update({'kv_cache_config': kv_cache_config})
 
     return base_config

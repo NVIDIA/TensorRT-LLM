@@ -1,3 +1,4 @@
+import os
 import random
 from collections.abc import Iterable
 from typing import Dict, List, Optional
@@ -13,12 +14,14 @@ from tensorrt_llm.bindings.executor import DecodingMode, ExecutorConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_manager import (LoraConfig,
                                        get_default_trtllm_modules_to_hf_modules,
-                                       load_torch_hf_lora)
+                                       load_torch_lora)
 from tensorrt_llm.mapping import Mapping
 
 from ..model_config import ModelConfig
-from ..speculative import get_spec_decoder
+from ..speculative import get_num_extra_kv_tokens, get_spec_decoder
+from .config import PyTorchConfig
 from .config_utils import is_mla, is_nemotron_hybrid
+from .guided_decoder import GuidedDecoder
 from .kv_cache_transceiver import AttentionTypeCpp, create_kv_cache_transceiver
 from .llm_request import ExecutorResponse
 from .model_engine import PyTorchModelEngine
@@ -161,7 +164,7 @@ class KvCacheCreator:
 
         if spec_cfg is not None:
             num_extra_tokens_per_seq += spec_cfg.max_draft_len
-            num_extra_tokens_per_seq += spec_cfg.num_extra_kv_tokens
+            num_extra_tokens_per_seq += get_num_extra_kv_tokens(spec_cfg)
         for req in self._dummy_reqs:
             num_req_tokens = len(req.input_token_ids) + num_extra_tokens_per_seq
             # Requests cannot share KV cache blocks. Round up to nearest integer multiple of block size.
@@ -412,19 +415,12 @@ def create_py_executor_instance(
         start_worker,
         sampler,
         drafter,
+        guided_decoder: Optional[GuidedDecoder] = None,
         lora_config: Optional[LoraConfig] = None,
         garbage_collection_gen0_threshold: Optional[int] = None) -> PyExecutor:
     kv_cache_manager = resources.get(ResourceManagerType.KV_CACHE_MANAGER, None)
 
     spec_config = model_engine.spec_config
-    if mapping.is_last_pp_rank(
-    ) and executor_config.guided_decoding_config is not None:
-        if spec_config is not None:
-            raise ValueError(
-                "Guided decoding is not supported with speculative decoding.")
-        if not pytorch_backend_config.disable_overlap_scheduler:
-            raise ValueError(
-                "Guided decoding is not supported with overlap scheduler.")
 
     logger.info(
         f"max_seq_len={executor_config.max_seq_len}, max_num_requests={executor_config.max_batch_size}, max_num_tokens={executor_config.max_num_tokens}, max_batch_size={executor_config.max_batch_size}"
@@ -436,11 +432,13 @@ def create_py_executor_instance(
                 f"Cannot overwrite existing resource manager {key}.")
         resources[key] = value
 
+    peft_cache_manager = None
     if lora_config is not None:
         from tensorrt_llm.bindings import LoraModule
 
         if len(lora_config.lora_dir) == 1:
-            load_torch_hf_lora(lora_config)
+            # Route to appropriate loader based on checkpoint source
+            load_torch_lora(lora_config)
         else:
             assert len(lora_config.lora_target_modules
                        ) >= 1, "Expecting at least one lora target module"
@@ -453,12 +451,25 @@ def create_py_executor_instance(
 
         num_experts = _try_infer_num_experts(model_engine.model.model_config)
 
+        num_attn_layers = model_binding_config.num_attention_layers()
+        per_layer_kv_heads = [
+            model_binding_config.num_kv_heads(i) for i in range(num_attn_layers)
+        ]
+        num_kv_attention_heads = max(per_layer_kv_heads)
+        if len(set(per_layer_kv_heads)) > 1:
+            # NOTE: This code-path is currently untested and not validated. Can fail!
+            # This support is tracked in TRTLLM-6561
+            logger.warning(
+                f"Non-uniform KV heads per layer detected, using max ({num_kv_attention_heads}) for LoRA. "
+                "This code-path is currently untested and not validated. May fail!"
+            )
+
         lora_modules = LoraModule.create_lora_modules(
             lora_module_names=lora_config.lora_target_modules,
             hidden_size=model_binding_config.hidden_size,
             mlp_hidden_size=model_binding_config.mlp_hidden_size,
             num_attention_heads=model_binding_config.num_heads,
-            num_kv_attention_heads=model_binding_config.num_heads,
+            num_kv_attention_heads=num_kv_attention_heads,
             attention_head_size=model_binding_config.head_size,
             tp_size=mapping.tp_size,
             num_experts=num_experts)
@@ -470,7 +481,6 @@ def create_py_executor_instance(
         num_lora_modules = model_engine.model.model_config.pretrained_config.num_hidden_layers * \
             len(lora_config.lora_target_modules + lora_config.missing_qkv_modules)
 
-        # TODO smor- need to figure out how to set these values
         executor_config.peft_cache_config = trtllm.PeftCacheConfig(
             num_device_module_layer=max_lora_rank * num_lora_modules *
             lora_config.max_loras,
@@ -512,6 +522,7 @@ def create_py_executor_instance(
     capacity_scheduler = BindCapacityScheduler(
         max_num_sequences,
         kv_cache_manager.impl if kv_cache_manager is not None else None,
+        peft_cache_manager.impl if peft_cache_manager is not None else None,
         executor_config.scheduler_config.capacity_scheduler_policy,
         two_step_lookahead=mapping.has_pp())
     mb_scheduler = BindMicroBatchScheduler(executor_config.max_batch_size,
@@ -525,7 +536,6 @@ def create_py_executor_instance(
     cache_transceiver_config = executor_config.cache_transceiver_config
     kv_cache_transceiver = create_kv_cache_transceiver(
         mapping, kv_cache_manager, attention_type, cache_transceiver_config)
-
     return PyExecutor(
         resource_manager,
         scheduler,
@@ -542,6 +552,7 @@ def create_py_executor_instance(
         if spec_config is not None else 0,
         kv_cache_transceiver=kv_cache_transceiver,
         draft_model_engine=draft_model_engine,
+        guided_decoder=guided_decoder,
         start_worker=start_worker,
         garbage_collection_gen0_threshold=garbage_collection_gen0_threshold)
 
@@ -718,3 +729,45 @@ def _try_infer_num_experts(model_config: ModelConfig) -> int:
         return 1
 
     return num_experts
+
+
+def _adjust_torch_mem_fraction(pytorch_backend_config: PyTorchConfig):
+    # FIXME: PyTorch only uses the garbage_collection_threshold setting
+    #        if a memory fraction is set, cf.
+    #   https://github.com/pytorch/pytorch/blob/cd995bfb2aac8891465809be3ce29543bd524287/c10/cuda/CUDACachingAllocator.cpp#L1357
+    logger.debug("Setting PyTorch memory fraction to 1.0")
+    torch.cuda.set_per_process_memory_fraction(1.0)
+
+    # FIXME: As soon as
+    #     torch.cuda._set_allocator_settings (added in PyTorch 2.8.0-rc1)
+    #   or a similar API is available, the warning below should be removed
+    #   and the allocator GC threshold be set via the new API instead.
+    torch_allocator_config = os.environ.get("PYTORCH_CUDA_ALLOC_CONF", "")
+    torch_mem_threshold_advised = (
+        torch.cuda.get_allocator_backend() == "native"
+        and "expandable_segments:True" not in torch_allocator_config)
+    torch_mem_threshold_set = "garbage_collection_threshold:" in torch_allocator_config
+    if torch_mem_threshold_advised and not torch_mem_threshold_set:
+        logger.warning(
+            "It is recommended to incl. 'garbage_collection_threshold:0.???' or 'backend:cudaMallocAsync'"
+            " or 'expandable_segments:True' in PYTORCH_CUDA_ALLOC_CONF.")
+
+    # NOTE: Even if a memory threshold was not set (cf. warning above), setting a memory
+    #       fraction < 1.0 is beneficial, because
+    #         https://github.com/pytorch/pytorch/blob/5228986c395dc79f90d2a2b991deea1eef188260/c10/cuda/CUDACachingAllocator.cpp#L2719
+    #       and
+    #         https://github.com/pytorch/pytorch/blob/5228986c395dc79f90d2a2b991deea1eef188260/c10/cuda/CUDACachingAllocator.cpp#L1240
+    #       lead PyTorch to release all unused memory before hitting the set fraction. This
+    #       still mitigates OOM, although at a higher performance impact, because it
+    #       effectively resets the allocator cache.
+    if not pytorch_backend_config._limit_torch_cuda_mem_fraction:
+        return
+    mem_reserved = torch.cuda.memory_reserved()
+    mem_free, mem_total = torch.cuda.mem_get_info()
+    safety_margin = 32 * 1024**2
+    mem_torch_max = mem_free + mem_reserved - safety_margin
+    mem_torch_fraction = mem_torch_max / mem_total
+    logger.info(
+        f"Setting PyTorch memory fraction to {mem_torch_fraction} ({mem_torch_max / 1024**3} GiB)"
+    )
+    torch.cuda.set_per_process_memory_fraction(mem_torch_fraction)

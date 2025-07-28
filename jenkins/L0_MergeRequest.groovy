@@ -105,7 +105,7 @@ def EXTRA_STAGE_LIST = "extra_stage"
 @Field
 def MULTI_GPU_FILE_CHANGED = "multi_gpu_file_changed"
 @Field
-def ONLY_PYTORCH_FILE_CHANGED = "only_pytorch_file_changed"
+def ONLY_ONE_GROUP_CHANGED = "only_one_group_changed"
 @Field
 def AUTO_TRIGGER_TAG_LIST = "auto_trigger_tag_list"
 @Field
@@ -125,7 +125,7 @@ def testFilter = [
     (DISABLE_MULTI_GPU_TEST): gitlabParamsFromBot.get((DISABLE_MULTI_GPU_TEST), false),
     (EXTRA_STAGE_LIST): trimForStageList(gitlabParamsFromBot.get((EXTRA_STAGE_LIST), null)?.tokenize(',')),
     (MULTI_GPU_FILE_CHANGED): false,
-    (ONLY_PYTORCH_FILE_CHANGED): false,
+    (ONLY_ONE_GROUP_CHANGED): "",
     (DEBUG_MODE): gitlabParamsFromBot.get(DEBUG_MODE, false),
     (AUTO_TRIGGER_TAG_LIST): [],
     (DETAILED_LOG): gitlabParamsFromBot.get(DETAILED_LOG, false),
@@ -139,10 +139,13 @@ def GITHUB_PR_API_URL = "github_pr_api_url"
 def CACHED_CHANGED_FILE_LIST = "cached_changed_file_list"
 @Field
 def ACTION_INFO = "action_info"
+@Field
+def IMAGE_KEY_TO_TAG = "image_key_to_tag"
 def globalVars = [
     (GITHUB_PR_API_URL): gitlabParamsFromBot.get('github_pr_api_url', null),
     (CACHED_CHANGED_FILE_LIST): null,
     (ACTION_INFO): gitlabParamsFromBot.get('action_info', null),
+    (IMAGE_KEY_TO_TAG): [:],
 ]
 
 // If not running all test stages in the L0 pre-merge, we will not update the GitLab status at the end.
@@ -318,7 +321,7 @@ def setupPipelineEnvironment(pipeline, testFilter, globalVars)
         echo "Env.gitlabMergeRequestLastCommit: ${env.gitlabMergeRequestLastCommit}."
         echo "Freeze GitLab commit. Branch: ${env.gitlabBranch}. Commit: ${env.gitlabCommit}."
         testFilter[(MULTI_GPU_FILE_CHANGED)] = getMultiGpuFileChanged(pipeline, testFilter, globalVars)
-        testFilter[(ONLY_PYTORCH_FILE_CHANGED)] = getOnlyPytorchFileChanged(pipeline, testFilter, globalVars)
+        testFilter[(ONLY_ONE_GROUP_CHANGED)] = getOnlyOneGroupChanged(pipeline, testFilter, globalVars)
         testFilter[(AUTO_TRIGGER_TAG_LIST)] = getAutoTriggerTagList(pipeline, testFilter, globalVars)
         getContainerURIs().each { k, v ->
             globalVars[k] = v
@@ -543,66 +546,69 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
     }
 
     def relatedFileList = [
+        "cpp/include/tensorrt_llm/batch_manager/",
+        "cpp/include/tensorrt_llm/executor/",
         "cpp/include/tensorrt_llm/runtime/gptJsonConfig.h",
-        "cpp/include/tensorrt_llm/runtime/worldConfig.h",
         "cpp/include/tensorrt_llm/runtime/utils/mpiUtils.h",
         "cpp/include/tensorrt_llm/runtime/utils/multiDeviceUtils.h",
-        "cpp/tensorrt_llm/runtime/utils/mpiUtils.cpp",
-        "cpp/tests/runtime/mpiUtilsTest.cpp",
-        "cpp/tensorrt_llm/batch_manager/trtGptModelFactory.h",
-        "cpp/tensorrt_llm/runtime/worldConfig.cpp",
-        "cpp/tensorrt_llm/runtime/ncclCommunicator.cpp",
-        "cpp/tensorrt_llm/runtime/workerPool.h",
-        "cpp/tensorrt_llm/executor_worker/executorWorker.cpp",
-        "cpp/tensorrt_llm/runtime/ipcUtils.cpp",
-        "cpp/tensorrt_llm/executor/executor.cpp",
-        "cpp/tensorrt_llm/executor/executorImpl.cpp",
-        "cpp/tensorrt_llm/executor/executorImpl.h",
-        "cpp/tensorrt_llm/runtime/ncclCommunicator.cpp",
+        "cpp/include/tensorrt_llm/runtime/worldConfig.h",
+        "cpp/tensorrt_llm/batch_manager/",
+        "cpp/tensorrt_llm/executor/",
+        "cpp/tensorrt_llm/executor_worker/",
         "cpp/tensorrt_llm/kernels/communicationKernels/",
-        "cpp/tensorrt_llm/thop/allreduceOp.cpp",
-        "cpp/tensorrt_llm/kernels/customAllReduceKernels.h",
         "cpp/tensorrt_llm/kernels/customAllReduceKernels.cu",
-        "cpp/tensorrt_llm/kernels/gptKernels.h",
+        "cpp/tensorrt_llm/kernels/customAllReduceKernels.h",
         "cpp/tensorrt_llm/kernels/gptKernels.cu",
-        "cpp/tensorrt_llm/kernels/unfusedAttentionKernels.h",
-        "cpp/tensorrt_llm/kernels/unfusedAttentionKernels.cu",
-        "cpp/tensorrt_llm/kernels/userbuffers/",
+        "cpp/tensorrt_llm/kernels/gptKernels.h",
         "cpp/tensorrt_llm/kernels/moe",
-        "cpp/tensorrt_llm/pybind/",
-        "cpp/tests/kernels/allReduce/",
-        "cpp/tensorrt_llm/plugins/cpSplitPlugin/cpSplitPlugin.h",
+        "cpp/tensorrt_llm/kernels/unfusedAttentionKernels.cu",
+        "cpp/tensorrt_llm/kernels/unfusedAttentionKernels.h",
+        "cpp/tensorrt_llm/kernels/userbuffers/",
         "cpp/tensorrt_llm/plugins/cpSplitPlugin/cpSplitPlugin.cpp",
-        "cpp/tensorrt_llm/plugins/gptAttentionCommon/gptAttentionCommon.h",
+        "cpp/tensorrt_llm/plugins/cpSplitPlugin/cpSplitPlugin.h",
         "cpp/tensorrt_llm/plugins/gptAttentionCommon/gptAttentionCommon.cpp",
-        "cpp/tensorrt_llm/plugins/gptAttentionPlugin/gptAttentionPlugin.h",
+        "cpp/tensorrt_llm/plugins/gptAttentionCommon/gptAttentionCommon.h",
         "cpp/tensorrt_llm/plugins/gptAttentionPlugin/gptAttentionPlugin.cpp",
-        "cpp/tests/runtime/mpiUtilsTest.cpp",
+        "cpp/tensorrt_llm/plugins/gptAttentionPlugin/gptAttentionPlugin.h",
         "cpp/tensorrt_llm/plugins/ncclPlugin/",
-        "tensorrt_llm/functional.py",
-        "tensorrt_llm/mapping.py",
-        "tensorrt_llm/llmapi/",
-        "tensorrt_llm/executor/",
+        "cpp/tensorrt_llm/pybind/",
+        "cpp/tensorrt_llm/runtime/ipcUtils.cpp",
+        "cpp/tensorrt_llm/runtime/ncclCommunicator.cpp",
+        "cpp/tensorrt_llm/runtime/utils/mpiUtils.cpp",
+        "cpp/tensorrt_llm/runtime/workerPool.h",
+        "cpp/tensorrt_llm/runtime/worldConfig.cpp",
+        "cpp/tensorrt_llm/thop/allgatherOp.cpp",
+        "cpp/tensorrt_llm/thop/allreduceOp.cpp",
+        "cpp/tensorrt_llm/thop/reducescatterOp.cpp",
+        "cpp/tests/executor/",
+        "cpp/tests/kernels/allReduce/",
+        "cpp/tests/runtime/mpiUtilsTest.cpp",
+        "jenkins/L0_Test.groovy",
         "tensorrt_llm/_ipc_utils.py",
-        "tensorrt_llm/parameter.py",
-        "tensorrt_llm/models/llama/",
         "tensorrt_llm/_torch/compilation/patterns/ar_residual_norm.py",
         "tensorrt_llm/_torch/compilation/patterns/ub_allreduce.py",
         "tensorrt_llm/_torch/custom_ops/userbuffers_custom_ops.py",
-        "tensorrt_llm/_torch/pyexecutor/model_engine.py",
-        "tensorrt_llm/_torch/pyexecutor/py_executor.py",
-        "tensorrt_llm/_torch/pyexecutor/_util.py",
         "tensorrt_llm/_torch/models/modeling_llama.py",
         "tensorrt_llm/_torch/modules/fused_moe/",
+        "tensorrt_llm/_torch/pyexecutor/_util.py",
+        "tensorrt_llm/_torch/pyexecutor/model_engine.py",
+        "tensorrt_llm/_torch/pyexecutor/py_executor.py",
+        "tensorrt_llm/executor/",
+        "tensorrt_llm/functional.py",
+        "tensorrt_llm/llmapi/",
+        "tensorrt_llm/mapping.py",
+        "tensorrt_llm/models/llama/",
+        "tensorrt_llm/parameter.py",
+        "tensorrt_llm/serve/",
         "tests/integration/defs/cpp/test_multi_gpu.py",
         "tests/integration/test_lists/test-db/l0_dgx_h100.yml",
         "tests/integration/test_lists/test-db/l0_dgx_h200.yml",
+        "tests/unittest/_torch/auto_deploy/unit/multigpu",
         "tests/unittest/_torch/multi_gpu/",
         "tests/unittest/_torch/multi_gpu_modeling/",
-        "tests/unittest/_torch/auto_deploy/unit/multigpu",
+        "tests/unittest/disaggregated/",
         "tests/unittest/llmapi/test_llm_multi_gpu.py",
         "tests/unittest/llmapi/test_llm_multi_gpu_pytorch.py",
-        "jenkins/L0_Test.groovy",
     ]
 
     def changedFileList = getMergeRequestChangedFileList(pipeline, globalVars)
@@ -634,52 +640,62 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
     return relatedFileChanged
 }
 
-def getOnlyPytorchFileChanged(pipeline, testFilter, globalVars) {
+def getOnlyOneGroupChanged(pipeline, testFilter, globalVars) {
     def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
     if (env.alternativeTRT || isOfficialPostMergeJob) {
-        pipeline.echo("Force set ONLY_PYTORCH_FILE_CHANGED false.")
-        return false
+        pipeline.echo("Force set ONLY_ONE_GROUP_CHANGED \"\".")
+        return ""
     }
-    def pytorchOnlyList = [
-        "tensorrt_llm/_torch/",
-        "tensorrt_llm/scaffolding/",
-        "tests/unittest/_torch/",
-        "tests/unittest/scaffolding/",
-        "tests/unittest/llmapi/test_llm_pytorch.py",
-        "tests/unittest/llmapi/test_llm_multi_gpu_pytorch.py",
-        "tests/integration/defs/accuracy/test_llm_api_pytorch.py",
-        "tests/integration/defs/disaggregated/",
-        "examples/auto_deploy",
-        "examples/disaggregated",
-        "examples/pytorch/",
-        "examples/scaffolding/",
-        "docs/"
+    def groupFileMap = [
+        "Docs": [ // TODO: Add more docs path to the list, e.g. *.md files in other directories
+            "docs/",
+        ],
+        "PyTorch": [
+            "tensorrt_llm/_torch/",
+            "tensorrt_llm/scaffolding/",
+            "tests/unittest/_torch/",
+            "tests/unittest/scaffolding/",
+            "tests/unittest/llmapi/test_llm_pytorch.py",
+            "tests/unittest/llmapi/test_llm_multi_gpu_pytorch.py",
+            "tests/integration/defs/accuracy/test_llm_api_pytorch.py",
+            "tests/integration/defs/disaggregated/",
+            "examples/auto_deploy",
+            "examples/disaggregated",
+            "examples/pytorch/",
+            "examples/scaffolding/",
+            "docs/",
+        ],
+        "Triton": [
+            "tests/integration/defs/triton_server/",
+            "triton_backend/",
+        ],
     ]
 
     def changedFileList = getMergeRequestChangedFileList(pipeline, globalVars)
-
     if (!changedFileList || changedFileList.isEmpty()) {
-        return false
+        return ""
     }
 
-    def result = true
-    for (file in changedFileList) {
-        def isPytorchFile = false
-        for (prefix in pytorchOnlyList) {
-            if (file.startsWith(prefix)) {
-                isPytorchFile = true
-                break
+    for (group in groupFileMap.keySet()) {
+        def groupPrefixes = groupFileMap[group]
+        def allFilesInGroup = changedFileList.every { file ->
+            groupPrefixes.any { prefix -> file.startsWith(prefix) }
+        }
+
+        if (allFilesInGroup) {
+            pipeline.echo("Only ${group} files changed.")
+            return group
+        } else {
+            def nonGroupFile = changedFileList.find { file ->
+                !groupPrefixes.any { prefix -> file.startsWith(prefix) }
+            }
+            if (nonGroupFile != null) {
+                pipeline.echo("Found non-${group} file: ${nonGroupFile}")
             }
         }
-        if (!isPytorchFile) {
-            pipeline.echo("Found non-PyTorch file: ${file}")
-            result = false
-            break
-        }
     }
 
-    pipeline.echo("Only PyTorch files changed: ${result}")
-    return result
+    return ""
 }
 
 def collectTestResults(pipeline, testFilter)
@@ -733,7 +749,7 @@ def collectTestResults(pipeline, testFilter)
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "apk add py3-pip")
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 config set global.break-system-packages true")
             sh """
-                python3 llm/tests/integration/defs/test_rerun.py \
+                python3 llm/jenkins/test_rerun.py \
                 generate_rerun_report \
                 --output-file=rerun/rerun_report.xml \
                 --input-files=${inputfiles}
@@ -840,6 +856,45 @@ def triggerJob(jobName, parameters, jenkinsUrl = "", credentials = "")
     return status
 }
 
+def launchJob(jobName, reuseBuild, enableFailFast, globalVars, platform="x86_64", additionalParameters = [:]) {
+    def parameters = getCommonParameters()
+    String globalVarsJson = writeJSON returnText: true, json: globalVars
+    parameters += [
+        'enableFailFast': enableFailFast,
+        'globalVars': globalVarsJson,
+    ] + additionalParameters
+
+    if (env.alternativeTRT && platform == "x86_64") {
+        parameters += [
+            'alternativeTRT': env.alternativeTRT,
+        ]
+    }
+
+    if (env.alternativeTrtSBSA && platform == "SBSA") {
+        parameters += [
+            'alternativeTRT': env.alternativeTrtSBSA,
+        ]
+    }
+
+    if (env.testPhase2StageName) {
+        parameters += [
+            'testPhase2StageName': env.testPhase2StageName,
+        ]
+    }
+
+    if (reuseBuild) {
+        parameters['reuseArtifactPath'] = "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${reuseBuild}"
+    }
+
+    echo "Trigger ${jobName} job, params: ${parameters}"
+
+    def status = triggerJob(jobName, parameters)
+    if (status != "SUCCESS") {
+        error "Downstream job did not succeed"
+    }
+    return status
+}
+
 def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
 {
     stages = [
@@ -851,78 +906,87 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
         "x86_64-linux": {
             script {
                 stage("Build") {
-                    def parameters = getCommonParameters()
-                    String globalVarsJson = writeJSON returnText: true, json: globalVars
-                    parameters += [
-                        'enableFailFast': enableFailFast,
+                    def additionalParameters = [
                         'dockerImage': globalVars["LLM_DOCKER_IMAGE"],
                         'wheelDockerImagePy310': globalVars["LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE"],
                         'wheelDockerImagePy312': globalVars["LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE"],
-                        'globalVars': globalVarsJson,
                     ]
-
-                    if (env.alternativeTRT) {
-                        parameters += [
-                            'alternativeTRT': env.alternativeTRT,
-                        ]
-                    }
-
-                    if (reuseBuild) {
-                        parameters['reuseArtifactPath'] = "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${reuseBuild}"
-                    }
-
-                    echo "trigger x86_64 build job, params: ${parameters}"
-
-                    def status = triggerJob("/LLM/helpers/Build-x86_64", parameters)
-                    if (status != "SUCCESS") {
-                        error "Downstream job did not succeed"
-                    }
-
+                    launchJob("/LLM/helpers/Build-x86_64", reuseBuild, enableFailFast, globalVars, "x86_64", additionalParameters)
                 }
-                def testStageName = "[Test-x86_64] Run"
-                if (env.localJobCredentials) {
-                    testStageName = "[Test-x86_64] Remote Run"
-                }
+                def testStageName = "[Test-x86_64-Single-GPU] ${env.localJobCredentials ? "Remote Run" : "Run"}"
+                def singleGpuTestFailed = false
                 stage(testStageName) {
                     if (X86_TEST_CHOICE == STAGE_CHOICE_SKIP) {
                         echo "x86_64 test job is skipped due to Jenkins configuration"
                         return
                     }
                     try {
-                        parameters = getCommonParameters()
                         String testFilterJson = writeJSON returnText: true, json: testFilter
-                        String globalVarsJson = writeJSON returnText: true, json: globalVars
-                        parameters += [
-                            'enableFailFast': enableFailFast,
+                        def additionalParameters = [
                             'testFilter': testFilterJson,
                             'dockerImage': globalVars["LLM_DOCKER_IMAGE"],
                             'wheelDockerImagePy310': globalVars["LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE"],
                             'wheelDockerImagePy312': globalVars["LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE"],
-                            'globalVars': globalVarsJson,
                         ]
 
-                        if (env.alternativeTRT) {
-                            parameters += [
-                                'alternativeTRT': env.alternativeTRT,
-                            ]
+                        launchJob("L0_Test-x86_64-Single-GPU", false, enableFailFast, globalVars, "x86_64", additionalParameters)
+                    } catch (InterruptedException e) {
+                        throw e
+                    } catch (Exception e) {
+                        if (X86_TEST_CHOICE == STAGE_CHOICE_IGNORE) {
+                            catchError(
+                                buildResult: 'SUCCESS',
+                                stageResult: 'FAILURE') {
+                                error "x86_64 test failed but ignored due to Jenkins configuration"
+                            }
+                        } else {
+                            catchError(
+                                buildResult: 'FAILURE',
+                                stageResult: 'FAILURE') {
+                                error "x86_64 single-GPU test failed"
+                            }
+                            singleGpuTestFailed = true
                         }
+                    }
+                }
 
-                        if (env.testPhase2StageName) {
-                            parameters += [
-                                'testPhase2StageName': env.testPhase2StageName,
-                            ]
+                def requireMultiGpuTesting = currentBuild.description?.contains("Require Multi-GPU Testing") ?: false
+                echo "requireMultiGpuTesting: ${requireMultiGpuTesting}"
+                if (!requireMultiGpuTesting) {
+                    if (singleGpuTestFailed) {
+                        error "Single-GPU test failed"
+                    }
+                    return
+                }
+
+                if (singleGpuTestFailed) {
+                    if (env.JOB_NAME ==~ /.*PostMerge.*/) {
+                        echo "In the official post-merge pipeline, single-GPU test failed, whereas multi-GPU test is still kept running."
+                    } else {
+                        stage("[Test-x86_64-Multi-GPU] Blocked") {
+                            error "This pipeline requires running multi-GPU test, but single-GPU test has failed."
                         }
+                        return
+                    }
+                }
 
-                        echo "trigger x86_64 test job, params: ${parameters}"
+                testStageName = "[Test-x86_64-Multi-GPU] ${env.localJobCredentials ? "Remote Run" : "Run"}"
+                stage(testStageName) {
+                    if (X86_TEST_CHOICE == STAGE_CHOICE_SKIP) {
+                        echo "x86_64 test job is skipped due to Jenkins configuration"
+                        return
+                    }
+                    try {
+                        def testFilterJson = writeJSON returnText: true, json: testFilter
+                        def additionalParameters = [
+                            'testFilter': testFilterJson,
+                            'dockerImage': globalVars["LLM_DOCKER_IMAGE"],
+                            'wheelDockerImagePy310': globalVars["LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE"],
+                            'wheelDockerImagePy312': globalVars["LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE"],
+                        ]
 
-                        def status = triggerJob(
-                            "L0_Test-x86_64",
-                            parameters,
-                        )
+                        launchJob("L0_Test-x86_64-Multi-GPU", false, enableFailFast, globalVars, "x86_64", additionalParameters)
 
-                        if (status != "SUCCESS") {
-                            error "Downstream job did not succeed"
-                        }
                     } catch (InterruptedException e) {
                         throw e
                     } catch (Exception e) {
@@ -948,38 +1012,16 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     testStageName = "[Test-SBSA] Remote Run"
                 }
 
-                def stageName = "Build"
-                stage(stageName) {
-                    def parameters = getCommonParameters()
-                    String globalVarsJson = writeJSON returnText: true, json: globalVars
-                    parameters += [
-                        'enableFailFast': enableFailFast,
+                if (testFilter[(ONLY_ONE_GROUP_CHANGED)] == "Docs") {
+                    echo "SBSA build job is skipped due to Jenkins configuration or conditional pipeline run"
+                    return
+                }
+
+                stage("Build") {
+                    def additionalParameters = [
                         "dockerImage": globalVars["LLM_SBSA_DOCKER_IMAGE"],
-                        'globalVars': globalVarsJson,
                     ]
-
-                    if (env.alternativeTrtSBSA) {
-                        parameters += [
-                            "alternativeTRT": env.alternativeTrtSBSA,
-                        ]
-                    }
-
-                    if (reuseBuild) {
-                        parameters['reuseArtifactPath'] = "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${reuseBuild}"
-                    }
-
-                    echo "trigger SBSA build job, params: ${parameters}"
-
-                    def status = triggerJob(
-                        "/LLM/helpers/Build-SBSA",
-                        parameters,
-                        jenkinsUrl,
-                        credentials,
-                    )
-
-                    if (status != "SUCCESS") {
-                        error "Downstream job did not succeed"
-                    }
+                    launchJob("/LLM/helpers/Build-SBSA", reuseBuild, enableFailFast, globalVars, "SBSA", additionalParameters)
                 }
                 stage(testStageName) {
                     if (SBSA_TEST_CHOICE == STAGE_CHOICE_SKIP) {
@@ -987,40 +1029,14 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         return
                     }
                     try {
-                        def parameters = getCommonParameters()
-                        String testFilterJson = writeJSON returnText: true, json: testFilter
-                        String globalVarsJson = writeJSON returnText: true, json: globalVars
-                        parameters += [
-                            'enableFailFast': enableFailFast,
+                        def testFilterJson = writeJSON returnText: true, json: testFilter
+                        def additionalParameters = [
                             'testFilter': testFilterJson,
                             "dockerImage": globalVars["LLM_SBSA_DOCKER_IMAGE"],
-                            'globalVars': globalVarsJson,
                         ]
 
-                        if (env.alternativeTrtSBSA) {
-                            parameters += [
-                                "alternativeTRT": env.alternativeTrtSBSA,
-                            ]
-                        }
+                        launchJob("L0_Test-SBSA", false, enableFailFast, globalVars, "SBSA", additionalParameters)
 
-                        if (env.testPhase2StageName) {
-                            parameters += [
-                                'testPhase2StageName': env.testPhase2StageName,
-                            ]
-                        }
-
-                        echo "trigger SBSA test job, params: ${parameters}"
-
-                        def status = triggerJob(
-                            "L0_Test-SBSA",
-                            parameters,
-                            jenkinsUrl,
-                            credentials,
-                        )
-
-                        if (status != "SUCCESS") {
-                            error "Downstream job did not succeed"
-                        }
                     } catch (InterruptedException e) {
                         throw e
                     } catch (Exception e) {
@@ -1042,31 +1058,24 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
         "Build-Docker-Images": {
             script {
                 stage("[Build-Docker-Images] Remote Run") {
-                    def parameters = getCommonParameters()
-                    String globalVarsJson = writeJSON returnText: true, json: globalVars
                     def branch = env.gitlabBranch ? env.gitlabBranch : "main"
                     if (globalVars[GITHUB_PR_API_URL]) {
                         branch = "github-pr-" + globalVars[GITHUB_PR_API_URL].split('/').last()
                     }
 
-                    parameters += [
-                        'enableFailFast': enableFailFast,
+                    def additionalParameters = [
                         'branch': branch,
                         'action': "push",
                         'triggerType': env.JOB_NAME ==~ /.*PostMerge.*/ ? "post-merge" : "pre-merge",
-                        'globalVars': globalVarsJson,
+                        'runSanityCheck': true,
                     ]
 
-                    echo "trigger BuildDockerImages job, params: ${parameters}"
-
-                    def status = triggerJob("/LLM/helpers/BuildDockerImages", parameters)
-                    if (status != "SUCCESS") {
-                        error "Downstream job did not succeed"
-                    }
+                    launchJob("/LLM/helpers/BuildDockerImages", false, enableFailFast, globalVars, "x86_64", additionalParameters)
                 }
             }
         }
     ]
+
     if (env.JOB_NAME ==~ /.*PostMerge.*/) {
         stages += dockerBuildJob
     }

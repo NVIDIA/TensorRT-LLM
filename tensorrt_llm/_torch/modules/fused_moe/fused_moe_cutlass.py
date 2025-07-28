@@ -4,8 +4,7 @@ import torch
 
 from ...distributed import allgather, reducescatter
 from ...model_config import ModelConfig
-from ...utils import (EventType, Fp4QuantizedTensor, ceil_div,
-                      disable_fp4_allgather, swizzle_sf)
+from ...utils import EventType, Fp4QuantizedTensor, ceil_div, swizzle_sf
 from .interface import MoE
 from .quantization import (DeepSeekFP8BlockScalesFusedMoEMethod,
                            FP8QDQFusedMoEMethod, MoEWeightLoadingMode,
@@ -125,6 +124,7 @@ class CutlassFusedMoE(MoE):
 
         if self.apply_router_weight_on_input:
             assert self.routing_method.top_k == 1, "Current walkaround only supports top-1 routing"
+
         if self.quant_config and self.quant_config.quant_mode.has_any_quant(
                 exclude_kv_cache=True):
             if not (self.quant_config.quant_mode.has_nvfp4()
@@ -214,15 +214,12 @@ class CutlassFusedMoE(MoE):
         assert token_selected_experts.dtype == torch.int32
 
         if self.apply_router_weight_on_input:
-            assert self.routing_method.top_k == 1, "Current workaround only supports top-1 routing"
             assert x.dtype != torch.float8_e4m3fn, "Current workaround for apply_router_weight_on_input does not support fp8 input"
             x = x * token_final_scales.to(x.dtype)
             # TODO: remove this once we have correct fusedmoe kernel ready
             token_final_scales = None
 
-        use_allgather = self.use_dp and self.parallel_size > 1 and not disable_fp4_allgather(
-        )
-
+        run_post_quant_allgather = self.use_dp and self.parallel_size > 1
         # quantize inputs
         use_deepseek_fp8_block_scale = False
         use_w4a8_group_scaling = False
@@ -238,7 +235,7 @@ class CutlassFusedMoE(MoE):
                 use_w4a8_group_scaling = True
                 weight_dtype = torch.quint4x2
             elif self.has_nvfp4:
-                if use_allgather:
+                if run_post_quant_allgather:
                     if isinstance(x, Fp4QuantizedTensor):
                         assert not x.is_sf_swizzled, "Fp4QuantizedTensor should not be swizzled before communication"
                         x_row = x.shape[0]
@@ -249,28 +246,26 @@ class CutlassFusedMoE(MoE):
                         x_row = x.shape[0]
                         x_col = x.shape[1]
                         x, x_sf = torch.ops.trtllm.fp4_quantize(
-                            x,
-                            self.fc31_input_scale,
-                            self.scaling_vector_size,
-                            sfUseUE8M0=False,
-                            swizzedLayout=False)
-                        x_sf = x_sf.view(
-                            x_row, ceil_div(x_col, self.scaling_vector_size))
+                            x, self.fc31_input_scale, self.scaling_vector_size,
+                            False, False)
                 else:
                     if not isinstance(x, Fp4QuantizedTensor):
                         x, x_sf = torch.ops.trtllm.fp4_quantize(
-                            x,
-                            self.fc31_input_scale,
-                            self.scaling_vector_size,
-                            sfUseUE8M0=False,
-                            swizzedLayout=True)
+                            x, self.fc31_input_scale, self.scaling_vector_size,
+                            False, True)
             else:
                 raise ValueError(
                     f"unsupported quantization mode: {self.quant_config.quant_mode}"
                 )
 
         # gather inputs for attention dp
-        if use_allgather:
+        if run_post_quant_allgather:
+            if x_sf is not None:
+                x_sf = x_sf.view(x_row, ceil_div(x_col,
+                                                 self.scaling_vector_size))
+                assert len(
+                    x_sf.shape
+                ) == 2, "The hidden states scaling factor should be 2D tensor before allgather"
             x, x_sf, token_selected_experts, token_final_scales = allgather(
                 [x, x_sf, token_selected_experts, token_final_scales],
                 self.mapping,

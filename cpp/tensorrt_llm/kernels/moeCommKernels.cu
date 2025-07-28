@@ -728,21 +728,24 @@ __global__ void moeLocalGatherDevice(MoeEpWorldInfo worldInfo, MoeExpertParallel
 
     int epSize = worldInfo.epSize;
     int rankTokenCount = recvRankCountCumSum[epSize - 1];
-    bool needLoad = laneInTile < expertParallelInfo.topK;
+    if (laneInTile >= expertParallelInfo.topK)
+    {
+        return;
+    }
 
     for (int index = tileId + blockIdx.x * tileCountPerBlock; index < localMaxTokenCount;
          index += tileCountPerBlock * gridDim.x)
     {
         int localTokenIndice = localGatherIndices[index];
-        int expertId = needLoad && (index < rankTokenCount)
+        int expertId = index < rankTokenCount
             ? gatheredExpertIds[localTokenIndice * expertParallelInfo.topK + laneInTile]
             : expertParallelInfo.expertCount;
-        float scale = needLoad && (index < rankTokenCount)
-            ? gatheredScales[localTokenIndice * expertParallelInfo.topK + laneInTile]
-            : 0.0f;
-        if (needLoad)
+        localExpertIds[index * expertParallelInfo.topK + laneInTile] = expertId;
+        if (gatheredScales)
         {
-            localExpertIds[index * expertParallelInfo.topK + laneInTile] = expertId;
+            float scale = index < rankTokenCount
+                ? gatheredScales[localTokenIndice * expertParallelInfo.topK + laneInTile]
+                : 0.0f;
             localScales[index * expertParallelInfo.topK + laneInTile] = scale;
         }
     }

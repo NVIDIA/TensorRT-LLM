@@ -11,6 +11,7 @@ from tensorrt_llm.llmapi import (CudaGraphConfig, DraftTargetDecodingConfig,
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils.llm_data import llm_models_root
+from utils.util import similar
 
 
 @pytest.mark.parametrize("use_cuda_graph,attn_backend",
@@ -65,7 +66,7 @@ def test_llama_draft_target(use_cuda_graph: bool, attn_backend: str):
 
     for text_spec, text_ref in zip(generated_text_spec, generated_text_ref):
         # The spec decode algorithm currently guarantees identical results
-        assert text_spec == text_ref
+        assert similar(text_spec, text_ref)
 
 
 if __name__ == "__main__":

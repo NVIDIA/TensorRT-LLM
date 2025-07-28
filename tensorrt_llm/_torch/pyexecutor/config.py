@@ -1,6 +1,8 @@
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Union
 
+from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import \
+    BaseCheckpointLoader
 from tensorrt_llm.bindings.executor import ExecutorConfig
 
 from ...builder import BuildConfig
@@ -32,7 +34,7 @@ class PyTorchConfig:
     # it's hard to capture a single graph with prefill requests since the
     # input shapes are a function of the sequence lengths).
     # Note that each CUDA graph can use up to 200 MB of extra memory.
-    use_cuda_graph: bool = False
+    use_cuda_graph: bool = True
     cuda_graph_batch_sizes: Optional[List[int]] = None
     cuda_graph_max_batch_size: int = 0
     # If true, batches are rounded up to the nearest cuda_graph_batch_size.
@@ -71,6 +73,7 @@ class PyTorchConfig:
     torch_compile_piecewise_cuda_graph: bool = False
     # When torch compile is enabled, userbuffers is enabled by default
     torch_compile_enable_userbuffers: bool = True
+    torch_compile_max_num_streams: int = 1
 
     # Enable autotuner only when torch compile is enabled
     # TODO: after it can be work stable in warmup stage
@@ -92,6 +95,11 @@ class PyTorchConfig:
 
     force_dynamic_quantization: bool = False
 
+    # If true, adjust PyTorch CUDA memory fraction to correspond to the
+    # total GPU memory minus the statically allocated engine memory.
+    # If false, set the PyTorch CUDA memory fraction to 1.0.
+    _limit_torch_cuda_mem_fraction: bool = True
+
 
 EXETENDED_EXECUTOR_CONFIG_FIELDS = [
     'backend',
@@ -112,7 +120,9 @@ def update_executor_config(
         speculative_config: Optional["DecodingBaseConfig"] = None,
         hf_model_dir: Optional[str] = None,
         max_input_len: Optional[int] = None,
-        max_seq_len: Optional[int] = None):
+        max_seq_len: Optional[int] = None,
+        checkpoint_format: Optional[str] = None,
+        checkpoint_loader: Optional[BaseCheckpointLoader] = None):
     if backend is None:
         return
 
@@ -140,3 +150,31 @@ def update_executor_config(
 
     if max_seq_len is not None:
         executor_config.max_seq_len = max_seq_len
+
+    executor_config.checkpoint_loader = _construct_checkpoint_loader(
+        backend, checkpoint_loader, checkpoint_format)
+
+
+def _construct_checkpoint_loader(
+        backend: str, checkpoint_loader: Optional[BaseCheckpointLoader],
+        checkpoint_format: Optional[str]) -> Optional[BaseCheckpointLoader]:
+    if backend == "_autodeploy":
+        return None
+
+    from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import \
+        BaseCheckpointLoader
+    from tensorrt_llm._torch.models.modeling_utils import (
+        get_checkpoint_weight_loader, get_config_loader)
+
+    if checkpoint_loader is None:
+        checkpoint_weight_loader = get_checkpoint_weight_loader(
+            checkpoint_format)()
+        config_loader = get_config_loader(checkpoint_format)()
+
+        checkpoint_loader = BaseCheckpointLoader.get(
+            checkpoint_format=checkpoint_format,
+            weight_loader=checkpoint_weight_loader,
+            weight_mapper=None,
+            config_loader=config_loader)
+
+    return checkpoint_loader

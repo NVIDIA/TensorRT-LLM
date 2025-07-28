@@ -170,7 +170,7 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .value("CONTINUOUS", tr::ModelConfig::KVCacheType::kCONTINUOUS)
         .value("PAGED", tr::ModelConfig::KVCacheType::kPAGED)
         .value("DISABLED", tr::ModelConfig::KVCacheType::kDISABLED)
-        .def(py::init(&tr::ModelConfig::KVCacheTypeFromString));
+        .def("from_string", &tr::ModelConfig::KVCacheTypeFromString);
 
     py::enum_<tr::ModelConfig::LayerType>(m, "LayerType")
         .value("ATTENTION", tr::ModelConfig::LayerType::kATTENTION)
@@ -355,7 +355,10 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
     };
     auto SamplingConfigSetState = [](py::tuple t) -> tr::SamplingConfig
     {
-        assert(t.size() == 19);
+        if (t.size() != 19)
+        {
+            throw std::runtime_error("Invalid SamplingConfig state!");
+        }
 
         tr::SamplingConfig config;
         config.beamWidth = t[0].cast<SizeType32>();

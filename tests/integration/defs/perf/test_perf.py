@@ -54,6 +54,9 @@ MODEL_PATH_DICT = {
     "modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp8",
     "llama_v3.3_70b_instruct_fp4":
     "modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp4",
+    "llama_v3.3_70b_instruct": "llama-3.3-models/Llama-3.3-70B-Instruct",
+    "llama_v3.1_405b_instruct_fp8":
+    "llama-3.1-model/Llama-3.1-405B-Instruct-FP8",
     "llama_v3.1_405b_instruct_fp4":
     "modelopt-hf-model-hub/Llama-3.1-405B-Instruct-fp4",
     "llama_v3.1_70b_instruct": "llama-3.1-model/Meta-Llama-3.1-70B-Instruct",
@@ -64,15 +67,20 @@ MODEL_PATH_DICT = {
     "nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1",
     "llama_v3.3_nemotron_super_49b_fp8":
     "nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1-FP8",
+    "llama_v3.1_nemotron_ultra_253b":
+    "nemotron-nas/Llama-3_1-Nemotron-Ultra-253B-v1",
     "llama_v3.1_nemotron_ultra_253b_fp8":
     "nemotron-nas/Llama-3_1-Nemotron-Ultra-253B-v1-FP8",
     "llama_v4_scout_17b_16e_instruct":
     "llama4-models/Llama-4-Scout-17B-16E-Instruct",
+    "llama_v4_scout_17b_16e_instruct_fp8":
+    "llama4-models/Llama-4-Scout-17B-16E-Instruct-FP8",
+    "llama_v4_scout_17b_16e_instruct_fp4":
+    "llama4-models/Llama-4-Scout-17B-16E-Instruct-FP4",
     "llama_v4_maverick_17b_128e_instruct":
     "llama4-models/Llama-4-Maverick-17B-128E-Instruct",
     "llama_v4_maverick_17b_128e_instruct_fp8":
-    "llama4-models/Llama-4-Maverick-17B-128E-Instruct-FP8",
-    # "llama_30b": "llama-models/llama-30b-hf",
+    "llama4-models/nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8",
     "mixtral_8x7b_v0.1": "Mixtral-8x7B-v0.1",
     "mixtral_8x7b_v0.1_instruct": "Mixtral-8x7B-Instruct-v0.1",
     "mixtral_8x7b_v0.1_instruct_fp8": "Mixtral-8x7B-Instruct-v0.1-fp8",
@@ -111,6 +119,11 @@ MODEL_PATH_DICT = {
     "phi_3_mini_4k_instruct": "Phi-3/Phi-3-mini-4k-instruct",
     "phi_3_mini_128k_instruct": "Phi-3/Phi-3-mini-128k-instruct",
     "phi_4_mini_instruct": "Phi-4-mini-instruct",
+    "phi_4_multimodal_instruct": "multimodals/Phi-4-multimodal-instruct",
+    "phi_4_multimodal_instruct_image": "multimodals/Phi-4-multimodal-instruct",
+    "phi_4_multimodal_instruct_audio": "multimodals/Phi-4-multimodal-instruct",
+    "bielik_11b_v2.2_instruct": "Bielik-11B-v2.2-Instruct",
+    "bielik_11b_v2.2_instruct_fp8": "Bielik-11B-v2.2-Instruct-FP8",
 }
 # Model PATH of HuggingFace
 HF_MODEL_PATH = {
@@ -142,11 +155,18 @@ HF_MODEL_PATH = {
     "phi_4_mini_instruct_hf": "microsoft/Phi-4-mini-instruct",
 }
 LORA_MODEL_PATH = {
-    "llama_v2_13b": "llama-models-v2/chinese-llama-2-lora-13b",
-    "mixtral_8x7b_0.1": "chinese-mixtral-lora",
-    "llama_v3.1_8b_instruct_fp8": "lora/llama-3-chinese-8b-instruct-v2-lora/",
+    "llama_v2_13b":
+    "llama-models-v2/chinese-llama-2-lora-13b",
+    "mixtral_8x7b_0.1":
+    "chinese-mixtral-lora",
+    "llama_v3.1_8b_instruct_fp8":
+    "lora/llama-3-chinese-8b-instruct-v2-lora/",
     "ministral_8b":
     "lora/ministral/Ministral-8B-Instruct-2410-Loras-Dummy",  # Dummy LoRA for Ministral
+    "phi_4_multimodal_instruct_image":
+    "multimodals/Phi-4-multimodal-instruct/vision-lora",
+    "phi_4_multimodal_instruct_audio":
+    "multimodals/Phi-4-multimodal-instruct/speech-lora",
 }
 
 TIMING_CACHE_DIR = os.environ.get("TIMING_CACHE_DIR", "")
@@ -1242,13 +1262,16 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         #use default yaml config
         if self._config.backend == "pytorch":
             import yaml
-            config = get_model_yaml_config(self._config.to_string())
+            pytorch_config_path = os.path.join(engine_dir,
+                                               "extra-llm-api-config.yml")
+            if not os.path.exists(pytorch_config_path):
+                os.makedirs(os.path.dirname(pytorch_config_path), exist_ok=True)
+            config = get_model_yaml_config(self._config.to_string(),
+                                           lora_dirs=self.lora_dirs)
             print_info(f"pytorch model config: {config}")
-            with open('extra-llm-api-config.yml', 'w') as f:
+            with open(pytorch_config_path, 'w') as f:
                 yaml.dump(config, f, default_flow_style=False)
-            benchmark_cmd += [
-                f"--extra_llm_api_options=extra-llm-api-config.yml"
-            ]
+            benchmark_cmd += [f"--extra_llm_api_options={pytorch_config_path}"]
         return benchmark_cmd
 
     def get_gpt_manager_runtime_benchmark_command(self, engine_dir, bs,

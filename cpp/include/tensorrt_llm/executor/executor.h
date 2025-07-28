@@ -1430,18 +1430,29 @@ private:
 class CacheTransceiverConfig
 {
 public:
-    explicit CacheTransceiverConfig(std::optional<size_t> maxNumTokens = std::nullopt);
+    enum class BackendType : std::uint8_t
+    {
+        DEFAULT = 0,
+        MPI = 1,
+        UCX = 2,
+        NIXL = 3
+    };
+    explicit CacheTransceiverConfig(
+        std::optional<BackendType> backendType = std::nullopt, std::optional<size_t> maxNumTokens = std::nullopt);
 
     bool operator==(CacheTransceiverConfig const& other) const;
+    void setBackendType(std::optional<BackendType> backendType);
+    void setMaxTokensInBuffer(std::optional<size_t> maxTokensInBuffer);
 
-    [[nodiscard]] std::optional<size_t> getMaxNumTokens() const;
-    void setMaxNumTokens(size_t maxNumTokens);
+    [[nodiscard]] std::optional<size_t> getMaxTokensInBuffer() const;
+    [[nodiscard]] std::optional<BackendType> getBackendType() const;
 
 private:
+    std::optional<BackendType> mBackendType;
     /// @brief The maximum number of tokens that the CacheTransceiver's pre-allocated buffer can hold. If the number of
     /// kvCache tokens to be transferred for a single request is greater than this value, the performance of the cache
     /// transfer may be degraded.
-    std::optional<size_t> mMaxNumTokens;
+    std::optional<size_t> mMaxTokensInBuffer;
 };
 
 /// @brief Configuration class for the model executor
@@ -1473,7 +1484,8 @@ public:
         std::optional<GuidedDecodingConfig> guidedDecodingConfig = std::nullopt,
         std::optional<std::vector<AdditionalModelOutput>> additionalModelOutputs = std::nullopt,
         std::optional<CacheTransceiverConfig> cacheTransceiverConfig = std::nullopt,
-        bool gatherGenerationLogits = false, bool promptTableOffloading = false, bool enableTrtOverlap = false);
+        bool gatherGenerationLogits = false, bool promptTableOffloading = false, bool enableTrtOverlap = false,
+        bool failFastOnAttentionWindowTooLarge = false);
 
     [[nodiscard]] SizeType32 getMaxBeamWidth() const;
     [[nodiscard]] SchedulerConfig getSchedulerConfig() const;
@@ -1508,6 +1520,7 @@ public:
     [[nodiscard]] bool getPromptTableOffloading() const;
     [[nodiscard]] std::optional<CacheTransceiverConfig> getCacheTransceiverConfig() const;
     [[nodiscard]] bool getEnableTrtOverlap() const;
+    [[nodiscard]] bool getFailFastOnAttentionWindowTooLarge() const;
 
     void setMaxBeamWidth(SizeType32 maxBeamWidth);
     void setMaxBatchSize(SizeType32 maxBatchSize);
@@ -1537,6 +1550,7 @@ public:
     void setPromptTableOffloading(bool promptTableOffloading);
     void setCacheTransceiverConfig(CacheTransceiverConfig const& cacheTransceiverConfig);
     void setEnableTrtOverlap(bool enableTrtOverlap);
+    void setFailFastOnAttentionWindowTooLarge(bool failFastOnAttentionWindowTooLarge);
 
 private:
     friend class Serialization;
@@ -1623,6 +1637,10 @@ private:
 
     /// @brief Controls whether preparation and TRT engine execution should be overlapped.
     bool mEnableTrtOverlap{false};
+
+    /// @brief Controls whether to fail fast when attention window is too large to fit even a single sequence in the KV
+    /// cache.
+    bool mFailFastOnAttentionWindowTooLarge{false};
 };
 
 struct KVCacheCreatedData

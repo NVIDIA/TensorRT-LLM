@@ -70,7 +70,7 @@ In addition, there are two shared files in the parent folder [`examples`](../../
 | Qwen2.5-72B(-Instruct)|     Y   |   Y   |    -    |   Y   |   Y*  |   Y   |   Y   |   Y   |   Y   |   -   | Ampere+ |
 | QwQ-32B            |     Y      |   Y   |    -    |   Y   |   Y   |   Y   |   Y   |   Y   |   Y   |   -   | Ampere+ |
 | Qwen3-32B          |     Y      |   Y   |    Y    |   -   |   -   |   -   |   -   |   Y   |   -   |   Y   | Hopper+ |
-| Qwen3-235B-A3B     |     Y      |   Y   |    Y    |   -   |   -   |   -   |   -   |   Y   |   -   |   Y   | Hopper+ |
+| Qwen3-235B-A22B    |     Y      |   Y   |    Y    |   -   |   -   |   -   |   -   |   Y   |   -   |   Y   | Hopper+ |
 
 Please note that Y* sign means that the model does not support all the AWQ + TP combination.
 
@@ -624,7 +624,7 @@ git clone https://huggingface.co/Qwen/Qwen3-30B-A3B <YOUR_MODEL_DIR>
 
 #### Run a single inference
 
-To quickly run Qwen3, [examples/llm-api/quickstart_advanced.py](../../../pytorch/quickstart_advanced.py):
+To quickly run Qwen3, [examples/llm-api/quickstart_advanced.py](../../../llm-api/quickstart_advanced.py):
 
 ```bash
 python3 examples/llm-api/quickstart_advanced.py --model_dir Qwen3-30B-A3B/ --kv_cache_fraction 0.6
@@ -745,7 +745,7 @@ To serve the model using `trtllm-serve`:
 ```bash
 cat >./extra-llm-api-config.yml <<EOF
 cuda_graph_config:
-  padding_enabled: true
+  enable_padding: true
   batch_sizes:
   - 1
   - 2
@@ -821,7 +821,7 @@ export TRTLLM_USE_UCX_KVCACHE=1
 
 cat >./gen-extra-llm-api-config.yml <<EOF
 cuda_graph_config:
-  padding_enabled: true
+  enable_padding: true
   batch_sizes:
     - 1
     - 2

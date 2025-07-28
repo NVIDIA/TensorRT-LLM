@@ -77,7 +77,8 @@ class SpeculativeDecodingMode(IntEnum):
         return self.is_mtp() or self.is_eagle3() or self.is_eagle3_one_model()
 
     def has_spec_drafter(self):
-        return self.is_ngram() or self.is_user_provided()
+        return self.is_eagle3() or self.is_draft_target() or self.is_ngram(
+        ) or self.is_user_provided()
 
     def extend_ctx(self, attention_backend: Type[AttentionBackend]):
         """
@@ -103,17 +104,6 @@ class SpeculativeDecodingMode(IntEnum):
         if name is None:
             return SpeculativeDecodingMode.NONE
         return SpeculativeDecodingMode[name.upper()]
-
-
-@dataclass
-class SpecConfig:
-    """
-    Configuration for speculative decoding.
-    This class is deprecated, but thread-leak of pytest raises flaky error if removing it.
-    TODO: remove this class safely.
-    """
-    # The name of speculative decoding.
-    spec_dec_name = None
 
 
 @dataclass

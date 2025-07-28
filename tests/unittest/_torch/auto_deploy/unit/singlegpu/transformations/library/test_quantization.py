@@ -9,7 +9,7 @@ from _model_test_utils import MLP, BMMDynamicModel, BMMModel
 from _torch_test_utils import fp4_compatible, fp8_compatible
 
 from tensorrt_llm._torch.auto_deploy.custom_ops.quant import QUANT_OPS
-from tensorrt_llm._torch.auto_deploy.transformations.export import torch_export, torch_export_to_gm
+from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.transformations.library import quantize
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import fp8_scale
@@ -71,7 +71,6 @@ def test_quantization(quant_config, atol, rtol, num_p_og):
     # check there's quantization error during transformation
     assert not torch.allclose(model(x), gm_transformed(x))
     # check if we can still export the model as expected
-    torch_export(gm_transformed, args=(x,))
     torch_export_to_gm(gm_transformed, args=(x,))
 
 
@@ -142,5 +141,4 @@ def test_bmm_quantization(quant_config, atol, rtol, num_p_og, model_class):
     # check there's quantization error during transformation
     assert not torch.allclose(model(x), gm_transformed(x))
     # check if we can still export the model as expected
-    torch_export(gm_transformed, args=(x,))
     torch_export_to_gm(gm_transformed, args=(x,))

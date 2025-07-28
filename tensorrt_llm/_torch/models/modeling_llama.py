@@ -1,4 +1,5 @@
 import copy
+import os
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
@@ -11,6 +12,8 @@ from transformers.models.llama4.modeling_llama4 import Llama4MultiModalProjector
 
 from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
                                              AllReduceParams, MoEAllReduce)
+from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
+    BaseWeightMapper
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_manager import HfLoraLoader
@@ -303,13 +306,6 @@ class Llama4MoE(nn.Module):
     def compute_routed_output(self, hidden_states, all_rank_num_tokens,
                               all_rank_max_num_tokens,
                               cutlass_min_latency_mode):
-        use_dp_padding = False
-        if self.enable_attention_dp and self.mapping.tp_size > 1:
-            # Use padding here to keep the behavior unchanged
-            use_dp_padding = True
-            hidden_states = torch.nn.functional.pad(
-                hidden_states,
-                (0, 0, 0, all_rank_max_num_tokens - hidden_states.shape[0]))
         router_logits = self.router(hidden_states)
         routed_output = self.experts(
             hidden_states,
@@ -317,8 +313,7 @@ class Llama4MoE(nn.Module):
             do_finalize=not cutlass_min_latency_mode,
             all_rank_num_tokens=all_rank_num_tokens,
             all_rank_max_num_tokens=all_rank_max_num_tokens,
-            use_dp_padding=use_dp_padding,
-        )
+            use_dp_padding=False)
         return routed_output
 
     def forward(
@@ -343,7 +338,7 @@ class Llama4MoE(nn.Module):
         assert shared_output.size() == routed_output.size(
         ), f'unmatched tensor shape'
         final_hidden_states = shared_output + routed_output
-        if not self.enable_attention_dp and self.mapping.tp_size > 1:
+        if not self.enable_attention_dp and self.mapping.has_tp():
             final_hidden_states = self.all_reduce(
                 final_hidden_states, all_reduce_params=final_all_reduce_params)
 
@@ -373,9 +368,6 @@ class Llama4DecoderLayer(DecoderLayer):
         self.fusion_config = EagerFusionConfig()
         # self.fusion_config.PRE_MOE_FUSION = model_config.mapping.has_tp(
         # )
-        # TODO: re-enable these fusions
-        self.fusion_config.PRE_MOE_FUSION = False
-        self.fusion_config.POST_MLP_FUSION = False
 
         nope_layer = config.no_rope_layers[layer_idx] == 0
         attention_chunk_size = getattr(config, "attention_chunk_size",
@@ -393,6 +385,26 @@ class Llama4DecoderLayer(DecoderLayer):
         self.is_mlp_layer = (layer_idx +
                              1) % config.interleave_moe_layer_step != 0
 
+        self.enable_fusion = os.environ.get(
+            "TRTLLM_LLAMA_EAGER_FUSION_DISABLED", "0") == "0"
+
+        # MLP layer supports pre and post AR + Res + RMSNorm + NVFP4/FP8
+        # MOE layer supports pre AR + Res + RMSNorm
+        # MOE layer supports post AR + Res + RMSNorm + QUANT + NVFP4/FP8
+        self.pre_feed_forward_fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM
+        self.post_feed_forward_fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM
+
+        # # Determine the pre and post feed forward fusion op based on the quant mode
+        if self.is_nvfp4:
+            self.pre_feed_forward_fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4
+            self.post_feed_forward_fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4
+        elif self.is_fp8_quant:
+            self.pre_feed_forward_fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8
+            self.post_feed_forward_fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8
+
+        if not self.is_mlp_layer:
+            self.pre_feed_forward_fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM
+
         if self.is_mlp_layer:
             self.feed_forward = GatedMLP(
                 hidden_size=config.hidden_size,
@@ -405,8 +417,10 @@ class Llama4DecoderLayer(DecoderLayer):
                 layer_idx=layer_idx,
             )
 
-            # self.fusion_config.POST_MLP_FUSION = model_config.mapping.has_tp(
-            # )
+            self.fusion_config.PRE_MLP_FUSION = model_config.mapping.has_tp(
+            ) and not self.enable_attention_dp and self.enable_fusion
+            self.fusion_config.POST_MLP_FUSION = model_config.mapping.has_tp(
+            ) and not self.enable_attention_dp and self.enable_fusion
         else:
             self.feed_forward = Llama4MoE(
                 num_experts=config.num_local_experts,
@@ -419,8 +433,10 @@ class Llama4DecoderLayer(DecoderLayer):
                 dtype=config.torch_dtype,
                 layer_idx=layer_idx)
 
-            # self.fusion_config.POST_MOE_FUSION = model_config.mapping.has_tp(
-            # )
+            self.fusion_config.PRE_MOE_FUSION = model_config.mapping.has_tp(
+            ) and not self.enable_attention_dp and self.enable_fusion
+            self.fusion_config.POST_MOE_FUSION = model_config.mapping.has_tp(
+            ) and not self.enable_attention_dp and self.enable_fusion
 
         self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                        eps=config.rms_norm_eps,
@@ -437,6 +453,15 @@ class Llama4DecoderLayer(DecoderLayer):
         self.next_attn: LlamaAttention = None
 
         self.moe_allreduce = MoEAllReduce(self.mapping)
+
+        self.disable_attn_allreduce = (self.fusion_config.PRE_MOE_FUSION
+                                       or self.fusion_config.PRE_MLP_FUSION
+                                       or self.mapping.tp_size == 1
+                                       or self.enable_attention_dp)
+        self.disable_feed_forward_allreduce = (
+            self.fusion_config.POST_MOE_FUSION
+            or self.fusion_config.POST_MLP_FUSION or self.mapping.tp_size == 1
+            or self.enable_attention_dp)
 
     def forward(
         self,
@@ -467,34 +492,48 @@ class Llama4DecoderLayer(DecoderLayer):
             position_ids=position_ids,
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
-            all_reduce_params=AllReduceParams(enable_allreduce=not (
-                self.fusion_config.PRE_MOE_FUSION or self.mapping.tp_size == 1
-                or self.enable_attention_dp)),
+            all_reduce_params=AllReduceParams(
+                enable_allreduce=not self.disable_attn_allreduce),
             **kwargs,
         )
 
-        if self.fusion_config.PRE_MOE_FUSION:
-            hidden_states, residual = self.all_reduce(
+        if self.fusion_config.PRE_MLP_FUSION or self.fusion_config.PRE_MOE_FUSION:
+            if self.is_mlp_layer and (self.is_nvfp4 or self.is_fp8_quant):
+                scale = self.feed_forward.gate_up_proj.input_scale
+            else:
+                scale = None
+            allreduce_output = self.all_reduce(
                 hidden_states,
                 all_reduce_params=AllReduceParams(
-                    fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                    fusion_op=self.pre_feed_forward_fusion_op,
                     residual=residual,
                     norm_weight=self.post_attention_layernorm.weight,
+                    scale=scale,
                     eps=self.post_attention_layernorm.variance_epsilon,
                 ))
+
+            if self.is_mlp_layer and self.is_nvfp4:
+                act_fp4, act_sf, residual = allreduce_output
+                hidden_states = Fp4QuantizedTensor(act_fp4, act_sf)
+            else:
+                hidden_states, residual = allreduce_output
         else:
-            # Fully Connected
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual)
+
+        # disable fusion for layers captured by spec_metadata
+        if spec_metadata is not None:
+            if spec_metadata.is_layer_capture(self.layer_idx):
+                self.fusion_config.POST_MLP_FUSION = False
+                self.fusion_config.POST_MOE_FUSION = False
+                self.disable_feed_forward_allreduce = self.mapping.tp_size == 1 or self.enable_attention_dp
 
         hidden_states = self.feed_forward(
             hidden_states,
             all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
             all_rank_max_num_tokens=attn_metadata.all_rank_max_num_tokens,
-            final_all_reduce_params=AllReduceParams(enable_allreduce=not (
-                self.fusion_config.POST_MOE_FUSION
-                or self.fusion_config.POST_MLP_FUSION
-                or self.mapping.tp_size == 1 or self.enable_attention_dp)),
+            final_all_reduce_params=AllReduceParams(
+                enable_allreduce=not self.disable_feed_forward_allreduce),
             cutlass_min_latency_mode=cutlass_min_latency_mode,
         )
 
@@ -509,13 +548,23 @@ class Llama4DecoderLayer(DecoderLayer):
         if (self.fusion_config.POST_MOE_FUSION
                 or self.fusion_config.POST_MLP_FUSION
             ) and self.next_layer_layernorm is not None:
+            # Get the scale for the next allreduce fusion op
+            if self.next_attn is not None and (self.is_nvfp4
+                                               or self.is_fp8_quant):
+                scale = self.next_attn.qkv_proj.input_scale
+            else:
+                # Add just the fusion op to RESIDUAL_RMS_NORM due to this is the last decoder layer
+                self.post_feed_forward_fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM
+                scale = None
+
+            # TODO: MIN_LATENCY_MODE is hardcoded to False
             if cutlass_min_latency_mode:
                 shared_output = hidden_states[0]
                 hidden_states_activated_experts = hidden_states[1]
                 num_activated_experts_per_node = hidden_states[2]
                 experts_to_token_score = hidden_states[3]
 
-                hidden_states, residual = self.moe_allreduce(
+                allreduce_output = self.moe_allreduce(
                     residual,
                     self.next_layer_layernorm.weight,
                     device_num_experts=num_activated_experts_per_node,
@@ -525,14 +574,22 @@ class Llama4DecoderLayer(DecoderLayer):
                     eps=self.next_layer_layernorm.variance_epsilon,
                 )
             else:
-                hidden_states, residual = self.all_reduce(
+                allreduce_output = self.all_reduce(
                     hidden_states,
                     all_reduce_params=AllReduceParams(
-                        fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
+                        fusion_op=self.post_feed_forward_fusion_op,
                         residual=residual,
                         norm_weight=self.next_layer_layernorm.weight,
+                        scale=scale,
                         eps=self.next_layer_layernorm.variance_epsilon,
                     ))
+
+            # Unpack the allreduce output
+            if self.next_attn is not None and self.is_nvfp4:
+                act_fp4, act_sf, residual = allreduce_output
+                hidden_states = Fp4QuantizedTensor(act_fp4, act_sf)
+            else:
+                hidden_states, residual = allreduce_output
         elif self.next_layer_layernorm:
             hidden_states, residual = self.next_layer_layernorm(
                 hidden_states, residual)
@@ -550,6 +607,14 @@ class LlamaDecoderLayer(DecoderLayer):
         super().__init__()
         config = model_config.pretrained_config
         self.layer_idx = layer_idx
+        self.mapping = model_config.mapping
+        self.enable_attention_dp = model_config.mapping.enable_attention_dp
+        self.is_quanted = model_config.quant_config and model_config.quant_config.quant_mode.has_any_quant(
+        )
+        self.is_fp8_quant = self.is_quanted and model_config.quant_config.quant_mode.has_fp8_qdq(
+        )
+        self.is_nvfp4 = self.is_quanted and model_config.quant_config.quant_mode.has_nvfp4(
+        )
 
         self.self_attn = LlamaAttention(
             model_config,
@@ -572,10 +637,41 @@ class LlamaDecoderLayer(DecoderLayer):
                                                 eps=config.rms_norm_eps,
                                                 dtype=config.torch_dtype)
 
+        self.all_reduce = AllReduce(mapping=model_config.mapping)
+
+        self.next_layer_layernorm: RMSNorm = None
+        self.next_attn: LlamaAttention = None
+
         self.attention_mask = PredefinedAttentionMask.CAUSAL
         # If the model is being used as an encoder model (prefill only) we use a full attention mask
         if not model_config.is_generation:
             self.attention_mask = PredefinedAttentionMask.FULL
+
+        self.enable_fusion = os.environ.get(
+            "TRTLLM_LLAMA_EAGER_FUSION_DISABLED", "0") == "0"
+        # Disable fusion for small models due to accuracy issues
+        self.enable_fusion &= config.hidden_size > 4096
+
+        self.PRE_MLP_FUSION = self.mapping.has_tp(
+        ) and not self.enable_attention_dp and self.enable_fusion
+        self.POST_MLP_FUSION = self.mapping.has_tp() and self.enable_fusion
+
+        if self.is_nvfp4:
+            self.pre_mlp_fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4
+            self.post_mlp_fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4
+        elif self.is_fp8_quant:
+            self.pre_mlp_fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8
+            self.post_mlp_fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8
+        else:
+            self.pre_mlp_fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM
+            self.post_mlp_fusion_op = AllReduceFusionOp.RESIDUAL_RMS_NORM
+
+        self.disable_attn_allreduce = (self.PRE_MLP_FUSION
+                                       or self.mapping.tp_size == 1
+                                       or self.enable_attention_dp)
+        self.disable_mlp_allreduce = (self.POST_MLP_FUSION
+                                      or self.mapping.tp_size == 1
+                                      or self.enable_attention_dp)
 
     def forward(
         self,
@@ -589,9 +685,6 @@ class LlamaDecoderLayer(DecoderLayer):
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
-        else:
-            hidden_states, residual = self.input_layernorm(
-                hidden_states, residual)
 
         # Self Attention
         hidden_states = self.self_attn(
@@ -599,20 +692,81 @@ class LlamaDecoderLayer(DecoderLayer):
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
             attention_mask=self.attention_mask,
+            all_reduce_params=AllReduceParams(
+                enable_allreduce=not self.disable_attn_allreduce),
+            **kwargs,
+        )
+        # Fully Connected
+        if self.PRE_MLP_FUSION:
+            if self.is_nvfp4 or self.is_fp8_quant:
+                scale = self.mlp.gate_up_proj.input_scale
+            else:
+                scale = None
+            all_reduce_output = self.all_reduce(
+                hidden_states,
+                all_reduce_params=AllReduceParams(
+                    fusion_op=self.pre_mlp_fusion_op,
+                    residual=residual,
+                    norm_weight=self.post_attention_layernorm.weight,
+                    scale=scale,
+                    eps=self.post_attention_layernorm.variance_epsilon,
+                ))
+            if self.is_nvfp4:
+                act_fp4, act_sf, residual = all_reduce_output
+                hidden_states = Fp4QuantizedTensor(act_fp4, act_sf)
+            else:
+                hidden_states, residual = all_reduce_output
+        else:
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual)
+
+        # disable fusion for layers captured by spec_metadata
+        if spec_metadata is not None:
+            # how to know if is_layer_capture exists, if not do not call
+            if hasattr(spec_metadata,
+                       "is_layer_capture") and spec_metadata.is_layer_capture(
+                           self.layer_idx):
+                self.POST_MLP_FUSION = False
+                self.disable_mlp_allreduce = self.mapping.tp_size == 1 or self.enable_attention_dp
+
+        hidden_states = self.mlp(
+            hidden_states,
+            final_all_reduce_params=AllReduceParams(
+                enable_allreduce=not self.disable_mlp_allreduce),
             **kwargs,
         )
 
-        # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(
-            hidden_states, residual)
-        hidden_states = self.mlp(hidden_states, **kwargs)
         if spec_metadata is not None:
             # We save the hidden states in the spec metadata here. In _prepare_draft_tokens,
             # PyExecutor will extract these from the model engine's spec metadata.
             # They will be passed to the draft model engine on the first draft iteration.
             # TODO: can we support multiple model outputs instead?
+
             spec_metadata.maybe_capture_hidden_states(self.layer_idx,
                                                       hidden_states, residual)
+        if self.POST_MLP_FUSION and self.next_attn is not None:
+            if self.is_nvfp4 or self.is_fp8_quant:
+                scale = self.next_attn.qkv_proj.input_scale
+            else:
+                scale = None
+            all_reduce_output = self.all_reduce(
+                hidden_states,
+                all_reduce_params=AllReduceParams(
+                    fusion_op=self.post_mlp_fusion_op,
+                    residual=residual,
+                    norm_weight=self.next_layer_layernorm.weight,
+                    scale=scale,
+                    eps=self.next_layer_layernorm.variance_epsilon,
+                ))
+            if self.is_nvfp4:
+                act_fp4, act_sf, residual = all_reduce_output
+                hidden_states = Fp4QuantizedTensor(act_fp4, act_sf)
+            else:
+                hidden_states, residual = all_reduce_output
+        elif self.next_layer_layernorm:
+            hidden_states, residual = self.next_layer_layernorm(
+                hidden_states, residual)
+
         return hidden_states, residual
 
 
@@ -624,6 +778,7 @@ class Llama4Model(DecoderModel):
         self.num_hidden_layers = config.num_hidden_layers
         self.aux_stream = torch.cuda.Stream()
         self.mapping = model_config.mapping
+        self.preload_weight_modules = []
 
         if self.model_config.mapping.enable_attention_dp:
             self.embed_tokens = Embedding(
@@ -646,6 +801,7 @@ class Llama4Model(DecoderModel):
         if model_config.enable_min_latency:
             from .modeling_llama_min_latency import Llama4MinLatencyDecoderLayer
             DecoderLayerClass = Llama4MinLatencyDecoderLayer
+            self.preload_weight_modules = ["gate_up_proj"]
 
         self.layers = nn.ModuleList([
             DecoderLayerClass(
@@ -707,11 +863,13 @@ class LlamaModel(DecoderModel):
                 model_config,
                 'lora_config') and model_config.lora_config is not None and len(
                     model_config.lora_config.lora_dir) == 1:
-            lora_loader = HfLoraLoader(model_config.lora_config.lora_dir)
-            if lora_loader.vocab_size != 0 and lora_loader.embed_tokens is not None:
-                vocab_size = lora_loader.vocab_size
-                weight = lora_loader.embed_tokens
-                self.has_custom_embed_tokens = True
+            # Only check for custom vocab in HF LoRA, not NeMo
+            if model_config.lora_config.lora_ckpt_source == "hf":
+                lora_loader = HfLoraLoader(model_config.lora_config.lora_dir)
+                if lora_loader.vocab_size != 0 and lora_loader.embed_tokens is not None:
+                    vocab_size = lora_loader.vocab_size
+                    weight = lora_loader.embed_tokens
+                    self.has_custom_embed_tokens = True
 
         if self.model_config.mapping.enable_attention_dp:
             self.embed_tokens = Embedding(
@@ -731,7 +889,7 @@ class LlamaModel(DecoderModel):
 
         if self.has_custom_embed_tokens:
             with torch.no_grad():
-                if model_config.mapping.tp_size > 1:
+                if model_config.mapping.has_tp():
                     weight = split_matrix_tp(
                         weight,
                         model_config.mapping.tp_size,
@@ -779,7 +937,6 @@ class LlamaModel(DecoderModel):
                 lora_params=lora_params,
             )
 
-        hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
 
@@ -791,6 +948,18 @@ class LlamaForCausalLM(SpecDecOneEngineForCausalLM[LlamaModel, LlamaConfig]):
         model_config: ModelConfig[LlamaConfig],
     ):
         super().__init__(LlamaModel(model_config), model_config)
+
+    def load_weights(self, weights: Dict):
+        super().load_weights(weights)
+
+        for idx, layer in enumerate(
+                self.model.layers[:self.config.num_hidden_layers]):
+            if idx == self.config.num_hidden_layers - 1:
+                layer.next_layer_layernorm = self.model.norm
+            else:
+                layer.next_layer_layernorm = self.model.layers[
+                    idx + 1].input_layernorm
+                layer.next_attn = self.model.layers[idx + 1].self_attn
 
 
 class Llama4InputProcessor(InputProcessor):
@@ -878,6 +1047,7 @@ class Llama4ForConditionalGeneration(SpecDecOneEngineForCausalLM[Llama4Model,
         model_config.pretrained_config = model_config.pretrained_config.text_config
         model_config.pretrained_config.architectures = architectures
         super().__init__(Llama4Model(model_config), model_config)
+        self.preload_weight_modules = self.model.preload_weight_modules
 
     def forward(
         self,
@@ -914,16 +1084,8 @@ class Llama4ForConditionalGeneration(SpecDecOneEngineForCausalLM[Llama4Model,
 
         return super().infer_max_seq_len()
 
-    def load_weights(self, weights: Dict):
-        new_weights = {}
-        for key, tensor in weights.items():
-            if key.startswith("language_model."):
-                new_key = key[len("language_model."):]
-                new_weights[new_key] = tensor
-            else:
-                new_weights[key] = tensor
-
-        super().load_weights(new_weights)
+    def load_weights(self, weights: Dict, weight_mapper: BaseWeightMapper):
+        super().load_weights(weights, weight_mapper)
 
         for idx, layer in enumerate(
                 self.model.layers[:self.config.num_hidden_layers]):
