@@ -47,7 +47,6 @@ def test_llama_draft_target(use_cuda_graph: bool, attn_backend: str):
     spec_config = DraftTargetDecodingConfig(
         max_draft_len=max_draft_len,
         speculative_model_dir=draft_model_dir,
-        enable_torch_sampler=True,
     )
 
     prompts = [
