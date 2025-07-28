@@ -1955,7 +1955,9 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
-    def test_eagle3(self):
+    @parametrize_with_ids("eagle3_one_model", [True, False])
+    @parametrize_with_ids("enable_chunked_prefill", [False, True])
+    def test_eagle3(self, enable_chunked_prefill, eagle3_one_model):
         pytorch_config = dict(
             disable_overlap_scheduler=True,
             cuda_graph_config=CudaGraphConfig(batch_sizes=[1]),
@@ -1967,11 +1969,13 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
 
         draft_len = 4
         spec_config = EagleDecodingConfig(max_draft_len=draft_len,
-                                          speculative_model_dir=eagle_model_dir)
+                                          speculative_model_dir=eagle_model_dir,
+                                          eagle3_one_model=eagle3_one_model)
 
         llm = LLM(model=target_model_dir,
                   **pytorch_config,
                   kv_cache_config=kv_cache_config,
+                  enable_chunked_prefill=enable_chunked_prefill,
                   speculative_config=spec_config,
                   build_config=None)
 
