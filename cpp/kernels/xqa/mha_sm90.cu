@@ -62,7 +62,7 @@ constexpr uint32_t gemm0NbThrds = gmmaWarpGrpSize * gemm0NbGmmaGrps;
 constexpr uint32_t gemm0NbWarps = gmmaWarpsPerGrp * gemm0NbGmmaGrps;
 #if SPEC_DEC && !SWAP_AB
 inline constexpr uint32_t ctaNbQHeads = Q_HEADS_PER_CTA;
-inline constexpr uint32_t inputTokensPerCta = exactDiv(ctaNbQHeads, headGrpSize);
+inline constexpr uint32_t inputTokensPerCta = ctaNbQHeads / headGrpSize;
 constexpr uint32_t ctaNbValidQHeads = ctaNbQHeads;
 #elif SPEC_DEC && SWAP_AB
 inline constexpr uint32_t inputTokensPerCta = specDecQLen;
@@ -350,7 +350,7 @@ __device__ inline uint32_t getInputTokOffset(SpecDecParams const& params, uint32
 struct SpecDec
 {
     static inline constexpr uint32_t tileSize = gemm0CtaTileNbTokens;
-    static inline constexpr uint32_t ctaMaxQSeqLen = exactDiv(ctaNbQHeads, headGrpSize);
+    static inline constexpr uint32_t ctaMaxQSeqLen = (ctaNbQHeads / headGrpSize);
     using TileMaskRow = Vec<uint32_t, exactDiv(tileSize, 32)>;
 
     __device__ inline SpecDec(SpecDecParams const& params, uint32_t idxReq, uint32_t idxInputSubSeq, uint32_t seqLen)
@@ -685,7 +685,6 @@ CUBIN_EXPORT __global__
     uint32_t const cacheSeqLen = getCacheSeqLen<usePagedKVCache>(cacheList, idxReq);
     static_assert(gemm0CtaTileNbTokens == gemm1CtaTileNbTokens);
     constexpr uint32_t tileSize = gemm0CtaTileNbTokens;
-    // static_assert(!(allowSlidingWindow && useSpecDec), "Sliding window is not yet supported in spec-dec mode");
 #if SPEC_DEC
     uint32_t const idxInputSubSeq = blockIdx.x;
     uint32_t const inputSeqLen = reqInputTokEnd - reqInputTokBeg;
@@ -2273,7 +2272,9 @@ __device__ inline void warpGrpApplyMask(Gemm0Acc& acc, SpecDec const& specDec,
         {
             uint32_t const row = gmma::instM * m + gmma::instM / 4 * warpRank + 8 * i + idxQuad;
             uint32_t const idxQTokInCta = row / headGrpSize;
-            auto const specDecMask = specDec.needMask(idxTile, idxQTokInCta)
+            bool const isQTokValid
+                = (headGrpSize * inputTokensPerCta == ctaNbQHeads) || (idxQTokInCta < inputTokensPerCta);
+            auto const specDecMask = (isQTokValid && specDec.needMask(idxTile, idxQTokInCta))
                 ? specDec.loadTileMaskRow(idxTile, idxQTokInCta)
                 : SpecDec::TileMaskRow{~0U, ~0U};
 #if SLIDING_WINDOW && !IS_SPEC_DEC_TREE
