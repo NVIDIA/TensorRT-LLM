@@ -149,7 +149,7 @@ void OffloadConfigurator::teardown(CUmemGenericAllocationHandle, bool destructin
     TLLM_CU_CHECK_FREE_RESOURCE(cuMemcpyDtoH_v2(mBackedStorage->data(), mAddress, mSize));
 }
 
-void CudaVirtualMemoryManager::add(uintptr_t handle, std::string mark, CUDAVirtualMemoryChunk&& memory)
+void CudaVirtualMemoryManager::add(uintptr_t handle, std::string tag, CUDAVirtualMemoryChunk&& memory)
 {
     bool success = false;
 
@@ -163,14 +163,14 @@ void CudaVirtualMemoryManager::add(uintptr_t handle, std::string mark, CUDAVirtu
         created, "CudaVirtualMemoryManager: handle 0x%016zx already being used by another memory", handle);
     ScopeGuard eraseMemIt{success, [&, memIt_ = memIt] { mMemories.erase(memIt_); }};
 
-    auto const entryIt = mEntries.emplace(std::move(mark), memIt);
+    auto const entryIt = mEntries.emplace(std::move(tag), memIt);
     entryIt->second->second.mEntryIt = entryIt;
 
     memIt->second.mMemory = std::move(memory);
     success = true;
 }
 
-void CudaVirtualMemoryManager::add(uintptr_t handle, std::string mark, CUDAVirtualMemoryChunk::CreatorPtr&& creator,
+void CudaVirtualMemoryManager::add(uintptr_t handle, std::string tag, CUDAVirtualMemoryChunk::CreatorPtr&& creator,
     CUDAVirtualMemoryChunk::Configurators&& configurators)
 {
     std::unique_lock lock(mMutex);
@@ -184,9 +184,9 @@ void CudaVirtualMemoryManager::add(uintptr_t handle, std::string mark, CUDAVirtu
         created, "CudaVirtualMemoryManager: handle 0x%016zx already being used by another memory", handle);
     ScopeGuard eraseMemIt{success, [&, memIt_ = memIt] { mMemories.erase(memIt_); }};
 
-    auto const entryIt = mEntries.emplace(std::move(mark), memIt);
+    auto const entryIt = mEntries.emplace(std::move(tag), memIt);
     memIt->second.mEntryIt = entryIt;
-    ScopeGuard eraseMarkIt{success, [&] { mEntries.erase(entryIt); }};
+    ScopeGuard eraseTagIt{success, [&] { mEntries.erase(entryIt); }};
 
     try
     {
@@ -238,12 +238,12 @@ std::vector<uintptr_t> CudaVirtualMemoryManager::retrieveBadHandles() noexcept
     return std::move(mBadHandles);
 }
 
-size_t CudaVirtualMemoryManager::releaseWithMark(std::string const& mark)
+size_t CudaVirtualMemoryManager::releaseWithTag(std::string const& tag)
 {
     std::unique_lock lock(mMutex);
 
     std::exception_ptr ePtr{};
-    auto [begin, end] = mEntries.equal_range(mark);
+    auto [begin, end] = mEntries.equal_range(tag);
     size_t count = 0;
     for (auto it = begin; it != end;)
     {
@@ -253,7 +253,7 @@ size_t CudaVirtualMemoryManager::releaseWithMark(std::string const& mark)
         if (memory.status() == CUDAVirtualMemoryChunk::MATERIALIZED)
         {
             if (!safe_invoke_helper(ePtr,
-                    "Multiple exceptions thrown during releaseWithMark. The previous exception is: %s",
+                    "Multiple exceptions thrown during releaseWithTag. The previous exception is: %s",
                     &CUDAVirtualMemoryChunk::release, &memory))
             {
                 addBadHandle(handle);
@@ -271,11 +271,11 @@ size_t CudaVirtualMemoryManager::releaseWithMark(std::string const& mark)
     return count;
 }
 
-size_t CudaVirtualMemoryManager::materializeWithMark(std::string const& mark)
+size_t CudaVirtualMemoryManager::materializeWithTag(std::string const& tag)
 {
     std::unique_lock lock(mMutex);
 
-    auto [begin, end] = mEntries.equal_range(mark);
+    auto [begin, end] = mEntries.equal_range(tag);
     size_t count = 0;
 
     auto it = begin;
@@ -307,7 +307,7 @@ size_t CudaVirtualMemoryManager::materializeWithMark(std::string const& mark)
             {
                 addBadHandle(handle);
                 unsafeRemove(handle);
-                TLLM_LOG_ERROR("Additional exception thrown during rollback of materializeWithMark: %s", e.what());
+                TLLM_LOG_ERROR("Additional exception thrown during rollback of materializeWithTag: %s", e.what());
             }
         }
 
@@ -365,7 +365,7 @@ void CudaVirtualMemoryAllocator::allocate(Pointer* ptr, std::size_t n, int devic
         break;
     }
 
-    mConfig->mManager.add(address, mConfig->mMark,
+    mConfig->mManager.add(address, mConfig->mTag,
         std::make_unique<LocalCreator<>>(CUmemAllocationProp{CU_MEM_ALLOCATION_TYPE_PINNED, CU_MEM_HANDLE_TYPE_NONE,
                                              {
                                                  CU_MEM_LOCATION_TYPE_DEVICE,
@@ -409,9 +409,9 @@ CudaVirtualMemoryAllocator const& getVirtualMemoryAllocator()
 }
 
 void pushVirtualMemoryAllocator(
-    std::string const& mark, CudaVirtualMemoryAllocator::RestoreMode mode, std::shared_ptr<CudaStream> backStream)
+    std::string const& tag, CudaVirtualMemoryAllocator::RestoreMode mode, std::shared_ptr<CudaStream> backStream)
 {
-    vmAllocators.emplace_front(std::make_shared<AllocConf>(getVirtualMemoryManager(), mark, mode, backStream));
+    vmAllocators.emplace_front(std::make_shared<AllocConf>(getVirtualMemoryManager(), tag, mode, backStream));
 }
 
 void popVirtualMemoryAllocator()

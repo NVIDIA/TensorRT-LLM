@@ -119,8 +119,8 @@ void initBindings(nb::module_& m)
         .def(nb::self == nb::self);
 
     nb::class_<tr::CudaVirtualMemoryManager>(m, "CudaVirtualMemoryManager")
-        .def("release_with_mark", &tr::CudaVirtualMemoryManager::releaseWithMark, nb::arg("mark"))
-        .def("materialize_with_mark", &tr::CudaVirtualMemoryManager::materializeWithMark, nb::arg("mark"));
+        .def("release_with_tag", &tr::CudaVirtualMemoryManager::releaseWithTag, nb::arg("tag"))
+        .def("materialize_with_tag", &tr::CudaVirtualMemoryManager::materializeWithTag, nb::arg("tag"));
 
     nb::class_<tr::BufferManager>(m, "BufferManager")
         .def(nb::init<tr::BufferManager::CudaStreamPtr, bool>(), nb::arg("stream"), nb::arg("trim_pool") = false)
@@ -348,9 +348,9 @@ void initBindings(nb::module_& m)
 
     m.def(
         "push_virtual_memory_allocator",
-        [](std::string const& mark, tr::CudaVirtualMemoryAllocator::RestoreMode mode, uintptr_t stream)
+        [](std::string const& tag, tr::CudaVirtualMemoryAllocator::RestoreMode mode, uintptr_t stream)
         {
-            tr::pushVirtualMemoryAllocator(mark, mode,
+            tr::pushVirtualMemoryAllocator(tag, mode,
                 std::make_shared<tr::CudaStream>(
                     reinterpret_cast<cudaStream_t>(stream), tensorrt_llm::common::getDevice(), false));
         },

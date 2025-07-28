@@ -88,9 +88,9 @@ def test_basic(memory_info_available):
     memory_usage_begin = get_current_process_memory_info()
 
     alloc_size = 256 * 1024 * 1024
-    mark = "test_mark"
+    tag = "test_tag"
 
-    with virtual_memory.scope(mark) as pool:
+    with virtual_memory.scope(tag) as pool:
         tensor = torch.full([alloc_size], 42, dtype=torch.int8, device='cuda')
         memory_usage_materialized = get_current_process_memory_info()
         if memory_info_available:
@@ -99,14 +99,14 @@ def test_basic(memory_info_available):
     assert tensor[0].item() == 42
 
     torch.cuda.synchronize()
-    virtual_memory.release_with_mark(mark)
+    virtual_memory.release_with_tag(tag)
 
     memory_usage_released = get_current_process_memory_info()
     if memory_info_available:
         assert memory_usage_begin == memory_usage_released
 
     torch.cuda.synchronize()
-    virtual_memory.materialize_with_mark(mark)
+    virtual_memory.materialize_with_tag(tag)
 
     memory_usage_rematerialized = get_current_process_memory_info()
     if memory_info_available:
@@ -125,19 +125,19 @@ def test_basic(memory_info_available):
 
 def test_restore():
     alloc_size = 1024 * 1024
-    mark = "test_mark"
+    tag = "test_tag"
 
-    with virtual_memory.scope(mark, virtual_memory.RestoreMode.PINNED) as pool:
+    with virtual_memory.scope(tag, virtual_memory.RestoreMode.PINNED) as pool:
         tensor = torch.full([alloc_size], 42, dtype=torch.int8, device='cuda')
 
     assert tensor[0].item() == 42
 
     torch.cuda.synchronize()
-    virtual_memory.release_with_mark(mark)
+    virtual_memory.release_with_tag(tag)
 
     torch.cuda.synchronize()
 
-    virtual_memory.materialize_with_mark(mark)
+    virtual_memory.materialize_with_tag(tag)
     torch.cuda.synchronize()
 
     assert tensor[0].item() == 42
@@ -166,7 +166,7 @@ def test_kv_cache_manager(memory_info_available):
 
     memory_usage_begin = get_current_process_memory_info()
 
-    mark = "test_mark"
+    tag = "test_tag"
     cache_size = torch.empty(
         [
             2,  # KV
@@ -180,21 +180,21 @@ def test_kv_cache_manager(memory_info_available):
 
     alloc_size = cache_size.nelement()
 
-    with virtual_memory.scope(mark) as pool:
+    with virtual_memory.scope(tag) as pool:
         mgr = KVCacheManager(**kv_cache_params)
         memory_usage_materialized = get_current_process_memory_info()
         if memory_info_available:
             assert memory_usage_begin + alloc_size == memory_usage_materialized
 
     torch.cuda.synchronize()
-    virtual_memory.release_with_mark(mark)
+    virtual_memory.release_with_tag(tag)
 
     memory_usage_released = get_current_process_memory_info()
     if memory_info_available:
         assert memory_usage_begin == memory_usage_released
 
     torch.cuda.synchronize()
-    virtual_memory.materialize_with_mark(mark)
+    virtual_memory.materialize_with_tag(tag)
 
     memory_usage_rematerialized = get_current_process_memory_info()
     if memory_info_available:
@@ -217,9 +217,9 @@ def test_cuda_graph(memory_info_available):
         return output
 
     g = torch.cuda.CUDAGraph()
-    mark = "cuda_graph"
+    tag = "cuda_graph"
 
-    with virtual_memory.scope(mark) as pool:
+    with virtual_memory.scope(tag) as pool:
         static_input = torch.ones(1024, dtype=torch.float32, device='cuda')
         static_output = torch.zeros(1024, dtype=torch.float32, device='cuda')
 
@@ -235,14 +235,14 @@ def test_cuda_graph(memory_info_available):
     memory_usage_before = get_current_process_memory_info()
 
     torch.cuda.synchronize()
-    virtual_memory.release_with_mark(mark)
+    virtual_memory.release_with_tag(tag)
 
     memory_usage_released = get_current_process_memory_info()
     if memory_info_available:
         assert memory_usage_released < memory_usage_before
 
     torch.cuda.synchronize()
-    virtual_memory.materialize_with_mark(mark)
+    virtual_memory.materialize_with_tag(tag)
 
     torch.fill_(static_input, 1.0)
     torch.fill_(static_output, 0.0)

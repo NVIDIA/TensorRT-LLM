@@ -353,31 +353,31 @@ public:
     /**
      * Add memory to be managed by this manager.
      * @param handle  Unique handle provided to reference this memory in `remove`.
-     * @param mark    Mark the memory, so this memory can be targeted in `releaseWithMark` and `materializeWithMark`.
+     * @param tag     Tag the memory, so this memory can be targeted in `releaseWithTag` and `materializeWithTag`.
      * @param memory  The CUDAVirtualMemory object.
      *
      * The memory and internal state will remain valid if any exception is thrown.
      */
-    void add(uintptr_t handle, std::string mark, CUDAVirtualMemoryChunk&& memory);
+    void add(uintptr_t handle, std::string tag, CUDAVirtualMemoryChunk&& memory);
 
     /**
      * Creates and adds memory to be managed by this manager. The created memory is automatically materialized.
      * @param handle         Unique handle provided to reference this memory in `remove`.
-     * @param mark           Mark the memory, so this memory can be targeted in `releaseWithMark` and
-     * `materializeWithMark`.
+     * @param tag            Tag the memory, so this memory can be targeted in `releaseWithTag` and
+     * `materializeWithTag`.
      * @param creator        The creator for the memory.
      * @param configurators  The configurators for the memory.
      *
      * The internal state will remain valid if any exception is thrown.
      */
-    void add(uintptr_t handle, std::string mark, CUDAVirtualMemoryChunk::CreatorPtr&& creator,
+    void add(uintptr_t handle, std::string tag, CUDAVirtualMemoryChunk::CreatorPtr&& creator,
         CUDAVirtualMemoryChunk::Configurators&& configurators);
 
     template <typename... Configurators>
-    void add(uintptr_t handle, std::string mark, CUDAVirtualMemoryChunk::CreatorPtr&& creator,
+    void add(uintptr_t handle, std::string tag, CUDAVirtualMemoryChunk::CreatorPtr&& creator,
         Configurators&&... configurators)
     {
-        add(handle, mark, std::move(creator), {std::forward<Configurators>(configurators)...});
+        add(handle, tag, std::move(creator), {std::forward<Configurators>(configurators)...});
     }
 
     /**
@@ -388,8 +388,8 @@ public:
     CUDAVirtualMemoryChunk remove(uintptr_t handle) noexcept;
 
     /**
-     * Call release for CUDAVirtualMemoryChunk objects with a given mark.
-     * @param mark the mark to select target memories.
+     * Call release for CUDAVirtualMemoryChunk objects with a given tag.
+     * @param tag the tag to select target memories.
      * @return Number of objects selected.
      *
      * This function will always call `CUDAVirtualMemoryChunk::release` on all selected objects.
@@ -398,11 +398,11 @@ public:
      * If any CUDAVirtualMemoryChunk threw an exception during `release`, it will be removed from the manager.
      * Call `retrieveBadHandles` to retrieve handles of all CUDAVirtualMemoryChunk that got removed due to exception.
      */
-    size_t releaseWithMark(std::string const& mark);
+    size_t releaseWithTag(std::string const& tag);
 
     /**
-     * Call materialize for CUDAVirtualMemoryChunk objects with a given mark.
-     * @param mark the mark to select target memories.
+     * Call materialize for CUDAVirtualMemoryChunk objects with a given tag.
+     * @param tag the tag to select target memories.
      * @return Number of objects selected.
      *
      * This function will stop at the first `CUDAVirtualMemoryChunk::materialize` that throws exception,
@@ -414,7 +414,7 @@ public:
      * manager. Successfully roll backed CUDAVirtualMemoryChunk will not be removed.
      * Call `retrieveBadHandles` to retrieve handles of all CUDAVirtualMemoryChunk that got removed due to exception.
      */
-    size_t materializeWithMark(std::string const& mark);
+    size_t materializeWithTag(std::string const& tag);
 
     /**
      * Retrieve handles of all CUDAVirtualMemoryChunk that got removed due to exception and reset the list.
@@ -431,37 +431,20 @@ private:
     struct Entry;
     // Unordered map invalidates iterator upon rehash, so we can only use the ordered map.
     using PointerMemoryMap = std::map<uintptr_t, Entry>;
-    using MarkEntryMap = std::multimap<std::string, PointerMemoryMap::iterator>;
+    using TagEntryMap = std::multimap<std::string, PointerMemoryMap::iterator>;
 
     struct Entry
     {
         CUDAVirtualMemoryChunk mMemory;
-        MarkEntryMap::iterator mEntryIt;
+        TagEntryMap::iterator mEntryIt;
     };
 
     std::mutex mMutex;
     PointerMemoryMap mMemories;
-    MarkEntryMap mEntries;
+    TagEntryMap mEntries;
     std::vector<uintptr_t> mBadHandles;
 
     friend VirtualMemoryManagerTest;
-};
-
-class CudaVirtualAddressManager
-{
-public:
-    static CudaVirtualAddressManager& instance();
-
-    CUdeviceptr Reserve(size_t size, size_t alignment = 0, CUdeviceptr addr = {}) const;
-    void Free(CUdeviceptr ptr, size_t size) const;
-
-private:
-    explicit CudaVirtualAddressManager(size_t pageSize)
-        : mPageSize(pageSize)
-    {
-    }
-
-    size_t mPageSize;
 };
 
 class CudaVirtualMemoryAllocator
@@ -481,7 +464,7 @@ public:
     class Configuration
     {
         CudaVirtualMemoryManager& mManager;
-        std::string mMark;
+        std::string mTag;
         CudaStreamPtr mBackStream;
         std::size_t mPageSize;
         RestoreMode mMode;
@@ -493,14 +476,14 @@ public:
         /**
          * CudaVirtualMemoryAllocator::Configuration
          * @param manager    Manager used to track and manage virtual memories
-         * @param mark       The mark for allocated memories
+         * @param tag        The tag for allocated memories
          * @param mode       Backed storage mode
          * @param backStream The CUDA stream used for restoring memory content
          *                   Note: Virtual Address Allocation is not async. The stream is not used in allocation.
          */
-        Configuration(CudaVirtualMemoryManager& manager, std::string mark, RestoreMode mode, CudaStreamPtr backStream)
+        Configuration(CudaVirtualMemoryManager& manager, std::string tag, RestoreMode mode, CudaStreamPtr backStream)
             : mManager(manager)
-            , mMark(std::move(mark))
+            , mTag(std::move(tag))
             , mBackStream(std::move(backStream))
             , mPageSize(getpagesize())
             , mMode(mode)
@@ -511,9 +494,9 @@ public:
         static Configuration backgroundConfiguration;
 
     private:
-        Configuration(CudaVirtualMemoryManager& manager, std::string mark, RestoreMode mode, CudaStreamPtr backStream,
+        Configuration(CudaVirtualMemoryManager& manager, std::string tag, RestoreMode mode, CudaStreamPtr backStream,
             bool background)
-            : Configuration(manager, std::move(mark), mode, std::move(backStream))
+            : Configuration(manager, std::move(tag), mode, std::move(backStream))
         {
             mBackground = background;
         }
@@ -544,7 +527,7 @@ namespace tensorrt_llm::runtime
 CudaVirtualMemoryManager& getVirtualMemoryManager();
 CudaVirtualMemoryAllocator const& getVirtualMemoryAllocator();
 void pushVirtualMemoryAllocator(
-    std::string const& mark, CudaVirtualMemoryAllocator::RestoreMode mode, std::shared_ptr<CudaStream> backStream);
+    std::string const& tag, CudaVirtualMemoryAllocator::RestoreMode mode, std::shared_ptr<CudaStream> backStream);
 void popVirtualMemoryAllocator();
 
 } // namespace tensorrt_llm::runtime

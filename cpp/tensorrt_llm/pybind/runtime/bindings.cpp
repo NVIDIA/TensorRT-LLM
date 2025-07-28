@@ -216,8 +216,8 @@ void initBindings(pybind11::module_& m)
         .def(py::self == py::self);
 
     py::class_<tr::CudaVirtualMemoryManager>(m, "CudaVirtualMemoryManager")
-        .def("release_with_mark", &tr::CudaVirtualMemoryManager::releaseWithMark, py::arg("mark"))
-        .def("materialize_with_mark", &tr::CudaVirtualMemoryManager::materializeWithMark, py::arg("mark"));
+        .def("release_with_tag", &tr::CudaVirtualMemoryManager::releaseWithTag, py::arg("tag"))
+        .def("materialize_with_tag", &tr::CudaVirtualMemoryManager::materializeWithTag, py::arg("tag"));
 
     py::classh<tr::BufferManager>(m, "BufferManager")
         .def(py::init<tr::BufferManager::CudaStreamPtr, bool>(), py::arg("stream"), py::arg("trim_pool") = false)
@@ -441,9 +441,9 @@ void initBindings(pybind11::module_& m)
 
     m.def(
         "push_virtual_memory_allocator",
-        [](std::string const& mark, tr::CudaVirtualMemoryAllocator::RestoreMode mode, uintptr_t stream)
+        [](std::string const& tag, tr::CudaVirtualMemoryAllocator::RestoreMode mode, uintptr_t stream)
         {
-            tr::pushVirtualMemoryAllocator(mark, mode,
+            tr::pushVirtualMemoryAllocator(tag, mode,
                 std::make_shared<tr::CudaStream>(
                     reinterpret_cast<cudaStream_t>(stream), tensorrt_llm::common::getDevice(), false));
         },

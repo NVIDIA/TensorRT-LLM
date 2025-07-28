@@ -277,7 +277,7 @@ TEST_F(VirtualMemoryTest, TestOrder)
             return createdHandle;
         }
 
-        void release(CUmemGenericAllocationHandle handle) override
+        void release(CUmemGenericAllocationHandle handle, bool destructing) override
         {
             releaseOrder = ++mCallOrder;
             ASSERT_EQ(handle, createdHandle);
@@ -304,7 +304,7 @@ TEST_F(VirtualMemoryTest, TestOrder)
             setupOrder = ++mCallOrder;
         }
 
-        void teardown(CUmemGenericAllocationHandle handle) override
+        void teardown(CUmemGenericAllocationHandle handle, bool destructing) override
         {
             teardownOrder = ++mCallOrder;
         }
@@ -377,7 +377,7 @@ TEST_F(VirtualMemoryTest, TestException)
             return createdHandle;
         }
 
-        void release(CUmemGenericAllocationHandle handle) override
+        void release(CUmemGenericAllocationHandle handle, bool destructing) override
         {
             releaseCalled = true;
             ASSERT_EQ(handle, createdHandle);
@@ -412,7 +412,7 @@ TEST_F(VirtualMemoryTest, TestException)
             }
         }
 
-        void teardown(CUmemGenericAllocationHandle handle) override
+        void teardown(CUmemGenericAllocationHandle handle, bool destructing) override
         {
             teardownCalled = true;
             if (throwOnTeardown)
@@ -662,7 +662,7 @@ TEST_F(VirtualMemoryTest, TestDestructor)
             return createdHandle;
         }
 
-        void release(CUmemGenericAllocationHandle handle) override
+        void release(CUmemGenericAllocationHandle handle, bool destructing) override
         {
             releaseCalledRef = true;
             ASSERT_EQ(handle, createdHandle);
@@ -689,7 +689,7 @@ TEST_F(VirtualMemoryTest, TestDestructor)
             setupCalledRef = true;
         }
 
-        void teardown(CUmemGenericAllocationHandle) override
+        void teardown(CUmemGenericAllocationHandle, bool) override
         {
             teardownCalledRef = true;
         }
@@ -791,7 +791,7 @@ TEST_F(VirtualMemoryTest, TestDestructor)
                 throw DummyException();
             }
 
-            void teardown(CUmemGenericAllocationHandle) override
+            void teardown(CUmemGenericAllocationHandle, bool) override
             {
                 teardownCalledRef = true;
             }
@@ -842,7 +842,7 @@ TEST_F(VirtualMemoryTest, TestEdgeCases)
             return createdHandle;
         }
 
-        void release(CUmemGenericAllocationHandle handle) override
+        void release(CUmemGenericAllocationHandle handle, bool destructing) override
         {
             ASSERT_EQ(handle, createdHandle);
         }
@@ -903,7 +903,7 @@ TEST_F(VirtualMemoryTest, TestEdgeCases)
                 }
             }
 
-            void teardown(CUmemGenericAllocationHandle) override {}
+            void teardown(CUmemGenericAllocationHandle, bool) override {}
         };
 
         auto creator = std::make_unique<DummyCreator>();
@@ -966,7 +966,7 @@ TEST_F(VirtualMemoryManagerTest, TestBasic)
     TLLM_CU_CHECK(cuMemAddressReserve(&address, size, 0, {}, 0));
 
     uintptr_t handle = static_cast<uintptr_t>(address);
-    std::string mark = "test_mark";
+    std::string tag = "test_tag";
 
     CUDAVirtualMemoryChunk::CreatorPtr creator
         = std::make_unique<LocalCreator<>>(CUmemAllocationProp{CU_MEM_ALLOCATION_TYPE_PINNED, CU_MEM_HANDLE_TYPE_NONE,
@@ -987,7 +987,7 @@ TEST_F(VirtualMemoryManagerTest, TestBasic)
     auto memoryBegin = getCurrentProcessMemoryInfo();
 
     // Add to manager - this automatically materializes
-    mVMManager->add(handle, mark, std::move(creator), std::move(configurators));
+    mVMManager->add(handle, tag, std::move(creator), std::move(configurators));
 
     auto memoryMaterialized = getCurrentProcessMemoryInfo();
     if (memoryInfoAvailable())
@@ -1001,23 +1001,23 @@ TEST_F(VirtualMemoryManagerTest, TestBasic)
     TLLM_CU_CHECK(cuStreamSynchronize(nullptr));
 
     // Release memory through manager
-    auto releaseCount = mVMManager->releaseWithMark(mark);
+    auto releaseCount = mVMManager->releaseWithTag(tag);
     ASSERT_EQ(releaseCount, 1) << "Expected to release 1 memory object";
 
     auto memoryReleased = getCurrentProcessMemoryInfo();
     if (memoryInfoAvailable())
     {
-        ASSERT_EQ(memoryBegin, memoryReleased) << "releaseWithMark does not release memory";
+        ASSERT_EQ(memoryBegin, memoryReleased) << "releaseWithTag does not release memory";
     }
 
     // Materialize again through manager
-    auto materializeCount = mVMManager->materializeWithMark(mark);
+    auto materializeCount = mVMManager->materializeWithTag(tag);
     ASSERT_EQ(materializeCount, 1) << "Expected to materialize 1 memory object";
 
     auto memoryRematerialized = getCurrentProcessMemoryInfo();
     if (memoryInfoAvailable())
     {
-        ASSERT_EQ(memoryBegin + size, memoryRematerialized) << "materializeWithMark does not allocate memory";
+        ASSERT_EQ(memoryBegin + size, memoryRematerialized) << "materializeWithTag does not allocate memory";
     }
 
     // Test memory access after rematerialization
@@ -1041,9 +1041,9 @@ TEST_F(VirtualMemoryManagerTest, TestBasic)
     ASSERT_FALSE(unknownMemory) << "Expect invalid memory for unknown handle";
 }
 
-TEST_F(VirtualMemoryManagerTest, TestMarks)
+TEST_F(VirtualMemoryManagerTest, TestTags)
 {
-    // Dummy Creator for testing mark functionality
+    // Dummy Creator for testing tag functionality
     class DummyCreator : public CUDAVirtualMemoryChunk::Creator
     {
     public:
@@ -1057,7 +1057,7 @@ TEST_F(VirtualMemoryManagerTest, TestMarks)
             return createdHandle;
         }
 
-        void release(CUmemGenericAllocationHandle handle) override
+        void release(CUmemGenericAllocationHandle handle, bool destructing) override
         {
             releaseCalled = true;
             ASSERT_EQ(handle, createdHandle);
@@ -1076,10 +1076,10 @@ TEST_F(VirtualMemoryManagerTest, TestMarks)
     auto* creator3Ptr = creator3.get();
     auto* creator4Ptr = creator4.get();
 
-    mVMManager->add(0x1000, "mark_A", std::move(creator1), {});
-    mVMManager->add(0x2000, "mark_B", std::move(creator2), {});
-    mVMManager->add(0x3000, "mark_A", std::move(creator3), {});
-    mVMManager->add(0x4000, "mark_C", std::move(creator4), {});
+    mVMManager->add(0x1000, "tag_A", std::move(creator1), {});
+    mVMManager->add(0x2000, "tag_B", std::move(creator2), {});
+    mVMManager->add(0x3000, "tag_A", std::move(creator3), {});
+    mVMManager->add(0x4000, "tag_C", std::move(creator4), {});
 
     // All should be materialized initially (since add() materializes automatically)
     EXPECT_TRUE(creator1Ptr->createCalled);
@@ -1087,43 +1087,43 @@ TEST_F(VirtualMemoryManagerTest, TestMarks)
     EXPECT_TRUE(creator3Ptr->createCalled);
     EXPECT_TRUE(creator4Ptr->createCalled);
 
-    // Reset create flags to test materializeWithMark later
+    // Reset create flags to test materializeWithTag later
     creator1Ptr->createCalled = false;
     creator2Ptr->createCalled = false;
     creator3Ptr->createCalled = false;
     creator4Ptr->createCalled = false;
 
-    // Test releaseWithMark - should release only memories with "mark_A"
-    auto releaseCount = mVMManager->releaseWithMark("mark_A");
-    EXPECT_EQ(releaseCount, 2); // Should release 2 memories with mark_A
+    // Test releaseWithTag - should release only memories with "tag_A"
+    auto releaseCount = mVMManager->releaseWithTag("tag_A");
+    EXPECT_EQ(releaseCount, 2); // Should release 2 memories with tag_A
 
-    // Verify only mark_A memories were released
-    EXPECT_TRUE(creator1Ptr->releaseCalled);  // mark_A
-    EXPECT_FALSE(creator2Ptr->releaseCalled); // mark_B
-    EXPECT_TRUE(creator3Ptr->releaseCalled);  // mark_A
-    EXPECT_FALSE(creator4Ptr->releaseCalled); // mark_C
+    // Verify only tag_A memories were released
+    EXPECT_TRUE(creator1Ptr->releaseCalled);  // tag_A
+    EXPECT_FALSE(creator2Ptr->releaseCalled); // tag_B
+    EXPECT_TRUE(creator3Ptr->releaseCalled);  // tag_A
+    EXPECT_FALSE(creator4Ptr->releaseCalled); // tag_C
 
-    // Test materializeWithMark - should materialize only memories with "mark_A"
-    auto materializeCount = mVMManager->materializeWithMark("mark_A");
-    EXPECT_EQ(materializeCount, 2); // Should materialize 2 memories with mark_A
+    // Test materializeWithTag - should materialize only memories with "tag_A"
+    auto materializeCount = mVMManager->materializeWithTag("tag_A");
+    EXPECT_EQ(materializeCount, 2); // Should materialize 2 memories with tag_A
 
-    // Verify only mark_A memories were materialized
-    EXPECT_TRUE(creator1Ptr->createCalled);  // mark_A
-    EXPECT_FALSE(creator2Ptr->createCalled); // mark_B
-    EXPECT_TRUE(creator3Ptr->createCalled);  // mark_A
-    EXPECT_FALSE(creator4Ptr->createCalled); // mark_C
+    // Verify only tag_A memories were materialized
+    EXPECT_TRUE(creator1Ptr->createCalled);  // tag_A
+    EXPECT_FALSE(creator2Ptr->createCalled); // tag_B
+    EXPECT_TRUE(creator3Ptr->createCalled);  // tag_A
+    EXPECT_FALSE(creator4Ptr->createCalled); // tag_C
 
-    // Reset flags and test releasing with a different mark
+    // Reset flags and test releasing with a different tag
     creator2Ptr->releaseCalled = false;
-    releaseCount = mVMManager->releaseWithMark("mark_B");
-    EXPECT_EQ(releaseCount, 1);              // Should release 1 memory with mark_B
-    EXPECT_TRUE(creator2Ptr->releaseCalled); // mark_B should now be released
+    releaseCount = mVMManager->releaseWithTag("tag_B");
+    EXPECT_EQ(releaseCount, 1);              // Should release 1 memory with tag_B
+    EXPECT_TRUE(creator2Ptr->releaseCalled); // tag_B should now be released
 
-    // Test with non-existent mark
-    releaseCount = mVMManager->releaseWithMark("nonexistent_mark");
+    // Test with non-existent tag
+    releaseCount = mVMManager->releaseWithTag("nonexistent_tag");
     EXPECT_EQ(releaseCount, 0); // Should release 0 memories
 
-    materializeCount = mVMManager->materializeWithMark("nonexistent_mark");
+    materializeCount = mVMManager->materializeWithTag("nonexistent_tag");
     EXPECT_EQ(materializeCount, 0); // Should materialize 0 memories
 
     // Clean up - remove all memories
@@ -1146,7 +1146,7 @@ TEST_F(VirtualMemoryManagerTest, TestAddException)
             return createdHandle;
         }
 
-        void release(CUmemGenericAllocationHandle handle) override
+        void release(CUmemGenericAllocationHandle handle, bool destructing) override
         {
             ASSERT_EQ(handle, createdHandle);
         }
@@ -1161,14 +1161,14 @@ TEST_F(VirtualMemoryManagerTest, TestAddException)
             throw DummyException();
         }
 
-        void teardown(CUmemGenericAllocationHandle) override
+        void teardown(CUmemGenericAllocationHandle, bool) override
         {
             ASSERT_TRUE(false) << "Unreachable";
         }
     };
 
     uintptr_t handle = 0x12345678;
-    std::string mark = "test_mark";
+    std::string tag = "test_tag";
 
     // Verify initial state is clean
     EXPECT_TRUE(memories().empty());
@@ -1180,7 +1180,7 @@ TEST_F(VirtualMemoryManagerTest, TestAddException)
     configurators.push_back(std::make_unique<ThrowingConfigurator>());
 
     // add() should throw because materialize() will fail due to ThrowingConfigurator
-    EXPECT_THROW(mVMManager->add(handle, mark, std::move(creator), std::move(configurators)), DummyException);
+    EXPECT_THROW(mVMManager->add(handle, tag, std::move(creator), std::move(configurators)), DummyException);
 
     // Verify that the manager state is clean after the exception
     // The ScopeGuards in add() should have cleaned up properly
@@ -1193,7 +1193,7 @@ TEST_F(VirtualMemoryManagerTest, TestAddException)
     CUDAVirtualMemoryChunk::Configurators successConfigurators; // Empty configurators should work
 
     // This should succeed without throwing
-    EXPECT_NO_THROW(mVMManager->add(handle, mark, std::move(successCreator), std::move(successConfigurators)));
+    EXPECT_NO_THROW(mVMManager->add(handle, tag, std::move(successCreator), std::move(successConfigurators)));
 
     // Verify that the manager now has the entry
     EXPECT_EQ(memories().size(), 1);
@@ -1245,7 +1245,7 @@ TEST_F(VirtualMemoryManagerTest, TestMaterializeException)
             return state.createdHandle;
         }
 
-        void release(CUmemGenericAllocationHandle handle) override
+        void release(CUmemGenericAllocationHandle handle, bool destructing) override
         {
             state.releaseCalled = true;
             ASSERT_EQ(handle, state.createdHandle);
@@ -1275,16 +1275,16 @@ TEST_F(VirtualMemoryManagerTest, TestMaterializeException)
     CUDAVirtualMemoryChunk vm2(std::move(creator2), {});
     CUDAVirtualMemoryChunk vm3(std::move(creator3), {});
 
-    mVMManager->add(0x1000, "test_mark", std::move(vm1));
-    mVMManager->add(0x2000, "test_mark", std::move(vm2));
-    mVMManager->add(0x3000, "test_mark", std::move(vm3));
+    mVMManager->add(0x1000, "test_tag", std::move(vm1));
+    mVMManager->add(0x2000, "test_tag", std::move(vm2));
+    mVMManager->add(0x3000, "test_tag", std::move(vm3));
 
     // Verify initial state is clean
     EXPECT_TRUE(badHandles().empty());
 
-    // materializeWithMark should stop at the first exception (second memory by create order)
+    // materializeWithTag should stop at the first exception (second memory by create order)
     // and attempt to rollback the first memory that succeeded
-    EXPECT_THROW(mVMManager->materializeWithMark("test_mark"), DummyException);
+    EXPECT_THROW(mVMManager->materializeWithTag("test_tag"), DummyException);
 
     // Find which creators were called and in what order
     std::vector<std::pair<uintptr_t, CreatorState*>> creators
@@ -1379,7 +1379,7 @@ TEST_F(VirtualMemoryManagerTest, TestReleaseException)
             return state.createdHandle;
         }
 
-        void release(CUmemGenericAllocationHandle handle) override
+        void release(CUmemGenericAllocationHandle handle, bool destructing) override
         {
             state.releaseCalled = true;
             ASSERT_EQ(handle, state.createdHandle);
@@ -1406,7 +1406,7 @@ TEST_F(VirtualMemoryManagerTest, TestReleaseException)
             state.setupCalled = true;
         }
 
-        void teardown(CUmemGenericAllocationHandle) override
+        void teardown(CUmemGenericAllocationHandle, bool) override
         {
             state.teardownCalled = true;
             if (++state.teardownCounter == state.throwOnTeardownCount)
@@ -1454,20 +1454,20 @@ TEST_F(VirtualMemoryManagerTest, TestReleaseException)
     CUDAVirtualMemoryChunk::Configurators configurators4;
     configurators4.push_back(std::move(config4));
 
-    mVMManager->add(0x1000, "test_mark", std::move(creator1), std::move(configurators1));
-    mVMManager->add(0x2000, "test_mark", std::move(creator2), std::move(configurators2));
-    mVMManager->add(0x3000, "test_mark", std::move(creator3), std::move(configurators3));
-    mVMManager->add(0x4000, "other_mark", std::move(creator4), std::move(configurators4));
+    mVMManager->add(0x1000, "test_tag", std::move(creator1), std::move(configurators1));
+    mVMManager->add(0x2000, "test_tag", std::move(creator2), std::move(configurators2));
+    mVMManager->add(0x3000, "test_tag", std::move(creator3), std::move(configurators3));
+    mVMManager->add(0x4000, "other_tag", std::move(creator4), std::move(configurators4));
 
     // Verify initial state
     EXPECT_TRUE(badHandles().empty());
 
-    // releaseWithMark should call release on all memories with "test_mark"
+    // releaseWithTag should call release on all memories with "test_tag"
     // and continue despite exceptions
-    EXPECT_THROW(mVMManager->releaseWithMark("test_mark"), DummyException);
+    EXPECT_THROW(mVMManager->releaseWithTag("test_tag"), DummyException);
 
     // Verify behavior:
-    // - All memories with "test_mark" should have had release() attempted
+    // - All memories with "test_tag" should have had release() attempted
     EXPECT_TRUE(state1.releaseCalled);
     EXPECT_TRUE(configState1.teardownCalled);
 
@@ -1477,7 +1477,7 @@ TEST_F(VirtualMemoryManagerTest, TestReleaseException)
     EXPECT_TRUE(state3.releaseCalled);
     EXPECT_TRUE(configState3.teardownCalled);
 
-    // - Memory with different mark should not be affected
+    // - Memory with different tag should not be affected
     EXPECT_FALSE(state4.releaseCalled);
     EXPECT_FALSE(configState4.teardownCalled);
 
@@ -1496,13 +1496,13 @@ TEST_F(VirtualMemoryManagerTest, TestReleaseException)
     EXPECT_TRUE(removedMem1);  // Should have been removed due to exception
     EXPECT_FALSE(removedMem2); // Should have been removed due to exception
     EXPECT_FALSE(removedMem3); // Should have been removed due to exception
-    EXPECT_TRUE(removedMem4);  // Should still be in manager (different mark, not affected)
+    EXPECT_TRUE(removedMem4);  // Should still be in manager (different tag, not affected)
 }
 
 TEST_F(VirtualMemoryManagerTest, TestCudaVirtualMemoryAllocator)
 {
     std::size_t constexpr size = 64 * 1024 * 1024; // 64 MB
-    std::string mark = "test_allocator_mark";
+    std::string tag = "test_allocator_tag";
 
     // Create a CUDA stream for the allocator
     CudaStream stream;
@@ -1510,7 +1510,7 @@ TEST_F(VirtualMemoryManagerTest, TestCudaVirtualMemoryAllocator)
 
     // Create configuration for the virtual address allocator
     auto config = std::make_shared<CudaVirtualMemoryAllocator::Configuration>(
-        *mVMManager.get(), mark, CudaVirtualMemoryAllocator::RestoreMode::NONE, streamPtr);
+        *mVMManager.get(), tag, CudaVirtualMemoryAllocator::RestoreMode::NONE, streamPtr);
 
     auto memoryBegin = getCurrentProcessMemoryInfo();
 
@@ -1536,8 +1536,8 @@ TEST_F(VirtualMemoryManagerTest, TestCudaVirtualMemoryAllocator)
     ASSERT_EQ(result, CUDA_SUCCESS) << "Memory access should succeed";
     TLLM_CU_CHECK(cuStreamSynchronize(nullptr));
 
-    // Test releasing memory with mark - this should free the virtual memory
-    auto releaseCount = mVMManager->releaseWithMark(mark);
+    // Test releasing memory with tag - this should free the virtual memory
+    auto releaseCount = mVMManager->releaseWithTag(tag);
     ASSERT_EQ(releaseCount, 1) << "Expected to release 1 memory object";
 
     auto memoryAfterRelease = getCurrentProcessMemoryInfo();
@@ -1546,8 +1546,8 @@ TEST_F(VirtualMemoryManagerTest, TestCudaVirtualMemoryAllocator)
         ASSERT_EQ(memoryBegin, memoryAfterRelease) << "Release should free the memory";
     }
 
-    // Test materializing memory with mark - this should re-allocate the virtual memory
-    auto materializeCount = mVMManager->materializeWithMark(mark);
+    // Test materializing memory with tag - this should re-allocate the virtual memory
+    auto materializeCount = mVMManager->materializeWithTag(tag);
     ASSERT_EQ(materializeCount, 1) << "Expected to materialize 1 memory object";
 
     auto memoryAfterMaterialize = getCurrentProcessMemoryInfo();
