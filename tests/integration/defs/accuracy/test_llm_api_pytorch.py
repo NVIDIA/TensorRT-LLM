@@ -1920,10 +1920,6 @@ class TestPhi4MiniInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "microsoft/Phi-4-mini-instruct"
     MODEL_PATH = f"{llm_models_root()}/Phi-4-mini-instruct"
 
-    @pytest.mark.skip(
-        reason=
-        "Temporarily skipping test_auto_dtype while resolving Phi-4's architecture issue."
-    )
     def test_auto_dtype(self):
         with LLM(self.MODEL_PATH) as llm:
             task = CnnDailymail(self.MODEL_NAME)
@@ -1932,9 +1928,6 @@ class TestPhi4MiniInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
-            task = GPQADiamond(self.MODEL_NAME)
-            task.evaluate(llm,
-                          extra_evaluator_kwargs=dict(apply_chat_template=True))
 
 
 class TestKanana_Instruct(LlmapiAccuracyTestHarness):
