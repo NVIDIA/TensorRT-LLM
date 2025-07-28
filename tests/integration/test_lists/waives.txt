@@ -449,3 +449,6 @@ examples/test_qwen.py::test_llm_qwen_7b_int8_kv_1node_1gpus[qwen2_vl_7b_instruct
 examples/test_qwen.py::test_llm_qwen_awq_single_gpu_summary[qwen2_vl_7b_instruct-nb:4] SKIP (https://nvbugs/5419068)
 examples/test_qwen.py::test_llm_qwen_smooth_quant_single_gpu_summary[qwen2_vl_7b_instruct-enable_ptpc-nb:4] SKIP (https://nvbugs/5419069)
 examples/test_recurrentgemma.py::test_llm_recurrentgemma_1gpu[use_cpp_session-recurrentgemma-2b-use_paged_cache-fp8-float16-enable_attn_plugin-enable_gemm_plugin] SKIP (https://nvbugs/5419070)
+qa/test_nvregress_debug_tests.py::test_failed_output_on_stdout SKIP (https://nvbugs/5419971)
+qa/test_nvregress_debug_tests.py::test_failed_output_on_stderr SKIP (https://nvbugs/5419971)
+qa/test_nvregress_debug_tests.py::test_failed_output_on_both SKIP (https://nvbugs/5419971)
