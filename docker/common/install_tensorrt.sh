@@ -9,10 +9,11 @@ CUDA_VER="12.9" # 12.9.1
 # Keep the installation for cuDNN if users want to install PyTorch with source codes.
 # PyTorch 2.x can compile with cuDNN v9.
 CUDNN_VER="9.10.2.21-1"
-# PyTorch 25.06 uses NCCL 2.27.3. NCCL 2.27.5 resolves a perf regression issue.
+# NGC PyTorch 25.06 image uses NCCL 2.27.3, while NCCL 2.27.5 resolves a perf regression issue.
 # Use NCCL version 2.27.5 instead.
 NCCL_VER="2.27.5-1+cuda12.9"
-# PyTorch 25.06 uses cuBLAS 12.9.1.4 but there are some issue in it. So don't upgrade cuBLAS version.
+# NGC PyTorch 25.06 image uses cuBLAS 12.9.1.4, but which leads to failures with MoE Lora (see https://nvbugs/5376270).
+# Continue using cuBLAS 12.9.0.13 until this issue is resolved.
 CUBLAS_VER="12.9.0.13-1"
 # Align with the pre-installed CUDA / NVCC / NVRTC versions from
 # https://docs.nvidia.com/cuda/cuda-toolkit-release-notes/index.html
