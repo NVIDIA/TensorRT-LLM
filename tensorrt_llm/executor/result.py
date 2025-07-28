@@ -245,13 +245,12 @@ class GenerationResultBase:
             output.cumulative_logprob = response_tensors.cum_log_probs[src_idx]
 
         if logprobs_result:
-            # update logprobs for TRT backend
+            # update logprobs from ResponseWrapper (TRT top logprobs WAR)
             output._last_logprobs_len = len(output.logprobs)
             output.prompt_logprobs = logprobs_result.prompt
             output.logprobs += logprobs_result.generation
-
-        if logprobs_result is None and response_tensors.log_probs is not None:
-            # update logprobs for both backends
+        elif response_tensors.log_probs is not None:
+            # handle logprobs directly from response tensors
             output._last_logprobs_len = len(output.logprobs)
             output.logprobs = response_tensors.log_probs[src_idx]
             # overcome some WAR in the cpp executor
