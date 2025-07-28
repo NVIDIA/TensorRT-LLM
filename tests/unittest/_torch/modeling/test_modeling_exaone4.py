@@ -5,13 +5,22 @@ from dataclasses import dataclass
 import torch
 from parameterized import parameterized
 
-SKIP_EXAONE4_TEST = False
 try:
     from transformers import Exaone4Config
+except ImportError:
+    # TODO: Remove this once we have a proper transformers package
+    from transformers import PretrainedConfig
+
+    class Exaone4Config(PretrainedConfig):
+        model_type = "exaone4"
+
+
+SKIP_EXAONE4_HF_ACCURACY_TEST = False
+try:
     from transformers import Exaone4ForCausalLM as HFExaone4ForCausalLM
 except ImportError:
     # TODO: Remove this once we have a proper config for Exaone4
-    SKIP_EXAONE4_TEST = True
+    SKIP_EXAONE4_HF_ACCURACY_TEST = True
 
 from transformers.cache_utils import HybridCache
 from utils.util import getSMVersion
@@ -196,7 +205,7 @@ class TestExaone4(unittest.TestCase):
         Compare output to HF
         """
         # TODO: Remove this once we have a proper transformers version for Exaone4
-        if SKIP_EXAONE4_TEST:
+        if SKIP_EXAONE4_HF_ACCURACY_TEST:
             self.skipTest("Exaone4 is not supported in this environment")
 
         backend = scenario.backend
