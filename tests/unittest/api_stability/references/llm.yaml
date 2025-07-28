@@ -53,6 +53,10 @@ methods:
       reasoning_parser:
         annotation: Optional[str]
         default: null
+      # Runtime behavior
+      fail_fast_on_attention_window_too_large:
+        annotation: bool
+        default: false
       garbage_collection_gen0_threshold:
         annotation: int
         default: 20000
@@ -67,7 +71,7 @@ methods:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.CudaGraphConfig]
         default: null
       checkpoint_loader:
-        annotation: Optional[tensorrt_llm._torch.BaseCheckpointLoader]
+        annotation: Optional[tensorrt_llm._torch.models.checkpoints.BaseCheckpointLoader]
         default: null
       checkpoint_format:
         annotation: Optional[str]
