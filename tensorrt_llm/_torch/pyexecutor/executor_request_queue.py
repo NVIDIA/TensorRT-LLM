@@ -110,8 +110,7 @@ class ExecutorRequestQueue:
 
     def enqueue_requests(self, requests: List[ExecutorRequest]):
         req_ids = []
-        try:
-            self.enqueue_lock.acquire()
+        with self.enqueue_lock:
             start_time = time.time()
             for request in requests:
                 self.start_times[self.next_request_id] = start_time
@@ -119,31 +118,22 @@ class ExecutorRequestQueue:
                     RequestQueueItem(self.next_request_id, request))
                 req_ids.append(self.next_request_id)
                 self.next_request_id += 1
-        finally:
-            self.enqueue_lock.release()
         return req_ids
 
     def enqueue_cancel_request(self, req_id: int):
-        try:
-            self.enqueue_lock.acquire()
+        with self.enqueue_lock:
             self.request_queue.put(
                 RequestQueueItem(req_id, is_canceled_request=True))
-        finally:
-            self.enqueue_lock.release()
 
     def enqueue_shutdown_request(self):
-        try:
-            self.enqueue_lock.acquire()
+        with self.enqueue_lock:
             self.request_queue.put(RequestQueueItem(SHUTDOWN_REQUEST_ID))
             self.active = False
-        finally:
-            self.enqueue_lock.release()
 
     def enqueue_request(self,
                         request: ExecutorRequest,
                         query: Optional[list] = None):
-        try:
-            self.enqueue_lock.acquire()
+        with self.enqueue_lock:
             assert self.active, "PyExecutor has already been shutdown."
             req_id = self.next_request_id
             if self.enable_iter_perf_stats:
@@ -154,16 +144,12 @@ class ExecutorRequestQueue:
             else:
                 self.request_queue.put(RequestQueueItem(req_id, request))
             self.next_request_id += 1
-        finally:
-            self.enqueue_lock.release()
 
         return req_id
 
     def can_enqueue_request(self) -> bool:
-        self.enqueue_lock.acquire()
-        can_enqueue = self.active
-        self.enqueue_lock.release()
-        return can_enqueue and self.dist.rank == 0
+        with self.enqueue_lock:
+            return self.active and self.dist.rank == 0
 
     def _fetch_and_process_requests(
             self, total_num_active_requests: int,
