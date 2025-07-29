@@ -3,7 +3,7 @@ from typing import Union
 import torch
 from torch import nn
 
-from tensorrt_llm._torch.model_config import TConfig
+from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.qwen2_moe_weight_mapper import \
     Qwen2MoeHfWeightMapper
 from tensorrt_llm._torch.models.modeling_utils import register_mapper
@@ -15,7 +15,7 @@ class Qwen3MoeHfWeightMapper(Qwen2MoeHfWeightMapper):
 
     def init_model_and_config(self, model: Union[nn.Module,
                                                  DecoderModelForCausalLM],
-                              config: TConfig):
+                              config: ModelConfig):
         super().init_model_and_config(model, config)
         self._num_kv_heads = model.config.num_key_value_heads if hasattr(
             model.config, 'num_key_value_heads'

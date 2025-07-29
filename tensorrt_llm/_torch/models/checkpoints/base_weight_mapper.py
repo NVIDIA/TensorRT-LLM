@@ -3,7 +3,7 @@ from typing import Callable, List, Union
 
 from torch import nn
 
-from tensorrt_llm._torch.model_config import ModelConfig, TConfig
+from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
 
 
@@ -14,11 +14,11 @@ class BaseWeightMapper(ABC):
         self._mapping: dict = {}
         self._skip_modules = []
         self._model: Union[nn.Module, DecoderModelForCausalLM] | None = None
-        self._config: TConfig | None = None
+        self._config: ModelConfig | None = None
 
-    def init_model_and_config(
-        self, model: Union[nn.Module, DecoderModelForCausalLM], config: TConfig
-    ):  # TODO: smor - wrong type hint. Also, model.config is the same as config
+    def init_model_and_config(self, model: Union[nn.Module,
+                                                 DecoderModelForCausalLM],
+                              config: ModelConfig):
         self._model = model
         self._config = config
 
@@ -153,7 +153,7 @@ class BaseWeightMapper(ABC):
         return self._mapping
 
     @property
-    def config(self) -> TConfig:
+    def config(self) -> ModelConfig:
         if self._config is None:
             raise RuntimeError("Weight mapper is not initialized")
         return self._config
