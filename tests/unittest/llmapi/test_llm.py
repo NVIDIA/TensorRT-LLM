@@ -1523,7 +1523,9 @@ def test_llama_7b_peft_cache_config_affects_peft_cache_size():
 
 
 def test_llama_7b_lora_config_overrides_peft_cache_config():
-    """Tests that cache size args in lora_config LLM arg override the cache size parameters in peft_cache_config LLM arg."""
+    """Tests that cache size args in lora_config LLM arg override the cache size
+    parameters in peft_cache_config LLM arg.
+    """    # noqa: D205
     build_config = BuildConfig(lora_config=LoraConfig(
         lora_target_modules=['attn_q', 'attn_k', 'attn_v'], max_lora_rank=8))
     check_llama_7b_multi_lora_from_request_test_harness(
