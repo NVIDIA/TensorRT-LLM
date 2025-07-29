@@ -235,3 +235,12 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
 
     def set_scheduler_output(self, scheduler_output: SchedulerOutput):
         self._scheduler_output = scheduler_output
+
+    def layer_pre_hook(self, module, *args):
+        self.worker.wait_for_layer_load(module.layer_idx)
+
+    def layer_post_hook(self, module, *args):
+        self.worker.save_kv_layer(module.layer_idx)
+
+    def model_post_hook(self, module, *args):
+        self.worker.wait_for_save()
