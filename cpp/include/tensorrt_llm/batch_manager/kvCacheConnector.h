@@ -162,28 +162,10 @@ public:
 class KvCacheConnectorManager
 {
 public:
-    KvCacheConnectorManager(std::shared_ptr<KvCacheConnectorWorker> const& worker,
-        std::optional<std::shared_ptr<KvCacheConnectorScheduler>> const& scheduler)
-        : mWorker(worker)
-        , mScheduler(scheduler)
-    {
-    }
+    KvCacheConnectorManager() = default;
+    virtual ~KvCacheConnectorManager() = default;
 
     virtual SizeType32 getNumNewMatchedTokens(LlmRequest const& request, SizeType32 numComputedTokens) = 0;
-
-    std::optional<std::shared_ptr<KvCacheConnectorScheduler>> getScheduler() const
-    {
-        return mScheduler;
-    }
-
-    std::shared_ptr<KvCacheConnectorWorker> getWorker() const
-    {
-        return mWorker;
-    }
-
-private:
-    std::shared_ptr<KvCacheConnectorWorker> mWorker;
-    std::optional<std::shared_ptr<KvCacheConnectorScheduler>> mScheduler;
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_connector
