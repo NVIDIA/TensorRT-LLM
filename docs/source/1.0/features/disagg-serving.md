@@ -93,17 +93,34 @@ The first approach to do disaggregated LLM inference with TensorRT-LLM involves 
 
 To run TRT-LLM in disaggregated mode, you must first launch context (prefill) and generation (decode) servers using `trtllm-serve`.
 
+We use the `cache_transceiver_config` configuration to set up disaggregated serving, which includes the following parameters:
+
+```yaml
+cache_transceiver_config:
+  backend: <str>
+  max_tokens_in_buffer: <int>
+```
+
+`backend` specifies the communication backend for transferring the kvCache, valid options include `DEFAULT`,`UCX`, `NIXL`, and `MPI`, the default backend is UCX.
+
+`max_tokens_in_buffer` defines the buffer size for kvCache transfers, it is recommended to set this value greater than or equal to the maximum ISL (Input Sequence Length) of all requests for optimal performance.
+
 For example, you could launch two context servers and one generation servers as follows:
 
 ```
-echo -e "disable_overlap_scheduler: True\ncache_transceiver_config:\n  max_num_tokens: 2048" > context_extra-llm-api-config.yml
-echo -e "cache_transceiver_config:\n  max_num_tokens: 2048" > gen_extra-llm-api-config.yml
 
-export TRTLLM_USE_UCX_KVCACHE=1
-#Context servers
+# Generate context_extra-llm-api-config.yml
+# Overlap scheduler for context servers are disabled because it's not supported for disaggregated context servers yet
+echo -e "disable_overlap_scheduler: True\ncache_transceiver_config:\n  backend: UCX\n  max_tokens_in_buffer: 2048" > context_extra-llm-api-config.yml
+
+# Start Context servers
 CUDA_VISIBLE_DEVICES=0 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8001 --backend pytorch --extra_llm_api_options ./context_extra-llm-api-config.yml &> log_ctx_0 &
 CUDA_VISIBLE_DEVICES=1 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8002 --backend pytorch --extra_llm_api_options ./context_extra-llm-api-config.yml &> log_ctx_1 &
-#Generation servers
+
+# Generate gen_extra-llm-api-config.yml
+echo -e "cache_transceiver_config:\n  backend: UCX\n  max_tokens_in_buffer: 2048" > gen_extra-llm-api-config.yml
+
+# Start Generation servers
 CUDA_VISIBLE_DEVICES=2 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8003 --backend pytorch --extra_llm_api_options ./gen_extra-llm-api-config.yml &> log_gen_0 &
 ```
 Once the context and generation servers are launched, you can launch the disaggregated
@@ -133,7 +150,21 @@ generation_servers:
 When routing requests to the context servers, the disaggregated server will mark the requests as "context-only" to skip the generation phase. Similarly,
 when routing requests to the generation serfvers, the disaggregated server will mark the requests as "generation-only" to skip the context phase.
 
-Clients can then send requests to the disaggregated server at `localhost:8000`, which is an OpenAI compatible endpoint.
+Clients can then send requests to the disaggregated server at `localhost:8000`, which is an OpenAI compatible endpoint. For example,  you can send requests to the disaggregated server using curl:
+```bash
+curl http://localhost:8000/v1/completions \
+    -H "Content-Type: application/json" \
+    -d '{
+        "model": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+        "prompt": "NVIDIA is a great company because",
+        "max_tokens": 16,
+        "temperature": 0
+    }' -w "\n"
+```
+
+#### Launching disaggregated servers on SLURM clusters
+
+Please refer to [Disaggregated Inference Benchmark Scripts](./examples/disaggregated/slurm/).
 
 ### Dynamo
 
@@ -154,11 +185,7 @@ For more information on how to use Dynamo with TensorRT-LLM, please refer to [th
 
 ## Environment Variables
 
-TRT-LLM uses some environment variables to control the behavior of disaggregated serving.
-
-* `TRTLLM_USE_MPI_KVCACHE`: Whether to use MPI to transfer KV cache. Currently, the default value is `0`.
-
-* `TRTLLM_USE_UCX_KVCACHE`: Whether to use UCX to transfer KV cache. Currently, the default value is `0`. To use disaggregated serving, either `TRTLLM_USE_MPI_KVCACHE=1` or `TRTLLM_USE_UCX_KVCACHE=1` is required to be set.
+TRT-LLM uses some environment variables to control the behavior of disaggregated service.
 
 * `TRTLLM_PARALLEL_CACHE_SEND`: If set to `1`, contextExecutor will attempt to send KV cache for multiple requests in parallel. The default value is `0`.
 
@@ -175,6 +202,10 @@ TRT-LLM uses some environment variables to control the behavior of disaggregated
 * `TRTLLM_KVCACHE_TRANSFER_USE_ASYNC_BUFFER`: If set to `1`, TRT-LLM will use `cudaMallocAsync` to allocate buffers for KV cache transmission. The default value is `0`. This environment variable only takes effect when `TRTLLM_KVCACHE_TRANSFER_BUFFER_SIZE` is greater than 0.
 
 * `TRTLLM_KVCACHE_SEND_MAX_CONCURRENCY_NUM`: The maximum number of concurrent KV cache sends. The default value is `4`. This environment variable only takes effect when `TRTLLM_KVCACHE_TRANSFER_BUFFER_SIZE` is greater than 0.
+
+There are some other useful environment variables that may help when encountering failures or performance issues.
+
+* `NCCL_GRAPH_MIXING_SUPPORT`: With the default value `1`, the CUDA driver may create too many CUDA streams while working with one CUDA graph, leading to performance drop. Setting it to `0` will reduce the number of CUDA streams, but please make sure there are no other NCCL ops outside the one CUDA graph, otherwise it's unsafe.
 
 ## Troubleshooting and FAQ
 
@@ -200,69 +231,30 @@ A. Yes, but it's not recommended. TRT-LLM does not implement optimal scheduling 
 
 A. Yes, it's recommended that different server instances use different GPUs. We support running context and generation servers on the same node or different nodes. The `CUDA_VISIBLE_DEVICES` env variable can be used to control which GPUs are used by each instance.
 
-*Q. What's the requirement for disaggregated serving in TRT-LLM?*
-
-A. TRT-LLM requires `UCX`-backend `CUDA-aware MPI` currently, TRT-LLM implements KV cache transfer with [`CUDA-aware MPI`](https://docs.open-mpi.org/en/v5.0.x/tuning-apps/networking/cuda.html#how-do-i-build-open-mpi-with-cuda-aware-support), and will support more communication components for KV cache transfer in future version.
-
 ### Debugging FAQs
 
 *Q. How to handle error `Disaggregated serving is not enabled, please check the configuration?`*
 
-A. please set the environment variables
-```
-export TRTLLM_USE_MPI_KVCACHE=1
-```
-or
-```
-export TRTLLM_USE_UCX_KVCACHE=1
-```
-When the environment variable `TRTLLM_USE_MPI_KVCACHE=1` is set, TRT-LLM will transfer the KV cache using `CUDA-aware MPI`. All executor processes involved must share the same MPI world communicator. Consequently, with `TRTLLM_USE_MPI_KVCACHE=1`, TRT-LLM only supports launching multiple executors via `MPI`. Additionally, the `CommunicationMode` for the executors must be set to `kLEADER` or `kORCHESTRATOR` with `SpawnProcesses=false` for the `disaggregated-service`. These restrictions do not apply when `TRTLLM_USE_UCX_KVCACHE=1` is set.
+A. please set `backendType` of `CacheTransceiverConfig`.
+```cpp
+ExecutorConfig executorConfig{...};
 
-
-*Q. Why do some profiling tools show that TRT-LLM's KV cache transfer does not utilize NVLink even on devices equipped with NVLink?*
-
-A. Ensure TRT-LLM is running with `UCX`-backend `CUDA-aware MPI` , and check version of `UCX` with `ucx_info -v`.
-If the version of UCX <=1.17, set the environment variables `UCX_RNDV_FRAG_MEM_TYPE=cuda` and `UCX_MEMTYPE_CACHE=n` to enable NVLink. For BlackWell architecture GPUs, UCX version >=1.19 is required to enable NVLink.
-If the version of UCX >=1.18, there are several ways to enable NVLink:
-1. Set the environment variables `TRTLLM_KVCACHE_TRANSFER_BUFFER_SIZE=0B`,`UCX_CUDA_COPY_ASYNC_MEM_TYPE=cuda`, `UCX_CUDA_COPY_DMABUF=no`, `UCX_MEMTYPE_CACHE=n` and `UCX_RNDV_PIPELINE_ERROR_HANDLING=y`.
-2. Set the environment variables `TRTLLM_KVCACHE_TRANSFER_BUFFER_SIZE=$Size`, `UCX_MEMTYPE_CACHE=n` and `UCX_RNDV_PIPELINE_ERROR_HANDLING=y`. $Size represents the size of the buffer for KV cache transfer, which is recommended to be larger than the size of the KV cache for the longest request.
-
+executorConfig.setCacheTransceiverConfig(texec::CacheTransceiverConfig(BackendType::DEFAULT));
+```
 *Q. Does TRT-LLM support using GPU direct RDMA for inter-node KV Cache transfer?*
 
-A. Yes, TRT-LLM supports using GPU direct RDMA for inter-node KV cache transfer, but it is not enabled by default. There are several ways to enable GPU direct RDMA:
-1. Set the environment variables `TRTLLM_KVCACHE_TRANSFER_BUFFER_SIZE=0B`,`UCX_RNDV_FRAG_MEM_TYPE=cuda`, `UCX_MEMTYPE_CACHE=n` and `UCX_RNDV_PIPELINE_ERROR_HANDLING=y`.
-2. Set the environment variables `TRTLLM_KVCACHE_TRANSFER_BUFFER_SIZE=$Size`, `UCX_MEMTYPE_CACHE=n` and `UCX_RNDV_PIPELINE_ERROR_HANDLING=y`, $Size represents the size of the buffer for KV cache transfer, which is recommended to be larger than the size of the KV cache for the longest request.
+A. Yes, TRT-LLM supports using GPU direct RDMA for inter-node KV cache transfer.
 
-*Q. Are there any guidelines for performance tuning of KV cache transfer?*
+*Q. What causes the substantial bandwidth fluctuations in kvCache transfers, especially during the first few requests following service initialization?*
 
-A. Depending on the user's use case, certain sets of environment variables can help avoid poor KV cache transfer performance.
+A. The communication for kvCache transfer between executors are established dynamically. The connection establishment process incurs significant overhead, which explains the apparently lower kvCache transfer bandwidth observed during the initial requests after service startup. This lower bandwidth reflects the inclusion of connection establishment overhead. When conducting benchmarks, it is recommended to perform a warm-up phase to ensure accurate performance measurements.
 
-Environment Variable Set A
+*Q. When my servers are running on different NVLink domains, some servers hang or have a lower performance. How to fix that?
 
-```
-export TRTLLM_KVCACHE_TRANSFER_BUFFER_SIZE=0B
-export UCX_RNDV_FRAG_MEM_TYPES=cuda
-export UCX_MEMTYPE_CACHE=n
-export UCX_RNDV_PIPELINE_ERROR_HANDLING=y
-```
-This set allows KV cache transfers to utilize NVLink within nodes and GDRDMA between nodes.
+A. NVLink domain can be found with `nvidia-smi -q` in the `Fabric.ClusterUUID` field. A few UCX environment variables can be adjusted when your servers have different NVLink domains:
 
-Environment Variable Set B
+* `UCX_CUDA_IPC_ENABLE_MNNVL`: Set to `n`. This also can reduce UCX timeout error messages like `UCX  ERROR   cuMemImportFromShareableHandle failed: invalid resource handle`, although these errors don't necessarily cause your trtllm-serve to fail.
 
-```
-export TRTLLM_KVCACHE_TRANSFER_BUFFER_SIZE=0B
-export UCX_CUDA_COPY_ASYNC_MEM_TYPE=cuda
-export UCX_CUDA_COPY_DMABUF=no
-export UCX_MEMTYPE_CACHE=n
-export UCX_RNDV_PIPELINE_ERROR_HANDLING=y
-```
-Set B may provide slightly better performance on a single node compared to Set A. However, when transferring KV cache across multiple nodes, it may cause program instability.
+* `UCX_NET_DEVICES`: Check if this is set correctly, or unset this variable to allow UCX to use all possible devices.
 
-Environment Variable Set C
-
-```
-export TRTLLM_KVCACHE_TRANSFER_BUFFER_SIZE=$Size
-export UCX_MEMTYPE_CACHE=n
-export UCX_RNDV_PIPELINE_ERROR_HANDLING=y
-```
-Set C can achieve better performance than Sets A and B, both within and between nodes. However, if the KV cache size exceeds the specified $Size, performance may degrade.
+* `UCX_RNDV_SCHEME`: Set to `get_zcopy` or `put_zcopy` on GB200 for better performance. The default value is `auto`.
