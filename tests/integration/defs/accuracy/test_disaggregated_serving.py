@@ -337,7 +337,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     def run_parallel_test(self, ctx_pp: int, ctx_tp: int, gen_pp: int,
                           gen_tp: int, test_set: LlmapiAccuracyTestHarness):
         if ctx_tp * ctx_pp + gen_tp * gen_pp > get_device_count():
-            pytest.skip(
+            pytest.fail(
                 f"Not enough devices for ctx_pp={ctx_pp}+ctx_tp={ctx_tp} and gen_pp={gen_pp}+gen_tp={gen_tp} test"
             )
 
@@ -389,7 +389,6 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
         return self.run_parallel_test(pp, tp, pp, tp,
                                       get_accuracy_task(testset))
 
-    # We focus on ctx+pp and gen+tp usecases for RTX6000D
     @parametrize_with_ids("ctx_pp", [2, 4])
     @parametrize_with_ids("gen_tp", [1, 2])
     @pytest.mark.parametrize("testset", ["GSM8K", "MMLU"])

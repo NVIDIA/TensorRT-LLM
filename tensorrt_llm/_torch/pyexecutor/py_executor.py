@@ -644,7 +644,7 @@ class PyExecutor:
         return False
 
     def _executor_loop_pp(self):
-        logger.info(f"Starting executor loop for pp_rank {self.dist.pp_rank}")
+        logger.debug(f"Starting executor loop for pp_rank {self.dist.pp_rank}")
         torch.cuda.set_device(self.device_id)
         microbatch_id = 0
         with self._profiler() as profile_step:
