@@ -16,9 +16,9 @@ class BaseWeightMapper(ABC):
         self._model: Union[nn.Module, DecoderModelForCausalLM] | None = None
         self._config: TConfig | None = None
 
-    def init_model_and_config(self, model: Union[nn.Module,
-                                                 DecoderModelForCausalLM],
-                              config: TConfig):
+    def init_model_and_config(
+        self, model: Union[nn.Module, DecoderModelForCausalLM], config: TConfig
+    ):  # TODO: smor - wrong type hint. Also, model.config is the same as config
         self._model = model
         self._config = config
 
@@ -29,9 +29,9 @@ class BaseWeightMapper(ABC):
             raise ValueError("model must have a config attribute")
 
         self._tp_size = 1 if model.model_config.mapping.enable_attention_dp else model.model_config.mapping.tp_size
-        self._num_kv_heads = model.config.num_key_value_heads if hasattr(
-            model.config, 'num_key_value_heads'
-        ) and model.config.num_key_value_heads is not None else model.config.num_attention_heads
+        self._head_dim = model.config.head_dim if hasattr(
+            model.config, 'head_dim'
+        ) and model.config.head_dim is not None else model.config.hidden_size // model.config.num_attention_heads
 
         self.map_weights()
 
