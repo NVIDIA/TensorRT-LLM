@@ -408,6 +408,12 @@ class EagleDecodingConfig(DecodingBaseConfig):
             raise ValueError("Draft model must be provided for EAGLE")
 
     @functools.cached_property
+    def num_capture_layers(self):
+        if self.eagle3_layers_to_capture is not None:
+            return len(self.eagle3_layers_to_capture)
+        return 3
+
+    @functools.cached_property
     def spec_dec_mode(self):
         from tensorrt_llm._torch.speculative.interface import \
             SpeculativeDecodingMode as TorchSpeculativeDecodingMode
