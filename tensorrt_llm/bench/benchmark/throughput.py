@@ -10,6 +10,7 @@ from click_option_group import (MutuallyExclusiveOptionGroup, OptionGroup,
                                 optgroup)
 from huggingface_hub import snapshot_download
 
+from tensorrt_llm.bench.benchmark import get_llm
 from tensorrt_llm.bench.benchmark.utils.asynchronous import async_benchmark
 from tensorrt_llm.bench.benchmark.utils.processes import IterationWriter
 from tensorrt_llm.bench.build.build import get_model_config
@@ -19,11 +20,10 @@ from tensorrt_llm.tools.importlib_utils import import_custom_module_from_dir
 from tensorrt_llm.bench.benchmark.utils.general import (
     get_settings_from_engine, get_settings, ALL_SUPPORTED_BACKENDS)
 # isort: on
-from tensorrt_llm import LLM as PyTorchLLM
-from tensorrt_llm._tensorrt_engine import LLM
-from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
 from tensorrt_llm.bench.benchmark.utils.general import (
-    generate_warmup_dataset, update_sampler_args_with_extra_options)
+    generate_warmup_dataset,
+    update_sampler_args_with_extra_options
+)
 from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
 from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
 from tensorrt_llm.bench.dataclasses.reporting import ReportUtility
@@ -432,36 +432,13 @@ def throughput_command(
     runtime_config = RuntimeConfig(**exec_settings)
     llm = None
 
-    def ignore_trt_only_args(kwargs: dict):
-        trt_only_args = [
-            "batching_type",
-            "normalize_log_probs",
-            "extended_runtime_perf_knob_config",
-        ]
-        for arg in trt_only_args:
-            if kwargs.pop(arg, None):
-                logger.warning(
-                    f"Ignore {arg} for {runtime_config.backend} backend.")
-
     try:
         logger.info("Setting up throughput benchmark.")
         kwargs = kwargs | runtime_config.get_llm_args()
         kwargs['backend'] = backend
         kwargs['skip_tokenizer_init'] = not no_skip_tokenizer_init
 
-        if backend == "pytorch" and iteration_log is not None:
-            kwargs["enable_iter_perf_stats"] = True
-
-        if runtime_config.backend == 'pytorch':
-            ignore_trt_only_args(kwargs)
-            llm = PyTorchLLM(**kwargs)
-        elif runtime_config.backend == "_autodeploy":
-            ignore_trt_only_args(kwargs)
-            kwargs["world_size"] = kwargs.pop("tensor_parallel_size", None)
-
-            llm = AutoDeployLLM(**kwargs)
-        else:
-            llm = LLM(**kwargs)
+        llm = get_llm(runtime_config, kwargs)
 
         sampler_args = {
             "end_id": eos_id,
