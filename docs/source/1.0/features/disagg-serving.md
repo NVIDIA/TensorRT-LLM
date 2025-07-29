@@ -182,7 +182,7 @@ TRT-LLM uses some environment variables to control the behavior of disaggregated
 
 *Q. What are the limitations of disaggregated serving in TRT-LLM?*
 
-A. Currently, only decoder-only models and beam width of 1  are supported. Also the KV cache at each layer of the model is required to be homogeneous, with the same data type and the same number of attention headers.
+A. Currently, only decoder-only models and beam width of 1  are supported. Also the KV cache at each layer of the model is required to be homogeneous, with the same data type and the same number of attention heads.
 
 *Q. When using the TRT backend, is the engine used for disaggregated serving different from other engines?*
 
@@ -232,7 +232,6 @@ If the version of UCX >=1.18, there are several ways to enable NVLink:
 A. Yes, TRT-LLM supports using GPU direct RDMA for inter-node KV cache transfer, but it is not enabled by default. There are several ways to enable GPU direct RDMA:
 1. Set the environment variables `TRTLLM_KVCACHE_TRANSFER_BUFFER_SIZE=0B`,`UCX_RNDV_FRAG_MEM_TYPE=cuda`, `UCX_MEMTYPE_CACHE=n` and `UCX_RNDV_PIPELINE_ERROR_HANDLING=y`.
 2. Set the environment variables `TRTLLM_KVCACHE_TRANSFER_BUFFER_SIZE=$Size`, `UCX_MEMTYPE_CACHE=n` and `UCX_RNDV_PIPELINE_ERROR_HANDLING=y`, $Size represents the size of the buffer for KV cache transfer, which is recommended to be larger than the size of the KV cache for the longest request.
-To achieve the optimal performance when using GPU direct RDMA, it is advisable to create CUDA context before MPI initialization when TRTLLM_USE_MPI_KVCACHE=1 is set. One possible approach is to rely on MPI environment variables to set the correct device before MPI initialization.
 
 *Q. Are there any guidelines for performance tuning of KV cache transfer?*
 
