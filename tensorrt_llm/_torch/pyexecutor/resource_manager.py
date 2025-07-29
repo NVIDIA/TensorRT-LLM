@@ -377,7 +377,7 @@ class KVCacheManager(BaseResourceManager):
                                    == self.mapping.cp_size - 1 else 0),
                         req_beam_width, req, self.kv_connector_manager)
             else:
-                if req.is_first_context_chunk:
+                if req.is_first_context_chunk and not req.is_kv_cache_connector_async_onboard:
                     self.impl.add_sequence(req.py_request_id, req.prompt_len,
                                            req_beam_width, req,
                                            self.kv_connector_manager)
