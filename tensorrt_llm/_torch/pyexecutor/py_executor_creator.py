@@ -28,6 +28,7 @@ from .guided_decoder import GuidedDecoder
 from .model_engine import PyTorchModelEngine
 from .py_executor import PyExecutor
 
+from transformers import PreTrainedTokenizerBase
 
 class _ExecutorCreationStage(enum.Enum):
     SAMPLER = "Sampler"
@@ -185,7 +186,8 @@ def create_py_executor(
         executor_config: ExecutorConfig,
         checkpoint_dir: str = None,
         lora_config: Optional[LoraConfig] = None,
-        garbage_collection_gen0_threshold: Optional[int] = None) -> PyExecutor:
+        garbage_collection_gen0_threshold: Optional[int] = None,
+        tokenizer:PreTrainedTokenizerBase = None) -> PyExecutor:
     _mangle_executor_config(executor_config)
     pytorch_backend_config = executor_config.pytorch_backend_config
 
@@ -327,7 +329,7 @@ def create_py_executor(
 
     with mem_monitor.observe_creation_stage(_ExecutorCreationStage.SAMPLER):
         sampler = instantiate_sampler(model_engine, executor_config,
-                                      pytorch_backend_config, mapping)
+                                      pytorch_backend_config, mapping, tokenizer)
 
     guided_decoder: Optional[GuidedDecoder] = None
     if executor_config.guided_decoding_config is not None:

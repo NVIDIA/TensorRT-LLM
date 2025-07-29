@@ -40,6 +40,8 @@ from .result import (GenerationResult, IterationResult, LogProbsResult,
 from .utils import (ErrorResponse, IntraProcessQueue, RequestError,
                     WorkerCommIpcAddrs, has_event_loop, is_llm_response)
 
+from transformers import PreTrainedTokenizerBase
+
 __all__ = [
     "GenerationExecutorWorker",
 ]
@@ -59,6 +61,7 @@ class GenerationExecutorWorker(GenerationExecutor):
         is_llm_executor: Optional[bool] = None,
         lora_config: Optional[LoraConfig] = None,
         garbage_collection_gen0_threshold: Optional[int] = None,
+        tokenizer: Optional[PreTrainedTokenizerBase] = None
     ) -> None:
         postproc_config = postproc_worker_config or PostprocWorkerConfig()
         super().__init__(
@@ -81,6 +84,8 @@ class GenerationExecutorWorker(GenerationExecutor):
         self._executor_config = executor_config
         self._is_pytorch_backend = getattr(self._executor_config, "backend",
                                            None) == "pytorch"
+
+        self.tokenizer = tokenizer
 
         if global_mpi_size() > 1:
             logger.set_rank(self.global_rank)
@@ -134,7 +139,7 @@ class GenerationExecutorWorker(GenerationExecutor):
             else:
                 raise ValueError(
                     f"Unsupported backend config: {executor_config.backend}")
-            return create_executor(**args)
+            return create_executor(**args,tokenizer=self.tokenizer)
 
         self.engine = _create_engine()
 
@@ -530,7 +535,9 @@ class GenerationExecutorWorker(GenerationExecutor):
             background_error_handler=self._handle_background_error,
             executor=self,
             disaggregated_params=request.disaggregated_params,
-            logprob_params=logprob_params)
+            logprob_params=logprob_params,
+            tokenizer=self.tokenizer
+            )
 
         self._results[client_id] = result
 
@@ -620,6 +627,7 @@ def worker_main(
         bool] = True,  # whether it's the main executor instance
     lora_config: Optional[LoraConfig] = None,
     garbage_collection_gen0_threshold: Optional[int] = None,
+    tokenizer: Optional[PreTrainedTokenizerBase] = None
 ) -> None:
     mpi_comm().barrier()
     print_colored_debug(f"Worker {mpi_rank()} entering worker_main...\n",
@@ -746,7 +754,8 @@ def worker_main(
             postproc_worker_config=postproc_worker_config,
             is_llm_executor=is_llm_executor,
             lora_config=lora_config,
-            garbage_collection_gen0_threshold=garbage_collection_gen0_threshold)
+            garbage_collection_gen0_threshold=garbage_collection_gen0_threshold,
+            tokenizer=tokenizer)
     except Exception as e:
         logger.error(f"Failed to initialize executor on rank {mpi_rank()}: {e}")
         logger.error(traceback.format_exc())

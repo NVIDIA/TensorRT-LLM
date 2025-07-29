@@ -1,7 +1,7 @@
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, Union, List
 
 import torch
 
@@ -26,6 +26,7 @@ from .finish_reason import FinishedState
 from .llm_request import LlmRequest, LlmRequestState
 from .scheduler import ScheduledRequests
 
+from transformers import PreTrainedTokenizerBase
 
 @dataclass(kw_only=True)
 class SampleStateTensors:
@@ -205,6 +206,49 @@ def int_tensor(shape: tuple[int, ...], device: str = 'cuda') -> torch.Tensor:
     return torch.empty(shape, dtype=torch.int, device=device)
 
 
+def meet_stop_token_criteria(
+    request: LlmRequest,
+    tokenizer: PreTrainedTokenizerBase, 
+    new_token: Union[int, List[int], torch.Tensor]
+    ):
+    if request.py_stop_words_list:
+        assert isinstance(
+            request.py_stop_words_list,
+            list), "request.py_stop_words_list should be a list"
+
+        stop_words_list, prefix_sum = request.py_stop_words_list
+        tokens = request.get_tokens(0)
+        try: 
+            new_words = tokenizer.decode(new_token,skip_special_tokens=False,clean_up_tokenization_spaces=False)
+        except Exception:
+            # If decode fails, fall back to token-based matching only
+            new_words = ""
+        offset = 0
+        for i, offset_end in enumerate(prefix_sum):
+            if i > 0:
+                offset = prefix_sum[i - 1]
+            stop_word = stop_words_list[offset:offset_end]
+            try:
+                stop_text = tokenizer.decode(stop_word, skip_special_tokens=False, clean_up_tokenization_spaces=False)
+            except Exception:
+                continue
+            if len(stop_word) > len(tokens):
+                continue
+            if tokens[-len(stop_word):] == stop_word:
+                return True
+            if stop_text in new_words:
+                return True
+
+    return False
+
+
+def meet_max_token_stop_criteria(request: LlmRequest,max_seq_len, beam: int):
+    num_tokens = request.get_num_tokens(beam)
+    return (num_tokens - request.py_orig_prompt_len
+            >= request.py_max_new_tokens) or (num_tokens
+                                                >= max_seq_len)
+
+
 class TorchSampler(Sampler):
     BEAM = 0
     MAX_BEAM_WIDTH = BEAM + 1
@@ -224,6 +268,7 @@ class TorchSampler(Sampler):
         max_num_sequences: int
         max_beam_width: int
         enable_mixed_sampler: bool
+        tokenizer: PreTrainedTokenizerBase
 
     def __init__(self, args: Args):
         self.max_seq_len = args.max_seq_len
@@ -231,6 +276,7 @@ class TorchSampler(Sampler):
         self.max_tokens = args.max_draft_len + 1
         assert args.max_beam_width == self.MAX_BEAM_WIDTH, "TorchSampler only supports beam_width = 1"
         self.num_seq_slots = args.max_num_sequences
+        self.tokenizer = args.tokenizer
 
         self.NEW_TOKENS_SHAPE = (self.max_tokens, self.num_seq_slots,
                                  self.MAX_BEAM_WIDTH)
@@ -240,31 +286,6 @@ class TorchSampler(Sampler):
         with torch.inference_mode(False):
             self.store = self.create_store()
 
-    def _meet_max_token_stop_criteria(self, request: LlmRequest):
-        num_tokens = request.get_num_tokens(self.BEAM)
-        return (num_tokens - request.py_orig_prompt_len
-                >= request.py_max_new_tokens) or (num_tokens
-                                                  >= self.max_seq_len)
-
-    @staticmethod
-    def _meet_stop_token_criteria(request: LlmRequest):
-        if request.py_stop_words_list:
-            assert isinstance(
-                request.py_stop_words_list,
-                list), "request.py_stop_words_list should be a list"
-            stop_words_list, prefix_sum = request.py_stop_words_list
-            tokens = request.get_tokens(0)
-            offset = 0
-            for i, offset_end in enumerate(prefix_sum):
-                if i > 0:
-                    offset = prefix_sum[i - 1]
-                stop_word = stop_words_list[offset:offset_end]
-                if len(stop_word) > len(tokens):
-                    continue
-                if tokens[-len(stop_word):] == stop_word:
-                    return True
-        return False
-
     def _handle_stop_criteria(self, request: LlmRequest,
                               new_token: int) -> bool:
         """Handle stop criteria and set appropriate finish reasons and state.
@@ -273,11 +294,11 @@ class TorchSampler(Sampler):
             request.finish_by(FinishReason.END_ID, self.BEAM)
             return True
 
-        if self._meet_max_token_stop_criteria(request):
+        if meet_max_token_stop_criteria(request,self.max_seq_len,self.BEAM):
             request.finish_by(FinishReason.LENGTH, self.BEAM)
             return True
 
-        if self._meet_stop_token_criteria(request):
+        if meet_stop_token_criteria(request, self.tokenizer, new_token):
             request.finish_by(FinishReason.STOP_WORDS, self.BEAM)
             return True
 
@@ -365,6 +386,7 @@ class TorchSampler(Sampler):
 
     def sample_async(self, scheduled_requests: ScheduledRequests,
                      model_outputs: dict[str, torch.Tensor]) -> SampleState:
+
         requests = scheduled_requests.all_requests()
         new_tokens = self.store.new_tokens
         vocab_size = model_outputs["logits"].shape[-1]
@@ -492,6 +514,7 @@ class TRTLLMSampler(Sampler):
         mapping: Mapping,
         decoding_mode: DecodingMode,
         disable_overlap_scheduler: bool,
+        tokenizer: PreTrainedTokenizerBase
     ):
 
         vocab_size = model.config.vocab_size
@@ -519,6 +542,8 @@ class TRTLLMSampler(Sampler):
         self.model_config = ModelConfig(vocab_size, num_hidden_layers,
                                         num_hidden_layers, 0, num_heads,
                                         hidden_size, self.model_datatype)
+
+        self.tokenizer = tokenizer
 
         self._initialize_store()
         self._instantiate_algorithms()
@@ -625,7 +650,6 @@ class TRTLLMSampler(Sampler):
     @nvtx_range("sample_async")
     def sample_async(self, scheduled_requests: ScheduledRequests,
                      model_outputs) -> SampleStateTRTLLM:
-
         batch_size = scheduled_requests.batch_size
         beam_width = self.beam_width(scheduled_requests.all_requests())
         if (batch_size > 1 and beam_width > 1
@@ -753,16 +777,17 @@ class TRTLLMSampler(Sampler):
             if (sequence_lengths_host_data[r.py_seq_slot] > r.get_num_tokens(0))
         ]
 
-        # Add new tokens
-        new_tokens = [
-            new_tokens_host[r.py_seq_slot] for r in reqs_with_new_tokens
-        ]
-        add_new_tokens_to_requests(reqs_with_new_tokens, new_tokens, 0)
-
         # Log probs
         for request in reqs_with_new_tokens:
+            seq_slot = request.py_seq_slot
+            new_token = new_tokens_host[seq_slot]
+            if meet_stop_token_criteria(request, self.tokenizer, new_token):
+                request.state = LlmRequestState.GENERATION_COMPLETE
+                request.set_finished_reason(FinishReason.STOP_WORDS, 0)
+
+            add_new_tokens_to_requests([request], [new_token], 0)
+
             if request.py_return_log_probs:
-                seq_slot = request.py_seq_slot
                 seq_len = sequence_lengths_host_data[seq_slot]
                 begin_log_probs_offset = request.prompt_len
                 current_token = seq_len - request.prompt_len - 1
@@ -828,6 +853,10 @@ class TRTLLMSampler(Sampler):
                                           new_tokens_host,
                                           beam=beam,
                                           step=step)
+
+                    if meet_stop_token_criteria(request, self.tokenizer, new_token):
+                        request.state = LlmRequestState.GENERATION_COMPLETE
+                        request.set_finished_reason(FinishReason.STOP_WORDS, beam)
 
                     if request.py_return_log_probs:
                         assert state.host.log_probs is not None

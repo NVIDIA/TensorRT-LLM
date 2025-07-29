@@ -28,6 +28,8 @@ from .utils import (ErrorResponse, IntraProcessQueue, WorkerCommIpcAddrs,
                     is_llm_response, print_alive_threads)
 from .worker import GenerationExecutorWorker, worker_main
 
+from transformers import PreTrainedTokenizerBase
+
 __all__ = [
     "GenerationExecutorProxy",
 ]
@@ -46,6 +48,7 @@ class GenerationExecutorProxy(GenerationExecutor):
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
         is_llm_executor: Optional[bool] = None,
         garbage_collection_gen0_threshold: Optional[int] = None,
+        tokenizer: Optional[PreTrainedTokenizerBase] = None,
     ) -> None:
         postproc_worker_config = postproc_worker_config or PostprocWorkerConfig(
         )
@@ -59,6 +62,7 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         self.workers_started = False
         self.worker_cls = worker_cls
+        self.tokenizer = tokenizer
 
         mpi_process_pre_spawned: bool = get_spawn_proxy_process_env()
 
@@ -94,7 +98,8 @@ class GenerationExecutorProxy(GenerationExecutor):
                              postproc_worker_config=postproc_worker_config,
                              is_llm_executor=False,
                              garbage_collection_gen0_threshold=self.
-                             garbage_collection_gen0_threshold)
+                             garbage_collection_gen0_threshold,
+                             tokenizer=tokenizer)
 
         if "log_level" not in worker_kwargs:
             worker_kwargs["log_level"] = logger.level
@@ -410,7 +415,9 @@ class GenerationExecutorProxy(GenerationExecutor):
             background_error_handler=self._handle_background_error,
             executor=self,
             disaggregated_params=request.disaggregated_params,
-            logprob_params=logprob_params)
+            logprob_params=logprob_params,
+            tokenizer = self.tokenizer
+            )
         self._results[request.id] = result
 
         with nvtx_range_debug("request_queue.put"):
