@@ -6,6 +6,12 @@ from tensorrt_llm.logger import logger
 
 
 def ignore_trt_only_args(kwargs: dict, backend: str):
+    """Ignore TensorRT-only arguments for non-TensorRT backends.
+
+    Args:
+        kwargs: Dictionary of keyword arguments to be passed to the LLM constructor.
+        backend: The backend type (e.g., "pytorch", "_autodeploy").
+    """
     trt_only_args = [
         "batching_type",
         "normalize_log_probs",
@@ -17,6 +23,15 @@ def ignore_trt_only_args(kwargs: dict, backend: str):
 
 
 def get_llm(runtime_config: RuntimeConfig, kwargs: dict):
+    """Create and return an appropriate LLM instance based on the backend configuration.
+
+    Args:
+        runtime_config: Runtime configuration containing backend selection and settings.
+        kwargs: Additional keyword arguments to pass to the LLM constructor.
+
+    Returns:
+        An instance of the appropriate LLM class for the specified backend.
+    """
     llm_cls = LLM
 
     if runtime_config.backend != "tensorrt":
