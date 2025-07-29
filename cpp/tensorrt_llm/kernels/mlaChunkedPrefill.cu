@@ -159,8 +159,8 @@ inline __device__ void dequantCopy(
 // merged_softmax_sum [q_total_len, H, 2] (float, max/sum)
 template <typename T>
 __global__ void mergeAttnWithSoftmaxKernel(T* merged_attn, float2* merged_softmax_stats, T const* pre_attn,
-    float2 const* pre_softmax_stats, T const* curr_attn, float2 const* curr_softmax_stats, int64_t const* cu_q_seq_len,
-    int64_t const* merge_op, int const num_heads, int const head_size)
+    float2 const* pre_softmax_stats, T const* curr_attn, float2 const* curr_softmax_stats, float bmm1_scale,
+    int64_t const* cu_q_seq_len, int64_t const* merge_op, int const num_heads, int const head_size)
 {
     using KT = MergeSoftmaxTraits<T>;
     int const batch_idx = static_cast<int>(blockIdx.y);
@@ -396,9 +396,9 @@ namespace kernels
 // == 2, we only copy curr_attn and curr_softmax_sum to merged_attn and merged_softmax_sum
 template <typename T>
 void invokeMergeAttnWithSoftmax(T* merged_attn, float* merged_softmax_stats, T const* pre_attn,
-    float const* pre_softmax_stats, T const* curr_attn, float const* curr_softmax_stats, int const batch_size,
-    int64_t const* cu_q_seq_len, int max_q_seq_len, int64_t const* merge_op, int const num_heads, int const head_size,
-    cudaStream_t stream)
+    float const* pre_softmax_stats, T const* curr_attn, float const* curr_softmax_stats, float bmm1_scale,
+    int const batch_size, int64_t const* cu_q_seq_len, int max_q_seq_len, int64_t const* merge_op, int const num_heads,
+    int const head_size, cudaStream_t stream)
 {
     using KT = MergeSoftmaxTraits<T>;
     TLLM_CHECK_WITH_INFO(head_size == KT::kHeadSize, "head dim should be equal to %d", KT::kHeadSize);
@@ -408,7 +408,8 @@ void invokeMergeAttnWithSoftmax(T* merged_attn, float* merged_softmax_stats, T c
 
     mergeAttnWithSoftmaxKernel<T><<<grid, block, 0, stream>>>(merged_attn,
         reinterpret_cast<float2*>(merged_softmax_stats), pre_attn, reinterpret_cast<float2 const*>(pre_softmax_stats),
-        curr_attn, reinterpret_cast<float2 const*>(curr_softmax_stats), cu_q_seq_len, merge_op, num_heads, head_size);
+        curr_attn, reinterpret_cast<float2 const*>(curr_softmax_stats), bmm1_scale, cu_q_seq_len, merge_op, num_heads,
+        head_size);
 }
 
 // load single chunk kv from kv_cache for each request
@@ -449,9 +450,9 @@ void invokeMLASetChunkedKV(T* output_kv, T const* kv, T const* k_pe, int const b
 
 #define INSTANTIATE_MLA_CHUNKED_PREFILL_KERNEL(T)                                                                      \
     template void invokeMergeAttnWithSoftmax<T>(T * merged_attn, float* merged_softmax_stats, T const* pre_attn,       \
-        float const* pre_softmax_stats, T const* curr_attn, float const* curr_softmax_stats, int const batch_size,     \
-        int64_t const* cu_q_seq_len, int max_q_seq_len, int64_t const* merge_op, int const num_heads,                  \
-        int const head_size, cudaStream_t stream);                                                                     \
+        float const* pre_softmax_stats, T const* curr_attn, float const* curr_softmax_stats, float bmm1_scale,         \
+        int const batch_size, int64_t const* cu_q_seq_len, int max_q_seq_len, int64_t const* merge_op,                 \
+        int const num_heads, int const head_size, cudaStream_t stream);                                                \
     template void invokeMLALoadChunkedKV<T, T>(T * output_kv_ptr, T * output_k_pe_ptr, KVBlockArray const& kv_cache,   \
         int const num_contexts, int64_t const* cu_ctx_chunked_len, int lora_size, int rope_size, int chunked_size,     \
         int chunked_idx, float const* kv_scale_quant_orig_ptr, cudaStream_t stream);                                   \

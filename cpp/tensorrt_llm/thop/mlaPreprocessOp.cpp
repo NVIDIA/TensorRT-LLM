@@ -114,9 +114,9 @@ void invokeMLARopeAppendPagedKVAssignQHelper(KVBlockArray& kv_cache, torch::Tens
 
 template <typename T>
 void mergeChunkedAttentionForMLAHelper(torch::Tensor& merged_attn, torch::Tensor const& temp_attn,
-    torch::Tensor& merged_softmax_stats, torch::Tensor const& temp_softmax_stats, int64_t const num_requests,
-    torch::Tensor const& cu_q_seq_lens, int64_t const max_q_seq_len, torch::Tensor const& merge_op,
-    int64_t const num_heads, int64_t const head_size)
+    torch::Tensor& merged_softmax_stats, torch::Tensor const& temp_softmax_stats, float bmm1_scale,
+    int64_t const num_requests, torch::Tensor const& cu_q_seq_lens, int64_t const max_q_seq_len,
+    torch::Tensor const& merge_op, int64_t const num_heads, int64_t const head_size)
 {
     auto stream = at::cuda::getCurrentCUDAStream(merged_attn.get_device());
     T* merged_attn_ptr = static_cast<T*>(merged_attn.data_ptr());
@@ -127,8 +127,8 @@ void mergeChunkedAttentionForMLAHelper(torch::Tensor& merged_attn, torch::Tensor
     int64_t* const merge_op_ptr = merge_op.data_ptr<int64_t>();
 
     tensorrt_llm::kernels::invokeMergeAttnWithSoftmax(merged_attn_ptr, merged_softmax_stats_ptr, merged_attn_ptr,
-        merged_softmax_stats_ptr, temp_attn_ptr, temp_softmax_stats_ptr, num_requests, cu_q_seq_lens_ptr, max_q_seq_len,
-        merge_op_ptr, num_heads, head_size, stream);
+        merged_softmax_stats_ptr, temp_attn_ptr, temp_softmax_stats_ptr, bmm1_scale, num_requests, cu_q_seq_lens_ptr,
+        max_q_seq_len, merge_op_ptr, num_heads, head_size, stream);
 }
 
 /**
@@ -572,9 +572,9 @@ void MLARopeAppendPagedKVAssignQ(torch::Tensor& q, torch::Tensor& latent_cache, 
 }
 
 void mergeChunkedAttentionForMLA(torch::Tensor& merged_attn, torch::Tensor const& temp_attn,
-    torch::Tensor& merged_softmax_stats, torch::Tensor const& temp_softmax_stats, int64_t const num_requests,
-    torch::Tensor const& cu_q_seq_lens, int64_t const max_q_seq_len, torch::Tensor const& merge_op,
-    int64_t const num_heads, int64_t const head_size)
+    torch::Tensor& merged_softmax_stats, torch::Tensor const& temp_softmax_stats, float bmm1_scale,
+    int64_t const num_requests, torch::Tensor const& cu_q_seq_lens, int64_t const max_q_seq_len,
+    torch::Tensor const& merge_op, int64_t const num_heads, int64_t const head_size)
 {
     TORCH_CHECK(merged_attn.numel() > 0);
     TORCH_CHECK(temp_attn.numel() > 0);
@@ -587,17 +587,17 @@ void mergeChunkedAttentionForMLA(torch::Tensor& merged_attn, torch::Tensor const
     if (merged_attn.scalar_type() == torch::kFloat16)
     {
         mergeChunkedAttentionForMLAHelper<half>(merged_attn, temp_attn, merged_softmax_stats, temp_softmax_stats,
-            num_requests, cu_q_seq_lens, max_q_seq_len, merge_op, num_heads, head_size);
+            bmm1_scale, num_requests, cu_q_seq_lens, max_q_seq_len, merge_op, num_heads, head_size);
     }
     else if (merged_attn.scalar_type() == torch::kFloat32)
     {
         mergeChunkedAttentionForMLAHelper<float>(merged_attn, temp_attn, merged_softmax_stats, temp_softmax_stats,
-            num_requests, cu_q_seq_lens, max_q_seq_len, merge_op, num_heads, head_size);
+            bmm1_scale, num_requests, cu_q_seq_lens, max_q_seq_len, merge_op, num_heads, head_size);
     }
     else if (merged_attn.scalar_type() == torch::kBFloat16)
     {
         mergeChunkedAttentionForMLAHelper<__nv_bfloat16>(merged_attn, temp_attn, merged_softmax_stats,
-            temp_softmax_stats, num_requests, cu_q_seq_lens, max_q_seq_len, merge_op, num_heads, head_size);
+            temp_softmax_stats, bmm1_scale, num_requests, cu_q_seq_lens, max_q_seq_len, merge_op, num_heads, head_size);
     }
 }
 } // namespace torch_ext
@@ -752,6 +752,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         ", Tensor temp_attn"
         ", Tensor merged_softmax_stats"
         ", Tensor temp_softmax_stats"
+        ", float bmm1_scale"
         ", int num_requests"
         ", Tensor cu_q_seq_lens"
         ", int max_q_seq_len"

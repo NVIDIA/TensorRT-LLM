@@ -1449,6 +1449,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         temp_attn: torch.Tensor,
         softmax_stats: torch.Tensor,
         temp_softmax_stats: torch.Tensor,
+        bmm1_scale: float,
         merge_op: torch.Tensor,
         metadata: TrtllmAttentionMetadata,
     ) -> None:
@@ -1460,6 +1461,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             temp_attn,
             softmax_stats,
             temp_softmax_stats,
+            bmm1_scale,
             metadata.num_contexts,
             metadata.ctx_uncached_token_indptr,  # cu_q_seq_len
             metadata.max_ctx_seq_len,  # max_q_seq_len
