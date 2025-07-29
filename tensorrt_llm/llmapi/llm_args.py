@@ -3,12 +3,13 @@ import functools
 import json
 import math
 import os
+import types
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum, EnumMeta
 from pathlib import Path
 from typing import (TYPE_CHECKING, Any, ClassVar, Dict, List, Literal, Optional,
-                    TypeAlias, Union)
+                    Type, TypeAlias, TypeVar, Union, get_args, get_origin)
 
 import torch
 import yaml
@@ -60,6 +61,8 @@ from .tokenizer import TokenizerBase, tokenizer_factory
 from .utils import generate_api_docs_as_docstring, get_type_repr
 
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
+
+TypeBaseModel = TypeVar("T", bound=BaseModel)
 
 
 def Field(default: Any = ...,
@@ -598,6 +601,62 @@ class PybindMirror(ABC):
                 return False
         return True
 
+    @classmethod
+    def from_pybind(cls: Type[TypeBaseModel],
+                    pybind_instance: "PybindMirror") -> TypeBaseModel:
+        """Construct an instance of the given class from the fields in the given
+        pybind class.
+
+        Args:
+            cls: Type of the class to construct, must be a subclass of pydantic
+                 BaseModel
+            pybind_instance: Instance of the pybind class to construct from its
+                             fields
+
+        Notes:
+            When a field value is None in the pybind class, but it's not
+            optional and has a default value in the BaseModel class, it would
+            get the default value defined in the BaseModel class.
+
+        Returns:
+            Instance of the given class, populated with the fields of the given
+            pybind instance
+        """  # noqa: D205
+        assert issubclass(cls, BaseModel)
+
+        # Some of the fields are optional in the C++ class but in python they aren't
+        # optional and have a default value, so copy the value from C++ instance
+        # only if it has a value, so otherwise the default value defined in the
+        # python class would be set.
+        def _is_optional_type(annotation: Any) -> bool:
+            """Returns True if a type annotation represents an Optional type
+            (Optional[X]) or a Union type that includes None (Union[X, Y, None]
+            or X | Y | None).
+            """  # noqa: D205
+            origin = get_origin(annotation)
+            args = get_args(annotation)
+
+            # Union is for Optional[x]
+            # UnionType is for the new | operation in Python 3.10+
+            return (origin is Union
+                    or origin is types.UnionType) and type(None) in args
+
+        fields_non_optional_with_default_value_in_basemodel = {
+            field_name
+            for field_name, field_info in cls.model_fields.items()
+            if not (_is_optional_type(field_info.annotation)
+                    and field_info.is_required())
+        }
+
+        kwargs = {}
+        cpp_fields = PybindMirror.get_pybind_variable_fields(
+            type(pybind_instance))
+        for field_name in cpp_fields:
+            field_value = getattr(pybind_instance, field_name)
+            if field_value is not None or field_name not in fields_non_optional_with_default_value_in_basemodel:
+                kwargs[field_name] = field_value
+        return cls(**kwargs)
+
 
 class PybindMirrorMeta(type(PybindMirror)):
     pass
@@ -731,10 +790,9 @@ class PeftCacheConfig(StrictBaseModel, PybindMirror):
         default=0.02,
         description=
         "Proportion of free device memory after engine load to use for cache, as a fraction from 0 to 1"
-        ", defaults to 2%")
+    )
     host_cache_size: int = Field(
-        default=1024**3,
-        description="size in bytes to use for host cache, defaults to 1GiB")
+        default=1024**3, description="size in bytes to use for host cache")
     lora_prefetch_dir: Optional[str] = Field(
         default=None,
         description=
@@ -755,32 +813,6 @@ class PeftCacheConfig(StrictBaseModel, PybindMirror):
             device_cache_percent=self.device_cache_percent,
             host_cache_size=self.host_cache_size,
             lora_prefetch_dir=self.lora_prefetch_dir)
-
-    @staticmethod
-    def create_from_pybind(
-            peft_cache_config: _PeftCacheConfig) -> "PeftCacheConfig":
-        # Some of the properties are optional in CPP but in python they have a default value and aren't optional,
-        # so copy their value only if they have a value in the CPP instance.
-        extra_kwargs = {}
-        if peft_cache_config.device_cache_percent is not None:
-            extra_kwargs[
-                "device_cache_percent"] = peft_cache_config.device_cache_percent
-        if peft_cache_config.host_cache_size is not None:
-            extra_kwargs["host_cache_size"] = peft_cache_config.host_cache_size
-
-        return PeftCacheConfig(
-            num_host_module_layer=peft_cache_config.num_host_module_layer,
-            num_device_module_layer=peft_cache_config.num_device_module_layer,
-            optimal_adapter_size=peft_cache_config.optimal_adapter_size,
-            max_adapter_size=peft_cache_config.max_adapter_size,
-            num_put_workers=peft_cache_config.num_put_workers,
-            num_ensure_workers=peft_cache_config.num_ensure_workers,
-            num_copy_streams=peft_cache_config.num_copy_streams,
-            max_pages_per_block_host=peft_cache_config.max_pages_per_block_host,
-            max_pages_per_block_device=peft_cache_config.
-            max_pages_per_block_device,
-            lora_prefetch_dir=peft_cache_config.lora_prefetch_dir,
-            **extra_kwargs)
 
 
 @PybindMirror.mirror_pybind_fields(_LookaheadDecodingConfig)
@@ -1640,7 +1672,9 @@ class BaseLlmArgs(StrictBaseModel):
     @model_validator(mode="after")
     def validate_peft_cache_config(self):
         if self.peft_cache_config is not None and self.peft_cache_config.lora_prefetch_dir is not None:
-            logger.warning("LoRA prefetch is not supported")
+            raise ValueError(
+                f"lora_prefetch_dir was set to '{self.peft_cache_config.lora_prefetch_dir}' "
+                "while LoRA prefetch is not supported")
         return self
 
     def _update_plugin_config(self, key: str, value: Any):
