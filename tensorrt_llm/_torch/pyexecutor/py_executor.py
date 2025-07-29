@@ -296,9 +296,15 @@ class PyExecutor:
 
             self.kv_connector_manager.worker.register_kv_caches(kv_cache_data)
 
-            for name, module in self.model_engine.model.named_modules():
+            for _name, module in self.model_engine.model.named_modules():
                 if isinstance(module, DecoderLayer):
-                    print("LAYER", name, module)
+                    module.register_forward_pre_hook(
+                        self.kv_connector_manager.layer_pre_hook)
+                    module.register_forward_hook(
+                        self.kv_connector_manager.layer_post_hook)
+
+            self.model_engine.model.register_forward_hook(
+                self.kv_connector_manager.model_post_hook)
 
     def _event_loop_wrapper(self):
         try:
