@@ -19,20 +19,16 @@ def ignore_trt_only_args(kwargs: dict, backend: str):
 def get_llm(runtime_config: RuntimeConfig, kwargs: dict):
     llm_cls = LLM
 
-    if runtime_config.backend == 'pytorch':
+    if runtime_config.backend != "tensorrt":
         ignore_trt_only_args(kwargs, runtime_config.backend)
 
         if runtime_config.iteration_log is not None:
             kwargs["enable_iter_perf_stats"] = True
 
+    if runtime_config.backend == 'pytorch':
         llm_cls = PyTorchLLM
     elif runtime_config.backend == "_autodeploy":
-        ignore_trt_only_args(kwargs)
         kwargs["world_size"] = kwargs.pop("tensor_parallel_size", None)
-
-        if runtime_config.iteration_log is not None:
-            kwargs["enable_iter_perf_stats"] = True
-
         llm_cls = AutoDeployLLM
 
     llm = llm_cls(**kwargs)
