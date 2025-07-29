@@ -23,7 +23,9 @@ def main():
     build_config.lora_config = LoraConfig(lora_dir=[lora_dir1])
     llm = LLM(model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
               enable_lora=True,
-              max_lora_rank=64,
+              lora_config=LoraConfig(max_lora_rank=64,
+                                     max_loras=3,
+                                     max_cpu_loras=3),
               build_config=build_config)
 
     # Sample prompts
