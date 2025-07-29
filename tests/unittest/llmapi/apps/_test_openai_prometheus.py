@@ -4,7 +4,6 @@ import tempfile
 from urllib.request import urlopen
 
 import pytest
-import torch
 import yaml
 
 from ..test_llm import get_model_path
@@ -40,10 +39,7 @@ def temp_extra_llm_api_options_file(request):
 def server(model_name: str,
            temp_extra_llm_api_options_file: str) -> RemoteOpenAIServer:
     model_path = get_model_path(model_name)
-    # Set parallelism based on GPU count
-    tp_size = torch.cuda.device_count()
-    assert tp_size > 0, "At least 1 GPU is required to run tests"
-    args = ["--backend", "pytorch", "--tp_size", str(tp_size)]
+    args = ["--backend", "pytorch", "--tp_size", "1"]
     args.extend(["--extra_llm_api_options", temp_extra_llm_api_options_file])
     logger.info(f"Starting server, model: {model_name}, args: {args}")
     with RemoteOpenAIServer(model_path, args) as remote_server:
