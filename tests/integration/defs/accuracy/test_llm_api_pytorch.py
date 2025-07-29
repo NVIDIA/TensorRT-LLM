@@ -489,6 +489,30 @@ class TestLlama4MaverickInstruct(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @skip_pre_hopper
+    @pytest.mark.skip_less_mpi_world_size(8)
+    @pytest.mark.parametrize("tp_size,pp_size,ep_size", [(8, 1, 1)],
+                             ids=["tp8"])
+    def test_fp8_eagle3(self, cuda_graph, tp_size, pp_size, ep_size):
+        model_path = f"{llm_models_root()}/llama4-models/nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8"
+        eagle_model_dir = f"{llm_models_root()}/Llama-4-Maverick-17B-128E-Eagle3"
+        spec_config = EagleDecodingConfig(max_draft_len=3,
+                                          speculative_model_dir=eagle_model_dir)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
+        pytorch_config = dict(
+            disable_overlap_scheduler=not cuda_graph,
+            cuda_graph_config=CudaGraphConfig(max_batch_size=8),
+            enable_attention_dp=False)
+        with LLM(model_path,
+                 kv_cache_config=kv_cache_config,
+                 tensor_parallel_size=tp_size,
+                 pipeline_parallel_size=pp_size,
+                 moe_expert_parallel_size=ep_size,
+                 **pytorch_config,
+                 speculative_config=spec_config) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
 
 class TestLlama4ScoutInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "meta-llama/Llama-4-Scout-17B-16E-Instruct"
