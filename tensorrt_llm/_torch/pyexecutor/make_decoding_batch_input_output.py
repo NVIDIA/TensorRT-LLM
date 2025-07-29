@@ -4,8 +4,8 @@ from typing import List
 import torch
 
 from tensorrt_llm._utils import nvtx_range
-from tensorrt_llm.bindings.internal.runtime import (DecoderInputBuffers,
-                                                    DecoderState)
+from tensorrt_llm.bindings.internal.batch_manager import DecoderInputBuffers
+from tensorrt_llm.bindings.internal.runtime import DecoderState
 
 
 @dataclass

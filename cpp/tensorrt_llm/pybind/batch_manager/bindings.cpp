@@ -403,27 +403,6 @@ void initBindings(pybind11::module_& m)
         .def(py::init<tr::SizeType32, tr::ModelConfig, tr::WorldConfig, tr::BufferManager>(),
             py::arg("max_num_sequences"), py::arg("model_config"), py::arg("world_config"), py::arg("buffer_manager"));
 
-    py::class_<tb::DecoderOutputBuffers>(m, "DecoderOutputBuffers")
-        .def_readwrite("sequence_lengths_host", &tb::DecoderOutputBuffers::sequenceLengthsHost)
-        .def_readwrite("finished_sum_host", &tb::DecoderOutputBuffers::finishedSumHost)
-        .def_property_readonly("new_output_tokens_host",
-            [](tb::DecoderOutputBuffers& self) { return tr::Torch::tensor(self.newOutputTokensHost); })
-        .def_readwrite("cum_log_probs_host", &tb::DecoderOutputBuffers::cumLogProbsHost)
-        .def_readwrite("log_probs_host", &tb::DecoderOutputBuffers::logProbsHost)
-        .def_readwrite("finish_reasons_host", &tb::DecoderOutputBuffers::finishReasonsHost);
-
-    py::class_<tb::SlotDecoderBuffers>(m, "SlotDecoderBuffers")
-        .def(py::init<runtime::SizeType32, runtime::SizeType32, runtime::BufferManager const&>(),
-            py::arg("max_beam_width"), py::arg("max_seq_len"), py::arg("buffer_manager"))
-        .def_readwrite("output_ids", &tb::SlotDecoderBuffers::outputIds)
-        .def_readwrite("output_ids_host", &tb::SlotDecoderBuffers::outputIdsHost)
-        .def_readwrite("sequence_lengths_host", &tb::SlotDecoderBuffers::sequenceLengthsHost)
-        .def_readwrite("cum_log_probs", &tb::SlotDecoderBuffers::cumLogProbs)
-        .def_readwrite("cum_log_probs_host", &tb::SlotDecoderBuffers::cumLogProbsHost)
-        .def_readwrite("log_probs", &tb::SlotDecoderBuffers::logProbs)
-        .def_readwrite("log_probs_host", &tb::SlotDecoderBuffers::logProbsHost)
-        .def_readwrite("finish_reasons_host", &tb::SlotDecoderBuffers::finishReasonsHost);
-
     m.def(
         "add_new_tokens_to_requests",
         [](std::vector<std::shared_ptr<tb::LlmRequest>>& requests,

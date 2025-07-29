@@ -223,11 +223,6 @@ void initBindings(pybind11::module_& m)
         .def("materialize_with_tag", &tr::CudaVirtualMemoryManager::materializeWithTag, py::arg("tag"),
             py::call_guard<py::gil_scoped_release>());
 
-    py::classh<tr::BufferManager>(m, "BufferManager")
-        .def(py::init<tr::BufferManager::CudaStreamPtr, bool>(), py::arg("stream"), py::arg("trim_pool") = false,
-            py::call_guard<py::gil_scoped_release>())
-        .def_property_readonly("stream", &tr::BufferManager::getStream);
-
     py::classh<tr::TllmRuntime>(m, "TllmRuntime")
         .def(py::init(
             [](std::filesystem::path engine_path, float gpu_weights_percent = 1.0f, bool use_shape_inference = true)
@@ -376,19 +371,6 @@ void initBindings(pybind11::module_& m)
         .def_property("generation_steps", &tr::decoder::DecoderState::getGenerationSteps,
             &tr::decoder::DecoderState::setGenerationSteps);
 
-    py::class_<tb::DecoderInputBuffers>(m, "DecoderInputBuffers")
-        .def(py::init<tr::SizeType32, tr::SizeType32, tr::BufferManager>(), py::arg("max_batch_size"),
-            py::arg("max_tokens_per_engine_step"), py::arg("manager"))
-        .def_readwrite("setup_batch_slots", &tb::DecoderInputBuffers::setupBatchSlots)
-        .def_readwrite("setup_batch_slots_device", &tb::DecoderInputBuffers::setupBatchSlotsDevice)
-        .def_readwrite("fill_values", &tb::DecoderInputBuffers::fillValues)
-        .def_readwrite("fill_values_device", &tb::DecoderInputBuffers::fillValuesDevice)
-        .def_readwrite("inputs_ids", &tb::DecoderInputBuffers::inputsIds)
-        .def_readwrite("batch_logits", &tb::DecoderInputBuffers::batchLogits)
-        .def_readwrite("forward_batch_slots", &tb::DecoderInputBuffers::forwardBatchSlots)
-        .def_readwrite("decoder_logits", &tb::DecoderInputBuffers::decoderLogits)
-        .def_readwrite("max_decoder_steps", &tb::DecoderInputBuffers::maxDecoderSteps);
-
     py::class_<tr::GptDecoderBatched>(m, "GptDecoderBatched")
         .def(py::init<tr::GptDecoderBatched::CudaStreamPtr>(), py::arg("stream"),
             py::call_guard<py::gil_scoped_release>())
@@ -498,6 +480,11 @@ void initBindings(pybind11::module_& m)
 
 void initBindingsEarly(py::module_& m)
 {
+    py::classh<tr::BufferManager>(m, "BufferManager")
+        .def(py::init<tr::BufferManager::CudaStreamPtr, bool>(), py::arg("stream"), py::arg("trim_pool") = false,
+            py::call_guard<py::gil_scoped_release>())
+        .def_property_readonly("stream", &tr::BufferManager::getStream);
+
     py::class_<tr::SpeculativeDecodingMode>(m, "SpeculativeDecodingMode")
         .def(py::init<tr::SpeculativeDecodingMode::UnderlyingType>(), py::arg("state"))
         .def_static("NoneType", &tr::SpeculativeDecodingMode::None)

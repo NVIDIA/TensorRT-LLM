@@ -40,13 +40,13 @@ from tensorrt_llm.bindings import (
 from tensorrt_llm.bindings.executor import DecodingConfig, DecodingMode, FinishReason
 from tensorrt_llm.bindings.internal.algorithms import CreateNewDecoderRequests
 from tensorrt_llm.bindings.internal.batch_manager import (
+    DecoderInputBuffers,
     add_new_tokens_to_requests,
     make_decoding_batch_input,
 )
 from tensorrt_llm.bindings.internal.runtime import (
     BufferManager,
     CudaEvent,
-    DecoderInputBuffers,
     DecoderState,
     GptDecoderBatched,
 )
