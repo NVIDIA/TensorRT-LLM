@@ -251,10 +251,6 @@ class ADEngine(ModelEngine):
 
         return {"logits": logits_flat}
 
-    def use_runtime_spec_decode(self, enabled: bool):
-        # Dynamically turning on/off spec decode at runtime is not supported yet.
-        pass
-
 
 def create_autodeploy_executor(executor_config: ExecutorConfig, checkpoint_dir: str = None):
     """Create an AutoDeploy executor from the given configuration and checkpoint directory.

@@ -23,7 +23,6 @@ class Drafter(ABC):
         """
         raise NotImplementedError
 
-    @abstractmethod
     def should_use_spec_decode(self, requests: List[LlmRequest]) -> bool:
         """Check if spec decode should be used for the current iteration."""
-        raise NotImplementedError
+        return True

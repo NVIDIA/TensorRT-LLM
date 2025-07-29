@@ -863,8 +863,7 @@ class PyExecutor:
         if self.drafter is not None:
             self.use_spec_decode = self.drafter.should_use_spec_decode(
                 self.active_requests)
-            self.model_engine.use_runtime_spec_decode(
-                self.use_spec_decode)
+            self.model_engine.enable_spec_decode = self.use_spec_decode
             self._prepare_draft_requests(self.active_requests)
 
         scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(

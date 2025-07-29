@@ -89,10 +89,6 @@ class ModelEngine(ABC):
         """
         return
 
-    @abstractmethod
-    def use_runtime_spec_decode(self, enabled: bool):
-        raise NotImplementedError
-
 
 _KV_CACHE_MAP = {
     "fp8": QuantAlgo.FP8.value,
@@ -281,9 +277,8 @@ class PyTorchModelEngine(ModelEngine):
             ExpertStatistic.create(self.dist.rank)
         self.pytorch_backend_config = pytorch_backend_config
         self.spec_config = spec_config
-        self.spec_config_rt = self.spec_config
         self.is_spec_decode = spec_config is not None
-        self.is_spec_decode_rt = self.is_spec_decode
+        self.enable_spec_decode = self.is_spec_decode
         self.is_draft_model = is_draft_model
 
         self.in_warmup = False
@@ -489,14 +484,6 @@ class PyTorchModelEngine(ModelEngine):
             yield
         finally:
             self._run_cuda_graphs = _run_cuda_graphs
-
-    def use_runtime_spec_decode(self, enabled: bool):
-        if enabled:
-            self.is_spec_decode_rt = True
-            self.spec_config_rt = self.spec_config
-        else:
-            self.is_spec_decode_rt = False
-            self.spec_config_rt = None
 
     @with_warmup_flag
     def warmup(self, resource_manager: ResourceManager) -> None:
@@ -751,7 +738,7 @@ class PyTorchModelEngine(ModelEngine):
                         logger.info(
                             f"Run generation only CUDA graph warmup for batch size={bs}, draft_len={draft_len}"
                         )
-                        self.use_runtime_spec_decode(draft_len > 0)
+                        self.enable_spec_decode = draft_len > 0
                         self.forward(batch,
                                      new_tensors_device=None,
                                      resource_manager=resource_manager)
@@ -779,8 +766,7 @@ class PyTorchModelEngine(ModelEngine):
                                 torch.cuda.empty_cache()
 
         # Set the values back to the original values
-        self.spec_config_rt = self.spec_config
-        self.is_spec_decode_rt = self.is_spec_decode
+        self.enable_spec_decode = self.is_spec_decode
 
     def _set_up_attn_metadata(self, kv_cache_manager: KVCacheManager):
         enable_paged_context_mla = is_mla(
@@ -823,9 +809,10 @@ class PyTorchModelEngine(ModelEngine):
             self,
             spec_resource_manager: Optional[BaseResourceManager],
             no_cache=False):
+        spec_config = self.spec_config if self.enable_spec_decode else None
         if no_cache:
             return get_spec_metadata(
-                self.spec_config_rt,
+                spec_config,
                 self.model.config,
                 self.batch_size,
                 max_num_tokens=self.max_num_tokens,
@@ -835,7 +822,7 @@ class PyTorchModelEngine(ModelEngine):
         if self.spec_metadata is not None:
             return self.spec_metadata
         self.spec_metadata = get_spec_metadata(
-            self.spec_config_rt,
+            spec_config,
             self.model.config,
             self.batch_size,
             max_num_tokens=self.max_num_tokens,
@@ -943,7 +930,7 @@ class PyTorchModelEngine(ModelEngine):
         if ExpertStatistic.set_iter(self.iter_counter):
             return None
 
-        draft_len = self.spec_config_rt.max_draft_len if self.is_spec_decode_rt else 0
+        draft_len = self.spec_config.max_draft_len if self.enable_spec_decode else 0
         can_run_cuda_graph = batch.can_run_cuda_graph
         batch_size = len(batch.generation_requests)
         if self._run_cuda_graphs and self.enable_attention_dp and self.mapping.tp_size > 1:
@@ -973,7 +960,7 @@ class PyTorchModelEngine(ModelEngine):
             num_sequences_in_batch, False, draft_len)
         assert attn_metadata.is_cuda_graph
 
-        if self.is_spec_decode_rt:
+        if self.enable_spec_decode:
             spec_metadata = self.spec_metadata.create_cuda_graph_metadata(
                 num_sequences_in_batch)
             spec_metadata.draft_tokens = self.draft_tokens_cuda
@@ -1159,7 +1146,7 @@ class PyTorchModelEngine(ModelEngine):
         """
         Make some changes to the device inputs and avoid block the async data transfer
         """
-        if self.is_spec_decode_rt and not self._disable_overlap_scheduler:
+        if self.enable_spec_decode and not self._disable_overlap_scheduler:
             # When enabling overlap scheduler, the kv cache for draft tokens will
             # be prepared in advance by using the max_draft_len. But we need to use
             # new_tokens_lens_device to get the real past kv lengths and the
@@ -1277,9 +1264,10 @@ class PyTorchModelEngine(ModelEngine):
                 multimodal_params_list.append(multimodal_params)
         extend_requests += extend_dummy_requests
 
-        if not self._disable_overlap_scheduler and self.is_spec_decode_rt:
-            assert self.spec_config_rt.spec_dec_mode.support_overlap_scheduler(
-            ), f"{self.spec_config_rt.decoding_type} does not support overlap scheduler"
+        spec_config = self.spec_config if self.enable_spec_decode else None
+        if not self._disable_overlap_scheduler and spec_config is not None:
+            assert spec_config.spec_dec_mode.support_overlap_scheduler(
+            ), f"{spec_config.decoding_type} does not support overlap scheduler"
 
         # will contain previous batch indices of generation requests
         previous_batch_indices = []
@@ -1302,7 +1290,7 @@ class PyTorchModelEngine(ModelEngine):
                 past_seen_token_num = request.max_beam_num_tokens - 1
                 draft_lens.append(num_draft_tokens)
 
-                if self.is_spec_decode_rt and self.spec_config_rt.spec_dec_mode.extend_ctx(
+                if self.enable_spec_decode and spec_config.spec_dec_mode.extend_ctx(
                         self.attn_backend):
                     # We're treating the prompt lengths as context requests here, so
                     # the the prompt lens should not include the cached tokens.
@@ -1496,7 +1484,7 @@ class PyTorchModelEngine(ModelEngine):
                                     pin_memory=True)
         self.position_ids_cuda[:total_num_tokens].copy_(position_ids,
                                                         non_blocking=True)
-        if self.is_spec_decode_rt:
+        if self.enable_spec_decode:
             self.gather_ids_cuda[:len(gather_ids)].copy_(torch.tensor(
                 gather_ids, dtype=torch.int, pin_memory=True),
                                                          non_blocking=True)
@@ -1527,14 +1515,14 @@ class PyTorchModelEngine(ModelEngine):
         attn_metadata.request_ids = request_ids
         attn_metadata.prompt_lens = prompt_lengths
         attn_metadata.num_contexts = len(scheduled_requests.context_requests)
-        if self.is_spec_decode_rt and self.spec_config_rt.spec_dec_mode.extend_ctx(
+        if self.enable_spec_decode and spec_config.spec_dec_mode.extend_ctx(
                 self.attn_backend):
             attn_metadata.num_contexts += len(extend_requests)
 
         attn_metadata.kv_cache_params = KVCacheParams(
             use_cache=True,
             num_cached_tokens_per_seq=num_cached_tokens_per_seq,
-            num_extra_kv_tokens=get_num_extra_kv_tokens(self.spec_config_rt))
+            num_extra_kv_tokens=get_num_extra_kv_tokens(spec_config))
         attn_metadata.kv_cache_manager = kv_cache_manager
 
         attn_metadata.prepare()
@@ -1608,7 +1596,7 @@ class PyTorchModelEngine(ModelEngine):
         self.iter_states['num_ctx_tokens'] = num_ctx_tokens
         self.iter_states['num_generation_tokens'] = num_generation_tokens
         return inputs, self.gather_ids_cuda[:len(
-            gather_ids)] if self.is_spec_decode_rt else None
+            gather_ids)] if self.enable_spec_decode else None
 
     def _prepare_tp_inputs_no_cache(
             self,
@@ -1652,7 +1640,7 @@ class PyTorchModelEngine(ModelEngine):
                                     pin_memory=True)
         self.position_ids_cuda[:num_tokens].copy_(position_ids,
                                                   non_blocking=True)
-        if self.is_spec_decode_rt:
+        if self.enable_spec_decode:
             self.gather_ids_cuda[:len(gather_ids)].copy_(torch.tensor(
                 gather_ids, dtype=torch.int, pin_memory=True),
                                                          non_blocking=True)
@@ -2108,7 +2096,7 @@ class PyTorchModelEngine(ModelEngine):
             self.kv_cache_manager_key)
 
         attn_metadata = self._set_up_attn_metadata(kv_cache_manager)
-        if self.is_spec_decode_rt:
+        if self.enable_spec_decode:
             spec_resource_manager = resource_manager.get_resource_manager(
                 ResourceManagerType.SPEC_RESOURCE_MANAGER)
             spec_metadata = self._set_up_spec_metadata(spec_resource_manager,
@@ -2148,7 +2136,7 @@ class PyTorchModelEngine(ModelEngine):
                 spec_metadata = maybe_graph.spec_metadata
             else:
                 attn_metadata = self.attn_metadata
-                if self.is_spec_decode_rt:
+                if self.enable_spec_decode:
                     spec_metadata = self.spec_metadata
                 else:
                     spec_metadata = None

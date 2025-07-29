@@ -398,6 +398,3 @@ class ModelDrafter(Drafter):
             error_msg = str(e)
             logger.error(f"Encountered an error in decode: {error_msg}")
             raise e
-
-    def should_use_spec_decode(self, requests: List[LlmRequest]) -> bool:
-        return True
