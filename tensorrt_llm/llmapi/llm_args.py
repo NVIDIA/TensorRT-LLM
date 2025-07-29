@@ -1628,7 +1628,7 @@ class BaseLlmArgs(StrictBaseModel):
 
     @model_validator(mode="after")
     def validate_peft_cache_config(self):
-        if self.backend == "pytorch" and self.peft_cache_config.lora_prefetch_dir is not None:
+        if self.backend == "pytorch" and self.peft_cache_config is not None and self.peft_cache_config.lora_prefetch_dir is not None:
             logger.warning(
                 "LoRA prefetch is not supported with pytorch backend")
         return self
