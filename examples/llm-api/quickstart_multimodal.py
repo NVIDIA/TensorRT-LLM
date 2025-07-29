@@ -55,7 +55,26 @@ example_medias_and_prompts = {
             "Describe the scene in the image briefly.",
             "",
         ]
-    }
+    },
+    "multiple_image": {
+        "media": [
+            "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/inpaint.png",
+            "https://huggingface.co/datasets/Sayali9141/traffic_signal_images/resolve/main/61.jpg",
+        ],
+        "prompt": ["Describe the difference between the two images."],
+    },
+    "mixture_text_image": {
+        "media": [
+            [],
+            [
+                "https://huggingface.co/datasets/huggingface/documentation-images/resolve/main/diffusers/inpaint.png"
+            ],
+        ],
+        "prompt": [
+            "Who invented the internet?",
+            "Describe the scene in the image briefly.",
+        ],
+    },
 }
 
 
@@ -66,7 +85,10 @@ def add_multimodal_args(parser):
                         help="Model type.")
     parser.add_argument("--modality",
                         type=str,
-                        choices=["image", "video", "audio", "image_audio"],
+                        choices=[
+                            "image", "video", "audio", "image_audio",
+                            "multiple_image", "mixture_text_image"
+                        ],
                         default="image",
                         help="Media type.")
     parser.add_argument("--media",
@@ -82,6 +104,10 @@ def add_multimodal_args(parser):
                         choices=["pt", "pil"],
                         default="pt",
                         help="The format of the image.")
+    parser.add_argument("--device",
+                        type=str,
+                        default="cpu",
+                        help="The device to have the input on.")
     return parser
 
 
@@ -114,11 +140,6 @@ def parse_arguments():
 
 def main():
     args = parse_arguments()
-    # set prompts and media to example prompts and images if they are not provided
-    if args.prompt is None:
-        args.prompt = example_medias_and_prompts[args.modality]["prompt"]
-    if args.media is None:
-        args.media = example_medias_and_prompts[args.modality]["media"]
 
     lora_config = None
     if args.load_lora:
@@ -138,7 +159,11 @@ def main():
             open(os.path.join(llm._hf_model_dir, 'config.json')))['model_type']
     assert model_type in ALL_SUPPORTED_MULTIMODAL_MODELS, f"Unsupported model_type: {model_type}"
 
-    device = "cpu"
+    # set prompts and media to example prompts and images if they are not provided
+    if args.prompt is None:
+        args.prompt = example_medias_and_prompts[args.modality]["prompt"]
+    if args.media is None:
+        args.media = example_medias_and_prompts[args.modality]["media"]
     inputs = default_multimodal_input_loader(tokenizer=llm.tokenizer,
                                              model_dir=llm._hf_model_dir,
                                              model_type=model_type,
@@ -147,7 +172,7 @@ def main():
                                              media=args.media,
                                              image_data_format=image_format,
                                              num_frames=args.num_frames,
-                                             device=device)
+                                             device=args.device)
 
     lora_request = None
     if args.load_lora:
