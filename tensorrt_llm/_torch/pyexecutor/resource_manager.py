@@ -331,7 +331,8 @@ class KVCacheManager(BaseResourceManager):
             remaining_tokens / self.tokens_per_block)
         return need_blocks
 
-    def prepare_resources(self, scheduled_batch: ScheduledRequests):
+    def prepare_resources_for_requests(self,
+                                       scheduled_batch: ScheduledRequests):
         context_batch = scheduled_batch.context_requests
         generation_batch = scheduled_batch.generation_requests
         # allocate KV Cache

@@ -342,6 +342,10 @@ class ModelDrafter(Drafter):
 
         if resource_manager is None:
             raise ValueError("Resource manager is required")
+        kv_cache_manager = resource_manager.get_resource_manager(
+            self.draft_model_engine.kv_cache_manager_key)
+        if kv_cache_manager is not None:
+            kv_cache_manager.prepare_resources_for_requests(scheduled_requests)
 
         try:
             draft_batch = self._prepare_draft_batch(scheduled_requests)

@@ -2069,6 +2069,10 @@ class PyTorchModelEngine(ModelEngine):
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
 
+        # The draft model shall handle the KV cache preparation inside the drafter.
+        skip_kv_cache_preparation = kv_cache_manager is None or self.in_warmup or self.is_draft_model
+        if not skip_kv_cache_preparation:
+            kv_cache_manager.prepare_resources_for_requests(scheduled_requests)
         attn_metadata = self._set_up_attn_metadata(kv_cache_manager)
         if self.is_spec_decode:
             spec_resource_manager = resource_manager.get_resource_manager(
