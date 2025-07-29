@@ -736,7 +736,7 @@ class PeftCacheConfig(StrictBaseModel, PybindMirror):
         default=None,
         description=
         "folder to store the LoRA weights we hope to load during engine initialization"
-    )
+        ", not supported with pytorch backend")
 
     def _to_pybind(self):
         return _PeftCacheConfig(
@@ -1624,6 +1624,13 @@ class BaseLlmArgs(StrictBaseModel):
                 )
                 self.lora_config.lora_target_modules = list(
                     default_trtllm_modules_to_hf_modules.keys())
+        return self
+
+    @model_validator(mode="after")
+    def validate_peft_cache_config(self):
+        if self.backend == "pytorch" and self.peft_cache_config.lora_prefetch_dir is not None:
+            logger.warning(
+                "LoRA prefetch is not supported with pytorch backend")
         return self
 
     def _update_plugin_config(self, key: str, value: Any):
