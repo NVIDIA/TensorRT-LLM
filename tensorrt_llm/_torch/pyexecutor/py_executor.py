@@ -11,6 +11,7 @@ from contextlib import contextmanager
 from typing import Dict, List, Optional, Union
 
 import torch
+from torch.cuda import cudart
 
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
@@ -25,6 +26,7 @@ from tensorrt_llm.bindings.executor import (DisServingRequestStats,
 from tensorrt_llm.bindings.internal.batch_manager import (LlmRequestType,
                                                           ReqIdsSet)
 from tensorrt_llm.logger import logger
+from tensorrt_llm.runtime.generation import CUASSERT
 
 from ..distributed import Distributed
 from ..speculative.drafter import Drafter
@@ -644,6 +646,8 @@ class PyExecutor:
     def _executor_loop_pp(self):
         logger.debug(f"Starting executor loop for pp_rank {self.dist.pp_rank}")
         torch.cuda.set_device(self.device_id)
+        # ensure the context is created, otherwise, some MPI calls will fail.
+        CUASSERT(cudart.cudaSetDevice(self.device_id))
         microbatch_id = 0
         with self._profiler() as profile_step:
             iter_start_time = time.time()
@@ -897,6 +901,8 @@ class PyExecutor:
 
     def _executor_loop(self):
         torch.cuda.set_device(self.device_id)
+        # ensure the context is created, otherwise, some MPI calls will fail.
+        CUASSERT(cudart.cudaSetDevice(self.device_id))
         with self._profiler() as profile_step:
             sample_state = None
             iter_start_time = time.time()
@@ -992,6 +998,8 @@ class PyExecutor:
 
     def _executor_loop_overlap(self):
         torch.cuda.set_device(self.device_id)
+        # ensure the context is created, otherwise, some MPI calls will fail.
+        CUASSERT(cudart.cudaSetDevice(self.device_id))
         if self.dist.rank == 0 and not self.is_warmup and self.benchmark_req_queues_size > 0 and self.kv_cache_transceiver:
             while self.executor_request_queue.get_request_queue_size(
             ) < self.benchmark_req_queues_size:
