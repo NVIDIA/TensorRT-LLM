@@ -1085,10 +1085,5 @@ def _maybe_wrap_response(
     logprobs_result = _get_logprobs(worker, response, is_pytorch_backend)
     req_perf_metrics = _get_metrics_dict(response)
     if logprobs_result or req_perf_metrics:
-        if hasattr(response, 'result') and hasattr(response.result, "_result"):
-            response.result.deserialize()
-            response = tllm.Response(request_id=response.request_id,
-                                     result=response.result._result,
-                                     client_id=response.client_id)
         response = ResponseWrapper(response, logprobs_result, req_perf_metrics)
     return response

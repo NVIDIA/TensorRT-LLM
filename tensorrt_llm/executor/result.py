@@ -322,7 +322,8 @@ class GenerationResultBase:
                     handler(response.error_msg)
 
             response_result = response.result
-            if hasattr(response_result, "_result"):
+            if hasattr(response_result, "_result") and isinstance(
+                    response_result._result, bytes):
                 response_result.deserialize()
 
             self._done = response_result.is_final
