@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from typing import Dict, List, Optional, Union
 
 import torch
-from torch.cuda import cudart
+from cuda import cudart
 
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
