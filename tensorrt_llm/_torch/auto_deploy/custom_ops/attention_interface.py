@@ -453,16 +453,7 @@ class SequenceInfo:
         with nvtx_range("flatten_input_ids"):
             self.input_ids = self.input_ids.flatten()
         with nvtx_range("assign_input_ids"):
-            self.input_ids[:num_tokens] = input_ids
-        with nvtx_range("replace_new_tokens"):
-            if new_tokens is not None and previous_batch_indices is not None and len(previous_batch_indices) > 0:
-                # Find positions of -1 values and replace them directly
-                # This avoids the expensive advanced indexing new_tokens[0, previous_batch_indices, 0]
-                mask = self.input_ids == -1
-                neg_one_positions = torch.where(mask)[0]
-                assert len(neg_one_positions) == len(previous_batch_indices)
-                replacement_values = new_tokens[0, :, 0][previous_batch_indices]
-                self.input_ids[neg_one_positions] = replacement_values
+            self.input_ids[:num_tokens] = input_ids # gpu-gpu copy
         with nvtx_range("reshape_input_ids"):
             self.input_ids = self.maybe_reshape_for_generate(self.input_ids)
         

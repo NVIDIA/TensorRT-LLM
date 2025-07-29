@@ -169,8 +169,6 @@ class ADEngine(ModelEngine):
         kv_cache_manager = resource_manager.get_resource_manager(
             ResourceManagerType.KV_CACHE_MANAGER
         )
-
-        new_tokens_cuda = new_tokens.to(self.cache_seq_interface.info.device) if new_tokens is not None else None
         # requests in order of context, generate
         context_requests = scheduled_requests.context_requests
         gen_requests = [r for r in scheduled_requests.generation_requests if not r.draft_tokens]
@@ -202,11 +200,13 @@ class ADEngine(ModelEngine):
         # TODO: we should also handle extend requests (for speculative decoding) here
         with nvtx_range("ad_update_generate"):
             previous_batch_idx = 0
-            self.input_ids_cuda[idx:idx+len(gen_requests)].fill_(-1) # fill for the common use case
+            #self.input_ids_cuda[idx:idx+len(gen_requests)].fill_(-1) # fill for the common use case
+            # input_ids_gen = []
+            new_tokens_idx = 0
             for request in gen_requests:
                 # new_tokens are provided when the overlap scheduler is enabled.
-                if new_tokens is None or request.is_dummy or request.py_batch_idx is None:
-                    self.input_ids_cuda[idx] = request.get_token(0, request.get_num_tokens(0) - 1)
+                if new_tokens is None or request.is_dummy or request.py_batch_idx is None: # when is this case even happening?
+                    self.input_ids_cuda[idx] = request.get_token(0, request.get_num_tokens(0) - 1) #this is a CPU->GPU copy, but it's rare. Consider batching this.
                     idx += 1
                     input_pos.append(request.max_beam_num_tokens - 1)
                 else:
@@ -214,7 +214,9 @@ class ADEngine(ModelEngine):
                     #self.input_ids_cuda is prefilled with -1s, so we don't need to do this
                     # self.input_ids_cuda[idx] = -1
                     # print("================================== type of input_ids_cuda: ===============================", self.input_ids_cuda.dtype)
+                    self.input_ids_cuda[idx] = new_tokens[0, new_tokens_idx, 0] # gpu-gpu copy. might be better to batch it.
                     idx += 1
+                    new_tokens_idx += 1
                     previous_batch_indices[previous_batch_idx] = request.py_batch_idx
                     previous_batch_idx += 1
                     input_pos.append(request.max_beam_num_tokens)
@@ -252,7 +254,7 @@ class ADEngine(ModelEngine):
         def update_input_ids(input_ids_tensor, new_tokens, previous_batch_indices, num_tokens):
             si.update_input_ids(input_ids_tensor, new_tokens, previous_batch_indices, num_tokens)
 
-        update_input_ids(self.input_ids_cuda[:idx], new_tokens_cuda, previous_batch_indices[:previous_batch_idx], idx)
+        update_input_ids(self.input_ids_cuda[:idx], new_tokens, previous_batch_indices[:previous_batch_idx], idx)
        
         return last_logit_only
 
