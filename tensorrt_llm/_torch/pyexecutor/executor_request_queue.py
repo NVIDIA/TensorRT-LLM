@@ -417,13 +417,13 @@ class ExecutorRequestQueue:
                 ['num_tokens', 'num_requests', 'rank', 'request_list'])
 
             all_ranks_new_requests_heap = [
-                HeapVal(0, self.expected_num_active_requests - val, tp_rank, [])
+                HeapVal(0, val, tp_rank, [])
                 for tp_rank, val in enumerate(all_ranks_num_active_requests)
             ]
 
             all_ranks_new_requests_heap = [
                 val for val in all_ranks_new_requests_heap
-                if val.num_requests > 0
+                if val.num_requests < self.expected_num_active_requests
             ]
 
             all_ranks_new_scheduled_requests = {
@@ -449,12 +449,12 @@ class ExecutorRequestQueue:
                 # Update the heap value with the new request
                 val = val._replace(
                     num_tokens=val.num_tokens + token_count,
-                    num_requests=val.num_requests - 1,
+                    num_requests=val.num_requests + 1,
                 )
 
                 val.request_list.append(req_item)
                 # If rank still has room for new requests, push back into heap
-                if val.num_requests > 0:
+                if val.num_requests < self.expected_num_active_requests:
                     heapq.heappush(all_ranks_new_requests_heap, val)
 
             # Extend all_ranks_new_requests with the new requests that have been scheduled

@@ -839,6 +839,7 @@ def run_test_attention_dp_scheduling(attention_dp_queue, waiting_queue,
         new_requests, all_ranks_num_active_requests)
 
     assert len(all_ranks_new_requests) == num_ranks
+    print("all_ranks_new_requests:", all_ranks_new_requests)
     for rank, reqs in all_ranks_new_requests.items():
         req_ids = [req.id for req in reqs]
         assert req_ids == all_ranks_expected_req_ids[rank]
