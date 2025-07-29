@@ -4,6 +4,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, fields
 from typing import List, NamedTuple, Optional, Tuple, Union
 
+from transformers import PreTrainedTokenizerBase
 import torch
 from pydantic import BaseModel
 
@@ -273,6 +274,8 @@ class SamplingParams:
     # TODO: make this a per-request parameter.
     _stream_interval: Optional[int] = field(default=None, init=False, repr=False)
 
+    tokenizer: Optional[PreTrainedTokenizerBase] = None
+
     def __post_init__(self):
         if self.pad_id is None:
             self.pad_id = self.end_id
@@ -334,6 +337,8 @@ class SamplingParams:
         return self.return_generation_logits and not self._generation_logits_auto_enabled
 
     def _setup(self, tokenizer, add_special_tokens: bool = False) -> "SamplingParams":
+        self.tokenizer = tokenizer
+
         if self.end_id is None:
             self.end_id = tokenizer.eos_token_id
             self.pad_id = tokenizer.pad_token_id

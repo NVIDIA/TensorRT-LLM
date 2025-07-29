@@ -860,7 +860,8 @@ class _TrtLLM(BaseLLM):
                 postprocess_tokenizer_dir=self.args.postprocess_tokenizer_dir,
             ),
             is_llm_executor=True,
-            lora_config=self.args.lora_config)
+            lora_config=self.args.lora_config,
+            tokenizer = self._tokenizer)
 
 
 @append_docstring(TORCH_LLM_DOCSTRING)
@@ -998,7 +999,8 @@ class _TorchLLM(BaseLLM):
             is_llm_executor=True,
             lora_config=self.args.lora_config,
             garbage_collection_gen0_threshold=self.args.
-            garbage_collection_gen0_threshold)
+            garbage_collection_gen0_threshold,
+            tokenizer = self._tokenizer)
 
     def _validate_args_for_torch_backend(self, kwargs: dict) -> None:
         """Validate that users don't pass TrtLlmArgs-specific arguments when using PyTorch backend.

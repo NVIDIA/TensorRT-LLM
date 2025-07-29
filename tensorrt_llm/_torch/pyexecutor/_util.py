@@ -34,6 +34,8 @@ from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
                         SimpleScheduler)
 from .seq_slot_manager import SeqSlotManager
 
+from transformers import PreTrainedTokenizerBase
+
 GB = 1 << 30
 
 
@@ -542,7 +544,8 @@ def create_py_executor_instance(
 
 
 def create_torch_sampler_args(executor_config: ExecutorConfig, mapping: Mapping,
-                              *, max_seq_len: int, enable_mixed_sampler: bool):
+                              *, max_seq_len: int, enable_mixed_sampler: bool,
+                              tokenizer: PreTrainedTokenizerBase):
     max_num_sequences = executor_config.max_batch_size * mapping.pp_size
     max_draft_len = (0 if executor_config.speculative_config is None else
                      executor_config.speculative_config.max_draft_len)
@@ -552,18 +555,22 @@ def create_torch_sampler_args(executor_config: ExecutorConfig, mapping: Mapping,
         max_num_sequences=max_num_sequences,
         max_beam_width=executor_config.max_beam_width,
         enable_mixed_sampler=enable_mixed_sampler,
+        tokenizer=tokenizer
     )
 
 
 def instantiate_sampler(engine: PyTorchModelEngine,
                         executor_config: ExecutorConfig,
                         pytorch_backend_config: PyTorchConfig,
-                        mapping: Mapping):
+                        mapping: Mapping,
+                        tokenizer: Optional[PreTrainedTokenizerBase]):
     sampler_args = create_torch_sampler_args(
         executor_config,
         mapping,
         max_seq_len=engine.max_seq_len,
-        enable_mixed_sampler=pytorch_backend_config.enable_mixed_sampler)
+        enable_mixed_sampler=pytorch_backend_config.enable_mixed_sampler,
+        tokenizer=tokenizer
+        )
     if mapping.cp_config.get('cp_type') == 'star_attention':
         assert pytorch_backend_config.attn_backend == "FLASHINFER_STAR_ATTENTION", "attention backend of star attention should be 'FLASHINFER_STAR_ATTENTION'"
         return TorchSampler(sampler_args)
@@ -574,7 +581,8 @@ def instantiate_sampler(engine: PyTorchModelEngine,
         decoding_mode = get_decoding_mode(executor_config)
         return TRTLLMSampler(executor_config, engine.model, engine.dtype,
                              mapping, decoding_mode,
-                             pytorch_backend_config.disable_overlap_scheduler)
+                             pytorch_backend_config.disable_overlap_scheduler,
+                             tokenizer)
     if not engine.model.model_config.is_generation:
         # NOTE: choose sampler based on model type
         return EarlyStopSampler()
