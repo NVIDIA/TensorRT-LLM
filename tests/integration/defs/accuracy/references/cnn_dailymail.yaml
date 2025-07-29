@@ -40,6 +40,8 @@ microsoft/Phi-3-small-128k-instruct:
   - accuracy: 27.208
 microsoft/Phi-3.5-mini-instruct:
   - accuracy: 31.354
+microsoft/Phi-4-mini-instruct:
+  - accuracy: 32.921
 state-spaces/mamba-130m-hf:
   - accuracy: 19.470
 lmsys/vicuna-7b-v1.3:

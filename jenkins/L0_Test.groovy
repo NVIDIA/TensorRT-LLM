@@ -1843,7 +1843,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
 
     x86SlurmTestConfigs = [
         "RTXPro6000-PyTorch-Post-Merge-1": ["rtx-pro-6000", "l0_rtx_pro_6000", 1, 1],
-        "DGX_B200-4_GPUs-PyTorch-Post-Merge-1": ["b200-4-gpus", "l0_dgx_b200", 1, 1, 4],
+        "DGX_B200-4_GPUs-PyTorch-Post-Merge-1": ["b200-x4", "l0_dgx_b200", 1, 1, 4],
     ]
     fullSet += x86SlurmTestConfigs.keySet()
 
@@ -1869,8 +1869,8 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
     fullSet += SBSATestConfigs.keySet()
 
     SBSASlurmTestConfigs = [
-        "GB200-4_GPUs-PyTorch-1": ["gb200-4-gpus", "l0_gb200", 1, 1, 4],
-        "GB200-4_GPUs-PyTorch-Post-Merge-1": ["gb200-4-gpus", "l0_gb200", 1, 1, 4],
+        "GB200-4_GPUs-PyTorch-1": ["gb200-x4", "l0_gb200", 1, 1, 4],
+        "GB200-4_GPUs-PyTorch-Post-Merge-1": ["gb200-x4", "l0_gb200", 1, 1, 4],
     ]
     fullSet += SBSASlurmTestConfigs.keySet()
 
@@ -2446,7 +2446,8 @@ pipeline {
                                 // We add a special marker to the parent job's description.
                                 // This will be used to decide whether to run multi-GPU test stage.
                                 def parentJob = globalVars[ACTION_INFO]['parents'][-2]
-                                trtllm_utils.appendBuildDescription(this, parentJob['name'], parentJob['build_number'], "====Require Multi-GPU Testing====<br/>")
+                                def archStr = (env.targetArch == X86_64_TRIPLE) ? "x86_64" : (env.targetArch == AARCH64_TRIPLE ? "SBSA" : "Unknown")
+                                trtllm_utils.appendBuildDescription(this, parentJob['name'], parentJob['build_number'], "====Require ${archStr} Multi-GPU Testing====<br/>")
                             } else {
                                 echo "No parent job found to add the special marker for executing multi-GPU test stage."
                             }
