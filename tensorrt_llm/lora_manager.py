@@ -898,19 +898,21 @@ class LoraManager(object):
 
                     # Handle missing "in" matrix (lora_A equivalent)
                     if "in" not in layer_weights:
-                        warnings.warn(
-                            f"Layer {layer_idx} is missing 'in' matrix for attn_qkv in NeMo LoRA weights, "
-                            f"creating zero tensor"
+                        raise ValueError(
+                            f"Layer {layer_idx} is missing required 'in' matrix (lora_A equivalent) for attn_qkv "
+                            f"in NeMo LoRA weights from file {model_file}. "
+                            f"LoRA adapters must contain both 'in' and 'out' matrices for all layers. "
+                            f"Please check if the LoRA checkpoint is complete or was corrupted during loading."
                         )
-                        layer_weights["in"] = torch.zeros(rank, model_config.hidden_size)
 
                     # Handle missing "out" matrix (lora_B equivalent) - 3x larger for fused QKV
                     if "out" not in layer_weights:
-                        warnings.warn(
-                            f"Layer {layer_idx} is missing 'out' matrix for attn_qkv in NeMo LoRA weights, "
-                            f"creating zero tensor"
+                        raise ValueError(
+                            f"Layer {layer_idx} is missing required 'out' matrix (lora_B equivalent) for attn_qkv "
+                            f"in NeMo LoRA weights from file {model_file}. "
+                            f"LoRA adapters must contain both 'in' and 'out' matrices for all layers. "
+                            f"Please check if the LoRA checkpoint is complete or was corrupted during loading."
                         )
-                        layer_weights["out"] = torch.zeros(3 * model_config.hidden_size, rank)
 
                     t_in = layer_weights["in"]
                     t_out = layer_weights["out"]
@@ -1125,15 +1127,19 @@ class LoraManager(object):
                         t_mag = None
                     else:
                         if "in" not in module_weights:
-                            warnings.warn(
-                                f"Module {hf_module} is missing 'in' matrix, creating zero tensor"
+                            raise ValueError(
+                                f"Module '{hf_module}' in layer {layer_idx} is missing required 'in' matrix (lora_A). "
+                                f"LoRA adapters must contain both 'in' and 'out' matrices for all target modules. "
+                                f"This indicates an incomplete or corrupted LoRA checkpoint in {model_dir}. "
+                                f"Please verify the LoRA adapter was trained and saved correctly."
                             )
-                            module_weights["in"] = torch.zeros(rank, model_config.hidden_size)
                         if "out" not in module_weights:
-                            warnings.warn(
-                                f"Module {hf_module} is missing 'out' matrix, creating zero tensor"
+                            raise ValueError(
+                                f"Module '{hf_module}' in layer {layer_idx} is missing required 'out' matrix (lora_B). "
+                                f"LoRA adapters must contain both 'in' and 'out' matrices for all target modules. "
+                                f"This indicates an incomplete or corrupted LoRA checkpoint in {model_dir}. "
+                                f"Please verify the LoRA adapter was trained and saved correctly."
                             )
-                            module_weights["out"] = torch.zeros(model_config.hidden_size, rank)
 
                         t_in = module_weights["in"]
                         t_out = module_weights["out"]
