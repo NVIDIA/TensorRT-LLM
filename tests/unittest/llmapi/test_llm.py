@@ -1509,7 +1509,8 @@ def test_llama_7b_peft_cache_config_affects_peft_cache_size():
             build_config=build_config,
             fast_build=True,
             lora_config=lora_config_no_cache_size_values,
-            peft_cache_config=PeftCacheConfig(host_cache_size=1))
+            peft_cache_config=PeftCacheConfig(
+                host_cache_size=1))  # size in bytes
 
     # Test that too small PeftCacheConfig.device_cache_percent causes failure
     with pytest.raises(RuntimeError):
@@ -1519,7 +1520,7 @@ def test_llama_7b_peft_cache_config_affects_peft_cache_size():
             build_config=build_config,
             fast_build=True,
             lora_config=lora_config_no_cache_size_values,
-            peft_cache_config=PeftCacheConfig(device_cache_percent=0.000001))
+            peft_cache_config=PeftCacheConfig(device_cache_percent=0.0000001))
 
 
 def test_llama_7b_lora_config_overrides_peft_cache_config():
@@ -1538,8 +1539,9 @@ def test_llama_7b_lora_config_overrides_peft_cache_config():
             max_lora_rank=8,
             max_loras=2,
             max_cpu_loras=2),
-        peft_cache_config=PeftCacheConfig(host_cache_size=1,
-                                          device_cache_percent=0.000001))
+        peft_cache_config=PeftCacheConfig(
+            host_cache_size=1,  # size in bytes
+            device_cache_percent=0.0000001))
 
 
 @skip_gpu_memory_less_than_40gb

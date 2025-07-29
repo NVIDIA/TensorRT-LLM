@@ -310,7 +310,8 @@ def test_llama_7b_peft_cache_config_affects_peft_cache_size():
         check_llama_7b_multi_lora_from_request_test_harness(
             LLM,
             lora_config=lora_config_no_cache_size_values,
-            peft_cache_config=PeftCacheConfig(host_cache_size=1),
+            peft_cache_config=PeftCacheConfig(
+                host_cache_size=1),  # size in bytes
             # Disable CUDA graph
             # TODO: remove this once we have a proper fix for CUDA graph in LoRA
             cuda_graph_config=None)
@@ -320,7 +321,7 @@ def test_llama_7b_peft_cache_config_affects_peft_cache_size():
         check_llama_7b_multi_lora_from_request_test_harness(
             LLM,
             lora_config=lora_config_no_cache_size_values,
-            peft_cache_config=PeftCacheConfig(device_cache_percent=0.000001),
+            peft_cache_config=PeftCacheConfig(device_cache_percent=0.0000001),
             # Disable CUDA graph
             # TODO: remove this once we have a proper fix for CUDA graph in LoRA
             cuda_graph_config=None)
@@ -337,8 +338,9 @@ def test_llama_7b_lora_config_overrides_peft_cache_config():
             max_lora_rank=8,
             max_loras=2,
             max_cpu_loras=2),
-        peft_cache_config=PeftCacheConfig(host_cache_size=1,
-                                          device_cache_percent=0.000001),
+        peft_cache_config=PeftCacheConfig(
+            host_cache_size=1,  # size in bytes
+            device_cache_percent=0.0000001),
         # Disable CUDA graph
         # TODO: remove this once we have a proper fix for CUDA graph in LoRA
         cuda_graph_config=None)
