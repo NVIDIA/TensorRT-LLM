@@ -20,6 +20,7 @@ from .bert.model import (BertForQuestionAnswering,
 from .bloom.model import BloomForCausalLM, BloomModel
 from .chatglm.config import ChatGLMConfig
 from .chatglm.model import ChatGLMForCausalLM, ChatGLMModel
+from .chatglm.glm4_moe_model import GLM4MoEForCausalLM
 from .clip.model import CLIPVisionTransformer
 from .cogvlm.config import CogVLMConfig
 from .cogvlm.model import CogVLMForCausalLM
@@ -109,6 +110,7 @@ __all__ = [
     'ChatGLMConfig',
     'ChatGLMForCausalLM',
     'ChatGLMModel',
+    'GLM4MoEForCausalLM',
     'BaichuanForCausalLM',
     'QWenConfig'
     'QWenForCausalLM',
@@ -165,6 +167,8 @@ MODEL_MAP = {
     'ChatGLMModel': ChatGLMForCausalLM,
     'ChatGLMForCausalLM': ChatGLMForCausalLM,
     'ChatGLMForConditionalGeneration': ChatGLMForCausalLM,
+    'GLM4MoEModel': GLM4MoEForCausalLM,
+    'GLM4MoEForCausalLM': GLM4MoEForCausalLM,
     'LlamaForCausalLM': LLaMAForCausalLM,
     'LlavaLlamaModel': LLaMAForCausalLM,
     'LlavaNextForConditionalGeneration': LlavaNextVisionWrapper,

@@ -18,9 +18,9 @@ from ...mapping import Mapping
 from ..convert_utils import infer_dtype
 from ..modeling_utils import PretrainedConfig, QuantConfig
 
-GLM_VERSIONS = ['glm4', 'chatglm3', 'chatglm2', 'chatglm', 'glm']
+GLM_VERSIONS = ['glm4', 'glm4_moe', 'chatglm3', 'chatglm2', 'chatglm', 'glm']
 GLM_ARCH1_VERSIONS = ['chatglm', 'glm']
-GLM_ARCH2_VERSIONS = ['glm4', 'chatglm3', 'chatglm2']
+GLM_ARCH2_VERSIONS = ['glm4', 'glm4_moe', 'chatglm3', 'chatglm2']
 
 
 class ChatGLMConfig(PretrainedConfig):
@@ -130,6 +130,12 @@ class ChatGLMConfig(PretrainedConfig):
             hf_config.max_position_embeddings = hf_config.seq_length
             hf_config.rmsnorm = getattr(hf_config, 'rmsnorm', 1.0)
             hf_config.rope_ratio = getattr(hf_config, 'rope_ratio', 1.0)
+            
+            # GLM4 MoE specific configuration
+            if chatglm_version == 'glm4_moe':
+                hf_config.num_experts = getattr(hf_config, 'num_experts', 8)
+                hf_config.num_experts_per_tok = getattr(hf_config, 'num_experts_per_tok', 2)
+                hf_config.interleave_moe_layer_step = getattr(hf_config, 'interleave_moe_layer_step', 2)
 
         if chatglm_version == 'glm':
             position_embedding_type = 'learned_absolute'
@@ -146,7 +152,7 @@ class ChatGLMConfig(PretrainedConfig):
                     'type': 'linear',
                     'factor': hf_config.rope_ratio
                 }
-        elif chatglm_version == 'chatglm3' or chatglm_version == 'glm4':
+        elif chatglm_version == 'chatglm3' or chatglm_version == 'glm4' or chatglm_version == 'glm4_moe':
             rotary_base *= hf_config.rope_ratio
 
         dtype = infer_dtype(dtype, getattr(hf_config, 'torch_dtype', None))
