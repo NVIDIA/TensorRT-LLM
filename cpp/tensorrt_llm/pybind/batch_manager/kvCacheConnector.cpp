@@ -22,75 +22,9 @@
 
 namespace
 {
-
-using KvCacheConnectorScheduler = tensorrt_llm::batch_manager::kv_connector::KvCacheConnectorScheduler;
-using KvCacheConnectorWorker = tensorrt_llm::batch_manager::kv_connector::KvCacheConnectorWorker;
 using KvCacheConnectorManager = tensorrt_llm::batch_manager::kv_connector::KvCacheConnectorManager;
 
-using NumNewMatchedTokens = std::tuple<SizeType32, bool>;
-
 namespace tb = tensorrt_llm::batch_manager;
-
-class PyKvCacheConnectorScheduler : public KvCacheConnectorScheduler, py::trampoline_self_life_support
-{
-public:
-    using KvCacheConnectorScheduler::KvCacheConnectorScheduler;
-
-    NumNewMatchedTokens getNumNewMatchedTokens(LlmRequest const& request, SizeType32 numComputedTokens) override
-    {
-        PYBIND11_OVERRIDE_PURE(
-            NumNewMatchedTokens, KvCacheConnectorScheduler, getNumNewMatchedTokens, request, numComputedTokens);
-    }
-
-    void updateStateAfterAlloc() override
-    {
-        PYBIND11_OVERRIDE(void, KvCacheConnectorScheduler, updateStateAfterAlloc);
-    }
-
-    bool requestFinished(LlmRequest const& request) override
-    {
-        PYBIND11_OVERRIDE(bool, KvCacheConnectorScheduler, requestFinished, request);
-    }
-};
-
-class PyKvCacheConnectorWorker : public KvCacheConnectorWorker, py::trampoline_self_life_support
-{
-public:
-    using KvCacheConnectorWorker::KvCacheConnectorWorker;
-
-    void registerKvCaches(kv_connector::KvCacheConnectorPoolsData const& kvCacheConnectorPoolsData) override
-    {
-        PYBIND11_OVERRIDE(void, KvCacheConnectorWorker, registerKvCaches, kvCacheConnectorPoolsData);
-    }
-
-    void startLoadKv() override
-    {
-        PYBIND11_OVERRIDE_PURE(void, KvCacheConnectorWorker, startLoadKv);
-    }
-
-    void waitForLayerLoad(SizeType32 layer_idx) override
-    {
-        PYBIND11_OVERRIDE_PURE(void, KvCacheConnectorWorker, waitForLayerLoad, layer_idx);
-    }
-
-    void saveKvLayer(SizeType32 layer_idx) override
-    {
-        PYBIND11_OVERRIDE_PURE(void, KvCacheConnectorWorker, saveKvLayer, layer_idx);
-    }
-
-    void waitForSave() override
-    {
-        PYBIND11_OVERRIDE_PURE(void, KvCacheConnectorWorker, waitForSave);
-    }
-
-    using FinishedReqs = std::tuple<std::vector<RequestIdType>, std::vector<RequestIdType>>;
-
-    FinishedReqs getFinished(std::vector<RequestIdType> const& finishedGenReqIds,
-        std::vector<RequestIdType> const& startedLoadingReqIds) override
-    {
-        PYBIND11_OVERRIDE(FinishedReqs, KvCacheConnectorWorker, getFinished, finishedGenReqIds, startedLoadingReqIds);
-    }
-};
 
 class PyKvCacheConnectorManager : public KvCacheConnectorManager, py::trampoline_self_life_support
 {
@@ -122,26 +56,6 @@ void tensorrt_llm::batch_manager::kv_cache_manager::KVCacheManagerConnectorBindi
         .def_property_readonly("pools", &tb::kv_connector::KvCacheConnectorPoolsData::getPoolsData)
         .def_property_readonly(
             "layer_to_pool_mapping", &tb::kv_connector::KvCacheConnectorPoolsData::getLayerToPoolMapping);
-
-    py::class_<tb::kv_connector::KvCacheConnectorWorker, PyKvCacheConnectorWorker, py::smart_holder>(
-        m, "KvCacheConnectorWorker")
-        .def(py::init<>())
-        .def(
-            "register_kv_caches", &tb::kv_connector::KvCacheConnectorWorker::registerKvCaches, py::arg("kv_cache_data"))
-        .def("start_load_kv", &tb::kv_connector::KvCacheConnectorWorker::startLoadKv)
-        .def("wait_for_layer_load", &tb::kv_connector::KvCacheConnectorWorker::waitForLayerLoad, py::arg("layer_idx"))
-        .def("save_kv_layer", &tb::kv_connector::KvCacheConnectorWorker::saveKvLayer, py::arg("layer_idx"))
-        .def("wait_for_save", &tb::kv_connector::KvCacheConnectorWorker::waitForSave)
-        .def("get_finished", &tb::kv_connector::KvCacheConnectorWorker::getFinished, py::arg("started_loading_req_ids"),
-            py::arg("finished_gen_req_ids"));
-
-    py::class_<tb::kv_connector::KvCacheConnectorScheduler, PyKvCacheConnectorScheduler, py::smart_holder>(
-        m, "KvCacheConnectorScheduler")
-        .def(py::init<>())
-        .def("get_num_new_matched_tokens", &tb::kv_connector::KvCacheConnectorScheduler::getNumNewMatchedTokens,
-            py::arg("request"), py::arg("num_computed_tokens"))
-        .def("update_state_after_alloc", &tb::kv_connector::KvCacheConnectorScheduler::updateStateAfterAlloc)
-        .def("request_finished", &tb::kv_connector::KvCacheConnectorScheduler::requestFinished, py::arg("request"));
 
     py::class_<tb::kv_connector::KvCacheConnectorManager, PyKvCacheConnectorManager, py::smart_holder>(
         m, "KvCacheConnectorManager")
