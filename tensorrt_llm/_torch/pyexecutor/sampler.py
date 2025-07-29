@@ -151,6 +151,14 @@ def top_p_sampling_batch(logits: torch.Tensor, top_p: float = 0.9):
     return next_tokens, softmax
 
 
+def temperature_sampling_batch(logits: torch.Tensor, temperature: float):
+    assert temperature > 0, "Temperature must be positive"
+    scaled_logits = logits / temperature
+    softmax_probs = torch.softmax(scaled_logits, dim=-1)
+    next_tokens = torch.multinomial(softmax_probs, num_samples=1).squeeze(-1)
+    return next_tokens, softmax_probs
+
+
 def greedy_search_sampling_batch(logits):
     next_tokens = torch.argmax(logits, dim=-1)
     softmax = torch.softmax(logits, dim=-1)
@@ -159,18 +167,29 @@ def greedy_search_sampling_batch(logits):
 
 TopK = tuple[Literal["top_k"], int]
 TopP = tuple[Literal["top_p"], float]
+Temperature = tuple[Literal["temperature"], float]
 Greedy = tuple[Literal["greedy"], None]
 GREEDY: Greedy = ("greedy", None)
-Strategy = TopK | TopP | Greedy
+Strategy = TopK | TopP | Greedy | Temperature
 
 
 def request_strategy(request: LlmRequest) -> Strategy:
-    if request.sampling_config.top_p is not None and len(
-            request.sampling_config.top_p) > 0:
-        return ("top_p", request.sampling_config.top_p[0])
-    elif request.sampling_config.top_k is not None and len(
-            request.sampling_config.top_k) > 0:
-        return ("top_k", request.sampling_config.top_k[0])
+    """
+    In Class SamplingParams
+    top_p defaults to 1.0
+    top_k defaults to 0
+    temperature defaults to 1.0
+    """
+    top_p = request.sampling_config.top_p[0]
+    top_k = request.sampling_config.top_k[0]
+    temperature = request.sampling_config.temperature[0]
+
+    if top_p != 1.0:
+        return ("top_p", top_p)
+    elif top_k != 0:
+        return ("top_k", top_k)
+    elif temperature != 1.0:
+        return ("temperature", temperature)
     else:
         return ("greedy", None)
 
@@ -185,6 +204,8 @@ def sample(strategy: Strategy, logits: torch.Tensor):
             return top_k_sampling_batch(logits, top_k)
         case ("top_p", top_p):
             return top_p_sampling_batch(logits, top_p)
+        case ("temperature", temperature):
+            return temperature_sampling_batch(logits, temperature)
         case ("greedy", None):
             return greedy_search_sampling_batch(logits)
 
@@ -398,35 +419,26 @@ class TorchSampler(Sampler):
                           *,
                           gen_logits_host: torch.Tensor | None = None,
                           log_probs_host: torch.Tensor | None = None):
-        beam_width = self.MAX_BEAM_WIDTH
+        self.MAX_BEAM_WIDTH
         beam = self.BEAM
         raw_logits = model_outputs["logits"]
         num_steps = [1 + len(req.py_draft_tokens) for req in requests]
         sum_steps = sum(num_steps)
         no_draft_tokens = len(requests) == sum_steps
-        fast_path = not self.enable_mixed_sampler and no_draft_tokens and gen_logits_host is None and log_probs_host is None
 
         seq_slots = torch.as_tensor([r.seq_slot for r in requests])
         seq_slots = seq_slots.to(device="cuda", non_blocking=True)
-
-        if fast_path:
-            logits = raw_logits[:len(requests)]
-            next_tokens = torch.argmax(logits, dim=-1)
-            self.append_eagle3(next_tokens, model_outputs)
-            int_next_tokens = next_tokens.to(torch.int, non_blocking=True)
-            next_tokens = int_next_tokens.view(1, -1, beam_width)
-            new_tokens[:1].index_copy_(1, seq_slots, next_tokens)
-            return
 
         strategies = sampling_strategies(requests)
         batched_next_tokens, batched_softmax = None, None
         batched_strategy: Strategy | None = GREEDY
         if self.enable_mixed_sampler:
             assert "d2t" not in model_outputs, "eagle3 does not yet support non-greedy sampling"
-            if len(set(strategies)) == 1:
-                batched_strategy = strategies[0]
-            else:
-                batched_strategy = None
+
+        if len(set(strategies)) == 1:
+            batched_strategy = strategies[0]
+        else:
+            batched_strategy = None
 
         if batched_strategy is not None:
             logits = raw_logits[:sum_steps]
@@ -440,6 +452,7 @@ class TorchSampler(Sampler):
             logits = raw_logits[input_slice]
             if batched_next_tokens is None:
                 next_tokens, softmax = sample(strategy, logits)
+                self.append_eagle3(next_tokens, model_outputs)
             else:
                 next_tokens = batched_next_tokens[input_slice]
                 softmax = batched_softmax[input_slice]
