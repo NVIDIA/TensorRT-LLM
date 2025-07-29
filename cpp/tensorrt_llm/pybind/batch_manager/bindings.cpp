@@ -256,7 +256,9 @@ void initBindings(pybind11::module_& m)
                 }
             })
         .def_property("is_dummy_request", &GenLlmReq::isDummyRequest, &GenLlmReq::setIsDummyRequest)
-        .def_property_readonly("return_perf_metrics", &GenLlmReq::getReturnPerfMetrics);
+        .def_property_readonly("return_perf_metrics", &GenLlmReq::getReturnPerfMetrics)
+        .def_property("is_kv_cache_connector_async_onboard", &GenLlmReq::isKvCacheConnectorAsyncOnboard,
+            &GenLlmReq::setIsKvCacheConnectorAsyncOnboard);
 
     py::classh<tb::LlmRequest, GenLlmReq>(m, "LlmRequest", pybind11::dynamic_attr())
         .def(py::init<>(

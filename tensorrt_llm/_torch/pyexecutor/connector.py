@@ -127,6 +127,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
 
         if load_kv_async:
             self.new_finished.loading[request.request_id] = request
+            request.is_kv_cache_connector_async_onboard = True
 
         return num_tokens
 
@@ -152,6 +153,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
 
         if saving_async:
             self.new_finished.saving[req.request_id] = req
+            req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
 
         return saving_async
 

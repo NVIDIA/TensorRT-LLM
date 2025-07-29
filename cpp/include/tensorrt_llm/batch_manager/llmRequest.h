@@ -1843,6 +1843,16 @@ public:
         return mIsDummyRequest;
     }
 
+    void setIsKvCacheConnectorAsyncOnboard(bool isKvCacheConnectorAsyncOnboard)
+    {
+        mIsKvCacheConnectorAsyncOnboard = isKvCacheConnectorAsyncOnboard;
+    }
+
+    [[nodiscard]] bool isKvCacheConnectorAsyncOnboard() const
+    {
+        return mIsKvCacheConnectorAsyncOnboard;
+    }
+
     RequestIdType mRequestId;
     SizeType32 mPromptLen;
     SizeType32 mMaxNewTokens;
@@ -2016,6 +2026,8 @@ protected:
     std::vector<size_t> mRequestedBlockHashes;
 
     bool mIsDummyRequest{false};
+
+    bool mIsKvCacheConnectorAsyncOnboard{false};
 
 private:
     void initialize(VecTokens const& inputTokens, bool outputLogProbs)
