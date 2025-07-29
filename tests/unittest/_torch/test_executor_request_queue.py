@@ -746,6 +746,13 @@ def append_to_waiting_queue(waiting_queue, rank, attention_dp_relax):
             2: [2, 6],
             3: [3]
         }),
+        # Case: Balanced distribution of relaxed requests
+        (3, [1, 2, 3, 0], [(None, True)] * 13, {
+            0: [1, 4],
+            1: [2],
+            2: [],
+            3: [0, 3, 5]
+        }),
         # Case: Limited by max active
         (3, [0, 0, 0, 0], [(None, True)] * 13, {
             0: [0, 4, 8],
@@ -763,9 +770,9 @@ def append_to_waiting_queue(waiting_queue, rank, attention_dp_relax):
         # Case: Rank 0 is full and cannot schedule attention_dp rank request
         (3, [3, 1, 3, 0], [(0, False), (0, True)], {
             0: [],
-            1: [1],
+            1: [],
             2: [],
-            3: []
+            3: [1]
         }),
         # Case: Only room for 1 request, need to skip req0 with attention dp rank
         (3, [3, 2, 3, 3], [(0, False), (0, True)], {
@@ -832,6 +839,7 @@ def run_test_attention_dp_scheduling(attention_dp_queue, waiting_queue,
         new_requests, all_ranks_num_active_requests)
 
     assert len(all_ranks_new_requests) == num_ranks
+    print("all_ranks_new_requests:", all_ranks_new_requests)
     for rank, reqs in all_ranks_new_requests.items():
         req_ids = [req.id for req in reqs]
         assert req_ids == all_ranks_expected_req_ids[rank]
