@@ -31,47 +31,6 @@ using namespace tensorrt_llm::batch_manager;
 namespace tensorrt_llm::batch_manager::kv_connector
 {
 
-struct NewRequestData
-{
-    NewRequestData(RequestIdType requestId, std::vector<runtime::UniqueToken> const& newTokens,
-        std::vector<SizeType32> const& blockIds, SizeType32 numComputedTokens)
-        : requestId(requestId)
-        , newTokens(newTokens)
-        , blockIds(blockIds)
-        , numComputedTokens(numComputedTokens)
-    {
-    }
-
-    RequestIdType requestId;
-    std::vector<runtime::UniqueToken> newTokens;
-    std::vector<SizeType32> blockIds;
-    SizeType32 numComputedTokens;
-};
-
-struct CachedRequestData
-{
-    CachedRequestData(RequestIdType requestId, std::vector<runtime::UniqueToken> const& newTokens,
-        std::vector<SizeType32> const& newBlockIds, SizeType32 numComputedTokens)
-        : requestId(requestId)
-        , newTokens(newTokens)
-        , newBlockIds(newBlockIds)
-        , numComputedTokens(numComputedTokens)
-    {
-    }
-
-    RequestIdType requestId;
-    std::vector<runtime::UniqueToken> newTokens;
-    std::vector<SizeType32> newBlockIds;
-    SizeType32 numComputedTokens;
-};
-
-class SchedulerOutput
-{
-public:
-    std::vector<NewRequestData> newRequests;
-    std::vector<CachedRequestData> cachedRequests;
-};
-
 class KvCacheConnectorPoolData
 {
 public:
