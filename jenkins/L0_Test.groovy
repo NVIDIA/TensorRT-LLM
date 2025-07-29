@@ -2446,7 +2446,8 @@ pipeline {
                                 // We add a special marker to the parent job's description.
                                 // This will be used to decide whether to run multi-GPU test stage.
                                 def parentJob = globalVars[ACTION_INFO]['parents'][-2]
-                                trtllm_utils.appendBuildDescription(this, parentJob['name'], parentJob['build_number'], "====Require Multi-GPU Testing====<br/>")
+                                def archStr = (env.targetArch == X86_64_TRIPLE) ? "x86_64" : (env.targetArch == AARCH64_TRIPLE ? "SBSA" : "Unknown")
+                                trtllm_utils.appendBuildDescription(this, parentJob['name'], parentJob['build_number'], "====Require ${archStr} Multi-GPU Testing====<br/>")
                             } else {
                                 echo "No parent job found to add the special marker for executing multi-GPU test stage."
                             }
