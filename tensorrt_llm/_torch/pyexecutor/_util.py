@@ -31,6 +31,8 @@ from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
                         SimpleScheduler)
 from .seq_slot_manager import SeqSlotManager
 
+from transformers import PreTrainedTokenizerBase
+
 GB = 1 << 30
 
 
@@ -563,15 +565,16 @@ def create_torch_sampler_args(executor_config: ExecutorConfig, mapping: Mapping,
 def instantiate_sampler(engine: PyTorchModelEngine,
                         executor_config: ExecutorConfig,
                         pytorch_backend_config: PyTorchConfig,
-                        mapping: Mapping):
+                        mapping: Mapping,
+                        tokenizer:PreTrainedTokenizerBase):
     sampler_args = create_torch_sampler_args(
         executor_config,
         mapping,
         max_seq_len=engine.max_seq_len,
-        enable_mixed_sampler=pytorch_backend_config.enable_mixed_sampler)
+        enable_mixed_sampler=pytorch_backend_config.enable_mixed_sampler,)
     if mapping.cp_config.get('cp_type') == 'star_attention':
         assert pytorch_backend_config.attn_backend == "FLASHINFER_STAR_ATTENTION", "attention backend of star attention should be 'FLASHINFER_STAR_ATTENTION'"
-        return TorchSampler(sampler_args)
+        return TorchSampler(sampler_args,tokenizer)
     if engine.spec_config is not None and engine.spec_config.spec_dec_mode.has_spec_decoder(
     ):
         return get_spec_decoder(sampler_args, engine.spec_config)
@@ -579,11 +582,12 @@ def instantiate_sampler(engine: PyTorchModelEngine,
         decoding_mode = get_decoding_mode(executor_config)
         return TRTLLMSampler(executor_config, engine.model, engine.dtype,
                              mapping, decoding_mode,
-                             pytorch_backend_config.disable_overlap_scheduler)
+                             pytorch_backend_config.disable_overlap_scheduler,
+                             tokenizer)
     if not engine.model.model_config.is_generation:
         # NOTE: choose sampler based on model type
         return EarlyStopSampler()
-    return TorchSampler(sampler_args)
+    return TorchSampler(sampler_args,tokenizer)
 
 
 def get_decoding_mode(executor_config: ExecutorConfig) -> DecodingMode:
