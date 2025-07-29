@@ -90,9 +90,10 @@ public:
         PYBIND11_OVERLOAD_PURE(tbk::KvCacheStats, tbk::BaseKVCacheManager, getKvCacheStats);
     }
 
-    void addToken(tb::LlmRequest::RequestIdType requestId) override
+    std::optional<SizeType32> addToken(tb::LlmRequest::RequestIdType requestId, bool returnNewBlockId = false) override
     {
-        PYBIND11_OVERLOAD_PURE(void, tbk::BaseKVCacheManager, addToken, requestId);
+        PYBIND11_OVERLOAD_PURE(
+            std::optional<SizeType32>, tbk::BaseKVCacheManager, addToken, requestId, returnNewBlockId);
     }
 
     void addSequence(tb::LlmRequest::RequestIdType requestId, SizeType32 inputLength, SizeType32 beamWidth,
@@ -347,7 +348,7 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
             [](tbk::BaseKVCacheManager& self) { return self.getOffsetTableDimensions().maxBlocksPerSeq; })
         .def("get_needed_blocks_one_step", &BaseKVCacheManager::getNeededBlocksOneStep)
         .def("get_remaining_blocks_to_completion", &BaseKVCacheManager::getRemainingBlocksToCompletion)
-        .def("add_token", &BaseKVCacheManager::addToken)
+        .def("add_token", &BaseKVCacheManager::addToken, py::arg("request_id"), py::arg("return_new_block_id") = false)
         .def("add_sequence", &BaseKVCacheManager::addSequence, py::arg("request_id"), py::arg("input_length"),
             py::arg("beam_width"), py::arg("llm_request") = std::nullopt,
             py::arg("kv_cache_connector_manager") = std::nullopt)

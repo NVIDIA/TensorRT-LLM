@@ -17,7 +17,7 @@ from tensorrt_llm.sampling_params import SamplingParams
 from ..._utils import binding_dtype_size, nvtx_range
 from ...logger import logger
 from ...mapping import Mapping
-from .connector import KvCacheConnectorManager
+from .connector import KvCacheConnectorManager, SchedulerOutput
 from .llm_request import (LlmRequest, LlmRequestState, SamplingConfig,
                           get_draft_token_length)
 from .scheduler import ScheduledRequests
@@ -363,6 +363,9 @@ class KVCacheManager(BaseResourceManager):
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         context_batch = scheduled_batch.context_requests
         generation_batch = scheduled_batch.generation_requests
+
+        scheduler_output = SchedulerOutput()
+
         # allocate KV Cache
         for req in context_batch:
             req_beam_width = req.sampling_config.beam_width
@@ -386,10 +389,41 @@ class KVCacheManager(BaseResourceManager):
                     for _ in range(get_draft_token_length(req)):
                         self.impl.add_token(req.py_request_id)
 
+                    if not req.is_kv_cache_connector_async_onboard:
+                        scheduler_output.add_request(
+                            req.request_id, req.get_tokens(0),
+                            self.impl.get_cache_block_ids(
+                                req.request_id,
+                                self.max_attention_window_vec[0]),
+                            req.context_current_position)
+                else:
+                    if req.is_first_context_chunk or req.is_kv_cache_connector_async_onboard:
+                        req.is_kv_cache_connector_async_onboard = False
+                        scheduler_output.add_request(
+                            req.request_id, req.get_tokens(0),
+                            self.impl.get_cache_block_ids(
+                                req.request_id,
+                                self.max_attention_window_vec[0]),
+                            req.context_current_position)
+                    else:
+                        scheduler_output.add_request(
+                            req.request_id, [], [],
+                            req.context_current_position)
+
         for req in generation_batch:
-            self.impl.add_token(req.py_request_id)
+            new_block_id = self.impl.add_token(req.py_request_id, True)
+
             for _ in range(get_draft_token_length(req)):
                 self.impl.add_token(req.py_request_id)
+
+            tokens = req.get_tokens(0)
+
+            scheduler_output.add_request(
+                req.request_id, tokens[-1:],
+                [new_block_id] if new_block_id is not None else [], len(tokens))
+
+        if self.kv_connector_manager is not None:
+            self.kv_connector_manager.set_scheduler_output(scheduler_output)
 
     def add_dummy_requests(
         self,
