@@ -19,6 +19,7 @@
 
 #include "tensorrt_llm/batch_manager/common.h"
 #include "tensorrt_llm/batch_manager/decoderBuffers.h"
+#include "tensorrt_llm/batch_manager/guidedDecoder.h"
 #include "tensorrt_llm/batch_manager/microBatchScheduler.h"
 #include "tensorrt_llm/batch_manager/peftCacheManager.h"
 #include "tensorrt_llm/batch_manager/rnnStateManager.h"
@@ -394,6 +395,15 @@ void initBindings(pybind11::module_& m)
     py::classh<tb::rnn_state_manager::RnnStateManager>(m, "RnnStateManager")
         .def(py::init<tr::SizeType32, tr::ModelConfig, tr::WorldConfig, tr::BufferManager>(),
             py::arg("max_num_sequences"), py::arg("model_config"), py::arg("world_config"), py::arg("buffer_manager"));
+
+    py::classh<tb::GuidedDecoder>(m, "GuidedDecoder")
+        .def(py::init<executor::GuidedDecodingConfig const&, tr::SizeType32, tr::SizeType32, nvinfer1::DataType,
+                 tr::BufferManager const&>(),
+            py::arg("guided_decoding_config"), py::arg("max_num_sequences"), py::arg("vocab_size_padded"),
+            py::arg("logits_dtype"), py::arg("buffer_manager"))
+        .def_property_readonly("logits_bitmask", &tb::GuidedDecoder::getLogitsBitmask)
+        .def_property_readonly("logits_bitmask_host", &tb::GuidedDecoder::getLogitsBitmaskHost)
+        .def("inc_logits_bitmask_host", &tb::GuidedDecoder::incLogitsBitmaskHost, py::arg("stream"));
 
     py::class_<tb::DecoderInputBuffers>(m, "DecoderInputBuffers")
         .def(py::init<runtime::SizeType32, runtime::SizeType32, tr::BufferManager>(), py::arg("max_batch_size"),

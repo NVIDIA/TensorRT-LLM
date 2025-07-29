@@ -36,12 +36,25 @@ class GuidedDecoder
 public:
     using TensorPtr = runtime::ITensor::SharedPtr;
     using SizeType32 = tensorrt_llm::runtime::SizeType32;
+    using CudaStream = tensorrt_llm::runtime::CudaStream;
     using BitmaskT = uint32_t;
 
     GuidedDecoder(executor::GuidedDecodingConfig const& guidedDecodingConfig, SizeType32 maxNumSequences,
         SizeType32 vocabSizePadded, nvinfer1::DataType logitsDtype, runtime::BufferManager const& runtimeBufferManager);
     void build(ScheduledRequests const& scheduledRequests);
     void execute(DecoderInputBuffers const& decoderInputBuffers, runtime::BufferManager const& runtimeBufferManager);
+
+    TensorPtr getLogitsBitmask() const
+    {
+        return mLogitsBitmask;
+    }
+
+    TensorPtr getLogitsBitmaskHost() const
+    {
+        return mLogitsBitmaskHost;
+    }
+
+    void incLogitsBitmaskHost(CudaStream const& stream);
 
 private:
     executor::GuidedDecodingConfig::GuidedDecodingBackend mGuidedDecodingBackend;
