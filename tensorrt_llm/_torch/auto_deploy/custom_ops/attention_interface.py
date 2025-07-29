@@ -130,10 +130,10 @@ class SequenceInfo:
         # Need to allocated input_ids and position_ids on the GPUs to avoid overheads of tensor creation in every forward pass.s\
         self.input_ids = torch.ones(self.max_num_tokens, dtype=torch.int, device=self.device)
         self.position_ids = torch.zeros(self.max_num_tokens, dtype=torch.long, device=self.device)
-        self.seq_len = torch.empty(self.max_batch_size, dtype=torch.int, device=self.device)
+        self.seq_len = torch.empty(self.max_batch_size, dtype=torch.int)
         self.input_pos = torch.empty_like(self.seq_len)
-        self.cache_loc = torch.empty(self.num_pages, dtype=torch.int)
-        self.pages_per_seq = torch.empty_like(self.seq_len)
+        self.cache_loc = torch.empty(self.num_pages, dtype=torch.int, device=self.device)
+        self.pages_per_seq = torch.empty_like(self.seq_len, device=self.device)
         self.num_tokens = torch.empty(1, dtype=torch.int, device=self.device)
         assert self.num_pages >= self.max_batch_size, (
             "num_pages must be greater than max_batch_size"
@@ -150,22 +150,26 @@ class SequenceInfo:
         # call reset once to initialize the tensors
         self.reset()
 
+
     @property
     def args(self) -> Tuple[torch.Tensor, ...]:
-        args = []
-        for f in fields(self):
-            val = getattr(self, f.name)
-            if isinstance(val, torch.Tensor):
-                if f.name == "input_ids" or f.name == "position_ids":
-                    shape = val.shape
-                    if any(s == 1 for s in shape):
-                        val = val.flatten()[:self.num_tokens]
-                        val = self.maybe_reshape_for_generate(val)
-                args.append(val)
-            if len(args) >= self._num_uncached_attn_args and not self._is_cached_attn:
-                break
-            
-        return tuple(args)
+        @nvtx_range("attention_interface_args")
+        def get_args():
+            args = []
+            for f in fields(self):
+                val = getattr(self, f.name)
+                if isinstance(val, torch.Tensor):
+                    if f.name == "input_ids" or f.name == "position_ids":
+                        shape = val.shape
+                        if any(s == 1 for s in shape):
+                            val = val.flatten()[:self.num_tokens]
+                            val = self.maybe_reshape_for_generate(val)
+                    args.append(val)
+                if len(args) >= self._num_uncached_attn_args and not self._is_cached_attn:
+                    break
+                
+            return tuple(args)
+        return get_args()
 
     @property
     def _num_uncached_attn_args(self) -> int:
@@ -438,6 +442,20 @@ class SequenceInfo:
         
         self.position_ids = self.maybe_reshape_for_generate(self.position_ids)
 
+    @nvtx_range("ad_update_sequence_lengths")
+    def update_sequence_lengths(self, sequence_lengths: List[int]) -> None:
+        self._sequence_lengths = sequence_lengths
+        self.seq_len.zero_()
+        self.num_tokens.copy_(torch.tensor(sum(self._sequence_lengths), dtype=torch.int), non_blocking=True)
+        self.seq_len[: len(self._sequence_lengths)].copy_(torch.tensor(self._sequence_lengths), non_blocking=True)
+
+    def update_input_ids(self, input_ids_host: torch.Tensor, new_tokens: Optional[torch.Tensor] = None, previous_batch_indices: List[int] = [], num_tokens: int = 0) -> None:
+        self.input_ids = self.input_ids.flatten()
+        self.input_ids[:num_tokens].copy_(input_ids_host, non_blocking=True)
+        if new_tokens is not None:
+            self.input_ids[self.input_ids == -1] = new_tokens[0,previous_batch_indices,0]
+        self.input_ids = self.maybe_reshape_for_generate(self.input_ids)
+        
     @nvtx_range("ad_nest_sequences")
     def nest_sequences(self, 
                        input_ids: Sequence[Sequence[int]], 
@@ -463,8 +481,6 @@ class SequenceInfo:
             for lst in input_ids
             for val in (lst.detach().tolist() if isinstance(lst, torch.Tensor) else lst)
         ]
-        # self.input_ids = torch.tensor(ids_list, dtype=dtype, pin_memory=True, device=self.device)
-        # self.input_ids = torch.tensor(ids_list, dtype=dtype, pin_memory=True)
         input_ids_host = torch.tensor(ids_list, dtype=dtype, pin_memory=True)
         self.input_ids = self.input_ids.flatten()
         if allow_realloc:
@@ -492,11 +508,11 @@ class SequenceInfo:
         If ``reset=True`, ``input_pos`` will be reset to zero before updating.
         """
         if not isinstance(seq_len, torch.Tensor):
-            seq_len = torch.tensor(seq_len, dtype=torch.int)
+            seq_len = torch.tensor(seq_len, dtype=torch.int, pin_memory=True)
         bs = len(seq_len) if seq_len.dim() > 0 else self.max_batch_size
 
         if reset:
-            self.input_pos[:bs] = seq_len.to(self.device)
+            self.input_pos[:bs].copy_(seq_len, non_blocking=True)
         else:
             self.input_pos[:bs] += seq_len.to(self.device)
 
@@ -511,7 +527,7 @@ class SequenceInfo:
         )
         self.cache_loc[: len(cache_loc_flat)].copy_(cache_loc_flat, non_blocking=True)
 
-        pages_per_seq = torch.tensor([len(p) for p in page_assignments], dtype=torch.int)
+        pages_per_seq = torch.tensor([len(p) for p in page_assignments], dtype=torch.int, pin_memory=True)
         self.pages_per_seq[: len(pages_per_seq)].copy_(pages_per_seq, non_blocking=True)
 
 

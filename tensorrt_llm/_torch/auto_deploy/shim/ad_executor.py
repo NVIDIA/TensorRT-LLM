@@ -208,11 +208,38 @@ class ADEngine(ModelEngine):
             # get cache indices
             cache_indices = kv_cache_manager.get_cache_indices(request)
             page_assignments.append(cache_indices)
+        
         # update the sequence info object now
         si = self.cache_seq_interface.info
-        si.nest_sequences(input_ids, previous_batch_indices, new_tokens)
-        si.update_pos(input_pos, reset=True)
-        si.assign_cache_loc(page_assignments)
+        seq_lens = [len(ids) for ids in input_ids]
+        si.update_sequence_lengths(seq_lens)
+        si.assign_cache_loc(page_assignments)   
+
+        input_ids_flat = [val for lst in input_ids for val in lst]
+        input_ids_host = torch.tensor(input_ids_flat, dtype=torch.int, pin_memory=True)
+        position_ids_list = [
+            num
+            for in_pos, seq_len in zip(input_pos, seq_lens)
+            for num in range(in_pos, in_pos + seq_len)
+        ]
+        @nvtx_range("ad_update_position_ids")
+        def update_position_ids(position_ids_list):
+            position_ids_host = torch.tensor(position_ids_list, dtype=torch.long, pin_memory=True)
+            si.position_ids = si.position_ids.flatten()
+            si.position_ids[:len(position_ids_list)].copy_(position_ids_host, non_blocking=True)
+            si.position_ids = si.maybe_reshape_for_generate(si.position_ids)
+        
+        update_position_ids(position_ids_list)
+
+        si.input_pos[:len(input_pos)].copy_(torch.tensor(input_pos), non_blocking=True)    
+        
+        @nvtx_range("ad_update_input_ids")
+        def update_input_ids(input_ids_host, new_tokens, previous_batch_indices):
+            num_tokens = sum(seq_lens)
+            si.update_input_ids(input_ids_host, new_tokens, previous_batch_indices, num_tokens)
+            
+        update_input_ids(input_ids_host, new_tokens, previous_batch_indices)
+       
         return last_logit_only
 
     @nvtx_range("ad_compute_logits")
@@ -232,13 +259,13 @@ class ADEngine(ModelEngine):
         self,
         scheduled_requests: ScheduledRequests,
         resource_manager: ResourceManager,
-        new_tokens_device: Optional[torch.Tensor] = None,
+        new_tensors_device: Optional[torch.Tensor] = None,
         gather_context_logits: bool = False,
         cache_indirection_buffer: Optional[torch.Tensor] = None,
     ):
         """Run forward from scheduled requests; main entrypoint that gets called by the executor."""
         # convert requests and store in sequence info object
-        new_tokens = getattr(new_tokens_device, "new_tokens", None)
+        new_tokens = getattr(new_tensors_device, "new_tokens", None)
         last_logit_only = self._prepare_inputs(scheduled_requests, resource_manager, new_tokens)
 
         # compute all logits
