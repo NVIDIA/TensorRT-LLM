@@ -2,6 +2,7 @@ import io
 import json
 import re
 import tarfile
+import warnings
 from collections import defaultdict
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -832,10 +833,33 @@ class LoraManager(object):
 
                 for lora_module in self.lora_target_modules:
                     if lora_module != "attn_qkv":
+                        warnings.warn(
+                            f"LoRA module '{lora_module}' not supported in NeMo loading for "
+                            f"layer {layer_idx}, skipping. NeMo LoRA currently only supports "
+                            f"'attn_qkv' modules."
+                        )
                         self._lora_uid_to_low_ranks[uid][layer_idx][lora_module] = 0
                         continue
 
                     if lora_module == "attn_qkv":
+                        # Check for missing "in" matrix (lora_A equivalent)
+                        if "in" not in all_lora_weights[layer_idx]:
+                            raise ValueError(
+                                f"Layer {layer_idx} is missing required 'in' matrix (lora_A equivalent) for attn_qkv "
+                                f"in NeMo LoRA weights from file {model_file}. "
+                                f"LoRA adapters must contain both 'in' and 'out' matrices for all layers. "
+                                f"Please check if the LoRA checkpoint is complete or was corrupted during loading."
+                            )
+
+                        # Check for missing "out" matrix (lora_B equivalent)
+                        if "out" not in all_lora_weights[layer_idx]:
+                            raise ValueError(
+                                f"Layer {layer_idx} is missing required 'out' matrix (lora_B equivalent) for attn_qkv "
+                                f"in NeMo LoRA weights from file {model_file}. "
+                                f"LoRA adapters must contain both 'in' and 'out' matrices for all layers. "
+                                f"Please check if the LoRA checkpoint is complete or was corrupted during loading."
+                            )
+
                         t_in = all_lora_weights[layer_idx]["in"]
                         t_out = all_lora_weights[layer_idx]["out"]
                         assert t_out.shape[0] % tp_size == 0
@@ -883,6 +907,8 @@ class LoraManager(object):
             load_from_model_file(uid, model_file)
             release_gc()
 
+        if new_uids:
+            print(f"Successfully loaded NeMo LoRA adapters with UIDs: {new_uids}")
         return new_uids
 
     def load_from_hf(
@@ -1022,10 +1048,16 @@ class LoraManager(object):
                 for hf_module, module_weights in layer_weights.items():
                     lora_module = hf_modules_to_trtllm_modules[hf_module]
                     if lora_module not in self.lora_target_modules:
+                        warnings.warn(
+                            f"LoRA module '{lora_module}' not in target modules {self.lora_target_modules}, skipping."
+                        )
                         self._lora_uid_to_low_ranks[uid][layer_idx][lora_module] = 0
                         continue
-                    if "in" not in module_weights:
-                        is_moe = True
+
+                    # Check if this is MoE by looking for integer keys (expert indices)
+                    has_expert_indices = all(isinstance(k, int) for k in module_weights.keys())
+
+                    if has_expert_indices:  # MoE
                         t_in = torch.stack(
                             [
                                 module_weights[expert_idx]["in"]
@@ -1044,7 +1076,23 @@ class LoraManager(object):
                                 raise ValueError("DoRA with MoE is not supported")
                         t_mag = None
                     else:
-                        is_moe = False
+                        # Not MoE - should have "in" and "out" matrices
+                        missing_matrices = []
+                        if "in" not in module_weights:
+                            missing_matrices.append("'in' matrix (lora_A)")
+                        if "out" not in module_weights:
+                            missing_matrices.append("'out' matrix (lora_B)")
+
+                        if missing_matrices:
+                            raise ValueError(
+                                f"Module '{hf_module}' in layer {layer_idx} is missing required "
+                                f"{' and '.join(missing_matrices)}. LoRA adapters must contain "
+                                f"both 'in' and 'out' matrices for all target modules. "
+                                f"This indicates an incomplete or corrupted LoRA checkpoint in "
+                                f"{model_dir}. Please verify the LoRA adapter was trained and "
+                                f"saved correctly."
+                            )
+
                         t_in = module_weights["in"]
                         t_out = module_weights["out"]
                         t_mag = module_weights.get("magnitude", None)
@@ -1062,14 +1110,14 @@ class LoraManager(object):
                         "moe_4h_to_h",
                     ]:
                         # split by row
-                        dim = 2 if is_moe else 1
+                        dim = 2 if has_expert_indices else 1
                         assert t_in.shape[dim] % tp_size == 0
                         t_in = torch.split(t_in, t_in.shape[dim] // tp_size, dim=dim)[
                             tp_rank
                         ].contiguous()
                     else:
                         # split by column
-                        dim = 1 if is_moe else 0
+                        dim = 1 if has_expert_indices else 0
                         assert t_out.shape[dim] % tp_size == 0
                         t_out = torch.split(t_out, t_out.shape[dim] // tp_size, dim=dim)[
                             tp_rank
@@ -1079,7 +1127,7 @@ class LoraManager(object):
                                 tp_rank
                             ].contiguous()
 
-                    rank_dim = 1 if is_moe else 0
+                    rank_dim = 1 if has_expert_indices else 0
                     effective_rank = t_in.shape[rank_dim]
 
                     t_in = t_in.cuda().contiguous()
