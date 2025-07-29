@@ -149,7 +149,11 @@ class ADEngine(ModelEngine):
 
         # build model
         self.model = get_inference_model(self.cache_seq_interface)
-
+        
+        # pre-allocate input_ids on the device, prefill with -1s for the common case
+        self.input_ids_cuda = torch.empty((seq_info.max_num_tokens, ),
+                                          dtype=torch.int32,
+                                          device='cuda')
         # start fresh with fixed seed
         torch.manual_seed(1234)
 
@@ -166,57 +170,68 @@ class ADEngine(ModelEngine):
             ResourceManagerType.KV_CACHE_MANAGER
         )
 
+        new_tokens_cuda = new_tokens.to(self.cache_seq_interface.info.device) if new_tokens is not None else None
         # requests in order of context, generate
         context_requests = scheduled_requests.context_requests
         gen_requests = [r for r in scheduled_requests.generation_requests if not r.draft_tokens]
 
         # info to be extracted
-        input_ids: List[List[int]] = []
+        seq_lens: List[int] = []
         input_pos: List[int] = []
         last_logit_only: List[bool] = []
         page_assignments: List[List[int]] = []
-        previous_batch_indices: List[int] = []
+        previous_batch_indices: torch.Tensor = torch.empty((len(gen_requests),), dtype=torch.int32, pin_memory=True)
         # look at context requests first
-        for request in context_requests:
-            # store input ids and pos of first token in sequence
-            input_ids.append(request.get_tokens(0))
-            input_pos.append(request.context_current_position)
+        idx = 0 # running index for input_ids
+        with nvtx_range("ad_update_context"):
+            for request in context_requests:
+                # store input ids and pos of first token in sequence
+                new_tokens_list = request.get_tokens(0)
+                new_tokens_tensor = torch.tensor(new_tokens_list, dtype=torch.int32)
+                self.input_ids_cuda[idx:idx+len(new_tokens_list)].copy_(new_tokens_tensor, non_blocking=True)
+                idx += len(new_tokens_list)
+                seq_lens.append(len(new_tokens_list))
+                input_pos.append(request.context_current_position)
 
-            request.py_batch_idx = request.seq_slot
-            last_logit_only.append(True)
+                request.py_batch_idx = request.seq_slot
+                last_logit_only.append(True)
+                cache_indices = kv_cache_manager.get_cache_indices(request)
+                page_assignments.append(cache_indices)
 
         # look at generate requests next
         # TODO: we should also handle extend requests (for speculative decoding) here
-        for request in gen_requests:
-            # new_tokens are provided when the overlap scheduler is enabled.
-            if new_tokens is None or request.is_dummy or request.py_batch_idx is None:
-                input_ids.append([request.get_token(0, request.get_num_tokens(0) - 1)])
-                input_pos.append(request.max_beam_num_tokens - 1)
-            else:
-                # insert a dummy token to indicate the new tokens
-                input_ids.append([-1])
-                previous_batch_indices.append(request.py_batch_idx)
-                input_pos.append(request.max_beam_num_tokens)
+        with nvtx_range("ad_update_generate"):
+            previous_batch_idx = 0
+            self.input_ids_cuda[idx:idx+len(gen_requests)].fill_(-1) # fill for the common use case
+            for request in gen_requests:
+                # new_tokens are provided when the overlap scheduler is enabled.
+                if new_tokens is None or request.is_dummy or request.py_batch_idx is None:
+                    self.input_ids_cuda[idx] = request.get_token(0, request.get_num_tokens(0) - 1)
+                    idx += 1
+                    input_pos.append(request.max_beam_num_tokens - 1)
+                else:
+                    # insert a dummy token to indicate the new tokens
+                    #self.input_ids_cuda is prefilled with -1s, so we don't need to do this
+                    # self.input_ids_cuda[idx] = -1
+                    # print("================================== type of input_ids_cuda: ===============================", self.input_ids_cuda.dtype)
+                    idx += 1
+                    previous_batch_indices[previous_batch_idx] = request.py_batch_idx
+                    previous_batch_idx += 1
+                    input_pos.append(request.max_beam_num_tokens)
 
-            request.py_batch_idx = request.seq_slot
+                request.py_batch_idx = request.seq_slot
+                cache_indices = kv_cache_manager.get_cache_indices(request)
+                page_assignments.append(cache_indices)
 
-            # return all logits
-            last_logit_only.append(False)
-
-        # extract cache information for all requests
-        for request in chain(context_requests, gen_requests):
-            # get cache indices
-            cache_indices = kv_cache_manager.get_cache_indices(request)
-            page_assignments.append(cache_indices)
+                # return all logits
+                last_logit_only.append(False)
+            seq_lens.extend([1] * len(gen_requests))
         
         # update the sequence info object now
         si = self.cache_seq_interface.info
-        seq_lens = [len(ids) for ids in input_ids]
         si.update_sequence_lengths(seq_lens)
-        si.assign_cache_loc(page_assignments)   
+        si.assign_cache_loc(page_assignments)
 
-        input_ids_flat = [val for lst in input_ids for val in lst]
-        input_ids_host = torch.tensor(input_ids_flat, dtype=torch.int, pin_memory=True)
         position_ids_list = [
             num
             for in_pos, seq_len in zip(input_pos, seq_lens)
@@ -234,11 +249,10 @@ class ADEngine(ModelEngine):
         si.input_pos[:len(input_pos)].copy_(torch.tensor(input_pos), non_blocking=True)    
         
         @nvtx_range("ad_update_input_ids")
-        def update_input_ids(input_ids_host, new_tokens, previous_batch_indices):
-            num_tokens = sum(seq_lens)
-            si.update_input_ids(input_ids_host, new_tokens, previous_batch_indices, num_tokens)
-            
-        update_input_ids(input_ids_host, new_tokens, previous_batch_indices)
+        def update_input_ids(input_ids_tensor, new_tokens, previous_batch_indices, num_tokens):
+            si.update_input_ids(input_ids_tensor, new_tokens, previous_batch_indices, num_tokens)
+
+        update_input_ids(self.input_ids_cuda[:idx], new_tokens_cuda, previous_batch_indices[:previous_batch_idx], idx)
        
         return last_logit_only
 

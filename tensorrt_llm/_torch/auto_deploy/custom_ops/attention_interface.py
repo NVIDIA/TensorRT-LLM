@@ -449,12 +449,16 @@ class SequenceInfo:
         self.num_tokens.copy_(torch.tensor(sum(self._sequence_lengths), dtype=torch.int), non_blocking=True)
         self.seq_len[: len(self._sequence_lengths)].copy_(torch.tensor(self._sequence_lengths), non_blocking=True)
 
-    def update_input_ids(self, input_ids_host: torch.Tensor, new_tokens: Optional[torch.Tensor] = None, previous_batch_indices: List[int] = [], num_tokens: int = 0) -> None:
-        self.input_ids = self.input_ids.flatten()
-        self.input_ids[:num_tokens].copy_(input_ids_host, non_blocking=True)
-        if new_tokens is not None:
-            self.input_ids[self.input_ids == -1] = new_tokens[0,previous_batch_indices,0]
-        self.input_ids = self.maybe_reshape_for_generate(self.input_ids)
+    def update_input_ids(self, input_ids: torch.Tensor, new_tokens: Optional[torch.Tensor] = None, previous_batch_indices: Optional[torch.Tensor] = None, num_tokens: int = 0) -> None:
+        with nvtx_range("flatten_input_ids"):
+            self.input_ids = self.input_ids.flatten()
+        with nvtx_range("assign_input_ids"):
+            self.input_ids[:num_tokens] = input_ids
+        with nvtx_range("replace_new_tokens"):
+            if new_tokens is not None and previous_batch_indices is not None:
+                self.input_ids[self.input_ids == -1] = new_tokens[0,previous_batch_indices,0]
+        with nvtx_range("reshape_input_ids"):
+            self.input_ids = self.maybe_reshape_for_generate(self.input_ids)
         
     @nvtx_range("ad_nest_sequences")
     def nest_sequences(self, 
@@ -490,7 +494,7 @@ class SequenceInfo:
 
         if new_tokens is not None:
             self.input_ids[self.input_ids == -1] = new_tokens[0,previous_batch_indices,0]
-    
+
         self.input_ids = self.maybe_reshape_for_generate(self.input_ids)
 
         # update position_ids
