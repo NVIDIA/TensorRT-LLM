@@ -10,6 +10,6 @@ class SupportedMetricNames(Enum):
 
 class RequestEventTiming(Enum):
     ARRIVAL_TIME = "arrival_time"
-    FIRST_TOKEN_TIME = "first_token_time"
+    FIRST_TOKEN_TIME = "first_token_time"  # nosec: B105
     FIRST_SCHEDULED_TIME = "first_scheduled_time"
-    LAST_TOKEN_TIME = "last_token_time"
+    LAST_TOKEN_TIME = "last_token_time"  # nosec: B105
