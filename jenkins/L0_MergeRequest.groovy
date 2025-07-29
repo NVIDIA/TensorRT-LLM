@@ -796,6 +796,7 @@ def getOnlyOneGroupChanged(pipeline, testFilter, globalVars) {
         "Triton": [
             "tests/integration/defs/triton_server/",
             "triton_backend/",
+            "jenkins/",
         ],
     ]
 
