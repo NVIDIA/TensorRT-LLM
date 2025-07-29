@@ -2,7 +2,6 @@ import unittest
 from copy import deepcopy
 from dataclasses import dataclass
 
-import pytest
 import torch
 from parameterized import parameterized
 from transformers import Gemma3Config
@@ -255,8 +254,6 @@ class TestGemma3(unittest.TestCase):
         """
         Compare output to HF.
         """
-        pytest.skip("Tests are broken after rebase to the latest main")
-
         backend = scenario.backend
         config_name = scenario.config_name
         metadata_cls = get_attention_backend(backend).Metadata
