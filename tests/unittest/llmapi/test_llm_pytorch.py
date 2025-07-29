@@ -1,11 +1,15 @@
 import pytest
 
 from tensorrt_llm import LLM
+from tensorrt_llm.llmapi.llm_args import PeftCacheConfig
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
 from tensorrt_llm.sampling_params import SamplingParams
 
 # isort: off
-from .lora_test_utils import check_llama_7b_multi_unique_lora_adapters_from_request, create_mock_nemo_lora_checkpoint
+from .lora_test_utils import (
+    check_llama_7b_multi_lora_from_request_test_harness,
+    check_llama_7b_multi_unique_lora_adapters_from_request,
+    create_mock_nemo_lora_checkpoint)
 from .test_llm import (get_model_path, global_kvcache_config, llama_model_path,
                        llm_get_stats_async_test_harness,
                        llm_get_stats_test_harness, prompts,
@@ -286,6 +290,57 @@ def test_llama_7b_multi_lora_load_previously_cpu_cache_evicted_adapter_fails(
             stop_waiting_criteria=_check_contains_expected_message)
 
     assert _check_contains_expected_message(child_stdout, child_stderr)
+
+
+def test_llama_7b_peft_cache_config_affects_peft_cache_size():
+    """Tests that LLM arg of peft_cache_config affects the peft cache sizes.
+
+    NOTE: The caller can't get the actual LoRA cache size without debug logs, so
+    to test whether it is affected by PeftCacheConfig LLM arg, a non-zero value
+    that's too small to contain a single adapter can be sent, which shall cause
+    a failure in init.
+    """
+    # For LoRA checkpoints without finetuned embedding and lm_head, we can either:
+    # (1) specify lora_target_modules, or
+    # (2) provide a lora_dir to infer the lora_target_modules.
+    lora_config_no_cache_size_values = LoraConfig(
+        lora_target_modules=['attn_q', 'attn_k', 'attn_v'], max_lora_rank=8)
+
+    # Test that init fails on PeftCacheConfig.host_cache_size too small
+    with pytest.raises(RuntimeError):
+        check_llama_7b_multi_lora_from_request_test_harness(
+            LLM,
+            lora_config=lora_config_no_cache_size_values,
+            peft_cache_config=PeftCacheConfig(host_cache_size=1),
+            # Disable CUDA graph
+            # TODO: remove this once we have a proper fix for CUDA graph in LoRA
+            cuda_graph_config=None)
+
+    # Test that init fails on PeftCacheConfig.device_cache_percent too small
+    with pytest.raises(RuntimeError):
+        check_llama_7b_multi_lora_from_request_test_harness(
+            LLM,
+            lora_config=lora_config_no_cache_size_values,
+            peft_cache_config=PeftCacheConfig(device_cache_percent=0.000001),
+            # Disable CUDA graph
+            # TODO: remove this once we have a proper fix for CUDA graph in LoRA
+            cuda_graph_config=None)
+
+
+def test_llama_7b_lora_config_overrides_peft_cache_config():
+    """Tests that cache size args in lora_config LLM arg override the cache size parameters in peft_cache_config LLM arg."""
+    check_llama_7b_multi_lora_from_request_test_harness(
+        LLM,
+        lora_config=LoraConfig(
+            lora_target_modules=['attn_q', 'attn_k', 'attn_v'],
+            max_lora_rank=8,
+            max_loras=2,
+            max_cpu_loras=2),
+        peft_cache_config=PeftCacheConfig(host_cache_size=1,
+                                          device_cache_percent=0.000001),
+        # Disable CUDA graph
+        # TODO: remove this once we have a proper fix for CUDA graph in LoRA
+        cuda_graph_config=None)
 
 
 # TODO smor: currently Nemotron-Super-49B-v1 with LoRA memory consumption is overly high

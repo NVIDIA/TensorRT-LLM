@@ -1493,10 +1493,10 @@ class BaseLlmArgs(StrictBaseModel):
         if self.parallel_config._world_size == 1 and self.build_config:
             self.build_config.plugin_config.nccl_plugin = None
 
-        if self.enable_lora and self.lora_config is None and self.backend != 'pytorch':
+        if self.enable_lora and self.backend != 'pytorch':
             self.build_config.plugin_config.lora_plugin = 'auto'
-            if self.max_lora_rank is not None:
-                self.build_config.lora_config.max_lora_rank = self.max_lora_rank
+            if self.lora_config is not None:
+                self.build_config.lora_config.max_lora_rank = self.lora_config.max_lora_rank
 
         if hasattr(self,
                    'enable_prompt_adapter') and self.enable_prompt_adapter:
