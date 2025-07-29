@@ -24,8 +24,8 @@ if [[ -f "$DOCKERFILE_MULTI_PATH" ]]; then
         TRITON_BASE_TAG=$(echo "$TRITON_BASE_TAG_LINE" | cut -d'=' -f2)
 
         if [[ -n "$TRITON_BASE_TAG" ]]; then
-            # Remove -py suffix and add r prefix
-            TRITON_SHORT_TAG="r${TRITON_BASE_TAG%-py}"
+            # Remove -py3 suffix and add r prefix
+            TRITON_SHORT_TAG="r${TRITON_BASE_TAG%-py3}"
         fi
     fi
 else
