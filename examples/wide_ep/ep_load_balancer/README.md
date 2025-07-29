@@ -41,7 +41,6 @@ trtllm-bench --model ${MODEL_NAME} \
     --ep 32 \
     --extra_llm_api_options ./extra_llm_api_options.yaml \
     --kv_cache_free_gpu_mem_fraction 0.75 \
-    --backend pytorch \
     --dataset ./dataset.json \
     --warmup 0 \
     --eos_id -1
@@ -133,7 +132,6 @@ trtllm-bench --model ${MODEL_NAME} \
     --ep 36 \
     --extra_llm_api_options ./extra_llm_api_options_eplb.yaml \
     --kv_cache_free_gpu_mem_fraction 0.75 \
-    --backend pytorch \
     --dataset ./dataset.json \
     --warmup 0 \
     --eos_id -1
@@ -200,7 +198,6 @@ trtllm-bench --model ${MODEL_NAME} \
     --ep 36 \
     --extra_llm_api_options ./extra_llm_api_options_eplb.yaml \
     --kv_cache_free_gpu_mem_fraction 0.75 \
-    --backend pytorch \
     --dataset ./dataset.json \
     --warmup 0 \
     --eos_id -1
