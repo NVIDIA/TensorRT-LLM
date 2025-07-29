@@ -70,10 +70,6 @@ class CutlassFusedMoE(MoE):
         swiglu_beta: Optional[torch.Tensor] = None,
     ):
 
-        if model_config.quant_config and model_config.quant_config.layer_quant_mode.has_w4a16_mxfp4(
-        ):
-            hidden_size = ((hidden_size + 127) // 128) * 128
-
         super().__init__(
             routing_method=routing_method,
             num_experts=num_experts,
@@ -87,6 +83,12 @@ class CutlassFusedMoE(MoE):
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
         )
+
+        if model_config.quant_config and model_config.quant_config.layer_quant_mode.has_w4a16_mxfp4(
+        ):
+            self.hidden_size = ((self.hidden_size + 127) // 128) * 128
+            self.intermediate_size_per_partition = (
+                (self.intermediate_size_per_partition + 127) // 128) * 128
 
         self.layer_idx = layer_idx
 

@@ -1046,15 +1046,16 @@ class WInt4AFP8FusedMoEMethod(FusedMoEMethodBase):
 
 class WFP4A16FusedMoEMethod(FusedMoEMethodBase):
 
+    group_size = 32
+
     def create_weights(self, module: torch.nn.Module):
-        group_size = 32
         module.sm_version = get_sm_version()
         if module.sm_version == 90:
             module.interleave = []
             for k_shape in [
                     module.hidden_size, module.intermediate_size_per_partition
             ]:
-                module.interleave.append(128 // group_size)
+                module.interleave.append(128 // self.group_size)
         else:
             raise NotImplementedError(
                 f"WFP4A16 MoE is unsupported on SM{module.sm_version}.")
@@ -1066,11 +1067,12 @@ class WFP4A16FusedMoEMethod(FusedMoEMethodBase):
                            module.intermediate_size_per_partition // 2)
 
         # col parallel
-        assert module.hidden_size % (group_size * module.interleave[0]) == 0
+        assert module.hidden_size % (self.group_size *
+                                     module.interleave[0]) == 0
         scale_dtype = torch.uint8
         fc31_weight_scale = nn.Parameter(torch.empty(
             module.expert_size_per_partition,
-            module.hidden_size // (group_size * module.interleave[0]),
+            module.hidden_size // (self.group_size * module.interleave[0]),
             module.intermediate_size_per_partition * 2 * module.interleave[0],
             dtype=scale_dtype),
                                          requires_grad=False)
@@ -1078,11 +1080,11 @@ class WFP4A16FusedMoEMethod(FusedMoEMethodBase):
 
         # row parallel
         assert module.intermediate_size_per_partition % (
-            group_size * module.interleave[1]) == 0
+            self.group_size * module.interleave[1]) == 0
         fc2_weight_scale = nn.Parameter(
             torch.empty(module.expert_size_per_partition,
                         module.intermediate_size_per_partition //
-                        (group_size * module.interleave[1]),
+                        (self.group_size * module.interleave[1]),
                         module.hidden_size * module.interleave[1],
                         dtype=scale_dtype),
             requires_grad=False)
@@ -1127,11 +1129,20 @@ class WFP4A16FusedMoEMethod(FusedMoEMethodBase):
                                             TensorParallelMode.COLUMN,
                                             device=device)
 
-        pad_size = module.hidden_size // 2 - w3_weight_shard.shape[1]
-        w1_weight_shard = torch.nn.functional.pad(w1_weight_shard,
-                                                  (0, pad_size))
-        w3_weight_shard = torch.nn.functional.pad(w3_weight_shard,
-                                                  (0, pad_size))
+        pad_size_inter = module.intermediate_size_per_partition - w3_weight_shard.shape[
+            0]
+        if w3_weight_shard.ndim == 2:
+            pad_size_hidden = module.hidden_size // 2 - w3_weight_shard.shape[1]
+            pad_shape = (0, pad_size_hidden, 0, pad_size_inter)
+        elif w3_weight_shard.ndim == 1:
+            pad_shape = (0, pad_size_inter)
+        else:
+            raise NotImplementedError(
+                f"Invalid shape of w1_weight_shard {w1_weight_shard.shape} and w3_weight_shard {w1_weight_shard.shape}"
+            )
+
+        w1_weight_shard = torch.nn.functional.pad(w1_weight_shard, pad_shape)
+        w3_weight_shard = torch.nn.functional.pad(w3_weight_shard, pad_shape)
 
         w31_weight_shard = torch.cat([w3_weight_shard, w1_weight_shard], dim=0)
 
@@ -1153,10 +1164,18 @@ class WFP4A16FusedMoEMethod(FusedMoEMethodBase):
                                             TensorParallelMode.ROW,
                                             device=device)
 
-        pad_size = module.hidden_size - w2_weight_shard.shape[0]
-        w2_weight_shard = torch.nn.functional.pad(w2_weight_shard,
-                                                  (0, 0, 0, pad_size))
+        pad_size_hidden = module.hidden_size - w2_weight_shard.shape[0]
+        if w2_weight_shard.ndim == 2:
+            pad_size_inter = module.intermediate_size_per_partition // 2 - w2_weight_shard.shape[
+                1]
+            pad_shape = (0, pad_size_inter, 0, pad_size_hidden)
+        elif w2_weight_shard.ndim == 1:
+            pad_shape = (0, pad_size_hidden)
+        else:
+            raise NotImplementedError(
+                f"Invalid shape of w2_weight_shard {w2_weight_shard.shape}")
 
+        w2_weight_shard = torch.nn.functional.pad(w2_weight_shard, pad_shape)
         dst_w2_weight.copy_(w2_weight_shard.view(dst_w2_weight.dtype),
                             non_blocking=True)
 
@@ -1183,11 +1202,14 @@ class WFP4A16FusedMoEMethod(FusedMoEMethodBase):
                 TensorParallelMode.COLUMN,
                 device=device)
 
-            pad_size = module.hidden_size // 32 - w3_scale_shard.shape[1]
-            w3_scale_shard = torch.nn.functional.pad(w3_scale_shard,
-                                                     (0, pad_size))
-            w1_scale_shard = torch.nn.functional.pad(w1_scale_shard,
-                                                     (0, pad_size))
+            pad_size_hidden = module.hidden_size // self.group_size - w3_scale_shard.shape[
+                1]
+            pad_size_inter = module.intermediate_size_per_partition - w3_scale_shard.shape[
+                0]
+            w3_scale_shard = torch.nn.functional.pad(
+                w3_scale_shard, (0, pad_size_hidden, 0, pad_size_inter))
+            w1_scale_shard = torch.nn.functional.pad(
+                w1_scale_shard, (0, pad_size_hidden, 0, pad_size_inter))
 
             all_w3_scales.append(w3_scale_shard)
             all_w1_scales.append(w1_scale_shard)
@@ -1217,9 +1239,11 @@ class WFP4A16FusedMoEMethod(FusedMoEMethodBase):
                 module.tp_rank,
                 TensorParallelMode.ROW,
                 device=device)
-            pad_size = module.hidden_size - w2_scales_shard.shape[0]
-            w2_scales_shard = torch.nn.functional.pad(w2_scales_shard,
-                                                      (0, 0, 0, pad_size))
+            pad_size_hidden = module.hidden_size - w2_scales_shard.shape[0]
+            pad_size_inter = module.intermediate_size_per_partition // self.group_size - w2_scales_shard.shape[
+                1]
+            w2_scales_shard = torch.nn.functional.pad(
+                w2_scales_shard, (0, pad_size_inter, 0, pad_size_hidden))
             all_w2_scales.append(w2_scales_shard)
 
         w2_scales = torch.stack(all_w2_scales).to(torch.bfloat16).view(

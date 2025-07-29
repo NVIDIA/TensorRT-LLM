@@ -667,11 +667,25 @@ class OpenAIMoeForCausalLM(SpecDecOneEngineForCausalLM[Transformer,
                         gate_up_weight_scale[i, :, :].transpose(0, 1)
                         for i in range(num_expert)
                     ]
+
+                    if self.model_config.quant_config.quant_algo == 'W4A16_MXFP4':
+                        for i in range(num_expert):
+                            moe_weights[f"{i}.w1.weight_scale_inv"] = gate[
+                                i, :, :]
+                            moe_weights[f"{i}.w3.weight_scale_inv"] = up[
+                                i, :, :]
+
                 if 'weight.scales' in down_proj:
                     moe_weights['down_proj_weight_scale'] = [
                         down_proj['weight.scales'][i, :, :].transpose(0, 1)
                         for i in range(num_expert)
                     ]
+
+                    if self.model_config.quant_config.quant_algo == 'W4A16_MXFP4':
+                        for i in range(num_expert):
+                            moe_weights[f"{i}.w2.weight_scale_inv"] = down_proj[
+                                'weight.scales'][i, :, :]
+
                 module.load_weights(weights=[moe_weights])
             elif hasattr(module, "load_weights"):
                 # Load Attention module weights.
