@@ -75,7 +75,7 @@ To minimize KV cache transmission latency, TensorRT-LLM currently uses direct tr
 </div>
 <p align="center"><sub><em>Figure 5. KV cache layout conversion</em></sub></p>
 
-The optimizations required for KV cache transmission vary depending on whether it's single-node multi-GPU, multi-node multi-GPU, or different GPU models. To accommodate this, TensorRT-LLM provides a set of environment variables for selection in different environments. Please refer to the following section for details [Environment Variables](Environment-Variables).
+The optimizations required for KV cache transmission vary depending on whether it's single-node multi-GPU, multi-node multi-GPU, or different GPU models. To accommodate this, TensorRT-LLM provides a set of environment variables for selection in different environments. Please refer to the following section for details [Environment Variables](#Environment-Variables).
 
 ## Usage
 
