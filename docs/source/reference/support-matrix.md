@@ -11,6 +11,7 @@ TensorRT-LLM optimizes the performance of a range of well-known models on NVIDIA
 | `BertForSequenceClassification` | BERT-based | `textattack/bert-base-uncased-yelp-polarity` | L |
 | `DeciLMForCausalLM` | Nemotron | `nvidia/Llama-3_1-Nemotron-51B-Instruct` | L |
 | `DeepseekV3ForCausalLM` | DeepSeek-V3 | `deepseek-ai/DeepSeek-V3 `| L |
+| `Exaone4ForCausalLM` | EXAONE 4.0 | `LGAI-EXAONE/EXAONE-4.0-32B` | L |
 | `Gemma3ForCausalLM` | Gemma 3 | `google/gemma-3-1b-it` | L |
 | `Gemma3ForConditionalGeneration` | Gemma 3 | `google/gemma-3-27b-it` | L + I |
 | `HCXVisionForCausalLM` | HyperCLOVAX-SEED-Vision | `naver-hyperclovax/HyperCLOVAX-SEED-Vision-Instruct-3B` | L + I |
