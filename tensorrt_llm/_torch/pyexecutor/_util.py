@@ -482,7 +482,7 @@ def create_py_executor_instance(
         num_lora_modules = model_engine.model.model_config.pretrained_config.num_hidden_layers * \
             len(lora_config.lora_target_modules + lora_config.missing_qkv_modules)
 
-        peft_cache_config_model = PeftCacheConfig.create_from_pybind(
+        peft_cache_config_model = PeftCacheConfig.from_pybind(
             executor_config.peft_cache_config
         ) if executor_config.peft_cache_config is not None else PeftCacheConfig(
         )

@@ -823,7 +823,7 @@ class _TrtLLM(BaseLLM):
             num_lora_modules = engine_config.pretrained_config.num_hidden_layers * \
                 len(lora_config.lora_target_modules + lora_config.missing_qkv_modules)
 
-            peft_cache_config_model = PeftCacheConfig.create_from_pybind(
+            peft_cache_config_model = PeftCacheConfig.from_pybind(
                 self._executor_config.peft_cache_config
             ) if self._executor_config.peft_cache_config is not None else PeftCacheConfig(
             )
