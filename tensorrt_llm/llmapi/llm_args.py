@@ -727,11 +727,13 @@ class PeftCacheConfig(StrictBaseModel, PybindMirror):
     max_pages_per_block_device: int = Field(
         default=8,
         description="Number of cache pages per allocation block (device)")
-    device_cache_percent: Optional[float] = Field(
-        default=None,
-        description="percent of memory after engine load to use for cache")
-    host_cache_size: Optional[int] = Field(
-        default=None, description="size in bytes to use for host cache")
+    device_cache_percent: float = Field(
+        default=0.02,
+        description=
+        "Proportion of free device memory after engine load to use for cache, as a fraction from 0 to 1"
+    )
+    host_cache_size: int = Field(
+        default=1024**3, description="size in bytes to use for host cache")
     lora_prefetch_dir: Optional[str] = Field(
         default=None,
         description=
