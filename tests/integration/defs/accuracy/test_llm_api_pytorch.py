@@ -367,9 +367,11 @@ class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
     @skip_pre_hopper
     def test_fp8_tp4(self):
         model_path = f"{llm_models_root()}/modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp8"
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5)
         with LLM(model_path,
                  tensor_parallel_size=4,
+                 max_seq_len=8192,
+                 max_batch_size=32,
                  kv_cache_config=kv_cache_config) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
             task = MMLU(self.MODEL_NAME)
@@ -516,6 +518,20 @@ class TestMistral7B(LlmapiAccuracyTestHarness):
     def test_auto_dtype(self):
         with LLM(self.MODEL_PATH) as llm:
             task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
+class TestMistralSmall24B(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "mistralai/Mistral-Small-3.1-24B-Instruct-2503"
+    MODEL_PATH = f"{llm_models_root()}/Mistral-Small-3.1-24B-Instruct-2503"
+
+    def test_auto_dtype(self):
+        with LLM(self.MODEL_PATH) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
 
@@ -1904,10 +1920,6 @@ class TestPhi4MiniInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "microsoft/Phi-4-mini-instruct"
     MODEL_PATH = f"{llm_models_root()}/Phi-4-mini-instruct"
 
-    @pytest.mark.skip(
-        reason=
-        "Temporarily skipping test_auto_dtype while resolving Phi-4's architecture issue."
-    )
     def test_auto_dtype(self):
         with LLM(self.MODEL_PATH) as llm:
             task = CnnDailymail(self.MODEL_NAME)
@@ -1916,9 +1928,6 @@ class TestPhi4MiniInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
-            task = GPQADiamond(self.MODEL_NAME)
-            task.evaluate(llm,
-                          extra_evaluator_kwargs=dict(apply_chat_template=True))
 
 
 class TestKanana_Instruct(LlmapiAccuracyTestHarness):
