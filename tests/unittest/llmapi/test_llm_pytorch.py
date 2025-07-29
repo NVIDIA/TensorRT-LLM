@@ -140,7 +140,9 @@ def test_llm_with_postprocess_parallel_and_result_handler(streaming):
 def llama_7b_lora_from_dir_test_harness(**llm_kwargs) -> None:
     lora_config = LoraConfig(
         lora_dir=[f"{llm_models_root()}/llama-models/luotuo-lora-7b-0.1"],
-        max_lora_rank=8)
+        max_lora_rank=8,
+        max_loras=2,
+        max_cpu_loras=2)
     llm = LLM(model=f"{llm_models_root()}/llama-models/llama-7b-hf",
               lora_config=lora_config,
               **llm_kwargs)
@@ -174,7 +176,7 @@ def test_llama_7b_lora():
 
 @skip_gpu_memory_less_than_40gb
 def test_llama_7b_lora_default_modules() -> None:
-    lora_config = LoraConfig(max_lora_rank=64)
+    lora_config = LoraConfig(max_lora_rank=64, max_loras=2, max_cpu_loras=2)
 
     hf_model_dir = f"{llm_models_root()}/llama-models/llama-7b-hf"
 
@@ -418,7 +420,9 @@ def test_codellama_fp8_with_bf16_lora() -> None:
 
         lora_config = LoraConfig(lora_dir=lora_paths,
                                  lora_target_modules=target_modules,
-                                 max_lora_rank=8)
+                                 max_lora_rank=8,
+                                 max_loras=2,
+                                 max_cpu_loras=2)
 
         llm = LLM(model_dir, quant_config=quant_config, lora_config=lora_config)
 
@@ -468,7 +472,9 @@ def test_bielik_11b_v2_2_instruct_multi_lora() -> None:
 
         trtllm_lora_config = LoraConfig(lora_dir=lora_paths,
                                         lora_target_modules=target_modules,
-                                        max_lora_rank=8)
+                                        max_lora_rank=8,
+                                        max_loras=2,
+                                        max_cpu_loras=2)
         llm = LLM(model_dir, lora_config=trtllm_lora_config)
 
         prompts = [
