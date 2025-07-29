@@ -54,6 +54,26 @@ Refer to the [ep_load_balancer](./ep_load_balancer/) directory for more details 
 
 Refer to the [slurm_scripts](./slurm_scripts/) directory, which reuses [disaggregated slurm scripts](../disaggregated/slurm/) to automatically generate configuration files and submit jobs to SLURM clusters.
 
+## Trouble shooting
+
+### Transparent HugePages failure
+
+When getting exception `madvise(MADV_HUGEPAGE) failed.`, check if Transparent Hugepages has been enabled.
+```bash
+>$ cat /sys/kernel/mm/transparent_hugepage/enabled
+always [madvise] never
+>$ cat /sys/kernel/mm/transparent_hugepage/defrag
+always defer defer+madvise [madvise] never
+```
+If `never` is highlighted, enable Transparent HugePages by the following command.
+```bash
+echo madvise > /sys/kernel/mm/transparent_hugepage/enabled
+```
+
+### Disaggregated serving related issues
+
+Refer to the [Troubleshooting and FAQ](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/advanced/disaggregated-service.md#troubleshooting-and-faq) section of Disaggregated-Service.
+
 ## References
 
 - [Technical Blog: Scaling Expert Parallelism in TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog4_Scaling_Expert_Parallelism_in_TensorRT-LLM.md)
