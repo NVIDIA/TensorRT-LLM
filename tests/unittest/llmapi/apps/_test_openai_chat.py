@@ -523,7 +523,7 @@ def test_stop_reason(client: openai.OpenAI, model_name: str, backend: str):
     assert resp.choices[0].stop_reason == "two"
 
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_chat_completion_with_logit_bias(async_client: openai.AsyncOpenAI,
                                                model_name: str):
     """Test logit_bias in chat completions"""
@@ -545,7 +545,7 @@ async def test_chat_completion_with_logit_bias(async_client: openai.AsyncOpenAI,
     assert chat_completion.choices[0].message.content
 
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_chat_completion_with_invalid_logit_bias(
         async_client: openai.AsyncOpenAI, model_name: str):
     """Test with invalid token IDs (non-integer keys)"""

@@ -370,7 +370,7 @@ async def test_completion_streaming(async_client: openai.AsyncOpenAI,
     assert tokens == single_output
 
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_completion_with_logit_bias(async_client: openai.AsyncOpenAI,
                                           model_name: str):
     """Test logit_bias with valid token IDs"""
@@ -390,7 +390,7 @@ async def test_completion_with_logit_bias(async_client: openai.AsyncOpenAI,
     assert completion.choices[0].text
 
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="module")
 async def test_completion_with_invalid_logit_bias(
         async_client: openai.AsyncOpenAI, model_name: str):
     """Test with invalid token IDs (non-integer keys)"""
