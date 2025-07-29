@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 from tensorrt_llm._utils import mpi_allgather, mpi_broadcast, mpi_rank
@@ -89,6 +89,25 @@ class Finished:
                         self.loading - other.loading)
 
 
+@dataclass
+class RequestData:
+    request_id: int
+    new_tokens: list[int]
+    new_block_ids: list[int]
+    computed_position: int
+
+
+@dataclass
+class SchedulerOutput:
+    requests: list[RequestData] = field(default_factory=list)
+
+    def add_request(self, request_id: int, new_tokens: list[int],
+                    new_block_ids: list[int], computed_position: int):
+        self.requests.append(
+            RequestData(request_id, new_tokens, new_block_ids,
+                        computed_position))
+
+
 class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
 
     def __init__(self, worker: KvCacheConnectorWorker,
@@ -109,6 +128,8 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
 
         # Requests that have been returned from get_finished locally, but haven't yet been returned by all workers.
         self.local_finished = Finished(dict(), dict())
+
+        self._scheduler_output = None
 
     def get_num_new_matched_tokens(self, request: LlmRequest,
                                    num_computed_tokens: int) -> int:
@@ -134,9 +155,14 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
     def build_connector_metadata(self) -> object:
         if self.scheduler is not None:
             assert mpi_rank() == 0, "The scheduler may only exist on rank 0!"
-            metadata = self.scheduler.build_connector_metadata()
+            if self._scheduler_output is None:
+                raise RuntimeError("Scheduler output not set!")
+            metadata = self.scheduler.build_connector_metadata(
+                self._scheduler_output)
         else:
             metadata = None
+
+        self._scheduler_output = None
 
         metadata = mpi_broadcast(metadata, root=0)
 
@@ -206,3 +232,6 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             req.state = LlmRequestState.CONTEXT_INIT
 
         return list(all_finished.saving.values())
+
+    def set_scheduler_output(self, scheduler_output: SchedulerOutput):
+        self._scheduler_output = scheduler_output

@@ -34,6 +34,7 @@ from tensorrt_llm.runtime.generation import CUASSERT
 
 from ..distributed import Distributed
 from ..models.modeling_utils import DecoderModelForCausalLM
+from ..modules.decoder_layer import DecoderLayer
 from ..speculative.drafter import Drafter
 from .connector import KvCacheConnectorManager
 from .executor_request_queue import ExecutorRequestQueue, RequestQueueItem
@@ -268,8 +269,14 @@ class PyExecutor:
 
         self.kv_connector_manager = kv_connector_manager
 
+        self._maybe_init_kv_connector_manager()
+
+        if start_worker:
+            self.start_worker()
+
+    def _maybe_init_kv_connector_manager(self):
         if self.kv_connector_manager is not None:
-            if kv_cache_transceiver is not None:
+            if self.kv_cache_transceiver is not None:
                 raise NotImplementedError(
                     "KV Cache Connector is not supported with KvCacheTransceiver."
                 )
@@ -279,17 +286,19 @@ class PyExecutor:
                     "KV Cache Connector is not supported with pipeline parallelism."
                 )
 
-            if not disable_overlap_scheduler:
+            if not self.disable_overlap_scheduler:
                 raise NotImplementedError(
                     "KV Cache Connector is not supported with overlap scheduler."
                 )
 
             kv_cache_data = self.kv_cache_manager.get_kv_cache_connector_pools_data(
             )
+
             self.kv_connector_manager.worker.register_kv_caches(kv_cache_data)
 
-        if start_worker:
-            self.start_worker()
+            for name, module in self.model_engine.model.named_modules():
+                if isinstance(module, DecoderLayer):
+                    print("LAYER", name, module)
 
     def _event_loop_wrapper(self):
         try:
