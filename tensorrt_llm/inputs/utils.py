@@ -254,10 +254,12 @@ PLACEHOLDER_PLACEMENT_MAP = {
     "mllama": MultimodalPlaceholderPlacement.BEFORE_TEXT,
     "hyperclovax_vlm": MultimodalPlaceholderPlacement.AFTER_TEXT,
     "gemma3": MultimodalPlaceholderPlacement.BEFORE_TEXT,
-    # NOTE: for mistral3 multimodal models, it does not strictly have to be after the text.
+    # NOTE: for mistral3 multimodal models, it does not strictly have to be before the text.
     # Ref: https://github.com/mistralai/mistral-common/blob/039465db2bdc0486df36365c9bdb428188482a18/
     #      src/mistral_common/tokens/tokenizers/base.py#L326
-    "mistral3": MultimodalPlaceholderPlacement.AFTER_TEXT,
+    # However, accuracy tests show that the model generates higher quality output when the image
+    # precedes the text (the relative difference can be as much as ~30% for both vLLM and TRT-LLM).
+    "mistral3": MultimodalPlaceholderPlacement.BEFORE_TEXT,
     "phi4mm": MultimodalPlaceholderPlacement.BEFORE_TEXT,
 }
 assert len(PLACEHOLDER_PLACEMENT_MAP) == len(ALL_SUPPORTED_MULTIMODAL_MODELS)
