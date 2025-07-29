@@ -30,7 +30,6 @@ set(SRCS
     guidedDecoder.cpp
     handleContextLogits.cpp
     handleGenerationLogits.cpp
-    kvCacheConnector.cpp
     kvCacheManager.cpp
     kvCacheEventManager.cpp
     kvCacheTransferManager.cpp

@@ -31,6 +31,7 @@ using namespace tensorrt_llm::batch_manager;
 namespace tensorrt_llm::batch_manager::kv_connector
 {
 
+// @brief Data used to provide the KV cache tensors to the connector worker for a single pool.
 class KvCacheConnectorPoolData
 {
 public:
@@ -80,42 +81,7 @@ private:
     std::vector<SizeType32> mLayerToPoolMapping;
 };
 
-class KvCacheConnectorScheduler
-{
-public:
-    explicit KvCacheConnectorScheduler() = default;
-    virtual ~KvCacheConnectorScheduler() = default;
-
-    virtual std::tuple<SizeType32, bool> getNumNewMatchedTokens(LlmRequest const& request, SizeType32 numComputedTokens)
-        = 0;
-
-    // TODO(jothomson): Need arguments here. Also, is this even needed?
-    virtual void updateStateAfterAlloc();
-
-    virtual bool requestFinished(LlmRequest const& request);
-};
-
-class KvCacheConnectorWorker
-{
-public:
-    explicit KvCacheConnectorWorker() = default;
-    virtual ~KvCacheConnectorWorker() = default;
-
-    virtual void registerKvCaches(KvCacheConnectorPoolsData const& kvCacheConnectorPoolsData);
-
-    // TODO(jothomson): Need arguments here.
-    virtual void startLoadKv() = 0;
-
-    virtual void waitForLayerLoad(SizeType32 layer_idx) = 0;
-
-    virtual void saveKvLayer(SizeType32 layer_idx) = 0;
-
-    virtual void waitForSave() = 0;
-
-    virtual std::tuple<std::vector<RequestIdType>, std::vector<RequestIdType>> getFinished(
-        std::vector<RequestIdType> const& finishedGenReqIds, std::vector<RequestIdType> const& startedLoadingReqIds);
-};
-
+// @brief The KV connector manager. This is passed into the C++ KV Cache Manager when adding sequences.
 class KvCacheConnectorManager
 {
 public:
