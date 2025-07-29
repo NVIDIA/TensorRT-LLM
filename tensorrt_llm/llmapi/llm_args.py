@@ -699,7 +699,7 @@ class PeftCacheConfig(StrictBaseModel, PybindMirror):
     num_device_module_layer: int = Field(
         default=0,
         description=
-        "number of max sized 1-layer 1-module sets of weights that can be stored in host cache"
+        "number of max sized 1-layer 1-module sets of weights that can be stored in device cache"
         ", affects device cache size and overrides value of device_cache_percent"
     )
     optimal_adapter_size: int = Field(
