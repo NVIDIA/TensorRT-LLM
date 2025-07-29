@@ -1609,21 +1609,23 @@ class TestNemotronH(LlmapiAccuracyTestHarness):
         kv_cache_config = KvCacheConfig(enable_block_reuse=False)
         with LLM(self.MODEL_PATH,
                  kv_cache_config=kv_cache_config,
-                 cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
-                 max_batch_size=128) as llm:
+                 max_batch_size=128,
+                 cuda_graph_config=CudaGraphConfig()
+                 if cuda_graph else None) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
-    @skip_pre_hopper
+    @skip_pre_ada
     @parametrize_with_ids("cuda_graph", [False, True])
     def test_reasoning_fp8_prequantized(self, cuda_graph):
         kv_cache_config = KvCacheConfig(enable_block_reuse=False)
         with LLM(f"{llm_models_root()}/Nemotron-H-8B-Reasoning-128K-FP8",
                  kv_cache_config=kv_cache_config,
-                 cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
-                 max_batch_size=256) as llm:
+                 max_batch_size=256,
+                 cuda_graph_config=CudaGraphConfig()
+                 if cuda_graph else None) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
