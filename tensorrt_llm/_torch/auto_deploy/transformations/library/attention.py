@@ -297,6 +297,28 @@ def _sfdp_replacement_7(query, key, value, attention_mask, scaling, dropout):
     )
 
 
+# with causal_mask, no division, does not cast to fp32 for softmax
+def _sfdp_pattern_8(query, key, value, attention_mask, scaling, dropout):
+    attn_weights = torch.matmul(query, key.transpose(2, 3)) * scaling
+    attn_weights = attn_weights + attention_mask
+    attn_weights = F.softmax(attn_weights, dim=-1)
+    attn_weights = F.dropout(attn_weights, p=dropout, training=False)
+    attn_output = torch.matmul(attn_weights, value)
+    return attn_output
+
+
+def _sfdp_replacement_8(query, key, value, attention_mask, scaling, dropout):
+    return torch.ops.auto_deploy.torch_attention_sdpa.default(
+        query,
+        key,
+        value,
+        attn_mask=None,
+        dropout_p=dropout,
+        is_causal=True,
+        scale=scaling,
+    )
+
+
 def _get_sfdp_patterns() -> List[Dict[str, Any]]:
     bs, seq_len, n_heads, hidden_size = 8, 16, 8, 512
     head_dim = hidden_size // n_heads
@@ -315,6 +337,7 @@ def _get_sfdp_patterns() -> List[Dict[str, Any]]:
         (_sfdp_pattern_5, _sfdp_replacement_5, False, 0.874321, 0.89734),
         (_sfdp_pattern_6, _sfdp_replacement_6, True, 0.634743, 0.6849734),
         (_sfdp_pattern_7, _sfdp_replacement_7, True, 0.34743, 0.849734),
+        (_sfdp_pattern_8, _sfdp_replacement_8, True, 0.2234743, 0.95849734),
     ]
 
     patterns = []
