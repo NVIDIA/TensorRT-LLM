@@ -1605,26 +1605,105 @@ class TestNemotronH(LlmapiAccuracyTestHarness):
     @parametrize_with_ids("cuda_graph", [False, True])
     def test_auto_dtype(self, cuda_graph):
         # TODO: remove max_batch_size after mamba cache manager is supported
-        # ToDo: check 47b and 56b model
+        # Once removed max_batch_size, the test will OOM
         kv_cache_config = KvCacheConfig(enable_block_reuse=False)
         with LLM(self.MODEL_PATH,
                  kv_cache_config=kv_cache_config,
-                 cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
-                 max_batch_size=128) as llm:
+                 max_batch_size=128,
+                 cuda_graph_config=CudaGraphConfig()
+                 if cuda_graph else None) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
-    @skip_pre_hopper
+    @skip_pre_ada
     @parametrize_with_ids("cuda_graph", [False, True])
     def test_reasoning_fp8_prequantized(self, cuda_graph):
         kv_cache_config = KvCacheConfig(enable_block_reuse=False)
         with LLM(f"{llm_models_root()}/Nemotron-H-8B-Reasoning-128K-FP8",
                  kv_cache_config=kv_cache_config,
-                 cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
-                 max_batch_size=256) as llm:
+                 max_batch_size=256,
+                 cuda_graph_config=CudaGraphConfig()
+                 if cuda_graph else None) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
+@pytest.mark.skip_less_device(8)
+@pytest.mark.skip_less_device_memory(80000)
+class TestNemotronH_47B_Base(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "nvidia/Nemotron-H-47B-Base-8K"
+    MODEL_PATH = f"{llm_models_root()}/Nemotron-H-47B-Base-8K"
+
+    @parametrize_with_ids("cuda_graph", [False, True])
+    @pytest.mark.parametrize("tp_size,pp_size,ep_size", [(8, 1, 1), (8, 1, 4),
+                                                         (8, 1, 8)],
+                             ids=["tp8", "tp8ep4", "tp8ep8"])
+    def test_auto_dtype(self, cuda_graph, tp_size, pp_size, ep_size):
+        kv_cache_config = KvCacheConfig(enable_block_reuse=False,
+                                        free_gpu_memory_fraction=0.6)
+        with LLM(self.MODEL_PATH,
+                 tensor_parallel_size=tp_size,
+                 pipeline_parallel_size=pp_size,
+                 moe_expert_parallel_size=ep_size,
+                 kv_cache_config=kv_cache_config,
+                 max_batch_size=256,
+                 cuda_graph_config=CudaGraphConfig()
+                 if cuda_graph else None) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_pre_ada
+    @parametrize_with_ids("cuda_graph", [False, True])
+    @pytest.mark.parametrize("tp_size,pp_size,ep_size", [(8, 1, 1), (8, 1, 4),
+                                                         (8, 1, 8)],
+                             ids=["tp8", "tp8ep4", "tp8ep8"])
+    def test_reasoning_fp8_prequantized(self, cuda_graph, tp_size, pp_size,
+                                        ep_size):
+        kv_cache_config = KvCacheConfig(enable_block_reuse=False,
+                                        free_gpu_memory_fraction=0.6)
+        with LLM(f"{llm_models_root()}/Nemotron-H-47B-Reasoning-128K-FP8",
+                 kv_cache_config=kv_cache_config,
+                 tensor_parallel_size=tp_size,
+                 pipeline_parallel_size=pp_size,
+                 moe_expert_parallel_size=ep_size,
+                 max_batch_size=256,
+                 cuda_graph_config=CudaGraphConfig()
+                 if cuda_graph else None) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
+@pytest.mark.skip_less_device(8)
+@pytest.mark.skip_less_device_memory(80000)
+class TestNemotronH_56B_Base(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "nvidia/Nemotron-H-56B-Base-8K"
+    MODEL_PATH = f"{llm_models_root()}/Nemotron-H-56B-Base-8K"
+
+    @parametrize_with_ids("cuda_graph", [False, True])
+    @pytest.mark.parametrize("tp_size,pp_size,ep_size", [(8, 1, 1), (8, 1, 4),
+                                                         (8, 1, 8)],
+                             ids=["tp8", "tp8ep4", "tp8ep8"])
+    def test_auto_dtype(self, cuda_graph, tp_size, pp_size, ep_size):
+        kv_cache_config = KvCacheConfig(enable_block_reuse=False,
+                                        free_gpu_memory_fraction=0.6)
+        with LLM(self.MODEL_PATH,
+                 tensor_parallel_size=tp_size,
+                 pipeline_parallel_size=pp_size,
+                 moe_expert_parallel_size=ep_size,
+                 kv_cache_config=kv_cache_config,
+                 max_batch_size=256,
+                 cuda_graph_config=CudaGraphConfig()
+                 if cuda_graph else None) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
