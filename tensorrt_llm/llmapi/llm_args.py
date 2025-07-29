@@ -605,7 +605,7 @@ class PybindMirror(ABC):
     def from_pybind(cls: Type[TypeBaseModel],
                     pybind_instance: "PybindMirror") -> TypeBaseModel:
         """Construct an instance of the given class from the fields in the given
-        pybind class.
+        pybind class instance.
 
         Args:
             cls: Type of the class to construct, must be a subclass of pydantic
