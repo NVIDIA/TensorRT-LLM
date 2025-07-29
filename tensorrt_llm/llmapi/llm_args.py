@@ -759,6 +759,15 @@ class PeftCacheConfig(StrictBaseModel, PybindMirror):
     @staticmethod
     def create_from_pybind(
             peft_cache_config: _PeftCacheConfig) -> "PeftCacheConfig":
+        # Some of the properties are optional in CPP but in python they have a default value and aren't optional,
+        # so copy their value only if they have a value in the CPP instance.
+        extra_kwargs = {}
+        if peft_cache_config.device_cache_percent is not None:
+            extra_kwargs[
+                "device_cache_percent"] = peft_cache_config.device_cache_percent
+        if peft_cache_config.host_cache_size is not None:
+            extra_kwargs["host_cache_size"] = peft_cache_config.host_cache_size
+
         return PeftCacheConfig(
             num_host_module_layer=peft_cache_config.num_host_module_layer,
             num_device_module_layer=peft_cache_config.num_device_module_layer,
@@ -770,9 +779,8 @@ class PeftCacheConfig(StrictBaseModel, PybindMirror):
             max_pages_per_block_host=peft_cache_config.max_pages_per_block_host,
             max_pages_per_block_device=peft_cache_config.
             max_pages_per_block_device,
-            device_cache_percent=peft_cache_config.device_cache_percent,
-            host_cache_size=peft_cache_config.host_cache_size,
-            lora_prefetch_dir=peft_cache_config.lora_prefetch_dir)
+            lora_prefetch_dir=peft_cache_config.lora_prefetch_dir,
+            **extra_kwargs)
 
 
 @PybindMirror.mirror_pybind_fields(_LookaheadDecodingConfig)
