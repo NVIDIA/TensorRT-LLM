@@ -20,6 +20,53 @@ be relaxed in a future version.
 _(1) Padding sequences in the generation phase, that contain a single token, to
 the length of the maximum input sequence is inefficient use of resources_.
 
+### `max_batch_size`, `max_seq_len` and `max_num_tokens`
+
+<p align="center">
+    <img src="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/media/max_bs_toks_len.svg?raw=true" alt="Explain `max_batch_size`, `max_seq_len` and `max_num_tokens`" width="30%" height="auto">
+</p>
+
+#### `max_batch_size`
+
+`max_batch_size` defines the maximum number of requests that the engine can handle.​
+
+It controls the maximum number of requests that can be scheduled at runtime.
+
+Set high enough `max_batch_size` when building the engine so that it does not become the bottleneck of the throughput, and use runtime `max_batch_size` to tune it without re-building the engine if you want to get better user throughput or lower latency.
+
+#### `max_seq_len`
+
+`max_seq_len` defines the maximum sequence length of single request​
+
+Starting from TensorRT-LLM v0.11, when `--remove_input_padding` and `--context_fmha` are enabled, `max_seq_len` can replace `max_input_len` and `max_output_len`, and is set to `max_position_embeddings` by default.
+
+Use default `max_seq_len` (which is `max_position_embeddings`), no need to tune it unless you are very sure what max sequence lengths would be on your workloads. If the GPU memory is so limited that it cannot make sure even one request to reach `max_seq_len`, you'll need to reduce it.
+
+#### `max_num_tokens`
+
+`max_num_tokens` defines the maximum number of batched input tokens after padding is removed in each batch.​
+
+`max_num_tokens` is set to 8192 by default starting from v0.11, you can tune it using the runtime `max_num_tokens` without re-buliding the engine. It is recommended to tune `--max_num_tokens` for better performance.
+
+The maximum number of tokens equals will not take effects when input padding is
+not removed. When input padding is removed, the tokens from different sequences are
+packed together and the maximum number of the tokens can be set to a different
+(lower) value, which by default to be 8192.
+
+There are two aspects that must be considered. Firstly, some input sequences
+will be shorter than the maximum input length. Secondly, when in-flight
+sequence batching is enabled, requests in context phase will be executed with
+requests in generation phase. Those latter requests produce a lot fewer tokens
+than `max_input_len` (at most, `beam_width` tokens).
+
+Using a more realistic value for `max_num_tokens` allows TensorRT-LLM to
+allocate more memory to store the KV cache and execute more requests together.
+It leads to an increased efficiency.
+
+Increasing `max_num_tokens` appropriately will be beneficial to performance.
+When increasing `--max_num_tokens` to some point, GPU utilization will plateau,
+going beyond that saturation point may hurt both first token latency as well as
+total end-to-end latency.
 
 
 ## Chunked Context (a.k.a Chunked Prefill)
@@ -64,7 +111,6 @@ blocks when required. See the simplified implementation of
 [`tensorrt_llm.runtime.KVCacheManager`](source:tensorrt_llm/runtime/kv_cache_manager.py).
 A more efficient C++ implementation is included in the
 [Batch Manager](source:cpp/include/tensorrt_llm/batch_manager).
-
 
 ## The schedulers
 
