@@ -998,6 +998,11 @@ class PyExecutor:
                 if self.kv_cache_transceiver and self.ctx_in_transmission_requests:
                     self._terminate_ctx_finished_requests()
 
+                if self.kv_connector_manager:
+                    reqs_to_terminate = self.kv_connector_manager.get_finished()
+                    for req in reqs_to_terminate:
+                        self._terminate_request(req)
+
                 if self.enable_iter_perf_stats:
                     iter_stats.inflight_batching_stats.num_ctx_tokens = self.model_engine.iter_states[
                         'num_ctx_tokens']
@@ -1548,7 +1553,9 @@ class PyExecutor:
         self._enqueue_responses(error_responses.items())
 
     def _terminate_request(self, request: LlmRequest):
-        self.resource_manager.free_resources(request)
+        if self.kv_connector_manager is None or not self.kv_connector_manager.request_finished(
+                request):
+            self.resource_manager.free_resources(request)
 
     @nvtx_range("_handle_canceled_requests")
     def _handle_canceled_requests(self):

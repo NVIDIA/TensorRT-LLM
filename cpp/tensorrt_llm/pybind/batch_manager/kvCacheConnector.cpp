@@ -85,9 +85,10 @@ public:
 
     using FinishedReqs = std::tuple<std::vector<RequestIdType>, std::vector<RequestIdType>>;
 
-    FinishedReqs getFinished(std::vector<RequestIdType> const& finishedReqIds) override
+    FinishedReqs getFinished(std::vector<RequestIdType> const& finishedGenReqIds,
+        std::vector<RequestIdType> const& startedLoadingReqIds) override
     {
-        PYBIND11_OVERRIDE(FinishedReqs, KvCacheConnectorWorker, getFinished, finishedReqIds);
+        PYBIND11_OVERRIDE(FinishedReqs, KvCacheConnectorWorker, getFinished, finishedGenReqIds, startedLoadingReqIds);
     }
 };
 
@@ -131,7 +132,8 @@ void tensorrt_llm::batch_manager::kv_cache_manager::KVCacheManagerConnectorBindi
         .def("wait_for_layer_load", &tb::kv_connector::KvCacheConnectorWorker::waitForLayerLoad, py::arg("layer_idx"))
         .def("save_kv_layer", &tb::kv_connector::KvCacheConnectorWorker::saveKvLayer, py::arg("layer_idx"))
         .def("wait_for_save", &tb::kv_connector::KvCacheConnectorWorker::waitForSave)
-        .def("get_finished", &tb::kv_connector::KvCacheConnectorWorker::getFinished, py::arg("finished_req_ids"));
+        .def("get_finished", &tb::kv_connector::KvCacheConnectorWorker::getFinished, py::arg("started_loading_req_ids"),
+            py::arg("finished_gen_req_ids"));
 
     py::class_<tb::kv_connector::KvCacheConnectorScheduler, PyKvCacheConnectorScheduler, py::smart_holder>(
         m, "KvCacheConnectorScheduler")
