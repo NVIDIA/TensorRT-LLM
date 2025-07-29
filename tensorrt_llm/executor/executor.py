@@ -121,7 +121,7 @@ class GenerationExecutor(ABC):
             disaggregated_params: Optional[DisaggregatedParams] = None,
             postproc_params: Optional[PostprocParams] = None,
             multimodal_params: Optional[MultimodalParams] = None,
-            return_perf_metrics: Optional[bool] = False) -> GenerationResult:
+            return_perf_metrics: bool = False) -> GenerationResult:
         """Generate output for the given prompt token ids in the asynchronous mode.
         Asynchronous generation accepts single prompt only.
         """

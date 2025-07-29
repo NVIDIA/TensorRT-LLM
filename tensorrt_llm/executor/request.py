@@ -95,7 +95,7 @@ class GenerationRequest:
         disaggregated_params: Optional[DisaggregatedParams] = None,
         postproc_params: Optional[PostprocParams] = None,
         multimodal_params: Optional[MultimodalParams] = None,
-        return_perf_metrics: Optional[bool] = False,
+        return_perf_metrics: bool = False,
     ):
         if isinstance(prompt_token_ids, list):
             self.prompt_token_ids = prompt_token_ids
