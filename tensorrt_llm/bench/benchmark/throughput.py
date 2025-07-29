@@ -438,7 +438,7 @@ def throughput_command(
         kwargs['backend'] = backend
         kwargs['skip_tokenizer_init'] = not no_skip_tokenizer_init
 
-        llm = get_llm(kwargs)
+        llm = get_llm(runtime_config, kwargs)
 
         sampler_args = {
             "end_id": eos_id,
