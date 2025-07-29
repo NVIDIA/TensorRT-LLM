@@ -443,6 +443,7 @@ void initBindings(pybind11::module_& m)
         "push_virtual_memory_allocator",
         [](std::string const& tag, tr::CudaVirtualMemoryAllocator::RestoreMode mode, uintptr_t stream)
         {
+            static_assert(sizeof(uintptr_t) == sizeof(cudaStream_t));
             tr::pushVirtualMemoryAllocator(tag, mode,
                 std::make_shared<tr::CudaStream>(
                     reinterpret_cast<cudaStream_t>(stream), tensorrt_llm::common::getDevice(), false));
