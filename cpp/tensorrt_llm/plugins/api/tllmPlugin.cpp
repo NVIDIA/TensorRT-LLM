@@ -34,6 +34,7 @@
 #include "tensorrt_llm/plugins/mambaConv1dPlugin/mambaConv1dPlugin.h"
 #include "tensorrt_llm/plugins/mixtureOfExperts/mixtureOfExpertsPlugin.h"
 #include "tensorrt_llm/plugins/quantizeToFP4Plugin/quantizeToFP4Plugin.h"
+#include "tensorrt_llm/plugins/wanAttentionPlugin/wanAttentionPlugin.h"
 #if ENABLE_MULTI_DEVICE
 #include "tensorrt_llm/plugins/cpSplitPlugin/cpSplitPlugin.h"
 #include "tensorrt_llm/plugins/gemmAllReducePlugin/gemmAllReducePlugin.h"
@@ -208,6 +209,7 @@ extern "C"
     {
         static tensorrt_llm::plugins::IdentityPluginCreator identityPluginCreator;
         static tensorrt_llm::plugins::BertAttentionPluginCreator bertAttentionPluginCreator;
+        static tensorrt_llm::plugins::WanAttentionPluginCreator wanAttentionPluginCreator;
         static tensorrt_llm::plugins::FusedLayernormPluginCreator fusedLayernormPluginCreator;
         static tensorrt_llm::plugins::GPTAttentionPluginCreator gptAttentionPluginCreator;
         static tensorrt_llm::plugins::GemmPluginCreator gemmPluginCreator;
@@ -250,6 +252,7 @@ extern "C"
         static std::array pluginCreators
             = { creatorPtr(identityPluginCreator),
                   creatorPtr(bertAttentionPluginCreator),
+                  creatorPtr(wanAttentionPluginCreator),
                   creatorPtr(gptAttentionPluginCreator),
                   creatorPtr(gemmPluginCreator),
                   creatorPtr(gemmSwigluPluginCreator),

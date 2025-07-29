@@ -48,6 +48,7 @@ set(PLUGIN_SOURCES)
 set(PLUGIN_CU_SOURCES)
 
 set(PLUGIN_LISTS
+    wanAttentionPlugin
     bertAttentionPlugin
     cpSplitPlugin
     fusedLayernormPlugin

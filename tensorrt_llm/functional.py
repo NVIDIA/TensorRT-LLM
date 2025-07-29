@@ -4673,6 +4673,89 @@ def bert_attention(tensor: Tensor,
     return output
 
 
+def wan_attention(query: Tensor, kv_packed: Tensor, cu_seqlens_q: Tensor,
+                  cu_seqlens_kv: Tensor, num_heads: int, head_size: int,
+                  q_scaling: float) -> Tuple[Tensor]:
+    '''
+    Add an operation that performs the multi-head attention in BERT.
+
+    The multi-head attention (MHA) is the sequence of a batched matmul, a
+    softmax and a batched matmul as described in
+    https://arxiv.org/abs/1706.03762. That function adds an operation that
+    performs those computations using a single GPU kernel.
+
+    The input tensor contains the Q, K and V elements. It is a 2D tensor and
+    its shape is '[sum_of_tokens, 3*hidden_dim]' where the 'sum_of_tokens' is
+    the sum of the sequence lengths in the batch.
+
+    In MHA, the output of the Q*K^T product is scaled by a constant value that
+    is computed as:
+
+        1.f / (q_scaling * sqrt(head_size)).
+
+    That 'q_scaling' constant is the last argument of that function.
+
+    That layer is implemented using a plugin (see bertAttentionPlugin).
+
+    Parameters:
+        tensor : Tensor
+            The QKV input tensor.
+
+        input_lengths : Tensor
+            The length of each sequence. It is a 1D tensor of size 'batch_size'.
+
+        num_heads : int
+            The number of heads.
+
+        head_size : int
+            The size of each head.
+
+        q_scaling : float
+            The factor to compute the scaling factor to scale the output of the
+            'Q*K^T' product.
+
+    Returns:
+        The tensor produced by that layer.
+    '''
+    attn_plg_creator = trt.get_plugin_registry().get_plugin_creator(
+        'WanAttention', '1', TRT_LLM_PLUGIN_NAMESPACE)
+    assert attn_plg_creator is not None
+
+    nheads = trt.PluginField("num_heads", np.array(num_heads, dtype=np.int32),
+                             trt.PluginFieldType.INT32)
+    head_size = trt.PluginField("head_size", np.array(head_size,
+                                                      dtype=np.int32),
+                                trt.PluginFieldType.INT32)
+    q_scaling = trt.PluginField("q_scaling",
+                                np.array(q_scaling, dtype=np.float32),
+                                trt.PluginFieldType.FLOAT32)
+    context_fmha_type = trt.PluginField(
+        "context_fmha_type",
+        # default_net().plugin_config.context_fmha_type
+        np.array(np.int8(2), dtype=np.int8),
+        trt.PluginFieldType.INT8)
+
+    p_dtype = default_net().plugin_config.bert_attention_plugin
+    pf_type = trt.PluginField(
+        "type_id", np.array([int(str_dtype_to_trt(p_dtype))], np.int32),
+        trt.PluginFieldType.INT32)
+    pfc = trt.PluginFieldCollection(
+        [nheads, head_size, q_scaling, context_fmha_type, pf_type])
+
+    attn_plug = attn_plg_creator.create_plugin("wan_attention", pfc)
+    plug_inputs = [query, kv_packed, cu_seqlens_q, cu_seqlens_kv]
+
+    plug_inputs = [i.trt_tensor for i in plug_inputs]
+
+    layer = default_trtnet().add_plugin_v2(plug_inputs, attn_plug)
+    _add_plugin_info(layer, attn_plg_creator, "wan_attention", pfc)
+    assert layer.num_outputs == 1, \
+        f"Plugin outputs number mismatch with expected, got {layer.num_outputs}, expected 1"
+    output = _create_tensor(layer.get_output(0), layer)
+    assert output is not None
+    return output
+
+
 class RopeEmbeddingUtils:
 
     @staticmethod
