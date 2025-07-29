@@ -1,9 +1,9 @@
 set -ex
-export PATH=${HOME}/.local/bin:$PATH # its where trtllm-bench is installed
 export TQDM_MININTERVAL=1000
 export PRINT_ITER_LOG=true
-pip install -e ./
 nvidia-smi
+
+echo "TRT-LLM GIT COMMIT": $TRT_LLM_GIT_COMMIT
 
 # The script must run under PWD as TRT-LLM source code root, because it uses ../benchmarks/cpp/prepare_dataset.py
 output_folder=$1
@@ -39,7 +39,7 @@ for req_info in "${data_configs[@]}"; do
   echo "========================================================="
 
   # Create the extra config file
-  cat >./extra-llm-api-config.yml<<EOF
+  cat >/tmp/extra-llm-api-config.yml<<EOF
   cuda_graph_config:
       enable_padding: true
       batch_sizes:
@@ -61,7 +61,7 @@ for req_info in "${data_configs[@]}"; do
 EOF
 
   # Generate dataset if it doesn't exist
-  dataset_file="${model_label}_${num_requests}_isl${isl}_osl${osl}.json"
+  dataset_file=/tmp/"${model_label}_${num_requests}_isl${isl}_osl${osl}.json"
   if [ ! -f "$dataset_file" ]; then
     echo "Generating dataset for $model_name: $dataset_file"
     python ../benchmarks/cpp/prepare_dataset.py --tokenizer=$model_name --stdout token-norm-dist --num-requests=$num_requests \
@@ -73,12 +73,12 @@ EOF
     LOCAL_DATA_PATH_OPTIONS="--model_path ${model_path}"
   fi
 
-  cat  ./extra-llm-api-config.yml
+  cat  /tmp/extra-llm-api-config.yml
 
   # Run benchmark for this model
   mpirun -n 1 --oversubscribe --allow-run-as-root \
   trtllm-bench --model $model_name ${LOCAL_DATA_PATH_OPTIONS} \
-    throughput --dataset $dataset_file --backend pytorch --extra_llm_api_options ./extra-llm-api-config.yml \
+    throughput --dataset $dataset_file --backend pytorch --extra_llm_api_options /tmp/extra-llm-api-config.yml \
       --tp ${GPUS} \
       --ep ${GPUS} \
       --warmup 0 \

@@ -1,13 +1,12 @@
 set -ex
-export PATH=${HOME}/.local/bin:$PATH # its where trtllm-serve is installed
 export TQDM_MININTERVAL=1000
 export PRINT_ITER_LOG=false
-pip install -e ./
 nvidia-smi
+
+echo "TRT-LLM GIT COMMIT": $TRT_LLM_GIT_COMMIT
 
 # The script must run under PWD as TRT-LLM source code root, because it uses ../tensorrt_llm/serve/scripts/benchmark_serving.py
 output_folder=$1
-[[ ! -e ${output_folder} ]] && mkdir -p ${output_folder}
 pushd ${output_folder} # all the dataset and the yaml are stored inside the folder
 
 # Sweep configs, change here if you want to run less or more
@@ -69,7 +68,7 @@ for model_info in "${models[@]}"; do
   echo "========================================================="
 
   # Create the extra config file
-  cat >./extra-llm-api-config.yml<<EOF
+  cat >/tmp/extra-llm-api-config.yml<<EOF
   print_iter_log: ${PRINT_ITER_LOG}
   cuda_graph_config:
       enable_padding: true
@@ -97,11 +96,11 @@ EOF
     MODEL="{model_name}"
   fi
 
-  cat  ./extra-llm-api-config.yml
+  cat  /tmp/extra-llm-api-config.yml
 
   # Start the server and capture its PID
   mpirun -n 1 --oversubscribe --allow-run-as-root \
-  trtllm-serve ${MODEL} --backend pytorch --tp_size ${GPUS} --ep_size ${GPUS} --max_batch_size 1024 --max_num_tokens ${max_num_tokens} --kv_cache_free_gpu_memory_fraction ${kv_fraction} --extra_llm_api_options ./extra-llm-api-config.yml &
+  trtllm-serve ${MODEL} --backend pytorch --tp_size ${GPUS} --ep_size ${GPUS} --max_batch_size 1024 --max_num_tokens ${max_num_tokens} --kv_cache_free_gpu_memory_fraction ${kv_fraction} --extra_llm_api_options /tmp/extra-llm-api-config.yml &
   server_pid=$!
 
   # Wait for the server to be ready before proceeding
