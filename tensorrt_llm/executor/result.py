@@ -391,13 +391,8 @@ class DetokenizedGenerationResultBase(GenerationResultBase):
                         stream_interval=self.sampling_params._stream_interval,
                         **kwargs)
                 else:
-                    try:
-                        beam_output.text = self.tokenizer.decode(
-                            beam_output.token_ids, **kwargs)
-                    except:
-                        # Tiktoken path
-                        beam_output.text = self.tokenizer.decode(
-                            beam_output.token_ids)
+                    beam_output.text = self.tokenizer.decode(
+                        beam_output.token_ids, **kwargs)
 
                 is_generating = not self._done
                 is_finished_with_stop_or_length = (
