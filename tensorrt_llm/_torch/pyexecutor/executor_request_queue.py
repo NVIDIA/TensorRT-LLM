@@ -99,8 +99,13 @@ class ExecutorRequestQueue:
         pending_requests = []
 
         # Track the request with strict requirements
+        if enable_attention_dp:
+            assert all_ranks_num_active_requests is not None, \
+            "all_ranks_num_active_requests must be provided for attention DP scheduling"
+
         scheduling_all_ranks_num_active_requests = all_ranks_num_active_requests.copy(
         ) if enable_attention_dp else None
+
         while req_count < max_req_count and waiting_queue:
             req_item = waiting_queue.popleft()
             can_process = self._can_process_attention_dp_request(
