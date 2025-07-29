@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from enum import Enum, EnumMeta
 from pathlib import Path
 from typing import (TYPE_CHECKING, Any, ClassVar, Dict, List, Literal, Optional,
-                    Type, TypeAlias, TypeVar, Union, get_args, get_origin)
+                    Tuple, Type, TypeAlias, TypeVar, Union, get_args, get_origin)
 
 import torch
 import yaml
