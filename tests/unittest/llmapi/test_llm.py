@@ -1490,10 +1490,9 @@ def test_llama_7b_multi_lora_evict_load_new_adapters(
 def test_llama_7b_peft_cache_config_affects_peft_cache_size():
     """Tests that LLM arg of peft_cache_config affects the peft cache sizes.
 
-    NOTE: The caller can't get the actual LoRA cache size without debug logs, so
-    to test whether it is affected by PeftCacheConfig LLM arg, a non-zero value
-    that's too small to contain a single adapter can be sent, which shall cause
-    a failure in init.
+    NOTE: The caller can't get the actual LoRA cache sizes, so we instead we
+    test that it fails when configured with a value too small to contain a
+    single adapter.
     """
     # For LoRA checkpoints without finetuned embedding and lm_head, we can either:
     # (1) specify lora_target_modules, or
@@ -1502,7 +1501,7 @@ def test_llama_7b_peft_cache_config_affects_peft_cache_size():
         lora_target_modules=['attn_q', 'attn_k', 'attn_v'], max_lora_rank=8)
     build_config = BuildConfig(lora_config=lora_config_no_cache_size_values)
 
-    # Test that init fails on PeftCacheConfig.host_cache_size too small
+    # Test that too small PeftCacheConfig.host_cache_size causes failure
     with pytest.raises(RuntimeError):
         check_llama_7b_multi_lora_from_request_test_harness(
             LLM,
@@ -1512,7 +1511,7 @@ def test_llama_7b_peft_cache_config_affects_peft_cache_size():
             lora_config=lora_config_no_cache_size_values,
             peft_cache_config=PeftCacheConfig(host_cache_size=1))
 
-    # Test that init fails on PeftCacheConfig.device_cache_percent too small
+    # Test that too small PeftCacheConfig.device_cache_percent causes failure
     with pytest.raises(RuntimeError):
         check_llama_7b_multi_lora_from_request_test_harness(
             LLM,
