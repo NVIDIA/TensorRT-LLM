@@ -347,8 +347,12 @@ def attention_dp_queue(mock_dist_attention_dp):
                                  enable_iter_perf_stats=True,
                                  is_disaggregated=False)
     # Initialize all_ranks_num_active_requests
-    queue.all_ranks_num_active_requests = [2, 1, 3, 0]  # 4 ranks
     return queue
+
+
+@pytest.fixture
+def all_ranks_num_active_requests():
+    return [2, 1, 3, 0]  # 4 ranks
 
 
 def create_mock_request_with_py_schedule_params(attention_dp_rank=None,
@@ -374,7 +378,8 @@ def create_mock_request_with_py_schedule_params(attention_dp_rank=None,
 
 
 # Unit tests for _schedule_attention_dp_requests
-def test_schedule_attention_dp_requests_scheduled_requests(attention_dp_queue):
+def test_schedule_attention_dp_requests_scheduled_requests(
+        attention_dp_queue, all_ranks_num_active_requests):
     req1 = RequestQueueItem(
         1,
         create_mock_request_with_py_schedule_params(attention_dp_rank=0,
@@ -386,17 +391,19 @@ def test_schedule_attention_dp_requests_scheduled_requests(attention_dp_queue):
 
     new_requests = [req1, req2]
 
-    result = attention_dp_queue._schedule_attention_dp_requests(new_requests)
+    all_ranks_new_requests = attention_dp_queue._schedule_attention_dp_requests(
+        new_requests, all_ranks_num_active_requests)
+    result = all_ranks_new_requests[0]
 
     assert len(result) == 2
     assert req1 in result
     assert req2 in result
 
-    assert attention_dp_queue.all_ranks_num_active_requests[0] == 4
+    assert all_ranks_num_active_requests[0] == 4
 
 
 def test_schedule_attention_dp_requests_scheduled_requests_other_ranks(
-        attention_dp_queue):
+        attention_dp_queue, all_ranks_num_active_requests):
     req1 = RequestQueueItem(
         1,
         create_mock_request_with_py_schedule_params(attention_dp_rank=1,
@@ -408,16 +415,18 @@ def test_schedule_attention_dp_requests_scheduled_requests_other_ranks(
 
     new_requests = [req1, req2]
 
-    result = attention_dp_queue._schedule_attention_dp_requests(new_requests)
+    all_ranks_new_requests = attention_dp_queue._schedule_attention_dp_requests(
+        new_requests, all_ranks_num_active_requests)
 
+    result = all_ranks_new_requests[0]
     assert len(result) == 0
 
-    assert attention_dp_queue.all_ranks_num_active_requests[1] == 2
-    assert attention_dp_queue.all_ranks_num_active_requests[2] == 4
+    assert all_ranks_num_active_requests[1] == 2
+    assert all_ranks_num_active_requests[2] == 4
 
 
 def test_schedule_attention_dp_requests_unscheduled_requests(
-        attention_dp_queue):
+        attention_dp_queue, all_ranks_num_active_requests):
     req1 = RequestQueueItem(
         1,
         create_mock_request_with_py_schedule_params(attention_dp_rank=0,
@@ -429,15 +438,17 @@ def test_schedule_attention_dp_requests_unscheduled_requests(
 
     new_requests = [req1, req2]
 
-    result = attention_dp_queue._schedule_attention_dp_requests(new_requests)
+    all_ranks_new_requests = attention_dp_queue._schedule_attention_dp_requests(
+        new_requests, all_ranks_num_active_requests)
+    result = all_ranks_new_requests[0]
 
     assert len(result) == 1  # Only req1 for current rank
     assert req1 in result
 
 
 def test_schedule_attention_dp_requests_unscheduled_no_capacity(
-        attention_dp_queue):
-    attention_dp_queue.all_ranks_num_active_requests[0] = 8
+        attention_dp_queue, all_ranks_num_active_requests):
+    all_ranks_num_active_requests[0] = 8
 
     req1 = RequestQueueItem(
         1,
@@ -446,12 +457,15 @@ def test_schedule_attention_dp_requests_unscheduled_no_capacity(
 
     new_requests = [req1]
 
-    result = attention_dp_queue._schedule_attention_dp_requests(new_requests)
+    all_ranks_new_requests = attention_dp_queue._schedule_attention_dp_requests(
+        new_requests, all_ranks_num_active_requests)
+    result = all_ranks_new_requests[0]
 
     assert len(result) == 0  # No capacity
 
 
-def test_schedule_attention_dp_requests_mixed_scenarios(attention_dp_queue):
+def test_schedule_attention_dp_requests_mixed_scenarios(
+        attention_dp_queue, all_ranks_num_active_requests):
     req_scheduled_current = RequestQueueItem(
         1,
         create_mock_request_with_py_schedule_params(attention_dp_rank=0,
@@ -474,21 +488,26 @@ def test_schedule_attention_dp_requests_mixed_scenarios(attention_dp_queue):
         req_unscheduled_other
     ]
 
-    result = attention_dp_queue._schedule_attention_dp_requests(new_requests)
+    all_ranks_new_requests = attention_dp_queue._schedule_attention_dp_requests(
+        new_requests, all_ranks_num_active_requests)
+    result = all_ranks_new_requests[0]
 
     assert len(result) == 2
     assert req_scheduled_current in result
     assert req_unscheduled_current in result
 
 
-def test_schedule_attention_dp_requests_empty_lists(attention_dp_queue):
-    result = attention_dp_queue._schedule_attention_dp_requests([])
+def test_schedule_attention_dp_requests_empty_lists(
+        attention_dp_queue, all_ranks_num_active_requests):
+    all_ranks_new_requests = attention_dp_queue._schedule_attention_dp_requests(
+        [], all_ranks_num_active_requests)
+    result = all_ranks_new_requests[0]
 
     assert len(result) == 0
 
 
 def test_schedule_attention_dp_requests_expected_num_active_calculation(
-        attention_dp_queue):
+        attention_dp_queue, all_ranks_num_active_requests):
     req1 = RequestQueueItem(
         1,
         create_mock_request_with_py_schedule_params(attention_dp_rank=0,
@@ -500,14 +519,16 @@ def test_schedule_attention_dp_requests_expected_num_active_calculation(
 
     new_requests = [req1, req2]
 
-    attention_dp_queue._schedule_attention_dp_requests(new_requests)
+    all_ranks_new_requests = attention_dp_queue._schedule_attention_dp_requests(
+        new_requests, all_ranks_num_active_requests)
+    all_ranks_new_requests[0]
 
     # 2 + 1 + 3 + 0 = 6, 6 + 2 = 8, (8 + 3) // 4 = 2, max(2, 2, 1, 3, 0) = 3
     assert attention_dp_queue.expected_num_active_requests == 3
 
 
 def test_schedule_attention_dp_requests_balance_requests_called(
-        attention_dp_queue):
+        attention_dp_queue, all_ranks_num_active_requests):
     req1 = RequestQueueItem(
         1,
         create_mock_request_with_py_schedule_params(attention_dp_rank=0,
@@ -517,22 +538,23 @@ def test_schedule_attention_dp_requests_balance_requests_called(
 
     with patch.object(attention_dp_queue,
                       '_balance_requests_across_ranks') as mock_balance:
-        mock_balance.return_value = [req1]
-        result = attention_dp_queue._schedule_attention_dp_requests(
-            new_requests)
+        mock_balance.return_value = {0: req1}
+
+        all_ranks_new_requests = attention_dp_queue._schedule_attention_dp_requests(
+            new_requests, all_ranks_num_active_requests)
+        all_ranks_new_requests[0]
 
     # Check that _balance_requests_across_ranks was called
     mock_balance.assert_called_once()
     call_args = mock_balance.call_args[0]
     assert isinstance(call_args[0], list)
-    assert isinstance(call_args[1], list)
-    assert call_args[
-        2] == attention_dp_queue.all_ranks_num_active_requests  # Third arg
+    assert isinstance(call_args[1], dict)
+    assert call_args[2] == all_ranks_num_active_requests  # Third arg
 
 
 def test_schedule_attention_dp_requests_no_scheduling_when_capacity_exceeded(
-        attention_dp_queue):
-    attention_dp_queue.all_ranks_num_active_requests[0] = 8
+        attention_dp_queue, all_ranks_num_active_requests):
+    all_ranks_num_active_requests[0] = 8
 
     req1 = RequestQueueItem(
         1,
@@ -541,15 +563,17 @@ def test_schedule_attention_dp_requests_no_scheduling_when_capacity_exceeded(
 
     new_requests = [req1]
 
-    result = attention_dp_queue._schedule_attention_dp_requests(new_requests)
+    all_ranks_new_requests = attention_dp_queue._schedule_attention_dp_requests(
+        new_requests, all_ranks_num_active_requests)
+    result = all_ranks_new_requests[0]
 
     assert len(result) == 0  # No requests scheduled
-    assert attention_dp_queue.all_ranks_num_active_requests[
-        0] == 8  # Capacity unchanged
+    assert all_ranks_num_active_requests[0] == 8  # Capacity unchanged
 
 
 # Integration tests combining both methods
-def test_filter_and_schedule_integration(attention_dp_queue):
+def test_filter_and_schedule_integration(attention_dp_queue,
+                                         all_ranks_num_active_requests):
     req_schedulable = RequestQueueItem(
         1,
         create_mock_request_with_py_schedule_params(attention_dp_rank=0,
@@ -566,15 +590,18 @@ def test_filter_and_schedule_integration(attention_dp_queue):
 
     new_requests = [req_schedulable, req_relax, req_no_params]
 
-    result = attention_dp_queue._schedule_attention_dp_requests(new_requests)
+    all_ranks_new_requests = attention_dp_queue._schedule_attention_dp_requests(
+        new_requests, all_ranks_num_active_requests)
+    result = all_ranks_new_requests[0]
 
     assert len(result) == 2
     assert req_schedulable in result
     assert req_relax in result
 
 
-def test_filter_and_schedule_with_capacity_limits(attention_dp_queue):
-    attention_dp_queue.all_ranks_num_active_requests[0] = 7
+def test_filter_and_schedule_with_capacity_limits(
+        attention_dp_queue, all_ranks_num_active_requests):
+    all_ranks_num_active_requests[0] = 7
 
     req1 = RequestQueueItem(
         1,
@@ -589,25 +616,30 @@ def test_filter_and_schedule_with_capacity_limits(attention_dp_queue):
 
     new_requests = [req1, req2]
 
-    result = attention_dp_queue._schedule_attention_dp_requests(new_requests)
+    all_ranks_new_requests = attention_dp_queue._schedule_attention_dp_requests(
+        new_requests, all_ranks_num_active_requests)
+    result = all_ranks_new_requests[0]
 
     assert len(result) == 1
     assert req1 in result
 
 
-def test_get_from_waiting_queue_with_attention_dp(attention_dp_queue):
+def test_get_from_waiting_queue_with_attention_dp(
+        attention_dp_queue, all_ranks_num_active_requests):
     items = [RequestQueueItem(i, Mock()) for i in range(5)]
     attention_dp_queue.waiting_queue.extend(items)
 
     result = attention_dp_queue._get_from_waiting_queue(
-        attention_dp_queue.waiting_queue, 3, enable_attention_dp=True)
+        attention_dp_queue.waiting_queue, 3, True,
+        all_ranks_num_active_requests)
 
     assert len(result) == 3
     assert result == items[:3]
     assert len(attention_dp_queue.waiting_queue) == 2
 
 
-def test_get_from_waiting_queue_with_attention_dp_filtering(attention_dp_queue):
+def test_get_from_waiting_queue_with_attention_dp_filtering(
+        attention_dp_queue, all_ranks_num_active_requests):
     req1 = RequestQueueItem(
         1,
         create_mock_request_with_py_schedule_params(attention_dp_rank=0,
@@ -623,10 +655,11 @@ def test_get_from_waiting_queue_with_attention_dp_filtering(attention_dp_queue):
     attention_dp_queue.waiting_queue.extend([req1, req2, req3])
 
     # Set rank 0 to full capacity to test filtering
-    attention_dp_queue.all_ranks_num_active_requests[0] = 8
+    all_ranks_num_active_requests[0] = 8
 
     result = attention_dp_queue._get_from_waiting_queue(
-        attention_dp_queue.waiting_queue, 3, enable_attention_dp=True)
+        attention_dp_queue.waiting_queue, 3, True,
+        all_ranks_num_active_requests)
 
     assert len(result) == 2
     assert req2 in result
@@ -682,14 +715,123 @@ def test_achieve_max_num_active_requests(attention_dp_queue):
                         attention_dp_rank=rank, attention_dp_relax=True)))
             req_id += 1
 
-    attention_dp_queue.all_ranks_num_active_requests = [5, 6, 3, 7]
+    all_ranks_num_active_requests = [5, 6, 3, 7]
     attention_dp_queue.waiting_queue.extend(req_list)
-    avaiable_active_requests = attention_dp_queue.max_num_active_requests * 4 - sum(
-        attention_dp_queue.all_ranks_num_active_requests)
+    available_active_requests = attention_dp_queue.max_num_active_requests * 4 - sum(
+        all_ranks_num_active_requests)
 
     result = attention_dp_queue._get_from_waiting_queue(
-        attention_dp_queue.waiting_queue,
-        avaiable_active_requests,
-        enable_attention_dp=True)
+        attention_dp_queue.waiting_queue, available_active_requests, True,
+        all_ranks_num_active_requests)
 
-    assert len(result) == avaiable_active_requests
+    assert len(result) == available_active_requests
+
+
+def append_to_waiting_queue(waiting_queue, rank, attention_dp_relax):
+    req_id = len(waiting_queue)
+    waiting_queue.append(
+        RequestQueueItem(
+            req_id,
+            create_mock_request_with_py_schedule_params(
+                attention_dp_rank=rank, attention_dp_relax=attention_dp_relax)))
+
+
+@pytest.mark.parametrize(
+    "max_num_active_requests,all_ranks_num_active_requests,request_configs,all_ranks_expected_req_ids",
+    [
+        # Case: Balanced distribution of relaxed requests
+        (3, [0, 0, 0, 0], [(None, True)] * 7, {
+            0: [0, 4],
+            1: [1, 5],
+            2: [2, 6],
+            3: [3]
+        }),
+        # Case: Limited by max active
+        (3, [0, 0, 0, 0], [(None, True)] * 13, {
+            0: [0, 4, 8],
+            1: [1, 5, 9],
+            2: [2, 6, 10],
+            3: [3, 7, 11]
+        }),
+        # Case: Empty new requests
+        (3, [3, 3, 3, 0], [], {
+            0: [],
+            1: [],
+            2: [],
+            3: []
+        }),
+        # Case: Rank 0 is full and cannot schedule attention_dp rank request
+        (3, [3, 1, 3, 0], [(0, False), (0, True)], {
+            0: [],
+            1: [1],
+            2: [],
+            3: []
+        }),
+        # Case: Only room for 1 request, need to skip req0 with attention dp rank
+        (3, [3, 2, 3, 3], [(0, False), (0, True)], {
+            0: [],
+            1: [1],
+            2: [],
+            3: []
+        }),
+        # Case: Targeting ranks 1 and 3 that have room
+        (3, [2, 1, 3, 0], [(1, False), (3, False)], {
+            0: [],
+            1: [0],
+            2: [],
+            3: [1]
+        }),
+        # Case: Target dp rank specified, by relax is True
+        (3, [3, 3, 3, 1], [(0, True), (1, True), (2, True)], {
+            0: [],
+            1: [],
+            2: [],
+            3: [0, 1]
+        }),
+        # Case:
+        (3, [3, 3, 3, 0], [(0, False), (1, True), (3, False)], {
+            0: [],
+            1: [],
+            2: [],
+            3: [2, 1]
+        }),
+    ])
+def test_attention_dp_scheduling_cases(attention_dp_queue,
+                                       max_num_active_requests,
+                                       all_ranks_num_active_requests,
+                                       request_configs,
+                                       all_ranks_expected_req_ids):
+    """Test attention DP scheduling with various scenarios."""
+    attention_dp_queue.max_num_active_requests = max_num_active_requests
+
+    waiting_queue = deque()
+    for rank, relax in request_configs:
+        append_to_waiting_queue(waiting_queue, rank, relax)
+
+    run_test_attention_dp_scheduling(attention_dp_queue, waiting_queue,
+                                     all_ranks_num_active_requests,
+                                     all_ranks_expected_req_ids)
+
+
+def run_test_attention_dp_scheduling(attention_dp_queue, waiting_queue,
+                                     all_ranks_num_active_requests,
+                                     all_ranks_expected_req_ids):
+
+    num_ranks = len(all_ranks_num_active_requests)
+    total_num_active_requests = sum(all_ranks_num_active_requests)
+    total_max_num_active_requests = attention_dp_queue.max_num_active_requests * num_ranks
+    enable_attention_dp = True
+
+    new_requests = attention_dp_queue._get_from_waiting_queue(
+        waiting_queue,
+        total_max_num_active_requests - total_num_active_requests,
+        enable_attention_dp, all_ranks_num_active_requests)
+
+    # Schedule attention dp requests
+    all_ranks_new_requests = attention_dp_queue._schedule_attention_dp_requests(
+        new_requests, all_ranks_num_active_requests)
+
+    assert len(all_ranks_new_requests) == num_ranks
+    for rank, reqs in all_ranks_new_requests.items():
+        req_ids = [req.id for req in reqs]
+        assert req_ids == all_ranks_expected_req_ids[rank]

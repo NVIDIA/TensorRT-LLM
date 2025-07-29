@@ -88,6 +88,7 @@ class ExecutorRequestQueue:
         waiting_queue: deque[RequestQueueItem],
         max_req_count: int,
         enable_attention_dp: bool,
+        all_ranks_num_active_requests: Optional[List[int]] = None,
     ) -> List[RequestQueueItem]:
 
         if max_req_count <= 0:
@@ -98,7 +99,7 @@ class ExecutorRequestQueue:
         pending_requests = []
 
         # Track the request with strict requirements
-        scheduling_all_ranks_num_active_requests = self.all_ranks_num_active_requests.copy(
+        scheduling_all_ranks_num_active_requests = all_ranks_num_active_requests.copy(
         ) if enable_attention_dp else None
         while req_count < max_req_count and waiting_queue:
             req_item = waiting_queue.popleft()
@@ -114,7 +115,7 @@ class ExecutorRequestQueue:
 
         # Put the pending requests back to the waiting queue
         # All ranks should have the same waiting queue
-        self.waiting_queue.extendleft(reversed(pending_requests))
+        waiting_queue.extendleft(reversed(pending_requests))
 
         return items
 
@@ -196,9 +197,12 @@ class ExecutorRequestQueue:
         return can_enqueue and self.dist.rank == 0
 
     def _fetch_and_process_requests(
-            self, total_num_active_requests: int,
-            total_max_num_active_requests: int,
-            enable_attention_dp: bool) -> List[RequestQueueItem]:
+        self,
+        total_num_active_requests: int,
+        total_max_num_active_requests: int,
+        enable_attention_dp: bool,
+        all_ranks_num_active_requests: Optional[List[int]] = None
+    ) -> List[RequestQueueItem]:
         """Common logic for fetching and processing requests from the queue."""
         # Calculate timeout
         timeout = None if (total_num_active_requests == 0) and len(
@@ -227,7 +231,7 @@ class ExecutorRequestQueue:
         new_requests = self._get_from_waiting_queue(
             self.waiting_queue,
             total_max_num_active_requests - total_num_active_requests,
-            enable_attention_dp)
+            enable_attention_dp, all_ranks_num_active_requests)
 
         # Update performance metrics
         if self.enable_iter_perf_stats and self.dist.rank == 0:
@@ -276,11 +280,13 @@ class ExecutorRequestQueue:
         new_requests = self._fetch_and_process_requests(
             total_num_active_requests,
             total_max_num_active_requests,
-            enable_attention_dp=True)
+            enable_attention_dp=True,
+            all_ranks_num_active_requests=all_ranks_num_active_requests)
 
         # Schedule attention dp requests
-        new_requests_cur_rank = self._schedule_attention_dp_requests(
-            new_requests)
+        all_ranks_new_requests = self._schedule_attention_dp_requests(
+            new_requests, all_ranks_num_active_requests)
+        new_requests_cur_rank = all_ranks_new_requests[self.dist.tp_rank]
 
         # Update performance metrics
         if self.enable_iter_perf_stats and self.start_times:
@@ -296,9 +302,15 @@ class ExecutorRequestQueue:
         return new_requests_cur_rank
 
     def _schedule_attention_dp_requests(
-            self,
-            new_requests: List[RequestQueueItem]) -> List[RequestQueueItem]:
+            self, new_requests: List[RequestQueueItem],
+            all_ranks_num_active_requests: List[int]) -> List[RequestQueueItem]:
         """Schedule attention dp requests."""
+
+        # Map from ranks to new requests
+        all_ranks_new_requests = {
+            tp_rank: []
+            for tp_rank in range(self.dist.tp_size)
+        }
 
         # Prioritize the requests that are not in relax mode
         def get_relax_value(req_item):
@@ -310,37 +322,33 @@ class ExecutorRequestQueue:
 
         # Try to put the requests to the target dp rank until the max_num_active_requests is reached
         remaining_unscheduled = []
-        new_requests_cur_rank = []
         for req_item in new_requests:
             scheduled = False
             if req_item.request.py_scheduling_params is not None:
                 target_dp_rank = req_item.request.py_scheduling_params.attention_dp_rank
-                if target_dp_rank is not None and self.all_ranks_num_active_requests[
+                if target_dp_rank is not None and all_ranks_num_active_requests[
                         target_dp_rank] < self.max_num_active_requests:
-                    self.all_ranks_num_active_requests[target_dp_rank] += 1
+                    all_ranks_num_active_requests[target_dp_rank] += 1
                     scheduled = True
-
-                    # If the target dp rank is the current rank, add it to the new_requests_cur_rank
-                    if target_dp_rank == self.dist.tp_rank:
-                        new_requests_cur_rank.append(req_item)
+                    all_ranks_new_requests[target_dp_rank].append(req_item)
 
             if not scheduled:
                 remaining_unscheduled.append(req_item)
 
         # Balance the remaining unscheduled requests across ranks
         num_new_requests_all_ranks = len(remaining_unscheduled)
-        total_num_active_requests = sum(self.all_ranks_num_active_requests)
+        total_num_active_requests = sum(all_ranks_num_active_requests)
         self.expected_num_active_requests = max(
             (total_num_active_requests + num_new_requests_all_ranks +
              self.dist.tp_size - 1) // self.dist.tp_size,
-            max(self.all_ranks_num_active_requests),
+            max(all_ranks_num_active_requests),
         )
 
-        new_requests_cur_rank = self._balance_requests_across_ranks(
-            remaining_unscheduled, new_requests_cur_rank,
-            self.all_ranks_num_active_requests)
+        all_ranks_new_requests = self._balance_requests_across_ranks(
+            remaining_unscheduled, all_ranks_new_requests,
+            all_ranks_num_active_requests)
 
-        return new_requests_cur_rank
+        return all_ranks_new_requests
 
     def _handle_request_broadcasting(self,
                                      new_requests: List[RequestQueueItem]):
@@ -390,12 +398,19 @@ class ExecutorRequestQueue:
 
     def _balance_requests_across_ranks(
             self, new_requests: List[RequestQueueItem],
+<<<<<<< HEAD
             all_ranks_num_active_requests: List[int]) -> List[RequestQueueItem]:
         """Balance requests across ranks for attention DP."""
         new_requests_cur_rank = []
 
         if new_requests and self.expected_num_active_requests > all_ranks_num_active_requests[
                 self.dist.tp_rank]:
+=======
+            all_ranks_new_requests: Dict[int, List[RequestQueueItem]],
+            all_ranks_num_active_requests: List[int]) -> List[RequestQueueItem]:
+        """Balance requests across ranks for attention DP."""
+        if new_requests:
+>>>>>>> 33dd2b3c6 (Refactor to make it easier to test)
             # Balance context tokens across ranks using heap
             HeapVal = namedtuple(
                 'HeapVal',
@@ -406,12 +421,21 @@ class ExecutorRequestQueue:
                 for tp_rank, val in enumerate(all_ranks_num_active_requests)
             ]
 
+<<<<<<< HEAD
             new_requests_cur_rank = all_ranks_new_requests_heap[
                 self.dist.tp_rank].request_list
+=======
+>>>>>>> 33dd2b3c6 (Refactor to make it easier to test)
             all_ranks_new_requests_heap = [
                 val for val in all_ranks_new_requests_heap
                 if val.num_requests > 0
             ]
+
+            all_ranks_new_scheduled_requests = {
+                val.rank: val.request_list
+                for val in all_ranks_new_requests_heap
+            }
+
             heapq.heapify(all_ranks_new_requests_heap)
 
             # Sort by token count (descending) for better load balancing
@@ -427,17 +451,26 @@ class ExecutorRequestQueue:
                 token_count = len(
                     getattr(req_item.request, 'input_token_ids',
                             [])) if req_item.request else 0
+                # Update the heap value with the new request
                 val = val._replace(
                     num_tokens=val.num_tokens + token_count,
                     num_requests=val.num_requests - 1,
                 )
+
                 val.request_list.append(req_item)
+                # If rank still has room for new requests, push back into heap
                 if val.num_requests > 0:
                     heapq.heappush(all_ranks_new_requests_heap, val)
-                elif val.rank == self.dist.tp_rank:
-                    break
 
+<<<<<<< HEAD
         return new_requests_cur_rank
+=======
+            # Extend all_ranks_new_requests with the new requests that have been scheduled
+            for rank, reqs in all_ranks_new_scheduled_requests.items():
+                all_ranks_new_requests[rank].extend(reqs)
+
+        return all_ranks_new_requests
+>>>>>>> 33dd2b3c6 (Refactor to make it easier to test)
 
     def _collect_py_objects_from_requests(
             self, requests: List[RequestQueueItem],
