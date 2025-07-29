@@ -731,9 +731,10 @@ class PeftCacheConfig(StrictBaseModel, PybindMirror):
         default=0.02,
         description=
         "Proportion of free device memory after engine load to use for cache, as a fraction from 0 to 1"
-    )
+        ", defaults to 2%")
     host_cache_size: int = Field(
-        default=1024**3, description="size in bytes to use for host cache")
+        default=1024**3,
+        description="size in bytes to use for host cache, defaults to 1GiB")
     lora_prefetch_dir: Optional[str] = Field(
         default=None,
         description=
