@@ -143,11 +143,7 @@ void tensorrt_llm::batch_manager::kv_cache_manager::KVCacheManagerConnectorBindi
 
     py::class_<tb::kv_connector::KvCacheConnectorManager, PyKvCacheConnectorManager, py::smart_holder>(
         m, "KvCacheConnectorManager")
-        .def(py::init<std::shared_ptr<tb::kv_connector::KvCacheConnectorWorker>,
-                 std::optional<std::shared_ptr<tb::kv_connector::KvCacheConnectorScheduler>>>(),
-            py::arg("worker"), py::arg("scheduler"))
-        .def_property_readonly("scheduler", &tb::kv_connector::KvCacheConnectorManager::getScheduler)
-        .def_property_readonly("worker", &tb::kv_connector::KvCacheConnectorManager::getWorker)
+        .def(py::init<>())
         .def("get_num_new_matched_tokens", &tb::kv_connector::KvCacheConnectorManager::getNumNewMatchedTokens,
             py::arg("request"), py::arg("num_computed_tokens"));
 

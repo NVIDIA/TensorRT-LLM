@@ -1247,6 +1247,8 @@ void WindowBlockManager::addSequence(GenerationRequest& sequence, SizeType32 inp
         numNewMatchedTokens = kvCacheConnectorManager->get()->getNumNewMatchedTokens(llmRequest, prepopulatedPromptLen);
         TLLM_LOG_DEBUG("addSequence: Request %lu, inputLength %d, prepopulatedPromptLen %d, numNewMatchedTokens %d",
             llmRequest.mRequestId, inputLength, prepopulatedPromptLen, numNewMatchedTokens);
+        TLLM_CHECK_WITH_INFO(prepopulatedPromptLen + numNewMatchedTokens < llmRequest.getPromptLen(),
+            "There must be at least one uncomputed token in the prompt!");
     }
 
     llmRequest.setPrepopulatedPromptLen(prepopulatedPromptLen + numNewMatchedTokens, getTokensPerBlock());
@@ -2060,6 +2062,11 @@ void KVCacheManager::addSequence(RequestIdType requestId, SizeType32 inputLength
 {
     // Need to add the bubble after the sink tokens to use even block size
     inputLength += mSinkBubbleLength;
+
+    if (kvCacheConnectorManager.has_value())
+    {
+        TLLM_CHECK_WITH_INFO(beamWidth == 1, "KV Cache Connector is not supported with beam search");
+    }
 
     auto kvCacheRetentionConfig = llmRequest
         ? llmRequest->getKvCacheRetentionConfig().value_or(executor::KvCacheRetentionConfig())
