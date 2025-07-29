@@ -1,6 +1,5 @@
 from typing import Union
 
-import torch
 from torch import nn
 
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -50,28 +49,3 @@ class Qwen3MoeHfWeightMapper(Qwen2MoeHfWeightMapper):
             return processed_weights
 
         return weights
-
-    def _duplicate_kv(self, weight: torch.Tensor, num_kv_heads: int,
-                      tensor_parallel_size: int):
-
-        if num_kv_heads >= tensor_parallel_size:
-            assert num_kv_heads % tensor_parallel_size == 0
-            return weight
-
-        assert tensor_parallel_size % num_kv_heads == 0
-        reps = tensor_parallel_size // num_kv_heads
-
-        # bias
-        if weight.ndim == 1:
-            return weight.repeat_interleave(reps)
-
-        # weight and scale
-        assert weight.shape[0] % num_kv_heads == 0
-        size_per_kv_head = weight.shape[0] // num_kv_heads
-        weight = weight.reshape(num_kv_heads, size_per_kv_head,
-                                -1)[:,
-                                    None, :, :].expand(num_kv_heads, reps,
-                                                       size_per_kv_head,
-                                                       weight.shape[1])
-        return weight.reshape(num_kv_heads * reps * size_per_kv_head,
-                              -1).clone().detach()
