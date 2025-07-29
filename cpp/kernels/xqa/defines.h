@@ -97,6 +97,15 @@ static_assert(SPEC_DEC, "SPEC_Q_SEQ_LEN should only be used when SPEC_DEC is ena
 #define USE_PAGED_KV_CACHE (TOKENS_PER_PAGE > 0)
 #endif
 
+// Paged KV Cache Format
+// 0 - XQA Original
+// 1 - separate K and V cache pools, each with layout (batch, seq_len, head, head_elem) for VLLM/SGLang
+#ifdef USE_PAGED_KV_CACHE
+#ifndef PAGED_KV_CACHE_LAYOUT
+#define PAGED_KV_CACHE_LAYOUT 0
+#endif
+#endif
+
 // don't modify
 #define USE_BEAM_SEARCH (BEAM_WIDTH > 1)
 
