@@ -1,3 +1,4 @@
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -5,16 +6,32 @@ from tensorrt_llm._utils import mpi_allgather, mpi_broadcast, mpi_rank
 from tensorrt_llm.bindings import LlmRequestState
 from tensorrt_llm.bindings.internal.batch_manager import \
     KvCacheConnectorManager as KvCacheConnectorManagerCpp
-from tensorrt_llm.bindings.internal.batch_manager import \
-    KvCacheConnectorScheduler as KvCacheConnectorSchedulerCpp
-from tensorrt_llm.bindings.internal.batch_manager import \
-    KvCacheConnectorWorker as KvCacheConnectorWorkerCpp
-from tensorrt_llm.bindings.internal.batch_manager import LlmRequest
+from tensorrt_llm.bindings.internal.batch_manager import (
+    KvCacheConnectorPoolsData, LlmRequest)
 
 from .scheduler import ScheduledRequests
 
 
-class KvCacheConnectorWorker(KvCacheConnectorWorkerCpp):
+@dataclass
+class RequestData:
+    request_id: int
+    new_tokens: list[int]
+    new_block_ids: list[int]
+    computed_position: int
+
+
+@dataclass
+class SchedulerOutput:
+    requests: list[RequestData] = field(default_factory=list)
+
+    def add_request(self, request_id: int, new_tokens: list[int],
+                    new_block_ids: list[int], computed_position: int):
+        self.requests.append(
+            RequestData(request_id, new_tokens, new_block_ids,
+                        computed_position))
+
+
+class KvCacheConnectorWorker(ABC):
 
     def __init__(self):
         super().__init__()
@@ -28,14 +45,44 @@ class KvCacheConnectorWorker(KvCacheConnectorWorkerCpp):
     def _clear_connector_meta(self):
         self._metadata = None
 
+    @abstractmethod
+    def register_kv_caches(self, kv_cache_data: KvCacheConnectorPoolsData):
+        pass
 
-class KvCacheConnectorScheduler(KvCacheConnectorSchedulerCpp):
+    @abstractmethod
+    def start_load_kv(self):
+        pass
+
+    @abstractmethod
+    def wait_for_layer_load(self, layer_idx: int):
+        pass
+
+    @abstractmethod
+    def save_kv_layer(self, layer_idx: int):
+        pass
+
+    @abstractmethod
+    def wait_for_save(self):
+        pass
+
+
+class KvCacheConnectorScheduler(ABC):
 
     def __init__(self):
         super().__init__()
 
-    def build_connector_metadata(self, metadata: object):
-        return None
+    @abstractmethod
+    def build_connector_meta(self, scheduler_output: SchedulerOutput):
+        pass
+
+    def get_num_new_matched_tokens(
+            self, request: LlmRequest,
+            num_computed_tokens: int) -> tuple[int, bool]:
+        pass
+
+    @abstractmethod
+    def request_finished(self, request: LlmRequest) -> bool:
+        pass
 
 
 @dataclass
@@ -89,25 +136,6 @@ class Finished:
                         self.loading - other.loading)
 
 
-@dataclass
-class RequestData:
-    request_id: int
-    new_tokens: list[int]
-    new_block_ids: list[int]
-    computed_position: int
-
-
-@dataclass
-class SchedulerOutput:
-    requests: list[RequestData] = field(default_factory=list)
-
-    def add_request(self, request_id: int, new_tokens: list[int],
-                    new_block_ids: list[int], computed_position: int):
-        self.requests.append(
-            RequestData(request_id, new_tokens, new_block_ids,
-                        computed_position))
-
-
 class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
 
     def __init__(self, worker: KvCacheConnectorWorker,
@@ -152,12 +180,12 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
 
         return num_tokens
 
-    def build_connector_metadata(self) -> object:
+    def build_connector_meta(self) -> object:
         if self.scheduler is not None:
             assert mpi_rank() == 0, "The scheduler may only exist on rank 0!"
             if self._scheduler_output is None:
                 raise RuntimeError("Scheduler output not set!")
-            metadata = self.scheduler.build_connector_metadata(
+            metadata = self.scheduler.build_connector_meta(
                 self._scheduler_output)
         else:
             metadata = None
