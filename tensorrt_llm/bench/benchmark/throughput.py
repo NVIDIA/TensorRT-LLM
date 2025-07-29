@@ -373,7 +373,7 @@ def throughput_command(
         kwargs = kwargs | runtime_config.get_llm_args()
         kwargs['backend'] = backend
 
-        llm = get_llm(runtime_config, kwargs)
+        llm = get_llm(kwargs)
 
         sampling_params = SamplingParams(end_id=eos_id,
                                          pad_id=eos_id,
