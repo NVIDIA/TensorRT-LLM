@@ -269,6 +269,21 @@ class PyExecutor:
         self.kv_connector_manager = kv_connector_manager
 
         if self.kv_connector_manager is not None:
+            if kv_cache_transceiver is not None:
+                raise NotImplementedError(
+                    "KV Cache Connector is not supported with KvCacheTransceiver."
+                )
+
+            if self.dist.pp_size > 1:
+                raise NotImplementedError(
+                    "KV Cache Connector is not supported with pipeline parallelism."
+                )
+
+            if not disable_overlap_scheduler:
+                raise NotImplementedError(
+                    "KV Cache Connector is not supported with overlap scheduler."
+                )
+
             kv_cache_data = self.kv_cache_manager.get_kv_cache_connector_pools_data(
             )
             self.kv_connector_manager.worker.register_kv_caches(kv_cache_data)
@@ -896,6 +911,10 @@ class PyExecutor:
                     "num_fitting_reqs=0 and fitting_disagg_gen_init_requests is empty, may not have enough kvCache"
                 )
                 self.kv_cache_transceiver.check_context_transfer_status(1)
+        elif self.kv_connector_manager is None:
+            assert scheduled_batch.batch_size > 0, (
+                "fail to schedule any pending request, "
+                "probably run out of resource.")
 
         self.num_scheduled_requests = scheduled_batch.batch_size
         logger.debug(
