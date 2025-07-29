@@ -572,7 +572,7 @@ void MLARopeAppendPagedKVAssignQ(torch::Tensor& q, torch::Tensor& latent_cache, 
 }
 
 void mergeChunkedAttentionForMLA(torch::Tensor& merged_attn, torch::Tensor const& temp_attn,
-    torch::Tensor& merged_softmax_stats, torch::Tensor const& temp_softmax_stats, float bmm1_scale,
+    torch::Tensor& merged_softmax_stats, torch::Tensor const& temp_softmax_stats, double bmm1_scale,
     int64_t const num_requests, torch::Tensor const& cu_q_seq_lens, int64_t const max_q_seq_len,
     torch::Tensor const& merge_op, int64_t const num_heads, int64_t const head_size)
 {
