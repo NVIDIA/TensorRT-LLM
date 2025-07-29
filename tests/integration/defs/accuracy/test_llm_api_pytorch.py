@@ -1995,7 +1995,7 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
                  moe_expert_parallel_size=ep_size,
                  **pytorch_config,
                  enable_attention_dp=attention_dp,
-                 max_batch_size=64) as llm:
+                 max_batch_size=32) as llm:
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)
