@@ -523,6 +523,10 @@ class GenerationExecutorWorker(GenerationExecutor):
             if self._is_pytorch_backend and request.schedule_params is not None:
                 executor_request.py_schedule_params = request.schedule_params
 
+            executor_request.py_schedule_params = None
+            if self._is_pytorch_backend and request.scheduling_params is not None:
+                executor_request.py_scheduling_params = request.scheduling_params
+
             if request.query_token_ids is not None:
                 # pytorch star attention workflow
                 # a workaround to avoid public interface update

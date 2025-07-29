@@ -3,7 +3,7 @@ from typing import Optional
 
 
 @dataclass(slots=True, kw_only=True)
-class ScheduleParams:
+class SchedulingParams:
     """Schedule parameters.
 
     Args:
