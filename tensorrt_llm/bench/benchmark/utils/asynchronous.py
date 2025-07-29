@@ -4,7 +4,7 @@ import asyncio
 import time
 from contextlib import asynccontextmanager
 from itertools import chain
-from typing import List, Optional, Set, Tuple
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 import tqdm
 from zmq import PUSH
@@ -36,21 +36,13 @@ class LlmManager:
         self._stop = asyncio.Event()
         self._running = asyncio.Event()
         self._tasks: Set[asyncio.Task] = set()
-        self._backend_task = None
-        self._iteration_log_task = None
+        self._backend_task: Optional[asyncio.Task] = None
+        self._iteration_log_task: Optional[asyncio.Task] = None
         self._concurrency_semaphore = asyncio.Semaphore(
             concurrency) if concurrency > 0 else None
         self.streaming = streaming
         self.request_seen = asyncio.Event()
         self.modality = modality
-
-    def _task_done_callback(self, task: asyncio.Task) -> None:
-        self._tasks.discard(task)
-        if task.exception() is not None and not self._stop.is_set():
-            logger.error(
-                f"Stopping benchmarking due to following exception raised during inference: {task.exception()}"
-            )
-            self.stop()
 
     async def process_request(self, request: InferenceRequest,
                               sampling_params: SamplingParams,
@@ -103,18 +95,54 @@ class LlmManager:
             pass
 
     async def worker(self) -> None:
-        while not self._stop.is_set():
-            try:
-                request, sampling_params, post_proc_params = await self._inbox.get(
-                )
+
+        def _raise_for_failed(tasks: Iterable[asyncio.Task]):
+            error_counts: Dict[str, int] = {}
+
+            for task in tasks:
+                e = task.exception()
+                if e is None:
+                    continue
+                error = str(e)
+                error_counts[error] = error_counts.get(error, 0) + 1
+
+            if error_counts:
+                task_errors = ", ".join(
+                    f"{error} ({count} requests)"
+                    for error, count in error_counts.items())
+                raise ValueError(f"Requests failed: {task_errors}")
+
+        try:
+            while not self._stop.is_set():
+                try:
+                    request, sampling_params, post_proc_params = self._inbox.get_nowait(
+                    )
+                except asyncio.QueueEmpty:
+                    await asyncio.sleep(1)
+                    continue
                 task = asyncio.create_task(
                     self.process_request(request,
                                          sampling_params=sampling_params,
                                          post_proc_params=post_proc_params))
                 self._tasks.add(task)
-                task.add_done_callback(self._task_done_callback)
-            except asyncio.CancelledError:
-                logger.info("Worker task cancelled.")
+                done_tasks, self._tasks = await asyncio.wait(self._tasks,
+                                                             timeout=0)
+                logger.debug(
+                    f"{len(done_tasks)} / {len(self._tasks)} tasks done / pending"
+                )
+                _raise_for_failed(done_tasks)
+            logger.debug("Worker task finishing...")
+        except asyncio.CancelledError:
+            logger.info("Worker task cancelled.")
+        finally:
+            logger.debug("Worker task cancelling remaining requests...")
+            for task in self._tasks:
+                task.cancel()
+            logger.debug("Waiting for requests...")
+            if self._tasks:
+                tasks, _ = await asyncio.wait(self._tasks)
+                self._tasks.clear()
+                _raise_for_failed(tasks)
 
     # This asynchronous function acts as a worker that logs iteration statistics.
     # It connects to a given address using a PUSH socket and sends JSON-encoded
@@ -167,25 +195,24 @@ class LlmManager:
 
         logger.info("Iteration log worker exiting.")
 
-    def stop(self) -> None:
+    async def stop(self) -> None:
         logger.info("Stopping LLM backend.")
         self._stop.set()
-        logger.info(f"Cancelling all {len(self._tasks)} tasks to complete.")
-        for task in self._tasks:
-            task.cancel()
-        logger.info("All tasks cancelled.")
         if self._iteration_log_task:
-            asyncio.gather(self._iteration_log_task)
+            await self._iteration_log_task
+        assert self._backend_task is not None
+        await self._backend_task
         logger.info("LLM Backend stopped.")
 
     @property
     def busy(self) -> bool:
-        return bool(self._tasks)
+        return not self._inbox.empty() or any(not task.done()
+                                              for task in self._tasks)
 
     def run(self, iteration_addr: str = None) -> None:
         self._backend_task = asyncio.create_task(self.worker())
         if iteration_addr is not None:
-            self._iteration_task = asyncio.create_task(
+            self._iteration_log_task = asyncio.create_task(
                 self.iteration_worker(iteration_addr))
 
     async def enqueue(self, request: InferenceRequest,
@@ -272,5 +299,6 @@ async def async_benchmark(
 
     except asyncio.CancelledError:
         enqueue_task.cancel()
+        await enqueue_task
     finally:
-        backend.stop()
+        await backend.stop()
