@@ -142,7 +142,6 @@ public:
     explicit KvCacheConnectorWorker() = default;
     virtual ~KvCacheConnectorWorker() = default;
 
-    // TODO(jothomson): Need arguments here.
     virtual void registerKvCaches(KvCacheConnectorPoolsData const& kvCacheConnectorPoolsData);
 
     // TODO(jothomson): Need arguments here.
@@ -150,13 +149,12 @@ public:
 
     virtual void waitForLayerLoad(SizeType32 layer_idx) = 0;
 
-    // TODO(jothomson): Need arguments here.
     virtual void saveKvLayer(SizeType32 layer_idx) = 0;
 
     virtual void waitForSave() = 0;
 
     virtual std::tuple<std::vector<RequestIdType>, std::vector<RequestIdType>> getFinished(
-        std::vector<RequestIdType> const& finishedReqIds);
+        std::vector<RequestIdType> const& finishedGenReqIds, std::vector<RequestIdType> const& startedLoadingReqIds);
 };
 
 class KvCacheConnectorManager

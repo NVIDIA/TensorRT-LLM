@@ -2078,7 +2078,11 @@ void KVCacheManager::addSequence(RequestIdType requestId, SizeType32 inputLength
         return mSequences.try_emplace(requestId, requestId, inputLength, beamWidth,
             mBlockManager.getWindowSizesMetadata(), kvCacheRetentionConfig);
     }();
-    TLLM_CHECK(emplaceDone);
+    TLLM_CHECK(emplaceDone || kvCacheConnectorManager.has_value());
+    if (!emplaceDone && kvCacheConnectorManager.has_value())
+    {
+        return;
+    }
     auto& sequence = seqIt->second;
 
     // Get statistics for block allocations/reuse pre request.
