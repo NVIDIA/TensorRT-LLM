@@ -36,7 +36,7 @@ def get_spec_metadata(spec_config,
             dtype=model_config.torch_dtype,
             is_draft_model=is_draft_model,
             eagle3_resource_manager=spec_resource_manager,
-            num_capture_layers=spec_config.num_capture_layers,
+            layers_to_capture=spec_config.eagle3_layers_to_capture,
         )
     if spec_config.spec_dec_mode.is_eagle3_one_model():
         return Eagle3OneModelSpecMetadata(
@@ -46,7 +46,7 @@ def get_spec_metadata(spec_config,
             num_layers=model_config.num_hidden_layers,
             hidden_size=model_config.hidden_size,
             max_num_tokens=max_num_tokens,
-            num_capture_layers=spec_config.num_capture_layers,
+            layers_to_capture=spec_config.eagle3_layers_to_capture,
         )
     if  spec_config.spec_dec_mode.is_draft_target() or \
         spec_config.spec_dec_mode.is_ngram() or \

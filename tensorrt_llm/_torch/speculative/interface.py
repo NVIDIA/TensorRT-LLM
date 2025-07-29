@@ -90,11 +90,8 @@ class SpeculativeDecodingMode(IntEnum):
         # Fixme: only trtllm attention backend supports eagle3 generation-phase kernels on blackwell.
 
         if self.is_eagle3() or self.is_draft_target():
-            if get_sm_version() == 100 and isinstance(attention_backend,
+            if get_sm_version() == 100 and issubclass(attention_backend,
                                                       TrtllmAttention):
-                return False
-            elif get_sm_version(
-            ) == 100 and attention_backend is TrtllmAttention:
                 return False
             else:
                 return True
@@ -188,6 +185,10 @@ class SpecMetadata:
         return cuda_graph_metadata
 
     def is_layer_capture(self, layer_id: int):
+        """
+        Whether the layer should be captured (eg for Eagle3).
+        By default, does nothing.
+        """
         return False
 
     def maybe_capture_hidden_states(self, layer_id: int,

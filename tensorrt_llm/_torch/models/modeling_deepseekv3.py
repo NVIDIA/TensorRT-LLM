@@ -743,7 +743,6 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         attn_metadata: AttentionMetadata,
         residual: torch.Tensor,
         spec_metadata: Optional[SpecMetadata] = None,
-        **kwargs,
     ) -> torch.Tensor:
         if residual is None:
             residual = hidden_states
@@ -1187,8 +1186,6 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
         return_context_logits: bool = False,
         **kwargs,
     ) -> torch.Tensor:
-        #TODO Izzy check this
-        attn_metadata.num_generations_per_batch = self.model_nextn + 1
         hidden_states = self.model(
             input_ids=input_ids,
             attn_metadata=attn_metadata,
