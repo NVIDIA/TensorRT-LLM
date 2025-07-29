@@ -464,8 +464,8 @@ def executor_request_to_llm_request(
         end_id=executor_request.end_id,
         pad_id=executor_request.pad_id,
         embedding_bias=torch.tensor(executor_request.embedding_bias,
-                                    dtype=torch.int32)
-        if executor_request.embedding_bias else None,
+                                    dtype=torch.float32)
+        if executor_request.embedding_bias is not None else None,
         bad_words_list=torch.tensor(
             convert_wordlist(executor_request.bad_words), dtype=torch.int32)
         if executor_request.bad_words else None,
