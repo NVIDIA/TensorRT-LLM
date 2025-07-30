@@ -120,8 +120,7 @@ def top_k_sampling_batch(logits, top_k=50):
     return next_tokens, softmax
 
 
-def top_p_sampling_batch(logits: torch.Tensor,
-                         top_p: float = 0.9):
+def top_p_sampling_batch(logits: torch.Tensor, top_p: float = 0.9):
     logits_dim = logits.dim()
     if logits_dim == 1:
         logits = logits.unsqueeze(0)
@@ -204,6 +203,13 @@ def add_token(request: LlmRequest,
 
 def int_tensor(shape: tuple[int, ...], device: str = 'cuda') -> torch.Tensor:
     return torch.empty(shape, dtype=torch.int, device=device)
+
+
+def get_embedding_bias_1d(request: LlmRequest) -> torch.Tensor | None:
+    """Get pre-squeezed 1D embedding bias"""
+    if hasattr(request, '_py_embedding_bias_1d'):
+        return request._py_embedding_bias_1d
+    return None
 
 
 class TorchSampler(Sampler):
@@ -413,21 +419,22 @@ class TorchSampler(Sampler):
         if fast_path:
             logits = raw_logits[:len(requests)]
             # Apply embedding bias for fast path if any request has it
-            # Collect indices and biases for requests that have bias
-            bias_indices = []
-            bias_list = []
-            for i, req in enumerate(requests):
-                if req.embedding_bias is not None:
-                    bias_indices.append(i)
-                    bias_list.append(req.embedding_bias.squeeze(0).to(logits.device))
+            bias_mask = torch.zeros(len(requests),
+                                    dtype=torch.bool,
+                                    device=logits.device)
+            bias_values = []
 
-            if bias_list:
-                # Apply all biases in one vectorized operation
-                bias_indices = torch.tensor(bias_indices, device=logits.device)
-                bias_tensor = torch.stack(bias_list)
-                # Use index_add_ for efficient in-place addition (or create new tensor)
-                logits = logits.clone()  # Clone to avoid inference mode issues
-                logits[bias_indices] = logits[bias_indices] + bias_tensor
+            for i, req in enumerate(requests):
+                bias = get_embedding_bias_1d(req)
+                if bias is not None:
+                    bias_mask[i] = True
+                    bias_values.append(bias)
+
+            if bias_values:
+                bias_tensor = torch.stack(bias_values).to(logits.device,
+                                                          non_blocking=True)
+                logits = logits.clone()
+                logits[bias_mask] = logits[bias_mask] + bias_tensor
 
             next_tokens = torch.argmax(logits, dim=-1)
             self.append_eagle3(next_tokens, model_outputs)
@@ -448,31 +455,44 @@ class TorchSampler(Sampler):
 
         if batched_strategy is not None:
             logits = raw_logits[:sum_steps]
-            # For batched strategy, we need to collect embedding biases from all requests
-            # and apply them appropriately to each logit slice
-            bias_indices = []
+            # For batched strategy, collect biases and steps for vectorized application
             bias_list = []
-            offset = 0
+            steps_per_bias = []
+
             for req in requests:
                 steps = 1 + len(req.py_draft_tokens)
-                if req.embedding_bias is not None:
-                    # Move to device once and squeeze to remove batch dimension
-                    bias = req.embedding_bias.squeeze(0).to(logits.device)
-                    # Add indices for each step of this request
-                    for step_offset in range(steps):
-                        bias_indices.append(offset + step_offset)
-                        bias_list.append(bias)
-                offset += steps
+                bias = get_embedding_bias_1d(req)
+                if bias is not None:
+                    bias_list.append(bias)
+                    steps_per_bias.append(steps)
 
-            # Apply embedding biases to logits in one vectorized operation
             if bias_list:
-                # Clone logits to avoid in-place modification in inference mode
-                logits = logits.clone()
-                bias_indices = torch.tensor(bias_indices, device=logits.device)
-                bias_tensor = torch.stack(bias_list)
-                logits[bias_indices] = logits[bias_indices] + bias_tensor
+                bias_tensor = torch.stack(bias_list).to(logits.device,
+                                                        non_blocking=True)
+                # Use repeat_interleave to expand biases for all steps
+                # as each step corresponds to a draft prediction of the same request
+                steps_tensor = torch.tensor(steps_per_bias,
+                                            device=logits.device)
+                expanded_biases = torch.repeat_interleave(bias_tensor,
+                                                          steps_tensor,
+                                                          dim=0)
 
-            # Note: We don't pass embedding_bias to sample() since we already applied it
+                # Create mask for which steps have bias
+                bias_mask = torch.zeros(sum_steps,
+                                        dtype=torch.bool,
+                                        device=logits.device)
+                offset = 0
+                for req in requests:
+                    steps = 1 + len(req.py_draft_tokens)
+                    if get_embedding_bias_1d(req) is not None:
+                        bias_mask[offset:offset + steps] = True
+                    offset += steps
+
+                # Apply biases in single operation
+                logits = logits.clone()
+                # we expect bias_mask to filter and give us logits that need bias application
+                logits[bias_mask] = logits[bias_mask] + expanded_biases
+
             batched_next_tokens, batched_softmax = sample(
                 batched_strategy, logits)
             self.append_eagle3(batched_next_tokens, model_outputs)
@@ -487,10 +507,9 @@ class TorchSampler(Sampler):
             req = requests[i]
 
             if batched_next_tokens is None:
-                # Apply bias directly to logits if not already done in batched processing
-                if req.embedding_bias is not None:
-                    logits = logits + req.embedding_bias.squeeze(0).to(logits.device)
-                # Don't pass embedding_bias to sample() to avoid double application
+                bias = get_embedding_bias_1d(req)
+                if bias is not None:
+                    logits = logits + bias.to(logits.device, non_blocking=True)
                 next_tokens, softmax = sample(strategy, logits)
             else:
                 # Batched processing already applied bias, just use the results
