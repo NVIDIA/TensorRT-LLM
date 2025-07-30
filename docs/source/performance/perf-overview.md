@@ -158,7 +158,6 @@ Note: Performance for Llama 4 on sequence lengths less than 8,192 tokens is affe
 | 2048, 128                    |    | 4,364.06          | 3,832.38         |
 | 2048, 2048                   |    | 12,800.89         |                  |
 | 5000, 500                    |    | 5,128.60          |                  |
-| 20000, 2000                  |    | 1,764.27          | 1,400.79         |
 
 ## Reproducing Benchmarked Results
 
