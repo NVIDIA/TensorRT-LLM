@@ -421,6 +421,8 @@ def test_fused_moe_fp8_blockwise_deepgemm(dtype,
     router_logits = torch.randn((SEQ_LEN, NUM_EXPERTS), dtype=dtype).cuda()
 
     weights = {}
+    w3_w1_weight_scales = []
+    w2_weight_scales = []
     for expert_id in range(NUM_EXPERTS):
         w1_weight = torch.randn(
             (INTERMEDIATE_SIZE, HIDDEN_SIZE), dtype=dtype).cuda() / HIDDEN_SIZE
@@ -450,6 +452,13 @@ def test_fused_moe_fp8_blockwise_deepgemm(dtype,
         weights[f"{expert_id}.w1.weight_scale"] = w1_weight_scale
         weights[f"{expert_id}.w2.weight_scale"] = w2_weight_scale
         weights[f"{expert_id}.w3.weight_scale"] = w3_weight_scale
+
+        w3_w1_weight_scales.append(
+            torch.cat([w3_weight_scale, w1_weight_scale], dim=0))
+        w2_weight_scales.append(w2_weight_scale)
+
+    w3_w1_weight_scales = torch.stack(w3_w1_weight_scales, dim=0).cuda()
+    w2_weight_scales = torch.stack(w2_weight_scales, dim=0).cuda()
 
     quant_config = QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES)
 
@@ -525,7 +534,7 @@ def test_fused_moe_fp8_blockwise_deepgemm(dtype,
         a=act_input_fp8,
         b=fused_moe.w3_w1_weight,
         a_sf=act_input_sf,
-        b_sf=fused_moe.quant_scales[0],
+        b_sf=w3_w1_weight_scales,
         offset_array=expert_first_token_offset_tensor,
     )
     h2 = swiglu_fused_moe(h1)
@@ -534,7 +543,7 @@ def test_fused_moe_fp8_blockwise_deepgemm(dtype,
         a=act_input_fp8,
         b=fused_moe.w2_weight,
         a_sf=act_input_sf,
-        b_sf=fused_moe.quant_scales[1],
+        b_sf=w2_weight_scales,
         offset_array=expert_first_token_offset_tensor,
     )
     ref_output = torch.zeros_like(x)
