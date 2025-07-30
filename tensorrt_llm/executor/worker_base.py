@@ -2,6 +2,7 @@ import copy
 import datetime
 import enum
 import json
+import weakref
 from pathlib import Path
 from queue import Queue
 from typing import Dict, List, Optional, Tuple, Union
@@ -23,6 +24,7 @@ from ..runtime import ModelConfig
 from ..runtime.model_runner import _engine_config_to_model_config
 from ..sampling_params import SamplingParams
 from .executor import GenerationExecutor
+from .ipc import IpcQueue
 from .postproc_worker import PostprocParams, PostprocWorker
 from .request import GenerationRequest, LoRARequest, PromptAdapterRequest
 from .result import (GenerationResult, LogProbsResult, ResponseWrapper,
@@ -35,16 +37,20 @@ __all__ = [
 
 
 class WorkerBase(GenerationExecutor):
+    """
+    Base class for all workers.
+
+    It contains all the core logic for the worker, without any specific logic for
+    cross-process communication such as IPC or RPC.
+    """
 
     def __init__(
         self,
         engine: Union[Path, Engine],
         executor_config: Optional[tllm.ExecutorConfig] = None,
         is_llm_executor: Optional[bool] = None,
-        lora_config: Optional[LoraConfig] = None,
-        garbage_collection_gen0_threshold: Optional[int] = None,
     ) -> None:
-        super().__init__(is_llm_executor=is_llm_executor, )
+        super().__init__(is_llm_executor=is_llm_executor)
 
         self.engine = None
         self.rank = mpi_rank()
@@ -61,36 +67,52 @@ class WorkerBase(GenerationExecutor):
             logger.set_rank(self.global_rank)
 
         if isinstance(engine, list):
-            engine = engine[self.rank]
+            self.engine = engine[self.rank]
+
+        self._await_response_helper = AwaitResponseHelper(weakref.proxy(self))
+
+        self.postproc_queues = None
+        self.result_queue = None
+
+        self._lora_manager: Optional[LoraManager] = None
+        self._prompt_adapter_manager: Optional[PromptAdapterManager] = None
+        self._runtime_model_config: Optional[ModelConfig] = None
+
+    def create_engine(
+            self,
+            engine: Union[Path, Engine],
+            executor_config: Optional[tllm.ExecutorConfig] = None,
+            lora_config: Optional[LoraConfig] = None,
+            garbage_collection_gen0_threshold: Optional[int] = None) -> None:
+
+        device_id = self.global_rank % torch.cuda.device_count()
+        torch.cuda.set_device(device_id)
+
+        # Make sure C++ executor would use same devices/ranks as py_executor
+        global_rank = global_mpi_rank()
+        comm_ranks = mpi_comm().allgather(global_rank)
+        device_ids = mpi_comm().allgather(device_id)
 
         if executor_config is None:
             executor_config = tllm.ExecutorConfig(1)
 
-        self._await_response_helper = AwaitResponseHelper(
-            self)  # TODO: make it weakref
+        executor_config.parallel_config = tllm.ParallelConfig(
+            participant_ids=comm_ranks, device_ids=device_ids)
 
-        def _create_engine():
-            device_id = self.global_rank % torch.cuda.device_count()
-            torch.cuda.set_device(device_id)
+        if isinstance(engine, list):
+            engine = engine[self.rank]
 
-            # Make sure C++ executor would use same devices/ranks as py_executor
-            global_rank = global_mpi_rank()
-            comm_ranks = mpi_comm().allgather(global_rank)
-            device_ids = mpi_comm().allgather(device_id)
-            executor_config.parallel_config = tllm.ParallelConfig(
-                participant_ids=comm_ranks, device_ids=device_ids)
-
-            if isinstance(engine, Engine):
-                return tllm.Executor(engine.engine,
-                                     json.dumps(engine.config.to_dict(),
-                                                cls=ConfigEncoder),
-                                     tllm.ModelType.DECODER_ONLY,
-                                     executor_config=executor_config,
-                                     managed_weights=engine.managed_weights)
-
-            if not hasattr(executor_config, "backend"):
-                return tllm.Executor(engine, tllm.ModelType.DECODER_ONLY,
-                                     executor_config)
+        if isinstance(engine, Engine):
+            self.engine = tllm.Executor(engine.engine,
+                                        json.dumps(engine.config.to_dict(),
+                                                   cls=ConfigEncoder),
+                                        tllm.ModelType.DECODER_ONLY,
+                                        executor_config=executor_config,
+                                        managed_weights=engine.managed_weights)
+        elif not hasattr(executor_config, "backend"):
+            self.engine = tllm.Executor(engine, tllm.ModelType.DECODER_ONLY,
+                                        executor_config)
+        else:
             args = {
                 "executor_config": executor_config,
                 "checkpoint_dir": executor_config.hf_model_dir,
@@ -109,13 +131,15 @@ class WorkerBase(GenerationExecutor):
             else:
                 raise ValueError(
                     f"Unsupported backend config: {executor_config.backend}")
-            return create_executor(**args)
+            self.engine = create_executor(**args)
 
-        self.engine = _create_engine()
+        self._setup_lora(engine, executor_config, lora_config)
 
-        self._lora_manager: Optional[LoraManager] = None
-        self._prompt_adapter_manager: Optional[PromptAdapterManager] = None
-        self._runtime_model_config: Optional[ModelConfig] = None
+    def _setup_lora(self, engine: Union[Path, Engine],
+                    executor_config: tllm.ExecutorConfig,
+                    lora_config: Optional[LoraConfig]) -> None:
+        """Setup LoRA and prompt adapter managers."""
+        # LoRA setup
         if self.rank == 0 and isinstance(self.engine, tllm.Executor):
             if isinstance(engine, Engine):
                 engine_config = engine.config
@@ -342,7 +366,6 @@ class WorkerBase(GenerationExecutor):
 
     def submit(self, request: GenerationRequest) -> GenerationResult:
         """ Low-level API to the executor. Return a "future" GenerationResult which can be waited. """
-
         if self.rank != 0:
             raise RuntimeError(
                 "Only rank 0 can submit requests.\n"
@@ -373,6 +396,26 @@ class WorkerBase(GenerationExecutor):
 
         return result
 
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.shutdown()
+        return True
+
+    def await_responses(self):
+        self._await_response_helper()
+
+    def set_result_queue(self, queue: Queue | IpcQueue):
+        """In multi-gpu mode, result_queue will be set here to communicate between the proxy and the worker 0 process."""
+        assert self.postproc_queues is None
+        self.result_queue = queue
+
+    def set_postproc_queues(self, queues: list[Queue | IpcQueue]):
+        """ Set the IPC queues for feeding post-processing processes. """
+        assert self.result_queue is None
+        self.postproc_queues = queues
+
     def _pop_result(self, client_id: int):
         self._results.pop(client_id, None)
         self._client_id_to_request_id.pop(client_id, None)
@@ -400,8 +443,7 @@ class AwaitResponseHelper:
         single_process_worker = 1
         ipc_batched = 2
 
-    def __init__(self, worker: "GenerationExecutorWorker"):
-        # TODO: make worker weakref
+    def __init__(self, worker: "WorkerBase"):
         self.worker = worker
         self.handler_kind: AwaitResponseHelper.HandlerKind = AwaitResponseHelper.HandlerKind.unknown
         self.enable_postprocprocess_parallel = self.worker.enable_postprocess_parallel
