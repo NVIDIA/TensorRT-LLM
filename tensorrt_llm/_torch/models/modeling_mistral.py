@@ -354,13 +354,9 @@ class Mistral3VLM(PreTrainedModel):
         logger.debug(f"{num_context_requests=}, {num_generation_requests=}")
 
         multimodal_params = kwargs.get("multimodal_params", [])
-        image_features = []
+        mm_embeds = []
         multimodal_params_len = len(multimodal_params)
         if multimodal_params_len > 0:
-            if multimodal_params_len != num_context_requests:
-                raise RuntimeError(
-                    f"Number of multimodal tensors ({multimodal_params_len}) should be equal to number of "
-                    f"context requests ({num_context_requests}) in the batch.")
             pixel_values = [
                 x.multimodal_data["image"]["pixel_values"]
                 for x in multimodal_params
@@ -377,7 +373,7 @@ class Mistral3VLM(PreTrainedModel):
                     f"({multimodal_params_len}).")
             batched_pixel_values, batched_image_sizes = self._batch_pixel_values(
                 pixel_values=pixel_values, image_sizes=image_sizes)
-            image_features = [
+            mm_embeds = [
                 self._get_image_features(pixel_values=batched_pixel_values,
                                          image_sizes=batched_image_sizes)
             ]
@@ -385,7 +381,7 @@ class Mistral3VLM(PreTrainedModel):
         input_ids, inputs_embeds = fuse_input_embeds(
             embedding_layer=self.llm.model.embed_tokens,
             input_ids=input_ids,
-            mm_embeds=image_features,
+            mm_embeds=mm_embeds,
             mm_token_ids=self._image_token_ids,
         )
 
