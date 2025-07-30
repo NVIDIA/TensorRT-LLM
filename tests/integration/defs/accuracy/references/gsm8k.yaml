@@ -136,5 +136,7 @@ mistralai/Mistral-Small-3.1-24B-Instruct-2503:
   - accuracy: 89.23
 microsoft/Phi-4-multimodal-instruct:
   - accuracy: 81.19
+microsoft/Phi-4-multimodal-instruct-long-rope:
+  - accuracy: 75.85
 microsoft/Phi-4-mini-instruct:
   - accuracy: 82.30
