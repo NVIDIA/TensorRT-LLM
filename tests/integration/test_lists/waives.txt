@@ -408,7 +408,6 @@ examples/test_multimodal.py::test_llm_multimodal_general[kosmos-2-pp:1-tp:1-floa
 examples/test_multimodal.py::test_llm_multimodal_general[fuyu-8b-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:1] SKIP (https://nvbugs/5387424)
 triton_server/test_triton_llm.py::test_llava_onevision[test_basic-False-1---False-True-False-0-128-disableDecoupleMode-inflight_fused_batching-disableTrtOverlap-0.2-max_utilization---1-1-1-False-tensorrt_llm_bls] SKIP (https://nvbugs/5396437)
 triton_server/test_triton_llm.py::test_llava_onevision[test_video-False-1---False-True-False-0-128-disableDecoupleMode-inflight_fused_batching-disableTrtOverlap-0.2-guaranteed_no_evict---1-1-1-False-tensorrt_llm_bls] SKIP (https://nvbugs/5396437)
-triton_server/test_triton.py::test_cpp_unit_tests[cpp-unit-tests] SKIP (https://nvbugs/5401088)
 accuracy/test_llm_api_pytorch.py::TestGemma3_27BInstruct::test_auto_dtype SKIP (https://nvbugs/5401114)
 test_e2e.py::test_ptp_quickstart_multimodal[gemma-3-27b-it-gemma/gemma-3-27b-it-image-True] SKIP (https://nvbugs/5401114)
 test_e2e.py::test_ptp_quickstart_multimodal[gemma-3-27b-it-gemma/gemma-3-27b-it-image-False] SKIP (https://nvbugs/5401114)
