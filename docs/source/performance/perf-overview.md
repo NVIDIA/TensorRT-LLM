@@ -30,6 +30,8 @@ The following GPU variants were used for testing:
 - B200 180GB (DGX B200)
 - GB200 192GB (GB200 NVL72)
 
+Other hardware variants may have different TDP, memory bandwidth, core count, or other features leading to performance differences on these workloads.
+
 ### FP4 Models:
 ```
 nvidia/Llama-3.3-70B-Instruct-FP4
