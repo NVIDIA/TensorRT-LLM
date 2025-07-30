@@ -1,3 +1,5 @@
+import enum
+from dataclasses import dataclass, field
 from typing import (Any, Callable, Dict, List, Optional, Protocol, Tuple, Type,
                     TypeVar)
 
@@ -10,7 +12,6 @@ from .data import TextPrompt
 from .multimodal import (MultimodalInput, apply_mm_hashes, default_hasher,
                          find_mm_token_lengths, find_mm_token_positions,
                          hexdigest_to_int32, validate_mm_inputs)
-from .utils import ALL_SUPPORTED_MULTIMODAL_MODELS
 
 N = TypeVar("N", bound=Type[nn.Module])
 
@@ -79,6 +80,96 @@ class DefaultInputProcessor(InputProcessor):
         return token_ids, None
 
 
+class MultimodalPlaceholderPlacement(enum.Enum):
+    INVALID = -1
+    BEFORE_TEXT = 0
+    AFTER_TEXT = 1
+
+
+@dataclass
+class MultimodalPlaceholderMetadata:
+    placeholder_map: Dict[str, str] = field(default_factory=dict)
+    placeholder_placement: MultimodalPlaceholderPlacement = MultimodalPlaceholderPlacement.AFTER_TEXT
+    placeholders_separator: str = "\n"
+
+
+class MultimodalPlaceholderRegistry:
+
+    def __init__(self) -> None:
+        self._multimodal_placeholder_by_model_type: Dict[
+            str, MultimodalPlaceholderMetadata] = {}
+
+    def __str__(self) -> str:
+        s = ""
+        for model_type, placeholder_metadata in self._multimodal_placeholder_by_model_type.items(
+        ):
+            s += "-" * 100 + "\n"
+            s += f"Model type: {model_type}\n"
+            s += f"Placeholder map: {placeholder_metadata.placeholder_map}\n"
+            s += f"Placeholder placement: {placeholder_metadata.placeholder_placement}\n"
+            s += f"Placeholders separator: \"{placeholder_metadata.placeholders_separator}\"\n"
+            s += "-" * 80 + "\n"
+        return s
+
+    def register(self, model_type: str,
+                 placeholder_metadata: MultimodalPlaceholderMetadata):
+        self._multimodal_placeholder_by_model_type[
+            model_type] = placeholder_metadata
+
+    def is_valid(self, model_type: str, modality: str) -> bool:
+        return model_type in self._multimodal_placeholder_by_model_type and \
+            modality in self._multimodal_placeholder_by_model_type[model_type].placeholder_map
+
+    def get_placeholder_metadata(
+            self, model_type: str) -> MultimodalPlaceholderMetadata:
+        assert model_type in self._multimodal_placeholder_by_model_type, \
+            f"Model type {model_type} is not registered in MultimodalPlaceholderRegistry"
+        return self._multimodal_placeholder_by_model_type[model_type]
+
+    def get_placeholder(self, model_type: str, modality: str) -> str:
+        return self._multimodal_placeholder_by_model_type[
+            model_type].placeholder_map[modality]
+
+    def get_placeholder_placement(
+            self, model_type: str) -> MultimodalPlaceholderPlacement:
+        return self._multimodal_placeholder_by_model_type[
+            model_type].placeholder_placement
+
+    def get_placeholders_separator(self, model_type: str) -> str:
+        return self._multimodal_placeholder_by_model_type[
+            model_type].placeholders_separator
+
+    def get_registered_image_model_types(self) -> List[str]:
+        return [
+            model_type
+            for model_type in self._multimodal_placeholder_by_model_type
+            if "image" in self.
+            _multimodal_placeholder_by_model_type[model_type].placeholder_map
+        ]
+
+    def get_registered_video_model_types(self) -> List[str]:
+        return [
+            model_type
+            for model_type in self._multimodal_placeholder_by_model_type
+            if "video" in self.
+            _multimodal_placeholder_by_model_type[model_type].placeholder_map
+        ]
+
+    def get_registered_audio_model_types(self) -> List[str]:
+        return [
+            model_type
+            for model_type in self._multimodal_placeholder_by_model_type
+            if "audio" in self.
+            _multimodal_placeholder_by_model_type[model_type].placeholder_map
+        ]
+
+    def get_registered_model_types(self) -> List[str]:
+        return list(self._multimodal_placeholder_by_model_type.keys())
+
+
+MULTIMODAL_PLACEHOLDER_REGISTRY = MultimodalPlaceholderRegistry()
+
+
 class InputProcessorRegistry:
 
     def __init__(self) -> None:
@@ -89,9 +180,10 @@ class InputProcessorRegistry:
 INPUT_PROCESSOR_REGISTRY = InputProcessorRegistry()
 
 
-def register_input_processor(processor_cls: Type[InputProcessor],
-                             model_type: str,
-                             out_of_tree: bool = False):
+def register_input_processor(
+        processor_cls: Type[InputProcessor],
+        model_type: str,
+        placeholder_metadata: MultimodalPlaceholderMetadata = None):
     """
     Register an input processor to a model class.
     NOTE:
@@ -99,17 +191,15 @@ def register_input_processor(processor_cls: Type[InputProcessor],
            the model type only for that.
         2. If this is used for other models in the future, this logic needs to be
            updated e.g. adding another version of this API without the model_type.
-        3. If the model is not in the tree, user needs to set out_of_tree to True
-           to bypass the model type check and provide their own input preparation.
     """
 
     def wrapper(model_cls: N) -> N:
         INPUT_PROCESSOR_REGISTRY._input_processors_cls_by_model_type[
             model_cls] = processor_cls
-        if not out_of_tree:
-            assert model_type in ALL_SUPPORTED_MULTIMODAL_MODELS, \
-                f"Model type {model_type} not in {ALL_SUPPORTED_MULTIMODAL_MODELS}.\n" \
-                "Please see the tensorrt_llm/inputs/utils.py file for more information."
+        assert placeholder_metadata is not None, \
+            f"A valid placeholder_metadata must be provided for out-of-tree models but got {placeholder_metadata}"
+        MULTIMODAL_PLACEHOLDER_REGISTRY.register(model_type,
+                                                 placeholder_metadata)
 
         return model_cls
 
@@ -163,41 +253,65 @@ def create_input_processor_with_hash(
         A wrapped processor that modifies prompts before processing.
     """
 
+    def multimodal_hashing_process(
+        inputs: TextPrompt, sampling_params: SamplingParams
+    ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
+        assert 'multi_modal_data' in inputs, "multi_modal_data must be provided for hashing support."
+        mm_data = inputs['multi_modal_data']
+        num_mm_tokens = find_mm_token_lengths(mm_data, input_processor)
+        if len(num_mm_tokens) > 0:
+            mm_hashes = apply_mm_hashes(mm_data, hash_lib)
+            prompt_token_ids, extra_processed_inputs = input_processor(
+                inputs, sampling_params)
+            start_positions = find_mm_token_positions(
+                input_ids=prompt_token_ids,  # token sequence
+                num_mm_tokens=
+                num_mm_tokens,  # list of lengths of each chunk of visual tokens
+                vocab_size=input_processor.model_config.vocab_size,
+            )
+            # flatten the hashes from dict to a single list
+            mm_hashes = [h for hashes in mm_hashes.values() for h in hashes]
+            validate_mm_inputs(prompt_token_ids, mm_hashes, start_positions,
+                               num_mm_tokens)
+            mm_hashes_int32 = [hexdigest_to_int32(h) for h in mm_hashes
+                               ]  # nested list w/ multiple int32 per hash
+
+            extra_processed_inputs[
+                "multimodal_input"] = MultimodalInput.from_components(
+                    mm_hashes_int32, start_positions, num_mm_tokens)
+            return prompt_token_ids, extra_processed_inputs
+
     def input_processor_wrapper(
         inputs: TextPrompt, sampling_params: SamplingParams
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
         try:
-            assert 'multi_modal_data' in inputs, "multi_modal_data must be provided for hashing support."
-            mm_data = inputs['multi_modal_data']
-            num_mm_tokens = find_mm_token_lengths(mm_data, input_processor)
-            if len(num_mm_tokens) > 0:
-                mm_hashes = apply_mm_hashes(mm_data, hash_lib)
-                prompt_token_ids, extra_processed_inputs = input_processor(
-                    inputs, sampling_params)
-                start_positions = find_mm_token_positions(
-                    input_ids=prompt_token_ids,  # token sequence
-                    num_mm_tokens=
-                    num_mm_tokens,  # list of lengths of each chunk of visual tokens
-                    vocab_size=input_processor.model_config.vocab_size,
-                )
-                # flatten the hashes from dict to a single list
-                mm_hashes = [h for hashes in mm_hashes.values() for h in hashes]
-                validate_mm_inputs(prompt_token_ids, mm_hashes, start_positions,
-                                   num_mm_tokens)
-                mm_hashes_int32 = [hexdigest_to_int32(h) for h in mm_hashes
-                                   ]  # nested list w/ multiple int32 per hash
-
-                extra_processed_inputs[
-                    "multimodal_input"] = MultimodalInput.from_components(
-                        mm_hashes_int32, start_positions, num_mm_tokens)
-                return prompt_token_ids, extra_processed_inputs
+            if hasattr(input_processor, "multimodal_hashing_supported"):
+                if input_processor.__getattribute__(
+                        "multimodal_hashing_supported"):
+                    return multimodal_hashing_process(inputs, sampling_params)
+                else:
+                    return input_processor(inputs, sampling_params)
             else:
-                return input_processor(inputs, sampling_params)
+                try:
+                    prompt_token_ids, extra_processed_inputs = multimodal_hashing_process(
+                        inputs, sampling_params)
+                    input_processor.__setattr__("multimodal_hashing_supported",
+                                                True)
+                    return prompt_token_ids, extra_processed_inputs
+                except Exception as e:
+                    import traceback
+                    traceback.print_exc()
+                    logger.warning(
+                        f"Multimodal hashing failed: {e}. Falling back to basic input processor."
+                    )
+                    input_processor.__setattr__("multimodal_hashing_supported",
+                                                False)
+                    return input_processor(inputs, sampling_params)
         except Exception as e:
-            # Fall back to basic input processor if multimodal processing fails
-            logger.warning(
-                f"Multimodal hashing failed: {e}. Falling back to basic input processor."
-            )
-            return input_processor(inputs, sampling_params)
+            import traceback
+            traceback.print_exc()
+            logger.error(
+                f"Basic input processor({input_processor}) failed: {e}.")
+            raise e
 
     return input_processor_wrapper

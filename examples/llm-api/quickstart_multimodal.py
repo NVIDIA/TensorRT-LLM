@@ -4,8 +4,9 @@ import os
 
 from quickstart_advanced import add_llm_args, setup_llm
 
-from tensorrt_llm.inputs import (ALL_SUPPORTED_MULTIMODAL_MODELS,
-                                 default_multimodal_input_loader)
+from tensorrt_llm.inputs import default_multimodal_input_loader
+from tensorrt_llm.inputs.registry import MULTIMODAL_PLACEHOLDER_REGISTRY
+from tensorrt_llm.tools.importlib_utils import import_custom_module_from_dir
 
 example_medias_and_prompts = {
     "image": {
@@ -79,10 +80,11 @@ example_medias_and_prompts = {
 
 
 def add_multimodal_args(parser):
-    parser.add_argument("--model_type",
-                        type=str,
-                        choices=ALL_SUPPORTED_MULTIMODAL_MODELS,
-                        help="Model type.")
+    parser.add_argument(
+        "--model_type",
+        type=str,
+        choices=MULTIMODAL_PLACEHOLDER_REGISTRY.get_registered_model_types(),
+        help="Model type.")
     parser.add_argument("--modality",
                         type=str,
                         choices=[
@@ -108,6 +110,18 @@ def add_multimodal_args(parser):
                         type=str,
                         default="cpu",
                         help="The device to have the input on.")
+    parser.add_argument(
+        "--custom_module_dirs",
+        type=str,
+        nargs="+",
+        default=None,
+        help=
+        ("Paths to an out-of-tree model directory which should be imported."
+         " This is useful to load a custom model. The directory should have a structure like:"
+         " <model_name>"
+         " ├── __init__.py"
+         " ├── <model_name>.py"
+         " └── <sub_dirs>"))
     return parser
 
 
@@ -140,6 +154,9 @@ def parse_arguments():
 
 def main():
     args = parse_arguments()
+    if args.custom_module_dirs is not None:
+        for custom_module_dir in args.custom_module_dirs:
+            import_custom_module_from_dir(custom_module_dir)
 
     lora_config = None
     if args.load_lora:
@@ -156,8 +173,11 @@ def main():
         model_type = args.model_type
     else:
         model_type = json.load(
-            open(os.path.join(llm._hf_model_dir, 'config.json')))['model_type']
-    assert model_type in ALL_SUPPORTED_MULTIMODAL_MODELS, f"Unsupported model_type: {model_type}"
+            open(os.path.join(str(llm._hf_model_dir),
+                              'config.json')))['model_type']
+    assert model_type in MULTIMODAL_PLACEHOLDER_REGISTRY.get_registered_model_types(), \
+        f"Unsupported model_type: {model_type} found!\n" \
+        f"Supported types: {MULTIMODAL_PLACEHOLDER_REGISTRY.get_registered_model_types()}"
 
     # set prompts and media to example prompts and images if they are not provided
     if args.prompt is None:
@@ -165,7 +185,7 @@ def main():
     if args.media is None:
         args.media = example_medias_and_prompts[args.modality]["media"]
     inputs = default_multimodal_input_loader(tokenizer=llm.tokenizer,
-                                             model_dir=llm._hf_model_dir,
+                                             model_dir=str(llm._hf_model_dir),
                                              model_type=model_type,
                                              modality=args.modality,
                                              prompts=args.prompt,

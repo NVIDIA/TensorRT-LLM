@@ -1,10 +1,11 @@
 from .data import PromptInputs, TextPrompt, TokensPrompt, prompt_inputs
 from .multimodal import MultimodalInput
 from .registry import (ExtraProcessedInputs, InputProcessor,
-                       create_input_processor, create_input_processor_with_hash,
+                       MultimodalPlaceholderMetadata,
+                       MultimodalPlaceholderPlacement, create_input_processor,
+                       create_input_processor_with_hash,
                        register_input_processor)
-from .utils import (ALL_SUPPORTED_MULTIMODAL_MODELS, ConversationMessage,
-                    MultimodalData, MultimodalDataTracker,
+from .utils import (ConversationMessage, MultimodalData, MultimodalDataTracker,
                     add_multimodal_placeholders, async_load_audio,
                     async_load_image, async_load_video,
                     default_multimodal_input_loader,
@@ -20,7 +21,8 @@ __all__ = [
     "create_input_processor_with_hash",
     "register_input_processor",
     "ExtraProcessedInputs",
-    "ALL_SUPPORTED_MULTIMODAL_MODELS",
+    "MultimodalPlaceholderMetadata",
+    "MultimodalPlaceholderPlacement",
     "ConversationMessage",
     "MultimodalDataTracker",
     "MultimodalData",
