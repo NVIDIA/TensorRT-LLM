@@ -1182,40 +1182,48 @@ class PyExecutor:
                     # the generation requests always have batch_idx.
                     scheduled_batch.generation_requests = sorted(  # stable sort
                         scheduled_batch.generation_requests,
-                        key=lambda req: int(req.py_batch_idx is not None),
+                        key=lambda req:
+                        int(req.py_batch_idx is not None and req.
+                            py_decoding_iter + 1 < req.py_max_new_tokens),
                     )
+                    if scheduled_batch.batch_size > 0:
+                        if self.kv_cache_transceiver:
+                            # Return the first token to the client
+                            self._handle_first_token_response(scheduled_batch)
 
-                    if self.kv_cache_transceiver:
-                        # Return the first token to the client
-                        self._handle_first_token_response(scheduled_batch)
+                        previous_tensors_device = self.previous_batch and self.previous_batch.sample_state and self.previous_batch.sample_state.device
 
-                    # init_disagg_gen_requests must be before engine forward, where the prev_seq_slot is updated.
-                    if self.guided_decoder is not None and self.kv_cache_transceiver:
-                        self.guided_decoder.add_batch(scheduled_batch)
-                        self.guided_decoder.init_disagg_gen_requests()
+                        # init_disagg_gen_requests must be before engine forward, where the prev_seq_slot is updated.
+                        if self.guided_decoder is not None and self.kv_cache_transceiver:
+                            self.guided_decoder.add_batch(scheduled_batch)
+                            self.guided_decoder.init_disagg_gen_requests()
 
-                    previous_tensors_device = self.previous_batch and self.previous_batch.sample_state and self.previous_batch.sample_state.device
+                        previous_tensors_device = self.previous_batch and self.previous_batch.sample_state and self.previous_batch.sample_state.device
+                        batch_outputs = self._forward_step(
+                            scheduled_batch, previous_tensors_device)
 
-                    batch_outputs = self._forward_step(scheduled_batch,
-                                                       previous_tensors_device)
+                        if self.previous_batch is not None:
+                            self._update_requests(
+                                self.previous_batch.sample_state)
 
-                    if self.previous_batch is not None:
-                        self._update_requests(self.previous_batch.sample_state)
+                        if self.guided_decoder is not None:
+                            self.guided_decoder.build(scheduled_batch)
+                            self.guided_decoder.execute(scheduled_batch,
+                                                        batch_outputs['logits'])
 
-                    if self.guided_decoder is not None:
-                        # add_batch must be called again to have updated new tokens.
-                        self.guided_decoder.add_batch(scheduled_batch)
-                        self.guided_decoder.execute(batch_outputs['logits'])
+                        if self.guided_decoder is not None:
+                            # add_batch must be called again to have updated new tokens.
+                            self.guided_decoder.add_batch(scheduled_batch)
+                            self.guided_decoder.execute(batch_outputs['logits'])
+                        sample_state = self._sample_async(
+                            scheduled_batch, batch_outputs)
+                        assert sample_state is not None, "Sampling failed"
 
-                    sample_state = self._sample_async(scheduled_batch,
-                                                      batch_outputs)
-                    assert sample_state is not None, "Sampling failed"
+                        self._update_request_states(scheduled_batch)
 
-                    self._update_request_states(scheduled_batch)
-
-                    ctx_transmission_reqs = self._send_disagg_ctx_cache(
-                        scheduled_batch.context_requests
-                    ) if self.kv_cache_transceiver else []
+                        ctx_transmission_reqs = self._send_disagg_ctx_cache(
+                            scheduled_batch.context_requests
+                        ) if self.kv_cache_transceiver else []
 
                     if self.previous_batch is not None:
                         self._process_previous_batch()
@@ -1225,11 +1233,14 @@ class PyExecutor:
                         iter_stats.inflight_batching_stats.num_ctx_tokens = self.model_engine.iter_states[
                             'num_ctx_tokens']
 
-                    self.previous_batch = BatchState(
-                        sample_state=sample_state,
-                        iter_start_time=iter_start_time,
-                        iter_stats=iter_stats,
-                        ctx_transmission_reqs=ctx_transmission_reqs)
+                    if scheduled_batch.batch_size > 0:
+                        self.previous_batch = BatchState(
+                            sample_state=sample_state,
+                            iter_start_time=iter_start_time,
+                            iter_stats=iter_stats,
+                            ctx_transmission_reqs=ctx_transmission_reqs)
+                    else:
+                        self.previous_batch = None
 
                 if self.kv_cache_transceiver and self.ctx_in_transmission_requests:
                     self._terminate_ctx_finished_requests()
