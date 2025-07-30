@@ -23,6 +23,13 @@ The performance numbers below were collected using the steps described in this d
 
 Testing was performed on models with weights quantized using [ModelOpt](https://nvidia.github.io/TensorRT-Model-Optimizer/#) and published by NVIDIA on the [Model Optimizer HuggingFace Collection](https://huggingface.co/collections/nvidia/model-optimizer-66aa84f7966b3150262481a4).
 
+### Hardware:
+The following GPU variants were used for testing:
+- H100 SXM 80GB (DGX H100)
+- H200 SXM 141GB (DGX H200)
+- B200 180GB (DGX B200)
+- GB200 192GB (GB200 NVL72)
+
 ### FP4 Models:
 ```
 nvidia/Llama-3.3-70B-Instruct-FP4
@@ -31,7 +38,7 @@ nvidia/Llama-3.1-405B-Instruct-FP4
 
 #### Llama 3.3 70B FP4
 
-|                          | GPU:   | B200      | GB200 180GB   |
+|                          | GPU:   | B200     | GB200  |
 |:-----------------------------|:---|:----------|:--------------|
 |    | TP Size   | 1      | 1          |
 | ISL, OSL |    |           |               |
@@ -50,7 +57,7 @@ nvidia/Llama-3.1-405B-Instruct-FP4
 
 #### Llama 3.1 405B FP4
 
-|                         | GPU:    | B200     | GB200 180GB   |
+|                         | GPU:    | B200    | GB200  |
 |:-----------------------------|:---|:---------|:--------------|
 |   | TP Size   | 4     | 4          |
 | ISL, OSL |    |          |               |
@@ -77,7 +84,7 @@ nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8
 
 #### Llama 3.1 8B FP8
 
-|                          | GPU:   | GH200 96GB  | H100 80GB HBM3   | H200 141GB HBM3   |
+|                          | GPU:   | GH200  | H100   | H200   |
 |:-----------------------------|:---|:--------------|:-----------------|:------------------|
 |    | TP Size   | 1          | 1             | 1              |
 | ISL, OSL |    |               |                  |                   |
@@ -96,7 +103,7 @@ nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8
 
 #### Llama 3.3 70B FP8
 
-|                        | GPU:     | H100 80GB HBM3   | H200 141GB HBM3   |
+|                        | GPU:     | H100   | H200   |
 |:-----------------------------|:---|:-----------------|:------------------|
 |    | TP Size   | 2             | 2              |
 | ISL, OSL |    |                  |                   |
@@ -114,7 +121,7 @@ nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8
 | 20000, 2000                  |    | 411.85           | 609.42            |
 
 #### Llama 3.1 405B FP8
-|                         | GPU:    | H100 80GB HBM3   | H200 141GB HBM3   |
+|                         | GPU:    | H100   | H200   |
 |:-----------------------------|:---|:-----------------|:------------------|
 |    | TP Size   | 8             | 8              |
 | Runtime Input/Output Lengths |    |                  |                   |
@@ -135,7 +142,7 @@ nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8
 
 Note: Performance for Llama 4 on sequence lengths less than 8,192 tokens is affected by an issue introduced in v0.21. To reproduce the Llama 4 performance noted here, please use v0.20
 
-|                          | GPU    | H200 141GB HBM3   | H100 80GB HBM3   |
+|                          | GPU    | H200   | H100   |
 |:-----------------------------|:---|:------------------|:-----------------|
 |    | TP Size    | 8              | 8             |
 | ISL, OSL |    |                   |                  |
@@ -248,7 +255,7 @@ cuda_graph_batch_sizes:
   - 8192
 ```
 
-In a majority of cases, we also use a higher KV cache percentage by setting `--kv_cache_free_gpu_mem_fraction 0.95` in the benchmark command. This allows us to obtain better performance than the default setting of `0.90`. We fall back to `0.90` if we hit an out of memory issue.
+In many cases, we also use a higher KV cache percentage by setting `--kv_cache_free_gpu_mem_fraction 0.95` in the benchmark command. This allows us to obtain better performance than the default setting of `0.90`. We fall back to `0.90` or lower if out-of-memory errors are encountered.
 
 The results will be printed to the terminal upon benchmark completion. For example,
 
