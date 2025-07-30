@@ -248,7 +248,7 @@ class DeepseekV3Attention(MLA):
                          dtype=config.torch_dtype,
                          config=model_config,
                          aux_stream=aux_stream)
-        self.fused_a = DeepseekV3Linear(
+        self.kv_a_proj_with_mqa = DeepseekV3Linear(
             config.hidden_size,
             self.kv_lora_rank + self.qk_rope_head_dim +
             (self.q_lora_rank if not self.is_lite else 0),
@@ -1384,7 +1384,7 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
                         attn_module.v_b_proj_scale = nn.Parameter(
                             v_b_proj_scale, requires_grad=False)
 
-                elif names[-1] == "fused_a":
+                elif names[-1] == "kv_a_proj_with_mqa":
                     fused_a = weights[
                         f"{'.'.join(names[:-1])}.kv_a_proj_with_mqa.weight"][:]
                     if not is_lite:
