@@ -140,7 +140,6 @@ class PyExecutor:
                  max_beam_width: int = 1,
                  max_draft_len: int = 0,
                  kv_cache_transceiver: Optional[KvCacheTransceiver] = None,
-                 draft_model_engine: Optional[ModelEngine] = None,
                  guided_decoder: Optional[GuidedDecoder] = None,
                  garbage_collection_gen0_threshold: Optional[int] = None,
                  start_worker: bool = True):
@@ -161,12 +160,11 @@ class PyExecutor:
         self.enable_attention_dp = model_engine.enable_attention_dp
         self.sampler = sampler
         self.drafter = drafter
+        self.draft_model_engine = getattr(self.drafter, "draft_model_engine",
+                                          None)
         self.guided_decoder = guided_decoder
         self.dist = dist
         self.disable_overlap_scheduler = disable_overlap_scheduler
-
-        # Draft model for certain spec decode algorithms, e.g. EAGLE3
-        self.draft_model_engine = draft_model_engine
 
         # enqueue and _fetch_new_requests used data
         self.next_req_id = max_batch_size  # The first max_batch_size request IDs are reserved for dummy requests
