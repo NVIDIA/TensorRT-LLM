@@ -273,17 +273,24 @@ class QWenForCausalLM(DecoderModelForCausalLM):
                 get_default_trtllm_modules_to_hf_modules())
             # Common MoE expert mappings for both Qwen2 and Qwen3 MoE
             self.trtllm_modules_to_hf_modules.update({
-                "moe_h_to_4h": "mlp.experts.gate_proj",
-                "moe_4h_to_h": "mlp.experts.down_proj",
-                "moe_gate": "mlp.experts.up_proj",
+                "moe_h_to_4h":
+                "mlp.experts.gate_proj",
+                "moe_4h_to_h":
+                "mlp.experts.down_proj",
+                "moe_gate":
+                "mlp.experts.up_proj",
             })
             # Qwen2 MoE additionally has shared expert
             if config.qwen_type == 'qwen2_moe':
                 self.trtllm_modules_to_hf_modules.update({
-                    "mlp_h_to_4h": "mlp.shared_expert.gate_proj",
-                    "mlp_4h_to_h": "mlp.shared_expert.down_proj",
-                    "mlp_gate": "mlp.shared_expert.up_proj",
-                    "mlp_router": "mlp.shared_expert_gate",
+                    "mlp_h_to_4h":
+                    "mlp.shared_expert.gate_proj",
+                    "mlp_4h_to_h":
+                    "mlp.shared_expert.down_proj",
+                    "mlp_gate":
+                    "mlp.shared_expert.up_proj",
+                    "mlp_router":
+                    "mlp.shared_expert_gate",
                 })
         else:
             self.trtllm_modules_to_hf_modules = None
@@ -347,9 +354,10 @@ class QWenForCausalLM(DecoderModelForCausalLM):
                 }
             elif config.qwen_type == "qwen3_moe":
                 custom_dict = {
-                    "fc": ["up_proj", "gate_proj"],  # MoE experts weight mapping
-                    "q_layernorm": "q_norm",         # Q normalization for Qwen3
-                    "k_layernorm": "k_norm",         # K normalization for Qwen3
+                    "fc": ["up_proj",
+                           "gate_proj"],  # MoE experts weight mapping
+                    "q_layernorm": "q_norm",  # Q normalization for Qwen3
+                    "k_layernorm": "k_norm",  # K normalization for Qwen3
                 }
             elif config.qwen_type in {"qwen2", "qwen2_vl"
                                       } and config.tie_word_embeddings:
