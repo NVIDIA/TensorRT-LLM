@@ -296,6 +296,8 @@ class PyExecutor:
 
             self.kv_connector_manager.worker.register_kv_caches(kv_cache_data)
 
+            # For each of our layers, we need to register the pre/post hooks.
+            # These are used for methods like `wait_for_layer_load` and `save_kv_layer`.
             for _name, module in self.model_engine.model.named_modules():
                 if isinstance(module, DecoderLayer):
                     module.register_forward_pre_hook(
@@ -303,6 +305,9 @@ class PyExecutor:
                     module.register_forward_hook(
                         self.kv_connector_manager.layer_post_hook)
 
+            # We also need a hook that runs once the model is complete.
+            # In theory, we could do this at the end of _forward_step, but this is more convenient,
+            # and may give slightly better perf.
             self.model_engine.model.register_forward_hook(
                 self.kv_connector_manager.model_post_hook)
 
@@ -927,6 +932,8 @@ class PyExecutor:
                 )
                 self.kv_cache_transceiver.check_context_transfer_status(1)
         elif self.kv_connector_manager is None:
+            # The kv cache connector also puts requests to sleep similar to the transceiver.
+            # Thus, this assertion is only applicable when both the cache transceiver and connector are disabled.
             assert scheduled_batch.batch_size > 0, (
                 "fail to schedule any pending request, "
                 "probably run out of resource.")
@@ -974,7 +981,6 @@ class PyExecutor:
 
                         # Return the first token to the client
                         self._handle_first_token_response(scheduled_batch)
-
                     self.resource_manager.prepare_resources(scheduled_batch)
 
                     if self.kv_cache_transceiver and self.guided_decoder:
@@ -1012,8 +1018,7 @@ class PyExecutor:
 
                 if self.kv_cache_transceiver and self.ctx_in_transmission_requests:
                     self._terminate_ctx_finished_requests()
-
-                if self.kv_connector_manager:
+                elif self.kv_connector_manager:
                     reqs_to_terminate = self.kv_connector_manager.get_finished()
                     for req in reqs_to_terminate:
                         self._terminate_request(req)

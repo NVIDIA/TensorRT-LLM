@@ -25,7 +25,6 @@
 #include "tensorrt_llm/batch_manager/peftCacheManager.h"
 #include "tensorrt_llm/batch_manager/rnnStateManager.h"
 #include "tensorrt_llm/batch_manager/sequenceSlotManager.h"
-#include "tensorrt_llm/pybind/batch_manager/kvCacheConnector.h"
 #include "tensorrt_llm/pybind/common/bindTypes.h"
 #include "tensorrt_llm/runtime/gptDecoderBatched.h"
 #include "tensorrt_llm/runtime/runtimeKernels.h"
