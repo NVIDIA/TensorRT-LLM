@@ -51,7 +51,8 @@ EXAONE4_SINGLE_LAYER_CONFIG = {
     "max_position_embeddings": 131072,
     "model_type": "exaone4",
     "num_attention_heads": 40,
-    "num_hidden_layers": 4,
+    "num_hidden_layers":
+    4,  #NOTE: For testing, we use 4 instead of 64(all layers)
     "num_key_value_heads": 8,
     "pad_token_id": 0,
     "rms_norm_eps": 1e-05,
@@ -84,7 +85,7 @@ class Scenario:
         return f"backend:{self.backend.lower()}-input_len:{self.input_len}-use_cuda_graph:{self.use_cuda_graph}"
 
 
-class TestExaone4(unittest.TestCase):
+class TestEXAONE4(unittest.TestCase):
 
     @parameterized.expand([None, "FP8"])
     def test_exaone4_sanity(self, quant_algo):
