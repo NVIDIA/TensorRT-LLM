@@ -34,6 +34,7 @@ The following GPU variants were used for testing:
 Other hardware variants may have different TDP, memory bandwidth, core count, or other features leading to performance differences on these workloads.
 
 ### FP4 Models
+
 ```
 nvidia/Llama-3.3-70B-Instruct-FP4
 nvidia/Llama-3.1-405B-Instruct-FP4
@@ -78,6 +79,7 @@ nvidia/Llama-3.1-405B-Instruct-FP4
 | 20000, 2000                  |    | 667.39   | 649.95        |
 
 ### FP8 Models
+
 ```
 nvidia/Llama-3.1-8B-Instruct-FP8
 nvidia/Llama-3.3-70B-Instruct-FP8
