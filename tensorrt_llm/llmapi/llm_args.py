@@ -12,8 +12,9 @@ from typing import (TYPE_CHECKING, Any, ClassVar, Dict, List, Literal, Optional,
 
 import torch
 import yaml
-from pydantic import (BaseModel, Field, PrivateAttr, field_validator,
-                      model_validator)
+from pydantic import BaseModel
+from pydantic import Field as PydanticField
+from pydantic import PrivateAttr, field_validator, model_validator
 from strenum import StrEnum
 from transformers import PreTrainedTokenizerBase
 
@@ -61,7 +62,46 @@ from .utils import generate_api_docs_as_docstring, get_type_repr
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
 
 
-class CudaGraphConfig(BaseModel):
+def Field(default: Any = ...,
+          *,
+          status: Optional[Literal["prototype", "beta", "deprecated"]] = None,
+          **kwargs: Any) -> Any:
+    """Custom Field wrapper that adds status to json_schema_extra.
+
+    Args:
+        default: The default value for the field
+        status: Optional status indicator that gets added to json_schema_extra.
+            - None: Stable.
+            - "beta": Recommended for use per the latest documentation.
+            - "prototype": Not yet stable and subject to breaking changes; intended for experimentation only.
+        **kwargs: All other arguments passed to the original Pydantic Field
+
+    Returns:
+        A Pydantic FieldInfo object with the status added to json_schema_extra if provided
+    """
+
+    if status is not None:
+        json_schema_extra = kwargs.get('json_schema_extra', {})
+        if isinstance(json_schema_extra, dict):
+            json_schema_extra['status'] = status
+        else:
+            # If json_schema_extra is not a dict, create a new dict with the status
+            json_schema_extra = {'status': status}
+        kwargs['json_schema_extra'] = json_schema_extra
+
+    return PydanticField(default, **kwargs)
+
+
+class StrictBaseModel(BaseModel):
+    """
+    A base model that forbids arbitrary fields.
+    """
+
+    class Config:
+        extra = "forbid"  # globally forbid arbitrary fields
+
+
+class CudaGraphConfig(StrictBaseModel):
     """
     Configuration for CUDA graphs.
     """
@@ -88,8 +128,40 @@ class CudaGraphConfig(BaseModel):
                 "cuda_graph_config.max_batch_size must be non-negative")
         return v
 
+    @staticmethod
+    def _generate_cuda_graph_batch_sizes(max_batch_size: int,
+                                         enable_padding: bool) -> List[int]:
+        """Generate a list of batch sizes for CUDA graphs.
 
-class MoeConfig(BaseModel):
+        Args:
+            max_batch_size: Maximum batch size to generate up to
+            enable_padding: Whether padding is enabled, which affects the batch size distribution
+
+        Returns:
+            List of batch sizes to create CUDA graphs for
+        """
+        if enable_padding:
+            batch_sizes = [1, 2, 4] + [i * 8 for i in range(1, 17)]
+        else:
+            batch_sizes = list(range(1, 32)) + [32, 64, 128]
+
+        # Add powers of 2 up to max_batch_size
+        batch_sizes += [
+            2**i for i in range(8, math.floor(math.log(max_batch_size, 2)))
+        ]
+
+        # Filter and sort batch sizes
+        batch_sizes = sorted(
+            [size for size in batch_sizes if size <= max_batch_size])
+
+        # Add max_batch_size if not already included
+        if max_batch_size != batch_sizes[-1]:
+            batch_sizes.append(max_batch_size)
+
+        return batch_sizes
+
+
+class MoeConfig(StrictBaseModel):
     """
     Configuration for MoE.
     """
@@ -194,7 +266,7 @@ class _ParallelConfig:
                        auto_parallel=self.auto_parallel)
 
 
-class CalibConfig(BaseModel):
+class CalibConfig(StrictBaseModel):
     """
     Calibration configuration.
     """
@@ -246,7 +318,7 @@ class _ModelFormatKind(Enum):
     TLLM_ENGINE = 2
 
 
-class DecodingBaseConfig(BaseModel):
+class DecodingBaseConfig(StrictBaseModel):
     max_draft_len: Optional[int] = None
     speculative_model_dir: Optional[Union[str, Path]] = None
 
@@ -267,6 +339,7 @@ class DecodingBaseConfig(BaseModel):
         config_class = config_classes.get(decoding_type)
         if config_class is None:
             raise ValueError(f"Invalid decoding type: {decoding_type}")
+        data.pop("decoding_type")
 
         return config_class(**data)
 
@@ -465,7 +538,7 @@ class PybindMirror(ABC):
         """
 
         def decorator(cls):
-            assert issubclass(cls, BaseModel)
+            assert issubclass(cls, StrictBaseModel)
             # Get all non-private fields from the C++ class
             cpp_fields = PybindMirror.get_pybind_variable_fields(pybind_class)
             python_fields = set(cls.model_fields.keys())
@@ -566,7 +639,7 @@ class ContextChunkingPolicy(StrEnum, metaclass=PybindMirrorEnumMeta):
 
 
 @PybindMirror.mirror_pybind_fields(_DynamicBatchConfig)
-class DynamicBatchConfig(BaseModel, PybindMirror):
+class DynamicBatchConfig(StrictBaseModel, PybindMirror):
     """Dynamic batch configuration.
 
     Controls how batch size and token limits are dynamically adjusted at runtime.
@@ -592,7 +665,7 @@ class DynamicBatchConfig(BaseModel, PybindMirror):
 
 
 @PybindMirror.mirror_pybind_fields(_SchedulerConfig)
-class SchedulerConfig(BaseModel, PybindMirror):
+class SchedulerConfig(StrictBaseModel, PybindMirror):
     capacity_scheduler_policy: CapacitySchedulerPolicy = Field(
         default=CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
         description="The capacity scheduler policy to use")
@@ -614,7 +687,7 @@ class SchedulerConfig(BaseModel, PybindMirror):
 
 
 @PybindMirror.mirror_pybind_fields(_PeftCacheConfig)
-class PeftCacheConfig(BaseModel, PybindMirror):
+class PeftCacheConfig(StrictBaseModel, PybindMirror):
     """
     Configuration for the PEFT cache.
     """
@@ -742,7 +815,7 @@ SpeculativeConfig: TypeAlias = Optional[Union[
 
 
 @PybindMirror.mirror_pybind_fields(_KvCacheConfig)
-class KvCacheConfig(BaseModel, PybindMirror):
+class KvCacheConfig(StrictBaseModel, PybindMirror):
     """
     Configuration for the KV cache.
     """
@@ -825,7 +898,7 @@ class KvCacheConfig(BaseModel, PybindMirror):
 
 
 @PybindMirror.mirror_pybind_fields(_ExtendedRuntimePerfKnobConfig)
-class ExtendedRuntimePerfKnobConfig(BaseModel, PybindMirror):
+class ExtendedRuntimePerfKnobConfig(StrictBaseModel, PybindMirror):
     """
     Configuration for extended runtime performance knobs.
     """
@@ -856,7 +929,7 @@ class ExtendedRuntimePerfKnobConfig(BaseModel, PybindMirror):
 
 
 @PybindMirror.mirror_pybind_fields(_CacheTransceiverConfig)
-class CacheTransceiverConfig(BaseModel, PybindMirror):
+class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
     """
     Configuration for the cache transceiver.
     """
@@ -916,7 +989,7 @@ class _ModelWrapper:
         return self.model if isinstance(self.model, str) else None
 
 
-class BaseLlmArgs(BaseModel):
+class BaseLlmArgs(StrictBaseModel):
     """
     Base class for both TorchLlmArgs and TrtLlmArgs. It contains all the arguments that are common to both.
     """
@@ -972,12 +1045,13 @@ class BaseLlmArgs(BaseModel):
     gpus_per_node: Optional[int] = Field(
         default=None,
         description="The number of GPUs per node.",
+        status="beta",
         validate_default=True)
 
     moe_cluster_parallel_size: Optional[int] = Field(
         default=None,
-        description="The cluster parallel size for MoE models's expert weights."
-    )
+        description="The cluster parallel size for MoE models's expert weights.",
+        status="beta")
 
     moe_tensor_parallel_size: Optional[int] = Field(
         default=None,
@@ -988,10 +1062,13 @@ class BaseLlmArgs(BaseModel):
         description="The expert parallel size for MoE models's expert weights.")
 
     enable_attention_dp: bool = Field(
-        default=False, description="Enable attention data parallel.")
+        default=False,
+        description="Enable attention data parallel.",
+        status="beta")
 
     cp_config: Optional[dict] = Field(default_factory=dict,
-                                      description="Context parallel config.")
+                                      description="Context parallel config.",
+                                      status="prototype")
 
     load_format: Literal['auto', 'dummy'] = Field(
         default='auto',
@@ -1010,16 +1087,23 @@ class BaseLlmArgs(BaseModel):
     max_lora_rank: Optional[int] = Field(
         default=None,
         description="The maximum LoRA rank.",
-        deprecated="Use lora_config.max_lora_rank instead.")
+        deprecated="Use lora_config.max_lora_rank instead.",
+        status="deprecated",
+    )
 
-    max_loras: int = Field(default=4,
-                           description="The maximum number of LoRA.",
-                           deprecated="Use lora_config.max_loras instead.")
+    max_loras: int = Field(
+        default=4,
+        description="The maximum number of LoRA.",
+        deprecated="Use lora_config.max_loras instead.",
+        status="deprecated",
+    )
 
     max_cpu_loras: int = Field(
         default=4,
         description="The maximum number of LoRA on CPU.",
-        deprecated="Use lora_config.max_cpu_loras instead.")
+        deprecated="Use lora_config.max_cpu_loras instead.",
+        status="deprecated",
+    )
 
     lora_config: Optional[LoraConfig] = Field(
         default=None, description="LoRA configuration for the model.")
@@ -1046,31 +1130,30 @@ class BaseLlmArgs(BaseModel):
 
     iter_stats_max_iterations: Optional[int] = Field(
         default=None,
-        description="The maximum number of iterations for iter stats.")
+        description="The maximum number of iterations for iter stats.",
+        status="prototype")
 
     request_stats_max_iterations: Optional[int] = Field(
         default=None,
-        description="The maximum number of iterations for request stats.")
+        description="The maximum number of iterations for request stats.",
+        status="prototype")
 
     # A handful of options from PretrainedConfig
     peft_cache_config: Optional[PeftCacheConfig] = Field(
-        default=None, description="PEFT cache config.")
+        default=None, description="PEFT cache config.", status="prototype")
 
     scheduler_config: SchedulerConfig = Field(default_factory=SchedulerConfig,
-                                              description="Scheduler config.")
+                                              description="Scheduler config.",
+                                              status="prototype")
 
     cache_transceiver_config: Optional[CacheTransceiverConfig] = Field(
-        default=None, description="Cache transceiver config.")
+        default=None,
+        description="Cache transceiver config.",
+        status="prototype")
 
     # Speculative decoding parameters
     speculative_config: SpeculativeConfig = Field(
         default=None, description="Speculative decoding config.")
-
-    batching_type: Optional[BatchingType] = Field(default=None,
-                                                  description="Batching type.")
-
-    normalize_log_probs: bool = Field(
-        default=False, description="Normalize log probabilities.")
 
     max_batch_size: Optional[int] = Field(default=None,
                                           description="The maximum batch size.")
@@ -1089,28 +1172,35 @@ class BaseLlmArgs(BaseModel):
         default=None, description="The maximum number of tokens.")
 
     gather_generation_logits: bool = Field(
-        default=False, description="Gather generation logits.")
+        default=False,
+        description="Gather generation logits.",
+        status="prototype")
 
     # private fields those are unstable and just for internal use
     num_postprocess_workers: int = Field(
         default=0,
         description=
-        "The number of processes used for postprocessing the generated tokens, including detokenization."
-    )
+        "The number of processes used for postprocessing the generated tokens, including detokenization.",
+        status="prototype")
 
     postprocess_tokenizer_dir: Optional[str] = Field(
         default=None,
-        description="The path to the tokenizer directory for postprocessing.")
+        description="The path to the tokenizer directory for postprocessing.",
+        status="prototype")
 
     reasoning_parser: Optional[str] = Field(
         default=None,
-        description="The parser to separate reasoning content from output.")
+        description="The parser to separate reasoning content from output.",
+        status="prototype")
 
     # TODO[Superjomn]: To deprecate this config.
     decoding_config: Optional[object] = Field(
         default=None,
         description="The decoding config.",
-        json_schema_extra={"type": "Optional[DecodingConfig]"},
+        json_schema_extra={
+            "type": "Optional[tensorrt_llm.llmapi.llm_args.DecodingConfig]"
+        },
+        status="deprecated",
         deprecated="Use speculative_config instead.",
     )
 
@@ -1126,6 +1216,7 @@ class BaseLlmArgs(BaseModel):
         description="The backend to use for this LLM instance.",
         exclude_json_schema=True,  # hide from API references
         validate_default=True,
+        status="deprecated",
     )
 
     _parallel_config: Optional[object] = PrivateAttr(default=None)
@@ -1305,7 +1396,8 @@ class BaseLlmArgs(BaseModel):
         """
         Creating a default BuildConfig if none is provided
         """
-        if self.build_config is None:
+        build_config = getattr(self, "build_config", None)
+        if build_config is None:
             kwargs = {}
             if self.max_batch_size:
                 kwargs["max_batch_size"] = self.max_batch_size
@@ -1318,10 +1410,10 @@ class BaseLlmArgs(BaseModel):
             if self.max_input_len:
                 kwargs["max_input_len"] = self.max_input_len
             self.build_config = BuildConfig(**kwargs)
-
-        assert isinstance(
-            self.build_config, BuildConfig
-        ), f"build_config is not initialized: {self.build_config}"
+        else:
+            assert isinstance(
+                build_config,
+                BuildConfig), f"build_config is not initialized: {build_config}"
         return self
 
     @model_validator(mode="after")
@@ -1677,6 +1769,12 @@ class TrtLlmArgs(BaseLlmArgs):
     max_prompt_adapter_token: int = Field(
         default=0, description="The maximum number of prompt adapter tokens.")
 
+    batching_type: Optional[BatchingType] = Field(default=None,
+                                                  description="Batching type.")
+
+    normalize_log_probs: bool = Field(
+        default=False, description="Normalize log probabilities.")
+
     # Private attributes
     _auto_parallel_config: Optional[AutoParallelConfig] = PrivateAttr(
         default=None)
@@ -1758,7 +1856,7 @@ class LoadFormat(Enum):
     DUMMY = 1
 
 
-class TorchCompileConfig(BaseModel):
+class TorchCompileConfig(StrictBaseModel):
     """
     Configuration for torch.compile.
     """
@@ -1799,14 +1897,17 @@ class TorchLlmArgs(BaseLlmArgs):
         default=None,
         description="Build config.",
         exclude_from_json=True,
-        json_schema_extra={"type": f"Optional[{get_type_repr(BuildConfig)}]"})
+        json_schema_extra={"type": f"Optional[{get_type_repr(BuildConfig)}]"},
+        status="deprecated",
+    )
 
     # PyTorch backend specific configurations
     garbage_collection_gen0_threshold: int = Field(
         default=20000,
         description=
         "Threshold for Python garbage collection of generation 0 objects."
-        "Lower values trigger more frequent garbage collection.")
+        "Lower values trigger more frequent garbage collection.",
+        status="beta")
 
     cuda_graph_config: Optional[CudaGraphConfig] = Field(
         default_factory=CudaGraphConfig,
@@ -1815,50 +1916,61 @@ class TorchLlmArgs(BaseLlmArgs):
         and are enabled for batches that consist of decoding requests *only* \
         (the reason is that it's hard to capture a single graph with prefill requests \
         since the input shapes are a function of the sequence lengths).\
-         Note that each CUDA graph can use up to 200 MB of extra memory.")
+         Note that each CUDA graph can use up to 200 MB of extra memory.",
+        status="beta")
 
     disable_overlap_scheduler: bool = Field(
-        default=False, description="Disable the overlap scheduler.")
+        default=False,
+        description="Disable the overlap scheduler.",
+        status="beta")
 
     moe_config: MoeConfig = Field(default_factory=MoeConfig,
-                                  description="MoE config.")
+                                  description="MoE config.",
+                                  status="beta")
 
     attn_backend: str = Field(default='TRTLLM',
-                              description="Attention backend to use.")
+                              description="Attention backend to use.",
+                              status="beta")
 
     enable_mixed_sampler: bool = Field(
         default=False,
         description=
-        "If true, will iterate over sampling_params of each request and use the corresponding sampling strategy, e.g. top-k, top-p, etc."
-    )
+        "If true, will iterate over sampling_params of each request and use the corresponding sampling strategy, e.g. top-k, top-p, etc.",
+        status="beta")
 
     enable_trtllm_sampler: bool = Field(
         default=False,
         description=
-        "If true, will use the TRTLLM sampler instead of the PyTorch sampler. The TRTLLM sampler has a wide coverage of sampling strategies."
-    )
+        "If true, will use the TRTLLM sampler instead of the PyTorch sampler. The TRTLLM sampler has a wide coverage of sampling strategies.",
+        status="prototype")
 
     enable_iter_perf_stats: bool = Field(
-        default=False, description="Enable iteration performance statistics.")
+        default=False,
+        description="Enable iteration performance statistics.",
+        status="prototype")
 
     enable_iter_req_stats: bool = Field(
         default=False,
         description=
-        "If true, enables per request stats per iteration. Must also set enable_iter_perf_stats to true to get request stats."
-    )
+        "If true, enables per request stats per iteration. Must also set enable_iter_perf_stats to true to get request stats.",
+        status="prototype")
 
     print_iter_log: bool = Field(default=False,
-                                 description="Print iteration logs.")
+                                 description="Print iteration logs.",
+                                 status="beta")
 
     torch_compile_config: Optional[TorchCompileConfig] = Field(
-        default=None, description="Torch compile config.")
+        default=None, description="Torch compile config.", status="prototype")
 
     enable_autotuner: bool = Field(
         default=True,
-        description="Enable autotuner only when torch compile is enabled.")
+        description="Enable autotuner only when torch compile is enabled.",
+        status="prototype")
 
     enable_layerwise_nvtx_marker: bool = Field(
-        default=False, description="If true, enable layerwise nvtx marker.")
+        default=False,
+        description="If true, enable layerwise nvtx marker.",
+        status="beta")
 
     load_format: Union[str, LoadFormat] = Field(
         default=LoadFormat.AUTO,
@@ -1870,6 +1982,7 @@ class TorchLlmArgs(BaseLlmArgs):
         default=False,
         description=
         "If true, enable min-latency mode. Currently only used for Llama4.",
+        status="beta",
     )
 
     # TODO: make this a per-request parameter
@@ -1883,13 +1996,17 @@ class TorchLlmArgs(BaseLlmArgs):
     force_dynamic_quantization: bool = Field(
         default=False,
         description="If true, force dynamic quantization. Defaults to False.",
+        status="prototype",
     )
 
     allreduce_strategy: Optional[
         Literal['AUTO', 'NCCL', 'UB', 'MINLATENCY', 'ONESHOT', 'TWOSHOT',
-                'LOWPRECISION',
-                'MNNVL']] = Field(default='AUTO',
-                                  description="Allreduce strategy to use.")
+                'LOWPRECISION', 'MNNVL']] = Field(
+                    default='AUTO',
+                    description="Allreduce strategy to use.",
+                    status="beta",
+                )
+
     checkpoint_loader: Optional[object] = Field(
         default=None,
         description="The checkpoint loader to use for this LLM instance.",
@@ -1897,11 +2014,13 @@ class TorchLlmArgs(BaseLlmArgs):
             "type":
             "Optional[tensorrt_llm._torch.models.checkpoints.BaseCheckpointLoader]"
         },
+        status="prototype",
     )
 
     checkpoint_format: Optional[str] = Field(
         default=None,
         description="The format of the provided checkpoint.",
+        status="prototype",
     )
 
     # PrivateVars
@@ -1973,38 +2092,6 @@ class TorchLlmArgs(BaseLlmArgs):
 
         return self
 
-    @staticmethod
-    def _generate_cuda_graph_batch_sizes(max_batch_size: int,
-                                         enable_padding: bool) -> List[int]:
-        """Generate a list of batch sizes for CUDA graphs.
-
-        Args:
-            max_batch_size: Maximum batch size to generate up to
-            enable_padding: Whether padding is enabled, which affects the batch size distribution
-
-        Returns:
-            List of batch sizes to create CUDA graphs for
-        """
-        if enable_padding:
-            batch_sizes = [1, 2, 4] + [i * 8 for i in range(1, 17)]
-        else:
-            batch_sizes = list(range(1, 32)) + [32, 64, 128]
-
-        # Add powers of 2 up to max_batch_size
-        batch_sizes += [
-            2**i for i in range(8, math.floor(math.log(max_batch_size, 2)))
-        ]
-
-        # Filter and sort batch sizes
-        batch_sizes = sorted(
-            [size for size in batch_sizes if size <= max_batch_size])
-
-        # Add max_batch_size if not already included
-        if max_batch_size != batch_sizes[-1]:
-            batch_sizes.append(max_batch_size)
-
-        return batch_sizes
-
     @model_validator(mode="after")
     def validate_load_balancer(self) -> 'TorchLlmArgs':
         from .._torch import MoeLoadBalancerConfig
@@ -2041,7 +2128,7 @@ class TorchLlmArgs(BaseLlmArgs):
         if config.batch_sizes:
             config.batch_sizes = sorted(config.batch_sizes)
             if config.max_batch_size != 0:
-                if config.batch_sizes != self._generate_cuda_graph_batch_sizes(
+                if config.batch_sizes != CudaGraphConfig._generate_cuda_graph_batch_sizes(
                         config.max_batch_size, config.enable_padding):
                     raise ValueError(
                         "Please don't set both cuda_graph_config.batch_sizes "
@@ -2053,7 +2140,7 @@ class TorchLlmArgs(BaseLlmArgs):
                 config.max_batch_size = max(config.batch_sizes)
         else:
             max_batch_size = config.max_batch_size or 128
-            generated_sizes = self._generate_cuda_graph_batch_sizes(
+            generated_sizes = CudaGraphConfig._generate_cuda_graph_batch_sizes(
                 max_batch_size, config.enable_padding)
             config.batch_sizes = generated_sizes
             config.max_batch_size = max_batch_size
@@ -2074,6 +2161,27 @@ class TorchLlmArgs(BaseLlmArgs):
             logger.warning(
                 f"Cannot sync quant_config.kv_cache_quant_algo with kv_cache_config.dtype of {self.kv_cache_config.dtype}, "
                 "please update the validator")
+
+        return self
+
+    def warn_on_unstable_feature_usage(self) -> 'TorchLlmArgs':
+        """Warn on unstable feature usage."""
+        set_fields = self.model_dump(exclude_unset=True).keys()
+
+        for field_name in set_fields:
+            field_info = self.model_fields.get(field_name)
+
+            if not field_info or not field_info.json_schema_extra:
+                continue
+
+            status = field_info.json_schema_extra.get('status', None)
+
+            if status in ('beta', 'prototype'):
+                logger.warning(
+                    f"The '{field_name}' knob is a '{status}' feature. "
+                    "It is not recommended for production use and may change or be removed.",
+                )
+
         return self
 
     # TODO: Remove this after the PyTorch backend is fully migrated to TorchLlmArgs from ExecutorConfig
