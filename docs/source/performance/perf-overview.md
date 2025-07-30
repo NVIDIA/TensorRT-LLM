@@ -35,7 +35,7 @@ Other hardware variants may have different TDP, memory bandwidth, core count, or
 
 ### FP4 Models
 
-```
+```text
 nvidia/Llama-3.3-70B-Instruct-FP4
 nvidia/Llama-3.1-405B-Instruct-FP4
 ```
@@ -80,7 +80,7 @@ nvidia/Llama-3.1-405B-Instruct-FP4
 
 ### FP8 Models
 
-```
+```text
 nvidia/Llama-3.1-8B-Instruct-FP8
 nvidia/Llama-3.3-70B-Instruct-FP8
 nvidia/Llama-3.1-405B-Instruct-FP8
