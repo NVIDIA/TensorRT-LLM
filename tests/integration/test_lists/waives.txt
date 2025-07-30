@@ -419,8 +419,6 @@ accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_ngram SKIP (http
 test_e2e.py::test_openai_multi_chat_example SKIP (https://nvbugs/5409416)
 test_e2e.py::test_ptp_quickstart_multimodal[llava-v1.6-mistral-7b-llava-v1.6-mistral-7b-hf-image-False] SKIP (https://nvbugs/5409417)
 test_e2e.py::test_ptp_star_attention_example[Llama3.1-8B-BF16-llama-3.1-model/Meta-Llama-3.1-8B] SKIP (https://nvbugs/5409420)
-accuracy/test_disaggregated_serving.py::TestLlama4ScoutInstruct::test_auto_dtype[False] SKIP (https://nvbugs/5410296)
-accuracy/test_disaggregated_serving.py::TestLlama4ScoutInstruct::test_auto_dtype[True] SKIP (https://nvbugs/5410296)
 llmapi/test_llm_examples.py::test_llmapi_speculative_decoding_mtp SKIP (https://nvbugs/5410399)
 unittest/trt/attention/test_gpt_attention.py -k "partition0" SKIP (https://nvbugs/5412456)
 unittest/trt/attention/test_gpt_attention.py -k "partition1" SKIP (https://nvbugs/5412456)
