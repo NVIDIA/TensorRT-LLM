@@ -18,6 +18,7 @@
 #include "bufferManager.h"
 
 #include <forward_list>
+#include <shared_mutex>
 
 namespace tensorrt_llm::runtime
 {
@@ -401,13 +402,13 @@ using AllocConf = CudaVirtualMemoryAllocator::Configuration;
 
 AllocConf AllocConf::backgroundConfiguration{getVirtualMemoryManager(), "", NONE, nullptr, true};
 
-static std::mutex vmAllocatorsMutex;
+static std::shared_mutex vmAllocatorsMutex;
 static std::forward_list vmAllocators{
     CudaVirtualMemoryAllocator{{std::shared_ptr<AllocConf>{}, &AllocConf::backgroundConfiguration}}};
 
 CudaVirtualMemoryAllocator const& getVirtualMemoryAllocator()
 {
-    std::unique_lock lock(vmAllocatorsMutex);
+    std::shared_lock lock(vmAllocatorsMutex);
     return vmAllocators.front();
 }
 
