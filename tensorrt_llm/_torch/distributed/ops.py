@@ -1,5 +1,6 @@
 import math
 import os
+import platform
 import threading
 from typing import List, Optional, Tuple, Union
 
@@ -10,6 +11,7 @@ from tensorrt_llm._utils import mpi_barrier
 from tensorrt_llm.bindings.internal.runtime import McastGPUBuffer
 from tensorrt_llm.functional import (AllReduceFusionOp, AllReduceParams,
                                      AllReduceStrategy, MoEAllReduceParams)
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.plugin.plugin import CustomAllReduceHelper
 
@@ -74,7 +76,7 @@ def get_allreduce_mnnvl_workspace(
             mapping.tp_size,
             mapping.tp_rank,
             torch.device("cuda", mapping.local_rank),
-            mapping.is_multi_node() or force_mn,
+            True,  # mnNvlink
         )
 
         buffer = mcast_buffer.get_uc_buffer(mapping.tp_rank,
@@ -308,6 +310,16 @@ class MNNVLAllReduce(nn.Module):
     def get_supported_dtypes():
         return (torch.float16, torch.bfloat16, torch.float32)
 
+    @staticmethod
+    def is_mnnvl(mapping: Mapping, dtype: torch.dtype) -> bool:
+        from tensorrt_llm._mnnvl_utils import MnnvlMemory
+
+        arch = platform.machine().lower()
+        is_on_aarch64 = "aarch64" in arch
+        return (dtype in MNNVLAllReduce.get_supported_dtypes()
+                and not mapping.has_cp() and mapping.is_multi_node()
+                and MnnvlMemory.supports_mnnvl() and is_on_aarch64)
+
     def forward(
         self,
         input: torch.Tensor,
@@ -330,6 +342,9 @@ class MNNVLAllReduce(nn.Module):
         # Slice the buffer according to the hidden size, need to pass this numel as the new buffer size
         num_elements_in_use = self.max_num_elements_mnnvl // hidden_dim * hidden_dim
         if num_elements_in_use > self.max_num_elements_mnnvl:
+            logger.debug(
+                f"MNNVL AllReduce can't be enabled due to {num_elements_in_use=} larger than {self.max_num_elements_mnnvl=}."
+            )
             return None
 
         input = input.view(-1, hidden_dim)
@@ -430,11 +445,25 @@ class AllReduce(nn.Module):
                 self.workspace = get_allreduce_workspace(self.mapping)
 
             # Initialize MNNVL AllReduce if needed
-            if self.strategy == AllReduceStrategy.MNNVL and (
-                    dtype and dtype in MNNVLAllReduce.get_supported_dtypes()
-            ) and (not self.mapping.has_cp()):
-                self.mnnvl_allreduce = MNNVLAllReduce(self.mapping,
-                                                      dtype) if dtype else None
+            if self.strategy in (AllReduceStrategy.AUTO,
+                                 AllReduceStrategy.MNNVL):
+                if MNNVLAllReduce.is_mnnvl(self.mapping, dtype):
+                    try:
+                        self.mnnvl_allreduce = MNNVLAllReduce(
+                            self.mapping, dtype) if dtype else None
+                        if self.mnnvl_allreduce:
+                            logger.debug(f"MNNVLAllReduce is enabled")
+                        else:
+                            logger.debug(f"MNNVLAllReduce is disabled")
+                    except Exception as e:
+                        logger.debug(
+                            f"MNNVL AllReduce can't be enabled due to {e}.")
+                        self.mnnvl_allreduce = None
+                else:
+                    logger.debug(
+                        f"MNNVLAllReduce can't be enabled due to failing the is_mnnvl check."
+                    )
+                    self.mnnvl_allreduce = None
 
     def forward(
         self,
