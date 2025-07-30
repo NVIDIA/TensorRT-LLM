@@ -1,7 +1,8 @@
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal,Optional,Any
+import math
 
 import torch
 
@@ -97,96 +98,141 @@ class EarlyStopSampler(Sampler):
                 request.py_result.append_context_logits(logits)
 
 
-def top_k_sampling_batch(logits, top_k=50):
-    logits_dim = logits.dim()
-    if logits_dim == 1:
-        logits = logits.unsqueeze(0)
-    # logits should be 2D ：[batch_size, vocab_size]
-    batch_size, vocab_size = logits.size()
-
-    # get first top_k logits of each sample and their indices
-    values, indices = torch.topk(logits, top_k, dim=-1)
-    min_values = values[:, -1].unsqueeze(-1).expand(batch_size, vocab_size)
-
-    # set the logits who is less than first top_k logits to -inf
-    logits = torch.where(logits < min_values,
-                         torch.full_like(logits, float('-inf')), logits)
-
-    # compute probability distribution
-    softmax = torch.softmax(logits, dim=-1)
-
-    # sample from the distribution and generate result of [batch_size, 1]
-    next_tokens = torch.multinomial(softmax, num_samples=1).squeeze(-1)
-    return next_tokens, softmax
+Strategy = Literal["top_k", "top_p", "temperature", "greedy"]
 
 
-def top_p_sampling_batch(logits: torch.Tensor, top_p: float = 0.9):
-    logits_dim = logits.dim()
-    if logits_dim == 1:
-        logits = logits.unsqueeze(0)
-    assert logits_dim == 2, "logits should be 2D: [batch_size, vocab_size]"
+@dataclass
+class TorchSamplingConfig:
+    top_k: Optional[int] = None
+    top_p: Optional[float] = None
+    temperature: Optional[float] = None
 
-    # sort the logits of each sample in descending order
-    sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+    def __eq__(self, other: object) -> bool:
+        if not isinstance(other, TorchSamplingConfig):
+            return False
+        return (self.top_k == other.top_k and 
+                self.top_p == other.top_p and
+                self.temperature == other.temperature)
 
-    # compute  cumulative probability distribution of each sample
-    cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1),
-                                    dim=-1)
-
-    # get the location of top_p
-    sorted_indices_to_remove = cumulative_probs > top_p
-    sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
-    sorted_indices_to_remove[:, 0] = 0
-
-    # set the logits to -inf whose is outside top_p
-    indices_to_remove = sorted_indices_to_remove.scatter(
-        1, sorted_indices, sorted_indices_to_remove)
-    logits = logits.masked_fill(indices_to_remove, float('-inf'))
-
-    # compute probability distribution
-    softmax = torch.softmax(logits, dim=-1)
-
-    # sample from the distribution and generate result of [batch_size, 1]
-    next_tokens = torch.multinomial(softmax, num_samples=1).squeeze(-1)
-    return next_tokens, softmax
+class TorchSamplingPipeline:
+    def __init__(self, config: TorchSamplingConfig):
+        self.steps = self._build_pipeline(config)
+    
+    
+    def _build_pipeline(self, config: TorchSamplingConfig) -> list[tuple[Strategy, Any]]:
+        steps = []
+        if config.temperature is not None and config.temperature > 0 :
+            steps.append(("temperature", config.temperature))
+        if config.top_k is not None and config.top_k > 1:
+            steps.append(("top_k", config.top_k))
+        if config.top_p is not None and int(config.top_p) != 1:
+            steps.append(("top_p", config.top_p))
+        return steps
 
 
-def greedy_search_sampling_batch(logits):
-    next_tokens = torch.argmax(logits, dim=-1)
-    softmax = torch.softmax(logits, dim=-1)
-    return next_tokens, softmax
+    def apply(self, logits: torch.Tensor) -> tuple[torch.Tensor,torch.Tensor]:
+        for strategy, param in self.steps:
+            logits = self._apply_strategy(logits, strategy, param)
+
+        # greedy 
+        if not self.steps:
+            next_tokens,softmax = self.apply_greedy_search_sampling(logits)
+        else:
+            # compute probability distribution
+            softmax = torch.softmax(logits, dim=-1)
+            # sample from the distribution and generate result of [batch_size, 1]
+            next_tokens = torch.multinomial(softmax, num_samples=1).squeeze(-1)
+
+        return next_tokens,softmax
 
 
-TopK = tuple[Literal["top_k"], int]
-TopP = tuple[Literal["top_p"], float]
-Greedy = tuple[Literal["greedy"], None]
-GREEDY: Greedy = ("greedy", None)
-Strategy = TopK | TopP | Greedy
+    def _apply_strategy(self, logits: torch.Tensor, strategy: Strategy, param: Any) -> torch.Tensor:
+        match strategy:
+            case "temperature":
+                return self.apply_temperature_sampling(logits,param)
+            case "top_k":
+                return self.apply_top_k_sampling(logits,param)
+            case "top_p":
+                return self.apply_top_p_sampling(logits,param)
+        return logits
 
 
-def request_strategy(request: LlmRequest) -> Strategy:
-    if request.sampling_config.top_p is not None and len(
-            request.sampling_config.top_p) > 0:
-        return ("top_p", request.sampling_config.top_p[0])
-    elif request.sampling_config.top_k is not None and len(
-            request.sampling_config.top_k) > 0:
-        return ("top_k", request.sampling_config.top_k[0])
-    else:
-        return ("greedy", None)
+    def apply_top_k_sampling(self,logits: torch.Tensor, top_k = 5):
+
+        if logits.dim() == 1:
+            logits = logits.unsqueeze(0)
+        # logits should be 2D ：[batch_size, vocab_size]
+        batch_size, vocab_size = logits.size()
+
+        # get first top_k logits of each sample and their indices
+        values, indices = torch.topk(logits, top_k, dim=-1)
+        min_values = values[:, -1].unsqueeze(-1).expand(batch_size, vocab_size)
+
+        # set the logits who is less than first top_k logits to -inf
+        logits = torch.where(logits < min_values,
+                            torch.full_like(logits, float('-inf')), logits)
+
+        return logits
 
 
-def sampling_strategies(requests: Iterable[LlmRequest]) -> list[Strategy]:
+    def apply_top_p_sampling(self,logits: torch.Tensor, top_p: float = 0.9):
+        logits_dim = logits.dim()
+        if logits_dim == 1:
+            logits = logits.unsqueeze(0)
+        assert logits_dim == 2, "logits should be 2D: [batch_size, vocab_size]"
+
+        # sort the logits of each sample in descending order
+        sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+
+        # compute  cumulative probability distribution of each sample
+        cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1),
+                                        dim=-1)
+
+        # get the location of top_p
+        sorted_indices_to_remove = cumulative_probs > top_p
+        sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
+        sorted_indices_to_remove[:, 0] = 0
+
+        # set the logits to -inf whose is outside top_p
+        indices_to_remove = sorted_indices_to_remove.scatter(
+            1, sorted_indices, sorted_indices_to_remove)
+        logits = logits.masked_fill(indices_to_remove, float('-inf'))
+
+        return logits
+
+
+    def apply_temperature_sampling(self,logits: torch.Tensor, temperature: float = 1.0):
+        assert temperature > 0, "Temperature must be positive (got {})".format(temperature)
+        if logits.dim() == 1:
+            logits = logits.unsqueeze(0)
+        return logits / temperature
+
+
+    def apply_greedy_search_sampling(self,logits: torch.Tensor):
+        next_tokens = torch.argmax(logits, dim=-1)
+        softmax = torch.softmax(logits, dim=-1)
+        return next_tokens, softmax
+
+
+def request_strategy(request: LlmRequest) -> TorchSamplingConfig:
+    return TorchSamplingConfig(
+        top_k=request.sampling_config.top_k[0] if request.sampling_config.top_k is not None and len(
+            request.sampling_config.top_k) > 0 else None,
+        top_p=request.sampling_config.top_p[0] if request.sampling_config.top_p is not None and len(
+            request.sampling_config.top_p) > 0 else None,
+        temperature=request.sampling_config.temperature[0] if request.sampling_config.temperature is not None and len(
+            request.sampling_config.temperature) > 0 and request.sampling_config.temperature[0] > 0 else None
+    )
+    
+
+def sampling_strategies(requests: Iterable[LlmRequest]) -> list[TorchSamplingConfig]:
     return [request_strategy(req) for req in requests]
 
 
-def sample(strategy: Strategy, logits: torch.Tensor):
-    match strategy:
-        case ("top_k", top_k):
-            return top_k_sampling_batch(logits, top_k)
-        case ("top_p", top_p):
-            return top_p_sampling_batch(logits, top_p)
-        case ("greedy", None):
-            return greedy_search_sampling_batch(logits)
+def sample(config: TorchSamplingConfig, logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    pipeline = TorchSamplingPipeline(config)
+    next_tokens, softmax = pipeline.apply(logits)
+    return next_tokens, softmax
 
 
 def add_token(request: LlmRequest,
@@ -409,21 +455,28 @@ class TorchSampler(Sampler):
         seq_slots = torch.as_tensor([r.py_seq_slot for r in requests])
         seq_slots = seq_slots.to(device="cuda", non_blocking=True)
 
+        strategies = sampling_strategies(requests)
+        first_strategy = strategies[0] if strategies else None
+        batched_strategy = first_strategy if all(s == first_strategy for s in strategies) else None
+
         if fast_path:
             logits = raw_logits[:len(requests)]
-            next_tokens = torch.argmax(logits, dim=-1)
+            if batched_strategy is not None:
+                next_tokens,_= sample(batched_strategy,logits)
+            else:
+                next_tokens = torch.empty(len(requests), dtype=torch.long, device=logits.device,pin_memory=logits.device.type == 'cuda')
+                for i, strategy in enumerate(strategies):
+                    next_tokens[i],_ = sample(strategy, logits[i])
             self.append_eagle3(next_tokens, model_outputs)
             int_next_tokens = next_tokens.to(torch.int, non_blocking=True)
             next_tokens = int_next_tokens.view(1, -1, beam_width)
             new_tokens[:1].index_copy_(1, seq_slots, next_tokens)
             return
 
-        strategies = sampling_strategies(requests)
         batched_next_tokens, batched_softmax = None, None
-        batched_strategy: Strategy | None = GREEDY
         if self.enable_mixed_sampler:
             assert "d2t" not in model_outputs, "eagle3 does not yet support non-greedy sampling"
-            if len(set(strategies)) == 1:
+            if len(strategies) == 1:
                 batched_strategy = strategies[0]
             else:
                 batched_strategy = None
