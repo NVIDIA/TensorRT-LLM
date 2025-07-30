@@ -2106,7 +2106,7 @@ class TestPhi4MM(LlmapiAccuracyTestHarness):
 
 
 class TestExaone4(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "EXAONE-4.0-32B"
+    MODEL_NAME = "LGAI-EXAONE/EXAONE-4.0-32B"
     kv_cache_config = KvCacheConfig(
         enable_block_reuse=False,
         enable_partial_reuse=False,

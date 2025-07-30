@@ -232,5 +232,5 @@ microsoft/Phi-4-multimodal-instruct:
   - accuracy: 69.69
 microsoft/Phi-4-multimodal-instruct-long-rope:
   - accuracy: 65.98
-Exaone-4.0-32B:
+LGAI-EXAONE/EXAONE-4.0-32B:
   - accuracy: 78.52
