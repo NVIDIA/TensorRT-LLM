@@ -1194,6 +1194,7 @@ class MTPEagleWorker(MTPWorker):
                     **inputs)
                 # All of the seq_len are 1, use batch_indices_cuda as gather_ids
                 gather_ids = spec_metadata.batch_indices_cuda[:batch_size]
+            print("MTP layer ", i, " finished")
             logits = mtp_layers[0].shared_head(hidden_states[gather_ids],
                                                lm_head, attn_metadata, True)
             new_draft_token = self.draft_sampler(logits)
@@ -1241,6 +1242,7 @@ class MTPEagleWorker(MTPWorker):
                 "hidden_states": hidden_states,
                 "attn_metadata": attn_metadata,
             }
+        # torch.cuda.synchronize()
 
         # restore attn_metadata to support cuda graph
         if attn_metadata.is_cuda_graph:

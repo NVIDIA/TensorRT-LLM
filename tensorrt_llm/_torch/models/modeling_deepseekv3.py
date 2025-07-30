@@ -905,6 +905,7 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
     def __init__(self, model_config: ModelConfig[PretrainedConfig],
                  layer_idx: int, aux_stream_dict: Dict[AuxStreamType,
                                                        torch.cuda.Stream]):
+        print("DeepseekV3MTP init", layer_idx)
         super().__init__(model_config, layer_idx, aux_stream_dict)
         config = model_config.pretrained_config
         self.hidden_dim = config.hidden_size
@@ -1113,6 +1114,8 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
             ckpt_nextn = self.config.num_nextn_predict_layers
             self.num_hidden_layers = self.config.num_hidden_layers
             assert ckpt_nextn > 0, "There is not MTP modules in the checkpoint."
+            print("model_nextn", model_nextn)
+            print("ckpt_nextn", ckpt_nextn)
             if ckpt_nextn == 1 and not model_config.spec_config.use_mtp_vanilla:
                 moe_load_balancer_set_repeated_for_next_layer(model_nextn)
                 mtp_layer = DeepseekV3MTP(model_config, self.num_hidden_layers,
@@ -1169,7 +1172,10 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
             inputs_embeds=inputs_embeds,
         )
 
+        # torch.cuda.synchronize()
+
         if spec_metadata and spec_metadata.spec_dec_mode.is_mtp():
+            print("Start Logits")
             # get logits
             logits = self.logits_processor.forward(
                 hidden_states[spec_metadata.gather_ids],
@@ -1178,6 +1184,7 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
                 True,
             )
             # get accepted tokens and next draft tokens
+            print("Start MTP worker")
             return self.mtp_worker(
                 input_ids=input_ids,
                 position_ids=position_ids,

@@ -499,8 +499,10 @@ def mla_custom_op_inplace(
     layer_idx: str,
     output: torch.Tensor,
 ) -> None:
+    print("Start MLA ", layer_idx)
     metadata, mla_layer = extract_extra_attrs(layer_idx, "mla")
     mla_layer.forward_impl(position_ids, hidden_states, metadata, output=output)
+    print("End MLA ", layer_idx)
 
 
 def fp8_block_scaling_bmm_out(
