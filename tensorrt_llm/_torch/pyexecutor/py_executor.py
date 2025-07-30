@@ -136,24 +136,25 @@ class BatchStatePP(BatchState):
 
 class PyExecutor:
 
-    def __init__(self,
-                 resource_manager,
-                 scheduler: RequestScheduler,
-                 model_engine: ModelEngine,
-                 sampler: Sampler,
-                 dist: Distributed,
-                 max_num_sequences: int,
-                 drafter: Optional[Drafter] = None,
-                 disable_overlap_scheduler: bool = False,
-                 max_input_len: int = 2048,
-                 max_batch_size: int = 8,
-                 max_beam_width: int = 1,
-                 max_draft_len: int = 0,
-                 kv_cache_transceiver: Optional[KvCacheTransceiver] = None,
-                 guided_decoder: Optional[GuidedDecoder] = None,
-                 garbage_collection_gen0_threshold: Optional[int] = None,
-                 start_worker: bool = True,
-                 kv_connector_manager: Optional[KvCacheConnectorManager] = None):
+    def __init__(
+            self,
+            resource_manager,
+            scheduler: RequestScheduler,
+            model_engine: ModelEngine,
+            sampler: Sampler,
+            dist: Distributed,
+            max_num_sequences: int,
+            drafter: Optional[Drafter] = None,
+            disable_overlap_scheduler: bool = False,
+            max_input_len: int = 2048,
+            max_batch_size: int = 8,
+            max_beam_width: int = 1,
+            max_draft_len: int = 0,
+            kv_cache_transceiver: Optional[KvCacheTransceiver] = None,
+            guided_decoder: Optional[GuidedDecoder] = None,
+            garbage_collection_gen0_threshold: Optional[int] = None,
+            start_worker: bool = True,
+            kv_connector_manager: Optional[KvCacheConnectorManager] = None):
         super(PyExecutor, self).__init__()
         self.device_id = torch.cuda.current_device()
         self.global_rank = global_mpi_rank()
@@ -986,9 +987,10 @@ class PyExecutor:
                     if self.kv_cache_transceiver and self.guided_decoder:
                         self.guided_decoder.init_disagg_gen_requests(
                             scheduled_batch)
-                    elif self.kv_connector_manager:
-                        self.kv_connector_manager.take_scheduled_requests_pending_load(scheduled_batch)
-
+                    
+                    if self.kv_connector_manager:
+                        self.kv_connector_manager.take_scheduled_requests_pending_load(
+                            scheduled_batch)
 
                 if scheduled_batch.batch_size > 0 or (
                         self.enable_attention_dp and self.dist.tp_size > 1):
