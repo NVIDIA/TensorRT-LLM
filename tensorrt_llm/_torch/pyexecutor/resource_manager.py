@@ -364,6 +364,7 @@ class KVCacheManager(BaseResourceManager):
         context_batch = scheduled_batch.context_requests
         generation_batch = scheduled_batch.generation_requests
 
+        # Build the scheduler output for the connector.
         scheduler_output = SchedulerOutput()
 
         # allocate KV Cache
@@ -380,6 +381,13 @@ class KVCacheManager(BaseResourceManager):
                                    == self.mapping.cp_size - 1 else 0),
                         req_beam_width, req, self.kv_connector_manager)
             else:
+                # TODO(jthomson04): This is begging for a mega refactor, and can likely be significantly simplified.
+                # In add sequence, the connector API's get_num_new_matched_tokens is called.
+                # The result of this call may be that blocks will be loaded asynchronously.
+                # If so, we set the is_kv_cache_connector_async_onboard flag, and set the request state to be DISAGG_GENERATION_TRANS_IN_PROGRESS.
+                # When the async load is complete, we set the request state back to CONTEXT_INIT.
+                # When that happens, the request will go through this same code path, but with is_kv_cache_connector_async_onboard set to True.
+                # Because of this, we need to filter this case out to avoid adding the same sequence twice.
                 if req.is_first_context_chunk and not req.is_kv_cache_connector_async_onboard:
                     self.impl.add_sequence(req.py_request_id, req.prompt_len,
                                            req_beam_width, req,
@@ -389,6 +397,7 @@ class KVCacheManager(BaseResourceManager):
                     for _ in range(get_draft_token_length(req)):
                         self.impl.add_token(req.py_request_id)
 
+                    # If this is not an async load, we can add the new tokens and blocks right away.
                     if not req.is_kv_cache_connector_async_onboard:
                         scheduler_output.add_request(
                             req.request_id, req.get_tokens(0),
@@ -397,6 +406,10 @@ class KVCacheManager(BaseResourceManager):
                                 self.max_attention_window_vec[0]),
                             req.context_current_position)
                 else:
+                    # When using the connector, this code path will be hit after the async load is complete.
+                    # Alternatively, with no connector, this is hit after the first chunk of prefill.
+
+                    # If this is the first actual prefill, we can add all of our new tokens and blocks.
                     if req.is_first_context_chunk or req.is_kv_cache_connector_async_onboard:
                         req.is_kv_cache_connector_async_onboard = False
                         scheduler_output.add_request(
@@ -406,6 +419,7 @@ class KVCacheManager(BaseResourceManager):
                                 self.max_attention_window_vec[0]),
                             req.context_current_position)
                     else:
+                        # Otherwise, we just provide the new context position. No new blocks are allocated.
                         scheduler_output.add_request(
                             req.request_id, [], [],
                             req.context_current_position)

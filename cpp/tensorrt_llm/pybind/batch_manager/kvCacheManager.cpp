@@ -98,7 +98,7 @@ public:
 
     void addSequence(tb::LlmRequest::RequestIdType requestId, SizeType32 inputLength, SizeType32 beamWidth,
         tensorrt_llm::common::OptionalRef<tb::LlmRequest> llmRequest = std::nullopt,
-        std::optional<std::shared_ptr<kv_connector::KvCacheConnectorManager>> kvCacheConnectorManager
+        tensorrt_llm::common::OptionalRef<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager
         = std::nullopt) override
     {
         PYBIND11_OVERLOAD_PURE(void, tbk::BaseKVCacheManager, addSequence, requestId, inputLength, beamWidth,

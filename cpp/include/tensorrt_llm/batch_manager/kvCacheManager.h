@@ -550,8 +550,7 @@ public:
 
     //! \brief Assign blocks for new sequence. Try to reuse blocks.
     void addSequence(GenerationRequest& sequence, SizeType32 inputLength, SizeType32 numContextBlocks,
-        LlmRequest& llmRequest,
-        std::optional<std::shared_ptr<kv_connector::KvCacheConnectorManager>> kvCacheConnectorManager);
+        LlmRequest& llmRequest, OptionalRef<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager);
 
     //! \brief Assign blocks for new sequence. Does not try to reuse blocks.
     void addSequence(GenerationRequest& sequence, SizeType32 numBlocks, SizeType32 unsharedBlockIdx);
@@ -885,8 +884,7 @@ public:
     void allocatePools(bool useUvm);
 
     void addSequence(GenerationRequest& sequence, SizeType32 inputLength, SizeType32 numContextBlocks,
-        LlmRequest& llmRequest,
-        std::optional<std::shared_ptr<kv_connector::KvCacheConnectorManager>> kvCacheConnectorManager,
+        LlmRequest& llmRequest, OptionalRef<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager,
         SizeType32 windowSize);
 
     void addSequence(
@@ -1239,6 +1237,8 @@ public:
         = 0;
 
     /// @brief Increase size for request at seqSlotIdx. Allocate new KV cache block(s) if needed.
+    /// @param returnNewBlockId If true, return the id of the newly allocated block (if any). Only supported when VSWA
+    /// and beam search are disabled.
     virtual std::optional<SizeType32> addToken(LlmRequest::RequestIdType requestId, bool returnNewBlockId = false) = 0;
 
     /// @brief Add new request to the KV cache manager.
@@ -1249,7 +1249,7 @@ public:
     /// inputLength - 1 tokens and populate prepopulatedPromptLen.
     virtual void addSequence(LlmRequest::RequestIdType requestId, SizeType32 inputLength, SizeType32 beamWidth,
         OptionalRef<LlmRequest> llmRequest = std::nullopt,
-        std::optional<std::shared_ptr<kv_connector::KvCacheConnectorManager>> kvCacheConnectorManager = std::nullopt)
+        OptionalRef<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager = std::nullopt)
         = 0;
 
     virtual void removeSequence(
@@ -1540,6 +1540,8 @@ public:
         LlmRequest const& req, SizeType32 windowSize) const override;
 
     /// @brief Increase size for request with requestId. Allocate new KV cache block(s) if needed.
+    /// @param returnNewBlockId If true, return the id of the newly allocated block (if any). Only supported when VSWA
+    /// and beam search are disabled.
     std::optional<SizeType32> addToken(LlmRequest::RequestIdType requestId, bool returnNewBlockId = false) override;
 
     /// @brief Add new request to the KV cache manager.
@@ -1550,8 +1552,7 @@ public:
     /// inputLength - 1 tokens and populate prepopulatedPromptLen.
     void addSequence(LlmRequest::RequestIdType requestId, SizeType32 inputLength, SizeType32 beamWidth,
         OptionalRef<LlmRequest> llmRequest = std::nullopt,
-        std::optional<std::shared_ptr<kv_connector::KvCacheConnectorManager>> kvCacheConnectorManager
-        = std::nullopt) override;
+        OptionalRef<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager = std::nullopt) override;
 
     void removeSequence(
         LlmRequest::RequestIdType requestId, OptionalRef<LlmRequest const> llmRequest = std::nullopt) override;
