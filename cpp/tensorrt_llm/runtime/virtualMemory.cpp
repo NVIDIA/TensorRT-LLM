@@ -406,7 +406,7 @@ static std::shared_mutex vmAllocatorsMutex;
 static std::forward_list vmAllocators{
     CudaVirtualMemoryAllocator{{std::shared_ptr<AllocConf>{}, &AllocConf::backgroundConfiguration}}};
 
-CudaVirtualMemoryAllocator const& getVirtualMemoryAllocator()
+CudaVirtualMemoryAllocator getVirtualMemoryAllocator()
 {
     std::shared_lock lock(vmAllocatorsMutex);
     return vmAllocators.front();

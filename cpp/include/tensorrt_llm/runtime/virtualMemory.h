@@ -530,7 +530,7 @@ private:
 namespace tensorrt_llm::runtime
 {
 CudaVirtualMemoryManager& getVirtualMemoryManager();
-CudaVirtualMemoryAllocator const& getVirtualMemoryAllocator();
+CudaVirtualMemoryAllocator getVirtualMemoryAllocator();
 void pushVirtualMemoryAllocator(
     std::string const& tag, CudaVirtualMemoryAllocator::RestoreMode mode, std::shared_ptr<CudaStream> backStream);
 void popVirtualMemoryAllocator();
