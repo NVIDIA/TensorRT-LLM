@@ -986,6 +986,13 @@ class PyExecutor:
                     if self.kv_cache_transceiver and self.guided_decoder:
                         self.guided_decoder.init_disagg_gen_requests(
                             scheduled_batch)
+                    elif self.kv_connector_manager:
+                        self.kv_connector_manager.take_scheduled_requests_pending_load(scheduled_batch)
+
+
+                if scheduled_batch.batch_size > 0 or (
+                        self.enable_attention_dp and self.dist.tp_size > 1):
+
                     if self.drafter is not None and self.use_spec_decode:
                         if self.guided_decoder is not None:
                             self.guided_decoder.rollback_rejected_tokens(
