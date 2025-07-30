@@ -207,7 +207,7 @@ def run_parallel_test(model_name: str, model_path: str, ctx_pp: int,
                       ctx_tp: int, gen_pp: int, gen_tp: int,
                       test_set: LlmapiAccuracyTestHarness):
     if ctx_tp * ctx_pp + gen_tp * gen_pp > get_device_count():
-        pytest.skip(
+        pytest.fail(
             f"Not enough devices for ctx_pp={ctx_pp}+ctx_tp={ctx_tp} and gen_pp={gen_pp}+gen_tp={gen_tp} test"
         )
 
