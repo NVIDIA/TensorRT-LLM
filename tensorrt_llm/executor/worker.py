@@ -24,7 +24,7 @@ from .ipc import FusedIpcQueue, IpcQueue
 from .postproc_worker import (PostprocWorker, PostprocWorkerConfig,
                               postproc_worker_main)
 from .request import CancellingRequest, GenerationRequest
-from .result import IterationResult
+from .result import GenerationResult, IterationResult
 from .utils import (ErrorResponse, IntraProcessQueue, RequestError,
                     WorkerCommIpcAddrs, has_event_loop)
 from .worker_base import WorkerBase
@@ -53,8 +53,6 @@ class GenerationExecutorWorker(WorkerBase):
             engine=engine,
             executor_config=executor_config,
             is_llm_executor=is_llm_executor,
-            lora_config=lora_config,
-            garbage_collection_gen0_threshold=garbage_collection_gen0_threshold,
         )
 
         self.doing_shutdown = False
@@ -67,6 +65,12 @@ class GenerationExecutorWorker(WorkerBase):
 
         executor_config.logits_post_processor_config = tllm.LogitsPostProcessorConfig(
             processor_batched=batched_logits_processor, replicate=False)
+
+        self.create_engine(
+            engine=engine,
+            executor_config=executor_config,
+            lora_config=lora_config,
+            garbage_collection_gen0_threshold=garbage_collection_gen0_threshold)
 
         self.await_response_thread = ManagedThread(
             self.await_response_task,
@@ -82,16 +86,6 @@ class GenerationExecutorWorker(WorkerBase):
             self.dispatch_kv_cache_events_task,
             error_queue=self._error_queue,
             name="dispatch_kv_cache_events_thread")
-
-    def set_result_queue(self, queue):
-        """In multi-gpu mode, result_queue will be set here to communicate between the proxy and the worker 0 process."""
-        assert self.postproc_queues is None
-        self.result_queue = queue
-
-    def set_postproc_queues(self, queues: List["IpcQueue"]):
-        """ Set the IPC queues for feeding post-processing processes. """
-        assert self.result_queue is None
-        self.postproc_queues = queues
 
     def _create_iteration_result_queue(self,
                                        it_result_queue: IterationResultQueue):
@@ -114,6 +108,10 @@ class GenerationExecutorWorker(WorkerBase):
         it_result_queue.is_initialized = True
         it_result_queue.queue = queue
         it_result_queue.aqueue = None
+
+    def submit(self, request: GenerationRequest) -> GenerationResult:
+        self.start()
+        return super().submit(request)
 
     def return_queue(self, client_id: int):
         """ If a centralized result queue is registered (used for communication with the proxy)
