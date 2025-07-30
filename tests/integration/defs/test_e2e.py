@@ -2049,8 +2049,11 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
         "mistral-small-3.1-24b-instruct": {
             "image": [
                 ["dramatic", "seascape", "ocean", "turbulent", "waves", "dark"],
-                ["scenic", "rock", "landscape", "snow", "altitude"],
-                ["highway", "traffic", "directions", "lanes", "Jurong"],
+                ["scenic", "rock", "landscape", "monolith", "formation"],
+                [
+                    "multi-lane", "highway", "moderate", "traffic", "flow",
+                    "vehicles", "congestion"
+                ],
             ],
             "mixture_text_image":
             [["invention", "person", "scientists", "Lick", "engineers"],
