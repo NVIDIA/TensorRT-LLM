@@ -1149,9 +1149,14 @@ def tinyllama_logits_processor_test_harness(backend=None, **llm_kwargs):
     sampling_params = SamplingParams(
         max_tokens=6, logits_processor=MyLogitsProcessor(biased_word_id))
 
+    input_prompts = prompts
+    if llm_kwargs.get('enable_chunked_prefill', None):
+        input_prompts[0] = input_prompts[0] * 256
+        llm_kwargs["max_num_tokens"] = 256
+
     llm_test_harness(
         llama_model_path,
-        prompts, ["Z Z Z Z Z Z"],
+        input_prompts, ["Z Z Z Z Z Z"],
         sampling_params=sampling_params,
         kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.4),
         backend=backend,
