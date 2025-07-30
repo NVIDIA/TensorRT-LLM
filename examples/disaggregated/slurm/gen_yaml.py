@@ -173,14 +173,16 @@ def gen_config_file(config_path: str,
             'max_batch_size': ctx_batch_size,
             'max_num_tokens': ctx_max_num_tokens,
             'max_seq_len': 1152,
-            'free_gpu_memory_fraction': 0.85,
             'tensor_parallel_size': ctx_tp_size,
             'moe_expert_parallel_size': ctx_tp_size,
             'enable_attention_dp': ctx_enable_attention_dp,
             'pipeline_parallel_size': 1,
             'print_iter_log': True,
             'disable_overlap_scheduler': True,
-            'kv_cache_dtype': 'fp8',
+            'kv_cache_config': {
+                'free_gpu_memory_fraction': 0.85,
+                'dtype': 'fp8',
+            },
             'cache_transceiver_config': {
                 'backend': 'default',
                 'max_tokens_in_buffer': 8320,
@@ -195,14 +197,18 @@ def gen_config_file(config_path: str,
             'max_batch_size': gen_batch_size,
             'max_num_tokens': gen_max_num_tokens,
             'max_seq_len': 2176,
-            'free_gpu_memory_fraction': gen_gpu_memory_fraction,
             'cuda_graph_config': {
                 'enable_padding': True,
                 'batch_sizes': gen_cuda_graph_batch_sizes,
             },
             'print_iter_log': True,
-            'kv_cache_dtype': 'fp8',
-            'moe_backend': gen_moe_backend,
+            'kv_cache_config': {
+                'free_gpu_memory_fraction': gen_gpu_memory_fraction,
+                'dtype': 'fp8',
+            },
+            'moe_config': {
+                'backend': gen_moe_backend,
+            },
             'cache_transceiver_config': {
                 'backend': 'default',
                 'max_tokens_in_buffer': 8320,
@@ -242,8 +248,8 @@ def gen_config_file(config_path: str,
                       f,
                       default_flow_style=False,
                       sort_keys=False)
-        config['generation_servers'][
-            'moe_load_balancer'] = moe_load_balancer_file
+        config['generation_servers']['moe_config'][
+            'load_balancer'] = moe_load_balancer_file
 
     if mtp_size > 0:
         config['context_servers']['speculative_config'] = {
