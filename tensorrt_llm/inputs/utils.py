@@ -487,9 +487,9 @@ def default_multimodal_input_loader(
                                         modality: str) -> ConversationMessage:
         if isinstance(media, str):
             media = [media]
-        if modality == "image":
+        if modality in ["image", "multiple_image"]:
             mm_data = [
-                MultimodalData(modality=modality,
+                MultimodalData(modality="image",
                                data=load_image(i,
                                                format=image_data_format,
                                                device=device)) for i in media
@@ -530,6 +530,15 @@ def default_multimodal_input_loader(
                 if _modal is None:
                     raise ValueError(f"Unknown matching modality: {modality}")
                 mm_data.append(MultimodalData(modality=_modal, data=data))
+        elif modality == "mixture_text_image":
+            mm_data = []
+            for m in media:
+                if m:
+                    mm_data.append(
+                        MultimodalData(modality="image",
+                                       data=load_image(m,
+                                                       format=image_data_format,
+                                                       device=device)))
         else:
             raise ValueError(f"Unknown modality: {modality}")
         return ConversationMessage(role="user", content=prompt, media=mm_data)
@@ -561,16 +570,16 @@ def default_multimodal_input_loader(
         if mm_placeholder_counts:
             conv["content"] = add_multimodal_placeholders(
                 model_type, conv["content"], mm_placeholder_counts)
-            prompt = apply_chat_template(
-                model_type=model_type,
-                tokenizer=tokenizer,
-                processor=processor,
-                conversation=[conv],
-                add_generation_prompt=True,
-                mm_placeholder_counts=mm_placeholder_counts)
-        inputs.append({
-            "prompt": prompt,
-            "multi_modal_data": mm_data_tracker.retrieve_all_sync()
-        })
+        prompt = apply_chat_template(
+            model_type=model_type,
+            tokenizer=tokenizer,
+            processor=processor,
+            conversation=[conv],
+            add_generation_prompt=True,
+            mm_placeholder_counts=mm_placeholder_counts)
+        input = {"prompt": prompt}
+        if mm_placeholder_counts:
+            input["multi_modal_data"] = mm_data_tracker.retrieve_all_sync()
+        inputs.append(input)
 
     return inputs

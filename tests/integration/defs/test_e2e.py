@@ -1939,7 +1939,7 @@ def test_ptp_quickstart_advanced_mixed_precision(llm_root, llm_venv):
 
 
 @pytest.mark.parametrize("use_cuda_graph", [False, True])
-@pytest.mark.parametrize("modality", ["image", "video"])
+@pytest.mark.parametrize("modality", ["image", "video", "mixture_text_image"])
 @pytest.mark.parametrize("model_name,model_path", [
     ("NVILA-8B-FP16", "vila/NVILA-8B"),
     ("NVILA-15B-FP16", "NVILA-15B"),
@@ -1987,6 +1987,16 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
                 str(test_data_root / "world.mp4"),
             ],
         },
+        "mixture_text_image": {
+            "prompt": [
+                "Who invented the internet?",
+                "Describe the scene in the image briefly.",
+            ],
+            "media": [
+                [],
+                [str(test_data_root / "inpaint.png")],
+            ],
+        }
     }
 
     expected_keywords = {
@@ -2042,6 +2052,9 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
                 ["scenic", "rock", "landscape", "snow", "altitude"],
                 ["highway", "traffic", "directions", "lanes", "Jurong"],
             ],
+            "mixture_text_image":
+            [["invention", "person", "scientists", "Lick", "engineers"],
+             ["landscape", "dome", "yosemite", "altitude", "scattered"]]
         },
         "gemma-3-27b-it": {
             "image": [
