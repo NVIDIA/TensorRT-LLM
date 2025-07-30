@@ -973,8 +973,8 @@ class _TorchLLM(BaseLLM):
             max_batch_size=max_batch_size,
             max_num_tokens=max_num_tokens,
             gather_generation_logits=self.args.gather_generation_logits,
-            fail_fast_on_attention_window_too_large=getattr(
-                self.args, 'fail_fast_on_attention_window_too_large', False),
+            # fail_fast_on_attention_window_too_large=getattr(
+            #     self.args, 'fail_fast_on_attention_window_too_large', False),
             **kwargs)
 
         if self.args.kv_cache_config is not None:

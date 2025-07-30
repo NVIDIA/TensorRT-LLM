@@ -448,7 +448,7 @@ def print_kv_cache_metrics(kv_cache_metrics):
 def trtllm_bench_unified_comparison(
     llm_root,  # noqa: F811
     comparison_mode="backend",
-    free_mem_ratio=0.5,
+    free_mem_ratio=0.1,
     num_hidden_layers=2,
     max_batch_size=32,  # below this value the kv cache resizing is skipped
     golden_tokens_per_sec=1400,
@@ -483,7 +483,7 @@ def trtllm_bench_unified_comparison(
             yaml.dump(
                 {
                     "model_kwargs": {"num_hidden_layers": num_hidden_layers},
-                    # "cuda_graph_batch_sizes": [1, 2],
+                    "cuda_graph_batch_sizes": [1, 2, 4, 8, 16, 32],
                     "compile_backend": "torch-opt",
                     "free_mem_ratio": free_mem_ratio,
                     "runtime": "trtllm",
