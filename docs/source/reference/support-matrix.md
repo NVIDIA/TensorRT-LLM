@@ -15,10 +15,10 @@ TensorRT-LLM optimizes the performance of a range of well-known models on NVIDIA
 | `Gemma3ForCausalLM` | Gemma 3 | `google/gemma-3-1b-it` | L |
 | `Gemma3ForConditionalGeneration` | Gemma 3 | `google/gemma-3-27b-it` | L + I |
 | `HCXVisionForCausalLM` | HyperCLOVAX-SEED-Vision | `naver-hyperclovax/HyperCLOVAX-SEED-Vision-Instruct-3B` | L + I |
-| `LlavaLlamaModel` | VILA | `Efficient-Large-Model/NVILA-8B` | L + V |
+| `LlavaLlamaModel` | VILA | `Efficient-Large-Model/NVILA-8B` | L + I + V |
 | `LlavaNextForConditionalGeneration` | LLaVA-NeXT | `llava-hf/llava-v1.6-mistral-7b-hf` | L + I |
 | `LlamaForCausalLM` | Llama 3.1, Llama 3, Llama 2, LLaMA | `meta-llama/Meta-Llama-3.1-70B` | L |
-| `Llama4ForConditionalGeneration` | Llama 4 | `meta-llama/Llama-4-Scout-17B-16E-Instruct` | L + I + V |
+| `Llama4ForConditionalGeneration` | Llama 4 | `meta-llama/Llama-4-Scout-17B-16E-Instruct` | L + I |
 | `MistralForCausalLM` | Mistral | `mistralai/Mistral-7B-v0.1` | L |
 | `Mistral3ForConditionalGeneration` | Mistral3 | `mistralai/Mistral-Small-3.1-24B-Instruct-2503` | L + I |
 | `MixtralForCausalLM` | Mixtral | `mistralai/Mixtral-8x7B-v0.1` | L |
