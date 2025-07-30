@@ -765,7 +765,6 @@ trtllm-serve \
   Qwen3-30B-A3B/ \
   --host localhost \
   --port 8000 \
-  --backend pytorch \
   --max_batch_size 161 \
   --max_num_tokens 1160 \
   --tp_size 1 \
@@ -804,7 +803,6 @@ trtllm-serve \
   Qwen3-30B-A3B/ \
   --host localhost \
   --port 8001 \
-  --backend pytorch \
   --max_batch_size 161 \
   --max_num_tokens 1160 \
   --tp_size 1 \
@@ -842,7 +840,6 @@ trtllm-serve \
   Qwen3-30B-A3B/ \
   --host localhost \
   --port ${port} \
-  --backend pytorch \
   --max_batch_size 161 \
   --max_num_tokens 1160 \
   --tp_size 1 \

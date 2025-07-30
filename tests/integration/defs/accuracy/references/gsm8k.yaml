@@ -96,6 +96,16 @@ nvidia/Nemotron-H-8B-Base-8K:
   - quant_algo: FP8
     kv_cache_quant_algo: FP8
     accuracy: 85.78
+nvidia/Nemotron-H-47B-Base-8K:
+  - accuracy: 88.82
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 88.55
+nvidia/Nemotron-H-56B-Base-8K:
+  - accuracy: 89.27
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 89.27
 nvidia/Llama-3.1-Nemotron-Nano-8B-v1:
   - accuracy: 37.15
   - quant_algo: FP8
@@ -126,5 +136,7 @@ mistralai/Mistral-Small-3.1-24B-Instruct-2503:
   - accuracy: 89.23
 microsoft/Phi-4-multimodal-instruct:
   - accuracy: 81.19
+microsoft/Phi-4-multimodal-instruct-long-rope:
+  - accuracy: 75.85
 microsoft/Phi-4-mini-instruct:
   - accuracy: 82.30
