@@ -338,7 +338,7 @@ static void* deviceptr_cast(CUdeviceptr ptr)
 void CudaVirtualMemoryAllocator::allocate(Pointer* ptr, std::size_t n, int device) const
 {
     CUdeviceptr address{};
-    std::size_t const pageAlignedSize = (n + mConfig->mPageSize - 1) & ~(mConfig->mPageSize - 1);
+    std::size_t const pageAlignedSize = mConfig->pageAligned(n);
     TLLM_CU_CHECK(cuMemAddressReserve(&address, pageAlignedSize, 0, {}, 0));
 
     CUDAVirtualMemoryChunk::Configurators configurators;
@@ -382,7 +382,7 @@ void CudaVirtualMemoryAllocator::deallocate(Pointer ptr, std::size_t n) const
     auto const address = deviceptr_cast(ptr);
     mConfig->mManager.remove(address);
 
-    std::size_t const pageAlignedSize = (n + mConfig->mPageSize - 1) & ~(mConfig->mPageSize - 1);
+    std::size_t const pageAlignedSize = mConfig->pageAligned(n);
     TLLM_CU_CHECK_FREE_RESOURCE(cuMemAddressFree(address, pageAlignedSize));
 }
 
@@ -400,22 +400,27 @@ CudaVirtualMemoryManager& getVirtualMemoryManager()
 using AllocConf = CudaVirtualMemoryAllocator::Configuration;
 
 AllocConf AllocConf::backgroundConfiguration{getVirtualMemoryManager(), "", NONE, nullptr, true};
+
+static std::mutex vmAllocatorsMutex;
 static std::forward_list vmAllocators{
     CudaVirtualMemoryAllocator{{std::shared_ptr<AllocConf>{}, &AllocConf::backgroundConfiguration}}};
 
 CudaVirtualMemoryAllocator const& getVirtualMemoryAllocator()
 {
+    std::unique_lock lock(vmAllocatorsMutex);
     return vmAllocators.front();
 }
 
 void pushVirtualMemoryAllocator(
     std::string const& tag, CudaVirtualMemoryAllocator::RestoreMode mode, std::shared_ptr<CudaStream> backStream)
 {
+    std::unique_lock lock(vmAllocatorsMutex);
     vmAllocators.emplace_front(std::make_shared<AllocConf>(getVirtualMemoryManager(), tag, mode, backStream));
 }
 
 void popVirtualMemoryAllocator()
 {
+    std::unique_lock lock(vmAllocatorsMutex);
     vmAllocators.pop_front();
 }
 

@@ -490,6 +490,11 @@ public:
         {
         }
 
+        [[nodiscard]] std::size_t pageAligned(std::size_t n) const noexcept
+        {
+            return (n + mPageSize - 1) & ~(mPageSize - 1);
+        }
+
         // Background configuration, used to indicate no virtual memory allocator is explicitly configured by the user.
         static Configuration backgroundConfiguration;
 
