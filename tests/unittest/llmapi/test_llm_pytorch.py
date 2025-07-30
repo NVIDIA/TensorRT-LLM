@@ -37,9 +37,10 @@ from transformers import AutoModelForCausalLM
 
 
 @force_ampere
-@pytest.mark.parametrize("enable_chunked_prefill,", [False, True,])
+@pytest.mark.parametrize("enable_chunked_prefill,", [False, True])
 def test_tinyllama_logits_processor(enable_chunked_prefill):
-    tinyllama_logits_processor_test_harness(backend="pytorch", enable_chunked_prefill=enable_chunked_prefill)
+    tinyllama_logits_processor_test_harness(
+        backend="pytorch", enable_chunked_prefill=enable_chunked_prefill)
 
 
 @pytest.mark.parametrize(
