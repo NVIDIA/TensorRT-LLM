@@ -456,11 +456,17 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
     def test_auto_dtype(self, overlap_scheduler):
         ctx_server_config = {
             "disable_overlap_scheduler": True,
-            "cuda_graph_config": None
+            "cuda_graph_config": None,
+            "cache_transceiver_config": {
+                "backend": "default"
+            }
         }
         gen_server_config = {
             "disable_overlap_scheduler": overlap_scheduler,
-            "cuda_graph_config": None
+            "cuda_graph_config": None,
+            "cache_transceiver_config": {
+                "backend": "default"
+            }
         }
         disaggregated_server_config = {
             "hostname": "localhost",
