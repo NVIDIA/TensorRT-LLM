@@ -239,8 +239,10 @@ def test_nemotron_h_correctness():
 
 def test_nemotron_h_cuda_graph_overlap_scheduler():
     prompts = [
-        "The sky is blue because", "The sum of two and two is",
-        "The largest mammal is the", "The chemical symbol for water is"
+        "The sky is blue because",
+        "The sum of two and two is",
+        "The largest mammal is the",
+        "The chemical symbol for water is",
     ]
 
     sampling_config = SamplingParams(max_tokens=10,
