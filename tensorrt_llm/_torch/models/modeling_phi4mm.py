@@ -215,14 +215,16 @@ class Phi4MMForCausalLM(transformers.PreTrainedModel):
         )
 
         multimodal_params = kwargs.get("multimodal_params", [])
-        mm_embedding = [
-            multimodal_param.multimodal_data["multimodal_embedding"]
-            for multimodal_param in multimodal_params
-        ]
+        mm_embeds = []
+        if len(multimodal_params) > 0:
+            mm_embeds = [
+                multimodal_param.multimodal_data["multimodal_embedding"]
+                for multimodal_param in multimodal_params
+            ]
         input_ids, input_embeds = fuse_input_embeds(
             self.llm.model.embed_tokens,
             input_ids,
-            mm_embedding,
+            mm_embeds,
             mm_token_ids=self.MM_TOKEN_IDS,
         )
 
