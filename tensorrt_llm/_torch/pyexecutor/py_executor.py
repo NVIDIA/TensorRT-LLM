@@ -306,12 +306,6 @@ class PyExecutor:
                     module.register_forward_hook(
                         self.kv_connector_manager.layer_post_hook)
 
-            # We also need a hook that runs once the model is complete.
-            # In theory, we could do this at the end of _forward_step, but this is more convenient,
-            # and may give slightly better perf.
-            self.model_engine.model.register_forward_hook(
-                self.kv_connector_manager.model_post_hook)
-
     def _event_loop_wrapper(self):
         try:
             with customized_gc_thresholds(
@@ -1474,6 +1468,10 @@ class PyExecutor:
             outputs = forward(scheduled_requests, self.resource_manager,
                               new_tensors_device, gather_context_logits,
                               cache_indirection_buffer)
+
+            if self.kv_connector_manager is not None:
+                self.kv_connector_manager.worker.wait_for_save()
+
             return outputs
         except Exception as e:
             traceback.print_exc()
