@@ -440,20 +440,18 @@ void initBindings(pybind11::module_& m)
         py::return_value_policy::reference);
 
     m.def(
-        "push_virtual_memory_allocator",
+        "set_virtual_memory_allocator",
         [](std::string const& tag, tr::CudaVirtualMemoryAllocator::RestoreMode mode, uintptr_t stream)
         {
             static_assert(sizeof(uintptr_t) == sizeof(cudaStream_t));
-            tr::pushVirtualMemoryAllocator(tag, mode,
+            tr::setVirtualMemoryAllocator(tag, mode,
                 std::make_shared<tr::CudaStream>(
                     reinterpret_cast<cudaStream_t>(stream), tensorrt_llm::common::getDevice(), false));
         },
-        "Create a new virtual address allocator. Push it into the allocator stack to be used for subsequent "
-        "allocations");
+        "Set the virtual memory allocator and start allocating virtual memory for CUDA allocations");
 
-    m.def("pop_virtual_memory_allocator", &tr::popVirtualMemoryAllocator,
-        "Pop the current virtual address allocator from the allocator stack. Restore the active allocator for "
-        "subsequent allocations to be the previous one");
+    m.def("clear_virtual_memory_allocator", &tr::clearVirtualMemoryAllocator,
+        "Reset the current virtual memory allocator and stop allocating virtual memory for CUDA allocations");
 
     py::class_<tensorrt_llm::runtime::McastGPUBuffer>(m, "McastGPUBuffer")
         .def(py::init<size_t, uint32_t, uint32_t, at::Device, bool>())

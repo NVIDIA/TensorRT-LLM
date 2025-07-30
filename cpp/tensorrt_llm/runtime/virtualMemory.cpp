@@ -402,27 +402,27 @@ using AllocConf = CudaVirtualMemoryAllocator::Configuration;
 
 AllocConf AllocConf::backgroundConfiguration{getVirtualMemoryManager(), "", NONE, nullptr, true};
 
-static std::shared_mutex vmAllocatorsMutex;
-static std::forward_list vmAllocators{
-    CudaVirtualMemoryAllocator{{std::shared_ptr<AllocConf>{}, &AllocConf::backgroundConfiguration}}};
+static const std::shared_ptr<AllocConf> bgConf{std::shared_ptr<AllocConf>{}, &AllocConf::backgroundConfiguration};
+static std::shared_ptr<AllocConf> currentConf = bgConf;
 
 CudaVirtualMemoryAllocator getVirtualMemoryAllocator()
 {
-    std::shared_lock lock(vmAllocatorsMutex);
-    return vmAllocators.front();
+    return CudaVirtualMemoryAllocator{std::atomic_load(&currentConf)};
 }
 
-void pushVirtualMemoryAllocator(
+void setVirtualMemoryAllocator(
     std::string const& tag, CudaVirtualMemoryAllocator::RestoreMode mode, std::shared_ptr<CudaStream> backStream)
 {
-    std::unique_lock lock(vmAllocatorsMutex);
-    vmAllocators.emplace_front(std::make_shared<AllocConf>(getVirtualMemoryManager(), tag, mode, backStream));
+    auto expected = bgConf;
+    auto const desired = std::make_shared<AllocConf>(getVirtualMemoryManager(), tag, mode, backStream);
+    TLLM_CHECK_WITH_INFO(std::atomic_compare_exchange_strong(&currentConf, &expected, desired),
+        "An active virtual memory allocator (tag: %s, mode: %d, stream: %p) is already present", expected->mTag.c_str(),
+        expected->mMode, expected->mBackStream.get());
 }
 
-void popVirtualMemoryAllocator()
+void clearVirtualMemoryAllocator()
 {
-    std::unique_lock lock(vmAllocatorsMutex);
-    vmAllocators.pop_front();
+    std::atomic_store(&currentConf, bgConf);
 }
 
 } // namespace tensorrt_llm::runtime

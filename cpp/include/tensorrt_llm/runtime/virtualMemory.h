@@ -471,6 +471,8 @@ public:
         bool mBackground{};
 
         friend class CudaVirtualMemoryAllocator;
+        friend void setVirtualMemoryAllocator(
+            std::string const& tag, RestoreMode mode, std::shared_ptr<CudaStream> backStream);
 
     public:
         /**
@@ -531,8 +533,8 @@ namespace tensorrt_llm::runtime
 {
 CudaVirtualMemoryManager& getVirtualMemoryManager();
 CudaVirtualMemoryAllocator getVirtualMemoryAllocator();
-void pushVirtualMemoryAllocator(
+void setVirtualMemoryAllocator(
     std::string const& tag, CudaVirtualMemoryAllocator::RestoreMode mode, std::shared_ptr<CudaStream> backStream);
-void popVirtualMemoryAllocator();
+void clearVirtualMemoryAllocator();
 
 } // namespace tensorrt_llm::runtime

@@ -7,8 +7,8 @@ import torch
 from tensorrt_llm.bindings.internal.runtime import \
     CudaVirtualMemoryAllocatorRestoreMode as RestoreMode
 from tensorrt_llm.bindings.internal.runtime import (
-    get_virtual_memory_manager, pop_virtual_memory_allocator,
-    push_virtual_memory_allocator)
+    clear_virtual_memory_allocator, get_virtual_memory_manager,
+    set_virtual_memory_allocator)
 
 __all__ = [
     "RestoreMode", "maybe_scope", "scope", "release_with_tag",
@@ -27,13 +27,13 @@ def _get_torch_pluggable_virtual_memory_allocator():
 
 
 @contextmanager
-def _virtual_address_helper(tag: str, mode: RestoreMode):
+def _virtual_memory_helper(tag: str, mode: RestoreMode):
     stream = torch.cuda.current_stream()
-    push_virtual_memory_allocator(tag, mode, stream.cuda_stream)
+    set_virtual_memory_allocator(tag, mode, stream.cuda_stream)
     try:
         yield
     finally:
-        pop_virtual_memory_allocator()
+        clear_virtual_memory_allocator()
 
 
 def _scope(
@@ -47,7 +47,7 @@ def _scope(
     :param mode: The backed mode to choose how the memory content is backed up
     """
     pool = torch.cuda.MemPool(_get_torch_pluggable_virtual_memory_allocator())
-    with _virtual_address_helper(tag, mode), torch.cuda.use_mem_pool(pool):
+    with _virtual_memory_helper(tag, mode), torch.cuda.use_mem_pool(pool):
         yield pool
 
 
