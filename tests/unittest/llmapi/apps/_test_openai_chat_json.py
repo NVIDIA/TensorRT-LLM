@@ -44,10 +44,7 @@ def temp_extra_llm_api_options_file(request):
 @pytest.fixture(scope="module")
 def server(model_name: str, temp_extra_llm_api_options_file: str):
     model_path = get_model_path(model_name)
-    args = [
-        "--backend", "pytorch", "--extra_llm_api_options",
-        temp_extra_llm_api_options_file
-    ]
+    args = ["--extra_llm_api_options", temp_extra_llm_api_options_file]
     with RemoteOpenAIServer(model_path, args) as remote_server:
         yield remote_server
 
@@ -55,11 +52,6 @@ def server(model_name: str, temp_extra_llm_api_options_file: str):
 @pytest.fixture(scope="module")
 def client(server: RemoteOpenAIServer):
     return server.get_client()
-
-
-@pytest.fixture(scope="module")
-def async_client(server: RemoteOpenAIServer):
-    return server.get_async_client()
 
 
 @pytest.fixture(scope="module")
