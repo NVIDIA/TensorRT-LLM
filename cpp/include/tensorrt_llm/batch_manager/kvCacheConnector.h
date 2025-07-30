@@ -20,7 +20,7 @@
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/runtime/common.h"
 
-#include <cstdint>
+#include <utility>
 #include <vector>
 
 using SizeType32 = tensorrt_llm::runtime::SizeType32;
@@ -31,12 +31,11 @@ using namespace tensorrt_llm::batch_manager;
 namespace tensorrt_llm::batch_manager::kv_connector
 {
 
-// @brief Data used to provide the KV cache tensors to the connector worker for a single pool.
 class KvCacheConnectorPoolData
 {
 public:
-    KvCacheConnectorPoolData(runtime::ITensor::SharedPtr const& poolTensor, SizeType32 numBlocks)
-        : mPoolTensor(poolTensor)
+    KvCacheConnectorPoolData(runtime::ITensor::SharedPtr poolTensor, SizeType32 numBlocks)
+        : mPoolTensor(std::move(poolTensor))
         , mNumBlocks(numBlocks)
     {
     }
@@ -56,6 +55,7 @@ private:
     SizeType32 mNumBlocks;
 };
 
+/// @brief Data used to provide the KV cache tensors to the connector worker for all the pools.
 class KvCacheConnectorPoolsData
 {
 public:
@@ -81,13 +81,15 @@ private:
     std::vector<SizeType32> mLayerToPoolMapping;
 };
 
-// @brief The KV connector manager. This is passed into the C++ KV Cache Manager when adding sequences.
+/// @brief The KV connector manager. This is passed into the C++ KV Cache Manager when adding sequences.
 class KvCacheConnectorManager
 {
 public:
     KvCacheConnectorManager() = default;
     virtual ~KvCacheConnectorManager() = default;
 
+    /// @brief Handle the getNumNewMatchedTokens call inside the C++ KV Cache Manager.
+    /// @return The number of tokens that can be loaded from remote KV cache.
     virtual SizeType32 getNumNewMatchedTokens(LlmRequest const& request, SizeType32 numComputedTokens) = 0;
 };
 
