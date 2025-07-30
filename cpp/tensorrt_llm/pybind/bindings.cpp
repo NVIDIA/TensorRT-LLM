@@ -27,7 +27,6 @@
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/pybind/batch_manager/algorithms.h"
 #include "tensorrt_llm/pybind/batch_manager/bindings.h"
-#include "tensorrt_llm/pybind/batch_manager/buffers.h"
 #include "tensorrt_llm/pybind/batch_manager/cacheTransceiver.h"
 #include "tensorrt_llm/pybind/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/pybind/batch_manager/llmRequest.h"
@@ -45,7 +44,6 @@
 
 namespace py = pybind11;
 namespace tb = tensorrt_llm::batch_manager;
-namespace tbk = tensorrt_llm::batch_manager::kv_cache_manager;
 namespace tpb = tensorrt_llm::pybind::batch_manager;
 namespace tc = tensorrt_llm::common;
 namespace tr = tensorrt_llm::runtime;
@@ -467,7 +465,6 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
     tb::kv_cache_manager::KVCacheManagerBindings::initBindings(mInternalBatchManager);
     tb::BasePeftCacheManagerBindings::initBindings(mInternalBatchManager);
     tb::CacheTransceiverBindings::initBindings(mInternalBatchManager);
-    tpb::Buffers::initBindings(mInternalBatchManager);
 
     auto mInternalAlgorithms = mInternal.def_submodule("algorithms", "Algorithms internal bindings");
     tpb::algorithms::initBindings(mInternalAlgorithms);
