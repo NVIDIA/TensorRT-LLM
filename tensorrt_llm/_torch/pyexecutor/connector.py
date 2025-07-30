@@ -275,7 +275,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
 
         # TODO(jthomson04): This part is a bit ugly.
         # When the connector indicates that a request will be loaded asynchronously, we need to suspend it's execution.
-        # This is problematic, since at this point when this function is called, the request has already been scheduled!
+        # This is problematic, since at the point when this function is called, the request has already been scheduled!
         # Because of this, we need to remove it from our list of scheduled requests (see `take_scheduled_requests_pending_load`).
         if load_kv_async:
             self.new_async_requests.loading[request.request_id] = request
@@ -307,8 +307,6 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
 
         # Update the list of scheduled requests.
         scheduled_requests.context_requests = allowed_context_requests
-
-        return scheduled_requests
 
     def build_connector_meta(self) -> object:
         metadata = self._run_on_leader(
