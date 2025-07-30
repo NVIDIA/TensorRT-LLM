@@ -122,6 +122,7 @@ class BatchState:
 @dataclasses.dataclass
 class BatchStatePP(BatchState):
     microbatch_id: int = -1
+    scheduled_ctx_reqs: list[LlmRequest] = None
 
 
 class PyExecutor:
@@ -140,7 +141,6 @@ class PyExecutor:
                  max_beam_width: int = 1,
                  max_draft_len: int = 0,
                  kv_cache_transceiver: Optional[KvCacheTransceiver] = None,
-                 draft_model_engine: Optional[ModelEngine] = None,
                  guided_decoder: Optional[GuidedDecoder] = None,
                  garbage_collection_gen0_threshold: Optional[int] = None,
                  start_worker: bool = True):
@@ -161,12 +161,11 @@ class PyExecutor:
         self.enable_attention_dp = model_engine.enable_attention_dp
         self.sampler = sampler
         self.drafter = drafter
+        self.draft_model_engine = getattr(self.drafter, "draft_model_engine",
+                                          None)
         self.guided_decoder = guided_decoder
         self.dist = dist
         self.disable_overlap_scheduler = disable_overlap_scheduler
-
-        # Draft model for certain spec decode algorithms, e.g. EAGLE3
-        self.draft_model_engine = draft_model_engine
 
         # enqueue and _fetch_new_requests used data
         self.next_req_id = max_batch_size  # The first max_batch_size request IDs are reserved for dummy requests
@@ -643,6 +642,7 @@ class PyExecutor:
         return False
 
     def _executor_loop_pp(self):
+        logger.debug(f"Starting executor loop for pp_rank {self.dist.pp_rank}")
         torch.cuda.set_device(self.device_id)
         microbatch_id = 0
         with self._profiler() as profile_step:
@@ -656,6 +656,9 @@ class PyExecutor:
                 if self.should_stop_processing:
                     break
 
+                if self.kv_cache_transceiver:
+                    self._check_disagg_gen_transfer_status()
+
                 if self.enable_iter_perf_stats:
                     iter_stats = self._get_init_iter_stats(
                         len(new_requests),
@@ -664,9 +667,23 @@ class PyExecutor:
 
                 self._pad_attention_dp_dummy_request()
 
-                scheduled_batch, _, _ = self._schedule()
+                scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
+                )
+
+                if self.kv_cache_transceiver:
+                    # For requests that are fitting disagg gen init, also prepare resources for KV cache manager
+                    self._prepare_disagg_gen_init(
+                        fitting_disagg_gen_init_requests)
+
+                    if num_fitting_reqs == 0 and not fitting_disagg_gen_init_requests:
+                        logger.warning(
+                            "num_fitting_reqs=0 and fitting_disagg_gen_init_requests is empty, may not have enough kvCache"
+                        )
+                        self.kv_cache_transceiver.check_context_transfer_status(
+                            1)
 
                 self.num_scheduled_requests = scheduled_batch.batch_size
+
                 logger.debug(
                     f'has {len(self.active_requests)} active_request, '
                     f'scheduled {len(scheduled_batch.context_requests)} context requests and '
@@ -679,7 +696,7 @@ class PyExecutor:
                     can_queue = 0 not in tp_batch_sizes
                 else:
                     can_queue = scheduled_batch.batch_size > 0
-                    if not can_queue:
+                    if not can_queue and not self.kv_cache_transceiver:
                         assert len(self.inflight_req_ids) > 0, (
                             "fail to schedule any pending request, probably run out of resource"
                         )
@@ -688,7 +705,27 @@ class PyExecutor:
                     self.micro_batches[microbatch_id] = None
                 else:
                     self._add_inflight_ids(scheduled_batch)
+
+                    if self.kv_cache_transceiver:
+                        # For generation requests which have completed KV cache transfer
+                        self._prepare_disagg_gen_transmission_complete(
+                            scheduled_batch)
+
                     self.resource_manager.prepare_resources(scheduled_batch)
+
+                    # The generation requests that are do not have batch_idx,
+                    # needs to be in front of the batch due to the assumptions
+                    # made in model_engine.py::_forward_step. This is only important
+                    # for disaggregated serving. For non-disaggregated serving,
+                    # the generation requests always have batch_idx.
+                    scheduled_batch.generation_requests = sorted(  # stable sort
+                        scheduled_batch.generation_requests,
+                        key=lambda req: int(req.py_batch_idx is not None),
+                    )
+
+                    if self.kv_cache_transceiver:
+                        # Return the first token to the client
+                        self._handle_first_token_response(scheduled_batch)
 
                     # Stage 1: Async forward (all ranks) and decoding pass (last rank only)
                     if not self.dist.is_last_pp_rank:
@@ -701,11 +738,8 @@ class PyExecutor:
                             if self._need_return_logits(scheduled_batch):
                                 logits_host = batch_outputs["logits"].to(
                                     "cpu", non_blocking=True)
-
-                            if self.guided_decoder is not None:
-                                self.guided_decoder.build(scheduled_batch)
-                                self.guided_decoder.execute(
-                                    scheduled_batch, batch_outputs['logits'])
+                            self._execute_guided_decoder(
+                                scheduled_batch, batch_outputs['logits'])
 
                             sample_state = self._sample_async(
                                 scheduled_batch, batch_outputs)
@@ -720,6 +754,7 @@ class PyExecutor:
                         iter_start_time=iter_start_time,
                         iter_stats=iter_stats,
                         microbatch_id=microbatch_id,
+                        scheduled_ctx_reqs=scheduled_batch.context_requests,
                     )
 
                     self.micro_batches[microbatch_id] = batch_state
@@ -784,6 +819,11 @@ class PyExecutor:
                 if previous_batch is not None:
                     with torch.cuda.nvtx.range("_handle_previous_batch_pp"):
                         self._update_requests(previous_batch.sample_state)
+
+                        if self.kv_cache_transceiver and previous_batch.scheduled_ctx_reqs:
+                            self._send_disagg_ctx_cache(
+                                previous_batch.scheduled_ctx_reqs)
+
                         self._handle_canceled_requests()
                         finished_requests = self._handle_responses()
                         previous_scheduled_batch = previous_batch.sample_state.scheduled_requests
@@ -791,6 +831,9 @@ class PyExecutor:
                             previous_scheduled_batch)
                         self._remove_inflight_ids(previous_scheduled_batch)
                     self.micro_batches[prev_microbatch_id] = None
+
+                if self.kv_cache_transceiver and self.ctx_in_transmission_requests:
+                    self._terminate_ctx_finished_requests()
 
                 # march forward in microbatch slots
                 microbatch_id = (microbatch_id + 1) % self.num_micro_batches
@@ -844,6 +887,11 @@ class PyExecutor:
             f'{len(scheduled_batch.generation_requests)} generation requests')
         return scheduled_batch, iter_stats
 
+    def _execute_guided_decoder(self, scheduled_batch, logits):
+        if self.guided_decoder is not None:
+            self.guided_decoder.build(scheduled_batch)
+            self.guided_decoder.execute(scheduled_batch, logits)
+
     def _executor_loop(self):
         torch.cuda.set_device(self.device_id)
         with self._profiler() as profile_step:
@@ -879,11 +927,8 @@ class PyExecutor:
                             scheduled_batch, self.resource_manager)
 
                     batch_outputs = self._forward_step(scheduled_batch)
-
-                    if self.guided_decoder is not None:
-                        self.guided_decoder.build(scheduled_batch)
-                        self.guided_decoder.execute(scheduled_batch,
-                                                    batch_outputs['logits'])
+                    self._execute_guided_decoder(scheduled_batch,
+                                                 batch_outputs['logits'])
 
                     sample_state = self._sample_async(scheduled_batch,
                                                       batch_outputs)
@@ -891,11 +936,9 @@ class PyExecutor:
                     self._update_request_states(scheduled_batch)
                     self._update_requests(sample_state)
 
-                    ctx_transmission_reqs = self._send_disagg_ctx_cache(
-                        scheduled_batch.context_requests
-                    ) if self.kv_cache_transceiver else []
-
                     if self.kv_cache_transceiver:
+                        ctx_transmission_reqs = self._send_disagg_ctx_cache(
+                            scheduled_batch.context_requests)
                         # For context only req in transmission, we reset the state since sampler might have changed it
                         for req in ctx_transmission_reqs:
                             req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
@@ -998,10 +1041,8 @@ class PyExecutor:
                     if self.previous_batch is not None:
                         self._update_requests(self.previous_batch.sample_state)
 
-                    if self.guided_decoder is not None:
-                        self.guided_decoder.build(scheduled_batch)
-                        self.guided_decoder.execute(scheduled_batch,
-                                                    batch_outputs['logits'])
+                    self._execute_guided_decoder(scheduled_batch,
+                                                 batch_outputs['logits'])
 
                     sample_state = self._sample_async(scheduled_batch,
                                                       batch_outputs)

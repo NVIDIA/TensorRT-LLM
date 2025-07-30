@@ -38,7 +38,8 @@ from tensorrt_llm.llmapi import TrtLlmArgs as LlmArgs
 from tensorrt_llm.llmapi.llm_args import DynamicBatchConfig, SchedulerConfig
 from tensorrt_llm.llmapi.llm_utils import (BuildConfig, QuantAlgo, QuantConfig,
                                            _ParallelConfig)
-from tensorrt_llm.llmapi.tokenizer import TokenizerBase, TransformersTokenizer
+from tensorrt_llm.llmapi.tokenizer import (TokenizerBase, TransformersTokenizer,
+                                           load_hf_tokenizer)
 from tensorrt_llm.llmapi.utils import get_total_gpu_memory
 from tensorrt_llm.lora_manager import LoraConfig
 from tensorrt_llm.models.automodel import AutoConfig, AutoModelForCausalLM
@@ -840,6 +841,93 @@ def test_generate_with_stop_words():
                                                     stop_token_ids=[stop_id]),
                      finish_reasons=['stop'],
                      stop_reasons=["I J"])
+
+
+@force_ampere
+@pytest.mark.part0
+@pytest.mark.parametrize("model_path", [
+    get_model_path('gemma/gemma-3-1b-it'),
+])
+def test_generate_with_detokenization_stop_words(model_path):
+    llm = LLM(
+        model=model_path,
+        kv_cache_config=global_kvcache_config,
+        fast_build=True,
+    )
+
+    # Format the prompt using chat template
+    messages = [{
+        "role": "user",
+        "content": "Say exactly: Hello there! How can I help"
+    }]
+
+    formatted_prompt = llm.tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True)
+
+    detokenization_prompts = [formatted_prompt]
+
+    # Test case 1: Stop word "How" should be detected after detokenization
+    llm_check_output(llm,
+                     detokenization_prompts, ["Hello there!"],
+                     sampling_params=SamplingParams(stop="How", max_tokens=10),
+                     finish_reasons=['stop'],
+                     stop_reasons=["How"])
+
+    # Test case 2: Stop word "there" should be detected after detokenization
+    llm_check_output(llm,
+                     detokenization_prompts, ["Hello"],
+                     sampling_params=SamplingParams(stop="there",
+                                                    max_tokens=10),
+                     finish_reasons=['stop'],
+                     stop_reasons=["there"])
+
+    # Test case 3: Stop word that should not be found after detokenization
+    llm_check_output(llm,
+                     detokenization_prompts, ["Hello there! How can I help"],
+                     sampling_params=SamplingParams(stop="XYZ", max_tokens=10),
+                     finish_reasons=['length'],
+                     stop_reasons=[None])
+
+    # Test case 4: Multiple stop words, one should be found after detokenization
+    llm_check_output(llm,
+                     detokenization_prompts, ["Hello"],
+                     sampling_params=SamplingParams(stop=["XYZ", "there"],
+                                                    max_tokens=10),
+                     finish_reasons=['stop'],
+                     stop_reasons=["there"])
+
+
+@force_ampere
+@pytest.mark.part0
+@pytest.mark.parametrize("model_path", [
+    get_model_path('gemma/gemma-3-1b-it'),
+])
+def test_generate_with_detokenization_stop_words_streaming(model_path):
+    llm = LLM(
+        model=model_path,
+        kv_cache_config=global_kvcache_config,
+        fast_build=True,
+    )
+
+    # Format the prompt using chat template
+    messages = [{
+        "role": "user",
+        "content": "Say exactly: Hello there! How can I help"
+    }]
+
+    formatted_prompt = llm.tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True)
+
+    sampling_params = SamplingParams(stop="How", max_tokens=10)
+
+    for output in llm.generate_async(formatted_prompt,
+                                     sampling_params=sampling_params,
+                                     streaming=True):
+        if output.outputs[0].finish_reason == 'stop':
+            assert output.outputs[0].stop_reason == "How"
+            break
+        elif output.outputs[0].finish_reason == 'length':
+            assert False, f"Expected to find stop word 'How' but reached max_tokens. Generated: {output.outputs[0].text}"
 
 
 @force_ampere
@@ -2180,7 +2268,8 @@ def run_llm_with_postprocess_parallel_and_result_handler(
     from .run_llm_with_postproc import get_concatenated_content
 
     sampling_params = SamplingParams(max_tokens=6)
-    post_proc_args = ChatPostprocArgs(tokenizer=llama_model_path,
+    tokenizer = load_hf_tokenizer(llama_model_path)
+    post_proc_args = ChatPostprocArgs(tokenizer=tokenizer,
                                       role="assistant",
                                       model=llama_model_path)
     post_proc_params = PostprocParams(post_processor=chat_stream_post_processor,
