@@ -31,7 +31,7 @@ class PyKvCacheConnectorManager : public KvCacheConnectorManager, py::trampoline
 public:
     using KvCacheConnectorManager::KvCacheConnectorManager;
 
-    SizeType32 getNumNewMatchedTokens(LlmRequest const& request, SizeType32 numComputedTokens) override
+    SizeType32 getNumNewMatchedTokens(tb::LlmRequest const& request, SizeType32 numComputedTokens) override
     {
         PYBIND11_OVERRIDE_PURE_NAME(SizeType32, KvCacheConnectorManager, "get_num_new_matched_tokens",
             getNumNewMatchedTokens, request, numComputedTokens);

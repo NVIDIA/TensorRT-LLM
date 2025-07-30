@@ -971,6 +971,14 @@ class PyExecutor:
                         # Return the first token to the client
                         self._handle_first_token_response(scheduled_batch)
                     self.resource_manager.prepare_resources(scheduled_batch)
+
+                    if self.kv_connector_manager:
+                        self.kv_connector_manager.take_scheduled_requests_pending_load(scheduled_batch)
+
+
+                if scheduled_batch.batch_size > 0 or (
+                        self.enable_attention_dp and self.dist.tp_size > 1):
+
                     if self.drafter is not None and self.use_spec_decode:
                         self.drafter.prepare_draft_tokens(
                             scheduled_batch, self.resource_manager)

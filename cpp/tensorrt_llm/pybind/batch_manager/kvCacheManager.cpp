@@ -98,7 +98,7 @@ public:
 
     void addSequence(tb::LlmRequest::RequestIdType requestId, SizeType32 inputLength, SizeType32 beamWidth,
         tensorrt_llm::common::OptionalRef<tb::LlmRequest> llmRequest = std::nullopt,
-        tensorrt_llm::common::OptionalRef<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager
+        tensorrt_llm::common::OptionalRef<tb::kv_connector::KvCacheConnectorManager> kvCacheConnectorManager
         = std::nullopt) override
     {
         PYBIND11_OVERLOAD_PURE(void, tbk::BaseKVCacheManager, addSequence, requestId, inputLength, beamWidth,
@@ -238,10 +238,10 @@ public:
         PYBIND11_OVERLOAD_PURE(void, tbk::BaseKVCacheManager, flushIterationEvents);
     }
 
-    kv_connector::KvCacheConnectorPoolsData getKvCacheConnectorPoolsData() const override
+    [[nodiscard]] tb::kv_connector::KvCacheConnectorPoolsData getKvCacheConnectorPoolsData() const override
     {
         PYBIND11_OVERLOAD_PURE(
-            kv_connector::KvCacheConnectorPoolsData, tbk::BaseKVCacheManager, getKvCacheConnectorPoolsData);
+            tb::kv_connector::KvCacheConnectorPoolsData, tbk::BaseKVCacheManager, getKvCacheConnectorPoolsData);
     }
 };
 

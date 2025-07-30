@@ -26,8 +26,6 @@
 using SizeType32 = tensorrt_llm::runtime::SizeType32;
 using RequestIdType = tensorrt_llm::batch_manager::LlmRequest::RequestIdType;
 
-using namespace tensorrt_llm::batch_manager;
-
 namespace tensorrt_llm::batch_manager::kv_connector
 {
 
