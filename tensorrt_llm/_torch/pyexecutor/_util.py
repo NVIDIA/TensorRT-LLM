@@ -450,12 +450,23 @@ def create_py_executor_instance(
 
         num_experts = _try_infer_num_experts(model_engine.model.model_config)
 
+        num_kv_attention_heads_per_layer = model_binding_config.num_kv_heads_per_layer
+        if max(num_kv_attention_heads_per_layer) != min(
+                num_kv_attention_heads_per_layer):
+            logger.warning(
+                "Defining LORA with per-layer KV heads is not supported for LORA, using the max number of KV heads per layer"
+            )
+            num_kv_attention_heads = max(num_kv_attention_heads_per_layer)
+        else:
+            # all layers have the same number of KV heads
+            num_kv_attention_heads = num_kv_attention_heads_per_layer[0]
+
         lora_modules = LoraModule.create_lora_modules(
             lora_module_names=lora_config.lora_target_modules,
             hidden_size=model_binding_config.hidden_size,
             mlp_hidden_size=model_binding_config.mlp_hidden_size,
             num_attention_heads=model_binding_config.num_heads,
-            num_kv_attention_heads=model_binding_config.num_heads,
+            num_kv_attention_heads=num_kv_attention_heads,
             attention_head_size=model_binding_config.head_size,
             tp_size=mapping.tp_size,
             num_experts=num_experts)
