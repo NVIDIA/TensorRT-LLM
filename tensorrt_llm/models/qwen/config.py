@@ -114,7 +114,7 @@ class QWenConfig(PretrainedConfig):
             hf_config.hidden_size // hf_config.num_attention_heads)
         head_size = getattr(hf_config, "kv_channels", head_dim)
         hidden_act = getattr(hf_config, "hidden_act", "silu")
-        if qwen_type == "qwen2_moe":
+        if qwen_type in ("qwen2_moe", "qwen3_moe"):
             hidden_act = "swiglu"
 
         # Qwen3 models have no attention bias, while legacy models have bias
