@@ -1,0 +1,66 @@
+# Adapted from https://github.com/vllm-project/vllm/tree/main/.github/ISSUE_TEMPLATE/200-installation.yml
+name: 🛠️ Installation
+description: Report an issue here when you hit errors during installation.
+title: "[Installation]: "
+labels: ["installation"]
+
+body:
+- type: markdown
+  attributes:
+    value: >
+      #### Before submitting an issue, please make sure the issue hasn't been already addressed by searching through [the existing and past issues](https://github.com/NVIDIA/TensorRT-LLM/issues?q=is%3Aissue+sort%3Acreated-desc+).
+- type: textarea
+  attributes:
+    label: System Info
+    description: |
+      Please provide the following system information to help us debug your installation issue:
+
+      ```bash
+      # System information
+      cat /etc/os-release
+      nvidia-smi
+      nvcc --version
+      python --version
+      pip list | grep -E "(tensorrt|torch|cuda)"
+
+      # TensorRT-LLM installation method and version
+      pip show tensorrt_llm
+      ```
+    value: |
+      **System Information:**
+      - OS:
+      - Python version:
+      - CUDA version:
+      - GPU model(s):
+      - Driver version:
+      - TensorRT version:
+      - PyTorch version:
+      - TensorRT-LLM version:
+
+      **Detailed output:**
+      ```text
+      Paste the output of the above commands here
+      ```
+  validations:
+    required: true
+- type: textarea
+  attributes:
+    label: How you are installing TensorRT-LLM
+    description: |
+      Paste the full command you are trying to execute or describe your installation method.
+    value: |
+      ```sh
+      # Installation command or method
+      pip install tensorrt_llm
+      ```
+- type: markdown
+  attributes:
+    value: >
+      Thanks for contributing 🎉!
+- type: checkboxes
+  id: askllm
+  attributes:
+    label: Before submitting a new issue...
+    options:
+      - label: Make sure you already searched for relevant issues, and checked the [installation documentation](https://nvidia.github.io/TensorRT-LLM/installation/) and [examples](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples) for answers to frequently asked questions.
+        required: true
