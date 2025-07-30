@@ -1915,7 +1915,7 @@ class TestQwen3_235B_A22B(LlmapiAccuracyTestHarness):
                 max_draft_len=2,
                 speculative_model_dir=
                 f"{llm_models_root()}/Qwen3/qwen3-235B-eagle3/",
-                eagle3_one_model=not eagle3)
+                eagle3_one_model=True)
         with LLM(
                 f"{llm_models_root()}/Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf",
                 tensor_parallel_size=tp_size,
