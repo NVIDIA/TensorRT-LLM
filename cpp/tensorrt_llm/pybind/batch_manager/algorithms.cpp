@@ -109,8 +109,9 @@ void tensorrt_llm::pybind::batch_manager::algorithms::initBindings(pybind11::mod
                 DecoderInputBuffers& inputBuffers, runtime::decoder::DecoderState& decoderState,
                 tensorrt_llm::runtime::CudaStream const& runtimeStream,
                 tensorrt_llm::runtime::CudaStream const& decoderStream, SizeType32 maxSequenceLength,
-                SizeType32 beamWidth, OptionalRef<MedusaBuffers const> medusaBuffers = std::nullopt)
+                SizeType32 beamWidth)
             {
+                OptionalRef<MedusaBuffers const> medusaBuffers = std::nullopt;
                 auto [batchSlots, samplingConfigs, lookaheadPrompt, lookaheadAlgoConfigs] = self(modelConfig,
                     worldConfig, decodingConfig, contextRequests, bufferManager, logitsType, inputBuffers, decoderState,
                     runtimeStream, decoderStream, maxSequenceLength, beamWidth, medusaBuffers);
@@ -121,6 +122,6 @@ void tensorrt_llm::pybind::batch_manager::algorithms::initBindings(pybind11::mod
             py::arg("model_config"), py::arg("world_config"), py::arg("decoding_config"), py::arg("context_requests"),
             py::arg("buffer_manager"), py::arg("logits_type"), py::arg("decoder_input_buffers"),
             py::arg("decoder_state"), py::arg("runtime_stream"), py::arg("decoder_stream"),
-            py::arg("max_sequence_length"), py::arg("beam_width"), py::arg("medusa_buffers") = std::nullopt)
+            py::arg("max_sequence_length"), py::arg("beam_width"))
         .def("name", [](CreateNewDecoderRequests const&) { return CreateNewDecoderRequests::name; });
 }

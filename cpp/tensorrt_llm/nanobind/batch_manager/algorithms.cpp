@@ -107,8 +107,9 @@ void tensorrt_llm::nanobind::batch_manager::algorithms::initBindings(nb::module_
                 DecoderInputBuffers& inputBuffers, runtime::decoder::DecoderState& decoderState,
                 tensorrt_llm::runtime::CudaStream const& runtimeStream,
                 tensorrt_llm::runtime::CudaStream const& decoderStream, SizeType32 maxSequenceLength,
-                SizeType32 beamWidth, OptionalRef<MedusaBuffers const> medusaBuffers = std::nullopt)
+                SizeType32 beamWidth)
             {
+                OptionalRef<MedusaBuffers const> medusaBuffers = std::nullopt;
                 auto [batchSlots, samplingConfigs, lookaheadPrompt, lookaheadAlgoConfigs] = self(modelConfig,
                     worldConfig, decodingConfig, contextRequests, bufferManager, logitsType, inputBuffers, decoderState,
                     runtimeStream, decoderStream, maxSequenceLength, beamWidth, medusaBuffers);
@@ -119,6 +120,6 @@ void tensorrt_llm::nanobind::batch_manager::algorithms::initBindings(nb::module_
             nb::arg("model_config"), nb::arg("world_config"), nb::arg("decoding_config"), nb::arg("context_requests"),
             nb::arg("buffer_manager"), nb::arg("logits_type"), nb::arg("decoder_input_buffers"),
             nb::arg("decoder_state"), nb::arg("runtime_stream"), nb::arg("decoder_stream"),
-            nb::arg("max_sequence_length"), nb::arg("beam_width"), nb::arg("medusa_buffers") = std::nullopt)
+            nb::arg("max_sequence_length"), nb::arg("beam_width"))
         .def("name", [](CreateNewDecoderRequests const&) { return CreateNewDecoderRequests::name; });
 }

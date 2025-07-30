@@ -19,7 +19,6 @@
 
 #include "tensorrt_llm/batch_manager/common.h"
 #include "tensorrt_llm/batch_manager/decoderBuffers.h"
-#include "tensorrt_llm/batch_manager/medusaBuffers.h"
 #include "tensorrt_llm/batch_manager/microBatchScheduler.h"
 #include "tensorrt_llm/batch_manager/peftCacheManager.h"
 #include "tensorrt_llm/batch_manager/rnnStateManager.h"
@@ -424,13 +423,6 @@ void initBindings(pybind11::module_& m)
         .def_readwrite("log_probs", &tb::SlotDecoderBuffers::logProbs)
         .def_readwrite("log_probs_host", &tb::SlotDecoderBuffers::logProbsHost)
         .def_readwrite("finish_reasons_host", &tb::SlotDecoderBuffers::finishReasonsHost);
-
-    py::class_<tb::MedusaBuffers>(m, "MedusaBuffers")
-        .def(py::init<runtime::SizeType32, runtime::SizeType32, runtime::BufferManager const&,
-                 runtime::ModelConfig const&, runtime::WorldConfig const&, executor::DecodingConfig const&,
-                 runtime::TllmRuntime const&>(),
-            py::arg("max_beam_width"), py::arg("max_seq_len"), py::arg("buffer_manager"), py::arg("model_config"),
-            py::arg("world_config"), py::arg("decoding_config"), py::arg("runtime"));
 
     m.def(
         "add_new_tokens_to_requests",
