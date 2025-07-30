@@ -389,12 +389,14 @@ class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
     def test_eagle3_tp8(self, eagle3_one_model):
         model_path = f"{llm_models_root()}/llama-3.3-models/Llama-3.3-70B-Instruct"
         eagle_model_dir = f"{llm_models_root()}/EAGLE3-LLaMA3.3-Instruct-70B"
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7)
         spec_config = EagleDecodingConfig(max_draft_len=4,
                                           speculative_model_dir=eagle_model_dir,
                                           eagle3_one_model=eagle3_one_model)
         with LLM(model_path,
                  tensor_parallel_size=8,
-                 speculative_config=spec_config) as llm:
+                 speculative_config=spec_config,
+                 kv_cache_config=kv_cache_config) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
