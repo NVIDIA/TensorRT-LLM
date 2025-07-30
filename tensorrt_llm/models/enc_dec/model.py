@@ -20,7 +20,8 @@ import tensorrt as trt
 import torch
 
 from tensorrt_llm._common import default_net
-from tensorrt_llm._utils import numpy_to_torch, str_dtype_to_torch
+from tensorrt_llm._utils import (numpy_to_torch, pad_vocab_size,
+                                 str_dtype_to_torch)
 from tensorrt_llm.functional import (LayerNormPositionType, LayerNormType,
                                      MLPType, PositionEmbeddingType, Tensor,
                                      assertion, cast, gather_last_token_logits,
@@ -44,8 +45,6 @@ from tensorrt_llm.module import Module, ModuleList
 from tensorrt_llm.parameter import Parameter
 from tensorrt_llm.plugin.plugin import current_all_reduce_helper
 from tensorrt_llm.quantization import QuantMode
-from tensorrt_llm._utils import pad_vocab_size
-
 
 layernorm_map = {
     LayerNormType.LayerNorm: LayerNorm,
@@ -1159,7 +1158,7 @@ class DecoderModel(PretrainedModel):
 
         if self.mapping.is_last_pp_rank():
             vocab_size_padded = pad_vocab_size(self.config.vocab_size,
-                                           self.config.mapping.tp_size)
+                                               self.config.mapping.tp_size)
             self.lm_head = ColumnLinear(
                 self.config.hidden_size,
                 vocab_size_padded,
