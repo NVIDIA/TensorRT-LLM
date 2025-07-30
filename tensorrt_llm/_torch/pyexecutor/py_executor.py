@@ -996,10 +996,10 @@ class PyExecutor:
                         batch_outputs = self._forward_step(
                             scheduled_batch, previous_tensors_device)
 
-                        if self.previous_batch is not None:
-                            self._update_requests(
-                                self.previous_batch.sample_state)
+                    if self.previous_batch is not None:
+                        self._update_requests(self.previous_batch.sample_state)
 
+                    if scheduled_batch.batch_size > 0:
                         if self.guided_decoder is not None:
                             self.guided_decoder.build(scheduled_batch)
                             self.guided_decoder.execute(scheduled_batch,
