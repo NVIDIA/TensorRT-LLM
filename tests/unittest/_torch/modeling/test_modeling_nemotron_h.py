@@ -349,18 +349,20 @@ def test_nemotron_h_chunked_prefill():
         prefill_logprobs = extract_prefill_logprobs(output)
         chunked_prefill_logprobs = extract_prefill_logprobs(
             chunked_prefill_output)
-        torch.testing.assert_close(prefill_logprobs,
-                                   chunked_prefill_logprobs,
-                                   atol=0.3,
-                                   rtol=0.05,
-                                   msg=f"Prompt {i} prefill logprobs ")
+        torch.testing.assert_close(
+            prefill_logprobs,
+            chunked_prefill_logprobs,
+            atol=0.3,
+            rtol=0.05,
+            msg=lambda x: f"Prompt {i} prefill logprobs {x}")
 
         # Decode logprobs shouldn't be affected by chunked prefill - tolerance like batching tolerance
         decode_logprobs = extract_decode_logprobs(output)
         chunked_decode_logprobs = extract_decode_logprobs(
             chunked_prefill_output)
-        torch.testing.assert_close(decode_logprobs,
-                                   chunked_decode_logprobs,
-                                   atol=0.2,
-                                   rtol=0.05,
-                                   msg=f"Prompt {i} decode logprobs ")
+        torch.testing.assert_close(
+            decode_logprobs,
+            chunked_decode_logprobs,
+            atol=0.2,
+            rtol=0.05,
+            msg=lambda x: f"Prompt {i} decode logprobs {x}")
