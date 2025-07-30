@@ -150,7 +150,6 @@ trtllm-bench -m deepseek-ai/DeepSeek-R1 --model_path ${DS_R1_NVFP4_MODEL_PATH} t
         --tp 8 --ep 8 \
         --warmup 0 \
         --dataset /tmp/benchmarking_64k.txt \
-        --backend pytorch \
         --max_batch_size 12 \
         --max_num_tokens 65548 \
         --kv_cache_free_gpu_mem_fraction 0.6 \
@@ -179,7 +178,6 @@ trtllm-bench -m deepseek-ai/DeepSeek-R1 --model_path ${DS_R1_NVFP4_MODEL_PATH} t
         --tp 8 --ep 8 \
         --warmup 0 \
         --dataset /tmp/benchmarking_128k.txt \
-        --backend pytorch \
         --max_batch_size 2 \
         --max_num_tokens 131074 \
         --kv_cache_free_gpu_mem_fraction 0.3 \
@@ -512,7 +510,7 @@ mpirun \
 -H <HOST1>:8,<HOST2>:8 \
 -mca plm_rsh_args "-p 2233" \
 --allow-run-as-root -n 16 \
-trtllm-llmapi-launch trtllm-bench --model deepseek-ai/DeepSeek-V3 --model_path /models/DeepSeek-V3 throughput --backend pytorch --max_batch_size 161 --max_num_tokens 1160 --dataset /workspace/tensorrt_llm/dataset_isl1000.txt --tp 16 --ep 8 --kv_cache_free_gpu_mem_fraction 0.95 --extra_llm_api_options /workspace/tensorrt_llm/extra-llm-api-config.yml --concurrency 4096 --streaming
+trtllm-llmapi-launch trtllm-bench --model deepseek-ai/DeepSeek-V3 --model_path /models/DeepSeek-V3 throughput --max_batch_size 161 --max_num_tokens 1160 --dataset /workspace/tensorrt_llm/dataset_isl1000.txt --tp 16 --ep 8 --kv_cache_free_gpu_mem_fraction 0.95 --extra_llm_api_options /workspace/tensorrt_llm/extra-llm-api-config.yml --concurrency 4096 --streaming
 ```
 
 #### Slurm
@@ -524,7 +522,7 @@ trtllm-llmapi-launch trtllm-bench --model deepseek-ai/DeepSeek-V3 --model_path /
   --container-image=<CONTAINER_IMG> \
   --container-mounts=/workspace:/workspace \
   --container-workdir /workspace \
-  bash -c "trtllm-llmapi-launch trtllm-bench --model deepseek-ai/DeepSeek-V3 --model_path <YOUR_MODEL_DIR> throughput --backend pytorch --max_batch_size 161 --max_num_tokens 1160 --dataset /workspace/dataset.txt --tp 16 --ep 4 --kv_cache_free_gpu_mem_fraction 0.95 --extra_llm_api_options ./extra-llm-api-config.yml"
+  bash -c "trtllm-llmapi-launch trtllm-bench --model deepseek-ai/DeepSeek-V3 --model_path <YOUR_MODEL_DIR> throughput --max_batch_size 161 --max_num_tokens 1160 --dataset /workspace/dataset.txt --tp 16 --ep 4 --kv_cache_free_gpu_mem_fraction 0.95 --extra_llm_api_options ./extra-llm-api-config.yml"
 ```
 
 
@@ -592,7 +590,7 @@ DS_R1_NVFP4_MODEL_PATH=/path/to/DeepSeek-R1  # optional
 trtllm-llmapi-launch trtllm-bench \
     --model deepseek-ai/DeepSeek-R1 \
     --model_path $DS_R1_NVFP4_MODEL_PATH \
-    throughput --backend pytorch \
+    throughput \
     --num_requests 49152 \
     --max_batch_size 384 --max_num_tokens 1536 \
     --concurrency 3072 \
@@ -644,7 +642,6 @@ trtllm-bench \
       --model deepseek-ai/DeepSeek-V3 \
       --model_path /models/DeepSeek-V3 \
       throughput \
-      --backend pytorch \
       --max_batch_size ${MAX_BATCH_SIZE} \
       --max_num_tokens ${MAX_NUM_TOKENS} \
       --dataset dataset.txt \
@@ -666,7 +663,6 @@ mpirun -H <HOST1>:8,<HOST2>:8 \
       --model deepseek-ai/DeepSeek-V3 \
       --model_path /models/DeepSeek-V3 \
       throughput \
-      --backend pytorch \
       --max_batch_size ${MAX_BATCH_SIZE} \
       --max_num_tokens ${MAX_NUM_TOKENS} \
       --dataset dataset.txt \

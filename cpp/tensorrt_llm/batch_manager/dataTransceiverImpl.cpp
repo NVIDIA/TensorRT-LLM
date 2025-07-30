@@ -39,6 +39,7 @@ DataSenderImpl::DataSenderImpl(executor::kv_cache::ConnectionManager* manager,
 {
     TLLM_CHECK(mManager);
     TLLM_CHECK(mManager->getCommState().getSelfIdx() == selfIndex);
+    mFormatter->markAsSender(true);
 }
 
 [[nodiscard]] RequestInfo DataSenderImpl::recvRequestInfo()
@@ -136,6 +137,7 @@ DataReceiverImpl::DataReceiverImpl(executor::kv_cache::ConnectionManager* manage
     TLLM_CHECK(mManager);
     TLLM_CHECK(mManager->getCommState().getSelfIdx() == selfIndex);
     TLLM_CHECK(mFormatter);
+    mFormatter->markAsSender(false);
 }
 
 TransferSession DataReceiverImpl::sendRequestInfo(LlmRequest const& llmRequest)

@@ -95,6 +95,8 @@ mistralai/Mixtral-8x7B-Instruct-v0.1:
 mistralai/Mixtral-8x22B-v0.1:
   - quant_algo: FP8
     accuracy: 77.63
+mistralai/Mistral-Small-3.1-24B-Instruct-2503:
+  - accuracy: 81.7
 google/gemma-2-9b-it:
   - accuracy: 73.05
 google/gemma-3-27b-it:
@@ -183,6 +185,16 @@ nvidia/Nemotron-H-8B-Base-8K:
   - quant_algo: FP8
     kv_cache_quant_algo: FP8
     accuracy: 69.180
+nvidia/Nemotron-H-47B-Base-8K:
+  - accuracy: 83.26
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 82.68
+nvidia/Nemotron-H-56B-Base-8K:
+  - accuracy: 83.82
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 83.82
 microsoft/Phi-4-mini-instruct:
   - accuracy: 68.98
 # Created a dummy accuracy to track tp_size=2 for phi4-mini model.

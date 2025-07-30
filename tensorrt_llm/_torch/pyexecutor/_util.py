@@ -411,7 +411,6 @@ def create_py_executor_instance(
         executor_config,
         ctx_chunk_config,
         model_engine,
-        draft_model_engine,
         start_worker,
         sampler,
         drafter,
@@ -551,7 +550,6 @@ def create_py_executor_instance(
         max_draft_len=spec_config.max_draft_len
         if spec_config is not None else 0,
         kv_cache_transceiver=kv_cache_transceiver,
-        draft_model_engine=draft_model_engine,
         guided_decoder=guided_decoder,
         start_worker=start_worker,
         garbage_collection_gen0_threshold=garbage_collection_gen0_threshold)

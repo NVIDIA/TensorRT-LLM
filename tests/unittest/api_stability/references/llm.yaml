@@ -107,10 +107,6 @@ methods:
         annotation: bool
         default: False
         status: beta
-      kv_cache_dtype:
-        annotation: str
-        default: auto
-        status: prototype
       enable_iter_perf_stats:
         annotation: bool
         default: False

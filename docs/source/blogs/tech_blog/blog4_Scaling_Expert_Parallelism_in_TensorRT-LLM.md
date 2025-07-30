@@ -3,7 +3,7 @@
 By NVIDIA TensorRT-LLM Team
 
 ## Table of Contents
-- [Scaling Expert Parallelism in TensorRT-LLM (Part 1: Design and Implementation of Large-scale EP)](#scaling-expert-parallelism-in-tensorrt-llmpart-1-design-and-implementation-of-large-scale-ep)
+- [Scaling Expert Parallelism in TensorRT-LLM (Part 1: Design and Implementation of Large-scale EP)](#scaling-expert-parallelism-in-tensorrt-llm-part-1-design-and-implementation-of-large-scale-ep)
   - [Table of Contents](#table-of-contents)
   - [Motivation for large-scale EP](#motivation-for-large-scale-ep)
     - [Observations over one machine translation dataset](#observations-over-one-machine-translation-dataset)
@@ -15,8 +15,8 @@ By NVIDIA TensorRT-LLM Team
   - [EP Load Balancer](#ep-load-balancer)
     - [Python Interface](#python-interface)
     - [C++ extension](#c-extension)
-    - [Core implementations of host side logics](#core-implementations-of-host-side-logics)
-    - [Core implementations of GPU side logics](#core-implementations-of-gpu-side-logics)
+    - [Core implementations of the host logic](#core-implementations-of-the-host-logic)
+    - [Core implementations of the GPU logic](#core-implementations-of-the-gpu-logic)
     - [Online EP Load Balancer](#online-ep-load-balancer)
     - [Offline EP Load Balancer](#offline-ep-load-balancer)
   - [E2E evaluation](#e2e-evaluation)
@@ -516,7 +516,9 @@ Clearly in Figure 25, we can see that EPLB brings a clear performance improvemen
 
 ## Reproducing steps
 Currently to run through the reproducing steps described in this section, please, use this [feature branch](https://github.com/NVIDIA/TensorRT-LLM/tree/feat/large-ep/tensorrt_llm). It will get merged to the main branch soon.
+
 ### The effect of EP Load Balancer
+
 Please, refer to the [EP Load Balancer example](https://github.com/NVIDIA/TensorRT-LLM/tree/feat/large-ep/examples/ep_load_balancer) for how to reproduce the results for the offline EP Load Balancer.
 
 ##### Step 1: Run inference and collect statistics

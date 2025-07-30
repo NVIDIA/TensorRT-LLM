@@ -58,11 +58,6 @@ def client(server: RemoteOpenAIServer):
 
 
 @pytest.fixture(scope="module")
-def async_client(server: RemoteOpenAIServer):
-    return server.get_async_client()
-
-
-@pytest.fixture(scope="module")
 def user_profile_schema():
     """Provides a sample JSON schema for a user profile."""
     return {
