@@ -1,5 +1,6 @@
 import io
 import json
+import logging
 import re
 import tarfile
 import warnings
@@ -22,6 +23,40 @@ from .models.convert_utils import get_model_path, load_state_dict, split_matrix_
 
 if TYPE_CHECKING:
     from .runtime import ModelConfig
+
+NEMO_SUPPORTED_LORA_MODULES = {"attn_qkv"}
+
+logger = logging.getLogger(__name__)
+
+
+def _check_lora_in_out(
+    layer_idx: int, lora_module: str, available_matrices: Dict, source_identifier: str
+) -> None:
+    """Check that 'in' and 'out' matrices are present."""
+    missing = []
+    if "in" not in available_matrices:
+        missing.append("'in' matrix (lora_A equivalent)")
+    if "out" not in available_matrices:
+        missing.append("'out' matrix (lora_B equivalent)")
+
+    if missing:
+        raise ValueError(
+            f"Layer {layer_idx} is missing required {' and '.join(missing)} for {lora_module} "
+            f"in LoRA weights from {source_identifier}. "
+            f"LoRA adapters must contain both 'in' and 'out' matrices for all layers. "
+            f"Please check if the LoRA checkpoint is complete or was corrupted during loading."
+        )
+
+
+def _is_moe_module_weights(module_weights: Dict) -> bool:
+    """Check if module weights represent MoE (integer expert indices with nested dicts)."""
+    if not module_weights:
+        return False
+
+    # All keys should be integers (expert indices) and values should be dicts
+    return all(isinstance(k, int) for k in module_weights.keys()) and all(
+        isinstance(v, dict) for v in module_weights.values()
+    )
 
 
 def get_all_nemo_lora_weights(
@@ -371,8 +406,7 @@ class NemoLoraLoader:
             if not path.exists():
                 raise ValueError(f"{path} does not exist")
         self.is_valid = True
-        # Hardcoded since LoraManager only supports this case now
-        self.lora_target_modules = ["attn_qkv"]
+        self.lora_target_modules = list(NEMO_SUPPORTED_LORA_MODULES)
 
     def get_target_modules(self):
         """Get target modules for NeMo LoRA.
@@ -475,11 +509,10 @@ def load_torch_nemo_lora(lora_config: LoraConfig):
             "Please specify lora_target_modules or provide lora_dir to infer lora_target_modules."
         )
 
-    supported_modules = {"attn_qkv"}
-    unsupported_modules = set(lora_config.lora_target_modules) - supported_modules
+    unsupported_modules = set(lora_config.lora_target_modules) - NEMO_SUPPORTED_LORA_MODULES
     if unsupported_modules:
         raise ValueError(
-            f"NeMo LoRA only supports {supported_modules} modules, "
+            f"NeMo LoRA only supports {NEMO_SUPPORTED_LORA_MODULES} modules, "
             f"but got unsupported modules: {unsupported_modules}. "
             f"NeMo LoRA does not support embedding, lm_head, or MLP adapters."
         )
@@ -832,33 +865,23 @@ class LoraManager(object):
                 self._lora_weights_pointers_list[uid][layer_idx] = {}
 
                 for lora_module in self.lora_target_modules:
-                    if lora_module != "attn_qkv":
+                    if lora_module not in NEMO_SUPPORTED_LORA_MODULES:
                         warnings.warn(
                             f"LoRA module '{lora_module}' not supported in NeMo loading for "
                             f"layer {layer_idx}, skipping. NeMo LoRA currently only supports "
-                            f"'attn_qkv' modules."
+                            f"{NEMO_SUPPORTED_LORA_MODULES} modules."
                         )
                         self._lora_uid_to_low_ranks[uid][layer_idx][lora_module] = 0
                         continue
 
                     if lora_module == "attn_qkv":
-                        # Check for missing "in" matrix (lora_A equivalent)
-                        if "in" not in all_lora_weights[layer_idx]:
-                            raise ValueError(
-                                f"Layer {layer_idx} is missing required 'in' matrix (lora_A equivalent) for attn_qkv "
-                                f"in NeMo LoRA weights from file {model_file}. "
-                                f"LoRA adapters must contain both 'in' and 'out' matrices for all layers. "
-                                f"Please check if the LoRA checkpoint is complete or was corrupted during loading."
-                            )
-
-                        # Check for missing "out" matrix (lora_B equivalent)
-                        if "out" not in all_lora_weights[layer_idx]:
-                            raise ValueError(
-                                f"Layer {layer_idx} is missing required 'out' matrix (lora_B equivalent) for attn_qkv "
-                                f"in NeMo LoRA weights from file {model_file}. "
-                                f"LoRA adapters must contain both 'in' and 'out' matrices for all layers. "
-                                f"Please check if the LoRA checkpoint is complete or was corrupted during loading."
-                            )
+                        # Validate required matrices are present
+                        _check_lora_in_out(
+                            layer_idx=layer_idx,
+                            lora_module=lora_module,
+                            available_matrices=all_lora_weights[layer_idx],
+                            source_identifier=f"file {model_file}",
+                        )
 
                         t_in = all_lora_weights[layer_idx]["in"]
                         t_out = all_lora_weights[layer_idx]["out"]
@@ -908,7 +931,7 @@ class LoraManager(object):
             release_gc()
 
         if new_uids:
-            print(f"Successfully loaded NeMo LoRA adapters with UIDs: {new_uids}")
+            logger.info(f"Successfully loaded NeMo LoRA adapters with UIDs: {new_uids}")
         return new_uids
 
     def load_from_hf(
@@ -1054,44 +1077,38 @@ class LoraManager(object):
                         self._lora_uid_to_low_ranks[uid][layer_idx][lora_module] = 0
                         continue
 
-                    # Check if this is MoE by looking for integer keys (expert indices)
-                    has_expert_indices = all(isinstance(k, int) for k in module_weights.keys())
+                    has_expert_indices = _is_moe_module_weights(module_weights)
 
                     if has_expert_indices:  # MoE
-                        t_in = torch.stack(
-                            [
-                                module_weights[expert_idx]["in"]
-                                for expert_idx in sorted(module_weights.keys())
-                            ]
-                        )
-                        t_out = torch.stack(
-                            [
-                                module_weights[expert_idx]["out"]
-                                for expert_idx in sorted(module_weights.keys())
-                            ]
-                        )
+                        # Validate and extract matrices in one pass
+                        expert_indices = sorted(module_weights.keys())
+                        t_in_list, t_out_list = [], []
+                        for expert_idx in expert_indices:
+                            expert_weights = module_weights[expert_idx]
+                            _check_lora_in_out(
+                                layer_idx=layer_idx,
+                                lora_module=f"{lora_module}_expert_{expert_idx}",
+                                available_matrices=expert_weights,
+                                source_identifier=f"directory {model_dir}",
+                            )
+                            t_in_list.append(expert_weights["in"])
+                            t_out_list.append(expert_weights["out"])
+
+                        t_in = torch.stack(t_in_list)
+                        t_out = torch.stack(t_out_list)
                         for weights in module_weights.values():
                             if "mag" in weights:
                                 # TODO(oargov): this might work, but I had no MoE DoRA models to test
                                 raise ValueError("DoRA with MoE is not supported")
                         t_mag = None
                     else:
-                        # Not MoE - should have "in" and "out" matrices
-                        missing_matrices = []
-                        if "in" not in module_weights:
-                            missing_matrices.append("'in' matrix (lora_A)")
-                        if "out" not in module_weights:
-                            missing_matrices.append("'out' matrix (lora_B)")
-
-                        if missing_matrices:
-                            raise ValueError(
-                                f"Module '{hf_module}' in layer {layer_idx} is missing required "
-                                f"{' and '.join(missing_matrices)}. LoRA adapters must contain "
-                                f"both 'in' and 'out' matrices for all target modules. "
-                                f"This indicates an incomplete or corrupted LoRA checkpoint in "
-                                f"{model_dir}. Please verify the LoRA adapter was trained and "
-                                f"saved correctly."
-                            )
+                        # Not MoE - validate required matrices are present
+                        _check_lora_in_out(
+                            layer_idx=layer_idx,
+                            lora_module=lora_module,
+                            available_matrices=module_weights,
+                            source_identifier=f"directory {model_dir}",
+                        )
 
                         t_in = module_weights["in"]
                         t_out = module_weights["out"]
