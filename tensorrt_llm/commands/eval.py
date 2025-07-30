@@ -22,7 +22,8 @@ from .. import LLM as PyTorchLLM
 from .._tensorrt_engine import LLM
 from ..evaluate import (GSM8K, MMLU, CnnDailymail, GPQADiamond, GPQAExtended,
                         GPQAMain, JsonModeEval)
-from ..llmapi import BuildConfig, KvCacheConfig
+from ..llmapi import BuildConfig
+from ..llmapi.llm_args import create_kv_cache_config
 from ..llmapi.llm_utils import update_llm_args_with_extra_options
 from ..logger import logger, severity_map
 
@@ -108,8 +109,10 @@ def main(ctx, model: str, tokenizer: Optional[str], log_level: str,
                                max_beam_width=max_beam_width,
                                max_seq_len=max_seq_len)
 
-    kv_cache_config = KvCacheConfig(
-        free_gpu_memory_fraction=kv_cache_free_gpu_memory_fraction)
+    kv_cache_config = create_kv_cache_config(
+        free_gpu_memory_fraction=kv_cache_free_gpu_memory_fraction,
+        model_path=model,
+        max_seq_len=max_seq_len)
 
     if backend == "tensorrt":
         backend = None

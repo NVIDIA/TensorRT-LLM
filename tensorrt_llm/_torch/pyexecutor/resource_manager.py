@@ -205,6 +205,14 @@ class KVCacheManager(BaseResourceManager):
             self.max_attention_window_vec = kv_cache_config.max_attention_window.copy(
             )  # Make a copy to avoid modifying original
 
+            # NOTE: For global layers without sliding window, the initial
+            # window size is set to the maximum value (2^31-1) of int32 in
+            # llm_args. Here we clamp it to max_seq_len.
+            self.max_attention_window_vec = [
+                min(max_seq_len, window)
+                for window in self.max_attention_window_vec
+            ]
+
         sink_token_length = (kv_cache_config.sink_token_length
                              if kv_cache_config.sink_token_length is not None
                              else 0)

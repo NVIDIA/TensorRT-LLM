@@ -16,6 +16,7 @@ from pydantic import BaseModel
 from pydantic import Field as PydanticField
 from pydantic import PrivateAttr, field_validator, model_validator
 from strenum import StrEnum
+from transformers import AutoConfig as HFAutoConfig
 from transformers import PreTrainedTokenizerBase
 
 from tensorrt_llm.lora_manager import (LoraConfig,
@@ -1109,8 +1110,8 @@ class BaseLlmArgs(StrictBaseModel):
         default=None, description="LoRA configuration for the model.")
 
     # Several options from ExecutorConfig, expanded here for less hierarchy
-    kv_cache_config: KvCacheConfig = Field(default_factory=KvCacheConfig,
-                                           description="KV cache config.")
+    kv_cache_config: Optional[KvCacheConfig] = Field(
+        default=None, description="KV cache config.")
 
     enable_chunked_prefill: bool = Field(default=False,
                                          description="Enable chunked prefill.")
@@ -1350,6 +1351,31 @@ class BaseLlmArgs(StrictBaseModel):
                 self.tokenizer,
                 trust_remote_code=self.trust_remote_code,
                 use_fast=self.tokenizer_mode != 'slow')
+        return self
+
+    @model_validator(mode="after")
+    def validate_sliding_window_config(self):
+        """ Initialize kv_cache_config if not provided.
+
+        If kv_cache_config is not provided, this validator initializes
+        kv_cache_config and sets sliding window based on a given HF model.
+        It must be executed before other validators that depend on
+        kv_cache_config.
+        """
+
+        is_kv_cache_config_not_provided = self.kv_cache_config is None
+
+        # Initialize a default kv_cache_config if not provided.
+        if is_kv_cache_config_not_provided:
+            logger.info(
+                "KVCacheConfig is not provided. Use the default configuration.")
+            self.kv_cache_config = KvCacheConfig()
+
+        if self.backend == 'pytorch' and is_kv_cache_config_not_provided:
+            update_kv_cache_config(kv_cache_config=self.kv_cache_config,
+                                   modle_path=self.model,
+                                   max_seq_len=self.max_seq_len)
+
         return self
 
     @model_validator(mode="after")
@@ -2235,6 +2261,50 @@ class TorchLlmArgs(BaseLlmArgs):
             stream_interval=self.stream_interval,
             force_dynamic_quantization=self.force_dynamic_quantization,
             allreduce_strategy=self.allreduce_strategy)
+
+
+def update_kv_cache_config(kv_cache_config: KvCacheConfig,
+                           model_path: str,
+                           max_seq_len: Optional[int] = None):
+    """ Update the KV cache config based on the model config. """
+
+    # Set sliding window attention size to KV cache config (SWA or VSWA)
+    hf_config = HFAutoConfig.from_pretrained(model_path)
+    sliding_window = getattr(hf_config, "sliding_window", None)
+    sliding_window_pattern = getattr(hf_config, "sliding_window_pattern", 1)
+    if sliding_window is not None:
+        # FIXME: Enable KV Cache reuse for VSWA after https://github.com/NVIDIA/TensorRT-LLM/pull/4983.
+        if kv_cache_config.enable_block_reuse and sliding_window_pattern > 1:
+            logger.info(
+                "Disabling KV Cache reuse for VSWA since it is not yet supported."
+            )
+            kv_cache_config.enable_block_reuse = False
+
+        if kv_cache_config.max_attention_window is None:
+            max_attention_window = [sliding_window] * sliding_window_pattern
+            if sliding_window_pattern > 1:
+                # The window size of a global layer is set to max_seq_len.
+                # If not provided, the largest sequence length (2^31-1) is
+                # used and will be adjusted at KVCacheManager init.
+                max_attention_window[-1] = max_seq_len or 2147483647
+            logger.info(f"Setting `kv_cache_config.max_attention_window` to "
+                        f"{max_attention_window} from the model config. The "
+                        f"size of global window size will be adjusted after "
+                        f"loading a model engine.")
+            kv_cache_config.max_attention_window = max_attention_window
+
+
+def create_kv_cache_config(model_path: Optional[str] = None,
+                           max_seq_len: Optional[int] = None,
+                           **kwargs) -> KvCacheConfig:
+    """ Create a KV cache config and adjust attributes based on the model config.
+
+    If model_path is provided, the KV cache config is adjusted based on the model config.
+    """
+    kv_cache_config = KvCacheConfig(**kwargs)
+    if model_path is not None:
+        update_kv_cache_config(kv_cache_config, model_path, max_seq_len)
+    return kv_cache_config
 
 
 def update_llm_args_with_extra_dict(

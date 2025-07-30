@@ -16,12 +16,12 @@ from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm._utils import mpi_rank
 from tensorrt_llm.executor.utils import LlmLauncherEnvs
 from tensorrt_llm.llmapi import (BuildConfig, CapacitySchedulerPolicy,
-                                 DynamicBatchConfig, KvCacheConfig,
-                                 SchedulerConfig)
+                                 DynamicBatchConfig, SchedulerConfig)
 from tensorrt_llm.llmapi.disagg_utils import (CtxGenServerConfig,
                                               MetadataServerConfig, ServerRole,
                                               parse_disagg_config_file,
                                               parse_metadata_server_config_file)
+from tensorrt_llm.llmapi.llm_args import create_kv_cache_config
 from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_dict
 from tensorrt_llm.llmapi.mpi_session import find_free_port
 from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
@@ -95,8 +95,10 @@ def get_llm_args(model: str,
                                max_num_tokens=max_num_tokens,
                                max_beam_width=max_beam_width,
                                max_seq_len=max_seq_len)
-    kv_cache_config = KvCacheConfig(
-        free_gpu_memory_fraction=free_gpu_memory_fraction)
+    kv_cache_config = create_kv_cache_config(
+        free_gpu_memory_fraction=free_gpu_memory_fraction,
+        model_path=model,
+        max_seq_len=max_seq_len)
 
     dynamic_batch_config = DynamicBatchConfig(
         enable_batch_size_tuning=True,
