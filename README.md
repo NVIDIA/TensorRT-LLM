@@ -18,6 +18,9 @@ TensorRT-LLM
 <div align="left">
 
 ## Tech Blogs
+* [07/28] N-Gram Speculative Decoding in TensorRT‑LLM
+✨ [➡️ link](./docs/source/blogs/tech_blog/blog_7_NGram_performance_Analysis_And_Auto_Enablement.md)
+
 * [06/19] Disaggregated Serving in TensorRT-LLM
 ✨ [➡️ link](./docs/source/blogs/tech_blog/blog5_Disaggregated_Serving_in_TensorRT-LLM.md)
 
