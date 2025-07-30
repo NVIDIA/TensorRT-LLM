@@ -520,10 +520,7 @@ class GenerationExecutorWorker(GenerationExecutor):
                 executor_request.py_logits_post_processors = lp if isinstance(
                     lp, list) else [lp]
 
-            if self._is_pytorch_backend and request.schedule_params is not None:
-                executor_request.py_schedule_params = request.schedule_params
-
-            executor_request.py_schedule_params = None
+            executor_request.py_scheduling_params = None
             if self._is_pytorch_backend and request.scheduling_params is not None:
                 executor_request.py_scheduling_params = request.scheduling_params
 

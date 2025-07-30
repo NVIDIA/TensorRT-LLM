@@ -171,6 +171,7 @@ methods:
       scheduling_params:
         annotation: Optional[tensorrt_llm.scheduling_params.SchedulingParams]
         default: null
+        status: prototype
     return_annotation: tensorrt_llm.llmapi.llm.RequestOutput
   get_kv_cache_events:
     parameters:

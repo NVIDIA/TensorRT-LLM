@@ -90,6 +90,15 @@ class ExecutorRequestQueue:
         enable_attention_dp: bool,
         all_ranks_num_active_requests: Optional[List[int]] = None,
     ) -> List[RequestQueueItem]:
+        """
+        Args:
+            waiting_queue: The queue to pop items from.
+            max_req_count: Maximum items to retrieve. Returns empty list if <=0.
+            enable_attention_dp: Whether to enable attention DP scheduling.
+            all_ranks_num_active_requests: Number of active requests for each rank.
+        Returns:
+            List of requests that can be processed.
+        """
 
         if max_req_count <= 0:
             return []
@@ -99,13 +108,8 @@ class ExecutorRequestQueue:
         pending_requests = []
 
         # Track the request with strict requirements
-        if enable_attention_dp:
-            assert all_ranks_num_active_requests is not None, \
-            "all_ranks_num_active_requests must be provided for attention DP scheduling"
-
         scheduling_all_ranks_num_active_requests = all_ranks_num_active_requests.copy(
         ) if enable_attention_dp else None
-
         while req_count < max_req_count and waiting_queue:
             req_item = waiting_queue.popleft()
             can_process = self._can_process_attention_dp_request(
@@ -403,37 +407,23 @@ class ExecutorRequestQueue:
 
     def _balance_requests_across_ranks(
             self, new_requests: List[RequestQueueItem],
-<<<<<<< HEAD
-            all_ranks_num_active_requests: List[int]) -> List[RequestQueueItem]:
-        """Balance requests across ranks for attention DP."""
-        new_requests_cur_rank = []
-
-        if new_requests and self.expected_num_active_requests > all_ranks_num_active_requests[
-                self.dist.tp_rank]:
-=======
             all_ranks_new_requests: Dict[int, List[RequestQueueItem]],
             all_ranks_num_active_requests: List[int]) -> List[RequestQueueItem]:
         """Balance requests across ranks for attention DP."""
         if new_requests:
->>>>>>> 33dd2b3c6 (Refactor to make it easier to test)
             # Balance context tokens across ranks using heap
             HeapVal = namedtuple(
                 'HeapVal',
                 ['num_tokens', 'num_requests', 'rank', 'request_list'])
 
             all_ranks_new_requests_heap = [
-                HeapVal(0, val, tp_rank, [])
+                HeapVal(0, self.expected_num_active_requests - val, tp_rank, [])
                 for tp_rank, val in enumerate(all_ranks_num_active_requests)
             ]
 
-<<<<<<< HEAD
-            new_requests_cur_rank = all_ranks_new_requests_heap[
-                self.dist.tp_rank].request_list
-=======
->>>>>>> 33dd2b3c6 (Refactor to make it easier to test)
             all_ranks_new_requests_heap = [
                 val for val in all_ranks_new_requests_heap
-                if val.num_requests < self.expected_num_active_requests
+                if val.num_requests > 0
             ]
 
             all_ranks_new_scheduled_requests = {
@@ -459,23 +449,19 @@ class ExecutorRequestQueue:
                 # Update the heap value with the new request
                 val = val._replace(
                     num_tokens=val.num_tokens + token_count,
-                    num_requests=val.num_requests + 1,
+                    num_requests=val.num_requests - 1,
                 )
 
                 val.request_list.append(req_item)
                 # If rank still has room for new requests, push back into heap
-                if val.num_requests < self.expected_num_active_requests:
+                if val.num_requests > 0:
                     heapq.heappush(all_ranks_new_requests_heap, val)
 
-<<<<<<< HEAD
-        return new_requests_cur_rank
-=======
             # Extend all_ranks_new_requests with the new requests that have been scheduled
             for rank, reqs in all_ranks_new_scheduled_requests.items():
                 all_ranks_new_requests[rank].extend(reqs)
 
         return all_ranks_new_requests
->>>>>>> 33dd2b3c6 (Refactor to make it easier to test)
 
     def _collect_py_objects_from_requests(
             self, requests: List[RequestQueueItem],
