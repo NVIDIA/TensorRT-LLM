@@ -23,16 +23,17 @@ The performance numbers below were collected using the steps described in this d
 
 Testing was performed on models with weights quantized using [ModelOpt](https://nvidia.github.io/TensorRT-Model-Optimizer/#) and published by NVIDIA on the [Model Optimizer HuggingFace Collection](https://huggingface.co/collections/nvidia/model-optimizer-66aa84f7966b3150262481a4).
 
-### Hardware:
+### Hardware
 The following GPU variants were used for testing:
 - H100 SXM 80GB (DGX H100)
 - H200 SXM 141GB (DGX H200)
+- GH200 96GB HBM3 (480GB LPDDR5X)
 - B200 180GB (DGX B200)
 - GB200 192GB (GB200 NVL72)
 
 Other hardware variants may have different TDP, memory bandwidth, core count, or other features leading to performance differences on these workloads.
 
-### FP4 Models:
+### FP4 Models
 ```
 nvidia/Llama-3.3-70B-Instruct-FP4
 nvidia/Llama-3.1-405B-Instruct-FP4
@@ -76,7 +77,7 @@ nvidia/Llama-3.1-405B-Instruct-FP4
 | 5000, 500                    |    | 1,032.40 | 1,078.87      |
 | 20000, 2000                  |    | 667.39   | 649.95        |
 
-### FP8 Models:
+### FP8 Models
 ```
 nvidia/Llama-3.1-8B-Instruct-FP8
 nvidia/Llama-3.3-70B-Instruct-FP8
