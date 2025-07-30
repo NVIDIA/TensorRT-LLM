@@ -465,8 +465,7 @@ struct Softmax_saver_tma
         , softmax_sum_ptr_(reinterpret_cast<char*>(params.softmax_stats_ptr))
         , softmax_stats_stride_in_bytes_(params.softmax_stats_stride_in_bytes)
     {
-        size_t softmax_max_off = sizeof(float) * params.b * params.s * params.h;
-        softmax_max_ptr_ = reinterpret_cast<char*>(params.softmax_stats_ptr) + softmax_max_off;
+        softmax_max_ptr_ = reinterpret_cast<char*>(params.softmax_stats_ptr);
         int warp = (threadIdx.x % 128) / Cta_tile::THREADS_PER_WARP;
         int lane = threadIdx.x % Cta_tile::THREADS_PER_WARP;
         // MMA row0 index (8x4 thread layout)
@@ -474,9 +473,9 @@ struct Softmax_saver_tma
 
         int sum_s = params.is_s_padded ? params.s * head_info.bidb : params.cu_q_seqlens[head_info.bidb];
         int token_id = sum_s * params.h + head_info.bidh;
-        size_t const bh_offset = token_id * sizeof(float) + local_q_tile_offset_ * softmax_stats_stride_in_bytes_;
-        softmax_sum_ptr_ += bh_offset + row0_ * softmax_stats_stride_in_bytes_;
+        size_t const bh_offset = token_id * sizeof(float) * 2 + local_q_tile_offset_ * softmax_stats_stride_in_bytes_;
         softmax_max_ptr_ += bh_offset + row0_ * softmax_stats_stride_in_bytes_;
+        softmax_sum_ptr_ += bh_offset + row0_ * softmax_stats_stride_in_bytes_ + sizeof(float);
     };
 
     inline __device__ void store(float* p_sum, float* p_max, float sqrt_d, int row_offset, bool valid_run)
