@@ -176,7 +176,7 @@ void CreateNewDecoderRequests::newRequest(SizeType32 batchSlot, runtime::decoder
 
     BufferManager manager{std::make_shared<CudaStream>(decoderStream.get())};
 
-    auto const batchSize = decoderState.getMaxBatchSize();
+    auto const batchSize = decoderState.getMaxNumSequences();
     TLLM_CHECK(0 <= batchSize && batchSlot < batchSize);
     auto const maxBeamWidth = decoderState.getMaxBeamWidth();
     auto const beamWidth = samplingConfig.beamWidth;
