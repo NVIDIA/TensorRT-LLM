@@ -716,13 +716,14 @@ class PyTorchModelEngine(ModelEngine):
             cuda_graph_batch_sizes = sorted(self._cuda_graph_batch_sizes,
                                             reverse=True)
             # Create CUDA graphs for different draft lengths
-            draft_lengths = []
+            draft_lengths = [self.max_draft_len]
             # For non-draft model, we also capture the CUDA graph instance for draft length 0,
             # so that when we disable spec decode at runtime, we can still run the captured graph.
-            if not self.is_draft_model:
+            # Note that for one engine mode, we are not able to turn off spec decode at runtime.
+            if not self.is_draft_model and self.max_draft_len > 0 and not self.spec_config.spec_dec_mode.use_one_engine(
+            ):
                 draft_lengths.append(0)
-            if self.max_draft_len > 0:
-                draft_lengths.append(self.max_draft_len)
+
             for bs in cuda_graph_batch_sizes:
                 if bs > self.batch_size:
                     # skip batch size larger than self.batch_size
@@ -738,7 +739,7 @@ class PyTorchModelEngine(ModelEngine):
                         logger.info(
                             f"Run generation only CUDA graph warmup for batch size={bs}, draft_len={draft_len}"
                         )
-                        self.enable_spec_decode = draft_len > 0
+                        self.enable_spec_decode = draft_len > 0 or self.is_draft_model
                         self.forward(batch,
                                      new_tensors_device=None,
                                      resource_manager=resource_manager)
@@ -765,7 +766,7 @@ class PyTorchModelEngine(ModelEngine):
                                 gc.collect()
                                 torch.cuda.empty_cache()
 
-        # Set the values back to the original values
+        # Set the value back to the original value
         self.enable_spec_decode = self.is_spec_decode
 
     def _set_up_attn_metadata(self, kv_cache_manager: KVCacheManager):

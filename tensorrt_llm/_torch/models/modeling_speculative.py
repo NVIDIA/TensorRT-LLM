@@ -130,9 +130,8 @@ class Eagle3DecoderLayer(DecoderLayer):
         # PyExecutor will extract these from the draft model engine's spec metadata.
         # They will be passed to the draft model engine on the next iteration.
         # TODO: can we support multiple model outputs instead?
-        if spec_metadata is not None:
-            spec_metadata.maybe_capture_hidden_states(self.layer_idx,
-                                                      hidden_states, residual)
+        spec_metadata.maybe_capture_hidden_states(self.layer_idx, hidden_states,
+                                                  residual)
         return hidden_states, residual
 
 
@@ -250,9 +249,6 @@ class Eagle3ForCausalLM(DecoderModelForCausalLM[Eagle3DraftModel, LlamaConfig]):
         hidden_states: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
-        if spec_metadata is None:
-            return None
-
         hidden_states = self.apply_eagle3_fc(spec_metadata.get_hidden_states())
         output, _ = self.model(
             input_ids=input_ids,
@@ -385,7 +381,7 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
             **kwargs,
         )
 
-        if self.draft_model is not None and spec_metadata is not None:
+        if self.draft_model is not None:
             # get logits
             logits = self.logits_processor.forward(
                 hidden_states[spec_metadata.gather_ids],
