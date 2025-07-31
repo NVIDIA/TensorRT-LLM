@@ -263,7 +263,7 @@ class TorchSampler(Sampler):
             stop_words_list, prefix_sum = request.py_stop_words_list
             tokens = request.get_tokens(0)
             try: 
-                new_words = tokenizer.decode(new_token,skip_special_tokens=False,clean_up_tokenization_spaces=False)
+                new_words = tokenizer.decode(new_token, skip_special_tokens=False, clean_up_tokenization_spaces=False)
             except Exception:
                 # If decode fails, fall back to token-based matching only
                 new_words = ""
@@ -273,7 +273,11 @@ class TorchSampler(Sampler):
                     offset = prefix_sum[i - 1]
                 stop_word = stop_words_list[offset:offset_end]
                 try:
-                    stop_text = tokenizer.decode(stop_word, skip_special_tokens=False, clean_up_tokenization_spaces=False)
+                    stop_text = tokenizer.decode(
+                        stop_word, 
+                        skip_special_tokens=False, 
+                        clean_up_tokenization_spaces=False
+                    )
                 except Exception:
                     continue
                 if len(stop_word) > len(tokens):
