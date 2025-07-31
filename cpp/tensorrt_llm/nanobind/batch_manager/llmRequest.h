@@ -51,7 +51,7 @@ public:
     using VecTokenExtraIds = Base::VecTokenExtraIds;
     using LogitsPostProcessor = Base::LogitsPostProcessor;
 
-    // 49 parameters
+    // 50 parameters
     LlmRequest(RequestIdType requestId, SizeType32 maxNewTokens, std::vector<TokenIdType> inputTokens,
         runtime::SamplingConfig samplingConfig, bool isStreaming, std::optional<SizeType32> endId = std::nullopt,
         std::optional<SizeType32> padId = std::nullopt, std::optional<TensorPtr> embeddingBias = std::nullopt,
@@ -66,7 +66,7 @@ public:
         std::optional<TensorPtr> mropeRotaryCosSin = std::nullopt,
         std::optional<SizeType32> mropePositionDeltas = std::nullopt,
         std::optional<LoraTaskIdType> loraTaskId = std::nullopt, std::optional<TensorPtr> loraWeights = std::nullopt,
-        std::optional<TensorPtr> loraConfig = std::nullopt,
+        std::optional<TensorPtr> loraConfig = std::nullopt, std::optional<std::string> loraPath = std::nullopt,
         std::optional<executor::LookaheadDecodingConfig> lookaheadConfig = std::nullopt,
         std::optional<executor::KvCacheRetentionConfig> kvCacheRetentionConfig = std::nullopt,
         bool returnLogProbs = false, bool returnContextLogits = false, bool returnGenerationLogits = false,
@@ -116,6 +116,7 @@ public:
             loraTaskId,                                                                                          //
             loraWeights,                                                                                         //
             loraConfig,                                                                                          //
+            loraPath,                                                                                            //
             lookaheadConfig,                                                                                     //
             kvCacheRetentionConfig,                                                                              //
             returnLogProbs,                                                                                      //
