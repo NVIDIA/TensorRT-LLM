@@ -4,7 +4,7 @@ import asyncio
 import time
 from contextlib import asynccontextmanager
 from itertools import chain
-from typing import Dict, Iterable, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import tqdm
 from zmq import PUSH
@@ -36,6 +36,7 @@ class LlmManager:
         self._stop = asyncio.Event()
         self._running = asyncio.Event()
         self._tasks: Set[asyncio.Task] = set()
+        self._task_errors: List[BaseException] = []
         self._backend_task: Optional[asyncio.Task] = None
         self._iteration_log_task: Optional[asyncio.Task] = None
         self._concurrency_semaphore = asyncio.Semaphore(
@@ -76,7 +77,7 @@ class LlmManager:
             response_end_timestamp = time.perf_counter_ns()
 
             # Mark that the response returned. Construct a record to send to statistics.
-            tokens = list(chain(*[beam.token_ids for beam in response.outputs]))
+            tokens = list(chain(*(beam.token_ids for beam in response.outputs)))
             request_perf_item = PerfItemTuple(
                 start_timestamp=request_start_timestamp,
                 end_timestamp=response_end_timestamp,
@@ -94,24 +95,25 @@ class LlmManager:
         except asyncio.CancelledError:
             pass
 
+    def _raise_for_failed_tasks(self):
+        if not self._task_errors:
+            return
+
+        error_counts: Dict[str, int] = {}
+        for error in self._task_errors:
+            error_str = str(error)
+            error_counts[error_str] = error_counts.get(error_str, 0) + 1
+
+        task_errors_str = ", ".join(f"{error} ({count} requests)"
+                                    for error, count in error_counts.items())
+        raise ValueError(f"Requests failed: {task_errors_str}")
+
+    def _task_done_callback(self, task: asyncio.Task):
+        error = task.exception()
+        if error is not None:
+            self._task_errors.append(error)
+
     async def worker(self) -> None:
-
-        def _raise_for_failed(tasks: Iterable[asyncio.Task]):
-            error_counts: Dict[str, int] = {}
-
-            for task in tasks:
-                e = task.exception()
-                if e is None:
-                    continue
-                error = str(e)
-                error_counts[error] = error_counts.get(error, 0) + 1
-
-            if error_counts:
-                task_errors = ", ".join(
-                    f"{error} ({count} requests)"
-                    for error, count in error_counts.items())
-                raise ValueError(f"Requests failed: {task_errors}")
-
         try:
             while not self._stop.is_set():
                 try:
@@ -124,13 +126,9 @@ class LlmManager:
                     self.process_request(request,
                                          sampling_params=sampling_params,
                                          post_proc_params=post_proc_params))
+                task.add_done_callback(self._task_done_callback)
                 self._tasks.add(task)
-                done_tasks, self._tasks = await asyncio.wait(self._tasks,
-                                                             timeout=0)
-                logger.debug(
-                    f"{len(done_tasks)} / {len(self._tasks)} tasks done / pending"
-                )
-                _raise_for_failed(done_tasks)
+                self._raise_for_failed_tasks()
             logger.debug("Worker task finishing...")
         except asyncio.CancelledError:
             logger.info("Worker task cancelled.")
@@ -140,9 +138,9 @@ class LlmManager:
                 task.cancel()
             logger.debug("Waiting for requests...")
             if self._tasks:
-                tasks, _ = await asyncio.wait(self._tasks)
+                await asyncio.wait(self._tasks)
                 self._tasks.clear()
-                _raise_for_failed(tasks)
+                self._raise_for_failed_tasks()
 
     # This asynchronous function acts as a worker that logs iteration statistics.
     # It connects to a given address using a PUSH socket and sends JSON-encoded
