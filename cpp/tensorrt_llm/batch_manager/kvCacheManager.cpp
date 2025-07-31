@@ -1980,12 +1980,8 @@ void KVCacheManager::updateNewBlockPointer(GenerationRequest& sequence, SizeType
     }
 }
 
-std::optional<SizeType32> KVCacheManager::updateToken(GenerationRequest& sequence, bool addToken, bool returnNewBlockId)
+std::optional<SizeType32> KVCacheManager::updateToken(GenerationRequest& sequence, bool addToken)
 {
-    TLLM_CHECK_WITH_INFO(
-        !returnNewBlockId || (mBlockManager.getWindowSizesMetadata().size() == 1 && sequence.getBeamWidth() == 1),
-        "KV Cache Connector is not supported with beam search");
-
     auto currNumTokens = sequence.getNumTokens();
 
     if (addToken)
@@ -2025,9 +2021,6 @@ std::optional<SizeType32> KVCacheManager::updateToken(GenerationRequest& sequenc
                 {
                     mBlockManager.allocateBlock(sequence, windowSize);
                     cacheNewBlockOffsets(sequence, windowSize);
-
-                    return returnNewBlockId ? std::make_optional(sequence.getCacheBlockIds(windowSize).at(0).back())
-                                            : std::nullopt;
                 }
                 else
                 {
@@ -2049,10 +2042,10 @@ std::optional<SizeType32> KVCacheManager::updateToken(GenerationRequest& sequenc
     return std::nullopt;
 }
 
-std::optional<SizeType32> KVCacheManager::addToken(RequestIdType requestId, bool returnNewBlockId)
+std::optional<SizeType32> KVCacheManager::addToken(RequestIdType requestId)
 {
     auto& sequence = getSequence(requestId);
-    return updateToken(sequence, true, returnNewBlockId);
+    return updateToken(sequence, true);
 }
 
 std::optional<BlockKey> KVCacheManager::findNewContextBlock(
@@ -2494,7 +2487,7 @@ void KVCacheManager::removeToken(RequestIdType requestId)
     {
         return;
     }
-    updateToken(sequence, false, false);
+    updateToken(sequence, false);
 }
 
 void KVCacheManager::rewindKVCache(RequestIdType requestId, SizeType32 rewindLengths)

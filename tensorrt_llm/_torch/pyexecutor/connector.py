@@ -28,6 +28,8 @@ etc.
 The Connector API is split into two parts:
 1. The scheduler, which is responsible for orchestration, and building metadata for the workers.
 2. The worker, which performs and monitors transfers indicated by the scheduler's metadata.
+
+To implement a custom KV connector, you need to implement both the scheduler and worker-side interfaces.
 """
 
 
@@ -230,6 +232,16 @@ class AsyncRequests:
 
 
 class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
+    """
+    The KvCacheConnectorManager is used to manager connector-related state.
+
+    It has the following responsibilities:
+    1. Managing the state of async requests (both offload and onboard)
+    2. Handling MPI communication. We only run the leader on one rank, but need the results of the leader API on all ranks.
+
+    Note: This class is solely an implementation detail, and is not part of the connector interface itself.
+    When implementing a connector API, you do not need to implement this class.
+    """
 
     def __init__(self, worker: KvCacheConnectorWorker,
                  scheduler: Optional[KvCacheConnectorScheduler]):
@@ -308,7 +320,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         # Update the list of scheduled requests.
         scheduled_requests.context_requests = allowed_context_requests
 
-    def build_connector_meta(self) -> object:
+    def handle_metadata(self) -> object:
         metadata = self._run_on_leader(
             lambda: self.scheduler.build_connector_meta(self._scheduler_output))
 
