@@ -336,24 +336,26 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
-    @pytest.mark.parametrize("overlap_scheduler", [False])
-    def test_eagle3(self, overlap_scheduler):
+    @parametrize_with_ids("overlap_scheduler", [True, False])
+    @parametrize_with_ids("eagle3_one_model", [True, False])
+    def test_eagle3(self, overlap_scheduler, eagle3_one_model):
         speculative_decoding_config = {
             "decoding_type": "Eagle",
             "max_draft_len": 4,
             "speculative_model_dir":
             f"{llm_models_root()}/EAGLE3-LLaMA3.1-Instruct-8B",
-            "eagle3_one_model": False
-        }
-        kv_cache_config = {
-            "free_gpu_memory_fraction": 0.5,
-            "enable_block_reuse": False
+            "eagle3_one_model": eagle3_one_model
         }
         ctx_server_config = {
-            "disable_overlap_scheduler": True,
+            "disable_overlap_scheduler":
+            True,  # BS=1 does not need overlap scheduling
             "speculative_config": speculative_decoding_config,
-            "kv_cache_config": kv_cache_config,
+            "kv_cache_config": {
+                "free_gpu_memory_fraction": 0.5,
+                "enable_block_reuse": True  # reuse on context requests
+            },
             "max_num_tokens": 13393 * 2,
+            "max_batch_size": 1,
             "cache_transceiver_config": {
                 "backend": "default"
             }
@@ -361,8 +363,12 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
         gen_server_config = {
             "disable_overlap_scheduler": not overlap_scheduler,
             "speculative_config": speculative_decoding_config,
-            "kv_cache_config": kv_cache_config,
-            "max_num_tokens": 13393 * 2,
+            "kv_cache_config": {
+                "free_gpu_memory_fraction": 0.5,
+                "enable_block_reuse": False
+            },
+            "max_num_tokens": 20,  # BS * (draft token + 1)
+            "max_batch_size": 4,
             "cache_transceiver_config": {
                 "backend": "default"
             }
