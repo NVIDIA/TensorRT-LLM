@@ -150,7 +150,7 @@ directory. For example, to generate a synthetic dataset of 1000 requests with a 
 128/128 for [meta-llama/Llama-3.1-8B](https://huggingface.co/meta-llama/Llama-3.1-8B), run:
 
 ```shell
-benchmarks/cpp/prepare_dataset.py --stdout --tokenizer meta-llama/Llama-3.1-8B token-norm-dist --input-mean 128 --output-mean 128 --input-stdev 0 --output-stdev 0 --num-requests 1000 > /tmp/synthetic_128_128.txt
+python benchmarks/cpp/prepare_dataset.py --stdout --tokenizer meta-llama/Llama-3.1-8B token-norm-dist --input-mean 128 --output-mean 128 --input-stdev 0 --output-stdev 0 --num-requests 1000 > /tmp/synthetic_128_128.txt
 ```
 
 ### Running with the PyTorch Workflow
@@ -168,7 +168,11 @@ for build heuristics.
 ```
 
 ```shell
-trtllm-bench --model meta-llama/Llama-3.1-8B --model_path /Ckpt/Path/To/Llama-3.1-8B throughput --dataset /tmp/synthetic_128_128.txt --backend pytorch
+trtllm-bench --model meta-llama/Llama-3.1-8B \
+  --model_path /Ckpt/Path/To/Llama-3.1-8B \
+  throughput \
+  --dataset /tmp/synthetic_128_128.txt \
+  --backend pytorch
 
 # Example output
 <snip verbose logging>
@@ -203,6 +207,24 @@ Token Throughput (tokens/sec):  20685.5510
 Request Throughput (req/sec):   161.6059
 Total Latency (ms):             18563.6825
 
+```
+
+When enabling streaming, time to first token (TTFT) and inter-token latency (ITL) metrics will also be recorded.
+```shell
+trtllm-bench --model meta-llama/Llama-3.1-8B \
+  --model_path /Ckpt/Path/To/Llama-3.1-8B \
+  throughput \
+  --dataset /tmp/synthetic_128_128.txt \
+  --backend pytorch
+```
+
+Alternatively, users can benchmark the low latency mode:
+```shell
+trtllm-bench --model meta-llama/Llama-3.1-8B \
+  --model_path /Ckpt/Path/To/Llama-3.1-8B \
+  latency \
+  --dataset /tmp/synthetic_128_128.txt \
+  --backend pytorch
 ```
 
 #### Benchmarking with LoRA Adapters in PyTorch workflow
