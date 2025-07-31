@@ -9,11 +9,11 @@ from pydantic import (BaseModel, Field, PositiveFloat, field_validator,
                       model_validator)
 
 import tensorrt_llm.bindings.executor as trtllm
+from tensorrt_llm._tensorrt_engine import ExtendedRuntimePerfKnobConfig
 from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 from tensorrt_llm.llmapi import (BatchingType, CapacitySchedulerPolicy,
                                  ContextChunkingPolicy, DynamicBatchConfig,
-                                 ExtendedRuntimePerfKnobConfig, KvCacheConfig,
-                                 SchedulerConfig)
+                                 KvCacheConfig, SchedulerConfig)
 from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_options
 from tensorrt_llm.models.modeling_utils import SpeculativeDecodingMode
 

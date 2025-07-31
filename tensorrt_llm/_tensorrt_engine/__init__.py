@@ -1,3 +1,9 @@
-from tensorrt_llm.llmapi.llm import _TrtLLM as LLM
+from .llm import LLM
+from .llm_args import CalibConfig, ExtendedRuntimePerfKnobConfig, TrtLlmArgs
 
-__all__ = ['LLM']
+__all__ = [
+    'LLM',
+    'TrtLlmArgs',
+    'CalibConfig',
+    'ExtendedRuntimePerfKnobConfig',
+]
