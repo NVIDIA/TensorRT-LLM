@@ -63,5 +63,19 @@ The exported graph then undergoes a series of automated transformations, includi
 
 ## Roadmap
 
-Check out our [Github Project Board](https://github.com/orgs/NVIDIA/projects/83) to learn more about
-the current progress in AutoDeploy and where you can help.
+We are actively expanding AutoDeploy to support a broader range of model architectures and inference features.
+
+**Upcoming Model Support:**
+
+- Vision-Language Models (VLMs)
+
+- Structured State Space Models (SSMs) and Linear Attention architectures
+
+**Planned Features:**
+
+- Low-Rank Adaptation (LoRA)
+
+- Speculative Decoding for accelerated generation
+
+To track development progress and contribute, visit our [Github Project Board](https://github.com/orgs/NVIDIA/projects/83).
+We welcome community contributions, see our [`CONTRIBUTING.md`](../../../../../examples/auto_deploy/CONTRIBUTING.md) for guidelines.
