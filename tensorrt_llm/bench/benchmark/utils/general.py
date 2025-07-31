@@ -12,6 +12,7 @@ from tensorrt_llm._torch.pyexecutor.model_engine import \
     validate_and_set_kv_cache_quant
 from tensorrt_llm.bench.build.build import (get_benchmark_engine_settings,
                                             get_model_config)
+from tensorrt_llm.bench.build.dataclasses import NemotronHybridConfig
 from tensorrt_llm.bench.dataclasses.general import (DatasetMetadata,
                                                     InferenceRequest)
 from tensorrt_llm.logger import logger
@@ -88,6 +89,7 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
     enable_chunked_prefill = params.get("enable_chunked_prefill", False)
 
     kv_cache_dtype = "auto"
+    mamba_ssm_cache_dtype = params.get("mamba_ssm_cache_dtype", "auto")
     kv_cache_config = {}
     if extra_llm_api_options:
         with open(extra_llm_api_options, 'r') as f:
@@ -96,6 +98,8 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
                 "dtype": "auto",
             })
             kv_cache_dtype = kv_cache_config.get("dtype", "auto")
+            mamba_ssm_cache_dtype = kv_cache_config.get("mamba_ssm_cache_dtype",
+                                                        mamba_ssm_cache_dtype)
 
         enable_chunked_prefill = llm_args_dict.get("enable_chunked_prefill",
                                                    enable_chunked_prefill)
@@ -114,6 +118,9 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
             "max_batch_size"), params.get("max_num_tokens")
     else:
         model_config = get_model_config(model, model_path)
+
+        if isinstance(model_config, NemotronHybridConfig):
+            model_config.set_mamba_ssm_cache_dtype(mamba_ssm_cache_dtype)
 
         from tensorrt_llm._torch.model_config import ModelConfig
         model = model_path or model
@@ -161,6 +168,7 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
     }
 
     kv_cache_config["dtype"] = kv_cache_dtype
+    kv_cache_config["mamba_ssm_cache_dtype"] = mamba_ssm_cache_dtype
 
     pyt_options = {
         "cuda_graph_config": cuda_graph_config,

@@ -149,6 +149,7 @@ class QuantConfig:
     has_zero_point: bool = False
     pre_quant_scale: bool = False
     exclude_modules: Optional[List[str]] = None
+    mamba_ssm_cache_dtype: Optional[str] = None
 
     @cached_property
     def quant_mode(self) -> QuantModeWrapper:
