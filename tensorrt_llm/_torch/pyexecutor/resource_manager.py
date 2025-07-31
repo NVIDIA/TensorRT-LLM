@@ -423,6 +423,8 @@ class KVCacheManager(BaseResourceManager):
                             req.context_current_position)
 
         for req in generation_batch:
+            tokens = req.get_tokens(0)
+            computed_token_position = len(req.get_tokens(0)) - 1
 
             old_block_ids = self.get_cache_indices(req)
 
@@ -435,10 +437,9 @@ class KVCacheManager(BaseResourceManager):
 
             delta_block_ids = new_block_ids[len(old_block_ids):]
 
-            tokens = req.get_tokens(0)
-
             scheduler_output.add_request(req.request_id, tokens[-1:],
-                                         delta_block_ids, len(tokens))
+                                         delta_block_ids,
+                                         computed_token_position)
 
         if self.kv_connector_manager is not None:
             self.kv_connector_manager.set_scheduler_output(scheduler_output)

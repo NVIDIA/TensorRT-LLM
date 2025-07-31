@@ -358,12 +358,12 @@ def create_py_executor(
             scheduler_cls = getattr(
                 module, kv_connector_config.connector_scheduler_class)
 
-            connector_worker = worker_cls()
+            connector_worker = worker_cls(executor_config)
 
             # Only initialize the scheduler on rank 0.
             rank = tensorrt_llm.mpi_rank()
             if rank == 0:
-                connector_scheduler = scheduler_cls()
+                connector_scheduler = scheduler_cls(executor_config)
             else:
                 connector_scheduler = None
 
