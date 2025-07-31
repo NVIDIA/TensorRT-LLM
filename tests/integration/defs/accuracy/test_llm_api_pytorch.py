@@ -384,7 +384,7 @@ class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=dict(apply_chat_template=True))
 
     @pytest.mark.skip_less_mpi_world_size(8)
-    @pytest.mark.parametrize("eagle3_one_model", [True, False])
+    @parametrize_with_ids("eagle3_one_model", [True, False])
     def test_eagle3_tp8(self, eagle3_one_model):
         model_path = f"{llm_models_root()}/llama-3.3-models/Llama-3.3-70B-Instruct"
         eagle_model_dir = f"{llm_models_root()}/EAGLE3-LLaMA3.3-Instruct-70B"
