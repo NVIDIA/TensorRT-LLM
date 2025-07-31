@@ -1,21 +1,21 @@
 # Expert Configuration of LLM API
 
-For expert TensorRT-LLM users, we also expose the full set of [`LlmArgs`](../../tensorrt_llm/_torch/auto_deploy/llm_args.py)
+For expert TensorRT-LLM users, we also expose the full set of [`LlmArgs`](../../../../../tensorrt_llm/_torch/auto_deploy/llm_args.py)
 *at your own risk* (the argument list diverges from TRT-LLM's argument list):
 
 - All config fields that are used by the AutoDeploy core pipeline (i.e. the `InferenceOptimizer`) are
-  _exclusively_ exposed in the [`AutoDeployConfig` class](../../tensorrt_llm/_torch/auto_deploy/llm_args.py).
+  _exclusively_ exposed in the [`AutoDeployConfig` class](../../../../../tensorrt_llm/_torch/auto_deploy/llm_args.py).
   Please make sure to refer to those first.
-- For expert users we expose the full set of [`LlmArgs`](../../tensorrt_llm/_torch/auto_deploy/llm_args.py)
-  that can be used to configure the [AutoDeploy `LLM` API](../../tensorrt_llm/_torch/auto_deploy/llm.py) including runtime options.
-- Note that some fields in the full [`LlmArgs`](../../tensorrt_llm/_torch/auto_deploy/llm_args.py)
+- For expert users we expose the full set of [`LlmArgs`](../../../../../tensorrt_llm/_torch/auto_deploy/llm_args.py)
+  that can be used to configure the [AutoDeploy `LLM` API](../../../../../tensorrt_llm/_torch/auto_deploy/llm.py) including runtime options.
+- Note that some fields in the full [`LlmArgs`](../../../../../tensorrt_llm/_torch/auto_deploy/llm_args.py)
   object are overlapping, duplicated, and/or _ignored_ in AutoDeploy, particularly arguments
   pertaining to configuring the model itself since AutoDeploy's model ingestion+optimize pipeline
   significantly differs from the default manual workflow in TensorRT-LLM.
-- However, with the proper care the full [`LlmArgs`](../../tensorrt_llm/_torch/auto_deploy/llm_args.py)
+- However, with the proper care the full [`LlmArgs`](../../../../../tensorrt_llm/_torch/auto_deploy/llm_args.py)
   objects can be used to configure advanced runtime options in TensorRT-LLM.
 - Note that any valid field can be simply provided as keyword argument ("`**kwargs`") to the
-  [AutoDeploy `LLM` API](../../tensorrt_llm/_torch/auto_deploy/llm.py).
+  [AutoDeploy `LLM` API](../../../../../tensorrt_llm/_torch/auto_deploy/llm.py).
 
 # Expert Configuration of `build_and_run_ad.py`
 
@@ -23,7 +23,7 @@ For expert users, `build_and_run_ad.py` provides advanced configuration capabili
 
 ## CLI Arguments with Dot Notation
 
-The script supports flexible CLI argument parsing using dot notation to modify nested configurations dynamically. You can target any field in both the [`ExperimentConfig`](./build_and_run_ad.py) and nested [`AutoDeployConfig`](../../tensorrt_llm/_torch/auto_deploy/llm_args.py)/[`LlmArgs`](../../tensorrt_llm/_torch/auto_deploy/llm_args.) objects:
+The script supports flexible CLI argument parsing using dot notation to modify nested configurations dynamically. You can target any field in both the [`ExperimentConfig`](../../../../../examples/auto_deploy/build_and_run_ad.py) and nested [`AutoDeployConfig`](../../../../../tensorrt_llm/_torch/auto_deploy/llm_args.py)/[`LlmArgs`](../../../../../tensorrt_llm/_torch/auto_deploy/llm_args.) objects:
 
 ```bash
 # Configure model parameters
@@ -56,7 +56,7 @@ python build_and_run_ad.py \
 
 ## YAML Configuration Files
 
-Both [`ExperimentConfig`](./build_and_run_ad.py) and [`AutoDeployConfig`](../../tensorrt_llm/_torch/auto_deploy/llm_args.py)/[`LlmArgs`](../../tensorrt_llm/_torch/auto_deploy/llm_args.py) inherit from [`DynamicYamlMixInForSettings`](../../tensorrt_llm/_torch/auto_deploy/utils/_config.py), enabling you to provide multiple YAML configuration files that are automatically deep-merged at runtime.
+Both [`ExperimentConfig`](../../../../../examples/auto_deploy/build_and_run_ad.py) and [`AutoDeployConfig`](../../../../../tensorrt_llm/_torch/auto_deploy/llm_args.py)/[`LlmArgs`](../../../../../tensorrt_llm/_torch/auto_deploy/llm_args.py) inherit from [`DynamicYamlMixInForSettings`](../../../../../tensorrt_llm/_torch/auto_deploy/utils/_config.py), enabling you to provide multiple YAML configuration files that are automatically deep-merged at runtime.
 
 Create a YAML configuration file (e.g., `my_config.yaml`):
 
@@ -167,7 +167,7 @@ python build_and_run_ad.py \
 
 ## Built-in Default Configuration
 
-Both [`AutoDeployConfig`](../../tensorrt_llm/_torch/auto_deploy/llm_args.py) and [`LlmArgs`](../../tensorrt_llm/_torch/auto_deploy/llm_args.py) classes automatically load a built-in [`default.yaml`](../../tensorrt_llm/_torch/auto_deploy/config/default.yaml) configuration file that provides sensible defaults for the AutoDeploy inference optimizer pipeline. This file is specified in the [`_get_config_dict()`](../../tensorrt_llm/_torch/auto_deploy/llm_args.py) function and defines default transform configurations for graph optimization stages.
+Both [`AutoDeployConfig`](../../../../../tensorrt_llm/_torch/auto_deploy/llm_args.py) and [`LlmArgs`](../../../../../tensorrt_llm/_torch/auto_deploy/llm_args.py) classes automatically load a built-in [`default.yaml`](../../../../../tensorrt_llm/_torch/auto_deploy/config/default.yaml) configuration file that provides sensible defaults for the AutoDeploy inference optimizer pipeline. This file is specified in the [`_get_config_dict()`](../../../../../tensorrt_llm/_torch/auto_deploy/llm_args.py) function and defines default transform configurations for graph optimization stages.
 
 The built-in defaults are automatically merged with your configurations at the lowest priority level, ensuring that your custom settings always override the defaults. You can inspect the current default configuration to understand the baseline transform pipeline:
 

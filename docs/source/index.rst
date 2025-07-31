@@ -15,7 +15,6 @@ Welcome to TensorRT-LLM's Documentation!
    quick-start-guide.md
    key-features.md
    torch.md
-   auto-deploy.md
    release-notes.md
 
 

@@ -9,7 +9,6 @@ This project is in active development and is currently in an early (beta) stage.
 
 AutoDeploy is an experimental feature in beta stage designed to simplify and accelerate the deployment of PyTorch models, including off-the-shelf models like those from Hugging Face, to TensorRT-LLM. It automates graph transformations to integrate inference optimizations such as tensor parallelism, KV-caching and quantization. AutoDeploy supports optimized in-framework deployment, minimizing the amount of manual modification needed.
 
-
 ## Motivation & Approach
 
 Deploying large language models (LLMs) can be challenging, especially when balancing ease of use with high performance. Teams need simple, intuitive deployment solutions that reduce engineering effort, speed up the integration of new models, and support rapid experimentation without compromising performance.
@@ -34,7 +33,7 @@ AutoDeploy is accessible through TRT-LLM installation.
 sudo apt-get -y install libopenmpi-dev && pip3 install --upgrade pip setuptools && pip3 install tensorrt_llm
 ```
 
-You can refer to [TRT-LLM installation guide](./installation/linux.md) for more information.
+You can refer to [TRT-LLM installation guide](../../installation/linux.md) for more information.
 
 2. **Run Llama Example:**
 
@@ -53,17 +52,14 @@ AutoDeploy streamlines the model deployment process through an automated workflo
 
 The exported graph then undergoes a series of automated transformations, including graph sharding, KV-cache insertion, and GEMM fusion, to optimize model performance. After these transformations, the graph is compiled using one of the supported compile backends (like `torch-opt`), followed by deploying it via the TRT-LLM runtime.
 
-- [Supported Matrix](./auto_deploy/support_matrix.md)
-
+- [Supported Matrix](support_matrix.md)
 
 ## Advanced Usage
 
-- [Example Run Script](./auto_deploy/advanced/example_run.md)
-- [Logging Level](./auto_deploy/advanced/logging.md)
-- [Model Evaluation with LM Evaluation Harness](./auto_deploy/advanced/model_eval.md)
-- [Mixed-precision Quantization using TensorRT Model Optimizer](./auto_deploy/advanced/mixed_precision_quantization.md)
-- [Incorporating auto_deploy into your own workflow](./auto_deploy/advanced/workflow.md)
-- [Expert Configurations](./auto_deploy/advanced/expert_configurations.md)
+- [Example Run Script](./advanced/example_run.md)
+- [Logging Level](./advanced/logging.md)
+- [Incorporating AutoDeploy into Your Own Workflow](./advanced/workflow.md)
+- [Expert Configurations](./advanced/expert_configurations.md)
 
 ## Roadmap
 

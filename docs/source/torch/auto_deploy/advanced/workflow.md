@@ -27,6 +27,6 @@ llm = LLM(
 
 ```
 
-Please consult the [AutoDeploy `LLM` API](../../tensorrt_llm/_torch/auto_deploy/llm.py) and the
-[`AutoDeployConfig` class](../../tensorrt_llm/_torch/auto_deploy/llm_args.py)
+Please consult the [AutoDeploy `LLM` API](../../../../../tensorrt_llm/_torch/auto_deploy/llm.py) and the
+[`AutoDeployConfig` class](../../../../../tensorrt_llm/_torch/auto_deploy/llm_args.py)
 for more detail on how AutoDeploy is configured via the `**kwargs` of the `LLM` API.
