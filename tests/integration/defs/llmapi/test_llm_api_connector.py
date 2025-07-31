@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import math
 import os
 import sys
 from unittest.mock import MagicMock, patch
@@ -42,8 +43,8 @@ def init_connector_classes():
     return scheduler, worker
 
 
-@pytest.fixture
-def connector():
+@pytest.fixture(scope="function")
+def model_with_connector():
     with patch("tensorrt_llm._torch.pyexecutor.py_executor_creator.importlib"
                ) as importlib_mock:
         mock_scheduler = MagicMock()
@@ -58,7 +59,10 @@ def connector():
             connector_worker_class="KvConnectorWorker",
         )
 
-        yield connector_config, mock_scheduler, mock_worker
+        def model_fn(*args, **kwargs):
+            return LLM(*args, **kwargs, connector_config=connector_config)
+
+        yield model_fn, mock_scheduler, mock_worker
 
 
 # Needed because MagicMocks don't work across processes.
@@ -67,17 +71,17 @@ os.environ["TLLM_WORKER_USE_SINGLE_PROCESS"] = "1"
 
 
 @pytest.mark.threadleak(enabled=False)
-def test_llm_api_connector_simple(connector):
-    connector_config, scheduler, worker = connector
-
+def test_llm_api_connector_simple(model_with_connector):
     NUM_TOKENS = 8
 
-    model = LLM(model="Qwen/Qwen2-0.5B",
-                backend="pytorch",
-                disable_overlap_scheduler=True,
-                connector_config=connector_config,
-                cuda_graph_config=None,
-                kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.1))
+    model_fn, scheduler, worker = model_with_connector
+
+    model = model_fn(
+        model="Qwen/Qwen2-0.5B",
+        backend="pytorch",
+        disable_overlap_scheduler=True,
+        cuda_graph_config=None,
+        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.1))
 
     assert worker.register_kv_caches.call_count == 1
 
@@ -126,17 +130,17 @@ def test_llm_api_connector_simple(connector):
 
 
 @pytest.mark.threadleak(enabled=False)
-def test_llm_api_connector_async_onboard(connector):
-    connector_config, scheduler, worker = connector
-
+def test_llm_api_connector_async_onboard(model_with_connector):
     NUM_TOKENS = 8
 
-    model = LLM(model="Qwen/Qwen2-0.5B",
-                backend="pytorch",
-                disable_overlap_scheduler=True,
-                connector_config=connector_config,
-                cuda_graph_config=None,
-                kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.1))
+    model_fn, scheduler, worker = model_with_connector
+
+    model = model_fn(
+        model="Qwen/Qwen2-0.5B",
+        backend="pytorch",
+        disable_overlap_scheduler=True,
+        cuda_graph_config=None,
+        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.1))
 
     assert worker.register_kv_caches.call_count == 1
 
@@ -157,17 +161,17 @@ def test_llm_api_connector_async_onboard(connector):
 
 
 @pytest.mark.threadleak(enabled=False)
-def test_llm_api_connector_async_save(connector):
-    connector_config, scheduler, worker = connector
-
+def test_llm_api_connector_async_save(model_with_connector):
     NUM_TOKENS = 8
 
-    model = LLM(model="Qwen/Qwen2-0.5B",
-                backend="pytorch",
-                disable_overlap_scheduler=True,
-                connector_config=connector_config,
-                cuda_graph_config=None,
-                kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.1))
+    model_fn, scheduler, worker = model_with_connector
+
+    model = model_fn(
+        model="Qwen/Qwen2-0.5B",
+        backend="pytorch",
+        disable_overlap_scheduler=True,
+        cuda_graph_config=None,
+        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.1))
 
     assert worker.register_kv_caches.call_count == 1
 
@@ -195,3 +199,48 @@ def test_llm_api_connector_async_save(connector):
             assert len(args[0]) == 1
             assert args[0][0] == scheduler.request_finished.call_args.args[
                 0].request_id
+
+
+@pytest.mark.threadleak(enabled=False)
+def test_llm_api_scheduler_output(model_with_connector):
+    NUM_INPUT_TOKENS = 48
+    NUM_TOKENS = 32
+    BLOCK_SIZE = 32
+
+    model_fn, scheduler, worker = model_with_connector
+
+    model = model_fn(
+        model="Qwen/Qwen2-0.5B",
+        backend="pytorch",
+        disable_overlap_scheduler=True,
+        cuda_graph_config=None,
+        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.1))
+
+    assert worker.register_kv_caches.call_count == 1
+
+    scheduler.get_num_new_matched_tokens.return_value = 0, False
+
+    worker.get_finished.return_value = [], []
+
+    sampling_params = SamplingParams(max_tokens=32, ignore_eos=True)
+
+    model.generate([0] * NUM_INPUT_TOKENS, sampling_params)
+
+    assert scheduler.build_connector_meta.call_count == NUM_TOKENS
+
+    for i, call in enumerate(scheduler.build_connector_meta.call_args_list):
+        sched_output = call.args[0]
+
+        assert len(sched_output.requests) == 1
+        request = sched_output.requests[0]
+        if i == 0:
+            assert len(request.new_tokens) == NUM_INPUT_TOKENS
+            assert len(request.new_block_ids) == math.ceil(NUM_INPUT_TOKENS /
+                                                           BLOCK_SIZE)
+        else:
+            assert len(request.new_tokens) == 1
+
+            if request.computed_position % BLOCK_SIZE == 0:
+                assert len(request.new_block_ids) == 1
+            else:
+                assert request.new_block_ids == []
