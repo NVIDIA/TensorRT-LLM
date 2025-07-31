@@ -25,7 +25,7 @@ To run unit tests, run `./unitTests`. There are a few runtime options that can b
 - XQA_USE_QGMMA: On Hopper, we try to use TMA+QGMMA kernel (mha_sm90.cu) by default if possible. To force using mha.cu, set this to 0.
 - XQA_NB_SUB_SEQ: The number of CUDA thread blocks used to handle one K/V head. We have reasonable default but if you want to change it manually, use this variable.
 
-## Support for VLLM Paged KV-Cache:
+## Support for VLLM Paged KV-Cache
 When `PAGED_KV_CACHE_LAYOUT=1` is enabled, XQA supports VLLM-style KV pool input with split-wise KV-pool and sequence-first memory layout.
 To build and test with this feature enabled, run the following commands:
 
