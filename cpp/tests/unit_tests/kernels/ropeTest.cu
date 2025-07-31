@@ -715,7 +715,7 @@ protected:
         preprocessingParams.cu_kv_seq_lens = nullptr; // Only used by cross attention.
         preprocessingParams.rotary_embedding_inv_freq = rotary_inv_freq_buf;
         preprocessingParams.rotary_coef_cache_buffer = rotary_cos_sin;
-        preprocessingParams.kvScaleOrigQuant = kv_scale_orig_quant;
+        preprocessingParams.kv_scale_orig_quant = kv_scale_orig_quant;
         preprocessingParams.kv_cache_scale_factors = kv_cache_scale_factors;
         preprocessingParams.spec_decoding_position_offsets = nullptr; // Cast to int* if necessary
         preprocessingParams.batch_size = batch_size;

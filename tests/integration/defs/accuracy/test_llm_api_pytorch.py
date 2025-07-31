@@ -130,8 +130,8 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     @skip_pre_ada
     @parametrize_with_ids("torch_compile", [False, True])
     @parametrize_with_ids("attn_backend", ["TRTLLM", "FLASHINFER"])
-    @parametrize_with_ids("fp8kv", [False, True])
-    def test_fp8(self, fp8kv, attn_backend, torch_compile):
+    @parametrize_with_ids("kv_cache_dtype", ["auto", "fp8", "nvfp4"])
+    def test_fp8(self, kv_cache_dtype, attn_backend, torch_compile):
         torch_compile_config = TorchCompileConfig(
             enable_fullgraph=True) if torch_compile else None
         pytorch_config = dict(
@@ -141,12 +141,18 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             attn_backend=attn_backend,
             disable_overlap_scheduler=torch_compile,
         )
-        if fp8kv:
+        if kv_cache_dtype == "fp8":
             pytorch_config["kv_cache_config"] = KvCacheConfig(dtype="fp8")
+        elif kv_cache_dtype == "nvfp4":
+            pytorch_config["kv_cache_config"] = KvCacheConfig(dtype="nvfp4")
         with LLM(
                 f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct-FP8",
                 **pytorch_config) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
+            if kv_cache_dtype == "nvfp4":
+                # This test reuses FP8 KV checkpoint for testing, need to manually change the KV cache dtype.
+                # It can be removed when NVFP4 KV checkpoint is available in the model repository.
+                llm.args.quant_config.kv_cache_quant_algo = QuantAlgo.NVFP4
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 

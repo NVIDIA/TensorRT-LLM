@@ -534,6 +534,8 @@ TEST_F(KVCacheManagerTest, FP4BlockScaleManagementTest)
     auto constexpr maxNumSequences = 8;
     auto constexpr blocksInPrimaryPool = 16;
     auto constexpr blocksInSecondaryPool = 16;
+    auto constexpr numFp4EltsPerContainer = 2;
+    auto constexpr vectorSize = 16;
     auto constexpr onboardBlocks = true;
     auto const stream = std::make_shared<tr::CudaStream>();
     auto constexpr beamWidth = 1;
@@ -555,7 +557,9 @@ TEST_F(KVCacheManagerTest, FP4BlockScaleManagementTest)
 
     auto const& blockManager = kvCacheManager.getBlockManager();
     EXPECT_TRUE(blockManager.containsBlockScales(1));
-    EXPECT_EQ(blockManager.getBlockSize(0) / 16, blockManager.getBlockSize(1));
+    // Block size of pool 0 reflects the number of container elements. It is number of FP4 elements / 2.
+    // The expected block size of pool 1 should be the number of FP4 elements / vectorSize.
+    EXPECT_EQ(blockManager.getBlockSize(0) * numFp4EltsPerContainer / vectorSize, blockManager.getBlockSize(1));
 }
 #endif
 
