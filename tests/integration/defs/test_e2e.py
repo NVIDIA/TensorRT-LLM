@@ -1628,6 +1628,8 @@ def test_ptp_quickstart_advanced(llm_root, llm_venv, model_name, model_path):
             ]
             if "Qwen3" in model_name:
                 cmds.append(f"--kv_cache_fraction=0.6")
+            if "Llama3.1-70B" in model_name:
+                cmds.append(f"--max_num_tokens=1024")
             llm_venv.run_cmd(cmds, stdout=running_log)
             if model_name in mapping:
                 _check_mem_usage(running_log, [mapping[model_name], 0, 0, 0])
@@ -2232,15 +2234,15 @@ def test_ptp_quickstart_multimodal_phi4mm(llm_root, llm_venv, modality):
     }
     expected_keywords = {
         "image": [
-            ["clear", "sunny", "sky", "image", "object"],
-            ["road", "car", "lane", "strip", "bus"],
+            ["image", "depicts", "mountain", "half", "rock"],
+            ["road", "car", "lane", "traffic", "bus"],
         ],
         "audio": [
             ["what", "is", "the", "traffic", "sign", "in", "image"],
             ["what", "is", "shown", "in", "this", "image"],
         ],
         "image_audio": [
-            ["Half", "Dome", "Park", "natural", "image"],
+            ["image", "depicts", "Grand", "rock", "scene"],
         ],
     }
 
@@ -2254,6 +2256,8 @@ def test_ptp_quickstart_multimodal_phi4mm(llm_root, llm_venv, modality):
         *accuracy_inputs[modality]["prompt"],
         "--media",
         *accuracy_inputs[modality]["media"],
+        # Set max_seq_len to 4096 to use short rope factor.
+        "--max_seq_len=4096",
         "--load_lora",
         "--auto_model_name",
         "Phi4MMForCausalLM",

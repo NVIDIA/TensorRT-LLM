@@ -31,7 +31,7 @@ from ..inputs import (PromptInputs, create_input_processor,
 from ..logger import logger
 from ..sampling_params import SamplingParams
 from .llm_args import (TORCH_LLMARGS_EXPLICIT_DOCSTRING,
-                       TRT_LLMARGS_EXPLICIT_DOCSTRING, NGramDecodingConfig,
+                       TRT_LLMARGS_EXPLICIT_DOCSTRING, NGramDecodingConfig, PeftCacheConfig,
                        PybindMirror, TorchLlmArgs, TrtLlmArgs)
 from .llm_utils import (CachedModelLoader, KvCacheRetentionConfig,
                         LlmBuildStats, ModelLoader, _ModelRuntimeContext)
@@ -815,19 +815,35 @@ class _TrtLLM(BaseLLM):
         if self.args.peft_cache_config is not None:
             self._executor_config.peft_cache_config = PybindMirror.maybe_to_pybind(
                 self.args.peft_cache_config)
-        elif self.args.build_config.plugin_config.lora_plugin:
+
+        lora_config = None
+        if self.args.build_config.plugin_config.lora_plugin:
             engine_config = EngineConfig.from_json_file(self._engine_dir /
                                                         "config.json")
             lora_config = engine_config.build_config.lora_config
+            if self.args.lora_config is not None:
+                logger.info(
+                    "Overriding lora_config from engine with lora_config from LLM args"
+                )
+                lora_config = self.args.lora_config
+
             max_lora_rank = lora_config.max_lora_rank
             num_lora_modules = engine_config.pretrained_config.num_hidden_layers * \
                 len(lora_config.lora_target_modules + lora_config.missing_qkv_modules)
-            self._executor_config.peft_cache_config = tllm.PeftCacheConfig(
-                num_device_module_layer=max_lora_rank * num_lora_modules *
-                self.args.max_loras,
-                num_host_module_layer=max_lora_rank * num_lora_modules *
-                self.args.max_cpu_loras,
+
+            peft_cache_config_model = PeftCacheConfig.from_pybind(
+                self._executor_config.peft_cache_config
+            ) if self._executor_config.peft_cache_config is not None else PeftCacheConfig(
             )
+            if lora_config.max_loras is not None:
+                peft_cache_config_model.num_device_module_layer = \
+                    max_lora_rank * num_lora_modules * lora_config.max_loras
+            if lora_config.max_cpu_loras is not None:
+                peft_cache_config_model.num_host_module_layer = \
+                    max_lora_rank * num_lora_modules * lora_config.max_cpu_loras
+            self._executor_config.peft_cache_config = peft_cache_config_model._to_pybind(
+            )
+
         if self.args.decoding_config is not None:
             self._executor_config.decoding_config = self.args.decoding_config
         if self.args.guided_decoding_backend == 'xgrammar':
@@ -868,7 +884,7 @@ class _TrtLLM(BaseLLM):
                 postprocess_tokenizer_dir=self.args.postprocess_tokenizer_dir,
             ),
             is_llm_executor=True,
-            lora_config=self.args.lora_config)
+            lora_config=lora_config)
 
 
 @append_docstring(TORCH_LLM_DOCSTRING)
