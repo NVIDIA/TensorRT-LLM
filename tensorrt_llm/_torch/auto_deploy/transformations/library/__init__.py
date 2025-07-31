@@ -1,6 +1,5 @@
 """A library of transformation passes."""
 
-from .attention import *
 from .collectives import *
 from .eliminate_redundant_transposes import *
 from .fused_moe import *

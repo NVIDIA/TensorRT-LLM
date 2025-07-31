@@ -12,19 +12,15 @@ from torch.fx import GraphModule
 from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.models.llama.modeling_llama import LlamaModel
 
+from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import AttentionDescriptor
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
+from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.transformations._graph import move_to_device
-from tensorrt_llm._torch.auto_deploy.transformations.library import (
-    match_attention_layout,
-    match_eager_attention,
-    match_grouped_attention,
-    match_repeat_kv,
-)
 
 torch.manual_seed(0)
 
 
-class MockAttentionDescriptor:
+class MockAttentionDescriptor(AttentionDescriptor):
     """A mock class that mimics the AttentionDescriptor interface for testing."""
 
     layout: str = "bsnd"
@@ -49,10 +45,24 @@ class HFWrapper(nn.Module):
 
 
 def _joint_transform(gm: GraphModule) -> None:
-    match_repeat_kv(gm)
-    match_eager_attention(gm)
-    match_grouped_attention(gm)
-    match_attention_layout(gm, MockAttentionDescriptor())
+    gm = InferenceOptimizer(
+        None,
+        {
+            "match_repeat_kv": {
+                "stage": "pattern_matcher",
+            },
+            "match_eager_attention": {
+                "stage": "pattern_matcher",
+            },
+            "match_grouped_attention": {
+                "stage": "pattern_matcher",
+            },
+            "match_attention_layout": {
+                "stage": "pattern_matcher",
+                "attention_op": MockAttentionDescriptor,
+            },
+        },
+    )(None, gm)
 
 
 @pytest.mark.parametrize(
