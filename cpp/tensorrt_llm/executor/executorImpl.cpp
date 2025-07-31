@@ -1621,9 +1621,6 @@ std::tuple<Executor::Impl::RequestList, double> Executor::Impl::fetchNewRequests
                     TLLM_CHECK_WITH_INFO(mModel->hasGuidedDecoder(),
                         "Request is specified with GuidedDecodingParams, but GuidedDecoder is not setup. Please "
                         "provide a valid GuidedDecodingConfig to setup GuidedDecoder.");
-                    TLLM_CHECK_WITH_INFO(newReq->getGuidedDecodingParams()->getGuideType()
-                            != executor::GuidedDecodingParams::GuideType::kSTRUCTURAL_TAG,
-                        "Structural tag is not supported for guided decoding in C++ Executor.");
                 }
 
                 if (mModel->getWorldConfig().isLastPipelineParallelRank() && newReq->hasAdditionalOutputs())

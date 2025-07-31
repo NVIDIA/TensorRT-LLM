@@ -3,12 +3,13 @@ import functools
 import json
 import math
 import os
+import types
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum, EnumMeta
 from pathlib import Path
 from typing import (TYPE_CHECKING, Any, ClassVar, Dict, List, Literal, Optional,
-                    TypeAlias, Union)
+                    Type, TypeAlias, TypeVar, Union, get_args, get_origin)
 
 import torch
 import yaml
@@ -29,8 +30,7 @@ if TYPE_CHECKING:
 
 # yapf: disable
 # isort: off
-from ..bindings.executor import (
-                                 BatchingType as _BatchingType,
+from ..bindings.executor import (BatchingType as _BatchingType,
                                  CacheTransceiverBackendType as _CacheTransceiverBackendType,
                                  CacheTransceiverConfig as _CacheTransceiverConfig,
                                  CapacitySchedulerPolicy as _CapacitySchedulerPolicy,
@@ -60,6 +60,8 @@ from .tokenizer import TokenizerBase, tokenizer_factory
 from .utils import generate_api_docs_as_docstring, get_type_repr
 
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
+
+TypeBaseModel = TypeVar("T", bound=BaseModel)
 
 
 def Field(default: Any = ...,
@@ -92,7 +94,16 @@ def Field(default: Any = ...,
     return PydanticField(default, **kwargs)
 
 
-class CudaGraphConfig(BaseModel):
+class StrictBaseModel(BaseModel):
+    """
+    A base model that forbids arbitrary fields.
+    """
+
+    class Config:
+        extra = "forbid"  # globally forbid arbitrary fields
+
+
+class CudaGraphConfig(StrictBaseModel):
     """
     Configuration for CUDA graphs.
     """
@@ -119,8 +130,40 @@ class CudaGraphConfig(BaseModel):
                 "cuda_graph_config.max_batch_size must be non-negative")
         return v
 
+    @staticmethod
+    def _generate_cuda_graph_batch_sizes(max_batch_size: int,
+                                         enable_padding: bool) -> List[int]:
+        """Generate a list of batch sizes for CUDA graphs.
 
-class MoeConfig(BaseModel):
+        Args:
+            max_batch_size: Maximum batch size to generate up to
+            enable_padding: Whether padding is enabled, which affects the batch size distribution
+
+        Returns:
+            List of batch sizes to create CUDA graphs for
+        """
+        if enable_padding:
+            batch_sizes = [1, 2, 4] + [i * 8 for i in range(1, 17)]
+        else:
+            batch_sizes = list(range(1, 32)) + [32, 64, 128]
+
+        # Add powers of 2 up to max_batch_size
+        batch_sizes += [
+            2**i for i in range(8, math.floor(math.log(max_batch_size, 2)))
+        ]
+
+        # Filter and sort batch sizes
+        batch_sizes = sorted(
+            [size for size in batch_sizes if size <= max_batch_size])
+
+        # Add max_batch_size if not already included
+        if max_batch_size != batch_sizes[-1]:
+            batch_sizes.append(max_batch_size)
+
+        return batch_sizes
+
+
+class MoeConfig(StrictBaseModel):
     """
     Configuration for MoE.
     """
@@ -225,7 +268,7 @@ class _ParallelConfig:
                        auto_parallel=self.auto_parallel)
 
 
-class CalibConfig(BaseModel):
+class CalibConfig(StrictBaseModel):
     """
     Calibration configuration.
     """
@@ -277,7 +320,7 @@ class _ModelFormatKind(Enum):
     TLLM_ENGINE = 2
 
 
-class DecodingBaseConfig(BaseModel):
+class DecodingBaseConfig(StrictBaseModel):
     max_draft_len: Optional[int] = None
     speculative_model_dir: Optional[Union[str, Path]] = None
 
@@ -298,6 +341,7 @@ class DecodingBaseConfig(BaseModel):
         config_class = config_classes.get(decoding_type)
         if config_class is None:
             raise ValueError(f"Invalid decoding type: {decoding_type}")
+        data.pop("decoding_type")
 
         return config_class(**data)
 
@@ -496,7 +540,7 @@ class PybindMirror(ABC):
         """
 
         def decorator(cls):
-            assert issubclass(cls, BaseModel)
+            assert issubclass(cls, StrictBaseModel)
             # Get all non-private fields from the C++ class
             cpp_fields = PybindMirror.get_pybind_variable_fields(pybind_class)
             python_fields = set(cls.model_fields.keys())
@@ -556,6 +600,62 @@ class PybindMirror(ABC):
                 return False
         return True
 
+    @classmethod
+    def from_pybind(cls: Type[TypeBaseModel],
+                    pybind_instance: "PybindMirror") -> TypeBaseModel:
+        """Construct an instance of the given class from the fields in the given
+        pybind class instance.
+
+        Args:
+            cls: Type of the class to construct, must be a subclass of pydantic
+                 BaseModel
+            pybind_instance: Instance of the pybind class to construct from its
+                             fields
+
+        Notes:
+            When a field value is None in the pybind class, but it's not
+            optional and has a default value in the BaseModel class, it would
+            get the default value defined in the BaseModel class.
+
+        Returns:
+            Instance of the given class, populated with the fields of the given
+            pybind instance
+        """  # noqa: D205
+        assert issubclass(cls, BaseModel)
+
+        # Some of the fields are optional in the C++ class but in python they aren't
+        # optional and have a default value, so copy the value from C++ instance
+        # only if it has a value, so otherwise the default value defined in the
+        # python class would be set.
+        def _is_optional_type(annotation: Any) -> bool:
+            """Returns True if a type annotation represents an Optional type
+            (Optional[X]) or a Union type that includes None (Union[X, Y, None]
+            or X | Y | None).
+            """  # noqa: D205
+            origin = get_origin(annotation)
+            args = get_args(annotation)
+
+            # Union is for Optional[x]
+            # UnionType is for the new | operation in Python 3.10+
+            return (origin is Union
+                    or origin is types.UnionType) and type(None) in args
+
+        fields_non_optional_with_default_value_in_basemodel = {
+            field_name
+            for field_name, field_info in cls.model_fields.items()
+            if not (_is_optional_type(field_info.annotation)
+                    and field_info.is_required())
+        }
+
+        kwargs = {}
+        cpp_fields = PybindMirror.get_pybind_variable_fields(
+            type(pybind_instance))
+        for field_name in cpp_fields:
+            field_value = getattr(pybind_instance, field_name)
+            if field_value is not None or field_name not in fields_non_optional_with_default_value_in_basemodel:
+                kwargs[field_name] = field_value
+        return cls(**kwargs)
+
 
 class PybindMirrorMeta(type(PybindMirror)):
     pass
@@ -597,7 +697,7 @@ class ContextChunkingPolicy(StrEnum, metaclass=PybindMirrorEnumMeta):
 
 
 @PybindMirror.mirror_pybind_fields(_DynamicBatchConfig)
-class DynamicBatchConfig(BaseModel, PybindMirror):
+class DynamicBatchConfig(StrictBaseModel, PybindMirror):
     """Dynamic batch configuration.
 
     Controls how batch size and token limits are dynamically adjusted at runtime.
@@ -623,7 +723,7 @@ class DynamicBatchConfig(BaseModel, PybindMirror):
 
 
 @PybindMirror.mirror_pybind_fields(_SchedulerConfig)
-class SchedulerConfig(BaseModel, PybindMirror):
+class SchedulerConfig(StrictBaseModel, PybindMirror):
     capacity_scheduler_policy: CapacitySchedulerPolicy = Field(
         default=CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
         description="The capacity scheduler policy to use")
@@ -645,7 +745,7 @@ class SchedulerConfig(BaseModel, PybindMirror):
 
 
 @PybindMirror.mirror_pybind_fields(_PeftCacheConfig)
-class PeftCacheConfig(BaseModel, PybindMirror):
+class PeftCacheConfig(StrictBaseModel, PybindMirror):
     """
     Configuration for the PEFT cache.
     """
@@ -653,11 +753,12 @@ class PeftCacheConfig(BaseModel, PybindMirror):
         default=0,
         description=
         "number of max sized 1-layer 1-module adapterSize=1 sets of weights that can be stored in host cache"
-    )
+        ", affects host cache size and overrides value of host_cache_size")
     num_device_module_layer: int = Field(
         default=0,
         description=
-        "number of max sized 1-layer 1-module sets of weights that can be stored in host cache"
+        "number of max sized 1-layer 1-module sets of weights that can be stored in device cache"
+        ", affects device cache size and overrides value of device_cache_percent"
     )
     optimal_adapter_size: int = Field(
         default=
@@ -684,15 +785,17 @@ class PeftCacheConfig(BaseModel, PybindMirror):
     max_pages_per_block_device: int = Field(
         default=8,
         description="Number of cache pages per allocation block (device)")
-    device_cache_percent: Optional[float] = Field(
-        default=None,
-        description="percent of memory after engine load to use for cache")
-    host_cache_size: Optional[int] = Field(
-        default=None, description="size in bytes to use for host cache")
+    device_cache_percent: float = Field(
+        default=0.02,
+        description=
+        "Proportion of free device memory after engine load to use for cache, as a fraction from 0 to 1"
+    )
+    host_cache_size: int = Field(
+        default=1024**3, description="size in bytes to use for host cache")
     lora_prefetch_dir: Optional[str] = Field(
         default=None,
         description=
-        "folder to store the LoRA weights we hope to load during engine initialization"
+        "folder to store the LoRA weights we hope to load during engine initialization, currently not supported"
     )
 
     def _to_pybind(self):
@@ -773,7 +876,7 @@ SpeculativeConfig: TypeAlias = Optional[Union[
 
 
 @PybindMirror.mirror_pybind_fields(_KvCacheConfig)
-class KvCacheConfig(BaseModel, PybindMirror):
+class KvCacheConfig(StrictBaseModel, PybindMirror):
     """
     Configuration for the KV cache.
     """
@@ -856,7 +959,7 @@ class KvCacheConfig(BaseModel, PybindMirror):
 
 
 @PybindMirror.mirror_pybind_fields(_ExtendedRuntimePerfKnobConfig)
-class ExtendedRuntimePerfKnobConfig(BaseModel, PybindMirror):
+class ExtendedRuntimePerfKnobConfig(StrictBaseModel, PybindMirror):
     """
     Configuration for extended runtime performance knobs.
     """
@@ -887,7 +990,7 @@ class ExtendedRuntimePerfKnobConfig(BaseModel, PybindMirror):
 
 
 @PybindMirror.mirror_pybind_fields(_CacheTransceiverConfig)
-class CacheTransceiverConfig(BaseModel, PybindMirror):
+class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
     """
     Configuration for the cache transceiver.
     """
@@ -947,7 +1050,7 @@ class _ModelWrapper:
         return self.model if isinstance(self.model, str) else None
 
 
-class BaseLlmArgs(BaseModel):
+class BaseLlmArgs(StrictBaseModel):
     """
     Base class for both TorchLlmArgs and TrtLlmArgs. It contains all the arguments that are common to both.
     """
@@ -1041,27 +1144,6 @@ class BaseLlmArgs(BaseModel):
 
     # LoRA arguments
     enable_lora: bool = Field(default=False, description="Enable LoRA.")
-
-    max_lora_rank: Optional[int] = Field(
-        default=None,
-        description="The maximum LoRA rank.",
-        deprecated="Use lora_config.max_lora_rank instead.",
-        status="deprecated",
-    )
-
-    max_loras: int = Field(
-        default=4,
-        description="The maximum number of LoRA.",
-        deprecated="Use lora_config.max_loras instead.",
-        status="deprecated",
-    )
-
-    max_cpu_loras: int = Field(
-        default=4,
-        description="The maximum number of LoRA on CPU.",
-        deprecated="Use lora_config.max_cpu_loras instead.",
-        status="deprecated",
-    )
 
     lora_config: Optional[LoraConfig] = Field(
         default=None, description="LoRA configuration for the model.")
@@ -1354,7 +1436,8 @@ class BaseLlmArgs(BaseModel):
         """
         Creating a default BuildConfig if none is provided
         """
-        if self.build_config is None:
+        build_config = getattr(self, "build_config", None)
+        if build_config is None:
             kwargs = {}
             if self.max_batch_size:
                 kwargs["max_batch_size"] = self.max_batch_size
@@ -1367,10 +1450,10 @@ class BaseLlmArgs(BaseModel):
             if self.max_input_len:
                 kwargs["max_input_len"] = self.max_input_len
             self.build_config = BuildConfig(**kwargs)
-
-        assert isinstance(
-            self.build_config, BuildConfig
-        ), f"build_config is not initialized: {self.build_config}"
+        else:
+            assert isinstance(
+                build_config,
+                BuildConfig), f"build_config is not initialized: {build_config}"
         return self
 
     @model_validator(mode="after")
@@ -1452,10 +1535,10 @@ class BaseLlmArgs(BaseModel):
         if self.parallel_config._world_size == 1 and self.build_config:
             self.build_config.plugin_config.nccl_plugin = None
 
-        if self.enable_lora and self.lora_config is None and self.backend != 'pytorch':
+        if self.enable_lora and self.backend != 'pytorch':
             self.build_config.plugin_config.lora_plugin = 'auto'
-            if self.max_lora_rank is not None:
-                self.build_config.lora_config.max_lora_rank = self.max_lora_rank
+            if self.lora_config is not None:
+                self.build_config.lora_config.max_lora_rank = self.lora_config.max_lora_rank
 
         if hasattr(self,
                    'enable_prompt_adapter') and self.enable_prompt_adapter:
@@ -1559,16 +1642,6 @@ class BaseLlmArgs(BaseModel):
     @model_validator(mode="after")
     def validate_lora_config_consistency(self):
         if self.lora_config:
-            if self.max_lora_rank is not None:
-                logger.warning(
-                    "max_lora_rank is ignored when lora_config is provided.")
-            if self.max_loras != self.lora_config.max_loras:
-                logger.warning(
-                    "max_loras is ignored when lora_config is provided.")
-            if self.max_cpu_loras != self.lora_config.max_cpu_loras:
-                logger.warning(
-                    "max_cpu_loras is ignored when lora_config is provided.")
-
             if len(self.lora_config.lora_dir) == 0:
                 # TODO [TRTLLM-5173]
                 logger.warning(
@@ -1593,6 +1666,14 @@ class BaseLlmArgs(BaseModel):
                 )
                 self.lora_config.lora_target_modules = list(
                     default_trtllm_modules_to_hf_modules.keys())
+        return self
+
+    @model_validator(mode="after")
+    def validate_peft_cache_config(self):
+        if self.peft_cache_config is not None and self.peft_cache_config.lora_prefetch_dir is not None:
+            raise ValueError(
+                f"lora_prefetch_dir was set to '{self.peft_cache_config.lora_prefetch_dir}' "
+                "while LoRA prefetch is not supported")
         return self
 
     def _update_plugin_config(self, key: str, value: Any):
@@ -1813,7 +1894,7 @@ class LoadFormat(Enum):
     DUMMY = 1
 
 
-class TorchCompileConfig(BaseModel):
+class TorchCompileConfig(StrictBaseModel):
     """
     Configuration for torch.compile.
     """
@@ -2049,38 +2130,6 @@ class TorchLlmArgs(BaseLlmArgs):
 
         return self
 
-    @staticmethod
-    def _generate_cuda_graph_batch_sizes(max_batch_size: int,
-                                         enable_padding: bool) -> List[int]:
-        """Generate a list of batch sizes for CUDA graphs.
-
-        Args:
-            max_batch_size: Maximum batch size to generate up to
-            enable_padding: Whether padding is enabled, which affects the batch size distribution
-
-        Returns:
-            List of batch sizes to create CUDA graphs for
-        """
-        if enable_padding:
-            batch_sizes = [1, 2, 4] + [i * 8 for i in range(1, 17)]
-        else:
-            batch_sizes = list(range(1, 32)) + [32, 64, 128]
-
-        # Add powers of 2 up to max_batch_size
-        batch_sizes += [
-            2**i for i in range(8, math.floor(math.log(max_batch_size, 2)))
-        ]
-
-        # Filter and sort batch sizes
-        batch_sizes = sorted(
-            [size for size in batch_sizes if size <= max_batch_size])
-
-        # Add max_batch_size if not already included
-        if max_batch_size != batch_sizes[-1]:
-            batch_sizes.append(max_batch_size)
-
-        return batch_sizes
-
     @model_validator(mode="after")
     def validate_load_balancer(self) -> 'TorchLlmArgs':
         from .._torch import MoeLoadBalancerConfig
@@ -2117,7 +2166,7 @@ class TorchLlmArgs(BaseLlmArgs):
         if config.batch_sizes:
             config.batch_sizes = sorted(config.batch_sizes)
             if config.max_batch_size != 0:
-                if config.batch_sizes != self._generate_cuda_graph_batch_sizes(
+                if config.batch_sizes != CudaGraphConfig._generate_cuda_graph_batch_sizes(
                         config.max_batch_size, config.enable_padding):
                     raise ValueError(
                         "Please don't set both cuda_graph_config.batch_sizes "
@@ -2129,7 +2178,7 @@ class TorchLlmArgs(BaseLlmArgs):
                 config.max_batch_size = max(config.batch_sizes)
         else:
             max_batch_size = config.max_batch_size or 128
-            generated_sizes = self._generate_cuda_graph_batch_sizes(
+            generated_sizes = CudaGraphConfig._generate_cuda_graph_batch_sizes(
                 max_batch_size, config.enable_padding)
             config.batch_sizes = generated_sizes
             config.max_batch_size = max_batch_size

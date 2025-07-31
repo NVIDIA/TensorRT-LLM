@@ -269,12 +269,24 @@ private:
 class KvCacheMeasureHelper
 {
 public:
+    struct Measure
+    {
+        double delay;     // from last token (ctx) or arrival time (gen), in ms
+        double duration;  // in ms
+        double bandwidth; // in Gbps
+    };
+
     KvCacheMeasureHelper(std::string output_path)
         : mOutputPath(std::move(output_path))
     {
     }
 
-    void appendKVCacheTransfer(LlmRequest::RequestIdType requestId, double duration, size_t size)
+    void markAsSender(bool isSender)
+    {
+        mIsSender = isSender;
+    }
+
+    void appendKVCacheTransfer(LlmRequest::RequestIdType requestId, double delay, double duration, size_t size)
     {
         auto bandwidth = size * 8 / (duration / 1000) / 1e9;
         if (mOutputPath.empty())
@@ -283,15 +295,17 @@ public:
         }
 
         std::lock_guard<std::mutex> lock(mMutex);
-        mRequestKVCacheTranfserMeasure[requestId].emplace_back(duration, bandwidth);
+        mRequestKVCacheTranfserMeasure[requestId].emplace_back(Measure{delay, duration, bandwidth});
     }
 
     ~KvCacheMeasureHelper()
     {
         if (!mRequestKVCacheTranfserMeasure.empty() && !mOutputPath.empty())
         {
+            TLLM_CHECK(mIsSender.has_value());
             auto rank = mpi::MpiComm::world().getRank();
-            std::string outFilePath = mOutputPath + "rank_" + std::to_string(rank) + ".txt";
+            std::string outFilePath
+                = mOutputPath + "rank_" + std::to_string(rank) + "_" + (mIsSender.value() ? "send" : "recv") + ".csv";
             std::ofstream outFile(outFilePath);
 
             TLLM_CHECK_WITH_INFO(outFile.is_open(), "Cannot write to file " + outFilePath);
@@ -301,7 +315,7 @@ public:
             outFile << "RequestID";
             for (size_t i = 0; i < numTransferMeasure; i++)
             {
-                outFile << ",TimeDuration,Bandwidth";
+                outFile << ",Delay(ms),Duration(ms),Bandwidth(Gbps)";
             }
             outFile << '\n';
 
@@ -309,9 +323,9 @@ public:
             {
                 outFile << requestID;
 
-                for (auto const& [time, bandwidth] : measures)
+                for (auto const& measure : measures)
                 {
-                    outFile << "," << time << "," << bandwidth;
+                    outFile << "," << measure.delay << "," << measure.duration << "," << measure.bandwidth;
                 }
                 outFile << '\n';
             }
@@ -321,9 +335,10 @@ public:
     }
 
 private:
-    std::map<LlmRequest::RequestIdType, std::vector<std::pair<double, double>>> mRequestKVCacheTranfserMeasure;
+    std::map<LlmRequest::RequestIdType, std::vector<Measure>> mRequestKVCacheTranfserMeasure;
     std::string mOutputPath;
     std::mutex mMutex;
+    std::optional<bool> mIsSender;
 };
 
 } // namespace tensorrt_llm::batch_manager
