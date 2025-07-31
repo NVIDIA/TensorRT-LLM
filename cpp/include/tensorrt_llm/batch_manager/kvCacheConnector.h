@@ -26,6 +26,8 @@
 using SizeType32 = tensorrt_llm::runtime::SizeType32;
 using RequestIdType = tensorrt_llm::batch_manager::LlmRequest::RequestIdType;
 
+/// See tensorrt_llm/_torch/pyexecutor/connector.py for details on the Connector API.
+
 namespace tensorrt_llm::batch_manager::kv_connector
 {
 

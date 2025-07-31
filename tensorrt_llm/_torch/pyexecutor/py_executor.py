@@ -986,7 +986,7 @@ class PyExecutor:
                     if self.kv_connector_manager:
                         self.kv_connector_manager.take_scheduled_requests_pending_load(
                             scheduled_batch)
-                        self.kv_connector_manager.build_connector_meta()
+                        self.kv_connector_manager.handle_metadata()
                         self.kv_connector_manager.worker.start_load_kv()
 
                 if scheduled_batch.batch_size > 0 or (
