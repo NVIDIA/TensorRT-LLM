@@ -19,6 +19,7 @@ TensorRT-LLM optimizes the performance of a range of well-known models on NVIDIA
 | `LlavaNextForConditionalGeneration` | LLaVA-NeXT | `llava-hf/llava-v1.6-mistral-7b-hf` | L + I |
 | `LlamaForCausalLM` | Llama 3.1, Llama 3, Llama 2, LLaMA | `meta-llama/Meta-Llama-3.1-70B` | L |
 | `Llama4ForConditionalGeneration` | Llama 4 | `meta-llama/Llama-4-Scout-17B-16E-Instruct` | L + I |
+| `MistralForCausalLM` | Bielik | `speakleash/Bielik-11B-v2.2-Instruct` | L |
 | `MistralForCausalLM` | Mistral | `mistralai/Mistral-7B-v0.1` | L |
 | `Mistral3ForConditionalGeneration` | Mistral3 | `mistralai/Mistral-Small-3.1-24B-Instruct-2503` | L + I |
 | `MixtralForCausalLM` | Mixtral | `mistralai/Mixtral-8x7B-v0.1` | L |
