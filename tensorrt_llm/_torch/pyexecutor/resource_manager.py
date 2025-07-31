@@ -155,18 +155,33 @@ class KVCacheManager(BaseResourceManager):
                 (num_kv_heads + tp_size - 1) // tp_size
                 for _ in range(self.num_local_layers)
             ]
+            self.total_num_kv_heads_per_layer = [
+                (num_kv_heads + tp_size - 1) // tp_size
+                for _ in range(self.num_layers)
+            ]
         else:
             assert len(num_kv_heads) == self.num_layers
+
+            def append_to_kv_heads_per_layer(num_kv_heads_per_layer: List[int],
+                                             kv_head: Optional[int]):
+                if kv_head is not None:
+                    num_kv_heads_per_layer.append(
+                        (kv_head + tp_size - 1) // tp_size)
+                else:
+                    num_kv_heads_per_layer.append(0)
 
             self.num_kv_heads_per_layer = []
             if self.num_local_layers > 0:
                 for i in self.pp_layers:
                     kv_head = num_kv_heads[i]
-                    if kv_head is not None:
-                        self.num_kv_heads_per_layer.append(
-                            (kv_head + tp_size - 1) // tp_size)
-                    else:
-                        self.num_kv_heads_per_layer.append(0)
+                    append_to_kv_heads_per_layer(self.num_kv_heads_per_layer,
+                                                 kv_head)
+
+            self.total_num_kv_heads_per_layer = []
+            for i in range(self.num_layers):
+                kv_head = num_kv_heads[i]
+                append_to_kv_heads_per_layer(self.total_num_kv_heads_per_layer,
+                                             kv_head)
 
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim

@@ -187,9 +187,6 @@ class Gemma3VLM(PreTrainedModel):
             multimodal_param.multimodal_data["image"]["pixel_values"]
             for multimodal_param in multimodal_params
         ]
-        assert pixel_values == [] or len(
-            pixel_values
-        ) == num_context_requests, "Number of multimodal features (if provided) should be equal to number of context requests"
 
         mm_embeds = []
         mm_token_mask = None
