@@ -6,6 +6,7 @@ from tensorrt_llm._torch.models.modeling_utils import register_mapper
 
 
 @register_mapper("HF", "Gemma3ForCausalLM")
+@register_mapper("HF", "Gemma3ForConditionalGeneration")
 class Gemma3HfWeightMapper(HfWeightMapper):
 
     def should_skip_module(self, module_name: str) -> bool:

@@ -4,8 +4,10 @@ import pytest
 import torch
 from _graph_test_helpers import run_test
 from torch.export import Dim
+from torch.fx import GraphModule
 from transformers.integrations.sdpa_attention import repeat_kv as hf_repeat_kv
 
+from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.transformations.library.attention import (
     match_attention_layout,
     match_causal_attn_mask,
@@ -416,6 +418,21 @@ class GroupedAttentionModel(torch.nn.Module):
         return {0: Dim("batch_size", max=8), 1: Dim("seq_len", min=4, max=16)}
 
 
+def _get_match_repeat_kv_optimizer() -> Callable:
+    config = {
+        "cleanup_noop_slice": {
+            "stage": "post_export",
+        },
+    }
+
+    def _transform(gm: GraphModule) -> GraphModule:
+        gm = InferenceOptimizer(None, config)(None, gm)
+        match_repeat_kv(gm)
+        return gm
+
+    return _transform
+
+
 @pytest.mark.parametrize("num_heads, num_kv_heads", [(8, 8), (8, 4), (8, 2)])
 @pytest.mark.parametrize(
     "model_cls", [RepeatKVModel, RepeatKVModel2, RepeatKVModel3, HFRepeatKVModel]
@@ -488,7 +505,7 @@ def test_match_repeat_kv(num_heads, num_kv_heads, model_cls):
     _ = run_test(
         model,
         x,
-        match_repeat_kv,
+        _get_match_repeat_kv_optimizer(),
         verify_matcher,
         lambda num_p_og: num_p_og,
         atol=1e-3,

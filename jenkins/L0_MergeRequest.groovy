@@ -105,15 +105,13 @@ def EXTRA_STAGE_LIST = "extra_stage"
 @Field
 def MULTI_GPU_FILE_CHANGED = "multi_gpu_file_changed"
 @Field
-def ONLY_PYTORCH_FILE_CHANGED = "only_pytorch_file_changed"
+def ONLY_ONE_GROUP_CHANGED = "only_one_group_changed"
 @Field
 def AUTO_TRIGGER_TAG_LIST = "auto_trigger_tag_list"
 @Field
 def DEBUG_MODE = "debug"
 @Field
 def DETAILED_LOG = "detailed_log"
-@Field
-def ONLY_DOCS_FILE_CHANGED = "only_docs_file_changed"
 
 def testFilter = [
     (REUSE_STAGE_LIST): trimForStageList(gitlabParamsFromBot.get(REUSE_STAGE_LIST, null)?.tokenize(',')),
@@ -127,11 +125,10 @@ def testFilter = [
     (DISABLE_MULTI_GPU_TEST): gitlabParamsFromBot.get((DISABLE_MULTI_GPU_TEST), false),
     (EXTRA_STAGE_LIST): trimForStageList(gitlabParamsFromBot.get((EXTRA_STAGE_LIST), null)?.tokenize(',')),
     (MULTI_GPU_FILE_CHANGED): false,
-    (ONLY_PYTORCH_FILE_CHANGED): false,
+    (ONLY_ONE_GROUP_CHANGED): "",
     (DEBUG_MODE): gitlabParamsFromBot.get(DEBUG_MODE, false),
     (AUTO_TRIGGER_TAG_LIST): [],
     (DETAILED_LOG): gitlabParamsFromBot.get(DETAILED_LOG, false),
-    (ONLY_DOCS_FILE_CHANGED): false,
 ]
 
 String reuseBuild = gitlabParamsFromBot.get('reuse_build', null)
@@ -142,10 +139,13 @@ def GITHUB_PR_API_URL = "github_pr_api_url"
 def CACHED_CHANGED_FILE_LIST = "cached_changed_file_list"
 @Field
 def ACTION_INFO = "action_info"
+@Field
+def IMAGE_KEY_TO_TAG = "image_key_to_tag"
 def globalVars = [
     (GITHUB_PR_API_URL): gitlabParamsFromBot.get('github_pr_api_url', null),
     (CACHED_CHANGED_FILE_LIST): null,
     (ACTION_INFO): gitlabParamsFromBot.get('action_info', null),
+    (IMAGE_KEY_TO_TAG): [:],
 ]
 
 // If not running all test stages in the L0 pre-merge, we will not update the GitLab status at the end.
@@ -321,9 +321,8 @@ def setupPipelineEnvironment(pipeline, testFilter, globalVars)
         echo "Env.gitlabMergeRequestLastCommit: ${env.gitlabMergeRequestLastCommit}."
         echo "Freeze GitLab commit. Branch: ${env.gitlabBranch}. Commit: ${env.gitlabCommit}."
         testFilter[(MULTI_GPU_FILE_CHANGED)] = getMultiGpuFileChanged(pipeline, testFilter, globalVars)
-        testFilter[(ONLY_PYTORCH_FILE_CHANGED)] = getOnlyPytorchFileChanged(pipeline, testFilter, globalVars)
+        testFilter[(ONLY_ONE_GROUP_CHANGED)] = getOnlyOneGroupChanged(pipeline, testFilter, globalVars)
         testFilter[(AUTO_TRIGGER_TAG_LIST)] = getAutoTriggerTagList(pipeline, testFilter, globalVars)
-        testFilter[(ONLY_DOCS_FILE_CHANGED)] = getOnlyDocsFileChanged(pipeline, testFilter, globalVars)
         getContainerURIs().each { k, v ->
             globalVars[k] = v
         }
@@ -547,66 +546,69 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
     }
 
     def relatedFileList = [
+        "cpp/include/tensorrt_llm/batch_manager/",
+        "cpp/include/tensorrt_llm/executor/",
         "cpp/include/tensorrt_llm/runtime/gptJsonConfig.h",
-        "cpp/include/tensorrt_llm/runtime/worldConfig.h",
         "cpp/include/tensorrt_llm/runtime/utils/mpiUtils.h",
         "cpp/include/tensorrt_llm/runtime/utils/multiDeviceUtils.h",
-        "cpp/tensorrt_llm/runtime/utils/mpiUtils.cpp",
-        "cpp/tests/runtime/mpiUtilsTest.cpp",
-        "cpp/tensorrt_llm/batch_manager/trtGptModelFactory.h",
-        "cpp/tensorrt_llm/runtime/worldConfig.cpp",
-        "cpp/tensorrt_llm/runtime/ncclCommunicator.cpp",
-        "cpp/tensorrt_llm/runtime/workerPool.h",
-        "cpp/tensorrt_llm/executor_worker/executorWorker.cpp",
-        "cpp/tensorrt_llm/runtime/ipcUtils.cpp",
-        "cpp/tensorrt_llm/executor/executor.cpp",
-        "cpp/tensorrt_llm/executor/executorImpl.cpp",
-        "cpp/tensorrt_llm/executor/executorImpl.h",
-        "cpp/tensorrt_llm/runtime/ncclCommunicator.cpp",
+        "cpp/include/tensorrt_llm/runtime/worldConfig.h",
+        "cpp/tensorrt_llm/batch_manager/",
+        "cpp/tensorrt_llm/executor/",
+        "cpp/tensorrt_llm/executor_worker/",
         "cpp/tensorrt_llm/kernels/communicationKernels/",
-        "cpp/tensorrt_llm/thop/allreduceOp.cpp",
-        "cpp/tensorrt_llm/kernels/customAllReduceKernels.h",
         "cpp/tensorrt_llm/kernels/customAllReduceKernels.cu",
-        "cpp/tensorrt_llm/kernels/gptKernels.h",
+        "cpp/tensorrt_llm/kernels/customAllReduceKernels.h",
         "cpp/tensorrt_llm/kernels/gptKernels.cu",
-        "cpp/tensorrt_llm/kernels/unfusedAttentionKernels.h",
-        "cpp/tensorrt_llm/kernels/unfusedAttentionKernels.cu",
-        "cpp/tensorrt_llm/kernels/userbuffers/",
+        "cpp/tensorrt_llm/kernels/gptKernels.h",
         "cpp/tensorrt_llm/kernels/moe",
-        "cpp/tensorrt_llm/pybind/",
-        "cpp/tests/kernels/allReduce/",
-        "cpp/tensorrt_llm/plugins/cpSplitPlugin/cpSplitPlugin.h",
+        "cpp/tensorrt_llm/kernels/unfusedAttentionKernels.cu",
+        "cpp/tensorrt_llm/kernels/unfusedAttentionKernels.h",
+        "cpp/tensorrt_llm/kernels/userbuffers/",
         "cpp/tensorrt_llm/plugins/cpSplitPlugin/cpSplitPlugin.cpp",
-        "cpp/tensorrt_llm/plugins/gptAttentionCommon/gptAttentionCommon.h",
+        "cpp/tensorrt_llm/plugins/cpSplitPlugin/cpSplitPlugin.h",
         "cpp/tensorrt_llm/plugins/gptAttentionCommon/gptAttentionCommon.cpp",
-        "cpp/tensorrt_llm/plugins/gptAttentionPlugin/gptAttentionPlugin.h",
+        "cpp/tensorrt_llm/plugins/gptAttentionCommon/gptAttentionCommon.h",
         "cpp/tensorrt_llm/plugins/gptAttentionPlugin/gptAttentionPlugin.cpp",
-        "cpp/tests/runtime/mpiUtilsTest.cpp",
+        "cpp/tensorrt_llm/plugins/gptAttentionPlugin/gptAttentionPlugin.h",
         "cpp/tensorrt_llm/plugins/ncclPlugin/",
-        "tensorrt_llm/functional.py",
-        "tensorrt_llm/mapping.py",
-        "tensorrt_llm/llmapi/",
-        "tensorrt_llm/executor/",
+        "cpp/tensorrt_llm/pybind/",
+        "cpp/tensorrt_llm/runtime/ipcUtils.cpp",
+        "cpp/tensorrt_llm/runtime/ncclCommunicator.cpp",
+        "cpp/tensorrt_llm/runtime/utils/mpiUtils.cpp",
+        "cpp/tensorrt_llm/runtime/workerPool.h",
+        "cpp/tensorrt_llm/runtime/worldConfig.cpp",
+        "cpp/tensorrt_llm/thop/allgatherOp.cpp",
+        "cpp/tensorrt_llm/thop/allreduceOp.cpp",
+        "cpp/tensorrt_llm/thop/reducescatterOp.cpp",
+        "cpp/tests/executor/",
+        "cpp/tests/kernels/allReduce/",
+        "cpp/tests/runtime/mpiUtilsTest.cpp",
+        "jenkins/L0_Test.groovy",
         "tensorrt_llm/_ipc_utils.py",
-        "tensorrt_llm/parameter.py",
-        "tensorrt_llm/models/llama/",
         "tensorrt_llm/_torch/compilation/patterns/ar_residual_norm.py",
         "tensorrt_llm/_torch/compilation/patterns/ub_allreduce.py",
         "tensorrt_llm/_torch/custom_ops/userbuffers_custom_ops.py",
-        "tensorrt_llm/_torch/pyexecutor/model_engine.py",
-        "tensorrt_llm/_torch/pyexecutor/py_executor.py",
-        "tensorrt_llm/_torch/pyexecutor/_util.py",
         "tensorrt_llm/_torch/models/modeling_llama.py",
         "tensorrt_llm/_torch/modules/fused_moe/",
+        "tensorrt_llm/_torch/pyexecutor/_util.py",
+        "tensorrt_llm/_torch/pyexecutor/model_engine.py",
+        "tensorrt_llm/_torch/pyexecutor/py_executor.py",
+        "tensorrt_llm/executor/",
+        "tensorrt_llm/functional.py",
+        "tensorrt_llm/llmapi/",
+        "tensorrt_llm/mapping.py",
+        "tensorrt_llm/models/llama/",
+        "tensorrt_llm/parameter.py",
+        "tensorrt_llm/serve/",
         "tests/integration/defs/cpp/test_multi_gpu.py",
         "tests/integration/test_lists/test-db/l0_dgx_h100.yml",
         "tests/integration/test_lists/test-db/l0_dgx_h200.yml",
+        "tests/unittest/_torch/auto_deploy/unit/multigpu",
         "tests/unittest/_torch/multi_gpu/",
         "tests/unittest/_torch/multi_gpu_modeling/",
-        "tests/unittest/_torch/auto_deploy/unit/multigpu",
+        "tests/unittest/disaggregated/",
         "tests/unittest/llmapi/test_llm_multi_gpu.py",
         "tests/unittest/llmapi/test_llm_multi_gpu_pytorch.py",
-        "jenkins/L0_Test.groovy",
     ]
 
     def changedFileList = getMergeRequestChangedFileList(pipeline, globalVars)
@@ -638,86 +640,62 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
     return relatedFileChanged
 }
 
-def getOnlyPytorchFileChanged(pipeline, testFilter, globalVars) {
+def getOnlyOneGroupChanged(pipeline, testFilter, globalVars) {
     def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
     if (env.alternativeTRT || isOfficialPostMergeJob) {
-        pipeline.echo("Force set ONLY_PYTORCH_FILE_CHANGED false.")
-        return false
+        pipeline.echo("Force set ONLY_ONE_GROUP_CHANGED \"\".")
+        return ""
     }
-    def pytorchOnlyList = [
-        "tensorrt_llm/_torch/",
-        "tensorrt_llm/scaffolding/",
-        "tests/unittest/_torch/",
-        "tests/unittest/scaffolding/",
-        "tests/unittest/llmapi/test_llm_pytorch.py",
-        "tests/unittest/llmapi/test_llm_multi_gpu_pytorch.py",
-        "tests/integration/defs/accuracy/test_llm_api_pytorch.py",
-        "tests/integration/defs/disaggregated/",
-        "examples/auto_deploy",
-        "examples/disaggregated",
-        "examples/pytorch/",
-        "examples/scaffolding/",
-        "docs/"
-    ]
-
-    def changedFileList = getMergeRequestChangedFileList(pipeline, globalVars)
-
-    if (!changedFileList || changedFileList.isEmpty()) {
-        return false
-    }
-
-    def result = true
-    for (file in changedFileList) {
-        def isPytorchFile = false
-        for (prefix in pytorchOnlyList) {
-            if (file.startsWith(prefix)) {
-                isPytorchFile = true
-                break
-            }
-        }
-        if (!isPytorchFile) {
-            pipeline.echo("Found non-PyTorch file: ${file}")
-            result = false
-            break
-        }
-    }
-
-    pipeline.echo("Only PyTorch files changed: ${result}")
-    return result
-}
-
-def getOnlyDocsFileChanged(pipeline, testFilter, globalVars) {
-    def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
-    if (env.alternativeTRT || isOfficialPostMergeJob) {
-        pipeline.echo("Force set ONLY_DOCS_FILE_CHANGED false.")
-        return false
-    }
-
-    // TODO: Add more docs path to the list, e.g. *.md files in other directories
-    def docsFileList = [
-        "docs/",
+    def groupFileMap = [
+        "Docs": [ // TODO: Add more docs path to the list, e.g. *.md files in other directories
+            "docs/",
+        ],
+        "PyTorch": [
+            "tensorrt_llm/_torch/",
+            "tensorrt_llm/scaffolding/",
+            "tests/unittest/_torch/",
+            "tests/unittest/scaffolding/",
+            "tests/unittest/llmapi/test_llm_pytorch.py",
+            "tests/unittest/llmapi/test_llm_multi_gpu_pytorch.py",
+            "tests/integration/defs/accuracy/test_llm_api_pytorch.py",
+            "tests/integration/defs/disaggregated/",
+            "examples/auto_deploy",
+            "examples/disaggregated",
+            "examples/pytorch/",
+            "examples/scaffolding/",
+            "docs/",
+        ],
+        "Triton": [
+            "tests/integration/defs/triton_server/",
+            "triton_backend/",
+        ],
     ]
 
     def changedFileList = getMergeRequestChangedFileList(pipeline, globalVars)
     if (!changedFileList || changedFileList.isEmpty()) {
-        return false
+        return ""
     }
 
-    for (file in changedFileList) {
-        def isDocsFile = false
-        for (prefix in docsFileList) {
-            if (file.startsWith(prefix)) {
-                isDocsFile = true
-                break
+    for (group in groupFileMap.keySet()) {
+        def groupPrefixes = groupFileMap[group]
+        def allFilesInGroup = changedFileList.every { file ->
+            groupPrefixes.any { prefix -> file.startsWith(prefix) }
+        }
+
+        if (allFilesInGroup) {
+            pipeline.echo("Only ${group} files changed.")
+            return group
+        } else {
+            def nonGroupFile = changedFileList.find { file ->
+                !groupPrefixes.any { prefix -> file.startsWith(prefix) }
+            }
+            if (nonGroupFile != null) {
+                pipeline.echo("Found non-${group} file: ${nonGroupFile}")
             }
         }
-        if (!isDocsFile) {
-            pipeline.echo("Found non-docs file: ${file}")
-            return false
-        }
     }
-    pipeline.echo("Only docs files changed.")
-    return true
+
+    return ""
 }
 
 def collectTestResults(pipeline, testFilter)
@@ -972,22 +950,21 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     }
                 }
 
-                def requireMultiGpuTesting = currentBuild.description?.contains("Require Multi-GPU Testing") ?: false
+                def requireMultiGpuTesting = currentBuild.description?.contains("Require x86_64 Multi-GPU Testing") ?: false
                 echo "requireMultiGpuTesting: ${requireMultiGpuTesting}"
                 if (!requireMultiGpuTesting) {
+                    if (singleGpuTestFailed) {
+                        error "x86_64 single-GPU test failed"
+                    }
                     return
                 }
 
                 if (singleGpuTestFailed) {
                     if (env.JOB_NAME ==~ /.*PostMerge.*/) {
-                        echo "In the official post-merge pipeline, single-GPU test failed, whereas multi-GPU test is still kept running."
+                        echo "In the official post-merge pipeline, x86_64 single-GPU test failed, whereas multi-GPU test is still kept running."
                     } else {
                         stage("[Test-x86_64-Multi-GPU] Blocked") {
-                            catchError(
-                                buildResult: 'FAILURE',
-                                stageResult: 'FAILURE') {
-                                error "This pipeline requires running multi-GPU test, but single-GPU test has failed."
-                            }
+                            error "This pipeline requires running multi-GPU test, but x86_64 single-GPU test has failed."
                         }
                         return
                     }
@@ -1030,12 +1007,10 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
             script {
                 def jenkinsUrl = ""
                 def credentials = ""
-                def testStageName = "[Test-SBSA] Run"
-                if (env.localJobCredentials) {
-                    testStageName = "[Test-SBSA] Remote Run"
-                }
+                def testStageName = "[Test-SBSA-Single-GPU] ${env.localJobCredentials ? "Remote Run" : "Run"}"
+                def singleGpuTestFailed = false
 
-                if (testFilter[(ONLY_DOCS_FILE_CHANGED)]) {
+                if (testFilter[(ONLY_ONE_GROUP_CHANGED)] == "Docs") {
                     echo "SBSA build job is skipped due to Jenkins configuration or conditional pipeline run"
                     return
                 }
@@ -1052,13 +1027,67 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         return
                     }
                     try {
+                        String testFilterJson = writeJSON returnText: true, json: testFilter
+                        def additionalParameters = [
+                            'testFilter': testFilterJson,
+                            "dockerImage": globalVars["LLM_SBSA_DOCKER_IMAGE"],
+                        ]
+
+                        launchJob("L0_Test-SBSA-Single-GPU", false, enableFailFast, globalVars, "SBSA", additionalParameters)
+                    } catch (InterruptedException e) {
+                        throw e
+                    } catch (Exception e) {
+                        if (SBSA_TEST_CHOICE == STAGE_CHOICE_IGNORE) {
+                            catchError(
+                                buildResult: 'SUCCESS',
+                                stageResult: 'FAILURE') {
+                                error "SBSA test failed but ignored due to Jenkins configuration"
+                            }
+                        } else {
+                            catchError(
+                                buildResult: 'FAILURE',
+                                stageResult: 'FAILURE') {
+                                error "SBSA single-GPU test failed"
+                            }
+                            singleGpuTestFailed = true
+                        }
+                    }
+                }
+
+                def requireMultiGpuTesting = currentBuild.description?.contains("Require SBSA Multi-GPU Testing") ?: false
+                echo "requireMultiGpuTesting: ${requireMultiGpuTesting}"
+                if (!requireMultiGpuTesting) {
+                    if (singleGpuTestFailed) {
+                        error "SBSA single-GPU test failed"
+                    }
+                    return
+                }
+
+                if (singleGpuTestFailed) {
+                    if (env.JOB_NAME ==~ /.*PostMerge.*/) {
+                        echo "In the official post-merge pipeline, SBSA single-GPU test failed, whereas multi-GPU test is still kept running."
+                    } else {
+                        stage("[Test-SBSA-Multi-GPU] Blocked") {
+                            error "This pipeline requires running SBSA multi-GPU test, but SBSA single-GPU test has failed."
+                        }
+                        return
+                    }
+                }
+
+                testStageName = "[Test-SBSA-Multi-GPU] ${env.localJobCredentials ? "Remote Run" : "Run"}"
+                stage(testStageName) {
+                    if (SBSA_TEST_CHOICE == STAGE_CHOICE_SKIP) {
+                        echo "SBSA test job is skipped due to Jenkins configuration"
+                        return
+                    }
+                    try {
                         def testFilterJson = writeJSON returnText: true, json: testFilter
                         def additionalParameters = [
                             'testFilter': testFilterJson,
                             "dockerImage": globalVars["LLM_SBSA_DOCKER_IMAGE"],
                         ]
 
-                        launchJob("L0_Test-SBSA", false, enableFailFast, globalVars, "SBSA", additionalParameters)
+                        launchJob("L0_Test-SBSA-Multi-GPU", false, enableFailFast, globalVars, "SBSA", additionalParameters)
 
                     } catch (InterruptedException e) {
                         throw e
@@ -1090,6 +1119,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         'branch': branch,
                         'action': "push",
                         'triggerType': env.JOB_NAME ==~ /.*PostMerge.*/ ? "post-merge" : "pre-merge",
+                        'runSanityCheck': true,
                     ]
 
                     launchJob("/LLM/helpers/BuildDockerImages", false, enableFailFast, globalVars, "x86_64", additionalParameters)

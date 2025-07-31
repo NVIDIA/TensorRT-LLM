@@ -14,11 +14,11 @@ from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import (BaseMoeRoutingMethod, CutlassFusedMoE,
+from ..modules.fused_moe import (BaseMoeRoutingMethod,
                                  RenormalizeMoeRoutingMethod,
                                  RenormalizeNaiveMoeRoutingMethod,
                                  RoutingMethodType, TRTLLMGenFusedMoE,
-                                 WideEPMoE, create_moe)
+                                 create_moe)
 from ..modules.linear import TensorParallelMode
 from ..modules.rms_norm import RMSNorm
 from ..speculative import SpecMetadata
@@ -137,13 +137,6 @@ class Qwen3MoE(nn.Module):
                                           self.mapping,
                                           dim=0,
                                           sizes=all_rank_num_tokens)
-            elif not isinstance(self.experts, (CutlassFusedMoE, WideEPMoE)) or (
-                    not self.experts.has_fp8_qdq and self.experts.has_nvfp4):
-                # Use padding when not using the cutlass path or when x_sf in self.experts is not None
-                use_dp_padding = True
-                hidden_states = torch.nn.functional.pad(
-                    hidden_states,
-                    (0, 0, 0, all_rank_max_num_tokens - hidden_states.shape[0]))
 
         router_logits = self.gate(hidden_states)
         final_hidden_states = self.experts(
@@ -316,6 +309,13 @@ class Qwen3MoEModel(DecoderModel):
         super().__init__(model_config)
         config = self.model_config
         self.aux_stream = torch.cuda.Stream()
+        self.preload_weight_modules = []
+        if config.moe_backend == "TRTLLM":
+            self.preload_weight_modules = [
+                "experts",
+                "routing_method",
+                "all_reduce",
+            ]
 
         if model_config.mapping.enable_attention_dp:
             # When attention_dp is enabled, we cannot do all_reduce since
@@ -388,6 +388,7 @@ class Qwen3MoeForCausalLM(SpecDecOneEngineForCausalLM[Qwen3MoEModel,
             Qwen3MoEModel(model_config),
             model_config,
         )
+        self.preload_weight_modules = self.model.preload_weight_modules
 
     def load_weights(self, weights: dict, weight_mapper: BaseWeightMapper):
         super().load_weights(weights, weight_mapper)

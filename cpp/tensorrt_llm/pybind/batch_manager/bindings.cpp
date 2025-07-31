@@ -393,16 +393,16 @@ void initBindings(pybind11::module_& m)
             py::arg("max_num_sequences"), py::arg("model_config"), py::arg("world_config"), py::arg("buffer_manager"));
 
     py::class_<tb::DecoderInputBuffers>(m, "DecoderInputBuffers")
-        .def(py::init<runtime::SizeType32, runtime::SizeType32, runtime::SizeType32, tr::BufferManager>(),
-            py::arg("max_num_sequences"), py::arg("max_batch_size"), py::arg("max_tokens_per_engine_step"),
-            py::arg("manager"))
+        .def(py::init<runtime::SizeType32, runtime::SizeType32, tr::BufferManager>(), py::arg("max_batch_size"),
+            py::arg("max_tokens_per_engine_step"), py::arg("manager"))
         .def_readwrite("setup_batch_slots", &tb::DecoderInputBuffers::setupBatchSlots)
         .def_readwrite("setup_batch_slots_device", &tb::DecoderInputBuffers::setupBatchSlotsDevice)
         .def_readwrite("fill_values", &tb::DecoderInputBuffers::fillValues)
         .def_readwrite("fill_values_device", &tb::DecoderInputBuffers::fillValuesDevice)
         .def_readwrite("inputs_ids", &tb::DecoderInputBuffers::inputsIds)
         .def_readwrite("forward_batch_slots", &tb::DecoderInputBuffers::forwardBatchSlots)
-        .def_readwrite("logits", &tb::DecoderInputBuffers::logits);
+        .def_readwrite("logits", &tb::DecoderInputBuffers::logits)
+        .def_readwrite("decoder_requests", &tb::DecoderInputBuffers::decoderRequests);
 
     py::class_<tb::DecoderOutputBuffers>(m, "DecoderOutputBuffers")
         .def_readwrite("sequence_lengths_host", &tb::DecoderOutputBuffers::sequenceLengthsHost)

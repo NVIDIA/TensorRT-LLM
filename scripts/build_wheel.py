@@ -144,7 +144,7 @@ def setup_venv(project_dir: Path, requirements_file: Path, no_venv: bool):
         # Ensure PyPI PyTorch is not installed in the venv
         purelib_dir = Path(scheme["purelib"])
         pytorch_package_dir = purelib_dir / "torch"
-        if venv_prefix != sys.base_prefix and pytorch_package_dir.exists():
+        if str(venv_prefix) != sys.base_prefix and pytorch_package_dir.exists():
             warnings.warn(
                 f"Using the NVIDIA PyTorch container with PyPI distributed PyTorch may lead to compatibility issues.\n"
                 f"If you encounter any problems, please delete the environment at `{venv_prefix}` so that "
@@ -298,7 +298,6 @@ def main(*,
          install: bool = False,
          skip_building_wheel: bool = False,
          linking_install_binary: bool = False,
-         python_bindings: bool = True,
          binding_type: str = "pybind",
          benchmarks: bool = False,
          micro_benchmarks: bool = False,
@@ -860,11 +859,6 @@ def add_arguments(parser: ArgumentParser):
         "--linking_install_binary",
         action="store_true",
         help="Install the built binary by symbolic linking instead of copying.")
-    parser.add_argument(
-        "--python_bindings",
-        "-p",
-        action="store_true",
-        help="(deprecated) Build the python bindings for the C++ runtime.")
     parser.add_argument("--binding_type",
                         choices=["pybind", "nanobind"],
                         default="pybind",

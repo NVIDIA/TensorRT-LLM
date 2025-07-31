@@ -176,7 +176,9 @@ class KVCacheManager(BaseResourceManager):
         self.kv_factor = 1 if kv_cache_type == CacheTypeCpp.SELFKONLY else 2
         # Some speculative decoding methods need to use different kv lengths for the
         # draft/target layers. Add extra tokens to handle this issue.
-        self.num_extra_kv_tokens = 0 if spec_config is None else spec_config.num_extra_kv_tokens
+        # Import here to avoid circular imports
+        from ..speculative import get_num_extra_kv_tokens
+        self.num_extra_kv_tokens = get_num_extra_kv_tokens(spec_config)
         self.event_buffer_max_size = kv_cache_config.event_buffer_max_size
         self.max_num_tokens = max_num_tokens
 
@@ -373,11 +375,15 @@ class KVCacheManager(BaseResourceManager):
         prepare_resource: bool = True,
         max_num_draft_tokens: int = 0,
         use_mrope: bool = False,
+        max_beam_width: int = 1,
     ):
-        beam_width = 1  # TODO: more than 1 beam?
+        beam_width = max_beam_width
         requests = []
         for i, req_id in enumerate(request_ids):
-            sampling_params = SamplingParams()
+            # exact choice of n can be ignored for dummy requests
+            sampling_params = SamplingParams(n=beam_width,
+                                             best_of=beam_width,
+                                             use_beam_search=beam_width > 1)
             # Here 1+max_num_draft_tokens is used to extend the prompt length to
             # a non-zero number to skip illegal memory access issue in MLA kernel
             # during warmup.
@@ -536,16 +542,8 @@ class KVCacheManager(BaseResourceManager):
         return (num_tokens + self.tokens_per_block - 1) // self.tokens_per_block
 
     def get_num_available_tokens(self, max_num_draft_tokens: int = 0) -> int:
-        if self.max_attention_window_vec and len(
-                self.max_attention_window_vec) > 1:
-            # VSWA case, the available tokens should the the minimum of the available tokens for each window size
-            min_free_blocks = min(self.impl.get_kv_cache_stats().
-                                  num_free_blocks_per_window_size.values())
-            res = min_free_blocks * self.tokens_per_block - self.num_extra_kv_tokens - max_num_draft_tokens
-        else:
-            res = (self.get_num_free_blocks() * self.tokens_per_block -
-                   self.num_extra_kv_tokens - max_num_draft_tokens)
-        return res
+        return (self.get_num_free_blocks() * self.tokens_per_block -
+                self.num_extra_kv_tokens - max_num_draft_tokens)
 
     def get_buffers(self, layer_idx: int) -> Optional[torch.Tensor]:
         layer_offset = self.layer_offsets[layer_idx]
@@ -732,6 +730,8 @@ class KVCacheManager(BaseResourceManager):
 
         # VSWA on Torch backend has not supported the cross attention.
         is_cross_attention = False
+        # check model config
+        assert model_config.layer_types is not None, "layer_types have to be set correctly for VSWA"
 
         # Construct WorldConfig from self.mapping
         world_config_cpp = WorldConfig(
@@ -1224,7 +1224,7 @@ class PeftCacheManager(BaseResourceManager):
         pass
 
     def free_resources(self, request: LlmRequest):
-        pass
+        self.impl.mark_request_done(request)
 
     def shutdown(self):
         pass

@@ -9,7 +9,7 @@ TensorRT-LLM
 [![python](https://img.shields.io/badge/python-3.10-green)](https://www.python.org/downloads/release/python-31012/)
 [![cuda](https://img.shields.io/badge/cuda-12.9.0-green)](https://developer.nvidia.com/cuda-downloads)
 [![trt](https://img.shields.io/badge/TRT-10.11.0-green)](https://developer.nvidia.com/tensorrt)
-[![version](https://img.shields.io/badge/release-1.0.0rc4-green)](./tensorrt_llm/version.py)
+[![version](https://img.shields.io/badge/release-1.0.0rc5-green)](./tensorrt_llm/version.py)
 [![license](https://img.shields.io/badge/license-Apache%202-blue)](./LICENSE)
 
 [Architecture](./docs/source/torch/arch_overview.md)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Performance](./docs/source/performance/perf-overview.md)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Examples](https://nvidia.github.io/TensorRT-LLM/quick-start-guide.html)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Documentation](./docs/source/)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Roadmap](https://github.com/NVIDIA/TensorRT-LLM/issues?q=is%3Aissue%20state%3Aopen%20label%3Aroadmap)
@@ -222,6 +222,23 @@ To get started with TensorRT-LLM, visit our documentation:
 - [Supported Hardware, Models, and other Software](https://nvidia.github.io/TensorRT-LLM/reference/support-matrix.html)
 - [Benchmarking Performance](https://nvidia.github.io/TensorRT-LLM/performance/performance-tuning-guide/benchmarking-default-performance.html#benchmarking-with-trtllm-bench)
 - [Release Notes](https://nvidia.github.io/TensorRT-LLM/release-notes.html)
+
+## Deprecation Policy
+
+Deprecation is used to inform developers that some APIs and tools are no longer recommended for use. Beginning with version 1.0, TensorRT-LLM has the following deprecation policy:
+
+1. Communication of Deprecation
+  - Deprecation notices are documented in the Release Notes.
+  - Deprecated APIs, methods, classes, or parameters include a statement in the source code indicating when they were deprecated.
+  - If used, deprecated methods, classes, or parameters issue runtime deprecation warnings.
+2. Migration Period
+  - TensorRT-LLM provides a 3-month migration period after deprecation.
+  - During this period, deprecated APIs, tools, or parameters continue to work but trigger warnings.
+3. Scope of Deprecation
+  - Full API/Method/Class Deprecation: The entire API/method/class is marked for removal.
+  - Partial Deprecation: If only specific parameters of an API/method are deprecated (e.g., param1 in LLM.generate(param1, param2)), the method itself remains functional, but the deprecated parameters will be removed in a future release.
+4. Removal After Migration Period
+  - After the 3-month migration period ends, deprecated APIs, tools, or parameters are removed in a manner consistent with semantic versioning (major version changes may include breaking removals).
 
 ## Useful Links
 - [Quantized models on Hugging Face](https://huggingface.co/collections/nvidia/model-optimizer-66aa84f7966b3150262481a4): A growing collection of quantized (e.g., FP8, FP4) and optimized LLMs, including [DeepSeek FP4](https://huggingface.co/nvidia/DeepSeek-R1-FP4), ready for fast inference with TensorRT-LLM.

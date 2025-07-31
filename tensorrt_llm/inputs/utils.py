@@ -45,7 +45,7 @@ def load_base64_image(parsed_url: str) -> Image.Image:
 
 def load_image(image: str,
                format: str = "pt",
-               device: str = "cuda") -> Union[Image.Image, torch.Tensor]:
+               device: str = "cpu") -> Union[Image.Image, torch.Tensor]:
     assert format in ["pt", "pil"], "format must be either Pytorch or PIL"
 
     parsed_url = urlparse(image)
@@ -67,7 +67,7 @@ def load_image(image: str,
 async def async_load_image(
         image: str,
         format: str = "pt",
-        device: str = "cuda") -> Union[Image.Image, torch.Tensor]:
+        device: str = "cpu") -> Union[Image.Image, torch.Tensor]:
     assert format in ["pt", "pil"], "format must be either Pytorch or PIL"
 
     parsed_url = urlparse(image)
@@ -92,7 +92,7 @@ def load_video(
         video: str,
         num_frames: int = 10,
         format: str = "pt",
-        device: str = "cuda") -> Union[List[Image.Image], List[torch.Tensor]]:
+        device: str = "cpu") -> Union[List[Image.Image], List[torch.Tensor]]:
 
     # Keep this import local to avoid importing cv2 if not needed
     import cv2
@@ -141,7 +141,7 @@ async def async_load_video(
         video: str,
         num_frames: int = 10,
         format: str = "pt",
-        device: str = "cuda") -> Union[List[Image.Image], List[torch.Tensor]]:
+        device: str = "cpu") -> Union[List[Image.Image], List[torch.Tensor]]:
     assert format in ["pt", "pil"], "format must be either Pytorch or PIL"
 
     parsed_url = urlparse(video)
@@ -254,10 +254,12 @@ PLACEHOLDER_PLACEMENT_MAP = {
     "mllama": MultimodalPlaceholderPlacement.BEFORE_TEXT,
     "hyperclovax_vlm": MultimodalPlaceholderPlacement.AFTER_TEXT,
     "gemma3": MultimodalPlaceholderPlacement.BEFORE_TEXT,
-    # NOTE: for mistral3 multimodal models, it does not strictly have to be after the text.
+    # NOTE: for mistral3 multimodal models, it does not strictly have to be before the text.
     # Ref: https://github.com/mistralai/mistral-common/blob/039465db2bdc0486df36365c9bdb428188482a18/
     #      src/mistral_common/tokens/tokenizers/base.py#L326
-    "mistral3": MultimodalPlaceholderPlacement.AFTER_TEXT,
+    # However, accuracy tests show that the model generates higher quality output when the image
+    # precedes the text (the relative difference can be as much as ~30% for both vLLM and TRT-LLM).
+    "mistral3": MultimodalPlaceholderPlacement.BEFORE_TEXT,
     "phi4mm": MultimodalPlaceholderPlacement.BEFORE_TEXT,
 }
 assert len(PLACEHOLDER_PLACEMENT_MAP) == len(ALL_SUPPORTED_MULTIMODAL_MODELS)
@@ -480,16 +482,16 @@ def default_multimodal_input_loader(
         media: Union[List[str], List[List[str]]],
         image_data_format: str = "pt",
         num_frames: int = 8,
-        device: str = "cuda") -> List[dict[str, Union[str, torch.Tensor]]]:
+        device: str = "cpu") -> List[dict[str, Union[str, torch.Tensor]]]:
 
     def convert_to_conversation_message(prompt: str, media: Union[str,
                                                                   List[str]],
                                         modality: str) -> ConversationMessage:
         if isinstance(media, str):
             media = [media]
-        if modality == "image":
+        if modality in ["image", "multiple_image"]:
             mm_data = [
-                MultimodalData(modality=modality,
+                MultimodalData(modality="image",
                                data=load_image(i,
                                                format=image_data_format,
                                                device=device)) for i in media
@@ -530,6 +532,15 @@ def default_multimodal_input_loader(
                 if _modal is None:
                     raise ValueError(f"Unknown matching modality: {modality}")
                 mm_data.append(MultimodalData(modality=_modal, data=data))
+        elif modality == "mixture_text_image":
+            mm_data = []
+            for m in media:
+                if m:
+                    mm_data.append(
+                        MultimodalData(modality="image",
+                                       data=load_image(m,
+                                                       format=image_data_format,
+                                                       device=device)))
         else:
             raise ValueError(f"Unknown modality: {modality}")
         return ConversationMessage(role="user", content=prompt, media=mm_data)
@@ -561,16 +572,16 @@ def default_multimodal_input_loader(
         if mm_placeholder_counts:
             conv["content"] = add_multimodal_placeholders(
                 model_type, conv["content"], mm_placeholder_counts)
-            prompt = apply_chat_template(
-                model_type=model_type,
-                tokenizer=tokenizer,
-                processor=processor,
-                conversation=[conv],
-                add_generation_prompt=True,
-                mm_placeholder_counts=mm_placeholder_counts)
-        inputs.append({
-            "prompt": prompt,
-            "multi_modal_data": mm_data_tracker.retrieve_all_sync()
-        })
+        prompt = apply_chat_template(
+            model_type=model_type,
+            tokenizer=tokenizer,
+            processor=processor,
+            conversation=[conv],
+            add_generation_prompt=True,
+            mm_placeholder_counts=mm_placeholder_counts)
+        input = {"prompt": prompt}
+        if mm_placeholder_counts:
+            input["multi_modal_data"] = mm_data_tracker.retrieve_all_sync()
+        inputs.append(input)
 
     return inputs

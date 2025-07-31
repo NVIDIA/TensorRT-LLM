@@ -442,7 +442,6 @@ def test_SamplingConfig_pickle():
     config.beam_width_array = [[2, 3, 4, 5]]
 
     config1 = pickle.loads(pickle.dumps(config))
-
     assert config1 == config
 
 
