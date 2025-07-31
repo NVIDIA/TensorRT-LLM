@@ -20,6 +20,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.models.modeling_utils import KvCacheConnectorConfig
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
@@ -75,7 +76,8 @@ def test_llm_api_connector_simple(connector):
                 backend="pytorch",
                 disable_overlap_scheduler=True,
                 connector_config=connector_config,
-                cuda_graph_config=None)
+                cuda_graph_config=None,
+                kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.1))
 
     assert worker.register_kv_caches.call_count == 1
 
@@ -133,7 +135,8 @@ def test_llm_api_connector_async_onboard(connector):
                 backend="pytorch",
                 disable_overlap_scheduler=True,
                 connector_config=connector_config,
-                cuda_graph_config=None)
+                cuda_graph_config=None,
+                kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.1))
 
     assert worker.register_kv_caches.call_count == 1
 
@@ -163,7 +166,8 @@ def test_llm_api_connector_async_save(connector):
                 backend="pytorch",
                 disable_overlap_scheduler=True,
                 connector_config=connector_config,
-                cuda_graph_config=None)
+                cuda_graph_config=None,
+                kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.1))
 
     assert worker.register_kv_caches.call_count == 1
 

@@ -1237,9 +1237,7 @@ public:
         = 0;
 
     /// @brief Increase size for request at seqSlotIdx. Allocate new KV cache block(s) if needed.
-    /// @param returnNewBlockId If true, return the id of the newly allocated block (if any). Only supported when VSWA
-    /// and beam search are disabled.
-    virtual std::optional<SizeType32> addToken(LlmRequest::RequestIdType requestId, bool returnNewBlockId = false) = 0;
+    virtual std::optional<SizeType32> addToken(LlmRequest::RequestIdType requestId) = 0;
 
     /// @brief Add new request to the KV cache manager.
     /// @param inputLength Input length for which KV cache need to be allocated.
@@ -1542,7 +1540,7 @@ public:
     /// @brief Increase size for request with requestId. Allocate new KV cache block(s) if needed.
     /// @param returnNewBlockId If true, return the id of the newly allocated block (if any). Only supported when VSWA
     /// and beam search are disabled.
-    std::optional<SizeType32> addToken(LlmRequest::RequestIdType requestId, bool returnNewBlockId = false) override;
+    std::optional<SizeType32> addToken(LlmRequest::RequestIdType requestId) override;
 
     /// @brief Add new request to the KV cache manager.
     /// @param inputLength Input length for which KV cache need to be allocated.
@@ -1686,7 +1684,7 @@ private:
     void cacheBlockOffsets(GenerationRequest& seq, SizeType32 windowSize);
     void cacheNewBlockOffsets(GenerationRequest& seq, SizeType32 windowSize);
     void updateNewBlockPointer(GenerationRequest& seq, SizeType32 windowSize, SizeType32 blockIdx);
-    std::optional<SizeType32> updateToken(GenerationRequest& sequence, bool addToken, bool returnNewBlockId);
+    std::optional<SizeType32> updateToken(GenerationRequest& sequence, bool addToken);
 
 private:
     // Maximum number of sequences

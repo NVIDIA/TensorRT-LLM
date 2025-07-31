@@ -403,9 +403,7 @@ class KVCacheManager(BaseResourceManager):
                     if not req.is_kv_cache_connector_async_onboard:
                         scheduler_output.add_request(
                             req.request_id, req.get_tokens(0),
-                            self.impl.get_cache_block_ids(
-                                req.request_id,
-                                self.max_attention_window_vec[0]),
+                            self.get_cache_indices(req),
                             req.context_current_position)
                 else:
                     # When using the connector, this code path will be hit after the async load is complete.
@@ -416,9 +414,7 @@ class KVCacheManager(BaseResourceManager):
                         req.is_kv_cache_connector_async_onboard = False
                         scheduler_output.add_request(
                             req.request_id, req.get_tokens(0),
-                            self.impl.get_cache_block_ids(
-                                req.request_id,
-                                self.max_attention_window_vec[0]),
+                            self.get_cache_indices(req),
                             req.context_current_position)
                     else:
                         # Otherwise, we just provide the new context position. No new blocks are allocated.
@@ -427,16 +423,22 @@ class KVCacheManager(BaseResourceManager):
                             req.context_current_position)
 
         for req in generation_batch:
-            new_block_id = self.impl.add_token(req.py_request_id, True)
+
+            old_block_ids = self.get_cache_indices(req)
+
+            self.impl.add_token(req.py_request_id)
 
             for _ in range(get_draft_token_length(req)):
                 self.impl.add_token(req.py_request_id)
 
+            new_block_ids = self.get_cache_indices(req)
+
+            delta_block_ids = new_block_ids[len(old_block_ids):]
+
             tokens = req.get_tokens(0)
 
-            scheduler_output.add_request(
-                req.request_id, tokens[-1:],
-                [new_block_id] if new_block_id is not None else [], len(tokens))
+            scheduler_output.add_request(req.request_id, tokens[-1:],
+                                         delta_block_ids, len(tokens))
 
         if self.kv_connector_manager is not None:
             self.kv_connector_manager.set_scheduler_output(scheduler_output)
