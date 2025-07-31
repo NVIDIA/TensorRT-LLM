@@ -403,8 +403,46 @@ class WorkerBase(GenerationExecutor):
         self.shutdown()
         return True
 
-    def await_responses(self):
+    def await_responses(self) -> None:
         self._await_response_helper()
+
+    def fetch_kv_cache_events(self) -> list:
+        if isinstance(self.engine, tllm.Executor):
+            # Check if the engine has a kv cache event manager
+            # If not, return an empty list for the events which will cause the thread to exit early.
+            event_manager = self.engine.get_kv_cache_event_manager()
+            if event_manager is None:
+                return []
+            else:
+                return event_manager.get_latest_events()
+        else:
+            return self.engine.get_latest_kv_cache_events()
+
+    def fetch_stats(
+            self) -> List[Tuple[tllm.IterationStats, tllm.RequestStats]]:
+        if isinstance(self.engine, tllm.Executor):
+            iter_stats = self.engine.get_latest_iteration_stats()
+            #TODO: Support req stats with TRT engine
+            #      This would require ensuring iter and req stats have same size
+            return [(iter_stat, None) for iter_stat in iter_stats]
+        else:
+            return self.engine.get_latest_iteration_stats()
+
+    # Define a Callable to join iteration and request stats
+    @staticmethod
+    def _stats_serializer(
+            stats: Tuple[tllm.IterationStats, tllm.RequestStats]) -> str:
+        iteration_stats, req_stats = stats
+        stats_dict = json.loads(iteration_stats.to_json_str())
+
+        if req_stats is not None and len(req_stats) > 0:
+            stats_dict["requestStats"] = []
+            for req_stat in req_stats:
+                stats_dict["requestStats"].append(
+                    json.loads(req_stat.to_json_str()))
+
+        # Convert back to JSON string
+        return json.dumps(stats_dict)
 
     def set_result_queue(self, queue: Queue | IpcQueue):
         """In multi-gpu mode, result_queue will be set here to communicate between the proxy and the worker 0 process."""
