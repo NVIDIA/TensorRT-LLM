@@ -15,7 +15,7 @@ easier for users to reproduce our officially published [performance overiew](./p
 - Ability to benchmark various flows and features within TensorRT-LLM.
 
 `trtllm-bench` executes all benchmarks using [in-flight batching] -- for more information see
-the [this section](../advanced/gpt-attention.md#in-flight-batching) that describes the concept
+the [in-flight batching section](../advanced/gpt-attention.md#in-flight-batching) that describes the concept
 in further detail.
 
 ## Before Benchmarking
@@ -23,18 +23,21 @@ in further detail.
 For rigorous benchmarking where consistent and reproducible results are critical, proper GPU configuration is essential. These settings help maximize GPU utilization, eliminate performance variability, and ensure optimal conditions for accurate measurements. While not strictly required for normal operation, we recommend applying these configurations when conducting performance comparisons or publishing benchmark results.
 
 ### Persistence mode
+
 Ensure persistence mode is enabled to maintain consistent GPU state:
 ```shell
 sudo nvidia-smi -pm 1
 ```
 
 ### GPU Clock Management
+
 Allow the GPU to dynamically adjust its clock speeds based on workload and temperature. While locking clocks at maximum frequency might seem beneficial, it can sometimes lead to thermal throttling and reduced performance. Reset GPU clocks using:
 ```shell
 sudo nvidia-smi -rgc
 ```
 
 ### Set power limits
+
 First query the maximum power limit:
 ```shell
 nvidia-smi -q -d POWER
@@ -45,6 +48,7 @@ sudo nvidia-smi -pl <max_power_limit>
 ```
 
 ### Boost settings
+
 Potentially a GPU may support boost levels. First query available boost levels:
 ```shell
 sudo nvidia-smi boost-slider -l
@@ -390,7 +394,6 @@ P99:  1059.0000           137.0000          1178.0000
 
 #### Quantization in the PyTorch Flow
 
-In order to run a quantized run with `trtllm-bench` utilizing the PyTorch flow, you will need to use a pre-quantized
 To run a quantized benchmark with `trtllm-bench` utilizing the PyTorch flow, you will need to use a pre-quantized
 checkpoint. For the Llama-3.1 models, TensorRT-LLM provides the following checkpoints via HuggingFace:
 
