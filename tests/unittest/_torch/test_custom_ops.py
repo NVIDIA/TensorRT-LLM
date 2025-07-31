@@ -167,7 +167,6 @@ class TestCustomOp(CustomOpTestCaseBase):
             "trtllm::fp4_bmm",
             "trtllm::merge_chunked_attention_for_mla",
             "trtllm::cuda_scaled_mm",
-            "trtllm::cublas_mm_out",
             "trtllm::initialize_static_lowprecision_buffers",
             "trtllm::cutlass_scaled_mm",
             "trtllm::fp8_per_tensor_scaling_tllmg_gemm",
@@ -176,7 +175,6 @@ class TestCustomOp(CustomOpTestCaseBase):
             "trtllm::set_paged_kv_cache_for_mla",
             "trtllm::set_chunked_kv_cache_for_mla",
             "trtllm::mla_rope_append_paged_kv_assign_q",
-            "trtllm::cublas_scaled_mm_out",
             "trtllm::fused_qk_norm_rope",
         }
 
