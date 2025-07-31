@@ -25,7 +25,9 @@ def temp_extra_llm_api_options_file():
         extra_llm_api_options_dict = {
             "lora_config": {
                 "lora_target_modules": ['attn_q', 'attn_k', 'attn_v'],
-                "max_lora_rank": 8
+                "max_lora_rank": 8,
+                "max_loras": 4,
+                "max_cpu_loras": 4,
             }
         }
 

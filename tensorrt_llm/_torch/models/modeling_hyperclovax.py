@@ -597,7 +597,7 @@ class HCXVisionInputProcessor(InputProcessor):
                       input_ids: torch.Tensor,
                       preprocessed_image: dict[str, any] = None):
         if not preprocessed_image:
-            return input_ids
+            return input_ids[0]
 
         vision_query_lengths = preprocessed_image.get("vision_query_lengths",
                                                       None)
@@ -659,7 +659,6 @@ class HCXVisionInputProcessor(InputProcessor):
                     mm_processor_kwargs: Dict[str, Any]):
 
         preprocessed_image = None
-        is_video_list = [False] * len(images)
         if images is not None:
             is_video_list = [False] * len(images)
             preprocessed_image = self.processor(
@@ -1026,9 +1025,6 @@ class HCXVisionForCausalLM(PreTrainedModel):
         multimodal_params = kwargs.get("multimodal_params", [])
         mm_embeds = []
         if len(multimodal_params) > 0:
-            assert len(multimodal_params) == num_context_requests == len(
-                multimodal_params
-            ), f"Number of multimodal tensors ({len(multimodal_params)}) should be equal to number of context requests ({num_context_requests}) in the batch."
             if not DISAGG:
                 mm_embeds = self.mm_encoder.forward(multimodal_params)
             else:

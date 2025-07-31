@@ -1010,8 +1010,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             f"--workspace={engine_dir}", f"--model={hf_model_name}",
             f"--model_path={model_dir}", "build", f"--dataset={dataset_path}",
             f"--tp_size={self._config.tp_size}",
-            f"--pp_size={self._config.pp_size}",
-            f"--kv_cache_free_gpu_mem_fraction={self._config.kv_cache_free_gpu_mem_fraction}"
+            f"--pp_size={self._config.pp_size}"
         ]
         max_seq_len = max(self._config.input_lens) + max(
             self._config.output_lens)
@@ -1253,6 +1252,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             f"--max_batch_size={self._config.max_batch_size}",
             f"--max_num_tokens={self._config.max_num_tokens}",
             f"--report_json={report_path}",
+            f"--kv_cache_free_gpu_mem_fraction={self._config.kv_cache_free_gpu_mem_fraction}",
         ]
         if self._config.backend != "pytorch":
             benchmark_cmd += [
