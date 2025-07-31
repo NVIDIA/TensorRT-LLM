@@ -197,6 +197,28 @@ class GenerationResultBase:
     def context_logits(self) -> Optional[torch.Tensor]:
         return self._context_logits
 
+    def _check_text_stop_criteria(self, output, stop_reason: str, stop_ids: list) -> bool:
+        """Check if the stop text is found in newly generated tokens."""
+        now_token_ids_len = len(output.token_ids)
+        new_generated_token_ids = output.token_ids[output._last_token_ids_len:now_token_ids_len]
+        
+        for idx in range(len(new_generated_token_ids)):
+            if self.sampling_params.tokenizer is None:
+                continue
+            new_generated_text = self.sampling_params.tokenizer.decode(
+                new_generated_token_ids[idx],
+                skip_special_tokens=False,
+                clean_up_tokenization_spaces=False
+            )
+            if stop_reason in new_generated_text:
+                output.stop_reason = stop_reason
+                if not self.sampling_params.include_stop_str_in_output:
+                    output.token_ids = output.token_ids[:output._last_token_ids_len + idx]
+                else:
+                    output.token_ids = output.token_ids[:output._last_token_ids_len + idx] + stop_ids
+                return True
+        return False
+
     def _handle_sequence(self,
                          finish_reasons,
                          response_tensors,
@@ -253,11 +275,15 @@ class GenerationResultBase:
                 output.finish_reason = 'stop'
                 for stop_reason, stop_ids in self.sampling_params._get_stop_reasons_and_words(
                 ):
-                    if output.token_ids[-len(stop_ids):] == stop_ids:
-                        output.stop_reason = stop_reason
-                        if not self.sampling_params.include_stop_str_in_output:
-                            output.token_ids = output.token_ids[:-len(stop_ids)]
-                        break
+                    if isinstance(stop_reason, str):
+                        if self._check_text_stop_criteria(output, stop_reason, stop_ids):
+                            break
+                    else:
+                        if output.token_ids[-len(stop_ids):] == stop_ids:
+                            output.stop_reason = stop_reason
+                            if not self.sampling_params.include_stop_str_in_output:
+                                output.token_ids = output.token_ids[:-len(stop_ids)]
+                            break
             elif finish_reasons[src_idx] == tllm.FinishReason.LENGTH:
                 output.finish_reason = 'length'
             elif finish_reasons[src_idx] == tllm.FinishReason.TIMED_OUT:

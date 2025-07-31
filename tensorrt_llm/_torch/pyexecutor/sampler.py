@@ -1,7 +1,7 @@
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal,Union,List
 
 import torch
 
@@ -26,6 +26,7 @@ from .finish_reason import FinishedState
 from .llm_request import LlmRequest, LlmRequestState
 from .scheduler import ScheduledRequests
 
+from transformers import PreTrainedTokenizerBase
 
 @dataclass(kw_only=True)
 class SampleStateTensors:
@@ -224,6 +225,7 @@ class TorchSampler(Sampler):
         max_num_sequences: int
         max_beam_width: int
         enable_mixed_sampler: bool
+        tokenizer: PreTrainedTokenizerBase
 
     def __init__(self, args: Args):
         self.max_seq_len = args.max_seq_len
@@ -231,6 +233,7 @@ class TorchSampler(Sampler):
         self.max_tokens = args.max_draft_len + 1
         assert args.max_beam_width == self.MAX_BEAM_WIDTH, "TorchSampler only supports beam_width = 1"
         self.num_seq_slots = args.max_num_sequences
+        self.tokenizer = args.tokenizer
 
         self.NEW_TOKENS_SHAPE = (self.max_tokens, self.num_seq_slots,
                                  self.MAX_BEAM_WIDTH)
@@ -247,22 +250,43 @@ class TorchSampler(Sampler):
                                                   >= self.max_seq_len)
 
     @staticmethod
-    def _meet_stop_token_criteria(request: LlmRequest):
+    def _meet_stop_token_criteria(
+        request: LlmRequest,
+        tokenizer: PreTrainedTokenizerBase, 
+        new_token: Union[int, List[int], torch.Tensor]
+        ):
         if request.py_stop_words_list:
             assert isinstance(
                 request.py_stop_words_list,
                 list), "request.py_stop_words_list should be a list"
+
             stop_words_list, prefix_sum = request.py_stop_words_list
             tokens = request.get_tokens(0)
+            try: 
+                new_words = tokenizer.decode(new_token, skip_special_tokens=False, clean_up_tokenization_spaces=False)
+            except Exception:
+                # If decode fails, fall back to token-based matching only
+                new_words = ""
             offset = 0
             for i, offset_end in enumerate(prefix_sum):
                 if i > 0:
                     offset = prefix_sum[i - 1]
                 stop_word = stop_words_list[offset:offset_end]
+                try:
+                    stop_text = tokenizer.decode(
+                        stop_word, 
+                        skip_special_tokens=False, 
+                        clean_up_tokenization_spaces=False
+                    )
+                except Exception:
+                    continue
                 if len(stop_word) > len(tokens):
                     continue
                 if tokens[-len(stop_word):] == stop_word:
                     return True
+                if stop_text in new_words:
+                    return True
+
         return False
 
     def _handle_stop_criteria(self, request: LlmRequest,
@@ -277,7 +301,7 @@ class TorchSampler(Sampler):
             request.finish_by(FinishReason.LENGTH, self.BEAM)
             return True
 
-        if self._meet_stop_token_criteria(request):
+        if self._meet_stop_token_criteria(request, self.tokenizer, new_token):
             request.finish_by(FinishReason.STOP_WORDS, self.BEAM)
             return True
 
@@ -365,6 +389,7 @@ class TorchSampler(Sampler):
 
     def sample_async(self, scheduled_requests: ScheduledRequests,
                      model_outputs: dict[str, torch.Tensor]) -> SampleState:
+
         requests = scheduled_requests.all_requests()
         new_tokens = self.store.new_tokens
         vocab_size = model_outputs["logits"].shape[-1]
@@ -494,6 +519,7 @@ class TRTLLMSampler(Sampler):
         mapping: Mapping,
         decoding_mode: DecodingMode,
         disable_overlap_scheduler: bool,
+        tokenizer: PreTrainedTokenizerBase
     ):
 
         vocab_size = model.config.vocab_size
@@ -521,6 +547,8 @@ class TRTLLMSampler(Sampler):
         self.model_config = ModelConfig(vocab_size, num_hidden_layers,
                                         num_hidden_layers, 0, num_heads,
                                         hidden_size, self.model_datatype)
+
+        self.tokenizer = tokenizer
 
         self._initialize_store()
         self._instantiate_algorithms()
@@ -627,7 +655,6 @@ class TRTLLMSampler(Sampler):
     @nvtx_range("sample_async")
     def sample_async(self, scheduled_requests: ScheduledRequests,
                      model_outputs) -> SampleStateTRTLLM:
-
         batch_size = scheduled_requests.batch_size
         beam_width = self.beam_width(scheduled_requests.all_requests())
         if (batch_size > 1 and beam_width > 1
