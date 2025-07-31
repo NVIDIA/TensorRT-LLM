@@ -236,9 +236,10 @@ public:
         torch::optional<torch::Tensor> const& fc2_expert_biases,
         torch::optional<c10::ArrayRef<torch::Tensor>> const& quant_scales,
         torch::optional<torch::Tensor> const& input_sf, torch::optional<torch::Tensor> const& swiglu_alpha,
-        torch::optional<torch::Tensor> const& swiglu_beta, int64_t const tp_size, int64_t const tp_rank,
-        int64_t const ep_size, int64_t const ep_rank, int64_t const cluster_size, int64_t const cluster_rank,
-        bool const enable_alltoall, bool min_latency_mode, torch::optional<c10::ArrayRef<int64_t>> const& profile_ids)
+        torch::optional<torch::Tensor> const& swiglu_beta, torch::optional<torch::Tensor> const& swiglu_limit,
+        int64_t const tp_size, int64_t const tp_rank, int64_t const ep_size, int64_t const ep_rank,
+        int64_t const cluster_size, int64_t const cluster_rank, bool const enable_alltoall, bool min_latency_mode,
+        torch::optional<c10::ArrayRef<int64_t>> const& profile_ids)
     {
         std::lock_guard<std::mutex> lock(mMutex);
         // Free the profile workspace to save memory
@@ -334,19 +335,31 @@ public:
         auto const num_experts_total = static_cast<int>(num_experts_on_rank * ep_size);
         auto parallelism_config = kernels::MOEParallelismConfig(tp_size, tp_rank, ep_size, ep_rank);
         ActivationType base_activation_type = ActivationType::Swiglu;
-        if (swiglu_alpha.has_value() && swiglu_beta.has_value())
+        if (swiglu_alpha.has_value())
         {
             CHECK_INPUT(swiglu_alpha.value(), at::ScalarType::Float);
-            CHECK_INPUT(swiglu_beta.value(), at::ScalarType::Float);
             TORCH_CHECK(swiglu_alpha.value().sizes()[0] == num_experts_on_rank,
                 "swiglu_alpha must have num_experts_on_rank elements.");
+            base_activation_type = ActivationType::SwigluBias;
+        }
+        if (swiglu_beta.has_value())
+        {
+            CHECK_INPUT(swiglu_beta.value(), at::ScalarType::Float);
             TORCH_CHECK(swiglu_beta.value().sizes()[0] == num_experts_on_rank,
                 "swiglu_beta must have num_experts_on_rank elements.");
             base_activation_type = ActivationType::SwigluBias;
         }
+        if (swiglu_limit.has_value())
+        {
+            CHECK_INPUT(swiglu_limit.value(), at::ScalarType::Float);
+            TORCH_CHECK(swiglu_limit.value().sizes()[0] == num_experts_on_rank,
+                "swiglu_limit must have num_experts_on_rank elements.");
+            base_activation_type = ActivationType::SwigluBias;
+        }
         auto activation_params = ActivationParams(base_activation_type,
             reinterpret_cast<float const*>(swiglu_alpha.has_value() ? swiglu_alpha.value().const_data_ptr() : nullptr),
-            reinterpret_cast<float const*>(swiglu_beta.has_value() ? swiglu_beta.value().const_data_ptr() : nullptr));
+            reinterpret_cast<float const*>(swiglu_beta.has_value() ? swiglu_beta.value().const_data_ptr() : nullptr),
+            reinterpret_cast<float const*>(swiglu_limit.has_value() ? swiglu_limit.value().const_data_ptr() : nullptr));
 
         setRunnerProfiles(profile_ids);
 
@@ -402,9 +415,10 @@ public:
         torch::Tensor const& fc2_expert_weights, torch::optional<torch::Tensor> const& fc2_expert_biases,
         torch::optional<c10::ArrayRef<torch::Tensor>> const& quant_scales,
         torch::optional<torch::Tensor> const& input_sf, torch::optional<torch::Tensor> const& swiglu_alpha,
-        torch::optional<torch::Tensor> const& swiglu_beta, int64_t const tp_size, int64_t const tp_rank,
-        int64_t const ep_size, int64_t const ep_rank, int64_t const cluster_size, int64_t const cluster_rank,
-        bool const enable_alltoall, bool min_latency_mode, torch::optional<c10::ArrayRef<int64_t>> const& profile_ids)
+        torch::optional<torch::Tensor> const& swiglu_beta, torch::optional<torch::Tensor> const& swiglu_limit,
+        int64_t const tp_size, int64_t const tp_rank, int64_t const ep_size, int64_t const ep_rank,
+        int64_t const cluster_size, int64_t const cluster_rank, bool const enable_alltoall, bool min_latency_mode,
+        torch::optional<c10::ArrayRef<int64_t>> const& profile_ids)
     {
         std::lock_guard<std::mutex> lock(mMutex);
 
@@ -469,13 +483,31 @@ public:
         auto parallelism_config
             = kernels::MOEParallelismConfig(tp_size, tp_rank, ep_size, ep_rank, cluster_size, cluster_rank);
         ActivationType base_activation_type = ActivationType::Swiglu;
-        if (swiglu_alpha.has_value() && swiglu_beta.has_value())
+        if (swiglu_alpha.has_value())
         {
+            CHECK_INPUT(swiglu_alpha.value(), at::ScalarType::Float);
+            TORCH_CHECK(swiglu_alpha.value().sizes()[0] == num_experts_on_rank,
+                "swiglu_alpha must have num_experts_on_rank elements.");
+            base_activation_type = ActivationType::SwigluBias;
+        }
+        if (swiglu_beta.has_value())
+        {
+            CHECK_INPUT(swiglu_beta.value(), at::ScalarType::Float);
+            TORCH_CHECK(swiglu_beta.value().sizes()[0] == num_experts_on_rank,
+                "swiglu_beta must have num_experts_on_rank elements.");
+            base_activation_type = ActivationType::SwigluBias;
+        }
+        if (swiglu_limit.has_value())
+        {
+            CHECK_INPUT(swiglu_limit.value(), at::ScalarType::Float);
+            TORCH_CHECK(swiglu_limit.value().sizes()[0] == num_experts_on_rank,
+                "swiglu_limit must have num_experts_on_rank elements.");
             base_activation_type = ActivationType::SwigluBias;
         }
         auto activation_params = ActivationParams(base_activation_type,
             reinterpret_cast<float const*>(swiglu_alpha.has_value() ? swiglu_alpha.value().const_data_ptr() : nullptr),
-            reinterpret_cast<float const*>(swiglu_beta.has_value() ? swiglu_beta.value().const_data_ptr() : nullptr));
+            reinterpret_cast<float const*>(swiglu_beta.has_value() ? swiglu_beta.value().const_data_ptr() : nullptr),
+            reinterpret_cast<float const*>(swiglu_limit.has_value() ? swiglu_limit.value().const_data_ptr() : nullptr));
 
         setRunnerProfiles(profile_ids);
 

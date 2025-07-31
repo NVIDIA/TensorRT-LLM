@@ -68,6 +68,7 @@ class CutlassFusedMoE(MoE):
         layer_idx: Optional[int] = None,
         swiglu_alpha: Optional[torch.Tensor] = None,
         swiglu_beta: Optional[torch.Tensor] = None,
+        swiglu_limit: Optional[torch.Tensor] = None,
     ):
 
         super().__init__(
@@ -82,6 +83,7 @@ class CutlassFusedMoE(MoE):
             bias=bias,
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
+            swiglu_limit=swiglu_limit,
         )
 
         if model_config.quant_config and model_config.quant_config.layer_quant_mode.has_w4a16_mxfp4(
@@ -389,6 +391,7 @@ class CutlassFusedMoE(MoE):
             input_sf=x_sf,
             swiglu_alpha=self.swiglu_alpha,
             swiglu_beta=self.swiglu_beta,
+            swiglu_limit=self.swiglu_limit,
             tp_size=self.tp_size,
             tp_rank=self.tp_rank,
             ep_size=self.ep_size,
