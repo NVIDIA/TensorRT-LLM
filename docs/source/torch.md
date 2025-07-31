@@ -38,3 +38,7 @@ Here is a simple example to show how to use `tensorrt_llm.LLM` API with Llama mo
 ## Known Issues
 
 - The PyTorch backend on SBSA is incompatible with bare metal environments like Ubuntu 24.04. Please use the [PyTorch NGC Container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch) for optimal support on SBSA platforms.
+
+## Prototype Feature
+
+- [AutoDeploy: Seamless Model Deployment from PyTorch to TRT-LLM](./torch/auto_deploy/auto-deploy.md)
