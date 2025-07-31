@@ -130,11 +130,16 @@ class SequenceInfo:
         # Need to allocated input_ids and position_ids on the GPUs to avoid overheads of tensor creation in every forward pass.s\
         self.input_ids = torch.ones(self.max_num_tokens, dtype=torch.int, device=self.device)
         self.position_ids = torch.zeros(self.max_num_tokens, dtype=torch.long, device=self.device)
+        self.input_ids_view = torch.ones(self.max_batch_size, dtype=torch.int, device=self.device)
+        self.position_ids_view = torch.zeros(self.max_batch_size, dtype=torch.long, device=self.device)
+
         self.seq_len = torch.empty(self.max_batch_size, dtype=torch.int)
         self.input_pos = torch.empty_like(self.seq_len)
         self.cache_loc = torch.empty(self.num_pages, dtype=torch.int, device=self.device)
         self.pages_per_seq = torch.empty_like(self.seq_len, device=self.device)
-        self.num_tokens = torch.empty(1, dtype=torch.int, device=self.device)
+        # self.num_tokens = torch.empty(1, dtype=torch.int, device=self.device)
+        self.num_tokens_scalar = 0 # keep a scalar copy, because slicing with a GPU tensor is slow
+
         assert self.num_pages >= self.max_batch_size, (
             "num_pages must be greater than max_batch_size"
         )
@@ -158,13 +163,15 @@ class SequenceInfo:
             args = []
             for f in fields(self):
                 val = getattr(self, f.name)
+                val_view = val
                 if isinstance(val, torch.Tensor):
                     if f.name == "input_ids" or f.name == "position_ids":
                         shape = val.shape
                         if any(s == 1 for s in shape):
-                            val = val.flatten()[:self.num_tokens]
-                            val = self.maybe_reshape_for_generate(val)
-                    args.append(val)
+                            truncated_val = val.flatten()[:self.num_tokens_scalar]
+                            val_view = getattr(self, f.name + "_view")
+                            val_view = self.maybe_reshape_for_generate(truncated_val) #assign to view, no resize needed
+                    args.append(val_view)
                 if len(args) >= self._num_uncached_attn_args and not self._is_cached_attn:
                     break
                 
@@ -446,7 +453,8 @@ class SequenceInfo:
     def update_sequence_lengths(self, sequence_lengths: List[int]) -> None:
         self._sequence_lengths = sequence_lengths
         self.seq_len.zero_()
-        self.num_tokens.copy_(torch.tensor(sum(self._sequence_lengths), dtype=torch.int), non_blocking=True)
+        # self.num_tokens.copy_(torch.tensor(sum(self._sequence_lengths), dtype=torch.int), non_blocking=True)
+        self.num_tokens_scalar = sum(self._sequence_lengths)
         self.seq_len[: len(self._sequence_lengths)].copy_(torch.tensor(self._sequence_lengths), non_blocking=True)
 
     def update_input_ids(self, input_ids: torch.Tensor, new_tokens: Optional[torch.Tensor] = None, previous_batch_indices: Optional[torch.Tensor] = None, num_tokens: int = 0) -> None:
@@ -471,7 +479,8 @@ class SequenceInfo:
         # set new sequence lengths
         self._sequence_lengths = [len(ids) for ids in input_ids]
         num_tokens = sum(self._sequence_lengths)  
-        self.num_tokens.copy_(torch.tensor(num_tokens, dtype=torch.int), non_blocking=True)
+        # self.num_tokens.copy_(torch.tensor(num_tokens, dtype=torch.int), non_blocking=True)
+        self.num_tokens_scalar = num_tokens
         self.seq_len.zero_()
         self.seq_len[: len(self._sequence_lengths)].copy_(torch.tensor(self._sequence_lengths), non_blocking=True)
         # We'll preserve the dtype of the input_ids tensor if it is a tensor, otherwise we'll use int
