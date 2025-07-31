@@ -1027,7 +1027,7 @@ class PyExecutor:
                 elif self.kv_connector_manager:
                     reqs_to_terminate = self.kv_connector_manager.get_finished()
                     for req in reqs_to_terminate:
-                        self._terminate_request(req)
+                        self.resource_manager.free_resources(req)
 
                 if self.enable_iter_perf_stats:
                     iter_stats.inflight_batching_stats.num_ctx_tokens = self.model_engine.iter_states[
