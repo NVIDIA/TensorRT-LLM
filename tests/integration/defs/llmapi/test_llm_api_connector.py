@@ -15,8 +15,7 @@
 
 import os
 import sys
-from collections import defaultdict
-from unittest.mock import DEFAULT, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -42,27 +41,6 @@ def init_connector_classes():
     return scheduler, worker
 
 
-# Makes sure everything is called in the right order.
-class CallTimeMonitor:
-
-    def __init__(self):
-        self.call_times = defaultdict(list)
-        self.counter = 0
-
-    def monitor_fn(self, mock_fn, name):
-
-        def wrapper(*args, **kwargs):
-            self.call_times[name].append(self.counter)
-            self.counter += 1
-
-            return DEFAULT
-
-        mock_fn.side_effect = wrapper
-
-    def __getitem__(self, name):
-        return self.call_times[name]
-
-
 @pytest.fixture
 def connector():
     with patch("tensorrt_llm._torch.pyexecutor.py_executor_creator.importlib"
@@ -79,30 +57,17 @@ def connector():
             connector_worker_class="KvConnectorWorker",
         )
 
-        call_time_monitor = CallTimeMonitor()
+        yield connector_config, mock_scheduler, mock_worker
 
-        call_time_monitor.monitor_fn(mock_scheduler.build_connector_meta,
-                                     "build_connector_meta")
-        call_time_monitor.monitor_fn(mock_scheduler.get_num_new_matched_tokens,
-                                     "get_num_new_matched_tokens")
-        call_time_monitor.monitor_fn(mock_scheduler.request_finished,
-                                     "request_finished")
 
-        call_time_monitor.monitor_fn(mock_worker.start_load_kv, "start_load_kv")
-        call_time_monitor.monitor_fn(mock_worker.wait_for_layer_load,
-                                     "wait_for_layer_load")
-        call_time_monitor.monitor_fn(mock_worker.save_kv_layer, "save_kv_layer")
-        call_time_monitor.monitor_fn(mock_worker.wait_for_save, "wait_for_save")
-        call_time_monitor.monitor_fn(mock_worker.get_finished, "get_finished")
-
-        yield connector_config, mock_scheduler, mock_worker, call_time_monitor
+# Needed because MagicMocks don't work across processes.
+# TODO(jthomson04): This limits us to testing only TP1 for now.
+os.environ["TLLM_WORKER_USE_SINGLE_PROCESS"] = "1"
 
 
 @pytest.mark.threadleak(enabled=False)
 def test_llm_api_connector_simple(connector):
-    connector_config, scheduler, worker, call_time_monitor = connector
-
-    os.environ["TLLM_WORKER_USE_SINGLE_PROCESS"] = "1"
+    connector_config, scheduler, worker = connector
 
     NUM_TOKENS = 8
 
@@ -124,25 +89,25 @@ def test_llm_api_connector_simple(connector):
 
     assert scheduler.build_connector_meta.call_count == NUM_TOKENS
 
+    # We should have a single `SchedulerOutput` per forward pass.
     for i, call in enumerate(scheduler.build_connector_meta.call_args_list):
         scheduler_output = call[0][0]
         assert len(scheduler_output.requests) == 1
+
+        # If this is not prefill, we should always be adding a single token.
         if i != 0:
             assert len(scheduler_output.requests[0].new_tokens) == 1
 
+    # We call `start_load_kv` once at the beginning of each forward pass.
     assert worker.start_load_kv.call_count == NUM_TOKENS
 
-    # We should have always built our metadata before loading kv.
-    for load_kv_call_time, build_metadata_call_time in zip(
-            call_time_monitor["start_load_kv"],
-            call_time_monitor["build_connector_meta"]):
-        assert build_metadata_call_time < load_kv_call_time
-
+    # Only called once when the request is received.
     assert scheduler.get_num_new_matched_tokens.call_count == 1
 
     num_layers = max(call.args[0]
                      for call in worker.wait_for_layer_load.call_args_list) + 1
 
+    # Called num_layers * num_forward_passes times.
     assert worker.wait_for_layer_load.call_count == num_layers * NUM_TOKENS
     assert worker.save_kv_layer.call_count == num_layers * NUM_TOKENS
 
@@ -156,3 +121,73 @@ def test_llm_api_connector_simple(connector):
 
     assert scheduler.request_finished.call_count == 1
     assert worker.get_finished.call_count == NUM_TOKENS
+
+
+@pytest.mark.threadleak(enabled=False)
+def test_llm_api_connector_async_onboard(connector):
+    connector_config, scheduler, worker = connector
+
+    NUM_TOKENS = 8
+
+    model = LLM(model="Qwen/Qwen2-0.5B",
+                backend="pytorch",
+                disable_overlap_scheduler=True,
+                connector_config=connector_config,
+                cuda_graph_config=None)
+
+    assert worker.register_kv_caches.call_count == 1
+
+    scheduler.get_num_new_matched_tokens.return_value = 16, True
+
+    worker.get_finished.side_effect = lambda finished_gen, load_async: (
+        finished_gen, load_async)
+
+    model.generate([
+        "Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua."
+    ], SamplingParams(max_tokens=NUM_TOKENS, ignore_eos=True))
+
+    # Once for the initial poll, then once for each token.
+    assert worker.get_finished.call_count == NUM_TOKENS + 1
+
+    # In the first iteration, there should be a single request id provided.
+    assert len(worker.get_finished.call_args_list[0].args[1]) == 1
+
+
+@pytest.mark.threadleak(enabled=False)
+def test_llm_api_connector_async_save(connector):
+    connector_config, scheduler, worker = connector
+
+    NUM_TOKENS = 8
+
+    model = LLM(model="Qwen/Qwen2-0.5B",
+                backend="pytorch",
+                disable_overlap_scheduler=True,
+                connector_config=connector_config,
+                cuda_graph_config=None)
+
+    assert worker.register_kv_caches.call_count == 1
+
+    scheduler.get_num_new_matched_tokens.return_value = 0, False
+
+    scheduler.request_finished.return_value = True
+
+    worker.get_finished.side_effect = lambda finished_gen, load_async: (
+        finished_gen, load_async)
+
+    sampling_params = SamplingParams(max_tokens=NUM_TOKENS, ignore_eos=True)
+
+    model.generate(["Hello, world"], sampling_params)
+
+    assert scheduler.request_finished.call_count == 1
+
+    # On the last call to get_finished, we should be providing the async saving request.
+    assert worker.get_finished.call_count == NUM_TOKENS
+
+    for i in range(NUM_TOKENS):
+        args = worker.get_finished.call_args_list[i].args
+        if i != NUM_TOKENS - 1:
+            assert args == ([], [])
+        else:
+            assert len(args[0]) == 1
+            assert args[0][0] == scheduler.request_finished.call_args.args[
+                0].request_id
