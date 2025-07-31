@@ -705,6 +705,7 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
         mUseSpecDecoding = useSpecDecoding;
         // change mMultiBlockMode to default
         mMultiBlockMode = mUseSpecDecoding ? false : true;
+        // if Hopper XQA kernel is enabled, multi block mode will be true in decoderXQAImplJIT::runImpl
     }
 
     [[maybe_unused]] MlaParams<T> mla_params;
