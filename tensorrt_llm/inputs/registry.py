@@ -127,6 +127,10 @@ class MultimodalPlaceholderRegistry:
         return self._multimodal_placeholder_by_model_type[model_type]
 
     def get_placeholder(self, model_type: str, modality: str) -> str:
+        if not self.is_valid(model_type, modality):
+            raise ValueError(
+                f"Model type '{model_type}' with modality '{modality}' is not registered."
+            )
         return self._multimodal_placeholder_by_model_type[
             model_type].placeholder_map[modality]
 

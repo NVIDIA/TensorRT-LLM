@@ -286,7 +286,13 @@ def throughput_command(
     # Model, experiment, and engine params
     custom_module_dirs: list[Path] = params.pop("custom_module_dirs", [])
     for custom_module_dir in custom_module_dirs:
-        import_custom_module_from_dir(custom_module_dir)
+        try:
+            import_custom_module_from_dir(custom_module_dir)
+        except Exception as e:
+            logger.error(
+                f"Failed to import custom module from {custom_module_dir}: {e}")
+            raise e
+
     dataset_path: Path = params.get("dataset")
     no_skip_tokenizer_init: bool = params.get("no_skip_tokenizer_init", False)
     eos_id: int = params.get("eos_id")

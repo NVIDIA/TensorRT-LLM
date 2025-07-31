@@ -156,7 +156,13 @@ def main():
     args = parse_arguments()
     if args.custom_module_dirs is not None:
         for custom_module_dir in args.custom_module_dirs:
-            import_custom_module_from_dir(custom_module_dir)
+            try:
+                import_custom_module_from_dir(custom_module_dir)
+            except Exception as e:
+                print(
+                    f"Failed to import custom module from {custom_module_dir}: {e}"
+                )
+                raise e
 
     lora_config = None
     if args.load_lora:
