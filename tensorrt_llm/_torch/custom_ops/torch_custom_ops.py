@@ -19,7 +19,9 @@ from tensorrt_llm._torch.autotuner import (AutoTuner, ConstraintSpec,
                                            DynamicTensorSpec,
                                            OptimizationProfile, TunableRunner,
                                            TuningConfig)
-from tensorrt_llm._torch.custom_ops.cute_dsl_kernels.blackwell.blockwise_gemm import \
+# from tensorrt_llm._torch.custom_ops.cute_dsl_kernels.blackwell.blockwise_gemm import \
+#     BlockwiseGemmKernel
+from tensorrt_llm._torch.custom_ops.cute_dsl_kernels.blackwell.blockwise_gemm_release import \
     BlockwiseGemmKernel
 from tensorrt_llm._torch.utils import (compute_swizzled_sf_shape,
                                        fp4_scale_infer_shape,
@@ -1192,7 +1194,7 @@ class CuteDSLFp8BlackwellLinear(TunableRunner):
         use_2cta_instrs: bool = False,
         mma_tiler_mn: Tuple[int, int] = (128, 128),
         cluster_shape_mn: Tuple[int, int] = (1, 1),
-        use_tma_store: bool = True,
+        # use_tma_store: bool = True,
         **kwargs,
     ) -> List[int]:
         m = inputs[0].shape[0]
@@ -1212,7 +1214,7 @@ class CuteDSLFp8BlackwellLinear(TunableRunner):
             use_2cta_instrs,
             mma_tiler_mn,
             cluster_shape_mn,
-            use_tma_store,
+            # use_tma_store,
             m,
             n,
             k,
@@ -1232,7 +1234,7 @@ class CuteDSLFp8BlackwellLinear(TunableRunner):
         use_2cta_instrs: bool = False,
         mma_tiler_mn: Tuple[int, int] = (128, 128),
         cluster_shape_mn: Tuple[int, int] = (1, 1),
-        use_tma_store: bool = True,
+        # use_tma_store: bool = True,
         tactic: int = -1,
     ) -> torch.Tensor:
         """Performs fp8 blockwise (deepgemm like) operation using CuTe DSL.
@@ -1305,15 +1307,19 @@ class CuteDSLFp8BlackwellLinear(TunableRunner):
         torch_stream = torch.cuda.current_stream()
         stream = cuda.CUstream(torch_stream.cuda_stream)
 
-        cache_key = (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn,
-                     use_tma_store)
+        cache_key = (
+            use_2cta_instrs,
+            mma_tiler_mn,
+            cluster_shape_mn,
+            # use_tma_store
+        )
         if cache_key not in CuteDSLFp8BlackwellLinear.kernel_dict:
             gemm = BlockwiseGemmKernel(
                 cutlass.Float32,  # acc_dtype,
                 use_2cta_instrs=use_2cta_instrs,
                 mma_tiler_mn=mma_tiler_mn,
                 cluster_shape_mn=cluster_shape_mn,
-                use_tma_store=use_tma_store,
+                # use_tma_store=use_tma_store,
             )
             # Compute max active clusters on current device
             hardware_info = cutlass.utils.HardwareInfo()
@@ -1405,7 +1411,7 @@ def cute_dsl_fp8_gemm_blackwell(
         use_2cta_instrs=False,
         mma_tiler_mn=(128, 128),
         cluster_shape_mn=(1, 1),
-        use_tma_store=True,
+        # use_tma_store=True,
     )
 
 
