@@ -176,7 +176,7 @@ class ADEngine(ModelEngine):
         # info to be extracted
         seq_lens: List[int] = []
         input_pos: List[int] = []
-        last_logit_only: List[bool] = []
+        last_logit_only: List[bool] = [True] * len(context_requests) + [False] * len(gen_requests)
         page_assignments: List[List[int]] = []
         previous_batch_indices: torch.Tensor = torch.empty((len(gen_requests),), dtype=torch.int32, pin_memory=True)
         # look at context requests first
@@ -192,7 +192,6 @@ class ADEngine(ModelEngine):
                 input_pos.append(request.context_current_position)
 
                 request.py_batch_idx = request.seq_slot
-                last_logit_only.append(True)
                 cache_indices = kv_cache_manager.get_cache_indices(request)
                 page_assignments.append(cache_indices)
 
@@ -200,35 +199,28 @@ class ADEngine(ModelEngine):
         # TODO: we should also handle extend requests (for speculative decoding) here
         with nvtx_range("ad_update_generate"):
             previous_batch_idx = 0
-            #self.input_ids_cuda[idx:idx+len(gen_requests)].fill_(-1) # fill for the common use case
-            # input_ids_gen = []
-            new_tokens_idx = 0
             for request in gen_requests:
-                # new_tokens are provided when the overlap scheduler is enabled.
-                if new_tokens is None or request.is_dummy or request.py_batch_idx is None: # when is this case even happening?
-                    self.input_ids_cuda[idx] = request.get_token(0, request.get_num_tokens(0) - 1) #this is a CPU->GPU copy, but it's rare. Consider batching this.
-                    idx += 1
-                    input_pos.append(request.max_beam_num_tokens - 1)
-                else:
-                    # insert a dummy token to indicate the new tokens
-                    #self.input_ids_cuda is prefilled with -1s, so we don't need to do this
-                    # self.input_ids_cuda[idx] = -1
-                    # print("================================== type of input_ids_cuda: ===============================", self.input_ids_cuda.dtype)
-                    self.input_ids_cuda[idx] = new_tokens[0, new_tokens_idx, 0] # gpu-gpu copy. might be better to batch it.
-                    idx += 1
-                    new_tokens_idx += 1
-                    previous_batch_indices[previous_batch_idx] = request.py_batch_idx
-                    previous_batch_idx += 1
-                    input_pos.append(request.max_beam_num_tokens)
+                # Previous implementation (feat/ad-2025-07-22) included an if-else statement to handle dummy tokens.
+                # This is slowing down the execution, and AFAICT it always evaluates to False.
+                # By removing this, we can assign to a contigous slice of input_ids_cuda, without complex indexing.
+                # Spefically, we don't need to copy the real requests indices to the device.
+                dummy_cond = new_tokens is None or request.is_dummy or request.py_batch_idx is None
+                assert not dummy_cond, "dummy_cond in prepare_inputs is true - AD refactor is faulty."
+
+                previous_batch_indices[previous_batch_idx] = request.py_batch_idx
+                previous_batch_idx += 1
+                input_pos.append(request.max_beam_num_tokens)
 
                 request.py_batch_idx = request.seq_slot
                 cache_indices = kv_cache_manager.get_cache_indices(request)
                 page_assignments.append(cache_indices)
 
-                # return all logits
-                last_logit_only.append(False)
+            with nvtx_range("ad_update_input_ids"):
+                if new_tokens is not None:
+                    self.input_ids_cuda[idx:idx+len(gen_requests)] = new_tokens[0, :len(gen_requests), 0] # gpu-gpu copy. might be better to batch it.
+                    idx += len(gen_requests)
             seq_lens.extend([1] * len(gen_requests))
-        
+
         # update the sequence info object now
         si = self.cache_seq_interface.info
         si.update_sequence_lengths(seq_lens)
