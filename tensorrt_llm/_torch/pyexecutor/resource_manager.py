@@ -379,7 +379,8 @@ class KVCacheManager(BaseResourceManager):
                         req.py_request_id,
                         seq_len + (len(req.query_id) if self.mapping.cp_rank
                                    == self.mapping.cp_size - 1 else 0),
-                        req_beam_width, req, self.kv_connector_manager)
+                        req_beam_width, req, self.kv_connector_manager
+                        if not scheduled_batch.is_warmup else None)
             else:
                 # TODO(jthomson04): This is begging for a mega refactor, and can likely be significantly simplified.
                 # In add sequence, the connector API's get_num_new_matched_tokens is called.
@@ -389,9 +390,10 @@ class KVCacheManager(BaseResourceManager):
                 # When that happens, the request will go through this same code path, but with is_kv_cache_connector_async_onboard set to True.
                 # Because of this, we need to filter this case out to avoid adding the same sequence twice.
                 if req.is_first_context_chunk and not req.is_kv_cache_connector_async_onboard:
-                    self.impl.add_sequence(req.py_request_id, req.prompt_len,
-                                           req_beam_width, req,
-                                           self.kv_connector_manager)
+                    self.impl.add_sequence(
+                        req.py_request_id, req.prompt_len, req_beam_width, req,
+                        self.kv_connector_manager
+                        if not scheduled_batch.is_warmup else None)
                     for _ in range(self.num_extra_kv_tokens):
                         self.impl.add_token(req.py_request_id)
                     for _ in range(get_draft_token_length(req)):

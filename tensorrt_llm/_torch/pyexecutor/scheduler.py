@@ -21,6 +21,7 @@ class ScheduledRequests:
         self.context_requests: RequestList = []
         self.generation_requests: RequestList = []
         self.paused_requests: RequestList = []
+        self.is_warmup: bool = False
 
     @property
     def is_generation_only(self) -> bool:
