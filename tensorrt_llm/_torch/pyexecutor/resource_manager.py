@@ -15,7 +15,8 @@ from tensorrt_llm.sampling_params import SamplingParams
 from ..._utils import binding_dtype_size, nvtx_range
 from ...logger import logger
 from ...mapping import Mapping
-from .llm_request import LlmRequest, LlmRequestState, SamplingConfig
+from .llm_request import (LlmRequest, LlmRequestState, SamplingConfig,
+                          get_draft_token_length)
 from .scheduler import ScheduledRequests
 
 if ENABLE_MULTI_DEVICE:
@@ -368,12 +369,12 @@ class KVCacheManager(BaseResourceManager):
                                            req_beam_width, req)
                     for _ in range(self.num_extra_kv_tokens):
                         self.impl.add_token(req.py_request_id)
-                    for _ in range(len(req.py_draft_tokens)):
+                    for _ in range(get_draft_token_length(req)):
                         self.impl.add_token(req.py_request_id)
 
         for req in generation_batch:
             self.impl.add_token(req.py_request_id)
-            for _ in range(len(req.py_draft_tokens)):
+            for _ in range(get_draft_token_length(req)):
                 self.impl.add_token(req.py_request_id)
 
     def add_dummy_requests(
