@@ -7,13 +7,8 @@ from torch.export import Dim
 from torch.fx import GraphModule
 from transformers.integrations.sdpa_attention import repeat_kv as hf_repeat_kv
 
+from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import AttentionDescriptor
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
-from tensorrt_llm._torch.auto_deploy.transformations.library.attention import (
-    match_attention_layout,
-    match_eager_attention,
-    match_grouped_attention,
-    match_repeat_kv,
-)
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 
 torch.manual_seed(0)
@@ -417,11 +412,13 @@ def _get_match_repeat_kv_optimizer() -> Callable:
         "cleanup_noop_slice": {
             "stage": "post_export",
         },
+        "match_repeat_kv": {
+            "stage": "pattern_matcher",
+        },
     }
 
     def _transform(gm: GraphModule) -> GraphModule:
         gm = InferenceOptimizer(None, config)(None, gm)
-        match_repeat_kv(gm)
         return gm
 
     return _transform
@@ -432,11 +429,13 @@ def _get_match_eager_attention_optimizer() -> Callable:
         "cleanup_noop_slice": {
             "stage": "post_export",
         },
+        "match_eager_attention": {
+            "stage": "pattern_matcher",
+        },
     }
 
     def _transform(gm: GraphModule) -> GraphModule:
         gm = InferenceOptimizer(None, config)(None, gm)
-        match_eager_attention(gm)
         return gm
 
     return _transform
@@ -447,11 +446,13 @@ def _get_match_grouped_attention_optimizer() -> Callable:
         "cleanup_noop_slice": {
             "stage": "post_export",
         },
+        "match_grouped_attention": {
+            "stage": "pattern_matcher",
+        },
     }
 
     def _transform(gm: GraphModule) -> GraphModule:
         gm = InferenceOptimizer(None, config)(None, gm)
-        match_grouped_attention(gm)
         return gm
 
     return _transform
@@ -1014,7 +1015,7 @@ class Llama3CausalAttentionModel(torch.nn.Module):
         return {0: Dim("batch_size", max=8), 1: Dim("seq_len", min=4, max=16)}
 
 
-class MockAttentionDescriptor:
+class MockAttentionDescriptor(AttentionDescriptor):
     """A mock class that mimics the AttentionDescriptor interface for testing."""
 
     layout: str = "bnsd"
@@ -1319,7 +1320,15 @@ def test_match_attention_layout(layout, model_config, has_mask):
     run_test(
         model,
         x,
-        lambda gm: match_attention_layout(gm, MockAttentionDescriptor),
+        lambda gm: InferenceOptimizer(
+            None,
+            {
+                "match_attention_layout": {
+                    "stage": "pattern_matcher",
+                    "attention_op": MockAttentionDescriptor,
+                },
+            },
+        )(None, gm),
         verify_matcher,
         lambda num_p_og: num_p_og,
         atol=1e-3,

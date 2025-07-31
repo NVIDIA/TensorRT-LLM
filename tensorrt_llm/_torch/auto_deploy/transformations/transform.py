@@ -24,11 +24,7 @@ from .library import (
     fuse_collectives,
     fuse_rmsnorm,
     insert_cached_attention,
-    match_attention_layout,
-    match_eager_attention,
-    match_grouped_attention,
     match_moe_pattern,
-    match_repeat_kv,
     match_rope_layout,
     match_rope_pattern,
     optimize_rope,
@@ -60,6 +56,12 @@ class InferenceOptimizer:
         ############################################################################################
         # RUN MODULAR INFERENCE OPTIMIZER FOR ALREADY-MIGRATED TRANSFORMS
         ############################################################################################
+        # TODO (hg): default values that are not representable in YAML.
+        if "match_attention_layout" in self.ad_config.transforms:
+            self.ad_config.transforms[
+                "match_attention_layout"
+            ].attention_op = AttentionRegistry.get(self.ad_config.attn_backend)
+
         new_optimizer = ModularInferenceOptimizer(self.factory, self.ad_config.transforms)
         egm = new_optimizer(cm)
 
@@ -71,18 +73,6 @@ class InferenceOptimizer:
 
         # Match MoE pattern
         match_moe_pattern(egm)
-
-        # Match repeat_kv pattern
-        match_repeat_kv(egm)
-
-        # Match eager attention pattern
-        match_eager_attention(egm)
-
-        # Match grouped attention pattern
-        match_grouped_attention(egm)
-
-        # Match attention layout expected by our backend
-        match_attention_layout(egm, AttentionRegistry.get(self.ad_config.attn_backend))
 
         # Match rope
         match_rope_pattern(egm)
