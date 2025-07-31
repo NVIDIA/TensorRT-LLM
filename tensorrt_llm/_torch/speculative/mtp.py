@@ -822,8 +822,6 @@ class MTPWorker(nn.Module):
             ctx_slot_ids = spec_metadata.slot_ids[:num_contexts]
             mtp_relaxed_delta_pool.index_copy_(0, ctx_slot_ids, ctx_delta)
 
-            # print("AMEYN: before process_generation_logits (softmax) logits.shape:", logits.shape)
-
             # generation
             gen_logprobs = self.process_generation_logits(logits, num_contexts)
             topk_value, topk_indices, draft_tokens = self.topk_kernel(
@@ -1070,7 +1068,7 @@ class MTPWorker(nn.Module):
 
         original_last_dim = combined.shape[-1]
         
-        # Ensure the combined tensor has at least 8 elements by padding with zeros
+        # Ensure the combined tensor has at least 4 elements by padding with zeros
         if combined.numel() < 4:
             padding_size = 4 - combined.numel()
             # Create padding tensor with same shape as combined except for the last dimension
@@ -1088,6 +1086,39 @@ class MTPWorker(nn.Module):
         gathered = gathered[..., :original_last_dim]
         num_ranks, features_per_rank = gathered.shape
         gathered = gathered.reshape(1, num_ranks * features_per_rank)
+        gathered_indices_float = gathered[..., 0::2]  # Even positions: indices
+        gathered_values_float = gathered[..., 1::2]  # Odd positions: values
+
+        # Find the rank with maximum value
+        max_indices = torch.argmax(gathered_values_float, dim=-1, keepdim=True)
+
+        # Get the corresponding token indices and convert back to int32
+        draft_tokens = torch.gather(gathered_indices_float, -1,
+                                    max_indices).squeeze(-1).type(torch.int32)
+        return draft_tokens
+
+    @torch.compile(options={"max-autotune": True})
+    def get_local_max_and_combined_simple(self, logits):
+        """Simple version without padding for fallback allgather"""
+        local_max_values, local_argmax = torch.max(logits, dim=-1, keepdim=True)
+        # Adjust indices based on TP rank and size
+        vocab_per_rank = logits.shape[-1]
+        max_index_per_rank = local_argmax.type(
+            torch.int32) + (self.model_config.mapping.tp_rank * vocab_per_rank)
+        # Use torch.stack and flatten instead of view+cat to avoid torch.compile issues
+        # Convert both to float32 to ensure consistent dtype
+        max_index_per_rank_float = max_index_per_rank.float()
+        local_max_values_float32 = local_max_values.float()
+
+        # Stack and flatten to get interleaved layout: [idx0, val0, idx1, val1, ...]
+        combined = torch.stack(
+            [max_index_per_rank_float, local_max_values_float32],
+            dim=-1).flatten(-2)
+        return combined
+
+    @torch.compile(options={"max-autotune": True})
+    def get_draft_tokens_from_gathered_simple(self, gathered):
+        """Simple version without slicing for fallback allgather"""
         gathered_indices_float = gathered[..., 0::2]  # Even positions: indices
         gathered_values_float = gathered[..., 1::2]  # Odd positions: values
 
@@ -1120,19 +1151,10 @@ class MTPWorker(nn.Module):
                 and hasattr(self.model_config, 'mapping')
                 and self.model_config.mapping.tp_size
                 > 1) and not (self.model_config.mapping.enable_attention_dp):
-            original_last_dim, combined = self.get_local_max_and_combined(logits)
-
-            # if 1:
-                #print(f"DBG AMEY: rank: {self.model_config.mapping.tp_rank} combined.shape: {combined.shape}")
-                
-                # Store original size before padding
-                
-                
-                # if self.model_config.mapping.tp_rank == 0:
-                #     print(f"DBG AMEY: after padding rank: {self.model_config.mapping.tp_rank} combined.shape: {combined.shape} dtype: {combined.dtype} device: {combined.device}")
-
+            
             # Use AllReduce with ALLGATHER fusion op if available
-            if 1 and self.allreduce_op is not None:
+            if self.allreduce_op is not None:
+                original_last_dim, combined = self.get_local_max_and_combined(logits)
                 gathered = self.allreduce_op(
                     combined,
                     all_reduce_params=AllReduceParams(
@@ -1140,24 +1162,12 @@ class MTPWorker(nn.Module):
                         enable_allreduce=True,
                     ),
                 )
-                # if self.model_config.mapping.tp_rank == 0:
-                #     print(f"DBG AMEY: after allreduce rank: {self.model_config.mapping.tp_rank} gathered.shape: {gathered.shape} dtype: {gathered.dtype} device: {gathered.device}")
-                #     print("DBG AMEY: gathered: ", gathered)
-                
-                # Remove the padded zeros by slicing to original size
-                
-                #print(f"DBG AMEY: after reshaping to allgather format rank: {self.model_config.mapping.tp_rank} gathered.shape: {gathered.shape}")
-                
                 draft_tokens = self.get_draft_tokens_from_gathered(gathered, original_last_dim)
-            # else:
-            #     # Fallback to original allgather approach
-            #     gathered = allgather(combined, self.model_config.mapping, dim=-1)
-                
-            #     # Remove the padded zeros by slicing to original size
-            #     # gathered = gathered[..., :original_last_dim]
-            #     #print(f"DBG AMEY: fallback after removing padding rank: {self.model_config.mapping.tp_rank} gathered.shape: {gathered.shape}")
-                
-            #     draft_tokens = self.get_draft_tokens_from_gathered(gathered)
+            else:
+                # Fallback to original allgather approach (simpler, no padding)
+                combined = self.get_local_max_and_combined_simple(logits)
+                gathered = allgather(combined, self.model_config.mapping, dim=-1)
+                draft_tokens = self.get_draft_tokens_from_gathered_simple(gathered)
         else:
             # Simple argmax if no TP or no model config
             draft_tokens = torch.argmax(logits, dim=-1).type(torch.int32)

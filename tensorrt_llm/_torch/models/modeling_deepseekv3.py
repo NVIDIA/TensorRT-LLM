@@ -983,19 +983,9 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
         hidden_states = self.eh_proj(hidden_states)
 
         # Input layer norm
-        if self.fuse_norm_ar:
-            hidden_states, residual = self.allreduce(
-                hidden_states,
-                all_reduce_params=AllReduceParams(
-                    fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
-                    residual=torch.zeros_like(hidden_states),
-                    norm_weight=self.input_layernorm.weight,
-                    eps=self.input_layernorm.variance_epsilon,
-                ),
-            )
-        else:
-            residual = hidden_states
-            hidden_states = self.input_layernorm(hidden_states)
+
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
         hidden_states = self.self_attn(
