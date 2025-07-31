@@ -62,8 +62,8 @@ protected:
             /*multimodalEmbedding=*/std::nullopt,
             /*mropeRotaryCosSin=*/std::nullopt, /*mropePositionDeltas*/ std::nullopt,
             /*loraTaskId=*/std::nullopt, /*loraWeights=*/std::nullopt,
-            /*loraConfig=*/std::nullopt, /*lookaheadConfig=*/std::nullopt, /*kvCacheRetentionConfig=*/std::nullopt,
-            /*returnLogProbs=*/false,
+            /*loraConfig=*/std::nullopt, /*loraPath*/ std::nullopt, /*lookaheadConfig=*/std::nullopt,
+            /*kvCacheRetentionConfig=*/std::nullopt, /*returnLogProbs=*/false,
             /*returnContextLogits=*/false, /*returnGenerationLogits=*/false, draftTokens, draftLogits);
     }
 
