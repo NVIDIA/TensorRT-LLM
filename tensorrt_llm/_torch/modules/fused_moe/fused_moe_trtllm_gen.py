@@ -277,7 +277,10 @@ class TRTLLMGenFusedMoE(MoE):
         elif self.has_w4a16_mxfp4:
             assert x.dtype == torch.bfloat16
 
-            # TODO: remove bias / act_type
+            pad_size = self.w3_w1_weight.shape[-1] * 2 - x.shape[-1]
+            x = torch.nn.functional.pad(x, (0, pad_size))
+            intermediate_size_per_partition_padded = self.w3_w1_weight.shape[
+                -2] // 2
             final_hidden_states = torch.ops.trtllm.bf16_mxe2m1_block_scale_moe_runner(
                 router_logits,
                 routing_bias,
@@ -295,7 +298,7 @@ class TRTLLMGenFusedMoE(MoE):
                 top_k,
                 n_group,
                 topk_group,
-                self.intermediate_size_per_partition,
+                intermediate_size_per_partition_padded,
                 self.
                 slot_start,  # local_expert_start;  use ep_rank if stride!=1
                 self.expert_size_per_partition,  # local_expert_size
@@ -304,11 +307,16 @@ class TRTLLMGenFusedMoE(MoE):
                 self.routing_method.routing_method_type,
                 0,  # act_type
             )
+            final_hidden_states = final_hidden_states[:, :self.
+                                                      hidden_size].contiguous()
         elif self.has_w4a8_mxfp4_fp8:
+            pad_size = self.w3_w1_weight.shape[-1] * 2 - x.shape[-1]
+            x = torch.nn.functional.pad(x, (0, pad_size))
             x, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
                 x, self.fc31_input_gate_dequant[0])
+            intermediate_size_per_partition_padded = self.w3_w1_weight.shape[
+                -2] // 2
 
-            # TODO: remove bias / act_type
             final_hidden_states = torch.ops.trtllm.e4m3_mxe2m1_block_scale_moe_runner(
                 router_logits,
                 routing_bias,
@@ -329,7 +337,7 @@ class TRTLLMGenFusedMoE(MoE):
                 top_k,
                 n_group,
                 topk_group,
-                self.intermediate_size_per_partition,
+                intermediate_size_per_partition_padded,
                 self.
                 slot_start,  # local_expert_start;  use ep_rank if stride!=1
                 self.expert_size_per_partition,  # local_expert_size
@@ -338,6 +346,8 @@ class TRTLLMGenFusedMoE(MoE):
                 self.routing_method.routing_method_type,
                 0,  # act_type
             )
+            final_hidden_states = final_hidden_states[:, :self.
+                                                      hidden_size].contiguous()
         elif self.has_w4a8_mxfp4_mxfp8:
             # TRTLLM-Gen uses linear SF layout for the mxfp8 input.
             mxfp8_x, sf = torch.ops.trtllm.mxfp8_quantize(
@@ -345,7 +355,6 @@ class TRTLLMGenFusedMoE(MoE):
             intermediate_size_per_partition_padded = self.w3_w1_weight.shape[
                 -2] // 2
 
-            # TODO: remove bias / act_type
             final_hidden_states = torch.ops.trtllm.mxe4m3_mxe2m1_block_scale_moe_runner(
                 router_logits,
                 routing_bias,

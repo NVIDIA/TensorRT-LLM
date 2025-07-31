@@ -78,11 +78,12 @@ class AttentionBlock(Attention):
                 dim=pretrained_config.head_dim,
                 theta=pretrained_config.rope_theta,
                 scale_type=RotaryScalingType.yarn,
-                scale=pretrained_config.rope_scaling_factor,
+                scale=pretrained_config.rope_scaling['factor'],
                 max_positions=pretrained_config.max_position_embeddings,
-                original_max_positions=pretrained_config.initial_context_length,
-                beta_fast=pretrained_config.rope_ntk_beta,
-                beta_slow=pretrained_config.rope_ntk_alpha,
+                original_max_positions=pretrained_config.
+                rope_scaling['original_max_position_embeddings'],
+                beta_fast=pretrained_config.rope_scaling['beta_fast'],
+                beta_slow=pretrained_config.rope_scaling['beta_slow'],
                 duplicate_data=False),
             is_neox=False,
         )
@@ -157,7 +158,7 @@ class MLPBlock(torch.nn.Module):
 
         self.config = config  # Store config as instance variable
         pretrained_config = config.pretrained_config
-        self.num_experts = pretrained_config.num_experts
+        self.num_experts = pretrained_config.num_local_experts
         self.layer_idx = layer_idx
         self.enable_attention_dp = config.mapping.enable_attention_dp
         self.mapping = config.mapping
@@ -168,7 +169,7 @@ class MLPBlock(torch.nn.Module):
 
         self.gate = Linear(
             in_features=pretrained_config.hidden_size,
-            out_features=pretrained_config.num_experts,
+            out_features=pretrained_config.num_local_experts,
             bias=True,
             dtype=pretrained_config.torch_dtype,
             use_custom_cublas_mm=
@@ -176,7 +177,7 @@ class MLPBlock(torch.nn.Module):
         )
 
         self.routing_method = RenormalizeMoeRoutingMethod(
-            top_k=pretrained_config.experts_per_token)
+            top_k=pretrained_config.num_experts_per_tok)
         self.swiglu_alpha = torch.tensor(
             [1.702] * (self.num_experts // config.mapping.moe_ep_size),
             dtype=torch.float32).cuda()
@@ -189,7 +190,7 @@ class MLPBlock(torch.nn.Module):
         # Prepare MoE creation parameters
         moe_params = {
             'routing_method': self.routing_method,
-            'num_experts': pretrained_config.num_experts,
+            'num_experts': pretrained_config.num_local_experts,
             'hidden_size': pretrained_config.hidden_size,
             'intermediate_size': pretrained_config.intermediate_size,
             'dtype': pretrained_config.torch_dtype,
@@ -556,10 +557,36 @@ class OpenAIMoeForCausalLM(SpecDecOneEngineForCausalLM[Transformer,
         "lm_head": "unembedding",
     }
 
+    hf_params_map = {
+        # TRTLLM module name : HuggingFace module name
+        "embedding": "embed_tokens",
+        # Order matters for attn.norm and attn.
+        'attn.norm': 'input_layernorm',
+        'attn': 'self_attn',
+        'mlp.norm': 'post_attention_layernorm',
+        'block': 'layers',
+        'gate': 'router',
+    }
+
     def __init__(
         self,
         model_config: ModelConfig[OpenAIMoeConfig],
     ):
+        # Map config to HF format.
+        if hasattr(model_config.pretrained_config, 'num_experts'):
+            model_config.pretrained_config.num_local_experts = model_config.pretrained_config.num_experts
+            model_config.pretrained_config.num_experts_per_tok = model_config.pretrained_config.experts_per_token
+            model_config.pretrained_config.rope_scaling = {
+                'factor':
+                model_config.pretrained_config.rope_scaling_factor,
+                'beta_fast':
+                model_config.pretrained_config.rope_ntk_beta,
+                'beta_slow':
+                model_config.pretrained_config.rope_ntk_alpha,
+                'original_max_position_embeddings':
+                model_config.pretrained_config.initial_context_length,
+            }
+
         super().__init__(
             Transformer(model_config),
             model_config=model_config,
@@ -585,10 +612,155 @@ class OpenAIMoeForCausalLM(SpecDecOneEngineForCausalLM[Transformer,
                 module.create_weights()
 
     def load_weights(self, weights: Dict):
+        is_ori_model = True
+        for k, v in weights.items():
+            if 'q_proj' in k:
+                is_ori_model = False
+
+        if is_ori_model:
+            self.load_ori_weights(weights)
+        else:
+            self.load_hf_weights(weights)
+
+        for idx, layer in enumerate(
+                self.model.block[:self.config.num_hidden_layers]):
+            if idx == 0:
+                layer.input_layernorm = layer.attn.norm
+
+            layer.post_attention_layernorm = layer.mlp.norm
+
+            if idx == self.config.num_hidden_layers - 1:
+                layer.next_layer_layernorm = self.model.norm
+            else:
+                layer.next_layer_layernorm = self.model.block[idx + 1].attn.norm
+
+    def load_hf_weights(self, weights: Dict):
+        num_expert = self.config.num_local_experts
+
+        for name, module in tqdm(list(self.named_modules()),
+                                 desc="Loading weights"):
+            if len(module._parameters) <= 0 or name.startswith("draft_model"):
+                continue
+
+            module_weights = {}
+            for k, v in self.hf_params_map.items():
+                name = name.replace(k, v)
+            module_weights = filter_weights(name, weights)
+
+            if isinstance(module, MoE):
+                try:
+                    # For BF16 ckpt.
+                    # Deinterleave for gate and up.
+                    gate_up_weight = module_weights['gate_up_proj']
+                    gate, up = gate_up_weight[:, :, ::2], gate_up_weight[:, :,
+                                                                         1::2]
+                    gate_up_weight = torch.cat([gate, up], dim=-1)
+                    gate_up_bias = module_weights['gate_up_proj_bias']
+                    gate, up = gate_up_bias[:, ::2], gate_up_bias[:, 1::2]
+                    gate_up_bias = torch.cat([gate, up], dim=-1)
+                    moe_weights = {
+                        'gate_up_proj': [
+                            gate_up_weight.to(self.model.dtype)[i, :, :]
+                            for i in range(num_expert)
+                        ],
+                        'down_proj': [
+                            module_weights['down_proj'][i, :, :].to(
+                                self.model.dtype) for i in range(num_expert)
+                        ],
+                        'gate_up_proj.bias':
+                        [gate_up_bias[i, :] for i in range(num_expert)],
+                        'down_proj.bias': [
+                            module_weights['down_proj_bias'][i, :]
+                            for i in range(num_expert)
+                        ]
+                    }
+                except:
+                    # For MXFP4 ckpt.
+                    # Deinterleave for gate and up.
+                    gate_up_weight = module_weights[
+                        'gate_up_proj_blocks'].flatten(-2, -1)
+                    gate_weight, up_weight = gate_up_weight[:, ::
+                                                            2, :], gate_up_weight[:,
+                                                                                  1::
+                                                                                  2, :]
+                    gate_up_weight = torch.cat([gate_weight, up_weight], dim=-2)
+                    gate_up_bias = module_weights['gate_up_proj_bias']
+                    gate_bias, up_bias = gate_up_bias[:, ::
+                                                      2], gate_up_bias[:, 1::2]
+                    gate_up_bias = torch.cat([gate_bias, up_bias], dim=-1)
+                    gate_up_weight_scale = module_weights['gate_up_proj_scales']
+                    gate_weight_scale, up_weight_scale = gate_up_weight_scale[:, ::
+                                                                              2, :], gate_up_weight_scale[:,
+                                                                                                          1::
+                                                                                                          2, :]
+                    gate_up_weight_scale = torch.cat(
+                        [gate_weight_scale, up_weight_scale], dim=-2)
+                    moe_weights = {
+                        'gate_up_proj': [
+                            gate_up_weight[i, :, :].transpose(0, 1)
+                            for i in range(num_expert)
+                        ],
+                        'down_proj': [
+                            module_weights['down_proj_blocks'].flatten(
+                                -2, -1)[i, :, :].transpose(0, 1)
+                            for i in range(num_expert)
+                        ],
+                        'gate_up_proj.bias':
+                        [gate_up_bias[i, :] for i in range(num_expert)],
+                        'down_proj.bias': [
+                            module_weights['down_proj_bias'][i, :]
+                            for i in range(num_expert)
+                        ],
+                        'gate_up_proj_weight_scale': [
+                            gate_up_weight_scale[i, :, :].transpose(0, 1)
+                            for i in range(num_expert)
+                        ],
+                        'down_proj_weight_scale': [
+                            module_weights['down_proj_scales']
+                            [i, :, :].transpose(0, 1) for i in range(num_expert)
+                        ]
+                    }
+
+                    if self.model_config.quant_config.quant_algo == 'W4A16_MXFP4':
+                        for i in range(num_expert):
+                            moe_weights[
+                                f"{i}.w1.weight_scale_inv"] = gate_weight[
+                                    i, :, :]
+                            moe_weights[f"{i}.w3.weight_scale_inv"] = up_weight[
+                                i, :, :]
+                            moe_weights[
+                                f"{i}.w2.weight_scale_inv"] = module_weights[
+                                    'down_proj_scales'][i, :, :]
+
+                module.load_weights(weights=[moe_weights])
+            elif hasattr(module, "load_weights"):
+                if 'qkv' in name:
+                    # For qkv_proj
+                    q_weight_bias = filter_weights(
+                        name.replace('qkv_proj', 'q_proj'), weights)
+                    k_weight_bias = filter_weights(
+                        name.replace('qkv_proj', 'k_proj'), weights)
+                    v_weight_bias = filter_weights(
+                        name.replace('qkv_proj', 'v_proj'), weights)
+                    module.load_weights(
+                        weights=[q_weight_bias, k_weight_bias, v_weight_bias])
+                else:
+                    # For o_proj, sinks.
+                    module.load_weights(weights=[module_weights])
+            else:
+                # Load four LN weights (attn.norm, mlp.norm, input_layernorm, post_attention_layernorm).
+                if 'next_layer_layernorm' in name:
+                    continue
+
+                for n, p in module._parameters.items():
+                    if p is not None:
+                        p.data.copy_(module_weights[n][:])
+
+    def load_ori_weights(self, weights: Dict):
         head_dim = self.config.head_dim
         num_q_head = self.config.num_attention_heads
         num_kv_head = self.config.num_key_value_heads
-        num_expert = self.config.num_experts
+        num_expert = self.config.num_local_experts
         enable_attention_dp = self.model_config.mapping.enable_attention_dp
         tp_size = self.model_config.mapping.tp_size
 
@@ -757,15 +929,3 @@ class OpenAIMoeForCausalLM(SpecDecOneEngineForCausalLM[Transformer,
                     if p is not None:
                         p.data.copy_(module_weights[n.replace(
                             "weight", "scale")][:])
-
-        for idx, layer in enumerate(
-                self.model.block[:self.config.num_hidden_layers]):
-            if idx == 0:
-                layer.input_layernorm = layer.attn.norm
-
-            layer.post_attention_layernorm = layer.mlp.norm
-
-            if idx == self.config.num_hidden_layers - 1:
-                layer.next_layer_layernorm = self.model.norm
-            else:
-                layer.next_layer_layernorm = self.model.block[idx + 1].attn.norm

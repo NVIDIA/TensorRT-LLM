@@ -70,6 +70,8 @@ def test_orangina_trtllmgen(moe_backend):
               tensor_parallel_size=1,
               enable_chunked_prefill=False,
               **pytorch_config,
+              max_batch_size=16,
+              max_seq_len=1024,
               moe_expert_parallel_size=-1,
               moe_tensor_parallel_size=-1,
               enable_attention_dp=False,

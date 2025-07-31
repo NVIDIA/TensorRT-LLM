@@ -258,3 +258,7 @@ OpenAI/BF16:
   - accuracy: 77.50
 OpenAI/MXFP4:
   - accuracy: 75.50
+  - quant_algo: W4A8_MXFP4_MXFP8
+    accuracy: 75.50
+  - quant_algo: W4A8_MXFP4_FP8
+    accuracy: 75.50
