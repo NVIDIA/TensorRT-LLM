@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 from queue import Queue
 
 # isort: off
@@ -44,6 +45,28 @@ class TestWorkerBase:
                 worker.await_responses()
 
             assert result_queue.qsize() > 0
+
+    def test_fetch_stats(self):
+        request = GenerationRequest(
+            prompt_token_ids=[3, 4, 5],
+            sampling_params=SamplingParams(max_tokens=10))
+        with WorkerBase(engine=model_path) as worker:
+            worker.submit(request)
+            worker.await_responses()
+            stats = worker.fetch_stats()
+            assert len(stats) > 0
+
+    def test_dispatch_stats_task(self):
+        request = GenerationRequest(
+            prompt_token_ids=[3, 4, 5],
+            sampling_params=SamplingParams(max_tokens=10))
+        with WorkerBase(engine=model_path) as worker:
+            worker.submit(request)
+            worker.await_responses()
+            worker.dispatch_stats_task()
+            time.sleep(10)
+            stats = worker.fetch_stats()
+            assert len(stats) == 1
 
     def _create_executor_config(self):
         llm_args = LlmArgs(model=model_path, cuda_graph_config=None)
