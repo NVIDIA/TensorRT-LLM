@@ -44,7 +44,6 @@ Explanation:
 TensorRT-LLM supports nvidia TensorRT Model Optimizer quantized FP8 checkpoint
 ``` bash
 trtllm-serve nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8 \
-    --backend pytorch \
     --max_batch_size 512 \
     --tp_size 8 \
     --ep_size 8 \
@@ -99,7 +98,6 @@ Currently parallel weight loading conflicts with min_latency, disable the parall
 ``` bash
 TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL=True \
 trtllm-serve nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8 \
-    --backend pytorch \
     --max_batch_size 8 \
     --tp_size 8 \
     --ep_size 1 \

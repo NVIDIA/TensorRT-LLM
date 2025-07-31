@@ -2027,7 +2027,7 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
         "qwen2-vl-7b-instruct": {
             "image": [
                 ["ocean", "waves", "atmosphere", "stormy", "clouds", "intense"],
-                ["trees", "rocks", "road", "sunny", "natural", "greenery"],
+                ["trees", "winding", "road", "sunny", "sky", "atmosphere"],
                 ["traffic", "vehicles", "moderate", "lanes", "road", "cars"],
             ],
             "video": [
@@ -2049,8 +2049,11 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
         "mistral-small-3.1-24b-instruct": {
             "image": [
                 ["dramatic", "seascape", "ocean", "turbulent", "waves", "dark"],
-                ["scenic", "rock", "landscape", "snow", "altitude"],
-                ["highway", "traffic", "directions", "lanes", "Jurong"],
+                ["scenic", "rock", "landscape", "monolith", "formation"],
+                [
+                    "multi-lane", "highway", "moderate", "traffic", "flow",
+                    "vehicles", "congestion"
+                ],
             ],
             "mixture_text_image":
             [["invention", "person", "scientists", "Lick", "engineers"],
@@ -2204,15 +2207,15 @@ def test_ptp_quickstart_multimodal_phi4mm(llm_root, llm_venv, modality):
     }
     expected_keywords = {
         "image": [
-            ["clear", "sunny", "sky", "image", "object"],
-            ["road", "car", "lane", "strip", "bus"],
+            ["image", "depicts", "mountain", "half", "rock"],
+            ["road", "car", "lane", "traffic", "bus"],
         ],
         "audio": [
             ["what", "is", "the", "traffic", "sign", "in", "image"],
             ["what", "is", "shown", "in", "this", "image"],
         ],
         "image_audio": [
-            ["Half", "Dome", "Park", "natural", "image"],
+            ["image", "depicts", "Grand", "rock", "scene"],
         ],
     }
 
@@ -2226,6 +2229,8 @@ def test_ptp_quickstart_multimodal_phi4mm(llm_root, llm_venv, modality):
         *accuracy_inputs[modality]["prompt"],
         "--media",
         *accuracy_inputs[modality]["media"],
+        # Set max_seq_len to 4096 to use short rope factor.
+        "--max_seq_len=4096",
         "--load_lora",
         "--auto_model_name",
         "Phi4MMForCausalLM",
