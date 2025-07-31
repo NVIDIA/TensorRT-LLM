@@ -2,10 +2,10 @@
 #SBATCH --nodes=2
 #SBATCH --ntasks=8
 #SBATCH --ntasks-per-node=4
-#SBATCH --partition=${partition} # add your partition here
-#SBATCH --account=${account} # add your account here
+#SBATCH --partition=${partition} # add your partition here or specify in the sbatch command
+#SBATCH --account=${account} # add your account here or specify in the sbatch command
+#SBATCH --job-name=${job_name} # add your job name here or specify in the sbatch command
 #SBATCH --time=02:00:00
-#SBATCH --job-name=${job_name} # add your job name here
 
 # Context servers arguments
 num_ctx_servers=${1}
