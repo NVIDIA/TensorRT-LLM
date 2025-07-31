@@ -408,8 +408,8 @@ class OpenAIServer:
 
             promises: List[RequestOutput] = []
             postproc_params_collection: List[Optional[PostprocParams]] = []
-            # ``logit_bias`` is converted to embedding bias using the
-            # tokenizer's vocabulary size.
+            # Pass the tokenizer vocabulary size so ``logit_bias`` can be
+            # expanded into an embedding bias tensor in the sampler.
             sampling_params = request.to_sampling_params(
                 vocab_size=self.tokenizer.tokenizer.vocab_size)
             # TODO: better way to enable metrics

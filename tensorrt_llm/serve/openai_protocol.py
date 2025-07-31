@@ -254,26 +254,6 @@ class CompletionRequest(OpenAIBaseModel):
     # doc: end-completion-extra-params
 
     def to_sampling_params(self, vocab_size: int = 32000) -> SamplingParams:
-        """Return :class:`SamplingParams` for this request.
-
-        ``vocab_size`` is used to expand ``logit_bias`` into an embedding bias
-        tensor. The server provides its tokenizer size, with 32000 used as a
-        fallback when this function is called directly.
-        """
-        """Convert request settings to :class:`SamplingParams`.
-
-        ``vocab_size`` is used only when ``logit_bias`` is provided so that the
-        bias can be expanded to the correct vocabulary size. The server passes
-        its tokenizer's size; 32000 is used as a conservative fallback.
-
-        Parameters
-        ----------
-        vocab_size : int, optional
-            Vocabulary size used to construct the embedding bias tensor when
-            ``logit_bias`` is provided. 32000 is a safe default for common
-            tokenizer setups, but the server passes its tokenizer's actual
-            vocabulary size.
-        """
         sampling_params = SamplingParams(
             best_of=self.best_of,
             frequency_penalty=self.frequency_penalty,
@@ -570,12 +550,6 @@ class ChatCompletionRequest(OpenAIBaseModel):
     # doc: end-chat-completion-extra-params
 
     def to_sampling_params(self, vocab_size: int = 32000) -> SamplingParams:
-        """Create :class:`SamplingParams` for this request.
-
-        ``vocab_size`` allows ``logit_bias`` to be converted into an embedding
-        bias of the appropriate size. The server will supply its tokenizer's
-        size; callers may rely on the default of 32000.
-        """
 
         sampling_params = SamplingParams(
             frequency_penalty=self.frequency_penalty,
