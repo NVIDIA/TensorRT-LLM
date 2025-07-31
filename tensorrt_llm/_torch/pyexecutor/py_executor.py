@@ -3,7 +3,6 @@ import datetime
 import functools
 import gc
 import os
-import pickle  # nosec B403
 import threading
 import time
 import traceback
