@@ -1,6 +1,7 @@
 from abc import ABC, abstractmethod
-from typing import Optional
+from typing import List, Optional
 
+from ..pyexecutor.llm_request import LlmRequest
 from ..pyexecutor.resource_manager import ResourceManager
 from ..pyexecutor.scheduler import ScheduledRequests
 
@@ -21,3 +22,7 @@ class Drafter(ABC):
             scheduled_requests: The scheduled requests for this iteration
         """
         raise NotImplementedError
+
+    def should_use_spec_decode(self, requests: List[LlmRequest]) -> bool:
+        """Check if spec decode should be used for the current iteration."""
+        return True
