@@ -14,38 +14,42 @@
 # limitations under the License.
 
 name: PR Checks
+
 on:
   pull_request:
-    types: [opened, edited, synchronize]
+    types: [opened, edited, synchronize, reopened]
+
 jobs:
   check-pr-title:
-    name: Check PR Title
+    name: Check PR Title Format
     runs-on: ubuntu-latest
     steps:
-      - name: Check PR title
+      - name: Validate PR Title Format
         id: check-pr-title
-        continue-on-error: true
         uses: agenthunt/conventional-commit-checker-action@v2.0.0
+        continue-on-error: true
         with:
           pr-title-regex: "^(\\[(None|[A-Z0-9]+-[0-9]+|#[0-9]+|https:\\/\\/nvbugs\\/[0-9]+)\\])(\\[[a-z0-9]+\\]) (([^ ].*)?[^ ])$"
           pr-body-regex: ""
-      - name: PR title format
+
+      - name: PR Title Format Guide
         if: steps.check-pr-title.outcome == 'failure'
         run: |
-          echo "PR title format check failed"
-          echo "PR title format:"
-          echo "[JIRA ticket/NVBugs ID/GitHub issue/None][type] summary"
+          echo "::error::PR title format check failed."
+          echo "Expected PR title format:"
+          echo "  [JIRA ticket/NVBugs ID/GitHub issue/None][type] Summary"
           echo ""
           echo "Valid ticket formats:"
-          echo "  - JIRA ticket: [TRTLLM-1234] or [ABC-123]"
+          echo "  - JIRA ticket: [TRTLLM-1234] or [FOOBAR-123] for other FOOBAR project"
           echo "  - NVBugs ID: [https://nvbugs/1234567]"
           echo "  - GitHub issue: [#1234]"
           echo "  - No ticket: [None]"
           echo ""
-          echo "Valid types: [fix], [feat], [doc], [infra], etc. (lowercase)"
+          echo "Valid types (lowercase): [fix], [feat], [doc], [infra], [chore], etc."
           echo ""
-          echo "Examples:"          echo "e.g. [JIRA-1234][fix] some summary"
-          echo "e.g. [https://nvbugs/1234][feat] some summary"
-          echo "e.g. [#1234][doc] some summary"
-          echo "e.g. [None][fix] some summary"
+          echo "Examples:"
+          echo "  [TRTLLM-1234][feat] Add new feature"
+          echo "  [https://nvbugs/1234567][fix] Fix some bugs"
+          echo "  [#1234][doc] Update documentation"
+          echo "  [None][chore] Minor clean-up"
           exit 1
