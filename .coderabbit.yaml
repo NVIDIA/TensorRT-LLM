@@ -28,7 +28,6 @@ reviews:
   related_prs: true
   suggested_labels: true
   suggested_reviewers: true
-  auto_assign_reviewers: true
   poem: false
   auto_review:
     drafts: true
