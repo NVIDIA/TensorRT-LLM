@@ -450,10 +450,13 @@ inline int computeMultiBlockCountSpecDecGMMA(
                 {
                     auto getLog2 = [](int x) { return x ? 31 - __builtin_clz(x) : -1; };
                     auto history_length_log2 = getLog2(history_length);
+                    // Adjust multi_block_count based on history length using formula:
+                    // shift_amount = 3 - (log2(history_length) - 10) / 2
+                    // This gives us:
+                    // - history_length in [2^11, 2^12): shift by 3
+                    // - history_length in [2^13, 2^14): shift by 2
+                    // - history_length in [2^15, 2^16): shift by 1
                     multi_block_count >>= 3 - (history_length_log2 - 10) / 2;
-                    // 2^15 (< 65536) -> shift 1
-                    // 2^13, 2^14 -> shift 2
-                    // 2^11, 2^12 (> 1024) -> shift 3
                 }
             }
         }
