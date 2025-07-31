@@ -29,8 +29,7 @@ if TYPE_CHECKING:
 
 # yapf: disable
 # isort: off
-from ..bindings.executor import (
-                                 BatchingType as _BatchingType,
+from ..bindings.executor import (BatchingType as _BatchingType,
                                  CacheTransceiverBackendType as _CacheTransceiverBackendType,
                                  CacheTransceiverConfig as _CacheTransceiverConfig,
                                  CapacitySchedulerPolicy as _CapacitySchedulerPolicy,
