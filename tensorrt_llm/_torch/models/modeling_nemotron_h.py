@@ -139,7 +139,7 @@ class NemotronHLayer(DecoderLayer):
             self.mixer = Mamba2Mixer(d_model=config.hidden_size,
                                      d_state=config.ssm_state_size,
                                      d_conv=config.conv_kernel,
-                                     expand=config.expand,
+                                     nheads=config.mamba_num_heads,
                                      n_groups=config.n_groups,
                                      head_dim=config.mamba_head_dim,
                                      chunk_size=config.chunk_size,
