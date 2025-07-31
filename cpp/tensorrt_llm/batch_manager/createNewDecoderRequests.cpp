@@ -272,7 +272,7 @@ void CreateNewDecoderRequests::newRequest(SizeType32 batchSlot, runtime::decoder
         manager.setZero(*newTokensVec);
     }
 
-    TensorPtr const finishedStepsSlice = ITensor::slice(decoderState.getFinishedSteps(), batchSlot, 1);
+    TensorPtr const finishedStepsSlice = ITensor::slice(decoderState.getFinishReasons(), batchSlot, 1);
     manager.setZero(*finishedStepsSlice);
 
     // cumLogProb is mandatory for beamWidth > 1
