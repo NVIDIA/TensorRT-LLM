@@ -18,7 +18,7 @@ context_servers:
     event_buffer_max_size: 1024
     free_gpu_memory_fraction: 0.15
   cache_transceiver_config:
-    backend: default
+    backend: DEFAULT
   urls:
       - "localhost:8001"
 generation_servers:
@@ -33,6 +33,6 @@ generation_servers:
     event_buffer_max_size: 1024
     free_gpu_memory_fraction: 0.15
   cache_transceiver_config:
-    backend: default
+    backend: DEFAULT
   urls:
       - "localhost:8002"

@@ -184,7 +184,7 @@ def gen_config_file(config_path: str,
                 'dtype': 'fp8',
             },
             'cache_transceiver_config': {
-                'backend': 'default',
+                'backend': 'DEFAULT',
                 'max_tokens_in_buffer': 8320,
             },
         },
@@ -210,7 +210,7 @@ def gen_config_file(config_path: str,
                 'backend': gen_moe_backend,
             },
             'cache_transceiver_config': {
-                'backend': 'default',
+                'backend': 'DEFAULT',
                 'max_tokens_in_buffer': 8320,
             },
         }
