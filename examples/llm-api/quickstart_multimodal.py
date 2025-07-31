@@ -148,6 +148,9 @@ def main():
         models_module = importlib.import_module('tensorrt_llm._torch.models')
         model_class = getattr(models_module, args.auto_model_name)
         lora_config = model_class.lora_config(args.model_dir)
+        # For stability - explicitly set the LoRA GPU cache & CPU cache to have space for 2 adapters
+        lora_config.max_loras = 2
+        lora_config.max_cpu_loras = 2
 
     llm, sampling_params = setup_llm(args, lora_config=lora_config)
 

@@ -413,6 +413,9 @@ class TestLlama4ScoutInstruct(LlmapiAccuracyTestHarness):
         gen_server_config = {"disable_overlap_scheduler": overlap_scheduler}
         ctx_server_config["cache_transceiver_config"] = {"backend": "default"}
         gen_server_config["cache_transceiver_config"] = {"backend": "default"}
+        # Keep this low to avoid warmup OOM in CI
+        ctx_server_config["max_seq_len"] = 8192
+        gen_server_config["max_seq_len"] = 8192
         disaggregated_server_config = {
             "hostname": "localhost",
             "port": 8000,

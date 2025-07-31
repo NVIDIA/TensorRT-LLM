@@ -59,7 +59,7 @@ set(SRCS
 
 file(GLOB_RECURSE XGRAMMAR_SRCS "${3RDPARTY_DIR}/xgrammar/cpp/*.cc")
 list(FILTER XGRAMMAR_SRCS EXCLUDE REGEX
-     "${3RDPARTY_DIR}/xgrammar/cpp/pybind/.*\\.cc")
+     "${3RDPARTY_DIR}/xgrammar/cpp/nanobind/.*\\.cc")
 list(APPEND SRCS ${XGRAMMAR_SRCS})
 
 if(NOT WIN32)

@@ -70,9 +70,10 @@ meta-llama/Llama-4-Scout-17B-16E-Instruct:
   - accuracy: 80.00
   - quant_algo: NVFP4
     kv_cache_quant_algo: FP8
-    accuracy: 88.63
+    accuracy: 79.60
   - quant_algo: FP8
-    accuracy: 89.46
+    kv_cache_quant_algo: FP8
+    accuracy: 78.58
 mistralai/Mistral-7B-v0.1:
   - accuracy: 66
 mistralai/Mistral-7B-Instruct-v0.3:
@@ -168,6 +169,10 @@ Qwen3/Qwen3-235B-A22B:
     kv_cache_quant_algo: FP8
     accuracy: 86
   - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    accuracy: 86
+  - spec_dec_algo: Eagle
+    quant_algo: NVFP4
     kv_cache_quant_algo: FP8
     accuracy: 86
 nvidia/Llama-3_3-Nemotron-Super-49B-v1:
