@@ -205,13 +205,6 @@ def int_tensor(shape: tuple[int, ...], device: str = 'cuda') -> torch.Tensor:
     return torch.empty(shape, dtype=torch.int, device=device)
 
 
-def get_embedding_bias_1d(request: LlmRequest) -> torch.Tensor | None:
-    """Get pre-squeezed 1D embedding bias"""
-    if hasattr(request, '_py_embedding_bias_1d'):
-        return request._py_embedding_bias_1d
-    return None
-
-
 class TorchSampler(Sampler):
     BEAM = 0
     MAX_BEAM_WIDTH = BEAM + 1
@@ -425,7 +418,7 @@ class TorchSampler(Sampler):
             bias_values = []
 
             for i, req in enumerate(requests):
-                bias = get_embedding_bias_1d(req)
+                bias = req._py_embedding_bias_1d
                 if bias is not None:
                     bias_mask[i] = True
                     bias_values.append(bias)
@@ -461,7 +454,7 @@ class TorchSampler(Sampler):
 
             for req in requests:
                 steps = 1 + len(req.py_draft_tokens)
-                bias = get_embedding_bias_1d(req)
+                bias = req._py_embedding_bias_1d
                 if bias is not None:
                     bias_list.append(bias)
                     steps_per_bias.append(steps)
@@ -484,7 +477,7 @@ class TorchSampler(Sampler):
                 offset = 0
                 for req in requests:
                     steps = 1 + len(req.py_draft_tokens)
-                    if get_embedding_bias_1d(req) is not None:
+                    if req._py_embedding_bias_1d is not None:
                         bias_mask[offset:offset + steps] = True
                     offset += steps
 
@@ -507,7 +500,7 @@ class TorchSampler(Sampler):
             req = requests[i]
 
             if batched_next_tokens is None:
-                bias = get_embedding_bias_1d(req)
+                bias = req._py_embedding_bias_1d
                 if bias is not None:
                     logits = logits + bias.to(logits.device, non_blocking=True)
                 next_tokens, softmax = sample(strategy, logits)

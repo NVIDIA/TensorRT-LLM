@@ -202,11 +202,6 @@ class DemoEngine(ADEngine):
     def _sample(
         cls, logits: torch.Tensor, sampling_params: SamplingParams
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        # Apply embedding bias if present
-        if sampling_params.embedding_bias is not None:
-            # embedding_bias is now 1D [vocab_size], can add directly
-            logits = logits + sampling_params.embedding_bias.to(logits.device)
-
         logits_shape = logits.shape
         logits = logits.view(-1, logits_shape[-1])  # sampling_batch expects 2D logits
         if isinstance(sampling_params.top_k, int):
