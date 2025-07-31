@@ -48,8 +48,8 @@ jobs:
           echo "Valid types (lowercase): [fix], [feat], [doc], [infra], [chore], etc."
           echo ""
           echo "Examples:"
-          echo "  [TRTLLM-1234][feat] Add new feature"
-          echo "  [https://nvbugs/1234567][fix] Fix some bugs"
-          echo "  [#1234][doc] Update documentation"
-          echo "  [None][chore] Minor clean-up"
+          echo "  - [TRTLLM-1234][feat] Add new feature"
+          echo "  - [https://nvbugs/1234567][fix] Fix some bugs"
+          echo "  - [#1234][doc] Update documentation"
+          echo "  - [None][chore] Minor clean-up"
           exit 1
