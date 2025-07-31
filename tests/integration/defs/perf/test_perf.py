@@ -1225,11 +1225,13 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         tp_pp_str = f"tp_{self._config.tp_size}_pp_{self._config.pp_size}"
         engine_dir = os.path.join(engine_dir, hf_model_name, tp_pp_str)
         benchmark_cmd = [
-            self._benchmark_script, f"--model={model_name}",
-            f"--model_path={model_dir}", "throughput",
+            self._benchmark_script,
+            f"--model={model_name}",
+            f"--model_path={model_dir}",
+            "throughput",
             f"--dataset={dataset_path}",
-            f"--max_batch_size={self._config.max_batch_size}",
-            f"--max_num_tokens={self._config.max_num_tokens}",
+            # f"--max_batch_size={self._config.max_batch_size}",
+            # f"--max_num_tokens={self._config.max_num_tokens}",
             f"--report_json={report_path}",
             f"--kv_cache_free_gpu_mem_fraction={self._config.kv_cache_free_gpu_mem_fraction}"
         ]
