@@ -31,8 +31,8 @@ from ..inputs import (PromptInputs, create_input_processor,
 from ..logger import logger
 from ..sampling_params import SamplingParams
 from .llm_args import (TORCH_LLMARGS_EXPLICIT_DOCSTRING,
-                       TRT_LLMARGS_EXPLICIT_DOCSTRING, PeftCacheConfig,
-                       PybindMirror, TorchLlmArgs, TrtLlmArgs)
+                       TRT_LLMARGS_EXPLICIT_DOCSTRING, NGramDecodingConfig,
+                       PeftCacheConfig, PybindMirror, TorchLlmArgs, TrtLlmArgs)
 from .llm_utils import (CachedModelLoader, KvCacheRetentionConfig,
                         LlmBuildStats, ModelLoader, _ModelRuntimeContext)
 from .mpi_session import MpiPoolSession, external_mpi_comm_available
@@ -995,13 +995,43 @@ class _TorchLLM(BaseLLM):
             self._executor_config.cache_transceiver_config = PybindMirror.maybe_to_pybind(
                 self.args.cache_transceiver_config)
         from tensorrt_llm._torch.pyexecutor.config import update_executor_config
+
+        spec_config = self.args.speculative_config
+        max_batch_size = self._executor_config.max_batch_size
+        # Apply default heuristic to AutoDecodingConfig based on benchmark results
+        # With concurrency <= 4, max_draft_len = 5, max_matching_ngram_size = 3
+        # With concurrency <= 32, max_draft_len = 3, max_matching_ngram_size = 5
+        # With concurrency > 32, speculative decoding is disabled.
+        if spec_config is not None and spec_config.decoding_type == "AUTO":
+            if not self.args.disable_overlap_scheduler:
+                logger.info(
+                    "Disable overlap scheduler to enable Auto speculative decoding with Ngram."
+                )
+                # From benchmark results, we found that NGram speculative decoding provides better performance than overlap scheduler with low concurrency <= 32.
+                # Therefore, we disable overlap scheduler to enable NGram speculative decoding.
+                self.args.disable_overlap_scheduler = True
+
+            spec_config = NGramDecodingConfig(
+                max_draft_len=5 if max_batch_size <= 4 else 3,
+                max_matching_ngram_size=3 if max_batch_size <= 4 else 5,
+                is_keep_all=True,
+                is_use_oldest=True,
+                is_public_pool=True,
+                # Flag to indicate the NGramDecodingConfig is instantiated by auto heuristic.
+                is_auto_heuristic=True,
+            )
+
+            logger.info(
+                f"Apply heuristic to incomplete NGramDecodingConfig: max_draft_len={spec_config.max_draft_len}, max_matching_ngram_size={spec_config.max_matching_ngram_size}"
+            )
+
         update_executor_config(
             self._executor_config,
             backend=self.args.backend,
             pytorch_backend_config=self.args.get_pytorch_backend_config()
             if self.args.backend in ["pytorch", "_autodeploy"] else None,
             mapping=self.args.parallel_config.to_mapping(),
-            speculative_config=self.args.speculative_config,
+            speculative_config=spec_config,
             hf_model_dir=self._hf_model_dir,
             max_input_len=self.args.max_input_len,
             max_seq_len=max_seq_len,

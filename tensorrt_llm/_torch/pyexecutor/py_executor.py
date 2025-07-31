@@ -864,7 +864,7 @@ class PyExecutor:
             self.use_spec_decode = self.drafter.should_use_spec_decode(
                 self.active_requests)
             self.model_engine.enable_spec_decode = self.use_spec_decode
-            self._prepare_draft_requests(self.active_requests)
+            self._prepare_draft_requests()
 
         scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
         )
@@ -965,14 +965,15 @@ class PyExecutor:
                                    iter_stats=iter_stats,
                                    iter_start_time=iter_start_time))
 
-    def _prepare_draft_requests(self, requests):
+    def _prepare_draft_requests(self):
         try:
             # Set draft tokens here to make the KV cache manager
             # and scheduler aware of them.
-            for req in requests:
+            for req in self.active_requests:
                 if req.state not in (LlmRequestState.GENERATION_IN_PROGRESS,
                                      LlmRequestState.DISAGG_GENERATION_INIT):
                     continue
+
                 req.py_last_draft_tokens = req.py_draft_tokens
                 max_draft_len = self.model_engine.spec_config.max_draft_len
 
