@@ -1,72 +1,43 @@
 # Architecture Overview
 
-TensorRT-LLM is a toolkit designed to create optimized solutions for Large Language Model (LLM) inference.
-Besides TensorRT, PyTorch can also serve as the backend for TensorRT-LLM. This document provides an overview of the PyTorch Backend architecture.
-
-## Top Level API
-
-The interface for PyTorch backend is `tensorrt_llm.LLM`.
+The `LLM` class is a core entry point for the TensorRT-LLM, providing a simplified `generate()` API for efficient large language model inference. This abstraction aims to streamline the user experience, as demonstrated with TinyLlama:
 
 ```python
 from tensorrt_llm import LLM
-llm = LLM(model=<path_to_llama_from_hf>)
+
+# Initialize the LLM with a specified model
+llm = LLM(model="TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+
+# Generate text using the model
+output = llm.generate("Hello, my name is")
 ```
 
-The `LLM` also manages the tokenization and detokenization processes of the input.
+The `LLM` class automatically manages essential pre and post-processing steps, including tokenization (encoding input prompts into numerical representations) and detokenization (decoding model outputs back into human-readable text).
 
-## PyExecutor
+Internally, the `LLM` class orchestrates the creation of a dedicated `PyExecutor(Worker)` process on each rank.
 
+![TRT-LLM Architecture Overview](../../media/TRTLLM_Architecture_Overview.png)
 
-Similar to the TensorRT backend, which uses [Executor API](../advanced/executor.md), the PyTorch backend employs a `PyExecutor` class.
-This class has a similar interface to Executor, allowing it to be integrated into LLM as an alternative backend.
-Key components of the `PyExecutor` include:
+This `PyExecutor` operates in a continuous background loop, designed for the efficient, asynchronous processing of inference requests.
 
-- Model Engine: Holds the language model and efficiently supports single-step model forward.
-- Decoder: Generates output tokens based on Model Engine outputs. Currently, only greedy search is supported.
-- Scheduler: Decides whether to allocate resources (like KV Cache) for a request and whether to run forward for each request at the current step.
+The `PyExecutor`'s functionality is built upon several key components:
 
-The single-step flow of PyExecutor involves:
+- `Scheduler`: Responsible for determining which active requests are ready for execution at each processing step.
 
-- Fetching new requests from the request queue, if any.
-- Scheduling some requests.
-- Running model forward for scheduled requests.
-- Running the decoder using the model forward outputs for the scheduled requests.
-- Adding output tokens for each request and handling finished requests.
+- `KVCacheManager`: Manages the allocation, deallocation, and maintenance of the Key-Value (KV) Cache. This is a critical optimization for Transformer models, significantly enhancing performance during autoregressive text generation by storing previously computed attention keys and values.
 
-## Model Engine
+- `ModelEngine`: Handles the loading and highly efficient execution of the language model on the GPU hardware.
 
-The core component of `PyExecutor` is the `ModelEngine`, responsible for executing the model's forward pass efficiently on the GPU.
-The key method of `ModelEngine` is `forward`, which handles the forward pass computation.
-For the PyTorch backend, the derived class is `PyTorchModelEngine`, declared in [pytorch_model_engine.py](../../../tensorrt_llm/_torch/pyexecutor/pytorch_model_engine.py).
+- `Sampler`: Takes the raw outputs (logits) from the ModelEngine and applies appropriate sampling strategies (e.g., greedy, top-k, top-p, beam search) to generate the final output tokens.
 
-## Decoder
+During each iteration of its background loop, the `PyExecutor` performs the following sequence of operations:
 
-The Decoder generates output tokens based on Model Engine outputs and supports greedy search decoding.
+- Request Fetching: Retrieves new inference requests from an internal request queue, if available.
 
-## Scheduler
+- Scheduling: Interacts with the `Scheduler` to identify and prioritize requests that are ready to be processed in the current step.
 
-The scheduler operates in two steps:
+- Resource Preparation: Coordinates with the `KVCacheManager` to ensure that the necessary Key-Value (KV) Cache resources are allocated for the selected requests.
 
-1. CapacityScheduler: Determines if there are enough resources to accommodate a request.
-2. MicroBatchScheduler: Selects some requests for the model to run forward.
+- Model Execution: Invokes the `ModelEngine` to perform a forward pass on the scheduled requests, predicting the next output tokens.
 
-Both CapacityScheduler and MicroBatchScheduler currently use C++ bindings.
-However, since the interfaces are implemented in Python, customization is possible.
-The document [scheduler.md](./scheduler.md) explains how to implement customized scheduling logic.
-
-## ResourceManager
-
-`ResourceManager` helps allocate and manage these resources that may be needed to run inference for a single request.
-It is a container of objects inherited from `BaseResourceManager`, each managing a specific type of resource.
-There are three important interfaces for `BaseResourceManager`:
-
-- `prepare_resources`: Called at each step before model forward in PyExecutor for the current batch.
-- `update_resources`: Called at each step finish for the current batch.
-- `free_resources`: Called at each request finish.
-
-One crucial resource is the KV Cache for transformer models. The `BaseResourceManager` for KV Cache is `KVCacheManager`.
-
-### KVCacheManager
-
-Currently, the KVCacheManager uses C++ binding. However, customization in Python is possible, as its interface is implemented in Python.
-The document [kv_cache_manager.md](./kv_cache_manager.md) details how to implement a customized KVCacheManager.
+- Output Handling: Updates the partial outputs for ongoing requests and finalizes the results for any requests that have reached completion, returning them to the user.
