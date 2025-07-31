@@ -93,8 +93,8 @@ def create_moe(
             "Both swiglu_alpha and swiglu_beta must be provided."
 
     if swiglu_limit is not None:
-        assert moe_cls in [TritonFusedMoE, TRTLLMGenFusedMoE], \
-            f"swiglu_limit is only supported in TritonFusedMoE and TRTLLMGenFusedMoE, not in {moe_cls.__name__}."
+        assert moe_cls in [CutlassFusedMoE, TritonFusedMoE, TRTLLMGenFusedMoE], \
+            f"swiglu_limit is only supported in CutlassFusedMoE, TritonFusedMoE and TRTLLMGenFusedMoE, not in {moe_cls.__name__}."
 
     if moe_cls == TRTLLMGenFusedMoE:
         assert not apply_router_weight_on_input, "apply_router_weight_on_input is not supported in TRTLLMGenFusedMoE."
@@ -130,6 +130,7 @@ def create_moe(
             layer_idx=layer_idx,
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
+            swiglu_limit=swiglu_limit,
         )
     elif moe_cls == WideEPMoE:
         return moe_cls(

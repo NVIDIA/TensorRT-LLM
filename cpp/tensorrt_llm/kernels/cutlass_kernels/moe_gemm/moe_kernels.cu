@@ -2022,6 +2022,7 @@ struct IdentityAdaptor
     constexpr static bool IS_GLU = false;
     float alpha = 1.0f;
     float beta = 0.0f;
+    float limit = std::numeric_limits<float>::infinity();
 
     template <class T>
     __device__ T operator()(T const& x) const
@@ -2037,6 +2038,7 @@ struct GLUAdaptor
     constexpr static bool IS_GLU = true;
     float alpha = 1.0f;
     float beta = 0.0f;
+    float limit = std::numeric_limits<float>::infinity();
 
     template <class T>
     __device__ T operator()(T const& gate, T const& linear) const
@@ -2051,12 +2053,15 @@ struct SwigluBiasAdaptor
     constexpr static bool IS_GLU = true;
     float alpha = 1.0f;
     float beta = 0.0f;
+    float limit = std::numeric_limits<float>::infinity();
 
     template <class T>
     __device__ T operator()(T const& gate, T const& linear) const
     {
         cutlass::epilogue::thread::Sigmoid<T> fn{};
-        return gate * fn(gate * alpha) * (linear + beta);
+        T linear_clamped = cutlass::maximum<T>{}(cutlass::minimum<T>{}(linear, limit), -limit);
+        T gate_clamped = cutlass::minimum<T>{}(gate, limit);
+        return gate_clamped * fn(gate_clamped * alpha) * (linear_clamped + beta);
     }
 };
 
@@ -2093,17 +2098,21 @@ __global__ void doGatedActivationKernel(ActivationOutputType* output, GemmOutput
 
     float gate_alpha = 1.0f;
     float gate_bias = 0.0f;
-    if (activation_type.swiglu_alpha || activation_type.swiglu_beta)
+    float gate_limit = std::numeric_limits<float>::infinity();
+    if (activation_type.swiglu_alpha || activation_type.swiglu_beta || activation_type.swiglu_limit)
     {
         int expert
             = findTotalEltsLessThanTarget(expert_first_token_offset, num_experts_per_node, (int64_t) token + 1) - 1;
         gate_alpha = activation_type.swiglu_alpha ? activation_type.swiglu_alpha[expert] : 1.0f;
         gate_bias = activation_type.swiglu_beta ? activation_type.swiglu_beta[expert] : 0.0f;
+        gate_limit = activation_type.swiglu_limit ? activation_type.swiglu_limit[expert]
+                                                  : std::numeric_limits<float>::infinity();
     }
 
     ActFn fn{};
     fn.alpha = gate_alpha;
     fn.beta = gate_bias;
+    fn.limit = gate_limit;
     for (int64_t elem_index = start_offset; elem_index < num_elems_in_col; elem_index += stride)
     {
         auto linear_value = arrayConvert<GemmResultElem, ComputeElem>(gemm_result_vec[elem_index]);
@@ -2182,11 +2191,19 @@ __global__ void doActivationKernel(T* output, GemmOutputType const* gemm_result,
         size_t output_offset = token * inter_size;
 
         int64_t expert = 0;
+        float gate_alpha = 1.0f;
+        float gate_beta = 0.0f;
+        float gate_limit = std::numeric_limits<float>::infinity();
         if (bias_ptr || IsNVFP4 || IsMXFP8 || use_per_expert_act_scale || activation_params.swiglu_alpha
-            || activation_params.swiglu_beta)
+            || activation_params.swiglu_beta || activation_params.swiglu_limit)
         {
             // TODO this is almost certainly faster as a linear scan
             expert = findTotalEltsLessThanTarget(expert_first_token_offset, num_experts_per_node, token + 1) - 1;
+
+            gate_alpha = activation_params.swiglu_alpha ? activation_params.swiglu_alpha[expert] : 1.0f;
+            gate_beta = activation_params.swiglu_beta ? activation_params.swiglu_beta[expert] : 0.0f;
+            gate_limit = activation_params.swiglu_limit ? activation_params.swiglu_limit[expert]
+                                                        : std::numeric_limits<float>::infinity();
         }
 
         size_t act_scale_idx = use_per_expert_act_scale ? expert : 0;
@@ -2200,14 +2217,6 @@ __global__ void doActivationKernel(T* output, GemmOutputType const* gemm_result,
         if (bias_ptr)
         {
             bias_offset = (bias_is_broadcast ? expert * inter_size * gated_size_mul : gemm_result_offset);
-        }
-
-        float gate_alpha = 1.0f;
-        float gate_beta = 0.0f;
-        if (activation_params.swiglu_alpha || activation_params.swiglu_beta)
-        {
-            gate_alpha = activation_params.swiglu_alpha ? activation_params.swiglu_alpha[expert] : 1.0f;
-            gate_beta = activation_params.swiglu_beta ? activation_params.swiglu_beta[expert] : 0.0f;
         }
 
         using BiasElem = cutlass::Array<ScaleBiasType, ACTIVATION_ELEM_PER_THREAD>;
@@ -2229,6 +2238,7 @@ __global__ void doActivationKernel(T* output, GemmOutputType const* gemm_result,
         ActFn fn{};
         fn.alpha = gate_alpha;
         fn.beta = gate_beta;
+        fn.limit = gate_limit;
         for (int64_t elem_index = start_offset; elem_index < num_elems_in_col; elem_index += stride)
         {
             auto fc1_value = arrayConvert<GemmResultElem, ComputeElem>(gemm_result_vec[elem_index + gated_off_vec]);
@@ -4323,12 +4333,10 @@ std::map<std::string, std::pair<size_t, size_t>> GemmProfilerBackend::getProfile
         = mMinLatencyMode ? sizeof(int) * NUM_ROUTING_SAMPLES : 0; // smaller than or equal to num_experts_per_node
     size_t active_expert_global_ids_size = mMinLatencyMode ? mNumExpertsPerNode * sizeof(int) * NUM_ROUTING_SAMPLES : 0;
 
-    size_t swiglu_alpha_size = mActivationType == ActivationType::SwigluBias && mGemmToProfile == GemmToProfile::GEMM_1
-        ? num_experts_per_node * sizeof(float)
-        : 0;
-    size_t swiglu_beta_size = mActivationType == ActivationType::SwigluBias && mGemmToProfile == GemmToProfile::GEMM_1
-        ? num_experts_per_node * sizeof(float)
-        : 0;
+    bool is_swiglu_bias = mActivationType == ActivationType::SwigluBias && mGemmToProfile == GemmToProfile::GEMM_1;
+    size_t swiglu_alpha_size = is_swiglu_bias ? num_experts_per_node * sizeof(float) : 0;
+    size_t swiglu_beta_size = is_swiglu_bias ? num_experts_per_node * sizeof(float) : 0;
+    size_t swiglu_limit_size = is_swiglu_bias ? num_experts_per_node * sizeof(float) : 0;
 
     size_t map_offset = 0;
     std::map<std::string, std::pair<size_t, size_t>> out_map;
@@ -4371,6 +4379,7 @@ std::map<std::string, std::pair<size_t, size_t>> GemmProfilerBackend::getProfile
     ADD(gemm_workspace);
     ADD(swiglu_alpha);
     ADD(swiglu_beta);
+    ADD(swiglu_limit);
 #undef ADD_NAME
 #undef ADD
 
@@ -4676,6 +4685,7 @@ void GemmProfilerBackend::runProfiler(int original_num_tokens, Config const& tac
 
     GET_WS_PTR(float*, swiglu_alpha);
     GET_WS_PTR(float*, swiglu_beta);
+    GET_WS_PTR(float*, swiglu_limit);
 
 #undef GET_WS_PTR_OFFSET
 #undef GET_WS_PTR
@@ -4709,7 +4719,7 @@ void GemmProfilerBackend::runProfiler(int original_num_tokens, Config const& tac
             mExpertHiddenSize,                                                        //
             mExpertInterSize,                                                         //
             num_experts_per_node,                                                     //
-            ActivationParams(mActivationType, swiglu_alpha, swiglu_beta),             //
+            ActivationParams(mActivationType, swiglu_alpha, swiglu_beta, swiglu_limit),
             alpha_scale_ptr_array,                                                    //
             !mUseLora,                                                                //
             /*use_deepseek_fp8_block_scale=*/false,                                   //

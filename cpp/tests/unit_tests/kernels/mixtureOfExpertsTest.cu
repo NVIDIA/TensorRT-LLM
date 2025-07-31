@@ -289,8 +289,10 @@ protected:
 
     float mSwigluAlphaValue{0.5f};
     float mSwigluBetaValue{MX_QUANT_ACT ? 0.0f : 1.f};
+    float mSwigluLimitValue{MX_QUANT_ACT ? FP8_MAX / 4 : NVFP4 ? 2.f : 0.5f};
     float* mSwigluAlpha{};
     float* mSwigluBeta{};
+    float* mSwigluLimit{};
 
     DataType* mExpertIntScale1{};
     DataType* mExpertIntScale2{};
@@ -555,12 +557,16 @@ protected:
         {
             mSwigluAlpha = allocBuffer<float>(mNumExperts);
             mSwigluBeta = allocBuffer<float>(mNumExperts);
+            mSwigluLimit = allocBuffer<float>(mNumExperts);
             std::vector<float> h_swiglu_alpha(mNumExperts, mSwigluAlphaValue);
             std::vector<float> h_swiglu_beta(mNumExperts, mSwigluBetaValue);
+            std::vector<float> h_swiglu_limit(mNumExperts, mSwigluLimitValue);
             check_cuda_error(cudaMemcpyAsync(
                 mSwigluAlpha, h_swiglu_alpha.data(), mNumExperts * sizeof(float), cudaMemcpyHostToDevice, stream));
             check_cuda_error(cudaMemcpyAsync(
                 mSwigluBeta, h_swiglu_beta.data(), mNumExperts * sizeof(float), cudaMemcpyHostToDevice, stream));
+            check_cuda_error(cudaMemcpyAsync(
+                mSwigluLimit, h_swiglu_limit.data(), mNumExperts * sizeof(float), cudaMemcpyHostToDevice, stream));
         }
 
         check_cuda_error(cudaMemcpyAsync(mSelectedExpert, h_token_selected_experts.data(),
@@ -903,7 +909,8 @@ protected:
             // Generates numbers in increments of 1/max_order_of_magnitude in the range [0, 1)
             constexpr int max_order_of_magnitude = 256;
             std::vector<int> base(hidden_states.size());
-            std::iota(base.begin(), base.end(), 0);
+            // Start from the near largest value so we always have some large values even for small hidden sizes
+            std::iota(base.begin(), base.end(), max_order_of_magnitude - 4);
             std::mt19937 gen(0xD5);
             std::shuffle(base.begin(), base.end(), gen);
             // Lambda subtracts a small value so we have some < 0 to test the activation for negatives
@@ -1204,16 +1211,16 @@ protected:
         mMoERunner.setTactic(tactic1, tactic2);
 #ifdef USING_OSS_CUTLASS_MOE_GEMM
         mMoERunner.runMoe(mInputTensor, nullptr, mSelectedExpert, mTokenFinalScales, weight1_ptr, bias1_ptr,
-            ActivationParams(mActType, mSwigluAlpha, mSwigluBeta), weight2_ptr, bias2_ptr, quant_params, mTotalTokens,
-            mHiddenSize, mInterSize / parallelism_config.tp_size, mNumExperts, mK, mWorkspace, mFinalOutput,
-            mSourceToExpandedMap, parallelism_config, enable_alltoall, mUseLora, lora_params, useFp8BlockScales,
-            minLatencyMode, min_latency_params, stream);
+            ActivationParams(mActType, mSwigluAlpha, mSwigluBeta, mSwigluLimit), weight2_ptr, bias2_ptr, quant_params,
+            mTotalTokens, mHiddenSize, mInterSize / parallelism_config.tp_size, mNumExperts, mK, mWorkspace,
+            mFinalOutput, mSourceToExpandedMap, parallelism_config, enable_alltoall, mUseLora, lora_params,
+            useFp8BlockScales, minLatencyMode, min_latency_params, stream);
 #else
         mMoERunner.runMoe(mInputTensor, nullptr, mSelectedExpert, mTokenFinalScales, weight1_ptr, bias1_ptr,
-            ActivationParams(mActType, mSwigluAlpha, mSwigluBeta), weight2_ptr, bias2_ptr, quant_params, mTotalTokens,
-            mHiddenSize, mInterSize / parallelism_config.tp_size, mNumExperts, mK, mWorkspace, mFinalOutput,
-            mSourceToExpandedMap, parallelism_config, mUseLora, lora_params, useFp8BlockScales, minLatencyMode,
-            min_latency_params, stream);
+            ActivationParams(mActType, mSwigluAlpha, mSwigluBeta, mSwigluLimit), weight2_ptr, bias2_ptr, quant_params,
+            mTotalTokens, mHiddenSize, mInterSize / parallelism_config.tp_size, mNumExperts, mK, mWorkspace,
+            mFinalOutput, mSourceToExpandedMap, parallelism_config, mUseLora, lora_params, useFp8BlockScales,
+            minLatencyMode, min_latency_params, stream);
 #endif
 
         check_cuda_error(cudaStreamSynchronize(stream));
@@ -1301,6 +1308,8 @@ protected:
         case ActivationType::Geglu: return actfn(gate, 0.0f, ActivationType::Gelu) * linear;
         case ActivationType::Swiglu: return actfn(gate, 0.0f, ActivationType::Silu) * linear;
         case ActivationType::SwigluBias:
+            linear = std::min(std::max(linear, -mSwigluLimitValue), mSwigluLimitValue);
+            gate = std::min(gate, mSwigluLimitValue);
             // silu(gate * alpha) / alpha = gate * sigmoid(gate * alpha)
             return actfn(gate * mSwigluAlphaValue, 0.0f, ActivationType::Silu) / mSwigluAlphaValue
                 * (linear + mSwigluBetaValue);
@@ -1426,6 +1435,12 @@ protected:
     void compareFinal(std::vector<int> const& expected_experts, std::vector<float> const& token_final_scales,
         std::vector<OutputType> const& input_data, std::vector<OutputType> final_results = {})
     {
+        if (mActType == ActivationType::SwigluBias)
+        {
+            ASSERT_GT(mMaxInput * std::max(mExpertWDiag1, mExpertWDiagGated), mSwigluLimitValue)
+                << "SwigluBias limit values don't change the result";
+        }
+
         ASSERT_EQ(expected_experts.size(), token_final_scales.size());
         ASSERT_EQ(expected_experts.size() / mK, input_data.size() / mHiddenSize);
         if (final_results.empty())

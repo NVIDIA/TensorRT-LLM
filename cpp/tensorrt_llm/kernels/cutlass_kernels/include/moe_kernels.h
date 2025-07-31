@@ -118,6 +118,7 @@ struct ActivationParams
     ActivationType activation_type;
     float const* swiglu_alpha = nullptr;
     float const* swiglu_beta = nullptr;
+    float const* swiglu_limit = nullptr;
 
     explicit ActivationParams(ActivationType activation_type)
         : activation_type(activation_type)
@@ -126,10 +127,12 @@ struct ActivationParams
             "SwigluBias is not supported in ActivationParams without swiglu_alpha and swiglu_beta");
     }
 
-    ActivationParams(ActivationType activation_type, float const* swiglu_alpha, float const* swiglu_beta)
+    ActivationParams(
+        ActivationType activation_type, float const* swiglu_alpha, float const* swiglu_beta, float const* swiglu_limit)
         : activation_type(activation_type)
         , swiglu_alpha(swiglu_alpha)
         , swiglu_beta(swiglu_beta)
+        , swiglu_limit(swiglu_limit)
     {
     }
 
