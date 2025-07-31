@@ -205,7 +205,7 @@ def test_cute_dsl_group_gemm(num_experts, k, n, max_tokens_per_group):
             b_sf=b_scale,
             offset_array=offset_group)
 
-        for i in range(10):
+        for i in range(1):
             with nvtx.annotate("cute_dsl_fp8_group_gemm_blackwell",
                                color="red"):
                 c_actual = cute_dsl_fp8_group_gemm_blackwell(
@@ -245,12 +245,12 @@ def test_cute_dsl_group_gemm(num_experts, k, n, max_tokens_per_group):
         # assert torch.allclose(c_actual.cpu(), c_actual_ref.cpu(), atol=1e-2), "c_actual != c_actual_ref"
         # assert torch.allclose(c_actual.cpu(), c_expected.cpu(), atol=1e-2), "c_actual != c_expected"
         # assert torch.allclose(c_actual_ref.cpu(), c_expected.cpu(), atol=1e-2), "c_actual_ref != c_expected"
-        torch.testing.assert_close(c_actual.cpu(),
-                                   c_actual_ref.cpu(),
-                                   atol=0.1,
-                                   rtol=1e-03)
+        # torch.testing.assert_close(c_actual.cpu(),
+        #                            c_actual_ref.cpu(),
+        #                            atol=0.1,
+        #                            rtol=1e-03)
         # torch.testing.assert_close(c_actual_ref.cpu(), c_ref.cpu(), atol=0.1, rtol=1e-03)
-        # torch.testing.assert_close(c_actual.cpu(), c_ref.cpu(), atol=0.1, rtol=1e-03)
+        torch.testing.assert_close(c_actual.cpu(), c_ref.cpu(), atol=0.1, rtol=1e-03)
         print("PASS")
 
 

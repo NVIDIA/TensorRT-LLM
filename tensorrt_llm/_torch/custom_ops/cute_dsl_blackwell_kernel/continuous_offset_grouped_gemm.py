@@ -242,6 +242,7 @@ class BlockwiseContiguousGroupedGemmKernel:
         self.epilog_sync_bar_id = 1
         self.tmem_ptr_sync_bar_id = 2
         self.sched_sync_bar_id = 3
+        self.pdl_sync_bar_id = 4
         self.num_smem_capacity = sm100_utils.SMEM_CAPACITY["sm100"]
         # TMEM offset for final accumulator
         self.tmem_final_offset = 384
@@ -998,6 +999,16 @@ class BlockwiseContiguousGroupedGemmKernel:
         # Specialized TMA load warp
         #
         if warp_idx == self.sched_warp_id:
+            # # smem early release
+            # cute.nvgpu.setsmemsize_sync(
+            #         self.buffer_align_bytes
+            #         + cute.size_in_bytes(self.c_dtype, c_smem_layout_staged)
+            # )
+            # cute.arch.barrier_arrive(
+            #     barrier_id=self.pdl_sync_bar_id,
+            #     number_of_threads=self.threads_per_cta,
+            # )
+
             cute.arch.warpgroup_reg_dealloc(self.num_regs_tiled_warps)
             #
             # Persistent tile scheduling loop
@@ -1100,6 +1111,9 @@ class BlockwiseContiguousGroupedGemmKernel:
             tile_info_pipeline.consumer_release(tile_info_consumer_state)
             tile_info_consumer_state.advance()
 
+            cute.arch.griddepcontrol_wait()
+            # cute.arch.griddepcontrol_launch_dependents()
+
             while is_valid_tile:
                 #
                 # Slice to per mma tile index
@@ -1168,10 +1182,21 @@ class BlockwiseContiguousGroupedGemmKernel:
                 tile_info_pipeline.consumer_release(tile_info_consumer_state)
                 tile_info_consumer_state.advance()
 
+            # cute.arch.griddepcontrol_launch_dependents()
             #
             # Wait A/B buffer empty
             #
             ab_pipeline.producer_tail(ab_producer_state)
+
+            # # smem early release
+            # cute.nvgpu.setsmemsize_sync(
+            #         self.buffer_align_bytes
+            #         + cute.size_in_bytes(self.c_dtype, c_smem_layout_staged)
+            # )
+            # cute.arch.barrier_arrive(
+            #     barrier_id=self.pdl_sync_bar_id,
+            #     number_of_threads=self.threads_per_cta,
+            # )
 
         if warp_idx == self.scale_warp_id:
             # with cute.arch.elect_one():
@@ -1196,6 +1221,8 @@ class BlockwiseContiguousGroupedGemmKernel:
             is_valid_tile = tile_info[2] < group_count
             tile_info_pipeline.consumer_release(tile_info_consumer_state)
             tile_info_consumer_state.advance()
+
+            cute.arch.griddepcontrol_wait()
 
             while is_valid_tile:
 
@@ -1353,6 +1380,16 @@ class BlockwiseContiguousGroupedGemmKernel:
             #
             scale_pipeline.producer_tail(scale_producer_state)
 
+            # # smem early release
+            # cute.nvgpu.setsmemsize_sync(
+            #         self.buffer_align_bytes
+            #         + cute.size_in_bytes(self.c_dtype, c_smem_layout_staged)
+            # )
+            # cute.arch.barrier_arrive(
+            #     barrier_id=self.pdl_sync_bar_id,
+            #     number_of_threads=self.threads_per_cta,
+            # )
+
         #
         # Specialized MMA warp
         #
@@ -1496,6 +1533,18 @@ class BlockwiseContiguousGroupedGemmKernel:
                 is_valid_tile = tile_info[2] < group_count
                 tile_info_pipeline.consumer_release(tile_info_consumer_state)
                 tile_info_consumer_state.advance()
+            
+            cute.arch.griddepcontrol_launch_dependents()
+
+            # # Early smem release, non blocking
+            # cute.nvgpu.setsmemsize_sync(
+            #     self.buffer_align_bytes
+            #     + cute.size_in_bytes(self.c_dtype, c_smem_layout_staged)
+            # )
+            # cute.arch.barrier_arrive(
+            #     barrier_id=self.pdl_sync_bar_id,
+            #     number_of_threads=self.threads_per_cta,
+            # )
 
             #
             # Wait for accumulator buffer empty
@@ -1716,11 +1765,33 @@ class BlockwiseContiguousGroupedGemmKernel:
                 tile_info_pipeline.consumer_release(tile_info_consumer_state)
                 tile_info_consumer_state.advance()
 
+            # # wait for all other warp have finish setsmemsize, i.e., ensure a/b smem has been consumed in tma warp.
+            # cute.arch.barrier(
+            #     barrier_id=self.pdl_sync_bar_id,
+            #     number_of_threads=self.threads_per_cta,
+            # )
+            # cute.nvgpu.setsmemsize_sync(
+            #     self.buffer_align_bytes
+            #     + cute.size_in_bytes(self.c_dtype, c_smem_layout_staged)
+            # )
+            # cute.nvgpu.setsmemsize_flush()    
+
         #
         # Specialized epilogue warps
         #
         if warp_idx <= self.epilog_warp_id[
                 -1] and warp_idx >= self.epilog_warp_id[0]:
+            
+            # # Early smem release, non blocking
+            # cute.nvgpu.setsmemsize_sync(
+            #     self.buffer_align_bytes
+            #     + cute.size_in_bytes(self.c_dtype, c_smem_layout_staged)
+            # )
+            # cute.arch.barrier_arrive(
+            #     barrier_id=self.pdl_sync_bar_id,
+            #     number_of_threads=self.threads_per_cta,
+            # )
+
             cute.arch.warpgroup_reg_alloc(self.num_regs_epilogue_warps)
             #
             # Alloc tensor memory buffer
@@ -1990,6 +2061,8 @@ class BlockwiseContiguousGroupedGemmKernel:
             #
             if cutlass.const_expr(self.use_tma_store):
                 c_pipeline.producer_tail()
+            
+            # cute.arch.griddepcontrol_launch_dependents()
 
     @cute.jit
     def group_search(
@@ -3085,10 +3158,10 @@ if __name__ == "__main__":
     )
     parser.add_argument("--ab_dtype",
                         type=cutlass.dtype,
-                        default=cutlass.TFloat32)
+                        default=cutlass.Float8E5M2)
     parser.add_argument("--c_dtype",
                         type=cutlass.dtype,
-                        default=cutlass.Float32)
+                        default=cutlass.BFloat16)
     parser.add_argument("--acc_dtype",
                         type=cutlass.dtype,
                         default=cutlass.Float32)

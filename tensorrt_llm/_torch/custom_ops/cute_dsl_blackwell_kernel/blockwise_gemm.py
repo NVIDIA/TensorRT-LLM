@@ -166,6 +166,7 @@ class BlockwiseGemmKernel:
         self.cta_sync_bar_id = 0
         self.epilog_sync_bar_id = 1
         self.tmem_ptr_sync_bar_id = 2
+        self.pdl_sync_bar_id = 3
         self.num_smem_capacity = sm100_utils.SMEM_CAPACITY["sm100"]
         # TMEM offset for final accumulator
         self.tmem_final_offset = 384
@@ -860,7 +861,18 @@ class BlockwiseGemmKernel:
         # Specialized TMA load warp
         #
         if warp_idx == self.empty_warp_id:
+            # # smem early release
+            # cute.nvgpu.setsmemsize_sync(
+            #         self.buffer_align_bytes
+            #         + cute.size_in_bytes(self.c_dtype, c_smem_layout_staged)
+            # )
+            # cute.arch.barrier_arrive(
+            #     barrier_id=self.pdl_sync_bar_id,
+            #     number_of_threads=self.threads_per_cta,
+            # )
+
             cute.arch.warpgroup_reg_dealloc(self.num_regs_uniform_warps)
+
 
         if warp_idx == self.tma_warp_id:
             cute.arch.warpgroup_reg_dealloc(self.num_regs_uniform_warps)
@@ -873,6 +885,9 @@ class BlockwiseGemmKernel:
 
             ab_producer_state = utils.make_pipeline_state(
                 utils.PipelineUserType.Producer, self.num_ab_stage)
+            
+            cute.arch.griddepcontrol_wait()
+            # cute.arch.griddepcontrol_launch_dependents()
 
             while work_tile.is_valid_tile:
 
@@ -947,11 +962,23 @@ class BlockwiseGemmKernel:
                 #
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
+            
+            # cute.arch.griddepcontrol_launch_dependents()
 
             #
             # Wait A/B buffer empty
             #
             ab_pipeline.producer_tail(ab_producer_state)
+            
+            # # smem early release
+            # cute.nvgpu.setsmemsize_sync(
+            #         self.buffer_align_bytes
+            #         + cute.size_in_bytes(self.c_dtype, c_smem_layout_staged)
+            # )
+            # cute.arch.barrier_arrive(
+            #     barrier_id=self.pdl_sync_bar_id,
+            #     number_of_threads=self.threads_per_cta,
+            # )
 
         if warp_idx == self.scale_warp_id:
             cute.arch.warpgroup_reg_dealloc(self.num_regs_uniform_warps)
@@ -964,6 +991,8 @@ class BlockwiseGemmKernel:
 
             scale_producer_state = utils.make_pipeline_state(
                 utils.PipelineUserType.Producer, self.num_ab_stage)
+
+            cute.arch.griddepcontrol_wait()
 
             while work_tile.is_valid_tile:
 
@@ -1097,10 +1126,21 @@ class BlockwiseGemmKernel:
             #
             scale_pipeline.producer_tail(scale_producer_state)
 
+            # # smem early release
+            # cute.nvgpu.setsmemsize_sync(
+            #         self.buffer_align_bytes
+            #         + cute.size_in_bytes(self.c_dtype, c_smem_layout_staged)
+            # )
+            # cute.arch.barrier_arrive(
+            #     barrier_id=self.pdl_sync_bar_id,
+            #     number_of_threads=self.threads_per_cta,
+            # )
+
         #
         # Specialized MMA warp
         #
         if warp_idx == self.mma_warp_id:
+
             cute.arch.warpgroup_reg_dealloc(self.num_regs_uniform_warps)
             #
             # Bar sync for retrieve tensor memory ptr from shared mem
@@ -1238,11 +1278,23 @@ class BlockwiseGemmKernel:
                 #
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
+            
+            cute.arch.griddepcontrol_launch_dependents()
+
+            # # Early smem release, non blocking
+            # cute.nvgpu.setsmemsize_sync(
+            #     self.buffer_align_bytes
+            #     + cute.size_in_bytes(self.c_dtype, c_smem_layout_staged)
+            # )
+            # cute.arch.barrier_arrive(
+            #     barrier_id=self.pdl_sync_bar_id,
+            #     number_of_threads=self.threads_per_cta,
+            # )
 
             #
             # Wait for accumulator buffer empty
             #
-            acc_pipeline.producer_tail(acc_producer_state)
+            acc_pipeline.producer_tail(acc_producer_state)  
 
         #
         # Specialized acc update warps
@@ -1455,12 +1507,34 @@ class BlockwiseGemmKernel:
                 #
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
+            
+            # # wait for all other warp have finish setsmemsize, i.e., ensure a/b smem has been consumed in tma warp.
+            # cute.arch.barrier(
+            #     barrier_id=self.pdl_sync_bar_id,
+            #     number_of_threads=self.threads_per_cta,
+            # )
+            # cute.nvgpu.setsmemsize_sync(
+            #     self.buffer_align_bytes
+            #     + cute.size_in_bytes(self.c_dtype, c_smem_layout_staged)
+            # )
+            # cute.nvgpu.setsmemsize_flush()
 
         #
         # Specialized epilogue warps
         #
         if warp_idx <= self.epilog_warp_id[
                 -1] and warp_idx >= self.epilog_warp_id[0]:
+            
+            # # Early smem release, non blocking
+            # cute.nvgpu.setsmemsize_sync(
+            #     self.buffer_align_bytes
+            #     + cute.size_in_bytes(self.c_dtype, c_smem_layout_staged)
+            # )
+            # cute.arch.barrier_arrive(
+            #     barrier_id=self.pdl_sync_bar_id,
+            #     number_of_threads=self.threads_per_cta,
+            # )
+
             cute.arch.warpgroup_reg_dealloc(self.num_regs_epilogue_warps)
             #
             # Alloc tensor memory buffer
@@ -1683,6 +1757,7 @@ class BlockwiseGemmKernel:
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
 
+            
             #
             # Dealloc the tensor memory buffer
             #
@@ -1705,6 +1780,8 @@ class BlockwiseGemmKernel:
             #
             if cutlass.const_expr(self.use_tma_store):
                 c_pipeline.producer_tail()
+            
+            # cute.arch.griddepcontrol_launch_dependents()
 
     def acc_update_tmem_copy_and_partition(
         self,
@@ -2680,10 +2757,10 @@ if __name__ == "__main__":
     )
     parser.add_argument("--ab_dtype",
                         type=cutlass.dtype,
-                        default=cutlass.TFloat32)
+                        default=cutlass.Float8E4M3FN)
     parser.add_argument("--c_dtype",
                         type=cutlass.dtype,
-                        default=cutlass.Float32)
+                        default=cutlass.BFloat16)
     parser.add_argument("--acc_dtype",
                         type=cutlass.dtype,
                         default=cutlass.Float32)

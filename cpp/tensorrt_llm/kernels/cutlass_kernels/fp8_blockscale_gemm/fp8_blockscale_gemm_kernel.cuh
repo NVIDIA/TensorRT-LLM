@@ -31,6 +31,7 @@
 #include "fp8_blockscale_mma_utils.cuh"
 #include "fp8_blockscale_tma_utils.cuh"
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/deep_gemm/fp8_gemm.cuh"
 
@@ -973,6 +974,9 @@ __global__ void scale_1x128_kernel(
     size_t scales_along_dim_y = div_up(dim_y, 1);
     size_t stride_scale_dim_y = div_up(dim_y, 4) * 4;
     using Input2Type = typename std::conditional<std::is_same<InputType, half>::value, half2, __nv_bfloat162>::type;
+
+    asm volatile("griddepcontrol.wait;");
+
     for (size_t warp_idx = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
          warp_idx < scales_along_dim_x * scales_along_dim_y; warp_idx += gridDim.x * blockDim.x / 32)
     {
@@ -1037,6 +1041,7 @@ __global__ void scale_1x128_kernel(
             output_line += 64;
         }
     }
+    asm volatile("griddepcontrol.launch_dependents;");
 #endif
 }
 
@@ -1046,6 +1051,8 @@ __global__ void scale_1x128_kernel(OutputType* output, float* scales, InputType 
     uint32_t scale_dim_x_shr)
 {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    asm volatile("griddepcontrol.wait;");
+
     extern __shared__ char shared_memory[];
     int64_t* smem_problem_m_boundaries = reinterpret_cast<int64_t*>(shared_memory);
 
@@ -1163,6 +1170,7 @@ __global__ void scale_1x128_kernel(OutputType* output, float* scales, InputType 
             output_line += 32;
         }
     }
+    asm volatile("griddepcontrol.launch_dependents;");
 #endif
 }
 
@@ -1178,6 +1186,9 @@ __global__ void scale_1x128_reshape_kernel(
     size_t scales_along_dim_h = div_up(dim_h, 1);
     size_t stride_scale_dim_y = div_up(dim_y, 4) * 4;
     using Input2Type = typename std::conditional<std::is_same<InputType, half>::value, half2, __nv_bfloat162>::type;
+
+    asm volatile("griddepcontrol.wait;");
+
     for (size_t warp_idx = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
          warp_idx < scales_along_dim_x * scales_along_dim_y * scales_along_dim_h;
          warp_idx += gridDim.x * blockDim.x / 32)
@@ -1247,6 +1258,7 @@ __global__ void scale_1x128_reshape_kernel(
             output_line += 64;
         }
     }
+    asm volatile("griddepcontrol.launch_dependents;");
 #endif
 }
 
@@ -1372,7 +1384,23 @@ void fp8_1x128_cs(
     {
         kNumDeviceSMs = tensorrt_llm::common::getMultiProcessorCount();
     }
-    scale_1x128_kernel<<<kNumDeviceSMs * 8, 256, 0, stream>>>(mat_quant, scales, mat, shape_x, shape_y);
+
+    // scale_1x128_kernel<<<kNumDeviceSMs * 8, 256, 0, stream>>>(mat_quant, scales, mat, shape_x, shape_y);
+
+    int const threads = 256;
+    int const blocks = kNumDeviceSMs * 8;
+
+    cudaLaunchConfig_t config;
+    config.gridDim = blocks;
+    config.blockDim = threads;
+    config.dynamicSmemBytes = 0;
+    config.stream = stream;
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+    config.numAttrs = 1;
+    config.attrs = attrs;
+    cudaLaunchKernelEx(&config, scale_1x128_kernel<__nv_bfloat16, __nv_fp8_e4m3>, mat_quant, scales, mat, shape_x, shape_y);
 }
 
 void fp8_1x128_cs_reshape(__nv_fp8_e4m3* mat_quant, float* scales, __nv_bfloat16 const* mat, int shape_x, int shape_h,
@@ -1382,8 +1410,23 @@ void fp8_1x128_cs_reshape(__nv_fp8_e4m3* mat_quant, float* scales, __nv_bfloat16
     {
         kNumDeviceSMs = tensorrt_llm::common::getMultiProcessorCount();
     }
-    scale_1x128_reshape_kernel<<<kNumDeviceSMs * 8, 256, 0, stream>>>(
-        mat_quant, scales, mat, shape_x, shape_h, shape_y, stride_x);
+    // scale_1x128_reshape_kernel<<<kNumDeviceSMs * 8, 256, 0, stream>>>(
+    //     mat_quant, scales, mat, shape_x, shape_h, shape_y, stride_x);
+    int const threads = 256;
+    int const blocks = kNumDeviceSMs * 8;
+
+    cudaLaunchConfig_t config;
+    config.gridDim = blocks;
+    config.blockDim = threads;
+    config.dynamicSmemBytes = 0;
+    config.stream = stream;
+    cudaLaunchAttribute attrs[1];
+    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+    config.numAttrs = 1;
+    config.attrs = attrs;
+    cudaLaunchKernelEx(
+        &config, scale_1x128_reshape_kernel<__nv_bfloat16, __nv_fp8_e4m3>, mat_quant, scales, mat, shape_x, shape_h, shape_y, stride_x);
 }
 
 void fp8_128x128_cs(

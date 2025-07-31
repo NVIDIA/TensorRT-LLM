@@ -19,6 +19,7 @@ import sys
 import nvtx
 import pytest
 import torch
+from torch.utils.benchmark import Timer
 from _torch.helpers import calc_diff, per_block_cast_to_fp8
 from utils.util import getSMVersion
 
@@ -116,16 +117,16 @@ def test_cute_dsl_fp8_block_scale_gemm(dtype, m, k, n):
     for i in range(10):
         output = torch.ops.trtllm.fp8_block_scaling_gemm(act_a_fp8_origin, act_b_fp8_origin,
                                                          act_a_sf, act_b_sf)
-    a_time = 0
-    for i in range(10):
-        t1 = time()
+    # a_time = 0
+    for i in range(1):
+        # t1 = time()
         with nvtx.annotate("fp8_block_scaling_gemm", color="red"):
             output = torch.ops.trtllm.fp8_block_scaling_gemm(act_a_fp8_origin, act_b_fp8_origin,
                                                              act_a_sf, act_b_sf)
-        t2 = time()
-        print(f"    limin: aot time = {(t2 - t1)*1000000} us")
-        a_time += (t2 - t1)
-    print(f"limin: aot host overhead time = {(a_time / 10)*1000000} us")
+        # t2 = time()
+        # print(f"    limin: aot time = {(t2 - t1)*1000000} us")
+        # a_time += (t2 - t1)
+    # print(f"limin: aot host overhead time = {(a_time / 10)*1000000} us")
 
     output_expected = a @ b.t()
     diff = calc_diff(output, output_expected)
@@ -136,7 +137,7 @@ def test_cute_dsl_fp8_block_scale_gemm(dtype, m, k, n):
     cute_dsl_fp_gemm_func = torch.ops.trtllm.cute_dsl_fp8_gemm_blackwell if getSMVersion(
     ) == 100 else torch.ops.trtllm.cute_dsl_fp8_gemm
     
-    """
+    # """
     with autotune():
         our_out = cute_dsl_fp_gemm_func(act_a_fp8, act_b_fp8, act_a_sf,
                                         act_b_sf)
@@ -145,23 +146,23 @@ def test_cute_dsl_fp8_block_scale_gemm(dtype, m, k, n):
     for k, v in AutoTuner.get().profiling_cache.items():
         print(f"Autotuner profiling cache: {k} = {v}")
     print("inference after autotune")
-    host_time = 0
-    for i in range(10):
+    # host_time = 0
+    for i in range(1):
         # with nvtx.annotate("cute_dsl_fp_gemm_func", color="red"):
-        t1 = time()
+        # t1 = time()
         with nvtx.annotate("cute_dsl_fp_gemm_func", color="red"):
             our_out = cute_dsl_fp_gemm_func(act_a_fp8, act_b_fp8, act_a_sf,
                                             act_b_sf)
-        t2 = time()
-        host_time += (t2 - t1)
-        print(f"limin: time = {(t2 - t1)*1000000} us")
-    print(f"limin: host_time = {host_time / 10 * 1000000} us")
-    """
+        # t2 = time()
+        # host_time += (t2 - t1)
+        # print(f"limin: time = {(t2 - t1)*1000000} us")
+    # print(f"limin: host_time = {host_time / 10 * 1000000} us")
+    # """
 
-    # diff = calc_diff(our_out, output_expected)
-    # print("limin: our_out, output_expected, diff = ", diff)
-    # assert diff < 1e-3
-    # torch.testing.assert_close(our_out, output_expected, atol=1e-3, rtol=1e-3)
+    diff = calc_diff(our_out, output_expected)
+    print("limin: our_out, output_expected, diff = ", diff)
+    assert diff < 1e-3
+    torch.testing.assert_close(our_out, output_expected, atol=1e-3, rtol=1e-3)
 
     # our_ref = cute_dsl_fp8_linear_ref(act_a_fp8, act_b_fp8, act_a_sf, act_b_sf)
     # diff = calc_diff(our_ref, output_expected)
@@ -183,16 +184,107 @@ def test_cute_dsl_fp8_block_scale_gemm(dtype, m, k, n):
     # torch.testing.assert_close(ds_ref, output_expected, atol=1e-3, rtol=1e-3)
 
 
+@pytest.mark.parametrize(
+    "k, n",
+    # [(7168, 2112), (1536, 24576), (512, 32768), (16384, 7168), (7168, 4096),
+    #  (2048, 7168), (1024, 1024)],
+    [(7168, 4096), (1536, 32768)]
+    # [(512, 32768)]
+)
+@pytest.mark.parametrize(
+    "m",
+    # [7, 64, 128, 4096],
+    [64, 128, 4096]
+)
+@pytest.mark.parametrize(
+    "dtype",
+    [torch.bfloat16],
+)
+def test_cute_dsl_fp8_block_scale_gemm_perf(dtype, m, k, n):
+    torch.random.manual_seed(0)
+    a = torch.randn((m, k), device='cuda', dtype=dtype) / k
+    b = torch.randn((n, k), device='cuda', dtype=dtype) / k
+
+    act_a_fp8, act_a_sf = torch.ops.trtllm.fp8_quantize_1x128(a)
+
+    act_b_fp8, act_b_sf = per_block_cast_to_fp8(b)
+
+    # # torch.float8_e4m3fn
+    # # print("limin: act_a_fp8.dtype = ", act_a_fp8.dtype)
+    # act_a_fp8 = a.to(torch.float8_e4m3fn)
+    # act_b_fp8 = b.to(torch.float8_e4m3fn)
+    # act_a_sf = torch.ones((k // 128, m), dtype=torch.float32, device='cuda')
+    # act_b_sf = torch.ones((n // 128, k // 128), dtype=torch.float32, device='cuda')
+
+    print("call act_a_fp8.shape", act_a_fp8.shape)
+    print("call act_b_fp8.shape", act_b_fp8.shape)
+    print("call act_a_sf.shape", act_a_sf.shape)
+    print("call act_b_sf.shape", act_b_sf.shape)
+    act_a_fp8_origin = act_a_fp8.view(torch.float8_e4m3fn)
+    act_b_fp8_origin = act_b_fp8.view(torch.float8_e4m3fn)
+    for i in range(10):
+        output = torch.ops.trtllm.fp8_block_scaling_gemm(act_a_fp8_origin, act_b_fp8_origin,
+                                                         act_a_sf, act_b_sf)
+    # a_time = 0
+    for i in range(10):
+        # t1 = time()
+        with nvtx.annotate("fp8_block_scaling_gemm", color="red"):
+            timer = Timer(
+                stmt='torch.ops.trtllm.fp8_block_scaling_gemm(act_a_fp8_origin, act_b_fp8_origin, act_a_sf, act_b_sf)',
+                globals={'torch': torch, 'act_a_fp8_origin': act_a_fp8_origin, 'act_b_fp8_origin': act_b_fp8_origin, 
+                        'act_a_sf': act_a_sf, 'act_b_sf': act_b_sf})
+            print(f'fp8_block_scaling_gemm running time: {timer.timeit(10).mean * 1000000:.2f} us')
+        # t2 = time()
+        # print(f"    limin: aot time = {(t2 - t1)*1000000} us")
+        # a_time += (t2 - t1)
+    # print(f"limin: aot host overhead time = {(a_time / 10)*1000000} us")
+
+    output_expected = a @ b.t()
+    diff = calc_diff(output, output_expected)
+    print("limin: diff = ", diff)
+    assert diff < 1e-3
+    torch.testing.assert_close(output, output_expected, atol=1e-3, rtol=1e-3)
+
+    cute_dsl_fp_gemm_func = torch.ops.trtllm.cute_dsl_fp8_gemm_blackwell if getSMVersion(
+    ) == 100 else torch.ops.trtllm.cute_dsl_fp8_gemm
+    
+    # """
+    with autotune():
+        our_out = cute_dsl_fp_gemm_func(act_a_fp8, act_b_fp8, act_a_sf,
+                                        act_b_sf)
+    # print("after autotune")
+    # from tensorrt_llm._torch.autotuner import AutoTuner
+    # for k, v in AutoTuner.get().profiling_cache.items():
+    #     print(f"Autotuner profiling cache: {k} = {v}")
+
+    print("inference after autotune")
+    # host_time = 0
+    for i in range(10):
+        # with nvtx.annotate("cute_dsl_fp_gemm_func", color="red"):
+        # t1 = time()
+        with nvtx.annotate("cute_dsl_fp_gemm_func", color="red"):
+            timer = Timer(
+                stmt='cute_dsl_fp_gemm_func(act_a_fp8, act_b_fp8, act_a_sf, act_b_sf)',
+                globals={'cute_dsl_fp_gemm_func': cute_dsl_fp_gemm_func, 'act_a_fp8': act_a_fp8, 'act_b_fp8': act_b_fp8, 
+                        'act_a_sf': act_a_sf, 'act_b_sf': act_b_sf})
+            print(f'cute_dsl_fp_gemm_func running time: {timer.timeit(10).mean * 1000000:.2f} us')
+        # t2 = time()
+        # host_time += (t2 - t1)
+        # print(f"limin: time = {(t2 - t1)*1000000} us")
+    # print(f"limin: host_time = {host_time / 10 * 1000000} us")
+    # """
+
+    # diff = calc_diff(our_out, output_expected)
+    # print("limin: our_out, output_expected, diff = ", diff)
+    # assert diff < 1e-3
+    # torch.testing.assert_close(our_out, output_expected, atol=1e-3, rtol=1e-3)
+    
+
 def test_cute_dsl_fp8_block_scale_bmm(dtype=torch.bfloat16,
                                       m=1024,
                                       k=256,
                                       n=512,
                                       l=16):
-
-    # print("limin: torch.ops.trtllm = ", torch.ops.trtllm, dir(torch.ops.trtllm))
-    # for op in dir(torch.ops.trtllm):
-    #     print(op)
-    # print("limin end print ops")
     import math
 
     torch.random.manual_seed(0)
@@ -233,7 +325,6 @@ def test_cute_dsl_fp8_block_scale_bmm(dtype=torch.bfloat16,
     print("limin: our_out, output_expected, diff = ", diff)
     assert diff < 1e-3
     torch.testing.assert_close(output, output_expected, atol=1e-3, rtol=1e-3)
-
 
 # from functools import lru_cache
 # from typing import List, Optional, Tuple
