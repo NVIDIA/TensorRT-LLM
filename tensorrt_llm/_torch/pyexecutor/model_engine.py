@@ -839,6 +839,7 @@ class PyTorchModelEngine(ModelEngine):
             force_dynamic_quantization,
             spec_config=self.spec_config,
             max_num_tokens=max_num_tokens,
+            max_seq_len=self.max_seq_len,
             moe_max_num_tokens=moe_max_num_tokens,
             moe_load_balancer=moe_load_balancer,
             lora_config=lora_config,
