@@ -1229,12 +1229,6 @@ class PyTorchModelEngine(ModelEngine):
                 multimodal_runtime=py_multimodal_runtime)
 
             if multimodal_params.has_content():
-                multimodal_params.to_device("multimodal_data",
-                                            "cuda",
-                                            pin_memory=True)
-                # re-assign the recovered SharedTensorContainer to the request for generation usage
-                setattr(request, "py_multimodal_data",
-                        multimodal_params.multimodal_data)
                 multimodal_params_list.append(multimodal_params)
 
             request.py_batch_idx = request.py_seq_slot

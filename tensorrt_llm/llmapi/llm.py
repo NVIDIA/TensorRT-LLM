@@ -403,15 +403,12 @@ class BaseLLM:
                         'multimodal_input'),
                     multimodal_data=extra_processed_inputs.get(
                         'multimodal_data'))
-                # Convert to shared tensor handle to reduce IPC overhead
-                # for values with non-selected keys, it's no-op
-                multimodal_params.to_handle("multimodal_data",
-                                            key="multimodal_embedding")
                 # Only pass it if it has content
                 if not multimodal_params.has_content():
                     multimodal_params = None
                 else:
-                    multimodal_params.to_shared_tensor("multimodal_data")
+                    # Convert to shared tensor handle to reduce IPC overhead
+                    multimodal_params.to_handle("multimodal_data")
         else:
             raise TypeError(
                 f"The inputs must be type str or list of int, but got {type(inputs)}"
