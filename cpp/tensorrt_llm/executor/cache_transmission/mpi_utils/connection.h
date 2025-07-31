@@ -30,8 +30,10 @@ class MpiConnection : public Connection
 {
 public:
     MpiConnection(mpi::MpiComm const* comm, int rank);
-    void send(DataContext const& ctx, void const* data, size_t size) const override;
-    void recv(DataContext const& ctx, void* data, size_t size) const override;
+    void send(DataContext const& ctx, void const* data, size_t size,
+        std::chrono::milliseconds timeout = std::chrono::milliseconds{0}) const override;
+    void recv(DataContext const& ctx, void* data, size_t size,
+        std::chrono::milliseconds timeout = std::chrono::milliseconds{0}) const override;
 
 private:
     mpi::MpiComm const* mComm{};

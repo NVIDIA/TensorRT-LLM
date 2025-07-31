@@ -27,13 +27,17 @@ MpiConnection::MpiConnection(mpi::MpiComm const* comm, int rank)
 {
 }
 
-void MpiConnection::send(DataContext const& ctx, void const* data, size_t size) const
+void MpiConnection::send(DataContext const& ctx, void const* data, size_t size, std::chrono::milliseconds timeout) const
 {
+    // The timeout parameter is ignored for MPI connections
+    (void) timeout; // Suppress unused parameter warning
     mComm->sendRawTag(data, size, mpi::MpiType::kCHAR, mRank, ctx.getTag());
 }
 
-void MpiConnection::recv(DataContext const& ctx, void* data, size_t size) const
+void MpiConnection::recv(DataContext const& ctx, void* data, size_t size, std::chrono::milliseconds timeout) const
 {
+    // The timeout parameter is ignored for MPI connections
+    (void) timeout; // Suppress unused parameter warning
     mComm->recvRawTag(data, size, mpi::MpiType::kCHAR, mRank, ctx.getTag());
 }
 
