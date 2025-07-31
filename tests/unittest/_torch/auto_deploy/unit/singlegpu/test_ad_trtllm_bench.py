@@ -4,6 +4,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+import pytest
 import yaml
 from _model_test_utils import _hf_model_dir_or_hub_id
 from utils.cpp_paths import llm_root  # noqa: F401
@@ -601,6 +602,7 @@ def test_trtllm_bench(llm_root):  # noqa: F811
         run_benchmark(model_name, dataset_path, temp_dir)
 
 
+@pytest.mark.no_xdist
 def test_trtllm_bench_backend_comparison(llm_root):  # noqa: F811
     """Test that compares autodeploy backend performance against pytorch backend."""
     trtllm_bench_unified_comparison(llm_root, comparison_mode="backend")
