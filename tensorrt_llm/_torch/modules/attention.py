@@ -506,7 +506,7 @@ class MLA(nn.Module):
         self.quant_config = quant_config
 
         if not self.is_lite:
-            self.fused_a = Linear(
+            self.kv_a_proj_with_mqa = Linear(
                 hidden_size,
                 self.q_lora_rank + self.kv_lora_rank + self.qk_rope_head_dim,
                 bias=bias,
@@ -532,7 +532,7 @@ class MLA(nn.Module):
                 allreduce_strategy=config.allreduce_strategy,
                 force_dynamic_quantization=config.force_dynamic_quantization)
         else:
-            self.fused_a = Linear(
+            self.kv_a_proj_with_mqa = Linear(
                 hidden_size,
                 self.kv_lora_rank + self.qk_rope_head_dim,
                 bias=bias,
@@ -766,14 +766,15 @@ class MLA(nn.Module):
             torch.Tensor: The output tensor.
         """
         if self.is_lite:
-            compressed_kv, k_pe = self.fused_a(hidden_states).split(
+            compressed_kv, k_pe = self.kv_a_proj_with_mqa(hidden_states).split(
                 [self.kv_lora_rank, self.qk_rope_head_dim], -1)
             compressed_kv = self.kv_a_layernorm(compressed_kv)
             q = hidden_states
         else:
-            q, compressed_kv, k_pe = self.fused_a(hidden_states).split(
-                [self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim],
-                -1)
+            q, compressed_kv, k_pe = self.kv_a_proj_with_mqa(
+                hidden_states).split([
+                    self.q_lora_rank, self.kv_lora_rank, self.qk_rope_head_dim
+                ], -1)
 
             q, compressed_kv = maybe_execute_in_parallel(
                 lambda: self.q_a_layernorm(q),

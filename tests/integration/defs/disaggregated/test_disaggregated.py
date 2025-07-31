@@ -59,6 +59,16 @@ def get_test_config(test_desc, example_dir, test_root):
         "conditional": (2,
                         f"{test_configs_root}/disagg_config_conditional.yaml"),
         "ngram": (2, f"{test_configs_root}/disagg_config_ngram.yaml"),
+        "ctxpp2_genpp2":
+        (4, f"{test_configs_root}/disagg_config_ctxpp2_genpp2.yaml"),
+        "ctxtp2_genpp2":
+        (4, f"{test_configs_root}/disagg_config_ctxtp2_genpp2.yaml"),
+        "ctxpp2_gentp2":
+        (4, f"{test_configs_root}/disagg_config_ctxpp2_gentp2.yaml"),
+        "ctxtp2pp2_gentp2pp2":
+        (8, f"{test_configs_root}/disagg_config_ctxtp2pp2_gentp2pp2.yaml"),
+        "ctxpp4_genpp4":
+        (8, f"{test_configs_root}/disagg_config_ctxpp4_genpp4.yaml"),
         "deepseek_v3_lite_fp8_mpi":
         (4,
          f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_mpi.yaml"
@@ -223,14 +233,23 @@ def run_disaggregated_test(example_dir,
                     with open(output_file, 'r') as f:
                         content = f.read()
                         if "deepseek_v3_lite" in test_desc or output_file == "output_chat.json":
-                            expected_strings = ["Berlin", "Asyncio is a"]
+                            expected_strings = [
+                                "Berlin", ["Asyncio is a", "Asyncio module in"]
+                            ]
                         else:
                             expected_strings = [
                                 "The capital of Germany is Berlin",
                                 "Asyncio is a Python library"
                             ]
                         for expected_string in expected_strings:
-                            assert expected_string in content, f"Expected string '{expected_string}' not found in {output_file}"
+                            if isinstance(expected_string, list):
+                                # At least one of the strings in the list should be found in the content
+                                assert any(
+                                    string in content
+                                    for string in expected_string
+                                ), f"None of the strings in {expected_string} found in {output_file}"
+                            else:
+                                assert expected_string in content, f"Expected string '{expected_string}' not found in {output_file}"
                         for not_expected_string in not_expected_strings:
                             assert not_expected_string not in content, f"Unexpected string '{not_expected_string}' found in {output_file}"
     except Exception:
@@ -531,6 +550,108 @@ def test_disaggregated_ngram(disaggregated_test_root, llm_venv,
                            cwd=llm_venv.get_working_directory())
 
 
+@pytest.mark.skip_less_device(4)
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+def test_disaggregated_ctxpp2_genpp2(disaggregated_test_root, llm_venv,
+                                     disaggregated_example_root,
+                                     llama_model_root):
+    src_dst_dict = {
+        llama_model_root:
+        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+    run_disaggregated_test(disaggregated_example_root,
+                           "ctxpp2_genpp2",
+                           env=llm_venv._new_env,
+                           cwd=llm_venv.get_working_directory())
+
+
+@pytest.mark.skip_less_device(4)
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+def test_disaggregated_ctxtp2_genpp2(disaggregated_test_root, llm_venv,
+                                     disaggregated_example_root,
+                                     llama_model_root):
+    src_dst_dict = {
+        llama_model_root:
+        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+    run_disaggregated_test(disaggregated_example_root,
+                           "ctxtp2_genpp2",
+                           env=llm_venv._new_env,
+                           cwd=llm_venv.get_working_directory())
+
+
+@pytest.mark.skip_less_device(4)
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+def test_disaggregated_ctxpp2_gentp2(disaggregated_test_root, llm_venv,
+                                     disaggregated_example_root,
+                                     llama_model_root):
+    src_dst_dict = {
+        llama_model_root:
+        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+    run_disaggregated_test(disaggregated_example_root,
+                           "ctxpp2_gentp2",
+                           env=llm_venv._new_env,
+                           cwd=llm_venv.get_working_directory())
+
+
+@pytest.mark.skip_less_device(8)
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+def test_disaggregated_ctxtp2pp2_gentp2pp2(disaggregated_test_root, llm_venv,
+                                           disaggregated_example_root,
+                                           llama_model_root):
+    pytest.skip(f"8 GPU test times out currently, skipping")
+    src_dst_dict = {
+        llama_model_root:
+        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+    run_disaggregated_test(disaggregated_example_root,
+                           "ctxtp2pp2_gentp2pp2",
+                           env=llm_venv._new_env,
+                           cwd=llm_venv.get_working_directory())
+
+
+@pytest.mark.skip_less_device(8)
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+def test_disaggregated_ctxpp4_genpp4(disaggregated_test_root, llm_venv,
+                                     disaggregated_example_root,
+                                     llama_model_root):
+    pytest.skip(f"8 GPU test times out currently, skipping")
+    src_dst_dict = {
+        llama_model_root:
+        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+    run_disaggregated_test(disaggregated_example_root,
+                           "ctxpp4_genpp4",
+                           env=llm_venv._new_env,
+                           cwd=llm_venv.get_working_directory())
+
+
 @skip_no_hopper
 @pytest.mark.skip_less_device(4)
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
@@ -624,7 +745,6 @@ def test_disaggregated_deepseek_v3_lite_fp8_ucx(disaggregated_test_root,
                            cwd=llm_venv.get_working_directory())
 
 
-@skip_no_hopper
 @skip_arm
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)

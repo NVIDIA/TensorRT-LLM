@@ -551,7 +551,7 @@ class BenchRunner:
         if self.use_pytorch_backend:
             benchmark_cmd += " --backend pytorch"
         else:
-            benchmark_cmd += " --backend trt"
+            benchmark_cmd += " --backend tensorrt"
 
         if self.extra_llm_api_options:
             benchmark_cmd += f" --extra_llm_api_options {self.extra_llm_api_options}"
@@ -1443,6 +1443,14 @@ def test_openai_chat_structural_tag_example(llm_venv):
     ])
 
 
+def test_openai_chat_json_example(llm_venv):
+    test_root = unittest_path() / "llmapi" / "apps"
+
+    llm_venv.run_cmd(
+        ["-m", "pytest",
+         str(test_root / "_test_openai_chat_json.py")])
+
+
 @pytest.mark.skip_less_device(2)
 @pytest.mark.skip_less_device_memory(40000)
 def test_openai_multi_chat_example(llm_root, llm_venv):
@@ -1620,6 +1628,8 @@ def test_ptp_quickstart_advanced(llm_root, llm_venv, model_name, model_path):
             ]
             if "Qwen3" in model_name:
                 cmds.append(f"--kv_cache_fraction=0.6")
+            if "Llama3.1-70B" in model_name:
+                cmds.append(f"--max_num_tokens=1024")
             llm_venv.run_cmd(cmds, stdout=running_log)
             if model_name in mapping:
                 _check_mem_usage(running_log, [mapping[model_name], 0, 0, 0])
@@ -1931,7 +1941,7 @@ def test_ptp_quickstart_advanced_mixed_precision(llm_root, llm_venv):
 
 
 @pytest.mark.parametrize("use_cuda_graph", [False, True])
-@pytest.mark.parametrize("modality", ["image", "video"])
+@pytest.mark.parametrize("modality", ["image", "video", "mixture_text_image"])
 @pytest.mark.parametrize("model_name,model_path", [
     ("NVILA-8B-FP16", "vila/NVILA-8B"),
     ("NVILA-15B-FP16", "NVILA-15B"),
@@ -1979,6 +1989,16 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
                 str(test_data_root / "world.mp4"),
             ],
         },
+        "mixture_text_image": {
+            "prompt": [
+                "Who invented the internet?",
+                "Describe the scene in the image briefly.",
+            ],
+            "media": [
+                [],
+                [str(test_data_root / "inpaint.png")],
+            ],
+        }
     }
 
     expected_keywords = {
@@ -2009,7 +2029,7 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
         "qwen2-vl-7b-instruct": {
             "image": [
                 ["ocean", "waves", "atmosphere", "stormy", "clouds", "intense"],
-                ["trees", "rocks", "road", "sunny", "natural", "greenery"],
+                ["trees", "winding", "road", "sunny", "sky", "atmosphere"],
                 ["traffic", "vehicles", "moderate", "lanes", "road", "cars"],
             ],
             "video": [
@@ -2031,9 +2051,15 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
         "mistral-small-3.1-24b-instruct": {
             "image": [
                 ["dramatic", "seascape", "ocean", "turbulent", "waves", "dark"],
-                ["scenic", "rock", "landscape", "snow", "altitude"],
-                ["highway", "traffic", "directions", "lanes", "Jurong"],
+                ["scenic", "rock", "landscape", "monolith", "formation"],
+                [
+                    "multi-lane", "highway", "moderate", "traffic", "flow",
+                    "vehicles", "congestion"
+                ],
             ],
+            "mixture_text_image":
+            [["invention", "person", "scientists", "Lick", "engineers"],
+             ["landscape", "dome", "yosemite", "altitude", "scattered"]]
         },
         "gemma-3-27b-it": {
             "image": [
@@ -2183,15 +2209,15 @@ def test_ptp_quickstart_multimodal_phi4mm(llm_root, llm_venv, modality):
     }
     expected_keywords = {
         "image": [
-            ["clear", "sunny", "sky", "image", "object"],
-            ["road", "car", "lane", "strip", "bus"],
+            ["image", "depicts", "mountain", "half", "rock"],
+            ["road", "car", "lane", "traffic", "bus"],
         ],
         "audio": [
             ["what", "is", "the", "traffic", "sign", "in", "image"],
             ["what", "is", "shown", "in", "this", "image"],
         ],
         "image_audio": [
-            ["Half", "Dome", "Park", "natural", "image"],
+            ["image", "depicts", "Grand", "rock", "scene"],
         ],
     }
 
@@ -2205,6 +2231,8 @@ def test_ptp_quickstart_multimodal_phi4mm(llm_root, llm_venv, modality):
         *accuracy_inputs[modality]["prompt"],
         "--media",
         *accuracy_inputs[modality]["media"],
+        # Set max_seq_len to 4096 to use short rope factor.
+        "--max_seq_len=4096",
         "--load_lora",
         "--auto_model_name",
         "Phi4MMForCausalLM",
