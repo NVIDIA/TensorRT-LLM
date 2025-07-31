@@ -99,6 +99,9 @@ Qwen3/Qwen3-235B-A22B:
     quant_algo: NVFP4
     kv_cache_quant_algo: FP8
     accuracy: 85.78
+moonshotai/Kimi-K2-Instruct:
+  - quant_algo: FP8_BLOCK_SCALES
+    accuracy: 94.84
 nvidia/Llama-3_3-Nemotron-Super-49B-v1:
   - accuracy: 92.57
   - quant_algo: FP8
