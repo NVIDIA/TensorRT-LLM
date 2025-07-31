@@ -221,8 +221,7 @@ private:
     //! @brief Stateful outputs for the decoder. Allocated for maxBatchSize slots.
     DecodingOutputPtr mJointDecodingOutput;
 
-    //! @brief [maxTokensPerStep, batchSize, beamWidth] finished states of type FinishedState for each generated token
-    //! of maxTokensPerStep, on gpu
+    //! @brief [batchSize, beamWidth] finished states of type FinishedState, on gpu
     TensorPtr mFinishedSteps;
 
     //! @brief Workspace for beam search in streaming mode.

@@ -245,8 +245,7 @@ void DecoderState::reshapeBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWid
     auto& dOutput = *mJointDecodingOutput;
     dOutput.ids->reshape(maxTotalTokensShape);
 
-    auto const maxNewTokensShape = ITensor::makeShape({mMaxDecodingEngineTokens, mMaxBatchSize, mMaxBeamWidth});
-    mFinishedSteps->reshape(maxNewTokensShape);
+    mFinishedSteps->reshape(maxBatchSizeXmaxBeamWidthShape);
     bufferManager.setZero(*mFinishedSteps);
 
     dOutput.finishReasons->reshape(maxBatchSizeXmaxBeamWidthShape);
@@ -260,6 +259,7 @@ void DecoderState::reshapeBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWid
     dOutput.finishedSum->reshape(maxBatchSizeShape);
     bufferManager.setZero(*dOutput.finishedSum);
 
+    auto const maxNewTokensShape = ITensor::makeShape({mMaxDecodingEngineTokens, mMaxBatchSize, mMaxBeamWidth});
     dOutput.newTokensSteps->reshape(maxNewTokensShape);
     bufferManager.setZero(*dOutput.newTokensSteps);
 
@@ -342,8 +342,6 @@ void DecoderState::reshapeSpeculativeDecodingBuffers(SpeculativeDecodingMode con
         mMaxDecodingEngineTokens);
 
     auto const maxNewTokensShape = ITensor::makeShape({mMaxDecodingEngineTokens, mMaxBatchSize, mMaxBeamWidth});
-    mFinishedSteps->reshape(maxNewTokensShape);
-    bufferManager.setZero(*mFinishedSteps);
     dOutput.newTokensSteps->reshape(maxNewTokensShape);
     bufferManager.setZero(*dOutput.newTokensSteps);
 
@@ -454,7 +452,6 @@ void DecoderState::disableLookahead(RequestVector const& genRequests)
 
     auto const maxNewTokensShape = ITensor::makeShape({mMaxDecodingEngineTokens, mMaxBatchSize, mMaxBeamWidth});
     mJointDecodingOutput->newTokensSteps->reshape(maxNewTokensShape);
-    mFinishedSteps->reshape(maxNewTokensShape);
 
     for (auto const& llmReq : genRequests)
     {

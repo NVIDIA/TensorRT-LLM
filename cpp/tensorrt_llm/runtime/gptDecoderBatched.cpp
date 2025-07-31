@@ -116,7 +116,7 @@ void prepareForward(decoder::DecoderState const& decoderState, SizeType32 step, 
     dInput.batchSize = static_cast<SizeType32>(dInput.batchSlots->getSize());
     dInput.logitsVec = input.logits.at(step);
 
-    TensorPtr finishedSteps = ITensor::at(decoderState.getFinishedSteps(), {0});
+    TensorPtr finishedSteps = decoderState.getFinishedSteps();
     TensorPtr newTokensStepView
         = ITensor::slice(dOutput.newTokensSteps, step, decoderState.getMaxDecodingDecoderTokens());
 
