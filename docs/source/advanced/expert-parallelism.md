@@ -4,7 +4,7 @@
 
 ## Mixture of Experts (MoE)
 
-Mixture of Experts (MoE) architectures have been used widely recently, such as [Mistral Mixtral 8x7B](https://huggingface.co/mistralai/Mixtral-8x7B-v0.1/blob/main/config.json). Specifically, MOE’s structure supports multiple parallel Feedforward Neural Network (FFN) layers (called experts) to replace the single FFN layer in the dense model. When tokens arrive, the router layer selects the TopK experts for each token. The corresponding hidden state of the token is then dispatched to the selected TopK experts, respectively. As a result, there are multiple tokens’ hidden states that are dispatched to each expert.
+Mixture of Experts (MoE) architectures have been used widely recently, such as [Mistral Mixtral 8x7B](https://huggingface.co/mistralai/Mixtral-8x7B-v0.1). Specifically, MOE’s structure supports multiple parallel Feedforward Neural Network (FFN) layers (called experts) to replace the single FFN layer in the dense model. When tokens arrive, the router layer selects the TopK experts for each token. The corresponding hidden state of the token is then dispatched to the selected TopK experts, respectively. As a result, there are multiple tokens’ hidden states that are dispatched to each expert.
 
 <img src="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/media/moe_structure.png?raw=true" alt="moe_structure" width="500" height="auto">
 
