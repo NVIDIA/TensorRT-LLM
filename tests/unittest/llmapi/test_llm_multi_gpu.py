@@ -274,9 +274,6 @@ def test_llama_7b_multi_lora_tp2():
         enable_lora=True,
         build_config=BuildConfig(lora_config=lora_config),
         fast_build=True,
-        max_lora_rank=lora_config.max_lora_rank,
-        max_loras=lora_config.max_loras,
-        max_cpu_loras=lora_config.max_cpu_loras,
         kv_cache_config=global_kv_cache_config)
 
 

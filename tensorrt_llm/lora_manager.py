@@ -203,8 +203,8 @@ class LoraConfig(DictConversion):
     max_lora_rank: int = 64
     lora_target_modules: List[str] = field(default_factory=list)
     trtllm_modules_to_hf_modules: Dict[str, str] = field(default_factory=dict)
-    max_loras: int = 4
-    max_cpu_loras: int = 4
+    max_loras: int | None = None
+    max_cpu_loras: int | None = None
 
     def __post_init__(self):
         assert self.lora_ckpt_source in ["hf", "nemo"], (
