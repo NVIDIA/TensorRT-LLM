@@ -75,6 +75,7 @@ class ModelConfig(Generic[TConfig]):
 
     is_generation: bool = True
     max_num_tokens: int = 8192
+    max_seq_len: Optional[int] = None
 
     moe_max_num_tokens: Optional[int] = None
     moe_load_balancer: Optional[MoeLoadBalancerConfig] = None

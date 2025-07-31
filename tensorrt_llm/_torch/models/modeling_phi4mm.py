@@ -271,16 +271,16 @@ class Phi4MMForCausalLM(transformers.PreTrainedModel):
         if modality == "image" or modality == "image_audio":
             lora_request = [
                 LoRARequest(
-                    lora_name=f"vision-lora-{i}",
-                    lora_int_id=i,
+                    lora_name="vision-lora",
+                    lora_int_id=0,
                     lora_path=f"{base_model_dir}/vision-lora",
                 ) for i in range(num_requests)
             ]
         elif modality == "audio":
             lora_request = [
                 LoRARequest(
-                    lora_name=f"speech-lora-{i}",
-                    lora_int_id=i,
+                    lora_name="speech-lora",
+                    lora_int_id=1,
                     lora_path=f"{base_model_dir}/speech-lora",
                 ) for i in range(num_requests)
             ]
