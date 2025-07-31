@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 import asyncio
 import copy
+import json
 import os
 import signal
 import traceback
@@ -137,6 +138,10 @@ class OpenAIDisaggServer:
             #If request finished after first token not due to length, return right away and skip gen
             if ctx_response is not None and ctx_response.choices[0].finish_reason not in ["length", "not_finished"]:
                 yield f"data: [DONE]\n\n".encode('utf-8')
+                data = ctx_response.model_dump()
+                del data['choices'][0]['disaggregated_params']
+                data = json.dumps(data)
+                yield f"data: {data}\n\n".encode('utf-8')
             else:
                 # Then yield the generation responses
                 if isinstance(gen_req, CompletionRequest):
@@ -146,8 +151,11 @@ class OpenAIDisaggServer:
                 else:
                     raise TypeError("Invalid request type: {type(gen_req).__name__}")
 
+                i = 0
                 async for chunk in gen_response.body_iterator:
-                    yield chunk
+                    if i > 0:
+                        yield chunk
+                    i += 1
 
         finally:
             await self.gen_router.finish_request(gen_req)
