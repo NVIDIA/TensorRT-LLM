@@ -1045,7 +1045,7 @@ Refer to the {ref}`support-matrix-software` section for a list of supported mode
 - System prompt caching
 - Enabled split-k for weight-only cutlass kernels
 - FP8 KV cache support for XQA kernel
-- New Python builder API and `trtllm-build` command and OPT
+- Added Python builder API, `trtllm-build` command, and OPT support
 - Support `StoppingCriteria` and `LogitsProcessor` in Python generate API
 - FHMA support for chunked attention and paged KV cache
 - Performance enhancements include:
