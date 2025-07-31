@@ -117,13 +117,13 @@ T maxOfBatchSlots(runtime::SizeType32 const* batchSlotsHost, T const* data, runt
     auto const val = std::transform_reduce(
         batchSlotsHost, batchSlotsHost + batchSize, std::numeric_limits<T>::lowest(),
         [](auto a, auto b) { return std::max(a, b); }, [&](auto i) { return data[i]; });
-    if (val < 0)
+    if (val < 0 || val > 1024)
     {
-        TLLM_CHECK(false);
         TLLM_LOG_ERROR("val: %d", val);
         TLLM_LOG_ERROR("batchSlotsHost: %s", tensorrt_llm::common::arr2str(batchSlotsHost, batchSize).c_str());
         TLLM_LOG_ERROR("batchSize: %d", batchSize);
         TLLM_LOG_ERROR("data: %s", tensorrt_llm::common::arr2str(data, batchSize).c_str());
+        TLLM_CHECK(false);
     }
     return val;
 }
