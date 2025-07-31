@@ -236,4 +236,19 @@ void GuidedDecoder::execute(DecoderInputBuffers const& decoderInputBuffers, Buff
     }
 }
 
+void GuidedDecoder::incLogitsBitmaskHost(CudaStream const& stream)
+{
+    auto callback = [](void* guidedDecoderVoidPtr)
+    {
+        auto guidedDecoder = static_cast<GuidedDecoder*>(guidedDecoderVoidPtr);
+        auto logitsBitmaskHost = bufferCast<int32_t>(*guidedDecoder->getLogitsBitmaskHost());
+        auto const dims = guidedDecoder->getLogitsBitmaskHost()->getShape();
+        for (int i = 0; i < dims.d[0] * dims.d[1]; i++)
+        {
+            logitsBitmaskHost[i]++;
+        }
+    };
+    cudaLaunchHostFunc(stream.get(), callback, this);
+}
+
 } // namespace tensorrt_llm::batch_manager
