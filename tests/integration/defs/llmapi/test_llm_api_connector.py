@@ -71,7 +71,7 @@ os.environ["TLLM_WORKER_USE_SINGLE_PROCESS"] = "1"
 
 
 @pytest.mark.threadleak(enabled=False)
-def test_llm_api_connector_simple(model_with_connector):
+def test_connector_simple(model_with_connector):
     NUM_TOKENS = 8
 
     model_fn, scheduler, worker = model_with_connector
@@ -130,7 +130,7 @@ def test_llm_api_connector_simple(model_with_connector):
 
 
 @pytest.mark.threadleak(enabled=False)
-def test_llm_api_connector_async_onboard(model_with_connector):
+def test_connector_async_onboard(model_with_connector):
     NUM_TOKENS = 8
 
     model_fn, scheduler, worker = model_with_connector
@@ -161,7 +161,7 @@ def test_llm_api_connector_async_onboard(model_with_connector):
 
 
 @pytest.mark.threadleak(enabled=False)
-def test_llm_api_connector_async_save(model_with_connector):
+def test_connector_async_save(model_with_connector):
     NUM_TOKENS = 8
 
     model_fn, scheduler, worker = model_with_connector
@@ -202,7 +202,7 @@ def test_llm_api_connector_async_save(model_with_connector):
 
 
 @pytest.mark.threadleak(enabled=False)
-def test_llm_api_scheduler_output(model_with_connector):
+def test_connector_scheduler_output(model_with_connector):
     NUM_INPUT_TOKENS = 48
     NUM_TOKENS = 32
     BLOCK_SIZE = 32
@@ -237,6 +237,7 @@ def test_llm_api_scheduler_output(model_with_connector):
             assert len(request.new_tokens) == NUM_INPUT_TOKENS
             assert len(request.new_block_ids) == math.ceil(NUM_INPUT_TOKENS /
                                                            BLOCK_SIZE)
+            assert request.computed_position == 0
         else:
             assert len(request.new_tokens) == 1
 
@@ -244,3 +245,61 @@ def test_llm_api_scheduler_output(model_with_connector):
                 assert len(request.new_block_ids) == 1
             else:
                 assert request.new_block_ids == []
+
+    scheduler.build_connector_meta.reset_mock()
+
+    scheduler.get_num_new_matched_tokens.return_value = 8, False
+
+    model.generate([0] * NUM_INPUT_TOKENS, sampling_params)
+
+    assert scheduler.build_connector_meta.call_args_list[0].args[0].requests[
+        0].computed_position == 8
+
+
+@pytest.mark.threadleak(enabled=False)
+def test_connector_scheduler_output_chunked_context(model_with_connector):
+    model_fn, scheduler, worker = model_with_connector
+
+    CHUNK_SIZE = 128
+    BLOCK_SIZE = 32
+
+    model = model_fn(
+        model="Qwen/Qwen2-0.5B",
+        backend="pytorch",
+        disable_overlap_scheduler=True,
+        cuda_graph_config=None,
+        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.1),
+        enable_chunked_prefill=True,
+        max_num_tokens=CHUNK_SIZE)
+
+    assert worker.register_kv_caches.call_count == 1
+
+    scheduler.get_num_new_matched_tokens.return_value = 0, False
+
+    worker.get_finished.return_value = [], []
+
+    sampling_params = SamplingParams(max_tokens=32, ignore_eos=True)
+
+    model.generate([0] * (CHUNK_SIZE * 2), sampling_params)
+
+    for i, call in enumerate(scheduler.build_connector_meta.call_args_list):
+        sched_output = call.args[0]
+
+        assert len(sched_output.requests) == 1
+
+        req = sched_output.requests[0]
+
+        if i == 0:
+            # The first prefill chunk.
+            # All of the prefill tokens and all the blocks should be provided upfront.
+            assert req.computed_position == 0
+            assert len(req.new_tokens) == CHUNK_SIZE * 2
+            assert len(req.new_block_ids) == math.ceil(CHUNK_SIZE * 2 /
+                                                       BLOCK_SIZE)
+        elif i == 1:
+            # The second prefill chunk.
+            assert req.computed_position == CHUNK_SIZE
+            assert len(req.new_tokens) == 0
+            assert len(req.new_block_ids) == 0
+        else:
+            assert len(req.new_tokens) == 1
