@@ -6,7 +6,6 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Dict, List, Optional, Union
-from time import time
 
 import nvtx
 import torch
@@ -434,7 +433,7 @@ class FP8BlockScalesLinearMethod(LinearMethodBase):
         # with nvtx.annotate("fp8_block_scaling_gemm", color="blue"):
         #     t1 = time()
         #     output = torch.ops.trtllm.fp8_block_scaling_gemm(
-        #         act_input_fp8.view(torch.float8_e4m3fn), module.weight.view(torch.float8_e4m3fn), 
+        #         act_input_fp8.view(torch.float8_e4m3fn), module.weight.view(torch.float8_e4m3fn),
         #         act_input_sf, module.weight_scale)
         #     t2 = time()
         #     print(f"limin: fp8_block_scaling_gemm host time = {(t2 - t1)*1000000} us")

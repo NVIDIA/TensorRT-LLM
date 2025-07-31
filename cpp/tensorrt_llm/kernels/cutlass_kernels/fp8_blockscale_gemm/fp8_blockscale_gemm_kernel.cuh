@@ -1400,7 +1400,8 @@ void fp8_1x128_cs(
     attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
     config.numAttrs = 1;
     config.attrs = attrs;
-    cudaLaunchKernelEx(&config, scale_1x128_kernel<__nv_bfloat16, __nv_fp8_e4m3>, mat_quant, scales, mat, shape_x, shape_y);
+    cudaLaunchKernelEx(
+        &config, scale_1x128_kernel<__nv_bfloat16, __nv_fp8_e4m3>, mat_quant, scales, mat, shape_x, shape_y);
 }
 
 void fp8_1x128_cs_reshape(__nv_fp8_e4m3* mat_quant, float* scales, __nv_bfloat16 const* mat, int shape_x, int shape_h,
@@ -1425,8 +1426,8 @@ void fp8_1x128_cs_reshape(__nv_fp8_e4m3* mat_quant, float* scales, __nv_bfloat16
     attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
     config.numAttrs = 1;
     config.attrs = attrs;
-    cudaLaunchKernelEx(
-        &config, scale_1x128_reshape_kernel<__nv_bfloat16, __nv_fp8_e4m3>, mat_quant, scales, mat, shape_x, shape_h, shape_y, stride_x);
+    cudaLaunchKernelEx(&config, scale_1x128_reshape_kernel<__nv_bfloat16, __nv_fp8_e4m3>, mat_quant, scales, mat,
+        shape_x, shape_h, shape_y, stride_x);
 }
 
 void fp8_128x128_cs(

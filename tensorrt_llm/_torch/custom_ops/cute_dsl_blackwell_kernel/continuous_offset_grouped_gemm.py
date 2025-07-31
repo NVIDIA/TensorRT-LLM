@@ -1533,7 +1533,7 @@ class BlockwiseContiguousGroupedGemmKernel:
                 is_valid_tile = tile_info[2] < group_count
                 tile_info_pipeline.consumer_release(tile_info_consumer_state)
                 tile_info_consumer_state.advance()
-            
+
             cute.arch.griddepcontrol_launch_dependents()
 
             # # Early smem release, non blocking
@@ -1774,14 +1774,14 @@ class BlockwiseContiguousGroupedGemmKernel:
             #     self.buffer_align_bytes
             #     + cute.size_in_bytes(self.c_dtype, c_smem_layout_staged)
             # )
-            # cute.nvgpu.setsmemsize_flush()    
+            # cute.nvgpu.setsmemsize_flush()
 
         #
         # Specialized epilogue warps
         #
         if warp_idx <= self.epilog_warp_id[
                 -1] and warp_idx >= self.epilog_warp_id[0]:
-            
+
             # # Early smem release, non blocking
             # cute.nvgpu.setsmemsize_sync(
             #     self.buffer_align_bytes
@@ -2061,7 +2061,7 @@ class BlockwiseContiguousGroupedGemmKernel:
             #
             if cutlass.const_expr(self.use_tma_store):
                 c_pipeline.producer_tail()
-            
+
             # cute.arch.griddepcontrol_launch_dependents()
 
     @cute.jit

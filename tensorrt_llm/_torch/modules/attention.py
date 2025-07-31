@@ -1,7 +1,6 @@
 import math
 import weakref
 from typing import Optional, Union, cast
-from time import time
 
 import nvtx
 import torch

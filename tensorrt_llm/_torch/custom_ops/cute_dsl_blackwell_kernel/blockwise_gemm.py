@@ -873,7 +873,6 @@ class BlockwiseGemmKernel:
 
             cute.arch.warpgroup_reg_dealloc(self.num_regs_uniform_warps)
 
-
         if warp_idx == self.tma_warp_id:
             cute.arch.warpgroup_reg_dealloc(self.num_regs_uniform_warps)
             #
@@ -885,7 +884,7 @@ class BlockwiseGemmKernel:
 
             ab_producer_state = utils.make_pipeline_state(
                 utils.PipelineUserType.Producer, self.num_ab_stage)
-            
+
             cute.arch.griddepcontrol_wait()
             # cute.arch.griddepcontrol_launch_dependents()
 
@@ -962,14 +961,14 @@ class BlockwiseGemmKernel:
                 #
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
-            
+
             # cute.arch.griddepcontrol_launch_dependents()
 
             #
             # Wait A/B buffer empty
             #
             ab_pipeline.producer_tail(ab_producer_state)
-            
+
             # # smem early release
             # cute.nvgpu.setsmemsize_sync(
             #         self.buffer_align_bytes
@@ -1278,7 +1277,7 @@ class BlockwiseGemmKernel:
                 #
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
-            
+
             cute.arch.griddepcontrol_launch_dependents()
 
             # # Early smem release, non blocking
@@ -1294,7 +1293,7 @@ class BlockwiseGemmKernel:
             #
             # Wait for accumulator buffer empty
             #
-            acc_pipeline.producer_tail(acc_producer_state)  
+            acc_pipeline.producer_tail(acc_producer_state)
 
         #
         # Specialized acc update warps
@@ -1507,7 +1506,7 @@ class BlockwiseGemmKernel:
                 #
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
-            
+
             # # wait for all other warp have finish setsmemsize, i.e., ensure a/b smem has been consumed in tma warp.
             # cute.arch.barrier(
             #     barrier_id=self.pdl_sync_bar_id,
@@ -1524,7 +1523,7 @@ class BlockwiseGemmKernel:
         #
         if warp_idx <= self.epilog_warp_id[
                 -1] and warp_idx >= self.epilog_warp_id[0]:
-            
+
             # # Early smem release, non blocking
             # cute.nvgpu.setsmemsize_sync(
             #     self.buffer_align_bytes
@@ -1757,7 +1756,6 @@ class BlockwiseGemmKernel:
                 tile_sched.advance_to_next_work()
                 work_tile = tile_sched.get_current_work()
 
-            
             #
             # Dealloc the tensor memory buffer
             #
@@ -1780,7 +1778,7 @@ class BlockwiseGemmKernel:
             #
             if cutlass.const_expr(self.use_tma_store):
                 c_pipeline.producer_tail()
-            
+
             # cute.arch.griddepcontrol_launch_dependents()
 
     def acc_update_tmem_copy_and_partition(

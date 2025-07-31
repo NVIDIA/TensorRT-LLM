@@ -250,7 +250,10 @@ def test_cute_dsl_group_gemm(num_experts, k, n, max_tokens_per_group):
         #                            atol=0.1,
         #                            rtol=1e-03)
         # torch.testing.assert_close(c_actual_ref.cpu(), c_ref.cpu(), atol=0.1, rtol=1e-03)
-        torch.testing.assert_close(c_actual.cpu(), c_ref.cpu(), atol=0.1, rtol=1e-03)
+        torch.testing.assert_close(c_actual.cpu(),
+                                   c_ref.cpu(),
+                                   atol=0.1,
+                                   rtol=1e-03)
         print("PASS")
 
 
