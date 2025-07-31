@@ -119,9 +119,9 @@ class StatsKeeper:
             # For speculative decoding, we need to track the number of draft tokens per request and the number of accepted draft tokens per request
             if max_draft_tokens > 0:
                 num_draft_tokens.append(max_draft_tokens * (entry.decode_iteration + 1))
-                num_accepted_draft_tokens.append(entry.num_generated_tokens - entry.decode_iteration - 1)
+                num_accepted_draft_tokens.append(entry.num_total_output_tokens - entry.decode_iteration - 1)
                 draft_acceptance_rate.append(float(num_accepted_draft_tokens[-1]) / float(num_draft_tokens[-1]))
-                acceptance_length.append(entry.num_generated_tokens / (entry.decode_iteration +
+                acceptance_length.append(entry.num_total_output_tokens / (entry.decode_iteration +
                                                        1))
 
         global_acceptance_length = sum(output_tokens) / total_decoding_iterations
