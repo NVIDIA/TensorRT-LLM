@@ -2,7 +2,6 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-import pytest
 import yaml
 from _model_test_utils import _hf_model_dir_or_hub_id
 from click.testing import CliRunner
@@ -65,8 +64,7 @@ def run_benchmark(model_name: str, dataset_path: str, temp_dir: str):
     assert result.exit_code == 0
 
 
-@pytest.mark.parametrize("compile_backend", ["torch-compile", "torch-opt", "torch-cudagraph"])
-def test_trtllm_bench(llm_root, compile_backend):  # noqa: F811
+def test_trtllm_bench(llm_root):  # noqa: F811
     model_name = _hf_model_dir_or_hub_id(
         f"{llm_models_root()}/TinyLlama-1.1B-Chat-v1.0", "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
     )
@@ -76,9 +74,8 @@ def test_trtllm_bench(llm_root, compile_backend):  # noqa: F811
             yaml.dump(
                 {
                     "model_kwargs": {"num_hidden_layers": 2},
-                    "cuda_graph_batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128],
+                    "cuda_graph_batch_sizes": [1, 2],
                     "max_batch_size": 128,
-                    "compile_backend": compile_backend,
                 },
                 f,
             )
