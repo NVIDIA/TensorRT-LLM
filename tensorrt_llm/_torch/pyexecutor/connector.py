@@ -4,6 +4,7 @@ from typing import Any, Callable, Optional
 
 from tensorrt_llm._utils import mpi_allgather, mpi_broadcast, mpi_rank
 from tensorrt_llm.bindings import LlmRequestState
+from tensorrt_llm.bindings.executor import ExecutorConfig
 from tensorrt_llm.bindings.internal.batch_manager import \
     KvCacheConnectorManager as KvCacheConnectorManagerCpp
 from tensorrt_llm.bindings.internal.batch_manager import (
@@ -61,7 +62,8 @@ class SchedulerOutput:
 
 class KvCacheConnectorWorker(ABC):
 
-    def __init__(self):
+    def __init__(self, config: ExecutorConfig):
+        self._config = config
         super().__init__()
 
     def bind_connector_meta(self, metadata: object):
@@ -137,7 +139,8 @@ class KvCacheConnectorWorker(ABC):
 
 class KvCacheConnectorScheduler(ABC):
 
-    def __init__(self):
+    def __init__(self, executor_config: ExecutorConfig):
+        self._config = executor_config
         super().__init__()
 
     @abstractmethod
