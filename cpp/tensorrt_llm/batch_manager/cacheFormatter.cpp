@@ -840,6 +840,8 @@ void CacheFormatter::unformat(TransferSession& session)
     if (selfConfig.getModelConfig().mNbKvHeadsPerLayer.size() != destConfig.getModelConfig().mNbKvHeadsPerLayer.size())
     {
         TLLM_LOG_WARNING("CacheFormatter::inquireSupport: only support same number of layers");
+        TLLM_LOG_WARNING("self: %zu dest %zu", selfConfig.getModelConfig().mNbKvHeadsPerLayer.size(),
+            destConfig.getModelConfig().mNbKvHeadsPerLayer.size());
         return false;
     }
     int selfNumLayers = selfConfig.getModelConfig().mNbKvHeadsPerLayer.size();

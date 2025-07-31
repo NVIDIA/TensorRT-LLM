@@ -356,6 +356,7 @@ class RopeParams:
     mscale_all_dim: float = 0.0
     short_factor: Optional[Tuple[float]] = None
     long_factor: Optional[Tuple[float]] = None
+    max_seq_len: Optional[int] = None
 
     @staticmethod
     def from_config(config) -> "RopeParams":
@@ -406,6 +407,8 @@ class RopeParams:
         # Workaround for DeepSeek V3 Lite since its rope_scaling is null in config.json.
         elif config.model_type == "deepseek_v3":
             rope_params.scale_type = RotaryScalingType.yarn
+        # Other metdadata for RoPE.
+        rope_params.max_seq_len = getattr(config, 'max_seq_len', None)
 
         return rope_params
 
@@ -439,13 +442,14 @@ class RopeParams:
                 self.mscale_all_dim,
             )
         elif self.scale_type == RotaryScalingType.longrope:
-            rope_inv_freq, rope_cos_sin = RopeEmbeddingUtils.create_sinusoidal_positions_long_rope_for_attention_plugin(
+            rope_inv_freq, rope_cos_sin = RopeEmbeddingUtils.create_sinusoidal_positions_long_rope(
                 num_pos=self.max_positions,
                 dim=self.dim,
                 theta=self.theta,
                 original_max_pos=self.original_max_positions,
                 short_factor=self.short_factor,
                 long_factor=self.long_factor,
+                max_seq_len=self.max_seq_len,
             )
         else:
             rope_inv_freq, rope_cos_sin = RopeEmbeddingUtils.create_sinusoidal_positions_for_attention_plugin(

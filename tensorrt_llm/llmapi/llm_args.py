@@ -3,12 +3,13 @@ import functools
 import json
 import math
 import os
+import types
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum, EnumMeta
 from pathlib import Path
 from typing import (TYPE_CHECKING, Any, ClassVar, Dict, List, Literal, Optional,
-                    TypeAlias, Union)
+                    Type, TypeAlias, TypeVar, Union, get_args, get_origin)
 
 import torch
 import yaml
@@ -29,8 +30,7 @@ if TYPE_CHECKING:
 
 # yapf: disable
 # isort: off
-from ..bindings.executor import (
-                                 BatchingType as _BatchingType,
+from ..bindings.executor import (BatchingType as _BatchingType,
                                  CacheTransceiverBackendType as _CacheTransceiverBackendType,
                                  CacheTransceiverConfig as _CacheTransceiverConfig,
                                  CapacitySchedulerPolicy as _CapacitySchedulerPolicy,
@@ -60,6 +60,8 @@ from .tokenizer import TokenizerBase, tokenizer_factory
 from .utils import generate_api_docs_as_docstring, get_type_repr
 
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
+
+TypeBaseModel = TypeVar("T", bound=BaseModel)
 
 
 def Field(default: Any = ...,
@@ -598,6 +600,62 @@ class PybindMirror(ABC):
                 return False
         return True
 
+    @classmethod
+    def from_pybind(cls: Type[TypeBaseModel],
+                    pybind_instance: "PybindMirror") -> TypeBaseModel:
+        """Construct an instance of the given class from the fields in the given
+        pybind class instance.
+
+        Args:
+            cls: Type of the class to construct, must be a subclass of pydantic
+                 BaseModel
+            pybind_instance: Instance of the pybind class to construct from its
+                             fields
+
+        Notes:
+            When a field value is None in the pybind class, but it's not
+            optional and has a default value in the BaseModel class, it would
+            get the default value defined in the BaseModel class.
+
+        Returns:
+            Instance of the given class, populated with the fields of the given
+            pybind instance
+        """  # noqa: D205
+        assert issubclass(cls, BaseModel)
+
+        # Some of the fields are optional in the C++ class but in python they aren't
+        # optional and have a default value, so copy the value from C++ instance
+        # only if it has a value, so otherwise the default value defined in the
+        # python class would be set.
+        def _is_optional_type(annotation: Any) -> bool:
+            """Returns True if a type annotation represents an Optional type
+            (Optional[X]) or a Union type that includes None (Union[X, Y, None]
+            or X | Y | None).
+            """  # noqa: D205
+            origin = get_origin(annotation)
+            args = get_args(annotation)
+
+            # Union is for Optional[x]
+            # UnionType is for the new | operation in Python 3.10+
+            return (origin is Union
+                    or origin is types.UnionType) and type(None) in args
+
+        fields_non_optional_with_default_value_in_basemodel = {
+            field_name
+            for field_name, field_info in cls.model_fields.items()
+            if not (_is_optional_type(field_info.annotation)
+                    and field_info.is_required())
+        }
+
+        kwargs = {}
+        cpp_fields = PybindMirror.get_pybind_variable_fields(
+            type(pybind_instance))
+        for field_name in cpp_fields:
+            field_value = getattr(pybind_instance, field_name)
+            if field_value is not None or field_name not in fields_non_optional_with_default_value_in_basemodel:
+                kwargs[field_name] = field_value
+        return cls(**kwargs)
+
 
 class PybindMirrorMeta(type(PybindMirror)):
     pass
@@ -695,11 +753,12 @@ class PeftCacheConfig(StrictBaseModel, PybindMirror):
         default=0,
         description=
         "number of max sized 1-layer 1-module adapterSize=1 sets of weights that can be stored in host cache"
-    )
+        ", affects host cache size and overrides value of host_cache_size")
     num_device_module_layer: int = Field(
         default=0,
         description=
-        "number of max sized 1-layer 1-module sets of weights that can be stored in host cache"
+        "number of max sized 1-layer 1-module sets of weights that can be stored in device cache"
+        ", affects device cache size and overrides value of device_cache_percent"
     )
     optimal_adapter_size: int = Field(
         default=
@@ -726,15 +785,17 @@ class PeftCacheConfig(StrictBaseModel, PybindMirror):
     max_pages_per_block_device: int = Field(
         default=8,
         description="Number of cache pages per allocation block (device)")
-    device_cache_percent: Optional[float] = Field(
-        default=None,
-        description="percent of memory after engine load to use for cache")
-    host_cache_size: Optional[int] = Field(
-        default=None, description="size in bytes to use for host cache")
+    device_cache_percent: float = Field(
+        default=0.02,
+        description=
+        "Proportion of free device memory after engine load to use for cache, as a fraction from 0 to 1"
+    )
+    host_cache_size: int = Field(
+        default=1024**3, description="size in bytes to use for host cache")
     lora_prefetch_dir: Optional[str] = Field(
         default=None,
         description=
-        "folder to store the LoRA weights we hope to load during engine initialization"
+        "folder to store the LoRA weights we hope to load during engine initialization, currently not supported"
     )
 
     def _to_pybind(self):
@@ -1083,27 +1144,6 @@ class BaseLlmArgs(StrictBaseModel):
 
     # LoRA arguments
     enable_lora: bool = Field(default=False, description="Enable LoRA.")
-
-    max_lora_rank: Optional[int] = Field(
-        default=None,
-        description="The maximum LoRA rank.",
-        deprecated="Use lora_config.max_lora_rank instead.",
-        status="deprecated",
-    )
-
-    max_loras: int = Field(
-        default=4,
-        description="The maximum number of LoRA.",
-        deprecated="Use lora_config.max_loras instead.",
-        status="deprecated",
-    )
-
-    max_cpu_loras: int = Field(
-        default=4,
-        description="The maximum number of LoRA on CPU.",
-        deprecated="Use lora_config.max_cpu_loras instead.",
-        status="deprecated",
-    )
 
     lora_config: Optional[LoraConfig] = Field(
         default=None, description="LoRA configuration for the model.")
@@ -1495,10 +1535,10 @@ class BaseLlmArgs(StrictBaseModel):
         if self.parallel_config._world_size == 1 and self.build_config:
             self.build_config.plugin_config.nccl_plugin = None
 
-        if self.enable_lora and self.lora_config is None and self.backend != 'pytorch':
+        if self.enable_lora and self.backend != 'pytorch':
             self.build_config.plugin_config.lora_plugin = 'auto'
-            if self.max_lora_rank is not None:
-                self.build_config.lora_config.max_lora_rank = self.max_lora_rank
+            if self.lora_config is not None:
+                self.build_config.lora_config.max_lora_rank = self.lora_config.max_lora_rank
 
         if hasattr(self,
                    'enable_prompt_adapter') and self.enable_prompt_adapter:
@@ -1602,16 +1642,6 @@ class BaseLlmArgs(StrictBaseModel):
     @model_validator(mode="after")
     def validate_lora_config_consistency(self):
         if self.lora_config:
-            if self.max_lora_rank is not None:
-                logger.warning(
-                    "max_lora_rank is ignored when lora_config is provided.")
-            if self.max_loras != self.lora_config.max_loras:
-                logger.warning(
-                    "max_loras is ignored when lora_config is provided.")
-            if self.max_cpu_loras != self.lora_config.max_cpu_loras:
-                logger.warning(
-                    "max_cpu_loras is ignored when lora_config is provided.")
-
             if len(self.lora_config.lora_dir) == 0:
                 # TODO [TRTLLM-5173]
                 logger.warning(
@@ -1636,6 +1666,14 @@ class BaseLlmArgs(StrictBaseModel):
                 )
                 self.lora_config.lora_target_modules = list(
                     default_trtllm_modules_to_hf_modules.keys())
+        return self
+
+    @model_validator(mode="after")
+    def validate_peft_cache_config(self):
+        if self.peft_cache_config is not None and self.peft_cache_config.lora_prefetch_dir is not None:
+            raise ValueError(
+                f"lora_prefetch_dir was set to '{self.peft_cache_config.lora_prefetch_dir}' "
+                "while LoRA prefetch is not supported")
         return self
 
     def _update_plugin_config(self, key: str, value: Any):
