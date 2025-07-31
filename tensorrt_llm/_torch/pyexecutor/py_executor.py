@@ -1100,12 +1100,8 @@ class PyExecutor:
             if not hasattr(self.model_engine.model, "lm_head"):
                 return
 
-            # Check token ID range
-            token_lists = request.get_tokens()
-            if any(
-                    min(tokens) < 0 or max(tokens) >=
-                    self.model_engine.model.lm_head.num_embeddings
-                    for tokens in token_lists):
+            if not request.check_token_id_range(
+                    self.model_engine.model.lm_head.num_embeddings):
                 raise ValueError("Token ID out of range")
 
     @nvtx_range("_fetch_and_activate_new_requests")
