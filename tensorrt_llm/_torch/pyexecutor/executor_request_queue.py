@@ -133,7 +133,8 @@ class ExecutorRequestQueue:
             all_ranks_num_active_requests: List[int]) -> bool:
         """Return True if the request can be processed immediately, else False."""
 
-        scheduling_params = req_item.request.py_scheduling_params
+        scheduling_params = getattr(req_item.request, 'py_scheduling_params',
+                                    None)
         if scheduling_params is None:
             return True
 
@@ -303,7 +304,7 @@ class ExecutorRequestQueue:
                 new_requests_cur_rank)
 
         # Update counters
-        self.num_fetch_requests += num_new_requests_all_ranks
+        self.num_fetch_requests += len(new_requests)
         self.num_fetch_requests_cur_rank += len(new_requests_cur_rank)
 
         # Merge requests and add to active list
@@ -323,9 +324,11 @@ class ExecutorRequestQueue:
 
         # Prioritize the requests that are not in relax mode
         def get_relax_value(req_item):
-            if req_item.request.py_scheduling_params is None:
+            scheduling_params = getattr(req_item.request,
+                                        'py_scheduling_params', None)
+            if scheduling_params is None:
                 return True
-            return req_item.request.py_scheduling_params.attention_dp_relax
+            return scheduling_params.attention_dp_relax
 
         new_requests = sorted(new_requests, key=get_relax_value, reverse=True)
 
@@ -333,8 +336,10 @@ class ExecutorRequestQueue:
         remaining_unscheduled = []
         for req_item in new_requests:
             scheduled = False
-            if req_item.request.py_scheduling_params is not None:
-                target_dp_rank = req_item.request.py_scheduling_params.attention_dp_rank
+            scheduling_params = getattr(req_item.request,
+                                        'py_scheduling_params', None)
+            if scheduling_params is not None:
+                target_dp_rank = scheduling_params.attention_dp_rank
                 if target_dp_rank is not None and all_ranks_num_active_requests[
                         target_dp_rank] < self.max_num_active_requests:
                     all_ranks_num_active_requests[target_dp_rank] += 1
@@ -367,8 +372,13 @@ class ExecutorRequestQueue:
                 new_requests, "py_logits_post_processors")
             py_multimodal_data = self._collect_py_objects_from_requests(
                 new_requests, "py_multimodal_data")
+            py_scheduling_params = self._collect_py_objects_from_requests(
+                new_requests, "py_scheduling_params")
             py_request_objects = tuple(
-                filter(None, [py_logits_post_processors, py_multimodal_data]))
+                filter(None, [
+                    py_logits_post_processors, py_multimodal_data,
+                    py_scheduling_params
+                ]))
         else:
             py_request_objects = None
 
