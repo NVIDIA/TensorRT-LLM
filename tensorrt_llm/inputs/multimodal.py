@@ -233,8 +233,8 @@ class MultimodalParams:
         """Apply tensor operations recursively to nested data structures.
 
         This method handles three types of operations:
-        - "to_shared_tensor": Convert tensors to shared tensor dictionaries
-        - "from_shared_tensor": Convert shared tensor dictionaries back to tensors
+        - "to_handle": Convert tensors to shared tensor dictionaries
+        - "to_tensor": Convert shared tensor dictionaries back to tensors
         - "to_device": Move tensors to specified device
 
         Args:
@@ -258,7 +258,7 @@ class MultimodalParams:
 
         # Handle dictionary case
         if isinstance(input_data, dict):
-            if operation == "from_shared_tensor" and self._is_shared_tensor_dict(
+            if operation == "to_tensor" and self._is_shared_tensor_dict(
                     input_data):
                 # Convert shared tensor dict back to tensor
                 try:
@@ -282,7 +282,7 @@ class MultimodalParams:
 
         # Handle tensor case
         if isinstance(input_data, torch.Tensor):
-            if operation == "to_shared_tensor":
+            if operation == "to_handle":
                 try:
                     # Import here to avoid circular imports
                     from tensorrt_llm._torch.shared_tensor import \
@@ -329,38 +329,37 @@ class MultimodalParams:
                 f"Supported elements: {', '.join(repr(e) for e in supported_elements)}"
             )
 
-    def to_shared_tensor(self, element: str) -> None:
+    def to_handle(self, element: str) -> None:
         """Move specified multimodal data element to shared tensor.
 
         Args:
-            element: Element to move ("multimodal_data" or "multimodal_input")
+            element: Element to move ("multimodal_data")
 
         Raises:
             ValueError: If element is not supported
             RuntimeError: If tensor conversion fails
         """
-        supported_elements = ["multimodal_data", "multimodal_input"]
+        supported_elements = ["multimodal_data"]
         self._validate_element(element, supported_elements)
 
         data = getattr(self, element)
         if data is None:
             return  # Nothing to convert
 
-        transformed_data = self._apply_tensor_operation(data,
-                                                        "to_shared_tensor")
+        transformed_data = self._apply_tensor_operation(data, "to_handle")
         setattr(self, element, transformed_data)
 
-    def from_shared_tensor(self, element: str) -> None:
+    def to_tensor(self, element: str) -> None:
         """Move specified multimodal data element from shared tensor.
 
         Args:
-            element: Element to restore ("multimodal_data" or "multimodal_input")
+            element: Element to restore ("multimodal_data")
 
         Raises:
             ValueError: If element is not supported
             RuntimeError: If tensor restoration fails
         """
-        supported_elements = ["multimodal_data", "multimodal_input"]
+        supported_elements = ["multimodal_data"]
 
         self._validate_element(element, supported_elements)
 
@@ -368,7 +367,7 @@ class MultimodalParams:
         if data is None:
             return  # Nothing to restore
 
-        restored_data = self._apply_tensor_operation(data, "from_shared_tensor")
+        restored_data = self._apply_tensor_operation(data, "to_tensor")
         setattr(self, element, restored_data)
 
     def to_device(self,
@@ -378,7 +377,7 @@ class MultimodalParams:
         """Move specified multimodal data element to target device.
 
         Args:
-            element: Element to move ("multimodal_data" or "multimodal_input")
+            element: Element to move ("multimodal_data")
             device: Target device (e.g., "cuda", "cpu")
             pin_memory: Whether to pin memory for faster transfers
 
@@ -386,7 +385,7 @@ class MultimodalParams:
             ValueError: If element is not supported or device is invalid
             RuntimeError: If device transfer fails
         """
-        supported_elements = ["multimodal_data", "multimodal_input"]
+        supported_elements = ["multimodal_data"]
         self._validate_element(element, supported_elements)
 
         data = getattr(self, element)
