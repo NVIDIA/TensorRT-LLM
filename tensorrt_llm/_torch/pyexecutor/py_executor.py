@@ -976,6 +976,7 @@ class PyExecutor:
 
                         # Return the first token to the client
                         self._handle_first_token_response(scheduled_batch)
+                    scheduled_batch.is_warmup = self.is_warmup
                     self.resource_manager.prepare_resources(scheduled_batch)
 
                     if self.kv_cache_transceiver and self.guided_decoder:
@@ -985,6 +986,8 @@ class PyExecutor:
                     if self.kv_connector_manager:
                         self.kv_connector_manager.take_scheduled_requests_pending_load(
                             scheduled_batch)
+                        self.kv_connector_manager.build_connector_meta()
+                        self.kv_connector_manager.worker.start_load_kv()
 
                 if scheduled_batch.batch_size > 0 or (
                         self.enable_attention_dp and self.dist.tp_size > 1):
