@@ -38,6 +38,7 @@ container_image=${19}
 mounts=${20}
 workdir=${21}
 model_dir=${22}
+repo_dir=${23}
 
 ctx_max_seq_len=$((isl + 1))
 gen_max_seq_len=$((isl + osl))
@@ -108,20 +109,20 @@ echo "server host name: $hostname_value"
 srun -l --container-name=${container_name} \
         --container-mounts=${mounts} \
     --mpi=pmix --overlap \
-    bash ${workdir}/start_worker.sh ${full_logdir}/config.yaml "${enable_pdl}" ${ctx_gpus} ${nsys_on} &> ${full_logdir}/output_workers.log &
+    bash ${workdir}/start_worker.sh ${full_logdir}/config.yaml "${enable_pdl}" ${ctx_gpus} ${nsys_on} ${repo_dir} &> ${full_logdir}/output_workers.log &
 
 # start the server
 srun -l --container-name=${container_name} \
         --container-mounts=${mounts} \
         --mpi=pmix --overlap -N 1 -n 1 \
         -w ${hostname_value} \
-        bash ${workdir}/start_server.sh ${full_logdir}/config.yaml &> ${full_logdir}/output_server.log &
+        bash ${workdir}/start_server.sh ${full_logdir}/config.yaml ${repo_dir} &> ${full_logdir}/output_server.log &
 
 # start benchmarking
 srun -l --container-name=${container_name} \
         --container-mounts=${mounts} \
         --mpi=pmix --overlap -N 1 -n 1 \
-        bash ${workdir}/run_benchmark.sh ${isl} ${osl} ${multi_round} ${model_dir} "${concurrency}" ${streaming} ${full_logdir}/ > ${full_logdir}/benchmark.log 2>&1
+        bash ${workdir}/run_benchmark.sh ${isl} ${osl} ${multi_round} ${model_dir} "${concurrency}" ${streaming} ${full_logdir} ${repo_dir} > ${full_logdir}/benchmark.log 2>&1
 
 # try to kill the server and workers
 srun -l --container-name=${container_name} \
