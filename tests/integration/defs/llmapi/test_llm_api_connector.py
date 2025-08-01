@@ -71,7 +71,8 @@ os.environ["TLLM_WORKER_USE_SINGLE_PROCESS"] = "1"
 
 
 @pytest.mark.threadleak(enabled=False)
-def test_connector_simple(model_with_connector):
+@pytest.mark.parametrize("use_overlap_scheduler", [True, False])
+def test_connector_simple(model_with_connector, use_overlap_scheduler):
     NUM_TOKENS = 8
 
     model_fn, scheduler, worker = model_with_connector
@@ -79,7 +80,7 @@ def test_connector_simple(model_with_connector):
     model = model_fn(
         model="Qwen/Qwen2-0.5B",
         backend="pytorch",
-        disable_overlap_scheduler=True,
+        disable_overlap_scheduler=not use_overlap_scheduler,
         cuda_graph_config=None,
         kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.1))
 
@@ -93,7 +94,9 @@ def test_connector_simple(model_with_connector):
 
     model.generate(["Hello, world"], sampling_params)
 
-    assert scheduler.build_connector_meta.call_count == NUM_TOKENS
+    # With the overlap scheduler, we generate one extra token.
+    assert scheduler.build_connector_meta.call_count == NUM_TOKENS + int(
+        use_overlap_scheduler)
 
     # We should have a single `SchedulerOutput` per forward pass.
     for i, call in enumerate(scheduler.build_connector_meta.call_args_list):
@@ -105,7 +108,8 @@ def test_connector_simple(model_with_connector):
             assert len(scheduler_output.requests[0].new_tokens) == 1
 
     # We call `start_load_kv` once at the beginning of each forward pass.
-    assert worker.start_load_kv.call_count == NUM_TOKENS
+    assert worker.start_load_kv.call_count == NUM_TOKENS + int(
+        use_overlap_scheduler)
 
     # Only called once when the request is received.
     assert scheduler.get_num_new_matched_tokens.call_count == 1
@@ -114,8 +118,10 @@ def test_connector_simple(model_with_connector):
                      for call in worker.wait_for_layer_load.call_args_list) + 1
 
     # Called num_layers * num_forward_passes times.
-    assert worker.wait_for_layer_load.call_count == num_layers * NUM_TOKENS
-    assert worker.save_kv_layer.call_count == num_layers * NUM_TOKENS
+    assert worker.wait_for_layer_load.call_count == num_layers * (
+        NUM_TOKENS + int(use_overlap_scheduler))
+    assert worker.save_kv_layer.call_count == num_layers * (
+        NUM_TOKENS + int(use_overlap_scheduler))
 
     for i, call in enumerate(worker.wait_for_layer_load.call_args_list):
         assert call.args[0] == i % num_layers
@@ -123,14 +129,17 @@ def test_connector_simple(model_with_connector):
     for i, call in enumerate(worker.save_kv_layer.call_args_list):
         assert call.args[0] == i % num_layers
 
-    assert worker.wait_for_save.call_count == NUM_TOKENS
+    assert worker.wait_for_save.call_count == NUM_TOKENS + int(
+        use_overlap_scheduler)
 
     assert scheduler.request_finished.call_count == 1
-    assert worker.get_finished.call_count == NUM_TOKENS
+    assert worker.get_finished.call_count == NUM_TOKENS + int(
+        use_overlap_scheduler)
 
 
 @pytest.mark.threadleak(enabled=False)
-def test_connector_async_onboard(model_with_connector):
+@pytest.mark.parametrize("use_overlap_scheduler", [True, False])
+def test_connector_async_onboard(model_with_connector, use_overlap_scheduler):
     NUM_TOKENS = 8
 
     model_fn, scheduler, worker = model_with_connector
@@ -138,7 +147,7 @@ def test_connector_async_onboard(model_with_connector):
     model = model_fn(
         model="Qwen/Qwen2-0.5B",
         backend="pytorch",
-        disable_overlap_scheduler=True,
+        disable_overlap_scheduler=not use_overlap_scheduler,
         cuda_graph_config=None,
         kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.1))
 
@@ -153,15 +162,17 @@ def test_connector_async_onboard(model_with_connector):
         "Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua."
     ], SamplingParams(max_tokens=NUM_TOKENS, ignore_eos=True))
 
-    # Once for the initial poll, then once for each token.
-    assert worker.get_finished.call_count == NUM_TOKENS + 1
+    # Once for the initial poll, then once for each token. One extra token when using the overlap scheduler.
+    assert worker.get_finished.call_count == NUM_TOKENS + 1 + int(
+        use_overlap_scheduler)
 
     # In the first iteration, there should be a single request id provided.
     assert len(worker.get_finished.call_args_list[0].args[1]) == 1
 
 
 @pytest.mark.threadleak(enabled=False)
-def test_connector_async_save(model_with_connector):
+@pytest.mark.parametrize("use_overlap_scheduler", [True, False])
+def test_connector_async_save(model_with_connector, use_overlap_scheduler):
     NUM_TOKENS = 8
 
     model_fn, scheduler, worker = model_with_connector
@@ -169,7 +180,7 @@ def test_connector_async_save(model_with_connector):
     model = model_fn(
         model="Qwen/Qwen2-0.5B",
         backend="pytorch",
-        disable_overlap_scheduler=True,
+        disable_overlap_scheduler=not use_overlap_scheduler,
         cuda_graph_config=None,
         kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.1))
 
@@ -188,12 +199,13 @@ def test_connector_async_save(model_with_connector):
 
     assert scheduler.request_finished.call_count == 1
 
-    # On the last call to get_finished, we should be providing the async saving request.
-    assert worker.get_finished.call_count == NUM_TOKENS
+    # On the last call to get_finished, we should be providing the async saving request. One extra token when using the overlap scheduler.
+    assert worker.get_finished.call_count == NUM_TOKENS + int(
+        use_overlap_scheduler)
 
-    for i in range(NUM_TOKENS):
-        args = worker.get_finished.call_args_list[i].args
-        if i != NUM_TOKENS - 1:
+    for i, call in enumerate(worker.get_finished.call_args_list):
+        args = call.args
+        if i != len(worker.get_finished.call_args_list) - 1:
             assert args == ([], [])
         else:
             assert len(args[0]) == 1
@@ -202,7 +214,9 @@ def test_connector_async_save(model_with_connector):
 
 
 @pytest.mark.threadleak(enabled=False)
-def test_connector_scheduler_output(model_with_connector):
+@pytest.mark.parametrize("use_overlap_scheduler", [True, False])
+def test_connector_scheduler_output(model_with_connector,
+                                    use_overlap_scheduler):
     NUM_INPUT_TOKENS = 48
     NUM_TOKENS = 32
     BLOCK_SIZE = 32
@@ -212,7 +226,7 @@ def test_connector_scheduler_output(model_with_connector):
     model = model_fn(
         model="Qwen/Qwen2-0.5B",
         backend="pytorch",
-        disable_overlap_scheduler=True,
+        disable_overlap_scheduler=not use_overlap_scheduler,
         cuda_graph_config=None,
         kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.1))
 
@@ -226,7 +240,9 @@ def test_connector_scheduler_output(model_with_connector):
 
     model.generate([0] * NUM_INPUT_TOKENS, sampling_params)
 
-    assert scheduler.build_connector_meta.call_count == NUM_TOKENS
+    # Additional token when using the overlap scheduler.
+    assert scheduler.build_connector_meta.call_count == NUM_TOKENS + int(
+        use_overlap_scheduler)
 
     for i, call in enumerate(scheduler.build_connector_meta.call_args_list):
         sched_output = call.args[0]
@@ -241,7 +257,8 @@ def test_connector_scheduler_output(model_with_connector):
         else:
             assert len(request.new_tokens) == 1
 
-            if request.computed_position % BLOCK_SIZE == 0:
+            if (request.computed_position +
+                    int(use_overlap_scheduler)) % BLOCK_SIZE == 0:
                 assert len(request.new_block_ids) == 1
             else:
                 assert request.new_block_ids == []
@@ -257,7 +274,9 @@ def test_connector_scheduler_output(model_with_connector):
 
 
 @pytest.mark.threadleak(enabled=False)
-def test_connector_scheduler_output_chunked_context(model_with_connector):
+@pytest.mark.parametrize("use_overlap_scheduler", [True, False])
+def test_connector_scheduler_output_chunked_context(model_with_connector,
+                                                    use_overlap_scheduler):
     model_fn, scheduler, worker = model_with_connector
 
     CHUNK_SIZE = 128
@@ -266,7 +285,7 @@ def test_connector_scheduler_output_chunked_context(model_with_connector):
     model = model_fn(
         model="Qwen/Qwen2-0.5B",
         backend="pytorch",
-        disable_overlap_scheduler=True,
+        disable_overlap_scheduler=not use_overlap_scheduler,
         cuda_graph_config=None,
         kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.1),
         enable_chunked_prefill=True,
