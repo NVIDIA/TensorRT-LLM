@@ -18,6 +18,13 @@ TensorRT-LLM
 <div align="left">
 
 ## Tech Blogs
+
+* [08/01] Scaling Expert Parallelism in TensorRT-LLM (Part 2: Performance Status and Optimization)
+✨ [➡️ link](./docs/source/blogs/tech_blog/blog8_Scaling_Expert_Parallelism_in_TensorRT-LLM_part2.md)
+
+* [07/26] N-Gram Speculative Decoding in TensorRT‑LLM
+✨ [➡️ link](./docs/source/blogs/tech_blog/blog_7_NGram_performance_Analysis_And_Auto_Enablement.md)
+
 * [06/19] Disaggregated Serving in TensorRT-LLM
 ✨ [➡️ link](./docs/source/blogs/tech_blog/blog5_Disaggregated_Serving_in_TensorRT-LLM.md)
 
