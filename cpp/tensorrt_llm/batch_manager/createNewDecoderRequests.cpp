@@ -621,28 +621,6 @@ CreateNewDecoderRequests::createDecoderRequests(RequestVector const& finishedCon
         {
             decoderRequest.generatedTokensPerEngineStep = modelConfig.getMaxDecodingTokens();
         }
-        if (modelConfig.getSpeculativeDecodingMode().isMedusa())
-        {
-            TLLM_CHECK(medusaBuffers);
-            llmReq->mSamplingConfig.topKMedusaHeads = {medusaBuffers->mTopKs};
-            // FIXME: we must set medusa paths and tree ids not from seq slot, but from llmRequest?
-            // When multiple microbatches buffers are used, runtime buffers can not be addressed with seqSlot.
-            decoderRequest.medusaPaths = ITensor::slice(medusaBuffers->medusaPathsDevice, 0, 1);
-            decoderRequest.medusaTreeIds = ITensor::slice(medusaBuffers->medusaTreeIdsDevice, 0, 1);
-        }
-        else if (modelConfig.getSpeculativeDecodingMode().isLookaheadDecoding())
-        {
-            lookaheadPrompt.emplace_back(ITensor::slice(decoderRequest.ids, 0, decoderRequest.inputLen));
-
-            auto const& lookaheadRuntimeConfig
-                = llmReq->getLookaheadConfig().value_or(decodingConfig.getLookaheadDecodingConfig().value());
-            lookaheadAlgoConfigs.emplace_back(lookaheadRuntimeConfig);
-        }
-        else if (modelConfig.getSpeculativeDecodingMode().isEagle())
-        {
-            decoderRequest.eagleConfig
-                = llmReq->getEagleConfig() ? llmReq->getEagleConfig() : decodingConfig.getEagleConfig();
-        }
 
         if (llmReq->getEmbeddingBias().has_value())
         {
@@ -672,10 +650,33 @@ CreateNewDecoderRequests::createDecoderRequests(RequestVector const& finishedCon
         decoderState.setNumDecodingEngineTokens(batchSlot, numDecodingEngineTokens);
 
         // Speculative execution
-        if (numDecodingEngineTokens > 1 || decoderState.getSpeculativeDecodingMode().isDraftTokensExternal())
+        if (!decoderState.getSpeculativeDecodingMode().isNone())
         {
             auto const beamWidth = samplingConfig.beamWidth;
             TLLM_CHECK(beamWidth == 1);
+
+            if (modelConfig.getSpeculativeDecodingMode().isMedusa())
+            {
+                TLLM_CHECK(medusaBuffers);
+                llmReq->mSamplingConfig.topKMedusaHeads = {medusaBuffers->mTopKs};
+                // FIXME: we must set medusa paths and tree ids not from seq slot, but from llmRequest?
+                // When multiple microbatches buffers are used, runtime buffers can not be addressed with seqSlot.
+                decoderRequest.medusaPaths = ITensor::slice(medusaBuffers->medusaPathsDevice, 0, 1);
+                decoderRequest.medusaTreeIds = ITensor::slice(medusaBuffers->medusaTreeIdsDevice, 0, 1);
+            }
+            else if (modelConfig.getSpeculativeDecodingMode().isLookaheadDecoding())
+            {
+                lookaheadPrompt.emplace_back(ITensor::slice(decoderRequest.ids, 0, decoderRequest.inputLen));
+
+                auto const& lookaheadRuntimeConfig
+                    = llmReq->getLookaheadConfig().value_or(decodingConfig.getLookaheadDecodingConfig().value());
+                lookaheadAlgoConfigs.emplace_back(lookaheadRuntimeConfig);
+            }
+            else if (modelConfig.getSpeculativeDecodingMode().isEagle())
+            {
+                decoderRequest.eagleConfig
+                    = llmReq->getEagleConfig() ? llmReq->getEagleConfig() : decodingConfig.getEagleConfig();
+            }
 
             newRequestSpeculativeDecoding(batchSlot, decoderRequest, samplingConfig, modelConfig,
                 decoderState.getJointDecodingInput(), decoderState.getJointDecodingOutput(), runtimeStream,
