@@ -122,7 +122,7 @@ srun -l --container-name=${container_name} \
 srun -l --container-name=${container_name} \
         --container-mounts=${mounts} \
         --mpi=pmix --overlap -N 1 -n 1 \
-        bash ${workdir}/run_benchmark.sh ${isl} ${osl} ${multi_round} ${model_dir} "${concurrency}" ${streaming} ${full_logdir} ${repo_dir} > ${full_logdir}/benchmark.log 2>&1
+        bash ${workdir}/run_benchmark.sh ${isl} ${osl} ${multi_round} ${model_dir} "${concurrency}" ${streaming} ${full_logdir} > ${full_logdir}/benchmark.log 2>&1
 
 # try to kill the server and workers
 srun -l --container-name=${container_name} \
