@@ -48,8 +48,6 @@ public:
     std::optional<SizeType32> maxNewTokens;     // maximum number of tokens to generate for this request
     std::optional<SizeType32> endId;            // end token id
     SizeType32 generatedTokensPerEngineStep{1}; //
-    TensorPtr badWordsList;                     // [2, badWordsLength] on gpu
-    TensorPtr stopWordsList;                    // [2, stopWordsLength] on gpu
 
     //! Optional parameters for speculative decoding
     BufferPtr draftTokens;                // [generatedTokensPerEngineStep - 1] on gpu

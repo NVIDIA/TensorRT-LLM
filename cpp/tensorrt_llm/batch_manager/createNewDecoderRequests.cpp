@@ -192,21 +192,26 @@ void initializeEmbeddingBias(DecodingInput& dJointInput, SizeType32 batchSlot,
     }
 }
 
-void setupWords(std::vector<runtime::ITensor::SharedPtr>& jointWordsLists, TensorPtr const& requestWordsList,
-    SharedConstPtr& jointWordsPtrs, SharedConstPtr& jointWordsLens, SizeType32& jointMaxWordsLen, SizeType32 batchSlot)
+void setupWords(std::vector<runtime::ITensor::SharedPtr>& jointWordsLists,
+    std::optional<TensorPtr> const& requestWordsList, SharedConstPtr& jointWordsPtrs, SharedConstPtr& jointWordsLens,
+    SizeType32& jointMaxWordsLen, SizeType32 batchSlot, BufferManager const& manager)
 {
-    if (requestWordsList)
+    if (requestWordsList.has_value())
     {
-        auto const wordsLen = requestWordsList->getShape().d[1];
+        // Move to GPU and remove leading bs1 dimension since this is what decoderRequest expects
+        TensorPtr wordsList = manager.copyFrom(*requestWordsList.value(), MemoryType::kGPU);
+        wordsList->squeeze(0);
+
+        auto const wordsLen = wordsList->getShape().d[1];
         BufferRange<int32_t*>(*constPointerCast(jointWordsPtrs))[batchSlot]
-            = runtime::bufferCast<TokenIdType>(*requestWordsList);
+            = runtime::bufferCast<TokenIdType>(*wordsList);
         runtime::bufferCast<SizeType32>(*constPointerCast(jointWordsLens))[batchSlot] = wordsLen;
         // FIXME: this is monotonically growing size
         jointMaxWordsLen = std::max(static_cast<SizeType32>(wordsLen), jointMaxWordsLen);
 
         // NOTE: jointWordsList is not used in gptDecoder, but required to keep <name>WordsList's
         // memory allocated
-        jointWordsLists[batchSlot] = requestWordsList;
+        jointWordsLists[batchSlot] = wordsList;
     }
     else
     {
@@ -254,12 +259,6 @@ void CreateNewDecoderRequests::newRequest(SizeType32 batchSlot, runtime::decoder
 
     TensorPtr const endIdTensorPtr{ITensor::slice(constPointerCast(dJointInput.endIds), batchSlot, 1)};
     runtime::kernels::invokeFill(*endIdTensorPtr, endId, decoderStream);
-
-    setupWords(dJointInput.stopWordsLists, request.stopWordsList, dJointInput.stopWordsPtrs, dJointInput.stopWordsLens,
-        dJointInput.maxStopWordsLen, batchSlot);
-
-    setupWords(dJointInput.badWordsLists, request.badWordsList, dJointInput.badWordsPtrs, dJointInput.badWordsLens,
-        dJointInput.maxBadWordsLen, batchSlot);
 
     TensorPtr const sequenceLimitLength{
         ITensor::slice(constPointerCast(dJointInput.sequenceLimitLength), batchSlot, 1)};
@@ -631,18 +630,11 @@ CreateNewDecoderRequests::createDecoderRequests(RequestVector const& finishedCon
         initializeEmbeddingBias(
             dJointInput, batchSlot, llmReq->getEmbeddingBias(), logitsType, modelConfig, bufferManager);
 
-        if (llmReq->getBadWordsList().has_value())
-        {
-            // Move to GPU and remove leading bs1 dimension since this is what decoderRequest expects
-            decoderRequest.badWordsList = bufferManager.copyFrom(*llmReq->getBadWordsList().value(), MemoryType::kGPU);
-            decoderRequest.badWordsList->squeeze(0);
-        }
-        if (llmReq->getStopWordsList().has_value())
-        {
-            decoderRequest.stopWordsList
-                = bufferManager.copyFrom(*llmReq->getStopWordsList().value(), MemoryType::kGPU);
-            decoderRequest.stopWordsList->squeeze(0);
-        }
+        setupWords(dJointInput.badWordsLists, llmReq->getBadWordsList(), dJointInput.badWordsPtrs,
+            dJointInput.badWordsLens, dJointInput.maxBadWordsLen, batchSlot, bufferManager);
+
+        setupWords(dJointInput.stopWordsLists, llmReq->getStopWordsList(), dJointInput.stopWordsPtrs,
+            dJointInput.stopWordsLens, dJointInput.maxStopWordsLen, batchSlot, bufferManager);
 
         auto const& samplingConfig = llmReq->mSamplingConfig;
 
