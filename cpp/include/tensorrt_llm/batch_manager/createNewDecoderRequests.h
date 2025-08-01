@@ -24,7 +24,6 @@
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/runtime/modelConfig.h"
-#include "tensorrt_llm/runtime/request.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 
 namespace tensorrt_llm::runtime
@@ -88,33 +87,6 @@ public:
         SizeType32 maxSequenceLength, OptionalRef<MedusaBuffers const> medusaBuffers) const;
 
 private:
-    //! @brief Setups decoder internal tensors for new speculative decoding request
-    static void newRequestSpeculativeDecoding(SizeType32 batchIdx, runtime::decoder_batch::Request const& request,
-        SamplingConfig const& samplingConfig, runtime::ModelConfig const& modelConfig,
-        DecodingInput& jointDecodingInput, DecodingOutput& jointDecodingOutput, CudaStream const& runtimeStream,
-        CudaStream const& decoderStream, SpeculativeDecodingMode const& speculativeDecodingMode,
-        SizeType32 maxDecodingEngineTokens);
-
-    //! @brief Setups decoder internal tensors for new request in Draft model Sps mode
-    static void newRequestDraftTokensExternal(SizeType32 batchIdx, runtime::decoder_batch::Request const& request,
-        SamplingConfig const& samplingConfig, DecodingInput& jointDecodingInput, CudaStream const& decoderStream);
-
-    //! @brief Setups decoder internal tensors for new Medusa request
-    static void newRequestMedusa(SizeType32 batchIdx, runtime::decoder_batch::Request const& request,
-        DecodingInput& jointDecodingInput, CudaStream const& decoderStream, SizeType32 maxDecodingEngineTokens);
-
-    //! @brief Setups decoder internal tensors for new Lookahead request
-    static void newRequestLookahead(SizeType32 batchIdx, runtime::decoder_batch::Request const& request,
-        DecodingInput& jointDecodingInput, DecodingOutput& jointDecodingOutput, CudaStream const& runtimeStream);
-
-    //! @brief Setups decoder internal tensors for new Explicit draft tokens request
-    static void newRequestExplicitDraftTokens(SizeType32 batchIdx, runtime::decoder_batch::Request const& request,
-        DecodingOutput& jointDecodingOutput, CudaStream const& runtimeStream);
-
-    //! @brief Setups decoder internal tensors for new Eagle request
-    static void newRequestEagle(SizeType32 batchIdx, runtime::decoder_batch::Request const& request,
-        runtime::ModelConfig const& modelConfig, DecodingOutput& jointDecodingOutput, CudaStream const& runtimeStream);
-
     [[nodiscard]] std::shared_ptr<runtime::ITensor> retrieveDraftLogits(runtime::ModelConfig const& modelConfig,
         runtime::WorldConfig const& worldConfig, std::shared_ptr<runtime::ITensor> const& tensor,
         runtime::BufferManager const& bufferManager) const;
