@@ -73,6 +73,7 @@ All published functionality in the Release Notes has been fully tested and verif
 ### Known Issues
 - accuracy/test_cli_flow::TestGpt2::test_beam_search_large is broken.
 - Enabling disaggregated serving, MTP, and the overlap scheduler at the same time can lead to accuracy problems.
+- In 0.21, full chunked attention support has been added to make sure LLaMA4 model can functionally run with > 8K seq length, while there is a known performance regression(only affect LLaMA4 model) on Hopper due to this functional enhancement. The root cause of the regression has been identified already and the fix will be part of the future release.
 
 ## TensorRT-LLM Release 0.20.0
 
