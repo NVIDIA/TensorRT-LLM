@@ -237,11 +237,13 @@ class KvCacheCreator:
             torch_peak_memory = torch.cuda.memory_stats(
             )["allocated_bytes.all.peak"]
 
-            # Clear the caching allocator before measuring the current memory usage
-            torch.cuda.empty_cache()
             end, total_gpu_memory = torch.cuda.mem_get_info()
             torch_used_bytes = torch.cuda.memory_stats(
             )["allocated_bytes.all.current"]
+
+            # Clear the caching allocator after measuring the current memory usage
+            # This can help leave memory fragments buffer in pytorch
+            torch.cuda.empty_cache()
         finally:
             py_executor.shutdown()
             py_executor.is_warmup = False

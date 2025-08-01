@@ -73,6 +73,11 @@ class DecodingCUDAGraphRunner:
         self.optional_extra_model_inputs = ["mrope_position_deltas"]
 
     def __del__(self):
+        # del self.input_ids
+        # del self.position_ids
+        # del self.mrope_position_deltas
+        # del self.attn_metadata
+        # del self.spec_metadata
         self._graph.reset()
 
     def capture(
