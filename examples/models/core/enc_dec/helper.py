@@ -74,7 +74,12 @@ def get_qkv_module_name(model_type):
         q = "q"
         k = "k"
         v = "v"
-    elif model_type == "bart" or model_type == "nmt" or model_type == "language_adapter":
+    elif (
+        model_type == "bart"
+        or model_type == "florence2"
+        or model_type == "nmt"
+        or model_type == "language_adapter"
+    ):
         q = "q_proj"
         k = "k_proj"
         v = "v_proj"
