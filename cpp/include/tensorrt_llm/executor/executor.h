@@ -1727,7 +1727,12 @@ using KVCacheEventData = std::variant<KVCacheCreatedData, KVCacheStoredData, KVC
 struct KVCacheEvent
 {
 
-    KVCacheEvent(IdType eventId, KVCacheEventData data, SizeType32 windowSize);
+    KVCacheEvent(IdType eventId, KVCacheEventData data, SizeType32 windowSize,
+        std::optional<SizeType32> attentionDpRank = std::nullopt)
+        : eventId{eventId}
+        , data{std::move(data)}
+        , windowSize{windowSize}
+        , attentionDpRank{attentionDpRank} {};
 
     /// @brief The unique id of this event
     IdType eventId;
@@ -1735,6 +1740,8 @@ struct KVCacheEvent
     KVCacheEventData data;
     /// @brief The sliding window size
     SizeType32 windowSize;
+    /// @brief The attention DP rank of the event, if applicable
+    std::optional<SizeType32> attentionDpRank;
 };
 
 /// @brief Exposes a limited set of KV cache manager functionalities
