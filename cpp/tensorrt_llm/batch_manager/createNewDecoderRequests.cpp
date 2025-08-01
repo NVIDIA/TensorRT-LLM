@@ -569,9 +569,6 @@ CreateNewDecoderRequests::createDecoderRequests(RequestVector const& finishedCon
     }
     inputIds->resize(decoderInputSize);
 
-    std::vector<decoder_batch::Request> decoderRequests;
-    decoderRequests.reserve(finishedContextRequests.size());
-
     std::vector<runtime::ITensor::SharedConstPtr> lookaheadPrompt;
     std::vector<executor::LookaheadDecodingConfig> lookaheadAlgoConfigs;
     if (modelConfig.getSpeculativeDecodingMode().isLookaheadDecoding())
@@ -603,36 +600,18 @@ CreateNewDecoderRequests::createDecoderRequests(RequestVector const& finishedCon
 
         auto const promptLen = llmReq->getPromptLen();
 
-        decoder_batch::Request decoderRequest;
-
+        SizeType32 numDecodingEngineTokens{1};
         if (modelConfig.getSpeculativeDecodingMode().isDraftTokensExternal())
         {
-            if (llmReq->hasDraftTokens())
-            {
-                auto const& draftTokens = llmReq->getDraftTokens();
-                // Copy to pinned host memory (don't care about stream of bufferManager)
-                decoderRequest.draftTokens = decoderBufferManager.copyFrom(*draftTokens, MemoryType::kPINNEDPOOL);
-                auto const& draftLogits = llmReq->getDraftLogits();
-                if (draftLogits.has_value())
-                {
-                    decoderRequest.draftLogits
-                        = retrieveDraftLogits(modelConfig, worldConfig, draftLogits.value(), decoderBufferManager);
-                }
-                decoderRequest.generatedTokensPerEngineStep = draftTokens->size() + 1;
-            }
-            else
-            {
-                decoderRequest.generatedTokensPerEngineStep = 1;
-            }
+            numDecodingEngineTokens = llmReq->getNumDraftTokens() + 1;
         }
         else if (!modelConfig.getSpeculativeDecodingMode().isNone())
         {
-            decoderRequest.generatedTokensPerEngineStep = modelConfig.getMaxDecodingTokens();
+            numDecodingEngineTokens = modelConfig.getMaxDecodingTokens();
         }
 
         auto& dJointInput = decoderState.getJointDecodingInput();
 
-        auto const numDecodingEngineTokens = decoderRequest.generatedTokensPerEngineStep;
         initializeInputLengths(dJointInput, batchSlot, promptLen, llmReq->mMaxNewTokens, numDecodingEngineTokens,
             maxSequenceLength, decoderBufferManager);
         decoderState.setNumDecodingEngineTokens(batchSlot, numDecodingEngineTokens);
@@ -673,6 +652,21 @@ CreateNewDecoderRequests::createDecoderRequests(RequestVector const& finishedCon
         {
             TLLM_CHECK(beamWidth == 1);
 
+            decoder_batch::Request decoderRequest{numDecodingEngineTokens};
+
+            if (modelConfig.getSpeculativeDecodingMode().isDraftTokensExternal() && llmReq->hasDraftTokens())
+            {
+                auto const& draftTokens = llmReq->getDraftTokens();
+                // Copy to pinned host memory (don't care about stream of bufferManager)
+                decoderRequest.draftTokens = decoderBufferManager.copyFrom(*draftTokens, MemoryType::kPINNEDPOOL);
+                auto const& draftLogits = llmReq->getDraftLogits();
+                if (draftLogits.has_value())
+                {
+                    decoderRequest.draftLogits
+                        = retrieveDraftLogits(modelConfig, worldConfig, draftLogits.value(), decoderBufferManager);
+                }
+            }
+
             if (modelConfig.getSpeculativeDecodingMode().isMedusa())
             {
                 TLLM_CHECK(medusaBuffers);
@@ -700,8 +694,6 @@ CreateNewDecoderRequests::createDecoderRequests(RequestVector const& finishedCon
                 decoderState.getJointDecodingInput(), decoderState.getJointDecodingOutput(), runtimeStream,
                 decoderStream, decoderState.getSpeculativeDecodingMode(), decoderState.getMaxDecodingEngineTokens());
         }
-
-        decoderRequests.push_back(decoderRequest);
 
         inputOffset += promptLen;
     }
