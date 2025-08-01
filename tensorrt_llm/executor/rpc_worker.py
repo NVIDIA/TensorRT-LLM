@@ -41,11 +41,13 @@ class RpcWorker(WorkerBase):
         self.set_result_queue(self._response_queue)
 
     def fetch_responses(self) -> list:
+        logger.debug(f"RPC worker {mpi_rank()} is fetching responses")
         super().await_responses()
         qsize = self._response_queue.qsize()
         return [self._response_queue.get() for _ in range(qsize)]
 
     def shutdown(self):
+        logger.debug(f"RPC worker {mpi_rank()} is shutting down")
         self.shutdown_event.set()
         super().shutdown()
 

@@ -18,6 +18,7 @@ from ..builder import ConfigEncoder, Engine, EngineConfig
 from ..llmapi.llm_args import PybindMirror
 from ..llmapi.tracer import global_tracer
 from ..llmapi.utils import _SyncQueue, print_colored_debug
+from ..logger import logger
 from ..lora_manager import LoraConfig, LoraManager
 from ..prompt_adapter_manager import PromptAdapterManager
 from ..runtime import ModelConfig
@@ -29,7 +30,11 @@ from .postproc_worker import PostprocParams, PostprocWorker
 from .request import GenerationRequest, LoRARequest, PromptAdapterRequest
 from .result import (GenerationResult, LogProbsResult, ResponseWrapper,
                      compute_logprobs)
-from .utils import ErrorResponse, RequestError, is_llm_response
+from .utils import (ErrorResponse, RequestError, enable_llm_debug,
+                    is_llm_response)
+
+if enable_llm_debug():
+    logger.set_level("debug")
 
 __all__ = [
     "WorkerBase",
@@ -405,6 +410,7 @@ class WorkerBase(GenerationExecutor):
 
     def await_responses(self) -> None:
         self._await_response_helper()
+        logger.debug(f"worker done await_responses")
 
     def fetch_kv_cache_events(self) -> list:
         if isinstance(self.engine, tllm.Executor):
@@ -472,6 +478,11 @@ class WorkerBase(GenerationExecutor):
         # Check if there are any errors from the threads before shutdown.
         self._handle_background_error()
 
+    def _has_background_error(self) -> bool:
+        # TODO[Superjomn]: The worker background error should be deprecated once
+        # RPC approach is supported.
+        return not self._error_queue.empty()
+
 
 class AwaitResponseHelper:
     ''' Multiple-implementations for await_response for performance. '''
@@ -518,8 +529,11 @@ class AwaitResponseHelper:
 
     def __call__(self) -> bool:
         ''' This method should be called by a ManagedThread. '''
+        logger.debug(f"await_response: {self.worker.engine}")
         responses = self.worker.engine.await_responses(
             timeout=datetime.timedelta(milliseconds=100))
+        logger.debug(f"PyExecutor returned {len(responses)} responses")
+
         # filter since The _engine_response_callback may return None
         responses = list(
             filter(
