@@ -55,6 +55,7 @@ from .config import LoadFormat, PyTorchConfig
 from .config_utils import is_mla
 from .cuda_graph_model_engine import CUDAGraphModelEngine
 from .layerwise_nvtx_marker import LayerwiseNvtxMarker
+from .llm_request import get_draft_token_length
 from .resource_manager import (BaseResourceManager, KVCacheManager,
                                ResourceManager, ResourceManagerType)
 from .scheduler import ScheduledRequests
@@ -276,6 +277,7 @@ class PyTorchModelEngine(ModelEngine):
         self.pytorch_backend_config = pytorch_backend_config
         self.spec_config = spec_config
         self.is_spec_decode = spec_config is not None
+        self.enable_spec_decode = self.is_spec_decode
         self.is_draft_model = is_draft_model
 
         self.in_warmup = False
@@ -500,7 +502,7 @@ class PyTorchModelEngine(ModelEngine):
         # Reset the global cuda graph dummy request to None in warmup.
         self.cuda_graph_dummy_request = None
 
-        def get_cuda_graph_warmup_request(batch_size):
+        def get_cuda_graph_warmup_request(batch_size, draft_len):
             # Divide by max_beam_width to get an approximation of the number of requests that can be run in parallel.
             available_blocks = kv_cache_manager.get_num_free_blocks(
             ) // self.max_beam_width
@@ -512,12 +514,12 @@ class PyTorchModelEngine(ModelEngine):
                 requests = kv_cache_manager.add_dummy_requests(
                     list(range(batch_size - 1)),
                     is_gen=True,
-                    max_num_draft_tokens=self.max_draft_len,
+                    max_num_draft_tokens=draft_len,
                     use_mrope=use_mrope,
                     max_beam_width=self.max_beam_width)
                 # Divide by max_beam_width to get an approximation of the number of tokens that can be added to the final request.
                 available_tokens = kv_cache_manager.get_num_available_tokens(
-                    self.max_draft_len) // self.max_beam_width
+                    draft_len)
 
                 # Add one dummy request with the maximum possible sequence length.
                 # The sequence length is limited by both the max_seq_len and the number of available blocks.
@@ -526,7 +528,7 @@ class PyTorchModelEngine(ModelEngine):
                     request_ids=[batch_size - 1],
                     token_nums=[token_num],
                     is_gen=True,
-                    max_num_draft_tokens=self.max_draft_len,
+                    max_num_draft_tokens=draft_len,
                     use_mrope=use_mrope,
                     max_beam_width=self.max_beam_width)[0]
                 # Add the longest request before all other seq_len=1 request to simulate the padding CUDA graph case.
@@ -695,15 +697,16 @@ class PyTorchModelEngine(ModelEngine):
                             # No KV cache space!
                             pass
                         else:
-                            logger.info(
-                                f"Run autotuning warmup for batch size={1}")
                             self.forward(batch,
                                          new_tensors_device=None,
                                          resource_manager=resource_manager)
                             torch.cuda.synchronize()
 
-                    logger.info(f"Autotuner Cache size after warmup " +
-                                str(len(AutoTuner.get().profiling_cache)))
+                    logger.info(
+                        f"[Autotuner] Cache size after warmup is {len(AutoTuner.get().profiling_cache)}"
+                    )
+
+                AutoTuner.get().print_profiling_cache()
 
             if not (self._run_cuda_graphs
                     or self._torch_compile_piecewise_cuda_graph):
@@ -715,6 +718,15 @@ class PyTorchModelEngine(ModelEngine):
             # Reverse the order of the cuda graph batch sizes to make smaller batch size graph could reuse larger batch size graph memory
             cuda_graph_batch_sizes = sorted(self._cuda_graph_batch_sizes,
                                             reverse=True)
+            # Create CUDA graphs for different draft lengths
+            draft_lengths = [self.max_draft_len]
+            # For non-draft model, we also capture the CUDA graph instance for draft length 0,
+            # so that when we disable spec decode at runtime, we can still run the captured graph.
+            # Note that for one engine mode, we are not able to turn off spec decode at runtime.
+            if not self.is_draft_model and self.max_draft_len > 0 and not self.spec_config.spec_dec_mode.use_one_engine(
+            ):
+                draft_lengths.append(0)
+
             for bs in cuda_graph_batch_sizes:
                 if bs > self.batch_size:
                     # skip batch size larger than self.batch_size
@@ -732,25 +744,45 @@ class PyTorchModelEngine(ModelEngine):
                         resource_manager=resource_manager)
                     torch.cuda.synchronize()
 
-                if self._torch_compile_piecewise_cuda_graph and self._torch_compile_enabled:
-                    with self.no_cuda_graph():
-                        with release_batch(
-                                get_torch_compile_warmup_request(1,
-                                                                 bs)) as batch:
-                            logger.info(
-                                f"Run piecewise CUDA graph warmup for batch size={bs}"
-                            )
+                for draft_len in draft_lengths:
+                    with release_batch(
+                            get_cuda_graph_warmup_request(bs,
+                                                          draft_len)) as batch:
+                        if batch is None:
+                            # No KV cache space!
+                            return
+                        logger.info(
+                            f"Run generation only CUDA graph warmup for batch size={bs}, draft_len={draft_len}"
+                        )
+                        self.enable_spec_decode = draft_len > 0 or self.is_draft_model
+                        self.forward(batch,
+                                     new_tensors_device=None,
+                                     resource_manager=resource_manager)
+                        torch.cuda.synchronize()
 
-                            for _ in range(3):
+                    if self._torch_compile_piecewise_cuda_graph and self._torch_compile_enabled:
+                        with self.no_cuda_graph():
+                            with release_batch(
+                                    get_torch_compile_warmup_request(
+                                        1, bs)) as batch:
+                                logger.info(
+                                    f"Run piecewise CUDA graph warmup for batch size={bs}"
+                                )
+
+                                for _ in range(3):
+                                    self.forward(
+                                        batch,
+                                        new_tensors_device=None,
+                                        resource_manager=resource_manager)
                                 self.forward(batch,
                                              new_tensors_device=None,
                                              resource_manager=resource_manager)
-                            self.forward(batch,
-                                         new_tensors_device=None,
-                                         resource_manager=resource_manager)
-                            torch.cuda.synchronize()
-                            gc.collect()
-                            torch.cuda.empty_cache()
+                                torch.cuda.synchronize()
+                                gc.collect()
+                                torch.cuda.empty_cache()
+
+        # Set the value back to the original value
+        self.enable_spec_decode = self.is_spec_decode
 
     def _set_up_attn_metadata(self, kv_cache_manager: KVCacheManager):
         enable_paged_context_mla = is_mla(
@@ -793,9 +825,10 @@ class PyTorchModelEngine(ModelEngine):
             self,
             spec_resource_manager: Optional[BaseResourceManager],
             no_cache=False):
+        spec_config = self.spec_config if self.enable_spec_decode else None
         if no_cache:
             return get_spec_metadata(
-                self.spec_config,
+                spec_config,
                 self.model.config,
                 self.batch_size,
                 max_num_tokens=self.max_num_tokens,
@@ -805,7 +838,7 @@ class PyTorchModelEngine(ModelEngine):
         if self.spec_metadata is not None:
             return self.spec_metadata
         self.spec_metadata = get_spec_metadata(
-            self.spec_config,
+            spec_config,
             self.model.config,
             self.batch_size,
             max_num_tokens=self.max_num_tokens,
@@ -977,7 +1010,7 @@ class PyTorchModelEngine(ModelEngine):
         """
         Make some changes to the device inputs and avoid block the async data transfer
         """
-        if self.is_spec_decode and not self._disable_overlap_scheduler:
+        if self.enable_spec_decode and not self._disable_overlap_scheduler:
             # When enabling overlap scheduler, the kv cache for draft tokens will
             # be prepared in advance by using the max_draft_len. But we need to use
             # new_tokens_lens_device to get the real past kv lengths and the
@@ -1076,8 +1109,8 @@ class PyTorchModelEngine(ModelEngine):
         extend_dummy_requests = []
         generation_requests = []
         for request in scheduled_requests.generation_requests:
-            if len(request.py_draft_tokens
-                   ) > 0 or next_draft_tokens_device is not None:
+            if get_draft_token_length(
+                    request) > 0 or next_draft_tokens_device is not None:
                 if request.is_dummy:
                     extend_dummy_requests.append(request)
                 else:
@@ -1095,9 +1128,10 @@ class PyTorchModelEngine(ModelEngine):
                 multimodal_params_list.append(multimodal_params)
         extend_requests += extend_dummy_requests
 
-        if not self._disable_overlap_scheduler and self.is_spec_decode:
-            assert self.spec_config.spec_dec_mode.support_overlap_scheduler(
-            ), f"{self.spec_config.decoding_type} does not support overlap scheduler"
+        spec_config = self.spec_config if self.enable_spec_decode else None
+        if not self._disable_overlap_scheduler and spec_config is not None:
+            assert spec_config.spec_dec_mode.support_overlap_scheduler(
+            ), f"{spec_config.decoding_type} does not support overlap scheduler"
 
         # will contain previous batch indices of generation requests
         previous_batch_indices = []
@@ -1116,11 +1150,11 @@ class PyTorchModelEngine(ModelEngine):
                     input_ids.extend(request.py_draft_tokens)
                     draft_tokens.extend(request.py_draft_tokens)
                 # get other ids and lengths
-                num_draft_tokens = len(request.py_draft_tokens)
+                num_draft_tokens = get_draft_token_length(request)
                 past_seen_token_num = request.max_beam_num_tokens - 1
                 draft_lens.append(num_draft_tokens)
 
-                if self.is_spec_decode and self.spec_config.spec_dec_mode.extend_ctx(
+                if self.enable_spec_decode and spec_config.spec_dec_mode.extend_ctx(
                         self.attn_backend):
                     # We're treating the prompt lengths as context requests here, so
                     # the the prompt lens should not include the cached tokens.
@@ -1314,7 +1348,7 @@ class PyTorchModelEngine(ModelEngine):
                                     pin_memory=True)
         self.position_ids_cuda[:total_num_tokens].copy_(position_ids,
                                                         non_blocking=True)
-        if self.is_spec_decode:
+        if self.enable_spec_decode:
             self.gather_ids_cuda[:len(gather_ids)].copy_(torch.tensor(
                 gather_ids, dtype=torch.int, pin_memory=True),
                                                          non_blocking=True)
@@ -1345,14 +1379,14 @@ class PyTorchModelEngine(ModelEngine):
         attn_metadata.request_ids = request_ids
         attn_metadata.prompt_lens = prompt_lengths
         attn_metadata.num_contexts = len(scheduled_requests.context_requests)
-        if self.is_spec_decode and self.spec_config.spec_dec_mode.extend_ctx(
+        if self.enable_spec_decode and spec_config.spec_dec_mode.extend_ctx(
                 self.attn_backend):
             attn_metadata.num_contexts += len(extend_requests)
 
         attn_metadata.kv_cache_params = KVCacheParams(
             use_cache=True,
             num_cached_tokens_per_seq=num_cached_tokens_per_seq,
-            num_extra_kv_tokens=get_num_extra_kv_tokens(self.spec_config))
+            num_extra_kv_tokens=get_num_extra_kv_tokens(spec_config))
         attn_metadata.kv_cache_manager = kv_cache_manager
 
         attn_metadata.prepare()
@@ -1426,7 +1460,7 @@ class PyTorchModelEngine(ModelEngine):
         self.iter_states['num_ctx_tokens'] = num_ctx_tokens
         self.iter_states['num_generation_tokens'] = num_generation_tokens
         return inputs, self.gather_ids_cuda[:len(
-            gather_ids)] if self.is_spec_decode else None
+            gather_ids)] if self.enable_spec_decode else None
 
     def _prepare_tp_inputs_no_cache(
             self,
@@ -1470,7 +1504,7 @@ class PyTorchModelEngine(ModelEngine):
                                     pin_memory=True)
         self.position_ids_cuda[:num_tokens].copy_(position_ids,
                                                   non_blocking=True)
-        if self.is_spec_decode:
+        if self.enable_spec_decode:
             self.gather_ids_cuda[:len(gather_ids)].copy_(torch.tensor(
                 gather_ids, dtype=torch.int, pin_memory=True),
                                                          non_blocking=True)
@@ -1922,12 +1956,11 @@ class PyTorchModelEngine(ModelEngine):
         gather_context_logits: bool = False,
         cache_indirection_buffer: Optional[torch.Tensor] = None,
     ):
-
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
 
         attn_metadata = self._set_up_attn_metadata(kv_cache_manager)
-        if self.is_spec_decode:
+        if self.enable_spec_decode:
             spec_resource_manager = resource_manager.get_resource_manager(
                 ResourceManagerType.SPEC_RESOURCE_MANAGER)
             spec_metadata = self._set_up_spec_metadata(spec_resource_manager,

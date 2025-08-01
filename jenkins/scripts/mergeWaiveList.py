@@ -7,7 +7,9 @@ import sys
 # 3. Merge the current MR waive list and TOT waive list, and remove the removed lines from the step 1
 
 
-def get_remove_lines_from_diff(diff):
+def get_remove_lines_from_diff_file(diff_file):
+    with open(diff_file, 'r') as f:
+        diff = f.read()
     lines = diff.split('\n')
     remove_lines = [
         line[1:] + '\n' for line in lines
@@ -47,10 +49,12 @@ if __name__ == '__main__':
     parser.add_argument('--latest-waive-list',
                         required=True,
                         help='Latest waive list')
-    parser.add_argument('--diff', required=True, help='Diff of the waive list')
+    parser.add_argument('--diff-file',
+                        required=True,
+                        help='File containing diff of the waive list')
     parser.add_argument('--output-file', required=True, help='Output file')
     args = parser.parse_args(sys.argv[1:])
     cur_list = parse_waive_txt(args.cur_waive_list)
     main_list = parse_waive_txt(args.latest_waive_list)
-    remove_lines = get_remove_lines_from_diff(args.diff)
+    remove_lines = get_remove_lines_from_diff_file(args.diff_file)
     merge_waive_list(cur_list, main_list, remove_lines, args.output_file)

@@ -22,6 +22,7 @@ meta-llama/Llama-4-Scout-17B-16E-Instruct:
     kv_cache_quant_algo: FP8
     accuracy: 79.62
   - quant_algo: FP8
+    kv_cache_quant_algo: FP8
     accuracy: 80.37
 deepseek-ai/DeepSeek-V3-Lite:
   - accuracy: 64.74
