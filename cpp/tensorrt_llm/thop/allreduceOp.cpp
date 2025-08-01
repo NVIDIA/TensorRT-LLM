@@ -291,8 +291,11 @@ private:
         int size = input.numel();
 
         torch::Tensor reduce_output = torch::empty_like(input);
-        NCCLCHECK_THROW(ncclAllReduce(input.data_ptr(), reduce_output.mutable_data_ptr(), size, (*getDtypeMap())[mType],
-            ncclSum, *mNcclComm, stream));
+        if (size > 0)
+        {
+            NCCLCHECK_THROW(ncclAllReduce(input.data_ptr(), reduce_output.mutable_data_ptr(), size,
+                (*getDtypeMap())[mType], ncclSum, *mNcclComm, stream));
+        }
 
         if (mOp == AllReduceFusionOp::NONE)
         {
