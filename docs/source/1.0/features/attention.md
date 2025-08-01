@@ -6,8 +6,9 @@
 
 This document details the implementation of multi-head attention (MHA),
 multi-query attention (MQA), and group-query attention (GQA) for autoregressive
-models in TensorRT-LLM's PyTorch backend. As a quick reminder, multi-head attention
-involves a sequence of batched matrix multiplications, a softmax operation, and another batched matrix multiplication,
+models in TensorRT-LLM's PyTorch backend.
+
+Multi-head attention involves a sequence of batched matrix multiplications, a softmax operation, and another batched matrix multiplication,
 as described in the [Attention Is All You Need](https://arxiv.org/abs/1706.03762) paper.
 [Multi-query Attention (MQA)](https://arxiv.org/abs/1911.02150) and [Group-query Attention (GQA)](https://arxiv.org/abs/2307.09288) are
 variants of MHA that use fewer KV heads than the number of query heads.
@@ -99,7 +100,7 @@ Its `forward` accepts the following arguments:
 | metadata | AttentionMetadata | Metadata for the attention operation. |
 | attention_mask | AttentionMask | Optional attention mask. If None, causal mask is applied. |
 
-For example, the Flashinfer backend calls `append_paged_kv_cache` and then wrapper's `run` to perform the attention operation here.
+For example, the Flashinfer backend calls `append_paged_kv_cache` and then `wrapper.run` to perform the attention operation here.
 
 
 ## The Features of the `TrtllmAttention` Backend
@@ -127,8 +128,7 @@ context and generation phases into a single custom torch op.
 
 A context-phase implementation without optimization maps to a sequence of GPU kernels that will store the
 intermediate `Q*K^T` tensor in memory before calling the softmax operator. It
-is the slowest method and the memory footprint is significant (quadratically
-depends on the sequence length).
+is the slowest method and the memory footprint is significant (grows quadratically in proportion to the sequence length).
 
 The `TrtllmAttention` backend will trigger a kernel that performs the MHA/MQA block
 using a single kernel instead. For short sequences, that kernel uses a vanilla
@@ -140,8 +140,7 @@ and
 
 Currently, the implementation triggers extra kernels that apply pre-processing
 to the elements (like RoPE) and populate the KV cache (see below). In a future
-release, the number of such kernels is planned on being reduced in order to
-improve the overall performance.
+release, the number of such kernels may be reduced to improve the overall performance.
 
 #### FP8 Context FMHA
 
@@ -157,21 +156,18 @@ Please be aware that this feature is only supported on Ada, Hopper and above.
 
 The generation phase is implemented using a single kernel called the masked
 multi-head attention in TensorRT-LLM. That kernel is able to apply
-pre-processing on the Q, K, and V elements on-the-fly: adds the QKV bias, applies
+pre-processing on the Q, K, and V elements on-the-fly: it adds the QKV bias, applies
 RoPE, and performs dequantization and quantization. TensorRT-LLM will continue to add (or
-enable) additional features in future releases. For example, enable the support
-for IA3.
+enable) additional features in future releases, such as enabling support for IA3.
 
 The masked MHA kernel has a special version that distributes the work across
 multiple CUDA thread-blocks on the GPU for cases where the GPU occupancy is
 low. That mode called multi-block is always enabled.
-Users are recommended to test that mode in scenarios where both the batch
-size and the number of heads in the model are relatively small. The exact
-definition of small in that context will depend on the model of the GPU and is
-hard to predict but to provide with a rule of thumb, it is worth testing that
-mode when `batch_size * num_heads` is less than the number of multi-processors
-on the GPU (that suggestion may evolve in the future as more research is
-conducted and the software improves).
+NVIDIA recommends users to test that mode in scenarios where both the batch
+size and the number of heads in the model are relatively small.
+The definition of 'small' in that context is hard to quantify because it depends on the model of the GPU.
+However, NVIDIA currently recommends testing that mode when `batch_size * num_heads` is less than the number of multi-processors on the GPU.
+This guidance may be subject to change in the future.
 
 Note that even if the multi-block mode is enabled, the attention operator will
 not immediately trigger the multi-block version of the GPU kernel. There is a
@@ -182,27 +178,23 @@ heuristic.
 
 Another note is that as the masked MHA kernels use shared memory size
 proportional to sequence length, so there can be some cases that GPU's shared
-memory is not enough when multi-block mode is not enabled. To get masked MHA
-kernel work in these cases, multi-block mode is forced on and a warning log is
-printed.
+memory is not enough when multi-block mode is not enabled. To get masked MHA kernel to work in those cases, multi-block mode is forced on and a warning message is printed in the log.
 
 #### XQA Optimization
 
-Another optimization for MQA/GQA in generation phase called XQA optimization.
-It is still experimental feature and support limited configurations. LLAMA2 70B
-is one model that it supports.
+XQA optimization is another optimization for MQA/GQA in the generation phase.
+It currently only supports a limited number of model configurations, such as the LLAMA2 70B model.
 
 Support matrix of the XQA optimization:
  - FP16 / BF16 compute data type.
  - FP16 / BF16 / FP8 / INT8 KV cache data type.
  - Paged KV cache (8 / 16 / 32 / 64 / 128 tokens per block).
 
-This is default enabled. Note that a heuristic algorithm
+By default, this is enabled. Note that a heuristic algorithm
 is also used to decide whether to use XQA kernel or masked MHA kernel to get
-better performance. If you want to always use that kernel when possible,
-`TRTLLM_FORCE_XQA=1` can be set to force use XQA kernels when the model config
-is supported. Detailed supported configuration can be found function `shouldUse`
-of class `DecoderXQARunner` in
+better performance.
+If you want to use that kernel whenever possible, set `TRTLLM_FORCE_XQA=1` to force use of the XQA kernel when the model config is supported.
+Supported configurations can be found using the `shouldUse` function of the `DecoderXQARunner` class in
 `cpp/tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQARunner.h`.
 
 
@@ -212,8 +204,8 @@ of class `DecoderXQARunner` in
 
 TensorRT-LLM supports in-flight batching of requests (also known as continuous
 batching or iteration-level batching) for higher serving throughput. With this feature,
-sequences in context phase can be processed together with sequences in
-generation phase. The purpose of that technique is to better interleave
+sequences in the context phase can be processed together with sequences in
+the generation phase. The purpose of that technique is to better interleave
 requests to reduce latency as well as make better use of the GPUs.
 For efficiency reasons (1), the support for inflight batching ***requires the
 input tensors to be packed (no padding)***.
@@ -222,8 +214,7 @@ input tensors to be packed (no padding)***.
 context phase must be before the sequences in the generation phase in the input
 tensor. For example, for sequences `S0`, `S1` and `S2`, if `S0` and `S2` are in
 context phase (and `S1` in generation), tokens from `S0` and `S2` must appear
-before the tokens of `S1` in the input tensor***. The constraint may or may not
-be relaxed in a future version.
+before the tokens of `S1` in the input tensor***.
 
 _(1) Padding sequences in the generation phase, that contain a single token, to
 the length of the maximum input sequence is inefficient use of resources_.
@@ -236,9 +227,10 @@ In the original state, the common behavior was to process all context tokens at
 once. This feature splits the context into several chunks. In this way, the
 context chunks can be batched with more tokens during the generation phase,
 which is expected to increase the total throughput. Chunking contexts also removes
-constraints on input length. To enable this feature, the FMHA paged kv-cache also
-needs to be enabled. Except for the last one, the size of the context chunk needs
+constraints on input length. Except for the last one, the size of the context chunk needs
 to be an integer multiple of the kv-cache block size.
+
+> To enable this feature, the FMHA paged kv-cache also needs to be enabled.
 
 ### KV Cache
 
@@ -250,7 +242,7 @@ one KV cache per Transformer layer, which means that there are as many KV
 caches as layers in a model. The current version of TensorRT-LLM supports two
 different types of KV caches: **contiguous** and **paged** KV caches.
 
-### Contiguous KV Cache
+#### Contiguous KV Cache
 
 The contiguous KV cache is a monolithic tensor. Its shape is:
 ```
@@ -262,15 +254,15 @@ shorter than the maximum sequence length (even if they end up close to the
 limit after the generation of many output tokens, it may take a lot of steps to
 reach that point).
 
-### Paged KV Cache
+#### Paged KV Cache
 
 The paged KV cache decomposes the KV cache into blocks that are distributed to
 the different requests by a cache manager during processing. That cache manager
-keeps track of the sequences, allocate new blocks from a pool and recycle those
+keeps track of the sequences, allocates new blocks from a pool and recycles those
 blocks when required. See the implementation of
 [`KVCacheManager`](source:tensorrt_llm/_torch/pyexecutor/resource_manager.py).
 
-### INT8/FP8 KV Caches
+#### INT8/FP8 KV Caches
 
 In its current implementation, even if the rest of the network runs in INT8 or
 FP8, the attention operator works with FP32, FP16, and BFloat16 inputs and
@@ -286,7 +278,7 @@ quantization is supported in the current version. Quantization uses inversed sca
 since it does multiply as `fp_value * (1.0 / kv_cache_scaling_factor)` in plugin.
 
 During generation, the values read from the cache are dequantized on-the-fly in
-the MHA/MQA kernel, dequantization can be described as
+the MHA/MQA kernel. Dequantization is defined as
 `quantized_value * kv_cache_scaling_factor`.
 
 
@@ -316,8 +308,8 @@ Similar to the cyclic KV cache feature in TensorRT-LLM, `attention_window_size`
 parameter is used to determine `N`. Different from the cyclic KV cache feature,
 the first `S` tokens, called sink tokens, are always kept in the attention window,
 where `S` is determined by `sink_token_length` parameter.
-But in context phase, the self-attentions is dense in the official implementation of
-StreamingLLM, and it uses all of the tokens for computation and only saves `N` tokens
+But in context phase, the self-attentions are dense in the official implementation of
+StreamingLLM. It uses all of the tokens for computation and only saves `N` tokens
 to the KV cache.
 
 In addition, the relative position embedding is also changed in StreamingLLM.
@@ -353,7 +345,7 @@ length (even if the beam width is greater than `1` for beam search). For the
 sequences in generation phase, there are `beam_width` tokens per sequence. The
 beam width can be different for each sequence.
 
-In other words, the pseudo-code to compute the number of tokens is:
+The following pseudo code explains how the number of tokens is computed:
 
 ```python
 num_tokens = 0
@@ -395,4 +387,4 @@ norm_factor = 1.f / (q_scaling * sqrt(head_size)).
 
 On top of the MHA as self attention needed by GPT-style decoder-only models, the attention operator also supports cross attention.
 
-This enables using the attention operator in a broader aspect as a generic decoder component. For example, the Encoder-Decoder model uses it to issue both the self attention and cross attention modules in its Decoder.
+This enables the attention operator to be more broadly used as a generic decoder component. For example, the Encoder-Decoder model uses it to issue both the self attention and cross attention modules in its Decoder.
