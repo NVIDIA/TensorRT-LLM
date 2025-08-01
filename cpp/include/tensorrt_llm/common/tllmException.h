@@ -36,11 +36,14 @@ namespace tensorrt_llm::common
 enum class RequestErrorCode : uint32_t
 {
     // General errors (0-999)
-    UNKNOWN_ERROR = 0,
+    kUNKNOWN_ERROR = 0,
 
     // Network and communication errors (1000-1999)
-    NETWORK_ERROR = 1000,
+    kNETWORK_ERROR = 1000,
 };
+
+/// @brief Constant for unknown request ID
+static constexpr uint64_t kUNKNOWN_REQUEST_ID = static_cast<uint64_t>(-1);
 
 class TllmException : public std::runtime_error
 {
