@@ -189,6 +189,7 @@ CreateNewDecoderRequests::operator()(runtime::ModelConfig const& modelConfig, ru
             logitsType, modelConfig, worldConfig, runtimeStream, decoderStream, maxSequenceLength, medusaBuffers);
 
     auto samplingConfig = fuseSamplingConfigs(contextRequests);
+    TLLM_CHECK(samplingConfig.has_value());
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
     return {std::move(batchSlotsView), std::move(samplingConfig.value()), std::move(lookaheadPrompt),
