@@ -693,7 +693,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 )
 
     def prepare(self) -> None:
-        # print("prepare TrtllmAttentionMetadata")
         extra_attrs = get_model_extra_attrs()
         # If model extra attrs is set, attention_metadata is setup in executor.
         if extra_attrs is None:
