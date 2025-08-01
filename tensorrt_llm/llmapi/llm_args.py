@@ -336,6 +336,7 @@ class DecodingBaseConfig(StrictBaseModel):
             "NGram": NGramDecodingConfig,
             "DraftTarget": DraftTargetDecodingConfig,
             "UserProvided": UserProvidedDecodingConfig,
+            "ExternalAPI": ExternalAPIConfig,
             "AUTO": AutoDecodingConfig,
         }
 
@@ -425,6 +426,32 @@ class UserProvidedDecodingConfig(DecodingBaseConfig):
         return cls(**data)
 
     decoding_type: ClassVar[str] = "User_Provided"
+
+
+class ExternalAPIConfig(DecodingBaseConfig):
+    """
+    Configuration for custom drafter speculative decoding.
+
+    Arguments:
+        endpoint: str
+            The endpoint of the custom drafter from which to get the draft tokens.
+        template: dict
+            The template of the request body. Can be used to include additional fields in the request body.
+        response_field: str
+            The field of the response body from which to get the draft tokens.
+            If not provided, the default field "draft_tokens" is used.
+            The response body is expected to be a list of draft tokens.
+            Can be nested, e.g. "draft_tokens.0.tokens" to get draft tokens from response["draft_tokens"][0]["tokens"].
+    """
+    endpoint: str
+    template: Optional[dict] = None
+    response_field: Optional[str] = None
+
+    @classmethod
+    def from_dict(cls, data: dict):
+        return cls(**data)
+
+    decoding_type: ClassVar[str] = "External_API"
 
 
 class NGramDecodingConfig(DecodingBaseConfig):
@@ -898,6 +925,7 @@ SpeculativeConfig: TypeAlias = Optional[Union[
     MTPDecodingConfig,
     NGramDecodingConfig,
     UserProvidedDecodingConfig,
+    ExternalAPIConfig,
     AutoDecodingConfig,
 ]]
 
@@ -1645,6 +1673,11 @@ class BaseLlmArgs(StrictBaseModel):
                             UserProvidedDecodingConfig):
                 assert self.backend in ['pytorch', '_autodeploy']
                 self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.USER_PROVIDED
+                self.build_config.max_draft_len = self.speculative_config.max_draft_len
+
+            elif isinstance(self.speculative_config, ExternalAPIConfig):
+                assert self.backend in ['pytorch', '_autodeploy']
+                self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.EXTERNAL_API
                 self.build_config.max_draft_len = self.speculative_config.max_draft_len
 
             elif isinstance(self.speculative_config, AutoDecodingConfig):
