@@ -31,9 +31,8 @@ public:
     using TensorPtr = ITensor::SharedPtr;
     using BufferPtr = IBuffer::SharedPtr;
 
-    explicit Request(SizeType32 inputLen, std::optional<SizeType32> maxNewTokens = std::nullopt)
+    explicit Request(SizeType32 inputLen)
         : inputLen(inputLen)
-        , maxNewTokens{maxNewTokens}
     {
     }
 
@@ -41,7 +40,6 @@ public:
     SizeType32 inputLen; // Input length without draft tokens, increasing with generation steps
 
     // optional parameters
-    std::optional<SizeType32> maxNewTokens;     // maximum number of tokens to generate for this request
     SizeType32 generatedTokensPerEngineStep{1}; //
 
     //! Optional parameters for speculative decoding
