@@ -170,6 +170,46 @@ CreateNewDecoderRequests::operator()(runtime::ModelConfig const& modelConfig, ru
 namespace
 {
 
+void initializeRequestIds(DecodingInput& dJointInput, DecodingOutput& dJointOutput, SizeType32 batchSlot,
+    SharedConstPtr const& requestIds, SizeType32 endId, SizeType32 beamWidth, SizeType32 maxSequenceLength,
+    BufferManager const& manager)
+{
+    TensorPtr const endIdTensorPtr{ITensor::slice(constPointerCast(dJointInput.endIds), batchSlot, 1)};
+    runtime::kernels::invokeFill(*endIdTensorPtr, endId, manager.getStream());
+
+    // fill outputIds with endIds
+    TensorPtr const outputIds = ITensor::slice(dJointOutput.ids, batchSlot, 1);
+    auto outputIdsTileView = ITensor::view(outputIds, ITensor::makeShape({beamWidth, maxSequenceLength}));
+    runtime::kernels::invokeFill(*outputIdsTileView, endId, manager.getStream());
+
+    // copy the request ids into outputIds
+    auto const requestIdsShape = requestIds->getShape();
+    auto outputIdsView = ITensor::view(outputIds, requestIdsShape);
+    manager.copy(*requestIds, *outputIdsView);
+}
+
+void initializeBeamSearch(DecodingInput& dJointInput, DecodingOutput& dJointOutput, SizeType32 batchSlot,
+    SizeType32 endId, SizeType32 beamWidth, SizeType32 maxSequenceLength, BufferManager const& manager)
+{
+    TensorPtr const cumLogProbs = ITensor::slice(dJointOutput.cumLogProbs, batchSlot, 1);
+    runtime::kernels::invokeFill(
+        *IBuffer::slice(cumLogProbs, 1, beamWidth - 1), DecodingOutput::kNegativeInfinity, manager.getStream());
+
+    auto parentIds = ITensor::slice(dJointOutput.parentIds, batchSlot, 1);
+    auto const outputIdsShape = ITensor::makeShape({1, beamWidth, maxSequenceLength});
+    parentIds->reshape(outputIdsShape);
+    manager.setZero(*parentIds);
+
+    auto cacheIndirectionInput = ITensor::slice(dJointInput.cacheIndirection, batchSlot, 1);
+    manager.setZero(*cacheIndirectionInput);
+
+    auto cacheIndirectionOutput = ITensor::slice(dJointOutput.cacheIndirection, batchSlot, 1);
+    manager.setZero(*cacheIndirectionOutput);
+
+    auto beamHypotheses = dJointOutput.beamHypotheses.slice(batchSlot, 1);
+    beamHypotheses.init(manager, endId);
+}
+
 void initializeEmbeddingBias(DecodingInput& dJointInput, SizeType32 batchSlot,
     std::optional<TensorPtr> const& embeddingBias, nvinfer1::DataType logitsType,
     runtime::ModelConfig const& modelConfig, BufferManager const& manager)
@@ -257,9 +297,6 @@ void CreateNewDecoderRequests::newRequest(SizeType32 batchSlot, runtime::decoder
 
     dJointInput.beamWidths.at(batchSlot) = beamWidth;
 
-    TensorPtr const endIdTensorPtr{ITensor::slice(constPointerCast(dJointInput.endIds), batchSlot, 1)};
-    runtime::kernels::invokeFill(*endIdTensorPtr, endId, decoderStream);
-
     TensorPtr const sequenceLimitLength{
         ITensor::slice(constPointerCast(dJointInput.sequenceLimitLength), batchSlot, 1)};
     runtime::kernels::invokeFill(*sequenceLimitLength, inputLength + maxNewTokens, decoderStream);
@@ -269,7 +306,6 @@ void CreateNewDecoderRequests::newRequest(SizeType32 batchSlot, runtime::decoder
 
     // output
     auto& dJointOutput = decoderState.getJointDecodingOutput();
-    auto const outputIdsShape = ITensor::makeShape({1, beamWidth, maxSequenceLength});
 
     auto finishedSum = ITensor::slice(dJointOutput.finishedSum, batchSlot, 1);
     manager.setZero(*finishedSum);
@@ -298,35 +334,13 @@ void CreateNewDecoderRequests::newRequest(SizeType32 batchSlot, runtime::decoder
         manager.setZero(*logProbs);
     }
 
+    initializeRequestIds(
+        dJointInput, dJointOutput, batchSlot, requestIds, endId, beamWidth, maxSequenceLength, manager);
+
     if (beamWidth > 1)
     {
-        TensorPtr const cumLogProbs = ITensor::slice(dJointOutput.cumLogProbs, batchSlot, 1);
-        runtime::kernels::invokeFill(
-            *IBuffer::slice(cumLogProbs, 1, beamWidth - 1), DecodingOutput::kNegativeInfinity, decoderStream);
-
-        auto parentIds = ITensor::slice(dJointOutput.parentIds, batchSlot, 1);
-        parentIds->reshape(outputIdsShape);
-        manager.setZero(*parentIds);
-
-        auto cacheIndirectionInput = ITensor::slice(dJointInput.cacheIndirection, batchSlot, 1);
-        manager.setZero(*cacheIndirectionInput);
-
-        auto cacheIndirectionOutput = ITensor::slice(dJointOutput.cacheIndirection, batchSlot, 1);
-        manager.setZero(*cacheIndirectionOutput);
-
-        auto beamHypotheses = dJointOutput.beamHypotheses.slice(batchSlot, 1);
-        beamHypotheses.init(manager, endId);
+        initializeBeamSearch(dJointInput, dJointOutput, batchSlot, endId, beamWidth, maxSequenceLength, manager);
     }
-
-    // fill outputIds with endIds
-    TensorPtr const outputIds = ITensor::slice(dJointOutput.ids, batchSlot, 1);
-    auto outputIdsTileView = ITensor::view(outputIds, ITensor::makeShape({beamWidth, maxSequenceLength}));
-    runtime::kernels::invokeFill(*outputIdsTileView, endId, decoderStream);
-
-    // copy the request ids into outputIds
-    auto const requestIdsShape = requestIds->getShape();
-    auto outputIdsView = ITensor::view(outputIds, requestIdsShape);
-    manager.copy(*requestIds, *outputIdsView);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
