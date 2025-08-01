@@ -14,47 +14,57 @@
  * limitations under the License.
  */
 #include "ub_allocator.h"
+#include "tensorrt_llm/common/opUtils.h"
+#include <set>
 
 namespace tensorrt_llm::runtime::ub
 {
 UserBufferAllocator& UserBufferAllocator::Instance()
 {
-    static UserBufferAllocator _;
-    return _;
-}
-
-void UserBufferAllocator::initialize(tensorrt_llm::runtime::WorldConfig const& world_config)
-{
-    if (!is_initialized())
+    if (use_nccl_symmetric)
     {
-        ub_comm_ = nullptr;
-        world_config_ = world_config;
-        create_communicator_grouped2(&ub_comm_, world_config_);
-        TLLM_CHECK(ub_comm_ != nullptr);
-        is_initialized_ = true;
+        static NCCLUserBufferAllocator _;
+        return _;
+    }
+    else
+    {
+        static UserBufferAllocator _;
+        return _;
     }
 }
 
-bool UserBufferAllocator::is_initialized()
+void UserBufferAllocator::initialize(tensorrt_llm::runtime::WorldConfig const& worldConfig)
 {
-    return is_initialized_;
+    if (!isInitialized())
+    {
+        mUbComm = nullptr;
+        mWorldConfig = worldConfig;
+        create_communicator_grouped2(&mUbComm, worldConfig);
+        TLLM_CHECK(mUbComm != nullptr);
+        mIsInitialized = true;
+    }
 }
 
-UBBuffer UserBufferAllocator::register_ub_buffer(size_t bytes)
+bool UserBufferAllocator::isInitialized()
 {
-    TLLM_CHECK(is_initialized());
+    return mIsInitialized;
+}
+
+UBBuffer UserBufferAllocator::registerUBBuffer(size_t bytes)
+{
+    TLLM_CHECK(isInitialized());
     void* addr = nullptr;
     int handle = -1;
-    handle = register_user_buffer_collective((void**) &addr, bytes, ub_comm_);
+    handle = register_user_buffer_collective((void**) &addr, bytes, mUbComm);
     return {addr, handle, bytes};
 }
 
 UBBuffer UserBufferAllocator::allocate(size_t bytes)
 {
-    TLLM_CHECK(is_initialized());
-    auto ub_buffer = register_ub_buffer(bytes);
+    TLLM_CHECK(isInitialized());
+    auto ub_buffer = registerUBBuffer(bytes);
     TLLM_CHECK(!ub_buffer.invalid());
-    buffers_.push_back(ub_buffer);
+    mBuffers.push_back(ub_buffer);
     return ub_buffer;
 }
 
@@ -62,13 +72,42 @@ void UserBufferAllocator::deallocate(void* addr) {}
 
 UBBuffer UserBufferAllocator::get(int idx)
 {
-    TLLM_CHECK(is_initialized() && idx < buffers_.size() && !buffers_[idx].invalid());
-    return buffers_[idx];
+    TLLM_CHECK(isInitialized() && idx < mBuffers.size() && !mBuffers[idx].invalid());
+    return mBuffers[idx];
 }
 
 communicator* UserBufferAllocator::comm()
 {
-    TLLM_CHECK(is_initialized());
-    return ub_comm_;
+    TLLM_CHECK(isInitialized());
+    return mUbComm;
 }
+
+void NCCLUserBufferAllocator::initialize(tensorrt_llm::runtime::WorldConfig const& worldConfig)
+{
+    if (!isInitialized())
+    {
+        TLLM_LOG_INFO("Initializing NCCLUserBufferAllocator");
+        std::set<int> group;
+        for (int i = 0; i < worldConfig.getSize(); i++)
+        {
+            group.insert(i);
+        }
+        mComm = getComm(group);
+        mIsInitialized = true;
+    }
+}
+
+UBBuffer NCCLUserBufferAllocator::registerUBBuffer(size_t bytes)
+{
+    TLLM_CHECK(isInitialized());
+    UBBuffer ub_buffer;
+    NCCLCHECK(ncclMemAlloc(&ub_buffer.addr, bytes));
+    NCCLCHECK(ncclCommWindowRegister((*mComm), ub_buffer.addr, bytes, &ub_buffer.window, NCCL_WIN_COLL_SYMMETRIC));
+    ub_buffer.handle = 5;
+    ub_buffer.size = bytes;
+    return ub_buffer;
+}
+
+bool UserBufferAllocator::use_nccl_symmetric = false;
+
 }; // namespace tensorrt_llm::runtime::ub
