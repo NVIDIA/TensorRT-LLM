@@ -1652,6 +1652,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
 
         if (mIsMLAEnabled)
         {
+            TLLM_CHECK_WITH_INFO(params.mla_param != nullptr, "MLA param is nullptr");
             params.mla_param->cache_type = cache_type;
             params.mla_param->cu_q_seqlens = cu_q_seqlens;
             params.mla_param->quant_scale_kv = params.kv_scale_orig_quant;
