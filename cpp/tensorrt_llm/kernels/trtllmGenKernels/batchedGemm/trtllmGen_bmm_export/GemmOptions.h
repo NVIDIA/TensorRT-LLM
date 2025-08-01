@@ -31,23 +31,30 @@
 #else
 #include <iostream>
 
+template <typename T>
+void printArgs(T arg)
+{
+#ifdef TLLM_GEN_DEBUG
+    std::cout << arg;
+#endif
+}
+
 template <typename T, typename... Args>
 void printArgs(T first, Args... args)
 {
-#ifdef TLLM_GEN_DEBUG
-    std::cout << first;
+    printArgs(first);
     if constexpr (sizeof...(args) > 0)
     {
-        std::cout << " ";
+        printArgs(", ");
         printArgs(args...);
     }
-#endif
 }
 
 #define TLLM_CHECK_ERROR(cond, ...)                                                                                    \
     if (!(cond))                                                                                                       \
     {                                                                                                                  \
         printArgs(__VA_ARGS__);                                                                                        \
+        printArgs("\n");                                                                                               \
         return false;                                                                                                  \
     }
 
@@ -59,6 +66,7 @@ void printArgs(T first, Args... args)
     if (!(cond))                                                                                                       \
     {                                                                                                                  \
         printArgs(__VA_ARGS__);                                                                                        \
+        printArgs("\n");                                                                                               \
         return false;                                                                                                  \
     }
 
@@ -66,7 +74,7 @@ void printArgs(T first, Args... args)
 
 #define TLLM_LOG_INFO(...) TLLM_CHECK_WARNING(false, __VA_ARGS__)
 
-#endif
+#endif // TLLM_GEN_EXPORT_INTERFACE
 
 namespace batchedGemm
 {
@@ -527,6 +535,7 @@ inline int32_t getShuffleBlockSize(int epilogueTileM)
 inline bool checkAndUpdateGemmOptions(
     GemmOptions& options, bool isBlackwell, int /* tpGrpSize */, bool updateOptions = true)
 {
+
     if (options.mDtypeB == tg::Dtype::Void)
     {
         if (updateOptions)
@@ -567,7 +576,8 @@ inline bool checkAndUpdateGemmOptions(
     // Currently, we only support {MxFp4, NvFp4} -> Bf16.
     TLLM_CHECK_ERROR((options.mDtypeA == options.mDtypeMmaA)
             || ((options.mDtypeA == tg::Dtype::MxE2m1 || options.mDtypeA == tg::Dtype::E2m1)
-                && options.mDtypeMmaA == tg::Dtype::Bfloat16),
+                && options.mDtypeMmaA == tg::Dtype::Bfloat16)
+            || (options.mDtypeA == tg::Dtype::E2m1 && options.mDtypeMmaA == tg::Dtype::E4m3),
         "Unsupported cast for A: ", tg::dtypeToString(options.mDtypeA), " -> ", tg::dtypeToString(options.mDtypeMmaA));
 
     // Check that the B cast is supported.

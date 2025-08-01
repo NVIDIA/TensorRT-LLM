@@ -806,7 +806,12 @@ def test_fused_moe_fp8_blockwise_multi_gpu(ep_size, routing_method):
 
 @skip_pre_blackwell
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_fused_moe_nvfp4(dtype):
+@pytest.mark.parametrize("moe_backend", ["TRTLLM", "CUTLASS"])
+def test_fused_moe_nvfp4(dtype, moe_backend):
+
+    if dtype == torch.float16 and moe_backend == "TRTLLM":
+        pytest.skip("TRTLLM NVFP4 MoE backend does not support float16 yet")
+
     mapping = Mapping()
     mapping.rank = mpi_rank()
 
@@ -814,11 +819,11 @@ def test_fused_moe_nvfp4(dtype):
         SCALING_VECTOR_SIZE = 16
 
         SEQ_LEN = 4
-        HIDDEN_SIZE = 128
-        INTERMEDIATE_SIZE = 128
-        NUM_EXPERTS = 3
+        HIDDEN_SIZE = 512
+        INTERMEDIATE_SIZE = 512
+        NUM_EXPERTS = 4
         TOP_K = 2
-        routing_method = DefaultMoeRoutingMethod(top_k=TOP_K)
+        routing_method = RenormalizeMoeRoutingMethod(top_k=TOP_K)
         torch.manual_seed(0)
         torch.cuda.manual_seed(0)
         x = torch.randn((SEQ_LEN, HIDDEN_SIZE), dtype=dtype, device="cuda")
@@ -829,19 +834,19 @@ def test_fused_moe_nvfp4(dtype):
 
         weights = {}
         for expert_id in range(NUM_EXPERTS):
-            w1_weight = torch.randn((INTERMEDIATE_SIZE, HIDDEN_SIZE),
-                                    dtype=dtype,
-                                    device="cuda")
+            w1_weight = torch.randn(
+                (INTERMEDIATE_SIZE, HIDDEN_SIZE), dtype=dtype,
+                device="cuda") * 0.05
             w1_sf_global = (448 * 6) / w1_weight.abs().max().float()
 
-            w2_weight = torch.randn((HIDDEN_SIZE, INTERMEDIATE_SIZE),
-                                    dtype=dtype,
-                                    device="cuda")
+            w2_weight = torch.randn(
+                (HIDDEN_SIZE, INTERMEDIATE_SIZE), dtype=dtype,
+                device="cuda") * 0.05
             w2_sf_global = (448 * 6) / w2_weight.abs().max().float()
 
-            w3_weight = torch.randn((INTERMEDIATE_SIZE, HIDDEN_SIZE),
-                                    dtype=dtype,
-                                    device="cuda")
+            w3_weight = torch.randn(
+                (INTERMEDIATE_SIZE, HIDDEN_SIZE), dtype=dtype,
+                device="cuda") * 0.05
             w3_sf_global = (448 * 6) / w3_weight.abs().max().float()
 
             w3_w1_global = min(
@@ -887,14 +892,16 @@ def test_fused_moe_nvfp4(dtype):
             weights[f"{expert_id}.w3.weight_scale_2"] = 1.0 / w3_w1_global
 
         quant_config = QuantConfig(quant_algo=QuantAlgo.NVFP4)
-        fused_moe = CutlassFusedMoE(
+        fused_moe = create_moe(
             num_experts=NUM_EXPERTS,
             routing_method=routing_method,
             hidden_size=HIDDEN_SIZE,
             intermediate_size=INTERMEDIATE_SIZE,
             dtype=dtype,
-            reduce_results=False,
-            model_config=ModelConfig(quant_config=quant_config))
+            reduce_results=True,
+            model_config=ModelConfig(quant_config=quant_config,
+                                     moe_backend=moe_backend),
+        )
         fused_moe.load_weights([weights])
         fused_moe.cuda()
 
@@ -1070,14 +1077,14 @@ def test_fused_moe_w4afp8(dtype):
 @skip_pre_blackwell
 @pytest.mark.parametrize("moe_backend", ["TRTLLM", "CUTLASS"])
 @pytest.mark.parametrize("bias", [True, False])
-def test_fused_moe_mxfp4_mxpf8(moe_backend, bias):
+def test_fused_moe_mxfp4_mxfp8(moe_backend, bias):
     SCALING_VECTOR_SIZE = 32
     dtype = torch.bfloat16
     SEQ_LEN = 128
     HIDDEN_SIZE = 256
     INTERMEDIATE_SIZE = 256
     NUM_EXPERTS = 8
-    TOP_K = 1
+    TOP_K = 4
     routing_method = RenormalizeMoeRoutingMethod(top_k=TOP_K)
     torch.manual_seed(0)
     torch.cuda.manual_seed(0)
@@ -1138,6 +1145,7 @@ def test_fused_moe_mxfp4_mxpf8(moe_backend, bias):
         model_config=ModelConfig(quant_config=quant_config,
                                  moe_backend=moe_backend),
         bias=bias,
+        tllmgen_use_tma_oob_opt=True if moe_backend == "TRTLLM" else False,
     )
     fused_moe.cuda()
     fused_moe.load_weights([weights])
