@@ -188,7 +188,6 @@ public:
             {
                 TORCH_CHECK(latent_cache.has_value());
                 mla_params.latent_cache = static_cast<T const*>(latent_cache->data_ptr());
-
                 TORCH_CHECK(q_pe.has_value());
                 TORCH_CHECK(q_pe->dim() == 3);
                 TORCH_CHECK(q_pe->strides()[2] == 1);
@@ -440,7 +439,7 @@ void attention_inplace(torch::Tensor q, torch::optional<torch::Tensor> k, torch:
     bool const use_kv_cache = kv_cache_block_offsets.has_value() && host_kv_cache_block_offsets.has_value()
         && host_kv_cache_pool_pointers.has_value() && host_kv_cache_pool_mapping.has_value();
 
-    TLLM_CHECK_WITH_INFO(is_mla_enable || is_fused_qkv, "Only fused QKV is supported for non-MLAnow");
+    TLLM_CHECK_WITH_INFO(is_mla_enable || is_fused_qkv, "Only fused QKV is supported for non-MLA attention now");
     TLLM_CHECK_WITH_INFO(update_kv_cache, "KV cache update cannot be disabled now");
     auto qkv_or_q = q;
     if (is_fused_qkv)
