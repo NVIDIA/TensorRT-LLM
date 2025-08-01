@@ -244,7 +244,7 @@ def create_config_files(config):
     context_config_content = """pytorch_backend_config:
   disable_overlap_scheduler: True
 cache_transceiver_config:
-  backend: "default"
+  backend: "DEFAULT"
   max_tokens_in_buffer: 2048"""
 
     with open(CONTEXT_CONFIG_FILE, 'w') as file:
@@ -252,7 +252,7 @@ cache_transceiver_config:
 
     # Create generation config file
     generation_config_content = """cache_transceiver_config:
-  backend: "default"
+  backend: "DEFAULT"
   max_tokens_in_buffer: 2048"""
 
     with open(GENERATION_CONFIG_FILE, 'w') as file:
