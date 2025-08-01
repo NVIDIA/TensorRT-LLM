@@ -1,19 +1,21 @@
 from __future__ import annotations
+from transformers import AutoConfig
 
 from pathlib import Path
 from typing import Tuple, get_args
 import click
 from click_option_group import AllOptionGroup, optgroup
 
+from tensorrt_llm._torch.pyexecutor.config_utils import is_nemotron_hybrid
 from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
 from tensorrt_llm.bench.utils.data import create_dataset_from_stream, initialize_tokenizer
 from tensorrt_llm.bench.utils import VALID_QUANT_ALGOS
 from tensorrt_llm.builder import BuildConfig
-from tensorrt_llm.llmapi import LLM
+from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm.llmapi.llm_utils import QuantConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
-from tensorrt_llm.bench.build.dataclasses import ModelConfig
+from tensorrt_llm.bench.build.dataclasses import ModelConfig, NemotronHybridConfig
 from tensorrt_llm.bench.build.tuning import calc_engine_setting
 
 TUNED_QUANTS = {
@@ -31,6 +33,7 @@ def get_benchmark_engine_settings(
     pp_size: int,
     target_input_len: int,
     target_output_len: int,
+    kv_cache_gpu_mem_fraction: float = 0.95,
 ) -> Tuple[int, int]:
     """ Retrieve benchmark settings for a specific model + configuration.
 
@@ -58,6 +61,7 @@ def get_benchmark_engine_settings(
             pp_size,
             target_input_len,
             target_output_len,
+            kv_cache_gpu_mem_fraction,
         )
     else:
         max_batch_size = DEFAULT_MAX_BATCH_SIZE
@@ -82,6 +86,10 @@ def get_model_config(model_name: str, model_path: Path = None) -> ModelConfig:
     Raises:
         ValueError: When model is not supported.
     """
+    if is_nemotron_hybrid(
+            AutoConfig.from_pretrained(model_path or model_name,
+                                       trust_remote_code=True)):
+        return NemotronHybridConfig.from_hf(model_name, model_path)
     return ModelConfig.from_hf(model_name, model_path)
 
 
@@ -158,6 +166,20 @@ def apply_build_mode_settings(params):
     type=click.IntRange(min=1),
     help="Maximum total length of one request, including prompt and outputs.",
 )
+@optgroup.option(
+    "--no_weights_loading",
+    type=bool,
+    default=False,
+    help=
+    "Do not load the weights from the checkpoint. Use dummy weights instead.")
+@optgroup.option(
+    "--trust_remote_code",
+    type=bool,
+    default=False,
+    help=
+    "Trust remote code for the HF models that are not natively implemented in the transformers library. "
+    "This is needed when using LLM API when loading the HF config to build the engine."
+)
 @optgroup.group(
     "Build Engine with Dataset Information",
     cls=AllOptionGroup,
@@ -231,6 +253,8 @@ def build_command(
     target_input_len: int = params.get("target_input_len")
     target_output_len: int = params.get("target_output_len")
 
+    load_format = "dummy" if params.get("no_weights_loading") else "auto"
+    trust_remote_code: bool = params.get("trust_remote_code")
     model_name = bench_env.model
     checkpoint_path = bench_env.checkpoint_path or model_name
     model_config = get_model_config(model_name, bench_env.checkpoint_path)
@@ -307,7 +331,9 @@ def build_command(
               pipeline_parallel_size=pp_size,
               build_config=build_config,
               quant_config=quant_config,
-              workspace=str(bench_env.workspace))
+              workspace=str(bench_env.workspace),
+              load_format=load_format,
+              trust_remote_code=trust_remote_code)
     # Save the engine.
     llm.save(engine_dir)
     llm.shutdown()

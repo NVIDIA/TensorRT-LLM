@@ -17,6 +17,7 @@
 #include "fmha/hopper/utils_warpgroup.h"
 #include "fmha/softmax.h"
 #include "fmha/warpspec/circular_buffer.h"
+#include "fmha/warpspec/dma.h"
 #include "fmha/warpspec/epilogue.h"
 
 namespace fmha
@@ -98,16 +99,16 @@ struct Compute
         NUM_COMPUTE_GROUPS = Kernel_traits::NUM_COMPUTE_GROUPS
     };
 
-    // Whether do we skip those masked tiles when causal mask is enabled ?
+    // Whether we skip those masked tiles when causal mask is enabled ?
     enum
     {
         SKIP_CAUSAL_MASK_TILES = Kernel_traits::CAUSAL_MASK && !Kernel_traits::USE_CUSTOM_MASK
     };
 
-    // Whether we will ignore the long distance tokens in the beginning.
+    // Whether we attend to the specific sliding window or chunk ?
     enum
     {
-        SLIDING_WINDOW_ATTENTION = Kernel_traits::SLIDING_WINDOW_ATTENTION
+        SLIDING_OR_CHUNKED_ATTENTION = Kernel_traits::SLIDING_OR_CHUNKED_ATTENTION
     };
 
     // Are we applying alibi bias (drop FMA optimizations for accuracy reasons).
@@ -172,7 +173,7 @@ struct Compute
 
     enum
     {
-        TILE_SIZE_V = STEP_KV * Kernel_traits::D
+        TILE_SIZE_V = STEP_KV * Kernel_traits::DV
     };
 
     enum
@@ -247,10 +248,59 @@ struct Compute
 
 #define COMPUTE_SINGLE_TILE(IS_FIRST_COL, APPLY_MASK)                                                                  \
     compute_single_tile<IS_FIRST_COL, APPLY_MASK>(params, ctile_p, softmax, ctile_o, p_max, p_sum, tidx,               \
-        actual_kv_seqlen, params.sliding_window_size, alibi_head_scale,                                                \
+        actual_kv_seqlen, alibi_head_scale,                                                                            \
         USE_CUSTOM_MASK ? (head_info.mask_sum_s + q_step_idx * STEP_Q + local_q_tile_offset)                           \
                         : (q_step_idx * STEP_Q + head_info.q_tile_offset),                                             \
         kv_step_idx * STEP_KV, sage_scale_row, cbr, cbr_v, mutex_accessor, kv_step_idx == kv_idx_end - 1);
+
+    ////////////////////////////////////////////////////////////////////////////////////////////////
+
+    inline __device__ int div_up(int a, int b)
+    {
+        return (a + b - 1) / b;
+    }
+
+    ////////////////////////////////////////////////////////////////////////////////////////////////
+
+    // Compute the kv_left_mask_end and kv_right_mask_start, where mask is applied when kv_idx < kv_left_mask_end or
+    // kv_idx >= kv_right_mask_start.
+    template <typename Params>
+    inline __device__ std::pair<int, int> compute_kv_mask_start_end(
+        Params const& params, int const tile_offset_start, int const tile_offset_end, int const kv_idx_end)
+    {
+        // The kv_left_mask_end is 0 by default.
+        int kv_left_mask_end = 0;
+        // The kv_right_mask_start is kv_idx_end - 1 by default, which means only the last kv tile is masked.
+        int kv_right_mask_start = kv_idx_end - 1;
+
+        // Always apply mask is specified.
+        if constexpr (ALWAYS_APPLY_MASK)
+        {
+            return std::make_pair(0, 0);
+        }
+
+        // Is the chunked_attention used ?
+        bool is_chunked_attention = params.log2_chunked_attention_size > 0;
+
+        // The left mask is needed when we attend to a specific sliding window or chunk.
+        if constexpr (SLIDING_OR_CHUNKED_ATTENTION)
+        {
+            // The kv_left_mask_end is the start of the chunk.
+            kv_left_mask_end = div_up(is_chunked_attention
+                    ? ((tile_offset_end >> params.log2_chunked_attention_size) << params.log2_chunked_attention_size)
+                    : (tile_offset_end - params.sliding_window_size),
+                STEP_KV);
+        }
+
+        // The right mask is needed when causal mask (including sliding_window_attention or chunked attention) is used.
+        if constexpr (SKIP_CAUSAL_MASK_TILES)
+        {
+            kv_right_mask_start = tile_offset_start / STEP_KV;
+        }
+
+        // Return the kv_left_mask_end and kv_right_mask_start.
+        return std::make_pair(kv_left_mask_end, kv_right_mask_start);
+    }
 
     ////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -318,12 +368,6 @@ struct Compute
                 sage_scale_row = head_info.bidb * params.h + head_info.bidh;
             }
 
-            // Need to check if it is masked when sliding_window_size is smaller than what actual_seqlen.
-            static_assert(STEP_KV >= STEP_Q, "");
-            // There will only be one kv tile needed to be masked since STEP_KV >= STEP_Q;
-            bool const apply_start_mask
-                = (SLIDING_WINDOW_ATTENTION && actual_kv_seqlen > params.sliding_window_size) || ALWAYS_APPLY_MASK;
-
             int q_step_idx = warpgroup_id;
 
             // Compute work.
@@ -347,29 +391,22 @@ struct Compute
 
                 // KV tile is shared by two q tiles,
                 // so we need to consider the last compute group's q tile.
-                int const curr_tile_offset = q_step_idx * STEP_Q + q_tile_offset;
-                int const q_tile_offset_start = curr_tile_offset - warpgroup_id * STEP_Q;
-                int const q_tile_offset_end = curr_tile_offset + (NUM_COMPUTE_GROUPS - warpgroup_id) * STEP_Q - 1;
+                int const tile_offset_start = q_step_idx * STEP_Q + q_tile_offset;
+                int const tile_offset_end = tile_offset_start + STEP_Q - 1;
+                int const warpgroup_tile_offset_start = tile_offset_start - warpgroup_id * STEP_Q;
+                int const warpgroup_tile_offset_end
+                    = tile_offset_start + (NUM_COMPUTE_GROUPS - warpgroup_id) * STEP_Q - 1;
 
-                // Skip initial kv tiles due to sliding window attention.
-                // Consider the last 2 tiles.
-                int const kv_idx_start = SLIDING_WINDOW_ATTENTION
-                    ? (max(0, q_tile_offset_start - params.sliding_window_size) / STEP_KV)
-                    : 0;
+                // Compute the kv_idx start (inclusive) and end (exclusive).
+                auto const [kv_idx_start, kv_idx_end] = DMA<Kernel_traits>::Device::compute_kv_tile_idx(
+                    params, warpgroup_tile_offset_start, warpgroup_tile_offset_end, kv_steps);
 
-                static_assert(STEP_KV >= STEP_Q, "");
-                int kv_start_mask_bound = SLIDING_WINDOW_ATTENTION
-                    ? int((max(0, curr_tile_offset + STEP_Q - 1 - params.sliding_window_size) + STEP_KV - 1) / STEP_KV)
-                    : 0;
+                // Compute the kv_left_mask_end and kv_right_mask_start, where mask is applied when kv_idx <
+                // kv_left_mask_end or kv_idx >= kv_right_mask_start.
+                auto const [kv_left_mask_end, kv_right_mask_start]
+                    = compute_kv_mask_start_end(params, tile_offset_start, tile_offset_end, kv_idx_end);
 
-                // We will skip unnecessary kv steps for causal mask.
-                // Exclusive range.
-                int const kv_idx_end = SKIP_CAUSAL_MASK_TILES ? (q_tile_offset_end + STEP_KV - 1) / STEP_KV : kv_steps;
-
-                // Inclusive range (apply_mask when kv_idx >= kv_end_mask_lower_bound)
-                int const kv_end_mask_lower_bound
-                    = ALWAYS_APPLY_MASK ? 0 : (SKIP_CAUSAL_MASK_TILES ? (curr_tile_offset / STEP_KV) : kv_idx_end - 1);
-
+                // The gmem O tile.
                 Gmem_tile_o gmem_o(params, head_info, *shared, tidx, q_step_idx * STEP_Q + local_q_tile_offset);
 
                 // Q ready to use in smem.
@@ -387,7 +424,7 @@ struct Compute
                 // First K tiles ready to use in smem.
                 K_TILE_WAIT();
                 // Need to apply mask if only kv tile exists.
-                if (kv_idx_start >= kv_end_mask_lower_bound || apply_start_mask)
+                if (kv_idx_start < kv_left_mask_end || kv_idx_start >= kv_right_mask_start)
                 {
                     COMPUTE_SINGLE_TILE(true, true);
                 }
@@ -397,7 +434,7 @@ struct Compute
                 }
                 KV_TILE_COMPLETE();
 
-                for (kv_step_idx += 1; kv_step_idx < kv_end_mask_lower_bound; ++kv_step_idx)
+                for (kv_step_idx += 1; kv_step_idx < kv_right_mask_start; ++kv_step_idx)
                 {
 
                     // Current step's K tiles ready to use in smem.
@@ -416,7 +453,7 @@ struct Compute
                     ctile_o.increment_gmma_desc_group();
 
                     // Apply the start mask only when sliding window attention is enabled.
-                    if (apply_start_mask && kv_step_idx < kv_start_mask_bound)
+                    if (kv_step_idx < kv_left_mask_end)
                     {
                         COMPUTE_SINGLE_TILE(false, true);
                     }
@@ -478,9 +515,9 @@ struct Compute
     template <bool IS_FIRST_COL, bool APPLY_MASK, typename Params>
     inline __device__ void compute_single_tile(Params params, Compute_tile_p& ctile_p, Softmax& softmax,
         Compute_tile_o& ctile_o, float (&p_max)[Mma_tile_p::CORES_M], float (&p_sum)[Mma_tile_p::CORES_M],
-        int const tidx, int const actual_kv_seqlen, int const sliding_window_size, float const alibi_head_scale,
-        int const row_offset, int const col_offset, int const sage_scale_row, Circular_buffer_q_reader& cbr,
-        Circular_buffer_kv_reader& cbr_v, OrderedMutexAccessor& mutex, bool complete = false)
+        int const tidx, int const actual_kv_seqlen, float const alibi_head_scale, int const row_offset,
+        int const col_offset, int const sage_scale_row, Circular_buffer_q_reader& cbr, Circular_buffer_kv_reader& cbr_v,
+        OrderedMutexAccessor& mutex, bool complete = false)
     {
 // load the scales of K/V from global memory
 #define LOAD_SCALES_KV(dst, which, blocks_per_step, block_size)                                                        \
@@ -581,8 +618,8 @@ struct Compute
         }
 
         // Apply the alibi and mask.
-        softmax.apply_alibi_and_mask<APPLY_MASK>(ctile_p, params.alibi_params, alibi_head_scale, actual_kv_seqlen,
-            sliding_window_size, row_offset, col_offset);
+        softmax.apply_alibi_and_mask<APPLY_MASK>(
+            ctile_p, params.alibi_params, alibi_head_scale, actual_kv_seqlen, row_offset, col_offset);
 
         // Softmax Exp, max/sum, and update scales.
         softmax.compute_and_update_scale<IS_FIRST_COL>(p_max, p_sum);

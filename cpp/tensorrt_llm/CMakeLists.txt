@@ -72,6 +72,12 @@ if(ENABLE_MULTI_DEVICE)
   include_directories(${MPI_C_INCLUDE_DIRS})
 endif()
 
+if(ENABLE_NVSHMEM)
+  # Add hints for aarch64
+  find_package(NVSHMEM REQUIRED HINTS /usr/lib/sbsa-linux-gnu/cmake/nvshmem/)
+  include_directories(/usr/include/nvshmem/)
+endif()
+
 if(NOT WIN32)
   set(DECODER_SHARED_TARGET_0 decoder_attention_0)
   set(DECODER_SHARED_TARGET_1 decoder_attention_1)
@@ -141,6 +147,24 @@ add_subdirectory(runtime)
 add_subdirectory(testing)
 add_subdirectory(executor_worker)
 
+if(ENABLE_CUFILE)
+  find_library(
+    CUFILE_LIBRARY cufile HINTS ${CUDAToolkit_LIBRARY_DIR}
+                                /usr/lib/${TARGET_ARCH} /usr/local/lib)
+  if(NOT CUFILE_LIBRARY)
+    # FATAL_ERROR if user explicitly requests with GDS if CUDA's libcufile.so is
+    # not found.
+    message(
+      FATAL_ERROR
+        "cuFile library not found. Set -DENABLE_CUFILE=OFF if cufile isn't required."
+    )
+  else()
+    message(STATUS "Linking with cufile: ${CUFILE_LIBRARY}")
+  endif()
+else()
+  message(STATUS "ENABLE_CUFILE=OFF, skipping GDS linkage.")
+endif()
+
 set(BATCH_MANAGER_TARGET tensorrt_llm_batch_manager_static)
 set(BATCH_MANAGER_TARGET_ARCH ${TARGET_ARCH})
 add_subdirectory(batch_manager)
@@ -148,6 +172,11 @@ add_subdirectory(batch_manager)
 set(EXECUTOR_TARGET tensorrt_llm_executor_static)
 set(EXECUTOR_TARGET_ARCH ${TARGET_ARCH})
 set(UCX_WRAPPER_TARGET tensorrt_llm_ucx_wrapper)
+
+if(NIXL_ROOT)
+  set(NIXL_WRAPPER_TARGET tensorrt_llm_nixl_wrapper)
+endif()
+
 add_subdirectory(executor)
 
 find_package(Threads REQUIRED)
@@ -167,17 +196,15 @@ set(TRTLLM_LINK_LIBS
     context_attention_src
     decoder_attention_src
     trtllm_gen_fmha
-    trtllm_gen_blockscale_gemm
     trtllm_gen_fp8_block_scale_moe
     trtllm_gen_gemm
-    trtllm_gen_fp8_batched_gemm
     trtllm_gen_gemm_gated_act
+    trtllm_gen_batched_gemm
     selective_scan_src
     ws_layernorm_src
     fpA_intB_gemm_src
     # moe_gemm_src
     fb_gemm_src
-    ar_gemm_src
     gemm_swiglu_sm90_src
     cutlass_src
     layers_src
@@ -186,9 +213,33 @@ set(TRTLLM_LINK_LIBS
     userbuffers_src
     ${DECODER_SHARED_TARGET_0}
     ${DECODER_SHARED_TARGET_1})
+if(USING_OSS_CUTLASS_LOW_LATENCY_GEMM)
+  set(TRTLLM_LINK_LIBS ${TRTLLM_LINK_LIBS} low_latency_gemm_src)
+  message(STATUS "USING_OSS_CUTLASS_LOW_LATENCY_GEMM")
+endif()
+
+if(USING_OSS_CUTLASS_FP4_GEMM)
+  set(TRTLLM_LINK_LIBS ${TRTLLM_LINK_LIBS} fp4_gemm_src)
+  message(STATUS "USING_OSS_CUTLASS_FP4_GEMM")
+endif()
+
+if(USING_OSS_CUTLASS_MOE_GEMM)
+  set(TRTLLM_LINK_LIBS ${TRTLLM_LINK_LIBS} moe_gemm_src)
+  message(STATUS "USING_OSS_CUTLASS_MOE_GEMM")
+endif()
+
+if(USING_OSS_CUTLASS_ALLREDUCE_GEMM)
+  set(TRTLLM_LINK_LIBS ${TRTLLM_LINK_LIBS} ar_gemm_src)
+  message(STATUS "USING_OSS_CUTLASS_ALLREDUCE_GEMM")
+endif()
 
 if(ENABLE_MULTI_DEVICE)
   set(TRTLLM_LINK_LIBS ${TRTLLM_LINK_LIBS} ${MPI_C_LIBRARIES} ${NCCL_LIB})
+endif()
+
+if(ENABLE_NVSHMEM)
+  set(TRTLLM_LINK_LIBS ${TRTLLM_LINK_LIBS} nvshmem::nvshmem_host
+                       nvshmem::nvshmem_device)
 endif()
 
 if(NOT WIN32) # Unix-like compilers
@@ -212,6 +263,10 @@ set_target_properties(
 
 target_link_libraries(${SHARED_TARGET} PUBLIC ${TRTLLM_LINK_LIBS})
 
+if(ENABLE_CUFILE)
+  target_link_libraries(${SHARED_TARGET} PUBLIC ${CUFILE_LIBRARY})
+endif()
+
 target_link_libraries(
   ${SHARED_TARGET}
   PRIVATE $<LINK_LIBRARY:WHOLE_ARCHIVE,${BATCH_MANAGER_TARGET}>
@@ -233,6 +288,11 @@ if(TARGET ${UCX_WRAPPER_TARGET})
   add_dependencies(${SHARED_TARGET} ${UCX_WRAPPER_TARGET})
 endif()
 
+if(TARGET ${NIXL_WRAPPER_TARGET})
+  target_link_libraries(${NIXL_WRAPPER_TARGET} INTERFACE ${SHARED_TARGET})
+  add_dependencies(${SHARED_TARGET} ${NIXL_WRAPPER_TARGET})
+endif()
+
 if(NOT WIN32)
   set_target_properties(${SHARED_TARGET} PROPERTIES LINK_FLAGS
                                                     "-Wl,-rpath='$ORIGIN'")
@@ -242,8 +302,16 @@ if(BUILD_PYT)
   add_subdirectory(thop)
 endif()
 
-if(BUILD_PYBIND)
+if(BINDING_TYPE STREQUAL "pybind")
   add_subdirectory(pybind)
+endif()
+
+if(BINDING_TYPE STREQUAL "nanobind")
+  add_subdirectory(nanobind)
+endif()
+
+if(BUILD_DEEP_EP)
+  add_subdirectory(deep_ep)
 endif()
 
 add_subdirectory(plugins)

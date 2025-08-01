@@ -56,7 +56,8 @@ FmhaDispatcher::FmhaDispatcher(MHARunnerFixedParams fixedParams)
     else
     {
         TLLM_CHECK_WITH_INFO(mFixedParams.dataType == mFixedParams.dataTypeKv,
-            "KV cache data type should be the same as input data type.");
+            "KV cache data type %s is not the same as input data type %s.",
+            data_type_to_string(mFixedParams.dataTypeKv).c_str(), data_type_to_string(mFixedParams.dataType).c_str());
 
         // For FP8 MLA generation, the output type is BF16, which could be different from the input type.
         // So we shouldn't do this check anymore.
@@ -105,6 +106,11 @@ bool FmhaDispatcher::isSupported()
         tllmRunnerParams.mHeadDimV = mFixedParams.headSizeV;
         tllmRunnerParams.mNumTokensPerPage = mFixedParams.numTokensPerBlock;
         tllmRunnerParams.mNumHeadsQPerKv = mFixedParams.numQHeads / mFixedParams.numKvHeads;
+        // Set the chunked attention size and sliding window size to INT_MAX to disable them when checking if
+        // the kernel is supported.
+        tllmRunnerParams.mChunkedAttentionSize = INT_MAX;
+        tllmRunnerParams.mAttentionWindowSize = INT_MAX;
+
         foundKernels = mTllmGenFMHARunner->isSupported(tllmRunnerParams);
     }
     else
@@ -183,20 +189,17 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
         tllmRunnerParams.mMaxSeqLenQ = runnerParams.qSeqLen;
         tllmRunnerParams.mMaxSeqLenKv = runnerParams.kvSeqLen;
         tllmRunnerParams.mAttentionWindowSize = runnerParams.slidingWindowSize;
+        tllmRunnerParams.mChunkedAttentionSize = runnerParams.chunkedAttentionSize;
         tllmRunnerParams.mSumOfSeqLensQ = runnerParams.totalQSeqLen;
         tllmRunnerParams.mSumOfSeqLensKv = runnerParams.totalKvSeqLen;
         tllmRunnerParams.mMaxNumPagesPerSeqKv = maxBlocksPerSeq;
         tllmRunnerParams.mNumTokensPerPage = numTokensPerBlock;
         tllmRunnerParams.mScaleQ = mFixedParams.qScaling;
-        if (mFixedParams.attentionInputLayout == AttentionInputLayout::Q_PAGED_KV)
-        {
-            // The kv cache should be based on the maximum headDim of K and V due to paddings.
-            int maxHeadDimKv = std::max(tllmRunnerParams.mHeadDimQk, tllmRunnerParams.mHeadDimV);
-            tllmRunnerParams.mNumPagesInMemPool = mTllmGenFMHARunner->getTotalDeviceMemory()
-                / (tllmRunnerParams.mNumHeadsKv * tllmRunnerParams.mNumTokensPerPage * maxHeadDimKv
-                    * get_size_in_bytes(mFixedParams.dataType));
-        }
+        // Set it to INT_MAX as the kv cache pageOffsets will ensure that there is no out-of-bounds access.
+        tllmRunnerParams.mNumPagesInMemPool = INT_MAX;
         tllmRunnerParams.mSfStartTokenIdx = 0;
+        // For mla chunked prefill
+        tllmRunnerParams.softmaxStatsPtr = reinterpret_cast<float2*>(runnerParams.softmaxStatsPtr);
         tllmRunnerParams.stream = runnerParams.stream;
         mTllmGenFMHARunner->run(tllmRunnerParams);
     }

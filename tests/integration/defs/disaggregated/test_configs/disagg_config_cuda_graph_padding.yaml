@@ -12,10 +12,11 @@ context_servers:
   kv_cache_config:
     free_gpu_memory_fraction: 0.2
     enable_partial_reuse: False
-  pytorch_backend_config:
-    use_cuda_graph: True
-    cuda_graph_batch_sizes: [1,3000]
-    disable_overlap_scheduler: True
+  cuda_graph_config:
+    batch_sizes: [1,3000]
+  disable_overlap_scheduler: True
+  cache_transceiver_config:
+    backend: default
   urls:
       - "localhost:8001"
 generation_servers:
@@ -28,10 +29,11 @@ generation_servers:
   kv_cache_config:
     free_gpu_memory_fraction: 0.2
     enable_partial_reuse: False
-  pytorch_backend_config:
-    use_cuda_graph: True
-    disable_overlap_scheduler: True
-    cuda_graph_padding_enabled: True
-    cuda_graph_batch_sizes: [1,4,8,16,24,32]
+  cuda_graph_config:
+    enable_padding: True
+    batch_sizes: [1,4,8,16,24,32]
+  disable_overlap_scheduler: True
+  cache_transceiver_config:
+    backend: default
   urls:
       - "localhost:8002"

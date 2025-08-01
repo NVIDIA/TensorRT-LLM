@@ -23,10 +23,10 @@ import scipy
 import yaml
 
 import tensorrt_llm.evaluate
-from tensorrt_llm._torch import LLM as PyTorchLLM
-from tensorrt_llm._torch.speculative import SpecConfig
+from tensorrt_llm import LLM as PyTorchLLM
+from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm.builder import BuildConfig
-from tensorrt_llm.llmapi import LLM, SamplingParams
+from tensorrt_llm.llmapi import SamplingParams
 from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -147,15 +147,14 @@ class AccuracyTask:
                  llm: Union[LLM, PyTorchLLM],
                  extra_acc_spec: Optional[str] = None,
                  extra_evaluator_kwargs: Optional[dict] = None,
-                 sampling_params: Optional[SamplingParams] = None):
+                 sampling_params: Optional[SamplingParams] = None,
+                 streaming: bool = False):
         assert self.EVALUATOR_CLS is not None
 
         if llm.args.speculative_config is None:
             spec_dec_algo = None
         elif isinstance(llm.args.speculative_config, DecodingBaseConfig):
             spec_dec_algo = llm.args.speculative_config.decoding_type
-        elif isinstance(llm.args.speculative_config, SpecConfig):
-            spec_dec_algo = llm.args.speculative_config.spec_dec_name
         else:
             raise ValueError(
                 f"Not recognized speculative_config: {llm.args.speculative_config}."
@@ -193,7 +192,7 @@ class AccuracyTask:
             evaluator_kwargs.update(extra_evaluator_kwargs)
         evaluator = self.EVALUATOR_CLS(num_samples=num_samples,
                                        **evaluator_kwargs)
-        accuracy = evaluator.evaluate(llm, sampling_params)
+        accuracy = evaluator.evaluate(llm, sampling_params, streaming)
         if self.HIGHER_IS_BETTER:
             assert accuracy >= threshold, f"Expected accuracy >= {threshold}, but got {accuracy}."
         else:
@@ -316,6 +315,24 @@ class GPQADiamond(AccuracyTask):
     EVALUATOR_KWARGS = dict(dataset_path=DATASET_DIR, random_seed=0)
 
 
+class JsonModeEval(AccuracyTask):
+    DATASET = "json_mode_eval"
+    DATASET_DIR = f"{llm_models_root()}/datasets/NousResearch/json-mode-eval"
+
+    ALPHA = 0.05
+    BETA = 0.2
+    SIGMA = 50
+    NUM_SAMPLES = 100  # Full sample
+
+    MAX_INPUT_LEN = 1024
+    MAX_OUTPUT_LEN = 512
+
+    EVALUATOR_CLS = tensorrt_llm.evaluate.JsonModeEval
+    EVALUATOR_KWARGS = dict(dataset_path=DATASET_DIR,
+                            random_seed=0,
+                            apply_chat_template=True)
+
+
 class PassKeyRetrieval64k(AccuracyTask):
     DATASET = "passkey_retrieval_64k"
     LEVEL = 3
@@ -433,6 +450,9 @@ class CliFlowAccuracyTestHarness:
             f"--output_dir={self.ckpt_dir}",
             f"--dtype={self.dtype}",
         ]
+
+        if "nemotron_nas" in self.EXAMPLE_FOLDER:
+            convert_cmd.append("--trust_remote_code")
 
         if self.MODEL_FORMAT == "NEMO":
             convert_cmd.append(f"--nemo_ckpt_path={self.MODEL_PATH}")
@@ -715,3 +735,14 @@ class LlmapiAccuracyTestHarness:
         logger.set_level("info")
         yield
         logger.set_level(original_level)
+
+
+def get_accuracy_task(dataset_name: str):
+    try:
+        task_class = globals()[dataset_name]
+        if issubclass(task_class, AccuracyTask):
+            return task_class
+        else:
+            raise ValueError(f"Unknown dataset: {dataset_name}.")
+    except KeyError:
+        raise ValueError(f"Not registered dataset: {dataset_name}.")

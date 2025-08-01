@@ -59,6 +59,11 @@ class ResponseWrapper:
         self._response = response
         self.logprobs = logprobs
 
+    @property
+    def _is_llm_response(self):
+        response = object.__getattribute__(self, '_response')
+        return isinstance(response, tllm.Response)
+
     def __getattr__(self, name):
         response = object.__getattribute__(self, '_response')
         return getattr(response, name)
@@ -79,6 +84,7 @@ class CompletionOutput:
         stop_reason (int, str, optional): The stop string or token id that caused the completion to stop, None if the completion finished for some other reason. Defaults to None.
         generation_logits (torch.Tensor, optional): The logits on the generated output token ids. Defaults to None.
         disaggregated_params (tensorrt_llm.disaggregated_params.DisaggregatedParams, optional): Parameters needed for disaggregated serving. Includes the type of request, the first generated tokens, the context request id and the any additional state needing to be transferred from context and generation instances. Defaults to None.
+        request_perf_metrics (tensorrt_llm.bindings.executor.RequestPerfMetrics, optional): Performance metrics for the request. Defaults to None.
 
     Attributes:
         length (int): The number of generated tokens.
@@ -97,6 +103,7 @@ class CompletionOutput:
     stop_reason: Optional[Union[int, str]] = None
     generation_logits: Optional[torch.Tensor] = None
     disaggregated_params: Optional[DisaggregatedParams] = None
+    request_perf_metrics: Optional[tllm.RequestPerfMetrics] = None
 
     # hidden fields for tracking the diffs
     _last_text_len: int = field(default=0, init=False, repr=False)
@@ -209,10 +216,6 @@ class GenerationResultBase:
         else:
             output.token_ids.extend(response_tensors.output_token_ids[src_idx])
 
-        # In PD, the first token should be ignored in streaming mode, since it's already been returned by the context server
-        if self.disaggregated_params is not None and self.disaggregated_params.request_type == "generation_only" and self._streaming and self.decoding_iter == 2:
-            output._last_token_ids_len = 1
-
         if response_tensors.cum_log_probs is not None:
             output.cumulative_logprob = response_tensors.cum_log_probs[src_idx]
 
@@ -225,6 +228,10 @@ class GenerationResultBase:
             output.logprobs = response_tensors.log_probs[src_idx]
             # overcome some WAR in the cpp executor
             if finish_reasons[src_idx] != tllm.FinishReason.CANCELLED:
+                if len(output.logprobs) > output.length:
+                    # LlmResult holds a reference to LogProbStorage, which may be updated by the worker before the result is serialized.
+                    # Therefore, we treat extra logprobs/logits as expected and only consume what's needed.
+                    output.logprobs = output.logprobs[:output.length]
                 assert len(output.logprobs) == output.length
         if response_tensors.generation_logits is not None:
             output.generation_logits = response_tensors.generation_logits[
@@ -235,6 +242,9 @@ class GenerationResultBase:
         if finish_reasons and finish_reasons[
                 src_idx] == tllm.FinishReason.CANCELLED:
             output.finish_reason = 'cancelled'
+
+        if response_tensors.request_perf_metrics is not None:
+            output.request_perf_metrics = response_tensors.request_perf_metrics
 
         if self._done:
             if finish_reasons[src_idx] == tllm.FinishReason.END_ID:
@@ -252,6 +262,10 @@ class GenerationResultBase:
                 output.finish_reason = 'length'
             elif finish_reasons[src_idx] == tllm.FinishReason.TIMED_OUT:
                 output.finish_reason = 'timeout'
+            # For disaggregated serving, finish reason might be NOT_FINISHED which is ok
+            elif finish_reasons[
+                    src_idx] == tllm.FinishReason.NOT_FINISHED and self.disaggregated_params is not None and self.disaggregated_params.request_type == "context_only":
+                output.finish_reason = 'not_finished'
             elif finish_reasons[src_idx] == tllm.FinishReason.CANCELLED:
                 pass
             else:
@@ -289,6 +303,9 @@ class GenerationResultBase:
                     handler(response.error_msg)
 
             response_result = response.result
+            if hasattr(response_result, "_result"):
+                response_result.deserialize()
+
             self._done = response_result.is_final
             context_phase_params = response_result.context_phase_params
             self.decoding_iter = response_result.decoding_iter
@@ -347,9 +364,6 @@ class DetokenizedGenerationResultBase(GenerationResultBase):
         self.tokenizer = tokenizer
         self._streaming = streaming
 
-    @nvtx_range_debug("handle_response",
-                      color="red",
-                      category="DetokenizedGenerationResultBase")
     def _handle_response(self, response: "GenerationExecutor.Response"):
         GenerationResultBase._handle_response(self, response)
 
@@ -366,20 +380,43 @@ class DetokenizedGenerationResultBase(GenerationResultBase):
         if self.sampling_params.detokenize and self.tokenizer is not None:
             for beam_output in self.outputs:
                 beam_output._last_text_len = len(beam_output.text)
-                if hasattr(self.tokenizer, 'decode_incrementally'):
-                    if self._streaming and not self.sampling_params.use_beam_search:
-                        beam_output.text, beam_output._incremental_states = self.tokenizer.decode_incrementally(
-                            beam_output.token_ids_diff,
-                            prev_text=beam_output.text,
-                            states=beam_output._incremental_states,
-                            flush=self._done,
-                            **kwargs)
-                    else:
-                        beam_output.text, _ = self.tokenizer.decode_incrementally(
-                            beam_output.token_ids, flush=self._done, **kwargs)
+                if hasattr(
+                        self.tokenizer, 'decode_incrementally'
+                ) and self._streaming and not self.sampling_params.use_beam_search:
+                    beam_output.text, beam_output._incremental_states = self.tokenizer.decode_incrementally(
+                        beam_output.token_ids_diff,
+                        prev_text=beam_output.text,
+                        states=beam_output._incremental_states,
+                        flush=self._done,
+                        stream_interval=self.sampling_params._stream_interval,
+                        **kwargs)
                 else:
                     beam_output.text = self.tokenizer.decode(
                         beam_output.token_ids, **kwargs)
+
+                is_generating = not self._done
+                is_finished_with_stop_or_length = (
+                    beam_output.finish_reason == 'stop'
+                    or beam_output.finish_reason == 'length')
+
+                if is_generating or is_finished_with_stop_or_length:
+                    for stop_reason, _ in self.sampling_params._get_stop_reasons_and_words(
+                    ):
+                        if isinstance(stop_reason,
+                                      str) and stop_reason in beam_output.text:
+                            stop_pos = beam_output.text.find(stop_reason)
+                            if not self.sampling_params.include_stop_str_in_output:
+                                beam_output.text = beam_output.text[:stop_pos]
+                            else:
+                                beam_output.text = beam_output.text[:stop_pos +
+                                                                    len(stop_reason
+                                                                        )]
+
+                            beam_output.finish_reason = 'stop'
+                            beam_output.stop_reason = stop_reason
+                            self.abort()
+                            self._done = True
+                            break
 
 
 # alias
@@ -612,6 +649,11 @@ def compute_logprobs(
         if logits.dim() == 3:
             # reshape from [1, T, V] to [T, V]
             logits = logits.squeeze(0)
+
+        if tokens is not None and logits.size(0) > len(tokens):
+            # WAR for nvbug 5324291 where TRT backend might return more logits
+            # than output tokens.
+            logits = logits[:len(tokens)]
 
         logprobs = F.log_softmax(logits.to("cuda", dtype=torch.float32), dim=-1)
         topk_vals, topk_indices = torch.topk(logprobs, k=top_k, dim=-1)

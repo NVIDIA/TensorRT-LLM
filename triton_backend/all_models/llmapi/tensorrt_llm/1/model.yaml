@@ -1,0 +1,19 @@
+# ======= TRTLLM Model Configurations =======
+# The below configurations are used to initialize the LLM model
+# Check tensorrt_llm.llmapi.LLM for more details
+model: TinyLlama/TinyLlama-1.1B-Chat-v1.0
+backend: "pytorch"
+
+# Parallel Configurations
+tensor_parallel_size: 1
+pipeline_parallel_size: 1
+
+
+# ======= Triton Server Configurations =======
+# Triton Configurations to override the default values in config.pbtxt
+# If initialized in config.pbtxt, the values cannot be overwritten in model.py
+# Therefore specify here to allow flexibility for testing
+# Check config.pbtxt for other triton configurations
+triton_config:
+  max_batch_size: 0 # The current implementation does not support batching, batch support is tracked in JIRA-4496
+  decoupled: False

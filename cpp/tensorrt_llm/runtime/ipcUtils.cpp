@@ -149,7 +149,7 @@ AllReduceBuffers::AllReduceBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWi
     {
         auto const tpSize = worldConfig.getTensorParallelism();
         mAllReduceCommPtrs = BufferManager::cpu(
-            ITensor::makeShape({static_cast<SizeType32>(7) * tpSize + 2}), nvinfer1::DataType::kINT64);
+            ITensor::makeShape({static_cast<SizeType32>(7) * tpSize + 3}), nvinfer1::DataType::kINT64);
     }
     else
     {
@@ -168,7 +168,7 @@ AllReduceBuffers::AllReduceBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWi
             ? 1 // zero size is not allowed for IpcMemory::allocateIpcMemory.
             : (tpSize * tensorrt_llm::kernels::reduce_fusion::details::kLamportTokenNumThreshold * realHiddenSize
                 * sizeof(half));
-        auto const flagsSize = IpcMemory::FLAGS_SIZE * tpSize * 2;
+        auto const flagsSize = IpcMemory::FLAGS_SIZE * tpSize * 2 * tpSize;
 
         for (auto size :
             {bufferSize, bufferSize, flagsSize, flagsSize, lamportBufferSize, lamportBufferSize, lamportBufferSize})
@@ -177,13 +177,15 @@ AllReduceBuffers::AllReduceBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWi
         }
 
         mAllReduceCommPtrs
-            = BufferManager::cpu(ITensor::makeShape({static_cast<SizeType32>(mIpcMemoryHandles.size()) * tpSize + 2}),
+            = BufferManager::cpu(ITensor::makeShape({static_cast<SizeType32>(mIpcMemoryHandles.size()) * tpSize + 3}),
                 nvinfer1::DataType::kINT64);
         auto commPtrs = BufferRange<void*>(*mAllReduceCommPtrs);
-        auto const CustomARFlagPtr = static_cast<int64_t*>(mAllReduceCommPtrs->data(mAllReduceCommPtrs->getSize() - 1));
-        auto const LamportFlagPtr = static_cast<int64_t*>(mAllReduceCommPtrs->data(mAllReduceCommPtrs->getSize() - 2));
-        *CustomARFlagPtr = 0;
-        *LamportFlagPtr = 0;
+        // Start from 1 since 0 represents released state for barrier at the beginning of the all_reduce.
+        // The last element is the barrier flag counter.
+        mFlagPtrs = manager.copyFrom(std::vector<int64_t>{1, 1, 0}, ITensor::makeShape({3}), MemoryType::kGPU);
+        commPtrs[mIpcMemoryHandles.size() * tpSize] = mFlagPtrs->data();
+        commPtrs[mIpcMemoryHandles.size() * tpSize + 1] = mFlagPtrs->data(1);
+        commPtrs[mIpcMemoryHandles.size() * tpSize + 2] = mFlagPtrs->data(2);
 
         for (std::size_t memIdx = 0; memIdx < mIpcMemoryHandles.size(); memIdx++)
         {

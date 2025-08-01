@@ -2,7 +2,7 @@ import argparse
 
 from tensorrt_llm.scaffolding.controller import (BestOfNController,
                                                  NativeGenerationController,
-                                                 QwenRewardController)
+                                                 PRMController)
 from tensorrt_llm.scaffolding.scaffolding_llm import ScaffoldingLlm
 from tensorrt_llm.scaffolding.worker import TRTLLMWorker
 
@@ -41,13 +41,13 @@ def main():
         kv_cache_free_gpu_memory_fraction=0.2,
         disable_overlap_scheduler=True)
     workers[NativeGenerationController.WorkerTag.GENERATION] = gen_worker
-    workers[QwenRewardController.WorkerTag.REWARD] = reward_worker
+    workers[PRMController.WorkerTag.REWARD] = reward_worker
 
     gen_controller = NativeGenerationController(sampling_params={
         "max_tokens": 4096,
         "temperature": 0.6,
     })
-    reward_controller = QwenRewardController(tokenizer=reward_worker.tokenizer)
+    reward_controller = PRMController(tokenizer=reward_worker.tokenizer)
     controller = BestOfNController(
         generation_controller=gen_controller,
         reward_controller=reward_controller,
@@ -60,8 +60,8 @@ def main():
     prompts = [query]
 
     results = llm.generate(prompts)
-    print(results[0].output.output_str)
-    llm.shutdown(shutdown_wokers=True)
+    print(results[0].outputs[0].text)
+    llm.shutdown(shutdown_workers=True)
     print(f'main shut down done')
 
 

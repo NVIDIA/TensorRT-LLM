@@ -20,6 +20,7 @@ from functools import partial
 from typing import List, Optional, Sequence, Tuple, Union
 
 import numpy as np
+import torch
 
 # isort: off
 import tensorrt as trt
@@ -1147,7 +1148,7 @@ def gemm_swiglu(input: Tensor,
 
     p_dtype = default_net().plugin_config.gemm_swiglu_plugin
     if p_dtype == "fp8":
-        assert bias == None, "fp8 gemm_swiglu does not support bias yet"
+        assert bias is None, "fp8 gemm_swiglu does not support bias yet"
 
     pf_type = trt.PluginField(
         "type_id", np.array([int(str_dtype_to_trt(p_dtype))], np.int32),
@@ -2790,7 +2791,7 @@ def embedding(input: Tensor,
     # Distribute embedding lookup table across multiple GPU
     if tp_size > 1 and tp_group is not None:
         if sharding_dim == 0:  # TP on vocab_size dimension
-            if tp_rank == None:
+            if tp_rank is None:
                 raise ValueError(
                     "Rank cannot be none for tensor parallelism on vocab dim")
 
@@ -3879,6 +3880,8 @@ class AllReduceStrategy(IntEnum):
     AUTO = 3
     ONESHOT = 4
     TWOSHOT = 5
+    LOWPRECISION = 6
+    MNNVL = 7
 
 
 class AllReduceFusionOp(IntEnum):
@@ -3890,7 +3893,7 @@ class AllReduceFusionOp(IntEnum):
     RESIDUAL_RMS_NORM_QUANT_NVFP4 = 5
     RESIDUAL_RMS_NORM_OUT_QUANT_FP8 = 6
     RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4 = 7
-    MOE_ALLREDUCE_RESIDUAL_RMS_NORM = 8
+    MOE_FINALIZE_ALLREDUCE_RESIDUAL_RMS_NORM = 8
 
 
 class AllReduceParams():
@@ -3904,7 +3907,8 @@ class AllReduceParams():
                  scale: Optional[Tensor] = None,
                  norm_pre_residual_weight: Optional[Tensor] = None,
                  eps: float = 1e-06,
-                 enable_allreduce: bool = True):
+                 enable_allreduce: bool = True,
+                 trigger_completion_at_end: bool = True):
         self.strategy = strategy
         self.fusion_op = fusion_op
         self.bias = bias
@@ -3915,6 +3919,7 @@ class AllReduceParams():
         self.eps = eps
         # For torch path only, has no effect on TRT path
         self.enable_allreduce = enable_allreduce
+        self.trigger_completion_at_end = trigger_completion_at_end
         assert fusion_op == AllReduceFusionOp.NONE.value or (residual
                                                              is not None)
 
@@ -3931,6 +3936,45 @@ class AllReduceParams():
         if self.strategy == AllReduceStrategy.AUTO and default_net(
         ).plugin_config.user_buffer:
             self.strategy = AllReduceStrategy.UB
+
+
+class MoEAllReduceParams(AllReduceParams):
+
+    def __init__(self,
+                 device_num_experts: Optional[Tensor] = None,
+                 expert_scale_factor: Optional[Tensor] = None,
+                 expanded_idx_to_permuted_idx: Optional[Tensor] = None,
+                 shared_expert_output: Optional[Tensor] = None,
+                 bias: Optional[Tensor] = None,
+                 residual: Optional[Tensor] = None,
+                 norm_weight: Optional[Tensor] = None,
+                 scale: Optional[Tensor] = None,
+                 norm_pre_residual_weight: Optional[Tensor] = None,
+                 eps: float = 1e-06,
+                 enable_allreduce: bool = True,
+                 is_cutlass_min_latency: bool = False):
+        super().__init__(
+            bias=bias,
+            residual=residual,
+            norm_weight=norm_weight,
+            scale=scale,
+            norm_pre_residual_weight=norm_pre_residual_weight,
+            eps=eps,
+            enable_allreduce=enable_allreduce,
+        )
+        self.device_num_experts = device_num_experts
+        self.expert_scale_factor = expert_scale_factor
+        self.expanded_idx_to_permuted_idx = expanded_idx_to_permuted_idx
+        self.shared_expert_output = shared_expert_output
+        self.is_cutlass_min_latency = is_cutlass_min_latency
+
+    def is_valid(self):
+        if self.is_cutlass_min_latency:
+            return (self.device_num_experts is not None
+                    and self.expert_scale_factor is not None
+                    and self.shared_expert_output is not None)
+        else:
+            return (self.expanded_idx_to_permuted_idx is not None)
 
 
 def create_allreduce_plugin(
@@ -4351,7 +4395,7 @@ def gemm_allreduce(a: Tensor,
         assert a.dtype == trt.fp8
         assert b.dtype == trt.fp8
 
-    if output_dtype == None:
+    if output_dtype is None:
         output_dtype = str_dtype_to_trt(
             default_net().plugin_config.gemm_allreduce_plugin)
     assert output_dtype in [trt.float16, trt.bfloat16]
@@ -4735,7 +4779,7 @@ class RopeEmbeddingUtils:
 
         return inv_freq, concat.reshape(1, -1).astype(dtype)
 
-    def create_sinusoidal_positions_long_rope(
+    def create_sinusoidal_positions_long_rope_for_attention_plugin(
             num_pos: int,
             num_orig_pos: int,
             dim: int,
@@ -4791,9 +4835,49 @@ class RopeEmbeddingUtils:
                         scaling_long_factors, False, True), short_mscale
 
     @staticmethod
+    def create_sinusoidal_positions_long_rope(
+            num_pos: int,
+            dim: int,
+            theta: float,
+            original_max_pos: int,
+            short_factor: List[float],
+            long_factor: List[float],
+            dtype=np.float32,
+            max_seq_len: Optional[int] = None):
+        short_factor = np.array(short_factor, dtype=np.float32)
+        long_factor = np.array(long_factor, dtype=np.float32)
+
+        inv_freq = 1.0 / (theta**(np.arange(0, dim, 2, dtype=np.float32) / dim))
+        t_pos = np.arange(np.max([num_pos, original_max_pos]), dtype=np.float32)
+
+        # Choose proper freqs based on max_seq_len.
+        factor = long_factor if max_seq_len is None or max_seq_len > original_max_pos else short_factor
+        inv_freq = inv_freq / factor
+        freqs = np.einsum("i,j->ij", t_pos, inv_freq)
+        sinusoid_inp = freqs.astype(np.float32)[..., np.newaxis]
+
+        # Apply scaling
+        scale = num_pos / original_max_pos
+        if scale <= 1.0:
+            scaling_factor = 1.0
+        else:
+            scaling_factor = np.sqrt(1.0 +
+                                     np.log(scale) / np.log(original_max_pos))
+
+        # fuse cos/sin into float2 (cos, sin).
+        concat = np.concatenate(
+            (np.cos(sinusoid_inp) * scaling_factor,
+             np.sin(sinusoid_inp) * scaling_factor),
+            axis=-1,
+        )
+
+        return None, concat.reshape(1, -1).astype(dtype)
+
+    @staticmethod
     def create_fake_weight(dim: int, dtype=np.half):
         return np.random.rand(dim).astype(dtype)
 
+    # Note: When not using deepseek_yarn, make sure to set mscale_all_dim to 0.0.
     @staticmethod
     def create_sinusoidal_positions_yarn(
             num_pos: int,
@@ -4806,24 +4890,19 @@ class RopeEmbeddingUtils:
             mscale: float = 1.0,
             mscale_all_dim: float = 1.0,
             duplicate_data: bool = True,
-            dtype=np.float32):
+            dtype=torch.float32):
 
         # Copy from https://huggingface.co/deepseek-ai/DeepSeek-V2/blob/main/modeling_deepseek.py
         # Inverse dim formula to find dim based on number of rotations
-        def yarn_find_correction_dim(num_rotations,
-                                     dim,
-                                     base=10000,
-                                     max_position_embeddings=2048):
+        def yarn_find_correction_dim(num_rotations, dim, base,
+                                     max_position_embeddings):
             return (dim * math.log(max_position_embeddings /
                                    (num_rotations * 2 * math.pi))) / (
                                        2 * math.log(base))
 
         # Find dim range bounds based on rotations
-        def yarn_find_correction_range(low_rot,
-                                       high_rot,
-                                       dim,
-                                       base=10000,
-                                       max_position_embeddings=2048):
+        def yarn_find_correction_range(low_rot, high_rot, dim, base,
+                                       max_position_embeddings):
             low = math.floor(
                 yarn_find_correction_dim(low_rot, dim, base,
                                          max_position_embeddings))
@@ -4836,7 +4915,7 @@ class RopeEmbeddingUtils:
                 high = dim - 1
             return low, high  # Clamp values just in case
 
-        def yarn_get_mscale(scale=1, mscale=1):
+        def yarn_get_mscale(scale, mscale):
             if scale <= 1:
                 return 1.0
             return 0.1 * mscale * math.log(scale) + 1.0
@@ -4845,13 +4924,13 @@ class RopeEmbeddingUtils:
             if min == max:
                 max += 0.001  # Prevent singularity
 
-            linear_func = (np.arange(dim, dtype=dtype) - min) / (max - min)
-            ramp_func = np.clip(linear_func, 0, 1)
+            linear_func = (torch.arange(dim, dtype=dtype) - min) / (max - min)
+            ramp_func = torch.clamp(linear_func, 0, 1)
             return ramp_func
 
-        freq_extra = 1.0 / (base**(np.arange(0, dim, 2, dtype=dtype) / dim))
-        freq_inter = 1.0 / (scaling_factor *
-                            base**(np.arange(0, dim, 2, dtype=dtype) / dim))
+        pos_freqs = base**(torch.arange(0, dim, 2, dtype=dtype) / dim)
+        freq_extra = 1.0 / pos_freqs
+        freq_inter = 1.0 / (scaling_factor * pos_freqs)
 
         low, high = yarn_find_correction_range(
             beta_fast,
@@ -4860,28 +4939,23 @@ class RopeEmbeddingUtils:
             base,
             original_max_position_embeddings,
         )
-        inv_freq_mask = 1.0 - yarn_linear_ramp_mask(low, high,
-                                                    dim // 2).astype(dtype)
+        inv_freq_mask = (1 - yarn_linear_ramp_mask(low, high, dim // 2))
         inv_freq = freq_inter * (1 - inv_freq_mask) + freq_extra * inv_freq_mask
-        sinusoid_inp = np.expand_dims(np.einsum("i , j -> i j",
-                                                np.arange(num_pos, dtype=dtype),
-                                                inv_freq,
-                                                dtype=dtype),
-                                      axis=-1)
+        t = torch.arange(num_pos, dtype=dtype)
+        sinusoid_inp = torch.einsum("i,j -> ij", t, inv_freq).unsqueeze(-1)
 
         _mscale = float(
             yarn_get_mscale(scaling_factor, mscale) /
             yarn_get_mscale(scaling_factor, mscale_all_dim))
 
         if duplicate_data:
-            emb = np.concatenate((sinusoid_inp, sinusoid_inp), axis=-2)
+            emb = torch.cat((sinusoid_inp, sinusoid_inp), dim=-2)
         else:
             emb = sinusoid_inp
 
-        concat = np.concatenate((np.cos(emb) * _mscale, np.sin(emb) * _mscale),
-                                axis=-1)
-
-        return inv_freq, concat.reshape((1, -1)).astype(dtype)
+        concat = torch.cat((torch.cos(emb) * _mscale, torch.sin(emb) * _mscale),
+                           dim=-1)
+        return inv_freq.numpy(), concat.reshape((1, -1)).to(dtype).numpy()
 
     @staticmethod
     def rotate_every_two(tensor: Tensor) -> Tensor:

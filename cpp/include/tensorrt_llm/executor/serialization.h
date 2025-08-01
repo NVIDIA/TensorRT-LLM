@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/tensor.h"
 #include "tensorrt_llm/executor/types.h"
@@ -70,6 +71,11 @@ public:
     static void serialize(PromptTuningConfig const& config, std::ostream& os);
     [[nodiscard]] static size_t serializedSize(PromptTuningConfig const& config);
 
+    // MultimodalInput
+    [[nodiscard]] static MultimodalInput deserializeMultimodalInput(std::istream& is);
+    static void serialize(MultimodalInput const& multimodalInput, std::ostream& os);
+    [[nodiscard]] static size_t serializedSize(MultimodalInput const& multimodalInput);
+
     // MropeConfig
     [[nodiscard]] static MropeConfig deserializeMropeConfig(std::istream& is);
     static void serialize(MropeConfig const& config, std::ostream& os);
@@ -89,6 +95,11 @@ public:
     [[nodiscard]] static kv_cache::SocketState deserializeSocketState(std::istream& is);
     static void serialize(kv_cache::SocketState const& state, std::ostream& os);
     [[nodiscard]] static size_t serializedSize(kv_cache::SocketState const& state);
+
+    // AgentState
+    [[nodiscard]] static kv_cache::AgentState deserializeAgentState(std::istream& is);
+    static void serialize(kv_cache::AgentState const& state, std::ostream& os);
+    [[nodiscard]] static size_t serializedSize(kv_cache::AgentState const& state);
 
     // CacheState
     [[nodiscard]] static kv_cache::CacheState deserializeCacheState(std::istream& is);
@@ -251,6 +262,11 @@ public:
     static InflightBatchingStats deserializeInflightBatchingStats(std::istream& is);
     static void serialize(InflightBatchingStats const& inflightBatchingStats, std::ostream& os);
     static size_t serializedSize(InflightBatchingStats const& inflightBatchingStats);
+
+    // SpecDecodingStats
+    static SpecDecodingStats deserializeSpecDecodingStats(std::istream& is);
+    static void serialize(SpecDecodingStats const& specDecodingStats, std::ostream& os);
+    static size_t serializedSize(SpecDecodingStats const& specDecodingStats);
 
     // IterationStats
     static IterationStats deserializeIterationStats(std::vector<char>& buffer);

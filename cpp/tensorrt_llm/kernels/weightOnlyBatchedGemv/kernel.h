@@ -63,6 +63,10 @@ __global__ void kernel(TypeA* act, TypeA* act_scale, uint8_t* weight, TypeA* sca
         = (tid * StepK / (Details::kInterleave * Details::LayoutDetails::kTileSize)) * Details::LayoutDetails::kTileSize
         + ((tid * StepK) % Details::LayoutDetails::kTileSize);
 
+    bool constexpr scale_zero_ldg128 = Details::kInterleave == 1 && CtaN == 8;
+
+    using AccessTypeScaleZero = std::conditional_t<scale_zero_ldg128, AccessTypeA, TypeA>;
+
     GMemIterator<Mandatory, AccessTypeA, CtaM, Details::kAccessNumA, TypeA> act_iterator(
         act, offset_m * origin_k + real_offset_k, CtaK / Details::kInterleave, origin_k);
     GMemIterator<EnableActScale, AccessTypeA, 1, Details::kAccessNumA, TypeA> act_scale_iterator(
@@ -70,10 +74,10 @@ __global__ void kernel(TypeA* act, TypeA* act_scale, uint8_t* weight, TypeA* sca
     GMemIterator<Mandatory, AccessTypeW, CtaN, Details::kAccessNumW, uint8_t> weight_iterator(weight,
         (interleaved_offset_n * interleaved_k + tid * StepK) / Details::kElemsPerByteW, CtaK / Details::kElemsPerByteW,
         interleaved_k / Details::kElemsPerByteW);
-    GMemIterator<Mandatory, TypeA, CtaN, 1, TypeA> scales_iterator(scales,
+    GMemIterator<Mandatory, AccessTypeScaleZero, CtaN, 1, TypeA> scales_iterator(scales,
         (GroupSize != 0 ? real_offset_k / GroupSize * n : 0) + real_offset_n,
         (GroupSize != 0 ? CtaK / Details::kInterleave / GroupSize * n : 0), Details::kInterleave);
-    GMemIterator<EnableZero, TypeA, CtaN, 1, TypeA> zeros_iterator(zeros,
+    GMemIterator<EnableZero, AccessTypeScaleZero, CtaN, 1, TypeA> zeros_iterator(zeros,
         (GroupSize != 0 ? real_offset_k / GroupSize * n : 0) + real_offset_n,
         (GroupSize != 0 ? CtaK / Details::kInterleave / GroupSize * n : 0), Details::kInterleave);
 
@@ -92,11 +96,19 @@ __global__ void kernel(TypeA* act, TypeA* act_scale, uint8_t* weight, TypeA* sca
         TypeA vec_scale[CtaN], vec_zero[CtaN];
         TypeA tile_a[StepK], tile_w[StepK], tile_w_pack2[CtaN * StepK];
         uint8_t tile_w_quantized[StepK / Details::kElemsPerByteW];
-#pragma unroll
-        for (int i = 0; i < CtaN; ++i)
+        if constexpr (scale_zero_ldg128)
         {
-            scales_iterator.load(vec_scale + i, iter, i);
-            zeros_iterator.load(vec_zero + i, iter, i);
+            scales_iterator.load(vec_scale, iter);
+            zeros_iterator.load(vec_zero, iter);
+        }
+        else
+        {
+#pragma unroll
+            for (int i = 0; i < CtaN; ++i)
+            {
+                scales_iterator.load(vec_scale + i, iter, i);
+                zeros_iterator.load(vec_zero + i, iter, i);
+            }
         }
         act_scale_iterator.load(vec_act_scale, iter);
 #pragma unroll
@@ -112,7 +124,8 @@ __global__ void kernel(TypeA* act, TypeA* act_scale, uint8_t* weight, TypeA* sca
         {
             act_iterator.load(tile_a, iter, i);
             apply_scale<Details, 1, StepK, EnableActScale>(tile_a, vec_act_scale);
-            mma<Details, 1, CtaN, StepK>(tile_acc + i * CtaN, tile_w_pack2, tile_a);
+            mma<Details, 1, CtaN, StepK, EnableZero, ApplyAlphaInAdvance>(
+                tile_acc + i * CtaN, tile_w_pack2, tile_a, vec_scale);
         }
     }
     epilogue<Details, CtaM, CtaN, Threads, EnableBias, ApplyAlphaInAdvance>(out, n, tile_acc, bias, alpha);

@@ -46,6 +46,7 @@ class Tensor;
 
 using TensorPtr = std::shared_ptr<Tensor>;
 using SizeType32 = std::int32_t;
+using SizeType64 = std::int64_t;
 using FloatType = float;
 using TokenIdType = std::int32_t;
 using VecTokens = std::vector<TokenIdType>;
@@ -294,6 +295,24 @@ struct InflightBatchingStats
     float avgNumDecodedTokensPerIter;
 };
 
+/// @brief Struct that holds speculative decoding stats
+struct SpecDecodingStats
+{
+    /// @brief Total number of proposed draft tokens for all requests
+    SizeType64 numDraftTokens;
+    /// @brief Total number of accepted draft tokens for all requests
+    SizeType64 numAcceptedTokens;
+    /// @brief Number of requests with at least one draft token in batch
+    SizeType64 numRequestsWithDraftTokens;
+    /// @brief Acceptance length, defined as average number of tokens produced per step for all requests with at least
+    /// one draft token
+    double acceptanceLength;
+    /// @brief Iteration latency for draft token generation only (ms)
+    double iterLatencyMS;
+    /// @brief Draft overhead, defined as iterLatencyMS (specdec) / iterLatencyMS (total)
+    double draftOverhead;
+};
+
 /// @brief Struct that holds the stats of a single iteration
 struct IterationStats
 {
@@ -341,6 +360,8 @@ struct IterationStats
     std::optional<StaticBatchingStats> staticBatchingStats;
     /// @brief Stats specific to inflight batching
     std::optional<InflightBatchingStats> inflightBatchingStats;
+    /// @brief Stats specific to speculative decoding
+    std::optional<SpecDecodingStats> specDecodingStats;
 };
 
 /// @brief Enum class that represents the state of a request
@@ -497,6 +518,14 @@ enum class FinishReason
 
     /// @brief The request was cancelled by calling cancelRequest.
     kCANCELLED = 5
+};
+
+//! \brief Enum describing the transfer mode for KV cache.
+enum class KvCacheTransferMode
+{
+    DRAM = 0,                 //!< Copy to/from CPU memory (original approach).
+    GDS = 1,                  //!< Attempt GPUDirect Storage (cuFile).
+    POSIX_DEBUG_FALLBACK = 2, //!< Force a POSIX read/write for debugging.
 };
 
 /// @brief mode of the decoder

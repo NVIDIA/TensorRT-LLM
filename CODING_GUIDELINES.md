@@ -298,7 +298,7 @@ for (int i = 0; i < static_cast<int>(mTensors.size()); ++i)
 1. C headers should not be used directly.
    - Example: Use `<cstdint>` instead of  `<stdint.h>`
 2. Do not use C library functions, whenever possible.
-   * Use brace initialization or `std::fill_n()` instead of `memset()`. This is especially important when dealing with non-[POD types](http://en.cppreference.com/w/cpp/concept/PODType). In the example below, using `memset()` will corrupt the vtable of `Foo:`
+   * Use brace initialization or `std::fill_n()` instead of `memset()`. This is especially important when dealing with non-[POD types](https://en.cppreference.com/w/cpp/named_req/PODType). In the example below, using `memset()` will corrupt the vtable of `Foo:`
 ```cpp
 struct Foo {
     virtual int getX() { return x; }

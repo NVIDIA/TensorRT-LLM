@@ -1,36 +1,14 @@
 import json
 from functools import partial
-from typing import Any, Dict, List, TextIO, Tuple
+from typing import List, TextIO, Tuple
 
 from transformers import AutoTokenizer, PreTrainedTokenizer
 
 from tensorrt_llm.bench.dataclasses.general import (DatasetMetadata,
                                                     InferenceRequest)
 from tensorrt_llm.bench.dataclasses.statistics import PercentileStats
-from tensorrt_llm.inputs import (INPUT_FORMATTER_MAP, default_image_loader,
-                                 default_video_loader)
-
-
-def prepare_multimodal_inputs(model_dir: str,
-                              model_type: str,
-                              modality: str,
-                              prompts: List[str],
-                              media: List[str],
-                              image_data_format: str = "pt",
-                              num_frames: int = 8) -> List[Dict[str, Any]]:
-
-    inputs = []
-    if modality == "image":
-        inputs = default_image_loader(prompts, media, image_data_format)
-    elif modality == "video":
-        inputs = default_video_loader(prompts, media, image_data_format,
-                                      num_frames)
-    else:
-        raise ValueError(f"Unsupported modality: {modality}")
-
-    inputs = INPUT_FORMATTER_MAP[model_type](model_dir, inputs)
-
-    return inputs
+from tensorrt_llm.executor.request import LoRARequest
+from tensorrt_llm.inputs import default_multimodal_input_loader
 
 
 def initialize_tokenizer(model_name: str) -> PreTrainedTokenizer:
@@ -100,56 +78,84 @@ def create_dataset_from_stream(
     # For each line in the standard input, parse out the JSON string we expect
     # to see.
     # Note the := walrus -- we're assigning and checking the condition.
-    all_isl = []
     all_osl = []
-    all_seq_len = []
-    while (line := stream.readline()) and len(dataset) < max_requests:
+    prompts = []
+    media_paths = []
+    all_logits = []
+    task_ids = []
+    lora_requests = []
+    while (line := stream.readline()) and len(task_ids) < max_requests:
         # We expect the data to come in as a JSON string.
         # For example:
         # {"prompt": "Generate an infinite response to the following:
         # There once was a man who.", "output_tokens": 1000}
+        #
+        # For multimodal data, the data should be of the form:
+        # {"prompt": "Generate an infinite response to the following:
+        # There once was a man who.", "output_tokens": 1000,
+        # "media_paths": ["/path/to/image1.jpg", "/path/to/image2.jpg"]}
+        #
+        # For LoRA data, the data should be of the form:
+        # {"prompt": "Generate an infinite response to the following:
+        # There once was a man who.", "output_tokens": 1000,
+        # "lora_request": {"lora_name": "my_lora", "lora_int_id": 1, "lora_path": "/path/to/lora"}}
+        #
         # Each line should be a complete JSON dictionary with no indentation
         # or newline characters.
         data = json.loads(line)
-        if modality is not None:
-            # Multimodal data
-            assert modality in [
-                "image", "video"
-            ], f"Modality must be one of ['image', 'video'] but got {modality}."
+        prompts.append(data.get("prompt"))
+        media_paths.append(data.get("media_paths", None))
+        all_logits.append(data.get("input_ids", data.get("logits", None)))
+        all_osl.append(data.get("output_tokens"))
+        task_ids.append(data.get("task_id"))
 
-            prompt = data.get("prompt")  # cannot be None
-            media_paths = data.get("media_paths", None)
-            inputs = prepare_multimodal_inputs(
-                model_dir,
-                model_type,
-                modality,
-                prompts=[prompt],
-                media=media_paths)  # list of dicts
-            logits = None  # cannot tokenize multi-modal data, handled by preprocessor
-            prompt = inputs[0]
+        # Parse LoRA request if present
+        lora_data = data.get("lora_request", None)
+        if lora_data:
+            lora_request = LoRARequest(lora_name=lora_data["lora_name"],
+                                       lora_int_id=lora_data["lora_int_id"],
+                                       lora_path=lora_data.get("lora_path", ""))
+            lora_requests.append(lora_request)
         else:
-            logits = data.get("input_ids", data.get("logits", None))
-            prompt = data.get("prompt", None)
+            lora_requests.append(None)
+
+    if modality is not None:
+        # Multimodal data need extra preprocessing
+        assert modality in [
+            "image", "video"
+        ], f"Modality must be one of ['image', 'video'] but got {modality}."
+        prompts = default_multimodal_input_loader(
+            tokenizer=tokenizer,
+            model_dir=model_dir,
+            model_type=model_type,
+            modality=modality,
+            prompts=prompts,
+            media=media_paths)  # list of dicts
+
+    all_isl = []
+    all_seq_len = []
+    for prompt, logits, osl, task_id, lora_request in zip(
+            prompts, all_logits, all_osl, task_ids, lora_requests):
+        if modality is not None:
+            # NOTE: we cannot tokenize multi-modal data, handled by preprocessor
+            #       so the actual sequence length is unknown until the model is run
+            logits = None
+            cur_isl = max_input_seq_len_for_multimodal
+        else:
             # If the request comes in with logits, just use the provided.
             # Otherwise we need to tokenize it.
             logits = tokenize(prompt)["input_ids"] if logits is None else logits
-        task_id = data["task_id"]
-        osl = data["output_tokens"]
+            cur_isl = len(logits)
+        all_isl.append(cur_isl)
+        all_seq_len.append(cur_isl + osl)
 
         request = InferenceRequest(
             task_id=task_id,
             prompt=prompt,
             output_tokens=output_limiter(osl),
             input_ids=logits,
+            lora_request=lora_request,
         )
-        all_osl.append(osl)
-        if modality is not None:
-            cur_isl = max_input_seq_len_for_multimodal  # NOTE: actual sequence length is unknown until the model is run
-            all_isl.append(cur_isl)
-            all_seq_len.append(cur_isl + osl)
-        else:
-            all_isl.append(len(logits))
-            all_seq_len.append(len(logits) + osl)
         dataset.append(request)
 
     isl_stats = PercentileStats.from_iterable(all_isl)

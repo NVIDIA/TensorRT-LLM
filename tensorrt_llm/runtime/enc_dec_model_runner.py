@@ -165,8 +165,7 @@ class EncDecModelRunner:
             if self.encoder_runtime_mapping.has_pp():
                 # for Pipeline Parallelism in encoder
                 self.nccl_comm = torch.classes.trtllm.NcclCommunicatorOp(
-                    self.encoder_runtime_mapping.tp_size,
-                    self.encoder_runtime_mapping.pp_size,
+                    self.encoder_runtime_mapping.world_size,
                     self.encoder_runtime_mapping.rank)
 
             # session setup

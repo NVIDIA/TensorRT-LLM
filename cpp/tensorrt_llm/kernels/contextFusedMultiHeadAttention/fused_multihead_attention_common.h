@@ -66,9 +66,8 @@ enum class ContextAttentionMaskType
     PADDING = 0,
     // Mask the padded tokens and all the tokens that come after in a sequence.
     CAUSAL,
-    // Causal mask + mask the beginning tokens based on sliding_window_size
-    // Only pay attention to [max(0, q_i - sliding_window_size), q_i]
-    SLIDING_WINDOW_CAUSAL,
+    // Causal mask + attend to the specific sliding window or chunk.
+    SLIDING_OR_CHUNKED_CAUSAL,
     // The custom mask input.
     CUSTOM_MASK
 };
@@ -156,7 +155,7 @@ struct MHARunnerFixedParams
         {
         case ContextAttentionMaskType::PADDING: output += "padding"; break;
         case ContextAttentionMaskType::CAUSAL: output += "causal"; break;
-        case ContextAttentionMaskType::SLIDING_WINDOW_CAUSAL: output += "sliding_window_causal"; break;
+        case ContextAttentionMaskType::SLIDING_OR_CHUNKED_CAUSAL: output += "sliding_or_chunked_causal"; break;
         case ContextAttentionMaskType::CUSTOM_MASK: output += "custom_mask"; break;
         default: output += std::to_string(static_cast<int>(attentionMaskType)) + " (unknown)"; break;
         }
@@ -205,8 +204,8 @@ struct MHARunnerFixedParams
         case 1: // tensorrt_llm::kernels::AttentionMaskType::CAUSAL
             attentionMaskType = ContextAttentionMaskType::CAUSAL;
             break;
-        case 2: // tensorrt_llm::kernels::AttentionMaskType::SLIDING_WINDOW_CAUSAL
-            attentionMaskType = ContextAttentionMaskType::SLIDING_WINDOW_CAUSAL;
+        case 2: // tensorrt_llm::kernels::AttentionMaskType::SLIDING_OR_CHUNKED_CAUSAL
+            attentionMaskType = ContextAttentionMaskType::SLIDING_OR_CHUNKED_CAUSAL;
             break;
         // NOTE: For BIDIRECTIONAL, BIDIRECTIONALGLM, BLOCKSPARSE context phase, CAUSAL mask is used
         case 3: // tensorrt_llm::kernels::AttentionMaskType::BIDIRECTIONAL
@@ -234,12 +233,16 @@ struct MHARunnerParams
 {
     // The batch size.
     int b;
+    // The number of grouped heads.
+    int numGroupedHeads = 1;
     // The max q sequence length.
     int qSeqLen;
     // The max kv sequence length.
     int kvSeqLen;
     // The sliding window size.
     int slidingWindowSize;
+    // The chunked attention size.
+    int chunkedAttentionSize = INT_MAX;
     // The total number of Q sequence lengths in the batch.
     int totalQSeqLen;
     // The total number of KV sequence lengths in the batch.
@@ -339,6 +342,10 @@ struct Fused_multihead_attention_params_v2
     void const* qkv_ptr;
     // The separate Q matrice.
     void const* q_ptr;
+    // The separate K matrice.
+    void const* k_ptr;
+    // The separate V matrice.
+    void const* v_ptr;
     // The separate KV matrice.
     void const* kv_ptr;
     // The separate paged kv cache.
@@ -350,14 +357,12 @@ struct Fused_multihead_attention_params_v2
     // The Softmax stats vector of layout [2, B, S, H], including softmax_sum and softmax_max
     void* softmax_stats_ptr;
 
-    // The stride between rows of the Q, K and V matrices.
-    int64_t qkv_stride_in_bytes;
-    // The stride between rows of the separate Q matrice.
+    // The stride between rows of Q.
     int64_t q_stride_in_bytes;
-    // The stride between rows of the separate KV matrice.
-    int64_t kv_stride_in_bytes;
-    // The stride between rows of the separate V matrice, set if it is not same as that of K.
-    int64_t v_stride_in_bytes = 0;
+    // The stride between rows of K.
+    int64_t k_stride_in_bytes;
+    // The stride between rows of V.
+    int64_t v_stride_in_bytes;
     // The stride between matrices of packed mask.
     int64_t packed_mask_stride_in_bytes;
     // The stride between rows of O.
@@ -372,7 +377,8 @@ struct Fused_multihead_attention_params_v2
     // Kv in packed qkv layout: [B, S, 3, H, D]
     // Contiguous kv layout: [B, 2, H, S, D].
     // Paged kv layout: [UINT32_MAX, H, Tokens_per_block, D].
-    cudaTmaDesc tma_desc_kv;
+    cudaTmaDesc tma_desc_k;
+    cudaTmaDesc tma_desc_v;
     // Tma descriptor for o
     cudaTmaDesc tma_desc_o;
 
@@ -384,9 +390,13 @@ struct Fused_multihead_attention_params_v2
     int b, h, h_kv, h_q_per_kv, s, d;
     // The dimension of V. If unset, dv = d.
     int dv = 0;
+    // The number of grouped heads.
+    int num_grouped_heads = 1;
     // Sliding Window Attention
     // Only pay attention to [max(0, query_idx - sliding_window_size), query_idx].
     int sliding_window_size = INT_MAX;
+    // The chunked attention size in log2 (> 0 means chunked attention is used)
+    int log2_chunked_attention_size = 0;
     // The scaling factors for the kernel.
     uint32_t scale_bmm1, softcapping_scale_bmm1, scale_softmax, scale_bmm2;
 
@@ -426,10 +436,6 @@ struct Fused_multihead_attention_params_v2
             float* scales;
         } q, k, v;
     } sage;
-
-    // Separate TMA descriptor for V when d != dv in packed qkv input layout, e.g. MLA + 192/128 dims
-    // We need to add this parameter in the tail of the struct for cubin compatibility
-    cudaTmaDesc tma_desc_v;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -443,7 +449,7 @@ struct Launch_params
     int total_q_seqlen = 0;
     // total kv sequence length.
     int total_kv_seqlen = 0;
-    // padded head size (new power of 2) for tma descriptors.
+    // padded head size for tma descriptors.
     int padded_d = 0;
     // flags to control small batch kernel choice
     // true: never unroll

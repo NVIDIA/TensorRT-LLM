@@ -12,8 +12,10 @@ from torch.fx.passes.split_module import split_module
 from tensorrt_llm.llmapi.utils import enable_llm_debug
 from tensorrt_llm.logger import logger
 
-from ..utils import get_piecewise_cuda_graph_flag, make_weak_ref
-from .utils import (get_arg, get_enable_piecewise_cuda_graph_capture_flag,
+from ..utils import (get_model_extra_attrs, get_piecewise_cuda_graph_flag,
+                     make_weak_ref)
+from .multi_stream.auto_multi_stream import multi_stream_schedule
+from .utils import (get_enable_piecewise_cuda_graph_capture_flag,
                     is_call_function)
 
 
@@ -29,6 +31,7 @@ class PiecewiseInterpreter(Interpreter):
         graph_pool_handle: tuple[int, int],
         garbage_collect_values: bool = True,
         graph=None,
+        max_num_streams: int = 1,
     ):
         super().__init__(module, garbage_collect_values, graph)
 
@@ -39,6 +42,8 @@ class PiecewiseInterpreter(Interpreter):
         self.exclude_modules = [f"submod_{i}" for i in exclude_modules_id]
         self.graph_pool_handle = graph_pool_handle
         self.enable_inductor = enable_inductor
+        self.num_events = 0
+        self.max_num_streams = max_num_streams
 
     def run(self, *args):
         fake_args = [
@@ -71,6 +76,11 @@ class PiecewiseInterpreter(Interpreter):
                                                               dim_idx)
                                     found_dynamic_shape = True
                                     break
+
+            if self.max_num_streams > 1 and not self.enable_inductor:
+                num_events = multi_stream_schedule(submod, self.max_num_streams)
+                self.num_events = max(self.num_events, num_events)
+                submod.recompile()
 
             self.module.__dict__[target] = PiecewiseRunner(
                 submod,
@@ -179,8 +189,12 @@ class PiecewiseRunner(object):
             with patch("gc.collect", lambda: None):
                 # TODO: consider to use `make_graphed_callables()` when
                 # it's ready rather than capture it ourselves
+                # Graph Capture would override the stream. We need to setup the stream correctly.
+                extra_attrs = get_model_extra_attrs()
                 with torch.cuda.graph(graph, pool=self.graph_pool_handle):
+                    extra_attrs["global_stream"] = torch.cuda.current_stream()
                     output = entry.callable(*args)
+                extra_attrs["global_stream"] = torch.cuda.current_stream()
 
             entry.cuda_graph = graph
             # Mark weak ref here. The intermediate activation tensor should be freed properly.
@@ -218,55 +232,10 @@ def piecewise_optimizer(
     input_num_tokens: Union[int | torch.SymInt],
     cuda_graph_batch_sizes: Sequence[int],
     graph_pool_handle: tuple[int, int],
-) -> GraphModule:
+    max_num_streams: int = 1,
+) -> tuple[GraphModule, int]:
     graph_pool_handle = torch.cuda.graph_pool_handle()
     graph = gm.graph
-    nodes_to_remove = []
-
-    symint_node = {}
-
-    for node in graph.nodes:
-        if node.op == "placeholder":
-            if isinstance(node.meta["val"], torch.SymInt):
-                symint_node[str(node.meta["val"])] = node
-
-        elif is_call_function(node, torch.ops.trtllm.attention.default):
-            q = get_arg(node, 0, "q")
-            fake_mode = detect_fake_mode()
-            with fake_mode:
-                new_output_tensor = torch.ops.trtllm.attention.default(
-                    *[
-                        i.meta["val"] if hasattr(i, "meta") else i
-                        for i in node.args
-                    ],
-                    **node.kwargs,
-                )
-            with graph.inserting_before(node):
-                output = graph.call_function(
-                    torch.ops.aten.new_empty.default,
-                    (q, [
-                        symint_node[str(i)]
-                        if isinstance(i, torch.SymInt) else i
-                        for i in new_output_tensor.shape
-                    ]),
-                    {"dtype": new_output_tensor.dtype},
-                )
-                if len(node.args) > 3:
-                    args = node.args[:3] + tuple((output, )) + node.args[3:]
-                else:
-                    node.kwargs["output"] = output
-                new_attention = graph.call_function(
-                    torch.ops.trtllm.attention_inplace.default, args,
-                    node.kwargs)
-                node.replace_all_uses_with(output)
-                output.meta["val"] = new_output_tensor
-
-            nodes_to_remove.append(node)
-
-    for node in nodes_to_remove:
-        graph.erase_node(node)
-
-    gm.recompile()
 
     stop_partition = False
     node_to_graph_id = {}
@@ -278,13 +247,14 @@ def piecewise_optimizer(
             continue
         if (not stop_partition and is_call_function(node, [
                 torch.ops.trtllm.attention_inplace.default,
+                torch.ops.trtllm.mla_custom_op_inplace.default,
                 torch.ops.aten.index.Tensor,
                 torch.ops.aten.cumsum.default,
         ])):
             idx += 1
             node_to_graph_id[node] = idx
             exclude_modules_id.append(idx)
-            if node.target != torch.ops.trtllm.attention_inplace.default:
+            if node.target != torch.ops.trtllm.attention_inplace.default and node.target != torch.ops.trtllm.mla_custom_op_inplace.default:
                 # We only know it is safe to continue splitting after attention
                 # since attention_inplace will not produce any new tensor
                 stop_partition = True
@@ -298,13 +268,16 @@ def piecewise_optimizer(
                       lambda node: node_to_graph_id[node],
                       keep_original_order=True)
 
-    PiecewiseInterpreter(
+    interpreter = PiecewiseInterpreter(
         gm,
         enable_inductor,
         input_num_tokens,
         cuda_graph_batch_sizes,
         exclude_modules_id,
         graph_pool_handle,
-    ).run(*example_inputs)
+        max_num_streams=max_num_streams,
+    )
 
-    return gm
+    interpreter.run(*example_inputs)
+
+    return gm, interpreter.num_events

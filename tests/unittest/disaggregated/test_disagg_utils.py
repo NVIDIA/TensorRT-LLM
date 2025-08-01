@@ -51,24 +51,24 @@ def sample_yaml_file(tmp_path):
     return yaml_file
 
 
-def test_parse_disagg_config_file(sample_yaml_file):
-    config = parse_disagg_config_file(sample_yaml_file)
-    assert isinstance(config, DisaggServerConfig)
+def verify_disagg_config(config: DisaggServerConfig):
     assert config.hostname == "test_host"
     assert config.port == 9000
     assert config.ctx_router_config.type == "round_robin"
     assert config.gen_router_config.type == "load_balancing"
     assert len(config.server_configs) == 3
+
+
+def test_parse_disagg_config_file(sample_yaml_file):
+    config = parse_disagg_config_file(sample_yaml_file)
+    assert isinstance(config, DisaggServerConfig)
+    verify_disagg_config(config)
 
 
 def test_extract_disagg_cfg(sample_yaml_config):
     config = extract_disagg_cfg(**sample_yaml_config)
     assert isinstance(config, DisaggServerConfig)
-    assert config.hostname == "test_host"
-    assert config.port == 9000
-    assert config.ctx_router_config.type == "round_robin"
-    assert config.gen_router_config.type == "load_balancing"
-    assert len(config.server_configs) == 3
+    verify_disagg_config(config)
 
 
 def test_extract_ctx_gen_cfgs():

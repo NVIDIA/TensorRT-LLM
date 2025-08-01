@@ -1,27 +1,29 @@
 from collections import defaultdict
-from typing import Callable, Optional
+from typing import Optional
 
 import torch
 from torch.fx import GraphModule, Node
 
 from ...utils.cuda_mem_tracker import cuda_memory_tracker
 from ...utils.logger import ad_logger
-from ...utils.node_utils import identify_regions_between_residuals, is_linear_op, is_op
+from ...utils.node_utils import bfs, identify_regions_between_residuals, is_linear_op, is_op
+from ...utils.quantization_utils import get_scales_and_type_from_node
 from .._graph import canonicalize_graph
 
 
-def match_moe_pattern(gm: GraphModule) -> GraphModule:
+def match_moe_pattern(gm: GraphModule) -> None:
     graph = gm.graph
 
-    ad_logger.info("MoE Pattern Matching")
     ad_logger.debug("Before MoE Pattern Matching: " + str(gm))
     # Preprocessing: Identify boundary nodes (e.g. residual connections) in the graph.
     boundary_nodes = identify_regions_between_residuals(gm)
 
+    num_moe_patterns = 0
+
     for start_boundary, end_boundary in zip(boundary_nodes[:-1], boundary_nodes[1:]):
         # Step 1: Identify Expert Compute pattern
-        pattern_input_nodes, pattern_output_nodes, expert_weights = _match_expert_compute_pattern(
-            start_boundary, end_boundary
+        (pattern_input_nodes, pattern_output_nodes, expert_weights, expert_scales, weight_type) = (
+            _match_expert_compute_pattern(start_boundary, end_boundary)
         )
         if not expert_weights:
             continue
@@ -36,7 +38,7 @@ def match_moe_pattern(gm: GraphModule) -> GraphModule:
         common_ancessor2 = _find_lowest_common_ancessor(arg2_list)
         if not common_ancessor2:
             continue
-        selected_experts = _bfs(
+        selected_experts = bfs(
             common_ancessor2,
             lambda node: is_op(node, torch.ops.aten.one_hot),
             attr_next="all_input_nodes",
@@ -55,29 +57,70 @@ def match_moe_pattern(gm: GraphModule) -> GraphModule:
         if final_hidden_state_node is None:
             continue
 
-        # Step 5: Insert the moe op into the graph.
+        # Step 5: Insert the MoE op into the graph.
         ad_logger.debug(
-            f"""Found MoE Pattern: between boundary {start_boundary} and {end_boundary}.\n
-            Capturing input hidden states node: {hidden_states},
-            selected_experts node: {selected_experts}, routing_weights node: {normalized_routing_weights},
-            expert weights : {expert_weights} """
+            f"Found MoE Pattern: between boundary {start_boundary} and {end_boundary}.\n"
+            f"Input hidden states node: {hidden_states}, "
+            f"selected_experts node: {selected_experts}, "
+            f"routing_weights node: {normalized_routing_weights}, "
+            f"expert weights: {expert_weights}, weight type: {weight_type}"
         )
         with graph.inserting_before(final_hidden_state_node):
             w1_list = expert_weights["w1"]
             w2_list = expert_weights["w2"]
             w3_list = expert_weights["w3"]
 
-            fused_moe_node = graph.call_function(
-                torch.ops.moe.torch_moe,
-                args=(
-                    hidden_states,
-                    selected_experts,
-                    normalized_routing_weights,
-                    w1_list,
-                    w2_list,
-                    w3_list,
-                ),
-            )
+            if weight_type == "fp8":
+                fused_moe_node = graph.call_function(
+                    torch.ops.auto_deploy.torch_quant_fp8_moe,
+                    args=(
+                        hidden_states,
+                        selected_experts,
+                        normalized_routing_weights,
+                        w1_list,
+                        w2_list,
+                        w3_list,
+                        expert_scales["w1_input_scale"],
+                        expert_scales["w2_input_scale"],
+                        expert_scales["w3_input_scale"],
+                        expert_scales["w1_weight_scale"],
+                        expert_scales["w2_weight_scale"],
+                        expert_scales["w3_weight_scale"],
+                    ),
+                )
+            elif weight_type == "fp4":
+                fused_moe_node = graph.call_function(
+                    torch.ops.auto_deploy.torch_quant_fp4_moe,
+                    args=(
+                        hidden_states,
+                        selected_experts,
+                        normalized_routing_weights,
+                        w1_list,
+                        w2_list,
+                        w3_list,
+                        expert_scales["w1_input_scale"],
+                        expert_scales["w2_input_scale"],
+                        expert_scales["w3_input_scale"],
+                        expert_scales["w1_weight_scale"],
+                        expert_scales["w2_weight_scale"],
+                        expert_scales["w3_weight_scale"],
+                        expert_scales["w1_alpha"],
+                        expert_scales["w2_alpha"],
+                        expert_scales["w3_alpha"],
+                    ),
+                )
+            else:
+                fused_moe_node = graph.call_function(
+                    torch.ops.auto_deploy.torch_moe,
+                    args=(
+                        hidden_states,
+                        selected_experts,
+                        normalized_routing_weights,
+                        w1_list,
+                        w2_list,
+                        w3_list,
+                    ),
+                )
 
         final_hidden_state_node.replace_all_uses_with(fused_moe_node)
         graph.erase_node(final_hidden_state_node)
@@ -85,33 +128,36 @@ def match_moe_pattern(gm: GraphModule) -> GraphModule:
         while _remove_dead_inplace_nodes_in_region(gm.graph, start_boundary, end_boundary):
             gm.graph.eliminate_dead_code()
 
-    gm = canonicalize_graph(gm)
+        num_moe_patterns += 1
+
+    canonicalize_graph(gm)
+
+    ad_logger.info(f"Found {num_moe_patterns} MoE Patterns")
     ad_logger.debug("After MoE Pattern Matching: " + str(gm))
-    return gm
 
 
-def fuse_moe(gm: torch.fx.GraphModule) -> torch.fx.GraphModule:
+def fuse_moe(gm: torch.fx.GraphModule) -> None:
     """
-    Scan the FX graph and replace all calls to torch.ops.moe.torch_moe with
-    torch.ops.moe.trtllm_fused_moe.
+    Scan the FX graph and replace all calls to torch.ops.auto_deploy.torch_moe with
+    torch.ops.auto_deploy.trtllm_moe_fused.
     """
-    ad_logger.info("MoE fusion")
     ad_logger.debug("Before MoE fusion: " + str(gm))
 
     with cuda_memory_tracker():
-        _insert_fused_moe_ops(gm)
-        gm = canonicalize_graph(gm)
+        fused_key_counter = _insert_fused_moe_ops(gm)
+        if fused_key_counter:
+            canonicalize_graph(gm)
 
+    ad_logger.info(f"Found {fused_key_counter} MoE fusions")
     ad_logger.debug("After MoE fusion: " + str(gm))
-    return gm
 
 
-def _insert_fused_moe_ops(gm: GraphModule):
+def _insert_fused_moe_ops(gm: GraphModule) -> int:
     fused_key_counter = 0
     graph = gm.graph
 
     for node in list(graph.nodes):
-        if not is_op(node, torch.ops.moe.torch_moe):
+        if not is_op(node, torch.ops.auto_deploy.torch_moe):
             continue
 
         ad_logger.debug(f"Found MoE op to fuse: {node} with args: {node.args}")
@@ -139,7 +185,8 @@ def _insert_fused_moe_ops(gm: GraphModule):
 
         with graph.inserting_before(node):
             new_node = graph.call_function(
-                torch.ops.moe.trtllm_fused_moe,
+                # TODO(Fridah-nv): torch.ops.auto_deploy.trtllm_moe_fused for quantized models
+                torch.ops.auto_deploy.trtllm_moe_fused,
                 args=(
                     hidden_states,
                     selected_experts,
@@ -152,25 +199,7 @@ def _insert_fused_moe_ops(gm: GraphModule):
         node.replace_all_uses_with(new_node)
         graph.erase_node(node)
 
-
-def _bfs(
-    node: Node, target: Callable, attr_next: str = "users", boundary: Optional[Node] = None
-) -> Node:
-    queue = [node]
-    visited = set()
-    while queue:
-        cur_node = queue.pop(0)
-        if boundary is not None and cur_node == boundary:
-            continue  # Skip the boundary node.
-        if target(cur_node):
-            return cur_node
-        for next_node in getattr(cur_node, attr_next):
-            if boundary is not None and next_node == boundary:
-                continue  # Do not expand past the boundary.
-            if next_node not in visited:
-                visited.add(next_node)
-                queue.append(next_node)
-    raise RuntimeError(f"Could not find node with target condition {target}.")
+    return fused_key_counter
 
 
 def _find_lowest_common_ancessor(nodes: list[Node]) -> Optional[Node]:
@@ -238,6 +267,32 @@ def _find_lowest_common_ancessor(nodes: list[Node]) -> Optional[Node]:
     return common
 
 
+def _extract_linear_parameters(linear_node: Node) -> tuple[Node, torch.Tensor, Optional[dict], str]:
+    """
+    Given a linear op node, extract the input tensor node, weight tensor,
+    any quantization scales (if the op is quantized), and return a weight type.
+
+    For a torch.ops.auto_deploy.torch_linear_simple.default op:
+      - Returns (input_node, weight, None, "simple")
+
+    For a torch.ops.auto_deploy.torch_quant_fp8_linear op:
+      - Returns (input_node, weight, {"input_scale": input_scale, "weight_scale": weight_scale}, "fp8")
+       For a torch.ops.auto_deploy.torch_quant_fp4_linear op:
+      - Returns (input_node, weight, {"input_scale": input_scale, "weight_scale": weight_scale, "alpha": alpha}, "fp4")
+    """
+    input_node = linear_node.args[0]
+    if is_op(linear_node, torch.ops.auto_deploy.torch_linear_simple):
+        weight = linear_node.args[1]
+        return input_node, weight, None, ""
+    elif {
+        is_op(linear_node, torch.ops.auto_deploy.torch_quant_fp4_linear),
+        is_op(linear_node, torch.ops.auto_deploy.torch_quant_fp8_linear),
+    }:
+        weight = linear_node.args[1]
+        scales, quant_type = get_scales_and_type_from_node(linear_node)
+        return input_node, weight, scales, quant_type
+
+
 def _match_expert_compute_pattern(start_boundary: Node, end_boundary: Node):
     """
     Match the expert compute pattern between the given boundaries.
@@ -246,24 +301,39 @@ def _match_expert_compute_pattern(start_boundary: Node, end_boundary: Node):
 
         (F.silu(x @ w1.t()) * (x @ w3.t())) @ w2.t()
 
-    For each expert, the function returns:
-      - pattern_input_nodes: a list of input nodes (x) used for the expert compute.
-      - pattern_output_nodes: a list of final expert output nodes (the linear op with weight w2).
-      - expert_weights: a dict with keys "w1", "w2", and "w3" mapping to lists of
-        corresponding weight nodes from the w1, w2, and w3 branches.
+    For each expert, the function extracts the input node from the w1 branch and
+    collects the weight parameters from three linear ops (w1, w3, and w2 branches).
+
+    This function supports both:
+      - torch.ops.auto_deploy.torch_linear_simple.default ops, and
+      - torch.ops.auto_deploy.torch_quant_fp8_linear ops (also extracts quantization scales).
+      - torch.ops.auto_deploy.torch_quant_fp4_linear ops (also extracts quantization scales).
+
+    Returns:
+        A tuple:
+          (pattern_input_nodes, pattern_output_nodes, expert_weights, expert_scales, weight_type)
+
+          - pattern_input_nodes: List of input nodes (x) used for the expert compute.
+          - pattern_output_nodes: List of final expert output nodes (the linear op with weight w2).
+          - expert_weights: Dict with keys "w1", "w2", "w3" mapping to lists of weight tensors.
+          - expert_scales: Dict with keys "w1_input_scale", "w1_weight_scale", etc., containing scale tensors
+                           (empty if weight_type is "simple").
+          - weight_type: "fp8" if FP8 ops were used, "simple" otherwise.
     """
     pattern_input_nodes, pattern_output_nodes = [], []
     expert_weights = defaultdict(list)
+    expert_scales = defaultdict(list)
+    weight_type = "simple"  # default
 
     nodes = list(start_boundary.graph.nodes)
     region_nodes = nodes[nodes.index(start_boundary) + 1 : nodes.index(end_boundary)]
 
     for node in region_nodes:
-        if not is_linear_op(node):
+        # Accept both simple and quantized linear ops.
+        if not is_linear_op(node, include_quantization=True):
             continue
 
         final_linear = node
-        # Must have at least one argument, and that first argument must be a Node.
         if not final_linear.args or not isinstance(final_linear.args[0], Node):
             continue
 
@@ -272,39 +342,41 @@ def _match_expert_compute_pattern(start_boundary: Node, end_boundary: Node):
             continue
 
         arg_a, arg_b = mul_node.args[:2]
-        # Pick the silu op from either arg_a or arg_b.
         silu_node = (
             arg_a
-            if (isinstance(arg_a, Node) and is_op(arg_a, torch.ops.aten.silu))
+            if is_op(arg_a, torch.ops.aten.silu)
             else arg_b
-            if (isinstance(arg_b, Node) and is_op(arg_b, torch.ops.aten.silu))
+            if is_op(arg_b, torch.ops.aten.silu)
             else None
         )
         if silu_node is None:
             continue
 
-        if not (
-            silu_node.args
-            and isinstance(silu_node.args[0], Node)
-            and is_linear_op(silu_node.args[0])
-        ):
+        if not (silu_node.args and is_linear_op(silu_node.args[0], include_quantization=True)):
             continue
         linear_w1_node = silu_node.args[0]
 
         # The other branch should be a linear op (w3 branch).
         linear_w3_node = arg_b if arg_a is silu_node else arg_a
-        if not (isinstance(linear_w3_node, Node) and is_linear_op(linear_w3_node)):
+        if not is_linear_op(linear_w3_node, include_quantization=True):
             continue
         if not (linear_w1_node.args and linear_w3_node.args):
             continue
 
-        input_node_w1 = linear_w1_node.args[0]
-        weight_w1 = linear_w1_node.args[1] if len(linear_w1_node.args) > 1 else None
-        weight_w3 = linear_w3_node.args[1] if len(linear_w3_node.args) > 1 else None
-        weight_w2 = final_linear.args[1] if len(final_linear.args) > 1 else None
+        # Extract parameters from each linear op.
+        input_node_w1, weight_w1, quant_params_w1, wt_type_w1 = _extract_linear_parameters(
+            linear_w1_node
+        )
+        _, weight_w3, quant_params_w3, wt_type_w3 = _extract_linear_parameters(linear_w3_node)
+        _, weight_w2, quant_params_w2, wt_type_w2 = _extract_linear_parameters(final_linear)
 
         if None in (weight_w1, weight_w3, weight_w2):
             continue
+
+        # Ensure the weight type is consistent across branches.
+        if wt_type_w1 != wt_type_w3 or wt_type_w1 != wt_type_w2:
+            continue
+        weight_type = wt_type_w1
 
         pattern_input_nodes.append(input_node_w1)
         pattern_output_nodes.append(final_linear)
@@ -312,7 +384,26 @@ def _match_expert_compute_pattern(start_boundary: Node, end_boundary: Node):
         expert_weights["w3"].append(weight_w3)
         expert_weights["w2"].append(weight_w2)
 
-    return pattern_input_nodes, pattern_output_nodes, expert_weights
+        # TODO: sanity check that all experts have same weight type
+        if weight_type == "fp8":
+            expert_scales["w1_input_scale"].append(quant_params_w1["input_scale"])
+            expert_scales["w1_weight_scale"].append(quant_params_w1["weight_scale"])
+            expert_scales["w3_input_scale"].append(quant_params_w3["input_scale"])
+            expert_scales["w3_weight_scale"].append(quant_params_w3["weight_scale"])
+            expert_scales["w2_input_scale"].append(quant_params_w2["input_scale"])
+            expert_scales["w2_weight_scale"].append(quant_params_w2["weight_scale"])
+        elif weight_type == "fp4":
+            expert_scales["w1_input_scale"].append(quant_params_w1["input_scale"])
+            expert_scales["w1_weight_scale"].append(quant_params_w1["weight_scale"])
+            expert_scales["w1_alpha"].append(quant_params_w1["alpha"])
+            expert_scales["w3_input_scale"].append(quant_params_w3["input_scale"])
+            expert_scales["w3_weight_scale"].append(quant_params_w3["weight_scale"])
+            expert_scales["w3_alpha"].append(quant_params_w3["alpha"])
+            expert_scales["w2_input_scale"].append(quant_params_w2["input_scale"])
+            expert_scales["w2_weight_scale"].append(quant_params_w2["weight_scale"])
+            expert_scales["w2_alpha"].append(quant_params_w2["alpha"])
+
+    return pattern_input_nodes, pattern_output_nodes, expert_weights, expert_scales, weight_type
 
 
 def _find_final_hidden_state_node(
@@ -326,7 +417,7 @@ def _find_final_hidden_state_node(
     For each expert output node (from the expert compute pattern), this function:
       1. Retrieves a multiplication node from its users.
       2. Extracts the second argument from the multiplication node (assumed to be the index node).
-      3. Uses a BFS (via _bfs) to locate the subsequent index_add_ node (guarded by the end_boundary).
+      3. Uses a BFS to locate the subsequent index_add_ node (guarded by the end_boundary).
 
     After collecting all such index_add_ nodes, the final hidden state node is determined
     as the one that is not used by any of the other index_add_ nodes.
@@ -346,7 +437,7 @@ def _find_final_hidden_state_node(
         if not (hasattr(mul_node, "args") and len(mul_node.args) >= 2):
             return None
         index_node = mul_node.args[1]
-        index_add_node = _bfs(
+        index_add_node = bfs(
             index_node, lambda n: is_op(n, torch.ops.aten.index_add_), boundary=end_boundary
         )
         if not index_add_node:
@@ -387,7 +478,7 @@ def _extract_index_branches_from_expert_outputs(
         if not mul or len(mul.args) < 2:
             continue
         idx_node = mul.args[1]
-        if not (isinstance(idx_node, Node) and is_op(idx_node, torch.ops.aten.index)):
+        if not is_op(idx_node, torch.ops.aten.index):
             continue
         routing_branches.append(idx_node.args[0])
         experts = idx_node.args[1]
@@ -412,7 +503,7 @@ def _remove_dead_inplace_nodes_in_region(
         return is_op(n, {torch.ops.aten.index_add_}) and len(n.users) == 0
 
     try:
-        node_to_remove = _bfs(start_boundary, target, attr_next="users", boundary=end_boundary)
+        node_to_remove = bfs(start_boundary, target, attr_next="users", boundary=end_boundary)
         ad_logger.debug(f"Removing In-place Dead Node: {node_to_remove}")
         graph.erase_node(node_to_remove)
         return True

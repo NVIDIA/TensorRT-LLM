@@ -5,11 +5,10 @@ from typing import Tuple
 
 import model_explorer
 import torch
+import torch.export as te
 from model_explorer.graph_builder import GraphNode, KeyValue, MetadataItem
 from model_explorer.pytorch_exported_program_adater_impl import PytorchExportedProgramAdapterImpl
 from torch import fx
-
-from ..export import torch_export
 
 
 def print_tensor(self, tensor: torch.Tensor, size_limit: int = 16):
@@ -68,18 +67,18 @@ PytorchExportedProgramAdapterImpl.add_outputs_metadata = add_outputs_metadata
 
 # TODO(yudong): make custom_ops configurable
 CUSTOM_OPS = (
-    torch.ops.dist.all_reduce.default,
+    torch.ops.auto_deploy.torch_dist_all_reduce.default,
     torch.ops.aten.slice.Tensor,
-    torch.ops.attention.fused_mha_with_cache.default,
-    torch.ops.linear.fused_linear_all_reduce.default,
-    torch.ops.linear.simple.default,
+    torch.ops.auto_deploy.triton_attention_fused_mha_with_cache.default,
+    torch.ops.auto_deploy.trtllm_dist_fused_linear_all_reduce.default,
+    torch.ops.auto_deploy.torch_linear_simple.default,
     torch.ops.aten.split_with_sizes.default,
 )
 
 
 # TODO(yudong): make viz as non-block call.
 def visualize_namespace(gm: fx.GraphModule, args: Tuple[torch.Tensor, ...], dynamic_shapes):
-    ep = torch_export(gm, args=args, dynamic_shapes=dynamic_shapes)
+    ep = te.export(gm, args=args, dynamic_shapes=dynamic_shapes)
     graph = ep.graph
     # Ensure the ops land up in the right module for better viz
     for n in graph.nodes:

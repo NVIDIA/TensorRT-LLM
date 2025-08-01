@@ -26,5 +26,6 @@ namespace tensorrt_llm::pybind::runtime
 {
 
 void initBindings(py::module_& m);
+void initBindingsEarly(py::module_& m);
 
 } // namespace tensorrt_llm::pybind::runtime

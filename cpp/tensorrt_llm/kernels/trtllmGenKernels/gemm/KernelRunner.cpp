@@ -18,38 +18,25 @@
 
 #include "KernelRunner.h"
 #include "tensorrt_llm/common/assert.h"
-#include "trtllmGen_export/GemmInterface.h"
-#include "trtllmGen_export/GemmOptions.h"
-#include "trtllmGen_export/trtllm/gen/DtypeDecl.h"
+#include "trtllmGen_gemm_export/GemmInterface.h"
+#include "trtllmGen_gemm_export/GemmOptions.h"
+#include "trtllmGen_gemm_export/trtllm/gen/DtypeDecl.h"
 
 namespace tensorrt_llm
 {
 namespace kernels
 {
 
-namespace tg = trtllm::gen;
+namespace tg = gemm::trtllm::gen;
+using namespace gemm::gemm;
 
-namespace
-{
-tg::Dtype dtypeToTrtllmDtype(Dtype dtype)
-{
-    switch (dtype)
-    {
-    case Dtype::Bfloat16: return tg::Dtype::Bfloat16;
-    case Dtype::Fp16: return tg::Dtype::Fp16;
-    case Dtype::Fp32: return tg::Dtype::Fp32;
-    case Dtype::E2m1: return tg::Dtype::E2m1;
-    case Dtype::E4m3: return tg::Dtype::E4m3;
-    default: TLLM_CHECK_WITH_INFO(false, "Invalid dtype");
-    }
-}
-} // namespace
+static GemmInterface::ModuleCache globalTrtllmGenGemmModuleCache;
 
 TrtllmGenGemmRunner::TrtllmGenGemmRunner(TrtllmGenGemmRunnerOptions const& options_)
     : mOptions(options_)
 {
     // Select a GEMM kernel config to use
-    auto const gemm = gemm::GemmInterface();
+    auto const gemm = GemmInterface();
     auto const configs = gemm.getGemmConfigs();
 
     mPassingConfigIndices.clear();
@@ -59,8 +46,7 @@ TrtllmGenGemmRunner::TrtllmGenGemmRunner(TrtllmGenGemmRunnerOptions const& optio
         auto const options = configs[i].mOptions;
 
         // When we include low-latency kernels we can set transposeMmaOutput via constructor
-        if (options.mDtypeElt == dtypeToTrtllmDtype(mOptions.eltType)
-            && options.mDtypeC == dtypeToTrtllmDtype(mOptions.outputType)
+        if (options.mDtypeA == mOptions.eltType && options.mDtypeC == mOptions.outputType
             && options.mUseDeepSeekFp8 == mOptions.deepSeekFp8
             && options.mTransposeMmaOutput == mOptions.transposeMmaOutput)
         {
@@ -73,14 +59,16 @@ TrtllmGenGemmRunner::TrtllmGenGemmRunner(TrtllmGenGemmRunnerOptions const& optio
 
 size_t TrtllmGenGemmRunner::getWorkspaceSizeInBytes(int32_t m, int32_t n, int32_t k)
 {
-    gemm::GemmData gemmData;
+    GemmData gemmData;
     gemmData.mProblemDimensions.mM = mOptions.transposeMmaOutput ? n : m;
     gemmData.mProblemDimensions.mN = mOptions.transposeMmaOutput ? m : n;
     gemmData.mProblemDimensions.mK = k;
+    gemmData.mProblemDimensions.mRank = 0;
+    gemmData.mProblemDimensions.mWorldSize = 1;
 
     selectGemmConfig(m, n, k);
 
-    auto gemm = gemm::GemmInterface();
+    auto gemm = GemmInterface();
     auto const configs = gemm.getGemmConfigs();
     TLLM_CHECK_WITH_INFO(
         mSelectedConfigIndex.has_value(), "No valid kernel found for given param config and problem size");
@@ -90,11 +78,11 @@ size_t TrtllmGenGemmRunner::getWorkspaceSizeInBytes(int32_t m, int32_t n, int32_
 }
 
 void TrtllmGenGemmRunner::run(int32_t m, int32_t n, int32_t k, void const* a, float const* aScale, void const* b,
-    float const* bScale, void* c, float* cScale, void* workspace, CUstream stream, int device)
+    float const* bScale, void* c, float* cScale, float* cScalePtr, void* workspace, CUstream stream, int device)
 {
-    auto gemm = gemm::GemmInterface();
+    auto gemm = GemmInterface();
 
-    gemm::GemmData gemmData;
+    GemmData gemmData;
 
     auto const configs = gemm.getGemmConfigs();
     TLLM_CHECK_WITH_INFO(
@@ -105,6 +93,8 @@ void TrtllmGenGemmRunner::run(int32_t m, int32_t n, int32_t k, void const* a, fl
     gemmData.mProblemDimensions.mM = mOptions.transposeMmaOutput ? n : m;
     gemmData.mProblemDimensions.mN = mOptions.transposeMmaOutput ? m : n;
     gemmData.mProblemDimensions.mK = k;
+    gemmData.mProblemDimensions.mRank = 0;
+    gemmData.mProblemDimensions.mWorldSize = 1;
 
     // Inputs
     gemmData.mInputBuffers.mPtrA = mOptions.transposeMmaOutput ? b : a;
@@ -115,6 +105,7 @@ void TrtllmGenGemmRunner::run(int32_t m, int32_t n, int32_t k, void const* a, fl
 
     // Outputs
     gemmData.mOutputBuffers.mPtrC = c;
+    gemmData.mOutputBuffers.mPtrSfC = cScalePtr;
 
     int32_t multiProcessorCount;
     cudaDeviceGetAttribute(&multiProcessorCount, cudaDevAttrMultiProcessorCount, device);
@@ -122,7 +113,8 @@ void TrtllmGenGemmRunner::run(int32_t m, int32_t n, int32_t k, void const* a, fl
     // FIXME once we start using all-reduce in the epilogue of the gemm this can be moved elsewhere
     gemm.runInitBeforeWorldSync(config, gemmData, static_cast<void*>(stream));
 
-    auto const err = gemm.run(config, workspace, gemmData, static_cast<void*>(stream), multiProcessorCount);
+    auto const err = gemm.run(
+        config, workspace, gemmData, static_cast<void*>(stream), multiProcessorCount, globalTrtllmGenGemmModuleCache);
 
     TLLM_CHECK_WITH_INFO(err == 0, "Error occurred when running GEMM!");
 }
@@ -130,21 +122,52 @@ void TrtllmGenGemmRunner::run(int32_t m, int32_t n, int32_t k, void const* a, fl
 void TrtllmGenGemmRunner::run(int32_t m, int32_t n, int32_t k, void const* a, void const* b, void* c, float* cScale,
     void* workspace, CUstream stream, int device)
 {
-    run(m, n, k, a, /*aScale*/ nullptr, b, /*bScale*/ nullptr, c, cScale, workspace, stream, device);
+    run(m, n, k, a, /*aScale*/ nullptr, b, /*bScale*/ nullptr, c, cScale, /*cScalePtr*/ nullptr, workspace, stream,
+        device);
 }
 
 void TrtllmGenGemmRunner::selectGemmConfig(int32_t m, int32_t n, int32_t k)
 {
-    auto const gemm = gemm::GemmInterface();
+    auto const gemm = GemmInterface();
     auto const configs = gemm.getGemmConfigs();
 
-    gemm::GemmData gemmData;
+    GemmData gemmData;
     // Dims
     gemmData.mProblemDimensions.mM = mOptions.transposeMmaOutput ? n : m;
     gemmData.mProblemDimensions.mN = mOptions.transposeMmaOutput ? m : n;
     gemmData.mProblemDimensions.mK = k;
+    gemmData.mProblemDimensions.mRank = 0;
+    gemmData.mProblemDimensions.mWorldSize = 1;
 
-    for (auto const& configIndex : mPassingConfigIndices)
+    std::vector<int32_t> sortedIndices = mPassingConfigIndices;
+    std::sort(sortedIndices.begin(), sortedIndices.end(),
+        [&configs](int32_t idx0, int32_t idx1)
+        {
+            auto const& optionsA = configs[idx0].mOptions;
+            auto const& optionsB = configs[idx1].mOptions;
+
+            // Sort by tileK sizes first
+            if (optionsA.mTileK != optionsB.mTileK)
+            {
+                return optionsA.mTileK > optionsB.mTileK;
+            }
+
+            // Then by unroll loop 2x for mma
+            if (optionsA.mUseUnrollLoop2xForMma != optionsB.mUseUnrollLoop2xForMma)
+            {
+                return optionsA.mUseUnrollLoop2xForMma;
+            }
+
+            // Then by splitK sizes
+            if (optionsA.mNumSlicesForSplitK != optionsB.mNumSlicesForSplitK)
+            {
+                return optionsA.mNumSlicesForSplitK > optionsB.mNumSlicesForSplitK;
+            }
+
+            return true;
+        });
+
+    for (auto const& configIndex : sortedIndices)
     {
         auto const& config = configs[configIndex];
         // FIXME: We select the first valid config,

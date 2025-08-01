@@ -1,3 +1,2 @@
-from . import hf
-from .deepseek import *
+from . import hf, patches
 from .factory import *

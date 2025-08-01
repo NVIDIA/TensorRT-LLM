@@ -17,8 +17,11 @@ def test_default_moe_routing(top_k):
 
     logits = torch.tensor(
         [[0.1, 0.2, 0.3, 0.4], [0.4, 0.3, 0.2, 0.1], [0.1, 0.4, 0.2, 0.3]],
-        dtype=torch.float32)
+        dtype=torch.float32).cuda()
     indices, scales = routing.apply(logits)
+    indices = indices.cpu()
+    scales = scales.cpu()
+
     assert indices.shape == (3, top_k)
     assert scales.shape == (3, top_k)
 
@@ -26,7 +29,7 @@ def test_default_moe_routing(top_k):
     assert scales.dtype == torch.float32
     reference_indices = torch.tensor([[3, 2, 1], [0, 1, 2], [1, 3, 2]],
                                      dtype=torch.int32)
-    reference_scales = F.softmax(logits, dim=1)
+    reference_scales = F.softmax(logits, dim=1).cpu()
 
     # Check that the selected experts are the largest top_k values
     for i in range(top_k):
@@ -50,7 +53,7 @@ def test_renormalize_moe_routing(top_k):
 
     logits = torch.tensor(
         [[0.1, 0.2, 0.3, 0.4], [0.4, 0.3, 0.2, 0.1], [0.1, 0.4, 0.2, 0.3]],
-        dtype=torch.float32)
+        dtype=torch.float32).cuda()
     indices, scales = routing.apply(logits)
     assert indices.shape == (3, top_k)
     assert scales.shape == (3, top_k)
@@ -66,6 +69,40 @@ def test_renormalize_moe_routing(top_k):
     assert torch.allclose(scales, reference_scales)
 
 
+def gen_unique_logits(num_tokens, num_experts, dtype):
+    unique_logits = torch.rand((num_tokens, num_experts), dtype=dtype)
+
+    for i in range(unique_logits.size(0)):
+        torch.manual_seed(42 * i)
+        unique_row = torch.randperm(num_experts)
+        unique_logits[i] = unique_row.to(dtype)
+
+    return unique_logits.cuda()
+
+
+@pytest.mark.parametrize("num_tokens", [30])
+@pytest.mark.parametrize("top_k", [2, 8])
+@pytest.mark.parametrize("dtype",
+                         [torch.bfloat16, torch.float32, torch.float16])
+@pytest.mark.parametrize("num_experts", [8, 67, 128])
+def test_customized_renormalize_moe_routing(num_tokens, top_k, num_experts,
+                                            dtype):
+
+    #Because the order of equal elements is unpredictable, we use unique data to prevent any ambiguity.
+    router_logits = gen_unique_logits(num_tokens, num_experts, dtype)
+
+    routing = RenormalizeMoeRoutingMethod(top_k=top_k,
+                                          force_enable_pytorch_op=False)
+    indices, scales = routing.apply(router_logits)
+
+    ref_routing = RenormalizeMoeRoutingMethod(top_k=top_k,
+                                              force_enable_pytorch_op=True)
+    reference_indices, reference_scales = ref_routing.apply(router_logits)
+
+    assert torch.equal(indices, reference_indices)
+    assert torch.allclose(scales, reference_scales)
+
+
 def test_sparse_mixer_reference():
     routing = SparseMixerMoeRoutingMethod(top_k=2, eps=0.2)
     assert routing.experts_per_token == 2
@@ -75,8 +112,10 @@ def test_sparse_mixer_reference():
                            [2.0, 0.0, -float('inf'), -float('inf')],
                            [0.0, 2.0, -float('inf'), -float('inf')],
                            [1.0, 1.0, 1.0, -float('inf')]],
-                          dtype=torch.float32)
+                          dtype=torch.float32).cuda()
     indices, scales = routing.apply(logits.clone())
+    indices = indices.cpu()
+    scales = scales.cpu()
 
     assert indices.shape == (4, routing.experts_per_token)
     assert scales.shape == (4, routing.experts_per_token)
@@ -112,7 +151,7 @@ def test_load_balanced_moe_routing():
         assert routing.experts_per_token == k
 
         # Values don't matter for load balanced routing
-        logits = torch.empty((tokens, 4), dtype=torch.float32)
+        logits = torch.empty((tokens, 4), dtype=torch.float32).cuda()
 
         indices, scales = routing.apply(logits)
         assert indices.shape == (tokens, k)
@@ -129,12 +168,14 @@ def test_load_balanced_moe_routing():
 
 def test_static_moe_routing():
     routing = StaticMoeRoutingMethod(
-        torch.tensor([[0, 1, 2, 3], [0, 1, 2, 3]], dtype=torch.int32))
+        torch.tensor([[0, 1, 2, 3], [0, 1, 2, 3]], dtype=torch.int32).cuda())
     assert routing.experts_per_token == 4
 
     logits = torch.tensor([[0.1, 0.2, 0.3, 0.4], [0.4, 0.3, 0.2, 0.1]],
-                          dtype=torch.float32)
+                          dtype=torch.float32).cuda()
     indices, scales = routing.apply(logits)
+    indices = indices.cpu()
+
     assert scales is None
     assert indices.shape == (2, 4)
     assert indices.dtype == torch.int32
@@ -143,10 +184,12 @@ def test_static_moe_routing():
         indices, torch.tensor([[0, 1, 2, 3], [0, 1, 2, 3]], dtype=torch.int32))
 
     routing = StaticMoeRoutingMethod(
-        torch.tensor([[0, 1, 2, 3], [0, 1, 2, 3]], dtype=torch.int32),
+        torch.tensor([[0, 1, 2, 3], [0, 1, 2, 3]], dtype=torch.int32).cuda(),
         torch.tensor([[1.0, 2.0, 3.0, 4.0], [1.0, 2.0, 3.0, 4.0]],
-                     dtype=torch.float32))
+                     dtype=torch.float32).cuda())
     indices, scales = routing.apply(logits)
+    scales = scales.cpu()
+
     assert scales is not None
     assert scales.shape == (2, 4)
     assert scales.dtype == torch.float32

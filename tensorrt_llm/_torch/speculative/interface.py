@@ -1,21 +1,24 @@
 import copy
 from dataclasses import dataclass, field
 from enum import IntEnum, auto
-from typing import Dict, List, Optional
+from typing import List, Optional, Type
 
 import torch
 
 from ..._utils import get_sm_version
 from ..attention_backend.trtllm import AttentionBackend, TrtllmAttention
-from ..model_config import TConfig
-from ..pyexecutor.scheduler import ScheduledRequests
 
 
 class SpeculativeDecodingMode(IntEnum):
     MTP = auto()
     MTP_EAGLE = auto()
     EAGLE3 = auto()
+    EAGLE3_ONE_MODEL = auto()
+    NGRAM = auto()
+    DRAFT_TARGET = auto()
+    USER_PROVIDED = auto()
     NONE = auto()
+    AUTO = auto()
 
     def is_mtp(self):
         return self == SpeculativeDecodingMode.MTP or self == SpeculativeDecodingMode.MTP_EAGLE
@@ -26,19 +29,59 @@ class SpeculativeDecodingMode(IntEnum):
     def is_eagle3(self):
         return self == SpeculativeDecodingMode.EAGLE3
 
+    def use_one_engine(self):
+        return self.is_mtp() or self.is_eagle3_one_model()
+
+    def is_eagle3_one_model(self):
+        return self == SpeculativeDecodingMode.EAGLE3_ONE_MODEL
+
+    def is_ngram(self):
+        return self == SpeculativeDecodingMode.NGRAM
+
+    def is_user_provided(self):
+        return self == SpeculativeDecodingMode.USER_PROVIDED
+
     def is_none(self):
         return self == SpeculativeDecodingMode.NONE
 
+    def is_draft_target(self):
+        return self == SpeculativeDecodingMode.DRAFT_TARGET
+
     def without_logits(self):
-        return self.is_mtp()
+        return self.is_mtp() or self.is_eagle3_one_model()
 
     def needs_kv_cache_rewind(self):
-        return self.is_mtp()
+        return self.is_mtp() or self.is_eagle3_one_model() or self.is_ngram()
 
     def support_overlap_scheduler(self):
-        return self.is_mtp()
+        return self.is_mtp() or self.is_eagle3_one_model()
 
-    def extend_ctx(self, attention_backend: AttentionBackend):
+    def has_draft_model(self):
+        return self.is_eagle3() or self.is_draft_target()
+
+    def needs_kv_cache_recompute(self):
+        """
+        Whether the draft model needs to recompute the kv cache.
+        If true, the 1st draft model forward will recompute the kv cache for
+        the accepted draft tokens.
+        """
+        return self.is_eagle3()
+
+    def need_load_draft_weights(self):
+        """
+        Whether the draft model and target model are in the same model engine,
+        and the draft model needs to load weights from the separate checkpoint.
+        """
+        return self.is_eagle3_one_model()
+
+    def has_spec_decoder(self):
+        return self.is_mtp() or self.is_eagle3() or self.is_eagle3_one_model()
+
+    def has_spec_drafter(self):
+        return self.is_eagle3() or self.is_draft_target() or self.is_ngram(
+        ) or self.is_user_provided()
+
+    def extend_ctx(self, attention_backend: Type[AttentionBackend]):
         """
         If true, treat generation requests with draft tokens as
         chunked context requests at the kernel level. Required for
@@ -46,42 +89,22 @@ class SpeculativeDecodingMode(IntEnum):
         """
 
         # Fixme: only trtllm attention backend supports eagle3 generation-phase kernels on blackwell.
-        return self.is_eagle3() and not (isinstance(
-            attention_backend, TrtllmAttention) and get_sm_version() == 100)
+        return ((self.is_eagle3() or self.is_draft_target())
+                and not (isinstance(attention_backend, TrtllmAttention)
+                         and get_sm_version() == 100)
+                ) or self.is_ngram() or self.is_user_provided()
+
+    def attention_need_spec_dec_mode(self):
+        """
+        If true, the attention backend kernel needs to run in spec-dec mode (multi-token query mode).
+        """
+        return self.is_eagle3_one_model()
 
     @staticmethod
     def from_string(name: Optional[str]) -> "SpeculativeDecodingMode":
         if name is None:
             return SpeculativeDecodingMode.NONE
         return SpeculativeDecodingMode[name.upper()]
-
-
-@dataclass
-class SpecConfig:
-    """
-    Configuration for speculative decoding.
-    """
-    # The name of speculative decoding.
-    spec_dec_name = None
-    # The mode of speculative decoding.
-    spec_dec_mode: SpeculativeDecodingMode = SpeculativeDecodingMode.NONE
-    # The max number of draft tokens
-    max_draft_tokens: int = 1024
-
-    def __post_init__(self) -> None:
-        self.spec_dec_mode = SpeculativeDecodingMode.from_string(
-            self.spec_dec_name)
-
-    def update_from_model_config(self, model_config: TConfig):
-        pass
-
-    def get_draft_model_prompt(self,
-                               input_tokens: torch.Tensor) -> torch.Tensor:
-        """
-        Override for spec dec modes that need to preprocess prompt
-        tokens before passing them to the draft model.
-        """
-        return input_tokens
 
 
 @dataclass
@@ -92,7 +115,7 @@ class SpecMetadata:
     # The max number of requests in a single batch.
     max_num_requests: int
     # The max number of draft tokens.
-    max_draft_tokens: int
+    max_draft_len: int
     # The number of gen-phase sequences in the batch.
     num_generations: int = 0
     # Whether CUDA graph is enabled.
@@ -113,16 +136,31 @@ class SpecMetadata:
     # The number of tokens for speculative model/layer
     num_tokens: int = 0
     # The number of tokens for speculative model/layer of different rank
-    all_rank_num_tokens: Optional[List[int]] = None
+    _all_rank_num_tokens: Optional[List[int]] = field(init=False,
+                                                      default=None,
+                                                      repr=False)
+    all_rank_num_tokens: Optional[List[int]]
+    # The max number of tokens among all ranks.
+    all_rank_max_num_tokens: Optional[int] = None
+
     # The number of sequences for speculative model/layer of different rank
     all_rank_num_seqs: Optional[List[int]] = None
     # The number of extra kv tokens
     # Some speculative decoding methods need to use different kv lengths for the
     # draft/target layers. But KVCacheManager can only support kv caches with the
     # same kv lengths for different layers. Add extra kv token in kv cache manager
-    # to haddle this issue.
+    # to handle this issue.
     num_extra_kv_tokens: Optional[int] = 0  # Number of layers in target model
+    # The number of layers
     num_layers: int = 0
+
+    # if spec-dec tree is a tree or a chain (linear tree)
+    is_spec_dec_tree: bool = False
+    # if spec-dec tree wouldn't be changed at all, the mask won't be computed every step.
+    is_spec_dec_dynamic_tree: bool = False
+
+    def __post_init__(self):
+        pass
 
     def prepare(self):
         """
@@ -150,20 +188,12 @@ class SpecMetadata:
         model. Use this method to record them. By default, does nothing.
         """
 
-    def get_hidden_states(
-            self,
-            scheduled_requests: ScheduledRequests,
-            num_rejected_tokens: Optional[Dict] = None) -> List[torch.Tensor]:
-        """
-        Return any captured hidden states. Should do any necessary
-        pre-processing.
+    @property
+    def all_rank_num_tokens(self) -> Optional[List[int]]:
+        return self._all_rank_num_tokens
 
-        num_rejected_tokens is a dictionary mapping request IDs to the
-        number of tokens rejected for that request. If a request ID isn't
-        in the dictionary, it means that the request is not needed for drafting.
-
-        If the dictionary is not given, this function assumes that the hidden
-        states are being prepared for running the draft model autoregressively,
-        and only the last hidden state vector for each sequence is returned.
-        """
-        return []
+    @all_rank_num_tokens.setter
+    def all_rank_num_tokens(self, value: Optional[List[int]]):
+        value = value if value is not SpecMetadata.all_rank_num_tokens else None
+        self._all_rank_num_tokens = value
+        self.all_rank_max_num_tokens = max(value) if value is not None else None

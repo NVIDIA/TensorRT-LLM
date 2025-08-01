@@ -16,6 +16,7 @@ import copy
 import os
 import platform
 import re
+import time
 from difflib import SequenceMatcher
 from pathlib import Path
 
@@ -24,23 +25,23 @@ from packaging import version
 from .trt_test_alternative import check_call, check_output, exists, is_windows
 
 
-def venv_check_call(venv, cmd, running_log=None, env=None):
+def venv_check_call(venv, cmd, env=None, **kwargs):
 
     def _war_check_call(*args, **kwargs):
         kwargs["cwd"] = venv.get_working_directory()
         return check_call(*args, **kwargs)
 
-    venv.run_cmd(cmd, caller=_war_check_call, running_log=running_log, env=env)
+    venv.run_cmd(cmd, caller=_war_check_call, env=env, **kwargs)
 
 
-def venv_check_output(venv, cmd):
+def venv_check_output(venv, cmd, env=None, **kwargs):
 
     def _war_check_output(*args, **kwargs):
         kwargs["cwd"] = venv.get_working_directory()
         output = check_output(*args, **kwargs)
         return output
 
-    return venv.run_cmd(cmd, caller=_war_check_output)
+    return venv.run_cmd(cmd, caller=_war_check_output, env=env, **kwargs)
 
 
 def venv_mpi_check_call(venv, mpi_cmd, python_cmd):
@@ -308,7 +309,7 @@ def convert_weights(llm_venv,
             f"--dtype={data_type}",
         ]
 
-    elif "prompt_lookup" in model:
+    elif "ngram" in model:
         if "gpt" in model_path:
             example_name = "gpt"
         elif "llama" in model_path:
@@ -335,9 +336,9 @@ def convert_weights(llm_venv,
         redrafter_draft_len_per_beam = kwargs.pop(
             "redrafter_draft_len_per_beam")
         convert_cmd = [
-            f"{example_root}/{script}", "--model_dir", model_path[0],
-            "--drafter_model_dir", model_path[1], "--output_dir", model_dir,
-            f"--dtype={data_type}", f"--tp_size={tp_size}",
+            f"{example_root}/{script}", "--base_model_checkpoint_dir",
+            model_path[0], "--drafter_model_dir", model_path[1], "--output_dir",
+            model_dir, f"--dtype={data_type}", f"--tp_size={tp_size}",
             f"--redrafter_num_beams={redrafter_num_beams}",
             f"--redrafter_draft_len_per_beam={redrafter_draft_len_per_beam}"
         ]
@@ -771,7 +772,9 @@ def test_multi_lora_support(
     zero_lora_weights=True,
     use_code_prompts=False,
 ):
+    start_time = time.time()
     print("Creating dummy LoRAs...")
+    lora_start = time.time()
     lora_paths = generate_dummy_loras(
         hf_model_dir=hf_model_dir,
         lora_output_dir=llm_venv.get_working_directory(),
@@ -779,8 +782,13 @@ def test_multi_lora_support(
         lora_rank=lora_rank,
         target_modules=target_hf_modules,
         zero_weights=zero_lora_weights)
+    lora_end = time.time()
+    print(
+        f"Creating dummy LoRAs completed in {(lora_end - lora_start):.2f} seconds."
+    )
 
     print("Build engines...")
+    build_start = time.time()
     build_cmd = [
         "trtllm-build",
         f"--checkpoint_dir={tllm_ckpt_dir}",
@@ -801,6 +809,9 @@ def test_multi_lora_support(
         "--max_beam_width=1",
     ]
     check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
+    build_end = time.time()
+    print(
+        f"Build engines completed in {(build_end - build_start):.2f} seconds.")
 
     if use_code_prompts:
         input_prompts = [
@@ -822,6 +833,7 @@ def test_multi_lora_support(
         ]
 
     print("Run inference with C++ runtime with pybind...")
+    inference_start = time.time()
     run_script = f"{example_root}/../../../run.py" if "core" in example_root else f"{example_root}/../run.py"
     run_cmd = [
         run_script,
@@ -842,6 +854,15 @@ def test_multi_lora_support(
         "--max_output_len=30",
     ]
     venv_check_call(llm_venv, run_cmd)
+    inference_end = time.time()
+    print(
+        f"Inference completed in {(inference_end - inference_start):.2f} seconds."
+    )
+
+    total_time = time.time() - start_time
+    print(
+        f"Total test_multi_lora_support execution time: {total_time:.2f} seconds"
+    )
 
 
 def get_dummy_spec_decoding_heads(hf_model_dir,

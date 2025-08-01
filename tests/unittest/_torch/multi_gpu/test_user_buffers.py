@@ -7,7 +7,6 @@ import pytest
 import torch
 import torch.nn as nn
 from mpi4py import MPI
-from mpi4py.futures import MPIPoolExecutor
 from utils.util import skip_pre_blackwell_unittest
 
 import tensorrt_llm
@@ -29,6 +28,9 @@ MPI.pickle.__init__(
     cloudpickle.loads,
     pickle.HIGHEST_PROTOCOL,
 )
+
+# needed since we reuse the mpi executor pool, first test running will leak a thread
+pytestmark = pytest.mark.threadleak(enabled=False)
 
 
 def init_userbuffers_allocator(tp_size, rank, max_ub_size):
@@ -128,7 +130,7 @@ def run_single_rank_ar_rms_norm(tensor_parallel_size, a, b, c, gamma):
             tp_size=tensor_parallel_size,
             rank=rank,
         )
-        ar = AllReduce(mapping, strategy=AllReduceStrategy.UB)
+        ar = AllReduce(mapping=mapping, strategy=AllReduceStrategy.UB)
         ar_params = AllReduceParams(
             strategy=AllReduceStrategy.UB,
             fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM,
@@ -170,7 +172,8 @@ def run_single_rank_ar_rms_norm(tensor_parallel_size, a, b, c, gamma):
                     reason='needs 2 GPUs to run this test')
 @pytest.mark.parametrize("mnk", [(256, 512, 256), (32, 16, 64)],
                          ids=lambda x: f"m{x[0]}_n{x[1]}_k{x[2]}")
-def test_user_buffers_ar_rms_norm(mnk):
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_user_buffers_ar_rms_norm(mnk, mpi_pool_executor):
     torch.manual_seed(42)
     tensor_parallel_size = 2
     dtype = torch.float16
@@ -182,13 +185,11 @@ def test_user_buffers_ar_rms_norm(mnk):
     c = torch.randn((m, n), dtype=dtype)
     gamma = torch.randn((n), dtype=dtype)
 
-    with MPIPoolExecutor(max_workers=tensor_parallel_size) as executor:
-        results = executor.map(
-            run_single_rank_ar_rms_norm,
-            *zip(*[(tensor_parallel_size, a, b, c, gamma)] *
-                 tensor_parallel_size))
-        for r in results:
-            assert r is True
+    results = mpi_pool_executor.map(
+        run_single_rank_ar_rms_norm,
+        *zip(*[(tensor_parallel_size, a, b, c, gamma)] * tensor_parallel_size))
+    for r in results:
+        assert r is True
 
 
 def run_single_rank_ar_rms_norm_fp8(tensor_parallel_size, a, b, c, gamma,
@@ -220,7 +221,7 @@ def run_single_rank_ar_rms_norm_fp8(tensor_parallel_size, a, b, c, gamma,
             tp_size=tensor_parallel_size,
             rank=rank,
         )
-        ar = AllReduce(mapping, strategy=AllReduceStrategy.UB)
+        ar = AllReduce(mapping=mapping, strategy=AllReduceStrategy.UB)
         ar_params = AllReduceParams(
             strategy=AllReduceStrategy.UB,
             fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8,
@@ -262,7 +263,8 @@ def run_single_rank_ar_rms_norm_fp8(tensor_parallel_size, a, b, c, gamma,
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2,
                     reason='needs 2 GPUs to run this test')
-def test_user_buffers_basic():
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_user_buffers_basic(mpi_pool_executor):
     torch.manual_seed(42)
     tensor_parallel_size = 2
     dtype = torch.float32
@@ -272,19 +274,19 @@ def test_user_buffers_basic():
     a = torch.randn((m, k), dtype=dtype)
     b = torch.randn((k, n), dtype=dtype)
     c = torch.randn((m, n), dtype=dtype)
-    with MPIPoolExecutor(max_workers=tensor_parallel_size) as executor:
-        results = executor.map(
-            run_single_rank,
-            *zip(*[(tensor_parallel_size, a, b, c)] * tensor_parallel_size))
-        for r in results:
-            assert r is True
+    results = mpi_pool_executor.map(
+        run_single_rank,
+        *zip(*[(tensor_parallel_size, a, b, c)] * tensor_parallel_size))
+    for r in results:
+        assert r is True
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2,
                     reason='needs 2 GPUs to run this test')
 @pytest.mark.parametrize("mnk", [(256, 512, 256), (32, 16, 64)],
                          ids=lambda x: f"m{x[0]}_n{x[1]}_k{x[2]}")
-def test_user_buffers_ar_rms_norm_fp8(mnk):
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_user_buffers_ar_rms_norm_fp8(mnk, mpi_pool_executor):
     torch.manual_seed(42)
     tensor_parallel_size = 2
     dtype = torch.float16
@@ -297,13 +299,12 @@ def test_user_buffers_ar_rms_norm_fp8(mnk):
     gamma = torch.randn((n), dtype=dtype)
     scale = torch.randn((1), dtype=torch.float32)
 
-    with MPIPoolExecutor(max_workers=tensor_parallel_size) as executor:
-        results = executor.map(
-            run_single_rank_ar_rms_norm_fp8,
-            *zip(*[(tensor_parallel_size, a, b, c, gamma, scale)] *
-                 tensor_parallel_size))
-        for r in results:
-            assert r is True
+    results = mpi_pool_executor.map(
+        run_single_rank_ar_rms_norm_fp8,
+        *zip(*[(tensor_parallel_size, a, b, c, gamma, scale)] *
+             tensor_parallel_size))
+    for r in results:
+        assert r is True
 
 
 class UBTestModel(nn.Module):
@@ -456,10 +457,10 @@ def run_single_rank_ub_pass(
             output_fused = model_opt(input)
         # 3 AR_NORM fusion happens first
         # 2 AR_NORM fused with Quant
-        # 1 AR_NORM replacement
+        # 3 AR_NORM replacement
         # 3 Scaled MM Prologue
         # 2 UB Finalize Removal
-        assert backend.match_count == [3, 0, 2, 0, 1, 0, 3, 0, 2, 0]
+        assert backend.match_count == [3, 0, 2, 0, 3, 0, 3, 0, 2, 0]
         torch.cuda.synchronize()
 
         if rank == 0:
@@ -535,7 +536,8 @@ def run_single_rank_ub_pass(
 @pytest.mark.parametrize("tokens", [256, 16], ids=lambda x: f"_tokens{x}")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16],
                          ids=lambda x: "fp16" if x == torch.float16 else "bf16")
-def test_user_buffers_pass(hidden, tokens, dtype):
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_user_buffers_pass(hidden, tokens, dtype, mpi_pool_executor):
     torch.manual_seed(42)
     tensor_parallel_size = 2
 
@@ -559,17 +561,16 @@ def test_user_buffers_pass(hidden, tokens, dtype):
     l4_input_scale = torch.full((1, ), 0.1, dtype=torch.float32)
     l4_weight_scale = torch.full((1, ), 0.1, dtype=torch.float32)
 
-    with MPIPoolExecutor(max_workers=tensor_parallel_size) as executor:
-        results = executor.map(
-            run_single_rank_ub_pass,
-            *zip(*[(tensor_parallel_size, input, l0_weight, l0_input_scale,
-                    l0_weight_scale, l1_weight, l1_input_scale, l1_weight_scale,
-                    l2_weight, l2_input_scale, l2_weight_scale, l3_weight,
-                    l3_input_scale, l3_weight_scale, l4_weight, l4_input_scale,
-                    l4_weight_scale, norm0_gamma, norm1_gamma, norm2_gamma)] *
-                 tensor_parallel_size))
-        for r in results:
-            assert r is True
+    results = mpi_pool_executor.map(
+        run_single_rank_ub_pass,
+        *zip(*[(tensor_parallel_size, input, l0_weight, l0_input_scale,
+                l0_weight_scale, l1_weight, l1_input_scale, l1_weight_scale,
+                l2_weight, l2_input_scale, l2_weight_scale, l3_weight,
+                l3_input_scale, l3_weight_scale, l4_weight, l4_input_scale,
+                l4_weight_scale, norm0_gamma, norm1_gamma, norm2_gamma)] *
+             tensor_parallel_size))
+    for r in results:
+        assert r is True
 
 
 def run_single_rank_ar_rms_norm_fp4(tensor_parallel_size, a, b, c, gamma):
@@ -605,7 +606,7 @@ def run_single_rank_ar_rms_norm_fp4(tensor_parallel_size, a, b, c, gamma):
             tp_size=tensor_parallel_size,
             rank=rank,
         )
-        ar = AllReduce(mapping, strategy=AllReduceStrategy.UB)
+        ar = AllReduce(mapping=mapping, strategy=AllReduceStrategy.UB)
         ar_params = AllReduceParams(
             strategy=AllReduceStrategy.UB,
             fusion_op=AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4,
@@ -656,8 +657,9 @@ def run_single_rank_ar_rms_norm_fp4(tensor_parallel_size, a, b, c, gamma):
                     reason='needs 2 GPUs to run this test')
 @pytest.mark.parametrize("mnk", [(256, 512, 256), (32, 64, 64)],
                          ids=lambda x: f"m{x[0]}_n{x[1]}_k{x[2]}")
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
 @skip_pre_blackwell_unittest
-def test_user_buffers_ar_rms_norm_fp4(mnk):
+def test_user_buffers_ar_rms_norm_fp4(mnk, mpi_pool_executor):
     torch.manual_seed(42)
     tensor_parallel_size = 2
     dtype = torch.float16
@@ -669,13 +671,11 @@ def test_user_buffers_ar_rms_norm_fp4(mnk):
     c = torch.randn((m, n), dtype=dtype)
     gamma = torch.randn((n), dtype=dtype)
 
-    with MPIPoolExecutor(max_workers=tensor_parallel_size) as executor:
-        results = executor.map(
-            run_single_rank_ar_rms_norm_fp4,
-            *zip(*[(tensor_parallel_size, a, b, c, gamma)] *
-                 tensor_parallel_size))
-        for r in results:
-            assert r is True
+    results = mpi_pool_executor.map(
+        run_single_rank_ar_rms_norm_fp4,
+        *zip(*[(tensor_parallel_size, a, b, c, gamma)] * tensor_parallel_size))
+    for r in results:
+        assert r is True
 
 
 class UBMMAddModel(nn.Module):
@@ -692,9 +692,9 @@ class UBMMAddModel(nn.Module):
             tp_size=tp_size,
             rank=rank,
         )
-        self.ar_0 = AllReduce(mapping).cuda()
-        self.ar_1 = AllReduce(mapping).cuda()
-        self.ar_2 = AllReduce(mapping).cuda()
+        self.ar_0 = AllReduce(mapping=mapping).cuda()
+        self.ar_1 = AllReduce(mapping=mapping).cuda()
+        self.ar_2 = AllReduce(mapping=mapping).cuda()
         self.norm0 = RMSNorm(hidden_size=hidden_size, eps=eps,
                              dtype=dtype).cuda()
         self.norm1 = RMSNorm(hidden_size=hidden_size, eps=eps,
@@ -786,7 +786,8 @@ def run_single_rank_ub_mm_add_pass(tensor_parallel_size, num_tokens,
 @pytest.mark.parametrize("tokens", [256, 16], ids=lambda x: f"_tokens{x}")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16],
                          ids=lambda x: "fp16" if x == torch.float16 else "bf16")
-def test_user_buffers_mm_add_prologue(hidden, tokens, dtype):
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_user_buffers_mm_add_prologue(hidden, tokens, dtype, mpi_pool_executor):
     torch.manual_seed(42)
     tensor_parallel_size = 2
 
@@ -794,13 +795,12 @@ def test_user_buffers_mm_add_prologue(hidden, tokens, dtype):
     norm1_gamma = torch.randn((hidden, ), dtype=dtype)
     norm2_gamma = torch.randn((hidden, ), dtype=dtype)
 
-    with MPIPoolExecutor(max_workers=tensor_parallel_size) as executor:
-        results = executor.map(
-            run_single_rank_ub_mm_add_pass,
-            *zip(*[(tensor_parallel_size, tokens, hidden, dtype, norm0_gamma,
-                    norm1_gamma, norm2_gamma)] * tensor_parallel_size))
-        for r in results:
-            assert r is True
+    results = mpi_pool_executor.map(
+        run_single_rank_ub_mm_add_pass,
+        *zip(*[(tensor_parallel_size, tokens, hidden, dtype, norm0_gamma,
+                norm1_gamma, norm2_gamma)] * tensor_parallel_size))
+    for r in results:
+        assert r is True
 
 
 class UBFp4TestModel(nn.Module):
@@ -977,7 +977,7 @@ def run_single_rank_ub_pass_fp4(
 
         def block_scale_unswizzled(scale):
             sz = fp4_utils.pad_up(hidden_size, 128)
-            return torch.ops.tensorrt_llm.nvfp4_block_scale_interleave_reverse(
+            return torch.ops.trtllm.nvfp4_block_scale_interleave_reverse(
                 scale.cpu().view(sz, -1))[0:hidden_size]
 
         l0_weight_scale_block_unswizzled = block_scale_unswizzled(
@@ -1013,10 +1013,10 @@ def run_single_rank_ub_pass_fp4(
 
         # 3 AR_NORM fusion happens first
         # 2 AR_NORM fused with Quant
-        # 1 AR_NORM replacement
+        # 3 AR_NORM replacement
         # 3 Scaled MM Prologue
         # 2 UB Finalize Removal
-        assert backend.match_count == [3, 0, 2, 0, 1, 0, 3, 0, 2, 0]
+        assert backend.match_count == [3, 0, 2, 0, 3, 0, 3, 0, 2, 0]
         torch.cuda.synchronize()
         torch.testing.assert_close(output_fused,
                                    output_ref,
@@ -1035,8 +1035,9 @@ def run_single_rank_ub_pass_fp4(
 @pytest.mark.parametrize("tokens", [256, 16], ids=lambda x: f"_tokens{x}")
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16],
                          ids=lambda x: "fp16" if x == torch.float16 else "bf16")
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
 @skip_pre_blackwell_unittest
-def test_user_buffers_fp4_pass(hidden, tokens, dtype):
+def test_user_buffers_fp4_pass(hidden, tokens, dtype, mpi_pool_executor):
     torch.manual_seed(43)
     tensor_parallel_size = 2
 
@@ -1074,14 +1075,13 @@ def test_user_buffers_fp4_pass(hidden, tokens, dtype):
     l3_res = l2_res @ l3_weight.t()
     l3_res_scale = fp4_scale(l3_res)
 
-    with MPIPoolExecutor(max_workers=tensor_parallel_size) as executor:
-        results = executor.map(
-            run_single_rank_ub_pass_fp4,
-            *zip(*[(tensor_parallel_size, input, l0_weight, input_scale,
-                    l0_weight_scale, l1_weight, l0_res_scale, l1_weight_scale,
-                    l2_weight, l1_res_scale, l2_weight_scale, l3_weight,
-                    l2_res_scale, l3_weight_scale, l4_weight, l3_res_scale,
-                    l4_weight_scale, norm0_gamma, norm1_gamma, norm2_gamma)] *
-                 tensor_parallel_size))
-        for r in results:
-            assert r is True
+    results = mpi_pool_executor.map(
+        run_single_rank_ub_pass_fp4,
+        *zip(*[(tensor_parallel_size, input, l0_weight, input_scale,
+                l0_weight_scale, l1_weight, l0_res_scale, l1_weight_scale,
+                l2_weight, l1_res_scale, l2_weight_scale, l3_weight,
+                l2_res_scale, l3_weight_scale, l4_weight, l3_res_scale,
+                l4_weight_scale, norm0_gamma, norm1_gamma, norm2_gamma)] *
+             tensor_parallel_size))
+    for r in results:
+        assert r is True

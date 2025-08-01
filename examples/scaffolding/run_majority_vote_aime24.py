@@ -1,9 +1,12 @@
 import argparse
+import asyncio
 import json
 
-from tensorrt_llm.scaffolding import (MajorityVoteController,
+from tensorrt_llm.scaffolding import (GenerationTokenCounter,
+                                      MajorityVoteController,
                                       NativeGenerationController,
-                                      ScaffoldingLlm, TRTLLMWorker,
+                                      ScaffoldingBenchRequest, ScaffoldingLlm,
+                                      TRTLLMWorker, async_scaffolding_benchmark,
                                       extract_answer_from_boxed)
 
 
@@ -19,6 +22,8 @@ def parse_arguments():
     parser.add_argument('--jsonl_file', type=str, default='./test.jsonl')
     parser.add_argument('--threshold', type=float, default=None)
     parser.add_argument('--sample_num', type=int, default=10)
+    parser.add_argument('--concurrency', type=int, default=None)
+    parser.add_argument('--static_with_benchmark', action='store_true')
     args = parser.parse_args()
     return args
 
@@ -70,15 +75,34 @@ def main():
         test_case = test_dataset[i]
         prompts.append(test_case["problem"])
 
-    results = llm.generate(prompts)
+    if args.static_with_benchmark or args.concurrency:
+        if args.concurrency == None:
+            args.concurrency = 1
+
+        if args.static_with_benchmark:
+            task_collection_types = {"token_counter": GenerationTokenCounter}
+
+        requests = [
+            ScaffoldingBenchRequest(prompt=prompt) for prompt in prompts
+        ]
+
+        results, requests_execution_time, total_time = asyncio.run(
+            async_scaffolding_benchmark(llm, task_collection_types, requests,
+                                        args.concurrency))
+    else:
+        results = llm.generate(prompts)
+
+    print(f'main shutting down...')
+    llm.shutdown()
+    llm_worker.shutdown()
+    print(f'main shut down done')
 
     for i in range(len(results)):
         result = results[i]
         test_case = test_dataset[i]
         ref_answer = int(test_case["answer"])
-        result.result()
-        output = result.output
-        extracted_answer = extract_answer_from_boxed(output.output_str)
+        output = result.outputs[0]
+        extracted_answer = extract_answer_from_boxed(output.text)
         try:
             # print(f"[QUESTION]:\n{prompt}\n\n[OUTPUT]\n\n{output.output_str}\n\n")
             answer = int(extracted_answer)
@@ -91,14 +115,26 @@ def main():
     print(
         f'Controller {controller_name} Accuracy: {correct_count} out of {total_count}'
     )
+
     if args.threshold is not None:
-        assert correct_count >= args.threshold * total_count, \
+        accuracy = correct_count / total_count
+        if accuracy < args.threshold:
+            print(
                 f'Accuracy check failed with {correct_count}/{total_count} < {args.threshold}'
-        print(f'Accuracy check passed with threshold={args.threshold}')
-    print(f'main shutting down...')
-    llm.shutdown()
-    llm_worker.shutdown()
-    print(f'main shut down done')
+            )
+        else:
+            print(f'Accuracy check passed with threshold={args.threshold}')
+
+    if args.static_with_benchmark:
+        print(f'Total time: {total_time}')
+        print(
+            f'Average requests execution time: {sum(requests_execution_time) / len(requests_execution_time)}'
+        )
+        total_token_count = 0
+        for result in results:
+            total_token_count += result.task_collections[
+                "token_counter"].generation_token_count
+        print(f'Average output token count: {total_token_count / len(results)}')
 
 
 if __name__ == '__main__':

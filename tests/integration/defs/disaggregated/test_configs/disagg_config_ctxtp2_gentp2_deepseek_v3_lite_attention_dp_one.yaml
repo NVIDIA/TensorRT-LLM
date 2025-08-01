@@ -3,14 +3,15 @@ port: 8000
 model: DeepSeek-V3-Lite/fp8
 free_gpu_memory_fraction: 0.25
 backend: "pytorch"
-pytorch_backend_config:
-  use_cuda_graph: False
-  disable_overlap_scheduler: True
+cuda_graph_config: null
+disable_overlap_scheduler: True
 context_servers:
   num_instances: 1
   tensor_parallel_size: 2
   pipeline_parallel_size: 1
   enable_attention_dp: true
+  cache_transceiver_config:
+    backend: default
   urls:
       - "localhost:8001"
 generation_servers:
@@ -18,5 +19,7 @@ generation_servers:
   tensor_parallel_size: 2
   pipeline_parallel_size: 1
   enable_attention_dp: false
+  cache_transceiver_config:
+    backend: default
   urls:
       - "localhost:8002"

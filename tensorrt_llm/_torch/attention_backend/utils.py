@@ -41,7 +41,11 @@ def create_attention(
     v_head_dim: Optional[int] = None,
     predicted_tokens_per_seq: Optional[int] = 1,
     skip_create_weights_in_init: bool = False,
+    attention_chunk_size: Optional[int] = None,
 ):
+    if attention_chunk_size is not None and backend_name.upper() != "TRTLLM":
+        raise ValueError(
+            f"Backend {backend_name} does not support chunked attention.")
 
     attn_cls = get_attention_backend(backend_name)
 
@@ -71,4 +75,5 @@ def create_attention(
         pos_embd_params=pos_embd_params,
         mla_params=mla_params,
         skip_create_weights_in_init=skip_create_weights_in_init,
+        attention_chunk_size=attention_chunk_size,
     )

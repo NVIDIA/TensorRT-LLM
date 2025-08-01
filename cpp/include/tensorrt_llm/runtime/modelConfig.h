@@ -167,23 +167,36 @@ public:
         LayerType layerType, SizeType32 pipelineParallelism = 1, SizeType32 pipelineParallelismRank = 0) const
     {
         TLLM_CHECK_WITH_INFO(pipelineParallelism > 0, "Invalid pipelineParallelism: %d", pipelineParallelism);
-        auto const numLocalLayers = mNbLayers / pipelineParallelism; // WARNING: assume no remainder
-        auto const firstLocalLayerIt = mLayerTypes.cbegin() + (numLocalLayers * pipelineParallelismRank);
+        auto const firstLocalLayer = getFirstLocalLayer(pipelineParallelism, pipelineParallelismRank);
+        auto const numLocalLayers = getNbLayers(pipelineParallelism, pipelineParallelismRank);
+        auto const firstLocalLayerIt = mLayerTypes.cbegin() + firstLocalLayer;
         return std::count(firstLocalLayerIt, firstLocalLayerIt + numLocalLayers, layerType);
+    }
+
+    [[nodiscard]] SizeType32 getFirstLocalLayer(
+        SizeType32 pipelineParallelism = 1, SizeType32 pipelineParallelismRank = 0) const
+    {
+        auto const numBaseLayers = mNbLayers / pipelineParallelism;
+        auto const numExtraLayers = mNbLayers % pipelineParallelism;
+        // If num_layers % pp_size = n != 0, first n ranks get one extra layer
+        return pipelineParallelismRank * numBaseLayers + std::min(pipelineParallelismRank, numExtraLayers);
     }
 
     [[nodiscard]] SizeType32 countLowerRankLayers(
         LayerType layerType, SizeType32 pipelineParallelism = 1, SizeType32 pipelineParallelismRank = 0) const
     {
-        auto const numLocalLayers = mNbLayers / pipelineParallelism; // WARNING: assume no remainder
-        auto const firstLocalLayer = numLocalLayers * pipelineParallelismRank;
+        auto const firstLocalLayer = getFirstLocalLayer(pipelineParallelism, pipelineParallelismRank);
         // count number of previous non-local attention layers
         return std::count(mLayerTypes.cbegin(), mLayerTypes.cbegin() + firstLocalLayer, layerType);
     }
 
-    [[nodiscard]] SizeType32 getNbLayers(SizeType32 pipelineParallelism = 1) const
+    [[nodiscard]] SizeType32 getNbLayers(
+        SizeType32 pipelineParallelism = 1, SizeType32 pipelineParallelismRank = 0) const
     {
-        return mNbLayers / pipelineParallelism; // WARNING: assume no remainder
+        auto const numBaseLayers = mNbLayers / pipelineParallelism;
+        auto const numExtraLayers = mNbLayers % pipelineParallelism;
+        // If num_layers % pp_size = n != 0, first n ranks get one extra layer
+        return numBaseLayers + (pipelineParallelismRank < numExtraLayers ? 1 : 0);
     }
 
     [[nodiscard]] SizeType32 getNbAttentionLayers(
@@ -786,6 +799,18 @@ public:
         return mNumKvHeadsPerAttentionLayer;
     }
 
+    [[nodiscard]] std::vector<SizeType32> getNumKvHeadsForGivenLayers(
+        std::vector<SizeType32> const& layers, bool isCrossAttention) const
+    {
+        std::vector<SizeType32> numKvHeads;
+        numKvHeads.reserve(layers.size());
+        auto const numKvHeadsAllLayers
+            = isCrossAttention ? mNumKvHeadsPerCrossAttentionLayer : mNumKvHeadsPerAttentionLayer;
+        std::transform(layers.begin(), layers.end(), std::back_inserter(numKvHeads),
+            [&numKvHeadsAllLayers](SizeType32 layer) { return numKvHeadsAllLayers.at(layer); });
+        return numKvHeads;
+    }
+
     [[nodiscard]] std::pair<std::vector<SizeType32>::const_iterator, std::vector<SizeType32>::const_iterator>
     getNumKvHeadsPerLayerLocalRange(
         SizeType32 pipelineParallelism = 1, SizeType32 pipelineParallelismRank = 0, bool isCrossAttention = false) const
@@ -819,15 +844,6 @@ public:
         TLLM_CHECK_WITH_INFO(numElems == mNbAttentionLayers,
             "Length of head_per_layer (%d) must match number of attention layers (%d)", numElems, mNbAttentionLayers);
         mNumKvHeadsPerCrossAttentionLayer = headsPerLayer;
-    }
-
-    [[nodiscard]] SizeType32 getSumLocalKvHeads(
-        SizeType32 pipelineParallelism = 1, SizeType32 pipelineParallelismRank = 0, bool isCrossAttention = false) const
-    {
-        auto [cbegin, cend]
-            = getNumKvHeadsPerLayerLocalRange(pipelineParallelism, pipelineParallelismRank, isCrossAttention);
-        auto const sumLocalHeads = std::reduce(cbegin, cend);
-        return sumLocalHeads;
     }
 
     [[nodiscard]] bool constexpr skipCrossAttnBlocks() const noexcept

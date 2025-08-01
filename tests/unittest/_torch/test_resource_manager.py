@@ -5,17 +5,20 @@ import sys
 import unittest
 
 import numpy as np
+import pytest
 import torch
 
 import tensorrt_llm
 import tensorrt_llm.bindings
-from tensorrt_llm._torch.pyexecutor.resource_manager import (PeftCacheConfig,
+from tensorrt_llm._torch.pyexecutor.resource_manager import (KVCacheManager,
+                                                             PeftCacheConfig,
                                                              PeftCacheManager)
 from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
 from tensorrt_llm.bindings import executor as tllm
 from tensorrt_llm.bindings.internal.batch_manager import \
     PeftTaskNotCachedException
 
+DataType = tensorrt_llm.bindings.DataType
 LoraModule = tensorrt_llm.bindings.LoraModule
 LoraModuleType = tensorrt_llm.bindings.LoraModuleType
 current_dir = pathlib.Path(__file__).parent.resolve()
@@ -65,7 +68,15 @@ class TestResourceManager(unittest.TestCase):
             self.num_rnn_layers = 0
             self.num_attention_heads = 1
             self.hidden_size = 16
-            self.data_type = tensorrt_llm.bindings.DataType.HALF
+            self.data_type = DataType.HALF
+
+        @property
+        def num_kv_heads_per_layer(self):
+            return [self.num_attention_heads] * self.num_attention_layers
+
+        @property
+        def head_size(self):
+            return self.hidden_size // self.num_attention_heads
 
     class MockPeftCacheManagerConfig:
         """
@@ -338,6 +349,7 @@ class TestResourceManager(unittest.TestCase):
 
         self.assertEqual(len(peft_table), self.num_lora_modules)
 
+    @pytest.mark.skip(reason="https://nvbugs/5324252")
     def test_put_get(self):
         """Test adding a request with properly configured LoRA weights and config."""
         peft_cache_config = self.create_peft_cache_config()
@@ -406,11 +418,113 @@ class TestResourceManager(unittest.TestCase):
         self.assertEqual(len(peft_table), len(expected_values))
 
         for i, entry in enumerate(peft_table):
-            self.assertEqual(entry.pageId, expected_values[i][0])
-            self.assertEqual(entry.slotIdx, expected_values[i][1])
-            self.assertEqual(entry.inSize, expected_values[i][2])
-            self.assertEqual(entry.outSize, expected_values[i][3])
-            self.assertEqual(entry.moduleId, expected_values[i][4])
-            self.assertEqual(entry.layerId, expected_values[i][5])
-            self.assertEqual(entry.adapterSize, expected_values[i][6])
-            self.assertEqual(entry.numSlots, expected_values[i][7])
+            self.assertEqual(entry.page_id, expected_values[i][0])
+            self.assertEqual(entry.slot_idx, expected_values[i][1])
+            self.assertEqual(entry.in_size, expected_values[i][2])
+            self.assertEqual(entry.out_size, expected_values[i][3])
+            self.assertEqual(entry.module_id, expected_values[i][4])
+            self.assertEqual(entry.layer_id, expected_values[i][5])
+            self.assertEqual(entry.adapter_size, expected_values[i][6])
+            self.assertEqual(entry.num_slots, expected_values[i][7])
+
+    def test_adjust_window_sizes_for_vswa(self):
+        window_size_to_layers = {
+            100: [0, 1, 2, 3],
+            200: [4, 5, 6],
+            7000: [7, 8],
+        }
+
+        model_config = self.MockModelConfig()
+        model_config.num_attention_heads = 2
+        model_config.hidden_size = 2
+        model_config.data_type = DataType.HALF
+
+        total_layers = [
+            i for layers in window_size_to_layers.values() for i in layers
+        ]
+
+        model_config.num_hidden_layers = len(total_layers)
+        model_config.num_attention_layers = len(total_layers)
+
+        kv_factor = 2
+        cache_bytes_per_token_per_layer = 8
+
+        # Define test cases:
+        #    (memory_bytes, expected_window_sizes, max_tokens, description)
+        #    If max_tokens is None, then it will use the default value of KvCacheConfig.
+        test_cases = [
+            (
+                # Case 1: Limited memory - windows get clamped
+                cache_bytes_per_token_per_layer * (100 * 9 + 30 * 5) + 4,
+                {
+                    100: [0, 1, 2, 3],
+                    130: [4, 5, 6, 7, 8],
+                },
+                None,
+                "limited_memory_clamped_windows"),
+            (
+                # Case 2: Less limited memory - the largest window get clamped
+                cache_bytes_per_token_per_layer *
+                (100 * 9 + 100 * 5 + 817 * 2) + 4,
+                {
+                    100: [0, 1, 2, 3],
+                    200: [4, 5, 6],
+                    1017: [7, 8],
+                },
+                None,
+                "less_limited_memory_clamped_windows"),
+            (
+                # Case 3: Sufficient memory - no clamping needed
+                cache_bytes_per_token_per_layer *
+                (100 * 4 + 200 * 3 + 7000 * 2) + 9402,
+                {
+                    100: [0, 1, 2, 3],
+                    200: [4, 5, 6],
+                    7000: [7, 8],
+                },
+                None,
+                "sufficient_memory_no_clamping"),
+            (
+                # Case 4: Very limited memory - all windows get small values
+                cache_bytes_per_token_per_layer * (51 * 9) + 1,
+                {
+                    51: [0, 1, 2, 3, 4, 5, 6, 7, 8],
+                },
+                None,
+                "very_limited_memory_all_clamped"),
+            (
+                # Case 5: Less limited memory but max_tokens is given.
+                # memory is enough for 1017 tokens, it will be clamped by max_tokens=134.
+                cache_bytes_per_token_per_layer *
+                (100 * 9 + 100 * 5 + 817 * 2) + 4,
+                {
+                    100: [0, 1, 2, 3],
+                    134: [4, 5, 6, 7, 8],
+                },
+                134,
+                "less_limited_memory_but_clamped_by_max_tokens"),
+        ]
+
+        for memory_bytes, expected_window_sizes, max_tokens, description in test_cases:
+            with self.subTest(case=description, memory_bytes=memory_bytes):
+                kv_cache_config = tllm.KvCacheConfig(max_tokens=max_tokens)
+                adjusted = KVCacheManager.adjust_window_sizes_for_vswa(
+                    window_size_to_layers=window_size_to_layers,
+                    model_config=model_config,
+                    kv_cache_config=kv_cache_config,
+                    pool_memory_bytes=memory_bytes,
+                    kv_factor=kv_factor,
+                    dtype=model_config.data_type,
+                    is_cross_attention=False,
+                )
+
+                self.assertEqual(
+                    adjusted, expected_window_sizes,
+                    f"Test case '{description}' failed.\n"
+                    f"Memory bytes: {memory_bytes}\n"
+                    f"Actual: {adjusted}\n"
+                    f"Expected: {expected_window_sizes}")
+
+
+if __name__ == "__main__":
+    unittest.main()

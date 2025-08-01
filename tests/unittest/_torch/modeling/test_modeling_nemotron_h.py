@@ -1,177 +1,317 @@
-import unittest
-from copy import deepcopy
-
 import torch
+from utils.llm_data import llm_models_root
+from utils.util import skip_gpu_memory_less_than
 
-import tensorrt_llm
-from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
-from tensorrt_llm._torch.metadata import KVCacheParams
-from tensorrt_llm._torch.model_config import ModelConfig
-
-# isort: off
-from tensorrt_llm._torch.models.modeling_nemotron_h import (NemotronHConfig,
-                                                            NemotronHForCausalLM
-                                                            )
-# isort: on
-from tensorrt_llm._torch.pyexecutor.resource_manager import \
-    MambaHybridCacheManager
-from tensorrt_llm.bindings.executor import KvCacheConfig
-from tensorrt_llm.mapping import Mapping
-
-NEMOTRON_H_CONFIG = {
-    "architectures": ["NemotronHForCausalLM"],
-    "attention_bias": False,
-    "attention_dropout": 0.0,
-    "attention_head_dim": 128,
-    "bos_token_id": 1,
-    "chunk_size": 256,
-    "conv_kernel": 4,
-    "eos_token_id": 2,
-    "expand": 2,
-    "hidden_dropout": 0.0,
-    "hidden_size": 4096,
-    "hybrid_override_pattern":
-    "M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M*-M-M-M-M-M-",
-    "initializer_range": 0.02,
-    "intermediate_size": 21504,
-    "layer_norm_epsilon": 1e-05,
-    "mamba_head_dim": 64,
-    "mamba_hidden_act": "silu",
-    "mamba_num_heads": 128,
-    "mamba_proj_bias": False,
-    "max_position_embeddings": 8192,
-    "mlp_bias": False,
-    "mlp_hidden_act": "relu2",
-    "model_type": "nemotron_h",
-    "n_groups": 8,
-    "num_attention_heads": 32,
-    "num_hidden_layers": 52,
-    "num_key_value_heads": 8,
-    "num_logits_to_keep": 1,
-    "pad_token_id": 0,
-    "rescale_prenorm_residual": True,
-    "residual_in_fp32": False,
-    "rms_norm_eps": 1e-05,
-    "sliding_window": None,
-    "ssm_state_size": 128,
-    "tie_word_embeddings": False,
-    "torch_dtype": "bfloat16",
-    "use_bias": False,
-    "use_cache": True,
-    "use_conv_bias": True,
-    "use_mamba_kernels": True,
-    "vocab_size": 131072
-}
+from tensorrt_llm import LLM
+from tensorrt_llm.llmapi import KvCacheConfig
+from tensorrt_llm.llmapi.llm import RequestOutput
+from tensorrt_llm.llmapi.llm_args import CudaGraphConfig
+from tensorrt_llm.sampling_params import SamplingParams
 
 
-class TestNemotronH(unittest.TestCase):
+def get_logprobs(token_ids: torch.Tensor, logits: torch.Tensor) -> torch.Tensor:
+    raw_probs = torch.softmax(logits, dim=-1)
+    index = token_ids.unsqueeze(1).cuda()
+    token_probs = torch.gather(raw_probs, dim=1, index=index).squeeze(-1)
+    return torch.log(token_probs)
 
-    def test_nemotron_h_sanity(self):
-        config_dict = deepcopy(NEMOTRON_H_CONFIG)
-        nemotron_h_config = NemotronHConfig.from_dict(config_dict)
 
-        dtype = nemotron_h_config.torch_dtype
-        device = torch.device('cuda')
+def extract_prefill_logprobs(result: RequestOutput) -> torch.Tensor:
+    token_ids = torch.tensor(result.prompt_token_ids[1:])
+    logits = result.context_logits[:-1, :]
+    return get_logprobs(token_ids, logits)
 
-        model_config = ModelConfig(pretrained_config=nemotron_h_config)
-        nemotron_h = NemotronHForCausalLM(model_config).to(device)
 
-        input_ids = torch.tensor([100, 200, 300, 100, 200, 100, 400, 500],
-                                 dtype=torch.int,
-                                 device=device)
+def extract_decode_logprobs(result: RequestOutput,
+                            gen_idx: int = 0) -> torch.Tensor:
+    token_ids = torch.tensor(result.outputs[gen_idx].token_ids)
+    logits = result.outputs[gen_idx].generation_logits
+    return get_logprobs(token_ids, logits)
 
-        context_sequence_lengths = [3, 2, 1]
-        sequence_lengths = context_sequence_lengths + [1, 1]
-        past_seen_tokens = [0, 0, 0, 62, 75]
-        request_ids = list(range(len(sequence_lengths)))
-        token_nums = (torch.tensor(past_seen_tokens) +
-                      torch.tensor(sequence_lengths)).tolist()
-        prompt_lens = token_nums[:3] + past_seen_tokens[3:]
 
-        num_blocks = 100
-        tokens_per_block = 128
-        head_dim = nemotron_h.config.hidden_size // nemotron_h.config.num_attention_heads
-        num_layers = nemotron_h.config.hybrid_override_pattern.count("*")
-        mamba_num_layers = nemotron_h.config.hybrid_override_pattern.count("M")
-        num_kv_heads = nemotron_h.config.num_key_value_heads
-        max_seq_len = num_blocks * tokens_per_block
-        batch_size = len(context_sequence_lengths) + 2
+def create_nemotron_h_llm(use_cuda_graph, disable_overlap_scheduler,
+                          max_batch_size):
+    """Create LLM with specific overlap scheduler setting"""
+    model_dir = f"{llm_models_root(check=True)}/Nemotron-H-8B-Base-8K"
+    return LLM(
+        model=model_dir,
+        tensor_parallel_size=1,
+        max_batch_size=max_batch_size,
+        cuda_graph_config=CudaGraphConfig() if use_cuda_graph else None,
+        disable_overlap_scheduler=disable_overlap_scheduler,
+        kv_cache_config=KvCacheConfig(enable_block_reuse=False),
+        enable_trtllm_sampler=True,
+    )
 
-        if dtype == torch.bfloat16:
-            kv_cache_dtype = tensorrt_llm.bindings.DataType.BF16
-        else:
-            raise ValueError("Invalid dtype")
 
-        mapping = Mapping(world_size=1, tp_size=1, rank=0)
-        kv_cache_config = KvCacheConfig(max_tokens=num_blocks *
-                                        tokens_per_block,
-                                        enable_block_reuse=False)
-        kv_cache_manager = MambaHybridCacheManager(
-            # mamba cache parameters
-            nemotron_h.config.hidden_size,
-            nemotron_h.config.ssm_state_size,
-            nemotron_h.config.conv_kernel,
-            nemotron_h.config.expand,
-            nemotron_h.config.n_groups,
-            nemotron_h.config.mamba_head_dim,
-            mamba_num_layers,
-            nemotron_h.config.torch_dtype,
-            # kv cache parameters
-            kv_cache_config,
-            tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
-            num_layers=num_layers,
-            num_kv_heads=num_kv_heads,
-            head_dim=head_dim,
-            tokens_per_block=tokens_per_block,
-            max_seq_len=max_seq_len,
-            max_batch_size=batch_size,
-            mapping=mapping,
-            dtype=kv_cache_dtype,
-            num_extra_kv_tokens=0,
+@skip_gpu_memory_less_than(
+    (2 * 8 + 1) * 2**30)  # 8B, bf16, plus 1 GB for good measure
+def test_nemotron_h_correctness():
+    # This test is close to memory limit on A30 (with 24GB), so empty cache first
+    torch.cuda.empty_cache()
+
+    text_prompts = [
+        "The future of AI is",
+        "The president of the United States is",
+    ]
+    num_prompts = len(text_prompts)
+
+    nemotron_h = create_nemotron_h_llm(use_cuda_graph=False,
+                                       disable_overlap_scheduler=False,
+                                       max_batch_size=num_prompts)
+
+    expected_completions = [
+        " bright, with endless possibilities for innovation and growth",
+        " the head of state and head of government of",
+    ]
+
+    # reference logprobs for first prompt from mcore for prompt minus first token
+    # TODO(oargov): generate a reference on-the-fly once we have confidence in the HF impl
+    prefill_logprobs_ref_mcore = torch.tensor([
+        -7.415980815887451, -0.36192911863327026, -2.8658294677734375,
+        -2.316344738006592
+    ])
+
+    # reference logprobs from initial implementation (commit 5ce1102a02bd2938c0c8334138371f081f55fcc1 on single RTX 6000)
+    initial_impl_atol = 0.2
+    batching_atol = 0.2
+
+    prefill_logprobs_ref_initial_no_batching = [
+        torch.tensor([
+            -7.4359540939331055,
+            -0.37661877274513245,
+            -2.8925108909606934,
+            -2.268364906311035,
+        ]),
+        torch.tensor([
+            -8.759482383728027,
+            -1.656238079071045,
+            -0.5448741912841797,
+            -1.7702054977416992,
+            -0.05832016468048096,
+            -1.460732102394104,
+        ])
+    ]
+    prefill_logprobs_ref_initial_with_batching = [
+        torch.tensor([
+            -7.401950836181641, -0.38696032762527466, -2.8725428581237793,
+            -2.2654521465301514
+        ]),
+        torch.tensor([
+            -8.73007583618164, -1.6853574514389038, -0.5468529462814331,
+            -1.7846013307571411, -0.053610533475875854, -1.4385275840759277
+        ])
+    ]
+
+    decode_logprobs_ref_initial_no_batching = [
+        torch.tensor([
+            -2.2722280025482178, -0.5124826431274414, -0.7916123270988464,
+            -2.1908130645751953, -0.059298671782016754, -0.5125972032546997,
+            -0.3856367766857147, -0.055953752249479294, -1.1059765815734863
+        ]),
+        torch.tensor([
+            -1.329713225364685, -1.5038213729858398, -0.021283088251948357,
+            -0.38457369804382324, -0.3582419157028198, -0.16527847945690155,
+            -0.0044861179776489735, -0.059462934732437134, -0.041099339723587036
+        ])
+    ]
+    decode_logprobs_ref_initial_with_batching = [
+        torch.tensor([
+            -2.2877156734466553, -0.46699056029319763, -0.7909849286079407,
+            -2.1276988983154297, -0.062114741653203964, -0.5291495323181152,
+            -0.38685765862464905, -0.05595658719539642, -1.1020748615264893
+        ]),
+        torch.tensor([
+            -1.3567769527435303, -1.5647790431976318, -0.022344056516885757,
+            -0.38503751158714294, -0.3581986725330353, -0.18398350477218628,
+            -0.004726295825093985, -0.05941498652100563, -0.04291720315814018
+        ])
+    ]
+
+    try:
+        sampling_params = SamplingParams(max_tokens=9,
+                                         temperature=0.0,
+                                         add_special_tokens=False,
+                                         return_context_logits=True,
+                                         return_generation_logits=True)
+
+        results_no_batching = [
+            nemotron_h.generate(text_prompt, sampling_params)
+            for text_prompt in text_prompts
+        ]
+        completions_no_batching = [
+            result.outputs[0].text for result in results_no_batching
+        ]
+        prefill_logprobs_no_batching = [
+            extract_prefill_logprobs(result).cpu()
+            for result in results_no_batching
+        ]
+        decode_logprobs_no_batching = [
+            extract_decode_logprobs(result).cpu()
+            for result in results_no_batching
+        ]
+
+        results_batching = nemotron_h.generate(text_prompts, sampling_params)
+        completions_batching = [
+            result.outputs[0].text for result in results_batching
+        ]
+        prefill_logprobs_batching = [
+            extract_prefill_logprobs(result).cpu()
+            for result in results_batching
+        ]
+        decode_logprobs_batching = [
+            extract_decode_logprobs(result).cpu() for result in results_batching
+        ]
+
+        # compare logprobs with mcore logprobs, check that the max error is less than 0.3
+        mcore_atol = 0.3
+        torch.testing.assert_close(torch.tensor(
+            prefill_logprobs_no_batching[0]),
+                                   prefill_logprobs_ref_mcore,
+                                   atol=mcore_atol,
+                                   rtol=0.0)
+
+        for i in range(num_prompts):
+            # compare prompt logprobs with initial implementation
+            torch.testing.assert_close(
+                prefill_logprobs_no_batching[i],
+                prefill_logprobs_ref_initial_no_batching[i],
+                atol=initial_impl_atol,
+                rtol=0.0)
+            torch.testing.assert_close(
+                prefill_logprobs_batching[i],
+                prefill_logprobs_ref_initial_with_batching[i],
+                atol=initial_impl_atol,
+                rtol=0.0)
+
+            # compare expected completion
+            assert completions_batching[i] == expected_completions[i]
+            assert completions_no_batching[i] == expected_completions[i]
+
+            # compare decode logprobs with initial implementation
+            torch.testing.assert_close(
+                decode_logprobs_no_batching[i],
+                decode_logprobs_ref_initial_no_batching[i],
+                atol=initial_impl_atol,
+                rtol=0.0)
+            torch.testing.assert_close(
+                decode_logprobs_batching[i],
+                decode_logprobs_ref_initial_with_batching[i],
+                atol=initial_impl_atol,
+                rtol=0.0)
+
+            # compare logprobs with and without batching, tolerace by diff in initial implementation
+            torch.testing.assert_close(prefill_logprobs_batching[i],
+                                       prefill_logprobs_no_batching[i],
+                                       atol=batching_atol,
+                                       rtol=0.0)
+            torch.testing.assert_close(decode_logprobs_batching[i],
+                                       decode_logprobs_no_batching[i],
+                                       atol=batching_atol,
+                                       rtol=0.0)
+
+        # now let's test that decodes match prefill logprobs
+        text_prompts_with_completions = [
+            f"{text_prompts[i]}{completions_batching[i]}"
+            for i in range(num_prompts)
+        ]
+
+        sampling_params.max_tokens = 1
+        full_sequence_results = nemotron_h.generate(
+            text_prompts_with_completions, sampling_params)
+        full_sequence_logprobs = [
+            extract_prefill_logprobs(result).cpu()
+            for result in full_sequence_results
+        ]
+
+        # compare full sequence logprobs with prefill+decode logprobs, tolerance like mcore tolerance
+        for i in range(num_prompts):
+            prefill_decode_logprobs = torch.cat(
+                [prefill_logprobs_batching[i], decode_logprobs_batching[i]])
+            torch.testing.assert_close(full_sequence_logprobs[i],
+                                       prefill_decode_logprobs,
+                                       atol=mcore_atol,
+                                       rtol=0.0)
+
+    finally:
+        nemotron_h.shutdown()
+
+
+def test_nemotron_h_cuda_graph_overlap_scheduler():
+    prompts = [
+        "The sky is blue because",
+        "The sum of two and two is",
+        "The largest mammal is the",
+        "The chemical symbol for water is",
+    ]
+
+    sampling_config = SamplingParams(max_tokens=10,
+                                     temperature=0.0,
+                                     return_generation_logits=True)
+
+    # Test without cg and overlap scheduler disabled
+    with create_nemotron_h_llm(use_cuda_graph=False,
+                               disable_overlap_scheduler=True,
+                               max_batch_size=16) as llm:
+        outputs_no_cg_no_overlap = llm.generate(prompts,
+                                                sampling_params=sampling_config,
+                                                use_tqdm=True)
+
+    # Test with cg and overlap scheduler disabled
+    with create_nemotron_h_llm(use_cuda_graph=True,
+                               disable_overlap_scheduler=True,
+                               max_batch_size=16) as llm:
+        outputs_with_cg_no_overlap = llm.generate(
+            prompts, sampling_params=sampling_config, use_tqdm=True)
+
+    # Test with cg and overlap scheduler enabled
+    with create_nemotron_h_llm(use_cuda_graph=True,
+                               disable_overlap_scheduler=False,
+                               max_batch_size=16) as llm:
+        outputs_with_cg_with_overlap = llm.generate(
+            prompts, sampling_params=sampling_config, use_tqdm=True)
+
+    # Verify outputs are consistent
+    for i, (no_cg_no_overlap, with_cg_no_overlap,
+            with_cg_with_overlap) in enumerate(
+                zip(outputs_no_cg_no_overlap, outputs_with_cg_no_overlap,
+                    outputs_with_cg_with_overlap)):
+
+        assert (
+            no_cg_no_overlap.outputs[0].text ==
+            with_cg_no_overlap.outputs[0].text
+        ), f"Prompt {i}: no CG no overlap generated text != with CG no overlap generated text"
+        assert (
+            with_cg_no_overlap.outputs[0].text ==
+            with_cg_with_overlap.outputs[0].text
+        ), f"Prompt {i}: with CG no overlap generated text != with CG with overlap generated text"
+
+        # similar to other unittests comparing with / without CG, compare logits of first generation step (2nd generated token)
+        torch.testing.assert_close(
+            no_cg_no_overlap.outputs[0].generation_logits[1, :],
+            with_cg_no_overlap.outputs[0].generation_logits[1, :],
+            atol=0.2,
+            rtol=0.2,
+            msg=lambda x:
+            f"Prompt {i}: with/without CG (no overlap) logits for first generated step {x}"
         )
-        kv_cache_manager.add_dummy_requests(request_ids, token_nums)
-        kv_cache_manager.prepare_mamba_cache_blocks(request_ids)
 
-        metadata_cls = get_attention_backend(model_config.attn_backend).Metadata
-        attn_metadata = metadata_cls(
-            seq_lens=torch.tensor(sequence_lengths, dtype=torch.int),
-            num_contexts=len(context_sequence_lengths),
-            kv_cache_params=KVCacheParams(
-                use_cache=True,
-                num_cached_tokens_per_seq=past_seen_tokens,
-            ),
-            kv_cache_manager=kv_cache_manager,
-            request_ids=request_ids,
-            prompt_lens=prompt_lens,
-            max_num_requests=len(context_sequence_lengths) + 2,
-            max_num_tokens=8192,
+        # compare logprobs of all generated tokens
+        torch.testing.assert_close(
+            extract_decode_logprobs(no_cg_no_overlap),
+            extract_decode_logprobs(with_cg_no_overlap),
+            atol=0.2,
+            rtol=0.2,
+            msg=lambda x:
+            f"Prompt {i}: with/without CG (no overlap) logprobs for all selected tokens {x}"
         )
 
-        position_ids = []
-        for i, tokens in enumerate(past_seen_tokens):
-            seq_len = context_sequence_lengths[i] if i < len(
-                context_sequence_lengths) else 1
-            position_id = torch.arange(tokens,
-                                       tokens + seq_len,
-                                       device=input_ids.device)
-            position_ids.append(position_id)
-
-        position_ids = torch.cat(position_ids).unsqueeze(0)
-
-        with torch.inference_mode():
-            attn_metadata.prepare()
-            logits = nemotron_h.forward(input_ids=input_ids,
-                                        position_ids=position_ids,
-                                        attn_metadata=attn_metadata)
-
-        self.assertEqual(len(past_seen_tokens), logits.shape[0])
-
-        with torch.inference_mode():
-            attn_metadata.prepare()
-            logits = nemotron_h.forward(input_ids=input_ids,
-                                        position_ids=position_ids,
-                                        attn_metadata=attn_metadata,
-                                        return_context_logits=True)
-        self.assertEqual(input_ids.shape, logits.shape[:-1])
-
-        kv_cache_manager.shutdown()
+        # overlap scheduler should have no effect on all logits - low tolerance
+        torch.testing.assert_close(
+            with_cg_no_overlap.outputs[0].generation_logits,
+            with_cg_with_overlap.outputs[0].generation_logits,
+            atol=0.05,
+            rtol=0.05,
+            msg=lambda x:
+            f"Prompt {i}: with/without overlap (no CG) all generation logits {x}"
+        )

@@ -7,15 +7,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 from _model_test_utils import MLP
 from _torch_test_utils import all_close
-from torch.export import Dim
+from torch.export import Dim, export
 from torch.fx import GraphModule
 
-from tensorrt_llm._torch.auto_deploy.transformations.export import torch_export, torch_export_to_gm
+from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 
 
 def _torch_export_non_strict(model, *args, **kwargs):
     kwargs["strict"] = False
-    return torch_export(model, *args, **kwargs)
+    return export(model, *args, **kwargs)
 
 
 class ModuleForExport(ABC, nn.Module):
@@ -94,7 +94,7 @@ class ModuleWithWhere(ModuleForExport):
 
     def check_xfail(self, f_export, use_dynamic_shape, device) -> bool:
         return (
-            use_dynamic_shape and f_export in [torch_export, _torch_export_non_strict]
+            use_dynamic_shape and f_export in [export, _torch_export_non_strict]
         ) or device == "meta"
 
 
@@ -133,7 +133,7 @@ class ModuleWithRouting(ModuleForExport):
 
     def check_xfail(self, f_export, use_dynamic_shape, device) -> bool:
         return (
-            use_dynamic_shape and f_export in [torch_export, _torch_export_non_strict]
+            use_dynamic_shape and f_export in [export, _torch_export_non_strict]
         ) or device == "meta"
 
 
@@ -162,7 +162,7 @@ class ModuleWithModuleList(ModuleForExport):
 
 @pytest.mark.parametrize(
     "f_export",
-    [torch.export.export, torch_export, _torch_export_non_strict, torch_export_to_gm],
+    [torch.export.export, export, _torch_export_non_strict, torch_export_to_gm],
 )
 @pytest.mark.parametrize("use_dynamic_shape", [True, False])
 @pytest.mark.parametrize("device", ["cpu", "cuda", "meta"])
@@ -219,11 +219,23 @@ def test_deduplicate_during_export(model_cls: Type[nn.Module], device_export: st
     # check that deduplicated keys are removed from state_dict
     assert gm.state_dict().keys() == model.state_dict().keys() - model.get_deduplicated_keys()
 
-    # check that loading hook is called
-    sd_og = model.state_dict()
-    sd_og["fc3.weight"] = torch.randn_like(sd_og["fc1.weight"])
-    gm.load_state_dict(sd_og)
+    def check_parameter_loading(param_to_pop: str, expected_param: str):
+        """Helper function to check parameter loading behavior.
 
-    # check that fc1.weight got that tensor value
-    if device_export != "meta":
-        assert torch.equal(gm.fc1.weight, sd_og["fc3.weight"])
+        Args:
+            param_to_pop: The parameter to remove from state dict before loading
+            expected_param: The parameter whose value should be loaded into fc1.weight
+        """
+        sd_og = model.state_dict()
+        sd_og.pop(param_to_pop)
+        gm.load_state_dict(sd_og)
+
+        if device_export != "meta":
+            assert torch.equal(gm.fc1.weight, sd_og[expected_param])
+
+    # fc3.weight is aliased to fc1.weight
+    # Test loading fc3.weight into gm.fc1.weight. State dict does not contain fc1.weight
+    check_parameter_loading("fc1.weight", "fc3.weight")
+
+    # Test loading fc1.weight into gm.fc1.weight. State dict does not contain fc3.weight
+    check_parameter_loading("fc3.weight", "fc1.weight")

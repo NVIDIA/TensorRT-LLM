@@ -71,7 +71,7 @@ class SessionDataWriter:
     def _write_session_perf_logs(self):
         """
         Write session data. Should only be called once at the end of the entire
-        perf session, in otherwords, when TURTLE ends during teardown().
+        perf session, in otherwords, only during teardown().
         """
         # Output various log files depending on options.
         for fmt in self._output_formats:

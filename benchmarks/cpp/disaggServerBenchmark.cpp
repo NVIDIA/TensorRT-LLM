@@ -534,6 +534,7 @@ texec::Request makeExecutorContextRequest(Sample const& sample, SizeType32 const
             std::nullopt,    // embeddingBias
             std::nullopt,    // speculativeDecoding
             std::nullopt,    // pTuning
+            std::nullopt,    // multimodalInput
             std::nullopt,    // multimodalEmbedding
             std::nullopt,    // mRopeConfig
             loraConfig,      // loraConfig
@@ -635,6 +636,8 @@ public:
                                                                                 : texec::DecodingMode::Auto(),
                     benchmarkParams.executorLookaheadConfig, benchmarkParams.medusaChoices));
             executorConfig.setExtendedRuntimePerfKnobConfig(extendedRuntimePerfKnobConfig);
+            executorConfig.setCacheTransceiverConfig(
+                texec::CacheTransceiverConfig(texec::CacheTransceiverConfig::BackendType::DEFAULT));
             constexpr int maxIterationsForRequestStats = 1000;
             if (mEnableCollectKvCacheTransferTime)
             {

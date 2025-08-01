@@ -27,7 +27,7 @@ from defs.trt_test_alternative import (is_linux, is_windows, print_info,
                                        print_warning)
 
 from ..conftest import get_llm_root, llm_models_root, trt_environment
-from .model_yaml_config import get_model_yaml_config
+from .pytorch_model_config import get_model_yaml_config
 from .utils import (AbstractPerfScriptTestClass, PerfBenchScriptTestCmds,
                     PerfMetricType, PerfScriptTestCmds, generate_test_nodes)
 
@@ -45,26 +45,61 @@ MODEL_PATH_DICT = {
     "llama_v3.1_8b": "llama-3.1-model/Meta-Llama-3.1-8B",
     "llama_v3.1_8b_instruct": "llama-3.1-model/Llama-3.1-8B-Instruct",
     "llama_v3.1_8b_instruct_fp8": "llama-3.1-model/Llama-3.1-8B-Instruct-FP8",
+    "llama_v3.1_8b_instruct_fp4":
+    "modelopt-hf-model-hub/Llama-3.1-8B-Instruct-fp4",
     "llama_v3.1_70b": "llama-3.1-model/Meta-Llama-3.1-70B",
+    "llama_v3.3_70b_instruct": "llama-3.3-models/Llama-3.3-70B-Instruct",
+    "llama_v3.1_70b_instruct_fp8": "llama-3.1-model/Llama-3.1-70B-Instruct-FP8",
     "llama_v3.3_70b_instruct_fp8":
     "modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp8",
+    "llama_v3.3_70b_instruct_fp4":
+    "modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp4",
+    "llama_v3.3_70b_instruct": "llama-3.3-models/Llama-3.3-70B-Instruct",
+    "llama_v3.1_405b_instruct_fp8":
+    "llama-3.1-model/Llama-3.1-405B-Instruct-FP8",
     "llama_v3.1_405b_instruct_fp4":
-    "llm-models/modelopt-hf-model-hub/Llama-3.1-405B-Instruct-fp4",
+    "modelopt-hf-model-hub/Llama-3.1-405B-Instruct-fp4",
     "llama_v3.1_70b_instruct": "llama-3.1-model/Meta-Llama-3.1-70B-Instruct",
     "llama_v3.2_1b": "llama-3.2-models/Llama-3.2-1B",
-    "llama_v3.3_nemotron_49b": "nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1/",
     "llama_v3.1_nemotron_nano_8b": "Llama-3.1-Nemotron-Nano-8B-v1",
-    # "llama_30b": "llama-models/llama-30b-hf",
+    "llama_v3.1_nemotron_nano_8b_fp8": "Llama-3.1-Nemotron-Nano-8B-v1-FP8",
+    "llama_v3.3_nemotron_super_49b":
+    "nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1",
+    "llama_v3.3_nemotron_super_49b_fp8":
+    "nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1-FP8",
+    "llama_v3.1_nemotron_ultra_253b":
+    "nemotron-nas/Llama-3_1-Nemotron-Ultra-253B-v1",
+    "llama_v3.1_nemotron_ultra_253b_fp8":
+    "nemotron-nas/Llama-3_1-Nemotron-Ultra-253B-v1-FP8",
+    "llama_v4_scout_17b_16e_instruct":
+    "llama4-models/Llama-4-Scout-17B-16E-Instruct",
+    "llama_v4_scout_17b_16e_instruct_fp8":
+    "llama4-models/Llama-4-Scout-17B-16E-Instruct-FP8",
+    "llama_v4_scout_17b_16e_instruct_fp4":
+    "llama4-models/Llama-4-Scout-17B-16E-Instruct-FP4",
+    "llama_v4_maverick_17b_128e_instruct":
+    "llama4-models/Llama-4-Maverick-17B-128E-Instruct",
+    "llama_v4_maverick_17b_128e_instruct_fp8":
+    "llama4-models/nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8",
     "mixtral_8x7b_v0.1": "Mixtral-8x7B-v0.1",
     "mixtral_8x7b_v0.1_instruct": "Mixtral-8x7B-Instruct-v0.1",
+    "mixtral_8x7b_v0.1_instruct_fp8": "Mixtral-8x7B-Instruct-v0.1-fp8",
+    "mixtral_8x7b_v0.1_instruct_fp4":
+    "modelopt-hf-model-hub/Mixtral-8x7B-Instruct-v0.1-fp4",
+    "mistral_nemo_12b_base": "Mistral-Nemo-Base-2407",
+    "deepseek_r1_distill_qwen_32b": "DeepSeek-R1/DeepSeek-R1-Distill-Qwen-32B",
     "mixtral_8x22b_v0.1": "Mixtral-8x22B-v0.1",
     "mistral_7b_v0.1": "mistral-7b-v0.1",
+    "ministral_8b": "Ministral-8B-Instruct-2410",
+    "ministral_8b_fp8": "Ministral-8B-Instruct-2410-FP8",
     "deepseek_r1_fp8": "DeepSeek-R1/DeepSeek-R1",
     "deepseek_r1_nvfp4": "DeepSeek-R1/DeepSeek-R1-FP4",
     "deepseek_v3_lite_fp8": "DeepSeek-V3-Lite/fp8",
     "deepseek_v3_lite_nvfp4": "DeepSeek-V3-Lite/nvfp4_moe_only",
     "qwen2_7b_instruct": "Qwen2-7B-Instruct",
     "qwen_14b_chat": "Qwen-14B-Chat",
+    "qwen3_235b_a22b_fp8": "Qwen3/saved_models_Qwen3-235B-A22B_fp8_hf",
+    "qwen3_235b_a22b_fp4": "Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf",
     "starcoder2_3b": "starcoder2-3b",
     "starcoder_15b": "starcoder2-15b",
     "t5": "t5-small",  # not supported for trtllm-bench build config
@@ -83,6 +118,12 @@ MODEL_PATH_DICT = {
     "gpt_350m_moe": "gpt2-medium",
     "phi_3_mini_4k_instruct": "Phi-3/Phi-3-mini-4k-instruct",
     "phi_3_mini_128k_instruct": "Phi-3/Phi-3-mini-128k-instruct",
+    "phi_4_mini_instruct": "Phi-4-mini-instruct",
+    "phi_4_multimodal_instruct": "multimodals/Phi-4-multimodal-instruct",
+    "phi_4_multimodal_instruct_image": "multimodals/Phi-4-multimodal-instruct",
+    "phi_4_multimodal_instruct_audio": "multimodals/Phi-4-multimodal-instruct",
+    "bielik_11b_v2.2_instruct": "Bielik-11B-v2.2-Instruct",
+    "bielik_11b_v2.2_instruct_fp8": "Bielik-11B-v2.2-Instruct-FP8",
 }
 # Model PATH of HuggingFace
 HF_MODEL_PATH = {
@@ -98,17 +139,44 @@ HF_MODEL_PATH = {
     "llama_v3.1_70b_hf": "meta-llama/Llama-3.1-70B",
     "llama_v3.1_405b_hf": "meta-llama/Llama-3.1-405B",
     "llama_v3.1_nemotron_nano_8b_hf": "nvidia/Llama-3.1-Nemotron-Nano-8B-v1",
+    "llama_v3.1_nemotron_nano_8b_fp8_hf":
+    "nvidia/Llama-3.1-Nemotron-Nano-8B-v1-FP8",
+    "llama_v3.3_nemotron_super_49b_hf":
+    "nvidia/Llama-3_3-Nemotron-Super-49B-v1",
+    "llama_v3.3_nemotron_super_49b_fp8_hf":
+    "nvidia/Llama-3_3-Nemotron-Super-49B-v1-FP8",
+    "llama_v3.1_nemotron_ultra_253b_fp8_hf":
+    "nvidia/Llama-3_1-Nemotron-Ultra-253B-v1-FP8",
     "mixtral_8x7b_v0.1_hf": "mistralai/Mixtral-8x7B-v0.1",
     "mixtral_8x7b_v0.1_instruct_hf": "mistralai/Mixtral-8x7B-Instruct-v0.1",
     "mistral_7b_v0.1_hf": "mistralai/Mistral-7B-v0.1",
+    "ministral_8b_hf": "mistralai/Ministral-8B-Instruct-2410",
     "flan_t5_base_hf": "google/flan-t5-small",
+    "phi_4_mini_instruct_hf": "microsoft/Phi-4-mini-instruct",
 }
 LORA_MODEL_PATH = {
-    "llama_v2_13b": "llama-models-v2/chinese-llama-2-lora-13b",
-    "mixtral_8x7b_0.1": "chinese-mixtral-lora",
+    "llama_v2_13b":
+    "llama-models-v2/chinese-llama-2-lora-13b",
+    "mixtral_8x7b_0.1":
+    "chinese-mixtral-lora",
+    "llama_v3.1_8b_instruct_fp8":
+    "lora/llama-3-chinese-8b-instruct-v2-lora/",
+    "ministral_8b":
+    "lora/ministral/Ministral-8B-Instruct-2410-Loras-Dummy",  # Dummy LoRA for Ministral
+    "phi_4_multimodal_instruct_image":
+    "multimodals/Phi-4-multimodal-instruct/vision-lora",
+    "phi_4_multimodal_instruct_audio":
+    "multimodals/Phi-4-multimodal-instruct/speech-lora",
 }
 
 TIMING_CACHE_DIR = os.environ.get("TIMING_CACHE_DIR", "")
+
+TRUST_REMOTE_CODE_MODELS = {  # these models require explicit trust_remote_code=True
+    "llama_v3.3_nemotron_super_49b",
+    "llama_v3.3_nemotron_super_49b_fp8",
+    "llama_v3.1_nemotron_ultra_253b",
+    "llama_v3.1_nemotron_ultra_253b_fp8",
+}
 
 
 def cpu_socket_count_gt_1():
@@ -257,7 +325,7 @@ class PerfTestMetric(NamedTuple):
     """
     Configurations of a test metric.
     """
-    # The original test name used to run the TURTLE test.
+    # The original test name used to run the oraginal perf test.
     original_test_name: str
     # The name for this particular metric.
     metric_name: str
@@ -302,10 +370,12 @@ class PerfTestConfig:
         num_reqs: int = 512,
         concurrency: int = -1,
         quantization: str = "",
+        kv_cache_dtype: str = "auto",
         ep_size: int = None,
         tp_size: int = 1,
         pp_size: int = 1,
         num_gpus: int = 1,
+        kv_cache_free_gpu_mem_fraction: float = 0.9,
     ):
         # The model name.
         self.model_name = model_name
@@ -345,6 +415,8 @@ class PerfTestConfig:
         self.concurrency = concurrency
         # Quantization type.
         self.quantization = quantization
+        # KV Cache dtype
+        self.kv_cache_dtype = kv_cache_dtype
         # Multiple Profiles
         self.multiple_profiles = False
         # EP Size
@@ -357,6 +429,8 @@ class PerfTestConfig:
         self.num_gpus = num_gpus
         # Just build engines
         self.build_only = False
+        # kv cache free gpu mem fraction
+        self.kv_cache_free_gpu_mem_fraction = kv_cache_free_gpu_mem_fraction
 
     def to_string(self,
                   custom_bs: int = None,
@@ -442,6 +516,10 @@ class PerfTestConfig:
         if self.quantization != "":
             entries.append(f"quant:{self.quantization}")
 
+        # Add kv cache dtype.
+        if self.kv_cache_dtype != "auto":
+            entries.append(f"kv_cache_dtype:{self.kv_cache_dtype}")
+
         # Add number of requests.
         if self.num_reqs != 512:
             entries.append(f"reqs:{self.num_reqs}")
@@ -465,6 +543,10 @@ class PerfTestConfig:
         # Add number of GPUs.
         if self.num_gpus > 1:
             entries.append(f"gpus:{self.num_gpus}")
+
+        # Add kv cache free gpu mem fraction.
+        if self.kv_cache_free_gpu_mem_fraction != 0.9:
+            entries.append(f"kv_frac:{self.kv_cache_free_gpu_mem_fraction}")
 
         # Concatenate labels with "-".
         return "-".join(entries)
@@ -545,6 +627,11 @@ class PerfTestConfig:
                 "quant:") else labels.pop(0).replace("quant:", "")
 
         if len(labels) > 0:
+            self.kv_cache_dtype = "auto" if not labels[0].startswith(
+                "kv_cache_dtype:") else labels.pop(0).replace(
+                    "kv_cache_dtype:", "")
+
+        if len(labels) > 0:
             self.num_reqs = 512 if not labels[0].startswith("reqs:") else int(
                 labels.pop(0).replace("reqs:", ""))
 
@@ -567,6 +654,11 @@ class PerfTestConfig:
         if len(labels) > 0:
             self.num_gpus = 1 if not labels[0].startswith("gpus:") else int(
                 labels.pop(0).replace("gpus:", ""))
+
+        if len(labels) > 0:
+            self.kv_cache_free_gpu_mem_fraction = 0.9 if not labels[
+                0].startswith("kv_frac:") else float(
+                    labels.pop(0).replace("kv_frac:", ""))
 
         assert len(
             labels
@@ -602,6 +694,8 @@ class PerfTestConfig:
         # Validate dtype.
         VALID_DTYPES = ["float32", "float16", "bfloat16", "float8", "float4"]
         assert self.data_type in VALID_DTYPES, f"Invalid data_type {self.data_type}!"
+        VALID_KV_CACHE_DTYPES = ["auto", "fp8"]
+        assert self.kv_cache_dtype in VALID_KV_CACHE_DTYPES, f"Invalid kv_cache_dtype {self.kv_cache_dtype}!"
 
         # Validate quantization mode.
         if self.model_name in MODEL_PATH_DICT.keys():
@@ -742,7 +836,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
     """
 
     def __init__(self, full_test_name: str):
-        # full_test_name is the full test name appearing in TURTLE output.
+        # full_test_name is the full test name appearing in test output.
         self._full_test_name = full_test_name
         # test_domain_name is the part before "::".
         self._test_domain_name = "::".join(full_test_name.split("::")[:-1])
@@ -757,6 +851,7 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         self._config.load_from_str(self._test_param_labels)
         # This will store the currently running metric.
         self._current_metric = None
+        self.lora_dirs = []
 
     def get_test_name(self) -> str:
         return str(self._config)
@@ -923,6 +1018,8 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         if self._config.quantization:
             build_cmd.append(
                 f"--quantization={self._config.quantization.upper()}")
+        if self._config.model_name in TRUST_REMOTE_CODE_MODELS:
+            build_cmd.append(f"--trust_remote_code=True")
         return build_cmd
 
     def get_benchmark_build_command(self, engine_dir) -> list:
@@ -983,28 +1080,63 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             istdev = 16
             ostdev = 24
             nloras = self._config.num_loras
-            # lora_data = os.path.join(engine_dir,
-            #                          f"token-norm-dist-lora-{nloras}.json")
             dataset_path = os.path.join(engine_dir, "synthetic_data.json")
-            data_cmd += [
-                "python3", prepare_data_script, f"--stdout",
-                f"--rand-task-id 0 {nloras-1}", f"--tokenizer={tokenizer_dir}",
-                f"token-norm-dist", f"--num-requests={self._config.num_reqs}",
-                f"--input-mean={input_len}", f"--output-mean={output_len}",
-                f"--input-stdev={istdev}", f"--output-stdev={ostdev}",
-                f" > {dataset_path}"
-            ]
-            if self._config.runtime == "cppmanager":
-                data_cmd += [";"]
+
+            if self._config.model_name in LORA_MODEL_PATH.keys(
+            ) and self._config.backend == "pytorch" and self._config.runtime == "bench":
+                actual_lora_paths = LORA_MODEL_PATH[self._config.model_name]
+                if not isinstance(actual_lora_paths, list):
+                    actual_lora_paths = [actual_lora_paths]
+                for i, actual_lora_path in enumerate(actual_lora_paths):
+                    if not actual_lora_path.startswith("/"):
+                        actual_lora_paths[i] = os.path.join(
+                            llm_models_root(), actual_lora_path)
+                lora_dir = os.path.join(engine_dir, "loras")
+                data_cmd += [f"mkdir -p {lora_dir}", ";"]
+                if len(actual_lora_paths) != nloras:
+                    raise ValueError(
+                        f"Number of LoRA paths ({len(actual_lora_paths)}) does not match requested number of LoRAs ({nloras})"
+                    )
+                for i, lora_path in enumerate(actual_lora_paths):
+                    self.lora_dirs.append(f"{lora_dir}/{i}")
+                    data_cmd += [f"ln -sf {lora_path} {lora_dir}/{i}", ";"]
+                data_cmd += [
+                    "python3", prepare_data_script, f"--stdout",
+                    f"--rand-task-id 0 {nloras-1}",
+                    f"--tokenizer={tokenizer_dir}", f"--lora-dir={lora_dir}",
+                    f"token-norm-dist",
+                    f"--num-requests={self._config.num_reqs}",
+                    f"--input-mean={input_len}", f"--output-mean={output_len}",
+                    f"--input-stdev={istdev}", f"--output-stdev={ostdev}",
+                    f" > {dataset_path}"
+                ]
+            elif self._config.backend == "cppmanager":
+                data_cmd += [
+                    "python3", prepare_data_script, f"--stdout",
+                    f"--rand-task-id 0 {nloras-1}",
+                    f"--tokenizer={tokenizer_dir}", f"token-norm-dist",
+                    f"--num-requests={self._config.num_reqs}",
+                    f"--input-mean={input_len}", f"--output-mean={output_len}",
+                    f"--input-stdev={istdev}", f"--output-stdev={ostdev}",
+                    f" > {dataset_path}"
+                ]
+                # generate LoRA weights for C++ runtime
+                # the lora_dir is $engine_dir/loras. This is populated by the convert_lora_cmd executed before this.
+                # The generate_rand_loras.py will create random lora weights to $engine_dir/lora_cpp.
                 generate_rand_lora_script = os.path.join(
                     self._llm_root, "benchmarks", "cpp", "utils",
                     "generate_rand_loras.py")
                 checkpoint_dir = os.path.join(engine_dir, "lora_cpp")
-                lora_dir = os.path.join(engine_dir, f"loras")
                 data_cmd += [
                     "python3", generate_rand_lora_script, checkpoint_dir,
-                    lora_dir, "16"
+                    lora_dir,
+                    str(nloras)
                 ]
+
+            else:
+                pytest.skip(
+                    f"LoRA config not supported for {self._config.model_name} with the current backend and runtime."
+                )
         else:
             istdev = 0
             ostdev = 0
@@ -1120,9 +1252,12 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             f"--max_batch_size={self._config.max_batch_size}",
             f"--max_num_tokens={self._config.max_num_tokens}",
             f"--report_json={report_path}",
+            f"--kv_cache_free_gpu_mem_fraction={self._config.kv_cache_free_gpu_mem_fraction}",
         ]
         if self._config.backend != "pytorch":
-            benchmark_cmd += [f"--engine_dir={engine_dir}"]
+            benchmark_cmd += [
+                f"--backend=tensorrt", f"--engine_dir={engine_dir}"
+            ]
         else:
             benchmark_cmd += ["--backend=pytorch"]
         if self._config.num_reqs > 0:
@@ -1140,12 +1275,16 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         #use default yaml config
         if self._config.backend == "pytorch":
             import yaml
-            config = get_model_yaml_config(self._config.to_string())
-            with open('extra-llm-api-config.yml', 'w') as f:
+            pytorch_config_path = os.path.join(engine_dir,
+                                               "extra-llm-api-config.yml")
+            if not os.path.exists(pytorch_config_path):
+                os.makedirs(os.path.dirname(pytorch_config_path), exist_ok=True)
+            config = get_model_yaml_config(self._config.to_string(),
+                                           lora_dirs=self.lora_dirs)
+            print_info(f"pytorch model config: {config}")
+            with open(pytorch_config_path, 'w') as f:
                 yaml.dump(config, f, default_flow_style=False)
-            benchmark_cmd += [
-                f"--extra_llm_api_options=extra-llm-api-config.yml"
-            ]
+            benchmark_cmd += [f"--extra_llm_api_options={pytorch_config_path}"]
         return benchmark_cmd
 
     def get_gpt_manager_runtime_benchmark_command(self, engine_dir, bs,

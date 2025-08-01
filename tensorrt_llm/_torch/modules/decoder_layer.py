@@ -12,7 +12,7 @@ class DecoderLayer(nn.Module, ABC):
     @abstractmethod
     def forward(
         self,
-        position_ids: torch.LongTensor,
+        position_ids: torch.IntTensor,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor] = ...,
@@ -20,5 +20,15 @@ class DecoderLayer(nn.Module, ABC):
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         ...
 
-    def is_missing(self) -> bool:
-        return False
+    def skip_forward(
+        self,
+        position_ids: torch.IntTensor,
+        hidden_states: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        residual: Optional[torch.Tensor] = ...,
+        **kwargs,
+    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        if residual is ...:
+            return hidden_states
+        else:
+            return hidden_states, residual

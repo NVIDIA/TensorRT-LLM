@@ -1,4 +1,4 @@
-from typing import Dict, Optional
+from typing import Optional
 
 import torch
 from torch import nn
@@ -8,11 +8,11 @@ from tensorrt_llm.functional import PositionEmbeddingType
 
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
-from ..model_config import ModelConfig
 from ..models.modeling_utils import ModelConfig
 from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
-from ..modules.fused_moe import FusedMoE, RenormalizeMoeRoutingMethod
+from ..modules.embedding import Embedding
+from ..modules.fused_moe import RenormalizeMoeRoutingMethod, create_moe
 from ..modules.linear import Linear
 from ..modules.rms_norm import RMSNorm
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
@@ -25,6 +25,7 @@ class MixtralMoE(nn.Module):
         self,
         model_config: ModelConfig[PretrainedConfig],
         aux_stream: torch.cuda.Stream,
+        layer_idx: Optional[int] = None,
     ):
         super().__init__()
         config = model_config.pretrained_config
@@ -43,7 +44,7 @@ class MixtralMoE(nn.Module):
 
         reduce_results = True
 
-        self.experts = FusedMoE(
+        self.experts = create_moe(
             num_experts=self.num_experts,
             routing_method=RenormalizeMoeRoutingMethod(top_k=self.top_k),
             hidden_size=self.hidden_dim,
@@ -51,7 +52,8 @@ class MixtralMoE(nn.Module):
             aux_stream=aux_stream,
             dtype=config.torch_dtype,
             reduce_results=reduce_results,
-            model_config=model_config)
+            model_config=model_config,
+            layer_idx=layer_idx)
 
     def forward(
         self,
@@ -59,14 +61,14 @@ class MixtralMoE(nn.Module):
         attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
         all_rank_num_tokens = attn_metadata.all_rank_num_tokens
-        if self.enable_attention_dp and len(all_rank_num_tokens) > 1:
-            max_num_token = max(all_rank_num_tokens)
-            hidden_states = torch.nn.functional.pad(
-                hidden_states,
-                (0, 0, 0, max_num_token - hidden_states.shape[0]))
+        all_rank_max_num_tokens = attn_metadata.all_rank_max_num_tokens
         router_logits = self.gate(hidden_states)
-        final_hidden_states = self.experts(hidden_states, router_logits,
-                                           all_rank_num_tokens)
+        final_hidden_states = self.experts(
+            hidden_states,
+            router_logits,
+            all_rank_num_tokens=all_rank_num_tokens,
+            all_rank_max_num_tokens=all_rank_max_num_tokens,
+            use_dp_padding=False)
         return final_hidden_states
 
 
@@ -102,7 +104,9 @@ class MixtralDecoderLayer(DecoderLayer):
 
         self.self_attn = MixtralAttention(model_config, layer_idx=layer_idx)
 
-        self.block_sparse_moe = MixtralMoE(model_config, aux_stream)
+        self.block_sparse_moe = MixtralMoE(model_config,
+                                           aux_stream,
+                                           layer_idx=layer_idx)
 
         self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                        eps=config.rms_norm_eps,
@@ -116,7 +120,7 @@ class MixtralDecoderLayer(DecoderLayer):
 
     def forward(
         self,
-        position_ids: torch.LongTensor,
+        position_ids: torch.IntTensor,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor],
@@ -149,14 +153,14 @@ class MixtralModel(DecoderModel):
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
         super().__init__(model_config)
         config = model_config.pretrained_config
-        self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
         self.aux_stream = torch.cuda.Stream()
 
-        self.embed_tokens = nn.Embedding(config.vocab_size,
-                                         config.hidden_size,
-                                         config.pad_token_id,
-                                         dtype=config.torch_dtype)
+        self.embed_tokens = Embedding(
+            config.vocab_size,
+            config.hidden_size,
+            dtype=config.torch_dtype,
+        )
 
         self.layers = nn.ModuleList([
             MixtralDecoderLayer(model_config, layer_idx, self.aux_stream)
@@ -169,8 +173,8 @@ class MixtralModel(DecoderModel):
     def forward(
         self,
         attn_metadata: AttentionMetadata,
-        input_ids: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
+        input_ids: Optional[torch.IntTensor] = None,
+        position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         **kwargs,
     ) -> torch.Tensor:
@@ -204,35 +208,3 @@ class MixtralForCausalLM(DecoderModelForCausalLM[MixtralModel,
                          config=model_config,
                          hidden_size=model_config.pretrained_config.hidden_size,
                          vocab_size=model_config.pretrained_config.vocab_size)
-
-    def load_weights(self, weights: Dict):
-
-        def filter_weights(prefix, weights: Dict):
-            result = {}
-            for k, v in weights.items():
-                if k.startswith(prefix):
-                    new_k = k[len(prefix) + 1:]
-                    result[new_k] = v
-            return result
-
-        params_map = {
-            'qkv_proj': ['q_proj', 'k_proj', 'v_proj'],
-        }
-
-        for name, module in self.named_modules():
-            if len(module._parameters) > 0:
-                names = name.split('.')
-                if names[-1] in params_map:
-                    module_weights = []
-                    for new_name in params_map[names[-1]]:
-                        module_weights.append(
-                            filter_weights('.'.join(names[:-1] + [new_name]),
-                                           weights))
-                    module.load_weights(weights=module_weights)
-                else:
-                    module_weights = filter_weights(name, weights)
-                    if hasattr(module, 'load_weights'):
-                        module.load_weights(weights=[module_weights])
-                    else:
-                        for n, p in module.named_parameters():
-                            p.data.copy_(module_weights[n][:])

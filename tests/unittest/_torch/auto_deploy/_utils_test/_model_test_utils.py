@@ -1,10 +1,12 @@
+import copy
 import os
-from typing import Optional
+from typing import Any, Dict, Optional
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.export import Dim
+from utils.llm_data import llm_models_root
 
 
 def apply_rotary_emb(x: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
@@ -182,7 +184,7 @@ class MoEOpModel(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         x: Tensor of shape (batch, hidden_size)
-        Computes router logits via a gate, and then calls the MoE op via torch.moe.torch_moe.
+        Computes router logits via a gate, and then calls the MoE op via torch.ops.auto_deploy.torch_moe.
         """
 
         router_logits = self.gate(x)
@@ -195,13 +197,60 @@ class MoEOpModel(nn.Module):
         w2_list = [expert.w2 for expert in self.experts]
         w3_list = [expert.w3 for expert in self.experts]
 
-        out = torch.ops.moe.torch_moe(
+        out = torch.ops.auto_deploy.torch_moe(
             x, selected_experts, routing_weights, w1_list, w2_list, w3_list
         )
         return out
 
     def get_input(self, device, dtype=torch.bfloat16):
         return torch.randn(2, self.hidden_size, device=device, dtype=dtype)
+
+
+class BMM(nn.Module):
+    """Expert model with BMM operations for testing."""
+
+    # using hidden_size for both weight dimensions to simplify the test
+    def __init__(self, hidden_dim, batch_size):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.batch_size = batch_size
+        # Create parameter weights for BMM
+        self.weight1 = nn.Parameter(torch.randn(batch_size, hidden_dim, hidden_dim))
+
+    def forward(self, x):
+        # x shape: [batch_size, seq_len, embed_dim]
+        return torch.bmm(x, self.weight1)
+
+
+class BMMModel(nn.Module):
+    """Simple model with BMM operations for testing."""
+
+    def __init__(self, hidden_dim, batch_size, num_experts):
+        super().__init__()
+        self.experts = nn.ModuleList([BMM(hidden_dim, batch_size) for _ in range(num_experts)])
+
+    def forward(self, x):
+        # x shape: [batch_size, seq_len, embed_dim]
+        return torch.cat([expert(x) for expert in self.experts], dim=1)
+
+
+class BMMDynamicModel(nn.Module):
+    """BMM model with dynamic tensor weights for testing."""
+
+    def __init__(self, hidden_dim, batch_size):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.batch_size = batch_size
+        # Create a linear layer to generate dynamic weights
+        self.weight = nn.Parameter(torch.randn(batch_size, hidden_dim * hidden_dim))
+
+    def forward(self, x):
+        # x shape: [batch_size, seq_len, hidden_dim]
+        batch_size, seq_len, hidden_dim = x.shape
+
+        # Generate dynamic weights from input
+        dynamic_weights = self.weight.view(batch_size, hidden_dim, hidden_dim)
+        return torch.bmm(x, dynamic_weights)
 
 
 def generate_dynamic_shapes(max_batch_size, max_seq_len):
@@ -222,3 +271,211 @@ def _hf_model_dir_or_hub_id(
         return hf_model_dir
     else:
         return hf_hub_id
+
+
+def rotate_half(x: torch.Tensor) -> torch.Tensor:
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
+    return torch.cat((-x2, x1), dim=-1)
+
+
+# Copied from transformers.models.llama.modeling_llama.apply_rotary_pos_emb
+def apply_rotary_pos_emb_explicit(
+    q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, unsqueeze_dim: int = 1
+):
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
+
+
+def apply_rotary_pos_emb_complex(
+    xq: torch.Tensor,
+    xk: torch.Tensor,
+    freqs_cis: torch.Tensor,  # Expected shape: (B, seq, head_dim//2) and complex dtype.
+    unsqueeze_dim: int = 2,
+):
+    # Reshape the inputs to pair the last dimension.
+    xq_complex = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
+    xk_complex = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
+    # Multiply with frequencies. Note that freqs_cis is expected to broadcast with an extra head dim.
+    freqs_q = freqs_cis.unsqueeze(unsqueeze_dim)
+    freqs_k = freqs_cis.unsqueeze(unsqueeze_dim)
+    xq_out = torch.view_as_real(xq_complex * freqs_q).flatten(3)
+    xk_out = torch.view_as_real(xk_complex * freqs_k).flatten(3)
+    return xq_out.type_as(xq), xk_out.type_as(xk)
+
+
+# Copied from https://huggingface.co/deepseek-ai/DeepSeek-V3/blob/main/modeling_deepseek.py#L339
+def apply_rotary_pos_emb_ds(q, k, cos, sin, position_ids, unsqueeze_dim=1):
+    """
+    Apply rotary positional embeddings by interleaving Q/K ,
+    indexing cos/sin tables with position_ids, and returning rotated q, k.
+    cos:  [seq_len, head_dim]
+    sin:  [seq_len, head_dim]
+    """
+    cos = cos[position_ids].unsqueeze(unsqueeze_dim)
+    sin = sin[position_ids].unsqueeze(unsqueeze_dim)
+    b, h, s, d = q.shape
+    q = q.view(b, h, s, d // 2, 2).transpose(4, 3).reshape(b, h, s, d)
+    b, h, s, d = k.shape
+    k = k.view(b, h, s, d // 2, 2).transpose(4, 3).reshape(b, h, s, d)
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
+    return q_embed, k_embed
+
+
+_SMALL_MODEL_CONFIGS = {
+    "meta-llama/Meta-Llama-3.1-8B-Instruct": {
+        "model": _hf_model_dir_or_hub_id(
+            f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct",
+            "meta-llama/Meta-Llama-3.1-8B-Instruct",
+        ),
+        "model_kwargs": {
+            "num_hidden_layers": 1,
+            "hidden_size": 64,
+            "intermediate_size": 64,
+            "num_attention_heads": 2,
+            "num_key_value_heads": 1,
+        },
+    },
+    "mistralai/Mixtral-8x7B-Instruct-v0.1": {
+        "model": _hf_model_dir_or_hub_id(
+            f"{llm_models_root()}/Mixtral-8x7B-Instruct-v0.1",
+            "mistralai/Mixtral-8x7B-Instruct-v0.1",
+        ),
+        "model_kwargs": {
+            "num_hidden_layers": 2,
+            "intermediate_size": 256,
+            "hidden_size": 64,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "num_local_experts": 2,
+        },
+    },
+    "Qwen/Qwen3-30B-A3B": {
+        "model": _hf_model_dir_or_hub_id(
+            f"{llm_models_root()}/Qwen3/Qwen3-30B-A3B",
+            "Qwen/Qwen3-30B-A3B",
+        ),
+        "model_kwargs": {
+            "num_hidden_layers": 2,
+            "intermediate_size": 256,
+            "hidden_size": 64,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+            "num_local_experts": 2,
+        },
+    },
+    "microsoft/Phi-3-mini-4k-instruct": {
+        "model": _hf_model_dir_or_hub_id(
+            f"{llm_models_root()}/Phi-3/Phi-3-mini-4k-instruct",
+            "microsoft/Phi-3-mini-4k-instruct",
+        ),
+        "model_kwargs": {
+            "num_hidden_layers": 2,
+            "hidden_size": 128,
+            "intermediate_size": 256,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 2,
+        },
+    },
+    "meta-llama/Llama-4-Scout-17B-16E-Instruct": {
+        "model": _hf_model_dir_or_hub_id(
+            f"{llm_models_root()}/Llama-4-Scout-17B-16E-Instruct",
+            "meta-llama/Llama-4-Scout-17B-16E-Instruct",
+        ),
+        "model_factory": "AutoModelForImageTextToText",
+        "model_kwargs": {
+            "text_config": {
+                "num_hidden_layers": 1,
+                "head_dim": 64,
+                "hidden_size": 32,
+                "intermediate_size": 64,
+                "intermediate_size_mlp": 64,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 1,
+                "num_local_experts": 2,
+            },
+            "vision_config": {
+                "num_hidden_layers": 1,
+                "hidden_size": 64,
+                "intermediate_size": 64,
+                "num_attention_heads": 2,
+            },
+        },
+    },
+    "deepseek-ai/DeepSeek-V3": {
+        "model": _hf_model_dir_or_hub_id(
+            f"{llm_models_root()}/DeepSeek-V3",
+            "deepseek-ai/DeepSeek-V3",
+        ),
+        "model_kwargs": {
+            "first_k_dense_replace": 1,
+            "num_hidden_layers": 2,
+            "hidden_size": 32,
+            "intermediate_size": 64,
+            "kv_lora_rank": 128,
+            "moe_intermediate_size": 128,
+            "n_group": 2,
+            "topk_group": 2,
+            "n_routed_experts": 16,
+            "n_shared_experts": 1,
+            "num_attention_heads": 8,
+            "num_key_value_heads": 2,
+            "num_experts_per_token": 2,
+            "q_lora_rank": 128,
+        },
+    },
+    "Qwen/Qwen2.5-3B-Instruct": {
+        "model": _hf_model_dir_or_hub_id(
+            f"{llm_models_root()}/Qwen/Qwen2.5-3B-Instruct",
+            "Qwen/Qwen2.5-3B-Instruct",
+        ),
+        "model_kwargs": {
+            "num_hidden_layers": 2,
+        },
+    },
+}
+
+
+def get_small_model_config(model_hub_id: str, **llm_args_kwargs) -> Dict[str, Any]:
+    """
+    Get the small model configuration for a given HuggingFace model hub ID.
+
+    Args:
+        model_hub_id: The HuggingFace model hub ID (e.g., "meta-llama/Meta-Llama-3.1-8B-Instruct")
+
+    Returns:
+        Dictionary containing the model configuration
+
+    Raises:
+        KeyError: If the model_hub_id is not found in the configurations
+    """
+    if model_hub_id not in _SMALL_MODEL_CONFIGS:
+        available_models = list(_SMALL_MODEL_CONFIGS.keys())
+        raise KeyError(f"Model '{model_hub_id}' not found. Available models: {available_models}")
+
+    llm_args = copy.deepcopy(_SMALL_MODEL_CONFIGS[model_hub_id])
+
+    # add some defaults to llm_args
+    llm_args["skip_loading_weights"] = True  # No weight loading to speed up things
+    llm_args["free_mem_ratio"] = 0.00  # we don't need the cache and it may cause OOM issues
+    llm_args["attn_page_size"] = 4  # Make sure paging is activated despite small max_tokens
+    llm_args["max_batch_size"] = 2  # Minimum batching to speed up things
+
+    # update with custom llm_args kwargs
+    llm_args.update(llm_args_kwargs)
+
+    # add a couple of other defaults to the experiment config
+    experiment_config = {
+        "args": llm_args,
+        "benchmark": {"enabled": False},
+        "prompt": {
+            "queries": "Hello World",
+            "sp_kwargs": {"max_tokens": 8},
+        },
+    }
+
+    return experiment_config

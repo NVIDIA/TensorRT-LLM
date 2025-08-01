@@ -242,13 +242,18 @@ static inline void set_params(bert::Fused_multihead_attention_params_v2& params,
     Attention_input_layout input_layout,
     // sizes
     size_t const b, size_t const s_q, size_t const s_kv, size_t const h, size_t const h_kv, size_t const d,
-    size_t const dv, size_t const total, size_t const sliding_window_size,
+    size_t const dv, size_t const total, const size_t num_grouped_heads, const size_t sliding_window_size,
+    const size_t chunked_attention_size,
     // paged kv cache block size.
     size_t const tokens_per_block,
     // device pointers
     void* qkv_packed_d,
     // contiguous q.
     void* q_d,
+    // separate k.
+    void* k_d,
+    // separate v.
+    void* v_d,
     // contiguous kv.
     void* kv_d,
     // start address of the paged kv pool.
@@ -266,42 +271,57 @@ static inline void set_params(bert::Fused_multihead_attention_params_v2& params,
 
     memset(&params, 0, sizeof(params));
 
-    // Set the pointers.
-    params.qkv_ptr = qkv_packed_d;
-    // For grouped- or multi-query attention (h denotes num_q_heads; h' denotes h_kv):
-    //   qkv_layout = [b, s, [q_hd, k_h'd, v_h'd]]
-    //   qkv_stride = (h+2*h')d * bytes_per_elt
-    // Otherwise:
-    //   qkv_layout = [b, s, 3, h, d] or [b, s, h, 3, d]
-    //   qkv_stride = 3hd * bytes_per_elt
-    params.qkv_stride_in_bytes = get_size_in_bytes(h * d + h_kv * d + h_kv * dv, data_type);
     params.o_ptr = o_packed_d;
     params.o_stride_in_bytes = get_size_in_bytes(h * dv, output_dtype);
 
     if (interleaved)
     {
-        params.qkv_stride_in_bytes = total;
+        params.q_stride_in_bytes = total;
         params.o_stride_in_bytes = total;
     }
 
-    // Contiguous q + Paged kv cache.
-    int max_blocks_per_sequence = (s_kv + tokens_per_block - 1) / tokens_per_block;
-    params.paged_kv_cache = Kv_block_array(b, max_blocks_per_sequence, tokens_per_block,
-        get_size_in_bytes(tokens_per_block * h_kv * std::gcd(d, dv), data_type), paged_kv_pool_ptr);
-    params.paged_kv_cache.mBlockOffsets = paged_block_offsets;
-    params.q_stride_in_bytes = get_size_in_bytes(h * d, data_type);
-    // Layout [B, S, H, D].
-    params.q_ptr = q_d;
-    // Layout [B, S, 2, H, D].
-    params.kv_ptr = kv_d;
-    if (input_layout == Attention_input_layout::Q_PAGED_KV)
+    if (input_layout == Attention_input_layout::PACKED_QKV)
     {
-        params.kv_stride_in_bytes = get_size_in_bytes(tokens_per_block * d, data_type);
-        params.v_stride_in_bytes = get_size_in_bytes(tokens_per_block * dv, data_type);
+        // For grouped- or multi-query attention (h denotes num_q_heads; h' denotes h_kv):
+        //   qkv_layout = [b, s, [q_hd, k_h'd, v_h'd]]
+        //   qkv_stride = (h+2*h')d * bytes_per_elt
+        // Otherwise:
+        //   qkv_layout = [b, s, 3, h, d] or [b, s, h, 3, d]
+        //   qkv_stride = 3hd * bytes_per_elt
+        params.qkv_ptr = qkv_packed_d;
+        params.q_stride_in_bytes = params.k_stride_in_bytes = params.v_stride_in_bytes
+            = get_size_in_bytes(h * d + h_kv * d + h_kv * dv, data_type);
     }
     else
     {
-        params.kv_stride_in_bytes = get_size_in_bytes(2 * h_kv * d, data_type);
+        // Layout [B, S, H, D].
+        params.q_ptr = q_d;
+        params.q_stride_in_bytes = get_size_in_bytes(h * d, data_type);
+
+        if (input_layout == Attention_input_layout::CONTIGUOUS_Q_KV)
+        {
+            // Layout [B, S, 2, H, D].
+            params.kv_ptr = kv_d;
+            params.k_stride_in_bytes = params.v_stride_in_bytes = get_size_in_bytes(h_kv * (d + dv), data_type);
+        }
+        else if (input_layout == Attention_input_layout::Q_PAGED_KV)
+        {
+            int max_blocks_per_sequence = (s_kv + tokens_per_block - 1) / tokens_per_block;
+            params.paged_kv_cache = Kv_block_array(b, max_blocks_per_sequence, tokens_per_block,
+                get_size_in_bytes(tokens_per_block * h_kv * std::gcd(d, dv), data_type), paged_kv_pool_ptr);
+            params.paged_kv_cache.mBlockOffsets = paged_block_offsets;
+            params.k_stride_in_bytes = get_size_in_bytes(tokens_per_block * d, data_type);
+            params.v_stride_in_bytes = get_size_in_bytes(tokens_per_block * dv, data_type);
+        }
+        else if (input_layout == Attention_input_layout::SEPARATE_Q_K_V)
+        {
+            // Layout [B, S, H_kv, D].
+            params.k_ptr = k_d;
+            // Layout [B, S, H_kv, Dv].
+            params.v_ptr = v_d;
+            params.k_stride_in_bytes = get_size_in_bytes(h_kv * d, data_type);
+            params.v_stride_in_bytes = get_size_in_bytes(h_kv * dv, data_type);
+        }
     }
 
     // Packed mask.
@@ -328,7 +348,11 @@ static inline void set_params(bert::Fused_multihead_attention_params_v2& params,
     params.s = s_q;
     params.d = d;
     params.dv = dv;
+    params.num_grouped_heads = num_grouped_heads;
     params.sliding_window_size = sliding_window_size;
+    assert((chunked_attention_size == 0 || (chunked_attention_size & (chunked_attention_size - 1)) == 0)
+        && "chunked_attention_size has to be a power of 2");
+    params.log2_chunked_attention_size = chunked_attention_size > 0 ? std::log2(chunked_attention_size) : 0;
 
     // cumulative q or kv sequence lengths.
     params.cu_q_seqlens = static_cast<int*>(cu_q_seqlens_d);
@@ -457,9 +481,13 @@ int main(int argc, char** argv)
     size_t dv = 0;
     // The length of the sequence.
     size_t s = 384;
+    // Number of grouped heads in the seqlen dimension.
+    size_t num_grouped_heads = 1;
     // Sliding Window Attention
     // Only pay attention to [max(0, query_idx - sliding_window_size), query_idx].
     size_t sliding_window_size = size_t(INT_MAX);
+    // The chunked-attention size.
+    size_t chunked_attention_size = 0;
 
     // The data type of the kernel.
     Data_type data_type = DATA_TYPE_FP16;
@@ -486,7 +514,7 @@ int main(int argc, char** argv)
     bool skip_checks = false;
     // The tolerance when checking results.
     float epsilon = -1.f; // data_type == DATA_TYPE_FP16 ? 0.015f : 0.f;
-    // Use causal mask / padding_mask / sliding_window_causal mask / custom_mask input.
+    // Use causal mask / padding_mask / sliding_or_chunked_causal mask / custom_mask input.
     Attention_mask_type attention_mask_type = Attention_mask_type::PADDING;
     // Use padded format for input QKV tensor & output O tensor.
     // Instead of variable lengths [total, h, 3, d]  where total = b1*s1 + b2*s2 + ... bn*sn,
@@ -538,8 +566,9 @@ int main(int argc, char** argv)
     size_t tokens_per_block = 64;
 
     // Attention that has different q and kv lengths.
-    size_t s_q = 128;
-    bool chunked_attention = false;
+    size_t s_q = 0;
+    // different q and kv sequence lengths.
+    bool different_q_kv_lengths = false;
 
     // SageAttention block sizes
     int sage_block_size_q = 0, sage_block_size_k = 0, sage_block_size_v = 0;
@@ -578,7 +607,7 @@ int main(int argc, char** argv)
         else if (!strcmp(argv[ii], "-s-q") && ++ii < argc)
         {
             s_q = strtol(argv[ii], nullptr, 10);
-            chunked_attention = true;
+            different_q_kv_lengths = true;
         }
         else if (!strcmp(argv[ii], "-dropout") && ++ii < argc)
         {
@@ -644,6 +673,10 @@ int main(int argc, char** argv)
             output_dtype = DATA_TYPE_BF16;
             is_output_dtype_set = true;
         }
+        else if (!strcmp(argv[ii], "-num-grouped-heads") && ++ii < argc)
+        {
+            num_grouped_heads = strtol(argv[ii], nullptr, 10);
+        }
         else if (!strcmp(argv[ii], "-range-k") && ++ii < argc)
         {
             range_k = strtol(argv[ii], nullptr, 10);
@@ -667,6 +700,10 @@ int main(int argc, char** argv)
         else if (!strcmp(argv[ii], "-sliding-window-size") && ++ii < argc)
         {
             sliding_window_size = strtol(argv[ii], nullptr, 10);
+        }
+        else if (!strcmp(argv[ii], "-chunked-attention-size") && ++ii < argc)
+        {
+            chunked_attention_size = strtol(argv[ii], nullptr, 10);
         }
         else if (!strcmp(argv[ii], "-scale-bmm1") && ++ii < argc)
         {
@@ -712,9 +749,9 @@ int main(int argc, char** argv)
         {
             attention_mask_type = Attention_mask_type::CAUSAL;
         }
-        else if (!strcmp(argv[ii], "-sliding-window-causal-mask"))
+        else if (!strcmp(argv[ii], "-sliding-or-chunked-causal-mask"))
         {
-            attention_mask_type = Attention_mask_type::SLIDING_WINDOW_CAUSAL;
+            attention_mask_type = Attention_mask_type::SLIDING_OR_CHUNKED_CAUSAL;
         }
         else if (!strcmp(argv[ii], "-custom-mask"))
         {
@@ -737,6 +774,10 @@ int main(int argc, char** argv)
         else if (!strcmp(argv[ii], "-paged-kv"))
         {
             input_layout = Attention_input_layout::Q_PAGED_KV;
+        }
+        else if (!strcmp(argv[ii], "-separate-q-k-v"))
+        {
+            input_layout = Attention_input_layout::SEPARATE_Q_K_V;
         }
         else if (!strcmp(argv[ii], "-tokens-per-block") && ++ii < argc)
         {
@@ -830,6 +871,7 @@ int main(int argc, char** argv)
             return -1;
         }
     }
+
     if (save_softmax == true)
     {
         if (input_layout != Attention_input_layout::CONTIGUOUS_Q_KV)
@@ -851,12 +893,12 @@ int main(int argc, char** argv)
     min_s = std::min<uint32_t>(s, min_s);
     h_kv = multi_query_attention ? h_kv : h;
 
-    // Chunked attention.
-    if (chunked_attention)
+    // Check if the options are valid.
+    if (different_q_kv_lengths)
     {
         assert(input_layout != Attention_input_layout::PACKED_QKV
-            && "chunked attention is not allowed with packed_qkv input.");
-        assert(s >= s_q && "chunked attention's s_q has to be larger than the total seq_length !");
+            && "Packed QKV input layout is not supported with different q and kv lengths.");
+        assert(s >= s_q && "q seqlen has to be smaller than or equal to the kv seqlen !");
     }
     else
     {
@@ -866,7 +908,16 @@ int main(int argc, char** argv)
     // Sliding window attention (only pay attention to sliding-window-size long previous tokens).
     if (sliding_window_size < s)
     {
-        attention_mask_type = Attention_mask_type::SLIDING_WINDOW_CAUSAL;
+        assert(
+            chunked_attention_size == 0 && "chunked_attention_size should not be used when sliding_window_size is set");
+        attention_mask_type = Attention_mask_type::SLIDING_OR_CHUNKED_CAUSAL;
+    }
+    // Chunked attention.
+    if (chunked_attention_size > 0)
+    {
+        assert((chunked_attention_size & (chunked_attention_size - 1)) == 0
+            && "chunked_attention_size has to be a power of 2");
+        attention_mask_type = Attention_mask_type::SLIDING_OR_CHUNKED_CAUSAL;
     }
 
     // Set the norm.
@@ -1004,7 +1055,7 @@ int main(int argc, char** argv)
 
     // Contiguous KV cache buffer.
     // The shape is [B, 2, S, H, D].
-    size_t const kv_size = b * 2 * s * h_kv * d;
+    const size_t kv_size = b * s * h_kv * (d + dv);
     // The size in bytes.
     size_t const kv_size_in_bytes = get_size_in_bytes(kv_size, data_type);
     // Allocate on the host.
@@ -1055,6 +1106,16 @@ int main(int argc, char** argv)
     void* q_d;
     size_t const q_size = s * b * h * d;
     FMHA_CHECK_CUDA(cudaMalloc(&q_d, get_size_in_bytes(q_size, data_type)));
+
+    // K has [B, S, H_kv, D] with separate kv cache.
+    void* k_d;
+    const size_t k_size = s * b * h_kv * d;
+    FMHA_CHECK_CUDA(cudaMalloc(&k_d, get_size_in_bytes(k_size, data_type)));
+
+    // V has [B, S, H_kv, Dv] with separate kv cache.
+    void* v_d;
+    const size_t v_size = s * b * h_kv * dv;
+    FMHA_CHECK_CUDA(cudaMalloc(&v_d, get_size_in_bytes(v_size, data_type)));
 
     // Scale bmm2 (per-tensor).
     void* scale_bmm2_d;
@@ -1291,10 +1352,10 @@ int main(int argc, char** argv)
     int total = cu_seqlens.back();
     seqlens.emplace_back(total);
 
-    // Chunked attention (variable s_q, variable kv length).
+    // Different q and kv sequence lengths.
     std::vector<uint32_t> q_seqlens = seqlens;
     std::vector<int> cu_q_seqlens = cu_seqlens;
-    if (chunked_attention)
+    if (different_q_kv_lengths)
     {
         for (int it = 0; it < b; it++)
         {
@@ -1471,8 +1532,8 @@ int main(int argc, char** argv)
     //     "Padded MQA V[b, s, h_kv*d]");
     // }
 
-    // Contiguous KV Cache.
-    store_q_and_contiguous_kv_cache(q_d, contiguous_kv_h, contiguous_kv_d,
+    // Contiguous KV Cache and Separate KV Cache.
+    store_q_and_contiguous_kv_cache(q_d, k_d, v_d, contiguous_kv_h, contiguous_kv_d,
         reinterpret_cast<float const*>(qkv_packed_h.data()), reinterpret_cast<int const*>(cu_seqlens.data()),
         reinterpret_cast<int const*>(cu_q_seqlens.data()), b, s, h, h_kv, d, dv, data_type);
 
@@ -1488,6 +1549,9 @@ int main(int argc, char** argv)
     FMHA_CHECK_CUDA(cuda_memcpy_h2d(mqa_qkv_d, mqa_qkv_h.data(), mqa_qkv_size, data_type));
     FMHA_CHECK_CUDA(cuda_memcpy_h2d(qkv_bsh3d_d, qkv_bsh3d_h.data(), qkv_size, data_type));
 
+    // Is MTP used?
+    bool is_mtp = (d == 576 && dv == 512);
+
     for (size_t so = 0; so < s; ++so)
     { // s_q
         for (size_t bi = 0; bi < b; ++bi)
@@ -1501,13 +1565,30 @@ int main(int argc, char** argv)
                 //  attention_mask_type == Attention_mask_type::CUSTOM_MASK
                 if (attention_mask_type == Attention_mask_type::CUSTOM_MASK
                     || attention_mask_type == Attention_mask_type::CAUSAL
-                    || attention_mask_type == Attention_mask_type::SLIDING_WINDOW_CAUSAL)
+                    || attention_mask_type == Attention_mask_type::SLIDING_OR_CHUNKED_CAUSAL)
                 {
                     valid = valid && (so >= si);
                 }
-                if (attention_mask_type == Attention_mask_type::SLIDING_WINDOW_CAUSAL)
+                if (attention_mask_type == Attention_mask_type::SLIDING_OR_CHUNKED_CAUSAL)
                 {
-                    valid = valid && (si >= std::max(int(so - sliding_window_size), 0));
+                    if (chunked_attention_size > 0)
+                    {
+                        int chunk_idx = so / chunked_attention_size;
+                        valid = valid && (si >= (chunk_idx * chunked_attention_size));
+                    }
+                    else
+                    {
+                        valid = valid && (si >= std::max(int(so - sliding_window_size), 0));
+                    }
+                }
+                if (is_mtp)
+                {
+                    // Only the last s_q tokens are used for verifying the results.
+                    size_t idx = so - (actual_seqlen - s_q);
+                    size_t num_mtp_tokens = s_q / num_grouped_heads;
+                    size_t mtp_token_idx = idx / num_grouped_heads;
+                    valid
+                        = idx >= 0 && si < (actual_seqlen - num_mtp_tokens + 1 + mtp_token_idx) && (so < actual_seqlen);
                 }
                 if (!skip_checks)
                 {
@@ -1592,11 +1673,12 @@ int main(int argc, char** argv)
 
     bert::Fused_multihead_attention_params_v2 params_v2;
     set_params(params_v2, launch_params, data_type, acc_type, output_dtype, input_layout, b, s_q, s, h, h_kv, d, dv,
-        total, sliding_window_size,
+        total, num_grouped_heads, sliding_window_size, chunked_attention_size,
         // Paged kv cache.
-        tokens_per_block, qkv_d_view, q_d, contiguous_kv_d, kv_cache_pool_ptr, kv_cache_block_offsets_d, packed_mask_d,
-        cu_mask_rows_d, cu_seqlens_d, cu_q_seqlens_d, o_d_view, p_d, s_d, softmax_stats_ptr, scale_bmm2_d, scale_bmm1,
-        scale_softmax, scale_bmm2, softcapping_scale_bmm1, use_int8_scale_max, interleaved, is_s_padded, has_alibi);
+        tokens_per_block, qkv_d_view, q_d, k_d, v_d, contiguous_kv_d, kv_cache_pool_ptr, kv_cache_block_offsets_d,
+        packed_mask_d, cu_mask_rows_d, cu_seqlens_d, cu_q_seqlens_d, o_d_view, p_d, s_d, softmax_stats_ptr,
+        scale_bmm2_d, scale_bmm1, scale_softmax, scale_bmm2, softcapping_scale_bmm1, use_int8_scale_max, interleaved,
+        is_s_padded, has_alibi);
 
     // total number of tokens is needed to set TMA desc on the host.
     launch_params.total_q_seqlen = q_seqlens[b];
@@ -1705,10 +1787,12 @@ int main(int argc, char** argv)
 #else
         {
             // use external quant kernel
-            int const stride_qkv = params_v2.qkv_stride_in_bytes;
             run_sage_quant(b, h, d, s, params_v2.qkv_ptr,
                 (char*) params_v2.qkv_ptr + get_size_in_bytes(h * d, data_type),
-                (char*) params_v2.qkv_ptr + get_size_in_bytes(2 * h * d, data_type), stride_qkv, stride_qkv, stride_qkv,
+                (char*) params_v2.qkv_ptr + get_size_in_bytes(2 * h * d, data_type,
+                params_v2.q_stride_in_bytes,
+                params_v2.k_stride_in_bytes,
+                params_v2.v_stride_in_bytes,
                 params_v2.cu_q_seqlens, params_v2.cu_kv_seqlens, sage_block_size_q, sage_block_size_k,
                 sage_block_size_v, quant_qkv, quant_qkv + h * d, quant_qkv + 2 * h * d, params_v2.sage.q.scales,
                 params_v2.sage.k.scales, params_v2.sage.v.scales);
@@ -1716,7 +1800,8 @@ int main(int argc, char** argv)
 #endif
         // no need to free old params_v2.qkv_ptr, it will be released in the end
         params_v2.qkv_ptr = quant_qkv;
-        params_v2.qkv_stride_in_bytes = get_size_in_bytes((h + 2 * h_kv) * d, DATA_TYPE_E4M3);
+        params_v2.q_stride_in_bytes = params_v2.k_stride_in_bytes = params_v2.v_stride_in_bytes
+            = get_size_in_bytes((h + 2 * h_kv) * d, DATA_TYPE_E4M3);
     }
 
 #if defined(DEBUG_HAS_PRINT_BUFFER)
@@ -1921,15 +2006,9 @@ int main(int argc, char** argv)
                 x_vec32(false, o_h, h, is_s_padded ? b * h : total, 1);
             }
 
-            if (chunked_attention)
-            {
-                extract_and_transpose_chunked_output<float>(
-                    o_ref_trans_h.data(), o_ref_h, seqlens, q_seqlens, s, s_q, b, h, dv, is_s_padded);
-            }
-            else
-            {
-                extract_and_transpose_output<float>(o_ref_trans_h.data(), o_ref_h, seqlens, s, b, h, dv, is_s_padded);
-            }
+            // Extract the last s_q tokens from the output.
+            extract_and_transpose_output<float>(
+                o_ref_trans_h.data(), o_ref_h, seqlens, q_seqlens, s, s_q, b, h, dv, is_s_padded);
 
             if (verbose)
             {
@@ -2010,6 +2089,9 @@ int main(int argc, char** argv)
     FMHA_CHECK_CUDA(cudaFree(qkv_bsh3d_d));
     FMHA_CHECK_CUDA(cudaFree(mask_d));
     FMHA_CHECK_CUDA(cudaFree(packed_mask_d));
+    FMHA_CHECK_CUDA(cudaFree(q_d));
+    FMHA_CHECK_CUDA(cudaFree(k_d));
+    FMHA_CHECK_CUDA(cudaFree(v_d));
     FMHA_CHECK_CUDA(cudaFree(p_d));
     FMHA_CHECK_CUDA(cudaFree(s_d));
     FMHA_CHECK_CUDA(cudaFree(o_d));

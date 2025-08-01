@@ -11,6 +11,7 @@ from tensorrt_llm.bench.dataclasses.general import DatasetMetadata
 from tensorrt_llm.bench.dataclasses.statistics import (BenchmarkStatistics,
                                                        PercentileStats,
                                                        RequestRecord)
+from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.logger import Logger
 from tensorrt_llm.models.modeling_utils import SpeculativeDecodingMode
 
@@ -59,6 +60,7 @@ class StatsKeeper:
         Register request perf items, used exclusively with LLM API.
         """
         record = self.requests[request_perf_item.request_id]
+        record.id = request_perf_item.request_id
         record.num_input_tokens = request_perf_item.num_input_tokens
         record.start_timestamp = request_perf_item.start_timestamp
         record.register_event(request_perf_item.error,
@@ -220,6 +222,16 @@ class ReportUtility:
             retval[req_id] = output_str
         return dict(sorted(retval.items()))
 
+    def get_request_info(self, tokenizer) -> Dict[int, List[str]]:
+        requests = []
+        for request in self.raw_statistics.requests.values():
+            entry = request.model_dump()
+            entry["output"] = tokenizer.decode(entry["tokens"])
+            entry["output_tokens"] = len(entry["tokens"])
+            entry.pop("tokens")
+            requests.append(entry)
+        return requests
+
     def get_statistics_dict(self) -> Dict[str, Any]:
         """Get statistics as a dictionary.
 
@@ -236,7 +248,7 @@ class ReportUtility:
         }
 
         # Engine/Backend details
-        if self.rt_cfg.backend not in ('pytorch', 'autodeploy'):
+        if self.rt_cfg.backend not in ('pytorch', '_autodeploy'):
             config_path = self.rt_cfg.engine_dir / "config.json"
             with open(config_path, "r") as config:
                 engine_config = json.load(config)
@@ -264,9 +276,17 @@ class ReportUtility:
             model = self.rt_cfg.model_path or self.rt_cfg.model
             model_config = ModelConfig.from_pretrained(model,
                                                        trust_remote_code=True)
-            validate_and_set_kv_cache_quant(
-                model_config,
-                self.kwargs["pytorch_backend_config"].kv_cache_dtype)
+            kv_cache_config = self.kwargs.get("kv_cache_config",
+                                              KvCacheConfig())
+            if isinstance(kv_cache_config, KvCacheConfig):
+                kv_cache_dtype = kv_cache_config.dtype
+            elif isinstance(kv_cache_config, dict):
+                kv_cache_dtype = kv_cache_config.get("dtype", "auto")
+            else:
+                raise ValueError(
+                    f"Invalid kv_cache_config type: {type(kv_cache_config)}.")
+
+            validate_and_set_kv_cache_quant(model_config, kv_cache_dtype)
 
             stats_dict["engine"] |= {
                 "backend":
@@ -420,7 +440,7 @@ class ReportUtility:
         decoding = stats_dict.get("decoding_stats", None)
 
         backend_info = ""
-        if self.rt_cfg.backend not in ('pytorch', 'autodeploy'):
+        if self.rt_cfg.backend not in ('pytorch', '_autodeploy'):
             config_path = self.rt_cfg.engine_dir / "config.json"
             with open(config_path, "r") as config:
                 engine_config = json.load(config)
@@ -520,9 +540,9 @@ class ReportUtility:
                 ["minimum", "maximum", "average", "p50", "p90", "p95", "p99"])
 
             perf_stats += (
-                f"Average time-to-first-token [TTFT] (ms):   {streaming['avg_ttft_ms']:.4f}\n"
-                f"Average time-per-output-token [TPOT] (ms): {streaming['avg_tpot_ms']:.4f}\n"
-                f"Per User Output Speed (tps/user):          {streaming['token_output_speed_tok_s']:.4f}\n"
+                f"Average time-to-first-token [TTFT] (ms):          {streaming['avg_ttft_ms']:.4f}\n"
+                f"Average time-per-output-token [TPOT] (ms):        {streaming['avg_tpot_ms']:.4f}\n"
+                f"Per User Output Speed (tps/user):                 {streaming['token_output_speed_tok_s']:.4f}\n"
                 "\n-- Per-Request Time-per-Output-Token [TPOT] Breakdown (ms)\n\n"
                 f"{tpot_stats}\n"
                 "\n-- Per-Request Time-to-First-Token [TTFT] Breakdown (ms) \n\n"

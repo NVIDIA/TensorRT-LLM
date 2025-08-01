@@ -132,6 +132,15 @@ void initBindings(pybind11::module_& m)
         .def_readwrite("micro_batch_id", &tle::InflightBatchingStats::microBatchId)
         .def_readwrite("avg_num_decoded_tokens_per_iter", &tle::InflightBatchingStats::avgNumDecodedTokensPerIter);
 
+    py::class_<tle::SpecDecodingStats>(m, "SpecDecodingStats")
+        .def(py::init<>())
+        .def_readwrite("num_draft_tokens", &tle::SpecDecodingStats::numDraftTokens)
+        .def_readwrite("num_accepted_tokens", &tle::SpecDecodingStats::numAcceptedTokens)
+        .def_readwrite("num_requests_with_draft_tokens", &tle::SpecDecodingStats::numRequestsWithDraftTokens)
+        .def_readwrite("acceptance_length", &tle::SpecDecodingStats::acceptanceLength)
+        .def_readwrite("iter_latency_ms", &tle::SpecDecodingStats::iterLatencyMS)
+        .def_readwrite("draft_overhead", &tle::SpecDecodingStats::draftOverhead);
+
     py::class_<tle::IterationStats>(m, "IterationStats")
         .def(py::init<>())
         .def_readwrite("timestamp", &tle::IterationStats::timestamp)
@@ -150,6 +159,7 @@ void initBindings(pybind11::module_& m)
         .def_readwrite("cross_kv_cache_stats", &tle::IterationStats::crossKvCacheStats)
         .def_readwrite("static_batching_stats", &tle::IterationStats::staticBatchingStats)
         .def_readwrite("inflight_batching_stats", &tle::IterationStats::inflightBatchingStats)
+        .def_readwrite("specdec_stats", &tle::IterationStats::specDecodingStats)
         .def("to_json_str",
             [](tle::IterationStats const& iterationStats)
             { return tle::JsonSerialization::toJsonStr(iterationStats); });
@@ -229,11 +239,22 @@ void initBindings(pybind11::module_& m)
 
     py::class_<tle::KVCacheEvent>(executor_kv_cache, "KVCacheEvent")
         .def_readonly("event_id", &tle::KVCacheEvent::eventId)
-        .def_readonly("data", &tle::KVCacheEvent::data);
+        .def_readonly("data", &tle::KVCacheEvent::data)
+        .def_readonly("window_size", &tle::KVCacheEvent::windowSize);
 
     py::class_<tle::KVCacheEventManager, std::shared_ptr<tle::KVCacheEventManager>>(
         executor_kv_cache, "KVCacheEventManager")
-        .def("get_latest_events", &tle::KVCacheEventManager::getLatestEvents, py::arg("timeout") = std::nullopt);
+        .def(
+            "get_latest_events",
+            [](tle::KVCacheEventManager& self, std::optional<double> timeout_ms = std::nullopt)
+            {
+                if (timeout_ms)
+                {
+                    return self.getLatestEvents(std::chrono::milliseconds(static_cast<int64_t>(*timeout_ms)));
+                }
+                return self.getLatestEvents(std::nullopt);
+            },
+            py::arg("timeout_ms") = std::nullopt);
 
     tensorrt_llm::pybind::executor::initRequestBindings(m);
     tensorrt_llm::pybind::executor::initConfigBindings(m);

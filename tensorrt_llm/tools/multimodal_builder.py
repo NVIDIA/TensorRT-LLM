@@ -598,12 +598,12 @@ def build_llava_engine(args):
         args.output_dir,
         args.max_batch_size)
     if args.model_type == "llava_next":
-        image_newline = model.image_newline.data
+        image_newline = model.model.image_newline.data
         tensor_img_newline = {"image_newline": image_newline}
         save_file(tensor_img_newline,
                   os.path.join(args.output_dir, "image_newlines.safetensors"))
     if args.model_type == "llava_onevision":
-        image_newline = model.image_newline.data
+        image_newline = model.model.image_newline.data
         tensor_img_newline = {"image_newline": image_newline}
         save_file(tensor_img_newline,
                   os.path.join(args.output_dir, "image_newlines.safetensors"))
@@ -1326,6 +1326,8 @@ def compute_rotary_pos_emb(grid_thw, hf_config, VisionRotaryEmbedding):
 def build_qwen2_vl_engine(args):
     from qwen_vl_utils import process_vision_info
     from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
+    from transformers.models.qwen2_vl.configuration_qwen2_vl import \
+        Qwen2VLVisionConfig
     from transformers.models.qwen2_vl.modeling_qwen2_vl import (
         Qwen2VisionTransformerPretrainedModel, Qwen2VLVisionBlock,
         VisionAttention, VisionRotaryEmbedding)
@@ -1388,9 +1390,9 @@ def build_qwen2_vl_engine(args):
 
     class VisionAttentionOpt(VisionAttention):
 
-        def __init__(self, dim: int, num_heads: int = 16):
-            super().__init__(dim, num_heads)
-            self.head_dim = dim / num_heads
+        def __init__(self, config: Qwen2VLVisionConfig):
+            super().__init__(config)
+            self.head_dim = config.embed_dim // config.num_heads
 
         def forward(self,
                     hidden_states: torch.Tensor,
@@ -1444,8 +1446,7 @@ def build_qwen2_vl_engine(args):
 
         def __init__(self, config, attn_implementation: str = "eager") -> None:
             super().__init__(config)
-            self.attn = VisionAttentionOpt(config.embed_dim,
-                                           num_heads=config.num_heads)
+            self.attn = VisionAttentionOpt(config)
 
         def forward(self, hidden_states, attention_mask,
                     rotary_pos_emb) -> torch.Tensor:
@@ -1629,8 +1630,12 @@ def build_pixtral_engine(args):
         cos, sin = position_embeddings
         q, k = apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=0)
 
+        # attention_mask is of shape [batch, patches].
+        mask = attention_mask[:, None, None, :]
+
         attn_output = torch.nn.functional.scaled_dot_product_attention(
-            q, k, v, attn_mask=attention_mask).transpose(1, 2).contiguous()
+            q, k, v, attn_mask=mask).transpose(1, 2).contiguous()
+
         attn_output = attn_output.reshape(batch, patches, -1)
         attn_output = self.o_proj(attn_output)
 

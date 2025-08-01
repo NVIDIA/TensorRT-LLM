@@ -31,7 +31,8 @@ def parse_requirements(filename: os.PathLike):
         extra_URLs = []
         deps = []
         for line in requirements:
-            if line.startswith("#") or line.startswith("-r"):
+            if line.startswith("#") or line.startswith("-r") or line.startswith(
+                    "-c"):
                 continue
 
             # handle -i and --extra-index-url options
@@ -48,9 +49,9 @@ def parse_requirements(filename: os.PathLike):
 
 
 def sanity_check():
-    bindings_path = Path(
-        __file__).resolve().parent / "tensorrt_llm" / "bindings"
-    if not bindings_path.exists():
+    tensorrt_llm_path = Path(__file__).resolve().parent / "tensorrt_llm"
+    if not ((tensorrt_llm_path / "bindings").exists() or
+            (tensorrt_llm_path / "bindings.pyi").exists()):
         raise ImportError(
             'The `bindings` module does not exist. Please check the package integrity. '
             'If you are attempting to use the pip development mode (editable installation), '
@@ -87,6 +88,10 @@ required_deps, extra_URLs = parse_requirements(
 devel_deps, _ = parse_requirements(
     Path("requirements-dev-windows.txt"
          if on_windows else "requirements-dev.txt"))
+constraints_file = Path("constraints.txt")
+if constraints_file.exists():
+    constraints, _ = parse_requirements(constraints_file)
+    required_deps.extend(constraints)
 
 if on_windows:
     package_data = [
@@ -98,7 +103,11 @@ else:
         'bin/executorWorker', 'libs/libtensorrt_llm.so', 'libs/libth_common.so',
         'libs/libnvinfer_plugin_tensorrt_llm.so',
         'libs/libtensorrt_llm_ucx_wrapper.so', 'libs/libdecoder_attention_0.so',
-        'libs/libdecoder_attention_1.so', 'bindings.*.so', "include/**/*"
+        'libs/libtensorrt_llm_nixl_wrapper.so',
+        'libs/libdecoder_attention_1.so', 'libs/nvshmem/License.txt',
+        'libs/nvshmem/nvshmem_bootstrap_uid.so.3',
+        'libs/nvshmem/nvshmem_transport_ibgda.so.103', 'bindings.*.so',
+        'deep_ep/LICENSE', 'deep_ep_cpp_tllm.*.so', "include/**/*"
     ]
 
 package_data += [
@@ -106,6 +115,7 @@ package_data += [
     'tools/plugin_gen/templates/*',
     'bench/build/benchmark_config.yml',
     'evaluate/lm_eval_tasks/**/*',
+    "_torch/auto_deploy/config/*.yaml",
 ]
 
 
@@ -176,7 +186,7 @@ def extract_from_precompiled(precompiled_location: str, package_data: List[str],
 
     with zipfile.ZipFile(wheel_path) as wheel:
         for file in wheel.filelist:
-            if file.filename.endswith(".py"):
+            if file.filename.endswith((".py", ".yaml")):
                 continue
             for filename_pattern in package_data:
                 if fnmatch.fnmatchcase(file.filename,

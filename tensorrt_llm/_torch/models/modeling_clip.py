@@ -202,7 +202,7 @@ class CLIPVisionModel(nn.Module):
             request_ids=request_ids,
             prompt_lens=prompt_lens,
         )
-        attn_metadata.max_seq_len = seq_len * batch_size
+        attn_metadata.max_seq_len = seq_len
         attn_metadata.prepare()
         return attn_metadata
 
@@ -232,4 +232,4 @@ class CLIPVisionModel(nn.Module):
             r'(.*?)mlp\.fc1(.*)': r'\1mlp.up_proj\2',
             r'(.*?)mlp\.fc2(.*)': r'\1mlp.down_proj\2',
         }
-        _load_weights_impl(self, weights, pattern_mapping)
+        _load_weights_impl(self, weights, params_map=pattern_mapping)

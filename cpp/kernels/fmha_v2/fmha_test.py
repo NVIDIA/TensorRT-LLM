@@ -38,9 +38,16 @@ def getSMVersion():
 
 
 # The default test cases for flash attention fmha that will be used in TRTLLM.
-@pytest.mark.parametrize('d', [32, 40, 64, 72, 80, 96, 104, 128, 160, 192, 256])
-@pytest.mark.parametrize('s', [1024])
-@pytest.mark.parametrize('dtype', ["-fp16", "-bf16", "-fp16-fp32", "-e4m3"])
+@pytest.mark.parametrize('d', [32, 40, 64, 72, 80, 96, 104, 128, 160, 192, 256],
+                         ids=[
+                             "head-size-32", "head-size-40", "head-size-64",
+                             "head-size-72", "head-size-80", "head-size-96",
+                             "head-size-104", "head-size-128", "head-size-160",
+                             "head-size-192", "head-size-256"
+                         ])
+@pytest.mark.parametrize('s', [1024], ids=["seqlen-1024"])
+@pytest.mark.parametrize('dtype', ["-fp16", "-bf16", "-fp16-fp32", "-e4m3"],
+                         ids=["fp16", "bf16", "fp16-fp32", "e4m3"])
 @pytest.mark.parametrize('flag', [
     "-s-q 128 -paged-kv", "-s-q 63 -paged-kv", "-paged-kv",
     "-softcapping-scale-bmm1 30", "-contiguous-q-kv"
@@ -123,8 +130,8 @@ def test_trtllm_flash_attention_fmha(d, s, dtype, flag, tiled_kernel):
 
 
 # The test cases for sage attention.
-@pytest.mark.parametrize('d', [80, 128])
-@pytest.mark.parametrize('s', [1024, 4096])
+@pytest.mark.parametrize('d', [80, 128], ids=["head-size-80", "head-size-128"])
+@pytest.mark.parametrize('s', [1024, 4096], ids=["seqlen-1024", "seqlen-4096"])
 def test_trtllm_sage_attention_fmha(d, s):
     sm_version = getSMVersion()
     if sm_version != 89 and sm_version != 90:
@@ -138,19 +145,15 @@ def test_trtllm_sage_attention_fmha(d, s):
             shell=True,
             check=True)
 
-    # Hopper.
-    if sm_version == 90:
-        subprocess.run(
-            f"bin/fmha.exe -v 0 -runs 1 -min-s 1024 -s {s} -b 16 -h 8 -d {d} -bf16 \
-            -sage-block-q 64 -sage-block-k 64 -sage-block-v 256",
-            shell=True,
-            check=True)
-
 
 # The test cases for mla attention.
-@pytest.mark.parametrize('dtype', ["-bf16", "-e4m3", "-e4m3 -bf16-output"])
-@pytest.mark.parametrize('s', [1024, 4096])
-def test_trtllm_mla_attention_fmha(dtype, s):
+@pytest.mark.parametrize('dtype', ["-bf16", "-e4m3", "-e4m3 -bf16-output"],
+                         ids=["bf16", "e4m3", "e4m3-bf16"])
+@pytest.mark.parametrize('s', [1024, 4096], ids=["seqlen-1024", "seqlen-4096"])
+@pytest.mark.parametrize(
+    'input_layout', ["", "-paged-kv", "-contiguous-q-kv", "-separate-q-k-v"],
+    ids=["packed-qkv", "paged-kv", "q-contiguous-kv", "separate-q-k-v"])
+def test_trtllm_context_mla_attention_fmha(dtype, s, input_layout):
     # use higher error tolerance for bf16 and s = 4096.
     epsilon = ''
     if dtype == "-bf16" and s == 4096:
@@ -166,20 +169,80 @@ def test_trtllm_mla_attention_fmha(dtype, s):
     -force-non-warp-specialization -causal-mask {epsilon}",
         shell=True,
         check=True)
+
+    if sm_version == 90:
+        # Now only hopper-style supports separate-q-k-v
+        subprocess.run(
+            f"bin/fmha.exe -v 0 -runs 1 -min-s 1024 -s {s} -b 8 -h 8 -d 192 -dv 128 {dtype} \
+            -causal-mask {epsilon} {input_layout}",
+            shell=True,
+            check=True)
+
+
+@pytest.mark.parametrize('dtype', ["-bf16", "-e4m3", "-e4m3 -bf16-output"],
+                         ids=["bf16", "e4m3", "e4m3-bf16"])
+@pytest.mark.parametrize('s', [1024, 4096], ids=["seqlen-1024", "seqlen-4096"])
+@pytest.mark.parametrize('num_grouped_heads', [16, 32, 64, 128],
+                         ids=[
+                             "num-grouped-heads-16", "num-grouped-heads-32",
+                             "num-grouped-heads-64", "num-grouped-heads-128"
+                         ])
+def test_trtllm_gen_mla_attention_fmha(dtype, s, num_grouped_heads):
+    # use higher error tolerance for bf16 and s = 4096.
+    epsilon = ''
+    if dtype == "-bf16" and s == 4096:
+        epsilon += ' -epsilon 0.03'
+
+    sm_version = getSMVersion()
+    if dtype in ["-e4m3", "-e4m3 -bf16-output"] and sm_version != 89:
+        pytest.skip("FP8 MLAs only supported on sm89 currently.")
+
     # Generation phase kernels.
     subprocess.run(
-        f"bin/fmha.exe -v 0 -runs 1 -min-s 1024 -s {s} -b 8 -h 8 -d 576 -dv 512 {dtype} \
-    -paged-kv -force-non-warp-specialization {epsilon}",
+        f"bin/fmha.exe -v 0 -runs 1 -s-q 128 -min-s 1024 -s {s} -b 8 -h 1 -d 576 -dv 512 {dtype} \
+        -paged-kv -num-grouped-heads {num_grouped_heads} -force-non-warp-specialization {epsilon}",
         shell=True,
         check=True)
 
 
 # The test cases for saving softmax.
-@pytest.mark.parametrize('mask', ["-causal-mask", ""])
-@pytest.mark.parametrize('s', [128, 256, 384, 512])
+@pytest.mark.parametrize('mask', ["-causal-mask", ""],
+                         ids=["causal-mask", "padding-mask"])
+@pytest.mark.parametrize(
+    's', [128, 256, 384, 512],
+    ids=["seqlen-128", "seqlen-256", "seqlen-384", "seqlen-512"])
 def test_trtllm_save_softmax(mask, s):
     subprocess.run(
         f"bin/fmha.exe -v 0 -runs 1 -s {s} -d 64 -min-s 1 -b 1 -h 4 -fp16 \
     {mask} -contiguous-q-kv -save-softmax",
         shell=True,
         check=True)
+
+
+# The test cases for chunked attention.
+@pytest.mark.parametrize('chunked_attention_size', [128, 256, 512, 1024],
+                         ids=[
+                             "chunked-attention-size-128",
+                             "chunked-attention-size-256",
+                             "chunked-attention-size-512",
+                             "chunked-attention-size-1024"
+                         ])
+@pytest.mark.parametrize('input_layout', ["", "-paged-kv"],
+                         ids=["packed-qkv", "paged-kv"])
+def test_trtllm_chunked_attention(chunked_attention_size, input_layout):
+    # only supported on hopper currently.
+    if getSMVersion() != 90:
+        pytest.skip("Chunked attention only supported on hopper currently.")
+
+    subprocess.run(f"bin/fmha.exe -d 128 -b 4 -h 5 -fp16 -s 8192 -min-s 4096 \
+        -chunked-attention-size {chunked_attention_size} {input_layout} ",
+                   shell=True,
+                   check=True)
+
+    # Chunked context works with chunked attention.
+    if input_layout == "-paged-kv":
+        subprocess.run(
+            f"bin/fmha.exe -d 128 -b 8 -h 5 -s-q 256 -s 8192 -min-s 4096 -fp16 \
+            -chunked-attention-size {chunked_attention_size} -paged-kv",
+            shell=True,
+            check=True)

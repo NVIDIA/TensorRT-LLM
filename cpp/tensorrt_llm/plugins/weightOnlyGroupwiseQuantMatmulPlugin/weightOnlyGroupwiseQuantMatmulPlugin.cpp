@@ -46,7 +46,7 @@ void WeightOnlyGroupwiseQuantGemmPluginProfiler::runTactic(int m, int n, int k,
         nextWorkspacePtr(reinterpret_cast<int8_t*>(inputScalesPtr), k * originalN * sizeof(half) / mGroupSize));
     half* biasesPtr = reinterpret_cast<half*>(
         nextWorkspacePtr(reinterpret_cast<int8_t*>(zerosPtr), k * originalN * sizeof(half) / mGroupSize));
-    half* outputPtr = reinterpret_cast<half*>(nextWorkspacePtr(reinterpret_cast<int8_t*>(biasesPtr), m * sizeof(half)));
+    half* outputPtr = reinterpret_cast<half*>(nextWorkspacePtr(reinterpret_cast<int8_t*>(biasesPtr), n * sizeof(half)));
     char* workspacePtr
         = reinterpret_cast<char*>(nextWorkspacePtr(reinterpret_cast<int8_t*>(outputPtr), m * originalN * sizeof(half)));
     if ((mQuantAlgo & GroupwiseQuantAlgo::ZERO) == 0)
@@ -95,7 +95,7 @@ void WeightOnlyGroupwiseQuantGemmPluginProfiler::computeTmpSize(size_t maxM, siz
         k * n * sizeof(float),                        // B
         k * originalN * sizeof(half) / mGroupSize,    // scales
         k * originalN * sizeof(half) / mGroupSize,    // zeros
-        maxM * sizeof(half),                          // biases
+        originalN * sizeof(half),                     // biases
         maxM * originalN * sizeof(half),              // C
         mRunner->getWorkspaceSize(maxM, originalN, k) // workspace
     };
@@ -309,7 +309,7 @@ nvinfer1::DimsExprs WeightOnlyGroupwiseQuantMatmulPlugin::getOutputDimensions(
     //   2 weights          [K, N/2]
     //   3 scales           [K // group_size, N]
     //   4 zeros            [K // group_size, N] (optional)
-    //   5 biases           [M] (optional)
+    //   5 biases           [N] (optional)
 
     try
     {
@@ -394,13 +394,13 @@ void pre_quant_scale_for_act(int const m, int const k, int const mQuantAlgo, int
     {
         tensorrt_llm::kernels::apply_per_channel_scale_kernel_launcher<ActType, __nv_fp8_e4m3>(
             reinterpret_cast<__nv_fp8_e4m3*>(workspace), reinterpret_cast<ActType const*>(inputs[0]),
-            reinterpret_cast<ActType const*>(inputs[mPreQuantScaleInputIdx]), m, k, stream);
+            reinterpret_cast<ActType const*>(inputs[mPreQuantScaleInputIdx]), m, k, nullptr, stream);
     }
     else
     {
         tensorrt_llm::kernels::apply_per_channel_scale_kernel_launcher<ActType, ActType>(
             reinterpret_cast<ActType*>(workspace), reinterpret_cast<ActType const*>(inputs[0]),
-            reinterpret_cast<ActType const*>(inputs[mPreQuantScaleInputIdx]), m, k, stream);
+            reinterpret_cast<ActType const*>(inputs[mPreQuantScaleInputIdx]), m, k, nullptr, stream);
     }
 }
 
@@ -414,7 +414,7 @@ int WeightOnlyGroupwiseQuantMatmulPlugin::enqueue(nvinfer1::PluginTensorDesc con
     //   2 weights          [K, N/2]
     //   3 scales           [K // group_size, N]
     //   4 zeros            [K // group_size, N]
-    //   5 biases           [M]
+    //   5 biases           [N]
     // outputs
     //   mat                [M, N]
 

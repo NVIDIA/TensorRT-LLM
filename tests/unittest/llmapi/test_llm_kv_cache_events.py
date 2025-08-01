@@ -2,11 +2,11 @@ import asyncio
 import time
 
 import tensorrt_llm
-from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
+from tensorrt_llm import LLM
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._utils import KVCacheEventSerializer
-from tensorrt_llm.llmapi import LLM, KvCacheConfig
+from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -14,7 +14,6 @@ from .test_llm import get_model_path
 
 default_model_name = "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
 llama_model_path = get_model_path(default_model_name)
-
 global_kvcache_config = KvCacheConfig(free_gpu_memory_fraction=0.4,
                                       event_buffer_max_size=1024,
                                       enable_block_reuse=True,
@@ -48,8 +47,7 @@ def create_llm(tensor_parallel_size=1):
     return LLM(model=llama_model_path,
                tensor_parallel_size=tensor_parallel_size,
                kv_cache_config=global_kvcache_config,
-               pytorch_backend_config=PyTorchConfig(autotuner_enabled=False),
-               backend="pytorch")
+               enable_autotuner=False)
 
 
 def create_llm_request(id, input_tokens, new_tokens=1):

@@ -114,7 +114,7 @@ def load_dataset(args) -> datasets.Dataset:
 
 
 def load_hf_model(args):
-    if SUPPORTED_MODEL_TYPES[args.model_type] == None:
+    if SUPPORTED_MODEL_TYPES[args.model_type] is None:
         raise ValueError(f"Unsupported HF model_type: {args.model_type}")
     profiler.start('load HF model')
     model_class = getattr(__import__('transformers'),
@@ -229,7 +229,7 @@ runtime_rank = tensorrt_llm.mpi_rank()
 dataset = load_dataset(args)
 hf_model = load_hf_model(args) if args.test_hf else None
 trtllm_model = load_trtllm_model(args) if args.test_trtllm else None
-if SUPPORTED_MODEL_TYPES[args.model_type] == None:
+if SUPPORTED_MODEL_TYPES[args.model_type] is None:
     hf_processor = None
 else:
     hf_processor = AutoProcessor.from_pretrained(args.hf_model_dir,

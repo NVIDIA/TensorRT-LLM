@@ -12,13 +12,15 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import time
 from pathlib import Path
 
 import pytest
 from defs.common import (generate_summary_cmd, test_multi_lora_support,
                          venv_check_call)
-from defs.conftest import (get_device_memory, skip_fp8_pre_ada,
-                           skip_post_blackwell, skip_pre_hopper)
+from defs.conftest import (get_device_memory, get_gpu_device_list,
+                           skip_fp8_pre_ada, skip_post_blackwell,
+                           skip_pre_hopper)
 from defs.trt_test_alternative import check_call
 
 
@@ -80,6 +82,8 @@ VSWA_MODELS = VSWA_ATTENTION.keys()
 GEMMA2_MODELS = {GEMMA_2_9B_IT, GEMMA_2_27B_IT}
 
 
+@skip_pre_hopper
+@skip_post_blackwell
 @pytest.mark.parametrize("batch_size", [8])
 @pytest.mark.parametrize("data_type", ['bfloat16'])
 @pytest.mark.parametrize("qformat", ['fp8'])
@@ -90,6 +94,7 @@ def test_llm_hf_gemma_quantization_1gpu_vswa(batch_size, data_type,
                                              gemma_example_root,
                                              llm_datasets_root, llm_rouge_root,
                                              qformat):
+    skip_fp8_pre_ada(use_fp8=qformat == "fp8")
     max_attention_window = VSWA_ATTENTION[Path(gemma_model_root).stem]
     hf_gemma_quantization_1gpu(batch_size, data_type, gemma_model_root,
                                llm_venv, cmodel_dir, engine_dir,
@@ -204,6 +209,7 @@ def test_llm_gemma_1gpu_summary_vswa(batch_size, data_type, gemma_model_root,
                        max_attention_window)
 
 
+@pytest.mark.timeout(5400)
 @pytest.mark.parametrize("batch_size", [8])
 @pytest.mark.parametrize("data_type", ['float16', 'bfloat16'])
 @pytest.mark.parametrize("test_case", [
@@ -224,6 +230,10 @@ def test_llm_gemma_1gpu_summary(batch_size, data_type, gemma_model_root,
                                 llm_venv, cmodel_dir, engine_dir,
                                 gemma_example_root, llm_datasets_root,
                                 llm_rouge_root, test_case):
+    if "27b" in gemma_model_root and "GH200" in get_gpu_device_list(
+    )[0] and "other" in test_case:
+        pytest.skip("OOM on GH200. https://nvbugs/5250460")
+
     gemma_1gpu_summary(batch_size, data_type, gemma_model_root, llm_venv,
                        cmodel_dir, engine_dir, gemma_example_root,
                        llm_datasets_root, llm_rouge_root, test_case)
@@ -420,7 +430,9 @@ def test_hf_gemma_fp8_base_bf16_multi_lora(gemma_model_root,
                                            batch_size=8):
     "Run Gemma models with multiple dummy LoRAs."
 
+    start_time = time.time()
     print("Convert checkpoint by modelopt...")
+    convert_start = time.time()
     kv_cache_dtype = 'fp8' if qformat == 'fp8' else 'int8'
     convert_cmd = [
         f"{gemma_example_root}/../../../quantization/quantize.py",
@@ -432,7 +444,13 @@ def test_hf_gemma_fp8_base_bf16_multi_lora(gemma_model_root,
         f"--output_dir={cmodel_dir}",
     ]
     venv_check_call(llm_venv, convert_cmd)
+    convert_end = time.time()
+    print(
+        f"Convert checkpoint completed in {(convert_end - convert_start):.2f} seconds."
+    )
 
+    test_multi_lora_start = time.time()
+    print("Calling test_multi_lora_support...")
     test_multi_lora_support(
         hf_model_dir=gemma_model_root,
         tllm_ckpt_dir=cmodel_dir,
@@ -445,3 +463,10 @@ def test_hf_gemma_fp8_base_bf16_multi_lora(gemma_model_root,
         target_trtllm_modules=["attn_q", "attn_k", "attn_v"],
         zero_lora_weights=True,
     )
+    test_multi_lora_end = time.time()
+    print(
+        f"test_multi_lora_support completed in {(test_multi_lora_end - test_multi_lora_start):.2f} seconds"
+    )
+
+    total_time = time.time() - start_time
+    print(f"Total function execution time: {total_time:.2f} seconds")

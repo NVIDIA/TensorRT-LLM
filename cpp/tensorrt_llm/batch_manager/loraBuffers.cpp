@@ -26,7 +26,8 @@ namespace tensorrt_llm::batch_manager
 LoraBuffers::LoraBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, runtime::TllmRuntime const& tllmRuntime,
     runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig)
 {
-    auto const localNbLayers = modelConfig.getNbAttentionLayers(worldConfig.getPipelineParallelism());
+    auto const localNbLayers
+        = modelConfig.getNbAttentionLayers(worldConfig.getPipelineParallelism(), worldConfig.getPipelineParallelRank());
     auto const firstLayerId = worldConfig.getPipelineParallelRank() * localNbLayers;
 
     auto nbModelConfigs = static_cast<SizeType32>(modelConfig.getLoraModules().size());

@@ -51,17 +51,15 @@ class GatedMLP(nn.Module):
             tp_size = overridden_tp_size
             # "Misuse" pp_size here to perform all-reduce within smaller groups
             pp_size = config.mapping.pp_size * config.mapping.tp_size // overridden_tp_size
+            mapping = Mapping(
+                world_size=tp_size * pp_size,
+                rank=self.mapping.rank,
+                gpus_per_node=self.mapping.gpus_per_node,
+                tp_size=tp_size,
+                pp_size=pp_size,
+            )
         else:
-            tp_size = config.mapping.tp_size
-            pp_size = config.mapping.pp_size
-
-        mapping = Mapping(
-            world_size=tp_size * pp_size,
-            rank=self.mapping.rank,
-            gpus_per_node=self.mapping.gpus_per_node,
-            tp_size=tp_size,
-            pp_size=pp_size,
-        )
+            mapping = config.mapping
 
         self.gate_up_proj = Linear(
             self.hidden_size,
@@ -75,7 +73,9 @@ class GatedMLP(nn.Module):
             quant_config=config.get_quant_config(),
             reduce_output=False,
             skip_create_weights_in_init=config.skip_create_weights_in_init,
-        )
+            allreduce_strategy=config.allreduce_strategy,
+            force_dynamic_quantization=config.force_dynamic_quantization)
+
         self.down_lora = LoraLayer([LoraModuleType.MLP_4H_TO_H],
                                    [self.hidden_size])
 
@@ -90,7 +90,8 @@ class GatedMLP(nn.Module):
             reduce_output=reduce_output,
             skip_create_weights_in_init=config.skip_create_weights_in_init,
             lora=self.down_lora,
-        )
+            allreduce_strategy=config.allreduce_strategy,
+            force_dynamic_quantization=config.force_dynamic_quantization)
 
         # These two modules are mutually exclusive - either splitted_gate_up_lora or fused_gate_up_lora will be used,
         # but never both at the same time. splitted_gate_up_lora handles gate and up separately while fused_gate_up_lora
@@ -104,6 +105,16 @@ class GatedMLP(nn.Module):
             [LoraModuleType.MLP_GATE_UP],
             [2 * self.intermediate_size // mapping.tp_size])
 
+    def _apply_activation(self, x):
+        if self.activation == F.silu:
+            return swiglu(x)
+        elif self.activation == None:
+            return x
+        else:
+            raise NotImplementedError(
+                f"Activation {self.activation} not yet implemented for fused GatedMLP"
+            )
+
     def forward(
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],
@@ -116,18 +127,12 @@ class GatedMLP(nn.Module):
             return self.forward_lora(x, all_rank_num_tokens,
                                      final_all_reduce_params, lora_params)
 
-        if self.activation == F.silu:
-            h1 = self.gate_up_proj(x)
-
-            h2 = swiglu(h1)
-            output = self.down_proj(h2,
-                                    all_reduce_params=final_all_reduce_params,
-                                    layer_idx=self.layer_idx)
-            return output
-        else:
-            raise NotImplementedError(
-                f"Activation {self.activation} not yet implemented for fused GatedMLP"
-            )
+        h1 = self.gate_up_proj(x)
+        h2 = self._apply_activation(h1)
+        output = self.down_proj(h2,
+                                all_reduce_params=final_all_reduce_params,
+                                layer_idx=self.layer_idx)
+        return output
 
     def forward_lora(
         self,
@@ -138,7 +143,6 @@ class GatedMLP(nn.Module):
     ) -> torch.Tensor:
         assert lora_params is not None
         assert self.layer_idx is not None, "layer_idx is required for lora"
-        assert self.activation == F.silu
 
         h1 = self.gate_up_proj(x)
 
@@ -151,7 +155,7 @@ class GatedMLP(nn.Module):
         if h1_lora is not None:
             h1 = h1 + h1_lora
 
-        h2 = swiglu(h1)
+        h2 = self._apply_activation(h1)
         output = self.down_proj(h2,
                                 all_reduce_params=final_all_reduce_params,
                                 lora_params=lora_params,

@@ -23,6 +23,11 @@
 
 namespace tensorrt_llm::common
 {
+[[noreturn]] inline void throwRuntimeError(char const* const file, int const line, char const* info)
+{
+    throw TllmException(file, line, fmtstr("[TensorRT-LLM][ERROR] Assertion failed: %s", info).c_str());
+}
+
 [[noreturn]] inline void throwRuntimeError(char const* const file, int const line, std::string const& info = "")
 {
     throw TllmException(file, line, fmtstr("[TensorRT-LLM][ERROR] Assertion failed: %s", info.c_str()).c_str());
@@ -57,7 +62,7 @@ public:
         TLLM_LIKELY(static_cast<bool>(val))                                                                            \
         ? ((void) 0)                                                                                                   \
         : tensorrt_llm::common::throwRuntimeError(                                                                     \
-            __FILE__, __LINE__, tensorrt_llm::common::fmtstr(info, ##__VA_ARGS__));                                    \
+            __FILE__, __LINE__, tensorrt_llm::common::fmtstr(info, ##__VA_ARGS__).c_str());                            \
     } while (0)
 
 #define TLLM_CHECK_DEBUG(val)                                                                                          \
@@ -78,7 +83,7 @@ public:
             TLLM_LIKELY(static_cast<bool>(val))                                                                        \
             ? ((void) 0)                                                                                               \
             : tensorrt_llm::common::throwRuntimeError(                                                                 \
-                __FILE__, __LINE__, tensorrt_llm::common::fmtstr(info, ##__VA_ARGS__));                                \
+                __FILE__, __LINE__, tensorrt_llm::common::fmtstr(info, ##__VA_ARGS__).c_str());                        \
         }                                                                                                              \
     } while (0)
 

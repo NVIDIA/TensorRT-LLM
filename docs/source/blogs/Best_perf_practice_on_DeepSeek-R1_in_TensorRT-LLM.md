@@ -18,16 +18,19 @@ In this blog, we share the configurations and procedures about how to reproduce 
   - [Reproducing steps](#reproducing-steps)
     - [B200 min-latency](#b200-min-latency)
       - [Expected Results](#expected-results)
-    - [B200 max-throughput](#b200-max-throughput)
+    - [B200 max-throughput for R1-0528 with FP8 KV cache](#b200-max-throughput-for-r1-0528-with-fp8-kv-cache)
       - [Benchmark](#benchmark)
       - [Expected Result Format](#expected-result-format)
-    - [H200 min-latency](#h200-min-latency)
+    - [B200 max-throughput for R1 with FP16 KV cache](#b200-max-throughput-for-r1-with-fp16-kv-cache)
+      - [Benchmark](#benchmark-1)
       - [Expected Result Format](#expected-result-format-1)
-    - [H200 max-throughput](#h200-max-throughput)
+    - [H200 min-latency](#h200-min-latency)
       - [Expected Result Format](#expected-result-format-2)
+    - [H200 max-throughput](#h200-max-throughput)
+      - [Expected Result Format](#expected-result-format-3)
   - [Exploring more ISL/OSL combinations](#exploring-more-islosl-combinations)
     - [WIP: Enable more features by default](#wip-enable-more-features-by-default)
-    - [WIP: Chunked context support on DeepSeek models](#wip-chunked-context-support-on-deepseek-models)
+    - [Not supported: MLA chunked context support on Hopper](#not-supported-mla-chunked-context-support-on-hopper)
     - [Out of memory issues](#out-of-memory-issues)
 
 
@@ -134,9 +137,8 @@ To do the benchmark, run the following command:
 YOUR_DATA_PATH=<your dataset file following the format>
 
 cat >./extra-llm-api-config.yml<<EOF
-pytorch_backend_config:
-    use_cuda_graph: true
-    moe_backend: TRTLLM
+moe_config:
+  backend: TRTLLM
 speculative_config:
     decoding_type: MTP
     num_nextn_predict_layers: 3
@@ -147,7 +149,6 @@ export TRTLLM_ENABLE_PDL=1
 trtllm-bench --model nvidia/DeepSeek-R1-FP4 \
     throughput \
     --dataset $YOUR_DATA_PATH \
-    --backend pytorch \
     --num_requests 10 \
     --concurrency 1 \
     --max_batch_size 1 \
@@ -159,7 +160,6 @@ trtllm-bench --model nvidia/DeepSeek-R1-FP4 \
 Explanation:
 - `trtllm-bench`: A CLI benchmarking utility that aims to make it easier for users to reproduce our officially published. See [TensorRT-LLM Benchmarking](https://nvidia.github.io/TensorRT-LLM/performance/perf-benchmarking.html) for details.
 - `--dataset`: Prompt dataset used to benchmark. Our official benchmark dataset has ISL = 1K, OSL = 2K
-- `--backend`: Inference backend. Here we use PyTorch backend.
 - `--num_requests`: Num requests used for the benchmark.
 - `--concurrency`: Total concurrency for the system.
 - `--max_batch_size`: Max batch size in each rank.
@@ -182,9 +182,66 @@ Total Token Throughput (tokens/sec):              414.0461
 Total Latency (ms):                               74561.7520
 Average request latency (ms):                     7456.1219
 ```
+### B200 max-throughput for R1-0528 with FP8 KV cache
 
-### B200 max-throughput
-Our benchmark results are based on **Batch = 3072, ISL = 1K, OSL = 2K, num_requests = 49152 from synthetic dataset**
+Due to our evaluation found that FP8 KV cache does not introduce obvious accuracy drop compared to BF16 KV cache. See [Precision strategy](./tech_blog/blog3_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.md#precision-strategy), the latest [DeepSeek-R1-0528-FP4](https://huggingface.co/nvidia/DeepSeek-R1-0528-FP4) checkpoint had enabled FP8 KV cache by-default.
+
+We are seeing meaningful speedup using FP8 KV cache, thus refreshing the numbers here. The results are reproduced with TensorRT-LLM commit b6261862419c33d6ce2313aff1e7116067d6037d.
+
+!! Note that the exact command to reproduce numbers can change as the API/options are refactored, the option and numbers here is a reference at given exact commit.
+
+#### Benchmark
+```bash
+cat >./extra-llm-api-config.yml <<EOF
+cuda_graph_config:
+  enable_padding: true
+  batch_sizes:
+  - 896
+  - 512
+  - 256
+  - 128
+  - 64
+  - 32
+  - 16
+  - 8
+  - 4
+  - 2
+  - 1
+print_iter_log: true
+kv_cache_dtype: fp8
+enable_attention_dp: true
+EOF
+trtllm-bench  --model nvidia/DeepSeek-R1-0528-FP4
+     throughput
+     --dataset ${YOUR_DATA_PATH}
+     --tp 8  --ep 8
+     --extra_llm_api_options ./extra-llm-api-config.yml
+     --max_batch_size 896
+     --max_num_tokens 2048
+     --kv_cache_free_gpu_mem_fraction 0.93
+     --concurrency 7168
+     --num_requests 114688
+```
+#### Expected Result Format
+```
+===========================================================
+= PERFORMANCE OVERVIEW
+===========================================================
+Request Throughput (req/sec):                     21.0675
+Total Output Throughput (tokens/sec):             43146.2042
+Total Token Throughput (tokens/sec):              65100.6376
+Total Latency (ms):                               5443839.8140
+Average request latency (ms):                     332826.9898
+Per User Output Throughput [w/ ctx] (tps/user):   6.1806
+Per GPU Output Throughput (tps/gpu):              5393.2755
+```
+
+### B200 max-throughput for R1 with FP16 KV cache
+Our benchmark results are based on **Batch = 3072, ISL = 1K, OSL = 2K, num_requests = 49152 from synthetic dataset**.
+
+The results are reproduced with TensorRT-LLM commit b6261862419c33d6ce2313aff1e7116067d6037d.
+
+!! Note that the exact command to reproduce numbers can change as the API/options are refactored, the option and numbers here is a reference at given exact commit.
 
 #### Benchmark
 To do the benchmark, run the following command:
@@ -202,21 +259,20 @@ python ${YOUR_WORK_PATH}/benchmarks/cpp/prepare_dataset.py \
 YOUR_DATA_PATH=./dataset.txt
 
 cat >./extra-llm-api-config.yml <<EOF
-pytorch_backend_config:
-    use_cuda_graph: true
-    cuda_graph_padding_enabled: true
-    cuda_graph_batch_sizes:
-    - 1
-    - 2
-    - 4
-    - 8
-    - 16
-    - 32
-    - 64
-    - 128
-    - 256
-    - 384
-    print_iter_log: true
+cuda_graph_config:
+  enable_padding: true
+  batch_sizes:
+  - 1
+  - 2
+  - 4
+  - 8
+  - 16
+  - 32
+  - 64
+  - 128
+  - 256
+  - 384
+print_iter_log: ${PRINT_ITER_LOG}
 enable_attention_dp: true
 EOF
 
@@ -226,7 +282,6 @@ trtllm-bench -m nvidia/DeepSeek-R1-FP4 \
     --ep 8 \
     --warmup 0 \
     --dataset ${YOUR_DATA_PATH} \
-    --backend pytorch \
     --max_batch_size 384 \
     --max_num_tokens 1536 \
     --num_requests 49152 \
@@ -241,12 +296,13 @@ The perf might be different from different datasets and machines
 ===========================================================
 = PERFORMANCE OVERVIEW
 ===========================================================
-Request Throughput (req/sec):                     17.3885
-Total Output Throughput (tokens/sec):             35611.5942
-Per User Output Throughput (tokens/sec/user):     11.6701
-Per GPU Output Throughput (tokens/sec/gpu):       4451.4493
-Total Latency (ms):                               2826700.0758
-Average request latency (ms):                     176064.1921
+Request Throughput (req/sec):                     17.7657
+Total Output Throughput (tokens/sec):             36384.0838
+Total Token Throughput (tokens/sec):              54576.1257
+Total Latency (ms):                               2766684.9197
+Average request latency (ms):                     172321.7206
+Per User Output Throughput [w/ ctx] (tps/user):   11.9263
+Per GPU Output Throughput (tps/gpu):              4548.0105
 ```
 
 ### H200 min-latency
@@ -257,8 +313,6 @@ To do the benchmark, run the following command:
 YOUR_DATA_PATH=<your dataset file following the format>
 
 cat >./extra-llm-api-config.yml<<EOF
-pytorch_backend_config:
-    use_cuda_graph: true
 speculative_config:
     decoding_type: MTP
     num_nextn_predict_layers: 3
@@ -267,7 +321,6 @@ EOF
 trtllm-bench --model deepseek-ai/DeepSeek-R1 \
     throughput \
     --dataset $YOUR_DATA_PATH \
-    --backend pytorch \
     --num_requests 10 \
     --max_batch_size 1 \
     --tp 8 \
@@ -307,10 +360,9 @@ python ${YOUR_WORK_PATH}/benchmarks/cpp/prepare_dataset.py \
 YOUR_DATA_PATH=./dataset.txt
 
 cat >./extra-llm-api-config.yml<<EOF
-pytorch_backend_config:
-    use_cuda_graph: true
-    cuda_graph_batch_sizes:
-    - 128
+cuda_graph_config:
+  batch_sizes:
+  - 128
 enable_attention_dp: true
 EOF
 
@@ -323,9 +375,8 @@ trtllm-bench -m deepseek-ai/DeepSeek-R1 \
     --ep 8 \
     --warmup 0 \
     --dataset $YOUR_DATA_PATH \
-    --backend pytorch \
     --max_batch_size 128 \
-    --max_num_tokens 1127 \
+    --max_num_tokens 1151 \
     --num_requests 5120 \
     --concurrency 1024 \
     --kv_cache_free_gpu_mem_fraction 0.8 \
@@ -339,13 +390,13 @@ The perf might be different from different datasets and machines
 ===========================================================
 = PERFORMANCE OVERVIEW
 ===========================================================
-Request Throughput (req/sec):                     5.1532
-Total Output Throughput (tokens/sec):             10553.8445
-Per User Output Throughput (tokens/sec/user):     10.4199
-Per GPU Output Throughput (tokens/sec/gpu):       1319.2306
-Total Token Throughput (tokens/sec):              15707.0888
-Total Latency (ms):                               993548.8470
-Average request latency (ms):                     197768.0434
+Request Throughput (req/sec):                     5.6100
+Total Output Throughput (tokens/sec):             11489.2671
+Per User Output Throughput (tokens/sec/user):     11.3476
+Per GPU Output Throughput (tokens/sec/gpu):       1436.1584
+Total Token Throughput (tokens/sec):              17233.9007
+Total Latency (ms):                               912656.9938
+Average request latency (ms):                     181540.5739
 ```
 
 ## Exploring more ISL/OSL combinations
@@ -361,9 +412,9 @@ Generally, you should make sure that `max_batch_size` is not too low to bottlene
 
 For more details on `max_batch_size` and `max_num_tokens`, refer to [Tuning Max Batch Size and Max Num Tokens](../performance/performance-tuning-guide/tuning-max-batch-size-and-max-num-tokens.md).
 
-### WIP: Chunked context support on DeepSeek models
+### Not supported: MLA chunked context support on Hopper
 
-TensorRT-LLM team is actively working on chunked context support for DeepSeek models. Because of that missing feature, there is currently a limitation that `max_num_tokens` has to be at least larger than the max input sequence length of the samples in dataset.
+MLA chunked context support has been added on Blackwell GPUs, while it's not supported on Hopper yet. On Hopper, note that `max_num_tokens` has to be at least larger than the max input sequence length of the samples in dataset.
 For more details on `max_num_tokens`, refer to [Tuning Max Batch Size and Max Num Tokens](../performance/performance-tuning-guide/tuning-max-batch-size-and-max-num-tokens.md).
 
 ### Out of memory issues

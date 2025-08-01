@@ -180,6 +180,22 @@ _str_to_binding_dtype_dict = dict(
     fp8=DataType.FP8,
 )
 
+_binding_dtype_size = {
+    DataType.INT64: 8,
+    DataType.FLOAT: 4,
+    DataType.INT32: 4,
+    DataType.BF16: 2,
+    DataType.HALF: 2,
+    DataType.BOOL: 1,
+    DataType.FP8: 1,
+    DataType.INT8: 1,
+    DataType.UINT8: 1,
+}
+
+
+def binding_dtype_size(dtype: DataType):
+    return _binding_dtype_size[dtype]
+
 
 def str_dtype_to_binding(dtype):
     ret = _str_to_binding_dtype_dict.get(dtype)
@@ -454,6 +470,10 @@ def mpi_comm():
 local_comm = mpi_comm().Split_type(split_type=OMPI_COMM_TYPE_HOST)
 
 
+def local_mpi_comm():
+    return local_comm
+
+
 def mpi_rank():
     return mpi_comm().Get_rank() if ENABLE_MULTI_DEVICE else 0
 
@@ -492,8 +512,13 @@ def mpi_barrier():
         mpi_comm().Barrier()
 
 
+def local_mpi_barrier():
+    if ENABLE_MULTI_DEVICE:
+        local_comm.Barrier()
+
+
 def mpi_broadcast(obj, root=0):
-    return mpi_comm().bcast(obj, root) if ENABLE_MULTI_DEVICE else obj
+    return mpi_comm().bcast(obj, root) if is_multi_device_enable() else obj
 
 
 def mpi_allgather(obj):
@@ -520,6 +545,23 @@ def mpi_recv(buf, source, tag):
     # recv in buf-like object (e.g. numpy array)
     if ENABLE_MULTI_DEVICE:
         return mpi_comm().Recv(buf, source, tag=tag)
+    return None
+
+
+def mpi_send_object(obj, dest, tag=0):
+    if ENABLE_MULTI_DEVICE:
+        mpi_comm().send(obj, dest=dest, tag=tag)
+
+
+def mpi_isend_object(obj, dest, tag=0):
+    if ENABLE_MULTI_DEVICE:
+        return mpi_comm().isend(obj, dest=dest, tag=tag)
+    return None
+
+
+def mpi_recv_object(source, tag):
+    if ENABLE_MULTI_DEVICE:
+        return mpi_comm().recv(source=source, tag=tag)
     return None
 
 
@@ -647,7 +689,6 @@ def trace_func(func):
 
     @wraps(func)
     def wrapper(*args, **kwargs):
-        import dill  # nosec B403
 
         def globaltrace(frame, why, arg):
             if why == "call":
@@ -659,7 +700,7 @@ def trace_func(func):
                         ignore_it = tracer.ignore.names(filename, modulename)
                         if not ignore_it:
                             print(
-                                f"[rank{rank}] --- path: {filename}, funcname: {code.co_name}"
+                                f"[rank{rank}] --- path: {filename} , funcname: {code.co_name}"
                             )
                             return localtrace
                 else:
@@ -676,8 +717,7 @@ def trace_func(func):
             return localtrace
 
         ignoredirs = [
-            os.path.dirname(package.__file__)
-            for package in [os, torch, trace, dill]
+            os.path.dirname(package.__file__) for package in [os, torch, trace]
         ]
         tracer = trace.Trace(trace=1, count=0, ignoredirs=ignoredirs)
         rank = global_mpi_rank()
@@ -764,6 +804,26 @@ class QuantModeWrapper:
 
     def __getitem__(self, index):
         return self.objs[index]
+
+
+PYTHON_DEFAULT_GC_THRESHOLDS = gc.get_threshold()
+
+
+@contextmanager
+def customized_gc_thresholds(gen0_threshold: Optional[int] = None):
+    try:
+        if gen0_threshold:
+            gc.set_threshold(gen0_threshold)
+            logger.debug(
+                f'Set Python GC threshold to customized value: {gen0_threshold}'
+            )
+        yield
+    finally:
+        if gen0_threshold:
+            gc.set_threshold(*PYTHON_DEFAULT_GC_THRESHOLDS)
+            logger.debug(
+                f'Reset Python GC thresholds to default value: {PYTHON_DEFAULT_GC_THRESHOLDS}'
+            )
 
 
 @contextmanager
@@ -1028,3 +1088,14 @@ class KVCacheEventSerializer:
             "token_id": data.token_id,
             "token_extra_id": data.token_extra_id
         }
+
+
+def is_multi_device_enable():
+    """
+    This method evaluates if we are running on multiple GPUs and the flag ENABLE_MULTI_DEVICE is set.
+    So we can avoid broadcast calls on single GPU.
+    Issue: https://github.com/NVIDIA/TensorRT-LLM/issues/5927
+    ENABLE_MULTI_DEVICE is true by default when building tensorrt-llm so we need to also check
+    the number of devices
+    """
+    return local_mpi_size() > 1

@@ -17,7 +17,6 @@
 
 #include "tensorrt_llm/batch_manager/transformerBuffers.h"
 
-#include "tensorrt_llm/batch_manager/kvCacheConfig.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/logger.h"
@@ -221,7 +220,7 @@ void TransformerBuffers::reshapeKvTensors(SizeType32 maxBatchSize, SizeType32 ma
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     // allocate with max shape during init
-    if (kvCacheType == KvCacheType::kSELF)
+    if (kvCacheType == kv_cache_manager::CacheType::kSELF)
     {
         auto const cacheBlockOffsetsShape
             = ITensor::makeShape({numPools, maxBatchSize * maxBeamWidth, 2, maxBlocksPerSeq});
@@ -232,7 +231,7 @@ void TransformerBuffers::reshapeKvTensors(SizeType32 maxBatchSize, SizeType32 ma
         kvCacheBlockOffsetsDevice->reshape(cacheBlockOffsetsShape);
         manager.setZero(*kvCacheBlockOffsetsDevice);
     }
-    else if (kvCacheType == KvCacheType::kCROSS)
+    else if (kvCacheType == kv_cache_manager::CacheType::kCROSS)
     {
         auto const crossCacheBlockOffsetsShape
             = ITensor::makeShape({numPools, maxBatchSize * maxBeamWidth, 2, maxBlocksPerSeq});
@@ -313,18 +312,6 @@ void TransformerBuffers::getBuffers(
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void TransformerBuffers::reshapePositionIds(std::vector<SizeType32> const& positionIdsHost, bool isChatGlm)
-{
-    if (isChatGlm)
-    {
-        positionIds->reshape(ITensor::makeShape({2, static_cast<int>(positionIdsHost.size()) / 2}));
-    }
-    else
-    {
-        positionIds->reshape(ITensor::makeShape({static_cast<int>(positionIdsHost.size())}));
-    }
-}
-
 void TransformerBuffers::copyPositionIds(runtime::TllmRuntime const& runtime,
     std::vector<SizeType32> const& positionIdsHost, bool isChatGlm, TensorPtr const& decoderPositionIds)
 {
@@ -348,32 +335,6 @@ void TransformerBuffers::copyPositionIds(runtime::TllmRuntime const& runtime,
         manager.copy(positionIdsHost.data(), *ITensor::slice(positionIds, 0, contextPositionIdsLen));
         manager.copy(*decoderPositionIds, *ITensor::slice(positionIds, contextPositionIdsLen));
     }
-}
-
-void TransformerBuffers::resetCacheIndirection(RequestVector const& contextRequests, SizeType32 maxBeamWidth,
-    SizeType32 maxAttentionWindow, TensorPtr const& decoderCacheIndirectionInput,
-    TensorPtr const& decoderCacheIndirectionOutput, BufferManager const& manager)
-{
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    NVTX3_SCOPED_RANGE(resetCacheIndirection);
-
-    auto const& stream = manager.getStream();
-    auto const numContextRequests = contextRequests.size();
-
-    std::fill_n(bufferCast<SizeType32>(*fillValuesAlt), numContextRequests, 0);
-    std::transform(contextRequests.begin(), contextRequests.end(), bufferCast<SizeType32>(*seqSlotsAlt),
-        [](auto const& llmReq) { return llmReq->mSeqSlot.value(); });
-
-    auto const seqSlotsHostView = ITensor::slice(seqSlotsAlt, 0, numContextRequests);
-    auto seqSlotsDeviceView = ITensor::slice(seqSlotsAltDevice, 0, numContextRequests);
-    manager.copy(*seqSlotsHostView, *seqSlotsDeviceView);
-    manager.copy(*fillValuesAlt, *fillValuesAltDevice);
-    runtime::kernels::invokeFillBatch(*decoderCacheIndirectionInput, *seqSlotsDeviceView,
-        static_cast<std::uint64_t>(maxBeamWidth) * maxAttentionWindow, *fillValuesAltDevice, stream);
-    runtime::kernels::invokeFillBatch(*decoderCacheIndirectionOutput, *seqSlotsDeviceView,
-        static_cast<std::uint64_t>(maxBeamWidth) * maxAttentionWindow, *fillValuesAltDevice, stream);
-
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 void TransformerBuffers::copyKvBlockOffsets(RequestVector const& contextRequests, RequestVector const& genRequests,

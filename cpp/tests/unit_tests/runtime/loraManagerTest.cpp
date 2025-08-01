@@ -157,8 +157,8 @@ static void checkLoraTensors(LoraManager const& loraManager, std::vector<int64_t
     auto weightsPtrsPtr = bufferCast<int64_t>(*weightsPtrs);
     ASSERT_EQ(targetPtrs.size(), weightsPtrs->getSize());
     ASSERT_EQ(targetAdapterSizes.size(), adapterSizes->getSize());
-    auto firstLayerId = modelConfig.getNbAttentionLayers(worldConfig.getPipelineParallelism())
-        * worldConfig.getPipelineParallelRank();
+    auto firstLayerId
+        = modelConfig.getFirstLocalLayer(worldConfig.getPipelineParallelism(), worldConfig.getPipelineParallelRank());
     LoraManager::TensorMap expectedTensors;
 
     for (SizeType32 m = 0; m < numModules; ++m)

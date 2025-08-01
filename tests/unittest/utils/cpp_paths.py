@@ -14,7 +14,7 @@ _sys.path.append(_os.path.join(_os.path.dirname(__file__), '..', '..', '..'))
 def llm_root() -> _pl.Path:
     environ_root = _os.environ.get("LLM_ROOT", None)
     return _pl.Path(environ_root) if environ_root is not None else _pl.Path(
-        __file__).resolve().parent.parent.parent
+        __file__).resolve().parent.parent.parent.parent
 
 
 @pytest.fixture(scope="module")

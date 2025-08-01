@@ -7,10 +7,8 @@ import torch
 from utils.llm_data import llm_models_root
 from utils.util import getSMVersion
 
-from tensorrt_llm import SamplingParams
-from tensorrt_llm._torch import LLM
-from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
-from tensorrt_llm.llmapi import KvCacheConfig
+from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm.llmapi import KvCacheConfig, MoeConfig
 from tensorrt_llm.llmapi.utils import get_total_gpu_memory
 
 
@@ -23,7 +21,7 @@ def similar(a, b, threshold=0.9):
                          ids=["deepseekv3_lite"])
 @pytest.mark.parametrize("backend", ["TRTLLM"], ids=["trtllm"])
 @pytest.mark.parametrize("quant", ["bf16"])
-@pytest.mark.parametrize("tp_size", [1], ids=["tp1"])
+@pytest.mark.parametrize("tp_size", [1, 4], ids=["tp1", "tp4"])
 def test_deepseek_streaming(model_name, backend, quant, tp_size):
     model_path = {
         "bf16": "bf16",
@@ -48,6 +46,13 @@ def test_deepseek_streaming(model_name, backend, quant, tp_size):
     if get_total_gpu_memory(0) < 60 * 1024**3:
         pytest.skip(f"Not enough GPU memory to run. {get_total_gpu_memory(0)}")
 
+    if tp_size == 1:
+        enable_attention_dp = False
+        moe_max_num_tokens = None
+    else:
+        enable_attention_dp = True
+        moe_max_num_tokens = 64
+
     prompts = [
         "The president of the United States is",
     ] * 32
@@ -56,13 +61,11 @@ def test_deepseek_streaming(model_name, backend, quant, tp_size):
         " the head of state and head of government of the",
     ] * 32
 
-    pytorch_config = PyTorchConfig(
+    pytorch_config = dict(
         disable_overlap_scheduler=True,
-        use_cuda_graph=False,
-        kv_cache_dtype="auto",
         attn_backend=backend,
     )
-
+    moe_config = MoeConfig(max_num_tokens=moe_max_num_tokens)
     model_dir = str(llm_models_root() / model_name / model_path[quant])
 
     assert Path(model_dir).exists()
@@ -70,10 +73,11 @@ def test_deepseek_streaming(model_name, backend, quant, tp_size):
     llm = LLM(model=model_dir,
               tensor_parallel_size=tp_size,
               enable_chunked_prefill=False,
-              pytorch_backend_config=pytorch_config,
+              **pytorch_config,
+              moe_config=moe_config,
               moe_expert_parallel_size=-1,
               moe_tensor_parallel_size=-1,
-              enable_attention_dp=False,
+              enable_attention_dp=enable_attention_dp,
               kv_cache_config=KvCacheConfig(enable_block_reuse=False))
 
     sampling_params = SamplingParams(max_tokens=10)

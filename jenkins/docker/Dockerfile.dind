@@ -1,0 +1,15 @@
+# docker buildx build -t tensorrt-llm:{timestamp}_docker_dind_withbash -f jenkins/docker/Dockerfile.dind . --builder=multi-builder --platform linux/arm64,linux/amd64
+
+FROM docker:dind
+
+RUN apk add --no-cache bash git make python3 py3-pip
+
+ENV PATH=/usr/local/cmake/bin:$PATH
+ENV ENV=${ENV:-/etc/shinit_v2}
+COPY docker/common/install_cmake.sh install_cmake.sh
+RUN bash ./install_cmake.sh && rm install_cmake.sh
+
+RUN git clone https://github.com/rapidsai/rapids-cmake.git /tmp/rapids-cmake && \
+    mkdir -p /usr/local/share/cmake/rapids && \
+    cp -r /tmp/rapids-cmake/rapids-cmake/* /usr/local/share/cmake/rapids/ && \
+    rm -rf /tmp/rapids-cmake

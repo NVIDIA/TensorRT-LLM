@@ -6,6 +6,23 @@
 # Without approval from a member of this team, PRs cannot be merged to release branches.
 # * @NVIDIA/trt-llm-release-branch-approval
 
+# TensorRT-LLM Pytorch backend
+/tensorrt_llm/_torch @NVIDIA/trt-llm-torch-devs
+## TensorRT-LLM Pytorch backend - runtime
+/tensorrt_llm/_torch/pyexecutor @NVIDIA/trt-llm-torch-runtime-devs
+## TensorRT-LLM Pytorch backend - AutoDeploy flow
+/tensorrt_llm/_torch/auto_deploy @NVIDIA/trt-llm-torch-autodeploy-devs
+/tensorrt_llm/examples/auto_deploy @NVIDIA/trt-llm-torch-autodeploy-devs
+
+## TensorRT-LLM trtllm-bench Reviewers
+/tensorrt_llm/bench @NVIDIA/trtllm-bench-reviewers
+/tensorrt_llm/commands/bench.py @NVIDIA/trtllm-bench-reviewers
+docs/source/performance/perf-benchmarking.md @NVIDIA/trtllm-bench-reviewers
+
+## TensorRT-LLM LLM API
+/tensorrt_llm/llmapi @NVIDIA/trt-llm-llmapi-devs
+/tensorrt_llm/executor @NVIDIA/trt-llm-llmapi-devs
+
 # The rule below requires that any PR modifying public APIs must be approved by at least one member
 # of the NVIDIA/trt-llm-committed-api-review-committee or NVIDIA/trt-llm-noncommitted-api-review-committee team.
 # This approval is mandatory regardless of other approvals the PR may have received. Without approval

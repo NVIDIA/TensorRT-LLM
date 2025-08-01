@@ -642,7 +642,7 @@ class DeciLMForCausalLM(DecoderModelForCausalLM):
                           quant_config: Optional[QuantConfig] = None,
                           load_by_shard: bool = False,
                           load_model_on_cpu: bool = False,
-                          trust_remote_code: bool = False,
+                          trust_remote_code: bool = True,
                           **kwargs) -> "DeciLMForCausalLM":
         import transformers
 

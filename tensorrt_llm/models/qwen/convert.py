@@ -27,8 +27,6 @@ import torch
 import torch.nn as nn
 from tqdm import tqdm
 from transformers import AutoConfig, AutoTokenizer
-from transformers.models.qwen2.modeling_qwen2 import Qwen2DecoderLayer
-from transformers.models.qwen2_vl.modeling_qwen2_vl import Qwen2VLDecoderLayer
 from transformers.pytorch_utils import Conv1D
 
 from ..._utils import pad_vocab_size, str_dtype_to_torch
@@ -104,6 +102,9 @@ def smooth_qwen_model(model, scales, alpha, qwen_qkv_para, qwen_smoother):
 def smooth_qwen2_model(model, scales, alpha, qwen_qkv_para, qwen_smoother):
     # Smooth the activation and weights with smoother = $\diag{s}$
     for name, module in model.named_modules():
+        from transformers.models.qwen2.modeling_qwen2 import Qwen2DecoderLayer
+        from transformers.models.qwen2_vl.modeling_qwen2_vl import \
+            Qwen2VLDecoderLayer
         if not isinstance(module, Qwen2DecoderLayer) and not isinstance(
                 module, Qwen2VLDecoderLayer):
             continue
@@ -536,19 +537,26 @@ def convert_hf_qwen(hf_model,
                                          tensor_parallel)
                 assert (k_weight.shape[0] % (mapping.tp_size * head_size)) == 0
                 assert (v_weight.shape[0] % (mapping.tp_size * head_size)) == 0
-                assert (k_bias.shape[0] % (mapping.tp_size * head_size)) == 0
-                assert (v_bias.shape[0] % (mapping.tp_size * head_size)) == 0
+
+                if k_bias is not None and v_bias is not None:
+                    assert (k_bias.shape[0] %
+                            (mapping.tp_size * head_size)) == 0
+                    assert (v_bias.shape[0] %
+                            (mapping.tp_size * head_size)) == 0
 
                 wq = split(q_weight, mapping.tp_size, mapping.tp_rank)
                 wk = split(k_weight, mapping.tp_size, mapping.tp_rank)
                 wv = split(v_weight, mapping.tp_size, mapping.tp_rank)
 
-                bq = split(q_bias, mapping.tp_size, mapping.tp_rank)
-                bk = split(k_bias, mapping.tp_size, mapping.tp_rank)
-                bv = split(v_bias, mapping.tp_size, mapping.tp_rank)
-
                 qkv_w = torch.concat((wq, wk, wv))
-                qkv_b = torch.concat((bq, bk, bv))
+
+                if q_bias is not None and k_bias is not None and v_bias is not None:
+                    bq = split(q_bias, mapping.tp_size, mapping.tp_rank)
+                    bk = split(k_bias, mapping.tp_size, mapping.tp_rank)
+                    bv = split(v_bias, mapping.tp_size, mapping.tp_rank)
+                    qkv_b = torch.concat((bq, bk, bv))
+                else:
+                    qkv_b = None
             else:
                 qkv_weight = torch.cat([q_weight, k_weight, v_weight], dim=0)
                 qkv_bias = torch.cat([q_bias, k_bias, v_bias], dim=0)
@@ -653,6 +661,34 @@ def convert_hf_qwen(hf_model,
                                        None, use_weight_only,
                                        plugin_weight_only_quant_type, dtype,
                                        use_gemm_woq_plugin))
+
+        # Qwen3: Add q_norm and k_norm weight conversion
+        if qwen_type in ('qwen3', 'qwen3_moe'):
+            # Process q_norm.weight
+            q_norm_weight = get_weight(model_params,
+                                       prefix + key_list[0] + 'q_norm', dtype)
+            weights.update(
+                get_tllm_linear_weight(
+                    q_norm_weight,
+                    tllm_prex + 'attention.q_layernorm.',
+                    None,
+                    False,  # LayerNorm should not be quantized
+                    plugin_weight_only_quant_type,
+                    dtype,
+                    use_gemm_woq_plugin))
+
+            # Process k_norm.weight
+            k_norm_weight = get_weight(model_params,
+                                       prefix + key_list[0] + 'k_norm', dtype)
+            weights.update(
+                get_tllm_linear_weight(
+                    k_norm_weight,
+                    tllm_prex + 'attention.k_layernorm.',
+                    None,
+                    False,  # LayerNorm should not be quantized
+                    plugin_weight_only_quant_type,
+                    dtype,
+                    use_gemm_woq_plugin))
 
         if qwen_type == "qwen2_moe" and moe_config and moe_config.has_moe():
 
@@ -1038,7 +1074,7 @@ def load_weights_from_hf_gptq_model(hf_model, config: QWenConfig):
 
     model_params = {k: v for k, v in hf_model.state_dict().items()}
     torch.cuda.empty_cache()
-    valid_types = ('qwen', 'qwen2', 'qwen2_vl')
+    valid_types = ('qwen', 'qwen2', 'qwen2_vl', 'qwen3', 'qwen3_moe')
     assert qwen_type in valid_types, f"Unsupported Qwen type: {qwen_type}, only {valid_types} are supported for GPTQ."
     layer_prefix = "transformer.h." if qwen_type == 'qwen' else "model.layers."
     key_list = get_qwen_key_list(qwen_type)

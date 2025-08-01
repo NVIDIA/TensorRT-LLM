@@ -4,6 +4,7 @@ All the bootstrapping is done with our original core work.
 """
 import copy
 import os
+import shlex
 import subprocess
 import tempfile
 import textwrap as tw
@@ -116,12 +117,17 @@ class PythonVenvRunnerImpl(PythonRunnerInterface):
             new_env = os.environ
 
         if caller.__name__ == 'check_output':
-            result = subprocess.run(call_args,
-                                    env=new_env,
-                                    check=True,
-                                    capture_output=True,
-                                    **kwargs)
-            return result.stdout.decode('utf-8')
+            try:
+                result = subprocess.run(call_args,
+                                        env=new_env,
+                                        check=True,
+                                        capture_output=True,
+                                        **kwargs)
+                return result.stdout.decode('utf-8')
+            except subprocess.CalledProcessError as e:
+                raise RuntimeError(f"Failed to run `{shlex.join(e.cmd)}`:\n"
+                                   f"Stdout: {e.stdout.decode()}\n"
+                                   f"Stderr: {e.stderr.decode()}\n")
         else:
             print(f"Start subprocess with {caller}({call_args}, env={new_env})")
             return caller(call_args, env=new_env, **kwargs)

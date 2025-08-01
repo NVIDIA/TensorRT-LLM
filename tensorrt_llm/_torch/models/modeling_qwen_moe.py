@@ -1,9 +1,8 @@
-from typing import Dict, Optional
+from typing import Optional
 
 import torch
 import torch.nn.functional as F
 from torch import nn
-from tqdm import tqdm
 from transformers import Qwen2MoeConfig
 
 from tensorrt_llm.functional import PositionEmbeddingType
@@ -14,12 +13,12 @@ from ..model_config import ModelConfig
 from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import DefaultMoeRoutingMethod, FusedMoE
+from ..modules.fused_moe import DefaultMoeRoutingMethod, create_moe
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.rms_norm import RMSNorm
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
-                             duplicate_kv_weight, register_auto_model)
+                             register_auto_model)
 
 
 class QwenMoE(nn.Module):
@@ -28,6 +27,7 @@ class QwenMoE(nn.Module):
         self,
         model_config: ModelConfig[Qwen2MoeConfig],
         aux_stream: torch.cuda.Stream,
+        layer_idx: Optional[int] = None,
     ):
         super().__init__()
         config = model_config.pretrained_config
@@ -48,7 +48,7 @@ class QwenMoE(nn.Module):
 
         reduce_results = True
 
-        self.experts = FusedMoE(
+        self.experts = create_moe(
             num_experts=self.num_experts,
             routing_method=DefaultMoeRoutingMethod(top_k=self.top_k),
             hidden_size=self.hidden_dim,
@@ -56,7 +56,8 @@ class QwenMoE(nn.Module):
             aux_stream=aux_stream,
             dtype=config.torch_dtype,
             reduce_results=reduce_results,
-            model_config=model_config)
+            model_config=model_config,
+            layer_idx=layer_idx)
 
         self.shared_expert = GatedMLP(
             hidden_size=config.hidden_size,
@@ -82,14 +83,14 @@ class QwenMoE(nn.Module):
         hidden_states = hidden_states.view(-1, self.hidden_dim)
 
         all_rank_num_tokens = attn_metadata.all_rank_num_tokens
-        if self.enable_attention_dp and len(all_rank_num_tokens) > 1:
-            max_num_token = max(all_rank_num_tokens)
-            hidden_states = torch.nn.functional.pad(
-                hidden_states,
-                (0, 0, 0, max_num_token - hidden_states.shape[0]))
+        all_rank_max_num_tokens = attn_metadata.all_rank_max_num_tokens
         router_logits = self.gate(hidden_states)
-        final_hidden_states = self.experts(hidden_states, router_logits,
-                                           all_rank_num_tokens)
+        final_hidden_states = self.experts(
+            hidden_states,
+            router_logits,
+            all_rank_num_tokens=all_rank_num_tokens,
+            all_rank_max_num_tokens=all_rank_max_num_tokens,
+            use_dp_padding=False)
 
         shared_expert_output = self.shared_expert(hidden_states)
         shared_expert_output = F.sigmoid(
@@ -144,7 +145,7 @@ class QwenMoeDecoderLayer(DecoderLayer):
             layer_idx=layer_idx,
         )
 
-        self.mlp = QwenMoE(model_config, aux_stream)
+        self.mlp = QwenMoE(model_config, aux_stream, layer_idx=layer_idx)
 
         self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                        eps=config.rms_norm_eps,
@@ -157,7 +158,7 @@ class QwenMoeDecoderLayer(DecoderLayer):
 
     def forward(
         self,
-        position_ids: torch.LongTensor,
+        position_ids: torch.IntTensor,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor],
@@ -190,7 +191,6 @@ class QwenMoeModel(DecoderModel):
     def __init__(self, model_config: ModelConfig[Qwen2MoeConfig]):
         super().__init__(model_config)
         config = self.model_config
-        self.padding_idx = config.pretrained_config.pad_token_id
         self.aux_stream = torch.cuda.Stream()
 
         self.embed_tokens = Embedding(
@@ -215,8 +215,8 @@ class QwenMoeModel(DecoderModel):
     def forward(
         self,
         attn_metadata: AttentionMetadata,
-        input_ids: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
+        input_ids: Optional[torch.IntTensor] = None,
+        position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         **kwargs,
     ) -> torch.Tensor:
@@ -253,65 +253,3 @@ class Qwen2MoeForCausalLM(DecoderModelForCausalLM[QwenMoeModel,
                          config=model_config,
                          hidden_size=model_config.pretrained_config.hidden_size,
                          vocab_size=model_config.pretrained_config.vocab_size)
-
-    def load_weights(self, weights: Dict):
-        tp_size = self.model_config.mapping.tp_size
-        head_dim = self.config.hidden_size // self.config.num_attention_heads
-
-        def filter_weights(prefix, weights: Dict):
-            result = {}
-            for k, v in weights.items():
-                if k.startswith(prefix):
-                    new_k = k[len(prefix) + 1:]
-                    result[new_k] = v
-            return result
-
-        params_map = {
-            'qkv_proj': ['q_proj', 'k_proj', 'v_proj'],
-            'gate_up_proj': ['gate_proj', 'up_proj']
-        }
-        for name, module in tqdm(list(self.named_modules()),
-                                 desc="Loading weights"):
-            if len(module._parameters) > 0:
-                # skip load weights if tie word embeddings is enabled and layer is lm_head
-                if self.config.tie_word_embeddings and name.startswith(
-                        "lm_head"):
-                    continue
-
-                names = name.split('.')
-                if names[-1] in params_map:
-                    module_weights = []
-                    for new_name in params_map[names[-1]]:
-                        fw = filter_weights('.'.join(names[:-1] + [new_name]),
-                                            weights)
-                        if new_name in ['k_proj', 'v_proj']:
-                            fw = {
-                                k:
-                                duplicate_kv_weight(
-                                    weight=v[:],
-                                    head_dim=head_dim,
-                                    tensor_parallel_size=tp_size)
-                                if k in ["weight", "bias"] else v
-                                for k, v in fw.items()
-                            }
-                        module_weights.append(fw)
-                    module.load_weights(weights=module_weights)
-                else:
-                    module_weights = filter_weights(name, weights)
-                    if isinstance(module, FusedMoE):
-                        updated_module_weights = {}
-                        for weight_name, weight_value in module_weights.items():
-                            new_weight_name = weight_name.replace(
-                                "gate_proj",
-                                "w1").replace("up_proj",
-                                              "w3").replace("down_proj", "w2")
-                            updated_module_weights[
-                                new_weight_name] = weight_value
-                        del module_weights
-                        module.load_weights(weights=[updated_module_weights])
-                    elif hasattr(module, 'load_weights'):
-                        module.load_weights(weights=[module_weights])
-                    else:
-                        for n, p in module._parameters.items():
-                            if p is not None:
-                                p.data.copy_(module_weights[n][:])

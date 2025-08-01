@@ -17,6 +17,8 @@
 import os
 import platform
 import sys
+import sysconfig
+import warnings
 from argparse import ArgumentParser
 from contextlib import contextmanager
 from functools import partial
@@ -26,6 +28,11 @@ from shutil import copy, copytree, rmtree
 from subprocess import DEVNULL, CalledProcessError, check_output, run
 from textwrap import dedent
 from typing import List
+
+try:
+    from packaging.requirements import Requirement
+except (ImportError, ModuleNotFoundError):
+    from pip._vendor.packaging.requirements import Requirement
 
 build_run = partial(run, shell=True, check=True)
 
@@ -64,24 +71,37 @@ def clear_folder(folder_path):
         if os.path.isdir(item_path) and not os.path.islink(item_path):
             rmtree(item_path)
         else:
-            os.remove(item_path)
+            try:
+                os.remove(item_path)
+            except (OSError, IOError) as e:
+                print(f"Failed to remove {item_path}: {e}", file=sys.stderr)
 
 
-def setup_venv(project_dir: Path, requirements_file: Path):
-    """Creates/updates a venv and installs requirements.
+def sysconfig_scheme(override_vars=None):
+    # Backported 'venv' scheme from Python 3.11+
+    if os.name == 'nt':
+        scheme = {
+            'purelib': '{base}/Lib/site-packages',
+            'scripts': '{base}/Scripts',
+        }
+    else:
+        scheme = {
+            'purelib': '{base}/lib/python{py_version_short}/site-packages',
+            'scripts': '{base}/bin',
+        }
 
-    Args:
-        project_dir: The root directory of the project.
-        requirements_file: Path to the requirements file.
+    vars_ = sysconfig.get_config_vars()
+    if override_vars:
+        vars_.update(override_vars)
+    return {key: value.format(**vars_) for key, value in scheme.items()}
 
-    Returns:
-        Tuple[Path, Path]: Paths to the python and conan executables in the venv.
-    """
+
+def create_venv(project_dir: Path):
     py_major = sys.version_info.major
     py_minor = sys.version_info.minor
-    venv_dir = project_dir / f".venv-{py_major}.{py_minor}"
+    venv_prefix = project_dir / f".venv-{py_major}.{py_minor}"
     print(
-        f"-- Using virtual environment at: {venv_dir} (Python {py_major}.{py_minor})"
+        f"-- Using virtual environment at: {venv_prefix} (Python {py_major}.{py_minor})"
     )
 
     # Ensure compatible virtualenv version is installed (>=20.29.1, <22.0)
@@ -89,21 +109,89 @@ def setup_venv(project_dir: Path, requirements_file: Path):
     build_run(f'"{sys.executable}" -m pip install "virtualenv>=20.29.1,<22.0"')
 
     # Create venv if it doesn't exist
-    if not venv_dir.exists():
-        print(f"-- Creating virtual environment in {venv_dir}...")
+    if not venv_prefix.exists():
+        print(f"-- Creating virtual environment in {venv_prefix}...")
         build_run(
-            f'"{sys.executable}" -m virtualenv --system-site-packages "{venv_dir}"'
+            f'"{sys.executable}" -m virtualenv --system-site-packages "{venv_prefix}"'
         )
     else:
         print("-- Virtual environment already exists.")
 
+    return venv_prefix
+
+
+def setup_venv(project_dir: Path, requirements_file: Path, no_venv: bool):
+    """Creates/updates a venv and installs requirements.
+
+    Args:
+        project_dir: The root directory of the project.
+        requirements_file: Path to the requirements file.
+        no_venv: Use current Python environment as is.
+
+    Returns:
+        Tuple[Path, Path]: Paths to the python and conan executables in the venv.
+    """
+    if no_venv or sys.prefix != sys.base_prefix:
+        reason = "Explicitly requested by user" if no_venv else "Already inside virtual environment"
+        print(f"-- {reason}, using environment {sys.prefix} as is.")
+        venv_prefix = Path(sys.prefix)
+    else:
+        venv_prefix = create_venv(project_dir)
+
+    scheme = sysconfig_scheme({'base': venv_prefix})
     # Determine venv executable paths
-    scripts_dir = venv_dir / "bin"
-    venv_python = scripts_dir / "python"
+    scripts_dir = Path(scheme["scripts"])
+    venv_python = venv_prefix / sys.executable.removeprefix(sys.prefix)[1:]
+
+    if os.environ.get("NVIDIA_PYTORCH_VERSION"):
+        # Ensure PyPI PyTorch is not installed in the venv
+        purelib_dir = Path(scheme["purelib"])
+        pytorch_package_dir = purelib_dir / "torch"
+        if str(venv_prefix) != sys.base_prefix and pytorch_package_dir.exists():
+            warnings.warn(
+                f"Using the NVIDIA PyTorch container with PyPI distributed PyTorch may lead to compatibility issues.\n"
+                f"If you encounter any problems, please delete the environment at `{venv_prefix}` so that "
+                f"`build_wheel.py` can recreate the virtual environment correctly."
+            )
+            print("^^^^^^^^^^ IMPORTANT WARNING ^^^^^^^^^^", file=sys.stderr)
+            input("Press Ctrl+C to stop, any key to continue...\n")
+
+        # Ensure inherited PyTorch version is compatible
+        try:
+            info = check_output(
+                [str(venv_python), "-m", "pip", "show", "torch"])
+        except CalledProcessError:
+            raise RuntimeError(
+                "NVIDIA PyTorch container detected, but cannot find PyTorch installation. "
+                "The environment is corrupted. Please recreate your container.")
+        version_installed = next(
+            line.removeprefix("Version: ")
+            for line in info.decode().splitlines()
+            if line.startswith("Version: "))
+        version_required = None
+        try:
+            with open(requirements_file) as fp:
+                for line in fp:
+                    if line.startswith("torch"):
+                        version_required = Requirement(line)
+                        break
+        except FileNotFoundError:
+            pass
+
+        if version_required is not None:
+            if version_installed not in version_required.specifier:
+                raise RuntimeError(
+                    f"Incompatible NVIDIA PyTorch container detected. "
+                    f"The container provides PyTorch version {version_installed}, "
+                    f"but current revision requires {version_required}. "
+                    f"Please recreate your container using image specified in .devcontainer/docker-compose.yml. "
+                    f"NOTE: Please don't try install PyTorch using pip. "
+                    f"Using the NVIDIA PyTorch container with PyPI distributed PyTorch may lead to compatibility issues."
+                )
 
     # Install/update requirements
     print(
-        f"-- Installing requirements from {requirements_file} into {venv_dir}..."
+        f"-- Installing requirements from {requirements_file} into {venv_prefix}..."
     )
     build_run(f'"{venv_python}" -m pip install -r "{requirements_file}"')
 
@@ -182,50 +270,13 @@ def generate_fmha_cu(project_dir, venv_python):
     build_run("python3 setup.py", env=env)
 
     # Copy generated header file when cu path is active and cubins are deleted.
-    # cubin_dir = project_dir / "cpp/tensorrt_llm/kernels/contextFusedMultiHeadAttention/cubin"
-    # build_run(f"mv generated/fmha_cubin.h {cubin_dir}")
+    cubin_dir = project_dir / "cpp/tensorrt_llm/kernels/contextFusedMultiHeadAttention/cubin"
+    build_run(f"mv generated/fmha_cubin.h {cubin_dir}")
 
     for cu_file in (fmha_v2_dir / "generated").glob("*sm*.cu"):
         build_run(f"mv {cu_file} {fmha_v2_cu_dir}")
 
     os.chdir(project_dir)
-
-
-def apply_torch_nvtx3_workaround(venv_python: Path):
-    """Workaround for nvtx3 path detection in PyTorch's CMake files."""
-    try:
-        # Get site-packages directory
-        result = check_output(
-            f'"{venv_python}" -c "import site; print(site.getsitepackages()[0])"',
-            shell=True,
-            text=True)
-        site_packages = Path(result.strip())
-        torch_dir = site_packages / "torch"
-
-        if not torch_dir.exists():
-            print(f"Not found torch installation for patching NVTX3 workaround")
-            return
-
-        # Define patterns and their corresponding messages
-        replacement_patterns = [
-            ("find_path(nvtx3_dir NAMES nvtx3)",
-             "Applying NVTX3 workaround to {cmake_file}"),
-            ('find_path(nvtx3_dir NAMES nvtx3 PATHS "${PROJECT_SOURCE_DIR}/third_party/NVTX/c/include" NO_DEFAULT_PATH)',
-             "Applying additional NVTX3 workaround to {cmake_file}")
-        ]
-
-        replacement = "find_path(nvtx3_dir NAMES nvtx3 PATHS ${CUDA_INCLUDE_DIRS})"
-
-        for search_pattern, message_template in replacement_patterns:
-            for cmake_file in torch_dir.rglob("*.cmake"):
-                content = cmake_file.read_text()
-                if search_pattern in content:
-                    print(message_template.format(cmake_file=cmake_file))
-                    new_content = content.replace(search_pattern, replacement)
-                    cmake_file.write_text(new_content)
-
-    except Exception as e:
-        print(f"Failed to apply NVTX3 workaround: {e}")
 
 
 def main(*,
@@ -239,6 +290,7 @@ def main(*,
          extra_make_targets: str = "",
          trt_root: str = '/usr/local/tensorrt',
          nccl_root: str = None,
+         nixl_root: str = None,
          internal_cutlass_kernels_root: str = None,
          clean: bool = False,
          clean_wheel: bool = False,
@@ -249,12 +301,14 @@ def main(*,
          install: bool = False,
          skip_building_wheel: bool = False,
          linking_install_binary: bool = False,
-         python_bindings: bool = True,
+         binding_type: str = "pybind",
          benchmarks: bool = False,
          micro_benchmarks: bool = False,
          nvtx: bool = False,
          skip_stubs: bool = False,
-         generate_fmha: bool = False):
+         generate_fmha: bool = False,
+         no_venv: bool = False,
+         nvrtc_dynamic_linking: bool = False):
 
     if clean:
         clean_wheel = True
@@ -277,17 +331,13 @@ def main(*,
 
     # Setup venv and install requirements
     venv_python, venv_conan = setup_venv(project_dir,
-                                         project_dir / requirements_filename)
-
-    # Workaround for torch nvtx3 find_path not work issue with CUDA 12.9.
-    # See https://github.com/pytorch/pytorch/pull/147418.
-    apply_torch_nvtx3_workaround(Path(sys.executable))
-    apply_torch_nvtx3_workaround(venv_python)
+                                         project_dir / requirements_filename,
+                                         no_venv)
 
     # Ensure base TRT is installed (check inside the venv)
-    reqs = check_output([str(venv_python), "-m", "pip", "freeze"])
-    installed_packages = [r.decode().split("==")[0] for r in reqs.split()]
-    if "tensorrt" not in installed_packages:
+    try:
+        check_output([str(venv_python), "-m", "pip", "show", "tensorrt"])
+    except CalledProcessError:
         error_msg = "TensorRT was not installed properly."
         if on_windows:
             error_msg += (
@@ -303,9 +353,8 @@ def main(*,
         if "70-real" in cuda_architectures:
             raise RuntimeError("Volta architecture is deprecated support.")
 
-    cmake_cuda_architectures = (
-        f'"-DCMAKE_CUDA_ARCHITECTURES={cuda_architectures}"'
-        if cuda_architectures is not None else "")
+    cuda_architectures = cuda_architectures or 'all'
+    cmake_cuda_architectures = f'"-DCMAKE_CUDA_ARCHITECTURES={cuda_architectures}"'
 
     cmake_def_args = []
     cmake_generator = ""
@@ -340,12 +389,48 @@ def main(*,
     if nccl_root is not None:
         cmake_def_args.append(f"-DNCCL_ROOT={nccl_root}")
 
+    if nixl_root is not None:
+        cmake_def_args.append(f"-DNIXL_ROOT={nixl_root}")
+
     build_dir = get_build_dir(build_dir, build_type)
     first_build = not Path(build_dir, "CMakeFiles").exists()
 
     if clean and build_dir.exists():
         clear_folder(build_dir)  # Keep the folder in case it is mounted.
     build_dir.mkdir(parents=True, exist_ok=True)
+
+    def get_binding_type_from_cache():
+        cmake_cache_file = build_dir / "CMakeCache.txt"
+        if not cmake_cache_file.exists():
+            return None
+
+        with open(cmake_cache_file, 'r') as f:
+            for line in f:
+                if line.startswith("BINDING_TYPE:STRING="):
+                    cashed_binding_type = line.split("=", 1)[1].strip()
+                    if cashed_binding_type in ['pybind', 'nanobind']:
+                        return cashed_binding_type
+            return None
+
+    cached_binding_type = get_binding_type_from_cache()
+
+    if not first_build and cached_binding_type != binding_type:
+        # Clean up of previous binding build artifacts
+        nanobind_dir = build_dir / "tensorrt_llm" / "nanobind"
+        if nanobind_dir.exists():
+            rmtree(nanobind_dir)
+        nanobind_stub_file = project_dir / "tensorrt_llm" / "bindings.pyi"
+        if nanobind_stub_file.exists():
+            nanobind_stub_file.unlink()
+
+        pybind_dir = build_dir / "tensorrt_llm" / "pybind"
+        if pybind_dir.exists():
+            rmtree(pybind_dir)
+        pybind_stub_dir = project_dir / "tensorrt_llm" / "bindings"
+        if pybind_stub_dir.exists():
+            rmtree(pybind_stub_dir)
+
+        configure_cmake = True
 
     if use_ccache:
         cmake_def_args.append(
@@ -355,15 +440,18 @@ def main(*,
     if fast_build:
         cmake_def_args.append(f"-DFAST_BUILD=ON")
 
+    if nvrtc_dynamic_linking:
+        cmake_def_args.append(f"-DNVRTC_DYNAMIC_LINKING=ON")
+
     targets = ["tensorrt_llm", "nvinfer_plugin_tensorrt_llm"]
 
     if cpp_only:
         build_pyt = "OFF"
-        build_pybind = "OFF"
+        build_deep_ep = "OFF"
     else:
-        targets.extend(["bindings", "th_common"])
+        targets.extend(["th_common", "bindings", "deep_ep"])
         build_pyt = "ON"
-        build_pybind = "ON"
+        build_deep_ep = "ON"
 
     if benchmarks:
         targets.append("benchmarks")
@@ -391,7 +479,7 @@ def main(*,
     with working_directory(build_dir):
         if clean or first_build or configure_cmake:
             build_run(
-                f"\"{venv_conan}\" install --remote=tensorrt-llm --output-folder={build_dir}/conan -s 'build_type={build_type}' {source_dir}"
+                f"\"{venv_conan}\" install --build=missing --remote=tensorrt-llm --output-folder={build_dir}/conan -s 'build_type={build_type}' {source_dir}"
             )
             cmake_def_args.append(
                 f"-DCMAKE_TOOLCHAIN_FILE={build_dir}/conan/conan_toolchain.cmake"
@@ -402,7 +490,7 @@ def main(*,
                 )
             cmake_def_args = " ".join(cmake_def_args)
             cmake_configure_command = (
-                f'cmake -DCMAKE_BUILD_TYPE="{build_type}" -DBUILD_PYT="{build_pyt}" -DBUILD_PYBIND="{build_pybind}"'
+                f'cmake -DCMAKE_BUILD_TYPE="{build_type}" -DBUILD_PYT="{build_pyt}" -DBINDING_TYPE="{binding_type}" -DBUILD_DEEP_EP="{build_deep_ep}"'
                 f' -DNVTX_DISABLE="{disable_nvtx}" -DBUILD_MICRO_BENCHMARKS={build_micro_benchmarks}'
                 f' -DBUILD_WHEEL_TARGETS="{";".join(targets)}"'
                 f' -DPython_EXECUTABLE={venv_python} -DPython3_EXECUTABLE={venv_python}'
@@ -525,6 +613,14 @@ def main(*,
                 build_dir /
                 "tensorrt_llm/executor/cache_transmission/ucx_utils/libtensorrt_llm_ucx_wrapper.so",
                 lib_dir / "libtensorrt_llm_ucx_wrapper.so")
+        if os.path.exists(
+                build_dir /
+                "tensorrt_llm/executor/cache_transmission/nixl_utils/libtensorrt_llm_nixl_wrapper.so"
+        ):
+            install_file(
+                build_dir /
+                "tensorrt_llm/executor/cache_transmission/nixl_utils/libtensorrt_llm_nixl_wrapper.so",
+                lib_dir / "libtensorrt_llm_nixl_wrapper.so")
         install_file(
             build_dir /
             "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/libdecoder_attention_0.so",
@@ -533,6 +629,13 @@ def main(*,
             build_dir /
             "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/libdecoder_attention_1.so",
             lib_dir / "libdecoder_attention_1.so")
+
+    deep_ep_dir = pkg_dir / "deep_ep"
+    if deep_ep_dir.is_symlink():
+        deep_ep_dir.unlink()
+    elif deep_ep_dir.is_dir():
+        clear_folder(deep_ep_dir)
+        deep_ep_dir.rmdir()
 
     bin_dir = pkg_dir / "bin"
     if bin_dir.exists():
@@ -545,60 +648,115 @@ def main(*,
 
     if not cpp_only:
 
-        def get_pybind_lib():
-            pybind_build_dir = (build_dir / "tensorrt_llm" / "pybind")
+        def get_binding_lib(subdirectory, name):
+            binding_build_dir = (build_dir / "tensorrt_llm" / subdirectory)
             if on_windows:
-                pybind_lib = list(pybind_build_dir.glob("bindings.*.pyd"))
+                binding_lib = list(binding_build_dir.glob(f"{name}.*.pyd"))
             else:
-                pybind_lib = list(pybind_build_dir.glob("bindings.*.so"))
+                binding_lib = list(binding_build_dir.glob(f"{name}.*.so"))
 
             assert len(
-                pybind_lib
-            ) == 1, f"Exactly one pybind library should be present: {pybind_lib}"
-            return pybind_lib[0]
+                binding_lib
+            ) == 1, f"Exactly one binding library should be present: {binding_lib}"
+            return binding_lib[0]
 
-        install_file(get_pybind_lib(), pkg_dir)
+        install_file(get_binding_lib(binding_type, "bindings"), pkg_dir)
+
+        with (build_dir / "tensorrt_llm" / "deep_ep" /
+              "cuda_architectures.txt").open() as f:
+            deep_ep_cuda_architectures = f.read().strip().strip(";")
+        if deep_ep_cuda_architectures:
+            install_file(get_binding_lib("deep_ep", "deep_ep_cpp_tllm"),
+                         pkg_dir)
+            install_tree(build_dir / "tensorrt_llm" / "deep_ep" / "python" /
+                         "deep_ep",
+                         deep_ep_dir,
+                         dirs_exist_ok=True)
+            (lib_dir / "nvshmem").mkdir(exist_ok=True)
+            install_file(
+                build_dir / "tensorrt_llm/deep_ep/nvshmem-build/License.txt",
+                lib_dir / "nvshmem")
+            install_file(
+                build_dir /
+                "tensorrt_llm/deep_ep/nvshmem-build/src/lib/nvshmem_bootstrap_uid.so.3",
+                lib_dir / "nvshmem")
+            install_file(
+                build_dir /
+                "tensorrt_llm/deep_ep/nvshmem-build/src/lib/nvshmem_transport_ibgda.so.103",
+                lib_dir / "nvshmem")
         if not skip_stubs:
             with working_directory(project_dir):
-                build_run(f"\"{venv_python}\" -m pip install pybind11-stubgen")
+                if binding_type == "nanobind":
+                    build_run(f"\"{venv_python}\" -m pip install nanobind")
+                else:
+                    build_run(
+                        f"\"{venv_python}\" -m pip install pybind11-stubgen")
             with working_directory(pkg_dir):
                 if on_windows:
-                    stubgen = "stubgen.py"
-                    stubgen_contents = """
-                    # Loading torch, trt before bindings is required to avoid import errors on windows.
-                    # isort: off
-                    import torch
-                    import tensorrt as trt
-                    # isort: on
-                    import os
-                    import platform
+                    if binding_type == "nanobind":
+                        print("Windows not yet supported for nanobind stubs")
+                        exit(1)
+                    else:
+                        stubgen = "stubgen.py"
+                        stubgen_contents = """
+                        # Loading torch, trt before bindings is required to avoid import errors on windows.
+                        # isort: off
+                        import torch
+                        import tensorrt as trt
+                        # isort: on
+                        import os
+                        import platform
 
-                    from pybind11_stubgen import main
+                        from pybind11_stubgen import main
 
-                    if __name__ == "__main__":
-                        # Load dlls from `libs` directory before launching bindings.
-                        if platform.system() == "Windows":
-                            os.add_dll_directory(r\"{lib_dir}\")
-                        main()
-                    """.format(lib_dir=lib_dir)
-                    (pkg_dir / stubgen).write_text(dedent(stubgen_contents))
-                    build_run(f"\"{venv_python}\" {stubgen} -o . bindings")
-                    (pkg_dir / stubgen).unlink()
+                        if __name__ == "__main__":
+                            # Load dlls from `libs` directory before launching bindings.
+                            if platform.system() == "Windows":
+                                os.add_dll_directory(r\"{lib_dir}\")
+                            main()
+                        """.format(lib_dir=lib_dir)
+                        (pkg_dir / stubgen).write_text(dedent(stubgen_contents))
+                        build_run(f"\"{venv_python}\" {stubgen} -o . bindings")
+                        (pkg_dir / stubgen).unlink()
                 else:
                     env_ld = os.environ.copy()
 
                     new_library_path = "/usr/local/cuda/compat:/usr/local/cuda/compat/lib:/usr/local/cuda/compat/lib.real"
                     if 'LD_LIBRARY_PATH' in env_ld:
                         new_library_path += f":{env_ld['LD_LIBRARY_PATH']}"
+
+                    result = build_run("find /usr -name *libnvidia-ml.so*",
+                                       capture_output=True,
+                                       text=True)
+                    assert result.returncode == 0, f"Failed to run find *libnvidia-ml.so*: {result.stderr}"
+
+                    # Build containers only contain stub version of libnvidia-ml.so and not the real version.
+                    # If real version not in system, we need to create symbolic link to stub version to prevent import errors.
+                    if "libnvidia-ml.so.1" not in result.stdout:
+                        if "libnvidia-ml.so" in result.stdout:
+                            line = result.stdout.splitlines()[0]
+                            path = os.path.dirname(line)
+                            new_library_path += f":{path}"
+                            build_run(f"ln -s {line} {path}/libnvidia-ml.so.1")
+                        else:
+                            print(
+                                f"Failed to find libnvidia-ml.so: {result.stderr}",
+                                file=sys.stderr)
+                            exit(1)
+
                     env_ld["LD_LIBRARY_PATH"] = new_library_path
-                    try:
+                    if binding_type == "nanobind":
+                        build_run(
+                            f"\"{venv_python}\" -m nanobind.stubgen -m bindings -O .",
+                            env=env_ld)
+                    else:
                         build_run(
                             f"\"{venv_python}\" -m pybind11_stubgen -o . bindings --exit-code",
                             env=env_ld)
-                    except CalledProcessError as ex:
-                        print(f"Failed to build pybind11 stubgen: {ex}",
-                              file=sys.stderr)
-                        exit(1)
+                        if deep_ep_cuda_architectures:
+                            build_run(
+                                f"\"{venv_python}\" -m pybind11_stubgen -o . deep_ep_cpp_tllm --exit-code",
+                                env=env_ld)
 
     if not skip_building_wheel:
         if dist_dir is None:
@@ -680,6 +838,8 @@ def add_arguments(parser: ArgumentParser):
                         help="Directory to find TensorRT headers/libs")
     parser.add_argument("--nccl_root",
                         help="Directory to find NCCL headers/libs")
+    parser.add_argument("--nixl_root",
+                        help="Directory to find NIXL headers/libs")
     parser.add_argument(
         "--internal-cutlass-kernels-root",
         default="",
@@ -702,11 +862,10 @@ def add_arguments(parser: ArgumentParser):
         "--linking_install_binary",
         action="store_true",
         help="Install the built binary by symbolic linking instead of copying.")
-    parser.add_argument(
-        "--python_bindings",
-        "-p",
-        action="store_true",
-        help="(deprecated) Build the python bindings for the C++ runtime.")
+    parser.add_argument("--binding_type",
+                        choices=["pybind", "nanobind"],
+                        default="pybind",
+                        help="Which binding type to build: pybind, nanobind")
     parser.add_argument("--benchmarks",
                         action="store_true",
                         help="Build the benchmarks for the C++ runtime.")
@@ -722,6 +881,17 @@ def add_arguments(parser: ArgumentParser):
     parser.add_argument("--generate_fmha",
                         action="store_true",
                         help="Generate the FMHA cu files.")
+    parser.add_argument(
+        "--no-venv",
+        action="store_true",
+        help=
+        "Use the current Python interpreter without creating a virtual environment."
+    )
+    parser.add_argument(
+        "--nvrtc_dynamic_linking",
+        action="store_true",
+        help="Link against the dynamic NVRTC libraries and not the static ones."
+    )
 
 
 if __name__ == "__main__":

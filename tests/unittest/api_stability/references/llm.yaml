@@ -1,82 +1,152 @@
 methods:
   __init__:
     parameters:
-     # Parallelism
-      cp_config:
-        annotation: Optional[dict]
-        default: null
-      auto_parallel:
-        annotation: bool
-        default: false
-      auto_parallel_world_size:
+      # Parallelism
+      gpus_per_node:
         annotation: Optional[int]
         default: null
-      embedding_parallel_mode:
-        annotation: str
-        default: SHARDING_ALONG_VOCAB
+        status: beta
       moe_cluster_parallel_size:
         annotation: Optional[int]
         default: null
-      # Engine building
-      build_config:
-        annotation: Optional[tensorrt_llm.builder.BuildConfig]
-        default: null
-      enable_build_cache:
-        annotation: Union[tensorrt_llm.llmapi.build_cache.BuildCacheConfig, bool]
-        default: false
-      fast_build:
+        status: beta
+      enable_attention_dp:
         annotation: bool
-        default: false
-      # Bindings and mirrored configs
-      batching_type:
-        annotation: Optional[tensorrt_llm.llmapi.llm_args.BatchingType]
+        default: False
+        status: beta
+      cp_config:
+        annotation: Optional[dict]
         default: null
+        status: prototype
+      # Stats
+      iter_stats_max_iterations:
+        annotation: Optional[int]
+        default: null
+        status: prototype
+      request_stats_max_iterations:
+        annotation: Optional[int]
+        default: null
+        status: prototype
+      # Bindings and mirrored configs
       peft_cache_config:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.PeftCacheConfig]
         default: null
+        status: prototype
       scheduler_config:
-        annotation: Optional[tensorrt_llm.llmapi.llm_args.SchedulerConfig]
+        annotation: tensorrt_llm.llmapi.llm_args.SchedulerConfig
         default: null
-      extended_runtime_perf_knob_config:
-        annotation: Optional[tensorrt_llm.llmapi.llm_args.ExtendedRuntimePerfKnobConfig]
-        default: null
-      decoding_config:
-        annotation: Optional[tensorrt_llm.llmapi.llm_args.DecodingConfig]
-        default: null
+        status: prototype
       cache_transceiver_config:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.CacheTransceiverConfig]
         default: null
+        status: prototype
+      gather_generation_logits:
+        annotation: bool
+        default: False
+        status: prototype
+      num_postprocess_workers:
+        annotation: int
+        default: 0
+        status: prototype
+      postprocess_tokenizer_dir:
+        annotation: Optional[str]
+        default: null
+        status: prototype
+      # reasoning
+      reasoning_parser:
+        annotation: Optional[str]
+        default: null
+        status: prototype
+      # Runtime behavior
+      fail_fast_on_attention_window_too_large:
+        annotation: bool
+        default: false
+        status: prototype
+      garbage_collection_gen0_threshold:
+        annotation: int
+        default: 20000
+        status: beta
       # Misc
       backend:
         annotation: Optional[str]
         default: null
-      enable_attention_dp:
-        annotation: bool
-        default: false
-      normalize_log_probs:
-        annotation: bool
-        default: false
-      gather_generation_logits:
-        annotation: bool
-        default: false
-      gpus_per_node:
-        annotation: Optional[int]
+        status: deprecated
+      build_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.BuildConfig]
         default: null
-      iter_stats_max_iterations:
-        annotation: Optional[int]
+        status: deprecated
+      cuda_graph_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.CudaGraphConfig]
         default: null
-      request_stats_max_iterations:
-        annotation: Optional[int]
+        status: beta
+      checkpoint_loader:
+        annotation: Optional[tensorrt_llm._torch.models.checkpoints.BaseCheckpointLoader]
         default: null
-      workspace:
+        status: prototype
+      checkpoint_format:
         annotation: Optional[str]
         default: null
-      lora_config:
-        annotation: Optional[tensorrt_llm.llmapi.llm_args.LoraConfig]
+        status: prototype
+      disable_overlap_scheduler:
+        annotation: bool
+        default: False
+        status: beta
+      moe_config:
+        annotation: tensorrt_llm.llmapi.llm_args.MoeConfig
+        status: beta
         default: null
-      kwargs:
-        annotation: Any
-        default: inspect._empty
+      attn_backend:
+        annotation: str
+        default: TRTLLM
+        status: beta
+      enable_mixed_sampler:
+        annotation: bool
+        default: False
+        status: beta
+      enable_trtllm_sampler:
+        annotation: bool
+        default: False
+        status: prototype
+      enable_iter_perf_stats:
+        annotation: bool
+        default: False
+        status: prototype
+      enable_iter_req_stats:
+        annotation: bool
+        default: False
+        status: prototype
+      print_iter_log:
+        annotation: bool
+        default: False
+        status: beta
+      torch_compile_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.TorchCompileConfig]
+        default: null
+        status: prototype
+      enable_autotuner:
+        annotation: bool
+        default: True
+        status: prototype
+      enable_layerwise_nvtx_marker:
+        annotation: bool
+        default: False
+        status: beta
+      enable_min_latency:
+        annotation: bool
+        default: False
+        status: beta
+      force_dynamic_quantization:
+        annotation: bool
+        default: False
+        status: prototype
+      allreduce_strategy:
+        annotation: Optional[Literal['AUTO', 'NCCL', 'UB', 'MINLATENCY', 'ONESHOT', 'TWOSHOT', 'LOWPRECISION', 'MNNVL']]
+        default: AUTO
+        status: beta
+      decoding_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.DecodingConfig]
+        default: null
+        status: deprecated
     return_annotation: None
   generate:
     parameters:
@@ -102,34 +172,33 @@ methods:
         annotation: Optional[float]
         default: 2
     return_annotation: List[dict]
+    status: beta
   get_kv_cache_events_async:
     parameters:
       timeout:
         annotation: Optional[float]
         default: 2
     return_annotation: tensorrt_llm.executor.result.IterationResult
+    status: beta
   get_stats:
     parameters:
       timeout:
         annotation: Optional[float]
         default: 2
     return_annotation: List[dict]
+    status: beta
   get_stats_async:
     parameters:
       timeout:
         annotation: Optional[float]
         default: 2
     return_annotation: tensorrt_llm.executor.result.IterationResult
-  save:
-    parameters:
-      engine_dir:
-        annotation: str
-        default: inspect._empty
-    return_annotation: None
+    status: beta
   shutdown:
     parameters: {}
     return_annotation: None
+    status: beta
 properties:
-  workspace:
-    annotation: pathlib.Path
+  llm_id:
+    annotation: str
     default: inspect._empty

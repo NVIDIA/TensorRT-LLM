@@ -217,6 +217,30 @@ struct SocketState
     std::string mIp;
 };
 
+struct AgentState
+{
+    AgentState(std::string agentName, std::string connectionInfo)
+        : mAgentName(std::move(agentName))
+        , mConnectionInfo(std::move(connectionInfo))
+    {
+    }
+
+    AgentState() = default;
+
+    [[nodiscard]] bool operator==(AgentState const& other) const noexcept
+    {
+        return mAgentName == other.mAgentName && mConnectionInfo == other.mConnectionInfo;
+    }
+
+    [[nodiscard]] std::string toString() const
+    {
+        return mAgentName;
+    }
+
+    std::string mAgentName;
+    std::string mConnectionInfo;
+};
+
 class CommState final
 {
 public:
@@ -240,6 +264,12 @@ public:
     {
     }
 
+    explicit CommState(std::vector<AgentState> agentState, int selfIdx = -1)
+        : mState{std::move(agentState)}
+        , mSelfIdx{selfIdx}
+    {
+    }
+
     [[nodiscard]] bool isMpiState() const noexcept
     {
         return std::holds_alternative<MpiState>(mState);
@@ -248,6 +278,11 @@ public:
     [[nodiscard]] bool isSocketState() const noexcept
     {
         return std::holds_alternative<std::vector<SocketState>>(mState);
+    }
+
+    [[nodiscard]] bool isAgentState() const noexcept
+    {
+        return std::holds_alternative<std::vector<AgentState>>(mState);
     }
 
     [[nodiscard]] MpiState const& getMpiState() const
@@ -260,6 +295,12 @@ public:
     {
         TLLM_CHECK(isSocketState());
         return std::get<std::vector<SocketState>>(mState);
+    }
+
+    [[nodiscard]] std::vector<AgentState> const& getAgentState() const
+    {
+        TLLM_CHECK(isAgentState());
+        return std::get<std::vector<AgentState>>(mState);
     }
 
     [[nodiscard]] int getSelfIdx() const noexcept
@@ -289,12 +330,24 @@ public:
             sstring << "]";
             return sstring.str();
         }
+        if (isAgentState())
+        {
+            std::stringstream sstring;
+            sstring << "AGENT:[";
+            for (auto&& agent : getAgentState())
+            {
+                sstring << agent.toString() << ",";
+            }
+            sstring << "]";
+            return sstring.str();
+        }
+
         return "";
     }
 
 private:
     friend class tensorrt_llm::executor::Serialization;
-    std::variant<std::monostate, MpiState, std::vector<SocketState>> mState;
+    std::variant<std::monostate, MpiState, std::vector<SocketState>, std::vector<AgentState>> mState;
     int mSelfIdx{-1};
 };
 

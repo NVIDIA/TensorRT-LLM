@@ -1,6 +1,7 @@
+from .benchmark import ScaffoldingBenchRequest, async_scaffolding_benchmark
 from .controller import (BestOfNController, Controller, MajorityVoteController,
                          NativeGenerationController, NativeRewardController,
-                         ParallelProcess, ScaffoldingOutput)
+                         ParallelProcess)
 from .math_utils import (extract_answer_from_boxed, extract_answer_with_regex,
                          get_digit_majority_vote_result)
 from .scaffolding_llm import ScaffoldingLlm
@@ -11,7 +12,6 @@ from .worker import OpenaiWorker, TRTLLMWorker, TRTOpenaiWorker, Worker
 
 __all__ = [
     "ScaffoldingLlm",
-    "ScaffoldingOutput",
     "ParallelProcess",
     "Controller",
     "NativeGenerationController",
@@ -32,4 +32,6 @@ __all__ = [
     "TaskCollection",
     "with_task_collection",
     "GenerationTokenCounter",
+    "async_scaffolding_benchmark",
+    "ScaffoldingBenchRequest",
 ]

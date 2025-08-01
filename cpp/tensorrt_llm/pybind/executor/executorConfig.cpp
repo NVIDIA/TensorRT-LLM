@@ -103,11 +103,11 @@ void initConfigBindings(pybind11::module_& m)
         return py::make_tuple(self.getEnableBlockReuse(), self.getMaxTokens(), self.getMaxAttentionWindowVec(),
             self.getSinkTokenLength(), self.getFreeGpuMemoryFraction(), self.getHostCacheSize(),
             self.getOnboardBlocks(), self.getCrossKvCacheFraction(), self.getSecondaryOffloadMinPriority(),
-            self.getEventBufferMaxSize(), self.getEnablePartialReuse(), self.getCopyOnPartialReuse());
+            self.getEventBufferMaxSize(), self.getEnablePartialReuse(), self.getCopyOnPartialReuse(), self.getUseUvm());
     };
     auto kvCacheConfigSetstate = [](py::tuple const& state)
     {
-        if (state.size() != 12)
+        if (state.size() != 13)
         {
             throw std::runtime_error("Invalid state!");
         }
@@ -115,20 +115,20 @@ void initConfigBindings(pybind11::module_& m)
             state[2].cast<std::optional<std::vector<SizeType32>>>(), state[3].cast<std::optional<SizeType32>>(),
             state[4].cast<std::optional<float>>(), state[5].cast<std::optional<size_t>>(), state[6].cast<bool>(),
             state[7].cast<std::optional<float>>(), state[8].cast<std::optional<tle::RetentionPriority>>(),
-            state[9].cast<size_t>(), std::nullopt, state[10].cast<bool>(), state[11].cast<bool>());
+            state[9].cast<size_t>(), state[10].cast<bool>(), state[11].cast<bool>(), state[12].cast<bool>());
     };
     py::class_<tle::KvCacheConfig>(m, "KvCacheConfig")
         .def(py::init<bool, std::optional<SizeType32> const&, std::optional<std::vector<SizeType32>> const&,
                  std::optional<SizeType32> const&, std::optional<float> const&, std::optional<size_t> const&, bool,
-                 std::optional<float> const&, std::optional<tle::RetentionPriority>, size_t const&,
-                 std::optional<RuntimeDefaults> const&, bool, bool>(),
+                 std::optional<float> const&, std::optional<tle::RetentionPriority>, size_t const&, bool, bool, bool,
+                 std::optional<RuntimeDefaults> const&>(),
             py::arg("enable_block_reuse") = true, py::arg("max_tokens") = py::none(),
             py::arg("max_attention_window") = py::none(), py::arg("sink_token_length") = py::none(),
             py::arg("free_gpu_memory_fraction") = py::none(), py::arg("host_cache_size") = py::none(),
             py::arg("onboard_blocks") = true, py::arg("cross_kv_cache_fraction") = py::none(),
             py::arg("secondary_offload_min_priority") = py::none(), py::arg("event_buffer_max_size") = 0, py::kw_only(),
-            py::arg("runtime_defaults") = py::none(), py::arg("enable_partial_reuse") = true,
-            py::arg("copy_on_partial_reuse") = true)
+            py::arg("enable_partial_reuse") = true, py::arg("copy_on_partial_reuse") = true, py::arg("use_uvm") = false,
+            py::arg("runtime_defaults") = py::none())
         .def_property(
             "enable_block_reuse", &tle::KvCacheConfig::getEnableBlockReuse, &tle::KvCacheConfig::setEnableBlockReuse)
         .def_property("max_tokens", &tle::KvCacheConfig::getMaxTokens, &tle::KvCacheConfig::setMaxTokens)
@@ -150,6 +150,7 @@ void initConfigBindings(pybind11::module_& m)
             &tle::KvCacheConfig::setEnablePartialReuse)
         .def_property("copy_on_partial_reuse", &tle::KvCacheConfig::getCopyOnPartialReuse,
             &tle::KvCacheConfig::setCopyOnPartialReuse)
+        .def_property("use_uvm", &tle::KvCacheConfig::getUseUvm, &tle::KvCacheConfig::setUseUvm)
         .def("fill_empty_fields_from_runtime_defaults", &tle::KvCacheConfig::fillEmptyFieldsFromRuntimeDefaults)
         .def(py::pickle(kvCacheConfigGetstate, kvCacheConfigSetstate));
 
@@ -335,7 +336,7 @@ void initConfigBindings(pybind11::module_& m)
             throw std::runtime_error("Invalid extendedRuntimePerfKnobConfig state!");
         }
         return tle::ExtendedRuntimePerfKnobConfig(
-            state[0].cast<bool>(), state[1].cast<bool>(), state[2].cast<bool>(), state[2].cast<SizeType32>());
+            state[0].cast<bool>(), state[1].cast<bool>(), state[2].cast<bool>(), state[3].cast<SizeType32>());
     };
     auto extendedRuntimePerfKnobConfigGetstate = [](tle::ExtendedRuntimePerfKnobConfig const& self)
     {
@@ -374,7 +375,8 @@ void initConfigBindings(pybind11::module_& m)
     auto pyGuidedDecodingConfig = py::class_<tle::GuidedDecodingConfig>(m, "GuidedDecodingConfig");
 
     py::enum_<tle::GuidedDecodingConfig::GuidedDecodingBackend>(pyGuidedDecodingConfig, "GuidedDecodingBackend")
-        .value("XGRAMMAR", tle::GuidedDecodingConfig::GuidedDecodingBackend::kXGRAMMAR);
+        .value("XGRAMMAR", tle::GuidedDecodingConfig::GuidedDecodingBackend::kXGRAMMAR)
+        .value("LLGUIDANCE", tle::GuidedDecodingConfig::GuidedDecodingBackend::kLLGUIDANCE);
 
     auto guidedDecodingConfigGetstate = [](tle::GuidedDecodingConfig const& self) {
         return py::make_tuple(
@@ -405,21 +407,44 @@ void initConfigBindings(pybind11::module_& m)
             "stop_token_ids", &tle::GuidedDecodingConfig::getStopTokenIds, &tle::GuidedDecodingConfig::setStopTokenIds)
         .def(py::pickle(guidedDecodingConfigGetstate, guidedDecodingConfigSetstate));
 
-    auto cacheTransceiverConfigGetstate
-        = [](tle::CacheTransceiverConfig const& self) { return py::make_tuple(self.getMaxNumTokens()); };
+    auto cacheTransceiverConfigGetstate = [](tle::CacheTransceiverConfig const& self)
+    { return py::make_tuple(self.getBackendType(), self.getMaxTokensInBuffer()); };
     auto cacheTransceiverConfigSetstate = [](py::tuple const& state)
     {
-        if (state.size() != 1)
+        if (state.size() != 2)
         {
             throw std::runtime_error("Invalid CacheTransceiverConfig state!");
         }
-        return tle::CacheTransceiverConfig(state[0].cast<std::optional<size_t>>());
+        return tle::CacheTransceiverConfig(
+            state[0].cast<tle::CacheTransceiverConfig::BackendType>(), state[1].cast<std::optional<size_t>>());
     };
 
+    py::enum_<tle::CacheTransceiverConfig::BackendType>(m, "CacheTransceiverBackendType")
+        .value("DEFAULT", tle::CacheTransceiverConfig::BackendType::DEFAULT)
+        .value("MPI", tle::CacheTransceiverConfig::BackendType::MPI)
+        .value("UCX", tle::CacheTransceiverConfig::BackendType::UCX)
+        .value("NIXL", tle::CacheTransceiverConfig::BackendType::NIXL)
+        .def("from_string",
+            [](std::string const& str)
+            {
+                if (str == "DEFAULT" || str == "default")
+                    return tle::CacheTransceiverConfig::BackendType::DEFAULT;
+                if (str == "MPI" || str == "mpi")
+                    return tle::CacheTransceiverConfig::BackendType::MPI;
+                if (str == "UCX" || str == "ucx")
+                    return tle::CacheTransceiverConfig::BackendType::UCX;
+                if (str == "NIXL" || str == "nixl")
+                    return tle::CacheTransceiverConfig::BackendType::NIXL;
+                throw std::runtime_error("Invalid backend type: " + str);
+            });
+
     py::class_<tle::CacheTransceiverConfig>(m, "CacheTransceiverConfig")
-        .def(py::init<std::optional<size_t>>(), py::arg("max_num_tokens") = py::none())
-        .def_property("max_num_tokens", &tle::CacheTransceiverConfig::getMaxNumTokens,
-            &tle::CacheTransceiverConfig::setMaxNumTokens)
+        .def(py::init<std::optional<tle::CacheTransceiverConfig::BackendType>, std::optional<size_t>>(),
+            py::arg("backend") = std::nullopt, py::arg("max_tokens_in_buffer") = std::nullopt)
+        .def_property(
+            "backend", &tle::CacheTransceiverConfig::getBackendType, &tle::CacheTransceiverConfig::setBackendType)
+        .def_property("max_tokens_in_buffer", &tle::CacheTransceiverConfig::getMaxTokensInBuffer,
+            &tle::CacheTransceiverConfig::setMaxTokensInBuffer)
         .def(py::pickle(cacheTransceiverConfigGetstate, cacheTransceiverConfigSetstate));
 
     auto executorConfigGetState = [](py::object const& self)
@@ -434,7 +459,7 @@ void initConfigBindings(pybind11::module_& m)
             c.getExtendedRuntimePerfKnobConfig(), c.getDebugConfig(), c.getRecvPollPeriodMs(),
             c.getMaxSeqIdleMicroseconds(), c.getSpecDecConfig(), c.getGuidedDecodingConfig(),
             c.getAdditionalModelOutputs(), c.getCacheTransceiverConfig(), c.getGatherGenerationLogits(),
-            c.getPromptTableOffloading(), c.getEnableTrtOverlap());
+            c.getPromptTableOffloading(), c.getEnableTrtOverlap(), c.getFailFastOnAttentionWindowTooLarge());
         auto pickle_tuple = py::make_tuple(cpp_states, py::getattr(self, "__dict__"));
         return pickle_tuple;
     };
@@ -447,7 +472,7 @@ void initConfigBindings(pybind11::module_& m)
 
         // Restore C++ data
         auto cpp_states = state[0].cast<py::tuple>();
-        if (cpp_states.size() != 28)
+        if (cpp_states.size() != 29)
         {
             throw std::runtime_error("Invalid cpp_states!");
         }
@@ -480,7 +505,8 @@ void initConfigBindings(pybind11::module_& m)
             cpp_states[24].cast<std::optional<tle::CacheTransceiverConfig>>(),             // CacheTransceiverConfig
             cpp_states[25].cast<bool>(),                                                   // GatherGenerationLogits
             cpp_states[26].cast<bool>(),                                                   // PromptTableOffloading
-            cpp_states[27].cast<bool>()                                                    // EnableTrtOverlap
+            cpp_states[27].cast<bool>(),                                                   // EnableTrtOverlap
+            cpp_states[28].cast<bool>() // FailFastOnAttentionWindowTooLarge
         );
 
         auto py_state = state[1].cast<py::dict>();
@@ -517,7 +543,8 @@ void initConfigBindings(pybind11::module_& m)
                  std::optional<tle::CacheTransceiverConfig>,             // CacheTransceiverConfig
                  bool,                                                   // GatherGenerationLogits
                  bool,                                                   // PromptTableOffloading
-                 bool                                                    // EnableTrtOverlap
+                 bool,                                                   // EnableTrtOverlap
+                 bool                                                    // FailFastOnAttentionWindowTooLarge
                  >(),
             py::arg("max_beam_width") = 1, py::arg_v("scheduler_config", tle::SchedulerConfig(), "SchedulerConfig()"),
             py::arg_v("kv_cache_config", tle::KvCacheConfig(), "KvCacheConfig()"),
@@ -538,7 +565,7 @@ void initConfigBindings(pybind11::module_& m)
             py::arg("spec_dec_config") = py::none(), py::arg("guided_decoding_config") = py::none(),
             py::arg("additional_model_outputs") = py::none(), py::arg("cache_transceiver_config") = py::none(),
             py::arg("gather_generation_logits") = false, py::arg("mm_embedding_offloading") = false,
-            py::arg("enable_trt_overlap") = false)
+            py::arg("enable_trt_overlap") = false, py::arg("fail_fast_on_attention_window_too_large") = false)
         .def_property("max_beam_width", &tle::ExecutorConfig::getMaxBeamWidth, &tle::ExecutorConfig::setMaxBeamWidth)
         .def_property("max_batch_size", &tle::ExecutorConfig::getMaxBatchSize, &tle::ExecutorConfig::setMaxBatchSize)
         .def_property("max_num_tokens", &tle::ExecutorConfig::getMaxNumTokens, &tle::ExecutorConfig::setMaxNumTokens)
@@ -588,6 +615,9 @@ void initConfigBindings(pybind11::module_& m)
             &tle::ExecutorConfig::setPromptTableOffloading)
         .def_property(
             "enable_trt_overlap", &tle::ExecutorConfig::getEnableTrtOverlap, &tle::ExecutorConfig::setEnableTrtOverlap)
+        .def_property("fail_fast_on_attention_window_too_large",
+            &tle::ExecutorConfig::getFailFastOnAttentionWindowTooLarge,
+            &tle::ExecutorConfig::setFailFastOnAttentionWindowTooLarge)
         .def(py::pickle(executorConfigGetState, executorConfigSetState));
 }
 

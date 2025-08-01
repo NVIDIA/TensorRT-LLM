@@ -14,6 +14,8 @@
 # limitations under the License.
 from typing import List
 
+import torch
+
 
 class Mapping(object):
     '''
@@ -241,8 +243,10 @@ class Mapping(object):
         for i in range(pp_size):
             for j in range(moe_tp_size):
                 ranks = range(
-                    i * moe_tp_cluster_ep_size + j * moe_cluster_size,
-                    i * moe_tp_cluster_ep_size + (j + 1) * moe_cluster_size)
+                    i * moe_tp_cluster_ep_size +
+                    j * moe_cluster_size * moe_ep_size,
+                    i * moe_tp_cluster_ep_size +
+                    (j + 1) * moe_cluster_size * moe_ep_size)
                 self.moe_cluster_groups.append(list(ranks))
 
         # init moe ep group
@@ -297,8 +301,7 @@ class Mapping(object):
     def rank(self, rank: int):
         # TODO(qijun): skip check for enable_attention_dp temporarily, will support attention_dp_size
         if not self.enable_attention_dp:
-            if not isinstance(rank,
-                              int) or rank < 0 and rank >= self.world_size:
+            if not isinstance(rank, int) or rank < 0 or rank >= self.world_size:
                 raise ValueError(
                     f"Rank should be an integer between 0 and {self.world_size-1}, but got {rank}."
                 )
@@ -351,16 +354,14 @@ class Mapping(object):
 
     @property
     def moe_cluster_group(self):
-        return self.moe_cluster_groups[self.pp_rank * self.moe_tp_size *
-                                       self.moe_ep_size +
-                                       self.moe_tp_rank * self.moe_ep_size +
-                                       self.moe_ep_rank]
+        return self.moe_cluster_groups[self.pp_rank * self.moe_tp_size +
+                                       self.moe_tp_rank]
 
     @property
     def moe_ep_group(self):
-        return self.moe_ep_groups[self.pp_rank * self.moe_cluster_size *
-                                  self.moe_tp_size +
-                                  self.tp_rank * self.moe_cluster_size +
+        return self.moe_ep_groups[self.pp_rank * self.moe_tp_size *
+                                  self.moe_cluster_size +
+                                  self.moe_tp_rank * self.moe_cluster_size +
                                   self.moe_cluster_rank]
 
     @property
@@ -419,16 +420,10 @@ class Mapping(object):
     def has_moe_ep(self):
         return self.moe_ep_size > 1
 
-    # TODO: Add support of uneven/arbitrary layer segmentation
     def pp_layers(self, num_layers: int) -> List[int]:
-        layers_per_pipeline_stage = num_layers // self.pp_size
-        if self.pp_rank == self.pp_size - 1:
-            layers_range = range(self.pp_rank * layers_per_pipeline_stage,
-                                 num_layers)
-        else:
-            layers_range = range(self.pp_rank * layers_per_pipeline_stage,
-                                 (self.pp_rank + 1) * layers_per_pipeline_stage)
-        return list(layers_range)
+        # If num_layers % pp_size = n != 0, first n ranks get one extra layer
+        return torch.tensor_split(torch.arange(num_layers),
+                                  self.pp_size)[self.pp_rank].tolist()
 
     def ep_experts(self, num_experts: int) -> List[int]:
         assert self.cp_size == 1

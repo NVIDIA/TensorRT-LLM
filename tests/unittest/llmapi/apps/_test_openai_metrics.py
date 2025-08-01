@@ -4,8 +4,7 @@ import pytest
 from fastapi.testclient import TestClient
 from transformers import AutoTokenizer
 
-from tensorrt_llm._torch.llm import LLM as PyTorchLLM
-from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
+from tensorrt_llm import LLM as PyTorchLLM
 from tensorrt_llm.llmapi import BuildConfig, KvCacheConfig
 from tensorrt_llm.serve.openai_server import OpenAIServer
 
@@ -22,9 +21,7 @@ def client():
     llm = PyTorchLLM(model=llama_model_path,
                      build_config=build_config,
                      kv_cache_config=KvCacheConfig(),
-                     backend="pytorch",
-                     pytorch_backend_config=PyTorchConfig(
-                         enable_iter_perf_stats=True, ))
+                     enable_iter_perf_stats=True)
     hf_tokenizer = AutoTokenizer.from_pretrained(llama_model_path)
 
     app_instance = OpenAIServer(llm,

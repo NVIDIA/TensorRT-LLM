@@ -39,7 +39,7 @@ def test_fp4_linear(dtype):
     assert l_fp4.weight_scale.dtype == fp4_utils.float4_sf_dtype
 
     w_sf_block_unswizzled = (
-        torch.ops.tensorrt_llm.nvfp4_block_scale_interleave_reverse(
+        torch.ops.trtllm.nvfp4_block_scale_interleave_reverse(
             w_sf_block.cpu().view(HIDDEN_SIZE, -1)))
 
     l_fp4.load_weights([{
@@ -70,9 +70,9 @@ def test_fp4_linear(dtype):
     with torch.inference_mode():
         x_fp4, x_sf_block = torch.ops.trtllm.fp4_quantize(
             x, x_sf_global, scaling_vector_size, False)
-        output_ref = torch.ops.trtllm.fp4_gemm(x_fp4, w_fp4, x_sf_block,
-                                               w_sf_block, alpha_ref, False,
-                                               dtype)
+        output_ref = torch.ops.trtllm.fp4_gemm(
+            x_fp4, w_fp4, x_sf_block, w_sf_block, alpha_ref,
+            fp4_utils.FP4GemmType.W4A4_NVFP4_NVFP4, dtype)
 
     # compare
     torch.cuda.synchronize()

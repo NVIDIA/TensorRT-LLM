@@ -6,10 +6,12 @@ from typing import Optional
 
 import click
 
-from tensorrt_llm.executor.postproc_worker import PostprocArgs, PostprocParams
-from tensorrt_llm.llmapi import LLM, KvCacheConfig, SamplingParams
-from tensorrt_llm.llmapi._perf_evaluator import perform_faked_oai_postprocess
+from tensorrt_llm._tensorrt_engine import LLM
+from tensorrt_llm.executor.postproc_worker import PostprocParams
+from tensorrt_llm.llmapi import KvCacheConfig, SamplingParams
 from tensorrt_llm.llmapi.utils import print_colored
+from tensorrt_llm.serve.postprocess_handlers import (ChatPostprocArgs,
+                                                     chat_stream_post_processor)
 
 
 @click.command()
@@ -24,8 +26,8 @@ def main(model_dir: str, tp_size: int, engine_dir: Optional[str], n: int,
 
     # Simplified postprocessing configuration
     postproc_config = {
-        "_num_postprocess_workers": tp_size,
-        "_postprocess_tokenizer_dir": model_dir,
+        "num_postprocess_workers": tp_size,
+        "postprocess_tokenizer_dir": model_dir,
     }
 
     print_colored("Enabled OAI postprocessing\n", "yellow")
@@ -44,9 +46,11 @@ def main(model_dir: str, tp_size: int, engine_dir: Optional[str], n: int,
                                      n=n,
                                      best_of=best_of,
                                      top_k=top_k)
+    postproc_args = ChatPostprocArgs(role="assistant",
+                                     model="TinyLlama-1.1B-Chat-v1.0")
     postproc_params = PostprocParams(
-        post_processor=perform_faked_oai_postprocess,
-        postproc_args=PostprocArgs(),
+        post_processor=chat_stream_post_processor,
+        postproc_args=postproc_args,
     )
 
     prompt = "A B C D E F"

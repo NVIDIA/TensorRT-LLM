@@ -377,7 +377,7 @@ void argGenLoadFile(benchmark::internal::Benchmark* benchmark)
             {
                 continue;
             }
-            else if (BenchClass::FP4 && !hasDtype("fp4"))
+            else if (BenchClass::NVFP4 && !hasDtype("fp4"))
             {
                 continue;
             }
@@ -389,17 +389,21 @@ void argGenLoadFile(benchmark::internal::Benchmark* benchmark)
             {
                 continue;
             }
-            else if (std::is_same_v<typename BenchClass::WeightType, float> && !hasDtype("float")
-                && !hasDtype("float32"))
-            {
-                continue;
-            }
+            // else if (std::is_same_v<typename BenchClass::WeightType, float> && !hasDtype("float")
+            //     && !hasDtype("float32"))
+            // {
+            //     continue;
+            // }
             else if (std::is_same_v<typename BenchClass::WeightType, half> && !hasDtype("float16") && !hasDtype("half"))
             {
                 continue;
             }
             else if (std::is_same_v<typename BenchClass::WeightType, __nv_bfloat16> && !hasDtype("bfloat16")
                 && !hasDtype("bf16"))
+            {
+                continue;
+            }
+            else if (BenchClass::WFP4AFP8 && !hasDtype("wfp4afp8"))
             {
                 continue;
             }
@@ -448,7 +452,37 @@ void argGenLoadFile(benchmark::internal::Benchmark* benchmark)
         int world_rank = get_or("world_rank", 0);
         int bias = get_or("bias", 0);
         int do_final_scale = get_or("do_final_scale", 1); // Default to scales on
+        int gemm_to_profile = get_or("gemm_to_profile", (int) GemmToProfile::LAYER);
         TLLM_CHECK_WITH_INFO(world_rank < tp_size * ep_size, "Rank is out of bounds of tp*ep");
+
+        if (gemm_to_profile != (int) GemmToProfile::LAYER && routing_config != UNIFORM_ROUTING_CONFIG)
+        {
+            static bool info_printed = false;
+            if (!info_printed && LOG_LEVEL >= INFO)
+            {
+                std::cerr << "Warning: GEMM profiling is experimental, results may be inaccurate" << std::endl;
+                info_printed = true;
+            }
+
+            static bool printed = false;
+            if (LOG_LEVEL >= ERROR && !printed)
+            {
+                std::cerr << "Warning: Profiling a specific GEMM will always use uniform random token distribution"
+                          << std::endl;
+                printed = true;
+            }
+            routing_config = UNIFORM_ROUTING_CONFIG;
+            if (gemm_to_profile == (int) GemmToProfile::GEMM_1)
+            {
+                tactic_ids2 = {-1};
+            }
+            else if (gemm_to_profile == (int) GemmToProfile::GEMM_2)
+            {
+                if (!has_tactic_ids2)
+                    tactic_ids2 = std::move(tactic_ids1);
+                tactic_ids1 = {-1};
+            }
+        }
 
         auto get_range = [&](std::string name, int min = 1, int max = INT32_MAX)
         {
@@ -468,17 +502,17 @@ void argGenLoadFile(benchmark::internal::Benchmark* benchmark)
                 if (!has_tactic_ids2)
                     t2 = t1;
 
-                benchmark->Args({num_experts,                                             //
-                    get_range("k"),                                                       //
-                    get_range("hidden_size"),                                             //
-                    get_range("inter_size"),                                              //
-                    tp_size, ep_size, world_rank,                                         //
-                    get_range("num_tokens"),                                              //
-                    bias, do_final_scale,                                                 //
-                    get_range("act_fn", 0, (int) tensorrt_llm::ActivationType::Identity), //
-                    t1,                                                                   //
-                    t2,                                                                   //
-                    *routing_config});
+                benchmark->Args({num_experts,                               //
+                    get_range("k"),                                         //
+                    get_range("hidden_size"),                               //
+                    get_range("inter_size"),                                //
+                    tp_size, ep_size, world_rank,                           //
+                    get_range("num_tokens"),                                //
+                    bias, do_final_scale,                                   //
+                    get_range("act_fn", 0, (int) ActivationType::Identity), //
+                    t1,                                                     //
+                    t2,                                                     //
+                    *routing_config, gemm_to_profile});
             }
         }
     }
@@ -493,10 +527,10 @@ void argGenHardcoded(benchmark::internal::Benchmark* benchmark)
     auto inter_size_mul = {4.f};               // {7.f/2.f, 4.f};
     auto num_tokens = {2048};                  // {1, 20, 200, 2048};
     auto use_bias = {0};                       // {0, 1};
-    auto activation_type = {tensorrt_llm::ActivationType::Gelu};
-    // {tensorrt_llm::ActivationType::Relu, tensorrt_llm::ActivationType::Gelu,
-    // tensorrt_llm::ActivationType::Silu, tensorrt_llm::ActivationType::Geglu,
-    // tensorrt_llm::ActivationType::Swiglu};
+    auto activation_type = {ActivationType::Gelu};
+    // {ActivationType::Relu, ActivationType::Gelu,
+    // ActivationType::Silu, ActivationType::Geglu,
+    // ActivationType::Swiglu};
     auto cutlass_tactic = {-1};                           // {0,..., listAllTactics<BenchClass>().size()};
     auto routing_config = {LOAD_BALANCED_ROUTING_CONFIG}; // {0, 1, 2};
 
@@ -514,7 +548,8 @@ void argGenHardcoded(benchmark::internal::Benchmark* benchmark)
                                         for (auto tactic2 : cutlass_tactic)
                                             for (auto routing : routing_config)
                                                 benchmark->Args({num_expert, k, size, inter_size, 1, 1, 0, tokens, bias,
-                                                    (int) act, tactic1, tactic2, routing});
+                                                    1, (int) act, tactic1, tactic2, routing,
+                                                    (int) GemmToProfile::LAYER});
                     }
 }
 
@@ -536,8 +571,9 @@ void argGen(benchmark::internal::Benchmark* benchmark)
 
     // Generic setup
     benchmark->UseManualTime();
-    benchmark->ArgNames({"Num Experts", "K", "Hidden Size", "Inter Size", "TP Size", "EP Size", "World Rank",
-        "Num Tokens", "Use Bias", "Activation Function", "Tactic ID 1", "Tactic ID 2", "Routing ID"});
+    benchmark->ArgNames(
+        {"Num Experts", "K", "Hidden Size", "Inter Size", "TP Size", "EP Size", "World Rank", "Num Tokens", "Use Bias",
+            "Use Final Scale", "Activation Function", "Tactic ID 1", "Tactic ID 2", "Routing ID", "Gemm To Profile"});
 
     if (workloadFile)
         argGenLoadFile<BenchClass>(benchmark);
@@ -545,7 +581,8 @@ void argGen(benchmark::internal::Benchmark* benchmark)
         argGenHardcoded<BenchClass>(benchmark);
 }
 
-BENCHMARK_BASIC(float, float, float)
+// No one cares about float32
+// BENCHMARK_BASIC(float, float, float)
 BENCHMARK_BASIC(half, half, half)
 using uint8 = uint8_t;
 BENCHMARK_BASIC(half, uint8, half)
@@ -559,6 +596,7 @@ BENCHMARK_BASIC(SafeFP8, SafeFP8, half)
 #endif
 #ifdef ENABLE_FP4
 BENCHMARK_BASIC(SafeFP4, SafeFP4, half)
+BENCHMARK_BASIC(SafeFP8, SafeFP4, half)
 #endif
 
 void delayedRegisterBenchmark()
@@ -570,7 +608,7 @@ void delayedRegisterBenchmark()
     if (workloadFile)
     {
         // Extra ones we don't want for hardcoded runs
-        BENCHMARK_BASIC_DO_REGISTER(float, float, float);
+        // BENCHMARK_BASIC_DO_REGISTER(float, float, float);
         BENCHMARK_BASIC_DO_REGISTER(half, uint8, half);
         BENCHMARK_BASIC_DO_REGISTER(half, uint4b_t, half);
 #ifdef ENABLE_BF16
@@ -578,6 +616,7 @@ void delayedRegisterBenchmark()
 #endif
 #ifdef ENABLE_FP4
         BENCHMARK_BASIC_DO_REGISTER(SafeFP4, SafeFP4, half);
+        BENCHMARK_BASIC_DO_REGISTER(SafeFP8, SafeFP4, half);
 #endif
     }
 }
@@ -590,6 +629,9 @@ void doCleanup()
 
 void help()
 {
+    std::cout << "**Disclaimer: This benchmark is intended for developers to help evaluating the impact of new "
+                 "optimisations. This benchmark does not meet the same quality standards as other parts of TRT-LLM. "
+                 "Please use with caution**\n\n";
     std::cout << "Usage: mixtureOfExpertsBackendBenchmark [--disable_cuda_graphs] [--input_file <file>] [benchmark "
                  "options]\n";
     std::cout
@@ -616,7 +658,8 @@ void help()
            "    \"dtypes\": [string, ...], (optional)\n"
            "    \"routing_name\": string, (optional)\n"
            "    \"selected_experts\": [int, ...], or string, (optional, length is a multiple of k)\n"
-           "    \"expert_distribtuion\": [float, ...], or string, (optional, length is num_experts)\n"
+           "    \"expert_distribution\": [float, ...], or string, (optional, length is num_experts)\n"
+           "    \"gemm_to_profile\": int, (experimental, optional, 1 = gemm1, 2 = gemm2, 3 = layer)\n"
            "  },\n"
            "  ...\n"
            "]\n"
@@ -657,7 +700,7 @@ void help()
            "Useful for quick perf tests, prefer a full sweep and manually setting the tactic for more accurate "
            "results"
            "- dtypes - A list of dtypes to run this config through.\n"
-           "Allowed values are: fp8, int4, int8, float, half, bfloat16\n"
+           "Allowed values are: fp8, fp4, wfp4afp8, int4, int8, half, bfloat16\n"
            "If this argument is omitted all dtypes will be run. Note, not all tactics are supported for all "
            "dtypes,\n"
            "unsupported tactics will be skipped with a warning.\n"
@@ -674,6 +717,8 @@ void help()
            "- \"expert_distribution\" - instead of explicitly setting selected_experts, define a random distribution "
            "that experts will be randomly sampled from."
            "There is also pre-defined config \"uniform\", which is short-hand for a random uniform distribution\n"
+           "- \"gemm_to_profile\" - the gemm to profile, 1 = gemm1, 2 = gemm2, 3 = full layer. (default layer). If a "
+           "specific GEMM is profiled, it will always use uniform random token distribution\n"
            "\n";
 
     std::cout << "benchmark options:\n";

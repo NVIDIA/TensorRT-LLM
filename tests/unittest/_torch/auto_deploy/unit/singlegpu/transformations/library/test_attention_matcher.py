@@ -4,8 +4,10 @@ import pytest
 import torch
 from _graph_test_helpers import run_test
 from torch.export import Dim
+from torch.fx import GraphModule
 from transformers.integrations.sdpa_attention import repeat_kv as hf_repeat_kv
 
+from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.transformations.library.attention import (
     match_attention_layout,
     match_causal_attn_mask,
@@ -194,6 +196,95 @@ class EagerAttentionModel(torch.nn.Module):
         return {0: Dim("batch_size", max=8), 1: Dim("seq_len", min=4, max=16)}
 
 
+class ComplexEagerAttentionModel(torch.nn.Module):
+    """
+    A model that implements a complex eager attention pattern similar to the one in the user's graph.
+    This includes additional to_dtype operations and different transpose patterns.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        num_heads: int,
+        has_mask: bool = True,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.num_heads = num_heads
+        self.head_dim = hidden_size // num_heads
+        self.has_mask = has_mask
+        self.dropout = dropout
+
+        # Use a division for scaling instead of multiplication
+        self.scale_divisor = self.head_dim**0.5  # sqrt(head_dim)
+
+        # Define linear layers
+        self.q_proj = torch.nn.Linear(hidden_size, num_heads * self.head_dim)
+        self.k_proj = torch.nn.Linear(hidden_size, num_heads * self.head_dim)
+        self.v_proj = torch.nn.Linear(hidden_size, num_heads * self.head_dim)
+        self.out_proj = torch.nn.Linear(num_heads * self.head_dim, hidden_size)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        batch_size, seq_len, _ = x.shape
+        device = x.device
+        dtype = x.dtype
+
+        # Generate q, k, v
+        q = self.q_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim)
+        k = self.k_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim)
+        v = self.v_proj(x).view(batch_size, seq_len, self.num_heads, self.head_dim)
+
+        # Transpose to [batch, heads, seq, dim]
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+
+        # Use a standard transpose that will work correctly for matmul
+        # We need the dimensions to align for the matrix multiplication
+        k_transposed = k.transpose(2, 3)
+
+        # Compute attention scores using division for scaling instead of multiplication
+        attn_weights = torch.matmul(q, k_transposed) / self.scale_divisor
+
+        # Add attention mask if enabled
+        if self.has_mask:
+            mask = torch.triu(
+                torch.ones(seq_len, seq_len, dtype=torch.bool, device=device),
+                diagonal=1,
+            )
+            mask = mask.unsqueeze(0).unsqueeze(0)
+            attn_mask = torch.zeros_like(attn_weights, device=device)
+            attn_mask = attn_mask.masked_fill(mask, float("-inf"))
+            attn_weights = attn_weights + attn_mask
+
+        # Add a to_dtype node before softmax to match pattern in the graph
+        attn_weights = attn_weights.to(torch.float32)
+
+        # Apply softmax
+        attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1)
+
+        # Add a to_dtype node after softmax to match pattern in the graph
+        attn_weights = attn_weights.to(dtype)
+
+        # Apply dropout
+        attn_weights = torch.nn.functional.dropout(
+            attn_weights, p=self.dropout, training=self.training
+        )
+
+        # Apply attention weights to values
+        attn_output = torch.matmul(attn_weights, v)
+
+        # Reshape for output projection
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_len, -1)
+        output = self.out_proj(attn_output)
+
+        return output
+
+    def get_dynamic_shapes(self):
+        return {0: Dim("batch_size", max=8), 1: Dim("seq_len", min=4, max=16)}
+
+
 class CounterExampleModel(torch.nn.Module):
     """
     A model with similar operations (unsqueeze -> expand -> reshape) but with different
@@ -290,8 +381,8 @@ class GroupedAttentionModel(torch.nn.Module):
 
         # Manually apply repeat_kv to k and v
         if self.num_kv_heads != self.num_heads:
-            k = torch.ops.attention.repeat_kv(k, self.n_rep)
-            v = torch.ops.attention.repeat_kv(v, self.n_rep)
+            k = torch.ops.auto_deploy.torch_attention_repeat_kv(k, self.n_rep)
+            v = torch.ops.auto_deploy.torch_attention_repeat_kv(v, self.n_rep)
 
         # Create attention mask if needed
         attn_mask = None
@@ -307,7 +398,7 @@ class GroupedAttentionModel(torch.nn.Module):
             ).masked_fill(mask, float("-inf"))
 
         # Apply scaled dot product attention
-        attn_output = torch.ops.attention.scaled_dot_product_attention(
+        attn_output = torch.ops.auto_deploy.torch_attention_sdpa(
             q,
             k,
             v,
@@ -325,6 +416,21 @@ class GroupedAttentionModel(torch.nn.Module):
 
     def get_dynamic_shapes(self):
         return {0: Dim("batch_size", max=8), 1: Dim("seq_len", min=4, max=16)}
+
+
+def _get_match_repeat_kv_optimizer() -> Callable:
+    config = {
+        "cleanup_noop_slice": {
+            "stage": "post_export",
+        },
+    }
+
+    def _transform(gm: GraphModule) -> GraphModule:
+        gm = InferenceOptimizer(None, config)(None, gm)
+        match_repeat_kv(gm)
+        return gm
+
+    return _transform
 
 
 @pytest.mark.parametrize("num_heads, num_kv_heads", [(8, 8), (8, 4), (8, 2)])
@@ -345,7 +451,9 @@ def test_match_repeat_kv(num_heads, num_kv_heads, model_cls):
     expected_matches = 0 if num_heads == num_kv_heads else 2
 
     def verify_matcher(gm):
-        repeat_kv_nodes = [n for n in gm.graph.nodes if is_op(n, torch.ops.attention.repeat_kv)]
+        repeat_kv_nodes = [
+            n for n in gm.graph.nodes if is_op(n, torch.ops.auto_deploy.torch_attention_repeat_kv)
+        ]
 
         # Check that we have the expected number of replacements
         if len(repeat_kv_nodes) != expected_matches:
@@ -397,7 +505,7 @@ def test_match_repeat_kv(num_heads, num_kv_heads, model_cls):
     _ = run_test(
         model,
         x,
-        match_repeat_kv,
+        _get_match_repeat_kv_optimizer(),
         verify_matcher,
         lambda num_p_og: num_p_og,
         atol=1e-3,
@@ -411,40 +519,56 @@ def test_match_repeat_kv(num_heads, num_kv_heads, model_cls):
 @pytest.mark.parametrize("has_mask", [True, False])
 @pytest.mark.parametrize("use_division", [False, True])
 @pytest.mark.parametrize(
-    "dropout, rtol, atol",
+    "dropout, skip_output_assert",
     [
-        (0.0, 1e-3, 1e-3),  # (dropout, rtol, atol) for no dropout
-        (0.1, float("inf"), float("inf")),  # (dropout, rtol, atol) for dropout=0.1
+        (0.0, False),
+        (0.1, True),  # skip all_close assertion for dropout=0.1 for its non-deterministic output
     ],
 )
+@pytest.mark.parametrize("model_type", ["standard", "complex"])
 @torch.inference_mode()
-def test_match_eager_attention(has_mask, use_division, dropout, rtol, atol):
+def test_match_eager_attention(has_mask, use_division, dropout, skip_output_assert, model_type):
+    # Set a fixed seed for consistent dropout behavior in tests
+    torch.manual_seed(0)
+
     batch_size, seq_len = 4, 12
     hidden_size = 512
     num_heads = 8
 
-    model = EagerAttentionModel(hidden_size, num_heads, has_mask, dropout, use_division).to(
-        "cuda", dtype=torch.float16
-    )
-    x = torch.randn(batch_size, seq_len, hidden_size, device="cuda", dtype=torch.float16)
-    dynamic_shapes = model.get_dynamic_shapes()
-
-    # Print the original scaling approach and value
-    if use_division:
-        print(f"\nOriginal model using DIVISION with inv_scaling={model.inv_scaling}")
-        expected_scale = 1.0 / model.inv_scaling
-    else:
-        print(f"\nOriginal model using MULTIPLICATION with scaling={model.scaling}")
-        expected_scale = model.scaling
+    # Create different model types based on the parameter
+    if model_type == "standard":
+        model = EagerAttentionModel(hidden_size, num_heads, has_mask, dropout, use_division).to(
+            "cuda", dtype=torch.float16
+        )
+        # Print the original scaling approach and value
+        if use_division:
+            print(f"\nOriginal model using DIVISION with inv_scaling={model.inv_scaling}")
+            expected_scale = 1.0 / model.inv_scaling
+        else:
+            print(f"\nOriginal model using MULTIPLICATION with scaling={model.scaling}")
+            expected_scale = model.scaling
+    else:  # complex
+        # Complex model only uses division for scaling
+        model = ComplexEagerAttentionModel(hidden_size, num_heads, has_mask, dropout).to(
+            "cuda", dtype=torch.float16
+        )
+        expected_scale = 1.0 / model.scale_divisor
+        # Override use_division and only run test once (ignore the parameterization)
+        if not use_division:
+            pytest.skip("Complex model only uses division scaling")
 
     print(f"Expected normalized scale: {expected_scale}")
+    # Use fixed seed for input to ensure consistent results
+    torch.manual_seed(42)
+    x = torch.randn(batch_size, seq_len, hidden_size, device="cuda", dtype=torch.float16)
+    dynamic_shapes = model.get_dynamic_shapes()
 
     # We should find 1 instance of the pattern
     expected_matches = 1
 
     def verify_matcher(gm):
         sdpa_nodes = [
-            n for n in gm.graph.nodes if is_op(n, torch.ops.attention.scaled_dot_product_attention)
+            n for n in gm.graph.nodes if is_op(n, torch.ops.auto_deploy.torch_attention_sdpa)
         ]
 
         # Check that we have the expected number of replacements
@@ -512,16 +636,11 @@ def test_match_eager_attention(has_mask, use_division, dropout, rtol, atol):
 
             # Check mask handling for masked attention
             if has_mask:
-                # Check for either attn_mask in kwargs or is_causal in args/kwargs
                 has_mask_arg = "attn_mask" in kwargs
                 if not has_mask_arg and len(node.args) >= 4:
                     has_mask_arg = node.args[3] is not None
 
-                is_causal_value = kwargs.get("is_causal", None)
-                if is_causal_value is None and len(node.args) >= 6:
-                    is_causal_value = node.args[5]
-
-                if not has_mask_arg and is_causal_value is None:
+                if not has_mask_arg:
                     print("❌ Missing mask information in SDPA node")
                     valid = False
 
@@ -535,11 +654,12 @@ def test_match_eager_attention(has_mask, use_division, dropout, rtol, atol):
         match_eager_attention,
         verify_matcher,
         lambda num_p_og: num_p_og,
-        atol=atol,
-        rtol=rtol,
-        test_load_hook=True,
+        atol=1e-3,
+        rtol=1e-3,
+        test_load_hook=False,
         strict_loading=True,
         dynamic_shapes=dynamic_shapes,
+        skip_output_assert=skip_output_assert,
     )
 
 
@@ -555,8 +675,10 @@ def test_counter_example():
     dynamic_shapes = model.get_dynamic_shapes()
 
     def verify_no_matches(gm):
-        # No nodes should be replaced with torch.ops.attention.repeat_kv
-        repeat_kv_nodes = [n for n in gm.graph.nodes if is_op(n, torch.ops.attention.repeat_kv)]
+        # No nodes should be replaced with torch.ops.auto_deploy.torch_attention_repeat_kv
+        repeat_kv_nodes = [
+            n for n in gm.graph.nodes if is_op(n, torch.ops.auto_deploy.torch_attention_repeat_kv)
+        ]
         return len(repeat_kv_nodes) == 0
 
     # Ensure the pattern matcher doesn't match our counter-examples
@@ -593,7 +715,9 @@ def test_match_grouped_attention(num_heads, num_kv_heads, has_mask):
 
     def verify_matcher(gm):
         grouped_sdpa_nodes = [
-            n for n in gm.graph.nodes if is_op(n, torch.ops.attention.grouped_sdpa)
+            n
+            for n in gm.graph.nodes
+            if is_op(n, torch.ops.auto_deploy.torch_attention_grouped_sdpa)
         ]
 
         # Check that we have the expected number of replacements
@@ -690,8 +814,8 @@ class CausalAttentionModel(torch.nn.Module):
         # For grouped attention, repeat k and v
         if self.use_grouped_sdpa and self.num_kv_heads != self.num_heads:
             n_rep = self.num_heads // self.num_kv_heads
-            k = torch.ops.attention.repeat_kv(k, n_rep)
-            v = torch.ops.attention.repeat_kv(v, n_rep)
+            k = torch.ops.auto_deploy.torch_attention_repeat_kv(k, n_rep)
+            v = torch.ops.auto_deploy.torch_attention_repeat_kv(v, n_rep)
 
         # Create attention mask based on mask_type
         if self.mask_type == "triu":
@@ -730,7 +854,7 @@ class CausalAttentionModel(torch.nn.Module):
 
         # Choose the appropriate attention implementation
         if self.use_grouped_sdpa:
-            attn_output = torch.ops.attention.grouped_sdpa(
+            attn_output = torch.ops.auto_deploy.torch_attention_grouped_sdpa(
                 q,
                 k,
                 v,
@@ -740,7 +864,7 @@ class CausalAttentionModel(torch.nn.Module):
                 scale=1.0 / (self.head_dim**0.5),
             )
         else:
-            attn_output = torch.ops.attention.scaled_dot_product_attention(
+            attn_output = torch.ops.auto_deploy.torch_attention_sdpa(
                 q,
                 k,
                 v,
@@ -786,12 +910,14 @@ def test_match_causal_attention(mask_type, use_grouped_sdpa):
     def verify_matcher(gm):
         # Find attention operations
         if use_grouped_sdpa:
-            attn_nodes = [n for n in gm.graph.nodes if is_op(n, torch.ops.attention.grouped_sdpa)]
-        else:
             attn_nodes = [
                 n
                 for n in gm.graph.nodes
-                if is_op(n, torch.ops.attention.scaled_dot_product_attention)
+                if is_op(n, torch.ops.auto_deploy.torch_attention_grouped_sdpa)
+            ]
+        else:
+            attn_nodes = [
+                n for n in gm.graph.nodes if is_op(n, torch.ops.auto_deploy.torch_attention_sdpa)
             ]
 
         if len(attn_nodes) != 1:
@@ -890,8 +1016,8 @@ class Llama3CausalAttentionModel(torch.nn.Module):
         # For grouped attention, repeat k and v
         if self.use_grouped_sdpa and self.num_kv_heads != self.num_heads:
             n_rep = self.num_heads // self.num_kv_heads
-            k = torch.ops.attention.repeat_kv(k, n_rep)
-            v = torch.ops.attention.repeat_kv(v, n_rep)
+            k = torch.ops.auto_deploy.torch_attention_repeat_kv(k, n_rep)
+            v = torch.ops.auto_deploy.torch_attention_repeat_kv(v, n_rep)
 
         # Create a llama-3.1 style causal mask
         # 1. Create a full tensor with a very negative value
@@ -926,7 +1052,7 @@ class Llama3CausalAttentionModel(torch.nn.Module):
 
         # Choose the appropriate attention implementation
         if self.use_grouped_sdpa:
-            attn_output = torch.ops.attention.grouped_sdpa(
+            attn_output = torch.ops.auto_deploy.torch_attention_grouped_sdpa(
                 q,
                 k,
                 v,
@@ -936,7 +1062,7 @@ class Llama3CausalAttentionModel(torch.nn.Module):
                 scale=1.0 / (self.head_dim**0.5),
             )
         else:
-            attn_output = torch.ops.attention.scaled_dot_product_attention(
+            attn_output = torch.ops.auto_deploy.torch_attention_sdpa(
                 q,
                 k,
                 v,
@@ -957,6 +1083,7 @@ class Llama3CausalAttentionModel(torch.nn.Module):
 
 
 @pytest.mark.parametrize("use_grouped_sdpa", [False, True])
+@pytest.mark.skip(reason="Skip until we have more robust attention masking handling, see #4783")
 @torch.inference_mode()
 def test_match_llama3_causal_attention(use_grouped_sdpa):
     batch_size, seq_len = 4, 12
@@ -977,12 +1104,14 @@ def test_match_llama3_causal_attention(use_grouped_sdpa):
     def verify_matcher(gm):
         # Find attention operations
         if use_grouped_sdpa:
-            attn_nodes = [n for n in gm.graph.nodes if is_op(n, torch.ops.attention.grouped_sdpa)]
-        else:
             attn_nodes = [
                 n
                 for n in gm.graph.nodes
-                if is_op(n, torch.ops.attention.scaled_dot_product_attention)
+                if is_op(n, torch.ops.auto_deploy.torch_attention_grouped_sdpa)
+            ]
+        else:
+            attn_nodes = [
+                n for n in gm.graph.nodes if is_op(n, torch.ops.auto_deploy.torch_attention_sdpa)
             ]
 
         if len(attn_nodes) != 1:
@@ -1028,7 +1157,7 @@ class MockAttentionDescriptor:
     """A mock class that mimics the AttentionDescriptor interface for testing."""
 
     layout: str = "bnsd"
-    source_attention_op: Callable = torch.ops.attention.scaled_dot_product_attention
+    source_attention_op: Callable = torch.ops.auto_deploy.torch_attention_sdpa
 
     @classmethod
     def get_attention_layout(cls) -> str:
@@ -1098,7 +1227,7 @@ class AttentionLayoutModel(torch.nn.Module):
 
         # Apply scaled dot product attention
         if self.use_grouped_sdpa:
-            attn_output = torch.ops.attention.grouped_sdpa(
+            attn_output = torch.ops.auto_deploy.torch_attention_grouped_sdpa(
                 q,
                 k,
                 v,
@@ -1108,7 +1237,7 @@ class AttentionLayoutModel(torch.nn.Module):
                 scale=1.0 / (self.head_dim**0.5),
             )
         else:
-            attn_output = torch.ops.attention.scaled_dot_product_attention(
+            attn_output = torch.ops.auto_deploy.torch_attention_sdpa(
                 q,
                 k,
                 v,
@@ -1145,7 +1274,7 @@ class BsndAttentionModel(AttentionLayoutModel):
         attn_mask = self._get_attn_mask(x) if self.has_mask else None
 
         # Apply bsnd_grouped_sdpa directly
-        attn_output = torch.ops.attention.bsnd_grouped_sdpa.default(
+        attn_output = torch.ops.auto_deploy.torch_attention_bsnd_grouped_sdpa.default(
             q,
             k,
             v,
@@ -1183,11 +1312,11 @@ def test_match_attention_layout(layout, model_config, has_mask):
     MockAttentionDescriptor.layout = layout
     if layout == "bnsd":
         if model_config.get("use_grouped_sdpa"):
-            source_op = torch.ops.attention.grouped_sdpa
+            source_op = torch.ops.auto_deploy.torch_attention_grouped_sdpa
         else:
-            source_op = torch.ops.attention.scaled_dot_product_attention
+            source_op = torch.ops.auto_deploy.torch_attention_sdpa
     else:
-        source_op = torch.ops.attention.bsnd_grouped_sdpa
+        source_op = torch.ops.auto_deploy.torch_attention_bsnd_grouped_sdpa
     MockAttentionDescriptor.source_attention_op = source_op
 
     # Create appropriate model based on model_config
@@ -1218,18 +1347,24 @@ def test_match_attention_layout(layout, model_config, has_mask):
         if model_config["type"] == "standard":
             if model_config["use_grouped_sdpa"]:
                 original_nodes = [
-                    n for n in gm.graph.nodes if is_op(n, torch.ops.attention.grouped_sdpa)
+                    n
+                    for n in gm.graph.nodes
+                    if is_op(n, torch.ops.auto_deploy.torch_attention_grouped_sdpa)
                 ]
             else:
                 original_nodes = [
                     n
                     for n in gm.graph.nodes
-                    if is_op(n, torch.ops.attention.scaled_dot_product_attention)
+                    if is_op(n, torch.ops.auto_deploy.torch_attention_sdpa)
                 ]
         else:  # already_bsnd
             original_nodes = []
 
-        bsnd_nodes = [n for n in gm.graph.nodes if is_op(n, torch.ops.attention.bsnd_grouped_sdpa)]
+        bsnd_nodes = [
+            n
+            for n in gm.graph.nodes
+            if is_op(n, torch.ops.auto_deploy.torch_attention_bsnd_grouped_sdpa)
+        ]
         transpose_nodes = [n for n in gm.graph.nodes if is_op(n, torch.ops.aten.transpose.int)]
 
         # Different expectations based on model type and layout

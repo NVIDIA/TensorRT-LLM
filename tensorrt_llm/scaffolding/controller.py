@@ -1,23 +1,15 @@
 import copy
 from abc import ABC
 from enum import Enum
-from typing import Any, List, Mapping
+from typing import Any, List, Mapping, Tuple
 
 import torch
 from torch.nn import functional as F
 
+from tensorrt_llm.executor.result import GenerationResult
 from tensorrt_llm.logger import logger
 from tensorrt_llm.scaffolding.math_utils import get_digit_majority_vote_result
-from tensorrt_llm.scaffolding.task import (GenerationTask, ScaffoldingOutput,
-                                           Task)
-
-
-class ScaffoldingOutput:
-
-    def __init__(self):
-        self.output_str = None
-        # reserved for customized controller
-        self.customized_output = None
+from tensorrt_llm.scaffolding.task import GenerationTask, Task
 
 
 class Controller(ABC):
@@ -28,7 +20,7 @@ class Controller(ABC):
     def clone(self):
         return copy.deepcopy(self)
 
-    def generate(self, prompt: str, **kwargs) -> ScaffoldingOutput:
+    def generate(self, prompt: str, **kwargs) -> GenerationResult:
         task = GenerationTask.create_from_prompt(prompt)
 
         yield from self.process([task], **kwargs)
@@ -57,7 +49,7 @@ class NativeGenerationController(Controller):
     class WorkerTag(Enum):
         GENERATION = "generation"
 
-    def __init__(self, sampling_params: dict = None):
+    def __init__(self, sampling_params: dict = None, streaming: bool = False):
         super().__init__()
         if sampling_params is None:
             sampling_params = {}
@@ -67,6 +59,7 @@ class NativeGenerationController(Controller):
                     f"{key} is not a supported field for GenerationTask")
                 sampling_params.pop(key)
         self.sampling_params = sampling_params
+        self.streaming = streaming
 
     def process(self, tasks: List[Task], **kwargs):
         for task in tasks:
@@ -74,11 +67,15 @@ class NativeGenerationController(Controller):
             for key, value in self.sampling_params.items():
                 if getattr(task, key) is None:
                     setattr(task, key, value)
+            task.streaming = self.streaming
 
         yield tasks
 
 
 class NativeRewardController(Controller):
+
+    def __init__(self):
+        self.scores = None
 
     class WorkerTag(Enum):
         REWARD = "reward"
@@ -91,79 +88,112 @@ class NativeRewardController(Controller):
         yield tasks
 
 
-class QwenRewardController(NativeRewardController):
+class PRMController(NativeRewardController):
     """
-    Controller that integrate multi Generation output into one prompt and get
-    reward values from reward model.
+    Use PRM(Process Reward Model) to get the score of output. Will split
+    output into multi steps if `split_steps` is True. Otherwise will only
+    extract last token score.
+
+    Output:
+        The scores of each task will be stored in `self.scores`.
+
+    Example:
+        Suppose the model output is split using a special token like <extra_0>:
+        Input: "Step1,...<extra_0>Step2,...\\boxed{answer}.<extra_0>."
+        The function will mask out logits and remain only scores at separate_token.
+        Each represent the probability score for each step, eg: [0.98, 1.0].
+        We can assume the output is good when product of all probabilities is high.
     """
 
-    def __init__(self, tokenizer, separate_token="<extra_0>"):  # nosec B107
+    def __init__(
+            self,
+            tokenizer,
+            split_steps=True,
+            step_token="\n\n",
+            separate_token="<extra_0>",  # nosec B107
+    ):
         super().__init__()
         self.tokenizer = tokenizer
+        self.split_steps = split_steps
+        self.step_token = step_token
         self.separate_token = separate_token
 
-    def _make_step_rewards(self, logits, token_masks):
-        probabilities = F.softmax(logits, dim=-1)
-        probabilities = probabilities * token_masks.unsqueeze(
-            -1)  # bs, seq_len, num_labels=2
+    def _calc_steps_score(self, logits, token_mask):
+        probs = F.softmax(logits, dim=-1)  # seq_len, num_labels=2
+        masked_probs = probs * token_mask.unsqueeze(-1)[0]
 
-        all_scores_res = []
-        for i in range(probabilities.size(0)):
-            sample = probabilities[i]  # seq_len, num_labels
-            positive_probs = sample[sample != 0].view(
-                -1, 2)[:, 1]  # num_separate_tokens, num_labels
-            non_zero_elements_list = positive_probs.cpu().tolist()
-            all_scores_res.append(non_zero_elements_list)
-        return all_scores_res
+        # only keep the logits at the separate_token
+        step_probs = masked_probs[masked_probs != 0].view(-1, 2)[:, 1]
+        score = torch.prod(step_probs).item()
+        return score
+
+    def _calc_last_token_score(self, logits):
+        # seq_len, num_labels=2
+        probs = F.softmax(logits, dim=-1)
+        score = probs[-1, 1].item()
+        return score
 
     def process(self, tasks: List[Task], **kwargs):
-        # Combine messages using chat template
-        content = "".join(
-            (task.output_str + self.separate_token) for task in tasks)
-        messages = [
-            {
-                "role":
-                "system",
-                "content":
-                "Please reason step by step, and put your final answer within \\boxed{}."
-            },
-            {
-                "role": "user",
-                "content": tasks[0].input_str
-            },
-            {
-                "role": "assistant",
-                "content": content
-            },
-        ]
-        combined_prompt = self.tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=False)
+        reward_tasks = []
+        for task in tasks:
+            if self.split_steps:
+                steps = task.output_str.split(self.step_token)
+                content = "".join(
+                    (step + self.separate_token) for step in steps)
+            else:
+                content = self.separate_token + task.output_str + self.separate_token
+            # Combine messages using chat template
+            messages = [
+                {
+                    "role":
+                    "system",
+                    "content":
+                    "Please reason step by step, and put your final answer within \\boxed{}."
+                },
+                {
+                    "role": "user",
+                    "content": task.input_str
+                },
+                {
+                    "role": "assistant",
+                    "content": content
+                },
+            ]
+            processed_prompt = self.tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=False)
 
-        # TODO: support input_ids as model input, avoid doing it again in worker
-        merged_task = GenerationTask.create_from_prompt(combined_prompt)
-        merged_task.worker_tag = self.WorkerTag.REWARD
+            # TODO: support input_ids as model input, avoid doing it again in worker
+            reward_task = GenerationTask.create_from_prompt(processed_prompt)
+            reward_task.worker_tag = self.WorkerTag.REWARD
 
-        # TODO: pack this logic
-        merged_task.max_tokens = 1
-        merged_task.return_context_logits = True
+            # TODO: pack this logic
+            reward_task.max_tokens = 1
+            reward_task.return_context_logits = True
+            reward_tasks.append(reward_task)
 
-        yield [merged_task]
+        yield reward_tasks
 
-        assert merged_task.context_logits is not None
-        # TODO: consider running on cpu to not interrupt worker or move
-        # tokenizer to a worker
-        input_ids = self.tokenizer.encode(
-            combined_prompt,
-            return_tensors="pt",
-        ).to(merged_task.context_logits.device)
+        scores = []
+        for reward_task in reward_tasks:
+            assert reward_task.context_logits is not None
+            # TODO: consider running on cpu to not interrupt worker or move
+            # tokenizer to a worker
+            input_ids = self.tokenizer.encode(
+                reward_task.input_str,
+                return_tensors="pt",
+            ).to(reward_task.context_logits.device)
 
-        # TODO: align add_special_tokens with SamplingParams
-        token_masks = (input_ids == self.tokenizer.encode(
-            self.separate_token, add_special_tokens=True)[0])
-        all_scores_res = self._make_step_rewards(merged_task.context_logits,
-                                                 token_masks)
+            if self.split_steps:
+                # TODO: align add_special_tokens with SamplingParams
+                token_mask = (input_ids == self.tokenizer.encode(
+                    self.separate_token, add_special_tokens=True)[0])
+                score = self._calc_steps_score(reward_task.context_logits,
+                                               token_mask)
+            else:
+                score = self._calc_last_token_score(reward_task.context_logits)
+            scores.append(score)
 
-        return all_scores_res
+        self.scores = scores
 
 
 # Controller runs a single generation task with majority vote.
@@ -201,13 +231,14 @@ class MajorityVoteController(Controller):
                               generation_kwargs_list)
 
         candidates = [tasks[0].output_str for tasks in tasks_list]
-        result = self.majority_vote(candidates, **majority_vote_kwargs)
+        majority_index, majority_answer = self.majority_vote(
+            candidates, **majority_vote_kwargs)
 
-        assert isinstance(result, str), "majority_vote failed"
+        assert isinstance(majority_answer, str), "majority_vote failed"
         # The task returned by majority vote does not have output_tokens and logits.
-        tasks[0].output_str = result
+        tasks[0].result = tasks_list[majority_index][0].result
 
-    def majority_vote(self, candidates: List[str], **kwargs) -> str:
+    def majority_vote(self, candidates: List[str], **kwargs) -> Tuple[int, str]:
         return get_digit_majority_vote_result(candidates)
 
 
@@ -243,21 +274,27 @@ class BestOfNController(Controller):
             self.generation_controller for _ in range(sample_num)
         ]
         generation_kwargs_list = [generation_kwargs for _ in range(sample_num)]
-        generation_tasks_list = [copy.deepcopy(task) for _ in range(sample_num)]
+        generation_tasks = [copy.deepcopy(task) for _ in range(sample_num)]
 
-        # yield from self.generation_controller.process(generation_tasks_list,
-        #                                               **generation_kwargs)
         yield ParallelProcess(generation_controllers,
-                              [[t] for t in generation_tasks_list],
+                              [[t] for t in generation_tasks],
                               generation_kwargs_list)
 
-        reward_values = yield from self.reward_controller.process(
-            generation_tasks_list, **reward_kwargs)
+        yield from self.reward_controller.process(generation_tasks,
+                                                  **reward_kwargs)
 
-        best_task = self.select_best(generation_tasks_list, reward_values,
-                                     **select_best_kwargs)
-        task.output_str = best_task.output_str
+        assert self.reward_controller.scores is not None
+        reward_values = self.reward_controller.scores
+
+        for i, gen_task, reward_value in zip(range(sample_num),
+                                             generation_tasks, reward_values):
+            logger.info(
+                f"[output {i}, score {reward_value}]:\n{gen_task.output_str}")
+
+        best_task, best_idx = self.select_best(generation_tasks, reward_values,
+                                               **select_best_kwargs)
+        task.result = best_task.result
 
     def select_best(self, tasks: List[Task], reward_values, **kwargs) -> Task:
         max_index = torch.argmax(torch.tensor(reward_values)).item()
-        return tasks[max_index]
+        return tasks[max_index], max_index

@@ -40,6 +40,7 @@ from ...inputs import (ExtraProcessedInputs, InputProcessor, TextPrompt,
 from ...logger import logger
 from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
+from ..modules.embedding import Embedding, LMHead
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_encoder import (VisionTower, VisionTowerDynamicS2,
                                           VisionTowerS2)
@@ -559,18 +560,19 @@ def init_mm_projector(model_type_or_path: str,
         return mm_projector
 
 
-def _resize_embeds(old_embeddings, new_num_tokens):
+def _resize_embeds(old_embeddings: Embedding, new_num_tokens: int):
     # build new embeddings
-    old_num_tokens, old_embedding_dim = old_embeddings.weight.size()
-    new_embeddings = nn.Embedding(
-        new_num_tokens,
-        old_embedding_dim,
-        device=old_embeddings.weight.device,
+    new_embeddings = Embedding(
+        num_embeddings=new_num_tokens,
+        embedding_dim=old_embeddings.embedding_dim,
         dtype=old_embeddings.weight.dtype,
-    )
+        mapping=old_embeddings.mapping,
+        tensor_parallel_mode=old_embeddings.tp_mode,
+        gather_output=old_embeddings.gather_output,
+    ).to("cuda")
 
     # copy weights
-    num_tokens_to_copy = min(old_num_tokens, new_num_tokens)
+    num_tokens_to_copy = min(old_embeddings.num_embeddings, new_num_tokens)
     new_embeddings.weight.data[:
                                num_tokens_to_copy, :] = old_embeddings.weight.data[:
                                                                                    num_tokens_to_copy, :]
@@ -583,30 +585,24 @@ def _resize_embeds(old_embeddings, new_num_tokens):
     return old_embeddings
 
 
-def _resize_lm_head(old_lm_head, new_num_tokens):
+def _resize_lm_head(old_lm_head: LMHead, new_num_tokens: int):
     # build new lm head
-    old_num_tokens, old_lm_head_dim = old_lm_head.weight.size()
-    new_lm_head_shape = (old_lm_head_dim, new_num_tokens)
-    has_new_lm_head_bias = old_lm_head.bias is not None
-    new_lm_head = nn.Linear(
-        *new_lm_head_shape,
-        bias=has_new_lm_head_bias,
-        device=old_lm_head.weight.device,
+    new_lm_head = LMHead(
+        num_embeddings=new_num_tokens,
+        embedding_dim=old_lm_head.embedding_dim,
         dtype=old_lm_head.weight.dtype,
-    )
+        mapping=old_lm_head.mapping,
+        tensor_parallel_mode=old_lm_head.tp_mode,
+        gather_output=old_lm_head.gather_output,
+    ).to("cuda")
 
-    # copy weights and bias
-    num_tokens_to_copy = min(old_num_tokens, new_num_tokens)
+    # copy weights
+    num_tokens_to_copy = min(old_lm_head.num_embeddings, new_num_tokens)
     new_lm_head.weight.data[:
                             num_tokens_to_copy, :] = old_lm_head.weight.data[:
                                                                              num_tokens_to_copy, :]
     old_lm_head.weight.data = new_lm_head.weight.data
 
-    if has_new_lm_head_bias:
-        new_lm_head.bias.data[:
-                              num_tokens_to_copy] = old_lm_head.bias.data[:
-                                                                          num_tokens_to_copy]
-        old_lm_head.bias.data = new_lm_head.bias.data
     return old_lm_head
 
 
@@ -644,7 +640,7 @@ def init_llm(
     llm = AutoModelForCausalLM.from_config(llm_model_config)
     if llm_cfg.vocab_size != len(tokenizer):
         warnings.warn(
-            "LLM have a different vocab size than tokenizer. Consider update the LLM checkpoint with the tokenizer's vocab size with resize_token_embeddings()."
+            "LLM have a different vocab size than tokenizer. Consider update the LLM checkpoint with the tokenizer's vocab size with _resize_token_embeddings()."
         )
 
     model_config.pretrained_config.hidden_size = llm.config.hidden_size
@@ -868,7 +864,11 @@ def _apply_chat_template(text, conv, tokenizer):
 
 class VilaInputProcessor(InputProcessor):
 
-    def __init__(self, model_path, model_config, tokenizer):
+    def __init__(self,
+                 model_path,
+                 model_config,
+                 tokenizer,
+                 trust_remote_code: bool = True):
         self.model_config = model_config
         llm_path, vision_tower_path, mm_projector_path = _get_model_paths(
             self.model_config)
@@ -1102,18 +1102,23 @@ class VilaInputProcessor(InputProcessor):
         input_ids = self.tokenizer(
             text_prompt, return_tensors="pt").input_ids[0].to(self.device)
 
+        if not mm_data:
+            return input_ids.to(torch.int32).tolist(), {}
+
         mm_tensor, block_sizes = self._preprocess(
             mm_data, mm_processor_kwargs, use_fast=True
         )  # use_fast uses Pytorch GPU preprocessing, otherwise uses PIL CPU preprocessing
         mm_features = self._process(mm_tensor, block_sizes)
         fused_input_ids, mm_features = self._postprocess(input_ids, mm_features)
+        multimodal_data = {}
+        multimodal_data["multimodal_embedding"] = mm_features
         return fused_input_ids.to(torch.int32).tolist(), {
-            "mm_embedding": mm_features
+            "multimodal_data": multimodal_data
         }
 
 
 @register_auto_model(VilaConfig.model_architecture)
-@register_input_processor(VilaInputProcessor)
+@register_input_processor(VilaInputProcessor, model_type="llava_llama")
 class VilaModel(PreTrainedModel):
     config_class = VilaConfig
 
@@ -1150,8 +1155,8 @@ class VilaModel(PreTrainedModel):
     def forward(
         self,
         attn_metadata: AttentionMetadata,
-        input_ids: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
+        input_ids: Optional[torch.IntTensor] = None,
+        position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         return_context_logits: Optional[bool] = False,
         **kwargs,
@@ -1161,14 +1166,16 @@ class VilaModel(PreTrainedModel):
         """
 
         num_context_requests, num_generation_requests = attn_metadata.num_contexts, attn_metadata.num_generations
-        mm_embed = kwargs.get("multi_modal_data", [])
-
-        assert mm_embed == [] or len(
-            mm_embed
-        ) == num_context_requests, "Number of multimodal features (if provided) should be equal to number of context requests"
+        multimodal_params = kwargs.get("multimodal_params", [])
+        mm_embeds = []
+        if len(multimodal_params) > 0:
+            mm_embeds = [
+                multimodal_param.multimodal_data["multimodal_embedding"]
+                for multimodal_param in multimodal_params
+            ]
 
         input_ids, inputs_embeds = fuse_input_embeds(
-            self.llm.model.embed_tokens, input_ids, mm_embed)
+            self.llm.model.embed_tokens, input_ids, mm_embeds)
         logits = self.llm.forward(attn_metadata=attn_metadata,
                                   input_ids=input_ids,
                                   position_ids=position_ids,

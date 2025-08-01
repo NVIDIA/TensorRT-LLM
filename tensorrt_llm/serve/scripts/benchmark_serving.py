@@ -30,18 +30,22 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Optional
 
+import aiohttp
 import numpy as np
-from backend_request_func import (ASYNC_REQUEST_FUNCS,
-                                  OPENAI_COMPATIBLE_BACKENDS, RequestFuncInput,
-                                  RequestFuncOutput, get_tokenizer)
-from benchmark_dataset import (AIMODataset, BurstGPTDataset,
-                               ConversationDataset, HuggingFaceDataset,
-                               InstructCoderDataset, RandomDataset,
-                               SampleRequest, ShareGPTDataset, SonnetDataset,
-                               VisionArenaDataset)
-from benchmark_utils import convert_to_pytorch_benchmark_format, write_to_json
 from tqdm.asyncio import tqdm
 from transformers import PreTrainedTokenizerBase
+
+# isort: off
+from tensorrt_llm.serve.scripts.backend_request_func import (
+    AIOHTTP_TIMEOUT, ASYNC_REQUEST_FUNCS, OPENAI_COMPATIBLE_BACKENDS,
+    RequestFuncInput, RequestFuncOutput, get_tokenizer)
+from tensorrt_llm.serve.scripts.benchmark_dataset import (
+    AIMODataset, BurstGPTDataset, ConversationDataset, CustomDataset,
+    HuggingFaceDataset, InstructCoderDataset, RandomDataset, SampleRequest,
+    ShareGPTDataset, SonnetDataset, VisionArenaDataset)
+from tensorrt_llm.serve.scripts.benchmark_utils import (
+    convert_to_pytorch_benchmark_format, write_to_json)
+# isort: on
 
 MILLISECONDS_TO_SECONDS_CONVERSION = 1000
 
@@ -75,6 +79,11 @@ class BenchmarkMetrics:
     std_e2el_ms: float
     percentiles_e2el_ms: list[tuple[float, float]]
     tput_user: list[float]
+    # Request accuracy rate metrics
+    mean_request_ar: float
+    median_request_ar: float
+    std_request_ar: float
+    percentiles_request_ar: list[tuple[float, float]]
 
 
 async def get_request(
@@ -127,7 +136,7 @@ def calculate_metrics(
     selected_percentile_metrics: list[str],
     selected_percentiles: list[float],
     goodput_config_dict: dict[str, float],
-) -> tuple[BenchmarkMetrics, list[int]]:
+) -> tuple[BenchmarkMetrics, list[int], list[float]]:
     actual_output_lens: list[int] = []
     total_input = 0
     completed = 0
@@ -138,21 +147,19 @@ def calculate_metrics(
     ttfts: list[float] = []
     e2els: list[float] = []
     tput_user: list[float] = []
+    request_ars: list[float] = []  # Request accuracy rates
     for i in range(len(outputs)):
         if outputs[i].success:
             output_len = outputs[i].output_tokens
-            output_len = len(
-                tokenizer(outputs[i].generated_text,
-                          add_special_tokens=False).input_ids)
-            # if not output_len:
-            #     # We use the tokenizer to count the number of output tokens
-            #     # for some serving backends instead of looking at
-            #     # len(outputs[i].itl) since multiple output tokens may be
-            #     # bundled together
-            #     # Note : this may inflate the output token count slightly
-            #     output_len = len(
-            #         tokenizer(outputs[i].generated_text,
-            #                   add_special_tokens=False).input_ids)
+            if not output_len:
+                # We use the tokenizer to count the number of output tokens
+                # for some serving backends instead of looking at
+                # len(outputs[i].itl) since multiple output tokens may be
+                # bundled together
+                # Note : this may inflate the output token count slightly
+                output_len = len(
+                    tokenizer(outputs[i].generated_text,
+                              add_special_tokens=False).input_ids)
             actual_output_lens.append(output_len)
             total_input += input_requests[i].prompt_len
             tpot = 0
@@ -166,9 +173,24 @@ def calculate_metrics(
             ttfts.append(outputs[i].ttft)
             e2els.append(outputs[i].latency)
             tput_user.append(output_len / (outputs[i].latency))
+
+            # Calculate request accuracy rate (num_generated_tokens / (decode_iteration + 1))
+            decode_iter = outputs[i].decode_iteration
+            if decode_iter >= 0:
+                # For generated tokens, we use output_len - 1 (excluding the first token if needed)
+                # But according to the reference, it should be num_generated_tokens
+                num_generated_tokens = max(0, output_len -
+                                           1) if output_len > 1 else output_len
+                request_ar = num_generated_tokens / (
+                    decode_iter + 1) if decode_iter >= 0 else 0.0
+                request_ars.append(request_ar)
+            else:
+                request_ars.append(0.0)
+
             completed += 1
         else:
             actual_output_lens.append(0)
+            request_ars.append(0.0)
 
     if goodput_config_dict:
         valid_metrics = []
@@ -227,8 +249,13 @@ def calculate_metrics(
         percentiles_e2el_ms=[(p, np.percentile(e2els or 0, p) * 1000)
                              for p in selected_percentiles],
         tput_user=np.mean(tput_user or 0),
+        mean_request_ar=np.mean(request_ars or 0),
+        median_request_ar=np.median(request_ars or 0),
+        std_request_ar=np.std(request_ars or 0),
+        percentiles_request_ar=[(p, np.percentile(request_ars or 0, p))
+                                for p in selected_percentiles],
     )
-    return metrics, actual_output_lens
+    return metrics, actual_output_lens, request_ars
 
 
 async def benchmark(
@@ -251,36 +278,42 @@ async def benchmark(
     max_concurrency: Optional[int],
     lora_modules: Optional[Iterable[str]],
     extra_body: Optional[dict],
+    streaming: bool,
+    no_test_input: bool = False,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
     else:
         raise ValueError(f"Unknown backend: {backend}")
 
-    print("Starting initial single prompt test run...")
-    test_prompt, test_prompt_len, test_output_len = \
-        input_requests[0].prompt, input_requests[0].prompt_len, \
-        input_requests[0].expected_output_len
+    if not no_test_input:
+        print("Starting initial single prompt test run...")
+        test_prompt, test_prompt_len, test_output_len = \
+            input_requests[0].prompt, input_requests[0].prompt_len, \
+            input_requests[0].expected_output_len
 
-    test_input = RequestFuncInput(
-        model=model_id,
-        model_name=model_name,
-        prompt=test_prompt,
-        api_url=api_url,
-        prompt_len=test_prompt_len,
-        output_len=test_output_len,
-        logprobs=logprobs,
-        ignore_eos=ignore_eos,
-        extra_body=extra_body,
-    )
+        test_input = RequestFuncInput(
+            model=model_id,
+            model_name=model_name,
+            prompt=test_prompt,
+            api_url=api_url,
+            prompt_len=test_prompt_len,
+            output_len=test_output_len,
+            logprobs=logprobs,
+            ignore_eos=ignore_eos,
+            extra_body=extra_body,
+        )
 
-    test_output = await request_func(request_func_input=test_input)
-    if not test_output.success:
-        raise ValueError(
-            "Initial test run failed - Please make sure benchmark arguments "
-            f"are correctly specified. Error: {test_output.error}")
+        test_output = await request_func(request_func_input=test_input,
+                                         streaming=streaming)
+        if not test_output.success:
+            raise ValueError(
+                "Initial test run failed - Please make sure benchmark arguments "
+                f"are correctly specified. Error: {test_output.error}")
+        else:
+            print("Initial test run completed. Starting main benchmark run...")
     else:
-        print("Initial test run completed. Starting main benchmark run...")
+        print("Skipping initial test run. Starting main benchmark run...")
 
     if lora_modules:
         # For each input request, choose a LoRA module at random.
@@ -299,7 +332,8 @@ async def benchmark(
                                          logprobs=logprobs,
                                          ignore_eos=ignore_eos,
                                          extra_body=extra_body)
-        profile_output = await request_func(request_func_input=profile_input)
+        profile_output = await request_func(request_func_input=profile_input,
+                                            streaming=streaming)
         if profile_output.success:
             print("Profiler started")
 
@@ -321,16 +355,29 @@ async def benchmark(
     semaphore = (asyncio.Semaphore(max_concurrency)
                  if max_concurrency else None)
 
-    async def limited_request_func(request_func_input, pbar):
+    async def limited_request_func(request_func_input, streaming, pbar,
+                                   session):
         if semaphore is None:
             return await request_func(request_func_input=request_func_input,
-                                      pbar=pbar)
+                                      streaming=streaming,
+                                      pbar=pbar,
+                                      session=session)
         async with semaphore:
             return await request_func(request_func_input=request_func_input,
-                                      pbar=pbar)
+                                      streaming=streaming,
+                                      pbar=pbar,
+                                      session=session)
 
     benchmark_start_time = time.perf_counter()
     tasks: list[asyncio.Task] = []
+    session = aiohttp.ClientSession(trust_env=True,
+                                    timeout=AIOHTTP_TIMEOUT,
+                                    connector=aiohttp.TCPConnector(
+                                        limit=0,
+                                        limit_per_host=0,
+                                        force_close=True))
+
+    i = 0
     async for request in get_request(input_requests, request_rate, burstiness):
         prompt, prompt_len, output_len = request.prompt, \
             request.prompt_len, request.expected_output_len
@@ -352,7 +399,10 @@ async def benchmark(
         tasks.append(
             asyncio.create_task(
                 limited_request_func(request_func_input=request_func_input,
-                                     pbar=pbar)))
+                                     streaming=streaming,
+                                     pbar=pbar,
+                                     session=session)))
+        i += 1
     outputs: list[RequestFuncOutput] = await asyncio.gather(*tasks)
 
     if profile:
@@ -365,7 +415,9 @@ async def benchmark(
             output_len=test_output_len,
             logprobs=logprobs,
         )
-        profile_output = await request_func(request_func_input=profile_input)
+        profile_output = await request_func(request_func_input=profile_input,
+                                            streaming=streaming,
+                                            session=session)
         if profile_output.success:
             print("Profiler stopped")
 
@@ -374,7 +426,10 @@ async def benchmark(
 
     benchmark_duration = time.perf_counter() - benchmark_start_time
 
-    metrics, actual_output_lens = calculate_metrics(
+    # Close the session
+    await session.close()
+
+    metrics, actual_output_lens, request_ars = calculate_metrics(
         input_requests=input_requests,
         outputs=outputs,
         dur_s=benchmark_duration,
@@ -402,6 +457,10 @@ async def benchmark(
                                     metrics.total_token_throughput))
     print("{:<40} {:<10.2f}".format("User throughput (tok/s):",
                                     metrics.tput_user))
+    print("{:<40} {:<10.4f}".format("Mean Request AR:",
+                                    metrics.mean_request_ar))
+    print("{:<40} {:<10.4f}".format("Median Request AR:",
+                                    metrics.median_request_ar))
 
     result = {
         "duration": benchmark_duration,
@@ -414,12 +473,16 @@ async def benchmark(
         "output_throughput": metrics.output_throughput,
         "total_token_throughput": metrics.total_token_throughput,
         "user_throughput": metrics.tput_user,
+        "mean_request_ar": metrics.mean_request_ar,
+        "median_request_ar": metrics.median_request_ar,
         "input_lens": [output.prompt_len for output in outputs],
         "output_lens": actual_output_lens,
         "ttfts": [output.ttft for output in outputs],
         "itls": [output.itl for output in outputs],
         "generated_texts": [output.generated_text for output in outputs],
         "errors": [output.error for output in outputs],
+        "request_ars": request_ars,
+        "decode_iterations": [output.decode_iteration for output in outputs],
     }
 
     def process_one_metric(
@@ -505,11 +568,15 @@ def save_to_pytorch_benchmark_format(args: argparse.Namespace,
     metrics = [
         "median_ttft_ms", "mean_ttft_ms", "std_ttft_ms", "p99_ttft_ms",
         "mean_tpot_ms", "median_tpot_ms", "std_tpot_ms", "p99_tpot_ms",
-        "median_itl_ms", "mean_itl_ms", "std_itl_ms", "p99_itl_ms"
+        "median_itl_ms", "mean_itl_ms", "std_itl_ms", "p99_itl_ms",
+        "mean_request_ar", "median_request_ar", "std_request_ar"
     ]
     # These raw data might be useful, but they are rather big. They can be added
     # later if needed
-    ignored_metrics = ["ttfts", "itls", "generated_texts", "errors"]
+    ignored_metrics = [
+        "ttfts", "itls", "generated_texts", "errors", "request_ars",
+        "decode_iterations"
+    ]
     pt_records = convert_to_pytorch_benchmark_format(
         args=args,
         metrics={k: [results[k]]
@@ -608,11 +675,20 @@ def main(args: argparse.Namespace):
             output_len=args.hf_output_len,
         )
 
+    elif args.dataset_name == "trtllm_custom":
+        input_requests = CustomDataset(dataset_path=args.dataset_path,
+                                       random_seed=args.seed).sample(
+                                           num_requests=args.num_prompts,
+                                           tokenizer=tokenizer,
+                                       )
+
     else:
         # For datasets that follow a similar structure, use a mapping.
         dataset_mapping = {
             "sharegpt":
-            lambda: ShareGPTDataset(random_seed=args.seed,
+            lambda: ShareGPTDataset(download_path=args.download_path,
+                                    download_timeout=args.download_timeout,
+                                    random_seed=args.seed,
                                     dataset_path=args.dataset_path).sample(
                                         tokenizer=tokenizer,
                                         num_requests=args.num_prompts,
@@ -623,14 +699,19 @@ def main(args: argparse.Namespace):
                                     dataset_path=args.dataset_path).
             sample(tokenizer=tokenizer, num_requests=args.num_prompts),
             "random":
-            lambda: RandomDataset(dataset_path=args.dataset_path).sample(
-                tokenizer=tokenizer,
-                num_requests=args.num_prompts,
-                prefix_len=args.random_prefix_len,
-                input_len=args.random_input_len,
-                output_len=args.random_output_len,
-                range_ratio=args.random_range_ratio,
-            )
+            lambda: RandomDataset(sample_from_sharegpt=not args.random_ids,
+                                  return_text=not args.tokenize_on_client,
+                                  dataset_path=args.dataset_path,
+                                  download_path=args.download_path,
+                                  download_timeout=args.download_timeout
+                                  ).sample(
+                                      tokenizer=tokenizer,
+                                      num_requests=args.num_prompts,
+                                      prefix_len=args.random_prefix_len,
+                                      input_len=args.random_input_len,
+                                      output_len=args.random_output_len,
+                                      range_ratio=args.random_range_ratio,
+                                  )
         }
 
         try:
@@ -686,6 +767,8 @@ def main(args: argparse.Namespace):
             max_concurrency=args.max_concurrency,
             lora_modules=args.lora_modules,
             extra_body=sampling_params,
+            streaming=not args.non_streaming,
+            no_test_input=args.no_test_input,
         ))
 
     # Save config and results to json
@@ -710,11 +793,15 @@ def main(args: argparse.Namespace):
                     raise ValueError(
                         "Invalid metadata format. Please use KEY=VALUE format.")
 
+        # Merge with benchmark result
+        result_json = {**result_json, **benchmark_result}
+
         if not args.save_detailed:
             # Remove fields with too many data points
             for field in [
                     "input_lens", "output_lens", "ttfts", "itls",
-                    "generated_texts", "errors"
+                    "generated_texts", "errors", "request_ars",
+                    "decode_iterations"
             ]:
                 if field in result_json:
                     del result_json[field]
@@ -724,9 +811,6 @@ def main(args: argparse.Namespace):
                                        < float("inf") else "inf")
         result_json["burstiness"] = args.burstiness
         result_json["max_concurrency"] = args.max_concurrency
-
-        # Merge with benchmark result
-        result_json = {**result_json, **benchmark_result}
 
         # Save to file
         base_model_id = model_id.split("/")[-1]
@@ -770,7 +854,9 @@ if __name__ == "__main__":
         "--dataset-name",
         type=str,
         default="sharegpt",
-        choices=["sharegpt", "burstgpt", "sonnet", "random", "hf"],
+        choices=[
+            "sharegpt", "burstgpt", "sonnet", "random", "hf", "trtllm_custom"
+        ],
         help="Name of the dataset to benchmark on.",
     )
     parser.add_argument("--dataset-path",
@@ -778,6 +864,16 @@ if __name__ == "__main__":
                         default=None,
                         help="Path to the sharegpt/sonnet dataset. "
                         "Or the huggingface dataset ID if using HF dataset.")
+    parser.add_argument(
+        "--download-path",
+        type=str,
+        default=None,
+        help="Path to download dataset if dataset-path is None, "
+        "only sharegpt is supported for now")
+    parser.add_argument("--download-timeout",
+                        type=int,
+                        default=180,
+                        help="Timeout for downloading datasets")
     parser.add_argument(
         "--max-concurrency",
         type=int,
@@ -841,6 +937,11 @@ if __name__ == "__main__":
         "bursty requests. A higher burstiness value (burstiness > 1) "
         "results in a more uniform arrival of requests.",
     )
+    parser.add_argument(
+        "--non-streaming",
+        action="store_true",
+        help="Disable streaming mode",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--trust-remote-code",
@@ -901,11 +1002,11 @@ if __name__ == "__main__":
     parser.add_argument(
         "--percentile-metrics",
         type=str,
-        default="ttft,tpot,itl",
+        default="ttft,tpot,itl,request_ar",
         help="Comma-separated list of selected metrics to report percentils. "
         "This argument specifies the metrics to report percentiles. "
-        "Allowed metric names are \"ttft\", \"tpot\", \"itl\", \"e2el\". "
-        "Default value is \"ttft,tpot,itl\".")
+        "Allowed metric names are \"ttft\", \"tpot\", \"itl\", \"e2el\", \"request_ar\". "
+        "Default value is \"ttft,tpot,itl,request_ar\".")
     parser.add_argument(
         "--metric-percentiles",
         type=str,
@@ -993,6 +1094,17 @@ if __name__ == "__main__":
               "context length sampled from [input_len * (1 - range_ratio), "
               "input_len * (1 + range_ratio)]."),
     )
+    random_group.add_argument(
+        "--random-ids",
+        action="store_true",
+        help="Generate random ids instead of sample from ShareGPT dataset.",
+    )
+    random_group.add_argument(
+        "--tokenize-on-client",
+        action="store_true",
+        help=
+        "Tokenize on client instead of server. This option only takes effect with random dataset to let the server run exactly the same ISL specified by cli.",
+    )
 
     hf_group = parser.add_argument_group("hf dataset options")
     hf_group.add_argument("--hf-subset",
@@ -1062,6 +1174,12 @@ if __name__ == "__main__":
                         help="A subset of LoRA module names passed in when "
                         "launching the server. For each request, the "
                         "script chooses a LoRA module at random.")
+
+    parser.add_argument(
+        "--no-test-input",
+        action="store_true",
+        help="Skip initial test run with a single prompt.",
+    )
 
     args = parser.parse_args()
 

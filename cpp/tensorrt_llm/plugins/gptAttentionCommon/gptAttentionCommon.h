@@ -26,6 +26,11 @@
 #include <string>
 #include <vector>
 
+namespace tensorrt_llm::kernels
+{
+class DecoderXQARunnerResource;
+}
+
 namespace tensorrt_llm::plugins
 {
 
@@ -84,6 +89,9 @@ public:
 
 protected:
     std::string const mLayerName;
+
+private:
+    std::shared_ptr<tensorrt_llm::kernels::DecoderXQARunnerResource> mResource;
 };
 
 class GPTAttentionPluginCreatorCommon : public BaseCreator

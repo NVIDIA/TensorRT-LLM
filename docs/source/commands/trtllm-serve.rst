@@ -27,7 +27,7 @@ The following abbreviated command syntax shows the commonly used arguments to st
 
 .. code-block:: bash
 
-   trtllm-serve <model> [--backend pytorch --tp_size <tp> --pp_size <pp> --ep_size <ep> --host <host> --port <port>]
+   trtllm-serve <model> [--tp_size <tp> --pp_size <pp> --ep_size <ep> --host <host> --port <port>]
 
 For the full syntax and argument descriptions, refer to :ref:`syntax`.
 
@@ -67,9 +67,14 @@ Another example uses ``curl``:
     :linenos:
 
 Multimodal Serving
-~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~
 
-For multimodal models (e.g., Qwen2-VL), you'll need to create a configuration file and start the server with additional options:
+For multimodal models, you need to create a configuration file and start the server with additional options due to the following limitations:
+
+* TRT-LLM multimodal is currently not compatible with ``kv_cache_reuse``
+* Multimodal models require ``chat_template``, so only the Chat API is supported
+
+To set up multimodal models:
 
 First, create a configuration file:
 
@@ -85,11 +90,10 @@ Then, start the server with the configuration file:
 .. code-block:: bash
 
    trtllm-serve Qwen/Qwen2-VL-7B-Instruct \
-       --extra_llm_api_options ./extra-llm-api-config.yml \
-       --backend pytorch
+       --extra_llm_api_options ./extra-llm-api-config.yml
 
-Completions API
-~~~~~~~~~~~~~~~
+Multimodal Chat API
+~~~~~~~~~~~~~~~~~~~
 
 You can query Completions API with any http clients, a typical example is OpenAI Python client:
 
@@ -99,9 +103,77 @@ You can query Completions API with any http clients, a typical example is OpenAI
 
 Another example uses ``curl``:
 
-.. literalinclude:: ../../../examples/serve/curl_completion_client_for_multimodal.sh
+.. literalinclude:: ../../../examples/serve/curl_chat_client_for_multimodal.sh
     :language: bash
     :linenos:
+
+Multimodal Modality Coverage
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+TRT-LLM multimodal supports the following modalities and data types (depending on the model):
+
+**Text**
+
+* No type specified:
+
+  .. code-block:: json
+
+     {"role": "user", "content": "What's the capital of South Korea?"}
+
+* Explicit "text" type:
+
+  .. code-block:: json
+
+     {"role": "user", "content": [{"type": "text", "text": "What's the capital of South Korea?"}]}
+
+**Image**
+
+* Using "image_url" with URL:
+
+  .. code-block:: json
+
+     {"role": "user", "content": [
+         {"type": "text", "text": "What's in this image?"},
+         {"type": "image_url", "image_url": {"url": "https://example.com/image.png"}}
+     ]}
+
+* Using "image_url" with base64-encoded data:
+
+  .. code-block:: json
+
+     {"role": "user", "content": [
+         {"type": "text", "text": "What's in this image?"},
+         {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,{image_base64}"}}
+     ]}
+
+.. note::
+   To convert images to base64-encoded format, use the utility function
+   :func:`tensorrt_llm.utils.load_base64_image`. Refer to the
+   `load_base64_image utility <https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/utils/load_base64_image.py>`__
+   for implementation details.
+
+**Video**
+
+* Using "video_url":
+
+  .. code-block:: json
+
+     {"role": "user", "content": [
+         {"type": "text", "text": "What's in this video?"},
+         {"type": "video_url", "video_url": {"url": "https://example.com/video.mp4"}}
+     ]}
+
+**Audio**
+
+* Using "audio_url":
+
+  .. code-block:: json
+
+     {"role": "user", "content": [
+         {"type": "text", "text": "What's in this audio?"},
+         {"type": "audio_url", "audio_url": {"url": "https://example.com/audio.mp3"}}
+     ]}
+
 
 Benchmark
 ---------
@@ -140,7 +212,7 @@ You can deploy `DeepSeek-V3 <https://huggingface.co/deepseek-ai/DeepSeek-V3>`_ m
         --container-image=<CONTAINER_IMG> \
         --container-mounts=/workspace:/workspace \
         --container-workdir /workspace \
-        bash -c "trtllm-llmapi-launch trtllm-serve deepseek-ai/DeepSeek-V3 --backend pytorch --max_batch_size 161 --max_num_tokens 1160 --tp_size 16 --ep_size 4 --kv_cache_free_gpu_memory_fraction 0.95 --extra_llm_api_options ./extra-llm-api-config.yml"
+        bash -c "trtllm-llmapi-launch trtllm-serve deepseek-ai/DeepSeek-V3 --max_batch_size 161 --max_num_tokens 1160 --tp_size 16 --ep_size 4 --kv_cache_free_gpu_memory_fraction 0.95 --extra_llm_api_options ./extra-llm-api-config.yml"
 
 See `the source code <https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/llmapi/trtllm-llmapi-launch>`_ of ``trtllm-llmapi-launch`` for more details.
 
@@ -159,7 +231,7 @@ Metrics Endpoint
 
 The ``/metrics`` endpoint provides runtime-iteration statistics such as GPU memory use and inflight-batching details.
 For the TensorRT backend, these statistics are enabled by default.
-However, for the PyTorch backend, specified with the ``--backend pytorch`` argument, you must explicitly enable iteration statistics logging by setting the `enable_iter_perf_stats` field in a YAML configuration file as shown in the following example:
+However, for the PyTorch backend, you must explicitly enable iteration statistics logging by setting the `enable_iter_perf_stats` field in a YAML configuration file as shown in the following example:
 
 .. code-block:: yaml
 
@@ -173,7 +245,7 @@ Then start the server and specify the ``--extra_llm_api_options`` argument with 
 
    trtllm-serve <model> \
      --extra_llm_api_options <path-to-extra-llm-api-config.yml> \
-     [--backend pytorch --tp_size <tp> --pp_size <pp> --ep_size <ep> --host <host> --port <port>]
+     [--tp_size <tp> --pp_size <pp> --ep_size <ep> --host <host> --port <port>]
 
 After at least one inference request is sent to the server, you can fetch the runtime-iteration statistics by polling the `/metrics` endpoint:
 

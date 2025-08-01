@@ -23,6 +23,18 @@
 #define HEAD_ELEMS 128
 #endif
 
+// nbQHeads / nbKHeads for MQA/GQA
+#ifndef HEAD_GRP_SIZE
+#define HEAD_GRP_SIZE 8
+#endif
+
+#define IS_MLA (HEAD_GRP_SIZE == 128 && HEAD_ELEMS == 576)
+
+#if IS_MLA
+#define INPUT_ELEM __nv_fp8_e4m3
+#define INPUT_ELEM2 __nv_fp8x2_e4m3
+#define HEAD_ELEMS_V 512
+#else
 // 1 means fp16 and 0 means bf16 input/output
 #ifndef INPUT_FP16
 #define INPUT_FP16 1
@@ -36,15 +48,11 @@
 #define INPUT_ELEM __nv_bfloat16
 #define INPUT_ELEM2 __nv_bfloat162
 #endif
+#endif
 
 // For beam search. Allowed values: 1, 4
 #ifndef BEAM_WIDTH
 #define BEAM_WIDTH 1
-#endif
-
-// nbQHeads / nbKHeads for MQA/GQA
-#ifndef HEAD_GRP_SIZE
-#define HEAD_GRP_SIZE 8
 #endif
 
 #ifndef SPEC_DEC
@@ -57,6 +65,12 @@ using MaskType = uint32_t;
 #ifndef M_TILESIZE
 #define M_TILESIZE 32
 #endif
+#endif
+
+// Enables SWAP AB optimization for speculative decoding when using a small, fixed Q_SEQ_LEN.
+// NOTE: Requires a uniform input sequence length for the entire batch.
+#ifdef SPEC_Q_SEQ_LEN
+static_assert(SPEC_DEC, "SPEC_Q_SEQ_LEN should only be used when SPEC_DEC is enabled.");
 #endif
 
 // 0: half/bf16 based on INPUT_FP16; 1: int8_t; 2: __nv_fp8_e4m3
@@ -101,11 +115,11 @@ using MaskType = uint32_t;
 #define SLIDING_WINDOW 0
 #endif
 
-// 0 - no FDL
-// 1 - naive FDL
-// 2 - aggressive FDL (implemented only in mha_sm90.cu for now)
-#ifndef ENABLE_FDL
-#define ENABLE_FDL 2
+// 0 - no PDL
+// 1 - naive PDL
+// 2 - aggressive PDL (implemented only in mha_sm90.cu for now)
+#ifndef ENABLE_PDL
+#define ENABLE_PDL 2
 #endif
 
 #ifndef USE_INPUT_KV

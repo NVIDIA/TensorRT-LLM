@@ -83,7 +83,6 @@ TLLM_PROFILE_START_STOP=100-150 nsys profile \
     --model_path ${MODEL_PATH} \
     throughput \
     --dataset /tmp/dataset.txt --warmup 0 \
-    --backend pytorch \
     --streaming
 ```
 

@@ -66,13 +66,16 @@ struct XQAKernelRuntimeHashKey
     unsigned int tokens_per_page;
     bool paged_kv_cache;
     bool multi_query_tokens;
+    bool is_fp8_output;
+    std::optional<PositionEmbeddingType> position_embedding_type;
 
     bool operator==(XQAKernelRuntimeHashKey const& other) const
     {
         return kv_data_type == other.kv_data_type && head_size == other.head_size
             && num_q_heads_per_kv == other.num_q_heads_per_kv && beam_size == other.beam_size
             && multi_query_tokens == other.multi_query_tokens && m_tilesize == other.m_tilesize
-            && tokens_per_page == other.tokens_per_page && paged_kv_cache == other.paged_kv_cache;
+            && tokens_per_page == other.tokens_per_page && paged_kv_cache == other.paged_kv_cache
+            && is_fp8_output == other.is_fp8_output && position_embedding_type == other.position_embedding_type;
     }
 };
 
@@ -99,6 +102,10 @@ struct XQAKernelRuntimeHasher
         key ^= s.paged_kv_cache;
         key <<= 1;
         key ^= s.multi_query_tokens;
+        key <<= 1;
+        key ^= s.is_fp8_output;
+        key <<= 8;
+        key ^= static_cast<int8_t>(s.position_embedding_type.value_or(static_cast<PositionEmbeddingType>(-1)));
         return key;
     }
 };
@@ -232,7 +239,8 @@ void buildXQALaunchParams(XQALaunchParam<KVCacheBuffer>& launchParams, void*& in
     XQAParams const& params, KVCacheBuffer kv_cache_buffer)
 {
     TLLM_CHECK_WITH_INFO(
-        params.data_type == DATA_TYPE_FP16 || params.data_type == DATA_TYPE_BF16, "Only fp16 or bf16 supported now.");
+        params.data_type == DATA_TYPE_FP16 || params.data_type == DATA_TYPE_BF16 || params.data_type == DATA_TYPE_E4M3,
+        "Only fp16 or bf16 supported now.");
     launchParams = {};
     launchParams.num_k_heads = params.num_kv_heads;
     launchParams.slidingWindowSize = params.cyclic_attention_window_size;
@@ -307,12 +315,12 @@ void buildXQALaunchParams(XQALaunchParam<KVCacheBuffer>& launchParams, void*& in
 }
 
 template <typename T>
-std::optional<T> getGlobalVar(std::shared_ptr<tensorrt_llm::common::CUDADriverWrapper> const& driver, CUmodule hmod,
+std::optional<T> getGlobalVar(std::shared_ptr<tensorrt_llm::common::CUDADriverWrapper> const& driver, CUlibrary lib,
     char const* const name, bool required = false)
 {
     T* pVar = nullptr;
     size_t size = 0;
-    auto const error = driver->cuModuleGetGlobal(reinterpret_cast<CUdeviceptr*>(&pVar), &size, hmod, name);
+    auto const error = driver->cuLibraryGetGlobal(reinterpret_cast<CUdeviceptr*>(&pVar), &size, lib, name);
     T ret;
     switch (error)
     {
@@ -342,7 +350,7 @@ inline int computeMultiBlockCount(XQAParams const& xqaParams, int batch_size, in
     int num_kv_heads = xqaParams.num_kv_heads;
     int history_length = xqaParams.max_past_kv_length;
 
-    int32_t const maxNbSubSeq = kXQA_MAX_NUM_SUB_SEQ;
+    int32_t const maxNbSubSeq = getXqaMaxNumSubSeq(xqaParams.isMLA());
 
     multi_block_count = history_length / kMinHistoryTokensPerBlock;
     // avoid using too many blocks for one sequence, otherwise the final reduction may dominate.
@@ -366,6 +374,11 @@ inline int computeMultiBlockCount(XQAParams const& xqaParams, int batch_size, in
     TLLM_CHECK_WITH_INFO(
         multi_block_count == 1 || batch_size * multi_block_count <= maxNbSubSeq, "Insufficient workspace");
     return multi_block_count;
+}
+
+inline int computeMultiBlockCountForMLA(XQAParams const& xqaParams, int multiprocessor_count)
+{
+    return 1; // disable multi-block for MLA kernel for now.
 }
 
 } // namespace kernels
