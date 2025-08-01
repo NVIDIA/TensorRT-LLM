@@ -2,6 +2,7 @@ from itertools import chain
 
 from ordered_set import OrderedSet
 
+from tensorrt_llm.llmapi import NGramDecodingConfig
 from tensorrt_llm.logger import logger
 
 from ..pyexecutor.llm_request import *
@@ -163,10 +164,11 @@ class NGramDrafter(Drafter):
 
     def __init__(
         self,
-        spec_config: "NGramDecodingConfig",
+        spec_config: NGramDecodingConfig,
         ngram_pool_manager: NGramPoolManager = None,
     ):
         assert ngram_pool_manager is not None, "NGram needs a resource manager to maintain the pool."
+        self.spec_config = spec_config
         self.max_draft_len = spec_config.max_draft_len
         self.spec_resource_manager = ngram_pool_manager
 
@@ -175,6 +177,10 @@ class NGramDrafter(Drafter):
         scheduled_requests: ScheduledRequests,
         resource_manager: Optional[ResourceManager] = None,
     ) -> None:
+        # Disable NGram speculative decoding auto heuristic for batch size > 32.
+        if self.spec_config.is_auto_heuristic and len(
+                scheduled_requests.all_requests()) > 32:
+            return
         # Sort by request_id when py_batch_idx is None as a fallback.
         # This happens in the disagg case: for a set of new requests, we draft
         # before forward_step, so py_batch_idx is not assigned.

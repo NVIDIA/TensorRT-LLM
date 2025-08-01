@@ -158,25 +158,29 @@ class Gemma3Attention(Attention):
 
 class Gemma3MLP(nn.Module):
 
-    def __init__(self, config: Gemma3TextConfig):
+    def __init__(self, model_config: ModelConfig[Gemma3TextConfig]):
         super().__init__()
-        self.config = config
-        self.hidden_size = config.hidden_size
-        self.intermediate_size = config.intermediate_size
-        self.dtype = config.torch_dtype
+        self.config = model_config.pretrained_config
+        self.hidden_size = self.config.hidden_size
+        self.intermediate_size = self.config.intermediate_size
+        self.dtype = self.config.torch_dtype
+        self.quant_config = model_config.get_quant_config()
         self.gate_proj = Linear(self.hidden_size,
                                 self.intermediate_size,
                                 bias=False,
-                                dtype=self.dtype)
+                                dtype=self.dtype,
+                                quant_config=self.quant_config)
         self.up_proj = Linear(self.hidden_size,
                               self.intermediate_size,
                               bias=False,
-                              dtype=self.dtype)
+                              dtype=self.dtype,
+                              quant_config=self.quant_config)
         self.down_proj = Linear(self.intermediate_size,
                                 self.hidden_size,
                                 bias=False,
-                                dtype=self.dtype)
-        self.act_fn = ACT2FN[config.hidden_activation]
+                                dtype=self.dtype,
+                                quant_config=self.quant_config)
+        self.act_fn = ACT2FN[self.config.hidden_activation]
 
     @torch.inference_mode()
     def forward(self, x):
@@ -202,7 +206,7 @@ class Gemma3DecoderLayer(DecoderLayer):
             is_sliding=is_sliding,
         )
 
-        self.mlp = Gemma3MLP(config)
+        self.mlp = Gemma3MLP(model_config=model_config)
 
         self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                        eps=config.rms_norm_eps,

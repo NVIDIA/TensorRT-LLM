@@ -20,11 +20,9 @@
 
 #include "tensorrt_llm/batch_manager/common.h"
 #include "tensorrt_llm/batch_manager/decoderBuffers.h"
-#include "tensorrt_llm/batch_manager/medusaBuffers.h"
 #include "tensorrt_llm/batch_manager/microBatchScheduler.h"
 #include "tensorrt_llm/batch_manager/peftCacheManager.h"
 #include "tensorrt_llm/batch_manager/rnnStateManager.h"
-#include "tensorrt_llm/batch_manager/runtimeBuffers.h"
 #include "tensorrt_llm/batch_manager/sequenceSlotManager.h"
 #include "tensorrt_llm/nanobind/common/bindTypes.h"
 #include "tensorrt_llm/runtime/gptDecoderBatched.h"
@@ -418,13 +416,6 @@ void initBindings(nb::module_& m)
         .def_rw("log_probs", &tb::SlotDecoderBuffers::logProbs)
         .def_rw("log_probs_host", &tb::SlotDecoderBuffers::logProbsHost)
         .def_rw("finish_reasons_host", &tb::SlotDecoderBuffers::finishReasonsHost);
-
-    nb::class_<tb::MedusaBuffers>(m, "MedusaBuffers")
-        .def(nb::init<runtime::SizeType32, runtime::SizeType32, runtime::BufferManager const&,
-                 runtime::ModelConfig const&, runtime::WorldConfig const&, executor::DecodingConfig const&,
-                 runtime::TllmRuntime const&>(),
-            nb::arg("max_beam_width"), nb::arg("max_seq_len"), nb::arg("buffer_manager"), nb::arg("model_config"),
-            nb::arg("world_config"), nb::arg("decoding_config"), nb::arg("runtime"));
 
     m.def(
         "add_new_tokens_to_requests",
