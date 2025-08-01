@@ -1495,9 +1495,10 @@ class TestNemotronNas(LlmapiAccuracyTestHarness):
     MODEL_NAME = "nemotron-nas/Llama-3_1-Nemotron-51B-Instruct"
     MODEL_PATH = f"{llm_models_root()}/nemotron-nas/Llama-3_1-Nemotron-51B-Instruct"
 
+    @pytest.mark.skip_less_device_memory(80000)
     @pytest.mark.skip_less_device(8)
     def test_auto_dtype_tp8(self):
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
         pytorch_config = dict()
 
         with LLM(self.MODEL_PATH,
