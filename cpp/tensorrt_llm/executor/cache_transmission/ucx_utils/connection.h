@@ -20,7 +20,6 @@
 #include "ucxx/api.h"
 #include "ucxx/utils/sockaddr.h"
 #include "ucxx/utils/ucx.h"
-#include <chrono>
 #include <cstdint>
 #include <future>
 #if __linux__
@@ -29,7 +28,6 @@
 #endif
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
-#include "tensorrt_llm/common/tllmException.h"
 #include "tensorrt_llm/executor/cacheCommunicator.h"
 #include <memory>
 
@@ -48,10 +46,8 @@ public:
         UcxConnectionManager* manager, bool fromRequester);
     ~UcxConnection();
     void sendConnectionId(DataContext const& ctx, void const* data, size_t size) const;
-    void send(DataContext const& ctx, void const* data, size_t size,
-        std::chrono::milliseconds timeout = std::chrono::milliseconds{0}) const override;
-    void recv(DataContext const& ctx, void* data, size_t size,
-        std::chrono::milliseconds timeout = std::chrono::milliseconds{0}) const override;
+    void send(DataContext const& ctx, void const* data, size_t size) const override;
+    void recv(DataContext const& ctx, void* data, size_t size) const override;
     friend class UcxConnectionManager;
 
 private:

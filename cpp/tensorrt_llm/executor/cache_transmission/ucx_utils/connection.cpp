@@ -126,7 +126,7 @@ void UcxConnection::sendConnectionId(DataContext const& ctx, void const* data, s
         mConnectionId, mConnectionIdInPeer, mFromRequester);
 }
 
-void UcxConnection::send(DataContext const& ctx, void const* data, size_t size, std::chrono::milliseconds timeout) const
+void UcxConnection::send(DataContext const& ctx, void const* data, size_t size) const
 {
     if (ctx.getTag() == batch_manager::TransceiverTag::kID_TAG)
     {
@@ -146,19 +146,7 @@ void UcxConnection::send(DataContext const& ctx, void const* data, size_t size, 
     auto req = mEndpoint->tagSend(const_cast<void*>(data), size, ucxx::Tag(sendTag), false, completionCallback);
     if (!req->isCompleted())
     {
-        if (timeout.count() > 0)
-        {
-            auto status = future.wait_for(timeout);
-            if (status == std::future_status::timeout)
-            {
-                throw NEW_TLLM_REQUEST_SPECIFIC_EXCEPTION_WITH_ERROR_CODE(-1, common::RequestErrorCode::NETWORK_TIMEOUT,
-                    "UcxConnection::send timeout after " + std::to_string(timeout.count()) + "ms");
-            }
-        }
-        else
-        {
-            future.get();
-        }
+        future.get();
     }
     TLLM_CHECK_WITH_INFO(req->isCompleted(), "send should be completed");
     // throw if there is error
@@ -168,7 +156,7 @@ void UcxConnection::send(DataContext const& ctx, void const* data, size_t size, 
         mConnectionIdInPeer, mFromRequester);
 }
 
-void UcxConnection::recv(DataContext const& ctx, void* data, size_t size, std::chrono::milliseconds timeout) const
+void UcxConnection::recv(DataContext const& ctx, void* data, size_t size) const
 {
     // Guard to ensure CUDA context is initialized for UCX ops
     TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
@@ -182,20 +170,7 @@ void UcxConnection::recv(DataContext const& ctx, void* data, size_t size, std::c
     auto req = mEndpoint->tagRecv(data, size, ucxx::Tag(recvTag), ucxx::TagMaskFull, false, completionCallback);
     if (!req->isCompleted())
     {
-        if (timeout.count() > 0)
-        {
-            auto status = future.wait_for(timeout);
-            if (status == std::future_status::timeout)
-            {
-                // Set request id with -1, since the request id is not available in the ucx connection
-                throw NEW_TLLM_REQUEST_SPECIFIC_EXCEPTION_WITH_ERROR_CODE(-1, common::RequestErrorCode::NETWORK_TIMEOUT,
-                    "UcxConnection::recv timeout after " + std::to_string(timeout.count()) + "ms");
-            }
-        }
-        else
-        {
-            future.get();
-        }
+        future.get();
     }
     TLLM_CHECK_WITH_INFO(req->isCompleted(), "recv should be completed");
     // throw if there is error

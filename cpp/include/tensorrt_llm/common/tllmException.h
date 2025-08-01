@@ -40,7 +40,6 @@ enum class RequestErrorCode : uint32_t
 
     // Network and communication errors (1000-1999)
     NETWORK_ERROR = 1000,
-    NETWORK_TIMEOUT = 1001,
 };
 
 class TllmException : public std::runtime_error

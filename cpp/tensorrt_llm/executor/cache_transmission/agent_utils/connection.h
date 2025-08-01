@@ -171,10 +171,8 @@ class AgentConnection : public Connection
 public:
     AgentConnection(
         std::string mAgentName, std::string mRemoteAgentName, AgentConnectionManager* mAgentConnectionManager);
-    void send(DataContext const& ctx, void const* data, size_t size,
-        std::chrono::milliseconds timeout = std::chrono::milliseconds{0}) const override;
-    void recv(DataContext const& ctx, void* data, size_t size,
-        std::chrono::milliseconds timeout = std::chrono::milliseconds{0}) const override;
+    void send(DataContext const& ctx, void const* data, size_t size) const override;
+    void recv(DataContext const& ctx, void* data, size_t size) const override;
     void sendRequestAndBufferInfo(
         batch_manager::RequestInfo& requestInfo, std::optional<size_t> cacheBufferId, int validConnectionIdx);
     void setSenderState(MemoryDesc mReceiverBufferDesc, int valideSegmentIdx);
