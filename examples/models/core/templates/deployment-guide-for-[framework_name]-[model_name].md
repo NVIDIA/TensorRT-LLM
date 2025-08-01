@@ -8,7 +8,7 @@ The guide covers the complete setup, from preparing the software environment and
 
 # Access & Licensing
 
-Any licensing or access instructions as well as links should be provided here.
+Any licensing or access instructions as well as associated links should be provided here.
 
 # Prerequisites 
 
@@ -49,7 +49,7 @@ Any commands to launch the framework.
 
 ## Configs and Parameters 
 
-Description and recommendations for configurations/parameters. For example:
+Description and recommendations for configurations/parameters. Take the following flags for example.
 
 \--tp\_size
 
@@ -77,7 +77,7 @@ Description of test and how to execute.
 
 ```
 
-Output of exection
+Output of test execution.
 
 ```shell
 
