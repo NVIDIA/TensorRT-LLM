@@ -123,7 +123,7 @@ def test_rpc_without_wait_response():
         server.start()
         time.sleep(0.1)
         client = RPCClient("ipc:///tmp/rpc_test_no_wait")
-        client.send_task(need_response=False)
+        client.send_task(__rpc_need_response=False)
         time.sleep(0.1)  # wait for some time to make sure the task is submitted
         assert client.get_task_submitted()
 
@@ -149,14 +149,14 @@ def test_rpc_without_response_performance():
 
         time_start = time.time()
         for i in range(100):
-            client.send_task(need_response=False)
+            client.send_task(__rpc_need_response=False)
         time_end = time.time()
 
         no_wait_time = time_end - time_start
 
         time_start = time.time()
         for i in range(100):
-            client.send_task(need_response=True)
+            client.send_task(__rpc_need_response=True)
         time_end = time.time()
         wait_time = time_end - time_start
 

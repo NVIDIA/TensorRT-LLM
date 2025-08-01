@@ -340,16 +340,21 @@ class RPCClient:
             *args: Positional arguments
             **kwargs: Keyword arguments
             __rpc_timeout: The timeout (seconds) for the RPC call.
+            __rpc_need_response: Whether the RPC call needs a response.
+                If set to False, the remote call will return immediately.
 
         Returns:
             The result of the remote method call
         """
+        logger.debug(
+            f"RPC client calling method: {name} with args: {args} and kwargs: {kwargs}"
+        )
         await self._start_reader_if_needed()
-        need_response = kwargs.pop("need_response", True)
+        need_response = kwargs.pop("__rpc_need_response", True)
+        timeout = kwargs.pop("__rpc_timeout", self._timeout)
 
         request_id = uuid.uuid4().hex
         logger.debug(f"RPC client sending request: {request_id}")
-        timeout = kwargs.pop("__rpc_timeout", self._timeout)
         request = RPCRequest(request_id,
                              name,
                              args,
@@ -395,7 +400,7 @@ class RPCClient:
         Example:
             result = await client.call_async('remote_method', arg1, arg2, key=value)
         """
-        return self._call_async(name, *args, **kwargs, need_response=True)
+        return self._call_async(name, *args, **kwargs, __rpc_need_response=True)
 
     def call_future(self, name: str, *args,
                     **kwargs) -> concurrent.futures.Future:
@@ -457,9 +462,7 @@ class RPCClient:
 
             def call_async(self, *args, **kwargs):
                 """Async call - returns coroutine"""
-                return self.client._call_async(self.method_name,
-                                               *args,
-                                               need_response=True,
+                return self.client._call_async(self.method_name, *args,
                                                **kwargs)
 
             def call_future(self, *args, **kwargs) -> concurrent.futures.Future:
