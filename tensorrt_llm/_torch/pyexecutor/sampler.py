@@ -139,9 +139,6 @@ def top_p_sampling_batch(logits: torch.Tensor,
     # compute  cumulative probability distribution of each sample
     cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1),
                                     dim=-1)
-
-    if temperature != 0:
-        logits = logits / max(temperature, 1e-5)
     # get the location of top_p
     sorted_indices_to_remove = cumulative_probs > top_p
     sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
