@@ -572,8 +572,12 @@ class FP8BlockScalesLinearMethod(LinearMethodBase):
 
         act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(input)
 
-        output = torch.ops.trtllm.fp8_block_scaling_gemm(
-            act_input_fp8, module.weight, act_input_sf, module.weight_scale)
+        if module.use_cute_dsl_fp8_block_scale_gemm:
+            output = torch.ops.trtllm.cute_dsl_fp8_gemm_blackwell(
+                act_input_fp8, module.weight, act_input_sf, module.weight_scale)
+        else:
+            output = torch.ops.trtllm.fp8_block_scaling_gemm(
+                act_input_fp8, module.weight, act_input_sf, module.weight_scale)
         if bias is not None:
             output = output + bias
         return output
@@ -1444,6 +1448,7 @@ class Linear(nn.Module):
         reduce_output: bool = True,  # ROW parallel only
         skip_create_weights_in_init: bool = False,
         use_custom_cublas_mm: bool = False,
+        use_cute_dsl_fp8_block_scale_gemm: bool = False,
         lora: Optional[LoraLayer] = None,
         allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO,
         force_dynamic_quantization: bool = False,
@@ -1490,6 +1495,7 @@ class Linear(nn.Module):
         self._weights_created = False
         self.reduce_output = reduce_output
         self.use_custom_cublas_mm = use_custom_cublas_mm
+        self.use_cute_dsl_fp8_block_scale_gemm = use_cute_dsl_fp8_block_scale_gemm
         self.lora = lora
 
         self.enable_cuda_core = False

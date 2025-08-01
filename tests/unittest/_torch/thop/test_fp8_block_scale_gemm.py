@@ -57,6 +57,17 @@ def test_fp8_block_scale_gemm(dtype, m, k, n):
     assert diff < 1e-3
     torch.testing.assert_close(output, output_expected, atol=1e-3, rtol=1e-3)
 
+    # test Cute DSL kernel
+    if getSMVersion() == 100:
+        cute_dsl_output = torch.ops.trtllm.cute_dsl_fp8_gemm_blackwell(
+            act_a_fp8, act_b_fp8, act_a_sf, act_b_sf)
+        diff = calc_diff(cute_dsl_output, output_expected)
+        assert diff < 1e-3
+        torch.testing.assert_close(cute_dsl_output,
+                                   output_expected,
+                                   atol=1e-3,
+                                   rtol=1e-3)
+
 
 @pytest.mark.skipif(
     getSMVersion() != 90 and getSMVersion() != 89,
