@@ -8,9 +8,8 @@ import pytest
 
 from ..test_llm import get_model_path
 from .openai_server import RemoteOpenAIServer
-from .utils import (make_server_with_custom_sampler_fixture,
-                    test_invalid_logit_bias_helper,
-                    test_logit_bias_effect_helper)
+from .utils import (invalid_logit_bias_helper, logit_bias_effect_helper,
+                    make_server_with_custom_sampler_fixture)
 
 
 @pytest.fixture(scope="module")
@@ -397,12 +396,11 @@ async def test_completion_with_logit_bias_effect(
         model_name: str) -> None:
     '''Test that logit bias affects output as expected for both samplers (completions endpoint).'''
     client = server_with_custom_sampler.get_async_client()
-    await test_logit_bias_effect_helper(client, model_name, 'completions')
+    await logit_bias_effect_helper(client, model_name, 'completions')
 
 
 @pytest.mark.asyncio(loop_scope="module")
 async def test_completion_with_invalid_logit_bias(
         async_client: openai.AsyncOpenAI, model_name: str):
     """Test with invalid token IDs (non-integer keys)"""
-    await test_invalid_logit_bias_helper(async_client, model_name,
-                                         'completions')
+    await invalid_logit_bias_helper(async_client, model_name, 'completions')
