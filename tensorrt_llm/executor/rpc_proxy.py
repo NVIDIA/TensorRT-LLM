@@ -12,7 +12,6 @@ from .postproc_worker import PostprocWorkerConfig
 from .request import GenerationRequest
 from .result import GenerationResult
 from .rpc import RPCClient
-from .rpc_worker import rpc_worker_main
 from .utils import (ErrorResponse, create_mpi_comm_session,
                     get_spawn_proxy_process_env, is_llm_response)
 
@@ -42,7 +41,7 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
         """
 
         GenerationExecutorRpcProxy.INSTANCE_COUNTER += 1
-        self.rpc_addr = self._gen_rpc_addr()
+        self.rpc_addr = self.gen_uniq_rpc_addr()
         self.rpc_client = RPCClient(self.rpc_addr)
 
         postproc_worker_config = postproc_worker_config or PostprocWorkerConfig(
@@ -157,6 +156,7 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
             print_colored_debug('using external mpi session ...\n', "yellow")
             self.mpi_session = mpi_session
 
-    def _gen_rpc_addr(self):
+    @staticmethod
+    def gen_uniq_rpc_addr() -> str:
         process_id = os.getpid()
         return f"ipc:///tmp/rpc-proxy-{process_id}-{GenerationExecutorRpcProxy.INSTANCE_COUNTER}"

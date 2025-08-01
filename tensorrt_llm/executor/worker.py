@@ -66,7 +66,7 @@ class GenerationExecutorWorker(WorkerBase):
         executor_config.logits_post_processor_config = tllm.LogitsPostProcessorConfig(
             processor_batched=batched_logits_processor, replicate=False)
 
-        self.create_engine(
+        self.setup_engine(
             engine=engine,
             executor_config=executor_config,
             lora_config=lora_config,

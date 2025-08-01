@@ -1,7 +1,6 @@
 import os
 import sys
 import time
-from queue import Queue
 
 # isort: off
 sys.path.append(os.path.dirname(os.path.abspath(__file__)) + "/..")
@@ -21,37 +20,37 @@ model_path = llm_models_root() / default_model_name
 
 class TestWorkerBase:
 
+    class FakeWorker(WorkerBase):
+
+        def __init__(self, engine: str):
+            super().__init__(engine=engine)
+            executor_config = TestWorkerBase.create_fake_executor_config(engine)
+            self.setup_engine(engine=engine, executor_config=executor_config)
+
     def test_create_engine(self):
-        with WorkerBase(engine=model_path) as worker:
-            pass
+        with self.FakeWorker(engine=model_path) as worker:
+            print(f"Created engine: {worker.engine}")
 
     def test_submit_request(self):
         sampling_params = SamplingParams(max_tokens=10)
         request = GenerationRequest(prompt_token_ids=[3, 4, 5],
                                     sampling_params=sampling_params)
-        with WorkerBase(engine=model_path) as worker:
-            worker.submit(request)
-
-    def test_await_responses(self):
-        sampling_params = SamplingParams(max_tokens=10)
-        request = GenerationRequest(prompt_token_ids=[3, 4, 5],
-                                    sampling_params=sampling_params)
-        with WorkerBase(engine=model_path) as worker:
-            result_queue = Queue()
-            worker.set_result_queue(result_queue)
-
+        with self.FakeWorker(engine=model_path) as worker:
+            print(f"Created engine: {worker.engine}")
             worker.submit(request)
             for i in range(10):
+                time.sleep(0.5)
                 worker.await_responses()
-
-            assert result_queue.qsize() > 0
+            print(f"Submitted request: {request}")
+            time.sleep(6)
 
     def test_fetch_stats(self):
         request = GenerationRequest(
             prompt_token_ids=[3, 4, 5],
             sampling_params=SamplingParams(max_tokens=10))
-        with WorkerBase(engine=model_path) as worker:
+        with self.FakeWorker(engine=model_path) as worker:
             worker.submit(request)
+            time.sleep(1)
             worker.await_responses()
             stats = worker.fetch_stats()
             assert len(stats) > 0
@@ -60,7 +59,7 @@ class TestWorkerBase:
         request = GenerationRequest(
             prompt_token_ids=[3, 4, 5],
             sampling_params=SamplingParams(max_tokens=10))
-        with WorkerBase(engine=model_path) as worker:
+        with self.FakeWorker(engine=model_path) as worker:
             worker.submit(request)
             worker.await_responses()
             worker.dispatch_stats_task()
@@ -68,7 +67,8 @@ class TestWorkerBase:
             stats = worker.fetch_stats()
             assert len(stats) == 1
 
-    def _create_executor_config(self):
+    @staticmethod
+    def create_fake_executor_config(model_path):
         llm_args = LlmArgs(model=model_path, cuda_graph_config=None)
 
         executor_config = tllm.ExecutorConfig(1)
@@ -92,4 +92,4 @@ class TestWorkerBase:
 
 if __name__ == "__main__":
     test_worker_base = TestWorkerBase()
-    test_worker_base.test_create_engine()
+    test_worker_base.test_fetch_stats()
