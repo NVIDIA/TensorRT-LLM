@@ -12,7 +12,7 @@
    * [Llama-7b FP16 + WoQ INT8](#llama-7b-fp16-woq-int8)
    * [Llama2-70b FP8 with TP=2](#llama2-70b-fp8-with-tp2)
 - [Engine Plan File Size Results](#engine-plan-file-size-results)
-- [Experimental](#experimental)
+- [Prototype](#prototype)
    * [Checkpoint Pruner](#checkpoint-pruner)
       * [Pruning a TensorRT-LLM Checkpoint](#pruning-a-tensorrt-llm-checkpoint)
 
@@ -239,7 +239,7 @@ python3 ../summarize.py --engine_dir engines/llama2-70b-hf-fp8-tp2.refit \
 |llama-7b FP16 + WoQ INT8 | 6.54GB | 28.69MB |
 |llama2-70b FP8 + TP=2 | 64.78GB | 60.61MB |
 
-## Experimental
+## Prototype
 ### Checkpoint Pruner
 The checkpoint pruner allows you to strip `Conv` and `Gemm` weights out of a TensorRT-LLM [checkpoint](https://nvidia.github.io/TensorRT-LLM/latest/architecture/checkpoint.html). Since these make up the vast majority of weights, the pruner will decrease the size of your checkpoint up to 99%.
 
