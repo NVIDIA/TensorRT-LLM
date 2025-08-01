@@ -753,8 +753,11 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             dtype=torch.int8,
         )
 
-        self.host_kv_cache_block_offsets = torch.empty_like(
-            self.kv_cache_block_offsets,
+        self.host_kv_cache_block_offsets = torch.empty(
+            [
+                self.kv_cache_manager.num_pools, self.max_num_sequences, 2,
+                self.kv_cache_manager.max_blocks_per_seq
+            ],
             device='cpu',
             pin_memory=True,
         )
