@@ -527,8 +527,8 @@ struct DMA
                         }
                         else
                         {
-                            bar_id = load_kv(bidh_kv, kv_step_idx * STEP_KV, desc_k, desc_v, shared, cbw_k,
-                                cbw_v, cbw_v_scratch);
+                            bar_id = load_kv(
+                                bidh_kv, kv_step_idx * STEP_KV, desc_k, desc_v, shared, cbw_k, cbw_v, cbw_v_scratch);
                         }
 
                         // Opportunistically hide headinfo in the shadow of UTMALDGs of the QKV tensor

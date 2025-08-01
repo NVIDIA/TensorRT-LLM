@@ -872,14 +872,6 @@ class TestMoeFP8:
             assert num_experts % n_groups == 0
             assert top_k < (top_k_groups * num_experts / n_groups)
 
-        num_processed_tokens_per_expert = num_tokens * top_k / num_experts
-        # FIXME: tile_tokens_dim is hardcoded for now
-        tile_tokens_dim = 8
-        if 256 < num_processed_tokens_per_expert and num_processed_tokens_per_expert <= 512:
-            tile_tokens_dim = 16
-        elif num_processed_tokens_per_expert > 512:
-            tile_tokens_dim = 32
-
         expert_logits = torch.randn((num_tokens, num_experts),
                                     device='cuda').to(torch.float)
         routing_bias = torch.randn(num_experts,
