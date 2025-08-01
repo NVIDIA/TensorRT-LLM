@@ -122,8 +122,10 @@ class MultimodalPlaceholderRegistry:
 
     def get_placeholder_metadata(
             self, model_type: str) -> MultimodalPlaceholderMetadata:
-        assert model_type in self._multimodal_placeholder_by_model_type, \
-            f"Model type {model_type} is not registered in MultimodalPlaceholderRegistry"
+        if model_type not in self._multimodal_placeholder_by_model_type:
+            raise ValueError(
+                f"Model type {model_type} is not registered in MultimodalPlaceholderRegistry"
+            )
         return self._multimodal_placeholder_by_model_type[model_type]
 
     def get_placeholder(self, model_type: str, modality: str) -> str:
@@ -136,10 +138,14 @@ class MultimodalPlaceholderRegistry:
 
     def get_placeholder_placement(
             self, model_type: str) -> MultimodalPlaceholderPlacement:
+        if model_type not in self._multimodal_placeholder_by_model_type:
+            raise ValueError(f"Model type '{model_type}' is not registered")
         return self._multimodal_placeholder_by_model_type[
             model_type].placeholder_placement
 
     def get_placeholders_separator(self, model_type: str) -> str:
+        if model_type not in self._multimodal_placeholder_by_model_type:
+            raise ValueError(f"Model type '{model_type}' is not registered")
         return self._multimodal_placeholder_by_model_type[
             model_type].placeholders_separator
 
@@ -200,8 +206,11 @@ def register_input_processor(
     def wrapper(model_cls: N) -> N:
         INPUT_PROCESSOR_REGISTRY._input_processors_cls_by_model_type[
             model_cls] = processor_cls
-        assert placeholder_metadata is not None, \
-            f"A valid placeholder_metadata must be provided for out-of-tree models but got {placeholder_metadata}"
+        if placeholder_metadata is None:
+            raise ValueError(
+                f"A valid placeholder_metadata must be provided but got {placeholder_metadata}"
+            )
+
         MULTIMODAL_PLACEHOLDER_REGISTRY.register(model_type,
                                                  placeholder_metadata)
 

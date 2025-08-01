@@ -20,7 +20,8 @@ from tensorrt_llm.lora_manager import HfLoraLoader
 from tensorrt_llm.models.convert_utils import split_matrix_tp
 
 from ...inputs import (ExtraProcessedInputs, InputProcessor,
-                       MultimodalPlaceholderMetadata, TextPrompt,
+                       MultimodalPlaceholderMetadata,
+                       MultimodalPlaceholderPlacement, TextPrompt,
                        register_input_processor)
 from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
@@ -1165,10 +1166,13 @@ class Llama4InputProcessor(InputProcessor):
 
 
 @register_auto_model("Llama4ForConditionalGeneration")
-@register_input_processor(Llama4InputProcessor,
-                          model_type="llama4",
-                          placeholder_metadata=MultimodalPlaceholderMetadata(
-                              placeholder_map={"image": "<|image|>"}))
+@register_input_processor(
+    Llama4InputProcessor,
+    model_type="llama4",
+    placeholder_metadata=MultimodalPlaceholderMetadata(
+        placeholder_map={"image": "<|image|>"},
+        placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
+    ))
 class Llama4ForConditionalGeneration(SpecDecOneEngineForCausalLM[Llama4Model,
                                                                  Llama4Config]):
 

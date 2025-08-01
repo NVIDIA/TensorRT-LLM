@@ -42,7 +42,7 @@ def create_dataset_from_stream(
     model_type: str = None,
     modality: str = None,
     image_data_format: str = "pt",
-    data_device: str = "cuda",
+    data_device: str = "cpu",
     max_input_seq_len_for_multimodal: int = 4096,
 ) -> Tuple[DatasetMetadata, List[InferenceRequest]]:
     """Generate metadata and a list of requests to drive benchmarking.

@@ -12,7 +12,8 @@ from transformers.models.llava_next.modeling_llava_next import \
 
 from ..._utils import nvtx_range
 from ...inputs import (ExtraProcessedInputs, InputProcessor,
-                       MultimodalPlaceholderMetadata, TextPrompt,
+                       MultimodalPlaceholderMetadata,
+                       MultimodalPlaceholderPlacement, TextPrompt,
                        register_input_processor)
 from ...llmapi.utils import download_hf_model
 from ...logger import logger
@@ -263,10 +264,13 @@ class LlavaNextInputProcessor(InputProcessor):
 
 
 @register_auto_model("LlavaNextForConditionalGeneration")
-@register_input_processor(LlavaNextInputProcessor,
-                          model_type="llava_next",
-                          placeholder_metadata=MultimodalPlaceholderMetadata(
-                              placeholder_map={"image": "<image>"}))
+@register_input_processor(
+    LlavaNextInputProcessor,
+    model_type="llava_next",
+    placeholder_metadata=MultimodalPlaceholderMetadata(
+        placeholder_map={"image": "<image>"},
+        placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
+    ))
 class LlavaNextModel(PreTrainedModel):
     config_class = LlavaNextConfig
 

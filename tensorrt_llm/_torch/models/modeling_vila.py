@@ -36,7 +36,8 @@ from transformers import (AutoConfig, AutoImageProcessor, AutoModel,
 
 from ..._utils import nvtx_range
 from ...inputs import (ExtraProcessedInputs, InputProcessor,
-                       MultimodalPlaceholderMetadata, TextPrompt,
+                       MultimodalPlaceholderMetadata,
+                       MultimodalPlaceholderPlacement, TextPrompt,
                        register_input_processor)
 from ...logger import logger
 from ...sampling_params import SamplingParams
@@ -1122,10 +1123,13 @@ class VilaInputProcessor(InputProcessor):
 @register_input_processor(
     VilaInputProcessor,
     model_type="llava_llama",
-    placeholder_metadata=MultimodalPlaceholderMetadata(placeholder_map={
-        "image": "<image>",
-        "video": "<vila/video>"
-    }))
+    placeholder_metadata=MultimodalPlaceholderMetadata(
+        placeholder_map={
+            "image": "<image>",
+            "video": "<vila/video>"
+        },
+        placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
+    ))
 class VilaModel(PreTrainedModel):
     config_class = VilaConfig
 

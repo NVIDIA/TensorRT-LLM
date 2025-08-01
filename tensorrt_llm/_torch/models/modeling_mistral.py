@@ -283,7 +283,7 @@ class Mistral3InputProcessor(InputProcessor):
         #      src/mistral_common/tokens/tokenizers/base.py#L326
         # However, accuracy tests show that the model generates higher quality output when the image
         # precedes the text (the relative difference can be as much as ~30% for both vLLM and TRT-LLM).
-        placeholder_placement=MultimodalPlaceholderPlacement.AFTER_TEXT,
+        placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
     ))
 class Mistral3VLM(PreTrainedModel):
     """Mistral3VLM implementation for TRTLLM.

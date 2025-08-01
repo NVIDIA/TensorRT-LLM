@@ -214,6 +214,23 @@ HF_CHAT_TEMPLATE_EXCEPTIONS = ["llava_llama"]
 PLACEHOLDER_EXCEPTIONS = ["llava_next"]
 
 
+# Helpers to always get the latest supported multimodal model types from the registry
+def ALL_SUPPORTED_MULTIMODAL_MODELS():
+    return MULTIMODAL_PLACEHOLDER_REGISTRY.get_registered_model_types()
+
+
+def ALL_SUPPORTED_IMAGE_MODELS():
+    return MULTIMODAL_PLACEHOLDER_REGISTRY.get_registered_image_model_types()
+
+
+def ALL_SUPPORTED_VIDEO_MODELS():
+    return MULTIMODAL_PLACEHOLDER_REGISTRY.get_registered_video_model_types()
+
+
+def ALL_SUPPORTED_AUDIO_MODELS():
+    return MULTIMODAL_PLACEHOLDER_REGISTRY.get_registered_audio_model_types()
+
+
 def retrieve_multimodal_placeholder(model_type: str, modality: str,
                                     current_count: int) -> Optional[str]:
     """

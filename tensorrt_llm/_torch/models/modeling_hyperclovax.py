@@ -978,7 +978,8 @@ class HCXVisionModel:
              '형태입니다. 참고하여 답변하세요. '
              '{"ocr": "", "lens_keywords": "", "lens_local_keywords": ""}')
         },
-        placeholder_placement=MultimodalPlaceholderPlacement.AFTER_TEXT))
+        placeholder_placement=MultimodalPlaceholderPlacement.AFTER_TEXT,
+    ))
 class HCXVisionForCausalLM(PreTrainedModel):
 
     def __init__(self, model_config: ModelConfig):

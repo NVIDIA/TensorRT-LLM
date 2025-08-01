@@ -13,7 +13,8 @@ from tensorrt_llm.inputs.multimodal import MultimodalParams
 from ..._utils import nvtx_range_debug
 from ...functional import RopeEmbeddingUtils, RotaryScalingType
 from ...inputs import (ExtraProcessedInputs, InputProcessor,
-                       MultimodalPlaceholderMetadata, TextPrompt,
+                       MultimodalPlaceholderMetadata,
+                       MultimodalPlaceholderPlacement, TextPrompt,
                        register_input_processor)
 from ...logger import logger
 from ...sampling_params import SamplingParams
@@ -653,7 +654,9 @@ class Qwen2VLModelBase(PreTrainedModel):
         placeholder_map={
             "image": "<|vision_start|><|image_pad|><|vision_end|>",
             "video": "<|vision_start|><|video_pad|><|vision_end|>"
-        }))
+        },
+        placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
+    ))
 class Qwen2VLModel(Qwen2VLModelBase):
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args,

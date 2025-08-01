@@ -5,13 +5,19 @@ from .registry import (ExtraProcessedInputs, InputProcessor,
                        MultimodalPlaceholderPlacement, create_input_processor,
                        create_input_processor_with_hash,
                        register_input_processor)
-from .utils import (ConversationMessage, MultimodalData, MultimodalDataTracker,
+from .utils import (ALL_SUPPORTED_AUDIO_MODELS, ALL_SUPPORTED_IMAGE_MODELS,
+                    ALL_SUPPORTED_MULTIMODAL_MODELS, ALL_SUPPORTED_VIDEO_MODELS,
+                    ConversationMessage, MultimodalData, MultimodalDataTracker,
                     add_multimodal_placeholders, async_load_audio,
                     async_load_image, async_load_video,
                     default_multimodal_input_loader,
                     encode_base64_content_from_url, load_image, load_video)
 
 __all__ = [
+    "ALL_SUPPORTED_MULTIMODAL_MODELS",
+    "ALL_SUPPORTED_IMAGE_MODELS",
+    "ALL_SUPPORTED_VIDEO_MODELS",
+    "ALL_SUPPORTED_AUDIO_MODELS",
     "PromptInputs",
     "prompt_inputs",
     "TextPrompt",
