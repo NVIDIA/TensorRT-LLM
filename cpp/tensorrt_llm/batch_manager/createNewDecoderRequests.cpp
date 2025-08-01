@@ -278,7 +278,6 @@ void CreateNewDecoderRequests::newRequest(SizeType32 batchSlot, runtime::decoder
     TLLM_CHECK_WITH_INFO(beamWidth <= maxBeamWidth,
         tc::fmtstr("Beam width (%d) must be smaller than maxBeamWidth (%d) passed to decoder setup function.",
             beamWidth, maxBeamWidth));
-    auto const& requestIds = request.ids;
     auto const inputLength = request.inputLen;
     auto const numDecodingEngineTokens = request.generatedTokensPerEngineStep;
     auto const numDecodingDraftEngineTokens = numDecodingEngineTokens - 1;
@@ -289,8 +288,6 @@ void CreateNewDecoderRequests::newRequest(SizeType32 batchSlot, runtime::decoder
         tc::fmtstr(
             "Input length (%d) + max new tokens (%d) + draft tokens (%d) must be less than max sequence length (%d).",
             inputLength, maxNewTokens, numDecodingDraftEngineTokens, maxSequenceLength));
-    TLLM_CHECK(requestIds->getDataType() == TRTDataType<TokenIdType>::value);
-    auto const endId = request.endId.value_or(-1);
 
     // input
     auto& dJointInput = decoderState.getJointDecodingInput();
@@ -332,14 +329,6 @@ void CreateNewDecoderRequests::newRequest(SizeType32 batchSlot, runtime::decoder
     {
         auto logProbs = ITensor::slice(dJointOutput.logProbs, batchSlot, 1);
         manager.setZero(*logProbs);
-    }
-
-    initializeRequestIds(
-        dJointInput, dJointOutput, batchSlot, requestIds, endId, beamWidth, maxSequenceLength, manager);
-
-    if (beamWidth > 1)
-    {
-        initializeBeamSearch(dJointInput, dJointOutput, batchSlot, endId, beamWidth, maxSequenceLength, manager);
     }
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -607,13 +596,12 @@ CreateNewDecoderRequests::createDecoderRequests(RequestVector const& finishedCon
         TLLM_CHECK(llmReq->mSeqSlot.has_value());
         auto const batchSlot = llmReq->mSeqSlot.value();
 
-        auto const promptLen = llmReq->getPromptLen();
-        auto const& reqTokens = llmReq->getTokens(0);
-        TLLM_CHECK(reqTokens.size() == static_cast<decltype(reqTokens.size())>(promptLen));
-        TensorPtr inputView = ITensor::slice(inputIds, inputOffset, promptLen);
-        bufferManager.copy(reqTokens.data(), *inputView);
+        auto const& samplingConfig = llmReq->mSamplingConfig;
+        auto const beamWidth = samplingConfig.beamWidth;
 
-        auto decoderRequest = decoder_batch::Request{inputView, promptLen, llmReq->mMaxNewTokens, llmReq->mEndId};
+        auto const promptLen = llmReq->getPromptLen();
+
+        auto decoderRequest = decoder_batch::Request{promptLen, llmReq->mMaxNewTokens};
 
         llmReq->mSamplingConfig.normalizeLogProbs = mIsNormalizeLogProbs;
 
@@ -650,10 +638,26 @@ CreateNewDecoderRequests::createDecoderRequests(RequestVector const& finishedCon
         setupWords(dJointInput.stopWordsLists, llmReq->getStopWordsList(), dJointInput.stopWordsPtrs,
             dJointInput.stopWordsLens, dJointInput.maxStopWordsLen, batchSlot, bufferManager);
 
-        auto const& samplingConfig = llmReq->mSamplingConfig;
-
         newRequest(
             batchSlot, decoderRequest, samplingConfig, modelConfig, decoderState, decoderStream, maxSequenceLength);
+
+        auto& dJointOutput = decoderState.getJointDecodingOutput();
+
+        auto const& reqTokens = llmReq->getTokens(0);
+        TLLM_CHECK(reqTokens.size() == static_cast<decltype(reqTokens.size())>(promptLen));
+        TensorPtr requestIds = ITensor::slice(inputIds, inputOffset, promptLen);
+        // Copy to pinned host memory (don't care about stream of bufferManager)
+        bufferManager.copy(reqTokens.data(), *requestIds);
+        auto const endId = llmReq->mEndId.value_or(-1);
+
+        initializeRequestIds(
+            dJointInput, dJointOutput, batchSlot, requestIds, endId, beamWidth, maxSequenceLength, bufferManager);
+
+        if (beamWidth > 1)
+        {
+            initializeBeamSearch(
+                dJointInput, dJointOutput, batchSlot, endId, beamWidth, maxSequenceLength, bufferManager);
+        }
 
         auto const numDecodingEngineTokens = decoderRequest.generatedTokensPerEngineStep;
         decoderState.setNumDecodingEngineTokens(batchSlot, numDecodingEngineTokens);
@@ -661,7 +665,6 @@ CreateNewDecoderRequests::createDecoderRequests(RequestVector const& finishedCon
         // Speculative execution
         if (!decoderState.getSpeculativeDecodingMode().isNone())
         {
-            auto const beamWidth = samplingConfig.beamWidth;
             TLLM_CHECK(beamWidth == 1);
 
             if (modelConfig.getSpeculativeDecodingMode().isMedusa())
@@ -675,7 +678,7 @@ CreateNewDecoderRequests::createDecoderRequests(RequestVector const& finishedCon
             }
             else if (modelConfig.getSpeculativeDecodingMode().isLookaheadDecoding())
             {
-                lookaheadPrompt.emplace_back(ITensor::slice(decoderRequest.ids, 0, decoderRequest.inputLen));
+                lookaheadPrompt.emplace_back(requestIds);
 
                 auto const& lookaheadRuntimeConfig
                     = llmReq->getLookaheadConfig().value_or(decodingConfig.getLookaheadDecodingConfig().value());
