@@ -51,6 +51,9 @@ def test_pip_install():
                         help="The wheel path")
     args = parser.parse_args()
 
+    if not os.environ.get("CUDA_HOME"):
+        os.environ["CUDA_HOME"] = "/usr/local/cuda"
+
     print("##########  Install required system libs  ##########")
     if not os.path.exists("/usr/local/mpi/bin/mpicc"):
         subprocess.check_call("apt-get -y install libopenmpi-dev", shell=True)
