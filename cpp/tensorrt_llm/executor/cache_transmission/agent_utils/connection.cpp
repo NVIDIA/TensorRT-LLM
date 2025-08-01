@@ -17,9 +17,7 @@
 
 #include "connection.h"
 #include "tensorrt_llm/common/envUtils.h"
-#include <chrono>
 #include <string>
-#include <thread>
 #include <unistd.h>
 
 namespace tensorrt_llm::executor::kv_cache
@@ -77,8 +75,7 @@ size_t MemoryDesc::serializedSize(MemoryDesc const& memoryDesc)
         + su::serializedSize(memoryDesc.mDeviceId);
 }
 
-void AgentConnection::send(
-    DataContext const& ctx, void const* data, size_t size, std::chrono::milliseconds timeout) const
+void AgentConnection::send(DataContext const& ctx, void const* data, size_t size) const
 {
 
     MemoryDesc srcDesc{
@@ -95,61 +92,16 @@ void AgentConnection::send(
     NotificationInfo notificationInfo{syncInfo};
     std::stringstream ss;
     NotificationInfo::serialize(notificationInfo, ss);
-
-    if (timeout.count() > 0)
-    {
-        // For AgentConnection, we'll use a simple timeout check on the status
-        // This is a simplified approach since the underlying transfer agent may not support timeouts
-        auto start = std::chrono::steady_clock::now();
-        while (!status->isCompleted())
-        {
-            auto now = std::chrono::steady_clock::now();
-            if (now - start > timeout)
-            {
-                TLLM_THROW("AgentConnection::send timeout after " + std::to_string(timeout.count()) + "ms");
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }
-    }
-    else
-    {
-        status->wait();
-    }
-
+    status->wait();
     // TODO: there is a bug in request_with_notify https://github.com/ai-dynamo/nixl/pull/252
     mAgentConnectionManager->getAgent()->notifySyncMessage(mRemoteAgentName, ss.str());
 }
 
-void AgentConnection::recv(DataContext const& ctx, void* data, size_t size, std::chrono::milliseconds timeout) const
+void AgentConnection::recv(DataContext const& ctx, void* data, size_t size) const
 {
 
     NotificationSyncInfo syncInfo{mAgentName, ctx};
-
-    if (timeout.count() > 0)
-    {
-        // For AgentConnection, we'll use a simple timeout approach
-        // Since waitForSyncInfo has an infinite loop, we'll use a thread-based approach
-        std::promise<void> promise;
-        std::future<void> future = promise.get_future();
-
-        std::thread(
-            [&]()
-            {
-                mAgentConnectionManager->waitForSyncInfo(mRemoteAgentName, syncInfo);
-                promise.set_value();
-            })
-            .detach();
-
-        auto status = future.wait_for(timeout);
-        if (status == std::future_status::timeout)
-        {
-            TLLM_THROW("AgentConnection::recv timeout after " + std::to_string(timeout.count()) + "ms");
-        }
-    }
-    else
-    {
-        mAgentConnectionManager->waitForSyncInfo(mRemoteAgentName, syncInfo);
-    }
+    mAgentConnectionManager->waitForSyncInfo(mRemoteAgentName, syncInfo);
 }
 
 void AgentConnection::sendRequestAndBufferInfo(

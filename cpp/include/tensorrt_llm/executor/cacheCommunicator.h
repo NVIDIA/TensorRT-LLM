@@ -17,7 +17,6 @@
 #pragma once
 
 #include "tensorrt_llm/executor/serialization.h"
-#include <chrono>
 #include <vector>
 
 namespace tensorrt_llm::executor::kv_cache
@@ -47,13 +46,9 @@ class Connection
 public:
     virtual ~Connection() = default;
 
-    virtual void send(DataContext const& ctx, void const* data, size_t size,
-        std::chrono::milliseconds timeout = std::chrono::milliseconds{0}) const
-        = 0;
+    virtual void send(DataContext const& ctx, void const* data, size_t size) const = 0;
 
-    virtual void recv(DataContext const& ctx, void* data, size_t size,
-        std::chrono::milliseconds timeout = std::chrono::milliseconds{0}) const
-        = 0;
+    virtual void recv(DataContext const& ctx, void* data, size_t size) const = 0;
 
     [[nodiscard]] virtual bool isThreadSafe() const noexcept
     {
