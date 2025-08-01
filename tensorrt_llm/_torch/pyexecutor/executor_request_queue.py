@@ -22,6 +22,7 @@ SHUTDOWN_REQUEST_ID = -1
 class RequestQueueItem:
     id: int
     request: Optional[ExecutorRequest] = None
+    child_req_ids: Optional[list] = None
     is_canceled_request: bool = False
     query: Optional[list] = None  # only used in `StarAttention`
 
@@ -83,6 +84,12 @@ class ExecutorRequestQueue:
             pass
         return items
 
+    @staticmethod
+    def _get_num_child_requests(request: ExecutorRequest) -> int:
+        sampling_config = request.sampling_config
+        return 0 if sampling_config.beam_width > 1 else (
+            sampling_config.num_return_sequences or 1) - 1
+
     def _get_from_waiting_queue(
         self,
         waiting_queue: deque[RequestQueueItem],
@@ -104,21 +111,52 @@ class ExecutorRequestQueue:
         items = []
         req_count = 0
         while req_count < max_req_count and waiting_queue:
+            req_item = waiting_queue[0]
+            num_children = len(
+                req_item.child_req_ids) if req_item.child_req_ids else 0
+            if (req_count + 1 + num_children) > max_req_count:
+                break
+            req_count += 1 + num_children
             items.append(waiting_queue.popleft())
-            req_count += 1
         return items
+
+    def _get_request_id(self):
+        # (next_request_id + 1) % UINT64_MAX
+        current_id = self.next_request_id
+        self.next_request_id = (self.next_request_id + 1) & ((1 << 64) - 1)
+        return current_id
+
+    def _generate_child_request_ids(
+            self, request: ExecutorRequest) -> List[int] | None:
+        """ Generate child request IDs if needed. """
+        child_req_ids = None
+        num_children = self._get_num_child_requests(request)
+        if num_children > 0:
+            child_req_ids = []
+            for _ in range(num_children):
+                child_req_id = self._get_request_id()
+                if self.enable_iter_perf_stats:
+                    self.start_times[child_req_id] = time.time()
+                child_req_ids.append(child_req_id)
+
+        return child_req_ids
 
     def enqueue_requests(self, requests: List[ExecutorRequest]):
         req_ids = []
         try:
             self.enqueue_lock.acquire()
-            start_time = time.time()
             for request in requests:
-                self.start_times[self.next_request_id] = start_time
+                req_id = self._get_request_id()
+
+                if self.enable_iter_perf_stats:
+                    self.start_times[req_id] = time.time()
+
+                child_req_ids = self._generate_child_request_ids(request)
                 self.request_queue.put(
-                    RequestQueueItem(self.next_request_id, request))
-                req_ids.append(self.next_request_id)
-                self.next_request_id += 1
+                    RequestQueueItem(req_id, request, child_req_ids,
+                                     query=None))
+
+                req_ids.append(req_id)
         finally:
             self.enqueue_lock.release()
         return req_ids
@@ -145,15 +183,18 @@ class ExecutorRequestQueue:
         try:
             self.enqueue_lock.acquire()
             assert self.active, "PyExecutor has already been shutdown."
-            req_id = self.next_request_id
+            req_id = self._get_request_id()
             if self.enable_iter_perf_stats:
                 self.start_times[req_id] = time.time()
 
-            if query is not None:
-                self.request_queue.put(RequestQueueItem(req_id, request, query))
-            else:
-                self.request_queue.put(RequestQueueItem(req_id, request))
-            self.next_request_id += 1
+            child_req_ids = self._generate_child_request_ids(request)
+            self.request_queue.put(
+                RequestQueueItem(
+                    req_id,
+                    request,
+                    child_req_ids=child_req_ids,
+                    query=query,
+                ))
         finally:
             self.enqueue_lock.release()
 
@@ -420,6 +461,10 @@ class ExecutorRequestQueue:
             if req_item.id in self.start_times:
                 self.new_active_requests_queue_latency_ms += now - self.start_times.pop(
                     req_item.id)
+            if req_item.child_req_ids:
+                for child_id in req_item.child_req_ids:
+                    self.new_active_requests_queue_latency_ms += now - self.start_times.pop(
+                        child_id)
 
     @nvtx_range("_merge_requests")
     def _merge_requests(self, new_requests: list[RequestQueueItem]):
@@ -433,12 +478,15 @@ class ExecutorRequestQueue:
             else:
                 raise NotImplementedError(f'unsupport cp type {cp_type}')
         else:
-            return [
-                executor_request_to_llm_request(
-                    req_item.id, req_item.request,
+            req_with_children = []
+            for req_item in new_requests:
+                req = executor_request_to_llm_request(
+                    req_item.id, req_item.request, req_item.child_req_ids,
                     self._should_exclude_last_generation_logits())
-                for req_item in new_requests
-            ]
+                req_with_children.append(req)
+                if req.child_requests:
+                    req_with_children.extend(req.child_requests)
+            return req_with_children
 
     def _merge_star_attention_requests(self,
                                        new_requests: list[RequestQueueItem]):
