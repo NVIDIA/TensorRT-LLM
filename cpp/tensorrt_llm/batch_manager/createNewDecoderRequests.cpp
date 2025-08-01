@@ -167,6 +167,30 @@ CreateNewDecoderRequests::operator()(runtime::ModelConfig const& modelConfig, ru
         std::move(lookaheadAlgoConfigs)};
 }
 
+namespace
+{
+
+void initializeEmbeddingBias(DecodingInput& dJointInput, TensorPtr const& embeddingBiasTensor, SizeType32 batchSlot,
+    runtime::ModelConfig const& modelConfig, BufferManager const& manager)
+{
+    TensorPtr const embeddingBiasSlice = ITensor::slice(constPointerCast(dJointInput.embeddingBias), batchSlot, 1);
+    if (embeddingBiasTensor)
+    {
+        TLLM_CHECK(embeddingBiasTensor->getShape().nbDims == 2);
+        TLLM_CHECK(embeddingBiasTensor->getShape().d[0] == 1);
+        TLLM_CHECK_WITH_INFO(embeddingBiasTensor->getShape().d[1] == modelConfig.getVocabSize(),
+            "The embedding bias shape is not as expected. Expected last dimension to be same as vocab size: %d.",
+            modelConfig.getVocabSize());
+        manager.copy(*embeddingBiasTensor, *embeddingBiasSlice);
+    }
+    else
+    {
+        manager.setZero(*embeddingBiasSlice);
+    }
+}
+
+} // namespace
+
 void CreateNewDecoderRequests::newRequest(SizeType32 batchSlot, runtime::decoder_batch::Request const& request,
     SamplingConfig const& samplingConfig, runtime::ModelConfig const& modelConfig,
     runtime::decoder::DecoderState& decoderState, CudaStream const& runtimeStream, CudaStream const& decoderStream,
@@ -208,20 +232,7 @@ void CreateNewDecoderRequests::newRequest(SizeType32 batchSlot, runtime::decoder
     TensorPtr const endIdTensorPtr{ITensor::slice(constPointerCast(dJointInput.endIds), batchSlot, 1)};
     runtime::kernels::invokeFill(*endIdTensorPtr, endId, decoderStream);
 
-    TensorPtr const embeddingBiasSlice = ITensor::slice(constPointerCast(dJointInput.embeddingBias), batchSlot, 1);
-    if (request.embeddingBias)
-    {
-        TLLM_CHECK(request.embeddingBias->getShape().nbDims == 2);
-        TLLM_CHECK(request.embeddingBias->getShape().d[0] == 1);
-        TLLM_CHECK_WITH_INFO(request.embeddingBias->getShape().d[1] == modelConfig.getVocabSize(),
-            "The embedding bias shape is not as expected. Expected last dimension to be same as vocab size: %d.",
-            modelConfig.getVocabSize());
-        manager.copy(*request.embeddingBias, *embeddingBiasSlice);
-    }
-    else
-    {
-        manager.setZero(*embeddingBiasSlice);
-    }
+    initializeEmbeddingBias(dJointInput, request.embeddingBias, batchSlot, modelConfig, manager);
 
     auto setupWords = [](std::vector<runtime::ITensor::SharedPtr>& jointWordsLists, TensorPtr const& requestWordsList,
                           SharedConstPtr& jointWordsPtrs, SharedConstPtr& jointWordsLens, SizeType32& jointMaxWordsLen,
