@@ -80,6 +80,7 @@ install_ubuntu_requirements() {
 
 install_rockylinux_requirements() {
     CUBLAS_CUDA_VERSION=$(echo $CUDA_VER | sed 's/\./-/g')
+    NVRTC_CUDA_VERSION=$(echo $CUDA_VER | sed 's/\./-/g')
 
     ARCH=$(uname -m)
     if [ "$ARCH" = "x86_64" ];then ARCH1="x86_64" && ARCH2="x64" && ARCH3=$ARCH1;fi
