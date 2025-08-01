@@ -278,6 +278,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             return_perf_metrics: bool = False,
             stop_words_list: list[list[int]] | None = None,
             is_draft: bool = False,
+            seq_slot: Optional[int] = None,
+            target_seq_slot: Optional[int] = None,
             **kwargs):
         self.py_logits_post_processors = kwargs.pop("py_logits_post_processors",
                                                     None)
@@ -317,7 +319,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_return_generation_logits = return_generation_logits
         self.py_return_logits_device_memory = return_logits_device_memory
         self.py_is_draft = is_draft
-        self.py_seq_slot = None
+        self.py_seq_slot = seq_slot
+        self.py_target_seq_slot = target_seq_slot
 
         # TODO: remove this when use DynamicDecodeOp in pytorch flow.
         # currently, keep py_stop_words_list as python list, rather than tensor.
