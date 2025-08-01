@@ -11,7 +11,7 @@ from tensorrt_llm.logger import logger
 from ..pyexecutor.llm_request import (LlmRequest, LlmRequestState,
                                       SamplingConfig, get_draft_token_length)
 from ..pyexecutor.resource_manager import BaseResourceManager, ResourceManager
-from ..pyexecutor.sampler import Sampler, SampleState
+from ..pyexecutor.sampler import Sampler, SampleState, TorchSampler
 from ..pyexecutor.scheduler import ScheduledRequests
 from ..pyexecutor.seq_slot_manager import SeqSlotManager
 from .drafter import Drafter
@@ -62,6 +62,9 @@ class ModelDrafter(Drafter):
         self.max_draft_tokens = max_draft_tokens
         # Sampling
         self.sampler = sampler
+        self._request_draft_logits = False
+        if isinstance(sampler, TorchSampler):
+            self._request_draft_logits = sampler.enable_mixed_sampler
 
     def _create_draft_request(self, request_id: int, max_new_tokens: int,
                               input_tokens: Optional[List],
@@ -74,7 +77,8 @@ class ModelDrafter(Drafter):
                           sampling_config=sampling_config,
                           return_perf_metrics=return_perf_metrics,
                           is_streaming=False,
-                          is_draft=True)
+                          is_draft=True,
+                          return_generation_logits=self._request_draft_logits)
 
     def _initialize_draft_tokens(self, request: LlmRequest) -> Tuple[int, int]:
         """Initialize draft token tracking for a request."""
@@ -305,6 +309,8 @@ class ModelDrafter(Drafter):
                 continue
 
             target_model_req.py_draft_tokens.append(req.get_last_tokens(0))
+            if self._request_draft_logits:
+                target_model_req.py_draft_logits = req.py_result.generation_logits
             if req.state != LlmRequestState.GENERATION_COMPLETE and len(
                     target_model_req.py_draft_tokens
             ) < target_model_req.py_draft_pages_allocated:
