@@ -8,7 +8,8 @@ import torch
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.logger import logger
 
-from ..pyexecutor.llm_request import LlmRequest, LlmRequestState, SamplingConfig
+from ..pyexecutor.llm_request import (LlmRequest, LlmRequestState,
+                                      SamplingConfig, get_draft_token_length)
 from ..pyexecutor.resource_manager import BaseResourceManager, ResourceManager
 from ..pyexecutor.sampler import Sampler, SampleState
 from ..pyexecutor.scheduler import ScheduledRequests
@@ -59,7 +60,6 @@ class ModelDrafter(Drafter):
         # Configuration
         self.spec_config = spec_config
         self.max_draft_tokens = max_draft_tokens
-
         # Sampling
         self.sampler = sampler
 
@@ -214,7 +214,6 @@ class ModelDrafter(Drafter):
                 if request.py_draft_pages_allocated == 0:
                     # No space for draft tokens
                     continue
-
                 # Stop drafting when we hit the max seqlen. We still need dummy draft
                 # tokens attached to the requests to make sure everything works properly
                 # with CUDA graph. These dummy tokens are already added by
@@ -320,7 +319,7 @@ class ModelDrafter(Drafter):
         """Pad draft tokens to maximum length for all generation requests."""
         for req in scheduled_requests.generation_requests:
             max_draft_tokens = self.max_draft_tokens
-            num_draft_tokens = len(req.py_draft_tokens)
+            num_draft_tokens = get_draft_token_length(req)
             req.py_draft_tokens.extend(
                 0 for _ in range(max_draft_tokens - num_draft_tokens))
 

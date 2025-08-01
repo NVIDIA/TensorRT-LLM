@@ -15,7 +15,8 @@ from tensorrt_llm.sampling_params import SamplingParams
 from ..._utils import binding_dtype_size, nvtx_range
 from ...logger import logger
 from ...mapping import Mapping
-from .llm_request import LlmRequest, LlmRequestState, SamplingConfig
+from .llm_request import (LlmRequest, LlmRequestState, SamplingConfig,
+                          get_draft_token_length)
 from .scheduler import ScheduledRequests
 
 if ENABLE_MULTI_DEVICE:
@@ -205,6 +206,13 @@ class KVCacheManager(BaseResourceManager):
             self.max_attention_window_vec = kv_cache_config.max_attention_window.copy(
             )  # Make a copy to avoid modifying original
 
+            # Clamp all window sizes to max_seq_len before calculating the
+            # number of KV cache blocks. This prevents the KV cache pool from
+            # being skewed by the largest window values.
+            self.max_attention_window_vec = [
+                min(max_seq_len, w) for w in self.max_attention_window_vec
+            ]
+
         sink_token_length = (kv_cache_config.sink_token_length
                              if kv_cache_config.sink_token_length is not None
                              else 0)
@@ -368,12 +376,12 @@ class KVCacheManager(BaseResourceManager):
                                            req_beam_width, req)
                     for _ in range(self.num_extra_kv_tokens):
                         self.impl.add_token(req.py_request_id)
-                    for _ in range(len(req.py_draft_tokens)):
+                    for _ in range(get_draft_token_length(req)):
                         self.impl.add_token(req.py_request_id)
 
         for req in generation_batch:
             self.impl.add_token(req.py_request_id)
-            for _ in range(len(req.py_draft_tokens)):
+            for _ in range(get_draft_token_length(req)):
                 self.impl.add_token(req.py_request_id)
 
     def add_dummy_requests(
