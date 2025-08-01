@@ -15,7 +15,8 @@ from tensorrt_llm.sampling_params import SamplingParams
 from ..._utils import binding_dtype_size, nvtx_range
 from ...logger import logger
 from ...mapping import Mapping
-from .llm_request import LlmRequest, LlmRequestState, SamplingConfig
+from .llm_request import (LlmRequest, LlmRequestState, SamplingConfig,
+                          get_draft_token_length)
 from .scheduler import ScheduledRequests
 
 if ENABLE_MULTI_DEVICE:
@@ -155,18 +156,33 @@ class KVCacheManager(BaseResourceManager):
                 (num_kv_heads + tp_size - 1) // tp_size
                 for _ in range(self.num_local_layers)
             ]
+            self.total_num_kv_heads_per_layer = [
+                (num_kv_heads + tp_size - 1) // tp_size
+                for _ in range(self.num_layers)
+            ]
         else:
             assert len(num_kv_heads) == self.num_layers
+
+            def append_to_kv_heads_per_layer(num_kv_heads_per_layer: List[int],
+                                             kv_head: Optional[int]):
+                if kv_head is not None:
+                    num_kv_heads_per_layer.append(
+                        (kv_head + tp_size - 1) // tp_size)
+                else:
+                    num_kv_heads_per_layer.append(0)
 
             self.num_kv_heads_per_layer = []
             if self.num_local_layers > 0:
                 for i in self.pp_layers:
                     kv_head = num_kv_heads[i]
-                    if kv_head is not None:
-                        self.num_kv_heads_per_layer.append(
-                            (kv_head + tp_size - 1) // tp_size)
-                    else:
-                        self.num_kv_heads_per_layer.append(0)
+                    append_to_kv_heads_per_layer(self.num_kv_heads_per_layer,
+                                                 kv_head)
+
+            self.total_num_kv_heads_per_layer = []
+            for i in range(self.num_layers):
+                kv_head = num_kv_heads[i]
+                append_to_kv_heads_per_layer(self.total_num_kv_heads_per_layer,
+                                             kv_head)
 
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
@@ -176,7 +192,9 @@ class KVCacheManager(BaseResourceManager):
         self.kv_factor = 1 if kv_cache_type == CacheTypeCpp.SELFKONLY else 2
         # Some speculative decoding methods need to use different kv lengths for the
         # draft/target layers. Add extra tokens to handle this issue.
-        self.num_extra_kv_tokens = 0 if spec_config is None else spec_config.num_extra_kv_tokens
+        # Import here to avoid circular imports
+        from ..speculative import get_num_extra_kv_tokens
+        self.num_extra_kv_tokens = get_num_extra_kv_tokens(spec_config)
         self.event_buffer_max_size = kv_cache_config.event_buffer_max_size
         self.max_num_tokens = max_num_tokens
 
@@ -188,15 +206,22 @@ class KVCacheManager(BaseResourceManager):
             self.max_attention_window_vec = kv_cache_config.max_attention_window.copy(
             )  # Make a copy to avoid modifying original
 
+            # Clamp all window sizes to max_seq_len before calculating the
+            # number of KV cache blocks. This prevents the KV cache pool from
+            # being skewed by the largest window values.
+            self.max_attention_window_vec = [
+                min(max_seq_len, w) for w in self.max_attention_window_vec
+            ]
+
         sink_token_length = (kv_cache_config.sink_token_length
                              if kv_cache_config.sink_token_length is not None
                              else 0)
 
         # Determine if this is VSWA (Variable Sliding Window Attention)
-        is_vswa = len(self.max_attention_window_vec) > 1
+        self.is_vswa = len(self.max_attention_window_vec) > 1
 
         # Calculate blocks per window using appropriate method
-        if is_vswa:
+        if self.is_vswa:
             # VSWA case: use C++ implementation for variable window sizes
             # model config check
             if model_config is None:
@@ -351,12 +376,12 @@ class KVCacheManager(BaseResourceManager):
                                            req_beam_width, req)
                     for _ in range(self.num_extra_kv_tokens):
                         self.impl.add_token(req.py_request_id)
-                    for _ in range(len(req.py_draft_tokens)):
+                    for _ in range(get_draft_token_length(req)):
                         self.impl.add_token(req.py_request_id)
 
         for req in generation_batch:
             self.impl.add_token(req.py_request_id)
-            for _ in range(len(req.py_draft_tokens)):
+            for _ in range(get_draft_token_length(req)):
                 self.impl.add_token(req.py_request_id)
 
     def add_dummy_requests(
@@ -373,11 +398,15 @@ class KVCacheManager(BaseResourceManager):
         prepare_resource: bool = True,
         max_num_draft_tokens: int = 0,
         use_mrope: bool = False,
+        max_beam_width: int = 1,
     ):
-        beam_width = 1  # TODO: more than 1 beam?
+        beam_width = max_beam_width
         requests = []
         for i, req_id in enumerate(request_ids):
-            sampling_params = SamplingParams()
+            # exact choice of n can be ignored for dummy requests
+            sampling_params = SamplingParams(n=beam_width,
+                                             best_of=beam_width,
+                                             use_beam_search=beam_width > 1)
             # Here 1+max_num_draft_tokens is used to extend the prompt length to
             # a non-zero number to skip illegal memory access issue in MLA kernel
             # during warmup.
@@ -523,7 +552,14 @@ class KVCacheManager(BaseResourceManager):
         return result
 
     def get_num_free_blocks(self) -> int:
-        return self.impl.get_kv_cache_stats().free_num_blocks
+        if self.is_vswa:
+            logger.info(
+                f"For VSWA case, we return the minimum of the number of free blocks for each window size: {self.impl.get_kv_cache_stats().num_free_blocks_per_window_size}"
+            )
+            return min(self.impl.get_kv_cache_stats().
+                       num_free_blocks_per_window_size.values())
+        else:
+            return self.impl.get_kv_cache_stats().free_num_blocks
 
     def get_num_kv_blocks(self, num_tokens: int) -> int:
         return (num_tokens + self.tokens_per_block - 1) // self.tokens_per_block
@@ -717,6 +753,8 @@ class KVCacheManager(BaseResourceManager):
 
         # VSWA on Torch backend has not supported the cross attention.
         is_cross_attention = False
+        # check model config
+        assert model_config.layer_types is not None, "layer_types have to be set correctly for VSWA"
 
         # Construct WorldConfig from self.mapping
         world_config_cpp = WorldConfig(
@@ -1209,7 +1247,7 @@ class PeftCacheManager(BaseResourceManager):
         pass
 
     def free_resources(self, request: LlmRequest):
-        pass
+        self.impl.mark_request_done(request)
 
     def shutdown(self):
         pass

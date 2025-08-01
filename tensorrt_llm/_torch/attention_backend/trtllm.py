@@ -517,10 +517,9 @@ class TrtllmAttentionWrapper:
 class TrtllmAttentionMetadata(AttentionMetadata):
     workspace: Optional[torch.Tensor] = None
 
-    # TrtllmAttention needs to know the beam width and access to the cache indirection buffer,
+    # TrtllmAttention needs to know the beam width to access to the cache indirection buffer,
     # when beam search is enabled.
     beam_width: int = 1
-    cache_indirection: Optional[torch.Tensor] = None
 
     # TrtllmAttention needs to know the max sequence length.
     # Implemented as a property to support no cache mode.
@@ -635,7 +634,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             self.block_ids_per_seq = None
             self.kv_block_ids_per_seq = None
             if self.enable_flash_mla:
-                self.block_ids_per_seq = torch.empty(
+                self.block_ids_per_seq = torch.zeros(
                     [
                         self.kv_cache_manager.max_batch_size,
                         self.kv_cache_manager.max_blocks_per_seq

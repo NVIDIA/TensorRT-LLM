@@ -364,11 +364,13 @@ class DecoderModelForCausalLM(nn.Module,
             if (hasattr(config, 'lora_config')
                     and config.lora_config is not None
                     and len(config.lora_config.lora_dir) == 1):
-                lora_loader = HfLoraLoader(config.lora_config.lora_dir)
-                if lora_loader.lm_head is not None and lora_loader.vocab_size != 0:
-                    weight = lora_loader.lm_head
-                    self.has_custom_lm_head = True
-                    vocab_size = lora_loader.vocab_size
+                # Only check for custom lm_head in HF LoRA, not NeMo
+                if config.lora_config.lora_ckpt_source == "hf":
+                    lora_loader = HfLoraLoader(config.lora_config.lora_dir)
+                    if lora_loader.lm_head is not None and lora_loader.vocab_size != 0:
+                        weight = lora_loader.lm_head
+                        self.has_custom_lm_head = True
+                        vocab_size = lora_loader.vocab_size
 
             self.lm_head = LMHead(
                 vocab_size,
@@ -524,12 +526,25 @@ class DecoderModelForCausalLM(nn.Module,
             return_context_logits,
         )
 
-    def load_weights(self, weights: Dict, skip_modules: List[str] = []):
+    def load_weights(self,
+                     weights: Dict,
+                     weight_mapper: Optional["BaseWeightMapper"] = None,
+                     skip_modules: List[str] = []):
+        # TODO smor- this solution is a temporary solution to load weights while we are still using
+        # the old checkpoint format loading process. Once checkpoint format is unified
+        # this method will be removed.
         preload_weight_modules = getattr(self, "preload_weight_modules", None)
-        _load_weights_impl(self,
-                           weights,
-                           skip_modules,
-                           preload_weight_modules=preload_weight_modules)
+        if weight_mapper is None:
+            _load_weights_impl(self,
+                               weights,
+                               skip_modules,
+                               preload_weight_modules=preload_weight_modules)
+        else:
+            _load_weights_impl_v2(self,
+                                  weights,
+                                  weight_mapper,
+                                  skip_modules,
+                                  preload_weight_modules=preload_weight_modules)
 
     def infer_max_seq_len(self) -> int:
         # Modified from tensorrt_llm/builder.py _init_max_seq_len
@@ -558,6 +573,10 @@ class DecoderModelForCausalLM(nn.Module,
 
 
 MODEL_CLASS_MAPPING = {}
+MODEL_CLASS_MAPPER_MAPPING = {}
+MODEL_CLASS_CHECKPOINT_WEIGHT_LOADER_DEFAULT_MAPPING = {}
+MODEL_CLASS_CONFIG_LOADER_DEFAULT_MAPPING = {}
+CHECKPOINT_LOADER_FORMAT_DEFAULT_MAPPING = {}
 
 
 def register_auto_model(name: str):
@@ -567,6 +586,59 @@ def register_auto_model(name: str):
         return cls
 
     return decorator
+
+
+def register_mapper(format: str, name: Optional[str] = None):
+
+    def decorator(cls):
+        if name is not None:
+            # set cls for model name and format pair
+            MODEL_CLASS_MAPPER_MAPPING[f'{name}_{format}'] = cls
+        else:
+            # resort to the default per format
+            MODEL_CLASS_MAPPER_MAPPING[format] = cls
+        return cls
+
+    return decorator
+
+
+def register_checkpoint_weight_loader(name: str):
+
+    def decorator(cls):
+        MODEL_CLASS_CHECKPOINT_WEIGHT_LOADER_DEFAULT_MAPPING[name] = cls
+        return cls
+
+    return decorator
+
+
+def register_checkpoint_loader(name: str):
+
+    def decorator(cls):
+        CHECKPOINT_LOADER_FORMAT_DEFAULT_MAPPING[name] = cls
+        return cls
+
+    return decorator
+
+
+def register_config_loader(name: str):
+
+    def decorator(cls):
+        MODEL_CLASS_CONFIG_LOADER_DEFAULT_MAPPING[name] = cls
+        return cls
+
+    return decorator
+
+
+def get_checkpoint_weight_loader(name: str) -> Type["BaseWeightLoader"]:
+    if name not in MODEL_CLASS_CHECKPOINT_WEIGHT_LOADER_DEFAULT_MAPPING:
+        raise ValueError(f"Default checkpoint weight loader {name} not found.")
+    return MODEL_CLASS_CHECKPOINT_WEIGHT_LOADER_DEFAULT_MAPPING[name]
+
+
+def get_config_loader(name: str) -> Type["BaseConfigLoader"]:
+    if name not in MODEL_CLASS_CONFIG_LOADER_DEFAULT_MAPPING:
+        raise ValueError(f"Default config loader {name} not found.")
+    return MODEL_CLASS_CONFIG_LOADER_DEFAULT_MAPPING[name]
 
 
 def get_model_architecture(
@@ -587,7 +659,6 @@ def get_model_architecture(
 def rename_weights_with_regex(pattern_mapping: Dict[str, str], weights: Dict):
     """
     Rename weight keys according to regex pattern matching.
-
     Args:
         pattern_mapping: A dictionary mapping regex patterns to replacement strings. The key is HF name pattern, and the value is corresponding TRT-LLM name pattern.
             The patterns will be used to match keys in the weights dict and replace
@@ -600,7 +671,6 @@ def rename_weights_with_regex(pattern_mapping: Dict[str, str], weights: Dict):
                 r'(.*?)out_proj(.*)': r'\1o_proj\2'
             }
         weights: A dictionary of weights
-
     Returns:
         A dictionary of weights with renamed keys
     """
@@ -683,6 +753,9 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
                        preload_weight_modules: Optional[List[str]] = None):
     # TODO: remove preload_weight_modules - it is a workaround for min-latency llama4 model loading where
     # we need some order in the module loading. Once this is resolved, we can remove this workaround.
+    # TODO smor- this method is here as a temporary solution to load weights.
+    # Once checkpoint format is unified, this method will be removed.
+
     if not hasattr(model, 'model_config') or not isinstance(
             model.model_config, ModelConfig):
         raise ValueError("model must have a model_config attribute")
@@ -756,6 +829,74 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
                     for n, p in module._parameters.items():
                         if p is not None:
                             p.data.copy_(module_weights[n][:])
+
+    if os.environ.get("TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL",
+                      False) in ["True", "true", "1", "yes", "y"]:
+        for name, module in tqdm(list(model.named_modules()),
+                                 desc="Loading weights"):
+            load_single_module(name, module)
+    else:
+        all_modules = dict(model.named_modules())
+        serial_load_modules = []
+        if preload_weight_modules is not None:
+            for module in preload_weight_modules:
+                serial_load_modules.extend([
+                    name for name in all_modules.keys() if name.endswith(module)
+                ])
+            logger.info(f"Serial load modules: {serial_load_modules}")
+            pbar = tqdm(serial_load_modules, desc="Loading weights serially")
+            for module in serial_load_modules:
+                # logger.info(f"Loading weights for {module} in serial")
+                load_single_module(module, all_modules[module])
+                pbar.update(1)
+                del all_modules[module]
+            pbar.close()
+
+        pbar = tqdm(list(model.named_modules()),
+                    desc="Loading weights concurrently")
+        args_list = [(name, module) for name, module in model.named_modules()
+                     if name not in serial_load_modules]
+        run_concurrently(load_single_module, args_list, pbar=pbar)
+
+
+def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
+                          weights: Dict,
+                          weight_mapper: "BaseWeightMapper",
+                          skip_modules: List[str] = [],
+                          params_map: Optional[Dict[str, str]] = None,
+                          preload_weight_modules: Optional[List[str]] = None):
+    # TODO: remove preload_weight_modules - it is a workaround for min-latency llama4 and Qwen3 model loading where
+    # we need some order in the module loading. Once this is resolved, we can remove this workaround.
+    weight_mapper.add_skip_modules(skip_modules)
+    if params_map is not None:
+        weights = weight_mapper.rename_by_params_map(params_map, weights)
+        logger.info(f"Renamed weights with params_map: {params_map}")
+
+    def load_single_module(name, module):
+        if len(module._parameters) > 0:
+            if weight_mapper.should_skip_module(name):
+                return
+
+            names = name.split('.')
+            module_names_breakdown, module_name = names[:-1], names[-1]
+
+            if weight_mapper.does_require_special_handling(module_name):
+                module_weights = weight_mapper.apply_callbacks(
+                    module, module_name, module_names_breakdown, weights)
+                module.load_weights(weights=module_weights)
+            else:
+                module_weights = weight_mapper.filter_weights(name, weights)
+                if weight_mapper.is_special_instance_module(module):
+                    weight_mapper.handle_special_instance_module(
+                        module, module_name, module_weights)
+
+                elif hasattr(module, 'load_weights'):
+                    module.load_weights(weights=[module_weights])
+                else:
+                    for n, p in module._parameters.items():
+                        if p is not None:
+                            weight_mapper.handle_manual_copy(
+                                module_name, module_weights, n, p)
 
     if os.environ.get("TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL",
                       False) in ["True", "true", "1", "yes", "y"]:

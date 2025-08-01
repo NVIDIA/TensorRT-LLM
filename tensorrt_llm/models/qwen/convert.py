@@ -537,19 +537,26 @@ def convert_hf_qwen(hf_model,
                                          tensor_parallel)
                 assert (k_weight.shape[0] % (mapping.tp_size * head_size)) == 0
                 assert (v_weight.shape[0] % (mapping.tp_size * head_size)) == 0
-                assert (k_bias.shape[0] % (mapping.tp_size * head_size)) == 0
-                assert (v_bias.shape[0] % (mapping.tp_size * head_size)) == 0
+
+                if k_bias is not None and v_bias is not None:
+                    assert (k_bias.shape[0] %
+                            (mapping.tp_size * head_size)) == 0
+                    assert (v_bias.shape[0] %
+                            (mapping.tp_size * head_size)) == 0
 
                 wq = split(q_weight, mapping.tp_size, mapping.tp_rank)
                 wk = split(k_weight, mapping.tp_size, mapping.tp_rank)
                 wv = split(v_weight, mapping.tp_size, mapping.tp_rank)
 
-                bq = split(q_bias, mapping.tp_size, mapping.tp_rank)
-                bk = split(k_bias, mapping.tp_size, mapping.tp_rank)
-                bv = split(v_bias, mapping.tp_size, mapping.tp_rank)
-
                 qkv_w = torch.concat((wq, wk, wv))
-                qkv_b = torch.concat((bq, bk, bv))
+
+                if q_bias is not None and k_bias is not None and v_bias is not None:
+                    bq = split(q_bias, mapping.tp_size, mapping.tp_rank)
+                    bk = split(k_bias, mapping.tp_size, mapping.tp_rank)
+                    bv = split(v_bias, mapping.tp_size, mapping.tp_rank)
+                    qkv_b = torch.concat((bq, bk, bv))
+                else:
+                    qkv_b = None
             else:
                 qkv_weight = torch.cat([q_weight, k_weight, v_weight], dim=0)
                 qkv_bias = torch.cat([q_bias, k_bias, v_bias], dim=0)

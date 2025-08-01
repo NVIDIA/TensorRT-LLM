@@ -1,6 +1,8 @@
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Union
 
+from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import \
+    BaseCheckpointLoader
 from tensorrt_llm.bindings.executor import ExecutorConfig
 
 from ...builder import BuildConfig
@@ -71,6 +73,7 @@ class PyTorchConfig:
     torch_compile_piecewise_cuda_graph: bool = False
     # When torch compile is enabled, userbuffers is enabled by default
     torch_compile_enable_userbuffers: bool = True
+    torch_compile_max_num_streams: int = 1
 
     # Enable autotuner only when torch compile is enabled
     # TODO: after it can be work stable in warmup stage
@@ -117,7 +120,9 @@ def update_executor_config(
         speculative_config: Optional["DecodingBaseConfig"] = None,
         hf_model_dir: Optional[str] = None,
         max_input_len: Optional[int] = None,
-        max_seq_len: Optional[int] = None):
+        max_seq_len: Optional[int] = None,
+        checkpoint_format: Optional[str] = None,
+        checkpoint_loader: Optional[BaseCheckpointLoader] = None):
     if backend is None:
         return
 
@@ -145,3 +150,31 @@ def update_executor_config(
 
     if max_seq_len is not None:
         executor_config.max_seq_len = max_seq_len
+
+    executor_config.checkpoint_loader = _construct_checkpoint_loader(
+        backend, checkpoint_loader, checkpoint_format)
+
+
+def _construct_checkpoint_loader(
+        backend: str, checkpoint_loader: Optional[BaseCheckpointLoader],
+        checkpoint_format: Optional[str]) -> Optional[BaseCheckpointLoader]:
+    if backend == "_autodeploy":
+        return None
+
+    from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import \
+        BaseCheckpointLoader
+    from tensorrt_llm._torch.models.modeling_utils import (
+        get_checkpoint_weight_loader, get_config_loader)
+
+    if checkpoint_loader is None:
+        checkpoint_weight_loader = get_checkpoint_weight_loader(
+            checkpoint_format)()
+        config_loader = get_config_loader(checkpoint_format)()
+
+        checkpoint_loader = BaseCheckpointLoader.get(
+            checkpoint_format=checkpoint_format,
+            weight_loader=checkpoint_weight_loader,
+            weight_mapper=None,
+            config_loader=config_loader)
+
+    return checkpoint_loader

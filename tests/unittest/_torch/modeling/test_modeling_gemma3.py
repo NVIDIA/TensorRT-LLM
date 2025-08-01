@@ -10,10 +10,13 @@ from transformers import Gemma3TextConfig
 from transformers.cache_utils import HybridCache
 
 import tensorrt_llm
-from tensorrt_llm._torch.attention_backend import FlashInferAttentionMetadata
+from tensorrt_llm._torch.attention_backend import (AttentionMetadata,
+                                                   FlashInferAttentionMetadata)
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
+from tensorrt_llm._torch.models.checkpoints.hf.gemma3_weight_mapper import \
+    Gemma3HfWeightMapper
 from tensorrt_llm._torch.models.modeling_gemma3 import Gemma3ForCausalLM
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
@@ -214,6 +217,20 @@ class TestGemma3(unittest.TestCase):
 
         kv_cache_manager.shutdown()
 
+    def _verify_params_flushed_upon_prepare(self,
+                                            attn_metadata: AttentionMetadata):
+        # This check is valid only for FlashInferAttentionMetadata. It checks that the PlanParams specific
+        # to forward call with custom mask exist right after the forward call and are flushed upon prepare.
+        if isinstance(attn_metadata, FlashInferAttentionMetadata):
+            # Right after forward call with custom mask, plan_params will have non-trivial attention_mask_data.
+            # One for global-prefill, other for local-prefill.
+            self.assertEqual(len(attn_metadata._plan_params_to_wrappers), 2)
+            for plan_params in attn_metadata._plan_params_to_wrappers.keys():
+                assert plan_params.attention_mask_data is not None
+            # Prepare should flush the params with non-trivial attention_mask_data.
+            attn_metadata.prepare()
+            self.assertEqual(len(attn_metadata._plan_params_to_wrappers), 0)
+
     @parameterized.expand([
         Scenario(backend="TRTLLM", config_name="1B"),
         Scenario(backend="VANILLA", config_name="1B"),
@@ -268,7 +285,9 @@ class TestGemma3(unittest.TestCase):
         model_config = ModelConfig(pretrained_config=gemma3_config,
                                    attn_backend=backend)
         gemma3 = Gemma3ForCausalLM(model_config).to(dtype).to(device)
-        gemma3.load_weights(hf_gemma3.state_dict())
+        weight_mapper = Gemma3HfWeightMapper()
+        weight_mapper.init_model_and_config(gemma3, model_config)
+        gemma3.load_weights(hf_gemma3.state_dict(), weight_mapper)
 
         kv_cache_manager = self.get_kv_cache_manager(
             dtype=dtype,
@@ -328,6 +347,7 @@ class TestGemma3(unittest.TestCase):
                                        ref.logits[:, -1].float(),
                                        atol=0.4,
                                        rtol=0.4)
+            self._verify_params_flushed_upon_prepare(attn_metadata)
 
         # Generation phase.
         gen_input_ids = torch.tensor([900], dtype=torch.int, device=device)

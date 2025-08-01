@@ -57,6 +57,9 @@ l0_b200:
   - unittest/_torch/modeling -k "modeling_mixtral"
   - unittest/_torch/modeling -k "modeling_deepseek"
   - unittest/_torch/auto_deploy/unit/singlegpu
+  - unittest/_torch/speculative/test_eagle3.py
+  - unittest/_torch/speculative/test_kv_cache_reuse.py
+  - unittest/_torch/speculative/test_dynamic_spec_decode.py
 - condition:
     ranges:
       system_gpu_count:

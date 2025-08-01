@@ -75,6 +75,7 @@ class ModelConfig(Generic[TConfig]):
 
     is_generation: bool = True
     max_num_tokens: int = 8192
+    max_seq_len: Optional[int] = None
 
     moe_max_num_tokens: Optional[int] = None
     moe_load_balancer: Optional[MoeLoadBalancerConfig] = None
@@ -202,6 +203,9 @@ class ModelConfig(Generic[TConfig]):
             json_quant_configs = quant_config_dict['quantization']
 
             quant_config.quant_algo = json_quant_configs.get('quant_algo', None)
+            # fp8_pb_wo from modelopt is the same as FP8_BLOCK_SCALES
+            if quant_config.quant_algo == "fp8_pb_wo":
+                quant_config.quant_algo = 'FP8_BLOCK_SCALES'
             quant_config.kv_cache_quant_algo = json_quant_configs.get(
                 'kv_cache_quant_algo', None)
             quant_config.group_size = json_quant_configs.get('group_size', None)
@@ -294,6 +298,7 @@ class ModelConfig(Generic[TConfig]):
 
         num_heads = self.pretrained_config.num_attention_heads // (
             self.mapping.tp_size * self.mapping.cp_size)
+
         hidden_size = self.pretrained_config.hidden_size // self.mapping.tp_size
 
         model_config_cpp = ModelConfigCpp(
@@ -305,12 +310,28 @@ class ModelConfig(Generic[TConfig]):
             hidden_size=hidden_size,
             data_type=torch_dtype_to_binding(
                 self.pretrained_config.torch_dtype))
+
+        # For kv cache size calculation: set tokens_per_block
         if tokens_per_block is None:
             logger.warning(
                 f"tokens_per_block is not set, using default value {model_config_cpp.tokens_per_block}"
             )
         else:
             model_config_cpp.tokens_per_block = tokens_per_block
+
+        num_key_value_heads = getattr(self.pretrained_config,
+                                      "num_key_value_heads", num_heads)
+        if isinstance(num_key_value_heads, (list, tuple)):
+            # Per-layer KV heads (e.g., Nemotron-NAS, variable GQA models)
+            num_kv_heads_per_layer = [
+                kv_heads // (self.mapping.tp_size * self.mapping.cp_size)
+                for kv_heads in num_key_value_heads
+            ]
+            model_config_cpp.num_kv_heads_per_layer = num_kv_heads_per_layer
+        else:
+            num_kv_heads = num_key_value_heads // (self.mapping.tp_size *
+                                                   self.mapping.cp_size)
+            model_config_cpp.set_num_kv_heads(num_kv_heads)
 
         mlp_hidden_size = None
         if self.pretrained_config.intermediate_size is not None:
@@ -333,9 +354,16 @@ class ModelConfig(Generic[TConfig]):
                 f"Failed to infer mlp hidden size for model: {self.pretrained_config.model_type}"
             )
 
-        if "head_size" in self.pretrained_config:
-            head_size = self.pretrained_config.head_size
+        # For kv cache size calculation: set size_per_head
+        head_dim_names = ["head_size", "head_dim"]
+        for head_dim_name in head_dim_names:
+            if head_dim_name in self.pretrained_config:
+                head_size = getattr(self.pretrained_config, head_dim_name)
+                break
         else:
+            logger.warning(
+                f"head_size/head_dim is not set, using default value {hidden_size // num_heads}"
+            )
             head_size = hidden_size // num_heads
 
         model_config_cpp.mlp_hidden_size = mlp_hidden_size
@@ -353,8 +381,10 @@ class ModelConfig(Generic[TConfig]):
         # Nemotron-NAS has variable ffn_mult for each layer, we need to find the maximum
         # so that we don't set a too small mlp_hidden_size. This solution leads to a memory
         # consumption that is higher than required.
-        biggest_ffn_mult = max(
-            [x.ffn.ffn_mult for x in self.pretrained_config.block_configs])
+        biggest_ffn_mult = max([
+            (x.ffn.ffn_mult if x.ffn.ffn_mult is not None else 0)
+            for x in self.pretrained_config.block_configs
+        ])
 
         from tensorrt_llm._torch.models.modeling_nemotron_nas import \
             _ffn_mult_to_intermediate_size

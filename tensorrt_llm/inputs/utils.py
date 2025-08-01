@@ -5,12 +5,13 @@ import tempfile
 from collections import defaultdict
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Coroutine, Dict, List, Optional, TypedDict, Union
+from typing import Any, Coroutine, Dict, List, Optional, Tuple, TypedDict, Union
 from urllib.parse import urlparse
 
 import aiohttp
 import numpy as np
 import requests
+import soundfile
 import torch
 from PIL import Image
 from torchvision.transforms import ToTensor
@@ -44,7 +45,7 @@ def load_base64_image(parsed_url: str) -> Image.Image:
 
 def load_image(image: str,
                format: str = "pt",
-               device: str = "cuda") -> Union[Image.Image, torch.Tensor]:
+               device: str = "cpu") -> Union[Image.Image, torch.Tensor]:
     assert format in ["pt", "pil"], "format must be either Pytorch or PIL"
 
     parsed_url = urlparse(image)
@@ -66,7 +67,7 @@ def load_image(image: str,
 async def async_load_image(
         image: str,
         format: str = "pt",
-        device: str = "cuda") -> Union[Image.Image, torch.Tensor]:
+        device: str = "cpu") -> Union[Image.Image, torch.Tensor]:
     assert format in ["pt", "pil"], "format must be either Pytorch or PIL"
 
     parsed_url = urlparse(image)
@@ -91,7 +92,7 @@ def load_video(
         video: str,
         num_frames: int = 10,
         format: str = "pt",
-        device: str = "cuda") -> Union[List[Image.Image], List[torch.Tensor]]:
+        device: str = "cpu") -> Union[List[Image.Image], List[torch.Tensor]]:
 
     # Keep this import local to avoid importing cv2 if not needed
     import cv2
@@ -140,7 +141,7 @@ async def async_load_video(
         video: str,
         num_frames: int = 10,
         format: str = "pt",
-        device: str = "cuda") -> Union[List[Image.Image], List[torch.Tensor]]:
+        device: str = "cpu") -> Union[List[Image.Image], List[torch.Tensor]]:
     assert format in ["pt", "pil"], "format must be either Pytorch or PIL"
 
     parsed_url = urlparse(video)
@@ -157,6 +158,35 @@ async def async_load_video(
         video_path = video
 
     return load_video(video_path, num_frames, format, device)
+
+
+def load_audio(
+    audio: str,
+    format: str = "pt",
+    device: str = "cuda",
+) -> Tuple[np.ndarray, int]:
+    parsed_url = urlparse(audio)
+    if parsed_url.scheme in ["http", "https"]:
+        audio = requests.get(audio, stream=True, timeout=10)
+        audio = BytesIO(audio.content)
+
+    audio = soundfile.read(audio)
+    return audio
+
+
+async def async_load_audio(
+    audio: str,
+    format: str = "pt",
+    device: str = "cuda",
+) -> Tuple[np.ndarray, int]:
+    parsed_url = urlparse(audio)
+    if parsed_url.scheme in ["http", "https"]:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(audio) as response:
+                audio = BytesIO(await response.content.read())
+
+    audio = soundfile.read(audio)
+    return audio
 
 
 # Copied from https://github.com/vllm-project/vllm/blob/main/examples/online_serving/openai_chat_completion_client_for_multimodal.py#L38
@@ -186,19 +216,24 @@ SUPPORTED_LLAVA_IMAGE_MODEL_GROUP = ["llava_llama", "llava_next"]
 SUPPORTED_LLAVA_VIDEO_MODEL_GROUP = ["llava_llama"]
 SUPPORTED_MISTRAL_IMAGE_MODEL_GROUP = ["mistral3"]
 SUPPORTED_HYPERCLOVAX_MODEL_GROUP = ["hyperclovax_vlm"]
+SUPPORTED_PHI_MODEL_GROUP = ["phi4mm"]
 
 ALL_SUPPORTED_IMAGE_MODELS = SUPPORTED_QWEN_MODEL_GROUP \
     + SUPPORTED_LLAMA_MODEL_GROUP \
     + SUPPORTED_LLAVA_IMAGE_MODEL_GROUP \
     + SUPPORTED_HYPERCLOVAX_MODEL_GROUP \
     + SUPPORTED_GEMMA_MODEL_GROUP \
-    + SUPPORTED_MISTRAL_IMAGE_MODEL_GROUP
+    + SUPPORTED_MISTRAL_IMAGE_MODEL_GROUP \
+    + SUPPORTED_PHI_MODEL_GROUP
 
 ALL_SUPPORTED_VIDEO_MODELS = SUPPORTED_QWEN_MODEL_GROUP \
     + SUPPORTED_LLAVA_VIDEO_MODEL_GROUP
 
+ALL_SUPPORTED_AUDIO_MODELS = SUPPORTED_PHI_MODEL_GROUP
+
 ALL_SUPPORTED_MULTIMODAL_MODELS = list(set(ALL_SUPPORTED_IMAGE_MODELS) \
-    | set(ALL_SUPPORTED_VIDEO_MODELS))
+    | set(ALL_SUPPORTED_VIDEO_MODELS) \
+    | set(ALL_SUPPORTED_AUDIO_MODELS))
 
 HF_CHAT_TEMPLATE_EXCEPTIONS = ["llava_llama"]
 PLACEHOLDER_EXCEPTIONS = ["llava_next"]
@@ -219,10 +254,13 @@ PLACEHOLDER_PLACEMENT_MAP = {
     "mllama": MultimodalPlaceholderPlacement.BEFORE_TEXT,
     "hyperclovax_vlm": MultimodalPlaceholderPlacement.AFTER_TEXT,
     "gemma3": MultimodalPlaceholderPlacement.BEFORE_TEXT,
-    # NOTE: for mistral3 multimodal models, it does not strictly have to be after the text.
+    # NOTE: for mistral3 multimodal models, it does not strictly have to be before the text.
     # Ref: https://github.com/mistralai/mistral-common/blob/039465db2bdc0486df36365c9bdb428188482a18/
     #      src/mistral_common/tokens/tokenizers/base.py#L326
-    "mistral3": MultimodalPlaceholderPlacement.AFTER_TEXT,
+    # However, accuracy tests show that the model generates higher quality output when the image
+    # precedes the text (the relative difference can be as much as ~30% for both vLLM and TRT-LLM).
+    "mistral3": MultimodalPlaceholderPlacement.BEFORE_TEXT,
+    "phi4mm": MultimodalPlaceholderPlacement.BEFORE_TEXT,
 }
 assert len(PLACEHOLDER_PLACEMENT_MAP) == len(ALL_SUPPORTED_MULTIMODAL_MODELS)
 
@@ -235,7 +273,7 @@ def retrieve_multimodal_placeholder(model_type: str, modality: str,
         Args:
             model_type: The type of the multimodal model.
             modality: The modality of the data.
-            current_count: The number of multimodal data already added. Currently not used.
+            current_count: The number of multimodal data already added.
 
     """
 
@@ -257,6 +295,8 @@ def retrieve_multimodal_placeholder(model_type: str, modality: str,
             # Ref: https://github.com/mistralai/mistral-common/blob/26a6bb3a07ee0b78a3808f2797f23e1d28514b93/
             # src/mistral_common/tokens/tokenizers/base.py#L60
             return "[IMG]"
+        elif model_type in SUPPORTED_PHI_MODEL_GROUP:
+            return f"<|image_{current_count}|>"
         raise TypeError(
             f"For image modality, only {ALL_SUPPORTED_IMAGE_MODELS} are supported but got {model_type}"
         )
@@ -268,6 +308,9 @@ def retrieve_multimodal_placeholder(model_type: str, modality: str,
         raise TypeError(
             f"For video modality, only {ALL_SUPPORTED_VIDEO_MODELS} are supported but got {model_type}"
         )
+    elif modality == "audio":
+        if model_type in SUPPORTED_PHI_MODEL_GROUP:
+            return f"<|audio_{current_count}|>"
     raise TypeError(f"Unknown modality: {modality}")
 
 
@@ -281,7 +324,7 @@ class ConversationMessage(TypedDict):
     """Type definition for conversation message structure."""
     role: str
     content: List[dict[str, Any]]
-    media: List[MultimodalData]
+    media: List[MultimodalData] | List[torch.Tensor] | List[Dict[str, Any]]
 
     # @classmethod
     # def fromSample(cls, sample: dict[str, str]) -> "ConversationMessage":
@@ -343,7 +386,10 @@ def add_multimodal_placeholders(model_type: str, text_prompt: str,
         case MultimodalPlaceholderPlacement.AFTER_TEXT:
             parts.append(text_prompt)
             parts.extend(placeholders)
-    return "\n".join(parts)
+    if model_type == "phi4mm":
+        return "".join(parts)
+    else:
+        return "\n".join(parts)
 
 
 def resolve_hf_chat_template(
@@ -433,24 +479,44 @@ def default_multimodal_input_loader(
         model_type: str,
         modality: str,
         prompts: List[str],
-        media: Union[List[str], List[List[str]]],
+        media: Optional[Union[List[str], List[List[str]]]] = None,
         image_data_format: str = "pt",
         num_frames: int = 8,
-        device: str = "cuda") -> List[dict[str, Union[str, torch.Tensor]]]:
+        mm_embeddings: Optional[Union[List[torch.Tensor],
+                                      List[List[torch.Tensor]]]] = None,
+        device: str = "cpu") -> List[dict[str, Union[str, torch.Tensor]]]:
 
-    def convert_to_conversation_message(prompt: str, media: Union[str,
-                                                                  List[str]],
-                                        modality: str) -> ConversationMessage:
+    def convert_to_conversation_message(
+        prompt: str,
+        media: Union[Any, List[Any]],
+        modality: str,
+        is_embedding: bool = False,
+    ) -> ConversationMessage:
         if isinstance(media, str):
             media = [media]
-        if modality == "image":
-            mm_data = [
-                MultimodalData(modality=modality,
-                               data=load_image(i,
-                                               format=image_data_format,
-                                               device=device)) for i in media
-            ]
+        if modality in ["image", "multiple_image"]:
+            if is_embedding:
+                # each mm_embedding corresponds to each image placeholder
+                if not isinstance(media, list):
+                    media = [media]
+
+                mm_data = [{
+                    'modality': modality,
+                    'mm_embedding_info': mm
+                } for mm in media]
+            else:
+                mm_data = [
+                    MultimodalData(modality=modality,
+                                   data=load_image(i,
+                                                   format=image_data_format,
+                                                   device=device))
+                    for i in media
+                ]
         elif modality == "video":
+            if is_embedding:
+                raise ValueError(
+                    "External embedding is not supported for video modality yet."
+                )
             mm_data = [
                 MultimodalData(modality=modality,
                                data=load_video(i,
@@ -458,16 +524,67 @@ def default_multimodal_input_loader(
                                                format=image_data_format,
                                                device=device)) for i in media
             ]
+        elif modality == "audio":
+            if is_embedding:
+                raise ValueError(
+                    "External embedding is not supported for audio modality yet."
+                )
+            mm_data = [
+                MultimodalData(modality=modality,
+                               data=load_audio(i, device=device)) for i in media
+            ]
+        elif modality == "image_audio":
+            if is_embedding:
+                raise ValueError(
+                    "External embedding is not supported for image_audio modality yet."
+                )
+            # Use different load_xxx functions to match the modality.
+            mm_data = []
+            for m in media:
+                data = None
+                _modal = None
+                if _modal is None:
+                    try:
+                        data = load_image(m,
+                                          format=image_data_format,
+                                          device=device)
+                        _modal = "image"
+                    except Exception:
+                        pass
+                if _modal is None:
+                    try:
+                        data = load_audio(m, device=device)
+                        _modal = "audio"
+                    except Exception:
+                        pass
+                if _modal is None:
+                    raise ValueError(f"Unknown matching modality: {modality}")
+                mm_data.append(MultimodalData(modality=_modal, data=data))
+        elif modality == "mixture_text_image":
+            mm_data = []
+            for m in media:
+                if m:
+                    mm_data.append(
+                        MultimodalData(modality="image",
+                                       data=load_image(m,
+                                                       format=image_data_format,
+                                                       device=device)))
         else:
             raise ValueError(f"Unknown modality: {modality}")
         return ConversationMessage(role="user", content=prompt, media=mm_data)
 
-    if len(media) > len(prompts) and len(prompts) == 1:
+    assert media is not None or mm_embeddings is not None, "Either media or mm_embeddings must be provided."
+    assert media is None or mm_embeddings is None, "Either media or mm_embeddings must be provided, not both."
+    media_or_embeddings = media if media is not None else mm_embeddings
+    is_embedding = mm_embeddings is not None
+
+    if len(media_or_embeddings) > len(prompts) and len(prompts) == 1:
         # 1 prompt + N media
         assert not isinstance(
-            media[0], list)  # media cannot be a list of lists in this case
-        media = [media]
-    assert len(media) == len(prompts)
+            media_or_embeddings[0],
+            list)  # media cannot be a list of lists in this case
+        media_or_embeddings = [media_or_embeddings]
+    assert len(media_or_embeddings) == len(prompts)
 
     if tokenizer is None and model_type not in HF_CHAT_TEMPLATE_EXCEPTIONS:
         tokenizer = ModelLoader.load_hf_tokenizer(model_dir, use_fast=True)
@@ -479,26 +596,40 @@ def default_multimodal_input_loader(
                                                   trust_remote_code=True)
 
     inputs = []
-    for prompt, media in zip(prompts, media):
-        conv = convert_to_conversation_message(prompt, media, modality)
+    for prompt_idx, (prompt,
+                     media) in enumerate(zip(prompts, media_or_embeddings)):
+        conv = convert_to_conversation_message(prompt, media, modality,
+                                               is_embedding)
         mm_data_tracker = MultimodalDataTracker(model_type)
         for mdata in conv["media"]:
-            mm_data_tracker.add_data(mdata["modality"], mdata["data"])
+            # Check if mdata is a MultimodalData
+            if isinstance(mdata,
+                          dict) and "modality" in mdata and "data" in mdata:
+                mm_data_tracker.add_data(mdata["modality"], mdata["data"])
+            else:
+                # Add embeddings to the tracker for placeholder handling
+                mm_data_tracker.add_data(mdata["modality"],
+                                         mdata["mm_embedding_info"])
         mm_placeholder_counts = mm_data_tracker.placeholder_counts()
         prompt = conv["content"]
         if mm_placeholder_counts:
             conv["content"] = add_multimodal_placeholders(
                 model_type, conv["content"], mm_placeholder_counts)
-            prompt = apply_chat_template(
-                model_type=model_type,
-                tokenizer=tokenizer,
-                processor=processor,
-                conversation=[conv],
-                add_generation_prompt=True,
-                mm_placeholder_counts=mm_placeholder_counts)
-        inputs.append({
-            "prompt": prompt,
-            "multi_modal_data": mm_data_tracker.retrieve_all_sync()
-        })
+        prompt = apply_chat_template(
+            model_type=model_type,
+            tokenizer=tokenizer,
+            processor=processor,
+            conversation=[conv],
+            add_generation_prompt=True,
+            mm_placeholder_counts=mm_placeholder_counts)
+        input = {"prompt": prompt}
+        if mm_placeholder_counts:
+            if mm_embeddings is not None:
+                input[
+                    "multi_modal_embeddings"] = mm_data_tracker.retrieve_all_sync(
+                    )
+            else:
+                input["multi_modal_data"] = mm_data_tracker.retrieve_all_sync()
+        inputs.append(input)
 
     return inputs

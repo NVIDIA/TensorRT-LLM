@@ -6,9 +6,14 @@ import yaml
 
 import tensorrt_llm.bindings.executor as tle
 from tensorrt_llm import LLM as TorchLLM
+from tensorrt_llm import AutoParallelConfig
 from tensorrt_llm._tensorrt_engine import LLM
+from tensorrt_llm.builder import LoraConfig
+from tensorrt_llm.llmapi import (BuildConfig, CapacitySchedulerPolicy,
+                                 SchedulerConfig)
 from tensorrt_llm.llmapi.llm_args import *
 from tensorrt_llm.llmapi.utils import print_traceback_on_error
+from tensorrt_llm.plugin import PluginConfig
 
 from .test_llm import llama_model_path
 
@@ -56,7 +61,6 @@ speculative_config:
     decoding_type: Lookahead
     max_window_size: 4
     max_ngram_size: 3
-    verification_set_size: 4
     """
         dict_content = self._yaml_to_dict(yaml_content)
 
@@ -219,10 +223,6 @@ def test_SchedulerConfig_declaration():
                                       config.dynamic_batch_config._to_pybind())
 
 
-def test_PeftCacheConfig_default_values():
-    check_defaults(PeftCacheConfig, tle.PeftCacheConfig)
-
-
 def test_PeftCacheConfig_declaration():
     config = PeftCacheConfig(num_host_module_layer=1,
                              num_device_module_layer=1,
@@ -250,6 +250,122 @@ def test_PeftCacheConfig_declaration():
     assert pybind_config.device_cache_percent == 0.5
     assert pybind_config.host_cache_size == 1024
     assert pybind_config.lora_prefetch_dir == "."
+
+
+def test_PeftCacheConfig_from_pybind():
+    pybind_config = tle.PeftCacheConfig(num_host_module_layer=1,
+                                        num_device_module_layer=1,
+                                        optimal_adapter_size=64,
+                                        max_adapter_size=128,
+                                        num_put_workers=1,
+                                        num_ensure_workers=1,
+                                        num_copy_streams=1,
+                                        max_pages_per_block_host=24,
+                                        max_pages_per_block_device=8,
+                                        device_cache_percent=0.5,
+                                        host_cache_size=1024,
+                                        lora_prefetch_dir=".")
+
+    config = PeftCacheConfig.from_pybind(pybind_config)
+    assert config.num_host_module_layer == 1
+    assert config.num_device_module_layer == 1
+    assert config.optimal_adapter_size == 64
+    assert config.max_adapter_size == 128
+    assert config.num_put_workers == 1
+    assert config.num_ensure_workers == 1
+    assert config.num_copy_streams == 1
+    assert config.max_pages_per_block_host == 24
+    assert config.max_pages_per_block_device == 8
+    assert config.device_cache_percent == 0.5
+    assert config.host_cache_size == 1024
+    assert config.lora_prefetch_dir == "."
+
+
+def test_PeftCacheConfig_from_pybind_gets_python_only_default_values_when_none(
+):
+    pybind_config = tle.PeftCacheConfig(num_host_module_layer=1,
+                                        num_device_module_layer=1,
+                                        optimal_adapter_size=64,
+                                        max_adapter_size=128,
+                                        num_put_workers=1,
+                                        num_ensure_workers=1,
+                                        num_copy_streams=1,
+                                        max_pages_per_block_host=24,
+                                        max_pages_per_block_device=8,
+                                        device_cache_percent=None,
+                                        host_cache_size=None,
+                                        lora_prefetch_dir=".")
+
+    config = PeftCacheConfig.from_pybind(pybind_config)
+    assert config.num_host_module_layer == 1
+    assert config.num_device_module_layer == 1
+    assert config.optimal_adapter_size == 64
+    assert config.max_adapter_size == 128
+    assert config.num_put_workers == 1
+    assert config.num_ensure_workers == 1
+    assert config.num_copy_streams == 1
+    assert config.max_pages_per_block_host == 24
+    assert config.max_pages_per_block_device == 8
+    assert config.device_cache_percent == PeftCacheConfig.model_fields[
+        "device_cache_percent"].default
+    assert config.host_cache_size == PeftCacheConfig.model_fields[
+        "host_cache_size"].default
+    assert config.lora_prefetch_dir == "."
+
+
+def test_update_llm_args_with_extra_dict_with_nested_dict():
+    llm_api_args_dict = {
+        "model":
+        "dummy-model",
+        "build_config":
+        None,  # Will override later.
+        "extended_runtime_perf_knob_config":
+        ExtendedRuntimePerfKnobConfig(multi_block_mode=True),
+        "kv_cache_config":
+        KvCacheConfig(enable_block_reuse=False),
+        "peft_cache_config":
+        PeftCacheConfig(num_host_module_layer=0),
+        "scheduler_config":
+        SchedulerConfig(capacity_scheduler_policy=CapacitySchedulerPolicy.
+                        GUARANTEED_NO_EVICT)
+    }
+    plugin_config_dict = {
+        "_dtype": 'float16',
+        "nccl_plugin": None,
+    }
+    plugin_config = PluginConfig.from_dict(plugin_config_dict)
+    build_config = BuildConfig(max_input_len=1024,
+                               lora_config=LoraConfig(lora_ckpt_source='hf'),
+                               auto_parallel_config=AutoParallelConfig(
+                                   world_size=1,
+                                   same_buffer_io={},
+                                   debug_outputs=[]),
+                               plugin_config=plugin_config)
+    extra_llm_args_dict = {
+        "build_config": build_config.to_dict(),
+    }
+
+    llm_api_args_dict = update_llm_args_with_extra_dict(llm_api_args_dict,
+                                                        extra_llm_args_dict,
+                                                        "build_config")
+    initialized_llm_args = TrtLlmArgs(**llm_api_args_dict)
+
+    def check_nested_dict_equality(dict1, dict2, path=""):
+        if not isinstance(dict1, dict) or not isinstance(dict2, dict):
+            if dict1 != dict2:
+                raise ValueError(f"Mismatch at {path}: {dict1} != {dict2}")
+            return True
+        if dict1.keys() != dict2.keys():
+            raise ValueError(f"Different keys at {path}:")
+        for key in dict1:
+            new_path = f"{path}.{key}" if path else key
+            if not check_nested_dict_equality(dict1[key], dict2[key], new_path):
+                raise ValueError(f"Mismatch at {path}: {dict1} != {dict2}")
+        return True
+
+    build_config_dict1 = build_config.to_dict()
+    build_config_dict2 = initialized_llm_args.build_config.to_dict()
+    check_nested_dict_equality(build_config_dict1, build_config_dict2)
 
 
 class TestTorchLlmArgsCudaGraphSettings:
@@ -312,18 +428,18 @@ class TestTorchLlmArgs:
     def test_runtime_sizes(self):
         llm = TorchLLM(
             llama_model_path,
-            max_beam_width=4,
+            max_beam_width=1,
             max_num_tokens=256,
             max_seq_len=128,
             max_batch_size=8,
         )
 
-        assert llm.args.max_beam_width == 4
+        assert llm.args.max_beam_width == 1
         assert llm.args.max_num_tokens == 256
         assert llm.args.max_seq_len == 128
         assert llm.args.max_batch_size == 8
 
-        assert llm._executor_config.max_beam_width == 4
+        assert llm._executor_config.max_beam_width == 1
         assert llm._executor_config.max_num_tokens == 256
         assert llm._executor_config.max_seq_len == 128
         assert llm._executor_config.max_batch_size == 8
@@ -413,3 +529,229 @@ class TestTrtLlmArgs:
 
         assert args.max_num_tokens == 16
         assert args.max_batch_size == 4
+
+
+class TestStrictBaseModelArbitraryArgs:
+    """Test that StrictBaseModel prevents arbitrary arguments from being accepted."""
+
+    def test_cuda_graph_config_arbitrary_args(self):
+        """Test that CudaGraphConfig rejects arbitrary arguments."""
+        # Valid arguments should work
+        config = CudaGraphConfig(batch_sizes=[1, 2, 4], max_batch_size=8)
+        assert config.batch_sizes == [1, 2, 4]
+        assert config.max_batch_size == 8
+
+        # Arbitrary arguments should be rejected
+        with pytest.raises(
+                pydantic_core._pydantic_core.ValidationError) as exc_info:
+            CudaGraphConfig(batch_sizes=[1, 2, 4], invalid_arg="should_fail")
+        assert "invalid_arg" in str(exc_info.value)
+
+    def test_moe_config_arbitrary_args(self):
+        """Test that MoeConfig rejects arbitrary arguments."""
+        # Valid arguments should work
+        config = MoeConfig(backend="CUTLASS", max_num_tokens=1024)
+        assert config.backend == "CUTLASS"
+        assert config.max_num_tokens == 1024
+
+        # Arbitrary arguments should be rejected
+        with pytest.raises(
+                pydantic_core._pydantic_core.ValidationError) as exc_info:
+            MoeConfig(backend="CUTLASS", unknown_field="should_fail")
+        assert "unknown_field" in str(exc_info.value)
+
+    def test_calib_config_arbitrary_args(self):
+        """Test that CalibConfig rejects arbitrary arguments."""
+        # Valid arguments should work
+        config = CalibConfig(device="cuda", calib_batches=512)
+        assert config.device == "cuda"
+        assert config.calib_batches == 512
+
+        # Arbitrary arguments should be rejected
+        with pytest.raises(
+                pydantic_core._pydantic_core.ValidationError) as exc_info:
+            CalibConfig(device="cuda", extra_field="should_fail")
+        assert "extra_field" in str(exc_info.value)
+
+    def test_decoding_base_config_arbitrary_args(self):
+        """Test that DecodingBaseConfig rejects arbitrary arguments."""
+        # Valid arguments should work
+        config = DecodingBaseConfig(max_draft_len=10)
+        assert config.max_draft_len == 10
+
+        # Arbitrary arguments should be rejected
+        with pytest.raises(
+                pydantic_core._pydantic_core.ValidationError) as exc_info:
+            DecodingBaseConfig(max_draft_len=10, random_field="should_fail")
+        assert "random_field" in str(exc_info.value)
+
+    def test_dynamic_batch_config_arbitrary_args(self):
+        """Test that DynamicBatchConfig rejects arbitrary arguments."""
+        # Valid arguments should work
+        config = DynamicBatchConfig(enable_batch_size_tuning=True,
+                                    enable_max_num_tokens_tuning=True,
+                                    dynamic_batch_moving_average_window=8)
+        assert config.enable_batch_size_tuning == True
+
+        # Arbitrary arguments should be rejected
+        with pytest.raises(
+                pydantic_core._pydantic_core.ValidationError) as exc_info:
+            DynamicBatchConfig(enable_batch_size_tuning=True,
+                               enable_max_num_tokens_tuning=True,
+                               dynamic_batch_moving_average_window=8,
+                               fake_param="should_fail")
+        assert "fake_param" in str(exc_info.value)
+
+    def test_scheduler_config_arbitrary_args(self):
+        """Test that SchedulerConfig rejects arbitrary arguments."""
+        # Valid arguments should work
+        config = SchedulerConfig(
+            capacity_scheduler_policy=CapacitySchedulerPolicy.MAX_UTILIZATION)
+        assert config.capacity_scheduler_policy == CapacitySchedulerPolicy.MAX_UTILIZATION
+
+        # Arbitrary arguments should be rejected
+        with pytest.raises(
+                pydantic_core._pydantic_core.ValidationError) as exc_info:
+            SchedulerConfig(capacity_scheduler_policy=CapacitySchedulerPolicy.
+                            MAX_UTILIZATION,
+                            invalid_option="should_fail")
+        assert "invalid_option" in str(exc_info.value)
+
+    def test_peft_cache_config_arbitrary_args(self):
+        """Test that PeftCacheConfig rejects arbitrary arguments."""
+        # Valid arguments should work
+        config = PeftCacheConfig(num_host_module_layer=1,
+                                 num_device_module_layer=1)
+        assert config.num_host_module_layer == 1
+        assert config.num_device_module_layer == 1
+
+        # Arbitrary arguments should be rejected
+        with pytest.raises(
+                pydantic_core._pydantic_core.ValidationError) as exc_info:
+            PeftCacheConfig(num_host_module_layer=1,
+                            unexpected_field="should_fail")
+        assert "unexpected_field" in str(exc_info.value)
+
+    def test_kv_cache_config_arbitrary_args(self):
+        """Test that KvCacheConfig rejects arbitrary arguments."""
+        # Valid arguments should work
+        config = KvCacheConfig(enable_block_reuse=True, max_tokens=1024)
+        assert config.enable_block_reuse == True
+        assert config.max_tokens == 1024
+
+        # Arbitrary arguments should be rejected
+        with pytest.raises(
+                pydantic_core._pydantic_core.ValidationError) as exc_info:
+            KvCacheConfig(enable_block_reuse=True,
+                          non_existent_field="should_fail")
+        assert "non_existent_field" in str(exc_info.value)
+
+    def test_extended_runtime_perf_knob_config_arbitrary_args(self):
+        """Test that ExtendedRuntimePerfKnobConfig rejects arbitrary arguments."""
+        # Valid arguments should work
+        config = ExtendedRuntimePerfKnobConfig(multi_block_mode=True,
+                                               cuda_graph_mode=False)
+        assert config.multi_block_mode == True
+        assert config.cuda_graph_mode == False
+
+        # Arbitrary arguments should be rejected
+        with pytest.raises(
+                pydantic_core._pydantic_core.ValidationError) as exc_info:
+            ExtendedRuntimePerfKnobConfig(multi_block_mode=True,
+                                          bogus_setting="should_fail")
+        assert "bogus_setting" in str(exc_info.value)
+
+    def test_cache_transceiver_config_arbitrary_args(self):
+        """Test that CacheTransceiverConfig rejects arbitrary arguments."""
+        # Valid arguments should work
+        config = CacheTransceiverConfig(backend="ucx",
+                                        max_tokens_in_buffer=1024)
+        assert config.backend == "ucx"
+        assert config.max_tokens_in_buffer == 1024
+
+        # Arbitrary arguments should be rejected
+        with pytest.raises(
+                pydantic_core._pydantic_core.ValidationError) as exc_info:
+            CacheTransceiverConfig(backend="ucx", invalid_config="should_fail")
+        assert "invalid_config" in str(exc_info.value)
+
+    def test_torch_compile_config_arbitrary_args(self):
+        """Test that TorchCompileConfig rejects arbitrary arguments."""
+        # Valid arguments should work
+        config = TorchCompileConfig(enable_fullgraph=True,
+                                    enable_inductor=False)
+        assert config.enable_fullgraph == True
+        assert config.enable_inductor == False
+
+        # Arbitrary arguments should be rejected
+        with pytest.raises(
+                pydantic_core._pydantic_core.ValidationError) as exc_info:
+            TorchCompileConfig(enable_fullgraph=True,
+                               invalid_flag="should_fail")
+        assert "invalid_flag" in str(exc_info.value)
+
+    def test_trt_llm_args_arbitrary_args(self):
+        """Test that TrtLlmArgs rejects arbitrary arguments."""
+        # Valid arguments should work
+        args = TrtLlmArgs(model=llama_model_path, max_batch_size=8)
+        assert args.model == llama_model_path
+        assert args.max_batch_size == 8
+
+        # Arbitrary arguments should be rejected
+        with pytest.raises(
+                pydantic_core._pydantic_core.ValidationError) as exc_info:
+            TrtLlmArgs(model=llama_model_path, invalid_setting="should_fail")
+        assert "invalid_setting" in str(exc_info.value)
+
+    def test_torch_llm_args_arbitrary_args(self):
+        """Test that TorchLlmArgs rejects arbitrary arguments."""
+        # Valid arguments should work
+        args = TorchLlmArgs(model=llama_model_path, max_batch_size=8)
+        assert args.model == llama_model_path
+        assert args.max_batch_size == 8
+
+        # Arbitrary arguments should be rejected
+        with pytest.raises(
+                pydantic_core._pydantic_core.ValidationError) as exc_info:
+            TorchLlmArgs(model=llama_model_path,
+                         unsupported_option="should_fail")
+        assert "unsupported_option" in str(exc_info.value)
+
+    def test_nested_config_arbitrary_args(self):
+        """Test that nested configurations also reject arbitrary arguments."""
+        # Test with nested KvCacheConfig
+        with pytest.raises(
+                pydantic_core._pydantic_core.ValidationError) as exc_info:
+            KvCacheConfig(enable_block_reuse=True,
+                          max_tokens=1024,
+                          invalid_nested_field="should_fail")
+        assert "invalid_nested_field" in str(exc_info.value)
+
+        # Test with nested SchedulerConfig
+        with pytest.raises(
+                pydantic_core._pydantic_core.ValidationError) as exc_info:
+            SchedulerConfig(capacity_scheduler_policy=CapacitySchedulerPolicy.
+                            MAX_UTILIZATION,
+                            nested_invalid_field="should_fail")
+        assert "nested_invalid_field" in str(exc_info.value)
+
+    def test_strict_base_model_inheritance(self):
+        """Test that StrictBaseModel properly forbids extra fields."""
+        # Verify that StrictBaseModel is properly configured
+        assert StrictBaseModel.model_config.get("extra") == "forbid"
+
+        # Test that a simple StrictBaseModel instance rejects arbitrary fields
+        class TestConfig(StrictBaseModel):
+            field1: str = "default"
+            field2: int = 42
+
+        # Valid configuration should work
+        config = TestConfig(field1="test", field2=100)
+        assert config.field1 == "test"
+        assert config.field2 == 100
+
+        # Arbitrary field should be rejected
+        with pytest.raises(
+                pydantic_core._pydantic_core.ValidationError) as exc_info:
+            TestConfig(field1="test", field2=100, extra_field="should_fail")
+        assert "extra_field" in str(exc_info.value)

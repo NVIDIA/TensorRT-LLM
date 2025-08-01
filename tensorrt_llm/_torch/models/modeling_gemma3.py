@@ -3,10 +3,11 @@ from typing import Dict, Optional, Tuple
 
 import torch
 from torch import nn
-from tqdm import tqdm
 from transformers import Gemma3TextConfig
 from transformers.activations import ACT2FN
 
+from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
+    BaseWeightMapper
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 from tensorrt_llm.mapping import Mapping
 
@@ -23,7 +24,6 @@ from ..modules.linear import Linear, TensorParallelMode
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
-                             duplicate_kv_weight, filter_weights,
                              register_auto_model)
 
 
@@ -158,25 +158,29 @@ class Gemma3Attention(Attention):
 
 class Gemma3MLP(nn.Module):
 
-    def __init__(self, config: Gemma3TextConfig):
+    def __init__(self, model_config: ModelConfig[Gemma3TextConfig]):
         super().__init__()
-        self.config = config
-        self.hidden_size = config.hidden_size
-        self.intermediate_size = config.intermediate_size
-        self.dtype = config.torch_dtype
+        self.config = model_config.pretrained_config
+        self.hidden_size = self.config.hidden_size
+        self.intermediate_size = self.config.intermediate_size
+        self.dtype = self.config.torch_dtype
+        self.quant_config = model_config.get_quant_config()
         self.gate_proj = Linear(self.hidden_size,
                                 self.intermediate_size,
                                 bias=False,
-                                dtype=self.dtype)
+                                dtype=self.dtype,
+                                quant_config=self.quant_config)
         self.up_proj = Linear(self.hidden_size,
                               self.intermediate_size,
                               bias=False,
-                              dtype=self.dtype)
+                              dtype=self.dtype,
+                              quant_config=self.quant_config)
         self.down_proj = Linear(self.intermediate_size,
                                 self.hidden_size,
                                 bias=False,
-                                dtype=self.dtype)
-        self.act_fn = ACT2FN[config.hidden_activation]
+                                dtype=self.dtype,
+                                quant_config=self.quant_config)
+        self.act_fn = ACT2FN[self.config.hidden_activation]
 
     @torch.inference_mode()
     def forward(self, x):
@@ -202,7 +206,7 @@ class Gemma3DecoderLayer(DecoderLayer):
             is_sliding=is_sliding,
         )
 
-        self.mlp = Gemma3MLP(config)
+        self.mlp = Gemma3MLP(model_config=model_config)
 
         self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                        eps=config.rms_norm_eps,
@@ -486,61 +490,5 @@ class Gemma3ForCausalLM(DecoderModelForCausalLM[Gemma3TextModel,
             return_context_logits,
         )
 
-    # This is a modified version of the load_weights function in modeling_utils.py with the
-    # minor change for Gemma3 RMSNorm.
-    def load_weights(self, weights: Dict):
-        tp_size = self.model_config.mapping.tp_size
-        num_kv_heads = self.config.num_key_value_heads
-
-        params_map = {
-            'qkv_proj': ['q_proj', 'k_proj', 'v_proj'],
-            'gate_up_proj': ['gate_proj', 'up_proj']
-        }
-
-        for name, module in tqdm(list(self.named_modules()),
-                                 desc="Loading weights"):
-            if len(module._parameters) > 0:
-                # skip load weights if tie word embeddings is enabled and layer is lm_head
-                if self.config.tie_word_embeddings and name.startswith(
-                        "lm_head"):
-                    continue
-
-                # Skip loading weights for embedding and lm_head if LoRA is enabled.
-                if hasattr(
-                        self.model_config, 'lora_config'
-                ) and self.model_config.lora_config is not None and len(
-                        self.model_config.lora_config.lora_dir) == 1 and (
-                            name == "model.embed_tokens" or name == "lm_head"):
-                    continue
-
-                names = name.split('.')
-                if names[-1] in params_map:
-                    module_weights = []
-                    for new_name in params_map[names[-1]]:
-                        fw = filter_weights('.'.join(names[:-1] + [new_name]),
-                                            weights)
-                        if new_name in ['k_proj', 'v_proj']:
-                            fw = {
-                                k:
-                                duplicate_kv_weight(
-                                    weight=v[:],
-                                    num_kv_heads=num_kv_heads,
-                                    tensor_parallel_size=tp_size)
-                                if k in ["weight", "bias"] else v
-                                for k, v in fw.items()
-                            }
-
-                        module_weights.append(fw)
-                    module.load_weights(weights=module_weights)
-                else:
-                    module_weights = filter_weights(name, weights)
-                    if hasattr(module, 'load_weights'):
-                        module.load_weights(weights=[module_weights])
-                    else:
-                        for n, p in module._parameters.items():
-                            if p is not None:
-                                # Gemma3 RMSNorm uses +1 just like LayerNorm-1P.
-                                if 'norm' in names[-1]:
-                                    p.data.copy_(module_weights[n][:] + 1)
-                                else:
-                                    p.data.copy_(module_weights[n][:])
+    def load_weights(self, weights: Dict, weight_mapper: BaseWeightMapper):
+        super().load_weights(weights, weight_mapper)

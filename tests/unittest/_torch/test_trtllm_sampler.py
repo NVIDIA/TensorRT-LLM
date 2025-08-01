@@ -49,8 +49,8 @@ def test_trtllm_sampler(model_path, test_case):
         "The capital of Bolivia is",
     ]
 
-    expected_outputs = [["circumnavigation of the world."], ["Paris."],
-                        ["La Paz."]]
+    expected_outputs = [["circumnavigation of the world"], ["Paris"],
+                        ["La Paz"]]
 
     # Test configuration
     max_new_tokens = test_case["max_new_tokens"]

@@ -35,7 +35,7 @@ from tensorrt_llm.runtime import PYTHON_BINDINGS, ModelRunner
 if PYTHON_BINDINGS:
     from tensorrt_llm.runtime import ModelRunnerCpp
 
-from prompt_lookup.run_dtm_pld import run_dtm_pld
+from ngram.run_dtm_ngram import run_dtm_ngram
 
 
 def parse_arguments(args=None):
@@ -106,6 +106,13 @@ def parse_arguments(args=None):
         default=False,
         action='store_true',
         help="Run several 10 iterations to profile the inference latencies.")
+    parser.add_argument(
+        '--fail_fast_on_attention_window_too_large',
+        action='store_true',
+        default=False,
+        help=
+        'Exit with runtime error when attention window is too large to fit even a single sequence in the KV cache.'
+    )
 
     parser = add_common_args(parser)
 
@@ -430,17 +437,17 @@ def main(args):
 
     logger.info(f"Using {'Python' if args.use_py_session else 'C++'} session")
 
-    if args.draft_target_model_config is not None or args.prompt_lookup_config is not None:
-        # Speculative-Decoding of Draft-Target-Model (DTM) and Prompt-Lookup-Decoding (PLD)
-        # If the parameters of `runner_kwargs` and `runner.generate()` in the "else" branch change, the same change should be done for `examples/prompt_lookup/run_dtm_pld.py`
+    if args.draft_target_model_config is not None or args.ngram_config is not None:
+        # Speculative-Decoding of Draft-Target-Model (DTM) and NGram
+        # If the parameters of `runner_kwargs` and `runner.generate()` in the "else" branch change, the same change should be done for `examples/ngram/run_dtm_ngram.py`
         assert args.kv_cache_enable_block_reuse, "`--kv_cache_enable_block_reuse` must be specified in speculative decoding."
         assert not args.use_py_session, "`--use_py_session` is not supported in Speculative decoding."
         assert not is_enc_dec, "Encoder-Decoder model is not supported in Speculative decoding."
         assert args.num_beams == 1, "`--num_beams>1` is not supported in Speculative decoding."
 
-        outputs = run_dtm_pld(batch_input_ids, args, runtime_rank, end_id,
-                              pad_id, stop_words_list, bad_words_list,
-                              len(tokenizer))
+        outputs = run_dtm_ngram(batch_input_ids, args, runtime_rank, end_id,
+                                pad_id, stop_words_list, bad_words_list,
+                                len(tokenizer))
         if not args.streaming:  # Unpack runner from the return value in No-Streaming mode
             outputs, runner = list(outputs)[0]
 
@@ -455,6 +462,8 @@ def main(args):
             gpu_weights_percent=args.gpu_weights_percent,
             max_output_len=args.max_output_len,
             enable_context_fmha_fp32_acc=args.enable_context_fmha_fp32_acc,
+            fail_fast_on_attention_window_too_large=args.
+            fail_fast_on_attention_window_too_large,
         )
         if args.medusa_choices is not None:
             args.medusa_choices = ast.literal_eval(args.medusa_choices)
@@ -549,6 +558,8 @@ def main(args):
                 eagle_choices=args.eagle_choices,
                 return_all_generated_tokens=args.return_all_generated_tokens,
                 input_token_extra_ids=input_token_extra_ids,
+                fail_fast_on_attention_window_too_large=args.
+                fail_fast_on_attention_window_too_large,
                 language_adapter_uids=args.language_task_uids)
             torch.cuda.synchronize()
 
@@ -680,7 +691,9 @@ def main(args):
                     return_dict=True,
                     return_all_generated_tokens=args.
                     return_all_generated_tokens,
-                    input_token_extra_ids=input_token_extra_ids)
+                    input_token_extra_ids=input_token_extra_ids,
+                    fail_fast_on_attention_window_too_large=args.
+                    fail_fast_on_attention_window_too_large)
                 torch.cuda.synchronize()
         tensorrt_llm.profiler.stop("tmp")
 
