@@ -748,8 +748,6 @@ public:
         return 0;
     }
 
-    [[nodiscard]] kv_connector::KvCacheConnectorPoolData getKvCacheConnectorPoolData() const;
-
 private:
     //! \brief Add single block to beam of sequence and mAllocatedBlocksPerSeq.
     void addBlockToBeam(BlockPtr& block, GenerationRequest& sequence, SizeType32 beamIdx);
@@ -1139,8 +1137,6 @@ public:
         return mWindowBlockManagers.at(windowSize).getPool(relativePoolIndex);
     }
 
-    [[nodiscard]] std::vector<kv_connector::KvCacheConnectorPoolData> getKvCacheConnectorPoolsData() const;
-
 private:
     [[nodiscard]] WindowBlockManager const& windowManagerByLayer(SizeType32 layerIdx) const
     {
@@ -1374,8 +1370,6 @@ public:
     [[nodiscard]] virtual SizeType32 getMaxCapacityBatchSize(SizeType32 inputLength, SizeType32 outputLength) const = 0;
 
     [[nodiscard]] virtual CacheType getCacheType() const = 0;
-
-    [[nodiscard]] virtual kv_connector::KvCacheConnectorPoolsData getKvCacheConnectorPoolsData() const = 0;
 };
 
 class KVCacheManager : public BaseKVCacheManager
@@ -1677,8 +1671,6 @@ public:
     /// @return SizeType32 A maximum attention window in number of tokens.
     [[nodiscard]] static SizeType32 calculateMaxAttentionWindow(SizeType32 inputLength, SizeType32 outputLength,
         SizeType32 sinkTokenLength, SizeType32 blockCapacity, SizeType32 beamWidth, SizeType32 tokensPerBlock);
-
-    [[nodiscard]] kv_connector::KvCacheConnectorPoolsData getKvCacheConnectorPoolsData() const override;
 
 private:
     void cacheBlockOffsets(GenerationRequest& seq, SizeType32 windowSize);

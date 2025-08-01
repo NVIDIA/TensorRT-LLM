@@ -2,13 +2,14 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
+import torch
+
 from tensorrt_llm._utils import mpi_allgather, mpi_broadcast, mpi_rank
 from tensorrt_llm.bindings import LlmRequestState
 from tensorrt_llm.bindings.executor import ExecutorConfig
 from tensorrt_llm.bindings.internal.batch_manager import \
     KvCacheConnectorManager as KvCacheConnectorManagerCpp
-from tensorrt_llm.bindings.internal.batch_manager import (
-    KvCacheConnectorPoolsData, LlmRequest)
+from tensorrt_llm.bindings.internal.batch_manager import LlmRequest
 
 from .scheduler import ScheduledRequests
 """
@@ -76,7 +77,7 @@ class KvCacheConnectorWorker(ABC):
         self._metadata = None
 
     @abstractmethod
-    def register_kv_caches(self, kv_cache_data: KvCacheConnectorPoolsData):
+    def register_kv_caches(self, kv_cache_data: dict[int, torch.Tensor]):
         """
         Register the KV cache tensors to the worker.
         This can be used for something like NIXL registration.
