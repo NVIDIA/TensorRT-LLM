@@ -571,7 +571,7 @@ CreateNewDecoderRequests::createDecoderRequests(RequestVector const& finishedCon
     runtime::CudaStream const& runtimeStream, runtime::CudaStream const& decoderStream, SizeType32 maxSequenceLength,
     OptionalRef<MedusaBuffers const> medusaBuffers) const
 {
-    auto const bufferManager = BufferManager{std::make_shared<CudaStream>(runtimeStream.get())};
+    auto const decoderBufferManager = BufferManager{std::make_shared<CudaStream>(decoderStream.get())};
 
     unsigned decoderInputSize{0};
     for (auto const& llmReq : finishedContextRequests)
@@ -616,12 +616,13 @@ CreateNewDecoderRequests::createDecoderRequests(RequestVector const& finishedCon
             if (llmReq->hasDraftTokens())
             {
                 auto const& draftTokens = llmReq->getDraftTokens();
-                decoderRequest.draftTokens = bufferManager.copyFrom(*draftTokens, MemoryType::kPINNEDPOOL);
+                // Copy to pinned host memory (don't care about stream of bufferManager)
+                decoderRequest.draftTokens = decoderBufferManager.copyFrom(*draftTokens, MemoryType::kPINNEDPOOL);
                 auto const& draftLogits = llmReq->getDraftLogits();
                 if (draftLogits.has_value())
                 {
                     decoderRequest.draftLogits
-                        = retrieveDraftLogits(modelConfig, worldConfig, draftLogits.value(), bufferManager);
+                        = retrieveDraftLogits(modelConfig, worldConfig, draftLogits.value(), decoderBufferManager);
                 }
                 decoderRequest.generatedTokensPerEngineStep = draftTokens->size() + 1;
             }
@@ -636,35 +637,35 @@ CreateNewDecoderRequests::createDecoderRequests(RequestVector const& finishedCon
         }
 
         initializeEmbeddingBias(
-            dJointInput, batchSlot, llmReq->getEmbeddingBias(), logitsType, modelConfig, bufferManager);
+            dJointInput, batchSlot, llmReq->getEmbeddingBias(), logitsType, modelConfig, decoderBufferManager);
 
         setupWords(dJointInput.badWordsLists, llmReq->getBadWordsList(), dJointInput.badWordsPtrs,
-            dJointInput.badWordsLens, dJointInput.maxBadWordsLen, batchSlot, bufferManager);
+            dJointInput.badWordsLens, dJointInput.maxBadWordsLen, batchSlot, decoderBufferManager);
 
         setupWords(dJointInput.stopWordsLists, llmReq->getStopWordsList(), dJointInput.stopWordsPtrs,
-            dJointInput.stopWordsLens, dJointInput.maxStopWordsLen, batchSlot, bufferManager);
+            dJointInput.stopWordsLens, dJointInput.maxStopWordsLen, batchSlot, decoderBufferManager);
 
         newRequest(
             batchSlot, decoderRequest, samplingConfig, modelConfig, decoderState, decoderStream, maxSequenceLength);
 
         auto& dJointOutput = decoderState.getJointDecodingOutput();
 
-        initializeLogProbs(dJointOutput, batchSlot, samplingConfig, bufferManager);
+        initializeLogProbs(dJointOutput, batchSlot, samplingConfig, decoderBufferManager);
 
         auto const& reqTokens = llmReq->getTokens(0);
         TLLM_CHECK(reqTokens.size() == static_cast<decltype(reqTokens.size())>(promptLen));
         TensorPtr requestIds = ITensor::slice(inputIds, inputOffset, promptLen);
         // Copy to pinned host memory (don't care about stream of bufferManager)
-        bufferManager.copy(reqTokens.data(), *requestIds);
+        decoderBufferManager.copy(reqTokens.data(), *requestIds);
         auto const endId = llmReq->mEndId.value_or(-1);
 
-        initializeRequestIds(
-            dJointInput, dJointOutput, batchSlot, requestIds, endId, beamWidth, maxSequenceLength, bufferManager);
+        initializeRequestIds(dJointInput, dJointOutput, batchSlot, requestIds, endId, beamWidth, maxSequenceLength,
+            decoderBufferManager);
 
         if (beamWidth > 1)
         {
             initializeBeamSearch(
-                dJointInput, dJointOutput, batchSlot, endId, beamWidth, maxSequenceLength, bufferManager);
+                dJointInput, dJointOutput, batchSlot, endId, beamWidth, maxSequenceLength, decoderBufferManager);
         }
 
         auto const numDecodingEngineTokens = decoderRequest.generatedTokensPerEngineStep;
