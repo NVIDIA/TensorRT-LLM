@@ -2419,6 +2419,7 @@ class TestPhi4MM(LlmapiAccuracyTestHarness):
 
 
 class TestOpenAI(LlmapiAccuracyTestHarness):
+    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5)
 
     def get_openai_root(self):
         open_ai_root = os.getenv("OPENAI_MODELS_ROOT")
@@ -2441,6 +2442,7 @@ class TestOpenAI(LlmapiAccuracyTestHarness):
             tensor_parallel_size=1,
             pipeline_parallel_size=1,
             moe_expert_parallel_size=1,
+            kv_cache_config=self.kv_cache_config,
             **pytorch_config,
             moe_config=MoeConfig(backend=moe_backend))
 
@@ -2476,6 +2478,7 @@ class TestOpenAI(LlmapiAccuracyTestHarness):
             tensor_parallel_size=tp_size,
             pipeline_parallel_size=pp_size,
             moe_expert_parallel_size=ep_size,
+            kv_cache_config=self.kv_cache_config,
             **pytorch_config,
             enable_attention_dp=attention_dp,
             moe_config=MoeConfig(backend=moe_backend))
@@ -2509,6 +2512,7 @@ class TestOpenAI(LlmapiAccuracyTestHarness):
             tensor_parallel_size=tp_size,
             pipeline_parallel_size=pp_size,
             moe_expert_parallel_size=ep_size,
+            kv_cache_config=self.kv_cache_config,
             **pytorch_config,
             enable_attention_dp=attention_dp,
             moe_config=MoeConfig(backend=moe_backend))
@@ -2538,6 +2542,7 @@ class TestOpenAI(LlmapiAccuracyTestHarness):
             tensor_parallel_size=tp_size,
             pipeline_parallel_size=pp_size,
             moe_expert_parallel_size=ep_size,
+            kv_cache_config=self.kv_cache_config,
             **pytorch_config,
             enable_attention_dp=attention_dp,
             moe_backend="TRITON")
