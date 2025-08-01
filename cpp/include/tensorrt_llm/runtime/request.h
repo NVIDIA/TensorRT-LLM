@@ -30,7 +30,12 @@ public:
     using TensorPtr = ITensor::SharedPtr;
     using BufferPtr = IBuffer::SharedPtr;
 
-    SizeType32 generatedTokensPerEngineStep{1};
+    explicit Request(SizeType32 generatedTokensPerEngineStep)
+        : generatedTokensPerEngineStep(generatedTokensPerEngineStep)
+    {
+    }
+
+    SizeType32 generatedTokensPerEngineStep;
 
     BufferPtr draftTokens;                // [generatedTokensPerEngineStep - 1] on gpu
     std::optional<TensorPtr> draftLogits; // [generatedTokensPerEngineStep - 1, vocabSize] on gpu
