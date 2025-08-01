@@ -18,10 +18,17 @@ import os
 import pytest
 from defs.common import (convert_weights, get_dummy_spec_decoding_heads,
                          venv_check_call)
-from defs.conftest import skip_fp8_pre_ada
+from defs.conftest import get_sm_version, skip_fp8_pre_ada, skip_post_blackwell
 from defs.trt_test_alternative import check_call
 
+# skip trt flow cases on post-Blackwell-Ultra
+if get_sm_version() >= 103:
+    pytest.skip(
+        "TRT workflow tests are not supported on post Blackwell-Ultra architecture",
+        allow_module_level=True)
 
+
+@skip_post_blackwell
 @pytest.mark.parametrize("batch_size", [1, 8], ids=['bs1', 'bs8'])
 @pytest.mark.parametrize("data_type", ['bfloat16'])
 @pytest.mark.parametrize("num_medusa_heads", [4], ids=['4-heads'])
@@ -79,6 +86,7 @@ def test_llm_medusa_1gpu(batch_size, data_type, medusa_model_roots,
     venv_check_call(llm_venv, summary_cmd)
 
 
+@skip_post_blackwell
 @pytest.mark.parametrize("batch_size", [1, 8], ids=['bs1', 'bs8'])
 @pytest.mark.parametrize("data_type", ['bfloat16', 'float16'])
 @pytest.mark.parametrize("num_medusa_heads", [4], ids=['4-heads'])

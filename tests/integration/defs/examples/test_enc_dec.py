@@ -16,9 +16,15 @@
 import pytest
 from defs.common import (convert_weights, quantize_data, venv_check_call,
                          venv_mpi_check_call)
-from defs.conftest import (get_device_count, skip_fp8_pre_ada,
+from defs.conftest import (get_device_count, get_sm_version, skip_fp8_pre_ada,
                            skip_post_blackwell)
 from defs.trt_test_alternative import check_call
+
+# skip trt flow cases on post-Blackwell-Ultra
+if get_sm_version() >= 103:
+    pytest.skip(
+        "TRT workflow tests are not supported on post Blackwell-Ultra architecture",
+        allow_module_level=True)
 
 
 @pytest.mark.parametrize("use_fp8", [True, False],
@@ -38,8 +44,11 @@ from defs.trt_test_alternative import check_call
                          ids=["enable_gemm_plugin", "disable_gemm_plugin"])
 @pytest.mark.parametrize("data_type", ['bfloat16', 'float16', 'float32'])
 @pytest.mark.parametrize("enc_dec_model_root", [
-    't5-small', 'flan-t5-small', 'byt5-small', 'bart-large-cnn',
-    'mbart-large-50-many-to-one-mmt', 'wmt14'
+    pytest.param('t5-small', marks=skip_post_blackwell),
+    pytest.param('flan-t5-small', marks=skip_post_blackwell),
+    pytest.param('byt5-small', marks=skip_post_blackwell), 'bart-large-cnn',
+    pytest.param('mbart-large-50-many-to-one-mmt', marks=skip_post_blackwell),
+    'wmt14'
 ],
                          indirect=True)
 @pytest.mark.parametrize("compare_hf_fp32", [True, False],

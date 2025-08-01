@@ -542,12 +542,6 @@ class TRTLLMSampler(Sampler):
                                     self.MAX_DECODING_TOKENS, buffer_manager)
                 for _ in range(self.num_micro_batches)
             ],
-            "sequence_lengths_host":
-            torch.empty((
-                self.executor_config.max_batch_size,
-                self.executor_config.max_beam_width,
-            ),
-                        dtype=torch.int),
             "decoder_state":
             DecoderState(),
             "decoding_input": [None] * self.num_micro_batches,

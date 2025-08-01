@@ -515,7 +515,7 @@ Next, let's use some representative workloads to understand the performance impa
 Clearly in Figure 25, we can see that EPLB brings a clear performance improvement when the EP size increases, for both MoE GroupGEMM and EP communication times.
 
 ## Reproducing steps
-Currently to run through the reproducing steps described in this section, please, use this [feature branch](https://github.com/NVIDIA/TensorRT-LLM/tree/feat/large-ep/tensorrt_llm). It will get merged to the main branch soon.
+The code and scripts required in the reproducing steps described in this section have been merged to the main branch.
 
 ### The effect of EP Load Balancer
 
@@ -713,4 +713,5 @@ We believe the current implementation can be viewed as a reasonable E2E large-sc
 ## Acknowledgement
 
 The large-scale EP work is another great team effort, spanning kernel-level optimizations, runtime enhancements, and systematic performance analysis and tuning. While we cannot individually acknowledge every contributor, we are proud to recognize the dedicated team of engineers whose collective expertise has helped advance the state-of-the-art in terms of performance in TensorRT-LLM.
+
 Through this collaborative endeavor, we have developed valuable insights to allow us improve GPU utilization for large language model inference. We hope that the techniques and the experience shared in this blog will help the developer community to better leverage NVIDIA GPU capabilities in their mission-critical LLM inference applications.

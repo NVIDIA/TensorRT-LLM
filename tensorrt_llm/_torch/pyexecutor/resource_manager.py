@@ -206,6 +206,13 @@ class KVCacheManager(BaseResourceManager):
             self.max_attention_window_vec = kv_cache_config.max_attention_window.copy(
             )  # Make a copy to avoid modifying original
 
+            # Clamp all window sizes to max_seq_len before calculating the
+            # number of KV cache blocks. This prevents the KV cache pool from
+            # being skewed by the largest window values.
+            self.max_attention_window_vec = [
+                min(max_seq_len, w) for w in self.max_attention_window_vec
+            ]
+
         sink_token_length = (kv_cache_config.sink_token_length
                              if kv_cache_config.sink_token_length is not None
                              else 0)
