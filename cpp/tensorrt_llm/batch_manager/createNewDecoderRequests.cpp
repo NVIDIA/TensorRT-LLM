@@ -189,6 +189,28 @@ void initializeEmbeddingBias(DecodingInput& dJointInput, TensorPtr const& embedd
     }
 }
 
+void setupWords(std::vector<runtime::ITensor::SharedPtr>& jointWordsLists, TensorPtr const& requestWordsList,
+    SharedConstPtr& jointWordsPtrs, SharedConstPtr& jointWordsLens, SizeType32& jointMaxWordsLen, SizeType32 batchSlot)
+{
+    if (requestWordsList)
+    {
+        auto const wordsLen = requestWordsList->getShape().d[1];
+        BufferRange<int32_t*>(*constPointerCast(jointWordsPtrs))[batchSlot]
+            = runtime::bufferCast<TokenIdType>(*requestWordsList);
+        runtime::bufferCast<SizeType32>(*constPointerCast(jointWordsLens))[batchSlot] = wordsLen;
+        // FIXME: this is monotonically growing size
+        jointMaxWordsLen = std::max(static_cast<SizeType32>(wordsLen), jointMaxWordsLen);
+
+        // NOTE: jointWordsList is not used in gptDecoder, but required to keep <name>WordsList's
+        // memory allocated
+        jointWordsLists[batchSlot] = requestWordsList;
+    }
+    else
+    {
+        runtime::bufferCast<SizeType32>(*constPointerCast(jointWordsLens))[batchSlot] = 0;
+    }
+};
+
 } // namespace
 
 void CreateNewDecoderRequests::newRequest(SizeType32 batchSlot, runtime::decoder_batch::Request const& request,
@@ -233,29 +255,6 @@ void CreateNewDecoderRequests::newRequest(SizeType32 batchSlot, runtime::decoder
     runtime::kernels::invokeFill(*endIdTensorPtr, endId, decoderStream);
 
     initializeEmbeddingBias(dJointInput, request.embeddingBias, batchSlot, modelConfig, manager);
-
-    auto setupWords = [](std::vector<runtime::ITensor::SharedPtr>& jointWordsLists, TensorPtr const& requestWordsList,
-                          SharedConstPtr& jointWordsPtrs, SharedConstPtr& jointWordsLens, SizeType32& jointMaxWordsLen,
-                          SizeType32 batchSlot)
-    {
-        if (requestWordsList)
-        {
-            auto const wordsLen = requestWordsList->getShape().d[1];
-            BufferRange<int32_t*>(*constPointerCast(jointWordsPtrs))[batchSlot]
-                = runtime::bufferCast<TokenIdType>(*requestWordsList);
-            runtime::bufferCast<SizeType32>(*constPointerCast(jointWordsLens))[batchSlot] = wordsLen;
-            // FIXME: this is monotonically growing size
-            jointMaxWordsLen = std::max(static_cast<SizeType32>(wordsLen), jointMaxWordsLen);
-
-            // NOTE: jointWordsList is not used in gptDecoder, but required to keep <name>WordsList's
-            // memory allocated
-            jointWordsLists[batchSlot] = requestWordsList;
-        }
-        else
-        {
-            runtime::bufferCast<SizeType32>(*constPointerCast(jointWordsLens))[batchSlot] = 0;
-        }
-    };
 
     setupWords(dJointInput.stopWordsLists, request.stopWordsList, dJointInput.stopWordsPtrs, dJointInput.stopWordsLens,
         dJointInput.maxStopWordsLen, batchSlot);
