@@ -170,6 +170,26 @@ CreateNewDecoderRequests::operator()(runtime::ModelConfig const& modelConfig, ru
 namespace
 {
 
+void initializeInputLengths(DecodingInput& dJointInput, SizeType32 batchSlot, SizeType32 inputLength,
+    std::optional<SizeType32> maxNewTokensOpt, SizeType32 numDecodingEngineTokens, SizeType32 maxSequenceLength,
+    BufferManager const& manager)
+{
+    auto const numDecodingDraftEngineTokens = numDecodingEngineTokens - 1;
+    auto const maxNewTokens = maxNewTokensOpt.value_or(maxSequenceLength - inputLength - numDecodingDraftEngineTokens);
+
+    TLLM_CHECK_WITH_INFO(inputLength + maxNewTokens + numDecodingDraftEngineTokens <= maxSequenceLength,
+        tc::fmtstr(
+            "Input length (%d) + max new tokens (%d) + draft tokens (%d) must be less than max sequence length (%d).",
+            inputLength, maxNewTokens, numDecodingDraftEngineTokens, maxSequenceLength));
+
+    TensorPtr const sequenceLimitLength{
+        ITensor::slice(constPointerCast(dJointInput.sequenceLimitLength), batchSlot, 1)};
+    runtime::kernels::invokeFill(*sequenceLimitLength, inputLength + maxNewTokens, manager.getStream());
+
+    TensorPtr const inputLengths{ITensor::slice(constPointerCast(dJointInput.lengths), batchSlot, 1)};
+    runtime::kernels::invokeFill(*inputLengths, inputLength, manager.getStream());
+}
+
 void initializeRequestIds(DecodingInput& dJointInput, DecodingOutput& dJointOutput, SizeType32 batchSlot,
     SharedConstPtr const& requestIds, SizeType32 endId, SizeType32 beamWidth, SizeType32 maxSequenceLength,
     BufferManager const& manager)
@@ -295,24 +315,12 @@ void CreateNewDecoderRequests::newRequest(SizeType32 batchSlot, runtime::decoder
 
     auto const inputLength = request.inputLen;
     auto const numDecodingEngineTokens = request.generatedTokensPerEngineStep;
-    auto const numDecodingDraftEngineTokens = numDecodingEngineTokens - 1;
-    auto const maxNewTokens
-        = request.maxNewTokens.value_or(maxSequenceLength - inputLength - numDecodingDraftEngineTokens);
-
-    TLLM_CHECK_WITH_INFO(inputLength + maxNewTokens + numDecodingDraftEngineTokens <= maxSequenceLength,
-        tc::fmtstr(
-            "Input length (%d) + max new tokens (%d) + draft tokens (%d) must be less than max sequence length (%d).",
-            inputLength, maxNewTokens, numDecodingDraftEngineTokens, maxSequenceLength));
 
     // input
     auto& dJointInput = decoderState.getJointDecodingInput();
 
-    TensorPtr const sequenceLimitLength{
-        ITensor::slice(constPointerCast(dJointInput.sequenceLimitLength), batchSlot, 1)};
-    runtime::kernels::invokeFill(*sequenceLimitLength, inputLength + maxNewTokens, decoderStream);
-
-    TensorPtr const inputLengths{ITensor::slice(constPointerCast(dJointInput.lengths), batchSlot, 1)};
-    runtime::kernels::invokeFill(*inputLengths, inputLength, decoderStream);
+    initializeInputLengths(dJointInput, batchSlot, inputLength, request.maxNewTokens,
+        request.generatedTokensPerEngineStep, maxSequenceLength, manager);
 
     // output
     auto& dJointOutput = decoderState.getJointDecodingOutput();
