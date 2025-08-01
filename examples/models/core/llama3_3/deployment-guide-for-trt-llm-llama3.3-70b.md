@@ -1,7 +1,5 @@
 # Deployment Guide for TensorRT-LLM  Llama3.3 70B FP8 and NVFP4
 
-## 
-
 # Introduction
 
 This deployment guide provides step-by-step instructions for running the Llama 3.3-70B Instruct model using TensorRT-LLM with FP8 and NVFP4 quantization, optimized for NVIDIA GPUs. It covers the complete setup required; from accessing model weights and preparing the software environment to configuring TensorRT-LLM parameters, launching the server, and validating inference output.
