@@ -1016,6 +1016,7 @@ class KVCacheEventSerializer:
         return {
             "event_id": event.event_id,
             "data": event_serialize_func(event.data),
+            "attention_dp_rank": event_serialize_func(event.attention_dp_rank),
         }
 
     @staticmethod
