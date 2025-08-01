@@ -123,7 +123,6 @@ class ExecutorRequestQueue:
                 req_item.child_req_ids) if req_item.child_req_ids else 0
             if (req_count + 1 + num_children) > max_req_count:
                 break
-            req_count += 1 + num_children
             req_item = waiting_queue.popleft()
             can_process = self._can_process_attention_dp_request(
                 req_item, scheduling_all_ranks_num_active_requests
@@ -131,7 +130,8 @@ class ExecutorRequestQueue:
 
             if can_process:
                 items.append(req_item)
-                else:
+                req_count += 1 + num_children
+            else:
                 pending_requests.append(req_item)
 
         # Put the pending requests back to the waiting queue
