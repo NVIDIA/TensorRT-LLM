@@ -22,6 +22,7 @@
 #include "tensorrt_llm/batch_manager/utils/logitsThread.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
+#include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/decoderState.h"
 #include "tensorrt_llm/runtime/decodingInput.h"
 #include "tensorrt_llm/runtime/decodingOutput.h"
@@ -408,8 +409,8 @@ void newRequestMedusa(SizeType32 batchIdx, runtime::decoder_batch::Request const
 }
 
 //! @brief Setups decoder internal tensors for new Lookahead request
-void newRequestLookahead(SizeType32 batchIdx, runtime::decoder_batch::Request const& request,
-    DecodingInput& jointDecodingInput, DecodingOutput& jointDecodingOutput, CudaStream const& runtimeStream)
+void newRequestLookahead(SizeType32 batchIdx, DecodingInput& jointDecodingInput, DecodingOutput& jointDecodingOutput,
+    CudaStream const& runtimeStream)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -424,8 +425,8 @@ void newRequestLookahead(SizeType32 batchIdx, runtime::decoder_batch::Request co
 }
 
 //! @brief Setups decoder internal tensors for new Explicit draft tokens request
-void newRequestExplicitDraftTokens(SizeType32 batchIdx, runtime::decoder_batch::Request const& request,
-    DecodingOutput& jointDecodingOutput, CudaStream const& runtimeStream)
+void newRequestExplicitDraftTokens(
+    SizeType32 batchIdx, SizeType32 inputLen, DecodingOutput& jointDecodingOutput, CudaStream const& runtimeStream)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -433,13 +434,13 @@ void newRequestExplicitDraftTokens(SizeType32 batchIdx, runtime::decoder_batch::
 
     TensorPtr positionIdsBaseSlice
         = ITensor::slice(jointDecodingOutput.explicitDraftTokensBuffers->positionIdsBase, batchIdx, 1);
-    runtime::kernels::invokeFill(*positionIdsBaseSlice, request.inputLen, runtimeStream);
+    runtime::kernels::invokeFill(*positionIdsBaseSlice, inputLen, runtimeStream);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
 //! @brief Setups decoder internal tensors for new Eagle request
-void newRequestEagle(SizeType32 batchIdx, runtime::decoder_batch::Request const& request,
+void newRequestEagle(SizeType32 batchIdx, SizeType32 inputLen, std::optional<executor::EagleConfig> eagleConfig,
     runtime::ModelConfig const& modelConfig, DecodingOutput& jointDecodingOutput, CudaStream const& runtimeStream)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
@@ -456,8 +457,8 @@ void newRequestEagle(SizeType32 batchIdx, runtime::decoder_batch::Request const&
         = ITensor::slice(jointDecodingOutput.eagleBuffers->eagleNetCtxPastKeyValueLengthsHost, batchIdx, 1);
 
     runtime::bufferCast<SizeType32>(*eagleNetCtxRequestTypesHostSlice)[0] = 0;
-    runtime::bufferCast<SizeType32>(*eagleNetCtxContextLengthsHostSlice)[0] = request.inputLen;
-    runtime::bufferCast<SizeType32>(*eagleNetCtxPastKeyValueLengthsHostSlice)[0] = request.inputLen;
+    runtime::bufferCast<SizeType32>(*eagleNetCtxContextLengthsHostSlice)[0] = inputLen;
+    runtime::bufferCast<SizeType32>(*eagleNetCtxPastKeyValueLengthsHostSlice)[0] = inputLen;
 
     TensorPtr eagleNetGenRequestTypesHostSlice
         = ITensor::slice(jointDecodingOutput.eagleBuffers->eagleNetGenRequestTypesHost, batchIdx, 1);
@@ -467,19 +468,19 @@ void newRequestEagle(SizeType32 batchIdx, runtime::decoder_batch::Request const&
         = ITensor::slice(jointDecodingOutput.eagleBuffers->eagleNetGenPastKeyValueLengthsHost, batchIdx, 1);
 
     runtime::bufferCast<SizeType32>(*eagleNetGenRequestTypesHostSlice)[0] = 1;
-    runtime::bufferCast<SizeType32>(*eagleNetGenContextLengthsHostSlice)[0] = request.inputLen;
-    runtime::bufferCast<SizeType32>(*eagleNetGenPastKeyValueLengthsHostSlice)[0] = request.inputLen;
+    runtime::bufferCast<SizeType32>(*eagleNetGenContextLengthsHostSlice)[0] = inputLen;
+    runtime::bufferCast<SizeType32>(*eagleNetGenPastKeyValueLengthsHostSlice)[0] = inputLen;
 
     auto const eagleModule = std::dynamic_pointer_cast<tensorrt_llm::runtime::EagleModule const>(
         modelConfig.getSpeculativeDecodingModulePtr());
     std::optional<executor::EagleChoices> eagleChoicesOpt;
 
-    if (request.eagleConfig)
+    if (eagleConfig)
     {
-        eagleChoicesOpt = request.eagleConfig->getEagleChoices();
+        eagleChoicesOpt = eagleConfig->getEagleChoices();
     }
 
-    if (!request.eagleConfig || !request.eagleConfig->useDynamicTree())
+    if (!eagleConfig || !eagleConfig->useDynamicTree())
     {
         TensorPtr draftPathsHostSlice = ITensor::slice(jointDecodingOutput.eagleBuffers->draftPathsHost, batchIdx, 1);
         TensorPtr draftPathsSlice = ITensor::slice(jointDecodingOutput.eagleBuffers->draftPaths, batchIdx, 1);
@@ -500,9 +501,10 @@ void newRequestEagle(SizeType32 batchIdx, runtime::decoder_batch::Request const&
 
 //! @brief Setups decoder internal tensors for new speculative decoding request
 void newRequestSpeculativeDecoding(SizeType32 batchIdx, runtime::decoder_batch::Request const& request,
-    SamplingConfig const& samplingConfig, runtime::ModelConfig const& modelConfig, DecodingInput& jointDecodingInput,
-    DecodingOutput& jointDecodingOutput, CudaStream const& runtimeStream, CudaStream const& decoderStream,
-    SpeculativeDecodingMode const& speculativeDecodingMode, SizeType32 maxDecodingEngineTokens)
+    SizeType32 inputLen, SamplingConfig const& samplingConfig, runtime::ModelConfig const& modelConfig,
+    DecodingInput& jointDecodingInput, DecodingOutput& jointDecodingOutput, CudaStream const& runtimeStream,
+    CudaStream const& decoderStream, SpeculativeDecodingMode const& speculativeDecodingMode,
+    SizeType32 maxDecodingEngineTokens)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -535,15 +537,15 @@ void newRequestSpeculativeDecoding(SizeType32 batchIdx, runtime::decoder_batch::
     }
     else if (speculativeDecodingMode.isLookaheadDecoding())
     {
-        newRequestLookahead(batchIdx, request, jointDecodingInput, jointDecodingOutput, runtimeStream);
+        newRequestLookahead(batchIdx, jointDecodingInput, jointDecodingOutput, runtimeStream);
     }
     else if (speculativeDecodingMode.isExplicitDraftTokens())
     {
-        newRequestExplicitDraftTokens(batchIdx, request, jointDecodingOutput, runtimeStream);
+        newRequestExplicitDraftTokens(batchIdx, inputLen, jointDecodingOutput, runtimeStream);
     }
     else if (speculativeDecodingMode.isEagle())
     {
-        newRequestEagle(batchIdx, request, modelConfig, jointDecodingOutput, runtimeStream);
+        newRequestEagle(batchIdx, inputLen, request.eagleConfig, modelConfig, jointDecodingOutput, runtimeStream);
     }
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -601,7 +603,7 @@ CreateNewDecoderRequests::createDecoderRequests(RequestVector const& finishedCon
 
         auto const promptLen = llmReq->getPromptLen();
 
-        auto decoderRequest = decoder_batch::Request{promptLen};
+        decoder_batch::Request decoderRequest;
 
         if (modelConfig.getSpeculativeDecodingMode().isDraftTokensExternal())
         {
@@ -694,7 +696,7 @@ CreateNewDecoderRequests::createDecoderRequests(RequestVector const& finishedCon
                     = llmReq->getEagleConfig() ? llmReq->getEagleConfig() : decodingConfig.getEagleConfig();
             }
 
-            newRequestSpeculativeDecoding(batchSlot, decoderRequest, samplingConfig, modelConfig,
+            newRequestSpeculativeDecoding(batchSlot, decoderRequest, promptLen, samplingConfig, modelConfig,
                 decoderState.getJointDecodingInput(), decoderState.getJointDecodingOutput(), runtimeStream,
                 decoderStream, decoderState.getSpeculativeDecodingMode(), decoderState.getMaxDecodingEngineTokens());
         }
