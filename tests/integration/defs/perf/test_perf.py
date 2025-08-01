@@ -71,7 +71,7 @@ MODEL_PATH_DICT = {
     "llama_v4_maverick_17b_128e_instruct":
     "llama4-models/Llama-4-Maverick-17B-128E-Instruct",
     "llama_v4_maverick_17b_128e_instruct_fp8":
-    "llama4-models/Llama-4-Maverick-17B-128E-Instruct-FP8",
+    "llama4-models/nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8",
     # "llama_30b": "llama-models/llama-30b-hf",
     "mixtral_8x7b_v0.1": "Mixtral-8x7B-v0.1",
     "mixtral_8x7b_v0.1_instruct": "Mixtral-8x7B-Instruct-v0.1",
@@ -321,34 +321,33 @@ class PerfTestConfig:
     This should hold only the attributes that distinguish different tests.
     """
 
-    def __init__(
-        self,
-        *,
-        model_name: str = "",
-        runtime: str = "python",
-        static_batching: str = "",
-        api: str = "",
-        streaming: str = "",
-        backend: str = "",
-        mode: str = "plugin",
-        data_type: str = "float16",
-        max_batch_size: int = 512,
-        max_num_tokens: int = 2048,
-        gpu_weights_percent: float = -1,
-        batch_sizes: List[int] = [0],
-        input_lens: List[int] = [8],
-        output_lens: List[int] = [1],
-        num_beams: int = 1,
-        num_loras: int = 0,
-        num_reqs: int = 512,
-        concurrency: int = -1,
-        quantization: str = "",
-        kv_cache_dtype: str = "auto",
-        ep_size: int = None,
-        tp_size: int = 1,
-        pp_size: int = 1,
-        num_gpus: int = 1,
-    ):
+    def __init__(self,
+                 *,
+                 model_name: str = "",
+                 runtime: str = "python",
+                 static_batching: str = "",
+                 api: str = "",
+                 streaming: str = "",
+                 backend: str = "",
+                 mode: str = "plugin",
+                 data_type: str = "float16",
+                 max_batch_size: int = 512,
+                 max_num_tokens: int = 2048,
+                 kv_cache_free_gpu_mem_fraction: float = 0.9,
+                 gpu_weights_percent: float = -1,
+                 batch_sizes: List[int] = [0],
+                 input_lens: List[int] = [8],
+                 output_lens: List[int] = [1],
+                 num_beams: int = 1,
+                 num_loras: int = 0,
+                 num_reqs: int = 512,
+                 concurrency: int = -1,
+                 quantization: str = "",
+                 kv_cache_dtype: str = "auto",
+                 ep_size: int = None,
+                 tp_size: int = 1,
+                 pp_size: int = 1,
+                 num_gpus: int = 1):
         # The model name.
         self.model_name = model_name
         # Python or cpp/cppmanager runtime.
@@ -371,6 +370,8 @@ class PerfTestConfig:
         self.max_batch_size = max_batch_size
         # Max number of tokens to build TRT engine with.
         self.max_num_tokens = max_num_tokens
+        # kv cache free gpu mem fraction
+        self.kv_cache_free_gpu_mem_fraction = kv_cache_free_gpu_mem_fraction
         # List of batch sizes to run benchmark with.
         self.batch_sizes = batch_sizes
         # List of input lens to run benchmark with.
@@ -401,6 +402,8 @@ class PerfTestConfig:
         self.num_gpus = num_gpus
         # Just build engines
         self.build_only = False
+        # kv cache free gpu mem fraction
+        self.kv_cache_free_gpu_mem_fraction = kv_cache_free_gpu_mem_fraction
 
     def to_string(self,
                   custom_bs: int = None,
@@ -443,6 +446,10 @@ class PerfTestConfig:
 
         # Add Max number of tokens.
         entries.append(f"maxnt:{self.max_num_tokens}")
+
+        # Add kv cache free gpu mem fraction.
+        if self.kv_cache_free_gpu_mem_fraction != 0.9:
+            entries.append(f"kv_frac:{self.kv_cache_free_gpu_mem_fraction}")
 
         if self.build_only:
             entries.append(f"build_only")
@@ -514,6 +521,10 @@ class PerfTestConfig:
         if self.num_gpus > 1:
             entries.append(f"gpus:{self.num_gpus}")
 
+        # Add kv cache free gpu mem fraction.
+        if self.kv_cache_free_gpu_mem_fraction != 0.9:
+            entries.append(f"kv_frac:{self.kv_cache_free_gpu_mem_fraction}")
+
         # Concatenate labels with "-".
         return "-".join(entries)
 
@@ -552,6 +563,10 @@ class PerfTestConfig:
 
         if labels[0].startswith("maxnt"):
             self.max_num_tokens = int(labels.pop(0).replace("maxnt:", ""))
+
+        if labels[0].startswith("kv_frac:"):
+            self.kv_cache_free_gpu_mem_fraction = float(
+                labels.pop(0).replace("kv_frac:", ""))
 
         if labels[0] == "build_only":
             self.build_only = True
@@ -620,6 +635,11 @@ class PerfTestConfig:
         if len(labels) > 0:
             self.num_gpus = 1 if not labels[0].startswith("gpus:") else int(
                 labels.pop(0).replace("gpus:", ""))
+
+        if len(labels) > 0:
+            self.kv_cache_free_gpu_mem_fraction = 0.9 if not labels[
+                0].startswith("kv_frac:") else float(
+                    labels.pop(0).replace("kv_frac:", ""))
 
         assert len(
             labels
@@ -1210,9 +1230,10 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
             f"--model_path={model_dir}",
             "throughput",
             f"--dataset={dataset_path}",
-            f"--max_batch_size={self._config.max_batch_size}",
-            f"--max_num_tokens={self._config.max_num_tokens}",
+            # f"--max_batch_size={self._config.max_batch_size}",
+            # f"--max_num_tokens={self._config.max_num_tokens}",
             f"--report_json={report_path}",
+            f"--kv_cache_free_gpu_mem_fraction={self._config.kv_cache_free_gpu_mem_fraction}"
         ]
         if self._config.backend != "pytorch":
             benchmark_cmd += [f"--engine_dir={engine_dir}"]
