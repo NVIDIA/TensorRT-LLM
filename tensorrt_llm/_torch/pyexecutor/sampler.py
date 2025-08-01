@@ -130,15 +130,15 @@ def top_p_sampling_batch(logits: torch.Tensor,
         logits = logits.unsqueeze(0)
     assert logits_dim == 2, "logits should be 2D: [batch_size, vocab_size]"
 
+    if temperature != 0:
+        logits = logits / max(temperature, 1e-5)
+
     # sort the logits of each sample in descending order
     sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
 
     # compute  cumulative probability distribution of each sample
     cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1),
                                     dim=-1)
-
-    if temperature != 0:
-        logits = logits / max(temperature, 1e-5)
     # get the location of top_p
     sorted_indices_to_remove = cumulative_probs > top_p
     sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
