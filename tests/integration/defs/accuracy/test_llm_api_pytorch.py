@@ -374,12 +374,17 @@ class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
                  max_batch_size=32,
                  kv_cache_config=kv_cache_config) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
+            sampling_params = SamplingParams(
+                temperature=0.0,
+                add_special_tokens=False,
+            )
             task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
+            task.evaluate(llm, sampling_params=sampling_params)
             task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
+            task.evaluate(llm, sampling_params=sampling_params)
             task = GPQADiamond(self.MODEL_NAME)
             task.evaluate(llm,
+                          sampling_params=sampling_params,
                           extra_evaluator_kwargs=dict(apply_chat_template=True))
 
     @pytest.mark.skip_less_device(4)
@@ -388,12 +393,17 @@ class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
         model_path = f"{llm_models_root()}/modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp4"
         with LLM(model_path, tensor_parallel_size=4) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+            sampling_params = SamplingParams(
+                temperature=0.0,
+                add_special_tokens=False,
+            )
             task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
+            task.evaluate(llm, sampling_params=sampling_params)
             task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
+            task.evaluate(llm, sampling_params=sampling_params)
             task = GPQADiamond(self.MODEL_NAME)
             task.evaluate(llm,
+                          sampling_params=sampling_params,
                           extra_evaluator_kwargs=dict(apply_chat_template=True))
 
 
