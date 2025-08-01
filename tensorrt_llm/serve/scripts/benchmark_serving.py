@@ -78,6 +78,10 @@ class BenchmarkMetrics:
     median_e2el_ms: float
     std_e2el_ms: float
     percentiles_e2el_ms: list[tuple[float, float]]
+    mean_ibftt_ms: float
+    median_ibftt_ms: float
+    std_ibftt_ms: float
+    percentiles_ibftt_ms: list[tuple[float, float]]
     tput_user: list[float]
     # Request accuracy rate metrics
     mean_request_ar: float
@@ -146,6 +150,7 @@ def calculate_metrics(
     all_tpots: list[float] = []
     ttfts: list[float] = []
     e2els: list[float] = []
+    ibftts: list[float] = []  # Interval between first two tokens
     tput_user: list[float] = []
     request_ars: list[float] = []  # Request accuracy rates
     for i in range(len(outputs)):
@@ -163,10 +168,13 @@ def calculate_metrics(
             actual_output_lens.append(output_len)
             total_input += input_requests[i].prompt_len
             tpot = 0
+            ibftt = 0
             if output_len > 1:
                 latency_minus_ttft = outputs[i].latency - outputs[i].ttft
                 tpot = latency_minus_ttft / (output_len - 1)
                 tpots.append(tpot)
+                ibftt = outputs[i].itl[0]
+            ibftts.append(ibftt)
             # Note: if output_len <= 1, we regard tpot as 0 for goodput
             all_tpots.append(tpot)
             itls += outputs[i].itl
@@ -208,6 +216,10 @@ def calculate_metrics(
             valid_metrics.append(e2els)
             slo_values.append(goodput_config_dict["e2el"] /
                               MILLISECONDS_TO_SECONDS_CONVERSION)
+        if "ibftt" in goodput_config_dict:
+            valid_metrics.append(ibftts)
+            slo_values.append(goodput_config_dict["ibftt"] /
+                              MILLISECONDS_TO_SECONDS_CONVERSION)
 
         for req_metric in zip(*valid_metrics):
             is_good_req = all([s >= r for s, r in zip(slo_values, req_metric)])
@@ -248,6 +260,11 @@ def calculate_metrics(
         median_e2el_ms=np.median(e2els or 0) * 1000,
         percentiles_e2el_ms=[(p, np.percentile(e2els or 0, p) * 1000)
                              for p in selected_percentiles],
+        mean_ibftt_ms=np.mean(ibftts or 0) * 1000,
+        std_ibftt_ms=np.std(ibftts or 0) * 1000,
+        median_ibftt_ms=np.median(ibftts or 0) * 1000,
+        percentiles_ibftt_ms=[(p, np.percentile(ibftts or 0, p) * 1000)
+                              for p in selected_percentiles],
         tput_user=np.mean(tput_user or 0),
         mean_request_ar=np.mean(request_ars or 0),
         median_request_ar=np.median(request_ars or 0),
@@ -533,6 +550,7 @@ async def benchmark(
                        "Time per Output Token (excl. 1st token)")
     process_one_metric("itl", "ITL", "Inter-token Latency")
     process_one_metric("e2el", "E2EL", "End-to-end Latency")
+    process_one_metric("ibftt", "IBFTT", "Interval Between First Two Tokens")
 
     print("=" * 50)
 
@@ -542,7 +560,7 @@ async def benchmark(
 def check_goodput_args(args):
     # Check and parse goodput arguments
     goodput_config_dict = {}
-    VALID_NAMES = ["ttft", "tpot", "e2el"]
+    VALID_NAMES = ["ttft", "tpot", "e2el", "ibftt"]
     if args.goodput:
         goodput_config_dict = parse_goodput(args.goodput)
         for slo_name, slo_val in goodput_config_dict.items():
@@ -1061,10 +1079,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--percentile-metrics",
         type=str,
-        default="ttft,tpot,itl,request_ar",
+        default="ttft,tpot,itl,request_ar,ibftt",
         help="Comma-separated list of selected metrics to report percentils. "
         "This argument specifies the metrics to report percentiles. "
-        "Allowed metric names are \"ttft\", \"tpot\", \"itl\", \"e2el\", \"request_ar\". "
+        "Allowed metric names are \"ttft\", \"tpot\", \"itl\", \"e2el\", \"ibftt\", \"request_ar\". "
         "Default value is \"ttft,tpot,itl,request_ar\".")
     parser.add_argument(
         "--metric-percentiles",
@@ -1083,7 +1101,7 @@ if __name__ == "__main__":
         "pairs, where the key is a metric name, and the value is in "
         "milliseconds. Multiple \"KEY:VALUE\" pairs can be provided, "
         "separated by spaces. Allowed request level metric names are "
-        "\"ttft\", \"tpot\", \"e2el\". For more context on the definition of "
+        "\"ttft\", \"tpot\", \"e2el\", \"ibftt\". For more context on the definition of "
         "goodput, refer to DistServe paper: https://arxiv.org/pdf/2401.09670 "
         "and the blog: https://hao-ai-lab.github.io/blogs/distserve")
 
