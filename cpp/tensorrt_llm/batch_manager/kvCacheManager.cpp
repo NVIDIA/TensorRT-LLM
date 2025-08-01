@@ -1962,7 +1962,7 @@ void KVCacheManager::updateNewBlockPointer(GenerationRequest& sequence, SizeType
     }
 }
 
-std::optional<SizeType32> KVCacheManager::updateToken(GenerationRequest& sequence, bool addToken)
+void KVCacheManager::updateToken(GenerationRequest& sequence, bool addToken)
 {
     auto currNumTokens = sequence.getNumTokens();
 
@@ -2020,14 +2020,12 @@ std::optional<SizeType32> KVCacheManager::updateToken(GenerationRequest& sequenc
             }
         }
     }
-
-    return std::nullopt;
 }
 
-std::optional<SizeType32> KVCacheManager::addToken(RequestIdType requestId)
+void KVCacheManager::addToken(RequestIdType requestId)
 {
     auto& sequence = getSequence(requestId);
-    return updateToken(sequence, true);
+    updateToken(sequence, true);
 }
 
 std::optional<BlockKey> KVCacheManager::findNewContextBlock(
