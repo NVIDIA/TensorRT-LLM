@@ -1,6 +1,6 @@
 # Description
 
-This folder contains QA test definitions for TensorRT-LLM, which are executed on a weekly/release schedule. These tests focus on end-to-end validation, accuracy verification, disaggregated testing, and performance benchmarking.
+This folder contains QA test definitions for TensorRT-LLM, which are executed on a daily/release schedule. These tests focus on end-to-end validation, accuracy verification, disaggregated testing, and performance benchmarking.
 
 ## Test Categories
 
@@ -47,24 +47,24 @@ pip install mako oyaml rouge_score lm_eval
 This directory contains various test configuration files:
 
 ### Functional Test Lists
-- `examples_test_list.txt` - Primary test list for single node multi-GPU scenarios (all new test cases should be added here)
-- `llm_sanity_test.txt` - Subset of examples for quick torch flow validation
-- `benchmark_test_list.txt` - Long-running single node test cases
-- `llm_multinodes_function_test.txt` - Multi-node functional test cases
-- `llm_release_gb20x.txt` - GB20X release test cases
-- `llm_release_rtx_pro_6000.txt` - RTX Pro 6000 specific tests
+- `llm_function_full.txt` - Primary test list for single node multi-GPU scenarios (all new test cases should be added here)
+- `llm_function_sanity.txt` - Subset of examples for quick torch flow validation
+- `llm_function_nim.txt` - NIM-specific functional test cases
+- `llm_function_multinode.txt` - Multi-node functional test cases
+- `llm_function_gb20x.txt` - GB20X release test cases
+- `llm_function_rtx6kd.txt` - RTX 6000 Ada specific tests
 
 ### Performance Test Files
-- `trt_llm_release_perf_test.yml` - Main performance test configuration
-- `trt_llm_release_perf_cluster_test.yml` - Cluster-based performance tests
-- `trt_llm_release_perf_sanity_test.yml` - Performance sanity checks
-- `trt_llm_release_perf_l2_test.yml` - L2 level performance tests
+- `llm_perf_full.yml` - Main performance test configuration
+- `llm_perf_cluster.yml` - Cluster-based performance tests
+- `llm_perf_sanity.yml` - Performance sanity checks
+- `llm_perf_l2.yml` - L2 level performance tests
 - `trt_llm_integration_perf_test.yml` - Integration performance tests
 - `trt_llm_integration_perf_sanity_test.yml` - Integration performance sanity checks
 - `llm_release_perf_multinode_test.txt` - Multi-node performance tests
 
 ### Triton Backend Tests
-- `llm_triton_integration_test.txt` - Triton backend integration tests
+- `llm_triton_integration.txt` - Triton backend integration tests
 
 ### Release-Specific Tests
 - `llm_release_digits_func.txt` - Functional tests for DIGITS release
@@ -88,7 +88,7 @@ To run specific test categories:
 # direct to defs folder
 cd tests/integration/defs
 # Run all fp8 functional test
-pytest --no-header -vs --test-list=../test_lists/qa/examples_test_list.txt -k fp8
+pytest --no-header -vs --test-list=../test_lists/qa/llm_function_full.txt -k fp8
 # Run a single test case
 pytest -vs accuracy/test_cli_flow.py::TestLlama3_1_8B::test_auto_dtype
 ```
@@ -104,6 +104,6 @@ QA tests are typically executed through CI/CD pipelines with appropriate test se
 ## Test Guidelines
 
 ### Adding New Test Cases
-- **Primary Location**: For functional testing, new test cases should be added to `examples_test_list.txt` first
+- **Primary Location**: For functional testing, new test cases should be added to `llm_function_full.txt` first
 - **Categorization**: Test cases should be categorized based on their scope and execution time
 - **Validation**: Ensure test cases are properly validated before adding to any test list
