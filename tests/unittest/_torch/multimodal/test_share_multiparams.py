@@ -39,14 +39,46 @@ class TestMultimodalParamsHandleConversion(unittest.TestCase):
         params.to_handle("multimodal_data")
         self.assertEqual(params.multimodal_data, {})
 
+    def test_to_handle_unsupported_element(self):
+        """Test to_handle raises ValueError for unsupported elements."""
         params = MultimodalParams()
         multimodal_input = MultimodalInput(
             multimodal_hashes=[[1, 2, 3, 4, 5, 6, 7, 8]] * 2,
             multimodal_positions=[0, 10],
             multimodal_lengths=[2, 2])
         params.multimodal_input = multimodal_input
-        params.to_handle("multimodal_input")
-        self.assertEqual(params.multimodal_input, multimodal_input)
+
+        with self.assertRaises(ValueError) as context:
+            params.to_handle("multimodal_input")
+
+        self.assertIn("Unsupported element 'multimodal_input'",
+                      str(context.exception))
+        self.assertIn("Supported elements: 'multimodal_data'",
+                      str(context.exception))
+
+    def test_to_tensor_unsupported_element(self):
+        """Test to_tensor raises ValueError for unsupported elements."""
+        params = MultimodalParams()
+
+        with self.assertRaises(ValueError) as context:
+            params.to_tensor("multimodal_input")
+
+        self.assertIn("Unsupported element 'multimodal_input'",
+                      str(context.exception))
+        self.assertIn("Supported elements: 'multimodal_data'",
+                      str(context.exception))
+
+    def test_to_device_unsupported_element(self):
+        """Test to_device raises ValueError for unsupported elements."""
+        params = MultimodalParams()
+
+        with self.assertRaises(ValueError) as context:
+            params.to_device("multimodal_input", device="cuda", pin_memory=True)
+
+        self.assertIn("Unsupported element 'multimodal_input'",
+                      str(context.exception))
+        self.assertIn("Supported elements: 'multimodal_data'",
+                      str(context.exception))
 
     def test_to_tensor_basic_handle(self):
         """Test converting a basic handle back to tensor."""
@@ -54,9 +86,9 @@ class TestMultimodalParamsHandleConversion(unittest.TestCase):
         params.multimodal_data = {"multimodal_embedding": self.mm_embedding}
 
         # Convert to handle
-        params.to_handle("multimodal_data", key="multimodal_embedding")
+        params.to_handle("multimodal_data")
         # Convert back to tensor
-        params.to_tensor("multimodal_data", key="multimodal_embedding")
+        params.to_tensor("multimodal_data")
 
         result = params.multimodal_data["multimodal_embedding"]
         self.assertIsInstance(result, torch.Tensor)
@@ -67,8 +99,8 @@ class TestMultimodalParamsHandleConversion(unittest.TestCase):
         params = MultimodalParams()
         params.multimodal_data = self.sample_multimodal_data.copy()
 
-        params.to_handle("multimodal_data", key=None)
-        params.to_tensor("multimodal_data", key=None)
+        params.to_handle("multimodal_data")
+        params.to_tensor("multimodal_data")
 
         self.assertTrue(
             torch.allclose(params.multimodal_data["multimodal_embedding"],
