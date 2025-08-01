@@ -113,7 +113,7 @@ Sample Benchmark Output. For example, the following takes the performance metric
 ==================================================
 ```
 
-## Key Metrics {#key-metrics}
+## Key Metrics
 
 Description and interpretation of key benchmark metrics. The following can be used as an example.
 
