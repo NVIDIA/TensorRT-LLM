@@ -78,7 +78,7 @@ class WorkerBase(GenerationExecutor):
         self._prompt_adapter_manager: Optional[PromptAdapterManager] = None
         self._runtime_model_config: Optional[ModelConfig] = None
 
-    def create_engine(
+    def setup_engine(
             self,
             engine: Union[Path, Engine],
             executor_config: Optional[tllm.ExecutorConfig] = None,
