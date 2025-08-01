@@ -7,6 +7,7 @@ container_image=<container_image>
 mounts=<mounts>  # e.g. /mnt/data:/mnt/data
 workdir=<workdir>  # Path to disaggr_torch.slurm
 model_dir=<model_dir>  # Path to the model checkpoint
+repo_dir=<repo_dir>  # Path to the repo, if this is empty, the pre-installed TensorRT-LLM will be used
 
 ntasks_per_node=4 # 4 GPUs per GB200 node
 total_node_num=8
@@ -31,6 +32,7 @@ args=(
     $mounts
     $workdir
     $model_dir
+    $repo_dir
 )
 
 # This command starts a job with 8 nodes, 32 GPUs in total.

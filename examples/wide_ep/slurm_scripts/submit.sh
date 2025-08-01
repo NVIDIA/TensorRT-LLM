@@ -9,6 +9,7 @@ container_image=<container_image>
 mounts=<mounts>  # e.g. /mnt/data:/mnt/data
 workdir=<workdir>  # Path to disaggr_torch.slurm
 model_dir=<model_dir>  # Path to the model checkpoint
+repo_dir=<repo_dir>  # Path to the repo, if this is empty, the pre-installed TensorRT-LLM will be used
 
 mtp_size=0
 ntasks_per_node=4 # 4 GPUs per GB200 node
@@ -39,6 +40,7 @@ for b in 1 64 1024; do
             $mounts
             $workdir
             $model_dir
+            $repo_dir
         )
 
         sbatch --nodes=${total_node_num} \
