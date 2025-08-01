@@ -18,8 +18,46 @@ import sys
 
 import pytest
 import torch
-from _torch.helpers import calc_diff, per_block_cast_to_fp8
+from _torch.helpers import (calc_diff, per_block_cast_to_fp8,
+                            per_block_cast_to_fp8_e8m0,
+                            per_token_cast_to_fp8_e8m0)
 from utils.util import getSMVersion
+
+
+@pytest.mark.skipif(
+    getSMVersion() != 100,
+    reason="The test is for Blackwell only. Current SM is %d." % getSMVersion(),
+)
+@pytest.mark.parametrize(
+    "k, n",
+    [(7168, 2112), (1536, 24576), (512, 32768), (16384, 7168), (7168, 4096),
+     (2048, 7168), (1024, 1024)],
+)
+@pytest.mark.parametrize(
+    "m",
+    [7, 64, 128, 4096],
+)
+@pytest.mark.parametrize(
+    "dtype",
+    [torch.bfloat16],
+)
+def test_fp8_block_scale_deep_gemm(dtype, m, k, n):
+    torch.random.manual_seed(0)
+    a = torch.randn((m, k), device='cuda', dtype=dtype)
+    b = torch.randn((n, k), device='cuda', dtype=dtype)
+
+    act_a_fp8, act_a_sf = per_token_cast_to_fp8_e8m0(a)
+    act_b_fp8, act_b_sf = per_block_cast_to_fp8_e8m0(b)
+
+    output_expected = a @ b.t()
+    import deep_gemm
+    output = torch.empty((act_a_fp8.shape[0], act_b_fp8.shape[0]),
+                         device=act_a_fp8.device,
+                         dtype=torch.bfloat16)
+
+    deep_gemm.fp8_gemm_nt((act_a_fp8, act_a_sf), (act_b_fp8, act_b_sf), output)
+    diff = calc_diff(output, output_expected)
+    assert diff < 1e-2
 
 
 @pytest.mark.skipif(

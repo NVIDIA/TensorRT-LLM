@@ -8,7 +8,8 @@ import torch
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.logger import logger
 
-from ..pyexecutor.llm_request import LlmRequest, LlmRequestState, SamplingConfig
+from ..pyexecutor.llm_request import (LlmRequest, LlmRequestState,
+                                      SamplingConfig, get_draft_token_length)
 from ..pyexecutor.resource_manager import BaseResourceManager, ResourceManager
 from ..pyexecutor.sampler import Sampler, SampleState
 from ..pyexecutor.scheduler import ScheduledRequests
@@ -59,7 +60,6 @@ class ModelDrafter(Drafter):
         # Configuration
         self.spec_config = spec_config
         self.max_draft_tokens = max_draft_tokens
-
         # Sampling
         self.sampler = sampler
 
@@ -92,10 +92,17 @@ class ModelDrafter(Drafter):
     def _create_context_request(self, request: LlmRequest,
                                 input_tokens: Any) -> LlmRequest:
         """Create a context request for first-time drafting."""
-        return self._create_draft_request(request.py_request_id,
-                                          request.py_max_new_tokens,
-                                          input_tokens, request.sampling_config,
-                                          request.return_perf_metrics)
+        new_request = self._create_draft_request(request.py_request_id,
+                                                 request.py_max_new_tokens,
+                                                 input_tokens,
+                                                 request.sampling_config,
+                                                 request.return_perf_metrics)
+
+        begin_compute, end_compute = request.py_last_context_chunk
+        if begin_compute is not None:
+            new_request.context_current_position = begin_compute
+            new_request.context_chunk_size = end_compute - begin_compute
+        return new_request
 
     def _create_generation_request(self, request: LlmRequest,
                                    input_tokens: Any) -> LlmRequest:
@@ -110,10 +117,13 @@ class ModelDrafter(Drafter):
         new_request.state = LlmRequestState.GENERATION_IN_PROGRESS
         return new_request
 
-    def _create_chunked_context_request(self, request: LlmRequest,
+    def _create_accepted_tokens_request(self, request: LlmRequest,
                                         input_tokens: Any,
                                         num_accepted_tokens: int) -> LlmRequest:
-        """Create a chunked context request when some tokens were accepted."""
+        """
+        Create a chunked context request for accepted tokens.
+        Only applicable if the draft model needs to recompute KV cache for accepted tokens (e.g. eagle 3)
+        """
         new_request = self._create_draft_request(request.py_request_id,
                                                  request.py_max_new_tokens,
                                                  input_tokens,
@@ -146,7 +156,7 @@ class ModelDrafter(Drafter):
 
         # Tokens accepted - chunked context request
         else:
-            return self._create_chunked_context_request(request, input_tokens,
+            return self._create_accepted_tokens_request(request, input_tokens,
                                                         num_accepted_tokens)
 
     def _add_to_draft_batch(self, draft_batch: ScheduledRequests,
@@ -184,11 +194,26 @@ class ModelDrafter(Drafter):
         try:
             draft_batch = ScheduledRequests()
 
+            for request in scheduled_requests.context_requests:
+                if request.is_first_context_chunk:
+                    # Ignore requests which still need to be processed by the target model.
+                    continue
+
+                # We hit this path if we're doing chunked prefill. The target model processed
+                # a prefill chunk on the last iteration. Now, we need to fill in the KV cache
+                # for the draft model too.
+                all_tokens = request.get_tokens()[0]
+                input_tokens = get_draft_model_prompt(
+                    self.spec_config.spec_dec_mode, all_tokens)
+
+                new_request = self._create_context_request(
+                    request, input_tokens)
+                self._add_to_draft_batch(draft_batch, new_request, request)
+
             for request in scheduled_requests.generation_requests:
                 if request.py_draft_pages_allocated == 0:
                     # No space for draft tokens
                     continue
-
                 # Stop drafting when we hit the max seqlen. We still need dummy draft
                 # tokens attached to the requests to make sure everything works properly
                 # with CUDA graph. These dummy tokens are already added by
@@ -273,6 +298,12 @@ class ModelDrafter(Drafter):
         new_requests = []
         for req in draft_batch.all_requests():
             target_model_req = req_id_to_old_request[req.py_request_id]
+            if target_model_req.state != LlmRequestState.GENERATION_IN_PROGRESS:
+                # This is a chunked prefill request and we have more prefill chunks
+                # to process. Defer adding draft tokens until the whole prompt is processed.
+                self.draft_seq_slot_manager.free_resources(req)
+                continue
+
             target_model_req.py_draft_tokens.append(req.get_last_tokens(0))
             if req.state != LlmRequestState.GENERATION_COMPLETE and len(
                     target_model_req.py_draft_tokens
@@ -288,7 +319,7 @@ class ModelDrafter(Drafter):
         """Pad draft tokens to maximum length for all generation requests."""
         for req in scheduled_requests.generation_requests:
             max_draft_tokens = self.max_draft_tokens
-            num_draft_tokens = len(req.py_draft_tokens)
+            num_draft_tokens = get_draft_token_length(req)
             req.py_draft_tokens.extend(
                 0 for _ in range(max_draft_tokens - num_draft_tokens))
 

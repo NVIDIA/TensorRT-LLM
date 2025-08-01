@@ -303,6 +303,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_batch_idx = None
         self.py_rewind_len = 0
         self.py_draft_tokens = [] if self.draft_tokens is None else self.draft_tokens
+        self.py_last_context_chunk = (None, None)
         self.py_last_draft_tokens = None
         self.py_num_accepted_draft_tokens = 0
         self.py_decoding_iter = 0
@@ -476,3 +477,17 @@ def executor_request_to_llm_request(
         py_multimodal_data=getattr(executor_request, "py_multimodal_data",
                                    None))
     return llm_request
+
+
+def get_draft_token_length(request: LlmRequest) -> int:
+    """Get the length of draft tokens for a given request.
+
+    Args:
+        request: The LlmRequest to get draft token length for
+
+    Returns:
+        The number of draft tokens, or 0 if no draft tokens exist
+    """
+    if request.py_draft_tokens is not None:
+        return len(request.py_draft_tokens)
+    return 0

@@ -19,9 +19,15 @@ from copy import deepcopy
 
 import pytest
 from defs.common import convert_weights, venv_check_call, venv_mpi_check_call
-from defs.conftest import (get_device_memory, llm_models_root,
+from defs.conftest import (get_device_memory, get_sm_version, llm_models_root,
                            skip_post_blackwell, skip_pre_hopper)
 from defs.trt_test_alternative import check_call
+
+# skip trt flow cases on post-Blackwell-Ultra
+if get_sm_version() >= 103:
+    pytest.skip(
+        "TRT workflow tests are not supported on post Blackwell-Ultra architecture",
+        allow_module_level=True)
 
 
 # TODO: remove skip after enable Blackwell for Speculative Decoding

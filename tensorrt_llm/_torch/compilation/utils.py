@@ -49,12 +49,14 @@ def inplace_info():
             1: "input",
             2: "residual"
         },
-        torch.ops.trtllm.attention_inplace.default: {
+        torch.ops.trtllm.attn_custom_op_inplace.default: {
             1: "output",
-            2: "output_sf"
         },
         torch.ops.trtllm.mla_custom_op_inplace.default: {
             1: "output"
+        },
+        torch.ops.trtllm.fused_qk_norm_rope.default: {
+            1: "qkv"
         }
     }
     return inplace_map

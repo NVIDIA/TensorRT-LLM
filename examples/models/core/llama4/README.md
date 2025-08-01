@@ -44,7 +44,6 @@ Explanation:
 TensorRT-LLM supports nvidia TensorRT Model Optimizer quantized FP8 checkpoint
 ``` bash
 trtllm-serve nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8 \
-    --backend pytorch \
     --max_batch_size 512 \
     --tp_size 8 \
     --ep_size 8 \
@@ -99,7 +98,6 @@ Currently parallel weight loading conflicts with min_latency, disable the parall
 ``` bash
 TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL=True \
 trtllm-serve nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8 \
-    --backend pytorch \
     --max_batch_size 8 \
     --tp_size 8 \
     --ep_size 1 \
@@ -134,7 +132,7 @@ python -m tensorrt_llm.serve.scripts.benchmark_serving \
 - `max_batch_size` and `max_num_tokens` can easily affect the performance. The default values for them are already carefully designed and should deliver good performance on overall cases, however, you may still need to tune it for peak performance.
 - `max_batch_size` should not be too low to bottleneck the throughput. Note with Attention DP, the the whole system's max_batch_size will be `max_batch_size*dp_size`.
 - CUDA grah `max_batch_size` should be same value as TensorRT-LLM server's `max_batch_size`.
-- For more details on `max_batch_size` and `max_num_tokens`, refer to [Tuning Max Batch Size and Max Num Tokens](../performance/performance-tuning-guide/tuning-max-batch-size-and-max-num-tokens.md).
+- For more details on `max_batch_size` and `max_num_tokens`, refer to [Tuning Max Batch Size and Max Num Tokens](../../../../docs/source/performance/performance-tuning-guide/tuning-max-batch-size-and-max-num-tokens.md).
 
 ### Troubleshooting
 

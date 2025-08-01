@@ -3,7 +3,7 @@ from typing import Callable, List, Union
 
 from torch import nn
 
-from tensorrt_llm._torch.model_config import ModelConfig, TConfig
+from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
 
 
@@ -14,11 +14,11 @@ class BaseWeightMapper(ABC):
         self._mapping: dict = {}
         self._skip_modules = []
         self._model: Union[nn.Module, DecoderModelForCausalLM] | None = None
-        self._config: TConfig | None = None
+        self._config: ModelConfig | None = None
 
     def init_model_and_config(self, model: Union[nn.Module,
                                                  DecoderModelForCausalLM],
-                              config: TConfig):
+                              config: ModelConfig):
         self._model = model
         self._config = config
 
@@ -29,9 +29,9 @@ class BaseWeightMapper(ABC):
             raise ValueError("model must have a config attribute")
 
         self._tp_size = 1 if model.model_config.mapping.enable_attention_dp else model.model_config.mapping.tp_size
-        self._num_kv_heads = model.config.num_key_value_heads if hasattr(
-            model.config, 'num_key_value_heads'
-        ) and model.config.num_key_value_heads is not None else model.config.num_attention_heads
+        self._head_dim = model.config.head_dim if hasattr(
+            model.config, 'head_dim'
+        ) and model.config.head_dim is not None else model.config.hidden_size // model.config.num_attention_heads
 
         self.map_weights()
 
@@ -153,7 +153,7 @@ class BaseWeightMapper(ABC):
         return self._mapping
 
     @property
-    def config(self) -> TConfig:
+    def config(self) -> ModelConfig:
         if self._config is None:
             raise RuntimeError("Weight mapper is not initialized")
         return self._config
