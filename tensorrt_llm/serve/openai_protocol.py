@@ -210,7 +210,7 @@ class CompletionRequest(OpenAIBaseModel):
     echo: Optional[bool] = False
     frequency_penalty: Optional[float] = 0.0
     logit_bias: Optional[Dict[str, float]] = None
-    logprobs: Optional[bool] = None
+    logprobs: Optional[int] = None
     max_tokens: Optional[int] = None
     n: int = 1
     presence_penalty: Optional[float] = 0.0
@@ -649,6 +649,10 @@ class ChatCompletionRequest(OpenAIBaseModel):
             else:
                 if gather_generation_logits:
                     sampling_params.logprobs = logprobs
+                elif self.top_logprobs:
+                    raise ValueError(
+                        "`gather_generation_logits` must be `True` to use `top_logprobs`"
+                    )
                 else:
                     sampling_params._return_log_probs = True
         return sampling_params
