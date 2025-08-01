@@ -1,6 +1,7 @@
 import pytest
 
 from tensorrt_llm import LLM
+from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.llmapi.llm_args import PeftCacheConfig
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
 from tensorrt_llm.sampling_params import SamplingParams
@@ -479,6 +480,62 @@ def test_bielik_11b_v2_2_instruct_multi_lora() -> None:
         prompts = [
             "Kim był Mikołaj Kopernik i z czego zasłynął?",
             "Gdzie znajduje się stolica Polski?",
+        ]
+        lora_req1 = LoRARequest("lora-1", 0, lora_paths[0])
+        lora_req2 = LoRARequest("lora-2", 1, lora_paths[1])
+        lora_requests = [lora_req1, lora_req2]
+        sampling_params = SamplingParams(max_tokens=200)
+
+        outputs = llm.generate(prompts,
+                               sampling_params,
+                               lora_request=lora_requests)
+
+        assert len(outputs) == 2
+
+
+def test_gemma3_1b_instruct_multi_lora() -> None:
+    model_dir = f"{llm_models_root()}/gemma/gemma-3-1b-it"
+
+    target_modules = ['attn_q', 'attn_k', 'attn_v']
+
+    # Set up temporary directory for LoRA adapters
+    with tempfile.TemporaryDirectory() as lora_dir:
+        print("Creating dummy LoRAs...")
+
+        model = AutoModelForCausalLM.from_pretrained(model_dir,
+                                                     torch_dtype=torch.bfloat16,
+                                                     device_map="auto")
+        hf_modules = ["q_proj", "k_proj", "v_proj"]
+        peft_lora_config = PeftLoraConfig(r=8,
+                                          target_modules=hf_modules,
+                                          bias="none",
+                                          task_type="CAUSAL_LM")
+        lora_paths = []
+        for i in range(2):
+            lora_model = get_peft_model(model, peft_lora_config)
+            for param in lora_model.parameters():
+                param.data.zero_()
+            lora_path = f"{lora_dir}/lora_{i}"
+            lora_model.save_pretrained(lora_path)
+            lora_paths.append(lora_path)
+
+        trtllm_lora_config = LoraConfig(lora_dir=lora_paths,
+                                        lora_target_modules=target_modules,
+                                        max_lora_rank=8,
+                                        max_loras=2,
+                                        max_cpu_loras=2)
+        # Disabling kv cache reuse as a WAR to deal with gaps in kernel support for Gemma3's non-inclusive sliding window size.
+        kv_cache_config = KvCacheConfig(
+            enable_block_reuse=False,
+            enable_partial_reuse=False,
+        )
+        llm = LLM(model_dir,
+                  lora_config=trtllm_lora_config,
+                  kv_cache_config=kv_cache_config)
+
+        prompts = [
+            "Is it ok to fill diesel in a petrol car?",
+            "What is the capital of France?",
         ]
         lora_req1 = LoRARequest("lora-1", 0, lora_paths[0])
         lora_req2 = LoRARequest("lora-2", 1, lora_paths[1])
