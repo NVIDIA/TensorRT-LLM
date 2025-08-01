@@ -84,7 +84,7 @@ enum class AttentionInputLayout
     Q_PAGED_KV,
     // Q has contiguous [B, S, H, D] layout, while K has contiguous [B, S, H_kv, D] layout, and V has
     // contiguous [B, S, H_kv, D_v] layout. Only used for context MLA now.
-    SEPARATE_QKV,
+    SEPARATE_Q_K_V,
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -118,6 +118,8 @@ struct MHARunnerFixedParams
     int headSize;
     // The head size of V.
     int headSizeV = 0;
+    // The head size of Q/K non-RoPE part, only used for MLA now.
+    int headSizeQkNope = 0;
     // The scaling applied to bmm1_scale.
     float qScaling;
     // The attention logit softcapping scale.
@@ -169,7 +171,7 @@ struct MHARunnerFixedParams
         case AttentionInputLayout::PACKED_QKV: output += "packed_qkv"; break;
         case AttentionInputLayout::Q_CONTIGUOUS_KV: output += "q_contiguous_kv"; break;
         case AttentionInputLayout::Q_PAGED_KV: output += "q_paged_kv"; break;
-        case AttentionInputLayout::SEPARATE_QKV: output += "separate_qkv"; break;
+        case AttentionInputLayout::SEPARATE_Q_K_V: output += "separate_q_k_v"; break;
         default: output += std::to_string(static_cast<int>(attentionInputLayout)) + " (unknown)"; break;
         }
 
