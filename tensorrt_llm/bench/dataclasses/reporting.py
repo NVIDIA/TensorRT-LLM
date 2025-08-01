@@ -118,15 +118,20 @@ class StatsKeeper:
 
             # For speculative decoding, we need to track the number of draft tokens per request and the number of accepted draft tokens per request
             if max_draft_tokens > 0:
-                num_draft_tokens.append(max_draft_tokens * (entry.decode_iteration + 1))
-                num_accepted_draft_tokens.append(entry.num_total_output_tokens - entry.decode_iteration - 1)
-                draft_acceptance_rate.append(float(num_accepted_draft_tokens[-1]) / float(num_draft_tokens[-1]))
-                acceptance_length.append(entry.num_total_output_tokens / (entry.decode_iteration +
-                                                       1))
+                num_draft_tokens.append(max_draft_tokens *
+                                        (entry.decode_iteration + 1))
+                num_accepted_draft_tokens.append(entry.num_total_output_tokens -
+                                                 entry.decode_iteration - 1)
+                draft_acceptance_rate.append(
+                    float(num_accepted_draft_tokens[-1]) /
+                    float(num_draft_tokens[-1]))
+                acceptance_length.append(entry.num_total_output_tokens /
+                                         (entry.decode_iteration + 1))
 
-        global_acceptance_length = sum(output_tokens) / total_decoding_iterations
+        global_acceptance_length = sum(
+            output_tokens) / total_decoding_iterations
         queue_time_total = last_queue_time - start_time
-        
+
         num_draft_tokens_percentiles = PercentileStats.from_iterable(
             num_draft_tokens) if num_draft_tokens else None
         num_accepted_draft_tokens_percentiles = PercentileStats.from_iterable(
@@ -156,7 +161,8 @@ class StatsKeeper:
             issue_rate_ns=queue_time_total / num_requests,
             acceptance_length=global_acceptance_length,
             num_draft_tokens_percentiles=num_draft_tokens_percentiles,
-            num_accepted_draft_tokens_percentiles=num_accepted_draft_tokens_percentiles,
+            num_accepted_draft_tokens_percentiles=
+            num_accepted_draft_tokens_percentiles,
             draft_acceptance_rate_percentiles=draft_acceptance_rate_percentiles,
             acceptance_length_percentiles=acceptance_length_percentiles,
         )
@@ -188,7 +194,8 @@ class ReportUtility:
         self.logger = logger
         self.kwargs = kwargs
         self.raw_statistics = statistics
-        self.statistics = statistics.generate_statistics_summary(self.get_max_draft_len())
+        self.statistics = statistics.generate_statistics_summary(
+            self.get_max_draft_len())
         self.streaming = streaming
 
     @staticmethod
@@ -436,16 +443,20 @@ class ReportUtility:
                 decoding_mode,
                 "num_draft_tokens_percentiles":
                 self.statistics.num_draft_tokens_percentiles.model_dump(
-                    exclude_none=True, by_alias=True, mode='json') if self.statistics.num_draft_tokens_percentiles else None,
+                    exclude_none=True, by_alias=True, mode='json')
+                if self.statistics.num_draft_tokens_percentiles else None,
                 "num_accepted_draft_tokens_percentiles":
-                self.statistics.num_accepted_draft_tokens_percentiles.model_dump(
-                    exclude_none=True, by_alias=True, mode='json') if self.statistics.num_accepted_draft_tokens_percentiles else None,
+                self.statistics.num_accepted_draft_tokens_percentiles.
+                model_dump(exclude_none=True, by_alias=True, mode='json') if
+                self.statistics.num_accepted_draft_tokens_percentiles else None,
                 "draft_acceptance_rate_percentiles":
                 self.statistics.draft_acceptance_rate_percentiles.model_dump(
-                    exclude_none=True, by_alias=True, mode='json') if self.statistics.draft_acceptance_rate_percentiles else None,
+                    exclude_none=True, by_alias=True, mode='json')
+                if self.statistics.draft_acceptance_rate_percentiles else None,
                 "acceptance_length_percentiles":
                 self.statistics.acceptance_length_percentiles.model_dump(
-                    exclude_none=True, by_alias=True, mode='json') if self.statistics.acceptance_length_percentiles else None
+                    exclude_none=True, by_alias=True, mode='json')
+                if self.statistics.acceptance_length_percentiles else None
             }
         # Dataset metadata
         stats_dict["dataset"] = self.dataset_metadata.model_dump(by_alias=True,
@@ -588,23 +599,37 @@ class ReportUtility:
             if self.get_max_draft_len() > 0:
                 num_draft_tokens = decoding["num_draft_tokens_percentiles"]
                 num_draft_tokens_stats = "\n".join(
-                    f"[DT] {key.upper():<7}: {num_draft_tokens[key]:.2f}" for key in
-                    ["minimum", "maximum", "average", "p50", "p90", "p95", "p99"])
+                    f"[DT] {key.upper():<7}: {num_draft_tokens[key]:.2f}"
+                    for key in [
+                        "minimum", "maximum", "average", "p50", "p90", "p95",
+                        "p99"
+                    ])
 
-                num_accepted_draft_tokens = decoding["num_accepted_draft_tokens_percentiles"]
+                num_accepted_draft_tokens = decoding[
+                    "num_accepted_draft_tokens_percentiles"]
                 num_accepted_draft_tokens_stats = "\n".join(
-                    f"[ADT] {key.upper():<7}: {num_accepted_draft_tokens[key]:.2f}" for key in
-                    ["minimum", "maximum", "average", "p50", "p90", "p95", "p99"])
+                    f"[ADT] {key.upper():<7}: {num_accepted_draft_tokens[key]:.2f}"
+                    for key in [
+                        "minimum", "maximum", "average", "p50", "p90", "p95",
+                        "p99"
+                    ])
 
-                draft_acceptance_rate = decoding["draft_acceptance_rate_percentiles"]
+                draft_acceptance_rate = decoding[
+                    "draft_acceptance_rate_percentiles"]
                 draft_acceptance_rate_stats = "\n".join(
-                    f"[DAR] {key.upper():<7}: {draft_acceptance_rate[key]:.2f}" for key in
-                    ["minimum", "maximum", "average", "p50", "p90", "p95", "p99"])
+                    f"[DAR] {key.upper():<7}: {draft_acceptance_rate[key]:.2f}"
+                    for key in [
+                        "minimum", "maximum", "average", "p50", "p90", "p95",
+                        "p99"
+                    ])
 
                 acceptance_length = decoding["acceptance_length_percentiles"]
                 acceptance_length_stats = "\n".join(
-                    f"[AL] {key.upper():<7}: {acceptance_length[key]:.2f}" for key in
-                    ["minimum", "maximum", "average", "p50", "p90", "p95", "p99"])
+                    f"[AL] {key.upper():<7}: {acceptance_length[key]:.2f}"
+                    for key in [
+                        "minimum", "maximum", "average", "p50", "p90", "p95",
+                        "p99"
+                    ])
 
                 decoding_stats = (
                     "===========================================================\n"
@@ -624,7 +649,8 @@ class ReportUtility:
                     "-- Acceptance Length Details --------------------------------\n\n"
                     f"{acceptance_length_stats}"
                     f"\n"
-                    "===========================================================\n")
+                    "===========================================================\n"
+                )
 
         logging_info = (f"{backend_info}"
                         f"{request_info}"
@@ -653,11 +679,10 @@ class ReportUtility:
                     return build_cfg.get("max_draft_len", 0)
                 except (FileNotFoundError, KeyError, json.JSONDecodeError):
                     pass
-        
+
         # Try to get from speculative_config
         if ("speculative_config" in self.kwargs
                 and self.kwargs["speculative_config"] is not None):
             return self.kwargs["speculative_config"].max_draft_len or 0
-        
-        return 0
 
+        return 0
