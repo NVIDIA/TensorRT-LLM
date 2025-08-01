@@ -16,9 +16,9 @@ def get_token_id(tokenizer: Any, word: str) -> int:
         pytest.skip(f'Could not get token id for {word}: {exc}')
 
 
-async def test_logit_bias_effect_helper(client: Any,
-                                        model_name: str,
-                                        api_type: str = 'completions') -> None:
+async def logit_bias_effect_helper(client: Any,
+                                   model_name: str,
+                                   api_type: str = 'completions') -> None:
     '''Helper function to test logit bias effects for both chat and completions APIs.
 
     Args:
@@ -93,9 +93,9 @@ async def test_logit_bias_effect_helper(client: Any,
     assert 'Paris' not in output, f"Did not expect 'Paris' in output with negative logit bias, got: {output}"
 
 
-async def test_invalid_logit_bias_helper(client: Any,
-                                         model_name: str,
-                                         api_type: str = 'completions') -> None:
+async def invalid_logit_bias_helper(client: Any,
+                                    model_name: str,
+                                    api_type: str = 'completions') -> None:
     '''Helper function to test invalid logit bias for both chat and completions APIs.
 
     Args:
