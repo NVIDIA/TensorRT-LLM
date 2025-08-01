@@ -298,23 +298,15 @@ void initializeLogProbs(DecodingOutput& dJointOutput, SizeType32 batchSlot, Samp
     }
 }
 
-} // namespace
-
-void CreateNewDecoderRequests::newRequest(SizeType32 batchSlot, runtime::decoder_batch::Request const& request,
-    SamplingConfig const& samplingConfig, runtime::ModelConfig const& modelConfig,
-    runtime::decoder::DecoderState& decoderState, CudaStream const& decoderStream)
+void initializeOutputs(DecodingOutput& dJointOutput, SizeType32 batchSlot, SizeType32 maxDecodingEngineTokens,
+    BufferManager const& manager)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-
-    BufferManager manager{std::make_shared<CudaStream>(decoderStream.get())};
-
-    // output
-    auto& dJointOutput = decoderState.getJointDecodingOutput();
 
     auto finishedSum = ITensor::slice(dJointOutput.finishedSum, batchSlot, 1);
     manager.setZero(*finishedSum);
 
-    for (SizeType32 ti = 0; ti < decoderState.getMaxDecodingEngineTokens(); ++ti)
+    for (SizeType32 ti = 0; ti < maxDecodingEngineTokens; ++ti)
     {
         TensorPtr const newTokensStepView = ITensor::slice(dJointOutput.newTokensSteps, ti, 1);
         newTokensStepView->squeeze(0);
@@ -322,11 +314,13 @@ void CreateNewDecoderRequests::newRequest(SizeType32 batchSlot, runtime::decoder
         manager.setZero(*newTokensVec);
     }
 
-    TensorPtr const finishedStepsSlice = ITensor::slice(decoderState.getFinishReasons(), batchSlot, 1);
+    TensorPtr const finishedStepsSlice = ITensor::slice(dJointOutput.finishReasons, batchSlot, 1);
     manager.setZero(*finishedStepsSlice);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
+
+} // namespace
 
 void CreateNewDecoderRequests::newRequestSpeculativeDecoding(SizeType32 batchIdx,
     runtime::decoder_batch::Request const& request, SamplingConfig const& samplingConfig,
@@ -646,9 +640,9 @@ CreateNewDecoderRequests::createDecoderRequests(RequestVector const& finishedCon
         setupWords(dJointInput.stopWordsLists, llmReq->getStopWordsList(), dJointInput.stopWordsPtrs,
             dJointInput.stopWordsLens, dJointInput.maxStopWordsLen, batchSlot, decoderBufferManager);
 
-        newRequest(batchSlot, decoderRequest, samplingConfig, modelConfig, decoderState, decoderStream);
-
         auto& dJointOutput = decoderState.getJointDecodingOutput();
+
+        initializeOutputs(dJointOutput, batchSlot, decoderState.getMaxDecodingEngineTokens(), decoderBufferManager);
 
         initializeLogProbs(dJointOutput, batchSlot, samplingConfig, decoderBufferManager);
 
