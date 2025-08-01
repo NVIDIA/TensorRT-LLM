@@ -114,9 +114,9 @@ protected:
         h_kv_scale_quant_orig{nullptr}, d_kv_scale_quant_orig{nullptr},
         // for kernel 1
         d_compressed_kv_output{nullptr}, h_compressed_kv_output{nullptr}, h_compressed_kv_output_ref{nullptr},
-        d_k_pe_output{nullptr}, h_k_pe_output{nullptr}, h_k_pe_output_ref{nullptr},
+        d_k_pe_output{nullptr}, h_k_pe_output{nullptr}, h_k_pe_output_ref{nullptr};
 
-        int mNumRequests{};
+    int mNumRequests{};
     int mMaxSeqLen{};
     int mMaxCachedSeqLen{};
     int mMaxUncachedSeqLen{};
