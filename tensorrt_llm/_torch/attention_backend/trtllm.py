@@ -632,6 +632,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 dtype=torch.int32,
                 device='cuda',
             )
+
             self.host_kv_cache_block_offsets = torch.empty_like(
                 self.kv_cache_block_offsets,
                 device='cpu',
@@ -689,6 +690,168 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     device='cpu',
                     pin_memory=True,
                 )
+
+    def get_runtime_buffers(self):
+        buffers = {
+            "prompt_lens_cuda": self.prompt_lens_cuda,
+            "kv_lens_cuda": self.kv_lens_cuda,
+            "kv_lens": self.kv_lens,
+            "workspace": self.workspace
+        }
+
+        if self.kv_cache_manager is not None:
+            buffers["kv_cache_block_offsets"] = self.kv_cache_block_offsets
+
+            if self.enable_flash_mla:
+                buffers["block_ids_per_seq"] = self.block_ids_per_seq
+                buffers["kv_block_ids_per_seq"] = self.kv_block_ids_per_seq
+
+            if self.enable_paged_context_mla:
+                buffers[
+                    "ctx_cached_token_indptr"] = self.ctx_cached_token_indptr
+                buffers[
+                    "ctx_uncached_token_indptr"] = self.ctx_uncached_token_indptr
+                buffers["ctx_kv_indptr"] = self.ctx_kv_indptr
+
+        return buffers
+
+    def __post_init_with_buffers__(self, buffers) -> None:
+        super().__post_init__()
+        # Set a default value, as max_num_sequences is not always set.
+        if self.max_num_sequences is None:
+            self.max_num_sequences = self.max_num_requests
+
+        self.prompt_lens_cpu = torch.empty(
+            (self.max_num_sequences, ),
+            device='cpu',
+            dtype=torch.int,
+            pin_memory=True,
+        )
+        if "prompt_lens_cuda" in buffers and buffers["prompt_lens_cuda"].numel(
+        ) >= self.prompt_lens_cpu.numel():
+            self.prompt_lens_cuda = buffers["prompt_lens_cuda"]
+        else:
+            self.prompt_lens_cuda = torch.empty_like(
+                self.prompt_lens_cpu,
+                device='cuda',
+            )
+
+        self.kv_lens = torch.empty_like(self.prompt_lens_cuda,
+                                        device='cpu',
+                                        pin_memory=True)
+
+        if "kv_lens_cuda" in buffers and buffers["kv_lens_cuda"].numel(
+        ) >= self.kv_lens.numel():
+            self.kv_lens_cuda = buffers["prompt_lens_cuda"]
+        else:
+            self.kv_lens_cuda = torch.empty_like(self.prompt_lens_cuda)
+
+        self.host_request_types = torch.empty_like(self.prompt_lens_cpu)
+        self.workspace = torch.empty(
+            (0, ),
+            device='cuda',
+            dtype=torch.int8,
+        )
+
+        self.host_kv_cache_block_offsets = torch.empty_like(
+            self.kv_cache_block_offsets,
+            device='cpu',
+            pin_memory=True,
+        )
+        if self.kv_cache_manager is not None:
+            if "kv_cache_block_offsets" in buffers and buffers[
+                    "kv_cache_block_offsets"].numel(
+                    ) >= self.host_kv_cache_block_offsets.numel():
+                self.kv_cache_block_offsets = buffers["kv_cache_block_offsets"]
+            else:
+                self.kv_cache_block_offsets = torch.empty_like(
+                    self.host_kv_cache_block_offsets,
+                    dtype=torch.int32,
+                    device='cuda',
+                )
+
+            self.block_ids_per_seq = None
+            self.kv_block_ids_per_seq = None
+            if self.enable_flash_mla:
+                if "block_ids_per_seq" in buffers and buffers["block_ids_per_seq"].numel(
+                ) >= self.kv_cache_manager.max_batch_size * self.kv_cache_manager.max_blocks_per_seq:
+                    self.block_ids_per_seq = buffers["block_ids_per_seq"]
+                else:
+                    self.block_ids_per_seq = torch.empty(
+                        [
+                            self.kv_cache_manager.max_batch_size,
+                            self.kv_cache_manager.max_blocks_per_seq
+                        ],
+                        dtype=torch.int32,
+                        device='cuda',
+                    )
+
+                if "kv_block_ids_per_seq" in buffers and buffers[
+                        "kv_block_ids_per_seq"].numel(
+                        ) >= self.kv_cache_manager.max_batch_size * self.kv_cache_manager.max_blocks_per_seq:
+                    self.kv_block_ids_per_seq = buffers["kv_block_ids_per_seq"]
+                else:
+                    self.kv_block_ids_per_seq = torch.zeros(
+                        [
+                            self.kv_cache_manager.max_batch_size,
+                            self.kv_cache_manager.max_blocks_per_seq
+                        ],
+                        dtype=torch.int32,
+                        device='cuda',
+                    )
+
+            if self.enable_paged_context_mla:
+                # for kv cache reuse/chunked context in MLA
+                self.host_ctx_cached_token_indptr = torch.zeros_like(
+                    self.ctx_cached_token_indptr,
+                    device='cpu',
+                    pin_memory=True,
+                )
+
+                if "ctx_cached_token_indptr" in buffers and buffers[
+                        "ctx_cached_token_indptr"].numel(
+                        ) >= self.host_ctx_cached_token_indptr.numel():
+                    self.ctx_cached_token_indptr = buffers[
+                        "ctx_cached_token_indptr"]
+                else:
+                    self.ctx_cached_token_indptr = torch.zeros_like(
+                        self.host_ctx_cached_token_indptr,
+                        device='cuda',
+                        dtype=torch.int64,
+                    )
+
+                self.host_ctx_uncached_token_indptr = torch.zeros(
+                    (self.max_num_requests + 1, ),
+                    device='cpu',
+                    pin_memory=True,
+                )
+                if "ctx_uncached_token_indptr" in buffers and buffers[
+                        "ctx_uncached_token_indptr"].numel(
+                        ) >= self.host_ctx_uncached_token_indptr.numel():
+                    self.ctx_uncached_token_indptr = buffers[
+                        "ctx_uncached_token_indptr"]
+                else:
+                    self.ctx_uncached_token_indptr = torch.zeros_like(
+                        self.host_ctx_uncached_token_indptr,
+                        device='cuda',
+                        dtype=torch.int64,
+                    )
+
+                self.host_ctx_kv_indptr = torch.zeros(
+                    (self.max_num_requests + 1, ),
+                    device='cpu',
+                    pin_memory=True,
+                )
+                # context full seqlens include cached tokens and uncached tokens
+                if "ctx_kv_indptr" in buffers and buffers["ctx_kv_indptr"].numel(
+                ) >= self.host_ctx_kv_indptr.numel():
+                    self.ctx_kv_indptr = buffers["ctx_kv_indptr"]
+                else:
+                    self.ctx_kv_indptr = torch.zeros_like(
+                        self.host_ctx_kv_indptr,
+                        device='cuda',
+                        dtype=torch.int64,
+                    )
 
     def prepare(self) -> None:
         extra_attrs = get_model_extra_attrs()
