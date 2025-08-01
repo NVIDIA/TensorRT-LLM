@@ -977,7 +977,7 @@ class PyTorchModelEngine(ModelEngine):
 
         num_sequences_in_batch = batch_size * self.max_beam_width
         attn_metadata = self.attn_metadata.create_cuda_graph_metadata(
-            num_sequences_in_batch, False, spec_max_draft_tokens,
+            num_sequences_in_batch, False, draft_len,
             self.max_cudagraph_meta_buffers)
         new_attn_buffers = attn_metadata.get_runtime_buffers()
 
