@@ -115,6 +115,12 @@ std::deque<tle::KVCacheEvent> KVCacheEventManager::getEvents(std::optional<std::
 void KVCacheEventManager::flush()
 {
     auto eventQueue = std::exchange(mEventQueue, {});
+
+    if (eventQueue.empty())
+    {
+        return;
+    }
+
     std::unique_lock<std::mutex> lck(mPendingEventsMutex);
     mPendingEvents.push_back(std::move(eventQueue));
     mPendingEmptyCV.notify_one();
