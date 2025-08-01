@@ -1200,10 +1200,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         return True
 
     @classmethod
-    def need_contiguous_qkv(cls) -> bool:
-        return True
-
-    @classmethod
     def support_mla(cls) -> bool:
         return True
 
