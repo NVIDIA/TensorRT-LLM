@@ -89,8 +89,7 @@ public:
         SizeType32 maxSequenceLength, OptionalRef<MedusaBuffers const> medusaBuffers) const;
 
 private:
-    //! @brief Initialize the decoder at `batchSlot` with a new `request`. Exposed only for static batching via
-    //! GptDecoderBatched::newBatch()
+    //! @brief Initialize the decoder at `batchSlot` with a new `request`.
     static void newRequest(SizeType32 batchSlot, runtime::decoder_batch::Request const& request,
         SamplingConfig const& samplingConfig, runtime::ModelConfig const& modelConfig,
         runtime::decoder::DecoderState& decoderState, CudaStream const& runtimeStream, CudaStream const& decoderStream,

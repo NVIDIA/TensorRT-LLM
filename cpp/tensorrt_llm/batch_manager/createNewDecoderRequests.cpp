@@ -44,6 +44,7 @@ namespace tensorrt_llm::batch_manager
 
 using SizeType32 = CreateNewDecoderRequests::SizeType32;
 using TensorPtr = CreateNewDecoderRequests::TensorPtr;
+using SharedConstPtr = CreateNewDecoderRequests::SharedConstPtr;
 
 namespace
 {
