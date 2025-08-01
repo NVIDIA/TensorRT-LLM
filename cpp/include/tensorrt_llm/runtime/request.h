@@ -27,27 +27,15 @@ namespace tensorrt_llm::runtime::decoder_batch
 class Request
 {
 public:
-    using TensorConstPtr = ITensor::SharedConstPtr;
     using TensorPtr = ITensor::SharedPtr;
     using BufferPtr = IBuffer::SharedPtr;
 
-    explicit Request(SizeType32 inputLen)
-        : inputLen(inputLen)
-    {
-    }
+    SizeType32 generatedTokensPerEngineStep{1};
 
-    //! Mandatory parameters
-    SizeType32 inputLen; // Input length without draft tokens, increasing with generation steps
-
-    // optional parameters
-    SizeType32 generatedTokensPerEngineStep{1}; //
-
-    //! Optional parameters for speculative decoding
     BufferPtr draftTokens;                // [generatedTokensPerEngineStep - 1] on gpu
     std::optional<TensorPtr> draftLogits; // [generatedTokensPerEngineStep - 1, vocabSize] on gpu
     TensorPtr medusaPaths;                // [maxDecodingTokens, maxPathLen], on gpu
     TensorPtr medusaTreeIds;              // [maxDecodingTokens], on gpu
-    std::optional<executor::LookaheadDecodingConfig> lookaheadRuntimeConfig;
     std::optional<executor::EagleConfig> eagleConfig;
 };
 
