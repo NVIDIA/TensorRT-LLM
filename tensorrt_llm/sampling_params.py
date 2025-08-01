@@ -279,6 +279,12 @@ class SamplingParams:
 
         self.best_of = self.best_of or self.n
 
+        if self.embedding_bias is not None:
+            if isinstance(self.embedding_bias, torch.Tensor):
+                self.embedding_bias = self.embedding_bias.detach().clone()
+            else:
+                self.embedding_bias = torch.tensor(self.embedding_bias, dtype=torch.float32)
+
         self._validate()
 
     def _validate(self):

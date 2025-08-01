@@ -471,11 +471,7 @@ def executor_request_to_llm_request(
         is_streaming=executor_request.streaming,
         end_id=executor_request.end_id,
         pad_id=executor_request.pad_id,
-        embedding_bias=(
-            executor_request.embedding_bias.detach().clone() if isinstance(
-                executor_request.embedding_bias, torch.Tensor) else
-            torch.tensor(executor_request.embedding_bias, dtype=torch.float32))
-        if executor_request.embedding_bias is not None else None,
+        embedding_bias=executor_request.embedding_bias,
         bad_words_list=torch.tensor(
             convert_wordlist(executor_request.bad_words), dtype=torch.int32)
         if executor_request.bad_words else None,
