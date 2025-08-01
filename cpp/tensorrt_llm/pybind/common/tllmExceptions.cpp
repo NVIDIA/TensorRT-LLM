@@ -26,8 +26,8 @@ void initExceptionsBindings(py::module_& m)
 {
     // Bind the RequestErrorCode enum
     py::enum_<tc::RequestErrorCode>(m, "RequestErrorCode")
-        .value("UNKNOWN_ERROR", tc::RequestErrorCode::UNKNOWN_ERROR)
-        .value("NETWORK_ERROR", tc::RequestErrorCode::NETWORK_ERROR)
+        .value("UNKNOWN_ERROR", tc::RequestErrorCode::kUNKNOWN_ERROR)
+        .value("NETWORK_ERROR", tc::RequestErrorCode::kNETWORK_ERROR)
         .export_values();
 
     // Create the RequestSpecificException Python exception class
