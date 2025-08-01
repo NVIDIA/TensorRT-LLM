@@ -140,6 +140,8 @@ def top_p_sampling_batch(logits: torch.Tensor,
     cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1),
                                     dim=-1)
 
+    if temperature != 0:
+        logits = logits / max(temperature, 1e-5)
     # get the location of top_p
     sorted_indices_to_remove = cumulative_probs > top_p
     sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
@@ -250,6 +252,24 @@ class TorchSampler(Sampler):
         # So, we temporarily exit inference mode.
         with torch.inference_mode(False):
             self.store = self.create_store()
+            # Initialize seed for multi-GPU consistency
+        self._global_seed = 42
+        self._generator = None
+
+    def get_generator(self, device: torch.device) -> torch.Generator:
+        """Get a deterministic generator for the specified device.
+
+        Args:
+            device: The device to create the generator on
+
+        Returns:
+            A torch.Generator with the global seed set
+        """
+        if self._generator is None:
+            # Fallback to a default seed if not set
+            self._generator = torch.Generator(device=device)
+            self._generator.manual_seed(self._global_seed)
+        return self._generator
 
         # Initialize seed for multi-GPU consistency
         self._global_seed = 42
@@ -601,7 +621,6 @@ class TorchSampler(Sampler):
             current_slice = slice(0, steps), slot, beam
             new_tokens[current_slice] = next_tokens
             if request.py_draft_logits is not None:
-                # Could be cleaner
                 request.py_target_probs = softmax.clone()
             if gen_logits_host is not None:
                 gen_logits_host[current_slice].copy_(logits, non_blocking=True)

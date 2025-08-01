@@ -320,6 +320,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_draft_pages_allocated = 0
         self.py_rewind_len = 0
         self.py_draft_tokens = [] if self.draft_tokens is None else self.draft_tokens
+        self.py_draft_logits = None
+        self.py_target_probs = None
         self.py_last_context_chunk = (None, None)
         self.py_draft_logits = None
         self.py_target_probs = None
