@@ -100,6 +100,10 @@ class FusedMoEMethodBase(ABC):
                 w1_weight = weights[f"{expert_id}.w1.weight"]
                 w3_weight = weights[f"{expert_id}.w3.weight"]
                 w2_weight = weights[f"{expert_id}.w2.weight"]
+            elif weight_loading_mode == MoEWeightLoadingMode.META_FP8_RECIPE:
+                w1_weight = weights[f"{expert_id}.gate_proj.weight"]
+                w3_weight = weights[f"{expert_id}.up_proj.weight"]
+                w2_weight = weights[f"{expert_id}.down_proj.weight"]
             elif weight_loading_mode == MoEWeightLoadingMode.FUSED_GATE_UP_PROJ:
                 w1_w3_weight = weights["gate_up_proj"][expert_id].transpose(
                     0, 1)
@@ -364,6 +368,11 @@ class FP8QDQFusedMoEMethod(FusedMoEMethodBase):
                 w1_input_scale = weights[f"{expert_id}.w1.input_scale"]
                 w3_input_scale = weights[f"{expert_id}.w3.input_scale"]
                 w2_input_scale = weights[f"{expert_id}.w2.input_scale"]
+            elif module.weight_loading_mode == MoEWeightLoadingMode.META_FP8_RECIPE:
+                # HACK: dynamic quantization so no input scale - create empty tensors for testing
+                w1_input_scale = torch.tensor(1.0, dtype=torch.float32)
+                w3_input_scale = torch.tensor(1.0, dtype=torch.float32)
+                w2_input_scale = torch.tensor(1.0, dtype=torch.float32)
             elif module.weight_loading_mode == MoEWeightLoadingMode.FUSED_GATE_UP_PROJ:
                 w1_input_scale = weights[f"gate_up_proj_input_scale"]
                 w3_input_scale = weights[f"gate_up_proj_input_scale"]
@@ -397,6 +406,11 @@ class FP8QDQFusedMoEMethod(FusedMoEMethodBase):
                 w1_weight_scale = weights[f"{expert_id}.w1.weight_scale"]
                 w3_weight_scale = weights[f"{expert_id}.w3.weight_scale"]
                 w2_weight_scale = weights[f"{expert_id}.w2.weight_scale"]
+            elif module.weight_loading_mode == MoEWeightLoadingMode.META_FP8_RECIPE:
+                # HACK: weight scale is not the right shape in blockwise recipe - create empty tensors for testing
+                w1_weight_scale = torch.tensor(1.0, dtype=torch.float32)
+                w3_weight_scale = torch.tensor(1.0, dtype=torch.float32)
+                w2_weight_scale = torch.tensor(1.0, dtype=torch.float32)
             elif module.weight_loading_mode == MoEWeightLoadingMode.FUSED_GATE_UP_PROJ:
                 w1_weight_scale = weights[f"gate_up_proj_weight_scale"]
                 w3_weight_scale = weights[f"gate_up_proj_weight_scale"]

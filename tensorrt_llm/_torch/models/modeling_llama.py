@@ -274,6 +274,7 @@ class Llama4MoE(nn.Module):
             overridden_tp_size=1 if self.enable_attention_dp else None,
             reduce_output=False)
 
+        weight_loading_mode = MoEWeightLoadingMode.META_FP8_RECIPE if model_config.quant_config.use_meta_recipe else MoEWeightLoadingMode.FUSED_GATE_UP_PROJ
         self.experts = create_moe(
             routing_method=Llama4RenormalizeMoeRoutingMethod(top_k),
             num_experts=num_experts,
@@ -282,7 +283,7 @@ class Llama4MoE(nn.Module):
             dtype=dtype,
             reduce_results=
             False,  # In both low latency and max-throughput scenarios, FusedMoE needs not to do allreduce inside op.
-            weight_loading_mode=MoEWeightLoadingMode.FUSED_GATE_UP_PROJ,
+            weight_loading_mode=weight_loading_mode,
             model_config=model_config,
             apply_router_weight_on_input=True,
             layer_idx=layer_idx)

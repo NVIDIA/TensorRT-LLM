@@ -498,7 +498,8 @@ class FP8RowwiseLinearMethod(LinearMethodBase):
 
         scale_name = self._get_scale_name(weights)
         weight_scale = load_weight_shard(weights[0][scale_name], module.tp_size,
-                                         module.tp_rank, module.tp_mode)
+                                         module.tp_rank,
+                                         module.tp_mode).squeeze()
         copy_weight(module.weight_scale, weight_scale)
         if "input_scale" in weights[0]:
             copy_weight(module.input_scale, weights[0]["input_scale"])
@@ -533,7 +534,7 @@ class FP8RowwiseLinearMethod(LinearMethodBase):
                                        module.tp_rank, module.tp_mode)
         right_scale = load_weight_shard(weights[1][scale_name], module.tp_size,
                                         module.tp_rank, module.tp_mode)
-        fused_scale = torch.cat((left_scale, right_scale))
+        fused_scale = torch.cat((left_scale, right_scale)).squeeze()
         copy_weight(module.weight_scale, fused_scale)
 
 

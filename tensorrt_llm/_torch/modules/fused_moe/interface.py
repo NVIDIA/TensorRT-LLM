@@ -12,6 +12,7 @@ from .routing import BaseMoeRoutingMethod
 class MoEWeightLoadingMode(Enum):
     VANILLA = 0
     FUSED_GATE_UP_PROJ = 1
+    META_FP8_RECIPE = 2
 
 
 class MoE(nn.Module):
@@ -109,6 +110,12 @@ class MoE(nn.Module):
     def has_fp8_qdq(self):
         assert self._weights_created
         return self.quant_config is not None and self.quant_config.layer_quant_mode.has_fp8_qdq(
+        )
+
+    @property
+    def has_fp8_rowwise(self):
+        assert self._weights_created
+        return self.quant_config is not None and self.quant_config.layer_quant_mode.has_fp8_rowwise(
         )
 
     @property

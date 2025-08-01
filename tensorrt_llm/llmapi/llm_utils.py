@@ -426,6 +426,12 @@ class ModelLoader:
                             "weight_block_size"):
                     quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
                     quant_config.exclude_modules = ["*eh_proj"]
+                elif hf_quant_config.get(
+                        "quant_method"
+                ) == "compressed-tensors" and hf_quant_config.get(
+                        "format") == "float-quantized":
+                    # Llama4 FP8 ckpt
+                    quant_config.quant_algo = QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN
                 else:
                     raise NotImplementedError(
                         f"Unsupported quantization_config: {hf_quant_config}.")
