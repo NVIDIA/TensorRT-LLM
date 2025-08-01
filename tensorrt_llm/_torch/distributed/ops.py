@@ -337,17 +337,25 @@ class MNNVLAllReduce(nn.Module):
 
         fusion_op = all_reduce_params.fusion_op
         shape = input.shape
-        hidden_dim = shape[-1]
+        input = input.view(-1, shape[-1])
+        (num_tokens, hidden_dim) = input.shape
 
         # Slice the buffer according to the hidden size, need to pass this numel as the new buffer size
-        num_elements_in_use = self.max_num_elements_mnnvl // hidden_dim * hidden_dim
+        max_num_tokens = self.max_num_elements_mnnvl // hidden_dim
+        num_elements_in_use = max_num_tokens * hidden_dim
+        if num_tokens > max_num_tokens:
+            logger.debug(
+                f"MNNVL AllReduce can't be enabled due to {num_tokens=} larger than {max_num_tokens=}."
+            )
+            return None
+
+        # This should not happen but leave this check for future code changes
         if num_elements_in_use > self.max_num_elements_mnnvl:
             logger.debug(
                 f"MNNVL AllReduce can't be enabled due to {num_elements_in_use=} larger than {self.max_num_elements_mnnvl=}."
             )
             return None
 
-        input = input.view(-1, hidden_dim)
         output = torch.empty_like(input)
         buffer_mnnvl = self.buffer_mnnvl.view(-1)[:(3 * 2 *
                                                     num_elements_in_use)].view(
@@ -364,7 +372,7 @@ class MNNVLAllReduce(nn.Module):
             return output.view(shape)
         # Fallback to use other allreduce if hidden_size is not supported
         elif (fusion_op == AllReduceFusionOp.RESIDUAL_RMS_NORM
-              and shape[-1] in MNNVLAllReduce.SUPPORTED_FUSION_HIDDEN_DIMS):
+              and hidden_dim in MNNVLAllReduce.SUPPORTED_FUSION_HIDDEN_DIMS):
             torch.ops.trtllm.mnnvl_twoshot_allreduce(
                 input,
                 buffer_mnnvl,
