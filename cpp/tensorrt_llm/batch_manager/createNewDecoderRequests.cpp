@@ -292,11 +292,7 @@ void CreateNewDecoderRequests::newRequest(SizeType32 batchSlot, runtime::decoder
 
     auto const batchSize = decoderState.getMaxNumSequences();
     TLLM_CHECK(0 <= batchSize && batchSlot < batchSize);
-    auto const maxBeamWidth = decoderState.getMaxBeamWidth();
-    auto const beamWidth = samplingConfig.beamWidth;
-    TLLM_CHECK_WITH_INFO(beamWidth <= maxBeamWidth,
-        tc::fmtstr("Beam width (%d) must be smaller than maxBeamWidth (%d) passed to decoder setup function.",
-            beamWidth, maxBeamWidth));
+
     auto const inputLength = request.inputLen;
     auto const numDecodingEngineTokens = request.generatedTokensPerEngineStep;
     auto const numDecodingDraftEngineTokens = numDecodingEngineTokens - 1;
@@ -310,8 +306,6 @@ void CreateNewDecoderRequests::newRequest(SizeType32 batchSlot, runtime::decoder
 
     // input
     auto& dJointInput = decoderState.getJointDecodingInput();
-
-    dJointInput.beamWidths.at(batchSlot) = beamWidth;
 
     TensorPtr const sequenceLimitLength{
         ITensor::slice(constPointerCast(dJointInput.sequenceLimitLength), batchSlot, 1)};
@@ -597,19 +591,25 @@ CreateNewDecoderRequests::createDecoderRequests(RequestVector const& finishedCon
     SizeType32 inputOffset{0};
     for (auto const& llmReq : finishedContextRequests)
     {
+        llmReq->mSamplingConfig.normalizeLogProbs = mIsNormalizeLogProbs;
+
         auto& dJointInput = decoderState.getJointDecodingInput();
 
         TLLM_CHECK(llmReq->mSeqSlot.has_value());
         auto const batchSlot = llmReq->mSeqSlot.value();
 
         auto const& samplingConfig = llmReq->mSamplingConfig;
+
         auto const beamWidth = samplingConfig.beamWidth;
+        auto const maxBeamWidth = decoderState.getMaxBeamWidth();
+        TLLM_CHECK_WITH_INFO(beamWidth <= maxBeamWidth,
+            tc::fmtstr("Beam width (%d) must be smaller than maxBeamWidth (%d) passed to decoder setup function.",
+                beamWidth, maxBeamWidth));
+        dJointInput.beamWidths.at(batchSlot) = beamWidth;
 
         auto const promptLen = llmReq->getPromptLen();
 
         auto decoderRequest = decoder_batch::Request{promptLen, llmReq->mMaxNewTokens};
-
-        llmReq->mSamplingConfig.normalizeLogProbs = mIsNormalizeLogProbs;
 
         if (modelConfig.getSpeculativeDecodingMode().isDraftTokensExternal())
         {
