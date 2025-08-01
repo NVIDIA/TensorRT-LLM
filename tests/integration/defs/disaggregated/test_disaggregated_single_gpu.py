@@ -27,21 +27,21 @@ MPI_READY = MPI_TAG + 2
 MPI_REQUEST = MPI_TAG
 MPI_RESULT = MPI_TAG + 1
 
+MODEL_PATHS = {
+    "DeepSeek-V3-Lite-fp8": "DeepSeek-V3-Lite/fp8",
+    "TinyLlama-1.1B-Chat-v1.0": "llama-models-v2/TinyLlama-1.1B-Chat-v1.0",
+    "Llama-3.1-8B-Instruct": "llama-3.1-model/Llama-3.1-8B-Instruct/",
+    "EAGLE3-LLaMA3.1-Instruct-8B": "EAGLE3-LLaMA3.1-Instruct-8B",
+    "Qwen3-8B-FP8": "Qwen3/Qwen3-8B-FP8",
+}
+
 
 def model_path(model_name):
     llm_models_root = os.environ["LLM_MODELS_ROOT"]
-    if 'DeepSeek-V3-Lite-fp8' in model_name:
-        return os.path.join(llm_models_root, 'DeepSeek-V3-Lite', 'fp8')
-    elif 'TinyLlama-1.1B-Chat-v1.0' in model_name:
-        return os.path.join(llm_models_root, 'llama-models-v2',
-                            'TinyLlama-1.1B-Chat-v1.0')
-    elif 'Llama-3.1-8B-Instruct' in model_name:
-        return os.path.join(llm_models_root, 'llama-3.1-model',
-                            'Llama-3.1-8B-Instruct/')
-    elif 'EAGLE3-LLaMA3.1-Instruct-8B' in model_name:
-        return os.path.join(llm_models_root, 'EAGLE3-LLaMA3.1-Instruct-8B')
-    else:
-        raise ValueError(f"Unknown model: {model_name}")
+    for name, path in MODEL_PATHS.items():
+        if name in model_name:
+            return os.path.join(llm_models_root, path)
+    raise ValueError(f"Unknown model: {model_name}")
 
 
 async def run_worker(kv_cache_config, cache_transceiver_config, pytorch_config,
@@ -229,6 +229,22 @@ def test_disaggregated_simple_deepseek(model, generation_overlap,
             369, 17575, 539, 3085, 344, 270, 6102, 294, 8760, 33, 369, 11111,
             539, 3085, 344, 270, 6102, 294, 14251, 33, 369, 16235, 539, 3085,
             344
+        ])
+
+
+@skip_no_hopper
+@pytest.mark.parametrize("model", ["Qwen3-8B-FP8"])
+@pytest.mark.parametrize("generation_overlap", [False, True])
+@pytest.mark.parametrize("enable_cuda_graph", [False, True])
+def test_disaggregated_simple_qwen3(model, generation_overlap,
+                                    enable_cuda_graph):
+    verify_disaggregated(
+        model, generation_overlap, enable_cuda_graph,
+        " What is the capital of China?",
+        " The capital of China is Beijing. 2. What is the population of China? The population of China is about 1",
+        [
+            576, 6722, 315, 5616, 374, 26549, 13, 220, 17, 13, 3555, 374, 279,
+            7042, 315, 5616, 30, 576, 7042, 315, 5616, 374, 911, 220, 16
         ])
 
 
