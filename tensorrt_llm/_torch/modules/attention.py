@@ -1146,14 +1146,15 @@ class MLA(nn.Module):
         # out_scale = getattr(self.o_proj, "inv_input_scale", None)
         out_scale = None  # Currently we use BF16 MHA for context phase
 
+        # latent_cache must be None to differentiate from normal context phase,
+        # so that we can skip applying RoPE and appending KV cache inside attention op
         attn_output = self.mha.forward(
             q,
             full_k,
             full_v,
             attn_metadata,
             attention_input_type=AttentionInputType.context_only,
-            latent_cache=
-            None,  # need to be None to differentiate from normal context phase
+            latent_cache=None,
             out_scale=out_scale,
             output=output,
         )
@@ -1176,7 +1177,6 @@ class MLA(nn.Module):
 
         # determine the number of loop
         # currently we assume that the chunk size is the same as the max_num_tokens
-        attn_metadata.runtime_features.chunk_size
         chunked_loop_num = attn_metadata.chunked_loop_num
 
         # [toal_token_q, num_heads, 2] -> [toal_token_q, num_heads] float2
@@ -1250,6 +1250,8 @@ class MLA(nn.Module):
 
             out_scale = None
             # do not apply mask for attention within loop
+            # latent_cache must be None to differentiate from normal context phase,
+            # so that we can skip applying RoPE and appending KV cache inside attention op
             temp_attn_output = self.mha.forward(
                 q,
                 chunked_k,
@@ -1282,10 +1284,10 @@ class MLA(nn.Module):
             ],
             -1,
         )
-        k = torch.empty_like(q).view(-1, self.num_heads, self.qk_head_dim)
-        k[..., :self.qk_nope_head_dim] = k_nope.view(-1, self.num_heads,
-                                                     self.qk_nope_head_dim)
-        k[..., self.qk_nope_head_dim:] = k_pe.view(-1, 1, self.qk_rope_head_dim)
+
+        k_nope = k_nope.view(-1, self.num_heads, self.qk_nope_head_dim)
+        k_pe = k_pe.view(-1, 1, self.qk_rope_head_dim)
+        k = torch.cat((k_nope, k_pe.expand(-1, self.num_heads, -1)), dim=-1)
         k = k.view(-1, self.num_heads * self.qk_head_dim)
 
         # copy q_lens to replace kv_lens_runtime
@@ -1298,6 +1300,9 @@ class MLA(nn.Module):
 
         # out_scale = getattr(self.o_proj, "inv_input_scale", None)
         out_scale = None  # Currently we use BF16 MHA for context phase
+
+        # latent_cache must be None to differentiate from normal context phase,
+        # so that we can skip applying RoPE and appending KV cache inside attention op
         temp_attn_output = self.mha.forward(
             q,
             k,
@@ -1457,6 +1462,7 @@ class MLA(nn.Module):
         attn_metadata: AttentionMetadata,
         all_reduce_params: Optional[AllReduceParams] = None,
     ) -> torch.Tensor:
+
         attn_output = self.create_output(hidden_states)
         if self.register_to_config:
             torch.ops.trtllm.mla_custom_op_inplace(hidden_states, position_ids,

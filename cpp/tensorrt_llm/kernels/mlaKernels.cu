@@ -121,27 +121,6 @@ struct loadPagedKVKernelTraits
     static constexpr int kKVThreadPerHead = (kLoraSize * kBytesPerElem) / kBytesPerLoad;
 };
 
-template <typename T>
-struct setPagedKVKernelTraits
-{
-    static constexpr int kQKNopeSize = 128;
-    static constexpr int kVHeadSize = 128;
-    static_assert(kQKNopeSize == kVHeadSize);
-    static constexpr int kRopeSize = 64;
-    static constexpr int kHeadSize = kQKNopeSize + kRopeSize;
-    using VecT = typename VecType<T>::Type;
-    static constexpr int kBytesPerElem = sizeof(T);
-    static constexpr int kBytesPerLoad = 16;
-    static constexpr int kElemPerLoad = kBytesPerLoad / kBytesPerElem;
-    static_assert((kHeadSize * kBytesPerElem) % kBytesPerLoad == 0,
-        "kHeadSize * kBytesPerElem must be multiple of kBytesPerLoad (16Bytes)");
-    static constexpr int kNumHeads = 128;
-    static constexpr int kThreadPerHead = (kHeadSize * kBytesPerElem) / kBytesPerLoad;
-    static constexpr int kKVThreadPerHead = (kQKNopeSize * kBytesPerElem) / kBytesPerLoad;
-    static constexpr int kCpTokenPerBlock = 16;
-    static constexpr int kBlockSize = kThreadPerHead * kCpTokenPerBlock;
-};
-
 template <typename SrcType, int NUM>
 inline __device__ void quantCopy(
     __nv_fp8_e4m3* dst_global_ptr, SrcType const* src_fragment_ptr, float const scale_val = 1.f)
@@ -709,79 +688,6 @@ __global__ void loadPagedKVCacheForMLAKernel(T* compressed_kv_ptr, T* k_pe_ptr,
     }
 }
 
-// k {total_token, h, d}, v {total_token, h, d}, k_pe {total_token, h=1, d_rope}
-// output {b, 2, ceil(max_seq / kv_cache_tokens_per_block), h, kv_cache_tokens_per_block, d}
-template <typename T>
-__global__ void setPagedKVCacheForMLAKernel(T* output, T const* k_ptr, T const* v_ptr, T const* k_pe_ptr,
-    int64_t const* cu_seq_lens, int const max_input_seq_len, int num_heads, int kv_dim, int rope_dim,
-    int kv_cache_tokens_per_block, int64_t kv_token_stride)
-{
-    using KT = typename tensorrt_llm::kernels::setPagedKVKernelTraits<T>;
-    int const batch_idx = static_cast<int>(blockIdx.y);
-    int const head_idx = static_cast<int>(blockIdx.z);
-    int const head_dim_vec_idx = (threadIdx.x % KT::kThreadPerHead);
-    int const head_dim_idx = head_dim_vec_idx * KT::kElemPerLoad;
-    bool const is_valid_v = head_dim_idx < KT::kVHeadSize;
-
-    size_t const seq_len_loop_end
-        = (max_input_seq_len + KT::kCpTokenPerBlock - 1) / KT::kCpTokenPerBlock * KT::kCpTokenPerBlock;
-    size_t const kv_cache_block_size = num_heads * kv_cache_tokens_per_block * (kv_dim + rope_dim);
-    size_t const kv_cache_block_num = (max_input_seq_len + kv_cache_tokens_per_block - 1) / kv_cache_tokens_per_block;
-    int64_t const global_token_offset = cu_seq_lens[batch_idx];
-    int64_t const cache_kv_len = cu_seq_lens[batch_idx + 1] - cu_seq_lens[batch_idx];
-
-    for (int local_token_idx = (threadIdx.x / KT::kThreadPerHead) + blockIdx.x * KT::kCpTokenPerBlock;
-         local_token_idx < seq_len_loop_end; local_token_idx += KT::kCpTokenPerBlock * gridDim.x)
-    {
-        int token_idx_in_kv_cache = local_token_idx;
-        bool const valid_token = token_idx_in_kv_cache < cache_kv_len;
-        if (valid_token)
-        {
-            // copy k and v
-            if (is_valid_v)
-            {
-                int ld_kv_global_offset = (global_token_offset + local_token_idx) * kv_token_stride + head_idx * kv_dim;
-                int ld_kv_local_offset = head_dim_vec_idx;
-                auto k_data
-                    = (reinterpret_cast<typename KT::VecT const*>(k_ptr + ld_kv_global_offset))[ld_kv_local_offset];
-                auto v_data
-                    = (reinterpret_cast<typename KT::VecT const*>(v_ptr + ld_kv_global_offset))[ld_kv_local_offset];
-                // {b, 0, token / kv_cache_tokens_per_block, h, token % kv_cache_tokens_per_block, ...}
-                int st_k_global_offset = batch_idx * 2 * kv_cache_block_num * kv_cache_block_size
-                    + local_token_idx / kv_cache_tokens_per_block * kv_cache_block_size
-                    + head_idx * kv_cache_tokens_per_block * (kv_dim + rope_dim)
-                    + (local_token_idx % kv_cache_tokens_per_block) * (kv_dim + rope_dim);
-                // {b, 1, token / kv_cache_tokens_per_block, h, token % kv_cache_tokens_per_block, ...}
-                int st_v_global_offset = st_k_global_offset + kv_cache_block_num * kv_cache_block_size;
-                int st_k_local_offset = head_dim_vec_idx;
-                int st_v_local_offset = head_dim_vec_idx;
-                (reinterpret_cast<typename KT::VecT*>(output + st_k_global_offset))[st_k_local_offset] = k_data;
-                (reinterpret_cast<typename KT::VecT*>(output + st_v_global_offset))[st_v_local_offset] = v_data;
-            }
-            // copy k_pe, only 1 head
-            else
-            {
-                int ld_rope_global_offset = (global_token_offset + local_token_idx) * rope_dim;
-                int ld_rope_local_offset = head_dim_vec_idx - KT::kKVThreadPerHead;
-                auto rope_data = (reinterpret_cast<typename KT::VecT const*>(
-                    k_pe_ptr + ld_rope_global_offset))[ld_rope_local_offset];
-                // {b, 0, token / kv_cache_tokens_per_block, h, token % kv_cache_tokens_per_block, ...}
-                int st_rope_global_offset = batch_idx * 2 * kv_cache_block_num * kv_cache_block_size
-                    + local_token_idx / kv_cache_tokens_per_block * kv_cache_block_size
-                    + head_idx * kv_cache_tokens_per_block * (kv_dim + rope_dim)
-                    + (local_token_idx % kv_cache_tokens_per_block) * (kv_dim + rope_dim);
-                int st_rope_local_offset = head_dim_vec_idx;
-                (reinterpret_cast<typename KT::VecT*>(output + st_rope_global_offset))[st_rope_local_offset]
-                    = rope_data;
-            }
-        }
-        else
-        {
-            break;
-        }
-    }
-}
-
 // q {total_uncached_tokens, h, d_nope + d_rope}
 // latent_cache {total_uncached_tokens, d_k + d_rope}
 template <typename T, typename TCache, int BLOCK_SIZE, int K_DIM, int ROPE_DIM>
@@ -1109,20 +1015,6 @@ void invokeMLALoadPagedKV(T* compressed_kv_ptr, T* k_pe_ptr, KVBlockArray& kv_ca
         compressed_kv_ptr, k_pe_ptr, kv_cache, cu_ctx_cached_kv_lens, max_input_seq_len, kv_scale_quant_orig_ptr);
 }
 
-template <typename T>
-void invokeMLASetPagedKV(T* output, T const* k_ptr, T const* v_ptr, T const* k_pe_ptr, int const num_requests,
-    int64_t const* cu_seq_lens, int const max_input_seq_len, int num_heads, int kv_dim, int rope_dim,
-    int kv_cache_tokens_per_block, int64_t kv_token_stride, cudaStream_t stream)
-{
-    using KT = typename tensorrt_llm::kernels::setPagedKVKernelTraits<T>;
-    TLLM_CHECK_WITH_INFO(kv_dim + rope_dim == KT::kHeadSize, "head dim should be equal to %d", KT::kHeadSize);
-    TLLM_CHECK_WITH_INFO(kv_cache_tokens_per_block % KT::kCpTokenPerBlock == 0,
-        "kv_cache_tokens_per_block should be multiple of %d", KT::kCpTokenPerBlock);
-    dim3 grid(tensorrt_llm::common::divUp(max_input_seq_len, KT::kCpTokenPerBlock), num_requests, num_heads);
-    setPagedKVCacheForMLAKernel<T><<<grid, KT::kBlockSize, 0, stream>>>(output, k_ptr, v_ptr, k_pe_ptr, cu_seq_lens,
-        max_input_seq_len, num_heads, kv_dim, rope_dim, kv_cache_tokens_per_block, kv_token_stride);
-}
-
 template <typename T, typename TCache>
 void invokeMLARopeAppendPagedKVAssignQ(KVBlockArray& kv_cache, T* q_ptr, T* latent_cache_ptr, int const num_requests,
     int64_t const* cu_ctx_cached_kv_lens, int64_t const* cu_seq_lens, int const max_input_uncached_seq_len,
@@ -1167,15 +1059,6 @@ INSTANTIATE_RW_KVCACHE_MLA(half, half);
 INSTANTIATE_RW_KVCACHE_MLA(half, __nv_fp8_e4m3);
 INSTANTIATE_RW_KVCACHE_MLA(__nv_bfloat16, __nv_bfloat16);
 INSTANTIATE_RW_KVCACHE_MLA(__nv_bfloat16, __nv_fp8_e4m3);
-
-#define INSTANTIATE_SET_KVCACHE_MLA(T)                                                                                 \
-    template void invokeMLASetPagedKV(T* output, T const* k_ptr, T const* v_ptr, T const* k_pe_ptr,                    \
-        int const num_requests, int64_t const* cu_seq_lens, int const max_input_seq_len, int num_heads, int kv_dim,    \
-        int rope_dim, int kv_cache_tokens_per_block, int64_t kv_token_stride, cudaStream_t stream);
-
-INSTANTIATE_SET_KVCACHE_MLA(float);
-INSTANTIATE_SET_KVCACHE_MLA(half);
-INSTANTIATE_SET_KVCACHE_MLA(__nv_bfloat16);
 
 } // namespace kernels
 
