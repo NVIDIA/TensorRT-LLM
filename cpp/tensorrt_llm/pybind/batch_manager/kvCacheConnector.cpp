@@ -42,21 +42,6 @@ public:
 
 void tensorrt_llm::batch_manager::kv_cache_manager::KVCacheManagerConnectorBindings::initBindings(py::module_& m)
 {
-    py::class_<tb::kv_connector::KvCacheConnectorPoolData>(m, "KvCacheConnectorPoolData")
-        .def_property_readonly("tensor",
-            [](tb::kv_connector::KvCacheConnectorPoolData& self)
-            {
-                auto const& poolTensor = self.getPoolTensor();
-
-                return tensorrt_llm::runtime::Torch::tensor(poolTensor);
-            })
-        .def_property_readonly("num_blocks", &tb::kv_connector::KvCacheConnectorPoolData::getNumBlocks);
-
-    py::class_<tb::kv_connector::KvCacheConnectorPoolsData>(m, "KvCacheConnectorPoolsData")
-        .def_property_readonly("pools", &tb::kv_connector::KvCacheConnectorPoolsData::getPoolsData)
-        .def_property_readonly(
-            "layer_to_pool_mapping", &tb::kv_connector::KvCacheConnectorPoolsData::getLayerToPoolMapping);
-
     py::class_<tb::kv_connector::KvCacheConnectorManager, PyKvCacheConnectorManager, py::smart_holder>(
         m, "KvCacheConnectorManager")
         .def(py::init<>())

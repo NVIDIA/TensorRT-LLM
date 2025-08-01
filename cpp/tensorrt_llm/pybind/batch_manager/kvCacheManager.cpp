@@ -236,12 +236,6 @@ public:
     {
         PYBIND11_OVERLOAD_PURE(void, tbk::BaseKVCacheManager, flushIterationEvents);
     }
-
-    [[nodiscard]] tb::kv_connector::KvCacheConnectorPoolsData getKvCacheConnectorPoolsData() const override
-    {
-        PYBIND11_OVERLOAD_PURE(
-            tb::kv_connector::KvCacheConnectorPoolsData, tbk::BaseKVCacheManager, getKvCacheConnectorPoolsData);
-    }
 };
 
 // TODO: Deduplicate executor bindings KvCacheStats
@@ -431,8 +425,7 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
         .def("get_cache_block_ids", &BaseKVCacheManager::getCacheBlockIds)
         .def("get_batch_cache_block_ids", &BaseKVCacheManager::getBatchCacheBlockIds)
         .def("get_newly_allocated_block_ids", &BaseKVCacheManager::getNewlyAllocatedBlockIds)
-        .def("flush_iteration_events", &BaseKVCacheManager::flushIterationEvents)
-        .def("get_kv_cache_connector_pools_data", &BaseKVCacheManager::getKvCacheConnectorPoolsData);
+        .def("flush_iteration_events", &BaseKVCacheManager::flushIterationEvents);
 
     py::enum_<tbk::CacheType>(m, "CacheType")
         .value("SELF", tbk::CacheType::kSELF)

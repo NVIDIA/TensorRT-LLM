@@ -10,8 +10,6 @@ import torch
 import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
-from tensorrt_llm.bindings.internal.batch_manager import \
-    KvCacheConnectorPoolsData
 from tensorrt_llm.sampling_params import SamplingParams
 
 from ..._utils import binding_dtype_size, nvtx_range
@@ -942,9 +940,6 @@ class KVCacheManager(BaseResourceManager):
             return temp_attention_window_inputs
         else:
             return None
-
-    def get_kv_cache_connector_pools_data(self) -> KvCacheConnectorPoolsData:
-        return self.impl.get_kv_cache_connector_pools_data()
 
 
 class MambaCacheManager(BaseResourceManager):
