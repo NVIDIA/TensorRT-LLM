@@ -104,15 +104,14 @@ void newRequests(std::vector<std::shared_ptr<tb::LlmRequest>> const& requests, T
     SizeType32 maxSequenceLength, tb::DecoderInputBuffers& inputBuffers, decoder::DecoderState& decoderState)
 {
     auto const& decoderStream = *decoder.getDecoderStream();
-    auto const bufferManager = BufferManager{std::make_shared<CudaStream>(runtimeStream.get())};
 
     auto batchSlotsRange = BufferRange<SizeType32>(*batchSlots);
     auto const localBatchSize = batchSlots->getSize();
 
     tb::CreateNewDecoderRequests createNewDecoderRequests(false, false, false);
-    auto [lookaheadPrompt, lookaheadAlgoConfigs] = createNewDecoderRequests.createDecoderRequests(requests,
-        inputBuffers.inputsIds, decodingConfig, decoderState, bufferManager, logitsType, modelConfig, worldConfig,
-        runtimeStream, decoderStream, maxSequenceLength, std::nullopt);
+    auto [lookaheadPrompt, lookaheadAlgoConfigs]
+        = createNewDecoderRequests.createDecoderRequests(requests, inputBuffers.inputsIds, decodingConfig, decoderState,
+            logitsType, modelConfig, worldConfig, runtimeStream, decoderStream, maxSequenceLength, std::nullopt);
 
     std::vector<SamplingConfig> samplingConfigs;
     samplingConfigs.reserve(requests.size());
