@@ -59,16 +59,16 @@ This directory contains various test configuration files:
 - `llm_perf_cluster.yml` - Cluster-based performance tests
 - `llm_perf_sanity.yml` - Performance sanity checks
 - `llm_perf_l2.yml` - L2 level performance tests
-- `trt_llm_integration_perf_test.yml` - Integration performance tests
-- `trt_llm_integration_perf_sanity_test.yml` - Integration performance sanity checks
-- `llm_release_perf_multinode_test.txt` - Multi-node performance tests
+- `llm_perf_multinode.txt` - Multi-node performance tests
+- `llm_trt_integration_perf.yml` - Integration performance tests
+- `llm_trt_integration_perf_sanity.yml` - Integration performance sanity checks
 
 ### Triton Backend Tests
 - `llm_triton_integration.txt` - Triton backend integration tests
 
 ### Release-Specific Tests
-- `llm_release_digits_func.txt` - Functional tests for DIGITS release
-- `llm_release_digits_perf.txt` - Performance tests for DIGITS release
+- `llm_digits_func.txt` - Functional tests for DIGITS release
+- `llm_digits_perf.txt` - Performance tests for DIGITS release
 
 ## Test Execution Schedule
 
