@@ -21,11 +21,11 @@ from tensorrt_llm.bench.build.build import get_model_config
 from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
 from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
 from tensorrt_llm.bench.dataclasses.reporting import ReportUtility
-from tensorrt_llm.llmapi import CapacitySchedulerPolicy
+from tensorrt_llm.llmapi import BackendType, CapacitySchedulerPolicy
 from tensorrt_llm.models.modeling_utils import SpeculativeDecodingMode
 
 # isort: off
-from tensorrt_llm.bench.benchmark.utils.general import get_settings_from_engine, get_settings, ALL_SUPPORTED_BACKENDS
+from tensorrt_llm.bench.benchmark.utils.general import get_settings_from_engine, get_settings
 # isort: on
 from tensorrt_llm.bench.utils.data import (create_dataset_from_stream,
                                            initialize_tokenizer,
@@ -46,10 +46,11 @@ from tensorrt_llm.sampling_params import SamplingParams
     default=None,
     help="Path to a serialized TRT-LLM engine.",
 )
-@optgroup.option("--backend",
-                 type=click.Choice(ALL_SUPPORTED_BACKENDS),
-                 default="pytorch",
-                 help="The backend to use when running benchmarking.")
+@optgroup.option(
+    "--backend",
+    type=click.Choice(BackendType.canonical_values()),
+    default=None,
+    help="The backend to use when running benchmarking. Default is 'pytorch'.")
 @optgroup.option(
     "--kv_cache_free_gpu_mem_fraction",
     type=float,
@@ -179,6 +180,11 @@ def latency_command(
     """Run a latency test on a TRT-LLM engine."""
 
     logger.info("Preparing to run latency benchmark...")
+
+    params["backend"] = BackendType.get_default_backend_with_warning(
+        params.get("backend"))
+    BackendType.print_backend_info(params.get("backend"))
+
     # Parameters from CLI
     # Model, experiment, and engine params
     dataset_path: Path = params.get("dataset")
@@ -192,7 +198,7 @@ def latency_command(
     modality: str = params.get("modality")
     max_input_len: int = params.get("max_input_len")
     max_seq_len: int = params.get("max_seq_len")
-    backend: str = params.get("backend")
+    backend: BackendType = BackendType(params.get("backend"))
     model_type = get_model_config(model, checkpoint_path).model_type
 
     # Runtime Options
@@ -228,8 +234,7 @@ def latency_command(
 
     # Engine configuration parsing for PyTorch backend
     kwargs = {}
-    if backend and backend.lower() in ALL_SUPPORTED_BACKENDS and backend.lower(
-    ) != "tensorrt":
+    if backend != BackendType.TENSORRT:
         if bench_env.checkpoint_path is None:
             snapshot_download(model)
 
@@ -238,7 +243,7 @@ def latency_command(
         kwargs_max_sql = max_seq_len or metadata.max_sequence_length
         logger.info(f"Setting PyTorch max sequence length to {kwargs_max_sql}")
         kwargs["max_seq_len"] = kwargs_max_sql
-    elif backend.lower() == "tensorrt":
+    else:  # TensorRT backend
         assert max_seq_len is None, (
             "max_seq_len is not a runtime parameter for C++ backend")
         exec_settings, build_cfg = get_settings_from_engine(engine_dir)
@@ -250,10 +255,6 @@ def latency_command(
                 "dataset contains a maximum sequence of "
                 f"{metadata.max_sequence_length}. Please rebuild a new engine to"
                 "support this dataset.")
-    else:
-        raise RuntimeError(
-            f"Invalid backend: {backend}, please use one of the following: "
-            f"{ALL_SUPPORTED_BACKENDS}")
 
     exec_settings["model"] = model
     engine_tokens = exec_settings["settings_config"]["max_num_tokens"]
@@ -290,7 +291,7 @@ def latency_command(
 
     llm = None
     kwargs = kwargs | runtime_config.get_llm_args()
-    kwargs['backend'] = backend
+    kwargs['backend'] = backend.canonical_value
 
     try:
         logger.info("Setting up latency benchmark.")

@@ -14,7 +14,7 @@ def model_name() -> str:
     return "DeepSeek-R1-Distill-Qwen-1.5B"
 
 
-@pytest.fixture(scope="module", params=["trt", "pytorch"])
+@pytest.fixture(scope="module", params=["tensorrt", "pytorch"])
 def backend(request):
     return request.param
 

@@ -15,7 +15,7 @@ from tensorrt_llm.bench.build.build import get_model_config
 
 # isort: off
 from tensorrt_llm.bench.benchmark.utils.general import (
-    get_settings_from_engine, get_settings, ALL_SUPPORTED_BACKENDS)
+    get_settings_from_engine, get_settings)
 # isort: on
 from tensorrt_llm import LLM as PyTorchLLM
 from tensorrt_llm._tensorrt_engine import LLM
@@ -27,7 +27,7 @@ from tensorrt_llm.bench.dataclasses.reporting import ReportUtility
 from tensorrt_llm.bench.utils.data import (create_dataset_from_stream,
                                            initialize_tokenizer,
                                            update_metadata_for_multimodal)
-from tensorrt_llm.llmapi import CapacitySchedulerPolicy
+from tensorrt_llm.llmapi import BackendType, CapacitySchedulerPolicy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -44,10 +44,11 @@ from tensorrt_llm.sampling_params import SamplingParams
     default=None,
     help="Path to a serialized TRT-LLM engine.",
 )
-@optgroup.option("--backend",
-                 type=click.Choice(ALL_SUPPORTED_BACKENDS),
-                 default="pytorch",
-                 help="The backend to use when running benchmarking.")
+@optgroup.option(
+    "--backend",
+    type=click.Choice(BackendType.canonical_values()),
+    default=None,
+    help="The backend to use when running benchmarking. Default is 'pytorch'.")
 @optgroup.option(
     "--extra_llm_api_options",
     type=str,
@@ -253,6 +254,10 @@ def throughput_command(
     """Run a throughput test on a TRT-LLM engine."""
 
     logger.info("Preparing to run throughput benchmark...")
+    params["backend"] = BackendType.get_default_backend_with_warning(
+        params.get("backend"))
+    BackendType.print_backend_info(params.get("backend"))
+
     # Parameters from CLI
     # Model, experiment, and engine params
     dataset_path: Path = params.get("dataset")
@@ -305,8 +310,8 @@ def throughput_command(
         logger.info(metadata.get_summary_for_print())
 
     # Engine configuration parsing
-    if backend and backend.lower() in ALL_SUPPORTED_BACKENDS and backend.lower(
-    ) != "tensorrt":
+    if backend and backend.lower() in BackendType.canonical_values(
+    ) and backend.lower() != BackendType.TENSORRT.canonical_value:
         # If we're dealing with a model name, perform a snapshot download to
         # make sure we have a local copy of the model.
         if bench_env.checkpoint_path is None:
@@ -317,7 +322,7 @@ def throughput_command(
         kwargs_max_sql = max_seq_len or metadata.max_sequence_length
         logger.info(f"Setting PyTorch max sequence length to {kwargs_max_sql}")
         kwargs["max_seq_len"] = kwargs_max_sql
-    elif backend.lower() == "tensorrt":
+    elif backend.lower() == BackendType.TENSORRT.canonical_value:
         assert max_seq_len is None, (
             "max_seq_len is not a runtime parameter for C++ backend")
         exec_settings, build_cfg = get_settings_from_engine(engine_dir)
@@ -386,7 +391,7 @@ def throughput_command(
         kwargs = kwargs | runtime_config.get_llm_args()
         kwargs['backend'] = backend
 
-        if backend == "pytorch" and iteration_log is not None:
+        if backend == BackendType.PYTORCH.canonical_value and iteration_log is not None:
             kwargs["enable_iter_perf_stats"] = True
 
         if runtime_config.backend == 'pytorch':

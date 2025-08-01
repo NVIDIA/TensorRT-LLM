@@ -15,7 +15,7 @@ def model_name():
     return "llama-models-v3/llama-v3-8b-instruct-hf"
 
 
-@pytest.fixture(scope="module", params=["trt", "pytorch"])
+@pytest.fixture(scope="module", params=["tensorrt", "pytorch"])
 def backend(request):
     return request.param
 

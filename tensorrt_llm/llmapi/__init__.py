@@ -16,6 +16,7 @@ from .llm_args import (AutoDecodingConfig, BatchingType, CacheTransceiverConfig,
 from .llm_utils import (BuildConfig, KvCacheRetentionConfig, QuantAlgo,
                         QuantConfig)
 from .mpi_session import MpiCommSession
+from .utils import BackendType
 
 __all__ = [
     'LLM',
@@ -54,4 +55,5 @@ __all__ = [
     'TorchLlmArgs',
     'TrtLlmArgs',
     'AutoDecodingConfig',
+    'BackendType',
 ]
