@@ -92,8 +92,12 @@ public:
             auto output = torch::empty(outputShape, input.options());
             if (use_nccl_reducescatter)
             {
-                ncclReduceScatter(input.data_ptr(), output.mutable_data_ptr(), output.numel(), (*getDtypeMap())[type],
-                    ncclSum, *mNcclComm, stream);
+                auto size = output.numel();
+                if (size > 0)
+                {
+                    ncclReduceScatter(input.data_ptr(), output.mutable_data_ptr(), output.numel(),
+                        (*getDtypeMap())[type], ncclSum, *mNcclComm, stream);
+                }
             }
             else
             {
@@ -103,9 +107,13 @@ public:
                 for (int root = 0; root < static_cast<int>(mGroup.size()); ++root)
                 {
                     auto split_size = sizes.value()[root];
-                    ncclReduce(input.index({torch::indexing::Slice(split_offset, torch::indexing::None)}).data_ptr(),
-                        output.mutable_data_ptr(), numel_base * split_size, (*getDtypeMap())[type], ncclSum, root,
-                        *mNcclComm, stream);
+                    if (split_size > 0)
+                    {
+                        ncclReduce(
+                            input.index({torch::indexing::Slice(split_offset, torch::indexing::None)}).data_ptr(),
+                            output.mutable_data_ptr(), numel_base * split_size, (*getDtypeMap())[type], ncclSum, root,
+                            *mNcclComm, stream);
+                    }
                     split_offset += split_size;
                 }
             }
