@@ -170,12 +170,15 @@ CreateNewDecoderRequests::operator()(runtime::ModelConfig const& modelConfig, ru
 namespace
 {
 
-void initializeEmbeddingBias(DecodingInput& dJointInput, TensorPtr const& embeddingBiasTensor, SizeType32 batchSlot,
+void initializeEmbeddingBias(DecodingInput& dJointInput, SizeType32 batchSlot,
+    std::optional<TensorPtr> const& embeddingBias, nvinfer1::DataType logitsType,
     runtime::ModelConfig const& modelConfig, BufferManager const& manager)
 {
     TensorPtr const embeddingBiasSlice = ITensor::slice(constPointerCast(dJointInput.embeddingBias), batchSlot, 1);
-    if (embeddingBiasTensor)
+    if (embeddingBias.has_value())
     {
+        auto embeddingBiasTensor = getEmbeddingBias(logitsType, embeddingBias.value());
+
         TLLM_CHECK(embeddingBiasTensor->getShape().nbDims == 2);
         TLLM_CHECK(embeddingBiasTensor->getShape().d[0] == 1);
         TLLM_CHECK_WITH_INFO(embeddingBiasTensor->getShape().d[1] == modelConfig.getVocabSize(),
@@ -251,8 +254,6 @@ void CreateNewDecoderRequests::newRequest(SizeType32 batchSlot, runtime::decoder
 
     TensorPtr const endIdTensorPtr{ITensor::slice(constPointerCast(dJointInput.endIds), batchSlot, 1)};
     runtime::kernels::invokeFill(*endIdTensorPtr, endId, decoderStream);
-
-    initializeEmbeddingBias(dJointInput, request.embeddingBias, batchSlot, modelConfig, manager);
 
     setupWords(dJointInput.stopWordsLists, request.stopWordsList, dJointInput.stopWordsPtrs, dJointInput.stopWordsLens,
         dJointInput.maxStopWordsLen, batchSlot);
@@ -588,6 +589,11 @@ CreateNewDecoderRequests::createDecoderRequests(RequestVector const& finishedCon
     SizeType32 inputOffset{0};
     for (auto const& llmReq : finishedContextRequests)
     {
+        auto& dJointInput = decoderState.getJointDecodingInput();
+
+        TLLM_CHECK(llmReq->mSeqSlot.has_value());
+        auto const batchSlot = llmReq->mSeqSlot.value();
+
         auto const promptLen = llmReq->getPromptLen();
         auto const& reqTokens = llmReq->getTokens(0);
         TLLM_CHECK(reqTokens.size() == static_cast<decltype(reqTokens.size())>(promptLen));
@@ -622,10 +628,9 @@ CreateNewDecoderRequests::createDecoderRequests(RequestVector const& finishedCon
             decoderRequest.generatedTokensPerEngineStep = modelConfig.getMaxDecodingTokens();
         }
 
-        if (llmReq->getEmbeddingBias().has_value())
-        {
-            decoderRequest.embeddingBias = getEmbeddingBias(logitsType, llmReq->getEmbeddingBias().value());
-        }
+        initializeEmbeddingBias(
+            dJointInput, batchSlot, llmReq->getEmbeddingBias(), logitsType, modelConfig, bufferManager);
+
         if (llmReq->getBadWordsList().has_value())
         {
             // Move to GPU and remove leading bs1 dimension since this is what decoderRequest expects
@@ -639,8 +644,6 @@ CreateNewDecoderRequests::createDecoderRequests(RequestVector const& finishedCon
             decoderRequest.stopWordsList->squeeze(0);
         }
 
-        TLLM_CHECK(llmReq->mSeqSlot.has_value());
-        auto const batchSlot = llmReq->mSeqSlot.value();
         auto const& samplingConfig = llmReq->mSamplingConfig;
 
         newRequest(
