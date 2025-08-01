@@ -164,6 +164,34 @@ def greedy_search_sampling_batch(logits):
     return next_tokens, softmax
 
 
+def get_rejected_indices(draft_probs: torch.Tensor, target_probs: torch.Tensor,
+                         generator: torch.Generator, draft_tokens: list[int]):
+
+    p = draft_probs[torch.arange(len(draft_tokens)), draft_tokens]
+    q = target_probs[:-1]
+    q = q[torch.arange(len(draft_tokens)), draft_tokens]
+    accept_probs = torch.minimum(torch.ones(()), q / p)
+    # Use deterministic random generation for multi-GPU consistency
+    rejected_indices = (torch.rand(accept_probs.shape,
+                                   generator=generator,
+                                   device=accept_probs.device)
+                        > accept_probs).nonzero()
+    return rejected_indices
+
+
+def sample_rejected(draft_probs: torch.Tensor, target_probs: torch.Tensor,
+                    generator: torch.Generator, num_accepted: int):
+
+    last_draft = draft_probs[num_accepted]
+    last_target = target_probs[num_accepted]
+    new = last_target - last_draft
+    new = torch.where(new > 0, new, 0.0)
+
+    new_token = torch.multinomial(new, num_samples=1,
+                                  generator=generator).squeeze(-1)
+    return new_token
+
+
 TopK = tuple[Literal["top_k"], int]
 TopP = tuple[Literal["top_p"], float, float]
 Greedy = tuple[Literal["greedy"], None]
@@ -377,17 +405,9 @@ class TorchSampler(Sampler):
                                     request.py_draft_logits[0],
                                     generator=generator)
             target_probs = request.py_target_probs
-            p = draft_probs[torch.arange(get_draft_token_length(request)),
-                            request.py_draft_tokens]
-            q = target_probs[:-1]
-            q = q[torch.arange(get_draft_token_length(request)),
-                  request.py_draft_tokens]
-            accept_probs = torch.minimum(torch.ones(()), q / p)
-            # Use deterministic random generation for multi-GPU consistency
-            rejected_indices = (torch.rand(accept_probs.shape,
-                                           generator=generator,
-                                           device=accept_probs.device)
-                                > accept_probs).nonzero()
+            rejected_indices = get_rejected_indices(draft_probs, target_probs,
+                                                    generator,
+                                                    request.py_draft_tokens)
             sample_last = True
             stop = False
             if rejected_indices.numel() == 0:
@@ -405,15 +425,8 @@ class TorchSampler(Sampler):
                     num_accepted = i + 1
                     break
             if not stop and sample_last:
-                last_draft = draft_probs[num_accepted]
-                last_target = target_probs[num_accepted]
-                new = last_target - last_draft
-                new = torch.where(new > 0, new, 0.0)
-
-                new_token = torch.multinomial(new,
-                                              num_samples=1,
-                                              generator=generator).squeeze(-1)
-
+                new_token = sample_rejected(draft_probs, target_probs,
+                                            generator, num_accepted)
                 new_tokens[num_accepted, request.seq_slot,
                            self.BEAM] = new_token
                 request.add_new_token(new_token, self.BEAM)
