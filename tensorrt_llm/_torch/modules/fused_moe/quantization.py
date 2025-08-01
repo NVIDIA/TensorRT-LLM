@@ -4,10 +4,13 @@ from typing import Dict, List, NamedTuple, Union
 import torch
 from torch import nn
 
+from tensorrt_llm import logger
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.quantization.utils.fp4_utils import (
     float4_sf_dtype, get_reorder_rows_for_gated_act_gemm_row_indices,
     get_shuffle_matrix_a_row_indices, get_shuffle_matrix_sf_a_row_indices)
+from tensorrt_llm.quantization.utils.fp8_utils import (
+    resmooth_to_fp8_e8m0, transform_sf_into_required_layout)
 
 from ..linear import TensorParallelMode, load_weight_shard
 from .interface import MoEWeightLoadingMode
@@ -462,6 +465,47 @@ class DeepSeekFP8BlockScalesFusedMoEMethod(FusedMoEMethodBase):
                                   w2_weight_scaling_factor)
 
         self.setup_quant_scales(module)
+
+    def load_weights(self, module: torch.nn.Module, weights: List[Dict],
+                     weight_loading_mode: MoEWeightLoadingMode):
+
+        if get_sm_version() == 100:
+            expert_ids = set(module.initial_local_expert_ids)
+            if self.need_load_shared_weights(module):
+                expert_ids.update(
+                    module.layer_load_balancer.get_load_expert_ids())
+            for name in list(weights.keys()):
+                if name.endswith("weight_scale_inv"):
+                    if int(name.split(".")[0]) not in expert_ids:
+                        continue
+                    weight_name = name.replace("weight_scale_inv", "weight")
+                    logger.debug(f"Resmoothing {weight_name}")
+                    weight = weights[weight_name][:]
+                    scale = weights[name][:]
+                    weights[weight_name], weights[name] = resmooth_to_fp8_e8m0(
+                        weight, scale)
+        super().load_weights(module, weights, weight_loading_mode)
+
+        if get_sm_version() == 100:
+            transfromed_w3_w1_scale = transform_sf_into_required_layout(
+                module.quant_scales[0],
+                mn=module.w3_w1_weight.shape[1],
+                k=module.w3_w1_weight.shape[2],
+                recipe=(1, 128, 128),
+                num_groups=module.w3_w1_weight.shape[0],
+                is_sfa=False)
+            module.w3_w1_weight_scaling_factor = nn.Parameter(
+                transfromed_w3_w1_scale, requires_grad=False)
+            transfromed_w2_scale = transform_sf_into_required_layout(
+                module.quant_scales[1],
+                mn=module.w2_weight.shape[1],
+                k=module.w2_weight.shape[2],
+                recipe=(1, 128, 128),
+                num_groups=module.w3_w1_weight.shape[0],
+                is_sfa=False)
+            module.w2_weight_scaling_factor = nn.Parameter(transfromed_w2_scale,
+                                                           requires_grad=False)
+            self.setup_quant_scales(module)
 
     def setup_quant_scales(self, module: torch.nn.Module):
         module.quant_scales = FusedMoEQuantScalesDeepSeekFP8BlockScales(

@@ -50,11 +50,13 @@ class TestGpt2(CliFlowAccuracyTestHarness):
     def test_context_fmha_fp32_acc(self):
         self.run(extra_summarize_args=["--enable_context_fmha_fp32_acc"])
 
+    @skip_post_blackwell
     @pytest.mark.parametrize("precision", ["int8", "int4"])
     def test_weight_only(self, precision: str):
         quant_algo = QuantAlgo.W8A16 if precision == "int8" else QuantAlgo.W4A16
         self.run(quant_algo=quant_algo)
 
+    @skip_post_blackwell
     def test_int8_kv_cache(self):
         self.run(kv_cache_quant_algo=QuantAlgo.INT8)
 
@@ -415,6 +417,7 @@ class TestVicuna7B(CliFlowAccuracyTestHarness):
     EAGLE_MODEL_NAME = "yuhuili/EAGLE-Vicuna-7B-v1.3"
     EAGLE_MODEL_PATH = f"{llm_models_root()}/EAGLE-Vicuna-7B-v1.3"
 
+    @skip_post_blackwell
     def test_lookahead(self, mocker):
         mocker.patch.object(CnnDailymail, "MAX_BATCH_SIZE", 8)
 
@@ -425,6 +428,7 @@ class TestVicuna7B(CliFlowAccuracyTestHarness):
                  ],
                  extra_summarize_args=["--lookahead_config=[7,7,7]"])
 
+    @skip_post_blackwell
     @parametrize_with_ids("cuda_graph", [False, True])
     def test_medusa(self, cuda_graph, mocker):
         mocker.patch.object(self.__class__, "EXAMPLE_FOLDER", "medusa")
@@ -1104,6 +1108,7 @@ class TestMixtral8x7B(CliFlowAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(2)
     @pytest.mark.skip_less_device_memory(80000)
+    @skip_post_blackwell
     def test_weight_only_int4_tp2(self):
         self.run(quant_algo=QuantAlgo.W4A16,
                  tp_size=2,
@@ -1111,6 +1116,7 @@ class TestMixtral8x7B(CliFlowAccuracyTestHarness):
 
     @pytest.mark.skip_less_device(2)
     @pytest.mark.skip_less_device_memory(80000)
+    @skip_post_blackwell
     def test_weight_only_int8_tp2(self):
         self.run(quant_algo=QuantAlgo.W8A16,
                  tp_size=2,

@@ -477,3 +477,17 @@ def executor_request_to_llm_request(
         py_multimodal_data=getattr(executor_request, "py_multimodal_data",
                                    None))
     return llm_request
+
+
+def get_draft_token_length(request: LlmRequest) -> int:
+    """Get the length of draft tokens for a given request.
+
+    Args:
+        request: The LlmRequest to get draft token length for
+
+    Returns:
+        The number of draft tokens, or 0 if no draft tokens exist
+    """
+    if request.py_draft_tokens is not None:
+        return len(request.py_draft_tokens)
+    return 0

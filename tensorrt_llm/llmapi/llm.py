@@ -31,8 +31,8 @@ from ..inputs import (PromptInputs, create_input_processor,
 from ..logger import logger
 from ..sampling_params import SamplingParams
 from .llm_args import (TORCH_LLMARGS_EXPLICIT_DOCSTRING,
-                       TRT_LLMARGS_EXPLICIT_DOCSTRING, PybindMirror,
-                       TorchLlmArgs, TrtLlmArgs)
+                       TRT_LLMARGS_EXPLICIT_DOCSTRING, NGramDecodingConfig,
+                       PeftCacheConfig, PybindMirror, TorchLlmArgs, TrtLlmArgs)
 from .llm_utils import (CachedModelLoader, KvCacheRetentionConfig,
                         LlmBuildStats, ModelLoader, _ModelRuntimeContext)
 from .mpi_session import MpiPoolSession, external_mpi_comm_available
@@ -342,10 +342,10 @@ class BaseLLM:
 
         inputs = prompt_inputs(inputs)
 
-        if not inputs.get("prompt") and inputs.get(
-                "prompt_token_ids") and inputs.get(
-                    "multi_modal_data") and not isinstance(
-                        self.input_processor, DefaultInputProcessor):
+        if not inputs.get("prompt") and inputs.get("prompt_token_ids") and (
+                inputs.get("multi_modal_data")
+                or inputs.get("multi_modal_embeddings")) and not isinstance(
+                    self.input_processor, DefaultInputProcessor):
             # VLMs need to process/tokenize the prompt in their own way
             prompt = self.tokenizer.decode(inputs['prompt_token_ids'])
             inputs = TextPrompt(
@@ -378,6 +378,10 @@ class BaseLLM:
                 with nvtx_range_debug("input_processor_with_hash"):
                     prompt_token_ids, extra_processed_inputs = input_processor_with_hash(
                         inputs, sampling_params)
+            elif 'multi_modal_embeddings' in inputs:
+                mm_embedding_info = inputs['multi_modal_embeddings']
+                prompt_token_ids, extra_processed_inputs = self.input_processor.attach_multimodal_embeddings(
+                    inputs, mm_embedding_info, sampling_params)
             else:
                 with nvtx_range_debug("input_processor"):
                     prompt_token_ids, extra_processed_inputs = self.input_processor(
@@ -391,6 +395,10 @@ class BaseLLM:
                         'multimodal_input'),
                     multimodal_data=extra_processed_inputs.get(
                         'multimodal_data'))
+                # Convert to shared tensor handle to reduce IPC overhead
+                # for values with non-selected keys, it's no-op
+                multimodal_params.to_handle("multimodal_data",
+                                            key="multimodal_embedding")
                 # Only pass it if it has content
                 if not multimodal_params.has_content():
                     multimodal_params = None
@@ -807,19 +815,35 @@ class _TrtLLM(BaseLLM):
         if self.args.peft_cache_config is not None:
             self._executor_config.peft_cache_config = PybindMirror.maybe_to_pybind(
                 self.args.peft_cache_config)
-        elif self.args.build_config.plugin_config.lora_plugin:
+
+        lora_config = None
+        if self.args.build_config.plugin_config.lora_plugin:
             engine_config = EngineConfig.from_json_file(self._engine_dir /
                                                         "config.json")
             lora_config = engine_config.build_config.lora_config
+            if self.args.lora_config is not None:
+                logger.info(
+                    "Overriding lora_config from engine with lora_config from LLM args"
+                )
+                lora_config = self.args.lora_config
+
             max_lora_rank = lora_config.max_lora_rank
             num_lora_modules = engine_config.pretrained_config.num_hidden_layers * \
                 len(lora_config.lora_target_modules + lora_config.missing_qkv_modules)
-            self._executor_config.peft_cache_config = tllm.PeftCacheConfig(
-                num_device_module_layer=max_lora_rank * num_lora_modules *
-                self.args.max_loras,
-                num_host_module_layer=max_lora_rank * num_lora_modules *
-                self.args.max_cpu_loras,
+
+            peft_cache_config_model = PeftCacheConfig.from_pybind(
+                self._executor_config.peft_cache_config
+            ) if self._executor_config.peft_cache_config is not None else PeftCacheConfig(
             )
+            if lora_config.max_loras is not None:
+                peft_cache_config_model.num_device_module_layer = \
+                    max_lora_rank * num_lora_modules * lora_config.max_loras
+            if lora_config.max_cpu_loras is not None:
+                peft_cache_config_model.num_host_module_layer = \
+                    max_lora_rank * num_lora_modules * lora_config.max_cpu_loras
+            self._executor_config.peft_cache_config = peft_cache_config_model._to_pybind(
+            )
+
         if self.args.decoding_config is not None:
             self._executor_config.decoding_config = self.args.decoding_config
         if self.args.guided_decoding_backend == 'xgrammar':
@@ -860,7 +884,7 @@ class _TrtLLM(BaseLLM):
                 postprocess_tokenizer_dir=self.args.postprocess_tokenizer_dir,
             ),
             is_llm_executor=True,
-            lora_config=self.args.lora_config)
+            lora_config=lora_config)
 
 
 @append_docstring(TORCH_LLM_DOCSTRING)
@@ -971,13 +995,43 @@ class _TorchLLM(BaseLLM):
             self._executor_config.cache_transceiver_config = PybindMirror.maybe_to_pybind(
                 self.args.cache_transceiver_config)
         from tensorrt_llm._torch.pyexecutor.config import update_executor_config
+
+        spec_config = self.args.speculative_config
+        max_batch_size = self._executor_config.max_batch_size
+        # Apply default heuristic to AutoDecodingConfig based on benchmark results
+        # With concurrency <= 4, max_draft_len = 5, max_matching_ngram_size = 3
+        # With concurrency <= 32, max_draft_len = 3, max_matching_ngram_size = 5
+        # With concurrency > 32, speculative decoding is disabled.
+        if spec_config is not None and spec_config.decoding_type == "AUTO":
+            if not self.args.disable_overlap_scheduler:
+                logger.info(
+                    "Disable overlap scheduler to enable Auto speculative decoding with Ngram."
+                )
+                # From benchmark results, we found that NGram speculative decoding provides better performance than overlap scheduler with low concurrency <= 32.
+                # Therefore, we disable overlap scheduler to enable NGram speculative decoding.
+                self.args.disable_overlap_scheduler = True
+
+            spec_config = NGramDecodingConfig(
+                max_draft_len=5 if max_batch_size <= 4 else 3,
+                max_matching_ngram_size=3 if max_batch_size <= 4 else 5,
+                is_keep_all=True,
+                is_use_oldest=True,
+                is_public_pool=True,
+                # Flag to indicate the NGramDecodingConfig is instantiated by auto heuristic.
+                is_auto_heuristic=True,
+            )
+
+            logger.info(
+                f"Apply heuristic to incomplete NGramDecodingConfig: max_draft_len={spec_config.max_draft_len}, max_matching_ngram_size={spec_config.max_matching_ngram_size}"
+            )
+
         update_executor_config(
             self._executor_config,
             backend=self.args.backend,
             pytorch_backend_config=self.args.get_pytorch_backend_config()
             if self.args.backend in ["pytorch", "_autodeploy"] else None,
             mapping=self.args.parallel_config.to_mapping(),
-            speculative_config=self.args.speculative_config,
+            speculative_config=spec_config,
             hf_model_dir=self._hf_model_dir,
             max_input_len=self.args.max_input_len,
             max_seq_len=max_seq_len,

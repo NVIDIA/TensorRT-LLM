@@ -1,14 +1,15 @@
 from functools import partial
-from typing import Any, Callable, Dict, List, Tuple
+from typing import Callable, List, Tuple
 
 import torch
 import torch.nn as nn
 from torch.fx import GraphModule, Node
 
-from ...utils.logger import ad_logger
+from ...models.factory import ModelFactory
+from ...shim.interface import CachedSequenceInterface
 from ...utils.node_utils import is_op
 from ...utils.quantization_utils import QuantizationImpl, should_skip_quantization
-from .._graph import canonicalize_graph
+from ..interface import BaseTransform, TransformInfo, TransformRegistry
 
 quantized_moe_op_map = {
     "FP8": torch.ops.auto_deploy.torch_quant_fp8_moe,
@@ -92,45 +93,8 @@ def _quantize_moe_node(
             quantized_op,
             args=tuple(args),
         )
-        ad_logger.debug(f"Updating {node.name} args to {new_node.args}")
         node.replace_all_uses_with(new_node)
         gm.graph.erase_node(node)
-
-
-def quantize_moe(gm: GraphModule, quant_config: Dict[str, Any]) -> None:
-    """
-    Traverse gm, find every torch.ops.auto_deploy.torch_moe, and replace it with the
-    quantized version using the quant_algo from quant_config.
-    """
-    quant_algo = quant_config.get("quant_algo")
-    if not quant_algo:
-        ad_logger.info("No quantization to do.")
-        return gm
-    excluded_patterns = quant_config.get("exclude_modules", [])
-
-    quant_impl = QuantizationImpl.create(quant_algo)
-    quantized_op = quantized_moe_op_map[quant_algo]
-
-    count = 0
-
-    for node in list(gm.graph.nodes):
-        if is_op(node, torch.ops.auto_deploy.torch_moe):
-            # Check that all expert weights should be quantized
-            w1_names, w2_names, w3_names = _extract_moe_weight_param_lists(node)
-            if any(
-                should_skip_quantization(n, excluded_patterns)
-                for n in w1_names + w2_names + w3_names
-            ):
-                continue
-            _quantize_moe_node(gm, node, quant_impl, quantized_op)
-            count += 1
-
-    if count == 0:
-        return gm
-
-    gm = canonicalize_graph(gm)
-    ad_logger.info(f"Found {count} {quant_algo} quantized {quantized_op} nodes.")
-    return
 
 
 # TODO(Fridah-nv): robust handling similar to `extract_param_names_from_lin_node` or expand it
@@ -165,3 +129,51 @@ def _extract_moe_weight_param_lists(moe_node: Node) -> Tuple[List[str], List[str
     w3_names = _unwrap_list(w3_list)
 
     return w1_names, w2_names, w3_names
+
+
+@TransformRegistry.register("quantize_moe")
+class QuantizeMOE(BaseTransform):
+    """
+    Traverse gm, find every torch.ops.auto_deploy.torch_moe, and replace it with the
+    quantized version using the quant_algo from quant_config.
+    """
+
+    def _apply(
+        self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory
+    ) -> Tuple[GraphModule, TransformInfo]:
+        quant_config = factory.get_quant_config()
+        quant_algo = quant_config.get("quant_algo") if quant_config else None
+
+        if not quant_config or not quant_algo:
+            return gm, TransformInfo(
+                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+            )
+        excluded_patterns = quant_config.get("exclude_modules", [])
+
+        quant_impl = QuantizationImpl.create(quant_algo)
+        quantized_op = quantized_moe_op_map[quant_algo]
+
+        count = 0
+
+        for node in list(gm.graph.nodes):
+            if is_op(node, torch.ops.auto_deploy.torch_moe):
+                # Check that all expert weights should be quantized
+                w1_names, w2_names, w3_names = _extract_moe_weight_param_lists(node)
+                if any(
+                    should_skip_quantization(n, excluded_patterns)
+                    for n in w1_names + w2_names + w3_names
+                ):
+                    continue
+                _quantize_moe_node(gm, node, quant_impl, quantized_op)
+                count += 1
+
+        if count == 0:
+            return gm, TransformInfo(
+                skipped=False, num_matches=0, is_clean=True, has_valid_shapes=True
+            )
+
+        info = TransformInfo(
+            skipped=False, num_matches=count, is_clean=False, has_valid_shapes=False
+        )
+
+        return gm, info

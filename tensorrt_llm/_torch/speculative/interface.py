@@ -19,6 +19,7 @@ class SpeculativeDecodingMode(IntEnum):
     USER_PROVIDED = auto()
     EXTERNAL_API = auto()
     NONE = auto()
+    AUTO = auto()
 
     def is_mtp(self):
         return self == SpeculativeDecodingMode.MTP or self == SpeculativeDecodingMode.MTP_EAGLE

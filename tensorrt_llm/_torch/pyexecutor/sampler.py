@@ -23,7 +23,7 @@ from tensorrt_llm.executor.result import Logprob
 from tensorrt_llm.mapping import Mapping
 
 from .finish_reason import FinishedState
-from .llm_request import LlmRequest, LlmRequestState
+from .llm_request import LlmRequest, LlmRequestState, get_draft_token_length
 from .scheduler import ScheduledRequests
 
 
@@ -337,7 +337,7 @@ class TorchSampler(Sampler):
             new_token = add_token(req, new_tokens, beam=self.BEAM)
             stop = self._handle_stop_criteria(req, new_token)
             processed = 1
-            if not stop and len(req.py_draft_tokens) > 0:
+            if not stop and get_draft_token_length(req) > 0:
                 num_accepted = self.process_draft_tokens(
                     req, new_tokens, new_token)
                 req.py_num_accepted_draft_tokens = num_accepted
@@ -401,7 +401,7 @@ class TorchSampler(Sampler):
         beam_width = self.MAX_BEAM_WIDTH
         beam = self.BEAM
         raw_logits = model_outputs["logits"]
-        num_steps = [1 + len(req.py_draft_tokens) for req in requests]
+        num_steps = [1 + get_draft_token_length(req) for req in requests]
         sum_steps = sum(num_steps)
         no_draft_tokens = len(requests) == sum_steps
         fast_path = not self.enable_mixed_sampler and no_draft_tokens and gen_logits_host is None and log_probs_host is None
@@ -542,12 +542,6 @@ class TRTLLMSampler(Sampler):
                                     self.MAX_DECODING_TOKENS, buffer_manager)
                 for _ in range(self.num_micro_batches)
             ],
-            "sequence_lengths_host":
-            torch.empty((
-                self.executor_config.max_batch_size,
-                self.executor_config.max_beam_width,
-            ),
-                        dtype=torch.int),
             "decoder_state":
             DecoderState(),
             "decoding_input": [None] * self.num_micro_batches,

@@ -45,6 +45,9 @@ trt_llm_integration_perf_test:
   - perf/test_perf.py::test_perf[llama_v3.1_8b-cpp-ootb_except_mha-bfloat16-maxbs:64-bs:64-input_output_len:128,8+512,32]
   - perf/test_perf.py::test_perf[llama_v3.1_8b-cpp-ootb_except_mha-bfloat16-maxbs:64-bs:64-input_output_len:128,128+512,32]
 
+  # Dummy lora tests
+  - perf/test_perf.py::test_perf[gemma_3_1b_it-bench-pytorch-bfloat16-maxbs:2-maxnt:1024-input_output_len:128,128-loras:1-reqs:8-con:2]
+
   # Test list validation
   - test_list_validation.py::test_list_validation
 

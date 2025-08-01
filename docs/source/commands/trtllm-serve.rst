@@ -27,7 +27,7 @@ The following abbreviated command syntax shows the commonly used arguments to st
 
 .. code-block:: bash
 
-   trtllm-serve <model> [--backend pytorch --tp_size <tp> --pp_size <pp> --ep_size <ep> --host <host> --port <port>]
+   trtllm-serve <model> [--tp_size <tp> --pp_size <pp> --ep_size <ep> --host <host> --port <port>]
 
 For the full syntax and argument descriptions, refer to :ref:`syntax`.
 
@@ -90,8 +90,7 @@ Then, start the server with the configuration file:
 .. code-block:: bash
 
    trtllm-serve Qwen/Qwen2-VL-7B-Instruct \
-       --extra_llm_api_options ./extra-llm-api-config.yml \
-       --backend pytorch
+       --extra_llm_api_options ./extra-llm-api-config.yml
 
 Multimodal Chat API
 ~~~~~~~~~~~~~~~~~~~
@@ -213,7 +212,7 @@ You can deploy `DeepSeek-V3 <https://huggingface.co/deepseek-ai/DeepSeek-V3>`_ m
         --container-image=<CONTAINER_IMG> \
         --container-mounts=/workspace:/workspace \
         --container-workdir /workspace \
-        bash -c "trtllm-llmapi-launch trtllm-serve deepseek-ai/DeepSeek-V3 --backend pytorch --max_batch_size 161 --max_num_tokens 1160 --tp_size 16 --ep_size 4 --kv_cache_free_gpu_memory_fraction 0.95 --extra_llm_api_options ./extra-llm-api-config.yml"
+        bash -c "trtllm-llmapi-launch trtllm-serve deepseek-ai/DeepSeek-V3 --max_batch_size 161 --max_num_tokens 1160 --tp_size 16 --ep_size 4 --kv_cache_free_gpu_memory_fraction 0.95 --extra_llm_api_options ./extra-llm-api-config.yml"
 
 See `the source code <https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/llmapi/trtllm-llmapi-launch>`_ of ``trtllm-llmapi-launch`` for more details.
 
@@ -232,7 +231,7 @@ Metrics Endpoint
 
 The ``/metrics`` endpoint provides runtime-iteration statistics such as GPU memory use and inflight-batching details.
 For the TensorRT backend, these statistics are enabled by default.
-However, for the PyTorch backend, specified with the ``--backend pytorch`` argument, you must explicitly enable iteration statistics logging by setting the `enable_iter_perf_stats` field in a YAML configuration file as shown in the following example:
+However, for the PyTorch backend, you must explicitly enable iteration statistics logging by setting the `enable_iter_perf_stats` field in a YAML configuration file as shown in the following example:
 
 .. code-block:: yaml
 
@@ -246,7 +245,7 @@ Then start the server and specify the ``--extra_llm_api_options`` argument with 
 
    trtllm-serve <model> \
      --extra_llm_api_options <path-to-extra-llm-api-config.yml> \
-     [--backend pytorch --tp_size <tp> --pp_size <pp> --ep_size <ep> --host <host> --port <port>]
+     [--tp_size <tp> --pp_size <pp> --ep_size <ep> --host <host> --port <port>]
 
 After at least one inference request is sent to the server, you can fetch the runtime-iteration statistics by polling the `/metrics` endpoint:
 

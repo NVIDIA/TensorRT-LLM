@@ -108,7 +108,9 @@ class GatedMLP(nn.Module):
     def _apply_activation(self, x):
         if self.activation == F.silu:
             return swiglu(x)
-        elif self.activation == None:
+        elif callable(self.activation):
+            return self.activation(x)
+        elif self.activation is None:
             return x
         else:
             raise NotImplementedError(

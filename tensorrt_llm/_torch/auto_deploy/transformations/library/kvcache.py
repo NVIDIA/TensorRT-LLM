@@ -174,7 +174,7 @@ def resize_kv_cache(
         memory_for_forward_pass = free_mem_pre - free_mem_post
         ad_logger.info(f"Memory for forward pass (MB): {memory_for_forward_pass}")
 
-        new_cache_size = free_mem_post * free_mem_ratio + current_cache_size
+        new_cache_size = free_mem_post * 1024 * 1024 * free_mem_ratio + current_cache_size
         new_num_pages = int(new_cache_size // (current_cache_size // current_num_pages))
 
         # Need to sync all the GPUs

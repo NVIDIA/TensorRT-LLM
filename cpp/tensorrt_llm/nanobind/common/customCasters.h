@@ -21,14 +21,11 @@
 #include "tensorrt_llm/batch_manager/decoderBuffers.h"
 #include "tensorrt_llm/common/optionalRef.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
-#include "tensorrt_llm/runtime/request.h"
 #include "tensorrt_llm/runtime/samplingConfig.h"
 #include "tensorrt_llm/runtime/torch.h"
 #include "tensorrt_llm/runtime/torchView.h"
 
 #include <ATen/DLConvertor.h>
-#include <deque>
-#include <filesystem>
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/filesystem.h>
 #include <nanobind/stl/optional.h>
@@ -38,7 +35,8 @@
 #include <torch/csrc/autograd/variable.h>
 #include <torch/extension.h>
 #include <torch/torch.h>
-#include <vector>
+
+#include <deque>
 
 // Pybind requires to have a central include in order for type casters to work.
 // Opaque bindings add a type caster, so they have the same requirement.
@@ -47,7 +45,6 @@
 // Opaque bindings
 NB_MAKE_OPAQUE(tensorrt_llm::batch_manager::ReqIdsSet)
 NB_MAKE_OPAQUE(std::vector<tensorrt_llm::batch_manager::SlotDecoderBuffers>)
-NB_MAKE_OPAQUE(std::vector<tensorrt_llm::runtime::decoder_batch::Request>)
 NB_MAKE_OPAQUE(std::vector<tensorrt_llm::runtime::SamplingConfig>)
 
 namespace nb = nanobind;

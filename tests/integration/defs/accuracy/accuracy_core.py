@@ -735,3 +735,14 @@ class LlmapiAccuracyTestHarness:
         logger.set_level("info")
         yield
         logger.set_level(original_level)
+
+
+def get_accuracy_task(dataset_name: str):
+    try:
+        task_class = globals()[dataset_name]
+        if issubclass(task_class, AccuracyTask):
+            return task_class
+        else:
+            raise ValueError(f"Unknown dataset: {dataset_name}.")
+    except KeyError:
+        raise ValueError(f"Not registered dataset: {dataset_name}.")
