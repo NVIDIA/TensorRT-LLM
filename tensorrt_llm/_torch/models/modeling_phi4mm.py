@@ -215,14 +215,16 @@ class Phi4MMForCausalLM(transformers.PreTrainedModel):
         )
 
         multimodal_params = kwargs.get("multimodal_params", [])
-        mm_embedding = [
-            multimodal_param.multimodal_data["multimodal_embedding"]
-            for multimodal_param in multimodal_params
-        ]
+        mm_embeds = []
+        if len(multimodal_params) > 0:
+            mm_embeds = [
+                multimodal_param.multimodal_data["multimodal_embedding"]
+                for multimodal_param in multimodal_params
+            ]
         input_ids, input_embeds = fuse_input_embeds(
             self.llm.model.embed_tokens,
             input_ids,
-            mm_embedding,
+            mm_embeds,
             mm_token_ids=self.MM_TOKEN_IDS,
         )
 
@@ -269,16 +271,16 @@ class Phi4MMForCausalLM(transformers.PreTrainedModel):
         if modality == "image" or modality == "image_audio":
             lora_request = [
                 LoRARequest(
-                    lora_name=f"vision-lora-{i}",
-                    lora_int_id=i,
+                    lora_name="vision-lora",
+                    lora_int_id=0,
                     lora_path=f"{base_model_dir}/vision-lora",
                 ) for i in range(num_requests)
             ]
         elif modality == "audio":
             lora_request = [
                 LoRARequest(
-                    lora_name=f"speech-lora-{i}",
-                    lora_int_id=i,
+                    lora_name="speech-lora",
+                    lora_int_id=1,
                     lora_path=f"{base_model_dir}/speech-lora",
                 ) for i in range(num_requests)
             ]

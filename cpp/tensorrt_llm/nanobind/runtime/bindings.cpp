@@ -36,7 +36,6 @@
 #include "tensorrt_llm/runtime/lookaheadBuffers.h"
 #include "tensorrt_llm/runtime/loraCache.h"
 #include "tensorrt_llm/runtime/mcastGPUBuffer.h"
-#include "tensorrt_llm/runtime/request.h"
 #include "tensorrt_llm/runtime/speculativeDecodingMode.h"
 #include "tensorrt_llm/runtime/tllmRuntime.h"
 #include "tensorrt_llm/runtime/torchView.h"
@@ -162,25 +161,6 @@ void initBindings(nb::module_& m)
         .def("report_to_profiler", &tr::TllmRuntime::reportToProfiler, nb::arg("context_id"))
         .def_prop_ro("logits_dtype_from_engine",
             [](tr::TllmRuntime& self) { return self.getEngine().getTensorDataType("logits"); });
-
-    nb::class_<tr::decoder_batch::Request>(m, "Request")
-        .def(nb::init<tr::decoder_batch::Request::TensorConstPtr, tr::SizeType32, std::optional<tr::SizeType32>,
-                 std::optional<tr::SizeType32>>(),
-            nb::arg("ids"), nb::arg("input_len"), nb::arg("max_new_tokens") = std::nullopt,
-            nb::arg("end_id") = std::nullopt)
-        .def_rw("ids", &tr::decoder_batch::Request::ids)
-        .def_rw("input_len", &tr::decoder_batch::Request::inputLen)
-        .def_rw("max_new_tokens", &tr::decoder_batch::Request::maxNewTokens)
-        .def_rw("end_id", &tr::decoder_batch::Request::endId)
-        .def_rw("draft_logits", &tr::decoder_batch::Request::draftLogits)
-        .def_rw("embedding_bias", &tr::decoder_batch::Request::embeddingBias)
-        .def_rw("bad_words_list", &tr::decoder_batch::Request::badWordsList)
-        .def_rw("stop_words_list", &tr::decoder_batch::Request::stopWordsList)
-        .def_rw("generated_tokens_per_engine_step", &tr::decoder_batch::Request::generatedTokensPerEngineStep)
-        .def_rw("medusa_paths", &tr::decoder_batch::Request::medusaPaths)
-        .def_rw("medusa_tree_ids", &tr::decoder_batch::Request::medusaTreeIds)
-        .def_rw("lookahead_runtime_config", &tr::decoder_batch::Request::lookaheadRuntimeConfig);
-    nb::bind_vector<std::vector<tr::decoder_batch::Request>>(m, "RequestVector");
 
     nb::class_<tr::decoder_batch::Input>(m, "DecoderBatchInput")
         .def(nb::init<std::vector<std::vector<tr::ITensor::SharedConstPtr>>, tr::SizeType32>(), nb::arg("logits"),

@@ -1571,7 +1571,6 @@ Explanation:
 TensorRT-LLM supports nvidia TensorRT Model Optimizer quantized FP8 checkpoint
 ``` bash
 trtllm-serve nvidia/Llama-3.3-70B-Instruct-FP8 \
-    --backend pytorch \
     --tp_size 8 \
     --max_batch_size 1024 \
     --trust_remote_code \
