@@ -67,6 +67,7 @@ class TrtllmAttentionWrapper:
     v_head_dim: Optional[int]
     attention_chunk_size: Optional[int]
     use_spec_decoding: bool
+    is_spec_dec_tree: bool
     spec_decoding_position_offsets: Optional[torch.Tensor]
     spec_decoding_packed_mask: Optional[torch.Tensor]
     spec_decoding_generation_lengths: Optional[torch.Tensor]
@@ -177,6 +178,7 @@ class TrtllmAttentionWrapper:
         softmax_stats_tensor: Optional[torch.Tensor] = None,
         is_spec_decoding_enabled: bool = False,
         use_spec_decoding: bool = False,
+        is_spec_dec_tree: bool = False,
         spec_decoding_position_offsets: Optional[torch.Tensor] = None,
         spec_decoding_packed_mask: Optional[torch.Tensor] = None,
         spec_decoding_generation_lengths: Optional[torch.Tensor] = None,
@@ -258,6 +260,7 @@ class TrtllmAttentionWrapper:
             )
         self.is_spec_decoding_enabled = is_spec_decoding_enabled
         self.use_spec_decoding = use_spec_decoding
+        self.is_spec_dec_tree = is_spec_dec_tree
         self.spec_decoding_position_offsets = spec_decoding_position_offsets
         self.spec_decoding_packed_mask = spec_decoding_packed_mask
         self.spec_decoding_generation_lengths = spec_decoding_generation_lengths
@@ -399,7 +402,8 @@ class TrtllmAttentionWrapper:
             self.rotary_embedding_original_max_positions
         ]
         spec_decoding_bool_params = [
-            self.is_spec_decoding_enabled, self.use_spec_decoding
+            self.is_spec_decoding_enabled, self.use_spec_decoding,
+            self.is_spec_dec_tree
         ]
         spec_decoding_tensor_params = [
             self.spec_decoding_generation_lengths,
@@ -1157,6 +1161,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             softmax_stats_tensor=softmax_stats_tensor,
             is_spec_decoding_enabled=metadata.is_spec_decoding_enabled,
             use_spec_decoding=metadata.use_spec_decoding,
+            is_spec_dec_tree=metadata.is_spec_dec_tree,
             spec_decoding_position_offsets=metadata.
             spec_decoding_position_offsets,
             spec_decoding_packed_mask=metadata.spec_decoding_packed_mask,

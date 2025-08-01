@@ -478,7 +478,7 @@ struct Mask<Traits, Cta_tile, 4> : public Mask<Traits, Cta_tile, 3>
     inline __device__ bool is_valid(int row, int col) const
     {
         // Is it a valid position in the sequence, i.e. are we in the lower triangle?
-        return (row >= col) && (col >= max(0, row - sliding_window_size_));
+        return (row >= col) && (col >= max(0, row + 1 - sliding_window_size_));
     }
 
     // The sliding window size.
@@ -946,7 +946,7 @@ struct Mask_hopper<Traits, Cta_tile, 4> : public Mask_hopper<Traits, Cta_tile, 3
     inline __device__ bool is_valid(int row, int col) const
     {
         // Is it a valid position in the sequence?
-        return col <= row && col >= max(0, row - sliding_window_size_);
+        return col <= row && col >= max(0, row + 1 - sliding_window_size_);
     }
 
     // The sliding window size for attention.

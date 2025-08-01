@@ -1056,3 +1056,14 @@ public:
 private:
     uint32_t mTic;
 };
+
+// [beg, end)
+struct Range
+{
+    uint32_t beg, end;
+};
+
+constexpr bool overlap(Range a, Range b)
+{
+    return a.beg < b.end && b.beg < a.end;
+}

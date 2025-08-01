@@ -1335,7 +1335,7 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
     // Note that the maximum sequence length supported by the model might be greater than this.
     // Note max_attention_window_size is maximum of cyclic_attention_window_size among all layers.
     // By default, you can assume that they are the same.
-    auto const cyclic_kv_cache_len = static_cast<unsigned>(params.cyclic_attention_window_size);
+    auto const cyclic_kv_cache_len = params.cyclic_attention_window_size;
     // The number of sink tokens in kv cache to support streamingllm
     auto const sink_token_len = static_cast<unsigned>(params.sink_token_length);
     // The current timestep (including paddings).
@@ -1361,7 +1361,7 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
 #ifndef MMHA_USE_FP32_ACCUM_FOR_LOGITS
     if (sizeof(Tk) != 4)
     {
-        auto const max_timesteps = min(timestep, cyclic_kv_cache_len);
+        auto const max_timesteps = min(timestep, static_cast<unsigned>(cyclic_kv_cache_len));
         logits_smem_ += divUp(max_timesteps + 1, 4u) * 16;
     }
     Tk* logits_smem = reinterpret_cast<Tk*>(logits_smem_);
@@ -1487,21 +1487,18 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
     int const tlength = DO_CROSS_ATTENTION
         ? params.memory_length_per_sample[batch_beam_idx] - 1
         : (params.length_per_sample ? (params.length_per_sample[batch_beam_idx] - 1) : static_cast<int>(timestep));
-    // We will use cyclic kv cache when it exceeds the limit.
-    // The length position for storing new key and value.
-    int const cyclic_tlength = kvCacheBuffer.getKVTokenIdx(tlength);
     // When enable cyclic kv cache and one more block mode, we need to shift the index to the actual index in the
     // sequence. Otherwise, if the token is not the sink token, we need to add the bubblen length to the index.
     bool const enable_use_seq_idx_kv = kvCacheBuffer.mEnableOneMoreBlock && tlength > cyclic_kv_cache_len;
     int const shift_for_cyclic_kv = (enable_use_seq_idx_kv) ? tlength - cyclic_kv_cache_len : kvCacheBuffer.mBubbleLen;
     int const shift_for_cyclic_k = (enable_use_seq_idx_kv) ? tlength - cyclic_kv_cache_len : pastKCache.mBubbleLen;
     // The actual kv cache length.
-    // tlength is the past length actually.
-    int kv_loop_length = min(tlength, cyclic_kv_cache_len);
-    // The bound of the kv token idx (kv_loop_length = 0 should not happen ideally, but add here for safety).
-    int const kv_token_idx_bound = max(kv_loop_length - 1, 0);
+    // Minus 1 because the current token is also included in the attention window.
+    int kv_loop_length = min(tlength, cyclic_kv_cache_len - 1);
+    // The bound of the kv token idx (tlength = 0 should not happen ideally, but add here for safety).
+    int const kv_token_idx_bound = max(tlength - 1, 0);
     // The kv_token_start_offset. All tokens before kv_token_start_offset will be fully masked.
-    int kv_token_start_offset = 0;
+    int kv_token_start_offset = max(tlength - cyclic_kv_cache_len + 1, 0);
     // Only consider the current attention chunk if the chunked attention is used.
     if (params.chunked_attention_size_log2 > 0)
     {
@@ -1513,8 +1510,6 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
     // as context kv cache might be overwritten by the new kv cache
     int const beam0_context_length
         = HAS_BEAMS && tlength > cyclic_kv_cache_len ? 0 : params.input_lengths[batch_beam_idx];
-    // The position of the current timestep, and it is used to apply the position embedding
-    int current_pos_idx = (!POS_SHIFT || DO_CROSS_ATTENTION) ? tlength : kv_loop_length;
 
     // The offset in the Q and K buffer also accounts for the batch.
     auto const qk_vec_idx = tidx * QK_VEC_SIZE;
@@ -1555,7 +1550,7 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
     {
         mmha::update_rotary_base_n_scale(rotary_embedding_base, rotary_embedding_scale,
             params.rotary_embedding_scale_type, params.rotary_embedding_dim, params.rotary_embedding_max_positions,
-            current_pos_idx);
+            tlength);
         // Query
         // The stride between tokens. We may be able to always use params.stride.
         uint32_t q_stride = params.stride ? static_cast<uint32_t>(params.stride) : (num_heads * Dh);
@@ -1579,8 +1574,8 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
         if constexpr (DO_CROSS_ATTENTION)
         {
             auto const k_idx = QK_VEC_SIZE * tidx;
-            int const inBlockIdx = pastKCache.getKVLocalIdx(cyclic_tlength, hi_kv, Dh, k_idx);
-            Tcache* k_cache = reinterpret_cast<Tcache*>(pastKCache.getKBlockPtr(batch_beam_idx, cyclic_tlength));
+            int const inBlockIdx = pastKCache.getKVLocalIdx(tlength, hi_kv, Dh, k_idx);
+            Tcache* k_cache = reinterpret_cast<Tcache*>(pastKCache.getKBlockPtr(batch_beam_idx, tlength));
 
             if constexpr (ENABLE_8BITS_K_CACHE)
             {
@@ -1671,18 +1666,19 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
         if (HANDLE_KV)
         {
             apply_rotary_embedding(q, k, tidx, params.rotary_embedding_dim, rotary_embedding_base,
-                rotary_embedding_scale, current_pos_idx, rotary_embedding_inv_freq_cache);
+                rotary_embedding_scale, tlength, rotary_embedding_inv_freq_cache);
         }
         else
         {
             apply_rotary_embedding(q, tidx, params.rotary_embedding_dim, rotary_embedding_base, rotary_embedding_scale,
-                current_pos_idx, rotary_embedding_inv_freq_cache);
+                tlength, rotary_embedding_inv_freq_cache);
         }
         break;
     }
     case PositionEmbeddingType::kLONG_ROPE:
     case PositionEmbeddingType::kROPE_M:
     case PositionEmbeddingType::kROPE_GPT_NEOX:
+    case PositionEmbeddingType::kYARN:
     {
         bool const do_rotary = is_valid_qk_vec && QK_VEC_SIZE * tidx < params.rotary_embedding_dim;
 
@@ -1695,9 +1691,10 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
         int const smem_pitch = half_rotary_dim; // TODO: adjust for bank conflicts
 
         assert(half_rotary_dim % QK_VEC_SIZE == 0);
+        int position_idx = tlength;
         if (params.position_embedding_type == PositionEmbeddingType::kROPE_M && params.mrope_position_deltas != nullptr)
         {
-            current_pos_idx += params.mrope_position_deltas[batch_idx];
+            position_idx += params.mrope_position_deltas[batch_idx];
         }
 
         if (do_rotary)
@@ -1724,7 +1721,7 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
                 mmha::vec_from_smem_transpose(k, k_smem_, transpose_idx, smem_pitch);
 
                 mmha::apply_rotary_embedding(q, k, transpose_idx / tidx_factor, params.rotary_embedding_dim,
-                    rotary_embedding_base, rotary_embedding_scale, current_pos_idx, rotary_embedding_inv_freq_cache,
+                    rotary_embedding_base, rotary_embedding_scale, position_idx, rotary_embedding_inv_freq_cache,
                     rotary_embedding_m_scale, params.rotary_cogvlm_vision_start, params.rotary_cogvlm_vision_length);
 
                 mmha::write_smem_transpose(k, k_smem_, transpose_idx, smem_pitch);
@@ -1732,7 +1729,7 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
             else
             {
                 mmha::apply_rotary_embedding(q, transpose_idx / tidx_factor, params.rotary_embedding_dim,
-                    rotary_embedding_base, rotary_embedding_scale, current_pos_idx, rotary_embedding_inv_freq_cache,
+                    rotary_embedding_base, rotary_embedding_scale, position_idx, rotary_embedding_inv_freq_cache,
                     rotary_embedding_m_scale, params.rotary_cogvlm_vision_start, params.rotary_cogvlm_vision_length);
             }
             mmha::write_smem_transpose(q, q_smem_, transpose_idx, smem_pitch);
@@ -2180,9 +2177,9 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
         // Trigger the stores to global memory.
         Qk_vec_k k_vec = *reinterpret_cast<Qk_vec_k*>(&k_smem[qk_vec_idx]);
         auto const k_idx = QK_VEC_SIZE * tidx;
-        int const inBlockIdx = kvCacheBuffer.getKVLocalIdx(cyclic_tlength, hi_kv, Dh, k_idx);
+        int const inBlockIdx = kvCacheBuffer.getKVLocalIdx(tlength, hi_kv, Dh, k_idx);
         // The base pointer for the value in the cache buffer.
-        Tcache* k_cache = reinterpret_cast<Tcache*>(kvCacheBuffer.getKBlockPtr(batch_beam_idx, cyclic_tlength));
+        Tcache* k_cache = reinterpret_cast<Tcache*>(kvCacheBuffer.getKBlockPtr(batch_beam_idx, tlength));
 
         if constexpr (ENABLE_8BITS_KV_CACHE)
         {
@@ -2389,9 +2386,9 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
     // One group of threads computes the product(s) for the current timestep.
     if (vo == kv_loop_length % V_PER_ITER && is_valid_vi && (!MULTI_BLOCK_FLAG || (c_tile == current_step_ctile_idx)))
     {
-        int const inBlockIdx = kvCacheBuffer.getKVLocalIdx(cyclic_tlength, hi_kv, Dh, vi);
+        int const inBlockIdx = kvCacheBuffer.getKVLocalIdx(tlength, hi_kv, Dh, vi);
         // The base pointer for the value in the cache buffer.
-        Tcache* v_cache_base = reinterpret_cast<Tcache*>(kvCacheBuffer.getVBlockPtr(batch_beam_idx, cyclic_tlength));
+        Tcache* v_cache_base = reinterpret_cast<Tcache*>(kvCacheBuffer.getVBlockPtr(batch_beam_idx, tlength));
 
         V_vec_k v;
         if (DO_CROSS_ATTENTION)
