@@ -884,21 +884,29 @@ class TRTLLMSampler(Sampler):
     @torch.inference_mode()
     @nvtx_range("setup_sampler_step")
     def setup_sampler_step(self, requests):
+        finished_context_requests = [
+            r for r in requests if r.is_last_context_chunk
+        ]
+
+        if len(finished_context_requests) == 0:
+            return
+
         batch_slots, sampling_config, lookahead_prompt, lookahead_algo_configs = self.algs.create_new_decoder_requests(
             self.model_config, self.world_config, self.decoding_config,
-            requests.context_requests, self.logits_datatype,
+            finished_context_requests, self.logits_datatype,
             self.store["decoder_input_buffers"][self.micro_batch_idx],
             self.store["decoder_state"], self.store["cuda_stream"],
             self.algs.decoder.decoder_stream, self.executor_config.max_seq_len,
-            self.beam_width(requests.context_requests))
+            self.beam_width(finished_context_requests))
 
         local_batch_size = len(batch_slots)
-        if local_batch_size > 0:
-            self.algs.decoder.underlying_decoder().setup(
-                sampling_config, local_batch_size, batch_slots,
-                self.store["decoder_state"].joint_decoding_output,
-                self.model_config.data_type, lookahead_prompt,
-                lookahead_algo_configs)
+        assert local_batch_size > 0, "Decoder setup should be called with at least one request"
+
+        self.algs.decoder.underlying_decoder().setup(
+            sampling_config, local_batch_size, batch_slots,
+            self.store["decoder_state"].joint_decoding_output,
+            self.model_config.data_type, lookahead_prompt,
+            lookahead_algo_configs)
 
         adp = [
             r for r in requests.generation_requests if r.is_attention_dp_dummy

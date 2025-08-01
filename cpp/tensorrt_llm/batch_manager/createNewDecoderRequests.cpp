@@ -174,7 +174,7 @@ std::optional<SamplingConfig> CreateNewDecoderRequests::fuseSamplingConfigs(Requ
     return SamplingConfig(samplingConfigs);
 }
 
-std::tuple<TensorPtr, std::optional<runtime::SamplingConfig>, std::vector<runtime::ITensor::SharedConstPtr>,
+std::tuple<TensorPtr, runtime::SamplingConfig, std::vector<runtime::ITensor::SharedConstPtr>,
     std::vector<executor::LookaheadDecodingConfig>>
 CreateNewDecoderRequests::operator()(runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig,
     executor::DecodingConfig const& decodingConfig, RequestVector const& contextRequests, nvinfer1::DataType logitsType,
@@ -185,21 +185,21 @@ CreateNewDecoderRequests::operator()(runtime::ModelConfig const& modelConfig, ru
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     NVTX3_SCOPED_RANGE(CreateNewDecoderRequests);
 
-    RequestVector finishedContextRequests;
-    std::copy_if(contextRequests.begin(), contextRequests.end(), std::back_inserter(finishedContextRequests),
-        [](auto const& llmReq) { return llmReq->isLastContextChunk(); });
+    TLLM_CHECK_WITH_INFO(
+        !contextRequests.empty(), "CreateNewDecoderRequests should be called with at least one request");
 
     auto batchSlotsView = copySequenceLengths(
-        finishedContextRequests, inputBuffers, *decoderState.getSequenceLengths(), beamWidth, runtimeStream);
+        contextRequests, inputBuffers, *decoderState.getSequenceLengths(), beamWidth, runtimeStream);
 
     auto [lookaheadPrompt, lookaheadAlgoConfigs]
-        = createDecoderRequests(finishedContextRequests, inputBuffers.inputsIds, decodingConfig, decoderState,
-            logitsType, modelConfig, worldConfig, runtimeStream, decoderStream, maxSequenceLength, medusaBuffers);
+        = createDecoderRequests(contextRequests, inputBuffers.inputsIds, decodingConfig, decoderState, logitsType,
+            modelConfig, worldConfig, runtimeStream, decoderStream, maxSequenceLength, medusaBuffers);
 
-    auto samplingConfig = fuseSamplingConfigs(finishedContextRequests);
+    auto samplingConfig = fuseSamplingConfigs(contextRequests);
+    TLLM_CHECK(samplingConfig.has_value());
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-    return {std::move(batchSlotsView), std::move(samplingConfig), std::move(lookaheadPrompt),
+    return {std::move(batchSlotsView), std::move(samplingConfig.value()), std::move(lookaheadPrompt),
         std::move(lookaheadAlgoConfigs)};
 }
 

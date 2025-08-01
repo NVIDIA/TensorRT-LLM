@@ -70,7 +70,7 @@ public:
     {
     }
 
-    std::tuple<TensorPtr, std::optional<runtime::SamplingConfig>, std::vector<runtime::ITensor::SharedConstPtr>,
+    std::tuple<TensorPtr, runtime::SamplingConfig, std::vector<runtime::ITensor::SharedConstPtr>,
         std::vector<executor::LookaheadDecodingConfig>>
     operator()(runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig,
         executor::DecodingConfig const& decodingConfig, RequestVector const& contextRequests,
