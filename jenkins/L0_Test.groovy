@@ -2209,6 +2209,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
             "pytorch": "-PyTorch-",
             "tensorrt": "-TensorRT-",
             "cpp": "-CPP-",
+            "triton": "-Triton-",
         ]
         def backendModeList = backendMode.collect { changeMap.get(it) }.flatten()
         def parallelJobsNoBackend = parallelJobsFiltered.findAll { key, _ ->
@@ -2232,7 +2233,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         } else {
             echo "ONLY_ONE_GROUP_CHANGED mode is true. The group is: ${testFilter[(ONLY_ONE_GROUP_CHANGED)]}."
             def excludedBackends = new HashMap()
-            excludedBackends["PyTorch"] = ["-CPP-", "-TensorRT-", "-Triton-"]
+            excludedBackends["PyTorch"] = ["-CPP-", "-TensorRT-"]   // Only pytorch file change also need to run triton tests
             excludedBackends["Triton"] = ["-PyTorch-", "-CPP-", "-TensorRT-"]
             def group = testFilter[(ONLY_ONE_GROUP_CHANGED)]
             if (excludedBackends.containsKey(group)) {
