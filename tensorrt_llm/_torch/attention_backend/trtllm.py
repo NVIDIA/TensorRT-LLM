@@ -742,7 +742,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
         if "kv_lens_cuda" in buffers and buffers["kv_lens_cuda"].numel(
         ) >= self.kv_lens.numel():
-            self.kv_lens_cuda = buffers["prompt_lens_cuda"]
+            self.kv_lens_cuda = buffers["kv_lens_cuda"]
         else:
             self.kv_lens_cuda = torch.empty_like(self.prompt_lens_cuda)
 
