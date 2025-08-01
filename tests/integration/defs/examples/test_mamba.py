@@ -18,16 +18,24 @@ import os
 import pytest
 from defs.common import (convert_weights, generate_summary_cmd, venv_check_call,
                          venv_mpi_check_call)
+from defs.conftest import get_sm_version, skip_post_blackwell
 from defs.trt_test_alternative import check_call
+
+# skip trt flow cases on post-Blackwell-Ultra
+if get_sm_version() >= 103:
+    pytest.skip(
+        "TRT workflow tests are not supported on post Blackwell-Ultra architecture",
+        allow_module_level=True)
 
 
 @pytest.mark.parametrize("gemm_plugin", [True, False],
                          ids=["enable_gemm_plugin", "disable_gemm_plugin"])
 @pytest.mark.parametrize("dtype", ['bfloat16', 'float16'])
 @pytest.mark.parametrize("mamba_model_root", [
-    'mamba-130m', 'mamba-2.8b', 'mamba-1.4b', 'mamba-790m', 'mamba-370m',
-    'mamba2-130m', 'mamba2-2.7b', 'mamba2-1.3b', 'mamba2-780m', 'mamba2-370m',
-    'mamba-codestral-7B-v0.1'
+    pytest.param('mamba-130m', marks=skip_post_blackwell), 'mamba-2.8b',
+    'mamba-1.4b', 'mamba-790m', 'mamba-370m', 'mamba2-130m', 'mamba2-2.7b',
+    'mamba2-1.3b', 'mamba2-780m', 'mamba2-370m',
+    pytest.param('mamba-codestral-7B-v0.1', marks=skip_post_blackwell)
 ],
                          indirect=True)
 def test_llm_mamba_1gpu(mamba_example_root, mamba_model_root,

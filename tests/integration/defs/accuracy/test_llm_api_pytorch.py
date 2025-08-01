@@ -88,7 +88,9 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     @parametrize_with_ids("attn_backend", ["TRTLLM", "FLASHINFER"])
     def test_bfloat16(self, attn_backend, torch_compile):
         torch_compile_config = TorchCompileConfig(
-            enable_fullgraph=True) if torch_compile else None
+            enable_fullgraph=True,
+            enable_piecewise_cuda_graph=True,
+            max_num_streams=3) if torch_compile else None
         pytorch_config = dict(
             torch_compile_config=torch_compile_config,
             cuda_graph_config=CudaGraphConfig(enable_padding=torch_compile,
@@ -112,7 +114,9 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                 "Issue: Unfusing flashinfer_fused_add_rmsnorm causes outputs to be "
                 "discarded at graph breaks.")
         torch_compile_config = TorchCompileConfig(
-            enable_fullgraph=True) if torch_compile else None
+            enable_fullgraph=True,
+            enable_piecewise_cuda_graph=True,
+            max_num_streams=3) if torch_compile else None
         pytorch_config = dict(
             torch_compile_config=torch_compile_config,
             cuda_graph_config=CudaGraphConfig(enable_padding=torch_compile,
@@ -133,7 +137,9 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     @parametrize_with_ids("fp8kv", [False, True])
     def test_fp8(self, fp8kv, attn_backend, torch_compile):
         torch_compile_config = TorchCompileConfig(
-            enable_fullgraph=True) if torch_compile else None
+            enable_fullgraph=True,
+            enable_piecewise_cuda_graph=True,
+            max_num_streams=3) if torch_compile else None
         pytorch_config = dict(
             torch_compile_config=torch_compile_config,
             cuda_graph_config=CudaGraphConfig(enable_padding=torch_compile,
@@ -164,7 +170,9 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                 "Issue: Unfusing flashinfer_fused_add_rmsnorm causes outputs to be "
                 "discarded at graph breaks.")
         torch_compile_config = TorchCompileConfig(
-            enable_fullgraph=True) if torch_compile else None
+            enable_fullgraph=True,
+            enable_piecewise_cuda_graph=True,
+            max_num_streams=3) if torch_compile else None
         pytorch_config = dict(
             torch_compile_config=torch_compile_config,
             cuda_graph_config=CudaGraphConfig(enable_padding=torch_compile,
@@ -374,12 +382,17 @@ class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
                  max_batch_size=32,
                  kv_cache_config=kv_cache_config) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
+            sampling_params = SamplingParams(
+                temperature=0.0,
+                add_special_tokens=False,
+            )
             task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
+            task.evaluate(llm, sampling_params=sampling_params)
             task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
+            task.evaluate(llm, sampling_params=sampling_params)
             task = GPQADiamond(self.MODEL_NAME)
             task.evaluate(llm,
+                          sampling_params=sampling_params,
                           extra_evaluator_kwargs=dict(apply_chat_template=True))
 
     @pytest.mark.skip_less_device(4)
@@ -388,12 +401,17 @@ class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
         model_path = f"{llm_models_root()}/modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp4"
         with LLM(model_path, tensor_parallel_size=4) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+            sampling_params = SamplingParams(
+                temperature=0.0,
+                add_special_tokens=False,
+            )
             task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
+            task.evaluate(llm, sampling_params=sampling_params)
             task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
+            task.evaluate(llm, sampling_params=sampling_params)
             task = GPQADiamond(self.MODEL_NAME)
             task.evaluate(llm,
+                          sampling_params=sampling_params,
                           extra_evaluator_kwargs=dict(apply_chat_template=True))
 
 
@@ -603,6 +621,22 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    def test_fp8_prequantized(self):
+        # Disabling kv cache reuse as a WAR to deal with gaps in kernel support for Gemma3's non-inclusive sliding window size.
+        kv_cache_config = KvCacheConfig(enable_block_reuse=False,
+                                        enable_partial_reuse=False,
+                                        dtype="fp8")
+        prequantized_model_path = f"{llm_models_root()}/gemma/gemma-3-1b-it-fp8/"
+        with LLM(prequantized_model_path,
+                 kv_cache_config=kv_cache_config) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
     def test_auto_dtype_vswa(self):
@@ -1119,7 +1153,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         torch_compile_config = TorchCompileConfig(
             enable_fullgraph=True,
             enable_piecewise_cuda_graph=cuda_graph,
-            max_num_streams=3) if torch_compile else None
+            max_num_streams=1) if torch_compile else None
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
@@ -1469,9 +1503,10 @@ class TestNemotronNas(LlmapiAccuracyTestHarness):
     MODEL_NAME = "nemotron-nas/Llama-3_1-Nemotron-51B-Instruct"
     MODEL_PATH = f"{llm_models_root()}/nemotron-nas/Llama-3_1-Nemotron-51B-Instruct"
 
+    @pytest.mark.skip_less_device_memory(80000)
     @pytest.mark.skip_less_device(8)
     def test_auto_dtype_tp8(self):
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
         pytorch_config = dict()
 
         with LLM(self.MODEL_PATH,
@@ -1802,15 +1837,22 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
 
     @skip_pre_hopper
     @skip_post_blackwell
+    @parametrize_with_ids("torch_compile", [False, True])
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler",
         [(1, 1, 1, False, False, True)],
         ids=["latency"])
     def test_fp8_block_scales(self, tp_size, pp_size, ep_size, attention_dp,
-                              cuda_graph, overlap_scheduler):
+                              cuda_graph, overlap_scheduler, torch_compile):
+        torch_compile_config = TorchCompileConfig(
+            enable_fullgraph=True,
+            enable_piecewise_cuda_graph=cuda_graph and not attention_dp,
+            max_num_streams=3) if torch_compile else None
+
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
-            cuda_graph_config=CudaGraphConfig() if cuda_graph else None)
+            cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
+            torch_compile_config=torch_compile_config)
 
         with LLM(f"{llm_models_root()}/Qwen3/Qwen3-30B-A3B-FP8",
                  tensor_parallel_size=tp_size,
@@ -1822,15 +1864,22 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     @skip_pre_hopper
+    @parametrize_with_ids("torch_compile", [False, True])
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler",
         [(1, 1, 1, True, True, True)],
         ids=["latency"])
     def test_fp8(self, tp_size, pp_size, ep_size, attention_dp, cuda_graph,
-                 overlap_scheduler):
+                 overlap_scheduler, torch_compile):
+        torch_compile_config = TorchCompileConfig(
+            enable_fullgraph=True,
+            enable_piecewise_cuda_graph=cuda_graph and not attention_dp,
+            max_num_streams=3) if torch_compile else None
+
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
-            cuda_graph_config=CudaGraphConfig() if cuda_graph else None)
+            cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
+            torch_compile_config=torch_compile_config)
 
         with LLM(f"{llm_models_root()}/Qwen3/saved_models_Qwen3-30B-A3B_fp8_hf",
                  tensor_parallel_size=tp_size,
@@ -1842,6 +1891,7 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     @skip_pre_blackwell
+    @parametrize_with_ids("torch_compile", [False, True])
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler,moe_backend",
         [
@@ -1870,11 +1920,19 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
         cuda_graph,
         overlap_scheduler,
         moe_backend,
+        torch_compile,
     ):
+
+        torch_compile_config = TorchCompileConfig(
+            enable_fullgraph=True,
+            enable_piecewise_cuda_graph=cuda_graph and not attention_dp,
+            max_num_streams=3) if torch_compile else None
+
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
             moe_config=MoeConfig(backend=moe_backend),
+            torch_compile_config=torch_compile_config,
         )
 
         with LLM(

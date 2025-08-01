@@ -67,6 +67,7 @@ struct XQAKernelRuntimeHashKey
     bool paged_kv_cache;
     bool multi_query_tokens;
     bool is_fp8_output;
+    std::optional<PositionEmbeddingType> position_embedding_type;
 
     bool operator==(XQAKernelRuntimeHashKey const& other) const
     {
@@ -74,7 +75,7 @@ struct XQAKernelRuntimeHashKey
             && num_q_heads_per_kv == other.num_q_heads_per_kv && beam_size == other.beam_size
             && multi_query_tokens == other.multi_query_tokens && m_tilesize == other.m_tilesize
             && tokens_per_page == other.tokens_per_page && paged_kv_cache == other.paged_kv_cache
-            && is_fp8_output == other.is_fp8_output;
+            && is_fp8_output == other.is_fp8_output && position_embedding_type == other.position_embedding_type;
     }
 };
 
@@ -103,6 +104,8 @@ struct XQAKernelRuntimeHasher
         key ^= s.multi_query_tokens;
         key <<= 1;
         key ^= s.is_fp8_output;
+        key <<= 8;
+        key ^= static_cast<int8_t>(s.position_embedding_type.value_or(static_cast<PositionEmbeddingType>(-1)));
         return key;
     }
 };
