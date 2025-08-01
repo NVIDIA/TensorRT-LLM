@@ -274,11 +274,6 @@ class PyExecutor:
                     "KV Cache Connector is not supported with pipeline parallelism."
                 )
 
-            if not self.disable_overlap_scheduler:
-                raise NotImplementedError(
-                    "KV Cache Connector is not supported with overlap scheduler."
-                )
-
             # TODO: This does NOT support pipeline parallel.
             layer_kv_tensors = {
                 layer_idx: self.kv_cache_manager.get_buffers(layer_idx)
@@ -948,6 +943,19 @@ class PyExecutor:
             self.guided_decoder.build(scheduled_batch)
             self.guided_decoder.execute(scheduled_batch, logits)
 
+    def _execute_kv_connector(self, scheduled_batch):
+        if self.kv_connector_manager:
+            self.kv_connector_manager.take_scheduled_requests_pending_load(
+                scheduled_batch)
+            self.kv_connector_manager.handle_metadata()
+            self.kv_connector_manager.worker.start_load_kv()
+
+    def _terminate_async_save_requests(self):
+        if self.kv_connector_manager:
+            reqs_to_terminate = self.kv_connector_manager.get_finished()
+            for req in reqs_to_terminate:
+                self.resource_manager.free_resources(req)
+
     def _executor_loop(self):
         torch.cuda.set_device(self.device_id)
         with self._profiler() as profile_step:
@@ -976,14 +984,9 @@ class PyExecutor:
 
                         # Return the first token to the client
                         self._handle_first_token_response(scheduled_batch)
-                    scheduled_batch.is_warmup = self.is_warmup
                     self.resource_manager.prepare_resources(scheduled_batch)
 
-                    if self.kv_connector_manager:
-                        self.kv_connector_manager.take_scheduled_requests_pending_load(
-                            scheduled_batch)
-                        self.kv_connector_manager.handle_metadata()
-                        self.kv_connector_manager.worker.start_load_kv()
+                    self._execute_kv_connector(scheduled_batch)
 
                 if scheduled_batch.batch_size > 0 or (
                         self.enable_attention_dp and self.dist.tp_size > 1):
@@ -1017,10 +1020,8 @@ class PyExecutor:
 
                 if self.kv_cache_transceiver and self.ctx_in_transmission_requests:
                     self._terminate_ctx_finished_requests()
-                elif self.kv_connector_manager:
-                    reqs_to_terminate = self.kv_connector_manager.get_finished()
-                    for req in reqs_to_terminate:
-                        self.resource_manager.free_resources(req)
+
+                self._terminate_async_save_requests()
 
                 if self.enable_iter_perf_stats:
                     iter_stats.inflight_batching_stats.num_ctx_tokens = self.model_engine.iter_states[
@@ -1086,8 +1087,11 @@ class PyExecutor:
                         # For generation requests which have completed KV cache transfer
                         self._prepare_disagg_gen_transmission_complete(
                             scheduled_batch)
-
                     self.resource_manager.prepare_resources(scheduled_batch)
+
+                    self._execute_kv_connector(scheduled_batch)
+
+                if scheduled_batch.batch_size > 0:
 
                     # The generation requests that are do not have batch_idx,
                     # needs to be in front of the batch due to the assumptions
@@ -1140,6 +1144,8 @@ class PyExecutor:
 
                 if self.kv_cache_transceiver and self.ctx_in_transmission_requests:
                     self._terminate_ctx_finished_requests()
+
+                self._terminate_async_save_requests()
 
     def _process_previous_batch(self):
         if self.kv_cache_transceiver and self.previous_batch.ctx_transmission_reqs:

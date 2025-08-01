@@ -392,7 +392,7 @@ def create_py_executor(
         with mem_monitor.observe_creation_stage(
                 _ExecutorCreationStage.INIT_KV_CACHE
                 if estimating_kv_cache else _ExecutorCreationStage.KV_CACHE):
-            kv_cache_creator.build_managers(resources)
+            kv_cache_creator.build_managers(resources, estimating_kv_cache)
 
     # Resource managers for speculative decoding
     # For user-specified drafters, use extra_resource_managers in PyTorchBackend config
@@ -443,7 +443,7 @@ def create_py_executor(
             # create_kv_cache_manager above, which caps executor_config.max_seq_len. Restoring
             # the original value before creating the final KV cache.
             executor_config.max_seq_len = max_seq_len
-            kv_cache_creator.build_managers(resources)
+            kv_cache_creator.build_managers(resources, False)
 
             for eng in [model_engine, draft_model_engine]:
                 if eng is None:
