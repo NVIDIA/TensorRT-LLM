@@ -4,31 +4,33 @@ from typing import Any, Callable, Dict, Tuple
 
 import torch
 from torch.multiprocessing import get_sharing_strategy, set_sharing_strategy
-from torch.multiprocessing.reductions import (rebuild_cuda_tensor,
-                                              rebuild_storage_filename,
-                                              rebuild_tensor,
-                                              rebuild_typed_storage,
-                                              reduce_storage, reduce_tensor)
+from torch.multiprocessing.reductions import (
+    rebuild_cuda_tensor,
+    rebuild_storage_filename,
+    rebuild_tensor,
+    rebuild_typed_storage,
+    reduce_storage,
+    reduce_tensor,
+)
 
 logger = logging.getLogger(__name__)
 
 DTYPE_MAPPING = {
-    'torch.float32': torch.float32,
-    'torch.float64': torch.float64,
-    'torch.int32': torch.int32,
-    'torch.int64': torch.int64,
-    'torch.bool': torch.bool,
-    'torch.uint8': torch.uint8,
-    'torch.int8': torch.int8,
-    'torch.int16': torch.int16,
-    'torch.float16': torch.float16,
-    'torch.bfloat16': torch.bfloat16,
+    "torch.float32": torch.float32,
+    "torch.float64": torch.float64,
+    "torch.int32": torch.int32,
+    "torch.int64": torch.int64,
+    "torch.bool": torch.bool,
+    "torch.uint8": torch.uint8,
+    "torch.int8": torch.int8,
+    "torch.int16": torch.int16,
+    "torch.float16": torch.float16,
+    "torch.bfloat16": torch.bfloat16,
 }
 
 
 def str_to_torch_dtype(dtype_str: str) -> torch.dtype:
-    """Convert dtype string to torch dtype
-    """
+    """Convert dtype string to torch dtype"""
     if dtype_str not in DTYPE_MAPPING:
         raise ValueError(
             f"Unsupported dtype: {dtype_str}. Supported dtypes are: {list(DTYPE_MAPPING.keys())}"
@@ -45,6 +47,7 @@ class _SharedTensorRebuildMethodRegistry:
     This class maintains a mapping of numeric keys to rebuild methods.
     Common methods are pre-registered with fixed keys for consistency.
     """
+
     # Fixed keys for common rebuild methods
     REBUILD_CUDA = 1
     REBUILD_CPU = 2
@@ -117,9 +120,10 @@ class SharedTensorContainer:
     consumer process(es), otherwise, the producer process cannot release the memory to caching
     allocator as the inner refcount never reaches zero.
 
-    Note: This module can also be extended to transfer CUDA tensors between different GPUs managed by different processes
-    using CE (Copy Engine) or torch.to() to initiate direct P2P transfers. This requires CUDA P2P support, i.e.,
-    torch.cuda.can_device_access_peer(src_device, dst_device) must return True for the source and destination devices.
+    Note: This module can also be extended to transfer CUDA tensors between different GPUs managed by different
+    processes using CE (Copy Engine) or torch.to() to initiate direct P2P transfers. This requires CUDA P2P support,
+    i.e., torch.cuda.can_device_access_peer(src_device, dst_device) must return True for the source and destination
+    devices.
 
     """
 
@@ -157,32 +161,19 @@ class SharedTensorContainer:
             # Convert tensor info to a basic dict with only serializable values
             serializable_info = {
                 # tensor_info[0] is the type of the tensor, which is "torch.Tensor"
-                "tensor_size":
-                list(tensor_info[1]),
-                "tensor_stride":
-                list(tensor_info[2]),
-                "tensor_offset":
-                tensor_info[3],
-                "dtype":
-                str(tensor_info[5]),
-                "storage_device":
-                tensor_info[6],
-                "storage_handle":
-                base64.b64encode(tensor_info[7]).decode('utf-8'),
-                "storage_size_bytes":
-                tensor_info[8],
-                "storage_offset_bytes":
-                tensor_info[9],
-                "requires_grad":
-                tensor_info[10],
-                "ref_counter_handle":
-                base64.b64encode(tensor_info[11]).decode('utf-8'),
-                "ref_counter_offset":
-                tensor_info[12],
-                "event_handle":
-                base64.b64encode(tensor_info[13]).decode('utf-8'),
-                "event_sync_required":
-                tensor_info[14]
+                "tensor_size": list(tensor_info[1]),
+                "tensor_stride": list(tensor_info[2]),
+                "tensor_offset": tensor_info[3],
+                "dtype": str(tensor_info[5]),
+                "storage_device": tensor_info[6],
+                "storage_handle": base64.b64encode(tensor_info[7]).decode("utf-8"),
+                "storage_size_bytes": tensor_info[8],
+                "storage_offset_bytes": tensor_info[9],
+                "requires_grad": tensor_info[10],
+                "ref_counter_handle": base64.b64encode(tensor_info[11]).decode("utf-8"),
+                "ref_counter_offset": tensor_info[12],
+                "event_handle": base64.b64encode(tensor_info[13]).decode("utf-8"),
+                "event_sync_required": tensor_info[14],
             }
             return serializable_info
         except IndexError as e:
@@ -191,8 +182,9 @@ class SharedTensorContainer:
             raise ValueError(f"Failed to serialize tensor information: {e}")
 
     @staticmethod
-    def cpu_handle_to_dict(meta_data: Dict[str, Any],
-                           storage_metadata: Dict[str, Any]) -> Dict[str, Any]:
+    def cpu_handle_to_dict(
+        meta_data: Dict[str, Any], storage_metadata: Dict[str, Any]
+    ) -> Dict[str, Any]:
         """Convert CPU tensor handle to serializable dictionary for IPC
 
         This method converts PyTorch's CPU tensor reduction handle into a format that can be
@@ -208,20 +200,13 @@ class SharedTensorContainer:
         """
         try:
             serializable_info = {
-                "tensor_storage_offset":
-                meta_data[0],
-                "tensor_size":
-                list(meta_data[1]),
-                "tensor_stride":
-                list(meta_data[2]),
-                "manager_handle":
-                base64.b64encode(storage_metadata[0]).decode('utf-8'),
-                "storage_handle":
-                base64.b64encode(storage_metadata[1]).decode('utf-8'),
-                "storage_size":
-                storage_metadata[2],
-                "storage_dtype":
-                str(storage_metadata[3])
+                "tensor_storage_offset": meta_data[0],
+                "tensor_size": list(meta_data[1]),
+                "tensor_stride": list(meta_data[2]),
+                "manager_handle": base64.b64encode(storage_metadata[0]).decode("utf-8"),
+                "storage_handle": base64.b64encode(storage_metadata[1]).decode("utf-8"),
+                "storage_size": storage_metadata[2],
+                "storage_dtype": str(storage_metadata[3]),
             }
             return serializable_info
         except IndexError as e:
@@ -245,23 +230,28 @@ class SharedTensorContainer:
         """
         try:
             # Decode base64 encoded binary data
-            storage_handle = base64.b64decode(tensor_info['storage_handle'])
-            ref_counter_handle = base64.b64decode(
-                tensor_info['ref_counter_handle'])
-            event_handle = base64.b64decode(tensor_info['event_handle'])
+            storage_handle = base64.b64decode(tensor_info["storage_handle"])
+            ref_counter_handle = base64.b64decode(tensor_info["ref_counter_handle"])
+            event_handle = base64.b64decode(tensor_info["event_handle"])
 
             # Reconstruct the tensor handle
-            tensor_handle = (torch.Tensor, tuple(tensor_info['tensor_size']),
-                             tuple(tensor_info['tensor_stride']),
-                             tensor_info['tensor_offset'],
-                             torch.storage.TypedStorage,
-                             str_to_torch_dtype(tensor_info['dtype']),
-                             tensor_info['storage_device'], storage_handle,
-                             tensor_info['storage_size_bytes'],
-                             tensor_info['storage_offset_bytes'],
-                             tensor_info['requires_grad'], ref_counter_handle,
-                             tensor_info['ref_counter_offset'], event_handle,
-                             tensor_info['event_sync_required'])
+            tensor_handle = (
+                torch.Tensor,
+                tuple(tensor_info["tensor_size"]),
+                tuple(tensor_info["tensor_stride"]),
+                tensor_info["tensor_offset"],
+                torch.storage.TypedStorage,
+                str_to_torch_dtype(tensor_info["dtype"]),
+                tensor_info["storage_device"],
+                storage_handle,
+                tensor_info["storage_size_bytes"],
+                tensor_info["storage_offset_bytes"],
+                tensor_info["requires_grad"],
+                ref_counter_handle,
+                tensor_info["ref_counter_offset"],
+                event_handle,
+                tensor_info["event_sync_required"],
+            )
 
             return tensor_handle
         except KeyError as e:
@@ -287,21 +277,27 @@ class SharedTensorContainer:
             A tuple representing the CPU tensor handle for PyTorch's rebuild_tensor
         """
         try:
-            manager_handle = base64.b64decode(tensor_info['manager_handle'])
-            storage_handle = base64.b64decode(tensor_info['storage_handle'])
-            storage_metadata = (torch.storage.TypedStorage, manager_handle,
-                                storage_handle, tensor_info['storage_size'],
-                                str_to_torch_dtype(
-                                    tensor_info['storage_dtype']))
+            manager_handle = base64.b64decode(tensor_info["manager_handle"])
+            storage_handle = base64.b64decode(tensor_info["storage_handle"])
+            storage_metadata = (
+                torch.storage.TypedStorage,
+                manager_handle,
+                storage_handle,
+                tensor_info["storage_size"],
+                str_to_torch_dtype(tensor_info["storage_dtype"]),
+            )
             storage = rebuild_storage_filename(*storage_metadata)
             if not isinstance(storage, torch.storage.TypedStorage):
                 storage = rebuild_typed_storage(
-                    storage, str_to_torch_dtype(tensor_info['storage_dtype']))
+                    storage, str_to_torch_dtype(tensor_info["storage_dtype"])
+                )
 
-            meta_data = (tensor_info['tensor_storage_offset'],
-                         tuple(tensor_info['tensor_size']),
-                         tuple(tensor_info['tensor_stride']), False
-                         )  # requires_grad is always False for cpu tensor
+            meta_data = (
+                tensor_info["tensor_storage_offset"],
+                tuple(tensor_info["tensor_size"]),
+                tuple(tensor_info["tensor_stride"]),
+                False,
+            )  # requires_grad is always False for cpu tensor
             tensor_handle = (torch.Tensor, storage, meta_data)
             return tensor_handle
         except KeyError as e:
@@ -310,7 +306,7 @@ class SharedTensorContainer:
             raise ValueError(f"Failed to deserialize tensor information: {e}")
 
     @classmethod
-    def from_tensor(cls, tensor: torch.Tensor) -> 'SharedTensorContainer':
+    def from_tensor(cls, tensor: torch.Tensor) -> "SharedTensorContainer":
         """Create a SharedTensorContainer from a local tensor (Producer side).
 
         This method is called by the producer process to prepare a tensor for sharing
@@ -331,7 +327,7 @@ class SharedTensorContainer:
         return cls(method_key, tensor_handle)
 
     @classmethod
-    def from_dict(cls, tensor_info: Dict[str, Any]) -> 'SharedTensorContainer':
+    def from_dict(cls, tensor_info: Dict[str, Any]) -> "SharedTensorContainer":
         """Create a SharedTensorContainer from a serialized dictionary (Consumer side).
 
         This method is called by the consumer process to reconstruct a SharedTensorContainer
@@ -347,16 +343,13 @@ class SharedTensorContainer:
         Raises:
             ValueError: If the method_key is not supported
         """
-        method_key = tensor_info['method_key']
+        method_key = tensor_info["method_key"]
         if method_key == _SharedTensorRebuildMethodRegistry.REBUILD_CUDA:
-            tensor_handle = SharedTensorContainer.dict_to_cuda_handle(
-                tensor_info)
+            tensor_handle = SharedTensorContainer.dict_to_cuda_handle(tensor_info)
         elif method_key == _SharedTensorRebuildMethodRegistry.REBUILD_CPU:
-            tensor_handle = SharedTensorContainer.dict_to_cpu_handle(
-                tensor_info)
+            tensor_handle = SharedTensorContainer.dict_to_cpu_handle(tensor_info)
         else:
-            raise ValueError(
-                f"Unsupported shared tensor method key: {method_key}")
+            raise ValueError(f"Unsupported shared tensor method key: {method_key}")
         return cls(method_key, tensor_handle)
 
     def get_local_view(self) -> torch.Tensor:
@@ -368,8 +361,7 @@ class SharedTensorContainer:
         Returns:
             The reconstructed tensor
         """
-        rebuild_method = _SharedTensorRebuildMethodRegistry.get_method(
-            self.method_key)
+        rebuild_method = _SharedTensorRebuildMethodRegistry.get_method(self.method_key)
         return rebuild_method(*self.tensor_handle)
 
     def dump_to_dict(self) -> Dict[str, Any]:
@@ -382,11 +374,11 @@ class SharedTensorContainer:
             Dictionary containing the serialized tensor information
         """
         if self.method_key == _SharedTensorRebuildMethodRegistry.REBUILD_CUDA:
-            tensor_dict = SharedTensorContainer.cuda_handle_to_dict(
-                self.tensor_handle)
+            tensor_dict = SharedTensorContainer.cuda_handle_to_dict(self.tensor_handle)
         elif self.method_key == _SharedTensorRebuildMethodRegistry.REBUILD_CPU:
             sharing_strategy = get_sharing_strategy()
-            # Here we use file_system sharing strategy to make it serializable between two non-python independent processes
+            # Here we use file_system sharing strategy to make it serializable between two non-python independent'
+            # processes.
             set_sharing_strategy("file_system")
             storage = self.tensor_handle[1]
             meta_data = self.tensor_handle[2]
@@ -395,8 +387,7 @@ class SharedTensorContainer:
             set_sharing_strategy(sharing_strategy)
             # exclude the first element which is the type of the storage
             storage_metadata = storage_handle[-1][1:]
-            tensor_dict = SharedTensorContainer.cpu_handle_to_dict(
-                meta_data, storage_metadata)
+            tensor_dict = SharedTensorContainer.cpu_handle_to_dict(meta_data, storage_metadata)
         else:
             raise ValueError(f"Unsupported tensor device: {self.method_key}")
 

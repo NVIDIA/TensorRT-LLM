@@ -33,17 +33,12 @@ from .config import LlavaNextVisionConfig
 
 # Adapted from https://github.com/huggingface/transformers/blob/v4.39.0/src/transformers/models/llava_next/modeling_llava_next.py#L149
 class LlavaNextMultiModalProjector(Module):
-
     def __init__(self, config: LlavaNextVisionConfig):
         super().__init__()
 
-        self.linear_1 = Linear(config.hidden_size,
-                               config.text_hidden_size,
-                               dtype=config.dtype)
+        self.linear_1 = Linear(config.hidden_size, config.text_hidden_size, dtype=config.dtype)
         self.act = ACT2FN[config.projector_hidden_act]
-        self.linear_2 = Linear(config.text_hidden_size,
-                               config.text_hidden_size,
-                               dtype=config.dtype)
+        self.linear_2 = Linear(config.text_hidden_size, config.text_hidden_size, dtype=config.dtype)
 
     def forward(self, image_features):
         hidden_states = self.linear_1(image_features)
@@ -53,7 +48,6 @@ class LlavaNextMultiModalProjector(Module):
 
 
 class LlavaNextVisionWrapper(PretrainedModel):
-
     def __init__(self, config: LlavaNextVisionConfig):
         super().__init__(config)
         self.vision_tower = None
@@ -72,48 +66,42 @@ class LlavaNextVisionWrapper(PretrainedModel):
                 num_hidden_layers=config.num_hidden_layers,
                 require_ln_f=False,
                 mapping=config.mapping,
-                dtype=config.dtype)
+                dtype=config.dtype,
+            )
         else:
-            logger.error(
-                "Currently TRT-LLM only supports CLIP vision transformer.")
+            logger.error("Currently TRT-LLM only supports CLIP vision transformer.")
 
         self.multi_modal_projector = LlavaNextMultiModalProjector(config)
-        self.image_newline = Parameter(shape=(config.text_hidden_size, ),
-                                       dtype=config.dtype)
+        self.image_newline = Parameter(shape=(config.text_hidden_size,), dtype=config.dtype)
 
     def forward(self, pixel_values, position_ids=None):
         image_features = self.vision_tower(pixel_values)
-        select_size = concat([
-            shape(image_features, 0), image_features.shape[1] - 1,
-            shape(image_features, 2)
-        ])
-        selected_image_feature = slice(image_features,
-                                       starts=[0, 1, 0],
-                                       sizes=select_size)  # (bs, 576, c)
+        select_size = concat(
+            [shape(image_features, 0), image_features.shape[1] - 1, shape(image_features, 2)]
+        )
+        selected_image_feature = slice(
+            image_features, starts=[0, 1, 0], sizes=select_size
+        )  # (bs, 576, c)
         image_features = self.multi_modal_projector(selected_image_feature)
-        image_features.mark_output('image_features', self.config.dtype)
+        image_features.mark_output("image_features", self.config.dtype)
         return image_features  # (bs, 576, c)
 
     @classmethod
-    def from_hugging_face(cls,
-                          hf_model_dir: str,
-                          dtype: str = 'auto',
-                          mapping: Optional[Mapping] = None,
-                          quant_config: Optional[QuantConfig] = None,
-                          **kwargs):
-        ''' Create a LlavaNextVisionWrapper object from give parameters
-        '''
+    def from_hugging_face(
+        cls,
+        hf_model_dir: str,
+        dtype: str = "auto",
+        mapping: Optional[Mapping] = None,
+        quant_config: Optional[QuantConfig] = None,
+        **kwargs,
+    ):
+        """Create a LlavaNextVisionWrapper object from give parameters."""
         if os.environ.get("TRTLLM_DISABLE_UNIFIED_CONVERTER") is not None:
-            logger.error(
-                "Please enable unified converter to convert llava-next checkpoints."
-            )
+            logger.error("Please enable unified converter to convert llava-next checkpoints.")
 
         config = LlavaNextVisionConfig.from_hugging_face(
-            hf_model_dir,
-            dtype=dtype,
-            mapping=mapping,
-            quant_config=quant_config,
-            **kwargs)
+            hf_model_dir, dtype=dtype, mapping=mapping, quant_config=quant_config, **kwargs
+        )
 
         custom_dict = {}
         if "llava" in hf_model_dir:
@@ -134,42 +122,33 @@ class LlavaNextVisionWrapper(PretrainedModel):
 
     def save_checkpoint(self, output_dir, save_config=True):
         rank = self.config.mapping.rank
-        weights = {
-            name: numpy_to_torch(param.raw_value)
-            for name, param in self.named_parameters()
-        }
-        image_newline = {
-            "image_newline": numpy_to_torch(self.image_newline.raw_value)
-        }
+        weights = {name: numpy_to_torch(param.raw_value) for name, param in self.named_parameters()}
+        image_newline = {"image_newline": numpy_to_torch(self.image_newline.raw_value)}
+        safetensors.torch.save_file(weights, os.path.join(output_dir, f"rank{rank}.safetensors"))
         safetensors.torch.save_file(
-            weights, os.path.join(output_dir, f'rank{rank}.safetensors'))
-        safetensors.torch.save_file(
-            image_newline,
-            os.path.join(output_dir, f'image_newlines.safetensors'))
+            image_newline, os.path.join(output_dir, "image_newlines.safetensors")
+        )
         if save_config:
-            self.config.to_json_file(os.path.join(output_dir, 'config.json'))
+            self.config.to_json_file(os.path.join(output_dir, "config.json"))
 
     def prepare_inputs(self, max_batch_size, **kwargs):
-        '''@brief: Prepare inputs Tensors for the model, the given sizes are used to determine the
-            ranges of the dimensions of when using TRT dynamic shapes.
+        """@brief: Prepare inputs Tensors for the model, the given sizes are used to determine the
+        ranges of the dimensions of when using TRT dynamic shapes.
 
-            @return: a list contains values which can be fed into the self.forward()
-        '''
-
-        batch_size_range = [
-            1, max(1, (max_batch_size + 1) // 2), max_batch_size
-        ]
+        @return: a list contains values which can be fed into the self.forward()
+        """  # noqa: D205
+        batch_size_range = [1, max(1, (max_batch_size + 1) // 2), max_batch_size]
         pixel_values = Tensor(
-            name='pixel_values',
+            name="pixel_values",
             dtype=self.config.dtype,
-            shape=[
-                -1, self.config.num_channels, self.config.image_size,
-                self.config.image_size
-            ],
-            dim_range=OrderedDict([
-                ('batch_size', [batch_size_range]),
-                ('in_channels', [[self.config.num_channels] * 3]),
-                ('latent_height', [[self.config.image_size] * 3]),
-                ('latent_width', [[self.config.image_size] * 3]),
-            ]))
-        return {'pixel_values': pixel_values}
+            shape=[-1, self.config.num_channels, self.config.image_size, self.config.image_size],
+            dim_range=OrderedDict(
+                [
+                    ("batch_size", [batch_size_range]),
+                    ("in_channels", [[self.config.num_channels] * 3]),
+                    ("latent_height", [[self.config.image_size] * 3]),
+                    ("latent_width", [[self.config.image_size] * 3]),
+                ]
+            ),
+        )
+        return {"pixel_values": pixel_values}

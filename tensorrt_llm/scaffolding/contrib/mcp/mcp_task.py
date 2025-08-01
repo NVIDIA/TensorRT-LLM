@@ -13,16 +13,15 @@ class MCPCallTask(Task):
     retry: Optional[int] = field(default=1)
     delay: Optional[float] = field(default=10)
 
-    worker_tag: Union[str, "Controller.WorkerTag"] = None
+    worker_tag: Union[str, "Controller.WorkerTag"] = None  # noqa: F821
 
-    #result field
+    # result field
     result_str: Optional[str] = None
 
     @staticmethod
-    def create_mcptask(tool_name: str,
-                       args: dict,
-                       retry: int = 1,
-                       delay: float = 1) -> "MCPCallTask":
+    def create_mcptask(
+        tool_name: str, args: dict, retry: int = 1, delay: float = 1
+    ) -> "MCPCallTask":
         task = MCPCallTask()
         task.tool_name = tool_name
         task.args = args
@@ -33,9 +32,9 @@ class MCPCallTask(Task):
 
 @dataclass
 class MCPListTask(Task):
-    worker_tag: Union[str, "Controller.WorkerTag"] = None
+    worker_tag: Union[str, "Controller.WorkerTag"] = None  # noqa: F821
 
-    #result field
+    # result field
     result_str: Optional[str] = None
     result_tools = None
 

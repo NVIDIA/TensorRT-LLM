@@ -1,8 +1,7 @@
 # This code is adapted from the Qwen2.5-Math project by the QwenLM team
 # Original source: https://github.com/QwenLM/Qwen2.5-Math
 # Thank you to the original authors for their valuable contribution
-"""
-Mathematical Expression Evaluator Module
+"""Mathematical Expression Evaluator Module.
 
 This module provides functionality for evaluating and comparing mathematical expressions,
 particularly for assessing the correctness of model-generated answers to mathematical problems.
@@ -24,8 +23,7 @@ from word2number import w2n
 
 
 def _fix_fracs(string: str) -> str:
-    """
-    Fix fraction notation in LaTeX strings.
+    r"""Fix fraction notation in LaTeX strings.
 
     Converts improper fraction notation (e.g., \frac12) to proper notation (e.g., \frac{1}{2}).
 
@@ -46,7 +44,7 @@ def _fix_fracs(string: str) -> str:
             else:
                 try:
                     assert len(substr) >= 2
-                except:
+                except Exception:
                     return string
                 a = substr[0]
                 b = substr[1]
@@ -67,8 +65,7 @@ def _fix_fracs(string: str) -> str:
 
 
 def _fix_a_slash_b(string: str) -> str:
-    """
-    Convert simple fraction notation (a/b) to LaTeX fraction notation (\frac{a}{b}).
+    r"""Convert simple fraction notation (a/b) to LaTeX fraction notation (\frac{a}{b}).
 
     Args:
         string: A string that may contain simple fraction notation.
@@ -88,13 +85,12 @@ def _fix_a_slash_b(string: str) -> str:
         assert string == "{}/{}".format(a, b)
         new_string = "\\frac{" + str(a) + "}{" + str(b) + "}"
         return new_string
-    except:
+    except Exception:
         return string
 
 
 def _fix_sqrt(string: str) -> str:
-    """
-    Fix square root notation in LaTeX strings.
+    """Fix square root notation in LaTeX strings.
 
     Ensures proper braces around the argument of square root.
 
@@ -109,8 +105,7 @@ def _fix_sqrt(string: str) -> str:
 
 
 def convert_word_number(text: str) -> str:
-    """
-    Convert word representations of numbers to their numerical form.
+    """Convert word representations of numbers to their numerical form.
 
     Args:
         text: A string that may contain word representations of numbers.
@@ -120,7 +115,7 @@ def convert_word_number(text: str) -> str:
     """
     try:
         text = str(w2n.word_to_num(text))
-    except:
+    except Exception:
         pass
     return text
 
@@ -265,8 +260,7 @@ unit_texts.extend([t + "s" for t in unit_texts])
 
 
 def strip_string(string: str, skip_unit: bool = False) -> str:
-    """
-    Clean and normalize a mathematical expression string.
+    """Clean and normalize a mathematical expression string.
 
     Performs various cleaning operations on a string containing a mathematical expression,
     including removing whitespace, normalizing LaTeX notation, and handling special cases.
@@ -299,9 +293,7 @@ def strip_string(string: str, skip_unit: bool = False) -> str:
     # replace tfrac and dfrac with frac
     string = string.replace("tfrac", "frac")
     string = string.replace("dfrac", "frac")
-    string = (string.replace("\\neq",
-                             "\\ne").replace("\\leq",
-                                             "\\le").replace("\\geq", "\\ge"))
+    string = string.replace("\\neq", "\\ne").replace("\\leq", "\\le").replace("\\geq", "\\ge")
 
     # remove \left and \right
     string = string.replace("\\left", "")
@@ -321,8 +313,7 @@ def strip_string(string: str, skip_unit: bool = False) -> str:
             for unit_text in unit_texts:
                 # use regex, the prefix should be either the start of the string or a non-alphanumeric character
                 # the suffix should be either the end of the string or a non-alphanumeric character
-                _string = re.sub(r"(^|\W)" + unit_text + r"($|\W)", r"\1\2",
-                                 string)
+                _string = re.sub(r"(^|\W)" + unit_text + r"($|\W)", r"\1\2", string)
                 if _string != "":
                     string = _string
 
@@ -340,17 +331,14 @@ def strip_string(string: str, skip_unit: bool = False) -> str:
 
     # replace "\\text{...}" to "..."
     string = re.sub(r"\\text\{(.*?)\}", r"\1", string)
-    for key in [
-            "x=", "y=", "z=", "x\\in", "y\\in", "z\\in", "x\\to", "y\\to",
-            "z\\to"
-    ]:
+    for key in ["x=", "y=", "z=", "x\\in", "y\\in", "z\\in", "x\\to", "y\\to", "z\\to"]:
         string = string.replace(key, "")
     string = string.replace("\\emptyset", r"{}")
     string = string.replace("(-\\infty,\\infty)", "\\mathbb{R}")
 
     # remove percentage
     string = string.replace("\\%", "")
-    string = string.replace("\%", "")
+    string = string.replace(r"\%", "")
     string = string.replace("%", "")
 
     # " 0." equivalent to " ." and "{0." equivalent to "{." Alternatively, add "0" if "." is the start of the string
@@ -359,10 +347,17 @@ def strip_string(string: str, skip_unit: bool = False) -> str:
 
     # cdot
     # string = string.replace("\\cdot", "")
-    if (string.startswith("{") and string.endswith("}") and string.isalnum()
-            or string.startswith("(") and string.endswith(")")
-            and string.isalnum() or string.startswith("[")
-            and string.endswith("]") and string.isalnum()):
+    if (
+        string.startswith("{")
+        and string.endswith("}")
+        and string.isalnum()
+        or string.startswith("(")
+        and string.endswith(")")
+        and string.isalnum()
+        or string.startswith("[")
+        and string.endswith("]")
+        and string.isalnum()
+    ):
         string = string[1:-1]
 
     # inf
@@ -404,7 +399,8 @@ def strip_string(string: str, skip_unit: bool = False) -> str:
     string = _fix_sqrt(string)
     string = string.replace(" ", "")
 
-    # \frac1b or \frac12 --> \frac{1}{b} and \frac{1}{2}, etc. Even works with \frac1{72} (but not \frac{72}1). Also does a/b --> \\frac{a}{b}
+    # \frac1b or \frac12 --> \frac{1}{b} and \frac{1}{2}, etc.
+    # Even works with \frac1{72} (but not \frac{72}1). Also does a/b --> \\frac{a}{b}
     string = _fix_fracs(string)
 
     # NOTE: X/Y changed to \frac{X}{Y} in dataset, but in simple cases fix in case the model output is X/Y
@@ -413,11 +409,8 @@ def strip_string(string: str, skip_unit: bool = False) -> str:
     return string
 
 
-def extract_answer(pred_str: str,
-                   data_name: str,
-                   use_last_number: bool = True) -> str:
-    """
-    Extract the answer from a model's prediction string.
+def extract_answer(pred_str: str, data_name: str, use_last_number: bool = True) -> str:
+    """Extract the answer from a model's prediction string.
 
     This function handles various formats of answer extraction, including:
     - Boxed answers
@@ -469,7 +462,7 @@ def extract_answer(pred_str: str,
         pred = pred_str.split("答案是")[1].strip().split("\n\n")[0].strip()
     else:  # use the last number
         if use_last_number:
-            pattern = "-?\d*\.?\d+"
+            pattern = r"-?\d*\.?\d+"
             pred = re.findall(pattern, pred_str.replace(",", ""))
             if len(pred) >= 1:
                 pred = pred[-1]
@@ -488,14 +481,12 @@ def extract_answer(pred_str: str,
         pred = pred[:-1]
     if pred != "" and pred[-1] == "/":
         pred = pred[:-1]
-    pred = strip_string(pred,
-                        skip_unit=data_name in ["carp_en", "minerva_math"])
+    pred = strip_string(pred, skip_unit=data_name in ["carp_en", "minerva_math"])
     return pred
 
 
 def extract_first_boxed_answer(pred_str: str, data_name: str) -> str:
-    """
-    Extract the first boxed answer from a model's prediction string.
+    """Extract the first boxed answer from a model's prediction string.
 
     Args:
         pred_str: The prediction string from the model.
@@ -540,14 +531,12 @@ def extract_first_boxed_answer(pred_str: str, data_name: str) -> str:
         pred = pred[:-1]
     if pred != "" and pred[-1] == "/":
         pred = pred[:-1]
-    pred = strip_string(pred,
-                        skip_unit=data_name in ["carp_en", "minerva_math"])
+    pred = strip_string(pred, skip_unit=data_name in ["carp_en", "minerva_math"])
     return pred
 
 
 def extract_boxed_answer(pred_str: str, data_name: str) -> str:
-    """
-    Extract the last boxed answer from a model's prediction string.
+    """Extract the last boxed answer from a model's prediction string.
 
     Args:
         pred_str: The prediction string from the model.
@@ -592,8 +581,7 @@ def extract_boxed_answer(pred_str: str, data_name: str) -> str:
         pred = pred[:-1]
     if pred != "" and pred[-1] == "/":
         pred = pred[:-1]
-    pred = strip_string(pred,
-                        skip_unit=data_name in ["carp_en", "minerva_math"])
+    pred = strip_string(pred, skip_unit=data_name in ["carp_en", "minerva_math"])
     return pred
 
 
@@ -602,8 +590,7 @@ def extract_boxed_answer(pred_str: str, data_name: str) -> str:
 
 
 def choice_answer_clean(pred: str) -> str:
-    """
-    Clean a multiple choice answer.
+    """Clean a multiple choice answer.
 
     Extracts and standardizes multiple choice answers (A, B, C, D, E).
 
@@ -627,8 +614,7 @@ def choice_answer_clean(pred: str) -> str:
 
 
 def parse_digits(num: str) -> Optional[float]:
-    """
-    Parse a string containing digits into a float.
+    """Parse a string containing digits into a float.
 
     Handles various formats including percentages and comma-separated numbers.
 
@@ -641,21 +627,20 @@ def parse_digits(num: str) -> Optional[float]:
     num = regex.sub(",", "", str(num))
     try:
         return float(num)
-    except:
+    except Exception:
         if num.endswith("%"):
             num = num[:-1]
             if num.endswith("\\"):
                 num = num[:-1]
             try:
                 return float(num) / 100
-            except:
+            except Exception:
                 pass
     return None
 
 
 def is_digit(num: str) -> bool:
-    """
-    Check if a string can be parsed as a number.
+    """Check if a string can be parsed as a number.
 
     Args:
         num: A string that may contain digits.
@@ -668,8 +653,7 @@ def is_digit(num: str) -> bool:
 
 
 def str_to_pmatrix(input_str: str) -> str:
-    """
-    Convert a string representation of a matrix to LaTeX pmatrix format.
+    """Convert a string representation of a matrix to LaTeX pmatrix format.
 
     Args:
         input_str: A string containing a matrix representation.
@@ -696,8 +680,7 @@ def math_equal(
     is_close: bool = True,
     timeout: bool = False,
 ) -> bool:
-    """
-    Determine if two mathematical expressions are equal.
+    """Determine if two mathematical expressions are equal.
 
     This function performs a comprehensive comparison of mathematical expressions,
     handling various formats and special cases. It considers expressions equal if:
@@ -722,8 +705,7 @@ def math_equal(
         return False
     if str(prediction.strip().lower()) == str(reference.strip().lower()):
         return True
-    if (reference in ["A", "B", "C", "D", "E"]
-            and choice_answer_clean(prediction) == reference):
+    if reference in ["A", "B", "C", "D", "E"] and choice_answer_clean(prediction) == reference:
         return True
 
     try:  # 1. numerical equal
@@ -746,7 +728,7 @@ def math_equal(
                 except Exception:
                     continue
             return False
-    except:
+    except Exception:
         pass
 
     if not prediction and prediction not in [0, False]:
@@ -757,15 +739,16 @@ def math_equal(
     prediction = str(prediction).strip()
 
     ## pmatrix (amps)
-    if "pmatrix" in prediction and not "pmatrix" in reference:
+    if "pmatrix" in prediction and "pmatrix" not in reference:
         reference = str_to_pmatrix(reference)
 
     ## deal with [], (), {}
     pred_str, ref_str = prediction, reference
-    if (prediction.startswith("[") and prediction.endswith("]")
-            and not reference.startswith("(")) or (
-                prediction.startswith("(") and prediction.endswith(")")
-                and not reference.startswith("[")):
+    if (
+        prediction.startswith("[") and prediction.endswith("]") and not reference.startswith("(")
+    ) or (
+        prediction.startswith("(") and prediction.endswith(")") and not reference.startswith("[")
+    ):
         pred_str = pred_str.strip("[]()")
         ref_str = ref_str.strip("[]()")
     for s in ["{", "}", "(", ")"]:
@@ -775,34 +758,34 @@ def math_equal(
         return True
 
     ## [a, b] vs. [c, d], return a==c and b==d
-    if (regex.match(r"(\(|\[).+(\)|\])", prediction) is not None
-            and regex.match(r"(\(|\[).+(\)|\])", reference) is not None):
+    if (
+        regex.match(r"(\(|\[).+(\)|\])", prediction) is not None
+        and regex.match(r"(\(|\[).+(\)|\])", reference) is not None
+    ):
         pred_parts = prediction[1:-1].split(",")
         ref_parts = reference[1:-1].split(",")
         if len(pred_parts) == len(ref_parts):
-            if all([
-                    math_equal(pred_parts[i], ref_parts[i], include_percentage,
-                               is_close) for i in range(len(pred_parts))
-            ]):
+            if all(
+                [
+                    math_equal(pred_parts[i], ref_parts[i], include_percentage, is_close)
+                    for i in range(len(pred_parts))
+                ]
+            ):
                 return True
-    if ((prediction.startswith("\\begin{pmatrix}")
-         or prediction.startswith("\\begin{bmatrix}"))
-            and (prediction.endswith("\\end{pmatrix}")
-                 or prediction.endswith("\\end{bmatrix}"))
-            and (reference.startswith("\\begin{pmatrix}")
-                 or reference.startswith("\\begin{bmatrix}"))
-            and (reference.endswith("\\end{pmatrix}")
-                 or reference.endswith("\\end{bmatrix}"))):
+    if (
+        (prediction.startswith("\\begin{pmatrix}") or prediction.startswith("\\begin{bmatrix}"))
+        and (prediction.endswith("\\end{pmatrix}") or prediction.endswith("\\end{bmatrix}"))
+        and (reference.startswith("\\begin{pmatrix}") or reference.startswith("\\begin{bmatrix}"))
+        and (reference.endswith("\\end{pmatrix}") or reference.endswith("\\end{bmatrix}"))
+    ):
         pred_lines = [
             line.strip()
-            for line in prediction[len("\\begin{pmatrix}"
-                                       ):-len("\\end{pmatrix}")].split("\\\\")
+            for line in prediction[len("\\begin{pmatrix}") : -len("\\end{pmatrix}")].split("\\\\")
             if line.strip()
         ]
         ref_lines = [
             line.strip()
-            for line in reference[len("\\begin{pmatrix}"
-                                      ):-len("\\end{pmatrix}")].split("\\\\")
+            for line in reference[len("\\begin{pmatrix}") : -len("\\end{pmatrix}")].split("\\\\")
             if line.strip()
         ]
         matched = True
@@ -811,14 +794,17 @@ def math_equal(
                 pred_parts = pred_line.split("&")
                 ref_parts = ref_line.split("&")
                 if len(pred_parts) == len(ref_parts):
-                    if not all([
+                    if not all(
+                        [
                             math_equal(
                                 pred_parts[i],
                                 ref_parts[i],
                                 include_percentage,
                                 is_close,
-                            ) for i in range(len(pred_parts))
-                    ]):
+                            )
+                            for i in range(len(pred_parts))
+                        ]
+                    ):
                         matched = False
                         break
                 else:
@@ -837,26 +823,24 @@ def math_equal(
         ref = f"{ref[0].strip()} - ({ref[1].strip()})"
         if symbolic_equal(pred, ref) or symbolic_equal(f"-({pred})", ref):
             return True
-    elif (prediction.count("=") == 1
-          and len(prediction.split("=")[0].strip()) <= 2
-          and "=" not in reference):
-        if math_equal(
-                prediction.split("=")[1], reference, include_percentage,
-                is_close):
+    elif (
+        prediction.count("=") == 1
+        and len(prediction.split("=")[0].strip()) <= 2
+        and "=" not in reference
+    ):
+        if math_equal(prediction.split("=")[1], reference, include_percentage, is_close):
             return True
-    elif (reference.count("=") == 1
-          and len(reference.split("=")[0].strip()) <= 2
-          and "=" not in prediction):
-        if math_equal(prediction,
-                      reference.split("=")[1], include_percentage, is_close):
+    elif (
+        reference.count("=") == 1
+        and len(reference.split("=")[0].strip()) <= 2
+        and "=" not in prediction
+    ):
+        if math_equal(prediction, reference.split("=")[1], include_percentage, is_close):
             return True
 
     # symbolic equal with sympy
     if timeout:
-        if call_with_timeout(symbolic_equal_process,
-                             prediction,
-                             reference,
-                             timeout=timeout):
+        if call_with_timeout(symbolic_equal_process, prediction, reference, timeout=timeout):
             return True
     else:
         if symbolic_equal(prediction, reference):
@@ -866,8 +850,7 @@ def math_equal(
 
 
 def count_not_empty(answers: List[str]) -> int:
-    """
-    Count the number of non-empty answers in a list.
+    """Count the number of non-empty answers in a list.
 
     Args:
         answers: A list of answer strings.
@@ -879,8 +862,7 @@ def count_not_empty(answers: List[str]) -> int:
 
 
 def equal_group(answers: List[str]) -> bool:
-    """
-    Check if all answers in a group are equal.
+    """Check if all answers in a group are equal.
 
     Args:
         answers: A list of answer strings.
@@ -904,8 +886,7 @@ def equal_group(answers: List[str]) -> bool:
 
 
 def math_equal_process(param: List[Any]) -> bool:
-    """
-    Process function for parallel execution of math_equal.
+    """Process function for parallel execution of math_equal.
 
     Args:
         param: A list containing the parameters for math_equal.
@@ -917,8 +898,7 @@ def math_equal_process(param: List[Any]) -> bool:
 
 
 def numeric_equal(prediction: float, reference: float) -> bool:
-    """
-    Check if two numbers are numerically equal within a tolerance.
+    """Check if two numbers are numerically equal within a tolerance.
 
     Args:
         prediction: The predicted number.
@@ -937,8 +917,7 @@ def numeric_equal(prediction: float, reference: float) -> bool:
 
 
 def symbolic_equal(a: str, b: str) -> bool:
-    """
-    Check if two mathematical expressions are symbolically equal.
+    """Check if two mathematical expressions are symbolically equal.
 
     This function attempts to parse the expressions using various methods and
     compares them using sympy's symbolic equality.
@@ -952,8 +931,7 @@ def symbolic_equal(a: str, b: str) -> bool:
     """
 
     def _parse(s: str) -> Any:
-        """
-        Parse a string into a sympy expression.
+        """Parse a string into a sympy expression.
 
         Args:
             s: A string containing a mathematical expression.
@@ -964,10 +942,10 @@ def symbolic_equal(a: str, b: str) -> bool:
         for f in [parse_latex, parse_expr, latex2sympy]:
             try:
                 return f(s.replace("\\\\", "\\"))
-            except:
+            except Exception:
                 try:
                     return f(s)
-                except:
+                except Exception:
                     pass
         return s
 
@@ -978,27 +956,27 @@ def symbolic_equal(a: str, b: str) -> bool:
     try:
         if str(a) == str(b) or a == b:
             return True
-    except:
+    except Exception:
         pass
 
     # simplify equal
     try:
         if a.equals(b) or simplify(a - b) == 0:
             return True
-    except:
+    except Exception:
         pass
 
     # equation equal
     try:
         if (abs(a.lhs - a.rhs)).equals(abs(b.lhs - b.rhs)):
             return True
-    except:
+    except Exception:
         pass
 
     try:
         if numeric_equal(float(N(a)), float(N(b))):
             return True
-    except:
+    except Exception:
         pass
 
     # matrix
@@ -1009,16 +987,14 @@ def symbolic_equal(a: str, b: str) -> bool:
             _b = b.applyfunc(lambda x: round(x, 3))
             if _a.equals(_b):
                 return True
-    except:
+    except Exception:
         pass
 
     return False
 
 
-def symbolic_equal_process(a: str, b: str,
-                           output_queue: multiprocessing.Queue) -> None:
-    """
-    Process function for parallel execution of symbolic_equal.
+def symbolic_equal_process(a: str, b: str, output_queue: multiprocessing.Queue) -> None:
+    """Process function for parallel execution of symbolic_equal.
 
     Args:
         a: The first mathematical expression.
@@ -1029,12 +1005,8 @@ def symbolic_equal_process(a: str, b: str,
     output_queue.put(result)
 
 
-def call_with_timeout(func: Callable,
-                      *args: Any,
-                      timeout: int = 1,
-                      **kwargs: Any) -> bool:
-    """
-    Call a function with a timeout.
+def call_with_timeout(func: Callable, *args: Any, timeout: int = 1, **kwargs: Any) -> bool:
+    """Call a function with a timeout.
 
     Args:
         func: The function to call.
@@ -1046,10 +1018,8 @@ def call_with_timeout(func: Callable,
         The result of the function call, or False if the call times out.
     """
     output_queue = multiprocessing.Queue()
-    process_args = args + (output_queue, )
-    process = multiprocessing.Process(target=func,
-                                      args=process_args,
-                                      kwargs=kwargs)
+    process_args = args + (output_queue,)
+    process = multiprocessing.Process(target=func, args=process_args, kwargs=kwargs)
     process.start()
     process.join(timeout)
 

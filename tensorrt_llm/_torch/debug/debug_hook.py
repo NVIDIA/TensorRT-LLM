@@ -98,8 +98,7 @@ class DebuggerContext:
         return self.layer_inner_counter
 
     def get_current_model_loop_index(self):
-        return self.layer_inner_counter[0] + 1 if len(
-            self.layer_inner_counter) >= 1 else 0
+        return self.layer_inner_counter[0] + 1 if len(self.layer_inner_counter) >= 1 else 0
 
     def do_actions(self, module, tensors, actions):
         assert isinstance(actions, list), "Actions shall be list."
@@ -109,7 +108,6 @@ class DebuggerContext:
 
 
 class Filter:
-
     def __init__(self):
         pass
 
@@ -151,14 +149,12 @@ def pre_forward(module: nn.Module, args, kwargs):
     if len(debug_ctx.get_module_indices_tree()) == 0:
         debug_ctx.get_module_indices_tree().append(0)
 
-    if len(debug_ctx.get_current_modules_tree()) >= len(
-            debug_ctx.get_module_indices_tree()):
+    if len(debug_ctx.get_current_modules_tree()) >= len(debug_ctx.get_module_indices_tree()):
         debug_ctx.get_module_indices_tree().append(0)
 
-    debug_ctx.get_module_indices_tree()[
-        len(debug_ctx.get_current_modules_tree()) -
-        1] = debug_ctx.get_module_indices_tree()[
-            len(debug_ctx.get_current_modules_tree()) - 1] + 1
+    debug_ctx.get_module_indices_tree()[len(debug_ctx.get_current_modules_tree()) - 1] = (
+        debug_ctx.get_module_indices_tree()[len(debug_ctx.get_current_modules_tree()) - 1] + 1
+    )
     debug_ctx.do_actions(module, args, debug_ctx.get_pre_forward_action())
     return None
 
@@ -179,8 +175,7 @@ def after_forward(module: nn.Module, args, kwargs, output):
     """
     debug_ctx = get_current_debug_ctx()
     debug_ctx.mark_in_pre_forward(False)
-    debug_ctx.do_actions(module, [args, output],
-                         debug_ctx.get_after_forward_action())
+    debug_ctx.do_actions(module, [args, output], debug_ctx.get_after_forward_action())
     name = module.name if hasattr(module, "name") else module.__class__.__name__
     old_name = debug_ctx.get_current_modules_tree().pop(-1)
     assert name == old_name, "module mismatch"
@@ -189,9 +184,9 @@ def after_forward(module: nn.Module, args, kwargs, output):
     return None
 
 
-def enable_debug(model: nn.Module,
-                 dest_folder: Optional[str] = None,
-                 filter: Optional[Filter] = None):
+def enable_debug(
+    model: nn.Module, dest_folder: Optional[str] = None, filter: Optional[Filter] = None
+):
     """
     The function style to interface to enable debugger on model.
     If filter is provided, it will be used to filter out satisfied module to register hook.
@@ -231,16 +226,16 @@ def enable_debug(model: nn.Module,
         if submodule not in debug_ctx.forward_hook_handles:
             do_hook = filter(submodule) if filter is not None else True
             if do_hook:
-                debug_ctx.forward_hook_handles[
-                    submodule] = submodule.register_forward_hook(
-                        after_forward, with_kwargs=True, always_call=True)
+                debug_ctx.forward_hook_handles[submodule] = submodule.register_forward_hook(
+                    after_forward, with_kwargs=True, always_call=True
+                )
 
         if submodule not in debug_ctx.forward_pre_hook_handles:
             do_hook = filter(submodule) if filter is not None else True
             if do_hook:
-                debug_ctx.forward_pre_hook_handles[
-                    submodule] = submodule.register_forward_pre_hook(
-                        pre_forward, with_kwargs=True)
+                debug_ctx.forward_pre_hook_handles[submodule] = submodule.register_forward_pre_hook(
+                    pre_forward, with_kwargs=True
+                )
 
 
 def disable_debug():
@@ -262,9 +257,9 @@ def disable_debug():
 
 
 @contextmanager
-def debug_mode(model: nn.Module,
-               dest_folder: Optional[str] = None,
-               filter: Optional[Filter] = None):
+def debug_mode(
+    model: nn.Module, dest_folder: Optional[str] = None, filter: Optional[Filter] = None
+):
     """
     The context manager style interface to enable debugger on model.
     If filter is provided, it will be used to filter out satisfied module to register hook.
@@ -329,8 +324,9 @@ def dump_tensor(module: nn.Module, data_tensor, debug_ctx: DebuggerContext):
     def get_dump_file_path(tensor):
         nonlocal tensor_counter
         nonlocal input_tensor_names
-        assert debug_ctx.get_log_folder(
-        ) is not None, "Log folder shall be initialized by DebugContext."
+        assert debug_ctx.get_log_folder() is not None, (
+            "Log folder shall be initialized by DebugContext."
+        )
 
         name_parts = []
         for idx in range(len(debug_ctx.get_current_modules_tree())):
