@@ -18,6 +18,7 @@ from typing import Iterable, List, Optional, Union
 
 import click
 import datasets
+import jsonschema
 import numpy as np
 
 from .. import LLM as PyTorchLLM
@@ -65,23 +66,30 @@ class JsonModeEval(Evaluator):
             sampling_args = {
                 "guided_decoding": GuidedDecodingParams(json=schema)
             }
-            yield sample["prompt"], sampling_args, sample["completion"]
+            yield sample["prompt"], sampling_args, sample["completion"], sample[
+                "schema"]
 
-    def compute_score(self, outputs: List[RequestOutput],
-                      references: List[str]) -> float:
-        all_corrections = []
-        for output, ref in zip(outputs, references):
+    def compute_score(self, outputs: List[RequestOutput], references: List[str],
+                      schemas: List[str]) -> float:
+        all_corrections, all_grammar_corrections = [], []
+        for output, ref, schema in zip(outputs, references, schemas):
             try:
                 output_json = json.loads(output.outputs[0].text)
-            except json.JSONDecodeError:
+                jsonschema.validate(output_json, json.loads(schema))
+            except (json.JSONDecodeError, jsonschema.ValidationError):
                 all_corrections.append(False)
+                all_grammar_corrections.append(False)
                 continue
-            ref_json = json.loads(ref)
-            all_corrections.append(output_json == ref_json)
+            all_corrections.append(output_json == json.loads(ref))
+            all_grammar_corrections.append(True)
 
         acc = np.mean(all_corrections) * 100
         logger.info(
             f"JSON Mode Eval accuracy: {acc:.2f} ({len(all_corrections)})")
+        grammar_acc = np.mean(all_grammar_corrections) * 100
+        logger.info(
+            f"JSON Mode Eval grammar accuracy: {grammar_acc:.2f} ({len(all_grammar_corrections)})"
+        )
         return acc
 
     @click.command("json_mode_eval")
