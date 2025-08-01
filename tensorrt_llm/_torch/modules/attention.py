@@ -835,7 +835,6 @@ class MLA(nn.Module):
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
 
         self.rope_fusion = self.mha.support_fused_rope()
-        self.need_contiguous_qkv = self.mha.need_contiguous_qkv()
         self.rotary_emb = None
         self.apply_rotary_emb = not self.rope_fusion
         if self.apply_rotary_emb:
@@ -1054,13 +1053,6 @@ class MLA(nn.Module):
         attn_output_gen = None
         return output
 
-    def _maybe_contiguous(self, q, k, v):
-        if self.need_contiguous_qkv:
-            q, k, v = [
-                x.contiguous() if x is not None else None for x in (q, k, v)
-            ]
-        return q, k, v
-
     def forward_context_default(
             self,
             q: torch.Tensor,
@@ -1069,7 +1061,6 @@ class MLA(nn.Module):
             attn_metadata: AttentionMetadata,
             latent_cache: Optional[torch.Tensor] = None,
             output: Optional[torch.Tensor] = None) -> torch.Tensor:
-        # print(f"=========forward_context_default layer_idx: {self.layer_idx}, q: {q.shape}, compressed_kv: {compressed_kv.shape}, k_pe: {k_pe.shape}, latent_cache: {latent_cache.shape}")
         kv = self.kv_b_proj(compressed_kv)
         k_nope, v = kv.split(
             [
@@ -1087,9 +1078,6 @@ class MLA(nn.Module):
                                                        self.qk_rope_head_dim)
         k = k.view(-1, self.num_heads * self.qk_head_dim)
 
-        # q, k and v may should be contiguous
-        q, k, v = self._maybe_contiguous(q, k, v)
-
         # out_scale = getattr(self.o_proj, "inv_input_scale", None)
         out_scale = None  # Currently we use BF16 MHA for context phase
 
@@ -1103,11 +1091,6 @@ class MLA(nn.Module):
             out_scale=out_scale,
             output=output,
         )
-        # if self.layer_idx == 0:
-        #     print(f"======= q shape: {q.shape}, value:\n{q}")
-        #     print(f"======= k shape: {k.shape}, value:\n{k}")
-        #     print(f"======= v shape: {v.shape}, value:\n{v}")
-        #     print(f"======= attn_output shape: {attn_output.shape}, value:\n{attn_output}")
 
         return attn_output
 
@@ -1118,7 +1101,6 @@ class MLA(nn.Module):
         attn_metadata: AttentionMetadata,
         output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        # print(f"=========forward_context_with_cached_kv layer_idx: {self.layer_idx}, q: {q.shape}, latent_cache: {latent_cache.shape}")
         assert latent_cache is not None
         trtllm_attention = cast(TrtllmAttention, self.mha)
 
@@ -1148,19 +1130,12 @@ class MLA(nn.Module):
             -1,
         )
 
-        full_k = torch.empty(
-            (full_k_nope.shape[0], self.num_heads, self.qk_head_dim),
-            dtype=full_k_nope.dtype,
-            device=full_k_nope.device)
-        full_k[..., :self.qk_nope_head_dim] = full_k_nope.view(
-            -1, self.num_heads, self.qk_nope_head_dim)
-        full_k[...,
-               self.qk_nope_head_dim:] = full_k_pe.view(-1, 1,
-                                                        self.qk_rope_head_dim)
+        full_k_nope = full_k_nope.view(-1, self.num_heads,
+                                       self.qk_nope_head_dim)
+        full_k_pe = full_k_pe.view(-1, 1, self.qk_rope_head_dim)
+        full_k = torch.cat(
+            (full_k_nope, full_k_pe.expand(-1, self.num_heads, -1)), dim=-1)
         full_k = full_k.view(-1, self.num_heads * self.qk_head_dim)
-
-        # q, full_k and full_v may should be contiguous
-        q, full_k, full_v = self._maybe_contiguous(q, full_k, full_v)
 
         # release pytorch activation memory
         full_compressed_kv = None
@@ -1251,18 +1226,14 @@ class MLA(nn.Module):
                 ],
                 -1,
             )
-            chunked_k = torch.empty(
-                (chunked_k_nope.shape[0], self.num_heads, self.qk_head_dim),
-                dtype=chunked_k_nope.dtype,
-                device=chunked_k_nope.device)
-            chunked_k[..., :self.qk_nope_head_dim] = chunked_k_nope.view(
-                -1, self.num_heads, self.qk_nope_head_dim)
-            chunked_k[..., self.qk_nope_head_dim:] = chunked_k_pe.view(
-                -1, 1, self.qk_rope_head_dim)
-            chunked_k = chunked_k.view(-1, self.num_heads * self.qk_head_dim)
 
-            q, chunked_k, chunked_v = self._maybe_contiguous(
-                q, chunked_k, chunked_v)
+            chunked_k_nope = chunked_k_nope.view(-1, self.num_heads,
+                                                 self.qk_nope_head_dim)
+            chunked_k_pe = chunked_k_pe.view(-1, 1, self.qk_rope_head_dim)
+            chunked_k = torch.cat(
+                (chunked_k_nope, chunked_k_pe.expand(-1, self.num_heads, -1)),
+                dim=-1)
+            chunked_k = chunked_k.view(-1, self.num_heads * self.qk_head_dim)
 
             # release pytorch activation memory
             chunked_compressed_kv = None
@@ -1316,8 +1287,6 @@ class MLA(nn.Module):
                                                      self.qk_nope_head_dim)
         k[..., self.qk_nope_head_dim:] = k_pe.view(-1, 1, self.qk_rope_head_dim)
         k = k.view(-1, self.num_heads * self.qk_head_dim)
-
-        q, k, v = self._maybe_contiguous(q, k, v)
 
         # copy q_lens to replace kv_lens_runtime
         attn_metadata.kv_lens_runtime = attn_metadata.prompt_lens_cpu_runtime
@@ -1488,7 +1457,6 @@ class MLA(nn.Module):
         attn_metadata: AttentionMetadata,
         all_reduce_params: Optional[AllReduceParams] = None,
     ) -> torch.Tensor:
-        # print(f"=========forward layer_idx: {self.layer_idx}, position_ids: {position_ids.shape}, hidden_states: {hidden_states.shape}")
         attn_output = self.create_output(hidden_states)
         if self.register_to_config:
             torch.ops.trtllm.mla_custom_op_inplace(hidden_states, position_ids,

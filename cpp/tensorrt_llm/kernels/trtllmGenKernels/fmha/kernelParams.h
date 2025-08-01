@@ -357,6 +357,11 @@ struct KernelParams
         {
             strideKeysVals = maxHeadDimKv;
         }
+        else if (isSeparateQkv(options.mQkvLayout) && !isK && options.mHeadDimQkNope > 0)
+        {
+            // Tensor V for context MLA is not contiguous, so we need to add the headSizeQkNope to the stride.
+            strideKeysVals = options.mNumHeadsKv * (options.mHeadDimQkNope + options.mHeadDimV);
+        }
 
         // The stride between heads.
         int32_t strideHeads{isK ? options.mHeadDimQk : options.mHeadDimV};

@@ -179,6 +179,28 @@ void FusedMHARunnerV2::setupKernelParams(MHARunnerParams runnerParams)
             // Thus, v_stride_in_bytes always equals to k_stride_in_bytes so far.
             mKernelParams.v_stride_in_bytes = mKernelParams.k_stride_in_bytes;
         }
+        else if (mFixedParams.attentionInputLayout == AttentionInputLayout::SEPARATE_Q_K_V)
+        {
+            // Separate QKV input layout, [total_kv_seqlen, H_KV, D] + [total_kv_seqlen, H_KV, DV]
+            mKernelParams.k_ptr = runnerParams.kPtr;
+            mKernelParams.v_ptr = runnerParams.vPtr;
+            // Tensor K is contiguous.
+            mKernelParams.k_stride_in_bytes
+                = get_size_in_bytes(mFixedParams.numKvHeads * mFixedParams.headSize, mFixedParams.dataType);
+            if (mFixedParams.headSizeQkNope > 0)
+            {
+                // Tensor V for context MLA is not contiguous, so we need to add the headSizeQkNope to the stride.
+                mKernelParams.v_stride_in_bytes = get_size_in_bytes(
+                    mFixedParams.numKvHeads * (mFixedParams.headSizeQkNope + mFixedParams.headSizeV),
+                    mFixedParams.dataType);
+            }
+            else
+            {
+                // Tensor V is contiguous for other cases.
+                mKernelParams.v_stride_in_bytes
+                    = get_size_in_bytes(mFixedParams.numKvHeads * mFixedParams.headSizeV, mFixedParams.dataType);
+            }
+        }
     }
 
     mKernelParams.o_ptr = runnerParams.outputPtr;
@@ -622,6 +644,12 @@ void FusedMHARunnerV2::setTmaDescriptors(MHARunnerParams runnerParams)
             // Layout, [B, S, H_kv * D + H_kv * Dv].
             k_ptr = reinterpret_cast<char const*>(mKernelParams.kv_ptr);
             v_ptr = k_ptr + h_kv * d_in_bytes;
+        }
+        else if (layout == AttentionInputLayout::SEPARATE_Q_K_V)
+        {
+            // Layout: [total_kv_seqlen, H_KV, D] + [total_kv_seqlen, H_KV, DV]
+            k_ptr = reinterpret_cast<char const*>(mKernelParams.k_ptr);
+            v_ptr = reinterpret_cast<char const*>(mKernelParams.v_ptr);
         }
 
         Multiple_tma_descriptor<3> kv_tma_descriptor;

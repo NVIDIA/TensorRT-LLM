@@ -1720,6 +1720,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         //    - v_ptr: [B, S, H_kv, D_v], which supports variable sequence length
         //    - cu_q_seqlens: the cumulative query sequence lengths, needed for variable sequence length.
         //    - cu_kv_seqlens: the cumulative kv sequence lengths, needed for variable sequence length.
+        //    - total_kv_len: the total kv sequence lengths, needed for variable sequence length.
 
         // Construct the fmha params for running kernels.
         MHARunnerParams fmhaParams{};
@@ -2620,8 +2621,8 @@ int AttentionOp::initialize() noexcept
         // the wrong kernel, no matter mIsGenerationMLA is true or false
         if (mIsMLAEnabled)
         {
-            // context MLA always use separate_qkv layout
-            fmhaParams.attentionInputLayout = AttentionInputLayout::SEPARATE_QKV;
+            // Context MLA always use separate_q_k_v layout
+            fmhaParams.attentionInputLayout = AttentionInputLayout::SEPARATE_Q_K_V;
             // Context attention of MLA is different
             fmhaParams.numKvHeads = mNumHeads;
             fmhaParams.headSize = mMLAParams.qk_nope_head_dim + mMLAParams.qk_rope_head_dim;
@@ -2630,6 +2631,7 @@ int AttentionOp::initialize() noexcept
             // attention op and that could fail to create the FmhaDispatcher for context phase.
             // Luckily, for deepseek, qk_nope_head_dim is the same as v_head_dim in context phase.
             fmhaParams.headSizeV = mMLAParams.qk_nope_head_dim;
+            fmhaParams.headSizeQkNope = mMLAParams.qk_nope_head_dim;
         }
         fmhaParams.qScaling = mQScaling;
         fmhaParams.attnLogitSoftcappingScale = mAttnLogitSoftcappingScale;
