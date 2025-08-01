@@ -1863,17 +1863,23 @@ void TrtGptModelInflightBatching::setupDecoderStep(
 
     if (mWorldConfig.isLastPipelineParallelRank() && !contextRequests.empty())
     {
-        auto const logitsType = mRuntime->getEngine().getTensorDataType("logits");
+        RequestVector finishedContextRequests;
+        std::copy_if(contextRequests.begin(), contextRequests.end(), std::back_inserter(finishedContextRequests),
+            [](auto const& llmReq) { return llmReq->isLastContextChunk(); });
 
-        auto [batchSlots, samplingConfig, lookaheadPrompt, lookaheadAlgoConfigs]
-            = (*mCreateNewDecoderRequests)(mModelConfig, mWorldConfig, mDecodingConfig, contextRequests,
-                mRuntime->getBufferManager(), logitsType, inputBuffers, *mDecoderState, mRuntime->getStream(),
-                *mDecoder->getDecoderStream(), getMaxSequenceLen(), mOperatingBeamWidth, buffers.mMedusaBuffers);
-
-        auto const localBatchSize = batchSlots->getSize();
-        if (localBatchSize > 0)
+        if (!finishedContextRequests.empty())
         {
-            mDecoder->getUnderlyingDecoder().setup(samplingConfig.value(), localBatchSize, batchSlots,
+            auto const logitsType = mRuntime->getEngine().getTensorDataType("logits");
+
+            auto [batchSlots, samplingConfig, lookaheadPrompt, lookaheadAlgoConfigs]
+                = (*mCreateNewDecoderRequests)(mModelConfig, mWorldConfig, mDecodingConfig, finishedContextRequests,
+                    mRuntime->getBufferManager(), logitsType, inputBuffers, *mDecoderState, mRuntime->getStream(),
+                    *mDecoder->getDecoderStream(), getMaxSequenceLen(), mOperatingBeamWidth, buffers.mMedusaBuffers);
+
+            auto const localBatchSize = batchSlots->getSize();
+            TLLM_CHECK_WITH_INFO(localBatchSize > 0, "Decoder setup should be called with at least one request");
+
+            mDecoder->getUnderlyingDecoder().setup(samplingConfig, localBatchSize, batchSlots,
                 {mDecoderState->getJointDecodingOutput()}, mModelConfig.getDataType(), lookaheadPrompt,
                 lookaheadAlgoConfigs);
 
