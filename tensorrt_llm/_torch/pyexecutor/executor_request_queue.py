@@ -5,14 +5,16 @@ import queue
 import threading
 import time
 from collections import deque, namedtuple
-from typing import Dict, List, Optional, Tuple
+from itertools import repeat
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import torch
 
 from tensorrt_llm._utils import nvtx_range
 
 from ..distributed import Distributed
-from .llm_request import ExecutorRequest, executor_request_to_llm_request
+from .llm_request import (ExecutorRequest, LlmRequest,
+                          executor_request_to_llm_request)
 from .sampler import Sampler, TorchSampler
 
 SHUTDOWN_REQUEST_ID = -1
@@ -22,6 +24,7 @@ SHUTDOWN_REQUEST_ID = -1
 class RequestQueueItem:
     id: int
     request: Optional[ExecutorRequest] = None
+    _ = dataclasses.KW_ONLY
     is_canceled_request: bool = False
     query: Optional[list] = None  # only used in `StarAttention`
 
@@ -108,61 +111,51 @@ class ExecutorRequestQueue:
             req_count += 1
         return items
 
-    def enqueue_requests(self, requests: List[ExecutorRequest]):
+    def _enqueue_impl(
+        self, requests_and_queries: Iterable[Tuple[ExecutorRequest,
+                                                   Optional[List]]]
+    ) -> List[int]:
         req_ids = []
-        try:
-            self.enqueue_lock.acquire()
+        with self.enqueue_lock:
+            assert self.active, "PyExecutor has already been shutdown."
             start_time = time.time()
-            for request in requests:
-                self.start_times[self.next_request_id] = start_time
+            for request, query in requests_and_queries:
+                if self.enable_iter_perf_stats:
+                    self.start_times[self.next_request_id] = start_time
                 self.request_queue.put(
-                    RequestQueueItem(self.next_request_id, request))
+                    RequestQueueItem(self.next_request_id, request,
+                                     query=query))
                 req_ids.append(self.next_request_id)
                 self.next_request_id += 1
-        finally:
-            self.enqueue_lock.release()
         return req_ids
 
-    def enqueue_cancel_request(self, req_id: int):
-        try:
-            self.enqueue_lock.acquire()
-            self.request_queue.put(
-                RequestQueueItem(req_id, is_canceled_request=True))
-        finally:
-            self.enqueue_lock.release()
-
-    def enqueue_shutdown_request(self):
-        try:
-            self.enqueue_lock.acquire()
-            self.request_queue.put(RequestQueueItem(SHUTDOWN_REQUEST_ID))
-            self.active = False
-        finally:
-            self.enqueue_lock.release()
+    def enqueue_requests(self, requests: List[ExecutorRequest]) -> List[int]:
+        """
+        Enqueue new requests
+        """
+        return self._enqueue_impl(zip(requests, repeat(None)))
 
     def enqueue_request(self,
                         request: ExecutorRequest,
-                        query: Optional[list] = None):
-        try:
-            self.enqueue_lock.acquire()
-            assert self.active, "PyExecutor has already been shutdown."
-            req_id = self.next_request_id
-            if self.enable_iter_perf_stats:
-                self.start_times[req_id] = time.time()
+                        query: Optional[List] = None) -> int:
+        """
+        Enqueue a new request, query is only used in `StarAttention`.
+        """
+        return self._enqueue_impl([(request, query)])[0]
 
-            if query is not None:
-                self.request_queue.put(RequestQueueItem(req_id, request, query))
-            else:
-                self.request_queue.put(RequestQueueItem(req_id, request))
-            self.next_request_id += 1
-        finally:
-            self.enqueue_lock.release()
+    def enqueue_cancel_request(self, req_id: int):
+        with self.enqueue_lock:
+            self.request_queue.put(
+                RequestQueueItem(req_id, is_canceled_request=True))
 
-        return req_id
+    def enqueue_shutdown_request(self):
+        with self.enqueue_lock:
+            self.request_queue.put(RequestQueueItem(SHUTDOWN_REQUEST_ID))
+            self.active = False
 
     def can_enqueue_request(self) -> bool:
-        self.enqueue_lock.acquire()
-        can_enqueue = self.active
-        self.enqueue_lock.release()
+        with self.enqueue_lock:
+            can_enqueue = self.active
         return can_enqueue and self.dist.rank == 0
 
     def _fetch_and_process_requests(
@@ -204,8 +197,7 @@ class ExecutorRequestQueue:
         return new_requests
 
     @nvtx_range("_fetch_new_requests")
-    def fetch_new_requests(self,
-                           num_active_requests: int) -> List[RequestQueueItem]:
+    def fetch_new_requests(self, num_active_requests: int) -> List[LlmRequest]:
 
         if self.enable_attention_dp:
             return self._fetch_new_requests_attention_dp(num_active_requests)
@@ -213,7 +205,7 @@ class ExecutorRequestQueue:
             return self._fetch_new_requests_attention_tp(num_active_requests)
 
     def _fetch_new_requests_attention_tp(
-            self, num_active_requests: int) -> List[RequestQueueItem]:
+            self, num_active_requests: int) -> List[LlmRequest]:
         """Handle standard (non-attention DP) request fetching."""
         total_num_active_requests = num_active_requests
         total_max_num_active_requests = self.max_num_active_requests
@@ -227,7 +219,7 @@ class ExecutorRequestQueue:
         return merged_requests
 
     def _fetch_new_requests_attention_dp(
-            self, num_active_requests: int) -> List[RequestQueueItem]:
+            self, num_active_requests: int) -> List[LlmRequest]:
         """Handle attention DP request fetching with load balancing."""
         # Get active request counts across all ranks
         all_ranks_num_active_requests = []
@@ -422,7 +414,8 @@ class ExecutorRequestQueue:
                     req_item.id)
 
     @nvtx_range("_merge_requests")
-    def _merge_requests(self, new_requests: list[RequestQueueItem]):
+    def _merge_requests(
+            self, new_requests: list[RequestQueueItem]) -> List[LlmRequest]:
         cp_config = self.dist.cp_config
         if 'cp_type' in cp_config:
             cp_type = cp_config['cp_type']
@@ -440,8 +433,8 @@ class ExecutorRequestQueue:
                 for req_item in new_requests
             ]
 
-    def _merge_star_attention_requests(self,
-                                       new_requests: list[RequestQueueItem]):
+    def _merge_star_attention_requests(
+            self, new_requests: list[RequestQueueItem]) -> List[LlmRequest]:
         result = []
         for req_item in new_requests:
             req_id, exe_req, query_token_ids = req_item.id, req_item.request, req_item.query
