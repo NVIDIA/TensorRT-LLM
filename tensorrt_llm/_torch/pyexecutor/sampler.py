@@ -749,8 +749,7 @@ class TRTLLMSampler(Sampler):
     def setup_sampler_step(self, requests):
         batch_slots, sampling_configs, lookahead_prompt, lookahead_algo_configs = self.algs.create_new_decoder_requests(
             self.model_config, self.world_config, self.decoding_config,
-            requests.context_requests, self.store["buffer_manager"],
-            self.logits_datatype,
+            requests.context_requests, self.logits_datatype,
             self.store["decoder_input_buffers"][self.micro_batch_idx],
             self.store["decoder_state"], self.store["cuda_stream"],
             self.algs.decoder.decoder_stream, self.executor_config.max_seq_len,

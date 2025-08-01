@@ -50,9 +50,10 @@ namespace
 {
 
 void copySequenceLengths(RequestVector const& contextRequests, DecoderInputBuffers& inputBuffers,
-    ITensor& sequenceLengths, SizeType32 beamWidth, runtime::BufferManager const& manager,
-    runtime::CudaStream const& stream)
+    ITensor& sequenceLengths, SizeType32 beamWidth, runtime::CudaStream const& stream)
 {
+    auto const bufferManager = BufferManager{std::make_shared<CudaStream>(stream.get())};
+
     auto const batchSize = contextRequests.size();
     auto batchSlotsView = tr::ITensor::slice(inputBuffers.setupBatchSlots, 0, batchSize);
     auto fillValuesView = tr::ITensor::slice(inputBuffers.fillValues, 0, batchSize);
@@ -80,8 +81,8 @@ void copySequenceLengths(RequestVector const& contextRequests, DecoderInputBuffe
         auto batchSlotsDeviceView = tr::ITensor::slice(inputBuffers.setupBatchSlotsDevice, 0, batchSize);
         auto fillValuesViewDevice = tr::ITensor::slice(inputBuffers.fillValuesDevice, 0, batchSize);
 
-        manager.copy(*batchSlotsView, *batchSlotsDeviceView);
-        manager.copy(*fillValuesView, *fillValuesViewDevice);
+        bufferManager.copy(*batchSlotsView, *batchSlotsDeviceView);
+        bufferManager.copy(*fillValuesView, *fillValuesViewDevice);
         tr::kernels::invokeFillBatch(sequenceLengths, *batchSlotsDeviceView, beamWidth, *fillValuesViewDevice, stream);
     }
 }
@@ -128,10 +129,10 @@ void copySequenceLengths(RequestVector const& contextRequests, DecoderInputBuffe
 std::tuple<TensorPtr, std::vector<runtime::SamplingConfig>, std::vector<runtime::ITensor::SharedConstPtr>,
     std::vector<executor::LookaheadDecodingConfig>>
 CreateNewDecoderRequests::operator()(runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig,
-    executor::DecodingConfig const& decodingConfig, RequestVector const& contextRequests,
-    runtime::BufferManager const& bufferManager, nvinfer1::DataType logitsType, DecoderInputBuffers& inputBuffers,
-    runtime::decoder::DecoderState& decoderState, CudaStream const& runtimeStream, CudaStream const& decoderStream,
-    SizeType32 maxSequenceLength, SizeType32 beamWidth, OptionalRef<MedusaBuffers const> medusaBuffers) const
+    executor::DecodingConfig const& decodingConfig, RequestVector const& contextRequests, nvinfer1::DataType logitsType,
+    DecoderInputBuffers& inputBuffers, runtime::decoder::DecoderState& decoderState, CudaStream const& runtimeStream,
+    CudaStream const& decoderStream, SizeType32 maxSequenceLength, SizeType32 beamWidth,
+    OptionalRef<MedusaBuffers const> medusaBuffers) const
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     NVTX3_SCOPED_RANGE(CreateNewDecoderRequests);
@@ -142,13 +143,13 @@ CreateNewDecoderRequests::operator()(runtime::ModelConfig const& modelConfig, ru
 
     if (!finishedContextRequests.empty())
     {
-        copySequenceLengths(finishedContextRequests, inputBuffers, *decoderState.getSequenceLengths(), beamWidth,
-            bufferManager, runtimeStream);
+        copySequenceLengths(
+            finishedContextRequests, inputBuffers, *decoderState.getSequenceLengths(), beamWidth, runtimeStream);
     }
 
-    auto [lookaheadPrompt, lookaheadAlgoConfigs] = createDecoderRequests(finishedContextRequests,
-        inputBuffers.inputsIds, decodingConfig, decoderState, bufferManager, logitsType, modelConfig, worldConfig,
-        runtimeStream, decoderStream, maxSequenceLength, medusaBuffers);
+    auto [lookaheadPrompt, lookaheadAlgoConfigs]
+        = createDecoderRequests(finishedContextRequests, inputBuffers.inputsIds, decodingConfig, decoderState,
+            logitsType, modelConfig, worldConfig, runtimeStream, decoderStream, maxSequenceLength, medusaBuffers);
 
     auto const batchSize = finishedContextRequests.size();
 
@@ -558,11 +559,12 @@ void CreateNewDecoderRequests::newRequestEagle(SizeType32 batchIdx, runtime::dec
 std::tuple<std::vector<runtime::ITensor::SharedConstPtr>, std::vector<executor::LookaheadDecodingConfig>>
 CreateNewDecoderRequests::createDecoderRequests(RequestVector const& finishedContextRequests, TensorPtr const& inputIds,
     executor::DecodingConfig const& decodingConfig, runtime::decoder::DecoderState& decoderState,
-    BufferManager const& bufferManager, nvinfer1::DataType logitsType, runtime::ModelConfig const& modelConfig,
-    runtime::WorldConfig const& worldConfig, runtime::CudaStream const& runtimeStream,
-    runtime::CudaStream const& decoderStream, SizeType32 maxSequenceLength,
+    nvinfer1::DataType logitsType, runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig,
+    runtime::CudaStream const& runtimeStream, runtime::CudaStream const& decoderStream, SizeType32 maxSequenceLength,
     OptionalRef<MedusaBuffers const> medusaBuffers) const
 {
+    auto const bufferManager = BufferManager{std::make_shared<CudaStream>(runtimeStream.get())};
+
     unsigned decoderInputSize{0};
     for (auto const& llmReq : finishedContextRequests)
     {
