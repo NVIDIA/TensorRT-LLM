@@ -358,7 +358,8 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             "max_batch_size": 1,
             "cache_transceiver_config": {
                 "backend": "default"
-            }
+            },
+            "cuda_graph_config": None,
         }
         gen_server_config = {
             "disable_overlap_scheduler": not overlap_scheduler,
@@ -367,11 +368,12 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                 "free_gpu_memory_fraction": 0.5,
                 "enable_block_reuse": False
             },
-            "max_num_tokens": 20,  # BS * (draft token + 1)
-            "max_batch_size": 4,
+            "max_num_tokens": 13393 * 2,
+            "max_batch_size": 16,
             "cache_transceiver_config": {
                 "backend": "default"
-            }
+            },
+            "cuda_graph_config": None,
         }
         disaggregated_server_config = {
             "hostname": "localhost",
