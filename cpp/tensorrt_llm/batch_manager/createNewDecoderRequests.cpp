@@ -25,6 +25,7 @@
 #include "tensorrt_llm/runtime/decoderState.h"
 #include "tensorrt_llm/runtime/decodingInput.h"
 #include "tensorrt_llm/runtime/decodingOutput.h"
+#include "tensorrt_llm/runtime/request.h"
 #include "tensorrt_llm/runtime/runtimeKernels.h"
 #include "tensorrt_llm/runtime/speculativeDecodingMode.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
@@ -320,61 +321,9 @@ void initializeOutputs(DecodingOutput& dJointOutput, SizeType32 batchSlot, SizeT
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-} // namespace
-
-void CreateNewDecoderRequests::newRequestSpeculativeDecoding(SizeType32 batchIdx,
-    runtime::decoder_batch::Request const& request, SamplingConfig const& samplingConfig,
-    runtime::ModelConfig const& modelConfig, DecodingInput& jointDecodingInput, DecodingOutput& jointDecodingOutput,
-    CudaStream const& runtimeStream, CudaStream const& decoderStream,
-    SpeculativeDecodingMode const& speculativeDecodingMode, SizeType32 maxDecodingEngineTokens)
-{
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-
-    if (speculativeDecodingMode.predictsDraftTokens())
-    {
-        auto const& stream = decoderStream;
-        BufferManager manager{std::make_shared<CudaStream>(stream.get())};
-
-        auto& dJointOutput = jointDecodingOutput;
-
-        TensorPtr nextDraftTokens
-            = ITensor::slice(dJointOutput.speculativeDecodingOutputs->nextDraftTokens, batchIdx, 1);
-        // FIXME: can we skip this?
-        manager.setZero(*nextDraftTokens);
-        if (speculativeDecodingMode.variableDraftLength())
-        {
-            TensorPtr nextDraftTokensLen
-                = ITensor::slice(dJointOutput.speculativeDecodingOutputs->nextDraftTokensLen, batchIdx, 1);
-            manager.setZero(*nextDraftTokensLen);
-        }
-    }
-
-    if (speculativeDecodingMode.isDraftTokensExternal())
-    {
-        newRequestDraftTokensExternal(batchIdx, request, samplingConfig, jointDecodingInput, decoderStream);
-    }
-    else if (speculativeDecodingMode.isMedusa())
-    {
-        newRequestMedusa(batchIdx, request, jointDecodingInput, decoderStream, maxDecodingEngineTokens);
-    }
-    else if (speculativeDecodingMode.isLookaheadDecoding())
-    {
-        newRequestLookahead(batchIdx, request, jointDecodingInput, jointDecodingOutput, runtimeStream);
-    }
-    else if (speculativeDecodingMode.isExplicitDraftTokens())
-    {
-        newRequestExplicitDraftTokens(batchIdx, request, jointDecodingOutput, runtimeStream);
-    }
-    else if (speculativeDecodingMode.isEagle())
-    {
-        newRequestEagle(batchIdx, request, modelConfig, jointDecodingOutput, runtimeStream);
-    }
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-}
-
-void CreateNewDecoderRequests::newRequestDraftTokensExternal(SizeType32 batchIdx,
-    runtime::decoder_batch::Request const& request, SamplingConfig const& samplingConfig,
-    DecodingInput& jointDecodingInput, CudaStream const& decoderStream)
+//! @brief Setups decoder internal tensors for new request in Draft model Sps mode
+void newRequestDraftTokensExternal(SizeType32 batchIdx, runtime::decoder_batch::Request const& request,
+    SamplingConfig const& samplingConfig, DecodingInput& jointDecodingInput, CudaStream const& decoderStream)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -426,7 +375,8 @@ void CreateNewDecoderRequests::newRequestDraftTokensExternal(SizeType32 batchIdx
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void CreateNewDecoderRequests::newRequestMedusa(SizeType32 batchIdx, runtime::decoder_batch::Request const& request,
+//! @brief Setups decoder internal tensors for new Medusa request
+void newRequestMedusa(SizeType32 batchIdx, runtime::decoder_batch::Request const& request,
     DecodingInput& jointDecodingInput, CudaStream const& decoderStream, SizeType32 maxDecodingEngineTokens)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
@@ -457,7 +407,8 @@ void CreateNewDecoderRequests::newRequestMedusa(SizeType32 batchIdx, runtime::de
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void CreateNewDecoderRequests::newRequestLookahead(SizeType32 batchIdx, runtime::decoder_batch::Request const& request,
+//! @brief Setups decoder internal tensors for new Lookahead request
+void newRequestLookahead(SizeType32 batchIdx, runtime::decoder_batch::Request const& request,
     DecodingInput& jointDecodingInput, DecodingOutput& jointDecodingOutput, CudaStream const& runtimeStream)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
@@ -472,9 +423,9 @@ void CreateNewDecoderRequests::newRequestLookahead(SizeType32 batchIdx, runtime:
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void CreateNewDecoderRequests::newRequestExplicitDraftTokens(SizeType32 batchIdx,
-    runtime::decoder_batch::Request const& request, DecodingOutput& jointDecodingOutput,
-    CudaStream const& runtimeStream)
+//! @brief Setups decoder internal tensors for new Explicit draft tokens request
+void newRequestExplicitDraftTokens(SizeType32 batchIdx, runtime::decoder_batch::Request const& request,
+    DecodingOutput& jointDecodingOutput, CudaStream const& runtimeStream)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -487,7 +438,8 @@ void CreateNewDecoderRequests::newRequestExplicitDraftTokens(SizeType32 batchIdx
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void CreateNewDecoderRequests::newRequestEagle(SizeType32 batchIdx, runtime::decoder_batch::Request const& request,
+//! @brief Setups decoder internal tensors for new Eagle request
+void newRequestEagle(SizeType32 batchIdx, runtime::decoder_batch::Request const& request,
     runtime::ModelConfig const& modelConfig, DecodingOutput& jointDecodingOutput, CudaStream const& runtimeStream)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
@@ -545,6 +497,58 @@ void CreateNewDecoderRequests::newRequestEagle(SizeType32 batchIdx, runtime::dec
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
+
+//! @brief Setups decoder internal tensors for new speculative decoding request
+void newRequestSpeculativeDecoding(SizeType32 batchIdx, runtime::decoder_batch::Request const& request,
+    SamplingConfig const& samplingConfig, runtime::ModelConfig const& modelConfig, DecodingInput& jointDecodingInput,
+    DecodingOutput& jointDecodingOutput, CudaStream const& runtimeStream, CudaStream const& decoderStream,
+    SpeculativeDecodingMode const& speculativeDecodingMode, SizeType32 maxDecodingEngineTokens)
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
+    if (speculativeDecodingMode.predictsDraftTokens())
+    {
+        auto const& stream = decoderStream;
+        BufferManager manager{std::make_shared<CudaStream>(stream.get())};
+
+        auto& dJointOutput = jointDecodingOutput;
+
+        TensorPtr nextDraftTokens
+            = ITensor::slice(dJointOutput.speculativeDecodingOutputs->nextDraftTokens, batchIdx, 1);
+        // FIXME: can we skip this?
+        manager.setZero(*nextDraftTokens);
+        if (speculativeDecodingMode.variableDraftLength())
+        {
+            TensorPtr nextDraftTokensLen
+                = ITensor::slice(dJointOutput.speculativeDecodingOutputs->nextDraftTokensLen, batchIdx, 1);
+            manager.setZero(*nextDraftTokensLen);
+        }
+    }
+
+    if (speculativeDecodingMode.isDraftTokensExternal())
+    {
+        newRequestDraftTokensExternal(batchIdx, request, samplingConfig, jointDecodingInput, decoderStream);
+    }
+    else if (speculativeDecodingMode.isMedusa())
+    {
+        newRequestMedusa(batchIdx, request, jointDecodingInput, decoderStream, maxDecodingEngineTokens);
+    }
+    else if (speculativeDecodingMode.isLookaheadDecoding())
+    {
+        newRequestLookahead(batchIdx, request, jointDecodingInput, jointDecodingOutput, runtimeStream);
+    }
+    else if (speculativeDecodingMode.isExplicitDraftTokens())
+    {
+        newRequestExplicitDraftTokens(batchIdx, request, jointDecodingOutput, runtimeStream);
+    }
+    else if (speculativeDecodingMode.isEagle())
+    {
+        newRequestEagle(batchIdx, request, modelConfig, jointDecodingOutput, runtimeStream);
+    }
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+}
+
+} // namespace
 
 std::tuple<std::vector<runtime::ITensor::SharedConstPtr>, std::vector<executor::LookaheadDecodingConfig>>
 CreateNewDecoderRequests::createDecoderRequests(RequestVector const& finishedContextRequests, TensorPtr const& inputIds,
