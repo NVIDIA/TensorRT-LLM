@@ -14,6 +14,27 @@
 /tensorrt_llm/_torch/auto_deploy @NVIDIA/trt-llm-torch-autodeploy-devs
 /tensorrt_llm/examples/auto_deploy @NVIDIA/trt-llm-torch-autodeploy-devs
 
+## TensorRT-LLM LLM Pytorch - Speculative Decoding
+/tensorrt_llm/_torch/speculative @NVIDIA/trt-llm-torch-spec-decoding
+
+## TensorRT-LLM LLM Pytorch - Graph Compiler
+/tensorrt_llm/_torch/compilation @NVIDIA/trt-llm-torch-graph-compiler
+/tensorrt_llm/_torch/custom_ops @NVIDIA/trt-llm-torch-graph-compiler
+
+## TensorRT-LLM LLM Pytorch Models
+/tensorrt_llm/_torch/models @NVIDIA/trt-llm-torch-models-devs
+
+### TensorRT-LLM LLM Pytorch - Models - Nemotron
+/tensorrt_llm/_torch/models/modeling_nemotron_nas.py @NVIDIA/trt-llm-torch-models-nemotron-devs @NVIDIA/trt-llm-torch-models-devs
+/tensorrt_llm/_torch/models/modeling_nemotron_h.py @NVIDIA/trt-llm-torch-models-nemotron-devs @NVIDIA/trt-llm-torch-models-devs
+/tensorrt_llm/_torch/models/modeling_nemotron_nas.py @NVIDIA/trt-llm-torch-models-nemotron-devs @NVIDIA/trt-llm-torch-models-devs
+/tensorrt_llm/_torch/pyexecutor/resource_manager.py @NVIDIA/trt-llm-torch-models-nemotron-devs @NVIDIA/trt-llm-torch-runtime-devs @NVIDIA/trt-llm-torch-models-devs
+/tensorrt_llm/_torch/modules/mamba @NVIDIA/trt-llm-torch-models-nemotron-devs @NVIDIA/trt-llm-torch-models-devs
+/tensorrt_llm/_torch/models/checkpoints/hf/nemotron_h_weight_mapper.py @NVIDIA/trt-llm-torch-models-nemotron-devs @NVIDIA/trt-llm-torch-models-devs
+/tests/unittest/_torch/modeling/test_modeling_nemotron.py @NVIDIA/trt-llm-torch-models-nemotron-devs @NVIDIA/trt-llm-torch-models-devs
+/tests/unittest/_torch/modeling/test_modeling_nemotron_h.py @NVIDIA/trt-llm-torch-models-nemotron-devs @NVIDIA/trt-llm-torch-models-devs
+/tests/unittest/_torch/modeling/test_modeling_nemotron_nas.py @NVIDIA/trt-llm-torch-models-nemotron-devs @NVIDIA/trt-llm-torch-models-devs
+
 ## TensorRT-LLM trtllm-bench Reviewers
 /tensorrt_llm/bench @NVIDIA/trtllm-bench-reviewers
 /tensorrt_llm/commands/bench.py @NVIDIA/trtllm-bench-reviewers
@@ -22,6 +43,21 @@ docs/source/performance/perf-benchmarking.md @NVIDIA/trtllm-bench-reviewers
 ## TensorRT-LLM LLM API
 /tensorrt_llm/llmapi @NVIDIA/trt-llm-llmapi-devs
 /tensorrt_llm/executor @NVIDIA/trt-llm-llmapi-devs
+
+## TensorRT-LLM LLM Disaggregated
+/examples/disaggregated @NVIDIA/trt-llm-disagg-devs
+/tensorrt_llm/disaggregated_params.py @NVIDIA/trt-llm-disagg-devs
+/tensorrt_llm/_torch/pyexecutor/kv_cache_transceiver.py @NVIDIA/trt-llm-disagg-devs
+/tensorrt_llm/_torch/pyexecutor/py_executor.py @NVIDIA/trt-llm-disagg-devs
+/cpp/tensorrt_llm/batch_manager/cacheFormatter.cpp @NVIDIA/trt-llm-disagg-devs
+/cpp/tensorrt_llm/batch_manager/cacheFormatter.h @NVIDIA/trt-llm-disagg-devs
+/cpp/tensorrt_llm/batch_manager/cacheTransBuffer.cpp @NVIDIA/trt-llm-disagg-devs
+/cpp/tensorrt_llm/batch_manager/cacheTransBuffer.h @NVIDIA/trt-llm-disagg-devs
+/cpp/tensorrt_llm/batch_manager/cacheTransceiver.cpp @NVIDIA/trt-llm-disagg-devs
+/cpp/tensorrt_llm/batch_manager/dataTransceiver.cpp @NVIDIA/trt-llm-disagg-devs
+/cpp/tensorrt_llm/batch_manager/dataTransceiver.h @NVIDIA/trt-llm-disagg-devs
+/cpp/tensorrt_llm/batch_manager/dataTransceiverImpl.cpp @NVIDIA/trt-llm-disagg-devs
+/cpp/tensorrt_llm/batch_manager/dataTransceiverImpl.h @NVIDIA/trt-llm-disagg-devs
 
 # The rule below requires that any PR modifying public APIs must be approved by at least one member
 # of the NVIDIA/trt-llm-committed-api-review-committee or NVIDIA/trt-llm-noncommitted-api-review-committee team.
