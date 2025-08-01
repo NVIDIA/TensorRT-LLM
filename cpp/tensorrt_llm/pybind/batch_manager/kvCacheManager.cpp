@@ -90,9 +90,9 @@ public:
         PYBIND11_OVERLOAD_PURE(tbk::KvCacheStats, tbk::BaseKVCacheManager, getKvCacheStats);
     }
 
-    std::optional<SizeType32> addToken(tb::LlmRequest::RequestIdType requestId) override
+    void addToken(tb::LlmRequest::RequestIdType requestId) override
     {
-        PYBIND11_OVERLOAD_PURE(std::optional<SizeType32>, tbk::BaseKVCacheManager, addToken, requestId);
+        PYBIND11_OVERLOAD_PURE(void, tbk::BaseKVCacheManager, addToken, requestId);
     }
 
     void addSequence(tb::LlmRequest::RequestIdType requestId, SizeType32 inputLength, SizeType32 beamWidth,
