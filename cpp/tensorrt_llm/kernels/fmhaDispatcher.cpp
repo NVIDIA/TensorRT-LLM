@@ -36,7 +36,7 @@ QkvLayout AttentionInputLayoutToQkvLayout(AttentionInputLayout layout)
     {
         return QkvLayout::PagedKv;
     }
-    else if (layout == AttentionInputLayout::SEPARATE_QKV)
+    else if (layout == AttentionInputLayout::SEPARATE_Q_K_V)
     {
         return QkvLayout::SeparateQkv;
     }
@@ -152,7 +152,7 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
             maxBlocksPerSeq = pagedKvCache.mMaxBlocksPerSeq;
             numTokensPerBlock = pagedKvCache.mTokensPerBlock;
         }
-        else if (mFixedParams.attentionInputLayout == AttentionInputLayout::SEPARATE_QKV)
+        else if (mFixedParams.attentionInputLayout == AttentionInputLayout::SEPARATE_Q_K_V)
         {
             qkvLayout = kernels::QkvLayout::SeparateQkv;
         }
@@ -189,6 +189,7 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
         // Assume same headDim for Qk and V here.
         tllmRunnerParams.mHeadDimQk = mFixedParams.headSize;
         tllmRunnerParams.mHeadDimV = mFixedParams.headSizeV;
+        tllmRunnerParams.mHeadDimQkNope = mFixedParams.headSizeQkNope;
         tllmRunnerParams.mNumHeadsQ = mFixedParams.numQHeads;
         tllmRunnerParams.mNumHeadsKv = mFixedParams.numKvHeads;
         tllmRunnerParams.mNumHeadsQPerKv = tllmRunnerParams.mNumHeadsQ / tllmRunnerParams.mNumHeadsKv;
@@ -211,26 +212,6 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
         tllmRunnerParams.softmaxStatsPtr = reinterpret_cast<float2*>(runnerParams.softmaxStatsPtr);
         tllmRunnerParams.stream = runnerParams.stream;
 
-        // if (runnerParams.totalQSeqLen < 8192) {
-        //     std::vector<int> cumSeqLensQ(runnerParams.b + 1);
-        //     std::vector<int> cumSeqLensKv(runnerParams.b + 1);
-        //     cudaMemcpy(cumSeqLensQ.data(), runnerParams.cuQSeqLenPtr, (runnerParams.b + 1) * sizeof(int),
-        //     cudaMemcpyDeviceToHost); cudaMemcpy(cumSeqLensKv.data(), runnerParams.cuKvSeqLenPtr, (runnerParams.b + 1)
-        //     * sizeof(int), cudaMemcpyDeviceToHost); std::stringstream ss; for (int i = 0; i < runnerParams.b + 1;
-        //     i++) {
-        //         ss << cumSeqLensQ[i] << " ";
-        //     }
-        //     TLLM_LOG_INFO("cumSeqLensQ: %s", ss.str().c_str());
-        //     ss.str("");
-        //     for (int i = 0; i < runnerParams.b + 1; i++) {
-        //         ss << cumSeqLensKv[i] << " ";
-        //     }
-        //     TLLM_LOG_INFO("cumSeqLensKv: %s", ss.str().c_str());
-        //     TLLM_LOG_INFO("mMaxSeqLenCacheKv: %d, mMaxSeqLenQ: %d, mMaxSeqLenKv: %d",
-        //     tllmRunnerParams.mMaxSeqLenCacheKv, tllmRunnerParams.mMaxSeqLenQ, tllmRunnerParams.mMaxSeqLenKv);
-        //     TLLM_LOG_INFO("mSumOfSeqLensQ: %d, mSumOfSeqLensKv: %d", tllmRunnerParams.mSumOfSeqLensQ,
-        //     tllmRunnerParams.mSumOfSeqLensKv);
-        // }
         mTllmGenFMHARunner->run(tllmRunnerParams);
     }
     else
