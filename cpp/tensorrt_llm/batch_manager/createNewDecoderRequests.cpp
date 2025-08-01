@@ -215,8 +215,7 @@ void setupWords(std::vector<runtime::ITensor::SharedPtr>& jointWordsLists, Tenso
 
 void CreateNewDecoderRequests::newRequest(SizeType32 batchSlot, runtime::decoder_batch::Request const& request,
     SamplingConfig const& samplingConfig, runtime::ModelConfig const& modelConfig,
-    runtime::decoder::DecoderState& decoderState, CudaStream const& runtimeStream, CudaStream const& decoderStream,
-    SizeType32 maxSequenceLength)
+    runtime::decoder::DecoderState& decoderState, CudaStream const& decoderStream, SizeType32 maxSequenceLength)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -249,7 +248,6 @@ void CreateNewDecoderRequests::newRequest(SizeType32 batchSlot, runtime::decoder
     auto& dJointInput = decoderState.getJointDecodingInput();
 
     dJointInput.beamWidths.at(batchSlot) = beamWidth;
-    decoderState.setNumDecodingEngineTokens(batchSlot, numDecodingEngineTokens);
 
     TensorPtr const endIdTensorPtr{ITensor::slice(constPointerCast(dJointInput.endIds), batchSlot, 1)};
     runtime::kernels::invokeFill(*endIdTensorPtr, endId, decoderStream);
@@ -318,15 +316,6 @@ void CreateNewDecoderRequests::newRequest(SizeType32 batchSlot, runtime::decoder
 
         auto beamHypotheses = dJointOutput.beamHypotheses.slice(batchSlot, 1);
         beamHypotheses.init(manager, endId);
-    }
-
-    // Speculative execution
-    if (numDecodingEngineTokens > 1 || decoderState.getSpeculativeDecodingMode().isDraftTokensExternal())
-    {
-        TLLM_CHECK(beamWidth == 1);
-        newRequestSpeculativeDecoding(batchSlot, request, samplingConfig, modelConfig,
-            decoderState.getJointDecodingInput(), decoderState.getJointDecodingOutput(), runtimeStream, decoderStream,
-            decoderState.getSpeculativeDecodingMode(), decoderState.getMaxDecodingEngineTokens());
     }
 
     // fill outputIds with endIds
@@ -608,6 +597,7 @@ CreateNewDecoderRequests::createDecoderRequests(RequestVector const& finishedCon
         auto decoderRequest = decoder_batch::Request{inputView, promptLen, llmReq->mMaxNewTokens, llmReq->mEndId};
 
         llmReq->mSamplingConfig.normalizeLogProbs = mIsNormalizeLogProbs;
+
         if (modelConfig.getSpeculativeDecodingMode().isDraftTokensExternal())
         {
             if (llmReq->hasDraftTokens())
@@ -653,6 +643,7 @@ CreateNewDecoderRequests::createDecoderRequests(RequestVector const& finishedCon
             decoderRequest.eagleConfig
                 = llmReq->getEagleConfig() ? llmReq->getEagleConfig() : decodingConfig.getEagleConfig();
         }
+
         if (llmReq->getEmbeddingBias().has_value())
         {
             decoderRequest.embeddingBias = getEmbeddingBias(logitsType, llmReq->getEmbeddingBias().value());
@@ -671,8 +662,25 @@ CreateNewDecoderRequests::createDecoderRequests(RequestVector const& finishedCon
         }
 
         TLLM_CHECK(llmReq->mSeqSlot.has_value());
-        newRequest(llmReq->mSeqSlot.value(), decoderRequest, llmReq->mSamplingConfig, modelConfig, decoderState,
-            runtimeStream, decoderStream, maxSequenceLength);
+        auto const batchSlot = llmReq->mSeqSlot.value();
+        auto const& samplingConfig = llmReq->mSamplingConfig;
+
+        newRequest(
+            batchSlot, decoderRequest, samplingConfig, modelConfig, decoderState, decoderStream, maxSequenceLength);
+
+        auto const numDecodingEngineTokens = decoderRequest.generatedTokensPerEngineStep;
+        decoderState.setNumDecodingEngineTokens(batchSlot, numDecodingEngineTokens);
+
+        // Speculative execution
+        if (numDecodingEngineTokens > 1 || decoderState.getSpeculativeDecodingMode().isDraftTokensExternal())
+        {
+            auto const beamWidth = samplingConfig.beamWidth;
+            TLLM_CHECK(beamWidth == 1);
+
+            newRequestSpeculativeDecoding(batchSlot, decoderRequest, samplingConfig, modelConfig,
+                decoderState.getJointDecodingInput(), decoderState.getJointDecodingOutput(), runtimeStream,
+                decoderStream, decoderState.getSpeculativeDecodingMode(), decoderState.getMaxDecodingEngineTokens());
+        }
 
         decoderRequests.push_back(decoderRequest);
 
