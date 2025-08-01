@@ -302,25 +302,11 @@ void initializeLogProbs(DecodingOutput& dJointOutput, SizeType32 batchSlot, Samp
 
 void CreateNewDecoderRequests::newRequest(SizeType32 batchSlot, runtime::decoder_batch::Request const& request,
     SamplingConfig const& samplingConfig, runtime::ModelConfig const& modelConfig,
-    runtime::decoder::DecoderState& decoderState, CudaStream const& decoderStream, SizeType32 maxSequenceLength)
+    runtime::decoder::DecoderState& decoderState, CudaStream const& decoderStream)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
-    TLLM_CHECK(batchSlot >= 0);
-
     BufferManager manager{std::make_shared<CudaStream>(decoderStream.get())};
-
-    auto const batchSize = decoderState.getMaxNumSequences();
-    TLLM_CHECK(0 <= batchSize && batchSlot < batchSize);
-
-    auto const inputLength = request.inputLen;
-    auto const numDecodingEngineTokens = request.generatedTokensPerEngineStep;
-
-    // input
-    auto& dJointInput = decoderState.getJointDecodingInput();
-
-    initializeInputLengths(dJointInput, batchSlot, inputLength, request.maxNewTokens,
-        request.generatedTokensPerEngineStep, maxSequenceLength, manager);
 
     // output
     auto& dJointOutput = decoderState.getJointDecodingOutput();
@@ -605,6 +591,8 @@ CreateNewDecoderRequests::createDecoderRequests(RequestVector const& finishedCon
 
         TLLM_CHECK(llmReq->mSeqSlot.has_value());
         auto const batchSlot = llmReq->mSeqSlot.value();
+        auto const batchSize = decoderState.getMaxNumSequences();
+        TLLM_CHECK(0 <= batchSlot && batchSlot < batchSize);
 
         auto const& samplingConfig = llmReq->mSamplingConfig;
 
@@ -617,7 +605,7 @@ CreateNewDecoderRequests::createDecoderRequests(RequestVector const& finishedCon
 
         auto const promptLen = llmReq->getPromptLen();
 
-        auto decoderRequest = decoder_batch::Request{promptLen, llmReq->mMaxNewTokens};
+        auto decoderRequest = decoder_batch::Request{promptLen};
 
         if (modelConfig.getSpeculativeDecodingMode().isDraftTokensExternal())
         {
@@ -644,6 +632,11 @@ CreateNewDecoderRequests::createDecoderRequests(RequestVector const& finishedCon
             decoderRequest.generatedTokensPerEngineStep = modelConfig.getMaxDecodingTokens();
         }
 
+        auto const numDecodingEngineTokens = decoderRequest.generatedTokensPerEngineStep;
+        initializeInputLengths(dJointInput, batchSlot, promptLen, llmReq->mMaxNewTokens, numDecodingEngineTokens,
+            maxSequenceLength, decoderBufferManager);
+        decoderState.setNumDecodingEngineTokens(batchSlot, numDecodingEngineTokens);
+
         initializeEmbeddingBias(
             dJointInput, batchSlot, llmReq->getEmbeddingBias(), logitsType, modelConfig, decoderBufferManager);
 
@@ -653,8 +646,7 @@ CreateNewDecoderRequests::createDecoderRequests(RequestVector const& finishedCon
         setupWords(dJointInput.stopWordsLists, llmReq->getStopWordsList(), dJointInput.stopWordsPtrs,
             dJointInput.stopWordsLens, dJointInput.maxStopWordsLen, batchSlot, decoderBufferManager);
 
-        newRequest(
-            batchSlot, decoderRequest, samplingConfig, modelConfig, decoderState, decoderStream, maxSequenceLength);
+        newRequest(batchSlot, decoderRequest, samplingConfig, modelConfig, decoderState, decoderStream);
 
         auto& dJointOutput = decoderState.getJointDecodingOutput();
 
@@ -675,9 +667,6 @@ CreateNewDecoderRequests::createDecoderRequests(RequestVector const& finishedCon
             initializeBeamSearch(
                 dJointInput, dJointOutput, batchSlot, endId, beamWidth, maxSequenceLength, decoderBufferManager);
         }
-
-        auto const numDecodingEngineTokens = decoderRequest.generatedTokensPerEngineStep;
-        decoderState.setNumDecodingEngineTokens(batchSlot, numDecodingEngineTokens);
 
         // Speculative execution
         if (!decoderState.getSpeculativeDecodingMode().isNone())
