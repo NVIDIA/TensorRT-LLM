@@ -90,6 +90,10 @@ class ModelConfig(Generic[TConfig]):
     # Allow models to select op according to whether CUDA Graphs are used.
     use_cuda_graph: bool = False
 
+    # If true, iterate over sampling_params of each request and use the corresponding sampling strategy.
+    # Currently only used for DeepSeek-MTP.
+    enable_mixed_sampler: bool = False
+
     force_dynamic_quantization: bool = False
 
     extra_attrs: Dict = field(default_factory=dict, repr=False, init=False)
