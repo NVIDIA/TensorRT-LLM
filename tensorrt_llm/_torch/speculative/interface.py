@@ -18,6 +18,7 @@ class SpeculativeDecodingMode(IntEnum):
     DRAFT_TARGET = auto()
     USER_PROVIDED = auto()
     NONE = auto()
+    AUTO = auto()
 
     def is_mtp(self):
         return self == SpeculativeDecodingMode.MTP or self == SpeculativeDecodingMode.MTP_EAGLE

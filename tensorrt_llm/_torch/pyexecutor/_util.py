@@ -453,18 +453,16 @@ def create_py_executor_instance(
 
         num_experts = _try_infer_num_experts(model_engine.model.model_config)
 
-        num_attn_layers = model_binding_config.num_attention_layers()
-        per_layer_kv_heads = [
-            model_binding_config.num_kv_heads(i) for i in range(num_attn_layers)
-        ]
-        num_kv_attention_heads = max(per_layer_kv_heads)
-        if len(set(per_layer_kv_heads)) > 1:
-            # NOTE: This code-path is currently untested and not validated. Can fail!
-            # This support is tracked in TRTLLM-6561
+        num_kv_attention_heads_per_layer = model_binding_config.num_kv_heads_per_layer
+        if max(num_kv_attention_heads_per_layer) != min(
+                num_kv_attention_heads_per_layer):
             logger.warning(
-                f"Non-uniform KV heads per layer detected, using max ({num_kv_attention_heads}) for LoRA. "
-                "This code-path is currently untested and not validated. May fail!"
+                "Defining LORA with per-layer KV heads is not supported for LORA, using the max number of KV heads per layer"
             )
+            num_kv_attention_heads = max(num_kv_attention_heads_per_layer)
+        else:
+            # all layers have the same number of KV heads
+            num_kv_attention_heads = num_kv_attention_heads_per_layer[0]
 
         lora_modules = LoraModule.create_lora_modules(
             lora_module_names=lora_config.lora_target_modules,

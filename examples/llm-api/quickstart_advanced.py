@@ -1,10 +1,10 @@
 import argparse
 
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm.llmapi import (CudaGraphConfig, DraftTargetDecodingConfig,
-                                 EagleDecodingConfig, KvCacheConfig, MoeConfig,
-                                 MTPDecodingConfig, NGramDecodingConfig,
-                                 TorchCompileConfig)
+from tensorrt_llm.llmapi import (AutoDecodingConfig, CudaGraphConfig,
+                                 DraftTargetDecodingConfig, EagleDecodingConfig,
+                                 KvCacheConfig, MoeConfig, MTPDecodingConfig,
+                                 NGramDecodingConfig, TorchCompileConfig)
 
 example_prompts = [
     "Hello, my name is",
@@ -184,6 +184,8 @@ def setup_llm(args, **kwargs):
             is_use_oldest=True,
             is_public_pool=True,
         )
+    elif spec_decode_algo == "AUTO":
+        spec_config = AutoDecodingConfig()
     else:
         spec_config = None
 
