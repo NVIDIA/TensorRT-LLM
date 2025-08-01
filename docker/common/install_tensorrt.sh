@@ -101,7 +101,7 @@ install_rockylinux_requirements() {
     done
 
     # Remove old packages
-    dnf remove -y --noautoremove "libnccl*" "cuda-compat*" "cuda-toolkit*" "libcublas*" "cuda-nvrtc-devel*"
+    # dnf remove -y --noautoremove "libnccl*" "cuda-compat*" "cuda-toolkit*" "libcublas*" "cuda-nvrtc-devel*"
 
     # Install new packages
     dnf -y install \
