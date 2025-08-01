@@ -357,7 +357,7 @@ class QWenForCausalLM(DecoderModelForCausalLM):
                     # Map MoE experts to standard MLP layers for quantization compatibility
                     # Follow the same pattern as other MoE models (only mlp.fc and mlp.proj)
                     "mlp.fc": ["mlp.experts.up_proj", "mlp.experts.gate_proj"],
-                    "mlp.proj": "mlp.experts.down_proj", 
+                    "mlp.proj": "mlp.experts.down_proj",
                     # Standard FC mapping for MoE experts
                     "fc": ["up_proj", "gate_proj"],
                     # Qwen3 normalization layers
