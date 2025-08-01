@@ -36,7 +36,9 @@ using BlockPtr = std::shared_ptr<KVCacheBlock>;
 class KVCacheEventManager
 {
 public:
-    explicit KVCacheEventManager(size_t maxKVEventEntries);
+    explicit KVCacheEventManager(size_t maxKVEventEntries, bool enableAttentionDp = false, std::optional<SizeType32>,
+        attentionDpRank = std::nullopt, std::optional<SizeType32> attentionDpSize = std::nullopt,
+        std::optional<SizeTyp32> ppSize);
 
     ~KVCacheEventManager();
     KVCacheEventManager(KVCacheEventManager& other) = delete;
@@ -91,6 +93,11 @@ private:
     size_t mMaxSize;
     /// @brief An auto-incrementing event id counter
     size_t mEventId;
+    /// @bried Whether this model uses attention DP
+    /// This is used to determine if we need to gather KV cache events
+    bool mEnableAttentionDp{false};
+    std::optional<mMaxSize> mAttentionDpRank;
+    std::optional<mMaxSize> mAttentionDpSize;
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager

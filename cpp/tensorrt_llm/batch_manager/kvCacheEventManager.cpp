@@ -24,12 +24,29 @@ namespace tle = tensorrt_llm::executor;
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
 
-KVCacheEventManager::KVCacheEventManager(size_t maxKVEventEntries)
+KVCacheEventManager::KVCacheEventManager(size_t maxKVEventEntries, std::optional<SizeType32> attentionDpRank,
+    std::optional<SizeType32> attentionDpSize, std::optional<attentionDpSize> ppSize)
     : mRun{true}
     , mMaxSize{maxKVEventEntries}
     , mEventId{0}
+    , mAttentionDpRank{attentionDpRank}
+    , mAttentionDpSize{attentionDpSize}
 {
     TLLM_CHECK(mMaxSize > 0);
+    if (mAttentionDpRank)
+    {
+        TLLM_CHECK_WITH_INFO(
+            mAttentionDpSize.has_value(), "If attention DP rank is set, the attention DP size must also be set");
+        TLLM_CHECK(ppSize.has_value());
+        TLLM_CHECK_WITH_INFO(ppSize.value() == 1, "Events with attention DP are not supported with PP > 1");
+        TLLM_CHECK_WITH_INFO(mAttentionDpRank.value() < mAttentionDpSize.value(),
+            "Attention DP rank must be less than attention DP size");
+    }
+    else
+    {
+        TLLM_CHECK_WITH_INFO(
+            !mAttentionDpSize.has_value(), "If attention DP size is set, the attention DP rank must also be set");
+    }
     // mWorkerThread = std::thread(std::bind(&KVCacheEventManager::worker, this));
     mWorkerThread = std::thread([this]() { this->worker(); });
 };
@@ -45,7 +62,7 @@ KVCacheEventManager::~KVCacheEventManager()
 void KVCacheEventManager::enqueueCreatedEvent(
     std::vector<SizeType32> const& numBlocksPerCacheLevel, SizeType32 windowSize)
 {
-    enqueueEvent({mEventId++, tle::KVCacheCreatedData{numBlocksPerCacheLevel}, windowSize});
+    enqueueEvent({mEventId++, tle::KVCacheCreatedData{numBlocksPerCacheLevel}, windowSize, mAttentionDpRank});
 }
 
 void KVCacheEventManager::enqueueStoredEvent(std::vector<BlockPtr> const& blocks, SizeType32 windowSize)
@@ -65,10 +82,10 @@ void KVCacheEventManager::enqueueStoredEvent(std::vector<BlockPtr> const& blocks
     for (auto const& block : blocks)
     {
         data.blocks.emplace_back(block->getHash(), block->getUniqueTokens(), block->getBlockKey().loraTaskId,
-            block->isPrimary() ? kPrimaryLevel : kSecondaryLevel, block->getPriority());
+            block->isPrimary() ? kPrimaryLevel : kSecondaryLevel, block->getPriority(), mAttentionDpRank);
     }
 
-    enqueueEvent({mEventId++, data, windowSize});
+    enqueueEvent({mEventId++, data, windowSize, mAttentionDpRank});
 }
 
 void KVCacheEventManager::enqueueRemovedEvent(BlockPtr const& block, SizeType32 windowSize)
@@ -87,7 +104,7 @@ void KVCacheEventManager::enqueueRemovedEvent(BlockPtr const& block, SizeType32 
 
 void KVCacheEventManager::enqueueUpdatedEvent(tle::KVCacheUpdatedData const& data, SizeType32 windowSize)
 {
-    enqueueEvent({mEventId++, data, windowSize});
+    enqueueEvent({mEventId++, data, windowSize, mAttentionDpRank});
 }
 
 void KVCacheEventManager::enqueueEvent(tle::KVCacheEvent&& event)
@@ -112,11 +129,46 @@ std::deque<tle::KVCacheEvent> KVCacheEventManager::getEvents(std::optional<std::
     return std::exchange(mEvents, {});
 }
 
+std::vector<char> KVCacheEventManager::serializeEventQueue(std::deque<tle::KVCacheEvent> const& eventQueue)
+{
+    std::vector<char> buffer;
+    for (auto const& event : eventQueue)
+    {
+        auto serialized = event.serialize();
+        buffer.insert(buffer.end(), serialized.begin(), serialized.end());
+    }
+    return buffer;
+}
+
 void KVCacheEventManager::flush()
 {
     auto eventQueue = std::exchange(mEventQueue, {});
+
+    // In case of attention DP, we need to gather the events on rank 0
+    if (mAttentionDpSize && mAttentionDpSize.value() > 1)
+    {
+        auto packed = serializeEventQueue(eventQueue);
+
+        std::vector<std::vector<char>> rankEventQueues(mAttentionDpSize.value());
+        serializedRankEventQueues[mAttentionDpRank.value()] = std::move(packed);
+
+        // Use COMM_SESSION to fill serializedRankEventQueues on rank 0
+
+        // Deserialize the events
+        eventQueue.clear();
+        if (mAttentionDpRank == 0)
+        {
+            for (auto const& serializedRankEventQueue : serializedRankEventQueues)
+            {
+                auto rankEventQueue = deserializeEventQueue(serializedRankEventQueue);
+                eventQueue.insert(eventQueue.end(), rankEventQueue.begin(), rankEventQueue.end());
+            }
+        }
+    }
+
     std::unique_lock<std::mutex> lck(mPendingEventsMutex);
     mPendingEvents.push_back(std::move(eventQueue));
+    // If we have events, we need to notify the worker thread to process them
     mPendingEmptyCV.notify_one();
 }
 
