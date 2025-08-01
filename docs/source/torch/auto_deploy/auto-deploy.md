@@ -77,5 +77,5 @@ We are actively expanding AutoDeploy to support a broader range of model archite
 
 - Speculative Decoding for accelerated generation
 
-To track development progress and contribute, visit our [Github Project Board](https://github.com/orgs/NVIDIA/projects/83).
-We welcome community contributions, see our [`CONTRIBUTING.md`](../../../../../examples/auto_deploy/CONTRIBUTING.md) for guidelines.
+To track development progress and contribute, visit our [Github Project Board](https://github.com/orgs/NVIDIA/projects/83/views/13).
+We welcome community contributions, see `examples/auto_deploy/CONTRIBUTING.md` for guidelines.

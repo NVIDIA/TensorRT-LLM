@@ -1,6 +1,6 @@
-# Example Run Script ([`build_and_run_ad.py`](../../../../../examples/auto_deploy/build_and_run_ad.py))
+# Example Run Script
 
-To build and run AutoDeploy example, use the [`build_and_run_ad.py`](../../../../../examples/auto_deploy/build_and_run_ad.py) script:
+To build and run AutoDeploy example, use `examples/auto_deploy/build_and_run_ad.py` script:
 
 ```bash
 cd examples/auto_deploy
@@ -33,7 +33,7 @@ Below is a non-exhaustive list of common config options:
 | `--prompt.batch-size` | Number of queries to generate |
 | `--benchmark.enabled` | Whether to run the built-in benchmark (true/false) |
 
-For default values and additional configuration options, refer to the `ExperimentConfig` class in [build_and_run_ad.py](../../../../../examples/auto_deploy/build_and_run_ad.py) file.
+For default values and additional configuration options, refer to the `ExperimentConfig` class in `examples/auto_deploy/build_and_run_ad.py` file.
 
 Here is a more complete example of using the script:
 
