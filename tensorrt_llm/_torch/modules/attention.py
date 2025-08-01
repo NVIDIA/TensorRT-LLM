@@ -357,6 +357,7 @@ def fp8_block_scaling_bmm_out(
     mat2_fp8: torch.Tensor,
     mat2_scale: torch.Tensor,
     out: torch.Tensor,
+    mat2_dequant: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     sm_version = get_sm_version()
     if sm_version == 90 or sm_version == 89:
@@ -365,30 +366,33 @@ def fp8_block_scaling_bmm_out(
         torch.ops.trtllm.fp8_block_scaling_bmm_out(mat1_fp8, mat2_fp8,
                                                    mat1_scale, mat2_scale, out)
     elif sm_version == 100:
-        low_latency = True
-        use_deep_seek_fp8 = True
-        tile_size = 8
-        epilogue_tile_m = 64 if use_deep_seek_fp8 else 128
-        m_size = mat1.shape[0]
-        if m_size % tile_size != 0:
-            tiled_shape = ((m_size + tile_size - 1) // tile_size) * tile_size
-            mat1 = torch.nn.functional.pad(
-                mat1, (0, 0, 0, 0, 0, tiled_shape - m_size), "constant", 0)
+        output = torch.bmm(mat1.transpose(0, 1), mat2_dequant.transpose(1, 2))
+        out.copy_(output)
 
-        mat1_fp8, mat1_scale = torch.ops.trtllm.fp8_batched_quantize_1x128_permute102(
-            mat1)
-        output, output_sf = torch.ops.trtllm.fp8_batched_gemm_trtllmgen(
-            mat1_fp8,
-            mat2_fp8,
-            tile_size=tile_size,
-            epilogue_tile_m=epilogue_tile_m,
-            use_deep_seek_fp8=use_deep_seek_fp8,
-            low_latency=low_latency,
-            dq_sfs_a=mat1_scale.reshape(mat1.shape[-1] // 128, -1),
-            dq_sfs_b=mat2_scale,
-            out_dtype=out.dtype,
-        )
-        out.copy_(output[:, :m_size])
+        # low_latency = True
+        # use_deep_seek_fp8 = True
+        # tile_size = 8
+        # epilogue_tile_m = 64 if use_deep_seek_fp8 else 128
+        # m_size = mat1.shape[0]
+        # if m_size % tile_size != 0:
+        #     tiled_shape = ((m_size + tile_size - 1) // tile_size) * tile_size
+        #     mat1 = torch.nn.functional.pad(
+        #         mat1, (0, 0, 0, 0, 0, tiled_shape - m_size), "constant", 0)
+
+        # mat1_fp8, mat1_scale = torch.ops.trtllm.fp8_batched_quantize_1x128_permute102(
+        #     mat1)
+        # output, output_sf = torch.ops.trtllm.fp8_batched_gemm_trtllmgen(
+        #     mat1_fp8,
+        #     mat2_fp8,
+        #     tile_size=tile_size,
+        #     epilogue_tile_m=epilogue_tile_m,
+        #     use_deep_seek_fp8=use_deep_seek_fp8,
+        #     low_latency=low_latency,
+        #     dq_sfs_a=mat1_scale.reshape(mat1.shape[-1] // 128, -1),
+        #     dq_sfs_b=mat2_scale,
+        #     out_dtype=out.dtype,
+        # )
+        # out.copy_(output[:, :m_size])
     else:
         raise NotImplementedError(f"SM{sm_version} is not supported")
 
@@ -676,6 +680,8 @@ class MLA(nn.Module):
             requires_grad=False,
         )
 
+        self.k_b_proj_trans_dequant = None
+        self.v_b_proj_dequant = None
         if has_fp8_block_scales:
             self.k_b_proj_trans_scale = nn.Parameter(
                 torch.empty(
@@ -701,6 +707,23 @@ class MLA(nn.Module):
                 ),
                 requires_grad=False,
             )
+            if get_sm_version() == 100:
+                assert self.dtype == torch.bfloat16
+                self.k_b_proj_trans_dequant = nn.Parameter(
+                    torch.empty(
+                        (self.num_heads, self.kv_lora_rank,
+                         self.qk_nope_head_dim),
+                        dtype=self.dtype,
+                    ),
+                    requires_grad=False,
+                )
+                self.v_b_proj_dequant = nn.Parameter(
+                    torch.empty(
+                        (self.num_heads, self.v_head_dim, self.kv_lora_rank),
+                        dtype=self.dtype,
+                    ),
+                    requires_grad=False,
+                )
         else:
             self.k_b_proj_trans_scale = None
             self.v_b_proj_scale = None
@@ -1197,8 +1220,13 @@ class MLA(nn.Module):
             # [num_heads, num_tokens, self.kv_lora_rank]
             q_nope_out = fused_q[..., :self.kv_lora_rank].transpose(0, 1)
 
-            fp8_block_scaling_bmm_out(q_nope, self.k_b_proj_trans,
-                                      self.k_b_proj_trans_scale, q_nope_out)
+            fp8_block_scaling_bmm_out(
+                q_nope,
+                self.k_b_proj_trans,
+                self.k_b_proj_trans_scale,
+                q_nope_out,
+                self.k_b_proj_trans_dequant,
+            )
         else:
             raise NotImplementedError(
                 f"Missing bmm impl for dtype: {self.k_b_proj_trans.dtype}.")
@@ -1247,9 +1275,13 @@ class MLA(nn.Module):
                                      self.v_b_proj.transpose(1, 2),
                                      attn_output.transpose(0, 1))
         elif self.v_b_proj.dtype == torch.float8_e4m3fn:
-            fp8_block_scaling_bmm_out(attn_out_latent, self.v_b_proj,
-                                      self.v_b_proj_scale,
-                                      attn_output.transpose(0, 1))
+            fp8_block_scaling_bmm_out(
+                attn_out_latent,
+                self.v_b_proj,
+                self.v_b_proj_scale,
+                attn_output.transpose(0, 1),
+                self.v_b_proj_dequant,
+            )
         else:
             raise NotImplementedError(
                 f"Missing bmm impl for dtype: {self.v_b_proj.dtype}.")
