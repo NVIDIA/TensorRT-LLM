@@ -109,18 +109,19 @@ class GenerationExecutor(ABC):
         pass
 
     def generate_async(
-        self,
-        prompt_token_ids: List[int],
-        sampling_params: SamplingParams,
-        query_token_ids: Optional[Union[torch.Tensor, np.ndarray, list]] = None,
-        lora_request: Optional[LoRARequest] = None,
-        prompt_adapter_request: Optional[PromptAdapterRequest] = None,
-        streaming: bool = False,
-        kv_cache_retention_config: Optional[KvCacheRetentionConfig] = None,
-        disaggregated_params: Optional[DisaggregatedParams] = None,
-        postproc_params: Optional[PostprocParams] = None,
-        multimodal_params: Optional[MultimodalParams] = None,
-    ) -> GenerationResult:
+            self,
+            prompt_token_ids: List[int],
+            sampling_params: SamplingParams,
+            query_token_ids: Optional[Union[torch.Tensor, np.ndarray,
+                                            list]] = None,
+            lora_request: Optional[LoRARequest] = None,
+            prompt_adapter_request: Optional[PromptAdapterRequest] = None,
+            streaming: bool = False,
+            kv_cache_retention_config: Optional[KvCacheRetentionConfig] = None,
+            disaggregated_params: Optional[DisaggregatedParams] = None,
+            postproc_params: Optional[PostprocParams] = None,
+            multimodal_params: Optional[MultimodalParams] = None,
+            return_perf_metrics: bool = False) -> GenerationResult:
         """Generate output for the given prompt token ids in the asynchronous mode.
         Asynchronous generation accepts single prompt only.
         """
@@ -142,7 +143,8 @@ class GenerationExecutor(ABC):
             streaming=streaming,
             kv_cache_retention_config=kv_cache_retention_config,
             disaggregated_params=disaggregated_params,
-            multimodal_params=multimodal_params)
+            multimodal_params=multimodal_params,
+            return_perf_metrics=return_perf_metrics)
         result = self.submit(request)
         # release memory in time
         if hasattr(request, "multimodal_params"):

@@ -1423,6 +1423,13 @@ def test_openai_reasoning(llm_root, llm_venv, backend: str):
     ])
 
 
+def test_openai_prometheus(llm_root, llm_venv):
+    test_root = unittest_path() / "llmapi" / "apps"
+    llm_venv.run_cmd(
+        ["-m", "pytest",
+         str(test_root / "_test_openai_prometheus.py")])
+
+
 def test_openai_lora(llm_root, llm_venv):
     test_root = unittest_path() / "llmapi" / "apps"
     llm_venv.run_cmd(["-m", "pytest", str(test_root / "_test_openai_lora.py")])
