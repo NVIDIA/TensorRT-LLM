@@ -292,10 +292,21 @@ class PyExecutor:
                     "KV Cache Connector is not supported with overlap scheduler."
                 )
 
-            kv_cache_data = self.kv_cache_manager.get_kv_cache_connector_pools_data(
-            )
+            # TODO: This does NOT support pipeline parallel.
+            layer_kv_tensors = {
+                layer_idx: self.kv_cache_manager.get_buffers(layer_idx)
+                for layer_idx in self.kv_cache_manager.pp_layers
+            }
 
-            self.kv_connector_manager.worker.register_kv_caches(kv_cache_data)
+            kv_shape = layer_kv_tensors[list(layer_kv_tensors.keys())[0]].shape
+
+            if not all(t.shape == kv_shape for t in layer_kv_tensors.values()):
+                return ValueError(
+                    "KV Cache Connector is not supported with Variable sliding window attention!"
+                )
+
+            self.kv_connector_manager.worker.register_kv_caches(
+                layer_kv_tensors)
 
             # For each of our layers, we need to register the pre/post hooks.
             # These are used for methods like `wait_for_layer_load` and `save_kv_layer`.

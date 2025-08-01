@@ -31,56 +31,6 @@ using RequestIdType = tensorrt_llm::batch_manager::LlmRequest::RequestIdType;
 namespace tensorrt_llm::batch_manager::kv_connector
 {
 
-class KvCacheConnectorPoolData
-{
-public:
-    KvCacheConnectorPoolData(runtime::ITensor::SharedPtr poolTensor, SizeType32 numBlocks)
-        : mPoolTensor(std::move(poolTensor))
-        , mNumBlocks(numBlocks)
-    {
-    }
-
-    runtime::ITensor::SharedPtr const& getPoolTensor() const
-    {
-        return mPoolTensor;
-    }
-
-    SizeType32 getNumBlocks() const
-    {
-        return mNumBlocks;
-    }
-
-private:
-    runtime::ITensor::SharedPtr mPoolTensor;
-    SizeType32 mNumBlocks;
-};
-
-/// @brief Data used to provide the KV cache tensors to the connector worker for all the pools.
-class KvCacheConnectorPoolsData
-{
-public:
-    explicit KvCacheConnectorPoolsData(
-        std::vector<KvCacheConnectorPoolData>& poolsData, std::vector<SizeType32>& layerToPoolMapping)
-        : mPoolsData(poolsData)
-        , mLayerToPoolMapping(layerToPoolMapping)
-    {
-    }
-
-    std::vector<KvCacheConnectorPoolData>& getPoolsData()
-    {
-        return mPoolsData;
-    }
-
-    std::vector<SizeType32>& getLayerToPoolMapping()
-    {
-        return mLayerToPoolMapping;
-    }
-
-private:
-    std::vector<KvCacheConnectorPoolData> mPoolsData;
-    std::vector<SizeType32> mLayerToPoolMapping;
-};
-
 /// @brief The KV connector manager. This is passed into the C++ KV Cache Manager when adding sequences.
 class KvCacheConnectorManager
 {
