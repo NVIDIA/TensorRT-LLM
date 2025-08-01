@@ -36,9 +36,9 @@ Welcome to TensorRT-LLM's Documentation!
    :maxdepth: 2
    :caption: CLI Reference
 
-   1.0/cli-reference/trtllm-serve.md
    1.0/cli-reference/trtllm-bench.rst
    1.0/cli-reference/trtllm-eval.md
+   1.0/cli-reference/trtllm-serve/index
 
 
 .. toctree::
