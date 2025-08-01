@@ -257,22 +257,24 @@ void initRequestBindings(pybind11::module_& m)
         .def(py::pickle(promptTuningConfigGetstate, promptTuningConfigSetstate));
 
     auto loraConfigGetstate = [](tle::LoraConfig const& self)
-    { return py::make_tuple(self.getTaskId(), self.getWeights(), self.getConfig()); };
+    { return py::make_tuple(self.getTaskId(), self.getWeights(), self.getConfig(), self.getPath()); };
     auto loraConfigSetstate = [](py::tuple const& state)
     {
-        if (state.size() != 3)
+        if (state.size() != 4)
         {
             throw std::runtime_error("Invalid LoraConfig state!");
         }
-        return tle::LoraConfig(
-            state[0].cast<IdType>(), state[1].cast<std::optional<Tensor>>(), state[2].cast<std::optional<Tensor>>());
+        return tle::LoraConfig(state[0].cast<IdType>(), state[1].cast<std::optional<Tensor>>(),
+            state[2].cast<std::optional<Tensor>>(), state[3].cast<std::optional<std::string>>());
     };
     py::class_<tle::LoraConfig>(m, "LoraConfig")
-        .def(py::init<uint64_t, std::optional<Tensor>, std::optional<Tensor>>(), py::arg("task_id"),
-            py::arg("weights") = py::none(), py::arg("config") = py::none())
+        .def(py::init<uint64_t, std::optional<Tensor>, std::optional<Tensor>, std::optional<std::string>>(),
+            py::arg("task_id"), py::arg("weights") = py::none(), py::arg("config") = py::none(),
+            py::arg("path") = py::none())
         .def_property_readonly("task_id", &tle::LoraConfig::getTaskId)
         .def_property_readonly("weights", &tle::LoraConfig::getWeights)
         .def_property_readonly("config", &tle::LoraConfig::getConfig)
+        .def_property_readonly("path", &tle::LoraConfig::getPath)
         .def(py::pickle(loraConfigGetstate, loraConfigSetstate));
 
     auto multimodalInputGetstate = [](tle::MultimodalInput const& self)
