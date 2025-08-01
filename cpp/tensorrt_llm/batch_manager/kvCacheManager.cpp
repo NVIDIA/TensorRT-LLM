@@ -920,50 +920,6 @@ void BlockManager::setOffsets(tk::KVCacheIndex* offsetsPtr, nvinfer1::Dims const
     mWindowBlockManagers.at(windowSize).setOffsets(offsetsPtr, offsetsShape, beamIdx, blockIdx, blockId);
 }
 
-void WindowBlockManager::addBlockToHashMap(BlockPtr const& block)
-{
-    if (!mEnableHashKey)
-    {
-        return;
-    }
-    auto range = mContextBlocksByHash.equal_range(block->getHash());
-    for (auto it = range.first; it != range.second; ++it)
-    {
-        if (it->second == block)
-        {
-            // TODO: change to assert when reused block is added only once
-            TLLM_LOG_TRACE(
-                "Block %d by %zx exists", block->getBlockId(), block->getHash(), mContextBlocksByHash.size());
-            return;
-        }
-    }
-    TLLM_LOG_TRACE(
-        "Add block %d by %zx, block n = %zu", block->getBlockId(), block->getHash(), mContextBlocksByHash.size());
-    mContextBlocksByHash.emplace(block->getHash(), std::move(block));
-}
-
-void WindowBlockManager::removeBlockFromHashMap(BlockPtr const& block)
-{
-    if (mContextBlocksByHash.empty() || block->getBlockKey().uniqueTokens.empty())
-    {
-        // Hash key not enabled / Empty block
-        return;
-    }
-    auto range = mContextBlocksByHash.equal_range(block->getHash());
-    TLLM_LOG_TRACE(
-        "Remove block %d by %zx, block n = %zu", block->getBlockId(), block->getHash(), mContextBlocksByHash.size());
-    for (auto it = range.first; it != range.second; ++it)
-    {
-        if (it->second == block)
-        {
-            mContextBlocksByHash.erase(it);
-            return;
-        }
-    }
-    // TODO: should be unreachable
-    TLLM_LOG_DEBUG("Trying to remove block %d by %zx that is not in hash map", block->getBlockId(), block->getHash());
-}
-
 void BlockManager::onboardBlock(BlockPtr const& offloadBlock, SizeType32 windowSize)
 {
     mWindowBlockManagers.at(windowSize).onboardBlock(offloadBlock);
@@ -1104,7 +1060,6 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const&
                         matchingBlock, perBlockRetentions[bi].retentionPriority, perBlockRetentions[bi].durationMs);
                     TLLM_LOG_DEBUG("%s::loadOrAllocateBlocks - Reused partially filled block %d", mLogPrefix.c_str(),
                         matchingBlockId);
-                    addBlockToHashMap(matchingBlock);
                 }
                 searchRoot = nullptr; // no matching needed for following blocks
             }
@@ -1114,7 +1069,6 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const&
                 mEvictionPolicy->claimBlock(
                     matchingBlock, perBlockRetentions[bi].retentionPriority, perBlockRetentions[bi].durationMs);
                 TLLM_LOG_DEBUG("%s::loadOrAllocateBlocks - Matched full block %d", mLogPrefix.c_str(), matchingBlockId);
-                addBlockToHashMap(matchingBlock);
                 searchRoot = matchingBlock;
             }
             onboardBlock(matchingBlock);
@@ -1145,7 +1099,6 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const&
                 ++blockItr;
             }
             freeBlock->setHash();
-            addBlockToHashMap(freeBlock);
             ++mMissedBlocks;
         }
     }
@@ -1169,7 +1122,6 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const&
                 ++blockItr;
             }
             freeBlock->setHash();
-            addBlockToHashMap(freeBlock);
             TLLM_LOG_DEBUG("%s::loadOrAllocateBlocks - Beam %d. Allocated non-shared block %d for bi %d",
                 mLogPrefix.c_str(), beamIdx, freeBlock->getBlockId(), bi);
         }
@@ -1369,9 +1321,7 @@ void WindowBlockManager::storeBlocks(
             if (oldHash != newHash)
             {
                 TLLM_LOG_DEBUG("#%d block hash %zx -> %zx", block->getBlockId(), oldHash, newHash);
-                removeBlockFromHashMap(block);
                 block->setHash(newHash);
-                addBlockToHashMap(block);
             }
             searchRoot = block;
         }
@@ -1408,7 +1358,6 @@ void WindowBlockManager::replaceSharedBlock(GenerationRequest& sequence, SizeTyp
         if (!block->hasRefs())
         {
             mEvictionPolicy->releaseBlock(block);
-            removeBlockFromHashMap(block);
         }
     }
 
@@ -1473,7 +1422,6 @@ void WindowBlockManager::releaseLastBlock(GenerationRequest& sequence)
     if (!block->hasRefs())
     {
         mEvictionPolicy->releaseBlock(block, true);
-        removeBlockFromHashMap(block);
     }
     // Remove block from allocated blocks
     allocatedBlocks.pop_back();
@@ -1616,7 +1564,6 @@ void WindowBlockManager::releaseBlocks(GenerationRequest& sequence)
         if (!block->hasRefs())
         {
             mEvictionPolicy->releaseBlock(block);
-            removeBlockFromHashMap(block);
         }
     }
     // Remove stored block ids in sequence
@@ -2106,7 +2053,6 @@ void KVCacheManager::addSequence(
                         block->setBlockKey({}, false);
                     }
                     block->setHash();
-                    mBlockManager.addBlockToHashMap(block, windowSize);
                 }
             }
         }

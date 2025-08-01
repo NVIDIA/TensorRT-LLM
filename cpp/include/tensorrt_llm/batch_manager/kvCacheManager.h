@@ -633,11 +633,6 @@ public:
         return mAllBlocksById.at(blockId);
     }
 
-    [[nodiscard]] BlockMapIterRange getBlocksByHash(size_t hash) const
-    {
-        return mContextBlocksByHash.equal_range(hash);
-    }
-
     [[nodiscard]] SizeType32 getTokensPerBlock() const noexcept
     {
         return mTokensPerBlock;
@@ -723,10 +718,6 @@ public:
     //! \param blockIds Id of each block.
     void storeBlocks(std::vector<BlockKey> const& blockKeys, std::vector<KVCacheBlock::IdType> const& blockIds);
 
-    void addBlockToHashMap(BlockPtr const& block);
-
-    void removeBlockFromHashMap(BlockPtr const& block);
-
     [[nodiscard]] bool verifyQueueIntegrity();
 
     // Only needed when sliding window attention + paged context fmha are used together.
@@ -808,8 +799,6 @@ private:
     SizeType32 mTokensPerBlock;
     // List of all blocks by idx
     std::vector<BlockPtr> mAllBlocksById;
-    // List of all context blocks by hash
-    BlockMap mContextBlocksByHash;
     // Dummy block acting as root for BlockToken searches
     BlockPtr mCachedBlocksRoot;
     // KV cache type (self or cross)
@@ -1081,11 +1070,6 @@ public:
         return mWindowBlockManagers.at(windowSize).getBlockById(blockId);
     }
 
-    [[nodiscard]] WindowBlockManager::BlockMapIterRange getBlocksByHash(size_t hash, SizeType32 windowSize) const
-    {
-        return mWindowBlockManagers.at(windowSize).getBlocksByHash(hash);
-    }
-
     [[nodiscard]] SizeType32 getNumPrimaryBlocks() const
     {
         return sumWindows([](auto const& manager) { return manager.getNumPrimaryBlocks(); });
@@ -1094,16 +1078,6 @@ public:
     [[nodiscard]] bool containsBlockScales(SizeType32 poolIdx) const
     {
         return getPool(poolIdx).containsBlockScales;
-    }
-
-    void addBlockToHashMap(BlockPtr const& block, SizeType32 windowSize)
-    {
-        mWindowBlockManagers.at(windowSize).addBlockToHashMap(block);
-    }
-
-    void removeBlockFromHashMap(BlockPtr const& block, SizeType32 windowSize)
-    {
-        mWindowBlockManagers.at(windowSize).removeBlockFromHashMap(block);
     }
 
     //! \brief Store context blocks
