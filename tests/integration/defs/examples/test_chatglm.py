@@ -18,12 +18,20 @@ import shutil
 
 import pytest
 from defs.common import convert_weights, venv_check_call
+from defs.conftest import get_sm_version, skip_post_blackwell
 from defs.trt_test_alternative import check_call, exists
+
+# skip trt flow cases on post-Blackwell-Ultra
+if get_sm_version() >= 103:
+    pytest.skip(
+        "TRT workflow tests are not supported on post Blackwell-Ultra architecture",
+        allow_module_level=True)
 
 
 # TODO: add more test case for input_padding, paged_kv_cache, num_beams
 @pytest.mark.skip_less_device_memory(24000)
-@pytest.mark.parametrize("use_weight_only", [True, False],
+@pytest.mark.parametrize("use_weight_only",
+                         [pytest.param(True, marks=skip_post_blackwell), False],
                          ids=["enable_weight_only", "disable_weight_only"])
 @pytest.mark.parametrize("llm_glm_4_9b_model_root",
                          ["glm-4-9b", "glm-4-9b-chat"],

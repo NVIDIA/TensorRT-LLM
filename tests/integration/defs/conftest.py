@@ -1892,6 +1892,10 @@ skip_post_blackwell = pytest.mark.skipif(
     get_sm_version() >= 100,
     reason="This test is not supported in post-Blackwell architecture")
 
+skip_post_blackwell_ultra = pytest.mark.skipif(
+    get_sm_version() >= 103,
+    reason="This test is not supported in post-Blackwell-Ultra architecture")
+
 skip_device_contain_gb200 = pytest.mark.skipif(
     check_device_contain(["GB200"]),
     reason="This test is not supported on GB200 or GB100")
