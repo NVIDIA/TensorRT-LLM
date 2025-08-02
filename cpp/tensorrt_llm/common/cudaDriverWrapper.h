@@ -155,6 +155,16 @@ void checkDriver(
     }
 }
 
+template <typename T>
+void checkDriverExitSafe(T result, char const* const func, char const* const file, int const line)
+{
+    if (result != CUDA_SUCCESS && result != CUDA_ERROR_DEINITIALIZED)
+    {
+        throw TllmException(
+            file, line, fmtstr("[TensorRT-LLM][ERROR] CUDA driver error in %s: %d.", func, result).c_str());
+    }
+}
+
 } // namespace tensorrt_llm::common
 
 /*
@@ -165,6 +175,13 @@ void checkDriver(
     {                                                                                                                  \
         tensorrt_llm::common::checkDriver(                                                                             \
             (stat), *tensorrt_llm::common::CUDADriverWrapper::getInstance(), #stat, __FILE__, __LINE__);               \
+    } while (0)
+
+// Avoid using CUDADriverWrapper when freeing resource, during which the global instance may already be freed.
+#define TLLM_CU_CHECK_FREE_RESOURCE(stat)                                                                              \
+    do                                                                                                                 \
+    {                                                                                                                  \
+        tensorrt_llm::common::checkDriverExitSafe((stat), #stat, __FILE__, __LINE__);                                  \
     } while (0)
 
 #endif // CUDA_DRIVER_WRAPPER_H
