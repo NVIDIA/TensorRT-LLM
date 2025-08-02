@@ -296,7 +296,7 @@ class PyExecutor:
             kv_shape = layer_kv_tensors[list(layer_kv_tensors.keys())[0]].shape
 
             if not all(t.shape == kv_shape for t in layer_kv_tensors.values()):
-                return ValueError(
+                raise ValueError(
                     "KV Cache Connector is not supported with Variable sliding window attention!"
                 )
 
@@ -952,7 +952,7 @@ class PyExecutor:
             self.guided_decoder.build(scheduled_batch)
             self.guided_decoder.execute(scheduled_batch, logits)
 
-    def _execute_kv_connector(self, scheduled_batch):
+    def _handle_kv_connector(self, scheduled_batch):
         if self.kv_connector_manager:
             self.kv_connector_manager.take_scheduled_requests_pending_load(
                 scheduled_batch)
@@ -1001,7 +1001,7 @@ class PyExecutor:
                         self.guided_decoder.init_disagg_gen_requests(
                             scheduled_batch)
 
-                    self._execute_kv_connector(scheduled_batch)
+                    self._handle_kv_connector(scheduled_batch)
 
                 if scheduled_batch.batch_size > 0 or (
                         self.enable_attention_dp and self.dist.tp_size > 1):
@@ -1109,7 +1109,7 @@ class PyExecutor:
                             scheduled_batch)
                     self.resource_manager.prepare_resources(scheduled_batch)
 
-                    self._execute_kv_connector(scheduled_batch)
+                    self._handle_kv_connector(scheduled_batch)
 
                 if scheduled_batch.batch_size > 0:
 

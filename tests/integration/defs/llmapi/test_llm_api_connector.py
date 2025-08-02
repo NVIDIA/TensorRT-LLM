@@ -15,7 +15,6 @@
 
 import math
 import os
-import sys
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -23,24 +22,6 @@ import pytest
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.models.modeling_utils import KvCacheConnectorConfig
-
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-
-KvConnectorScheduler = MagicMock()
-KvConnectorWorker = MagicMock()
-
-
-def init_connector_classes():
-    KvConnectorScheduler.reset_mock()
-    KvConnectorWorker.reset_mock()
-
-    scheduler = MagicMock()
-    worker = MagicMock()
-
-    KvConnectorScheduler.return_value = scheduler
-    KvConnectorWorker.return_value = worker
-
-    return scheduler, worker
 
 
 @pytest.fixture(scope="function")
