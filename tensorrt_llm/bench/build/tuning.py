@@ -56,10 +56,32 @@ def calc_engine_setting(
     # Each GPU in TP group has at least 1 kv head
     adjusted_num_kv_heads = max(tp_size, model_config.num_key_value_heads)
 
+    # Total sequence length.
+    target_seq_len = target_input_len + target_output_len
+
     logger.info(
         f"Number of attention layers: {model_config.num_attention_layers}")
 
-    gb_per_token = 2 * model_config.num_attention_layers * adjusted_num_kv_heads \
+    attention_window_sizes = model_config.max_attention_window_sizes
+    window_size_to_layers = {}
+    if attention_window_sizes is None:
+        # Vanila attention models.
+        # Set window_size by the total length target sequence.
+        window_size_to_layers[target_seq_len] = list(
+            range(model_config.num_attention_layers))
+    else:
+        # Sliding window models
+        for layer_idx in range(model_config.num_attention_layers):
+            pattern_idx = layer_idx % len(attention_window_sizes)
+            window_size = attention_window_sizes[pattern_idx]
+            if window_size not in window_size_to_layers:
+                window_size_to_layers[window_size] = []
+            window_size_to_layers[window_size].append(layer_idx)
+
+    logger.debug(f'Window size to layers: {window_size_to_layers}')
+
+    # Length of cache can be different across layers when VSWA is applied.
+    size_per_token_per_layer_in_gb = 2 * adjusted_num_kv_heads \
         * model_config.head_size * byte_per_kv_elem / (1024 ** 3)
 
     # Number of GPU used for this run.
@@ -74,21 +96,37 @@ def calc_engine_setting(
                 f"{available_memory:.2f} GB")
 
     # Calculate max requests in KV cache based on target ISL and OSL.
-    target_seq_len = target_input_len + target_output_len
     cache_memory = available_memory * model_config.cache_memory_fraction(
         kv_cache_gpu_mem_fraction)
     gb_per_extra_cache = model_config.extra_model_cache_in_gb(
         BYTES_PER_ELEM.get(QuantAlgo.NO_QUANT), target_seq_len)
-    kv_cache_max_requests = cache_memory / (gb_per_token * target_seq_len +
+
+    # Calculate the total cache size for a sequence of length target_seq_len.
+    total_cache_size = 0
+    for window_size, layers in window_size_to_layers.items():
+        num_layers = len(layers)
+        size_per_token = size_per_token_per_layer_in_gb * num_layers
+        total_cache_size += size_per_token * min(window_size, target_seq_len)
+        logger.debug(
+            f'KV Cache size[window_size={window_size}]: {size_per_token * min(window_size, target_seq_len)} GiB'
+        )
+    logger.debug(f'Total KV Cache Size per seq: {total_cache_size} GiB')
+    logger.debug(f'Extra Cache Size per seq: {gb_per_extra_cache} GiB')
+
+    kv_cache_max_requests = cache_memory / (total_cache_size +
                                             gb_per_extra_cache)
     extra_cache_memory = gb_per_extra_cache * kv_cache_max_requests
     kv_cache_memory = cache_memory - extra_cache_memory
-    kv_cache_max_tokens = kv_cache_memory / gb_per_token
 
     logger.info(
         f"Estimated total cache memory: {cache_memory:.2f} GB. KV cache: {kv_cache_memory:.2f} GB, Extra cache: {extra_cache_memory:.2f} GB"
     )
-    logger.info(f"Estimated kv cache max tokens: {kv_cache_max_tokens:.2f}")
+    if attention_window_sizes is None:
+        # For VSWA cases, cache pool is split per window_size, so that
+        # Calculating max_tokens is incorrect and not informative.
+        size_per_token = size_per_token_per_layer_in_gb * model_config.num_attention_layers
+        kv_cache_max_tokens = kv_cache_memory / size_per_token
+        logger.info(f"Estimated kv cache max tokens: {kv_cache_max_tokens:.2f}")
     logger.info("Estimated max number of requests in KV cache memory: "
                 f"{kv_cache_max_requests:.2f}")
 
