@@ -7,6 +7,7 @@ set(SRCS
     batch_manager/algorithms.cpp
     batch_manager/bindings.cpp
     batch_manager/cacheTransceiver.cpp
+    batch_manager/kvCacheConnector.cpp
     batch_manager/kvCacheManager.cpp
     batch_manager/llmRequest.cpp
     executor/bindings.cpp

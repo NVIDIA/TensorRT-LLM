@@ -15,6 +15,7 @@ from tensorrt_llm.sampling_params import SamplingParams
 from ..._utils import binding_dtype_size, nvtx_range
 from ...logger import logger
 from ...mapping import Mapping
+from .connector import KvCacheConnectorManager, SchedulerOutput
 from .llm_request import (LlmRequest, LlmRequestState, SamplingConfig,
                           get_draft_token_length)
 from .scheduler import ScheduledRequests
@@ -131,6 +132,7 @@ class KVCacheManager(BaseResourceManager):
         max_num_tokens: int = 8192,
         model_config: Optional[ModelConfig] = None,
         max_beam_width: int = 1,
+        kv_connector_manager: Optional[KvCacheConnectorManager] = None,
     ) -> None:
         self.mapping = mapping
         self.dtype = dtype
@@ -146,6 +148,8 @@ class KVCacheManager(BaseResourceManager):
             idx: offset
             for offset, idx in enumerate(self.pp_layers)
         }
+
+        self.kv_connector_manager = kv_connector_manager
 
         tp_size = mapping.tp_size
         if mapping.enable_attention_dp:
@@ -357,6 +361,10 @@ class KVCacheManager(BaseResourceManager):
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         context_batch = scheduled_batch.context_requests
         generation_batch = scheduled_batch.generation_requests
+
+        # Build the scheduler output for the connector.
+        scheduler_output = SchedulerOutput()
+
         # allocate KV Cache
         for req in context_batch:
             req_beam_width = req.sampling_config.beam_width
@@ -369,20 +377,68 @@ class KVCacheManager(BaseResourceManager):
                         req.py_request_id,
                         seq_len + (len(req.query_id) if self.mapping.cp_rank
                                    == self.mapping.cp_size - 1 else 0),
-                        req_beam_width, req)
+                        req_beam_width, req, self.kv_connector_manager)
             else:
-                if req.is_first_context_chunk:
+                # TODO(jthomson04): This is begging for a mega refactor, and can likely be significantly simplified.
+                # In add sequence, the connector API's get_num_new_matched_tokens is called.
+                # The result of this call may be that blocks will be loaded asynchronously.
+                # If so, we set the is_kv_cache_connector_async_onboard flag, and set the request state to be DISAGG_GENERATION_TRANS_IN_PROGRESS.
+                # When the async load is complete, we set the request state back to CONTEXT_INIT.
+                # When that happens, the request will go through this same code path, but with is_kv_cache_connector_async_onboard set to True.
+                # Because of this, we need to filter this case out to avoid adding the same sequence twice.
+                if req.is_first_context_chunk and not req.is_kv_cache_connector_async_onboard:
                     self.impl.add_sequence(req.py_request_id, req.prompt_len,
-                                           req_beam_width, req)
+                                           req_beam_width, req,
+                                           self.kv_connector_manager)
                     for _ in range(self.num_extra_kv_tokens):
                         self.impl.add_token(req.py_request_id)
                     for _ in range(get_draft_token_length(req)):
                         self.impl.add_token(req.py_request_id)
 
+                    # If this is not an async load, we can add the new tokens and blocks right away.
+                    if not req.is_kv_cache_connector_async_onboard:
+                        scheduler_output.add_request(
+                            req.request_id, req.get_tokens(0),
+                            self.get_cache_indices(req),
+                            req.context_current_position)
+                else:
+                    # When using the connector, this code path will be hit after the async load is complete.
+                    # Alternatively, with no connector, this is hit after the first chunk of prefill.
+
+                    # If this is the first actual prefill, we can add all of our new tokens and blocks.
+                    if req.is_first_context_chunk or req.is_kv_cache_connector_async_onboard:
+                        req.is_kv_cache_connector_async_onboard = False
+                        scheduler_output.add_request(
+                            req.request_id, req.get_tokens(0),
+                            self.get_cache_indices(req),
+                            req.context_current_position)
+                    else:
+                        # Otherwise, we just provide the new context position. No new blocks are allocated.
+                        scheduler_output.add_request(
+                            req.request_id, [], [],
+                            req.context_current_position)
+
         for req in generation_batch:
+            tokens = req.get_tokens(0)
+            computed_token_position = len(req.get_tokens(0)) - 1
+
+            old_block_ids = self.get_cache_indices(req)
+
             self.impl.add_token(req.py_request_id)
+
             for _ in range(get_draft_token_length(req)):
                 self.impl.add_token(req.py_request_id)
+
+            new_block_ids = self.get_cache_indices(req)
+
+            delta_block_ids = new_block_ids[len(old_block_ids):]
+
+            scheduler_output.add_request(req.request_id, tokens[-1:],
+                                         delta_block_ids,
+                                         computed_token_position)
+
+        if self.kv_connector_manager is not None:
+            self.kv_connector_manager.set_scheduler_output(scheduler_output)
 
     def add_dummy_requests(
         self,

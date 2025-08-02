@@ -13,6 +13,7 @@ from typing import Callable, Dict, List, Optional, Tuple, Union
 import torch
 
 from tensorrt_llm.logger import logger
+from tensorrt_llm.models.modeling_utils import KvCacheConnectorConfig
 
 from .._utils import (KVCacheEventSerializer, global_mpi_rank, global_mpi_size,
                       mpi_comm, mpi_rank, nvtx_range_debug)
@@ -59,6 +60,7 @@ class GenerationExecutorWorker(GenerationExecutor):
         is_llm_executor: Optional[bool] = None,
         lora_config: Optional[LoraConfig] = None,
         garbage_collection_gen0_threshold: Optional[int] = None,
+        kv_connector_config: Optional[KvCacheConnectorConfig] = None,
     ) -> None:
         postproc_config = postproc_worker_config or PostprocWorkerConfig()
         super().__init__(
@@ -81,6 +83,10 @@ class GenerationExecutorWorker(GenerationExecutor):
         self._executor_config = executor_config
         self._is_pytorch_backend = getattr(self._executor_config, "backend",
                                            None) == "pytorch"
+
+        if not self._is_pytorch_backend and kv_connector_config is not None:
+            raise ValueError(
+                "KV connector config is only supported for PyTorch backend")
 
         if global_mpi_size() > 1:
             logger.set_rank(self.global_rank)
@@ -127,6 +133,7 @@ class GenerationExecutorWorker(GenerationExecutor):
                 args["lora_config"] = lora_config
                 args[
                     "garbage_collection_gen0_threshold"] = garbage_collection_gen0_threshold
+                args["kv_connector_config"] = kv_connector_config
             elif executor_config.backend == "_autodeploy":
                 from tensorrt_llm._torch.auto_deploy.shim.ad_executor import \
                     create_autodeploy_executor
@@ -647,6 +654,7 @@ def worker_main(
         bool] = True,  # whether it's the main executor instance
     lora_config: Optional[LoraConfig] = None,
     garbage_collection_gen0_threshold: Optional[int] = None,
+    kv_connector_config: Optional[KvCacheConnectorConfig] = None,
 ) -> None:
     mpi_comm().barrier()
     print_colored_debug(f"Worker {mpi_rank()} entering worker_main...\n",
@@ -773,7 +781,8 @@ def worker_main(
             postproc_worker_config=postproc_worker_config,
             is_llm_executor=is_llm_executor,
             lora_config=lora_config,
-            garbage_collection_gen0_threshold=garbage_collection_gen0_threshold)
+            garbage_collection_gen0_threshold=garbage_collection_gen0_threshold,
+            kv_connector_config=kv_connector_config)
     except Exception as e:
         logger.error(f"Failed to initialize executor on rank {mpi_rank()}: {e}")
         logger.error(traceback.format_exc())

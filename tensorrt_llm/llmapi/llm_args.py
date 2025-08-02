@@ -52,7 +52,8 @@ from ..builder import BuildConfig, EngineConfig
 from ..logger import logger
 from ..mapping import Mapping
 from ..models.automodel import AutoConfig
-from ..models.modeling_utils import (PretrainedConfig, QuantAlgo, QuantConfig,
+from ..models.modeling_utils import (KvCacheConnectorConfig, PretrainedConfig,
+                                     QuantAlgo, QuantConfig,
                                      SpeculativeDecodingMode)
 from ..sampling_params import BatchedLogitsProcessor
 from .build_cache import BuildCacheConfig
@@ -2090,6 +2091,11 @@ class TorchLlmArgs(BaseLlmArgs):
         default=None,
         description="The format of the provided checkpoint.",
         status="prototype",
+    )
+
+    connector_config: Optional[KvCacheConnectorConfig] = Field(
+        default=None,
+        description="The config for KV cache connector.",
     )
 
     # PrivateVars

@@ -27,7 +27,9 @@ from tensorrt_llm.bindings.internal.batch_manager import (LlmRequestType,
 from tensorrt_llm.logger import logger
 
 from ..distributed import Distributed
+from ..modules.decoder_layer import DecoderLayer
 from ..speculative.drafter import Drafter
+from .connector import KvCacheConnectorManager
 from .executor_request_queue import ExecutorRequestQueue, RequestQueueItem
 from .guided_decoder import GuidedDecoder
 from .kv_cache_transceiver import KvCacheTransceiver
@@ -127,23 +129,25 @@ class BatchStatePP(BatchState):
 
 class PyExecutor:
 
-    def __init__(self,
-                 resource_manager,
-                 scheduler: RequestScheduler,
-                 model_engine: ModelEngine,
-                 sampler: Sampler,
-                 dist: Distributed,
-                 max_num_sequences: int,
-                 drafter: Optional[Drafter] = None,
-                 disable_overlap_scheduler: bool = False,
-                 max_input_len: int = 2048,
-                 max_batch_size: int = 8,
-                 max_beam_width: int = 1,
-                 max_draft_len: int = 0,
-                 kv_cache_transceiver: Optional[KvCacheTransceiver] = None,
-                 guided_decoder: Optional[GuidedDecoder] = None,
-                 garbage_collection_gen0_threshold: Optional[int] = None,
-                 start_worker: bool = True):
+    def __init__(
+            self,
+            resource_manager,
+            scheduler: RequestScheduler,
+            model_engine: ModelEngine,
+            sampler: Sampler,
+            dist: Distributed,
+            max_num_sequences: int,
+            drafter: Optional[Drafter] = None,
+            disable_overlap_scheduler: bool = False,
+            max_input_len: int = 2048,
+            max_batch_size: int = 8,
+            max_beam_width: int = 1,
+            max_draft_len: int = 0,
+            kv_cache_transceiver: Optional[KvCacheTransceiver] = None,
+            guided_decoder: Optional[GuidedDecoder] = None,
+            garbage_collection_gen0_threshold: Optional[int] = None,
+            start_worker: bool = True,
+            kv_connector_manager: Optional[KvCacheConnectorManager] = None):
         super(PyExecutor, self).__init__()
         self.device_id = torch.cuda.current_device()
         self.global_rank = global_mpi_rank()
@@ -250,8 +254,50 @@ class PyExecutor:
 
         self.worker_started = False
         self.worker_lock = threading.Lock()
+
+        self.kv_connector_manager = kv_connector_manager
+
+        self._maybe_init_kv_connector_manager()
+
         if start_worker:
             self.start_worker()
+
+    def _maybe_init_kv_connector_manager(self):
+        if self.kv_connector_manager is not None:
+            if self.kv_cache_transceiver is not None:
+                raise NotImplementedError(
+                    "KV Cache Connector is not supported with KvCacheTransceiver."
+                )
+
+            if self.dist.pp_size > 1:
+                raise NotImplementedError(
+                    "KV Cache Connector is not supported with pipeline parallelism."
+                )
+
+            # TODO: This does NOT support pipeline parallel.
+            layer_kv_tensors = {
+                layer_idx: self.kv_cache_manager.get_buffers(layer_idx)
+                for layer_idx in self.kv_cache_manager.pp_layers
+            }
+
+            kv_shape = layer_kv_tensors[list(layer_kv_tensors.keys())[0]].shape
+
+            if not all(t.shape == kv_shape for t in layer_kv_tensors.values()):
+                raise ValueError(
+                    "KV Cache Connector is not supported with Variable sliding window attention!"
+                )
+
+            self.kv_connector_manager.worker.register_kv_caches(
+                layer_kv_tensors)
+
+            # For each of our layers, we need to register the pre/post hooks.
+            # These are used for methods like `wait_for_layer_load` and `save_kv_layer`.
+            for _name, module in self.model_engine.model.named_modules():
+                if isinstance(module, DecoderLayer):
+                    module.register_forward_pre_hook(
+                        self.kv_connector_manager.layer_pre_hook)
+                    module.register_forward_hook(
+                        self.kv_connector_manager.layer_post_hook)
 
     def _event_loop_wrapper(self):
         try:
@@ -878,7 +924,9 @@ class PyExecutor:
                     "num_fitting_reqs=0 and fitting_disagg_gen_init_requests is empty, may not have enough kvCache"
                 )
                 self.kv_cache_transceiver.check_context_transfer_status(1)
-        else:
+        elif self.kv_connector_manager is None:
+            # The kv cache connector also puts requests to sleep similar to the transceiver.
+            # Thus, this assertion is only applicable when both the cache transceiver and connector are disabled.
             assert scheduled_batch.batch_size > 0, (
                 "fail to schedule any pending request, "
                 "probably run out of resource.")
@@ -894,6 +942,19 @@ class PyExecutor:
         if self.guided_decoder is not None:
             self.guided_decoder.build(scheduled_batch)
             self.guided_decoder.execute(scheduled_batch, logits)
+
+    def _handle_kv_connector(self, scheduled_batch):
+        if self.kv_connector_manager:
+            self.kv_connector_manager.take_scheduled_requests_pending_load(
+                scheduled_batch)
+            self.kv_connector_manager.handle_metadata()
+            self.kv_connector_manager.worker.start_load_kv()
+
+    def _terminate_async_save_requests(self):
+        if self.kv_connector_manager:
+            reqs_to_terminate = self.kv_connector_manager.get_finished()
+            for req in reqs_to_terminate:
+                self.resource_manager.free_resources(req)
 
     def _executor_loop(self):
         torch.cuda.set_device(self.device_id)
@@ -923,8 +984,13 @@ class PyExecutor:
 
                         # Return the first token to the client
                         self._handle_first_token_response(scheduled_batch)
-
                     self.resource_manager.prepare_resources(scheduled_batch)
+
+                    self._handle_kv_connector(scheduled_batch)
+
+                if scheduled_batch.batch_size > 0 or (
+                        self.enable_attention_dp and self.dist.tp_size > 1):
+
                     if self.drafter is not None and self.use_spec_decode:
                         self.drafter.prepare_draft_tokens(
                             scheduled_batch, self.resource_manager)
@@ -954,6 +1020,8 @@ class PyExecutor:
 
                 if self.kv_cache_transceiver and self.ctx_in_transmission_requests:
                     self._terminate_ctx_finished_requests()
+
+                self._terminate_async_save_requests()
 
                 if self.enable_iter_perf_stats:
                     iter_stats.inflight_batching_stats.num_ctx_tokens = self.model_engine.iter_states[
@@ -1019,8 +1087,11 @@ class PyExecutor:
                         # For generation requests which have completed KV cache transfer
                         self._prepare_disagg_gen_transmission_complete(
                             scheduled_batch)
-
                     self.resource_manager.prepare_resources(scheduled_batch)
+
+                    self._handle_kv_connector(scheduled_batch)
+
+                if scheduled_batch.batch_size > 0:
 
                     # The generation requests that are do not have batch_idx,
                     # needs to be in front of the batch due to the assumptions
@@ -1073,6 +1144,8 @@ class PyExecutor:
 
                 if self.kv_cache_transceiver and self.ctx_in_transmission_requests:
                     self._terminate_ctx_finished_requests()
+
+                self._terminate_async_save_requests()
 
     def _process_previous_batch(self):
         if self.kv_cache_transceiver and self.previous_batch.ctx_transmission_reqs:
@@ -1304,6 +1377,10 @@ class PyExecutor:
             outputs = forward(scheduled_requests, self.resource_manager,
                               new_tensors_device, gather_context_logits,
                               cache_indirection_buffer)
+
+            if self.kv_connector_manager is not None:
+                self.kv_connector_manager.worker.wait_for_save()
+
             return outputs
         except Exception as e:
             traceback.print_exc()
@@ -1402,7 +1479,9 @@ class PyExecutor:
         self._enqueue_responses(error_responses)
 
     def _terminate_request(self, request: LlmRequest):
-        self.resource_manager.free_resources(request)
+        if self.kv_connector_manager is None or not self.kv_connector_manager.request_finished(
+                request):
+            self.resource_manager.free_resources(request)
 
     @nvtx_range("_handle_canceled_requests")
     def _handle_canceled_requests(self):
