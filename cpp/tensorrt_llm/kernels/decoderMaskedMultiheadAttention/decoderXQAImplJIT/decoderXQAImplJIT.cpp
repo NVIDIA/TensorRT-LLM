@@ -446,7 +446,7 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
                 multi_block = computeMultiBlockCountSpecDecGMMA(
                     xqaParams, xqaParams.batch_size, multiprocessor_count, specDecBlocks);
             }
-            else
+            else if (!isSpecDec)
             {
                 multi_block = computeMultiBlockCount(xqaParams, xqaParams.batch_size, multiprocessor_count);
             }
