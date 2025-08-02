@@ -105,6 +105,7 @@ class LLaMAConfig(PretrainedConfig):
 
         if isinstance(hf_config_or_dir, transformers.PretrainedConfig):
             hf_config = hf_config_or_dir
+            orig_model_type = hf_config.model_type
         else:
             hf_config_dir = str(hf_config_or_dir)
             if "vila" in hf_config_dir.lower():
@@ -118,6 +119,7 @@ class LLaMAConfig(PretrainedConfig):
 
             hf_config = transformers.AutoConfig.from_pretrained(
                 hf_config_dir, trust_remote_code=trust_remote_code)
+            orig_model_type = hf_config.model_type
             if hf_config.model_type == "llava":
                 # LLaVA = Vision model + Llama LLM
                 # We load a llava config and use its' text config as llama config
@@ -142,6 +144,8 @@ class LLaMAConfig(PretrainedConfig):
                 hf_config = Mistral3Config.from_pretrained(
                     hf_config_dir).text_config
                 hf_config.architectures = ["MistralForCausalLM"]
+            if hf_config.model_type == "Llama_Nemotron_Nano_VL":
+                hf_config = hf_config.llm_config
 
         num_key_value_heads = getattr(hf_config, "num_key_value_heads",
                                       hf_config.num_attention_heads)
@@ -192,6 +196,7 @@ class LLaMAConfig(PretrainedConfig):
 
         return cls(
             architecture=hf_config.architectures[0],
+            orig_model_type=orig_model_type,
             dtype=dtype,
             num_hidden_layers=hf_config.num_hidden_layers,
             num_attention_heads=hf_config.num_attention_heads,
