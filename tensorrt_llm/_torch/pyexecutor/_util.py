@@ -431,7 +431,9 @@ class KvCacheCreator:
         
         if is_mla(config):
             # MLA case
+            print(f"[EXECUTOR_DEBUG] Creating MLA split KV cache managers")
             for half_name, batch_size in [('half1', half1_batch_size), ('half2', half2_batch_size)]:
+                print(f"[EXECUTOR_DEBUG] Creating {half_name} KV cache manager with batch_size={batch_size}")
                 split_managers[half_name] = KVCacheManager(
                     kv_cache_config,
                     tensorrt_llm.bindings.internal.batch_manager.CacheType.SELFKONLY,
@@ -494,6 +496,7 @@ class KvCacheCreator:
             ) if is_vswa else None)
 
             for half_name, batch_size in [('half1', half1_batch_size), ('half2', half2_batch_size)]:
+                print(f"[EXECUTOR_DEBUG] Creating {half_name} standard KV cache manager with batch_size={batch_size}")
                 split_managers[half_name] = KVCacheManager(
                     kv_cache_config,
                     tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
@@ -556,6 +559,7 @@ class KvCacheCreator:
 
     def build_managers(self, resources: Dict) -> None:
         """Construct KV caches for model and draft model (if applicable)."""
+        print(f"[EXECUTOR_DEBUG] Building Regular KV cache managers")
         kv_cache_manager = self._create_kv_cache_manager(self._model_engine)
         draft_kv_cache_manager = self._create_kv_cache_manager(
             self._draft_model_engine
@@ -589,8 +593,13 @@ def create_py_executor_instance(
         drafter,
         lora_config: Optional[LoraConfig] = None,
         garbage_collection_gen0_threshold: Optional[int] = None) -> PyExecutor:
+    
     kv_cache_manager = resources.get(ResourceManagerType.KV_CACHE_MANAGER, None)
-
+    half1_kv_cache_manager = resources.get(f"{ResourceManagerType.KV_CACHE_MANAGER}_half1", None)
+    half2_kv_cache_manager = resources.get(f"{ResourceManagerType.KV_CACHE_MANAGER}_half2", None)
+    if half1_kv_cache_manager is None and half2_kv_cache_manager is None:
+        raise ValueError("No Split KV cache manager found in resources")
+    
     spec_config = model_engine.spec_config
     if mapping.is_last_pp_rank(
     ) and executor_config.guided_decoding_config is not None:
@@ -683,6 +692,12 @@ def create_py_executor_instance(
     if kv_cache_manager is not None:
         resource_manager.resource_managers.move_to_end(
             ResourceManagerType.KV_CACHE_MANAGER, last=True)
+    if half1_kv_cache_manager is not None:
+        resource_manager.resource_managers.move_to_end(
+            f"{ResourceManagerType.KV_CACHE_MANAGER}_half1", last=True)
+    if half2_kv_cache_manager is not None:
+        resource_manager.resource_managers.move_to_end(
+            f"{ResourceManagerType.KV_CACHE_MANAGER}_half2", last=True)
 
     capacity_scheduler = BindCapacityScheduler(
         max_num_sequences,
@@ -701,7 +716,8 @@ def create_py_executor_instance(
     kv_cache_transceiver = create_kv_cache_transceiver(
         mapping, kv_cache_manager, attention_type, cache_transceiver_config)
 
-    # Create the PyExecutor
+    
+            # Create the PyExecutor
     py_executor = PyExecutor(
         resource_manager,
         scheduler,
@@ -728,6 +744,7 @@ def create_py_executor_instance(
         model_engine.model.set_executor_resources(resources)
     else:
         print(f"[EXECUTOR_DEBUG] Model does not support set_executor_resources")
+        raise ValueError("Model does not support set_executor_resources")
 
     return py_executor
 

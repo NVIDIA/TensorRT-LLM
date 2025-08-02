@@ -77,6 +77,7 @@ configure_batch_splitting() {
         3)
             echo "Mode 3: Only batch splitting (no inter-layer overlap)"
             USE_BATCH_SPLIT_MODEL="true"
+            USE_SPLIT_KV_CACHE="true"
             USE_SEPARATE_STREAMS="true"
             ENABLE_LAYER_COMPLETION_EVENTS="false"
             ENABLE_INTRA_LAYER_BATCH_SPLITTING="true"
@@ -87,6 +88,7 @@ configure_batch_splitting() {
         4)
             echo "Mode 4: Both inter-layer and batch splitting (full overlap)"
             USE_BATCH_SPLIT_MODEL="true"
+            USE_SPLIT_KV_CACHE="true"
             USE_SEPARATE_STREAMS="true"
             ENABLE_LAYER_COMPLETION_EVENTS="true"
             ENABLE_INTRA_LAYER_BATCH_SPLITTING="true"
@@ -295,6 +297,7 @@ fi
 
 # Set batch split environment variables
 export USE_BATCH_SPLIT_MODEL=${USE_BATCH_SPLIT_MODEL}
+export USE_SPLIT_KV_CACHE=${USE_SPLIT_KV_CACHE}
 export BATCH_SPLIT_RATIO=${BATCH_SPLIT_RATIO}
 export USE_SEPARATE_STREAMS=${USE_SEPARATE_STREAMS}
 export SYNC_AFTER_ATTENTION=${SYNC_AFTER_ATTENTION}
@@ -302,6 +305,33 @@ export ENABLE_LAYER_COMPLETION_EVENTS=${ENABLE_LAYER_COMPLETION_EVENTS}
 export ENABLE_INTRA_LAYER_BATCH_SPLITTING=${ENABLE_INTRA_LAYER_BATCH_SPLITTING}
 export ENABLE_ATTENTION_METADATA_SPLITTING=${ENABLE_ATTENTION_METADATA_SPLITTING}
 export ENABLE_SEPARATE_KV_CACHE_MANAGERS=${ENABLE_SEPARATE_KV_CACHE_MANAGERS}
+
+# Debug: Check environment variables and module import
+echo "=== DEBUG: Environment Variables ==="
+echo "USE_BATCH_SPLIT_MODEL: ${USE_BATCH_SPLIT_MODEL}"
+echo "USE_SPLIT_KV_CACHE: ${USE_SPLIT_KV_CACHE}"
+echo "ENABLE_SEPARATE_KV_CACHE_MANAGERS: ${ENABLE_SEPARATE_KV_CACHE_MANAGERS}"
+
+echo "=== DEBUG: Module Import Test ==="
+python -c "
+import os
+print('Environment variables in Python:')
+print('  USE_BATCH_SPLIT_MODEL:', os.environ.get('USE_BATCH_SPLIT_MODEL', 'not set'))
+print('  USE_SPLIT_KV_CACHE:', os.environ.get('USE_SPLIT_KV_CACHE', 'not set'))
+
+try:
+    import tensorrt_llm._torch.models.deepseek_v3_batch_split_moe
+    print('✓ Batch split module imported successfully')
+    
+    # Check if the registration happened
+    from tensorrt_llm._torch.models.modeling_auto import AutoModelForCausalLM
+    print('✓ AutoModelForCausalLM imported successfully')
+    
+except ImportError as e:
+    print('✗ Failed to import batch split module:', e)
+except Exception as e:
+    print('✗ Error during import:', e)
+"
 
 export TRTLLM_MOE_ENABLE_ALLTOALL_WITHOUT_ALLGATHER=1
 export TRTLLM_MNNVL_AR_ENABLED=1
@@ -333,6 +363,19 @@ if ! check_dataset_exists "${dataset_file}" 50000; then
 fi
 
 gen_attn_dp_config ${cuda_graph_batch} ${eplb_num_slots} ${moe_max_num_tokens} ${updates_per_iter} ${sub_dir}
+
+# Force import the batch split module to ensure registration happens
+echo "=== FORCING BATCH SPLIT MODULE IMPORT ==="
+python -c "
+import os
+print('Forcing import of batch split module...')
+try:
+    import tensorrt_llm._torch.models.deepseek_v3_batch_split_moe
+    print('✓ Batch split module imported and registered')
+except Exception as e:
+    print('✗ Error importing batch split module:', e)
+"
+
 run_dep_benchmark ${concurrency} ${max_batch_size} ${max_num_tokens} ${tp} ${ep} ${eplb_num_slots} ${updates_per_iter} ${sub_dir}
 #python /scratch/TensorRT-LLM/examples/wide_ep/ep_load_balancer/report_load_statistics.py --expert_statistic_path $EXPERT_STATISTIC_PATH
 

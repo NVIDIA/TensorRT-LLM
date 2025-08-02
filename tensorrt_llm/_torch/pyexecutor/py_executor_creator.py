@@ -225,6 +225,7 @@ def create_py_executor(
     logger.info("ATTENTION RUNTIME FEATURES: ", attn_runtime_features)
 
     mem_monitor = _ExecutorMemoryMonitor()
+    print(f"[EXECUTOR_DEBUG] Creating model engine")
     with mem_monitor.observe_creation_stage(
             _ExecutorCreationStage.MODEL_ENGINE_MAIN):
         model_engine = PyTorchModelEngine(
@@ -359,14 +360,15 @@ def create_py_executor(
         use_split_kv_cache = os.environ.get('USE_SPLIT_KV_CACHE', 'false').lower() == 'true'
         split_ratio = float(os.environ.get('BATCH_SPLIT_RATIO', '0.5'))
         
+        print(f"[EXECUTOR_DEBUG] use_split_kv_cache: {use_split_kv_cache} {os.environ.get('USE_SPLIT_KV_CACHE', 'false').lower()} estimating_kv_cache: {estimating_kv_cache}")
+
         with mem_monitor.observe_creation_stage(
                 _ExecutorCreationStage.INIT_KV_CACHE
                 if estimating_kv_cache else _ExecutorCreationStage.KV_CACHE):
-            if use_split_kv_cache and not estimating_kv_cache:
-                logger.info(f"Creating split KV cache managers with ratio {split_ratio}")
+            kv_cache_creator.build_managers(resources)
+            if use_split_kv_cache:
+                print(f"[EXECUTOR_DEBUG] is_generation: {model_engine.model.model_config.is_generation} Building split KV cache managers with ratio {split_ratio}")
                 kv_cache_creator.build_split_managers(resources, split_ratio)
-            else:
-                kv_cache_creator.build_managers(resources)
 
     # Resource managers for speculative decoding
     spec_resource_manager = get_spec_resource_manager(model_engine,
@@ -386,7 +388,8 @@ def create_py_executor(
             dist, resources, mapping, pytorch_backend_config, executor_config,
             ctx_chunk_config, model_engine, draft_model_engine, False, sampler,
             drafter, lora_config, garbage_collection_gen0_threshold)
-
+            
+    print(f"[EXECUTOR_DEBUG] PyExecutor created estimating_kv_cache: {estimating_kv_cache}")
     if estimating_kv_cache:
         assert kv_cache_creator is not None
         with mem_monitor.observe_creation_stage(
@@ -396,6 +399,7 @@ def create_py_executor(
         # Clean up KV cache managers (either split or standard)
         if use_split_kv_cache:
             kv_cache_creator.teardown_split_managers(resources)
+            kv_cache_creator.teardown_managers(resources)
         else:
             kv_cache_creator.teardown_managers(resources)
         del py_executor  # free before constructing new
@@ -409,8 +413,16 @@ def create_py_executor(
             
             # Create final KV cache managers (either split or standard)
             if use_split_kv_cache:
-                logger.info(f"Creating final split KV cache managers with ratio {split_ratio}")
+                print(f"[EXECUTOR_DEBUG] estimating_kv_cache: {estimating_kv_cache} Building final split KV cache managers with ratio {split_ratio}")
                 kv_cache_creator.build_split_managers(resources, split_ratio)
+                kv_cache_creator.build_managers(resources)
+                print(f"[EXECUTOR_DEBUG] Split KV cache managers built successfully resources: {resources[ResourceManagerType.KV_CACHE_MANAGER]}")
+                # Print the split keys in resources
+                split_keys = [key for key in resources.keys() if '_half1' in key or '_half2' in key]
+                print(f"[EXECUTOR_DEBUG] Resources contain split keys: {split_keys}")
+                print(f"[EXECUTOR_DEBUG] Split KV cache managers built successfully resources: {resources[ResourceManagerType.DRAFT_KV_CACHE_MANAGER]}")
+                print(f"[EXECUTOR_DEBUG] Split KV cache managers built successfully resources: {resources[f'{ResourceManagerType.KV_CACHE_MANAGER}_half1']}")
+                print(f"[EXECUTOR_DEBUG] Split KV cache managers built successfully resources: {resources[f'{ResourceManagerType.KV_CACHE_MANAGER}_half2']}")
             else:
                 kv_cache_creator.build_managers(resources)
 

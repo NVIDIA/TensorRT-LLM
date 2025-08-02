@@ -12,7 +12,7 @@ import weakref
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from contextlib import contextmanager
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 import psutil
 import safetensors
@@ -557,6 +557,7 @@ class PyTorchModelEngine(ModelEngine):
 
     @with_warmup_flag
     def warmup(self, resource_manager: ResourceManager) -> None:
+        print(f"[MODEL_ENGINE_DEBUG] Warmup")
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
         spec_resource_manager = resource_manager.get_resource_manager(
@@ -802,8 +803,8 @@ class PyTorchModelEngine(ModelEngine):
                             torch.cuda.synchronize()
                             gc.collect()
                             torch.cuda.empty_cache()
-
-    def _set_up_attn_metadata(self, kv_cache_manager: KVCacheManager):
+    
+    def _set_up_attn_metadata(self, kv_cache_manager, resource_manager):
         print(f"[MODEL_ENGINE_DEBUG] Setting up attention metadata")
         print(f"[MODEL_ENGINE_DEBUG] KV cache manager: {kv_cache_manager}")
         print(f"[MODEL_ENGINE_DEBUG] Batch size: {self.batch_size}")
@@ -815,51 +816,70 @@ class PyTorchModelEngine(ModelEngine):
                 or self.attn_runtime_features.chunked_prefill)
         
         # Check if we should use split attention metadata for batch splitting
-        use_split_attn_metadata = False
+        use_split_attn_metadata = True #kgoyal HACK
         if hasattr(self.model, 'enable_attention_metadata_splitting'):
             use_split_attn_metadata = self.model.enable_attention_metadata_splitting
             print(f"[MODEL_ENGINE_DEBUG] Model has enable_attention_metadata_splitting: {use_split_attn_metadata}")
         
-        if kv_cache_manager is None:
-            if use_split_attn_metadata:
-                # Create split attention metadata for no-cache case
-                print(f"[MODEL_ENGINE_DEBUG] Creating split attention metadata for no-cache case")
-                split_metadata = self._create_split_attn_metadata_no_cache()
-                # Set the split metadata on the model
+        if use_split_attn_metadata:
+            # Check if executor resources are available (not during warmup)
+            if hasattr(self.model, 'executor_resources') and self.model.executor_resources is not None:
+                # Create 3 different attention metadata objects for batch splitting
+                print(f"[MODEL_ENGINE_DEBUG] Creating 3 attention metadata objects for batch splitting")
+                
+                # 1. Standard metadata for dense layers (non-MOE layers) - uses full batch
+                dense_metadata = self.attn_backend.Metadata(
+                    max_num_requests=self.batch_size,
+                    max_num_tokens=self.max_num_tokens,
+                    max_num_sequences=self.batch_size * self.max_beam_width,
+                    kv_cache_manager= kv_cache_manager,
+                    enable_paged_context_mla=enable_paged_context_mla,
+                    runtime_features=self.attn_runtime_features,
+                )
+                
+                # 2. Split metadata for MOE layers (half1 and half2)
+                print(f"[MODEL_ENGINE_DEBUG] Creating split attention metadata")
+                split_metadata = self._create_split_attn_metadata(resource_manager)
+                
+                # Combine all 3 metadata objects
+                combined_metadata = {
+                    'dense': dense_metadata,  # For non-MOE layers (layers 0, 1, 2)
+                    'moe_half1': split_metadata['half1'],  # For MOE layers - first half
+                    'moe_half2': split_metadata['half2'],  # For MOE layers - second half
+                }
+                
+                # Set the combined metadata on the model
                 if hasattr(self.model, 'set_split_attention_metadata'):
-                    self.model.set_split_attention_metadata(split_metadata)
-                return split_metadata
+                    self.model.set_split_attention_metadata(combined_metadata)
+                else:
+                    raise ValueError("Model does not have set_split_attention_metadata method")
+                
+                print(f"[MODEL_ENGINE_DEBUG] Created 3 attention metadata objects: {list(combined_metadata.keys())}")
+                return combined_metadata
             else:
-                print(f"[MODEL_ENGINE_DEBUG] Creating standard attention metadata for no-cache case")
+                # During warmup or when executor resources not available, use standard metadata
+                print(f"[MODEL_ENGINE_DEBUG] Executor resources not available, using standard metadata for warmup")
                 return self.attn_backend.Metadata(
                     max_num_requests=self.batch_size,
                     max_num_tokens=self.max_num_tokens,
                     max_num_sequences=self.batch_size * self.max_beam_width,
-                    kv_cache_manager=None,
+                    kv_cache_manager=kv_cache_manager,
                     enable_paged_context_mla=enable_paged_context_mla,
-                    attn_runtime_features=self.attn_runtime_features,
+                    runtime_features=self.attn_runtime_features,
                 )
-        
-        if use_split_attn_metadata:
-            # Create split attention metadata for cache case
-            print(f"[MODEL_ENGINE_DEBUG] Creating split attention metadata for cache case")
-            split_metadata = self._create_split_attn_metadata(kv_cache_manager)
-            # Set the split metadata on the model
-            if hasattr(self.model, 'set_split_attention_metadata'):
-                self.model.set_split_attention_metadata(split_metadata)
-            return split_metadata
         else:
-            print(f"[MODEL_ENGINE_DEBUG] Creating standard attention metadata for cache case")
+            # Standard single metadata for all layers
+            print(f"[MODEL_ENGINE_DEBUG] Creating standard attention metadata for all layers")
             return self.attn_backend.Metadata(
                 max_num_requests=self.batch_size,
                 max_num_tokens=self.max_num_tokens,
                 max_num_sequences=self.batch_size * self.max_beam_width,
                 kv_cache_manager=kv_cache_manager,
                 enable_paged_context_mla=enable_paged_context_mla,
-                attn_runtime_features=self.attn_runtime_features,
+                runtime_features=self.attn_runtime_features,
             )
 
-    def _create_split_attn_metadata(self, kv_cache_manager: KVCacheManager):
+    def _create_split_attn_metadata(self):
         """Create split attention metadata for batch halves."""
         print(f"[MODEL_ENGINE_DEBUG] Creating split attention metadata")
         print(f"[MODEL_ENGINE_DEBUG] Original batch size: {self.batch_size}")
@@ -881,21 +901,28 @@ class PyTorchModelEngine(ModelEngine):
         half1_kv_cache_manager = None
         half2_kv_cache_manager = None
         
-        if hasattr(self.model, 'executor_resources'):
+        if hasattr(self.model, 'executor_resources') and self.model.executor_resources is not None:
             resources = self.model.executor_resources
             half1_kv_cache_manager = resources.get(f"{ResourceManagerType.KV_CACHE_MANAGER}_half1")
             half2_kv_cache_manager = resources.get(f"{ResourceManagerType.KV_CACHE_MANAGER}_half2")
             print(f"[MODEL_ENGINE_DEBUG] Half1 KV cache manager: {half1_kv_cache_manager}")
             print(f"[MODEL_ENGINE_DEBUG] Half2 KV cache manager: {half2_kv_cache_manager}")
+        else:
+            print(f"[MODEL_ENGINE_DEBUG] No executor resources found - this is normal during warmup")
+            print(f"[MODEL_ENGINE_DEBUG] Using standard KV cache manager for split metadata during warmup")
+            # During warmup, use the standard KV cache manager for both halves
+            # This is a temporary solution until executor resources are available
+            half1_kv_cache_manager = self.attn_metadata.kv_cache_manager if hasattr(self, 'attn_metadata') and self.attn_metadata else None
+            half2_kv_cache_manager = half1_kv_cache_manager
         
         # Create attention metadata for half1
         half1_metadata = self.attn_backend.Metadata(
             max_num_requests=half1_batch_size,
             max_num_tokens=self.max_num_tokens,
             max_num_sequences=half1_batch_size * self.max_beam_width,
-            kv_cache_manager=half1_kv_cache_manager or kv_cache_manager,
+            kv_cache_manager=half1_kv_cache_manager,
             enable_paged_context_mla=enable_paged_context_mla,
-            attn_runtime_features=self.attn_runtime_features,
+            runtime_features=self.attn_runtime_features,
         )
         
         # Create attention metadata for half2
@@ -903,11 +930,12 @@ class PyTorchModelEngine(ModelEngine):
             max_num_requests=half2_batch_size,
             max_num_tokens=self.max_num_tokens,
             max_num_sequences=half2_batch_size * self.max_beam_width,
-            kv_cache_manager=half2_kv_cache_manager or kv_cache_manager,
+            kv_cache_manager=half2_kv_cache_manager,
             enable_paged_context_mla=enable_paged_context_mla,
-            attn_runtime_features=self.attn_runtime_features,
+            runtime_features=self.attn_runtime_features,
         )
         
+
         split_metadata = {
             'half1': half1_metadata,
             'half2': half2_metadata
@@ -915,53 +943,6 @@ class PyTorchModelEngine(ModelEngine):
         
         print(f"[MODEL_ENGINE_DEBUG] Created split attention metadata: {list(split_metadata.keys())}")
         return split_metadata
-
-    def _create_split_attn_metadata_no_cache(self):
-        """Create split attention metadata for no-cache case."""
-        enable_paged_context_mla = is_mla(
-            self.model.model_config.pretrained_config) and (
-                self.attn_runtime_features.cache_reuse
-                or self.attn_runtime_features.chunked_prefill)
-        
-        # Get split ratio from model or use default
-        split_ratio = 0.5
-        if hasattr(self.model, 'batch_split_ratio'):
-            split_ratio = self.model.batch_split_ratio
-        
-        # Calculate split batch sizes
-        total_batch_size = self.batch_size
-        split_point = int(total_batch_size * split_ratio)
-        half1_batch_size = split_point
-        half2_batch_size = total_batch_size - split_point
-        
-        print(f"[MODEL_ENGINE_DEBUG] Creating split attention metadata (no-cache):")
-        print(f"[MODEL_ENGINE_DEBUG]   Half1 batch size: {half1_batch_size}")
-        print(f"[MODEL_ENGINE_DEBUG]   Half2 batch size: {half2_batch_size}")
-        
-        # Create split attention metadata for no-cache case
-        split_attn_metadata = {
-            'half1': self.attn_backend.Metadata(
-                max_num_requests=half1_batch_size,
-                max_num_tokens=self.max_num_tokens // 2,
-                max_num_sequences=half1_batch_size * self.max_beam_width,
-                kv_cache_manager=None,
-                mapping=self.mapping,
-                runtime_features=self.attn_runtime_features,
-                enable_flash_mla=self.model.model_config.enable_flash_mla,
-                enable_paged_context_mla=enable_paged_context_mla),
-            'half2': self.attn_backend.Metadata(
-                max_num_requests=half2_batch_size,
-                max_num_tokens=self.max_num_tokens // 2,
-                max_num_sequences=half2_batch_size * self.max_beam_width,
-                kv_cache_manager=None,
-                mapping=self.mapping,
-                runtime_features=self.attn_runtime_features,
-                enable_flash_mla=self.model.model_config.enable_flash_mla,
-                enable_paged_context_mla=enable_paged_context_mla)
-        }
-        
-        print(f"[MODEL_ENGINE_DEBUG] Split attention metadata (no-cache) created successfully")
-        return split_attn_metadata
 
     def _prepare_split_attn_metadata(self, scheduled_requests: ScheduledRequests, 
                                    split_attn_metadata: Dict[str, AttentionMetadata],
@@ -1275,7 +1256,1855 @@ class PyTorchModelEngine(ModelEngine):
             # NOTE: py_executor_creator makes sure that the executor uses this
             # smaller value as its max_seq_len too.
             logger.warning(
-                f"Specified {self.max_seq_len=} is larger than what the model can support "
+                f"Specified max_seq_len {self.max_seq_len} is larger than what the model can support "
+                f"({inferred_max_seq_len}). Setting max_seq_len to {inferred_max_seq_len}. "
+            )
+            self.max_seq_len = inferred_max_seq_len
+
+    def _init_max_num_tokens(self):
+        # Modified from tensorrt_llm/_common.py check_max_num_tokens
+        if self.max_num_tokens is None:
+            self.max_num_tokens = self.max_seq_len * self.batch_size
+        if self.max_num_tokens > self.max_seq_len * self.batch_size:
+            logger.warning(
+                f"max_num_tokens ({self.max_num_tokens}) shouldn't be greater than "
+                f"max_seq_len * max_batch_size ({self.max_seq_len * self.batch_size}), "
+                f"specifying to max_seq_len * max_batch_size ({self.max_seq_len * self.batch_size})."
+            )
+            self.max_num_tokens = self.max_seq_len * self.batch_size
+
+    def _init_model_capacity(self):
+        self._init_max_seq_len()
+        self._init_max_num_tokens()
+
+    def _release_cuda_graphs(self):
+        for _, graph in self._cuda_graphs.items():
+            del graph
+        self._cuda_graphs.clear()
+        torch.cuda.empty_cache()
+        del self._cuda_graph_mem_pool
+        self._cuda_graph_mem_pool = None
+
+    def get_max_num_sequences(self) -> int:
+        """
+        Return the maximum number of sequences that the model supports. PyExecutor need this to compute max_num_active_requests
+        """
+        num_batches = self.mapping.pp_size
+        return num_batches * self.batch_size
+
+    def _preprocess_inputs(self, inputs: Dict[str, Any]):
+        """
+        Make some changes to the device inputs and avoid block the async data transfer
+        """
+        if self.is_spec_decode and not self._disable_overlap_scheduler:
+            # When enabling overlap scheduler, the kv cache for draft tokens will
+            # be prepared in advance by using the max_draft_len. But we need to use
+            # new_tokens_lens_device to get the real past kv lengths and the
+            # correct position ids. And to avoid blocking the async data transfer,
+            # we need to preprocess the inputs in forward to update the position_ids and
+            # kv cache length.
+            if inputs['attn_metadata'].kv_cache_manager is not None:
+                num_seqs = inputs['attn_metadata'].num_seqs
+                num_ctx_requests = inputs['attn_metadata'].num_contexts
+                num_gen_requests = inputs['attn_metadata'].num_generations
+                num_ctx_tokens = inputs['attn_metadata'].num_ctx_tokens
+                previous_batch_tokens = inputs['input_ids'].shape[
+                    0] - num_ctx_tokens
+                inputs['position_ids'][0, num_ctx_tokens:] += (
+                    self.previous_pos_id_offsets_cuda[:previous_batch_tokens])
+                inputs['attn_metadata'].kv_lens_cuda[
+                    num_ctx_requests:num_seqs] += (
+                        self.previous_kv_lens_offsets_cuda[:num_gen_requests])
+        return inputs
+
+    def _prepare_tp_inputs(
+            self,
+            scheduled_requests: ScheduledRequests,
+            kv_cache_manager: KVCacheManager,
+            attn_metadata: Union[AttentionMetadata, Dict[str, AttentionMetadata]],
+            spec_metadata: Optional[SpecMetadata] = None,
+            new_tensors_device: Optional[SampleStateTensors] = None,
+            cache_indirection_buffer: Optional[torch.Tensor] = None):
+        """
+        Prepare inputs for Pytorch Model.
+        """
+
+        # if new_tensors_device exist, input_ids will only contain new context tokens
+        input_ids = []  # per sequence
+        sequence_lengths = []  # per sequence
+        prompt_lengths = []  # per sequence
+        request_ids = []  # per request
+        gather_ids = []
+        position_ids = []  # per sequence
+        num_cached_tokens_per_seq = []  # per sequence
+        multi_modal_data = []
+        draft_tokens = []
+        draft_lens = []
+        mrope_config = defaultdict(list)
+        gen_request_seq_slots = []  # per generation request
+
+        for request in scheduled_requests.context_requests:
+            request_ids.append(request.py_request_id)
+            all_prompt_tokens = request.get_tokens(0)
+            draft_lens.append(0)
+            begin_compute = request.context_current_position
+            end_compute = begin_compute + request.context_chunk_size
+            prompt_tokens = all_prompt_tokens[begin_compute:end_compute]
+            position_ids.extend(
+                range(begin_compute, begin_compute + len(prompt_tokens)))
+            input_ids.extend(prompt_tokens)
+            gather_ids.append(len(input_ids) - 1)
+            sequence_lengths.append(len(prompt_tokens))
+            prompt_lengths.append(len(prompt_tokens))
+            past_seen_token_num = begin_compute
+            num_cached_tokens_per_seq.append(past_seen_token_num)
+            multimodal_embedding = request.multimodal_embedding
+            if multimodal_embedding is not None:
+                multimodal_embedding = multimodal_embedding.pin_memory(
+                ) if multimodal_embedding.device == 'cpu' else multimodal_embedding
+                multi_modal_data.append(
+                    multimodal_embedding.to('cuda', non_blocking=True))
+
+            mrope_rotary_cos_sin = request.mrope_rotary_cos_sin
+            if mrope_rotary_cos_sin is not None:
+                mrope_rotary_cos_sin = mrope_rotary_cos_sin.pin_memory(
+                ) if mrope_rotary_cos_sin.device == 'cpu' else mrope_rotary_cos_sin
+                mrope_config['mrope_rotary_cos_sin'].append(
+                    mrope_rotary_cos_sin.to('cuda', non_blocking=True))
+            request.py_batch_idx = request.seq_slot
+
+        num_ctx_requests = len(scheduled_requests.context_requests)
+        num_ctx_tokens = len(input_ids)
+        new_tokens_device, new_tokens_lens_device, next_draft_tokens_device = None, None, None
+        if new_tensors_device is not None:
+            # speculative decoding cases: [batch, 1 + draft_len], others: [batch]
+            new_tokens_device = new_tensors_device.new_tokens
+            if self.without_logits:
+                assert isinstance(new_tensors_device, SampleStateTensorsMTP)
+                new_tokens_lens_device = new_tensors_device.new_tokens_lens  # [batch]
+                next_draft_tokens_device = new_tensors_device.next_draft_tokens  # [batch, draft_len]
+
+        # Requests with draft tokens are treated like extend requests. Dummy extend requests should be
+        # at the end of extend_requests.
+        extend_requests = []
+        extend_dummy_requests = []
+        generation_requests = []
+        for request in scheduled_requests.generation_requests:
+            if len(request.py_draft_tokens
+                   ) > 0 or next_draft_tokens_device is not None:
+                if request.is_dummy:
+                    extend_dummy_requests.append(request)
+                else:
+                    extend_requests.append(request)
+            else:
+                generation_requests.append(request)
+
+            mrope_position_deltas = request.mrope_position_deltas
+            if mrope_position_deltas is not None:
+                mrope_position_deltas = torch.tensor([mrope_position_deltas],
+                                                     dtype=torch.int32,
+                                                     pin_memory=True)
+                mrope_config['mrope_position_deltas'].append(
+                    mrope_position_deltas.to('cuda', non_blocking=True))
+        extend_requests += extend_dummy_requests
+
+        if not self._disable_overlap_scheduler and self.is_spec_decode:
+            spec_dec_mode = self.spec_config.spec_dec_mode
+            assert spec_dec_mode.support_overlap_scheduler(
+            ), f"{self.spec_config.spec_dec_name} does not support overlap scheduler"
+
+        # will contain previous batch indices of generation requests
+        previous_batch_indices = []
+        previous_pos_indices = []
+        for request in extend_requests:
+            # the request has no previous tensor:
+            # (1) next_draft_tokens_device is None, which means overlap scheduler is disabled; or
+            # (2) a dummy request; or
+            # (3) the first step in the generation server of disaggregated serving
+            if next_draft_tokens_device is None or request.is_dummy or request.py_batch_idx is None:
+                # get token ids, including input token ids and draft token ids. For these dummy requests,
+                # no need to copy the token ids.
+                if not request.is_dummy:
+                    input_ids.append(request.get_last_tokens(0))
+                    input_ids.extend(request.py_draft_tokens)
+                    draft_tokens.extend(request.py_draft_tokens)
+                # get other ids and lengths
+                num_draft_tokens = len(request.py_draft_tokens)
+                past_seen_token_num = request.max_beam_num_tokens - 1
+                draft_lens.append(num_draft_tokens)
+
+                if self.is_spec_decode and self.spec_config.spec_dec_mode.extend_ctx(
+                        self.attn_backend):
+                    # We're treating the prompt lengths as context requests here, so
+                    # the the prompt lens should not include the cached tokens.
+                    prompt_lengths.append(1 + num_draft_tokens)
+                else:
+                    prompt_lengths.append(request.py_prompt_len)
+
+                sequence_lengths.append(1 + num_draft_tokens)
+                gather_ids.extend(
+                    list(
+                        range(len(position_ids),
+                              len(position_ids) + 1 + self.max_draft_len)))
+                position_ids.extend(
+                    list(
+                        range(past_seen_token_num,
+                              past_seen_token_num + 1 + num_draft_tokens)))
+                num_cached_tokens_per_seq.append(past_seen_token_num)
+                request_ids.append(request.py_request_id)
+                # update batch index
+                request.py_batch_idx = request.seq_slot
+            else:
+                # update batch index
+                previous_batch_idx = request.py_batch_idx
+                request.py_batch_idx = request.seq_slot
+                # inputs
+                # overlap scheduler can only support the speculative decoding
+                # methods with a fixed number of draft tokens
+                sequence_lengths.append(1 + self.max_draft_len)
+                past_seen_token_num = request.max_beam_num_tokens - 1
+                draft_lens.append(self.max_draft_len)
+                gather_ids.extend(
+                    list(
+                        range(len(position_ids),
+                              len(position_ids) + 1 + self.max_draft_len)))
+                position_ids.extend(
+                    list(
+                        range(past_seen_token_num,
+                              past_seen_token_num + 1 + self.max_draft_len)))
+                # previous tensor
+                previous_batch_indices.append(previous_batch_idx)
+                previous_pos_indices.extend([previous_batch_idx] *
+                                            (1 + self.max_draft_len))
+                num_cached_tokens_per_seq.append(past_seen_token_num +
+                                                 self.max_draft_len + 1)
+                prompt_lengths.append(request.py_prompt_len)
+                request_ids.append(request.py_request_id)
+
+        for request in generation_requests:
+            beam_width = request.sampling_config.beam_width
+            for beam in range(beam_width):
+                # the request has no previous tensor:
+                # (1) new_tokens_device is None, which means overlap scheduler is disabled; or
+                # (2) a dummy request; or
+                # (3) the first step in the generation server of disaggregated serving
+                if new_tokens_device is None or request.is_dummy or request.py_batch_idx is None:
+                    # skip adding input_ids of CUDA graph dummy requests so that new_tokens_device
+                    # can be aligned to the correct positions.
+                    if not request.is_cuda_graph_dummy:
+                        input_ids.append(request.get_last_tokens(beam))
+                    past_seen_token_num = request.max_beam_num_tokens - 1
+                else:
+                    # the request has previous tensor
+                    # previous_batch_indices is used per request, not per beam
+                    # Only append it once for the first beam of each request
+                    first_beam = 0
+                    if beam == first_beam:
+                        previous_batch_indices.append(request.py_batch_idx)
+                    past_seen_token_num = request.max_beam_num_tokens
+
+                position_ids.append(past_seen_token_num)
+                num_cached_tokens_per_seq.append(past_seen_token_num)
+                prompt_lengths.append(request.py_prompt_len)
+                draft_lens.append(0)
+                sequence_lengths.append(1)
+                gather_ids.append(len(position_ids) - 1)
+
+            request_ids.append(request.py_request_id)
+            gen_request_seq_slots.append(request.seq_slot)
+            request.py_batch_idx = request.seq_slot
+
+        previous_batch_len = len(previous_batch_indices)
+
+        def previous_seq_slots_device():
+            previous_batch_indices_host = torch.tensor(previous_batch_indices,
+                                                       dtype=torch.int,
+                                                       pin_memory=True)
+            previous_slots = self.previous_batch_indices_cuda[:
+                                                              previous_batch_len]
+            previous_slots.copy_(previous_batch_indices_host, non_blocking=True)
+            return previous_slots
+
+        num_tokens = len(input_ids)
+        num_draft_tokens = len(draft_tokens)
+        num_requests = len(request_ids)
+        total_num_tokens = len(position_ids)
+        assert total_num_tokens <= self.max_num_tokens, (
+            "total_num_tokens should be less than or equal to max_num_tokens")
+        # if exist requests that do not have previous batch, copy input_ids and draft_tokens
+        if num_tokens > 0:
+            input_ids = torch.tensor(input_ids,
+                                     dtype=torch.int,
+                                     pin_memory=True)
+            self.input_ids_cuda[:num_tokens].copy_(input_ids, non_blocking=True)
+        if num_draft_tokens > 0:
+            draft_tokens = torch.tensor(draft_tokens,
+                                        dtype=torch.int,
+                                        pin_memory=True)
+            self.draft_tokens_cuda[:len(draft_tokens)].copy_(draft_tokens,
+                                                             non_blocking=True)
+        if next_draft_tokens_device is not None:
+            if previous_batch_len > 0:
+                previous_slots = previous_seq_slots_device()
+                # previous input ids
+                previous_batch_tokens = previous_batch_len * (
+                    1 + self.max_draft_len)
+                new_tokens = new_tokens_device.transpose(
+                    0, 1)[previous_slots, :].flatten()
+                self.input_ids_cuda[num_tokens:num_tokens +
+                                    previous_batch_tokens].copy_(
+                                        new_tokens, non_blocking=True)
+                # previous draft tokens
+                previous_batch_draft_tokens = previous_batch_len * self.max_draft_len
+                self.draft_tokens_cuda[num_draft_tokens:num_draft_tokens +
+                                       previous_batch_draft_tokens].copy_(
+                                           next_draft_tokens_device[
+                                               previous_slots, :].flatten(),
+                                           non_blocking=True)
+                # prepare data for the preprocess inputs
+                kv_len_offsets_device = new_tokens_lens_device - self.max_draft_len - 1
+                previous_pos_indices_host = torch.tensor(previous_pos_indices,
+                                                         dtype=torch.int,
+                                                         pin_memory=True)
+                self.previous_pos_indices_cuda[0:previous_batch_tokens].copy_(
+                    previous_pos_indices_host, non_blocking=True)
+                self.previous_pos_id_offsets_cuda[
+                    0:previous_batch_tokens].copy_(
+                        new_tokens_lens_device[self.previous_pos_indices_cuda[
+                            0:previous_batch_tokens]],
+                        non_blocking=True)
+                self.previous_kv_lens_offsets_cuda[0:previous_batch_len].copy_(
+                    kv_len_offsets_device[previous_slots], non_blocking=True)
+                # for the requests that do not have previous batch, set the previous_pos_id_offsets and
+                # previous_kv_lens_offsets to zeros to skip the value changes in _preprocess_inputs
+                self.previous_pos_id_offsets_cuda[
+                    previous_batch_tokens:num_requests *
+                    (1 + self.max_draft_len)] *= 0
+                self.previous_kv_lens_offsets_cuda[
+                    previous_batch_len:num_requests] *= 0
+            else:
+                # change the data to zeros to skip the value changes in _preprocess_inputs
+                self.previous_pos_id_offsets_cuda *= 0
+                self.previous_kv_lens_offsets_cuda *= 0
+        elif new_tokens_device is not None:
+            seq_slots_device = previous_seq_slots_device()
+            max_draft_len = max(draft_lens)
+            new_tokens = new_tokens_device[:max_draft_len + 1,
+                                           seq_slots_device, :self.
+                                           max_beam_width]
+            self.input_ids_cuda[num_tokens:num_tokens +
+                                previous_batch_len * self.max_beam_width].copy_(
+                                    new_tokens.flatten(), non_blocking=True)
+
+        position_ids = torch.tensor(position_ids,
+                                    dtype=torch.int,
+                                    pin_memory=True)
+        self.position_ids_cuda[:total_num_tokens].copy_(position_ids,
+                                                        non_blocking=True)
+        if self.is_spec_decode:
+            self.gather_ids_cuda[:len(gather_ids)].copy_(torch.tensor(
+                gather_ids, dtype=torch.int, pin_memory=True),
+                                                         non_blocking=True)
+
+        if not attn_metadata.is_cuda_graph:
+            # Assumes seq lens do not change between CUDA graph invocations. This applies
+            # to draft sequences too. This means that all draft sequences must be padded.
+            attn_metadata.seq_lens = torch.tensor(
+                sequence_lengths,
+                dtype=torch.int,
+                pin_memory=True,
+            )
+
+        num_generation_requests = len(scheduled_requests.generation_requests)
+        # Cache indirection is only used for beam search on generation requests
+        if self.max_beam_width > 1 and num_generation_requests > 0 and cache_indirection_buffer is not None:
+            cache_indirection_attention = torch.zeros_like(
+                cache_indirection_buffer)
+            #Copy cache indirection to local buffer with offsets changing:  seq_slots[i] -> i
+            cache_indirection_attention[:num_generation_requests].copy_(
+                cache_indirection_buffer[gen_request_seq_slots])
+            attn_metadata.cache_indirection = cache_indirection_attention
+            attn_metadata.beam_width = self.max_beam_width
+        else:
+            attn_metadata.cache_indirection = None
+            attn_metadata.beam_width = 1
+
+        attn_metadata.request_ids = request_ids
+        attn_metadata.prompt_lens = prompt_lengths
+        attn_metadata.num_contexts = len(scheduled_requests.context_requests)
+        if self.is_spec_decode and self.spec_config.spec_dec_mode.extend_ctx(
+                self.attn_backend):
+            attn_metadata.num_contexts += len(extend_requests)
+
+        attn_metadata.kv_cache_params = KVCacheParams(
+            use_cache=True,
+            num_cached_tokens_per_seq=num_cached_tokens_per_seq,
+            num_extra_kv_tokens=0 if self.spec_config is None else
+            self.spec_config.num_extra_kv_tokens)
+        attn_metadata.kv_cache_manager = kv_cache_manager
+
+        attn_metadata.prepare()
+
+        lora_params = self._get_lora_params_from_requests(
+            scheduled_requests, attn_metadata)
+
+        # Prepare inputs
+        inputs = {
+            'attn_metadata': attn_metadata,
+            'input_ids': self.input_ids_cuda[:total_num_tokens],
+            'position_ids':
+            self.position_ids_cuda[:total_num_tokens].unsqueeze(0),
+            'inputs_embeds': None,
+            'multi_modal_data': multi_modal_data,
+            'mrope_config': mrope_config
+        }
+
+        if bool(lora_params):
+            inputs['lora_params'] = lora_params
+
+        if spec_metadata is not None:
+            total_draft_lens = sum(draft_lens)
+            spec_metadata.draft_tokens = self.draft_tokens_cuda[:
+                                                                total_draft_lens]
+            spec_metadata.request_ids = request_ids
+            spec_metadata.gather_ids = self.gather_ids_cuda[:len(gather_ids)]
+            spec_metadata.num_generations = len(
+                scheduled_requests.generation_requests)
+            spec_metadata.num_tokens = total_num_tokens
+            spec_metadata.seq_lens = sequence_lengths
+            spec_metadata.prepare()
+            inputs['spec_metadata'] = spec_metadata
+
+        # support attention dp
+        if self.enable_attention_dp:
+            if spec_metadata is not None:
+                all_rank_num_tokens = self.dist.tp_allgather([
+                    attn_metadata.num_tokens, spec_metadata.num_tokens,
+                    len(sequence_lengths)
+                ])
+                attn_all_rank_num_tokens = [
+                    item[0] for item in all_rank_num_tokens
+                ]
+                spec_all_rank_num_tokens = [
+                    item[1] for item in all_rank_num_tokens
+                ]
+                all_rank_num_seqs = [item[2] for item in all_rank_num_tokens]
+                attn_metadata.all_rank_num_tokens = attn_all_rank_num_tokens
+                spec_metadata.all_rank_num_tokens = spec_all_rank_num_tokens
+                spec_metadata.all_rank_num_seqs = all_rank_num_seqs
+            else:
+                all_rank_num_tokens = self.dist.tp_allgather(
+                    attn_metadata.num_tokens)
+                attn_metadata.all_rank_num_tokens = all_rank_num_tokens
+
+        num_generation_tokens = len(generation_requests) + len(
+            extend_requests) + sum(draft_lens)
+        self.iter_states['num_ctx_requests'] = num_ctx_requests
+        self.iter_states['num_ctx_tokens'] = num_ctx_tokens
+        self.iter_states['num_generation_tokens'] = num_generation_tokens
+        return inputs, self.gather_ids_cuda[:len(
+            gather_ids)] if self.is_spec_decode else None
+
+    def _prepare_tp_inputs_no_cache(
+            self,
+            scheduled_requests: ScheduledRequests,
+            attn_metadata: AttentionMetadata,
+            spec_metadata: Optional[SpecMetadata] = None):
+        """
+        Prepare inputs for Pytorch Model.
+        """
+        sequence_lengths = []
+        input_ids = []
+        gather_ids = []
+        position_ids = []
+        multi_modal_data = []
+        draft_lens = []
+        request_ids = []
+
+        for request in scheduled_requests.context_requests:
+            prompt_tokens = request.get_tokens(0)
+            input_ids.extend(prompt_tokens)
+            request_ids.append(request.py_request_id)
+            if request.position_ids is None:
+                position_ids.extend(range(len(prompt_tokens)))
+            else:
+                position_ids.extend(request.position_ids)
+            gather_ids.append(len(input_ids) - 1)
+            sequence_lengths.append(len(prompt_tokens))
+            draft_lens.append(0)
+            multimodal_embedding = request.multimodal_embedding
+            if multimodal_embedding is not None:
+                multi_modal_data.append(multimodal_embedding)
+
+        num_tokens = len(input_ids)
+        assert num_tokens <= self.max_num_tokens, (
+            "num_tokens should be less than or equal to max_num_tokens")
+        input_ids = torch.tensor(input_ids, dtype=torch.int, pin_memory=True)
+        self.input_ids_cuda[:num_tokens].copy_(input_ids, non_blocking=True)
+
+        position_ids = torch.tensor(position_ids,
+                                    dtype=torch.int,
+                                    pin_memory=True)
+        self.position_ids_cuda[:num_tokens].copy_(position_ids,
+                                                  non_blocking=True)
+        if self.is_spec_decode:
+            self.gather_ids_cuda[:len(gather_ids)].copy_(torch.tensor(
+                gather_ids, dtype=torch.int, pin_memory=True),
+                                                         non_blocking=True)
+
+        if not attn_metadata.is_cuda_graph:
+            # No need to overwrite seq lens when using CUDA graphs -
+            # CUDA graphs are only used for pure decoding batches
+            # and have static batch size, so the seqlens never change.
+            # Note that it's important to not free the seq_lens_cuda
+            # buffer once the graph has been captured also - this will invalidate
+            # the graph and force an expensive recapture.
+            attn_metadata.seq_lens = torch.tensor(
+                sequence_lengths,
+                dtype=torch.int,
+                pin_memory=True,
+            )
+
+        attn_metadata.num_contexts = len(scheduled_requests.context_requests)
+        if self.enable_attention_dp:
+            all_rank_num_tokens = self.dist.allgather(attn_metadata.num_tokens)
+            attn_metadata.all_rank_num_tokens = all_rank_num_tokens
+        # this is for no cache attention, not for dummy attention
+        if attn_metadata.kv_cache_manager is None:
+            assert isinstance(
+                attn_metadata,
+                (VanillaAttentionMetadata, TrtllmAttentionMetadata)
+            ), "Only vanilla and trtllm attention metadata are supported for no cache attention for now"
+            attn_metadata.max_seq_len = self.max_seq_len
+            attn_metadata.request_ids = request_ids
+            attn_metadata.prepare()
+
+        lora_params = self._get_lora_params_from_requests(
+            scheduled_requests, attn_metadata)
+
+        inputs = {
+            'attn_metadata': attn_metadata,
+            'input_ids': self.input_ids_cuda[:num_tokens],
+            'position_ids': self.position_ids_cuda[:num_tokens].unsqueeze(0),
+            'inputs_embeds': None,
+            'multi_modal_data': multi_modal_data
+        }
+
+        if bool(lora_params):
+            inputs['lora_params'] = lora_params
+
+        if spec_metadata is not None:
+            total_draft_lens = sum(draft_lens)
+            spec_metadata.draft_tokens = self.draft_tokens_cuda[:
+                                                                total_draft_lens]
+            spec_metadata.request_ids = request_ids
+            spec_metadata.gather_ids = self.gather_ids_cuda[:len(gather_ids)]
+            spec_metadata.num_generations = len(
+                scheduled_requests.generation_requests)
+            spec_metadata.num_tokens = num_tokens
+            spec_metadata.seq_lens = sequence_lengths
+            spec_metadata.prepare()
+            inputs['spec_metadata'] = spec_metadata
+
+        # support attention dp
+        if self.enable_attention_dp:
+            if spec_metadata is not None:
+                all_rank_num_tokens = self.dist.tp_allgather([
+                    attn_metadata.num_tokens, spec_metadata.num_tokens,
+                    len(sequence_lengths)
+                ])
+                attn_all_rank_num_tokens = [
+                    item[0] for item in all_rank_num_tokens
+                ]
+                spec_all_rank_num_tokens = [
+                    item[1] for item in all_rank_num_tokens
+                ]
+                all_rank_num_seqs = [item[2] for item in all_rank_num_tokens]
+                attn_metadata.all_rank_num_tokens = attn_all_rank_num_tokens
+                spec_metadata.all_rank_num_tokens = spec_all_rank_num_tokens
+                spec_metadata.all_rank_num_seqs = all_rank_num_seqs
+            else:
+                all_rank_num_tokens = self.dist.tp_allgather(
+                    attn_metadata.num_tokens)
+                attn_metadata.all_rank_num_tokens = all_rank_num_tokens
+
+        return inputs, None
+
+    def _prepare_star_attention_inputs(self,
+                                       scheduled_requests: ScheduledRequests,
+                                       kv_cache_manager,
+                                       attn_metadata: AttentionMetadata):
+        """
+        Prepare inputs for Pytorch Model.
+        """
+        sequence_lengths = []
+        input_ids = []
+        prompt_lengths = []
+        request_ids = []
+        gather_ids = []
+        position_ids = []
+        # for star attention, we need customized block ids
+        block_ids_per_seq = []
+        num_cached_tokens_per_seq = []
+        for request in scheduled_requests.context_requests:
+            request_ids.append(request.py_request_id)
+            prompt_lengths.append(request.py_prompt_len)
+
+            ctx_iter = request.ctx_iters
+            ctx_blocks = request.ctx_blocks
+            ctx_position_blocks = request.ctx_position_blocks
+            all_cache_indices = kv_cache_manager.get_cache_indices(request)
+            ### for the first iteration, we need to construct input as C[0]  + C[1]
+            if ctx_iter == 0:
+                input_id = ctx_blocks[0] + ctx_blocks[1]
+                num_kv_blocks = kv_cache_manager.get_num_kv_blocks(
+                    len(input_id))
+                position_id = ctx_position_blocks[0] + ctx_position_blocks[1]
+                past_seen_token_num = 0
+                all_cache_indices = all_cache_indices[:num_kv_blocks]
+            else:
+                input_id = ctx_blocks[ctx_iter + 1]
+                position_id = ctx_position_blocks[ctx_iter + 1]
+                ## compute C[0] and ctx_blocks
+                if ctx_iter < len(ctx_blocks) - 2:
+                    if self.mapping.cp_rank == 0:
+                        anchor_block = ctx_blocks[
+                            0][:self.mapping.cp_config['cp_anchor_size']]
+                    else:
+                        anchor_block = ctx_blocks[0]
+
+                    num_anchor_cache_blocks = kv_cache_manager.get_num_kv_blocks(
+                        len(anchor_block))
+                    ### we need to construct input as C[0] + C[x+i]
+                    #C0 has been computed, can be shared across all blocks
+                    anchor_indices = all_cache_indices[:num_anchor_cache_blocks]
+
+                    # C1~C[ctx_iter] should be skipped in the computation
+                    token_start_idx = sum(
+                        len(block) for block in ctx_blocks[:(ctx_iter + 1)])
+                    token_end_idx = sum(
+                        len(block) for block in ctx_blocks[:(ctx_iter + 2)])
+                    block_start_idx = kv_cache_manager.get_num_kv_blocks(
+                        token_start_idx)
+                    block_end_idx = kv_cache_manager.get_num_kv_blocks(
+                        token_end_idx)
+                    block_indices = all_cache_indices[
+                        block_start_idx:block_end_idx]
+
+                    all_cache_indices = anchor_indices + block_indices
+                    past_seen_token_num = len(
+                        anchor_block)  ### C[0] can be reused
+                else:
+                    continue
+            input_ids.extend(input_id)
+            position_ids.extend(position_id)
+            gather_ids.append(len(input_ids) - 1)
+            sequence_lengths.append(len(input_id))
+            block_ids_per_seq.extend([all_cache_indices])
+            num_cached_tokens_per_seq.append(past_seen_token_num)
+        num_contexts = len(sequence_lengths)
+        for request in scheduled_requests.context_requests:
+            ctx_iter = request.ctx_iters
+            ctx_blocks = request.ctx_blocks
+            ctx_position_blocks = request.ctx_position_blocks
+            num_kvblocks_per_ctx_block = kv_cache_manager.get_num_kv_blocks(
+                len(ctx_blocks[0]))
+            all_cache_indices = kv_cache_manager.get_cache_indices(request)
+            ### for query phase
+            ## compute C[0~blocks] with query for the first rank
+            ## compute C[1~blocks] with query for the other rank
+            if ctx_iter == len(ctx_blocks) - 2:
+                input_id = ctx_blocks[ctx_iter + 1]
+                position_id = ctx_position_blocks[ctx_iter + 1]
+                if self.mapping.cp_rank == 0:
+                    past_seen_token_num = sum(
+                        len(block) for block in ctx_blocks[:ctx_iter + 1])
+                else:
+                    # drop C0, free KV cache
+                    all_cache_indices = all_cache_indices[
+                        num_kvblocks_per_ctx_block:]
+                    past_seen_token_num = sum(
+                        len(block) for block in ctx_blocks[1:ctx_iter + 1])
+                if self.mapping.cp_rank == self.mapping.cp_size - 1:
+                    num_kv_tokens = past_seen_token_num + len(input_id)
+                else:
+                    num_kv_tokens = past_seen_token_num  # don't need to append/compute query's kv cache
+                num_kv_blocks = kv_cache_manager.get_num_kv_blocks(
+                    num_kv_tokens)
+                all_cache_indices = all_cache_indices[:num_kv_blocks]
+            else:
+                continue
+
+            input_ids.extend(input_id)
+            position_ids.extend(position_id)
+            gather_ids.append(len(input_ids) - 1)
+            sequence_lengths.append(len(input_id))
+            block_ids_per_seq.extend([all_cache_indices])
+            num_cached_tokens_per_seq.append(past_seen_token_num)
+        num_queries = len(sequence_lengths) - num_contexts
+
+        # Requests with draft tokens are treated like extend requests.
+        extend_requests = [
+            request for request in scheduled_requests.generation_requests
+            if request.py_draft_tokens
+        ]
+        generation_requests = [
+            request for request in scheduled_requests.generation_requests
+            if not request.py_draft_tokens
+        ]
+        is_spec_decode = len(extend_requests) > 0
+        assert not is_spec_decode, 'star attention does not support draft tokens now.'
+
+        for request in generation_requests:
+            request_ids.append(request.py_request_id)
+            prompt_lengths.append(request.py_prompt_len)
+
+            input_token_id = request.get_token(0, request.get_num_tokens(0) - 1)
+            input_ids.append(input_token_id)
+            gather_ids.append(len(input_ids) - 1)
+            sequence_lengths.append(1)
+            past_seen_token_num = request.max_beam_num_tokens - 1
+
+            # for sp, we only increase the generated KV cache for the last rank
+            ctx_blocks = request.ctx_blocks
+            total_anchor_ctx_query_len = sum(
+                [len(block) for block in ctx_blocks])
+            query_len = len(ctx_blocks[-1])
+            anchor_len = len(ctx_blocks[0])
+
+            if self.mapping.cp_size == 1:
+                past_seen_token_num = total_anchor_ctx_query_len + request.gen_iters
+                num_kv_tokens = past_seen_token_num + 1
+            else:
+                if self.mapping.cp_rank == self.mapping.cp_size - 1:
+                    past_seen_token_num = total_anchor_ctx_query_len + request.gen_iters - anchor_len
+                    num_kv_tokens = past_seen_token_num + 1
+                else:
+                    if self.mapping.cp_rank != 0:
+                        past_seen_token_num = total_anchor_ctx_query_len - anchor_len - query_len
+                    else:
+                        past_seen_token_num = total_anchor_ctx_query_len - query_len
+                    num_kv_tokens = past_seen_token_num  # don't need to append kv cache
+
+            num_kv_blocks = kv_cache_manager.get_num_kv_blocks(num_kv_tokens)
+            all_cache_indices = kv_cache_manager.get_cache_indices(request)
+            if self.mapping.cp_rank != 0:
+                num_kvblocks_per_ctx_block = kv_cache_manager.get_num_kv_blocks(
+                    anchor_len)
+                all_cache_indices = all_cache_indices[
+                    num_kvblocks_per_ctx_block:]
+            cache_indices = all_cache_indices[:num_kv_blocks]
+            last_query_pos_id = request.ctx_position_blocks[-1][-1]
+            position_ids.append(last_query_pos_id + request.gen_iters + 1)
+            block_ids_per_seq.extend([all_cache_indices])
+            num_cached_tokens_per_seq.append(past_seen_token_num)
+
+        num_tokens = len(input_ids)
+        assert num_tokens <= self.max_num_tokens, (
+            "num_tokens should be less than or equal to max_num_tokens")
+        input_ids = torch.tensor(input_ids, dtype=torch.int, pin_memory=True)
+        self.input_ids_cuda[:num_tokens].copy_(input_ids, non_blocking=True)
+
+        position_ids = torch.tensor(position_ids,
+                                    dtype=torch.int,
+                                    pin_memory=True)
+        self.position_ids_cuda[:num_tokens].copy_(position_ids,
+                                                  non_blocking=True)
+
+        if not attn_metadata.is_cuda_graph:
+            # No need to overwrite seq lens when using CUDA graphs -
+            # CUDA graphs are only used for pure decoding batches
+            # and have static batch size, so the seqlens never change.
+            # Note that it's important to not free the seq_lens_cuda
+            # buffer once the graph has been captured also - this will invalidate
+            # the graph and force an expensive recapture.
+            attn_metadata.seq_lens = torch.tensor(
+                sequence_lengths,
+                dtype=torch.int,
+                pin_memory=True,
+            )
+
+        attn_metadata.request_ids = request_ids
+        attn_metadata.prompt_lens = prompt_lengths
+        attn_metadata.num_contexts = num_contexts
+        attn_metadata.num_queries = num_queries
+
+        attn_metadata.kv_cache_params = KVCacheParams(
+            use_cache=True,
+            block_ids_per_seq=block_ids_per_seq,
+            num_cached_tokens_per_seq=num_cached_tokens_per_seq)
+
+        attn_metadata.kv_cache_manager = kv_cache_manager
+
+        attn_metadata.prepare()
+        if self.enable_attention_dp:
+            all_rank_num_tokens = self.dist.tp_allgather(
+                attn_metadata.num_tokens)
+            attn_metadata.all_rank_num_tokens = all_rank_num_tokens
+
+        return {
+            'attn_metadata': attn_metadata,
+            'input_ids': self.input_ids_cuda[:num_tokens],
+            'position_ids': self.position_ids_cuda[:num_tokens].unsqueeze(0),
+            'inputs_embeds': None
+        }, gather_ids if is_spec_decode else None
+
+    def _get_lora_params_from_requests(self,
+                                       scheduled_requests: ScheduledRequests,
+                                       attn_metadata: AttentionMetadata):
+        '''
+        lora_params: dict
+        {
+            layer_id: dict
+            {
+                module_id: dict
+                {
+                    adapter_size: torch tensor: int
+                    is_dora: torch tensor: bool
+                    weight_pointers: torch tensor: int64
+                }
+            }
+        }
+        '''
+        lora_params = {}
+        tmp_lora_params = {}
+
+        request_list = scheduled_requests.context_requests + scheduled_requests.generation_requests
+
+        # trace all requests to get the union set of the lora params
+        for request in request_list:
+            if request.py_lora_task_layer_module_configs is None:
+                continue
+
+            for module in request.py_lora_task_layer_module_configs:
+                module_id = module.module_id
+                layer_id = module.layer_id
+                adapter_size = module.adapter_size
+                is_dora = module.scaling_vec_pointer == 0
+                weights_in_pointer = module.weights_in_pointer
+                weights_out_pointer = module.weights_out_pointer
+                scaling_vec_pointer = module.scaling_vec_pointer
+                if weights_in_pointer is None:
+                    weights_in_pointer = 0
+                if weights_out_pointer is None:
+                    weights_out_pointer = 0
+                if scaling_vec_pointer is None:
+                    scaling_vec_pointer = 0
+
+                if layer_id not in lora_params:
+                    lora_params[layer_id] = {}
+                if module_id not in lora_params[layer_id]:
+                    lora_params[layer_id][module_id] = {}
+
+                if 'adapter_size' not in lora_params[layer_id][module_id]:
+                    lora_params[layer_id][module_id]['adapter_size'] = []
+                if 'is_dora' not in lora_params[layer_id][module_id]:
+                    lora_params[layer_id][module_id]['is_dora'] = []
+                if 'weight_pointers' not in lora_params[layer_id][module_id]:
+                    lora_params[layer_id][module_id]['weight_pointers'] = []
+
+                tmp_lora_params[
+                    f'{request.py_request_id}_{layer_id}_{module_id}_adapter_size'] = [
+                        adapter_size
+                    ]
+                tmp_lora_params[
+                    f'{request.py_request_id}_{layer_id}_{module_id}_is_dora'] = [
+                        is_dora
+                    ]
+                tmp_lora_params[
+                    f'{request.py_request_id}_{layer_id}_{module_id}_weights_pointer'] = [
+                        weights_in_pointer, weights_out_pointer,
+                        scaling_vec_pointer
+                    ]
+
+        for request in request_list:
+            # Need to set default values for this case
+            if request.py_lora_task_layer_module_configs is None:
+                for layer_id in lora_params:
+                    for module_id in lora_params[layer_id]:
+                        lora_params[layer_id][module_id]['adapter_size'].append(
+                            0)
+                        lora_params[layer_id][module_id]['is_dora'].append(
+                            False)
+                        lora_params[layer_id][module_id]['weight_pointers'] += [
+                            0, 0, 0
+                        ]
+
+            else:
+                for layer_id in lora_params:
+                    for module_id in lora_params[layer_id]:
+                        if f'{request.py_request_id}_{layer_id}_{module_id}_adapter_size' not in tmp_lora_params:
+                            lora_params[layer_id][module_id][
+                                'adapter_size'].append(0)
+                            lora_params[layer_id][module_id]['is_dora'].append(
+                                False)
+                            lora_params[layer_id][module_id][
+                                'weight_pointers'] += [0, 0, 0]
+                        else:
+                            lora_params[layer_id][module_id][
+                                'adapter_size'] += tmp_lora_params[
+                                    f'{request.py_request_id}_{layer_id}_{module_id}_adapter_size']
+                            lora_params[layer_id][module_id][
+                                'is_dora'] += tmp_lora_params[
+                                    f'{request.py_request_id}_{layer_id}_{module_id}_is_dora']
+                            lora_params[layer_id][module_id][
+                                'weight_pointers'] += tmp_lora_params[
+                                    f'{request.py_request_id}_{layer_id}_{module_id}_weights_pointer']
+
+        for layer_id in lora_params:
+            for module_id in lora_params[layer_id]:
+                lora_params[layer_id][module_id][
+                    'adapter_size'] = torch.IntTensor(
+                        lora_params[layer_id][module_id]['adapter_size'])
+                lora_params[layer_id][module_id][
+                    'weight_pointers'] = torch.LongTensor(
+                        lora_params[layer_id][module_id]['weight_pointers'])
+
+        if bool(lora_params):
+            lora_params['host_request_types'] = attn_metadata.host_request_types
+            lora_params['prompt_lens_cpu'] = attn_metadata.prompt_lens_cpu
+            lora_params['num_seqs'] = attn_metadata.num_seqs
+
+        return lora_params
+
+    @nvtx_range("_prepare_inputs")
+    def _prepare_inputs(
+            self,
+            scheduled_requests: ScheduledRequests,
+            kv_cache_manager: KVCacheManager,
+            attn_metadata: AttentionMetadata,
+            spec_metadata: Optional[SpecMetadata] = None,
+            new_tensors_device: Optional[SampleStateTensors] = None,
+            cache_indirection_buffer: Optional[torch.Tensor] = None):
+        if self.mapping is not None and 'cp_type' in self.mapping.cp_config:
+            cp_type = self.mapping.cp_config['cp_type']
+            if 'star_attention' == cp_type:
+                return self._prepare_star_attention_inputs(
+                    scheduled_requests, kv_cache_manager, attn_metadata)
+            else:
+                assert False, f'Unsupport cp_type {cp_type}'
+        else:
+            return self._prepare_tp_inputs(scheduled_requests, kv_cache_manager,
+                                           attn_metadata, spec_metadata,
+                                           new_tensors_device,
+                                           cache_indirection_buffer)
+
+    @torch.inference_mode()
+    @with_model_extra_attrs(lambda self: self.model.extra_attrs)
+    def forward(
+        self,
+        scheduled_requests: ScheduledRequests,
+        resource_manager: ResourceManager,
+        new_tensors_device: Optional[SampleStateTensors] = None,
+        gather_context_logits: bool = False,
+        cache_indirection_buffer: Optional[torch.Tensor] = None,
+    ):
+        print(f"[MODEL_ENGINE_DEBUG] Starting forward pass")
+        print(f"[MODEL_ENGINE_DEBUG] Number of requests: {len(scheduled_requests.all_requests())}")
+        print(f"[MODEL_ENGINE_DEBUG] Batch size: {self.batch_size}")
+        print(f"[MODEL_ENGINE_DEBUG] Max num tokens: {self.max_num_tokens}")
+        print(f"[MODEL_ENGINE_DEBUG] KV cache manager key: {self.kv_cache_manager_key}")
+
+        kv_cache_manager = resource_manager.get_resource_manager(
+            self.kv_cache_manager_key)
+        if kv_cache_manager is None:
+            raise ValueError(f"[MODEL_ENGINE_DEBUG] KV cache manager not found in resources")
+
+        # Set up attention metadata
+        attn_metadata = self._set_up_attn_metadata(kv_cache_manager, resource_manager)
+        
+        # Check if we have split attention metadata (batch splitting enabled)
+        if isinstance(attn_metadata, dict) and 'dense' in attn_metadata:
+            # Use 3-metadata structure for batch splitting
+            print(f"[MODEL_ENGINE_DEBUG] Using 3-metadata structure for batch splitting")
+            print(f"[MODEL_ENGINE_DEBUG] Available metadata: {list(attn_metadata.keys())}")
+            
+            # For the model engine, we need to provide the appropriate metadata
+            # The model will select the correct metadata based on layer type
+            # For now, use dense metadata as the primary one for the engine
+            primary_metadata = attn_metadata['dense']
+            
+            # Set up speculative metadata if needed
+            spec_metadata = None
+            if self.is_spec_decode:
+                spec_metadata = self._set_up_spec_metadata(
+                    scheduled_requests, spec_config=self.spec_config)
+            
+            # Check for CUDA graph
+            maybe_graph = self._maybe_get_cuda_graph(
+                scheduled_requests, spec_config=self.spec_config)
+            if maybe_graph is not None:
+                primary_metadata = maybe_graph.attn_metadata
+                if self.is_spec_decode:
+                    spec_metadata = maybe_graph.spec_metadata
+            else:
+                if self.is_spec_decode:
+                    spec_metadata = self.spec_metadata
+
+            inputs, gather_ids = self._prepare_inputs(
+                scheduled_requests, kv_cache_manager, primary_metadata,
+                spec_metadata, new_tensors_device, cache_indirection_buffer)
+            
+            # The model will handle the appropriate metadata selection internally
+            return self._forward_with_3_metadata(
+                scheduled_requests, resource_manager, attn_metadata,
+                inputs, gather_ids, gather_context_logits)
+        
+        else:
+            print("SHOULD NOT REACH HERE!")
+            raise ValueError("Should not reach here")
+        # Standard path with single attention metadata
+        print(f"[MODEL_ENGINE_DEBUG] Using standard attention metadata path")
+        
+        # Set up speculative metadata if needed
+        spec_metadata = None
+        if self.is_spec_decode:
+            spec_metadata = self._set_up_spec_metadata(
+                scheduled_requests, spec_config=self.spec_config)
+        
+        # Check for CUDA graph
+        maybe_graph = self._maybe_get_cuda_graph(
+            scheduled_requests, spec_config=self.spec_config)
+        if maybe_graph is not None:
+            attn_metadata = maybe_graph.attn_metadata
+            if self.is_spec_decode:
+                spec_metadata = maybe_graph.spec_metadata
+        else:
+            if self.is_spec_decode:
+                spec_metadata = self.spec_metadata
+
+        inputs, gather_ids = self._prepare_inputs(
+            scheduled_requests, kv_cache_manager, attn_metadata,
+            spec_metadata, new_tensors_device, cache_indirection_buffer)
+
+        moe_load_balancer = None
+        if hasattr(self, 'moe_load_balancer'):
+            moe_load_balancer = getattr(self, 'moe_load_balancer')
+            if not self.in_warmup:
+                moe_enable_statistic = True
+                moe_enable_update = True
+                moe_load_balancer.set_next_iter_info(moe_enable_statistic,
+                                                     moe_enable_update)
+
+        if kv_cache_manager is None:
+            inputs, gather_ids = self._prepare_tp_inputs_no_cache(
+                scheduled_requests, attn_metadata, spec_metadata)
+
+            with MoeLoadBalancerIterContext(moe_load_balancer):
+                return self._forward_step(inputs, gather_ids,
+                                          gather_context_logits)
+
+        with self._maybe_pad_batch(scheduled_requests,
+                                   kv_cache_manager) as scheduled_requests:
+            maybe_graph = self._maybe_get_cuda_graph(
+                scheduled_requests, spec_config=self.spec_config)
+            if maybe_graph is not None:
+                attn_metadata = maybe_graph.attn_metadata
+                if self.is_spec_decode:
+                    spec_metadata = maybe_graph.spec_metadata
+            else:
+                attn_metadata = self.attn_metadata
+                if self.is_spec_decode:
+                    spec_metadata = self.spec_metadata
+
+            inputs, gather_ids = self._prepare_inputs(
+                scheduled_requests, kv_cache_manager, attn_metadata,
+                spec_metadata, new_tensors_device, cache_indirection_buffer)
+
+            self.iter_counter += 1
+
+            if maybe_graph is None:
+                with MoeLoadBalancerIterContext(moe_load_balancer):
+                    outputs = self._forward_step(inputs, gather_ids,
+                                                 gather_context_logits)
+            else:
+                if maybe_graph.needs_capture():
+
+                    def capture_forward_fn(inputs: Dict[str, Any]):
+                        with MoeLoadBalancerIterContext(moe_load_balancer):
+                            return self._forward_step(
+                                inputs,
+                                gather_ids=gather_ids,
+                                gather_context_logits=gather_context_logits)
+
+                    pool = maybe_graph.capture(
+                        capture_forward_fn,
+                        self._cuda_graph_mem_pool,
+                    )
+                    self._cuda_graph_mem_pool = pool
+
+                    # here we don't need to use context since cuda graph capture didn't run kernel.
+                    # maybe we need a cleaner way to do this.
+                    outputs = maybe_graph.run(inputs)
+                else:
+                    with MoeLoadBalancerIterContext(moe_load_balancer):
+                        outputs = maybe_graph.run(inputs)
+
+            # Note: To overlap the CPU and GPU computation as much as possible,
+            # guided_decoder.build should be called immediately after the launch of the single step;
+            # while guided_decoder.execute should be called right before the samplings.
+            # We can insert other CPU computation between them in the future.
+            if self.mapping.is_last_pp_rank(
+            ) and self.guided_decoder is not None:
+                seq_slot_manager = resource_manager.get_resource_manager(
+                    ResourceManagerType.SEQ_SLOT_MANAGER)
+                self.guided_decoder.build(scheduled_requests, seq_slot_manager)
+                self.guided_decoder.execute(scheduled_requests,
+                                            outputs['logits'], seq_slot_manager)
+
+            self._execute_logit_post_processors(scheduled_requests, outputs)
+
+            return outputs
+
+    def _forward_with_3_metadata(self, scheduled_requests: ScheduledRequests,
+                                resource_manager: ResourceManager,
+                                attn_metadata_dict: Dict[str, AttentionMetadata],
+                                inputs: Dict[str, Any],
+                                gather_ids: Optional[torch.Tensor],
+                                gather_context_logits: bool = False):
+        """Forward pass using 3-metadata structure for batch splitting."""
+        print(f"[MODEL_ENGINE_DEBUG] Starting forward pass with 3-metadata structure")
+        print(f"[MODEL_ENGINE_DEBUG] Available metadata: {list(attn_metadata_dict.keys())}")
+        
+        # Get split KV cache managers from executor resources
+        half1_kv_cache_manager = resource_manager.get_resource_manager(f"{ResourceManagerType.KV_CACHE_MANAGER}_half1")
+        half2_kv_cache_manager = resource_manager.get_resource_manager(f"{ResourceManagerType.KV_CACHE_MANAGER}_half2")
+        
+        if half1_kv_cache_manager is None or half2_kv_cache_manager is None:
+            raise ValueError("Split KV cache managers not found in resources")
+        
+        # Set the metadata dictionary on the model so it can access the appropriate metadata per layer
+        if hasattr(self.model, 'set_attention_metadata_dict'):
+            self.model.set_attention_metadata_dict(attn_metadata_dict)
+        
+        # MOE load balancer setup
+        moe_load_balancer = None
+        if hasattr(self, 'moe_load_balancer'):
+            moe_load_balancer = self.moe_load_balancer
+        
+        # Step 1: Process dense layers (0, 1, 2) with full batch
+        print(f"[MODEL_ENGINE_DEBUG] Processing dense layers with full batch")
+        dense_inputs = inputs.copy()
+        dense_inputs['attn_metadata'] = attn_metadata_dict['dense']
+        
+        with MoeLoadBalancerIterContext(moe_load_balancer):
+            dense_outputs = self._forward_step(dense_inputs, gather_ids, gather_context_logits)
+        
+        # Step 2: Prepare split attention metadata for MOE layers
+        print(f"[MODEL_ENGINE_DEBUG] Preparing split attention metadata for MOE layers")
+        split_metadata = {
+            'half1': attn_metadata_dict['moe_half1'],
+            'half2': attn_metadata_dict['moe_half2']
+        }
+        split_data = self._prepare_split_attn_metadata(scheduled_requests, split_metadata, half1_kv_cache_manager)
+        
+        # Step 3: Process MOE layers with split batches
+        half1_outputs = None
+        half2_outputs = None
+        
+        # Process half1 with half1 KV cache manager
+        print(f"[MODEL_ENGINE_DEBUG] Processing MOE half1 with dedicated KV cache manager")
+        half1_data = split_data['half1']
+        
+        # Create split inputs for half1
+        half1_inputs = self._create_split_inputs(inputs, half1_data['scheduled_requests'], half1_data['attn_metadata'])
+        
+        with MoeLoadBalancerIterContext(moe_load_balancer):
+            half1_outputs = self._forward_step(half1_inputs, gather_ids, gather_context_logits)
+        
+        # Process half2 with half2 KV cache manager
+        print(f"[MODEL_ENGINE_DEBUG] Processing MOE half2 with dedicated KV cache manager")
+        half2_data = split_data['half2']
+        
+        # Create split inputs for half2
+        half2_inputs = self._create_split_inputs(inputs, half2_data['scheduled_requests'], half2_data['attn_metadata'])
+        
+        with MoeLoadBalancerIterContext(moe_load_balancer):
+            half2_outputs = self._forward_step(half2_inputs, gather_ids, gather_context_logits)
+        
+        # Step 4: Combine outputs from both halves
+        print(f"[MODEL_ENGINE_DEBUG] Combining outputs from both MOE halves")
+        combined_moe_outputs = self._combine_split_outputs(half1_outputs, half2_outputs)
+        
+        # Step 5: Combine dense and MOE outputs
+        print(f"[MODEL_ENGINE_DEBUG] Combining dense and MOE outputs")
+        final_outputs = self._combine_dense_and_moe_outputs(dense_outputs, combined_moe_outputs)
+        
+        # Execute logit post processors
+        self._execute_logit_post_processors(scheduled_requests, final_outputs)
+        
+        return final_outputs
+
+    def _combine_split_outputs(self, half1_outputs: Dict[str, Any], half2_outputs: Dict[str, Any]) -> Dict[str, Any]:
+        """Combine outputs from both batch halves."""
+        combined_outputs = {}
+        
+        for key in half1_outputs:
+            if key == 'logits':
+                # Concatenate logits along batch dimension
+                half1_logits = half1_outputs[key]
+                half2_logits = half2_outputs[key]
+                combined_logits = torch.cat([half1_logits, half2_logits], dim=0)
+                combined_outputs[key] = combined_logits
+                print(f"[MODEL_ENGINE_DEBUG] Combined logits shape: {combined_logits.shape}")
+            else:
+                # For other outputs, just use half1 (assuming they're the same)
+                combined_outputs[key] = half1_outputs[key]
+        
+        return combined_outputs
+
+    def _combine_dense_and_moe_outputs(self, dense_outputs: Dict[str, Any], moe_outputs: Dict[str, Any]) -> Dict[str, Any]:
+        """Combine outputs from dense layers and MOE layers."""
+        print(f"[MODEL_ENGINE_DEBUG] Combining dense and MOE outputs")
+        print(f"[MODEL_ENGINE_DEBUG] Dense outputs keys: {list(dense_outputs.keys())}")
+        print(f"[MODEL_ENGINE_DEBUG] MOE outputs keys: {list(moe_outputs.keys())}")
+        
+        # For most cases, the MOE outputs should be the final outputs since they contain
+        # the results from processing through all layers (dense + MOE)
+        # The dense outputs are intermediate results from just the dense layers
+        
+        # If MOE outputs contain logits, use those as the final outputs
+        if 'logits' in moe_outputs:
+            print(f"[MODEL_ENGINE_DEBUG] Using MOE logits as final output")
+            return moe_outputs
+        
+        # If no MOE logits, combine the outputs appropriately
+        combined_outputs = {}
+        
+        # For logits, use MOE outputs if available, otherwise use dense outputs
+        if 'logits' in moe_outputs:
+            combined_outputs['logits'] = moe_outputs['logits']
+        elif 'logits' in dense_outputs:
+            combined_outputs['logits'] = dense_outputs['logits']
+        
+        # For other outputs, prefer MOE outputs over dense outputs
+        for key in moe_outputs:
+            if key != 'logits':
+                combined_outputs[key] = moe_outputs[key]
+        
+        # Add any dense outputs that aren't in MOE outputs
+        for key in dense_outputs:
+            if key not in combined_outputs:
+                combined_outputs[key] = dense_outputs[key]
+        
+        print(f"[MODEL_ENGINE_DEBUG] Combined outputs keys: {list(combined_outputs.keys())}")
+        return combined_outputs
+
+    def model_forward(self, **kwargs):
+        attrs = get_model_extra_attrs()
+        assert attrs is not None, "Model extra attrs is not set"
+        attrs["attention_metadata"] = weakref.ref(kwargs['attn_metadata'])
+        attrs.update(self.model.model_config.extra_attrs)
+
+        if is_trace_enabled("TLLM_TRACE_MODEL_FORWARD"):
+            return trace_func(self.model.forward)(**kwargs)
+        else:
+            return self.model.forward(**kwargs)
+
+    @nvtx_range("_forward_step")
+    def _forward_step(self,
+                      inputs: Dict[str, Any],
+                      gather_ids: Optional[torch.Tensor],
+                      gather_context_logits: bool = False) -> Dict[str, Any]:
+        inputs = self._preprocess_inputs(inputs)
+        if inputs.get('spec_metadata', None):
+            gather_ids = inputs['spec_metadata'].gather_ids
+        if self.without_logits:
+            outputs = self.model_forward(**inputs)
+            return outputs
+
+        # For simplicity, just return all the the logits if we have special gather_ids
+        # from speculative decoding.
+        logits = self.model_forward(
+            **inputs,
+            return_context_logits=gather_ids is not None
+            or gather_context_logits,
+        )
+        if gather_ids is not None:
+            return {'logits': logits[gather_ids]}
+        else:
+            return {'logits': logits}
+
+    def _init_userbuffers(self, hidden_size):
+        if self.mapping.tp_size <= 1:
+            return False
+
+        # Disable UB for unsupported platforms
+        if not ub.ub_supported():
+            return False
+        ub.initialize_userbuffers_manager(self.mapping.tp_size,
+                                          self.mapping.pp_size,
+                                          self.mapping.cp_size,
+                                          self.mapping.rank,
+                                          self.mapping.gpus_per_node,
+                                          hidden_size * self.max_num_tokens * 2)
+        return True
+
+    def load_weights_from_target_model(self,
+                                       target_model: torch.nn.Module) -> None:
+        """
+        When doing spec decode, sometimes draft models need to share certain weights
+        with their target models. Here, we set up such weights by invoking
+        self.model.load_weights_from_target_model if such a method exists.
+        """
+        loader = getattr(self.model, "load_weights_from_target_model", None)
+        if callable(loader):
+            loader(target_model)
+
+    def _execute_logit_post_processors(self,
+                                       scheduled_requests: ScheduledRequests,
+                                       outputs: dict):
+        """Apply logit post processors (in-place modify outputs Tensors) if any."""
+
+        if not (self.mapping.is_last_pp_rank()):
+            return
+
+        if not isinstance(outputs, dict) or "logits" not in outputs:
+            # TODO: support models that don't return outputs as dict
+            return
+
+        num_ctx_req = len(scheduled_requests.context_requests)
+        logits_tensor = outputs["logits"]
+
+        for idx, request in enumerate(scheduled_requests.all_requests()):
+            logits_processors = getattr(request, "py_logits_post_processors",
+                                        None)
+            if not logits_processors:
+                continue
+
+            token_ids = request.get_tokens(0)
+            if idx < num_ctx_req and request.py_orig_prompt_len < len(
+                    token_ids):
+                # Skip as we only need to apply logit processor on the last context request
+                continue
+
+            logits_row = logits_tensor[request.py_batch_idx]
+            # Reshape to align w/ the shape used in the TRT backend,
+            # so the same logit processors can be used across both backends.
+            logits_row = logits_row.view(1, 1, -1)
+            token_ids = [token_ids]
+            for lp in logits_processors:
+                lp_params = inspect.signature(lp).parameters
+
+                assert 4 <= len(lp_params) <= 5, (
+                    "Logit post processor signature must match the `LogitsProcessor` interface "
+                    "defined in `tensorrtllm.sampling_params`.")
+                lp(request.py_request_id, logits_row, token_ids, None, None)
+
+            logits_tensor[request.py_batch_idx] = logits_row.view(-1)
+
+    def _create_split_inputs(self, original_inputs: Dict[str, Any], 
+                           scheduled_requests: ScheduledRequests, 
+                           attn_metadata: AttentionMetadata) -> Dict[str, Any]:
+        """Create split inputs for a batch half."""
+        print(f"[MODEL_ENGINE_DEBUG] Creating split inputs for {len(scheduled_requests.all_requests())} requests")
+        
+        # Start with a copy of the original inputs
+        split_inputs = original_inputs.copy()
+        
+        # Update with the split attention metadata
+        split_inputs['attn_metadata'] = attn_metadata
+        
+        # Split the input tensors based on the scheduled requests
+        if 'input_ids' in split_inputs:
+            # Get the number of tokens for this half
+            total_tokens = sum(req.num_tokens for req in scheduled_requests.all_requests())
+            print(f"[MODEL_ENGINE_DEBUG] Total tokens for this half: {total_tokens}")
+            
+            # Split input_ids to match this half
+            original_input_ids = split_inputs['input_ids']
+            split_input_ids = original_input_ids[:total_tokens]
+            split_inputs['input_ids'] = split_input_ids
+            print(f"[MODEL_ENGINE_DEBUG] Split input_ids shape: {split_input_ids.shape}")
+        
+        if 'position_ids' in split_inputs:
+            # Split position_ids to match this half
+            original_position_ids = split_inputs['position_ids']
+            total_tokens = sum(req.num_tokens for req in scheduled_requests.all_requests())
+            split_position_ids = original_position_ids[:, :total_tokens]
+            split_inputs['position_ids'] = split_position_ids
+            print(f"[MODEL_ENGINE_DEBUG] Split position_ids shape: {split_position_ids.shape}")
+        
+        # Handle other input tensors that might need splitting
+        for key in split_inputs:
+            if isinstance(split_inputs[key], torch.Tensor) and key not in ['attn_metadata', 'input_ids', 'position_ids']:
+                # For other tensors, check if they need splitting based on batch dimension
+                tensor = split_inputs[key]
+                if tensor.dim() > 0 and tensor.size(0) > len(scheduled_requests.all_requests()):
+                    # Split along the first dimension (batch dimension)
+                    split_size = len(scheduled_requests.all_requests())
+                    split_tensor = tensor[:split_size]
+                    split_inputs[key] = split_tensor
+                    print(f"[MODEL_ENGINE_DEBUG] Split {key} shape: {split_tensor.shape}")
+        
+        return split_inputs
+
+    def _recreate_split_attn_metadata_if_needed(self, kv_cache_manager, resource_manager):
+        """Recreate split attention metadata if executor resources are now available."""
+        if (hasattr(self.model, 'enable_attention_metadata_splitting') and 
+            self.model.enable_attention_metadata_splitting and
+            hasattr(self.model, 'executor_resources') and 
+            self.model.executor_resources is not None and
+            not hasattr(self, 'split_attn_metadata_created')):
+            
+            print(f"[MODEL_ENGINE_DEBUG] Recreating split attention metadata with executor resources")
+            
+            # 1. Standard metadata for dense layers (non-MOE layers) - uses full batch
+            dense_metadata = self.attn_backend.Metadata(
+                max_num_requests=self.batch_size,
+                max_num_tokens=self.max_num_tokens,
+                max_num_sequences=self.batch_size * self.max_beam_width,
+                kv_cache_manager=kv_cache_manager,
+                enable_paged_context_mla=is_mla(self.model.model_config.pretrained_config) and (
+                    self.attn_runtime_features.cache_reuse or self.attn_runtime_features.chunked_prefill),
+                runtime_features=self.attn_runtime_features,
+            )
+            
+            # 2. Split metadata for MOE layers (half1 and half2)
+            split_metadata = self._create_split_attn_metadata(resource_manager)
+            
+            # Combine all 3 metadata objects
+            combined_metadata = {
+                'dense': dense_metadata,  # For non-MOE layers (layers 0, 1, 2)
+                'moe_half1': split_metadata['half1'],  # For MOE layers - first half
+                'moe_half2': split_metadata['half2'],  # For MOE layers - second half
+            }
+            
+            # Set the combined metadata on the model
+            if hasattr(self.model, 'set_split_attention_metadata'):
+                self.model.set_split_attention_metadata(combined_metadata)
+            else:
+                raise ValueError("Model does not have set_split_attention_metadata method")
+            
+            # Mark that we've created split metadata
+            self.split_attn_metadata_created = True
+            
+            print(f"[MODEL_ENGINE_DEBUG] Recreated 3 attention metadata objects: {list(combined_metadata.keys())}")
+            return combined_metadata
+        
+        return None
+
+    def _set_up_attn_metadata(self, kv_cache_manager, resource_manager):
+        print(f"[MODEL_ENGINE_DEBUG] Setting up attention metadata")
+        print(f"[MODEL_ENGINE_DEBUG] KV cache manager: {kv_cache_manager}")
+        print(f"[MODEL_ENGINE_DEBUG] Batch size: {self.batch_size}")
+        print(f"[MODEL_ENGINE_DEBUG] Max num tokens: {self.max_num_tokens}")
+        
+        enable_paged_context_mla = is_mla(
+            self.model.model_config.pretrained_config) and (
+                self.attn_runtime_features.cache_reuse
+                or self.attn_runtime_features.chunked_prefill)
+        
+        # Check if we should use split attention metadata for batch splitting
+        use_split_attn_metadata = True #kgoyal HACK
+        if hasattr(self.model, 'enable_attention_metadata_splitting'):
+            use_split_attn_metadata = self.model.enable_attention_metadata_splitting
+            print(f"[MODEL_ENGINE_DEBUG] Model has enable_attention_metadata_splitting: {use_split_attn_metadata}")
+        
+        if use_split_attn_metadata:
+                
+            # 1. Standard metadata for dense layers (non-MOE layers) - uses full batch
+            dense_metadata = self.attn_backend.Metadata(
+                max_num_requests=self.batch_size,
+                max_num_tokens=self.max_num_tokens,
+                max_num_sequences=self.batch_size * self.max_beam_width,
+                kv_cache_manager= kv_cache_manager,
+                enable_paged_context_mla=enable_paged_context_mla,
+                runtime_features=self.attn_runtime_features,
+            )
+            
+            # 2. Split metadata for MOE layers (half1 and half2)
+            print(f"[MODEL_ENGINE_DEBUG] Creating split attention metadata")
+            split_metadata = self._create_split_attn_metadata(resource_manager)
+                
+            # Combine all 3 metadata objects
+            combined_metadata = {
+                'dense': dense_metadata,  # For non-MOE layers (layers 0, 1, 2)
+                'moe_half1': split_metadata['half1'],  # For MOE layers - first half
+                'moe_half2': split_metadata['half2'],  # For MOE layers - second half
+            }
+                
+            print(f"[MODEL_ENGINE_DEBUG] Created 3 attention metadata objects: {list(combined_metadata.keys())}")
+            return combined_metadata
+
+        else:
+            # Standard single metadata for all layers
+            print(f"[MODEL_ENGINE_DEBUG] Creating standard attention metadata for all layers")
+            return self.attn_backend.Metadata(
+                max_num_requests=self.batch_size,
+                max_num_tokens=self.max_num_tokens,
+                max_num_sequences=self.batch_size * self.max_beam_width,
+                kv_cache_manager=kv_cache_manager,
+                enable_paged_context_mla=enable_paged_context_mla,
+                runtime_features=self.attn_runtime_features,
+            )
+
+    def _create_split_attn_metadata(self, resource_manager):
+        """Create split attention metadata for batch halves."""
+        print(f"[MODEL_ENGINE_DEBUG] Creating split attention metadata")
+        print(f"[MODEL_ENGINE_DEBUG] Original batch size: {self.batch_size}")
+        print(f"[MODEL_ENGINE_DEBUG] Original max num tokens: {self.max_num_tokens}")
+        
+        # Calculate split batch sizes
+        half1_batch_size = self.batch_size // 2
+        half2_batch_size = self.batch_size - half1_batch_size
+        
+        print(f"[MODEL_ENGINE_DEBUG] Half1 batch size: {half1_batch_size}")
+        print(f"[MODEL_ENGINE_DEBUG] Half2 batch size: {half2_batch_size}")
+        
+        enable_paged_context_mla = is_mla(
+            self.model.model_config.pretrained_config) and (
+                self.attn_runtime_features.cache_reuse
+                or self.attn_runtime_features.chunked_prefill)
+        
+        # Create separate KV cache managers for each half
+        half1_kv_cache_manager = resource_manager.get_resource_manager(
+            f"{ResourceManagerType.KV_CACHE_MANAGER}_half1")
+        half2_kv_cache_manager = resource_manager.get_resource_manager(
+            f"{ResourceManagerType.KV_CACHE_MANAGER}_half2")
+        
+        # Create attention metadata for half1
+        half1_metadata = self.attn_backend.Metadata(
+            max_num_requests=half1_batch_size,
+            max_num_tokens=self.max_num_tokens,
+            max_num_sequences=half1_batch_size * self.max_beam_width,
+            kv_cache_manager=half1_kv_cache_manager,
+            enable_paged_context_mla=enable_paged_context_mla,
+            runtime_features=self.attn_runtime_features,
+        )
+        
+        # Create attention metadata for half2
+        half2_metadata = self.attn_backend.Metadata(
+            max_num_requests=half2_batch_size,
+            max_num_tokens=self.max_num_tokens,
+            max_num_sequences=half2_batch_size * self.max_beam_width,
+            kv_cache_manager=half2_kv_cache_manager,
+            enable_paged_context_mla=enable_paged_context_mla,
+            runtime_features=self.attn_runtime_features,
+        )
+        
+
+        split_metadata = {
+            'half1': half1_metadata,
+            'half2': half2_metadata
+        }
+        
+        print(f"[MODEL_ENGINE_DEBUG] Created split attention metadata: {list(split_metadata.keys())}")
+        return split_metadata
+
+    def _prepare_split_attn_metadata(self, scheduled_requests: ScheduledRequests, 
+                                   split_attn_metadata: Dict[str, AttentionMetadata],
+                                   kv_cache_manager: KVCacheManager):
+        """Prepare split attention metadata for batch halves."""
+        print(f"[MODEL_ENGINE_DEBUG] Preparing split attention metadata")
+        print(f"[MODEL_ENGINE_DEBUG] Total requests: {len(scheduled_requests.all_requests())}")
+        print(f"[MODEL_ENGINE_DEBUG] Split metadata keys: {list(split_attn_metadata.keys())}")
+        
+        # Split the scheduled requests into two halves
+        total_requests = len(scheduled_requests.all_requests())
+        split_point = total_requests // 2
+        
+        # Create split scheduled requests
+        half1_requests = scheduled_requests.all_requests()[:split_point]
+        half2_requests = scheduled_requests.all_requests()[split_point:]
+        
+        print(f"[MODEL_ENGINE_DEBUG] Split point: {split_point}")
+        print(f"[MODEL_ENGINE_DEBUG] Half1 requests: {len(half1_requests)}")
+        print(f"[MODEL_ENGINE_DEBUG] Half2 requests: {len(half2_requests)}")
+        
+        # Create ScheduledRequests objects for each half
+        half1_scheduled_requests = ScheduledRequests(half1_requests)
+        half2_scheduled_requests = ScheduledRequests(half2_requests)
+        
+        print(f"[MODEL_ENGINE_DEBUG] Created scheduled requests for halves")
+        
+        # Prepare attention metadata for each half
+        half1_metadata = split_attn_metadata['half1']
+        half2_metadata = split_attn_metadata['half2']
+        
+        # Set sequence lengths for each half
+        if half1_requests:
+            half1_seq_lens = torch.tensor([req.num_tokens for req in half1_requests], 
+                                        dtype=torch.int32, device=self.device)
+            half1_metadata.seq_lens = half1_seq_lens
+            print(f"[MODEL_ENGINE_DEBUG] Set half1 seq_lens: {half1_seq_lens.shape}")
+        
+        if half2_requests:
+            half2_seq_lens = torch.tensor([req.num_tokens for req in half2_requests], 
+                                        dtype=torch.int32, device=self.device)
+            half2_metadata.seq_lens = half2_seq_lens
+            print(f"[MODEL_ENGINE_DEBUG] Set half2 seq_lens: {half2_seq_lens.shape}")
+        
+        return {
+            'half1': {
+                'scheduled_requests': half1_scheduled_requests,
+                'attn_metadata': half1_metadata
+            },
+            'half2': {
+                'scheduled_requests': half2_scheduled_requests,
+                'attn_metadata': half2_metadata
+            }
+        }
+
+    def _set_up_spec_metadata(
+            self,
+            spec_resource_manager: Optional[BaseResourceManager],
+            no_cache=False):
+        if no_cache:
+            return get_spec_metadata(
+                self.spec_config,
+                self.batch_size,
+                max_num_tokens=self.max_num_tokens,
+                spec_resource_manager=spec_resource_manager,
+                is_draft_model=self.is_draft_model)
+
+        if self.spec_metadata is not None:
+            return self.spec_metadata
+        self.spec_metadata = get_spec_metadata(
+            self.spec_config,
+            self.batch_size,
+            max_num_tokens=self.max_num_tokens,
+            spec_resource_manager=spec_resource_manager,
+            is_draft_model=self.is_draft_model)
+        return self.spec_metadata
+
+    def _get_padded_batch(self, scheduled_requests: ScheduledRequests,
+                          kv_cache_manager) -> int:
+        can_run_cuda_graph = scheduled_requests.can_run_cuda_graph
+        batch_size = scheduled_requests.batch_size
+        new_batch_size = batch_size
+        if self._run_cuda_graphs and self.enable_attention_dp and self.mapping.tp_size > 1:
+            graph_batch_size = self.dist.tp_allgather(
+                [can_run_cuda_graph, batch_size])
+            all_can_graph = all(graph_batch[0]
+                                for graph_batch in graph_batch_size)
+            if all_can_graph:
+                new_batch_size = max(gen_only_batch[1]
+                                     for gen_only_batch in graph_batch_size)
+
+        if (not self._run_cuda_graphs or not self._cuda_graph_padding_enabled
+                or not can_run_cuda_graph
+                or new_batch_size > self._max_cuda_graph_batch_size):
+            return 0
+
+        padded_batch_size = self._round_up_batch_size(new_batch_size)
+        if batch_size == padded_batch_size:
+            return 0
+
+        padding_size = padded_batch_size - batch_size
+        if padding_size + scheduled_requests.batch_size > self.batch_size:
+            return 0
+
+        # No padding if it would create too many concurrent requests.
+        # This is not strictly required, but we should probably
+        # respect the requirement just in case that changes in the future.
+        if self.cuda_graph_dummy_request is None:
+            available_blocks = kv_cache_manager.get_num_free_blocks()
+            # No padding if not enough KV cache space
+            if available_blocks < 1:
+                return 0
+
+            self.cuda_graph_dummy_request = kv_cache_manager.add_dummy_requests(
+                [MAX_UINT64 - 1],
+                is_gen=True,
+                max_num_draft_tokens=self.max_draft_len)[0]
+            self.cuda_graph_dummy_request.is_cuda_graph_dummy = True
+
+        scheduled_requests.generation_requests.extend(
+            [self.cuda_graph_dummy_request] * padding_size)
+
+        return padding_size
+
+    @contextlib.contextmanager
+    def _maybe_pad_batch(self, scheduled_requests: ScheduledRequests,
+                         kv_cache_manager):
+        """
+        CUDA graphs can only be used for specific batch sizes.
+
+        If using CUDA graphs, this method will add dummy requests to the given
+        batch so we can always use a CUDA graph. It is a context manager
+        because the padded requests will be removed from scheduled requests.
+        """
+        padding_size = self._get_padded_batch(scheduled_requests,
+                                              kv_cache_manager)
+        try:
+            yield scheduled_requests
+        finally:
+            if padding_size > 0:
+                scheduled_requests.generation_requests = scheduled_requests.generation_requests[:
+                                                                                                -padding_size]
+
+    def _round_up_batch_size(self, batch_size: int) -> int:
+        """
+        Round up the given batch size to the nearest batch size that is
+        associated with a CUDA graph.
+        """
+        idx = bisect.bisect_left(self._cuda_graph_batch_sizes, batch_size)
+        return self._cuda_graph_batch_sizes[idx]
+
+    def _maybe_get_cuda_graph(
+        self,
+        batch: ScheduledRequests,
+        spec_config: Optional[SpecConfig] = None
+    ) -> Optional[DecodingCUDAGraphRunner]:
+        """
+        Get a CUDA graph runner or return None (e.g. if CUDA graphs are disabled
+        or if the batch size is too big).
+        """
+        # disable when doing statistic
+        if ExpertStatistic.set_iter(self.iter_counter):
+            return None
+
+        spec_max_draft_tokens = spec_config.max_draft_tokens if self.is_spec_decode else 0
+        can_run_cuda_graph = batch.can_run_cuda_graph
+        batch_size = len(batch.generation_requests)
+        if self._run_cuda_graphs and self.enable_attention_dp and self.mapping.tp_size > 1:
+            all_can_graph_batch = self.dist.tp_allgather(
+                [can_run_cuda_graph, batch_size])
+            is_all_gen_only = all(all_can_graph[0]
+                                  for all_can_graph in all_can_graph_batch)
+            all_batch_size_equal = all(
+                all_gen_only[1] == all_can_graph_batch[0][1]
+                for all_gen_only in all_can_graph_batch)
+
+            if not is_all_gen_only or not all_batch_size_equal:
+                return None
+
+        if not self._run_cuda_graphs or not can_run_cuda_graph:
+            return None
+
+        if batch_size in self._cuda_graphs:
+            return self._cuda_graphs[batch_size]
+
+        if batch_size not in self._cuda_graph_batch_sizes:
+            return None
+
+        attn_metadata = self.attn_metadata.create_cuda_graph_metadata(
+            batch_size, False, spec_max_draft_tokens)
+        assert attn_metadata.is_cuda_graph
+
+        if self.is_spec_decode:
+            spec_metadata = self.spec_metadata.create_cuda_graph_metadata(
+                batch_size)
+            spec_metadata.draft_tokens = self.draft_tokens_cuda
+        else:
+            spec_metadata = None
+
+        self._cuda_graphs[batch_size] = DecodingCUDAGraphRunner(
+            batch_size, "cuda", attn_metadata, spec_metadata)
+        return self._cuda_graphs[batch_size]
+
+    def __del__(self) -> None:
+        if getattr(self, 'ub_buffers', None):
+            for u in self.ub_buffers:
+                ub.ub_deallocate(u.addr)
+        # Release model weights.
+        release_gc()
+
+    def _load_model(self,
+                    checkpoint_dir: str,
+                    load_format: LoadFormat,
+                    max_num_tokens: int,
+                    moe_max_num_tokens: Optional[int] = None,
+                    moe_load_balancer: Optional[MoeLoadBalancerConfig] = None,
+                    lora_config: Optional[LoraConfig] = None,
+                    **kwargs):
+        config = ModelConfig.from_pretrained(
+            checkpoint_dir,
+            trust_remote_code=True,
+            enable_min_latency=self.pytorch_backend_config.enable_min_latency,
+            use_cuda_graph=self.pytorch_backend_config.use_cuda_graph,
+            force_dynamic_quantization=self.pytorch_backend_config.
+            force_dynamic_quantization,
+            spec_config=self.spec_config,
+            max_num_tokens=max_num_tokens,
+            moe_max_num_tokens=moe_max_num_tokens,
+            moe_load_balancer=moe_load_balancer,
+            lora_config=lora_config,
+            **kwargs)
+
+        validate_and_set_kv_cache_quant(
+            config, self.pytorch_backend_config.kv_cache_dtype)
+        num_layers = int(os.environ.get("TLLM_OVERRIDE_LAYER_NUM", "0"))
+        if num_layers > 0:
+            config.pretrained_config.num_hidden_layers = num_layers
+            for sub_config in ["text_config", "vision_config"]:
+                if hasattr(config.pretrained_config, sub_config):
+                    getattr(config.pretrained_config,
+                            sub_config).num_hidden_layers = num_layers
+
+        with timing("Model init total"), maybe_create_moe_load_balancer(
+                config, self.mapping) as moe_load_balancer:
+            try:
+                with MetaInitMode():
+                    model = AutoModelForCausalLM.from_config(config)
+
+                memo = dict()
+
+                def init_meta_tensor(t: torch.Tensor):
+                    if t.device != torch.device('meta'):
+                        return t
+                    if t not in memo:
+                        memo[t] = torch.empty_like(t, device='cuda')
+                    return memo[t]
+
+                model._apply(init_meta_tensor)
+
+            except Exception:
+                logger.info(
+                    f"Fallback to regular model init: {traceback.format_exc(limit=1)}\n"
+                )
+                model = AutoModelForCausalLM.from_config(config)
+
+            model.to("cuda")
+            rank_model_storage = get_rank_model_storage(model)
+            logger.info(
+                f"Use {rank_model_storage / (1024**3):.2f} GB for model weights."
+            )
+
+            if load_format == LoadFormat.AUTO:
+                if hasattr(model, 'llm_checkpoint_dir'):
+                    weights = load_weights(model.llm_checkpoint_dir)
+                else:
+                    weights = load_weights(checkpoint_dir)
+
+                model.load_weights(weights)
+
+                if self.spec_config is not None and self.spec_config.spec_dec_mode.need_load_draft_weights(
+                ):
+                    weights = load_weights(self.spec_config.draft_model_path)
+                    model.load_draft_weights(weights)
+
+            elif load_format == LoadFormat.DUMMY:
+                initialize_dummy_weights(model)
+
+            else:
+                raise NotImplementedError(
+                    f"No load support for load format: {load_format}")
+
+            if isinstance(moe_load_balancer, MoeLoadBalancer):
+                setattr(self, "moe_load_balancer", moe_load_balancer)
+                moe_load_balancer.register_weight_slots_after_to_cuda()
+                logger.info("moe_load_balancer finalizing model...")
+                moe_load_balancer.finalize_model()
+                logger.info("moe_load_balancer finalize model done")
+
+            torch.cuda.current_stream().synchronize()
+        return model
+
+    def _init_max_seq_len(self):
+        inferred_max_seq_len = self.model.infer_max_seq_len()
+        if self.max_seq_len is None:
+            logger.info(
+                f"max_seq_len is not specified, using inferred value {inferred_max_seq_len}"
+            )
+            self.max_seq_len = inferred_max_seq_len
+
+        elif inferred_max_seq_len < self.max_seq_len:
+            # NOTE: py_executor_creator makes sure that the executor uses this
+            # smaller value as its max_seq_len too.
+            logger.warning(
+                f"Specified max_seq_len {self.max_seq_len} is larger than what the model can support "
                 f"({inferred_max_seq_len}). Setting max_seq_len to {inferred_max_seq_len}. "
             )
             self.max_seq_len = inferred_max_seq_len
@@ -2222,41 +4051,83 @@ class PyTorchModelEngine(ModelEngine):
         print(f"[MODEL_ENGINE_DEBUG] Number of requests: {len(scheduled_requests.all_requests())}")
         print(f"[MODEL_ENGINE_DEBUG] Batch size: {self.batch_size}")
         print(f"[MODEL_ENGINE_DEBUG] Max num tokens: {self.max_num_tokens}")
+        print(f"[MODEL_ENGINE_DEBUG] KV cache manager key: {self.kv_cache_manager_key}")
 
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
+        if kv_cache_manager is None:
+            raise ValueError(f"[MODEL_ENGINE_DEBUG] KV cache manager not found in resources")
 
-        attn_metadata = self._set_up_attn_metadata(kv_cache_manager)
+        # Set up attention metadata
+        attn_metadata = self._set_up_attn_metadata(kv_cache_manager, resource_manager)
+        print(f"[MODEL_ENGINE_DEBUG] Attn metadata: {attn_metadata}")
         
-        # Check if we're using split attention metadata
-        use_split_attn_metadata = False
-        if hasattr(self.model, 'enable_attention_metadata_splitting'):
-            use_split_attn_metadata = self.model.enable_attention_metadata_splitting
-            print(f"[MODEL_ENGINE_DEBUG] Split attention metadata enabled: {use_split_attn_metadata}")
-        
-        if use_split_attn_metadata and hasattr(self.model, 'split_attn_metadata'):
-            print(f"[MODEL_ENGINE_DEBUG] Using split attention metadata for batch halves")
-            return self._forward_with_split_attn_metadata(
-                scheduled_requests, resource_manager, self.model.split_attn_metadata,
-                new_tensors_device, gather_context_logits, cache_indirection_buffer)
-        
-        print(f"[MODEL_ENGINE_DEBUG] Using standard attention metadata")
-        # Standard single attention metadata processing
-        if self.is_spec_decode:
-            spec_resource_manager = resource_manager.get_resource_manager(
-                ResourceManagerType.SPEC_RESOURCE_MANAGER)
-            spec_metadata = self._set_up_spec_metadata(spec_resource_manager,
-                                                       no_cache=kv_cache_manager
-                                                       is None)
-            # attn_metadata now depends on spec_metadata since it determines the shape/content of spec_dec parameter Tensors
-            attn_metadata.update_spec_dec_param(
-                spec_metadata.spec_dec_mode.attention_need_spec_dec_mode(),
-                spec_metadata.is_spec_dec_tree,
-                spec_metadata.is_spec_dec_dynamic_tree,
-                spec_metadata.max_draft_tokens)
-        else:
+        # Check if we have split attention metadata (batch splitting enabled)
+        if isinstance(attn_metadata, dict) and 'dense' in attn_metadata and False:
+            # Use 3-metadata structure for batch splitting
+            print(f"[MODEL_ENGINE_DEBUG] Using 3-metadata structure for batch splitting")
+            print(f"[MODEL_ENGINE_DEBUG] Available metadata: {list(attn_metadata.keys())}")
+            
+            # For the model engine, we need to provide the appropriate metadata
+            # The model will select the correct metadata based on layer type
+            # For now, use dense metadata as the primary one for the engine
+            primary_metadata = attn_metadata['dense']
+            
+            # Set up speculative metadata if needed
             spec_metadata = None
+            if self.is_spec_decode:
+                spec_metadata = self._set_up_spec_metadata(
+                    scheduled_requests, spec_config=self.spec_config)
+            
+            # Check for CUDA graph
+            maybe_graph = self._maybe_get_cuda_graph(
+                scheduled_requests, spec_config=self.spec_config)
+            if maybe_graph is not None:
+                primary_metadata = maybe_graph.attn_metadata
+                if self.is_spec_decode:
+                    spec_metadata = maybe_graph.spec_metadata
+            else:
+                if self.is_spec_decode:
+                    spec_metadata = self.spec_metadata
 
+            inputs, gather_ids = self._prepare_inputs(
+                scheduled_requests, kv_cache_manager, primary_metadata,
+                spec_metadata, new_tensors_device, cache_indirection_buffer)
+            
+            # The model will handle the appropriate metadata selection internally
+            return self._forward_with_3_metadata(
+                scheduled_requests, resource_manager, attn_metadata,
+                inputs, gather_ids, gather_context_logits)
+        
+        # Standard path with single attention metadata
+        print(f"[MODEL_ENGINE_DEBUG] Using standard attention metadata path")
+        
+        # Set up speculative metadata if needed
+        spec_metadata = None
+        if self.is_spec_decode:
+            spec_metadata = self._set_up_spec_metadata(
+                scheduled_requests, spec_config=self.spec_config)
+        
+        # Check for CUDA graph
+        print(f"[MODEL_ENGINE_DEBUG] Checking for CUDA graph")
+        maybe_graph = self._maybe_get_cuda_graph(
+            scheduled_requests, spec_config=self.spec_config)
+        if maybe_graph is not None:
+            attn_metadata = maybe_graph.attn_metadata
+            if self.is_spec_decode:
+                spec_metadata = maybe_graph.spec_metadata
+        else:
+            if self.is_spec_decode:
+                spec_metadata = self.spec_metadata
+
+        print(f"[MODEL_ENGINE_DEBUG] Preparing inputs")
+        attn_metadata = attn_metadata['dense']
+        inputs, gather_ids = self._prepare_inputs(
+            scheduled_requests, kv_cache_manager, attn_metadata,
+            spec_metadata, new_tensors_device, cache_indirection_buffer)
+        
+        print(f"[MODEL_ENGINE_DEBUG] Inputs: {inputs}")
+        
         moe_load_balancer = None
         if hasattr(self, 'moe_load_balancer'):
             moe_load_balancer = getattr(self, 'moe_load_balancer')
@@ -2336,63 +4207,84 @@ class PyTorchModelEngine(ModelEngine):
 
             return outputs
 
-    def _forward_with_split_attn_metadata(self, scheduled_requests: ScheduledRequests,
-                                         resource_manager: ResourceManager,
-                                         split_attn_metadata: Dict[str, AttentionMetadata],
-                                         new_tensors_device: Optional[SampleStateTensors] = None,
-                                         gather_context_logits: bool = False,
-                                         cache_indirection_buffer: Optional[torch.Tensor] = None):
-        """Forward pass using split attention metadata for batch halves."""
-        print(f"[MODEL_ENGINE_DEBUG] Starting forward pass with split attention metadata")
+    def _forward_with_3_metadata(self, scheduled_requests: ScheduledRequests,
+                                resource_manager: ResourceManager,
+                                attn_metadata_dict: Dict[str, AttentionMetadata],
+                                inputs: Dict[str, Any],
+                                gather_ids: Optional[torch.Tensor],
+                                gather_context_logits: bool = False):
+        """Forward pass using 3-metadata structure for batch splitting."""
+        print(f"[MODEL_ENGINE_DEBUG] Starting forward pass with 3-metadata structure")
+        print(f"[MODEL_ENGINE_DEBUG] Available metadata: {list(attn_metadata_dict.keys())}")
         
         # Get split KV cache managers from executor resources
-        half1_kv_cache_manager = None
-        half2_kv_cache_manager = None
+        half1_kv_cache_manager = resource_manager.get_resource_manager(f"{ResourceManagerType.KV_CACHE_MANAGER}_half1")
+        half2_kv_cache_manager = resource_manager.get_resource_manager(f"{ResourceManagerType.KV_CACHE_MANAGER}_half2")
         
-        if hasattr(self.model, 'executor_resources'):
-            resources = self.model.executor_resources
-            half1_kv_cache_manager = resources.get(f"{ResourceManagerType.KV_CACHE_MANAGER}_half1")
-            half2_kv_cache_manager = resources.get(f"{ResourceManagerType.KV_CACHE_MANAGER}_half2")
-            print(f"[MODEL_ENGINE_DEBUG] Using split KV cache managers:")
-            print(f"[MODEL_ENGINE_DEBUG]   Half1 KV cache manager: {type(half1_kv_cache_manager).__name__ if half1_kv_cache_manager else 'None'}")
-            print(f"[MODEL_ENGINE_DEBUG]   Half2 KV cache manager: {type(half2_kv_cache_manager).__name__ if half2_kv_cache_manager else 'None'}")
-        else:
-            # Fallback to main KV cache manager if split managers not available
-            half1_kv_cache_manager = resource_manager.get_resource_manager(self.kv_cache_manager_key)
-            half2_kv_cache_manager = resource_manager.get_resource_manager(self.kv_cache_manager_key)
-            print(f"[MODEL_ENGINE_DEBUG] Using main KV cache manager for both halves")
+        if half1_kv_cache_manager is None or half2_kv_cache_manager is None:
+            raise ValueError("Split KV cache managers not found in resources")
         
-        # Prepare split attention metadata and inputs
-        split_data = self._prepare_split_attn_metadata(scheduled_requests, split_attn_metadata, half1_kv_cache_manager)
+        # Set the metadata dictionary on the model so it can access the appropriate metadata per layer
+        if hasattr(self.model, 'set_attention_metadata_dict'):
+            self.model.set_attention_metadata_dict(attn_metadata_dict)
         
-        # Process each half separately with their respective KV cache managers
+        # MOE load balancer setup
+        moe_load_balancer = None
+        if hasattr(self, 'moe_load_balancer'):
+            moe_load_balancer = self.moe_load_balancer
+        
+        # Step 1: Process dense layers (0, 1, 2) with full batch
+        print(f"[MODEL_ENGINE_DEBUG] Processing dense layers with full batch")
+        dense_inputs = inputs.copy()
+        dense_inputs['attn_metadata'] = attn_metadata_dict['dense']
+        
+        with MoeLoadBalancerIterContext(moe_load_balancer):
+            dense_outputs = self._forward_step(dense_inputs, gather_ids, gather_context_logits)
+        
+        # Step 2: Prepare split attention metadata for MOE layers
+        print(f"[MODEL_ENGINE_DEBUG] Preparing split attention metadata for MOE layers")
+        split_metadata = {
+            'half1': attn_metadata_dict['moe_half1'],
+            'half2': attn_metadata_dict['moe_half2']
+        }
+        split_data = self._prepare_split_attn_metadata(scheduled_requests, split_metadata, half1_kv_cache_manager)
+        
+        # Step 3: Process MOE layers with split batches
         half1_outputs = None
         half2_outputs = None
         
         # Process half1 with half1 KV cache manager
-        print(f"[MODEL_ENGINE_DEBUG] Processing half1 with dedicated KV cache manager")
+        print(f"[MODEL_ENGINE_DEBUG] Processing MOE half1 with dedicated KV cache manager")
         half1_data = split_data['half1']
-        half1_inputs, half1_gather_ids = self._prepare_inputs(
-            half1_data['scheduled_requests'], half1_kv_cache_manager, half1_data['metadata'], 
-            None, new_tensors_device, cache_indirection_buffer)
-        half1_outputs = self._forward_step(half1_inputs, half1_gather_ids, gather_context_logits)
+        
+        # Create split inputs for half1
+        half1_inputs = self._create_split_inputs(inputs, half1_data['scheduled_requests'], half1_data['attn_metadata'])
+        
+        with MoeLoadBalancerIterContext(moe_load_balancer):
+            half1_outputs = self._forward_step(half1_inputs, gather_ids, gather_context_logits)
         
         # Process half2 with half2 KV cache manager
-        print(f"[MODEL_ENGINE_DEBUG] Processing half2 with dedicated KV cache manager")
+        print(f"[MODEL_ENGINE_DEBUG] Processing MOE half2 with dedicated KV cache manager")
         half2_data = split_data['half2']
-        half2_inputs, half2_gather_ids = self._prepare_inputs(
-            half2_data['scheduled_requests'], half2_kv_cache_manager, half2_data['metadata'], 
-            None, new_tensors_device, cache_indirection_buffer)
-        half2_outputs = self._forward_step(half2_inputs, half2_gather_ids, gather_context_logits)
         
-        # Combine outputs
-        print(f"[MODEL_ENGINE_DEBUG] Combining outputs from both halves")
-        combined_outputs = self._combine_split_outputs(half1_outputs, half2_outputs)
+        # Create split inputs for half2
+        half2_inputs = self._create_split_inputs(inputs, half2_data['scheduled_requests'], half2_data['attn_metadata'])
         
-        # Execute logit post processors on combined outputs
-        self._execute_logit_post_processors(scheduled_requests, combined_outputs)
+        with MoeLoadBalancerIterContext(moe_load_balancer):
+            half2_outputs = self._forward_step(half2_inputs, gather_ids, gather_context_logits)
         
-        return combined_outputs
+        # Step 4: Combine outputs from both halves
+        print(f"[MODEL_ENGINE_DEBUG] Combining outputs from both MOE halves")
+        combined_moe_outputs = self._combine_split_outputs(half1_outputs, half2_outputs)
+        
+        # Step 5: Combine dense and MOE outputs
+        print(f"[MODEL_ENGINE_DEBUG] Combining dense and MOE outputs")
+        final_outputs = self._combine_dense_and_moe_outputs(dense_outputs, combined_moe_outputs)
+        
+        # Execute logit post processors
+        self._execute_logit_post_processors(scheduled_requests, final_outputs)
+        
+        return final_outputs
 
     def _combine_split_outputs(self, half1_outputs: Dict[str, Any], half2_outputs: Dict[str, Any]) -> Dict[str, Any]:
         """Combine outputs from both batch halves."""
@@ -2412,11 +4304,49 @@ class PyTorchModelEngine(ModelEngine):
         
         return combined_outputs
 
+    def _combine_dense_and_moe_outputs(self, dense_outputs: Dict[str, Any], moe_outputs: Dict[str, Any]) -> Dict[str, Any]:
+        """Combine outputs from dense layers and MOE layers."""
+        print(f"[MODEL_ENGINE_DEBUG] Combining dense and MOE outputs")
+        print(f"[MODEL_ENGINE_DEBUG] Dense outputs keys: {list(dense_outputs.keys())}")
+        print(f"[MODEL_ENGINE_DEBUG] MOE outputs keys: {list(moe_outputs.keys())}")
+        
+        # For most cases, the MOE outputs should be the final outputs since they contain
+        # the results from processing through all layers (dense + MOE)
+        # The dense outputs are intermediate results from just the dense layers
+        
+        # If MOE outputs contain logits, use those as the final outputs
+        if 'logits' in moe_outputs:
+            print(f"[MODEL_ENGINE_DEBUG] Using MOE logits as final output")
+            return moe_outputs
+        
+        # If no MOE logits, combine the outputs appropriately
+        combined_outputs = {}
+        
+        # For logits, use MOE outputs if available, otherwise use dense outputs
+        if 'logits' in moe_outputs:
+            combined_outputs['logits'] = moe_outputs['logits']
+        elif 'logits' in dense_outputs:
+            combined_outputs['logits'] = dense_outputs['logits']
+        
+        # For other outputs, prefer MOE outputs over dense outputs
+        for key in moe_outputs:
+            if key != 'logits':
+                combined_outputs[key] = moe_outputs[key]
+        
+        # Add any dense outputs that aren't in MOE outputs
+        for key in dense_outputs:
+            if key not in combined_outputs:
+                combined_outputs[key] = dense_outputs[key]
+        
+        print(f"[MODEL_ENGINE_DEBUG] Combined outputs keys: {list(combined_outputs.keys())}")
+        return combined_outputs
+
     def model_forward(self, **kwargs):
         attrs = get_model_extra_attrs()
         assert attrs is not None, "Model extra attrs is not set"
         attrs["attention_metadata"] = weakref.ref(kwargs['attn_metadata'])
         attrs.update(self.model.model_config.extra_attrs)
+        print(f"[MODEL_ENGINE_DEBUG] Model forward kwargs: {kwargs}")
 
         if is_trace_enabled("TLLM_TRACE_MODEL_FORWARD"):
             return trace_func(self.model.forward)(**kwargs)
@@ -2437,6 +4367,7 @@ class PyTorchModelEngine(ModelEngine):
 
         # For simplicity, just return all the the logits if we have special gather_ids
         # from speculative decoding.
+        print(f"[MODEL_ENGINE_DEBUG] Forwarding inputs: {inputs}")
         logits = self.model_forward(
             **inputs,
             return_context_logits=gather_ids is not None
@@ -2514,3 +4445,49 @@ class PyTorchModelEngine(ModelEngine):
                 lp(request.py_request_id, logits_row, token_ids, None, None)
 
             logits_tensor[request.py_batch_idx] = logits_row.view(-1)
+
+    def _create_split_inputs(self, original_inputs: Dict[str, Any], 
+                           scheduled_requests: ScheduledRequests, 
+                           attn_metadata: AttentionMetadata) -> Dict[str, Any]:
+        """Create split inputs for a batch half."""
+        print(f"[MODEL_ENGINE_DEBUG] Creating split inputs for {len(scheduled_requests.all_requests())} requests")
+        
+        # Start with a copy of the original inputs
+        split_inputs = original_inputs.copy()
+        
+        # Update with the split attention metadata
+        split_inputs['attn_metadata'] = attn_metadata
+        
+        # Split the input tensors based on the scheduled requests
+        if 'input_ids' in split_inputs:
+            # Get the number of tokens for this half
+            total_tokens = sum(req.num_tokens for req in scheduled_requests.all_requests())
+            print(f"[MODEL_ENGINE_DEBUG] Total tokens for this half: {total_tokens}")
+            
+            # Split input_ids to match this half
+            original_input_ids = split_inputs['input_ids']
+            split_input_ids = original_input_ids[:total_tokens]
+            split_inputs['input_ids'] = split_input_ids
+            print(f"[MODEL_ENGINE_DEBUG] Split input_ids shape: {split_input_ids.shape}")
+        
+        if 'position_ids' in split_inputs:
+            # Split position_ids to match this half
+            original_position_ids = split_inputs['position_ids']
+            total_tokens = sum(req.num_tokens for req in scheduled_requests.all_requests())
+            split_position_ids = original_position_ids[:, :total_tokens]
+            split_inputs['position_ids'] = split_position_ids
+            print(f"[MODEL_ENGINE_DEBUG] Split position_ids shape: {split_position_ids.shape}")
+        
+        # Handle other input tensors that might need splitting
+        for key in split_inputs:
+            if isinstance(split_inputs[key], torch.Tensor) and key not in ['attn_metadata', 'input_ids', 'position_ids']:
+                # For other tensors, check if they need splitting based on batch dimension
+                tensor = split_inputs[key]
+                if tensor.dim() > 0 and tensor.size(0) > len(scheduled_requests.all_requests()):
+                    # Split along the first dimension (batch dimension)
+                    split_size = len(scheduled_requests.all_requests())
+                    split_tensor = tensor[:split_size]
+                    split_inputs[key] = split_tensor
+                    print(f"[MODEL_ENGINE_DEBUG] Split {key} shape: {split_tensor.shape}")
+        
+        return split_inputs
