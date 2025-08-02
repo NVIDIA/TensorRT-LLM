@@ -11,13 +11,14 @@ pushd ${output_folder} # all the dataset and the yaml are stored inside the fold
 
 # Sweep configs, change here if you want to run less or more
 declare -a models=(
-  "R1-0528-FP4:nvidia/DeepSeek-R1-0528-FP4:/home/scratch.trt_llm_data/llm-models/DeepSeek-R1/DeepSeek-R1-0528-FP4:4:true:2048:0.9"
-  "70B-FP8:nvidia/Llama-3.1-70B-Instruct-FP8:/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Llama-3.1-70B-Instruct-FP8:4:false:5500:0.9"
+  # "R1-0528-FP4:nvidia/DeepSeek-R1-0528-FP4:/home/scratch.trt_llm_data/llm-models/DeepSeek-R1/DeepSeek-R1-0528-FP4:4:true:2048:0.9"
+  # "R1-FP8:deepseek-ai/DeepSeek-R1：/home/scratch.trt_llm_data/llm-models/DeepSeek-R1/DeepSeek-R1/:8:true:2048:0.8"
+  # "70B-FP8:nvidia/Llama-3.1-70B-Instruct-FP8:/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Llama-3.1-70B-Instruct-FP8:4:false:5500:0.9"
   "Scout-FP4:/home/scratch.trt_llm_data/llm-models/llama4-models/Llama-4-Scout-17B-16E-Instruct-FP4:/home/scratch.trt_llm_data/llm-models/llama4-models/Llama-4-Scout-17B-16E-Instruct-FP4:4:false:2048:0.85"
   #"405B-FP8:nvidia/Llama-3.1-405B-Instruct-FP8:/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Llama-3.1-405B-Instruct-FP8:4:false:5500"
   #"70B-FP16:meta-llama/Llama-3.1-70B:/home/scratch.trt_llm_data/llm-models/llama-3.1-model/Meta-Llama-3.1-70B:4:false:5500"
 )
-concurrency_levels=(1024 256 128 64 16 4)
+concurrency_levels=(4) #1024 256 128 64 16 4)
 ISL=1024
 OSL=1024
 
@@ -115,7 +116,7 @@ EOF
       num_prompts=$((concurrency * 10))
       echo "Running benchmark with concurrency: $concurrency and num-prompts: $num_prompts"
 
-      python3 ../tensorrt_llm/serve/scripts/benchmark_serving.py \
+      python -m tensorrt_llm.serve.scripts.benchmark_serving \
           --model ${MODEL} \
           --dataset-name random \
           --random-ids \

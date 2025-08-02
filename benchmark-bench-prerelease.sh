@@ -6,12 +6,13 @@
 #SBATCH --gres=gpu:4
 
 set -ex
-# The job must be executed under a TRT-LLM clone root folder
 
 env && hostname && nvidia-smi
 start_time=$(date '+%Y-%m-%d-%H:%M:%S')
-output_folder=benchmark.run.${SLURM_JOB_ID}.$(date '+%Y-%m-%d-%H:%M:%S')
-mkdir -p ${output_folder} && chmod 777 ${output_folder} # the docker user is root, otherwise it can not write logs to this folder
+output_folder=benchmark.run.${SLURM_JOB_ID}.${start_time}
+
+# the docker user is root, otherwise it can not write logs to this folder when running in scratch
+mkdir -p ${output_folder} && chmod 777 ${output_folder}
 
 run_benchmark() {
     IMAGE="urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-staging/release:main-x86_64"
@@ -26,8 +27,9 @@ run_benchmark() {
 }
 
 
-report() {
+parse_report() {
     results=$1
+    end_time=$(date '+%Y-%m-%d-%H:%M:%S')
     echo "Performance report ${SLURM_JOB_ID} - trtllm-bench"
     echo "==========================================="
     echo "Report path" $(realpath ${results})
@@ -39,11 +41,14 @@ report() {
     echo "==========================================="
 }
 
-echo "trtllm-bench Job ${SLURM_JOB_ID} started at:${start_time} on:$(hostname) under:$(pwd)
-git commit: $(git log --oneline origin/main | head -1)
-output: ${output_folder} " | ~/bin/slack.sh
+report_head() {
+    echo "trtllm-bench Job ${SLURM_JOB_ID} started at:${start_time} on:$(hostname) under:$(pwd)
+    git commit: $(git log --oneline origin/main | head -1)
+    output: ${output_folder} "
+}
+
+[[ -e ~/bin/slack.sh ]] && report_head | ~/bin/slack.sh
 
 run_benchmark
-report ${output_folder} | ~/bin/slack.sh
 
-end_time=$(date '+%Y-%m-%d-%H:%M:%S')
+[[ -e ~/bin/slack.sh ]] && parse_report ${output_folder} | ~/bin/slack.sh

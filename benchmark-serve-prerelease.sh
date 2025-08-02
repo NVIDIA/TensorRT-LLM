@@ -6,16 +6,18 @@
 #SBATCH --gres=gpu:4
 
 set -ex
-# The job must be executed under a TRT-LLM clone root folder
 
 env && hostname && nvidia-smi
 start_time=$(date '+%Y-%m-%d-%H:%M:%S')
-output_folder=benchmark.run.${SLURM_JOB_ID}.$(date '+%Y-%m-%d-%H:%M:%S')
+output_folder=benchmark.run.${SLURM_JOB_ID}.${start_time}
 
-mkdir -p ${output_folder} && chmod 777 ${output_folder} # the docker user is root, otherwise it can not write logs to this folder
+# the docker user is root, otherwise it can not write logs to this folder when running in scratch
+mkdir -p ${output_folder} && chmod 777 ${output_folder}
+
+DEFAULT_IMAGE="urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-staging/release:main-x86_64"
+IMAGE=${1:-$DEFAULT_IMAGE}
 
 run_benchmark() {
-    IMAGE="urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-staging/release:main-x86_64"
     docker run --rm --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 \
         -v /home/scratch.trt_llm_data:/home/scratch.trt_llm_data:ro \
         -v `pwd`:`pwd` \
@@ -23,11 +25,12 @@ run_benchmark() {
         --pull always \
         -it  \
         ${IMAGE} \
-        bash ./run_benchmark_serve.sh ${output_folder}
+        bash ./TensorRT-LLM.2/run_benchmark_serve.sh ${output_folder}
 }
 
-report() {
+parse_report() {
     results=$1
+    end_time=$(date '+%Y-%m-%d-%H:%M:%S')
     echo "Performance report ${SLURM_JOB_ID} - trtllm-serve"
     echo "==========================================="
     echo "Report path" $(realpath ${results})
@@ -35,16 +38,18 @@ report() {
     grep -Hn "Output token throughput (tok/s):" ${results}/serve.*log \
          | awk -F "serve." '{print $2}'  | awk -F ":" '{print $1" "$4}' | awk -F ".log" '{print $1" "$2}' \
          | awk -F "." '{print $1" "$2" "}' | awk -F " " '{print $1" "$2" "$3}' | sort  -k1,1 -k2,2rn \
-        ||true
-
+         || true
     echo "==========================================="
 }
 
-echo "trtllm-serve Job ${SLURM_JOB_ID} started at:${start_time} on:$(hostname) under:$(pwd)
- git commit: $(git log --oneline origin/main | head -1)
- output: ${output_folder} " | ~/bin/slack.sh
+report_head() {
+    echo "trtllm-serve Job ${SLURM_JOB_ID} started at:${start_time} on:$(hostname) under:$(pwd)
+    git commit: $(git log --oneline origin/main | head -1)
+    output: ${output_folder} "
+}
+
+[[ -e ~/bin/slack.sh ]] && report_head | ~/bin/slack.sh
 
 run_benchmark
-end_time=$(date '+%Y-%m-%d-%H:%M:%S')
 
-report ${output_folder} | ~/bin/slack.sh
+[[ -e ~/bin/slack.sh ]] && parse_report ${output_folder} | ~/bin/slack.sh
