@@ -926,7 +926,7 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         description=
         "Number of sink tokens (tokens to always keep in attention window).")
     free_gpu_memory_fraction: Optional[float] = Field(
-        default=None,
+        default=0.9,
         description=
         "The fraction of GPU memory fraction that should be allocated for the KV cache. Default is 90%. If both `max_tokens` and `free_gpu_memory_fraction` are specified, memory corresponding to the minimum will be used."
     )
@@ -963,6 +963,11 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
     )
     use_uvm: bool = Field(default=False,
                           description="Whether to use UVM for the KV cache.")
+    max_gpu_total_bytes: int = Field(
+        default=0,
+        description=
+        "The maximum size in bytes of GPU memory that can be allocated for the KV cache. If both `max_gpu_total_bytes` and `free_gpu_memory_fraction` are specified, memory corresponding to the minimum will be allocated."
+    )
 
     # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
     dtype: str = Field(default="auto",
@@ -982,7 +987,8 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             event_buffer_max_size=self.event_buffer_max_size,
             enable_partial_reuse=self.enable_partial_reuse,
             copy_on_partial_reuse=self.copy_on_partial_reuse,
-            use_uvm=self.use_uvm)
+            use_uvm=self.use_uvm,
+            max_gpu_total_bytes=self.max_gpu_total_bytes)
 
 
 @PybindMirror.mirror_pybind_fields(_ExtendedRuntimePerfKnobConfig)
