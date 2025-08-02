@@ -1,0 +1,286 @@
+import asyncio
+import queue
+import threading
+import time
+import traceback
+from concurrent.futures import ThreadPoolExecutor
+from typing import Optional
+
+from ...llmapi.utils import ManagedThread
+from ...logger import logger
+from ..ipc import ZeroMqQueue
+from .rpc_common import RPCError, RPCRequest, RPCResponse, RPCTimeout
+
+
+class RPCServer:
+    """
+    An RPC Server that listens for requests and executes them concurrently.
+    """
+
+    def __init__(self,
+                 instance,
+                 hmac_key=None,
+                 num_workers: int = 1,
+                 timeout: float = 0.5,
+                 async_run_task: bool = False):
+        """
+        Initializes the server with an instance.
+
+        Args:
+            instance: The instance whose methods will be exposed via RPC.
+            hmac_key (bytes, optional): HMAC key for encryption.
+            num_workers (int): Number of worker threads.
+            timeout (int): Timeout for RPC calls.
+            async_run_task (bool): Whether to run the task asynchronously.
+        """
+        self._instance = instance
+        self._hmac_key = hmac_key
+        self._num_workers = num_workers
+        self._address = None
+        self._timeout = timeout
+        self._client_socket = None
+
+        # set the stop event to True, and all the workers will exit
+        self._stop_event = threading.Event()
+
+        self._num_pending_requests = 0
+
+        self._functions = {
+            "__rpc_shutdown": lambda: self.shutdown(is_remote_call=True),
+            "__rpc_get_attr": lambda name: self.get_attr(name),
+        }
+        self._dispatcher_thread: Optional[ManagedThread] = None
+        if async_run_task:
+            self._executor = ThreadPoolExecutor(max_workers=num_workers,
+                                                thread_name_prefix="rpc_worker")
+        else:
+            self._executor = None
+
+        self._queue = None
+
+        # Automatically register the instance
+        self.register_instance(instance)
+
+        logger.debug(f"RPC Server initialized with {num_workers} workers.")
+
+    @property
+    def address(self) -> str:
+        assert self._client_socket is not None, "Client socket is not bound"
+        return self._client_socket.address[0]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.shutdown()
+
+    def bind(self, address="tcp://*:5555"):
+        """
+        Bind the server to the specified address.
+
+        Args:
+            address (str): The ZMQ address to bind the client-facing socket.
+        """
+        self._address = address
+        self._client_socket = ZeroMqQueue(address=(address, self._hmac_key),
+                                          is_server=True,
+                                          is_async=True,
+                                          use_hmac_encryption=False)
+        logger.info(f"RPC Server bound to {self._address}")
+
+    def shutdown(self, is_remote_call: bool = False):
+        """Internal method to trigger server shutdown.
+
+        Args:
+            is_remote_call: Whether the shutdown is called by a remote call.
+                This should be True when client.server_shutdown() is called.
+        """
+        # NOTE: shutdown is also a remote method, so it could be executed by
+        # a thread in a worker executor thread
+
+        if self._stop_event.is_set():
+            return
+
+        logger.debug(
+            "RPC Server shutdown signal received. Terminating server...")
+
+        # Set the stop event to True, this will trigger the dispatcher routine and
+        # the worker routine to prepare for exit, like stopping accepting new requests,
+        # and continue to process the pending requests.
+        self._stop_event.set()
+
+        # The worker routine should process the pending requests
+        logger.debug(
+            f"RPC Server shutdown: {self._num_pending_requests} pending requests"
+        )
+        while self._num_pending_requests > 0:
+            time.sleep(0.01)
+        logger.debug(f"RPC Server shutdown finished pending requests")
+
+        if not is_remote_call:
+            # Block the thread until shutdown is finished
+
+            # 1. Wait for the dispatcher thread to exit, so that no new requests are accepted
+            logger.debug(f"RPC Server dispatcher thread joining")
+            if self._dispatcher_thread:
+                self._dispatcher_thread.join()
+                self._dispatcher_thread = None
+            logger.debug(f"RPC Server dispatcher thread joined")
+
+            # 2. Wait for the executor to exit, it will wait for the pending requests to be processed
+            if self._executor:
+                self._executor.shutdown(wait=True)
+                self._executor = None
+
+            # 3. (Optionally) Close the client socket, this doesn't affect
+            # anything since zmq client will not timeout even if the target is not available
+            if self._client_socket:
+                self._client_socket.close()
+        else:
+            # if the shutdown is called by a remote call, this method itself will
+            # be executed in a executor thread, so we cannot join the dispatcher thread as
+            # the dispatcher thread is awaiting for the shutdown result.
+            logger.debug(
+                f"RPC Server to shutdown: {self._num_pending_requests} pending requests"
+            )
+
+            while self._num_pending_requests > 0:
+                time.sleep(0.01)
+            logger.debug(f"RPC Server shutdown finished pending requests")
+
+    def register_function(self, func, name=None):
+        """Exposes a single function to clients."""
+        fname = name or func.__name__
+        if fname in self._functions:
+            logger.warning(
+                f"Function '{fname}' is already registered. Overwriting.")
+        self._functions[fname] = func
+        logger.debug(f"Registered function: {fname}")
+
+    def register_instance(self, instance):
+        """Exposes all public methods of a class instance."""
+        logger.debug(
+            f"Registering instance of class: {instance.__class__.__name__}")
+        for name in dir(instance):
+            if not name.startswith('_'):
+                attr = getattr(instance, name)
+                if callable(attr):
+                    self.register_function(attr, name)
+
+    def get_attr(self, name: str):
+        """ Get the attribute of the RPC server.
+        This is mainly used for testing. """
+        return getattr(self, name)
+
+    async def _dispatcher_routine(self, stop_event: threading.Event):
+        assert self._client_socket is not None, "Client socket is not bound"
+        assert self._queue is not None, "RPC queue is not initialized"
+
+        # Once shutdown, the dispatcher will exit first, and the workers will
+        # continue to process the pending requests.
+        while not stop_event.is_set():
+            try:
+                req: RPCRequest = await self._client_socket.get_async_noblock(
+                    timeout=0.5)
+                logger.debug(f"RPC dispatcher got request: {req}")
+            except asyncio.TimeoutError:
+                await asyncio.sleep(0)
+                continue
+
+            await self._queue.put(req)  # type: ignore
+
+            # shutdown is a builtin method depends on _num_pending_requests, so
+            # it should not be counted
+            if req.method_name != "__rpc_shutdown":
+                self._num_pending_requests += 1
+
+    async def _worker_routine(self, stop_event: threading.Event):
+        """The routine executed by each worker thread."""
+        assert self._client_socket is not None, "Client socket is not bound"
+        assert self._queue is not None, "RPC queue is not initialized"
+
+        while (not stop_event.is_set()) or self._num_pending_requests > 0:
+            try:
+                req: RPCRequest = await asyncio.wait_for(
+                    self._queue.get(),  # type: ignore
+                    timeout=self._timeout)
+            except asyncio.TimeoutError:
+                await asyncio.sleep(0)
+                continue
+
+            response = await self._process_request(req)
+
+            # Some tasks don't need response, e.g. submit_request or shutdown
+            if req.need_response:
+                logger.debug(f"RPC Server sending response for request {req}")
+                await self._client_socket.put_async(response)
+                logger.debug(f"RPC Server sent response for request {req}")
+
+            self._num_pending_requests -= 1
+
+    async def _process_request(self, req: RPCRequest) -> RPCResponse:
+        if req.method_name not in self._functions:
+            return RPCResponse(
+                req.request_id, None,
+                RPCError(f"Method '{req.method_name}' not found in RPC server.",
+                         traceback=traceback.format_exc()))
+
+        try:
+            loop = asyncio.get_running_loop()
+
+            def call_with_kwargs():
+                return self._functions[req.method_name](*req.args, **req.kwargs)
+
+            result = await asyncio.wait_for(loop.run_in_executor(
+                self._executor, call_with_kwargs),
+                                            timeout=req.timeout)
+            logger.debug(f"RPC Server returned result for request {req}")
+            response = RPCResponse(req.request_id, result)
+
+        except asyncio.TimeoutError:
+            response = RPCResponse(
+                req.request_id, None,
+                RPCTimeout(
+                    f"Method '{req.method_name}' timed out after {req.timeout} seconds",
+                    traceback=traceback.format_exc()))
+
+        except Exception as e:
+            response = RPCResponse(
+                req.request_id, None,
+                RPCError(str(e), cause=e, traceback=traceback.format_exc()))
+
+        return response
+
+    def start(self):
+        """Binds sockets, starts workers, and begins proxying messages."""
+        if self._client_socket is None:
+            raise RuntimeError(
+                "Server must be bound to an address before starting. Call bind() first."
+            )
+
+        self._client_socket.setup_lazily()
+        logger.info(f"RPC Server started and listening on {self._address}")
+
+        async def tasks():
+            self._queue = asyncio.Queue()
+            await asyncio.gather(
+                self._dispatcher_routine(self._stop_event), *[
+                    self._worker_routine(self._stop_event)
+                    for i in range(self._num_workers)
+                ])
+
+        def loop() -> bool:
+            asyncio.run(tasks())
+            return True  # ManagedThread
+
+        error_queue = queue.Queue()
+        self._dispatcher_thread = ManagedThread(task=loop,
+                                                stop_event=self._stop_event,
+                                                name="rpc_dispatcher_thread",
+                                                error_queue=error_queue)
+        self._dispatcher_thread.start()
+
+        logger.info("RPC Server has started.")
+
+
+Server = RPCServer
