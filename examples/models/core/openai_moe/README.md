@@ -84,3 +84,44 @@ Looks like both coasts are enjoying a bright, mild day. Let me know if you’d l
 ```
 
 Once again, the function call works successfully, this time using a different function: `get_multiple_weathers`.
+
+## Using OpenAI Triton Kernels for MoE
+
+OpenAI ships a set of Triton kernels optimized for its MoE models. TensorRT-LLM can leverage these kernels; enable them with the steps below:
+
+1. **Build and install Triton** (tested with the commit below):
+
+```bash
+git clone https://github.com/triton-lang/triton.git
+cd triton
+# Specific commit verified with TensorRT-LLM
+git checkout ff57a4dbc81b5e02e6e1f61973eb9cc00f6f646c
+pip install -r python/requirements.txt          # build-time dependencies
+pip install wheel build
+python3 setup.py bdist_wheel
+pip install ./dist/*.whl
+```
+
+2. **Expose the Triton kernels to TensorRT-LLM**
+   The kernels are not packaged in the wheel, so set the environment variable `TRITON_ROOT` to your Triton clone:
+
+```bash
+export TRITON_ROOT=/local/user/triton
+# TensorRT-LLM expects the kernels at:
+#   $TRITON_ROOT/python/triton_kernels
+```
+
+3. **Select Triton as the MoE backend**
+
+• **trtllm-serve** (or other similar commands) — add this snippet to the YAML file passed via `--extra_llm_api_options`:
+
+```yaml
+moe_config:
+  backend: TRITON
+```
+
+• **Example scripts** (e.g. `examples/llm-api/quickstart_advanced.py`) — pass the CLI flag:
+
+```bash
+--moe_backend TRITON
+```

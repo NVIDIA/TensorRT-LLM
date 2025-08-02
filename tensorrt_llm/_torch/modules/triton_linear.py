@@ -398,17 +398,11 @@ class TritonLinear(Linear):
         skip_create_weights_in_init: bool = False,
         use_custom_cublas_mm: bool = False,
         lora: Optional[LoraLayer] = None,
-        override_quant_method=None,
     ):
         if not IS_TRITON_KERNELS_AVAILABLE:
             raise ImportError("Triton kernels are not available. "
                               "Please install the required dependencies.")
         assert not use_custom_cublas_mm, "TritonLinear does not support custom cublas mm."
-
-        # Override the quantization method if needed for test purpose
-        # TODO(dongfengy): Remove this when we have all the quantization classes and enums for mxfp4
-        if override_quant_method is not None:
-            self.override_quant_method = override_quant_method
 
         super().__init__(
             in_features=in_features,
@@ -427,9 +421,6 @@ class TritonLinear(Linear):
 
     # Most of the code can be reused, only change the quant method offloading here.
     def get_quant_method(self, quant_config: Optional[QuantConfig] = None):
-        if hasattr(self, 'override_quant_method'):
-            return self.override_quant_method()
-
         if quant_config is None or not quant_config.layer_quant_mode.has_any_quant(
                 exclude_kv_cache=True):
             return TritonUnquantizedLinearMethod()

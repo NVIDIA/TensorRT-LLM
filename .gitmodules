@@ -23,6 +23,3 @@
 [submodule "3rdparty/nanobind"]
 	path = 3rdparty/nanobind
 	url = https://github.com/wjakob/nanobind
-[submodule "3rdparty/triton"]
-	path = 3rdparty/triton
-	url = https://github.com/dongfengy/triton.git

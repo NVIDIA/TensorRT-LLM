@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+import sys
 from typing import Dict, List, NamedTuple, Optional
 
 import torch
@@ -9,36 +11,25 @@ import triton
 import triton.language as tl
 
 IS_TRITON_KERNELS_AVAILABLE = False
-try:
-    # WAR since the triton wheel doesn't include the triton_kernels module
-    import os
-    import sys
-    llm_root = os.getenv('LLM_ROOT')
-    if llm_root:
-        # On CI, we use LLM_ROOT to locate the 3rdparty directory.
-        triton_path = os.path.join(llm_root, '3rdparty', 'triton', 'python',
-                                   'triton_kernels')
-    else:
-        current_dir = os.path.dirname(os.path.abspath(__file__))
-        triton_path = os.path.join(current_dir, '..', '..', '..', '..',
-                                   '3rdparty', 'triton', 'python',
-                                   'triton_kernels')
-    triton_path = os.path.abspath(triton_path)
-    if os.path.exists(triton_path) and triton_path not in sys.path:
-        sys.path.insert(0, triton_path)
+# We expect to find triton_kernels under $TRITON_ROOT/python/triton_kernels
+# Triton upstream commit ff57a4dbc81b5e02e6e1f61973eb9cc00f6f646c has been verified.
+triton_root = os.getenv('TRITON_ROOT')
+if triton_root:
+    triton_root = os.path.abspath(
+        os.path.join(triton_root, 'python', 'triton_kernels'))
+    if os.path.exists(triton_root) and triton_root not in sys.path:
+        sys.path.insert(0, triton_root)
+    assert triton.__version__ >= "3.4.0", "Triton kernels are detected but the Triton wheel is too old"
     import triton_kernels.swiglu
     from triton_kernels.matmul_ogs import (FlexCtx, FnSpecs, FusedActivation,
                                            MicroscalingCtx, PrecisionConfig,
                                            matmul_ogs)
     from triton_kernels.numerics import InFlexData
     from triton_kernels.numerics_details.mxfp import (
-        SwizzlingType, perm_tensor_from_contig, perm_tuple_from_contig,
-        swizzle_mx_scale_bw, swizzle_mxfp4_scale_hopper,
+        SwizzlingType, downcast_to_mxfp_torch, perm_tensor_from_contig,
+        perm_tuple_from_contig, swizzle_mx_scale_bw, swizzle_mxfp4_scale_hopper,
         swizzle_mxfp4_value_hopper)
     IS_TRITON_KERNELS_AVAILABLE = True
-    from triton_kernels.numerics_details.mxfp import downcast_to_mxfp_torch
-except ImportError:
-    pass
 
 from ...model_config import ModelConfig
 from ..linear import TensorParallelMode, load_weight_shard
@@ -47,6 +38,21 @@ from .quantization import (FusedMoEMethodBase, MoEWeightLoadingMode,
                            load_activation_scales_fp8_qdq,
                            requantize_expert_w3_w1_weight_fp8_qdq)
 from .routing import BaseMoeRoutingMethod, RenormalizeMoeRoutingMethod
+
+
+# Triton kernels has hardcoded beta = 1, so we use this implementation when beta is not 1
+def swiglu_torch(a: torch.Tensor, alpha: float, beta: float,
+                 limit: Optional[float]) -> torch.Tensor:
+    a_glu = a[..., ::2]
+    if limit is not None:
+        a_glu = a_glu.clamp(max=limit)
+    a_linear = a[..., 1::2]
+    if limit is not None:
+        a_linear = a_linear.clamp(min=-limit, max=limit)
+
+    out_glu = a_glu * torch.sigmoid(alpha * a_glu)
+    out = out_glu * (a_linear + beta)
+    return out
 
 
 def shuffle_weight_for_activation_kernel(
@@ -230,9 +236,6 @@ class TritonUnquantizedFusedMoEMethod(FusedMoEMethodBase):
         super().__init__()
         self.shuffle_weight = shuffle_weight
 
-        if not IS_TRITON_KERNELS_AVAILABLE:
-            raise ImportError("Triton kernels are not available.")
-
     def create_weights(self, module: torch.nn.Module):
         weight_dtype = module.dtype
         assert weight_dtype == torch.bfloat16, \
@@ -378,16 +381,25 @@ class TritonUnquantizedFusedMoEMethod(FusedMoEMethodBase):
         # Call the Triton gemm kernel, which also does permutation and activation
         alpha = module.swiglu_alpha or 1.0
         beta = module.swiglu_beta or 0.0
-        act = FusedActivation(
-            FnSpecs("swiglu", triton_kernels.swiglu.swiglu_fn,
-                    ("alpha", "beta", "limit")), (alpha, beta, None), 2)
-        act_out = matmul_ogs(hidden_states,
-                             gemm1_weights,
-                             module.w3_w1_bias if module.bias else None,
-                             rdata,
-                             gather_indx=gather_indx,
-                             precision_config=pc1,
-                             fused_activation=act)
+        if beta == 1.0:
+            act = FusedActivation(
+                FnSpecs("swiglu", triton_kernels.swiglu.swiglu_fn,
+                        ("alpha", "limit")), (alpha, None), 2)
+            act_out = matmul_ogs(hidden_states,
+                                 gemm1_weights,
+                                 module.w3_w1_bias if module.bias else None,
+                                 rdata,
+                                 gather_indx=gather_indx,
+                                 precision_config=pc1,
+                                 fused_activation=act)
+        else:
+            act_out = matmul_ogs(hidden_states,
+                                 gemm1_weights,
+                                 module.w3_w1_bias if module.bias else None,
+                                 rdata,
+                                 gather_indx=gather_indx,
+                                 precision_config=pc1)
+            act_out = swiglu_torch(act_out, alpha, beta, module.swiglu_limit)
 
         # Step 3: Gemm2
         # Setup quantization context
@@ -601,16 +613,25 @@ class TritonFP8QDQFusedMoEMethod(TritonUnquantizedFusedMoEMethod):
         # Call the Triton gemm kernel, which also does permutation and activation
         alpha = module.swiglu_alpha or 1.0
         beta = module.swiglu_beta or 0.0
-        act = FusedActivation(
-            FnSpecs("swiglu", triton_kernels.swiglu.swiglu_fn,
-                    ("alpha", "beta", "limit")), (alpha, beta, None), 2)
-        act_out = matmul_ogs(hidden_states,
-                             gemm1_weights,
-                             module.w3_w1_bias if module.bias else None,
-                             rdata,
-                             gather_indx=gather_indx,
-                             precision_config=pc1,
-                             fused_activation=act)
+        if beta == 1.0:
+            act = FusedActivation(
+                FnSpecs("swiglu", triton_kernels.swiglu.swiglu_fn,
+                        ("alpha", "limit")), (alpha, None), 2)
+            act_out = matmul_ogs(hidden_states,
+                                 gemm1_weights,
+                                 module.w3_w1_bias if module.bias else None,
+                                 rdata,
+                                 gather_indx=gather_indx,
+                                 precision_config=pc1,
+                                 fused_activation=act)
+        else:
+            act_out = matmul_ogs(hidden_states,
+                                 gemm1_weights,
+                                 module.w3_w1_bias if module.bias else None,
+                                 rdata,
+                                 gather_indx=gather_indx,
+                                 precision_config=pc1)
+            act_out = swiglu_torch(act_out, alpha, beta, module.swiglu_limit)
 
         # Quantize the activation output manually since the Triton activation kernel doesn't support bf16 in fp8 out
         act_out, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
@@ -1166,18 +1187,26 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
         # Call the Triton gemm kernel, which also does permutation and activation
         alpha = module.swiglu_alpha or 1.0
         beta = module.swiglu_beta or 0.0
-        act = FusedActivation(
-            FnSpecs("swiglu", triton_kernels.swiglu.swiglu_fn,
-                    ("alpha", "beta", "limit")),
-            (alpha, beta, module.swiglu_limit), 2)
+        if beta == 1.0:
+            act = FusedActivation(
+                FnSpecs("swiglu", triton_kernels.swiglu.swiglu_fn,
+                        ("alpha", "limit")), (alpha, module.swiglu_limit), 2)
 
-        act_out = matmul_ogs(hidden_states,
-                             gemm1_weights,
-                             module.w3_w1_bias if module.bias else None,
-                             rdata,
-                             gather_indx=gather_indx,
-                             precision_config=pc1,
-                             fused_activation=act)
+            act_out = matmul_ogs(hidden_states,
+                                 gemm1_weights,
+                                 module.w3_w1_bias if module.bias else None,
+                                 rdata,
+                                 gather_indx=gather_indx,
+                                 precision_config=pc1,
+                                 fused_activation=act)
+        else:
+            act_out = matmul_ogs(hidden_states,
+                                 gemm1_weights,
+                                 module.w3_w1_bias if module.bias else None,
+                                 rdata,
+                                 gather_indx=gather_indx,
+                                 precision_config=pc1)
+            act_out = swiglu_torch(act_out, alpha, beta, module.swiglu_limit)
 
         def _maybe_remove_padding(gemm_output, expected_size):
             assert gemm_output.dim() == 2
@@ -1250,13 +1279,7 @@ class TritonFusedMoE(MoE):
         swiglu_alpha: Optional[torch.Tensor] = None,
         swiglu_beta: Optional[torch.Tensor] = None,
         swiglu_limit: Optional[torch.Tensor] = None,
-        override_quant_method=None,
     ):
-        # Override the quantization method if needed for test purpose
-        # TODO(dongfengy): Remove this when we have all the quantization classes and enums for mxfp4
-        if override_quant_method is not None:
-            self.override_quant_method = override_quant_method
-
         super().__init__(
             routing_method=routing_method,
             num_experts=num_experts,
@@ -1267,6 +1290,8 @@ class TritonFusedMoE(MoE):
             model_config=model_config,
             weight_loading_mode=weight_loading_mode,
         )
+        if not IS_TRITON_KERNELS_AVAILABLE:
+            raise ImportError("Triton kernels are not available.")
 
         assert isinstance(self.routing_method, RenormalizeMoeRoutingMethod), \
             "routing_method must be an instance of RenormalizeMoeRoutingMethod for TritonFusedMoE"
@@ -1318,9 +1343,6 @@ class TritonFusedMoE(MoE):
             optf.update_opt_flags_constraints(constraints)
 
     def _get_quant_method(self):
-        if hasattr(self, 'override_quant_method'):
-            return self.override_quant_method()
-
         if self.quant_config is not None and self.quant_config.layer_quant_mode.has_any_quant(
                 exclude_kv_cache=True):
             if self.quant_config.layer_quant_mode.has_fp8_qdq():
