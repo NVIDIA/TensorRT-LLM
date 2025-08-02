@@ -703,8 +703,6 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
             = static_cast<bool>(reinterpret_cast<int const*>(inputs[getIdx(IdxEntry::SPEC_DECODING_USE)])[0]);
         changeSpecDecodingMode = mUseSpecDecoding != useSpecDecoding;
         mUseSpecDecoding = useSpecDecoding;
-        // change mMultiBlockMode to default
-        mMultiBlockMode = mUseSpecDecoding ? false : true;
     }
 
     [[maybe_unused]] MlaParams<T> mla_params;
