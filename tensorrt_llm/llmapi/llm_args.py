@@ -9,7 +9,8 @@ from dataclasses import dataclass, field
 from enum import Enum, EnumMeta
 from pathlib import Path
 from typing import (TYPE_CHECKING, Any, ClassVar, Dict, List, Literal, Optional,
-                    Type, TypeAlias, TypeVar, Union, get_args, get_origin)
+                    Tuple, Type, TypeAlias, TypeVar, Union, get_args,
+                    get_origin)
 
 import torch
 import yaml
@@ -395,6 +396,7 @@ class EagleDecodingConfig(DecodingBaseConfig):
     num_eagle_layers: Optional[int] = None
     max_non_leaves_per_layer: Optional[int] = None
     eagle3_one_model: Optional[bool] = True
+    eagle3_layers_to_capture: Optional[Tuple[int, ...]] = None
 
     @classmethod
     def from_dict(cls, data: dict):
@@ -405,6 +407,12 @@ class EagleDecodingConfig(DecodingBaseConfig):
     def validate(self) -> None:
         if self.speculative_model_dir is None:
             raise ValueError("Draft model must be provided for EAGLE")
+
+    @functools.cached_property
+    def num_capture_layers(self):
+        if self.eagle3_layers_to_capture is not None:
+            return len(self.eagle3_layers_to_capture)
+        return 3
 
     @functools.cached_property
     def spec_dec_mode(self):
@@ -497,7 +505,9 @@ class MTPDecodingConfig(DecodingBaseConfig):
 
     @classmethod
     def from_dict(cls, data: dict):
-        return cls(**data)
+        out = cls(**data)
+        out.max_draft_len = out.num_nextn_predict_layers
+        return out
 
     decoding_type: ClassVar[str] = "MTP"
 

@@ -30,7 +30,7 @@ class SpeculativeDecodingMode(IntEnum):
         return self == SpeculativeDecodingMode.EAGLE3
 
     def use_one_engine(self):
-        return self.is_mtp() or self.is_eagle3_one_model()
+        return self.is_eagle3_one_model()
 
     def is_eagle3_one_model(self):
         return self == SpeculativeDecodingMode.EAGLE3_ONE_MODEL
@@ -87,12 +87,16 @@ class SpeculativeDecodingMode(IntEnum):
         chunked context requests at the kernel level. Required for
         any spec dec mode that uses the SpecExecutor.
         """
-
         # Fixme: only trtllm attention backend supports eagle3 generation-phase kernels on blackwell.
-        return ((self.is_eagle3() or self.is_draft_target())
-                and not (isinstance(attention_backend, TrtllmAttention)
-                         and get_sm_version() == 100)
-                ) or self.is_ngram() or self.is_user_provided()
+
+        if self.is_eagle3() or self.is_draft_target():
+            if get_sm_version() == 100 and issubclass(attention_backend,
+                                                      TrtllmAttention):
+                return False
+            else:
+                return True
+        else:
+            return self.is_ngram() or self.is_user_provided()
 
     def attention_need_spec_dec_mode(self):
         """
@@ -179,6 +183,13 @@ class SpecMetadata:
         cuda_graph_metadata.max_num_requests = max_batch_size
         cuda_graph_metadata.__post_init__()
         return cuda_graph_metadata
+
+    def is_layer_capture(self, layer_id: int):
+        """
+        Whether the layer should be captured (eg for Eagle3).
+        By default, does nothing.
+        """
+        return False
 
     def maybe_capture_hidden_states(self, layer_id: int,
                                     hidden_states: torch.Tensor,

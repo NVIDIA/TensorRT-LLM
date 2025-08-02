@@ -155,10 +155,12 @@ class Eagle3DraftModel(DecoderModel):
         else:
             self.hidden_size_in = config.hidden_size
 
-        self.fc = Linear(self.hidden_size_in * 3,
-                         config.hidden_size,
-                         bias=getattr(config, "bias", False),
-                         dtype=config.torch_dtype)
+        if self.spec_config.num_capture_layers > 1:
+            self.fc = Linear(self.hidden_size_in *
+                             self.spec_config.num_capture_layers,
+                             config.hidden_size,
+                             bias=getattr(config, "bias", False),
+                             dtype=config.torch_dtype)
 
         self.midlayer = Eagle3DecoderLayer(model_config, start_layer_idx)
 

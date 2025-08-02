@@ -53,6 +53,7 @@ from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
                            MoEAllReduce, MoEAllReduceParams, allgather)
 from ..model_config import ModelConfig
+from ..models.modeling_speculative import SpecDecOneEngineForCausalLM
 from ..models.modeling_utils import ModelConfig, QuantConfig
 from ..modules.attention import MLA
 from ..modules.decoder_layer import DecoderLayer
@@ -65,10 +66,9 @@ from ..modules.linear import Linear, TensorParallelMode, WeightsLoadingConfig
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..peft.lora.layer import LoraLayer
-from ..speculative import MTPEagleWorker, MTPSpecMetadata, MTPWorker
+from ..speculative import MTPEagleWorker, MTPWorker, SpecMetadata
 from ..utils import AuxStreamType, EventType, Fp4QuantizedTensor
-from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
-                             EagerFusionConfig, filter_weights,
+from .modeling_utils import (DecoderModel, EagerFusionConfig, filter_weights,
                              register_auto_model)
 
 
@@ -230,7 +230,7 @@ class DeepseekV3Attention(MLA):
         aux_stream: Optional[torch.cuda.Stream] = None,
     ):
         config = model_config.pretrained_config
-        predicted_tokens_per_seq = model_config.spec_config.num_nextn_predict_layers + 1 if model_config.spec_config is not None else 1
+        predicted_tokens_per_seq = model_config.spec_config.max_draft_len + 1 if model_config.spec_config is not None else 1
         super().__init__(hidden_size=config.hidden_size,
                          num_attention_heads=config.num_attention_heads,
                          num_key_value_heads=config.num_key_value_heads,
@@ -742,6 +742,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         residual: torch.Tensor,
+        spec_metadata: Optional[SpecMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
         if residual is None:
@@ -758,16 +759,26 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         )
 
         if isinstance(self.mlp, Deepseekv3MoE):
+
+            if spec_metadata is not None and spec_metadata.is_layer_capture(
+                    self.layer_idx):
+                self.fusion_config.POST_MOE_FUSION = False
             return self.forward_MoE(
                 hidden_states=hidden_states,
                 attn_metadata=attn_metadata,
                 residual=residual,
+                spec_metadata=spec_metadata,
             )
         else:
+
+            if spec_metadata is not None and spec_metadata.is_layer_capture(
+                    self.layer_idx):
+                self.fusion_config.POST_MLP_FUSION = False
             assert isinstance(self.mlp, GatedMLP)
             return self.forward_mlp(
                 hidden_states=hidden_states,
                 residual=residual,
+                spec_metadata=spec_metadata,
             )
 
     def forward_MoE(
@@ -775,6 +786,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         residual: torch.Tensor,
+        spec_metadata: Optional[SpecMetadata] = None,
     ) -> torch.Tensor:
 
         def _run_MoE(hidden_states, hidden_states_fp4, do_finalize):
@@ -849,6 +861,10 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 hidden_states, residual = self.moe_allreduce(
                     fc2_output, all_reduce_params=moe_all_reduce_params)
         else:
+            if spec_metadata is not None and spec_metadata.is_layer_capture(
+                    self.layer_idx):
+                spec_metadata.maybe_capture_hidden_states(
+                    self.layer_idx, hidden_states, residual)
             if self.next_layer_layernorm is not None:
                 hidden_states, residual = self.next_layer_layernorm(
                     hidden_states, residual)
@@ -859,6 +875,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         self,
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
+        spec_metadata: Optional[SpecMetadata] = None,
     ) -> torch.Tensor:
 
         if self.fusion_config.PRE_MLP_FUSION:
@@ -896,6 +913,10 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 ),
             )
         else:
+            if spec_metadata is not None and spec_metadata.is_layer_capture(
+                    self.layer_idx):
+                spec_metadata.maybe_capture_hidden_states(
+                    self.layer_idx, hidden_states, residual)
             if self.next_layer_layernorm is not None:
                 hidden_states, residual = self.next_layer_layernorm(
                     hidden_states, residual)
@@ -1077,6 +1098,8 @@ class DeepseekV3Model(DecoderModel):
         input_ids: Optional[torch.IntTensor] = None,
         position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
+        spec_metadata: Optional[SpecMetadata] = None,
+        **kwargs,
     ) -> torch.Tensor:
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
@@ -1095,23 +1118,23 @@ class DeepseekV3Model(DecoderModel):
                 hidden_states=hidden_states,
                 attn_metadata=attn_metadata,
                 residual=residual,
+                spec_metadata=spec_metadata,
             )
 
         return hidden_states
 
 
 @register_auto_model("DeepseekV3ForCausalLM")
-class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
-                                                    PretrainedConfig]):
+class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
+                                                        PretrainedConfig]):
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
         super().__init__(DeepseekV3Model(model_config),
-                         config=model_config,
-                         hidden_size=model_config.pretrained_config.hidden_size,
-                         vocab_size=model_config.pretrained_config.vocab_size)
+                         model_config=model_config)
 
         self.model_nextn = 0
-        if model_config.spec_config is not None:
+        if model_config.spec_config is not None and model_config.spec_config.spec_dec_mode.is_mtp(
+        ):
             model_nextn = model_config.spec_config.num_nextn_predict_layers
             ckpt_nextn = self.config.num_nextn_predict_layers
             self.num_hidden_layers = self.config.num_hidden_layers
@@ -1160,19 +1183,20 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
         input_ids: torch.IntTensor = None,
         position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
-        spec_metadata: Optional[MTPSpecMetadata] = None,
+        spec_metadata: Optional[SpecMetadata] = None,
         return_context_logits: bool = False,
         **kwargs,
     ) -> torch.Tensor:
-        attn_metadata.num_generations_per_batch = self.model_nextn + 1
         hidden_states = self.model(
             input_ids=input_ids,
             attn_metadata=attn_metadata,
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
+            spec_metadata=spec_metadata,
         )
 
         if spec_metadata and spec_metadata.spec_dec_mode.is_mtp():
+            # TODO Merge API with EagleWorker in modeling_speculative.py
             # get logits
             logits = self.logits_processor.forward(
                 hidden_states[spec_metadata.gather_ids],
@@ -1348,7 +1372,9 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
 
         for name, module in tqdm(all_named_modules.items(),
                                  desc="Loading weights"):
-            if len(module._parameters) > 0:
+            if len(module._parameters) <= 0 or name.startswith("draft_model"):
+                continue
+            else:
                 names = name.split('.')
                 parent_module_name = '.'.join(names[:-1])
                 if "model.layers" in name and int(
