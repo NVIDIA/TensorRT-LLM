@@ -36,6 +36,8 @@ from tensorrt_llm._torch.modules.fused_moe import (BaseMoeRoutingMethod,
                                                    TritonFusedMoE, VanillaMoE,
                                                    create_moe, WideEPMoE)
 # isort: on
+from tensorrt_llm._torch.modules.fused_moe.fused_moe_triton import \
+    IS_TRITON_KERNELS_AVAILABLE
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._utils import mpi_rank
 from tensorrt_llm.mapping import Mapping
@@ -63,6 +65,8 @@ def test_fused_moe(moe_backend,
                    mapping=None):
 
     if moe_backend == "TRITON":
+        if not IS_TRITON_KERNELS_AVAILABLE:
+            pytest.skip("Triton kernels are not available")
         if dtype != torch.bfloat16:
             pytest.skip("Unsupported for TritonFusedMoE")
         if routing_cls != RenormalizeMoeRoutingMethod:
@@ -293,6 +297,8 @@ def test_fused_moe_alltoall(alltoall_method_type):
 def test_fused_moe_fp8(moe_backend, dtype, routing_cls, bias):
 
     if moe_backend == "TRITON":
+        if not IS_TRITON_KERNELS_AVAILABLE:
+            pytest.skip("Triton kernels are not available")
         if dtype != torch.bfloat16:
             pytest.skip("Unsupported for TritonFusedMoE")
         if routing_cls != RenormalizeMoeRoutingMethod:
@@ -1301,6 +1307,8 @@ def test_fused_moe_wfp4a16(dtype, hidden_size):
 @pytest.mark.parametrize("dynamic_quant", [True, False])
 def test_fused_moe_triton_mxfp4(experts, hidden_size, intermediate_size,
                                 fp8_activation, bias, dynamic_quant):
+    if not IS_TRITON_KERNELS_AVAILABLE:
+        pytest.skip("Triton kernels are not available")
 
     mapping = Mapping()
     mapping.rank = mpi_rank()
@@ -1406,22 +1414,18 @@ def test_fused_moe_triton_mxfp4(experts, hidden_size, intermediate_size,
                 weights[f"{expert_id}.w2.bias"] = w2_bias[expert_id]
                 weights[f"{expert_id}.w3.bias"] = w3_bias[expert_id]
 
-        # Override the quantization method if needed for test purpose
-        # TODO(dongfengy): Remove this when we have all the quantization classes and enums for mxfp4
-        from tensorrt_llm._torch.modules.fused_moe.fused_moe_triton import \
-            TritonMXFP4FusedMoEMethod
-        quant_method = lambda: TritonMXFP4FusedMoEMethod(
-            activation_dtype=torch.bfloat16
-            if not fp8_activation else torch.float8_e4m3fn)
+        quant_algo = QuantAlgo.W4A8_MXFP4_FP8 if fp8_activation else QuantAlgo.W4A16_MXFP4
+        quant_config = QuantConfig(quant_algo=quant_algo)
         fused_moe = TritonFusedMoE(num_experts=NUM_EXPERTS,
                                    routing_method=routing_method,
                                    hidden_size=HIDDEN_SIZE,
                                    intermediate_size=INTERMEDIATE_SIZE,
                                    dtype=dtype,
                                    reduce_results=True,
-                                   model_config=ModelConfig(),
-                                   override_quant_method=quant_method,
-                                   bias=bias)
+                                   bias=bias,
+                                   model_config=ModelConfig(
+                                       quant_config=quant_config,
+                                       mapping=mapping))
         fused_moe.load_weights([weights])
         fused_moe.cuda()
 

@@ -5,6 +5,8 @@ import shutil
 import pytest
 
 from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm._torch.modules.fused_moe.fused_moe_triton import \
+    IS_TRITON_KERNELS_AVAILABLE
 from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, MoeConfig
 
 configs = """
@@ -46,6 +48,9 @@ def dump_config_json(dst_dir):
 
 @pytest.mark.parametrize("moe_backend", ["CUTLASS", "TRITON"])
 def test_orangina_trtllmgen(moe_backend):
+    if moe_backend == "TRITON" and not IS_TRITON_KERNELS_AVAILABLE:
+        pytest.skip("Triton kernels are not available")
+
     prompts = [
         "How are you?",
         "Hello, my name is",

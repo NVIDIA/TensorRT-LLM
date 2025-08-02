@@ -250,7 +250,6 @@ def row_linear_norm_fusion_forward(x, hidden_size, dtype, tensor_parallel_size,
                     reason='needs 2 GPUs to run this test')
 @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
 def test_mlp(mpi_pool_executor):
-    pytest.skip("Disabled due to triton version incompatibility issues")
     torch.manual_seed(42)
     seq_len = 2
     hidden_size = 16
@@ -273,7 +272,6 @@ def test_mlp(mpi_pool_executor):
                          ids=["balanced", "unbalanced"])
 @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
 def test_column_linear(hidden_size, mpi_pool_executor):
-    pytest.skip("Disabled due to triton version incompatibility issues")
     torch.manual_seed(42)
     seq_len = 10
     dtype = torch.bfloat16
@@ -299,7 +297,6 @@ def test_column_linear(hidden_size, mpi_pool_executor):
                          ids=["balanced", "unbalanced"])
 @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
 def test_row_linear(hidden_size, mpi_pool_executor):
-    pytest.skip("Disabled due to triton version incompatibility issues")
     torch.manual_seed(42)
     seq_len = 2
     dtype = torch.bfloat16
@@ -325,7 +322,6 @@ def test_row_linear(hidden_size, mpi_pool_executor):
 @pytest.mark.parametrize("hidden_size", [16, 256], ids=lambda x: f"hidden:{x}")
 @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
 def test_row_linear_norm_fusion(seq_len, hidden_size, mpi_pool_executor):
-    pytest.skip("Disabled due to triton version incompatibility issues")
     torch.manual_seed(42)
     dtype = torch.bfloat16
     tensor_parallel_size = mpi_pool_executor.num_workers

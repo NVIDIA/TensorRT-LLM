@@ -18,6 +18,8 @@ import pytest
 from defs.conftest import get_sm_version
 
 from tensorrt_llm import LLM
+from tensorrt_llm._torch.modules.fused_moe.fused_moe_triton import \
+    IS_TRITON_KERNELS_AVAILABLE
 from tensorrt_llm._torch.pyexecutor.config import MoeLoadBalancerConfig
 from tensorrt_llm.llmapi import (CudaGraphConfig, EagleDecodingConfig,
                                  KvCacheConfig, MoeConfig, MTPDecodingConfig,
@@ -2191,8 +2193,11 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
     def test_w4a8_mxfp4(self, moe_backend, tp_size, pp_size, ep_size,
                         attention_dp, cuda_graph, overlap_scheduler,
                         activation_dtype):
-        if moe_backend == "TRITON" and get_sm_version() < 90:
-            pytest.skip("TRITON moe backend requires Hopper or newer.")
+        if moe_backend == "TRITON":
+            if not IS_TRITON_KERNELS_AVAILABLE:
+                pytest.skip("TRITON moe backend is not available.")
+            if get_sm_version() < 90:
+                pytest.skip("TRITON moe backend requires Hopper or newer.")
         if moe_backend in ["CUTLASS", "TRTLLM"] and get_sm_version() < 100:
             pytest.skip(
                 "CUTLASS or TRTLLM moe backend requires Blackwell or newer.")
@@ -2432,6 +2437,8 @@ class TestOpenAI(LlmapiAccuracyTestHarness):
         (True, True),
     ])
     def test_w4_1gpu(self, moe_backend, cuda_graph, overlap_scheduler):
+        if moe_backend == "TRITON" and not IS_TRITON_KERNELS_AVAILABLE:
+            pytest.skip("Triton kernels are not available")
 
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
@@ -2464,10 +2471,13 @@ class TestOpenAI(LlmapiAccuracyTestHarness):
         ids=["tp4", "ep4", "dp4"])
     def test_w4_4gpus(self, moe_backend, tp_size, pp_size, ep_size,
                       attention_dp, cuda_graph, overlap_scheduler):
-        if tp_size != ep_size and moe_backend == "TRITON":
-            pytest.skip(
-                "TRITON moe backend currently doesn't supported mxfp4 tp for this size"
-            )
+        if moe_backend == "TRITON":
+            if not IS_TRITON_KERNELS_AVAILABLE:
+                pytest.skip("Triton kernels are not available")
+            if tp_size != ep_size:
+                pytest.skip(
+                    "TRITON moe backend currently doesn't supported mxfp4 tp for this size"
+                )
 
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
@@ -2503,6 +2513,8 @@ class TestOpenAI(LlmapiAccuracyTestHarness):
         ids=["tp4", "ep4", "dp4"])
     def test_w16a16(self, moe_backend, tp_size, pp_size, ep_size, attention_dp,
                     cuda_graph, overlap_scheduler):
+        if moe_backend == "TRITON" and not IS_TRITON_KERNELS_AVAILABLE:
+            pytest.skip("Triton kernels are not available")
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None)
@@ -2531,6 +2543,8 @@ class TestOpenAI(LlmapiAccuracyTestHarness):
         ids=["dp4"])
     def test_w4a16_dynamic(self, tp_size, pp_size, ep_size, attention_dp,
                            cuda_graph, overlap_scheduler, monkeypatch):
+        if not IS_TRITON_KERNELS_AVAILABLE:
+            pytest.skip("Triton kernels are not available")
         monkeypatch.setenv("OVERRIDE_QUANT_ALGO", "W4A16_MXFP4")
 
         pytorch_config = dict(

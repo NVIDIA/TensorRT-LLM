@@ -79,10 +79,6 @@ RUN pip3 install opencv-python-headless --force-reinstall --no-deps --no-cache-d
 RUN pip3 install --upgrade --no-cache-dir \
     "protobuf>=4.25.8"
 
-# Install Triton
-# The actual Triton version is still 3.4.0, but here we used 3.4.1 when building the wheel to avoid conflicts with previous builds.
-RUN python3 -m pip install -i https://urm.nvidia.com/artifactory/api/pypi/sw-tensorrt-pypi/simple triton==3.4.1
-
 FROM ${TRITON_IMAGE}:${TRITON_BASE_TAG} AS triton
 
 FROM devel AS tritondevel
