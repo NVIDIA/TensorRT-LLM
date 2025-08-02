@@ -98,59 +98,6 @@ class KvCacheCreator:
             fraction = 0.9
         return fraction
 
-    def _get_num_graphs(self) -> int:
-        return len(self._model_engine._cuda_graph_batch_sizes)
-
-    def _get_extra_memory_for_attention_metadata(
-            self, kv_cache_manager: KVCacheManager) -> int:
-        """
-        `kv_cache_block_offsets` (see `TrtllmAttentionMetadata`) stores the KV-cache
-        block offsets for every request.  Its layout is
-        [num_pools, max_num_sequences, 2, max_blocks_per_seq].
-
-        • Estimation phase: we run a dry-run with requests of length
-          `max_num_tokens` (e.g. 8192).  Consequently, `max_blocks_per_seq` is small
-          and the tensor's footprint appears modest.
-
-        • Real inference: `max_blocks_per_seq` can increase to
-          `max_seq_len / tokens_per_block`.  For long-context models this is
-          orders of magnitude larger, so the tensor consumes significantly more
-          GPU memory.
-
-        • CUDA graphs: when graph capture is enabled the full
-          `kv_cache_block_offsets` tensor must be pre-allocated,
-          making the extra memory grow linearly with the number of graphs.
-        """
-        # get the max_blocks_per_seq in estimation phase
-        est_phase_max_blocks_per_seq = kv_cache_manager.max_blocks_per_seq
-
-        max_batch_size = self._executor_config.max_batch_size
-        if max_batch_size is None:
-            logger.warning(f"max_batch_size is not set, using 1")
-            max_batch_size = 1
-        max_attention_window_from_config = self._executor_config.kv_cache_config.max_attention_window
-        max_window_size = max(
-            max_attention_window_from_config
-        ) if max_attention_window_from_config is not None else self._executor_config.max_seq_len
-        tokens_per_block = self._executor_config.tokens_per_block
-        num_pools = kv_cache_manager.num_pools
-
-        # calculate the max_blocks_per_seq in real inference phase
-        real_phase_max_blocks_per_seq = int(
-            (max_window_size + tokens_per_block - 1) // tokens_per_block)
-
-        # calculate the extra memory from kv_cache_block_offsets for each graph
-        extra_bytes_per_graph = (
-            real_phase_max_blocks_per_seq -
-            est_phase_max_blocks_per_seq) * num_pools * max_batch_size * 2 * 4
-        # get number of graphs
-        num_graphs = self._get_num_graphs()
-        total_extra_bytes = int(extra_bytes_per_graph * num_graphs)
-        logger.info(
-            f"extra bytes per graph from kv_cache_block_offsets: {extra_bytes_per_graph / (GB):.2f} GiB, total extra bytes: {total_extra_bytes / (GB):.2f} GiB"
-        )
-        return total_extra_bytes
-
     def _get_kv_size_per_token(self):
         model_config = self._model_engine.model.model_config
         mapping = self._mapping
@@ -246,8 +193,12 @@ class KvCacheCreator:
         estimating_kv_cache = False
         if 'cp_type' not in self._mapping.cp_config:
             estimating_kv_cache = True
-            self._executor_config.kv_cache_config.max_tokens = self._get_token_num_for_estimation(
-            )
+            max_attention_window_from_config = self._executor_config.kv_cache_config.max_attention_window
+            max_seq_len = max(
+                max_attention_window_from_config
+            ) if max_attention_window_from_config is not None else self._executor_config.max_seq_len
+            self._executor_config.kv_cache_config.max_tokens = max(
+                self._get_token_num_for_estimation(), max_seq_len)
         return estimating_kv_cache
 
     def configure_kv_cache_capacity(self, py_executor: PyExecutor) -> None:
@@ -318,12 +269,6 @@ class KvCacheCreator:
         logger.info(
             f"Memory used outside torch (e.g., NCCL and CUDA graphs) in memory usage profiling: {extra_cost / (GB):.2f} GiB"
         )
-
-        # get extra memory from attention metadata
-        extra_memory_for_attention_metadata = self._get_extra_memory_for_attention_metadata(
-            py_executor.resource_manager.resource_managers.get(
-                ResourceManagerType.KV_CACHE_MANAGER))
-        peak_memory += extra_memory_for_attention_metadata
 
         # get kv cache stats for both model and draft model
         kv_stats = py_executor.resource_manager.resource_managers.get(
