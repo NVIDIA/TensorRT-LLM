@@ -298,20 +298,15 @@ void initializeLogProbs(DecodingOutput& dJointOutput, SizeType32 batchSlot, Samp
     }
 }
 
-void initializeOutputs(runtime::decoder::DecoderState& decoderState, SizeType32 batchSlot,
-    SizeType32 numDecodingEngineTokens, BufferManager const& manager)
+void initializeOutputs(DecodingOutput& dJointOutput, SizeType32 batchSlot, SizeType32 maxDecodingEngineTokens,
+    BufferManager const& manager)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-
-    auto const& decoderStream = manager.getStream();
-
-    // output
-    auto& dJointOutput = decoderState.getJointDecodingOutput();
 
     auto finishedSum = ITensor::slice(dJointOutput.finishedSum, batchSlot, 1);
     manager.setZero(*finishedSum);
 
-    for (SizeType32 ti = 0; ti < decoderState.getMaxDecodingEngineTokens(); ++ti)
+    for (SizeType32 ti = 0; ti < maxDecodingEngineTokens; ++ti)
     {
         TensorPtr const newTokensStepView = ITensor::slice(dJointOutput.newTokensSteps, ti, 1);
         newTokensStepView->squeeze(0);
@@ -319,7 +314,7 @@ void initializeOutputs(runtime::decoder::DecoderState& decoderState, SizeType32 
         manager.setZero(*newTokensVec);
     }
 
-    TensorPtr const finishedStepsSlice = ITensor::slice(decoderState.getFinishReasons(), batchSlot, 1);
+    TensorPtr const finishedStepsSlice = ITensor::slice(dJointOutput.finishReasons, batchSlot, 1);
     manager.setZero(*finishedStepsSlice);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
@@ -645,9 +640,9 @@ CreateNewDecoderRequests::createDecoderRequests(RequestVector const& finishedCon
         setupWords(dJointInput.stopWordsLists, llmReq->getStopWordsList(), dJointInput.stopWordsPtrs,
             dJointInput.stopWordsLens, dJointInput.maxStopWordsLen, batchSlot, decoderBufferManager);
 
-        initializeOutputs(decoderState, batchSlot, numDecodingEngineTokens, decoderBufferManager);
-
         auto& dJointOutput = decoderState.getJointDecodingOutput();
+
+        initializeOutputs(dJointOutput, batchSlot, decoderState.getMaxDecodingEngineTokens(), decoderBufferManager);
 
         initializeLogProbs(dJointOutput, batchSlot, samplingConfig, decoderBufferManager);
 
