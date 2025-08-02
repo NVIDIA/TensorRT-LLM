@@ -182,6 +182,12 @@ class MoeConfig(StrictBaseModel):
         description="Configuration for MoE load balancing.",
         json_schema_extra={"type": "Union[MoeLoadBalancerConfig, str]"})
 
+    disable_finalize_fusion: bool = Field(
+        default=False,
+        description=
+        "Disable FC2+finalize kernel fusion in CUTLASS MoE backend. Setting this to True recovers deterministic numerical behavior with top-k > 2."
+    )
+
     @classmethod
     def from_dict(cls, data: dict):
         return cls(**data)
@@ -2301,6 +2307,7 @@ class TorchLlmArgs(BaseLlmArgs):
             enable_layerwise_nvtx_marker=self.enable_layerwise_nvtx_marker,
             load_format=self.load_format,
             enable_min_latency=self.enable_min_latency,
+            moe_disable_finalize_fusion=self.moe_config.disable_finalize_fusion,
             stream_interval=self.stream_interval,
             force_dynamic_quantization=self.force_dynamic_quantization,
             allreduce_strategy=self.allreduce_strategy)

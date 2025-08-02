@@ -458,7 +458,7 @@ def _register_fake():
         gemm2_output: torch.Tensor,
         fc2_expert_biases: torch.Tensor,
         unpermuted_final_scales: torch.Tensor,
-        expanded_source_row_to_expanded_dest_row: torch.Tensor,
+        unpermuted_row_to_permuted_row: torch.Tensor,
         expert_for_source_row: torch.Tensor,
         expert_first_token_offset_tensor: torch.Tensor,
         num_rows: torch.SymInt,
