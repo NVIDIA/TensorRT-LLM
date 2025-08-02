@@ -79,11 +79,6 @@ class BenchmarkMetrics:
     std_e2el_ms: float
     percentiles_e2el_ms: list[tuple[float, float]]
     tput_user: list[float]
-    # Request accuracy rate metrics
-    mean_request_ar: float
-    median_request_ar: float
-    std_request_ar: float
-    percentiles_request_ar: list[tuple[float, float]]
 
 
 async def get_request(
@@ -136,7 +131,7 @@ def calculate_metrics(
     selected_percentile_metrics: list[str],
     selected_percentiles: list[float],
     goodput_config_dict: dict[str, float],
-) -> tuple[BenchmarkMetrics, list[int], list[float]]:
+) -> tuple[BenchmarkMetrics, list[int]]:
     actual_output_lens: list[int] = []
     total_input = 0
     completed = 0
@@ -147,7 +142,6 @@ def calculate_metrics(
     ttfts: list[float] = []
     e2els: list[float] = []
     tput_user: list[float] = []
-    request_ars: list[float] = []  # Request accuracy rates
     for i in range(len(outputs)):
         if outputs[i].success:
             output_len = outputs[i].output_tokens
@@ -173,24 +167,9 @@ def calculate_metrics(
             ttfts.append(outputs[i].ttft)
             e2els.append(outputs[i].latency)
             tput_user.append(output_len / (outputs[i].latency))
-
-            # Calculate request accuracy rate (num_generated_tokens / (decode_iteration + 1))
-            decode_iter = outputs[i].decode_iteration
-            if decode_iter >= 0:
-                # For generated tokens, we use output_len - 1 (excluding the first token if needed)
-                # But according to the reference, it should be num_generated_tokens
-                num_generated_tokens = max(0, output_len -
-                                           1) if output_len > 1 else output_len
-                request_ar = num_generated_tokens / (
-                    decode_iter + 1) if decode_iter >= 0 else 0.0
-                request_ars.append(request_ar)
-            else:
-                request_ars.append(0.0)
-
             completed += 1
         else:
             actual_output_lens.append(0)
-            request_ars.append(0.0)
 
     if goodput_config_dict:
         valid_metrics = []
@@ -249,13 +228,8 @@ def calculate_metrics(
         percentiles_e2el_ms=[(p, np.percentile(e2els or 0, p) * 1000)
                              for p in selected_percentiles],
         tput_user=np.mean(tput_user or 0),
-        mean_request_ar=np.mean(request_ars or 0),
-        median_request_ar=np.median(request_ars or 0),
-        std_request_ar=np.std(request_ars or 0),
-        percentiles_request_ar=[(p, np.percentile(request_ars or 0, p))
-                                for p in selected_percentiles],
     )
-    return metrics, actual_output_lens, request_ars
+    return metrics, actual_output_lens
 
 
 async def benchmark(
@@ -439,7 +413,7 @@ async def benchmark(
     # Close the session
     await session.close()
 
-    metrics, actual_output_lens, request_ars = calculate_metrics(
+    metrics, actual_output_lens = calculate_metrics(
         input_requests=input_requests,
         outputs=outputs,
         dur_s=benchmark_duration,
@@ -467,10 +441,6 @@ async def benchmark(
                                     metrics.total_token_throughput))
     print("{:<40} {:<10.2f}".format("User throughput (tok/s):",
                                     metrics.tput_user))
-    print("{:<40} {:<10.4f}".format("Mean Request AR:",
-                                    metrics.mean_request_ar))
-    print("{:<40} {:<10.4f}".format("Median Request AR:",
-                                    metrics.median_request_ar))
 
     result = {
         "duration": benchmark_duration,
@@ -483,17 +453,12 @@ async def benchmark(
         "output_throughput": metrics.output_throughput,
         "total_token_throughput": metrics.total_token_throughput,
         "user_throughput": metrics.tput_user,
-        "mean_request_ar": metrics.mean_request_ar,
-        "median_request_ar": metrics.median_request_ar,
-        "std_request_ar": metrics.std_request_ar,
         "input_lens": [output.prompt_len for output in outputs],
         "output_lens": actual_output_lens,
         "ttfts": [output.ttft for output in outputs],
         "itls": [output.itl for output in outputs],
         "generated_texts": [output.generated_text for output in outputs],
         "errors": [output.error for output in outputs],
-        "request_ars": request_ars,
-        "decode_iterations": [output.decode_iteration for output in outputs],
     }
 
     def process_one_metric(
@@ -579,15 +544,11 @@ def save_to_pytorch_benchmark_format(args: argparse.Namespace,
     metrics = [
         "median_ttft_ms", "mean_ttft_ms", "std_ttft_ms", "p99_ttft_ms",
         "mean_tpot_ms", "median_tpot_ms", "std_tpot_ms", "p99_tpot_ms",
-        "median_itl_ms", "mean_itl_ms", "std_itl_ms", "p99_itl_ms",
-        "mean_request_ar", "median_request_ar", "std_request_ar"
+        "median_itl_ms", "mean_itl_ms", "std_itl_ms", "p99_itl_ms"
     ]
     # These raw data might be useful, but they are rather big. They can be added
     # later if needed
-    ignored_metrics = [
-        "ttfts", "itls", "generated_texts", "errors", "request_ars",
-        "decode_iterations"
-    ]
+    ignored_metrics = ["ttfts", "itls", "generated_texts", "errors"]
     pt_records = convert_to_pytorch_benchmark_format(
         args=args,
         metrics={k: [results[k]]
@@ -858,8 +819,7 @@ def main(args: argparse.Namespace):
             # Remove fields with too many data points
             for field in [
                     "input_lens", "output_lens", "ttfts", "itls",
-                    "generated_texts", "errors", "request_ars",
-                    "decode_iterations"
+                    "generated_texts", "errors"
             ]:
                 if field in result_json:
                     del result_json[field]
@@ -1061,11 +1021,11 @@ if __name__ == "__main__":
     parser.add_argument(
         "--percentile-metrics",
         type=str,
-        default="ttft,tpot,itl,request_ar",
+        default="ttft,tpot,itl",
         help="Comma-separated list of selected metrics to report percentils. "
         "This argument specifies the metrics to report percentiles. "
-        "Allowed metric names are \"ttft\", \"tpot\", \"itl\", \"e2el\", \"request_ar\". "
-        "Default value is \"ttft,tpot,itl,request_ar\".")
+        "Allowed metric names are \"ttft\", \"tpot\", \"itl\", \"e2el\". "
+        "Default value is \"ttft,tpot,itl\".")
     parser.add_argument(
         "--metric-percentiles",
         type=str,

@@ -45,7 +45,6 @@ class RequestFuncOutput:
     tpot: float = 0.0  # avg next-token latencies
     prompt_len: int = 0
     error: str = ""
-    decode_iteration: int = 0  # Number of decoding iterations
 
 
 async def async_request_trt_llm(
@@ -82,7 +81,6 @@ async def async_request_trt_llm(
     ttft = 0.0
     st = time.perf_counter()
     most_recent_timestamp = st
-    decode_iteration_count = 0  # Track decoding iterations
     try:
         async with request_session.post(url=api_url, json=payload) as response:
             if response.status == 200:
@@ -108,12 +106,9 @@ async def async_request_trt_llm(
                         else:
                             output.itl.append(timestamp - most_recent_timestamp)
 
-                        # Increment decode iteration for each chunk
-                        decode_iteration_count += 1
                         most_recent_timestamp = timestamp
 
                     output.latency = most_recent_timestamp - st
-                    output.decode_iteration = decode_iteration_count
                 else:
                     content = await response.content.read()
                     data = json.loads(content.decode())
@@ -121,9 +116,6 @@ async def async_request_trt_llm(
                     output.itl = []
                     output.generated_text = data["text_output"]
                     output.latency = time.perf_counter() - st
-                    # For non-streaming, estimate decode_iteration as number of output tokens
-                    output.decode_iteration = len(output.generated_text.split(
-                    )) if output.generated_text else 1
 
             else:
                 output.error = response.reason or ""
@@ -183,7 +175,6 @@ async def async_request_openai_completions(
     generated_text = ""
     st = time.perf_counter()
     most_recent_timestamp = st
-    decode_iteration_count = 0  # Track decoding iterations
     try:
         async with request_session.post(url=api_url,
                                         json=payload,
@@ -220,9 +211,6 @@ async def async_request_openai_completions(
                                     output.itl.append(timestamp -
                                                       most_recent_timestamp)
 
-                                # Increment decode iteration for each chunk with text
-                                if text is not None:
-                                    decode_iteration_count += 1
                                 most_recent_timestamp = timestamp
                                 generated_text += text or ""
                             elif usage := data.get("usage"):
@@ -237,7 +225,6 @@ async def async_request_openai_completions(
                             "This response will be marked as failed!")
                     output.generated_text = generated_text
                     output.latency = most_recent_timestamp - st
-                    output.decode_iteration = decode_iteration_count
                 else:
                     content = await response.content.read()
                     data = json.loads(content.decode())
@@ -248,8 +235,6 @@ async def async_request_openai_completions(
                     output.ttft = -1
                     output.itl = []
                     output.output_tokens = data["usage"]["completion_tokens"]
-                    # For non-streaming, estimate decode_iteration as number of output tokens
-                    output.decode_iteration = output.output_tokens if output.output_tokens > 0 else 1
             else:
                 output.error = response.reason or ""
                 output.success = False
@@ -322,7 +307,6 @@ async def async_request_openai_chat_completions(
     ttft = 0.0
     st = time.perf_counter()
     most_recent_timestamp = st
-    decode_iteration_count = 0  # Track decoding iterations
     try:
         async with request_session.post(url=api_url,
                                         json=payload,
@@ -353,9 +337,6 @@ async def async_request_openai_chat_completions(
                                     output.itl.append(timestamp -
                                                       most_recent_timestamp)
 
-                                # Increment decode iteration for each chunk with content
-                                if content is not None:
-                                    decode_iteration_count += 1
                                 generated_text += content or ""
                             elif usage := data.get("usage"):
                                 output.output_tokens = usage.get(
@@ -365,7 +346,6 @@ async def async_request_openai_chat_completions(
 
                     output.generated_text = generated_text
                     output.latency = most_recent_timestamp - st
-                    output.decode_iteration = decode_iteration_count
                 else:
                     content = await response.content.read()
                     data = json.loads(content.decode())
@@ -375,8 +355,6 @@ async def async_request_openai_chat_completions(
                     output.itl = []
                     output.latency = time.perf_counter() - st
                     output.ttft = -1
-                    # For non-streaming, estimate decode_iteration as number of output tokens
-                    output.decode_iteration = output.output_tokens if output.output_tokens > 0 else 1
 
             else:
                 output.error = response.reason or ""
