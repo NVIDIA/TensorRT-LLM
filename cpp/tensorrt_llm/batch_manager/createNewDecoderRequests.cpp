@@ -581,8 +581,6 @@ CreateNewDecoderRequests::createDecoderRequests(RequestVector const& finishedCon
     {
         llmReq->mSamplingConfig.normalizeLogProbs = mIsNormalizeLogProbs;
 
-        auto& dJointInput = decoderState.getJointDecodingInput();
-
         TLLM_CHECK(llmReq->mSeqSlot.has_value());
         auto const batchSlot = llmReq->mSeqSlot.value();
         auto const batchSize = decoderState.getMaxNumSequences();
@@ -595,7 +593,7 @@ CreateNewDecoderRequests::createDecoderRequests(RequestVector const& finishedCon
         TLLM_CHECK_WITH_INFO(beamWidth <= maxBeamWidth,
             tc::fmtstr("Beam width (%d) must be smaller than maxBeamWidth (%d) passed to decoder setup function.",
                 beamWidth, maxBeamWidth));
-        dJointInput.beamWidths.at(batchSlot) = beamWidth;
+        decoderState.setBeamWidth(batchSlot, beamWidth);
 
         auto const promptLen = llmReq->getPromptLen();
 
@@ -625,6 +623,8 @@ CreateNewDecoderRequests::createDecoderRequests(RequestVector const& finishedCon
         {
             decoderRequest.generatedTokensPerEngineStep = modelConfig.getMaxDecodingTokens();
         }
+
+        auto& dJointInput = decoderState.getJointDecodingInput();
 
         auto const numDecodingEngineTokens = decoderRequest.generatedTokensPerEngineStep;
         initializeInputLengths(dJointInput, batchSlot, promptLen, llmReq->mMaxNewTokens, numDecodingEngineTokens,

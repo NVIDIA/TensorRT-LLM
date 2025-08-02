@@ -644,6 +644,11 @@ void DecoderState::setGenerationSteps(std::vector<SizeType32> const& generationS
     mJointDecodingInput->generationSteps = generationSteps;
 }
 
+void DecoderState::setBeamWidth(SizeType32 batchIdx, SizeType32 beamWidth)
+{
+    mJointDecodingInput->beamWidths.at(batchIdx) = beamWidth;
+}
+
 DecodingInput& DecoderState::getJointDecodingInput() const
 {
     return *mJointDecodingInput;
