@@ -17,6 +17,7 @@
 
 #include "bindings.h"
 #include "moeBindings.h"
+#include "tensorrt_llm/batch_manager/decoderBuffers.h"
 #include "tensorrt_llm/kernels/communicationKernels/allReduceWorkspace.h"
 #include "tensorrt_llm/kernels/communicationKernels/customLowPrecisionAllReduceKernels.h"
 #include "tensorrt_llm/kernels/customAllReduceKernels.h"
@@ -47,6 +48,7 @@
 
 namespace tr = tensorrt_llm::runtime;
 namespace te = tensorrt_llm::executor;
+namespace tb = tensorrt_llm::batch_manager;
 
 class PyITensor : public tensorrt_llm::runtime::ITensor
 {
@@ -213,10 +215,6 @@ void initBindings(pybind11::module_& m)
         .def_readwrite("scaling_vec_pointer", &tr::LoraCache::TaskLayerModuleConfig::scalingVecPointer)
         .def(py::self == py::self);
 
-    py::classh<tr::BufferManager>(m, "BufferManager")
-        .def(py::init<tr::BufferManager::CudaStreamPtr, bool>(), py::arg("stream"), py::arg("trim_pool") = false)
-        .def_property_readonly("stream", &tr::BufferManager::getStream);
-
     py::classh<tr::TllmRuntime>(m, "TllmRuntime")
         .def(py::init(
             [](std::filesystem::path engine_path, float gpu_weights_percent = 1.0f, bool use_shape_inference = true)
@@ -248,14 +246,6 @@ void initBindings(pybind11::module_& m)
         .def("report_to_profiler", &tr::TllmRuntime::reportToProfiler, py::arg("context_id"))
         .def_property_readonly("logits_dtype_from_engine",
             [](tr::TllmRuntime& self) { return self.getEngine().getTensorDataType("logits"); });
-
-    py::class_<tr::decoder_batch::Input>(m, "DecoderBatchInput")
-        .def(py::init<std::vector<std::vector<tr::ITensor::SharedConstPtr>>, tr::SizeType32>(), py::arg("logits"),
-            py::arg("max_decoding_engine_tokens"))
-        .def(py::init<std::vector<tr::ITensor::SharedConstPtr>>(), py::arg("logits"))
-        .def_readwrite("logits", &tr::decoder_batch::Input::logits)
-        .def_readwrite("max_decoder_steps", &tr::decoder_batch::Input::maxDecoderSteps)
-        .def_readwrite("batch_slots", &tr::decoder_batch::Input::batchSlots);
 
     py::class_<tr::LookaheadDecodingBuffers>(m, "LookaheadDecodingBuffers")
         .def(py::init<tr::SizeType32, tr::SizeType32, tr::BufferManager const&>(), py::arg("max_num_sequences"),
@@ -436,6 +426,10 @@ void initBindings(pybind11::module_& m)
 
 void initBindingsEarly(py::module_& m)
 {
+    py::classh<tr::BufferManager>(m, "BufferManager")
+        .def(py::init<tr::BufferManager::CudaStreamPtr, bool>(), py::arg("stream"), py::arg("trim_pool") = false)
+        .def_property_readonly("stream", &tr::BufferManager::getStream);
+
     py::class_<tr::SpeculativeDecodingMode>(m, "SpeculativeDecodingMode")
         .def(py::init<tr::SpeculativeDecodingMode::UnderlyingType>(), py::arg("state"))
         .def_static("NoneType", &tr::SpeculativeDecodingMode::None)

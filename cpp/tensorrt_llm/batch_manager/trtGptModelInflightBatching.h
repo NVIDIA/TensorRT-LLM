@@ -551,8 +551,6 @@ private:
     std::vector<std::unique_ptr<SlotDecoderBuffers>> mSlotDecoderBuffers;
     // PEFT table for each micro batch
     std::vector<PeftTable> mPeftTables;
-    // Decoder input for each micro batch.
-    std::vector<std::unique_ptr<runtime::decoder_batch::Input>> mDecodingInputs;
 
     /******************** Book keeping ********************/
     // List of requests in each micro batch
