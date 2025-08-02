@@ -22,9 +22,12 @@ def bmm_out(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor) -> None:
 class MoERunner(TunableRunner):
     # avoid overhead of creating a new runner in forward pass
     runner_dict = dict()
-    tuning_config = TuningConfig(dynamic_tensor_specs=(
-        DynamicTensorSpec(0, 0, get_last_power_of_2_num_tokens_buckets(8192),
-                          lambda x: min(last_positive_power_of_2(x), 8192)), ))
+    tuning_config = TuningConfig(
+        dynamic_tensor_specs=(DynamicTensorSpec(
+            0, 0, get_last_power_of_2_num_tokens_buckets(8192),
+            lambda x: min(last_positive_power_of_2(x), 8192)), ),
+        tune_max_num_tokens=8192,
+    )
 
     def __init__(
         self,
@@ -106,15 +109,6 @@ class MoERunner(TunableRunner):
             do_preparation,
         )
 
-    @classmethod
-    @lru_cache(maxsize=None)
-    def refine_tuning_config(cls, tune_max_num_tokens: int):
-        cls.tuning_config = TuningConfig(
-            dynamic_tensor_specs=(DynamicTensorSpec(
-                0, 0, get_last_power_of_2_num_tokens_buckets(
-                    tune_max_num_tokens), lambda x: min(
-                        last_positive_power_of_2(x), tune_max_num_tokens)), ))
-
 
 @torch.library.custom_op("trtllm::fused_moe", mutates_args=())
 def fused_moe(
@@ -145,7 +139,6 @@ def fused_moe(
 ) -> List[torch.Tensor]:
 
     tuner = AutoTuner.get()
-    MoERunner.refine_tuning_config(tune_max_num_tokens)
 
     # Only the non-alltoall case is considered for profiling in the warmup phase.
     # Therefore, to get the correct tactics during the actual inference, the inputs to the tuner should be the same as when not using alltoall.
@@ -186,6 +179,7 @@ def fused_moe(
             fc2_expert_weights, fc2_expert_biases
         ],
         gemm_idx=1,
+        tune_max_num_tokens=tune_max_num_tokens,
     )
 
     _, gemm_tactic_2 = tuner.choose_one(
@@ -197,6 +191,7 @@ def fused_moe(
             fc2_expert_weights, fc2_expert_biases
         ],
         gemm_idx=2,
+        tune_max_num_tokens=tune_max_num_tokens,
     )
 
     run_moe = moe_runner.fused_moe_runner.run_moe_min_latency if min_latency_mode else moe_runner.fused_moe_runner.run_moe
