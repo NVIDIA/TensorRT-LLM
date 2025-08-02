@@ -15,7 +15,9 @@ from transformers.models.auto import CONFIG_MAPPING
 
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 
-from ...inputs import (ExtraProcessedInputs, InputProcessor, TextPrompt,
+from ...inputs import (ExtraProcessedInputs, InputProcessor,
+                       MultimodalPlaceholderMetadata,
+                       MultimodalPlaceholderPlacement, TextPrompt,
                        register_input_processor)
 from ...logger import logger
 from ...sampling_params import SamplingParams
@@ -961,7 +963,23 @@ class HCXVisionModel:
 
 
 @register_auto_model("HCXVisionForCausalLM")
-@register_input_processor(HCXVisionInputProcessor, model_type="hyperclovax_vlm")
+@register_input_processor(
+    HCXVisionInputProcessor,
+    model_type="hyperclovax_vlm",
+    placeholder_metadata=MultimodalPlaceholderMetadata(
+        placeholder_map={
+            "image":
+            ('<im_end>\n<|im_start|>user (mime) \n'
+             '{"type": "image/jpeg", "filename": ""}<|im_end|>\n'
+             '<|im_start|>user (vector)\n<|dummy3|><|im_end|>\n'
+             '<|im_start|>image/aux\n'
+             '다음 중 ocr은 사진에서 검출된 글자이고, lens_keyword는 사진에서 추출된 '
+             'keyword와 bbox 위치입니다.bbox는 0~1 사이로 정규화된 [x1, y1, x2, y2]의 '
+             '형태입니다. 참고하여 답변하세요. '
+             '{"ocr": "", "lens_keywords": "", "lens_local_keywords": ""}')
+        },
+        placeholder_placement=MultimodalPlaceholderPlacement.AFTER_TEXT,
+    ))
 class HCXVisionForCausalLM(PreTrainedModel):
 
     def __init__(self, model_config: ModelConfig):

@@ -10,7 +10,9 @@ import transformers
 from PIL import Image
 
 from ...executor.request import LoRARequest
-from ...inputs import (ExtraProcessedInputs, InputProcessor, TextPrompt,
+from ...inputs import (ExtraProcessedInputs, InputProcessor,
+                       MultimodalPlaceholderMetadata,
+                       MultimodalPlaceholderPlacement, TextPrompt,
                        register_input_processor)
 from ...logger import logger
 from ...lora_manager import LoraConfig
@@ -138,7 +140,17 @@ class Phi4MMInputProcessor(InputProcessor):
 
 
 @register_auto_model("Phi4MMForCausalLM")
-@register_input_processor(Phi4MMInputProcessor, model_type="phi4mm")
+@register_input_processor(
+    Phi4MMInputProcessor,
+    model_type="phi4mm",
+    placeholder_metadata=MultimodalPlaceholderMetadata(
+        placeholder_map={
+            "image": "<|image_{0}|>",
+            "audio": "<|audio_{0}|>",
+        },
+        placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
+        placeholders_separator="",
+    ))
 class Phi4MMForCausalLM(transformers.PreTrainedModel):
 
     _supports_flash_attn_2 = True
