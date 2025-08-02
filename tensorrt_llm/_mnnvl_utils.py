@@ -12,6 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import ctypes
+import os
 import platform
 import sys
 from dataclasses import dataclass
@@ -110,9 +112,17 @@ class MnnvlMemory:
         location.id = dev_id
         allocation_prop = cuda.CUmemAllocationProp()
         allocation_prop.type = cuda.CUmemAllocationType.CU_MEM_ALLOCATION_TYPE_PINNED
-        allocation_prop.requestedHandleTypes = (
-            cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
-        )
+
+        arch = platform.machine().lower()
+        is_on_aarch64 = "aarch64" in arch
+        if is_on_aarch64:
+            allocation_prop.requestedHandleTypes = (
+                cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
+            )
+        else:
+            allocation_prop.requestedHandleTypes = (
+                cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
+            )
         allocation_prop.location = location
         return allocation_prop
 
@@ -174,10 +184,28 @@ class MnnvlMemory:
         )
         exported_fabric_handle = _check_cu_result(
             cuda.cuMemExportToShareableHandle(
-                allocated_mem_handle, cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC, 0
+                allocated_mem_handle, allocation_prop.requestedHandleTypes, 0
             )
         )
-        all_handles_data = comm.allgather(exported_fabric_handle.data)
+
+        if (
+            allocation_prop.requestedHandleTypes
+            == cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
+        ):
+            all_handles_data = comm.allgather(exported_fabric_handle.data)
+        else:
+            all_handles_data = comm.allgather(exported_fabric_handle)
+            all_pids = comm.allgather(os.getpid())
+            syscall = ctypes.CDLL(None).syscall
+            SYS_pidfd_open = 434
+            SYS_pidfd_getfd = 438
+            pidfds = [syscall(SYS_pidfd_open, pid, 0) for pid in all_pids]
+            remote_fds = [
+                syscall(SYS_pidfd_getfd, pidfd, fd, 0)
+                for pidfd, fd in zip(pidfds, all_handles_data)
+            ]
+            all_handles_data = remote_fds
+
         # all_handles_data like b'\x00\x00\x00 \x00\x00\x00\x00\x8f\xec\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\t\x00\x00\x00\x00\x00\x1d\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'  # noqa: E501
         # can use buf = memoryview(data) to import if using plain buffer for data.
 
@@ -201,7 +229,7 @@ class MnnvlMemory:
                 # Fabric memory mapping
                 imported_mem_handle = _check_cu_result(
                     cuda.cuMemImportFromShareableHandle(
-                        remote_handle_data, cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
+                        remote_handle_data, allocation_prop.requestedHandleTypes
                     )
                 )
                 mem_handles[i] = imported_mem_handle
@@ -278,10 +306,10 @@ class MnnvlMemory:
         # We check if it is an aarch64 platform and has all NVLink up now.
         # But it is not equivalent to MNNVL support.
         # May need better support check.
-        arch = platform.machine().lower()
-        is_on_aarch64 = "aarch64" in arch
+        # arch = platform.machine().lower()
+        # is_on_aarch64 = "aarch64" in arch
         support_nvlink_and_all_up = MnnvlMemory.support_nvlink(True)
-        return is_on_aarch64 and support_nvlink_and_all_up
+        return support_nvlink_and_all_up
 
 
 @dataclass
@@ -300,6 +328,8 @@ class MnnvlMoe:
     moe_prepare_workspace: MnnvlMemory = None
     moe_workspace_tensor: torch.Tensor = None
     moe_prepare_workspace_tensor: torch.Tensor = None
+    moe_workspace_aux: MnnvlMemory = None
+    moe_workspace_aux_tensor: torch.Tensor = None
     moe_mapping: Mapping = None
 
     @staticmethod
@@ -315,6 +345,20 @@ class MnnvlMoe:
         MnnvlMoe.moe_workspace = MnnvlMemory(mapping, workspace_size_per_rank)
         MnnvlMoe.moe_workspace_tensor = MnnvlMoe.moe_workspace.as_torch_strided_tensor(torch.uint64)
         return MnnvlMoe.moe_workspace_tensor
+
+    @staticmethod
+    def get_moe_workspace_aux(mapping: Mapping):
+        if MnnvlMoe.moe_workspace_aux_tensor is not None:
+            assert mapping == MnnvlMoe.moe_mapping, "only one moe mapping supported now"
+            return MnnvlMoe.moe_workspace_aux_tensor
+        workspace_size_per_rank = torch.ops.trtllm.get_moe_commworkspace_size_per_rank(
+            mapping.tp_size
+        )
+        MnnvlMoe.moe_workspace_aux = MnnvlMemory(mapping, workspace_size_per_rank)
+        MnnvlMoe.moe_workspace_aux_tensor = MnnvlMoe.moe_workspace_aux.as_torch_strided_tensor(
+            torch.uint64
+        )
+        return MnnvlMoe.moe_workspace_aux_tensor
 
     @staticmethod
     def get_moe_prepare_workspace(mapping: Mapping):
@@ -509,13 +553,77 @@ class MnnvlMoe:
         ep_size: int,
         top_k: int,
         token_count: int,
+        x_sf: torch.Tensor = None,
+        is_sf_swizzled: bool = False,
+        low_precision_global_scale: torch.Tensor = None,
     ):
         assert x.dim() == 2, "2D tensor supported, please reshape."
+        hidden_dim = x.shape[1]
+        hidden_dim_in_bytes = hidden_dim * x.element_size()
+
+        if x_sf is not None:
+            assert x_sf.dim() == 2, "2D tensor supported, please reshape."
+            hidden_dim *= 2
+            hidden_dim_in_bytes += x_sf.shape[1] * x_sf.element_size()
+            assert low_precision_global_scale is not None, (
+                "low_precision_global_scale is required when x_sf is not None"
+            )
+            assert low_precision_global_scale.dtype == torch.float32, (
+                "low_precision_global_scale should be float32"
+            )
+            assert low_precision_global_scale.numel() == x.shape[0], (
+                "low_precision_global_scale should have the same number of elements as x.shape[0]"
+            )
+            hidden_dim_in_bytes += 4
+            hidden_dim_in_bytes_pad = hidden_dim_in_bytes + 15 & ~15
+            concat_tensors = [
+                x.view(torch.uint8),
+                x_sf.view(torch.uint8),
+                low_precision_global_scale.view(torch.uint8).view(-1, 4),
+            ]
+            if hidden_dim_in_bytes_pad != hidden_dim_in_bytes:
+                concat_tensors.append(
+                    torch.zeros(
+                        x.shape[0],
+                        hidden_dim_in_bytes_pad - hidden_dim_in_bytes,
+                        dtype=torch.uint8,
+                        device=x.device,
+                    )
+                )
+            input = torch.cat(concat_tensors, dim=1)
+        elif low_precision_global_scale is not None:
+            # Notes: this path is for fp8
+            hidden_dim_in_bytes += (
+                low_precision_global_scale.shape[1] * low_precision_global_scale.element_size()
+            )
+            hidden_dim_in_bytes_pad = hidden_dim_in_bytes + 15 & ~15
+            concat_tensors = [
+                x.view(torch.uint8),
+                low_precision_global_scale.view(torch.uint8),
+            ]
+            if hidden_dim_in_bytes_pad != hidden_dim_in_bytes:
+                concat_tensors.append(
+                    torch.zeros(
+                        x.shape[0],
+                        hidden_dim_in_bytes_pad - hidden_dim_in_bytes,
+                        dtype=torch.uint8,
+                        device=x.device,
+                    )
+                )
+            input = torch.cat(concat_tensors, dim=1)
+        else:
+            hidden_dim_in_bytes_pad = hidden_dim_in_bytes
+            input = x.view(torch.uint8)
+
         output_tensor = torch.zeros(
-            token_count * top_k, x.shape[1], dtype=x.dtype, device=torch.device("cuda")
+            token_count * top_k,
+            hidden_dim_in_bytes_pad,
+            dtype=torch.uint8,
+            device=torch.device("cuda"),
         )
+
         torch.ops.trtllm.moe_comm(
-            x,
+            input,
             alltoall_info.recv_rank_count_cumsum,
             alltoall_info.recv_rank_local_indices,
             output_tensor,
@@ -525,6 +633,43 @@ class MnnvlMoe:
             ep_rank,
             ep_size,
         )
+
+        if x_sf is not None:
+            x, x_sf, output_global_scale, _ = output_tensor.split(
+                [
+                    x.shape[1] * x.element_size(),
+                    x_sf.shape[1] * x_sf.element_size(),
+                    4,
+                    hidden_dim_in_bytes_pad - hidden_dim_in_bytes,
+                ],
+                dim=1,
+            )
+            output_tensor = torch.ops.trtllm.fp4_dequantize(
+                x.contiguous(),
+                x_sf.contiguous(),
+                1.0 / output_global_scale.view(torch.float32).contiguous(),
+                16,
+                False,
+                is_sf_swizzled,
+                "bfloat16",
+            )
+        elif low_precision_global_scale is not None:
+            # Notes: this path is for fp8
+            x, output_global_scale, _ = output_tensor.split(
+                [
+                    x.shape[1] * x.element_size(),
+                    low_precision_global_scale.element_size(),
+                    hidden_dim_in_bytes_pad - hidden_dim_in_bytes,
+                ],
+                dim=1,
+            )
+            output_tensor = torch.ops.tensorrt_llm.dequantize_e4m3_activation(
+                x.contiguous().view(torch.float8_e4m3fn),
+                output_global_scale.contiguous().view(low_precision_global_scale.dtype),
+            )
+        else:
+            output_tensor = output_tensor.view(x.dtype)
+
         return torch.sum(
-            output_tensor.reshape(token_count, top_k, x.shape[1]), dim=1, keepdim=False
+            output_tensor.reshape(token_count, top_k, hidden_dim), dim=1, keepdim=False
         )

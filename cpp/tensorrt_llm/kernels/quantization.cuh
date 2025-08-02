@@ -849,7 +849,7 @@ cvt_fp8_to_fp4_3d(
 }
 
 // Use UE4M3 by default.
-template <class Type, int SF_VEC_SIZE, bool UE8M0_SF>
+template <class Type, int SF_VEC_SIZE, bool UE8M0_SF, bool PER_TOKEN_GLOBAL_SCALE = false>
 __global__ void
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
     __launch_bounds__(512, 4) cvt_fp16_to_fp4(
@@ -866,12 +866,22 @@ cvt_fp16_to_fp4(
 
     // Get the global scaling factor, which will be applied to the SF.
     // Note SFScale is the same as next GEMM's alpha, which is (448.f / (Alpha_A / 6.f)).
-    float const SFScaleVal = SFScale == nullptr ? 1.0f : SFScale[0];
+    float SFScaleVal;
+    if constexpr (!PER_TOKEN_GLOBAL_SCALE)
+    {
+        SFScaleVal = SFScale == nullptr ? 1.0f : SFScale[0];
+    }
 
     asm volatile("griddepcontrol.wait;");
     // Input tensor row/col loops.
     for (int rowIdx = blockIdx.x; rowIdx < numRows; rowIdx += gridDim.x)
     {
+        // For per-token global scaling, read the scale for this row
+        if constexpr (PER_TOKEN_GLOBAL_SCALE)
+        {
+            SFScaleVal = SFScale == nullptr ? 1.0f : SFScale[rowIdx];
+        }
+
         for (int colIdx = threadIdx.x; colIdx < numCols / CVT_FP4_ELTS_PER_THREAD; colIdx += blockDim.x)
         {
             int64_t inOffset = rowIdx * (numCols / CVT_FP4_ELTS_PER_THREAD) + colIdx;
@@ -892,7 +902,7 @@ cvt_fp16_to_fp4(
 }
 
 // Use UE4M3 by default.
-template <int SF_VEC_SIZE, bool UE8M0_SF>
+template <int SF_VEC_SIZE, bool UE8M0_SF, bool PER_TOKEN_GLOBAL_SCALE = false>
 __global__ void
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
     __launch_bounds__(512, 4) cvt_fp8_to_fp4(
@@ -910,11 +920,21 @@ cvt_fp8_to_fp4(
 
     // Get the global scaling factor, which will be applied to the SF.
     // Note SFScale is the same as next GEMM's alpha, which is (448.f / (Alpha_A / 6.f)).
-    float const SFScaleVal = SFScale == nullptr ? 1.0f : SFScale[0];
+    float SFScaleVal;
+    if constexpr (!PER_TOKEN_GLOBAL_SCALE)
+    {
+        SFScaleVal = SFScale == nullptr ? 1.0f : SFScale[0];
+    }
 
     // Input tensor row/col loops.
     for (int rowIdx = blockIdx.x; rowIdx < numRows; rowIdx += gridDim.x)
     {
+        // For per-token global scaling, read the scale for this row
+        if constexpr (PER_TOKEN_GLOBAL_SCALE)
+        {
+            SFScaleVal = SFScale == nullptr ? 1.0f : SFScale[rowIdx];
+        }
+
         for (int colIdx = threadIdx.x; colIdx < numCols / CVT_FP8_TO_FP4_ELTS_PER_THREAD; colIdx += blockDim.x)
         {
             int64_t inOffset = rowIdx * (numCols / CVT_FP8_TO_FP4_ELTS_PER_THREAD) + colIdx;
