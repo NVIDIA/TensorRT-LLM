@@ -16,9 +16,6 @@
  */
 
 #include "tensorrt_llm/pybind/batch_manager/kvCacheConnector.h"
-#include "tensorrt_llm/runtime/torch.h"
-
-#include <torch/extension.h>
 
 namespace
 {
