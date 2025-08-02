@@ -1053,8 +1053,8 @@ class _TorchLLM(BaseLLM):
         return_logits = self.args.gather_generation_logits
 
         self._executor = self._executor_cls.create(
-            self._engine_dir,
-            executor_config=self._executor_config,
+            engine=None,
+            executor_config=None,
             batched_logits_processor=self.args.batched_logits_processor,
             model_world_size=self.args.parallel_config.world_size,
             mpi_session=self.mpi_session,
@@ -1067,8 +1067,8 @@ class _TorchLLM(BaseLLM):
             ),
             is_llm_executor=True,
             lora_config=self.args.lora_config,
-            garbage_collection_gen0_threshold=self.args.
-            garbage_collection_gen0_threshold)
+            hf_model_dir=self._hf_model_dir,
+            llm_args=self.args)
 
     def _validate_args_for_torch_backend(self, kwargs: dict) -> None:
         """Validate that users don't pass TrtLlmArgs-specific arguments when using PyTorch backend.
