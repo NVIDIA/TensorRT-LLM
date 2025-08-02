@@ -413,6 +413,3 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
 
     def layer_post_hook(self, module, *args):
         self.worker.save_kv_layer(module.layer_idx)
-
-    def model_post_hook(self, module, *args):
-        self.worker.wait_for_save()
