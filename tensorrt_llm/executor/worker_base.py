@@ -55,8 +55,15 @@ class WorkerBase(GenerationExecutor):
         engine: Union[Path, Engine],
         executor_config: Optional[tllm.ExecutorConfig] = None,
         is_llm_executor: Optional[bool] = None,
+        lora_config: Optional[LoraConfig] = None,
+        garbage_collection_gen0_threshold: Optional[int] = None,
     ) -> None:
         super().__init__(is_llm_executor=is_llm_executor)
+
+        # Persist constructor arguments for deferred setup
+        self._engine_input = engine
+        self._lora_config = lora_config
+        self._garbage_collection_gen0_threshold = garbage_collection_gen0_threshold
 
         self.engine = None
         self.rank = mpi_rank()
@@ -84,12 +91,7 @@ class WorkerBase(GenerationExecutor):
         self._prompt_adapter_manager: Optional[PromptAdapterManager] = None
         self._runtime_model_config: Optional[ModelConfig] = None
 
-    def setup_engine(
-            self,
-            engine: Union[Path, Engine],
-            executor_config: Optional[tllm.ExecutorConfig] = None,
-            lora_config: Optional[LoraConfig] = None,
-            garbage_collection_gen0_threshold: Optional[int] = None) -> None:
+    def setup_engine(self) -> None:
 
         device_id = self.global_rank % torch.cuda.device_count()
         torch.cuda.set_device(device_id)
@@ -99,12 +101,15 @@ class WorkerBase(GenerationExecutor):
         comm_ranks = mpi_comm().allgather(global_rank)
         device_ids = mpi_comm().allgather(device_id)
 
+        executor_config = self._executor_config
         if executor_config is None:
             executor_config = tllm.ExecutorConfig(1)
+            self._executor_config = executor_config
 
         executor_config.parallel_config = tllm.ParallelConfig(
             participant_ids=comm_ranks, device_ids=device_ids)
 
+        engine = self._engine_input
         if isinstance(engine, list):
             engine = engine[self.rank]
 
@@ -127,9 +132,9 @@ class WorkerBase(GenerationExecutor):
                 from tensorrt_llm._torch.pyexecutor.py_executor_creator import \
                     create_py_executor
                 create_executor = create_py_executor
-                args["lora_config"] = lora_config
+                args["lora_config"] = self._lora_config
                 args[
-                    "garbage_collection_gen0_threshold"] = garbage_collection_gen0_threshold
+                    "garbage_collection_gen0_threshold"] = self._garbage_collection_gen0_threshold
             elif executor_config.backend == "_autodeploy":
                 from tensorrt_llm._torch.auto_deploy.shim.ad_executor import \
                     create_autodeploy_executor
@@ -139,7 +144,7 @@ class WorkerBase(GenerationExecutor):
                     f"Unsupported backend config: {executor_config.backend}")
             self.engine = create_executor(**args)
 
-        self._setup_lora(engine, executor_config, lora_config)
+        self._setup_lora(engine, executor_config, self._lora_config)
 
     def _setup_lora(self, engine: Union[Path, Engine],
                     executor_config: tllm.ExecutorConfig,
@@ -406,8 +411,8 @@ class WorkerBase(GenerationExecutor):
         self.shutdown()
         return True
 
-    def await_responses(self) -> None:
-        self._await_response_helper()
+    def await_responses(self, timeout: Optional[float] = None) -> None:
+        self._await_response_helper(timeout)
         logger.debug(f"worker done await_responses")
 
     def fetch_kv_cache_events(self) -> list:
@@ -525,11 +530,11 @@ class AwaitResponseHelper:
             case _:
                 raise NotImplementedError
 
-    def __call__(self) -> bool:
+    def __call__(self, timeout: Optional[float] = None) -> bool:
         ''' This method should be called by a ManagedThread. '''
         logger.debug(f"await_response: {self.worker.engine}")
-        responses = self.worker.engine.await_responses(
-            timeout=datetime.timedelta(milliseconds=100))
+        timeout = datetime.timedelta(seconds=timeout or 0.1)
+        responses = self.worker.engine.await_responses(timeout=timeout)
         logger.debug(f"PyExecutor returned {len(responses)} responses")
 
         # filter since The _engine_response_callback may return None
