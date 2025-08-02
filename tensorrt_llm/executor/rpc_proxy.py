@@ -6,12 +6,15 @@ from typing import Optional
 
 from ..llmapi.mpi_session import MpiPoolSession, MpiSession
 from ..llmapi.tracer import global_tracer
-from ..llmapi.utils import _SyncQueue, print_colored_debug
+from ..llmapi.utils import (_SyncQueue, print_colored_debug,
+                            print_traceback_on_error)
+from ..logger import logger
 from .executor import GenerationExecutor
 from .postproc_worker import PostprocWorkerConfig
 from .request import GenerationRequest
 from .result import GenerationResult
 from .rpc import RPCClient
+from .rpc_worker import RpcWorker
 from .utils import (ErrorResponse, create_mpi_comm_session,
                     get_spawn_proxy_process_env, is_llm_response)
 
@@ -39,6 +42,7 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
             garbage_collection_gen0_threshold: the garbage collection gen0 threshold
             clock_unit: the unit of the clock, 1 means 1 second
         """
+        self.clock_unit = clock_unit
 
         GenerationExecutorRpcProxy.INSTANCE_COUNTER += 1
         self.rpc_addr = self.gen_uniq_rpc_addr()
@@ -55,26 +59,30 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
             is_llm_executor=is_llm_executor,
         )
 
-        self.mpi_session = self._create_mpi_session(model_world_size,
-                                                    mpi_session)
+        self._results = {}
+
+        self._create_mpi_session(model_world_size, mpi_session)
 
         self._shutdown_event = threading.Event()
+        self.worker_kwargs = worker_kwargs
 
         self.launch_workers()
         time.sleep(1)  # wait for the workers to launch
 
         # Invoke model creation on the remote
         # TBD: Move model creation to the mpi task, or left in RPC?
-        self.create_engine_remote()
+        self.setup_engine_remote()
 
         self.setup_mainloop()
 
     def launch_workers(self):
+        logger.debug(f"Launching workers")
         assert self.mpi_session is not None
-        self.mpi_session.submit(rpc_worker_main,
+        self.mpi_session.submit(RpcWorker.main_task,
                                 rpc_addr=self.rpc_addr,
                                 **self.worker_kwargs)
 
+    @print_traceback_on_error
     def main_loop_task(self):
         """
         Main loop of the proxy, it will invoke the actions periodically.
@@ -82,10 +90,10 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
         clock = 0
         while not self._shutdown_event.is_set():
             if clock % 1 == 0:
-                responses = self.await_responses_remote()
+                responses = self.fetch_responses_remote()
                 self.handle_responses(responses)
             if clock % 10 == 0:
-                stats = self.get_stats_remote()  # TODO
+                stats = self.fetch_stats_remote()  # TODO
                 self.handle_stats(stats)
 
             clock += 1
@@ -101,23 +109,24 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
         async_queues = []
         event_loop = None
 
-        def process_res(res):
-            client_id = res.client_id
-            nonlocal event_loop
-            nonlocal async_queues
+        def process_res(res: list):
+            for r in res:
+                client_id = r.client_id
+                nonlocal event_loop
+                nonlocal async_queues
 
-            queue = self._results[client_id].queue
-            if isinstance(queue, _SyncQueue):
-                queue.put_nowait(res)
-                async_queues.append(queue)
-                # all the loops are identical
-                event_loop = event_loop or queue.loop
-            else:
-                queue.put(res)
+                queue = self._results[client_id].queue
+                if isinstance(queue, _SyncQueue):
+                    queue.put_nowait(r)
+                    async_queues.append(queue)
+                    # all the loops are identical
+                    event_loop = event_loop or queue.loop
+                else:
+                    queue.put(r)
 
-            if (is_llm_response(res) and res.result.is_final) or isinstance(
-                    res, ErrorResponse):
-                self._results.pop(client_id)
+                if (is_llm_response(r) and r.result.is_final) or isinstance(
+                        r, ErrorResponse):
+                    self._results.pop(client_id)
 
         for res in responses:
             global_tracer().log_instant("RPC.get")
@@ -127,20 +136,64 @@ class GenerationExecutorRpcProxy(GenerationExecutor):
             _SyncQueue.notify_many(event_loop, async_queues)
 
     def handle_stats(self, stats: dict):
-        raise NotImplementedError
+        # raise NotImplementedError
+        pass
 
     def submit(self, request: GenerationRequest) -> GenerationResult:
+        request.set_id(self._get_next_client_id())
+        logprob_params = self._get_logprob_params(request)
+
         # submit is a fire-and-forget operation, don't need to wait for response
-        return self.rpc_client.submit(request, need_response=False)
+        self.rpc_client.submit(request, __rpc_need_response=False)
 
-    def await_responses_remote(self):
-        return self.rpc_client.await_responses()
+        result = GenerationResult(
+            request,
+            background_error_handler=self._handle_background_error,
+            executor=self,
+            disaggregated_params=request.disaggregated_params,
+            logprob_params=logprob_params)
+        self._results[request.id] = result
 
-    def create_engine_remote(self):
-        return self.rpc_client.create_engine()  # TODO
+        return result
+
+    def fetch_responses_remote(self):
+        return self.rpc_client.fetch_responses(__rpc_timeout=20)
+
+    def fetch_stats_remote(self):
+        return self.rpc_client.fetch_stats()
+
+    def setup_engine_remote(self):
+        return self.rpc_client.setup_engine(__rpc_timeout=60 * 20)  # 20 min
 
     def shutdown_remote(self):
-        self.rpc_client.shutdown()
+        self.rpc_client.shutdown(__rpc_timeout=60 * 20)  # 20 min
+
+    def abort_request(self, request_id: int) -> None:
+        return self.rpc_client.abort_request(request_id)
+
+    def shutdown(self):
+        if self._shutdown_event.is_set():
+            return
+
+        # 1. stop the main loop, so that no new rpc requests
+        self._shutdown_event.set()
+        self.main_loop_thread.join()
+
+        # 2. shutdown the rpc server (PyExecutor Rank 0 + RPC server)
+        self.shutdown_remote()
+
+        # 3. shutdown the mpi session, this should wait until all the PyExecutor
+        # processes are shutdown
+        if self.mpi_session is not None:
+            self.mpi_session.shutdown()
+
+        self.rpc_client.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.shutdown()
 
     def _create_mpi_session(self, model_world_size: int,
                             mpi_session: Optional[MpiSession]):

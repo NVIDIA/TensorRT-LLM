@@ -2,6 +2,8 @@ import os
 import sys
 import time
 
+import pytest
+
 # isort: off
 sys.path.append(os.path.dirname(os.path.abspath(__file__)) + "/..")
 from utils.llm_data import llm_models_root
@@ -24,8 +26,10 @@ class TestWorkerBase:
 
         def __init__(self, engine: str):
             super().__init__(engine=engine)
-            executor_config = TestWorkerBase.create_fake_executor_config(engine)
-            self.setup_engine(engine=engine, executor_config=executor_config)
+            executor_config = create_fake_executor_config(engine)
+            # Pass config in constructor and finalize with parameterless setup
+            self._executor_config = executor_config
+            self.setup_engine()
 
     def test_create_engine(self):
         with self.FakeWorker(engine=model_path) as worker:
@@ -62,32 +66,42 @@ class TestWorkerBase:
         with self.FakeWorker(engine=model_path) as worker:
             worker.submit(request)
             worker.await_responses()
-            worker.dispatch_stats_task()
             time.sleep(10)
             stats = worker.fetch_stats()
             assert len(stats) == 1
 
-    @staticmethod
-    def create_fake_executor_config(model_path):
-        llm_args = LlmArgs(model=model_path, cuda_graph_config=None)
+    @pytest.mark.parametrize("timeout", [0.1, 0.2, 1])
+    def test_fetch_responses_timeout(self, timeout: float):
+        with self.FakeWorker(engine=model_path) as worker:
+            # Not submit any request, and let the await_responses timeout.
+            start_time = time.time()
+            results = worker.await_responses(timeout=timeout)
+            elapsed = time.time() - start_time
+            print(f"await_responses latency: {elapsed:.3f} seconds")
+            assert timeout / 2 <= elapsed <= timeout * 2, f"Latency out of expected range: {elapsed}"
+            assert results is None
 
-        executor_config = tllm.ExecutorConfig(1)
-        executor_config.max_batch_size = 1
 
-        update_executor_config(
-            executor_config,
-            backend="pytorch",
-            pytorch_backend_config=llm_args.get_pytorch_backend_config(),
-            mapping=llm_args.parallel_config.to_mapping(),
-            speculative_config=llm_args.speculative_config,
-            hf_model_dir=model_path,
-            max_input_len=20,
-            max_seq_len=40,
-            checkpoint_format=llm_args.checkpoint_format,
-            checkpoint_loader=llm_args.checkpoint_loader,
-        )
+def create_fake_executor_config(model_path):
+    llm_args = LlmArgs(model=model_path, cuda_graph_config=None)
 
-        return executor_config
+    executor_config = tllm.ExecutorConfig(1)
+    executor_config.max_batch_size = 1
+
+    update_executor_config(
+        executor_config,
+        backend="pytorch",
+        pytorch_backend_config=llm_args.get_pytorch_backend_config(),
+        mapping=llm_args.parallel_config.to_mapping(),
+        speculative_config=llm_args.speculative_config,
+        hf_model_dir=model_path,
+        max_input_len=20,
+        max_seq_len=40,
+        checkpoint_format=llm_args.checkpoint_format,
+        checkpoint_loader=llm_args.checkpoint_loader,
+    )
+
+    return executor_config
 
 
 if __name__ == "__main__":
