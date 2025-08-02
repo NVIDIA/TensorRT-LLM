@@ -144,11 +144,7 @@ def make_server_with_custom_sampler_fixture(api_type: str) -> Callable:
         args = ['--backend', backend]
         temp_file_path = tmp_path / f'test_sampler_config_{request.node.name}.yaml'
         extra_llm_api_options_dict = {
-            'enable_chunked_prefill': False,
-            'kv_cache_config': {
-                'enable_block_reuse': False,
-                'max_tokens': 40000
-            },
+            'enable_chunked_prefill': True,
             'enable_trtllm_sampler': use_trtllm_sampler
         }
         with temp_file_path.open('w') as f:
