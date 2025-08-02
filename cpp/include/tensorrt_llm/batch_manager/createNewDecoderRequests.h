@@ -71,7 +71,7 @@ public:
     {
     }
 
-    std::tuple<TensorPtr, std::vector<runtime::SamplingConfig>, std::vector<runtime::ITensor::SharedConstPtr>,
+    std::tuple<TensorPtr, runtime::SamplingConfig, std::vector<runtime::ITensor::SharedConstPtr>,
         std::vector<executor::LookaheadDecodingConfig>>
     operator()(runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig,
         executor::DecodingConfig const& decodingConfig, RequestVector const& contextRequests,
@@ -87,6 +87,10 @@ public:
         runtime::ModelConfig const& modelConfig, runtime::WorldConfig const& worldConfig,
         runtime::CudaStream const& runtimeStream, runtime::CudaStream const& decoderStream,
         SizeType32 maxSequenceLength, OptionalRef<MedusaBuffers const> medusaBuffers) const;
+
+    static TensorPtr fillBatchSlots(RequestVector const& requests, DecoderInputBuffers& inputBuffers);
+
+    static std::optional<SamplingConfig> fuseSamplingConfigs(RequestVector const& requests);
 
 private:
     //! @brief Initialize the decoder at `batchSlot` with a new `request`. Exposed only for static batching via

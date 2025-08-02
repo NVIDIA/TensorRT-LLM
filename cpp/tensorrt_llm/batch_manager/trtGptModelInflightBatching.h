@@ -388,6 +388,8 @@ private:
     /// @brief Change the speculative decoding mode.
     void changeSpecDecMode(ScheduledRequests const& scheduledRequests);
 
+    void disableLookaheadDecoder(RequestVector const& genRequests, DecoderInputBuffers& inputBuffers);
+
     void prefetchNextPromptTableChunk(RequestVector const& contextRequests, bool isFirstChunk, SizeType32 bufferId);
 
     void remapInputTokensForPromptTable(
