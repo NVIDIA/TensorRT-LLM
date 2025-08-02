@@ -10,12 +10,15 @@ set -ex
 env && hostname && nvidia-smi
 start_time=$(date '+%Y-%m-%d-%H:%M:%S')
 output_folder=benchmark.run.${SLURM_JOB_ID}.${start_time}
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # the docker user is root, otherwise it can not write logs to this folder when running in scratch
 mkdir -p ${output_folder} && chmod 777 ${output_folder}
 
+DEFAULT_IMAGE="urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-staging/release:main-x86_64"
+IMAGE=${1:-$DEFAULT_IMAGE}
+
 run_benchmark() {
-    IMAGE="urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-staging/release:main-x86_64"
     docker run --rm --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 \
         -v /home/scratch.trt_llm_data:/home/scratch.trt_llm_data:ro \
         -v `pwd`:`pwd` \

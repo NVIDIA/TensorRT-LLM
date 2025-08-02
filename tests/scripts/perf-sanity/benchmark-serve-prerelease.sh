@@ -11,6 +11,8 @@ env && hostname && nvidia-smi
 start_time=$(date '+%Y-%m-%d-%H:%M:%S')
 output_folder=benchmark.run.${SLURM_JOB_ID}.${start_time}
 
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
 # the docker user is root, otherwise it can not write logs to this folder when running in scratch
 mkdir -p ${output_folder} && chmod 777 ${output_folder}
 
@@ -25,7 +27,7 @@ run_benchmark() {
         --pull always \
         -it  \
         ${IMAGE} \
-        bash ./TensorRT-LLM.2/run_benchmark_serve.sh ${output_folder}
+        bash ${script_dir}/run_benchmark_serve.sh ${output_folder}
 }
 
 parse_report() {
@@ -44,7 +46,6 @@ parse_report() {
 
 report_head() {
     echo "trtllm-serve Job ${SLURM_JOB_ID} started at:${start_time} on:$(hostname) under:$(pwd)
-    git commit: $(git log --oneline origin/main | head -1)
     output: ${output_folder} "
 }
 
