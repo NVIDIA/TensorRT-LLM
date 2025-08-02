@@ -4,8 +4,22 @@ config_file=$1
 enable_pdl=$2
 ctx_gpus=$3
 work_dir=$4
+repo_dir=$5
 unset UCX_TLS
 echo "config_file: ${config_file}, enable_pdl: ${enable_pdl}, ctx_gpus: ${ctx_gpus}, work_dir: ${work_dir}"
+
+if [ ! -z "${repo_dir}" ]; then
+    pushd ${repo_dir}
+    if [ $SLURM_LOCALID == 0 ];then
+        echo "Install dependencies on rank 0."
+        pip install -e .
+    else
+        echo "Sleep 120 seconds on other ranks."
+        sleep 120
+    fi
+    popd
+fi
+export PATH=${HOME}/.local/bin:${PATH}
 
 export TLLM_LOG_LEVEL=INFO
 export TRTLLM_MOE_ENABLE_ALLTOALL_WITHOUT_ALLGATHER=1

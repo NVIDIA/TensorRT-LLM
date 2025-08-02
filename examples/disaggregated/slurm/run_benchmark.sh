@@ -90,6 +90,7 @@ do_get_logs(){
 
 # run the loadgen
 
+export PATH=${HOME}/.local/bin:${PATH}
 mkdir -p ${log_path}/concurrency_${concurrency}
 cp ${log_path}/output_workers.log ${log_path}/concurrency_${concurrency}/workers_start.log
 max_count=$((${concurrency} * ${multi_round}))
