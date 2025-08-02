@@ -1,0 +1,62 @@
+# Adapted from https://github.com/vllm-project/vllm/tree/main/.github/ISSUE_TEMPLATE/300-usage.yml
+name: 💻 Usage
+description: Raise an issue here if you don't know how to use TensorRT-LLM.
+title: "[Usage]: "
+labels: ["usage"]
+
+body:
+- type: markdown
+  attributes:
+    value: >
+      #### Before submitting an issue, please make sure the issue hasn't been already addressed by searching through [the existing and past issues](https://github.com/NVIDIA/TensorRT-LLM/issues?q=is%3Aissue+sort%3Acreated-desc+).
+- type: textarea
+  attributes:
+    label: System Info
+    description: |
+      Please provide the following system information to help us debug your usage issue:
+
+      ```bash
+      # System information
+      nvidia-smi
+      python --version
+      pip show tensorrt_llm
+      ```
+    value: |
+      **System Information:**
+      - OS:
+      - Python version:
+      - CUDA version:
+      - GPU model(s):
+      - Driver version:
+      - TensorRT-LLM version:
+
+      **Detailed output:**
+      ```text
+      Paste the output of the above commands here
+      ```
+  validations:
+    required: true
+- type: textarea
+  attributes:
+    label: How would you like to use TensorRT-LLM
+    description: |
+      A detailed description of how you want to use TensorRT-LLM.
+    value: |
+      I want to run inference of a [specific model](put Hugging Face link here). I don't know how to integrate it with TensorRT-LLM or optimize it for my use case.
+
+      **Specific questions:**
+      - Model:
+      - Use case (e.g., chatbot, batch inference, real-time serving):
+      - Expected throughput/latency requirements:
+      - Multi-GPU setup needed:
+- type: markdown
+  attributes:
+    value: >
+      Thanks for contributing 🎉!
+- type: checkboxes
+  id: askllm
+  attributes:
+    label: Before submitting a new issue...
+    options:
+      - label: Make sure you already searched for relevant issues, and checked the [documentation](https://nvidia.github.io/TensorRT-LLM/) and [examples](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples) for answers to frequently asked questions.
+        required: true
