@@ -45,6 +45,7 @@ testCmdLines=(
     "-v"
     "--timeout=$pytestTestTimeout"
     "--test-list=$testListPathNode"
+    "--waives-file=$waivesListPathNode"
     "--rootdir $llmSrcNode/tests/integration/defs"
     "--test-prefix=$stageName"
     "--splits $splits"

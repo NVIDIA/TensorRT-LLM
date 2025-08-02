@@ -699,7 +699,6 @@ trtllm-serve \
   google/gemma-3-1b-it \
   --host localhost \
   --port 8001 \
-  --backend pytorch \
   --max_batch_size 8 \
   --tp_size 2 \
   --ep_size 2 \
@@ -723,7 +722,6 @@ trtllm-serve \
   google/gemma-3-1b-it \
   --host localhost \
   --port 8002 \
-  --backend pytorch \
   --max_batch_size 8 \
   --tp_size 2 \
   --ep_size 2 \

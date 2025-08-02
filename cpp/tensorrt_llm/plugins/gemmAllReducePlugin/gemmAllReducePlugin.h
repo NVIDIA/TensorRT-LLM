@@ -154,7 +154,7 @@ private:
     int mNbOutputs = 0;
 
     std::map<KeyType, ValueType> mTypedInstantiators;
-    char const* mWorkspaceKey = "gemm_allreduce_workspace";
+    std::string mWorkspaceKey;
     std::shared_ptr<cutlass_kernels::GemmAllReduceImplInterface> mGemm;
     // Params that are initialized during configurePlugin()
     GemmAllReducePersistentWorkspace* mWorkspace = nullptr;

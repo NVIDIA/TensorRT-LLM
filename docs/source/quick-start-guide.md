@@ -8,13 +8,15 @@ This is the starting point to try out TensorRT-LLM. Specifically, this Quick Sta
 
 There are multiple ways to install and run TensorRT-LLM. For most users, the options below should be ordered from simple to complex. The approaches are equivalent in terms of the supported features.
 
+Note: **This project will download and install additional third-party open source software projects. Review the license terms of these open source projects before use.**
+
 1. [](installation/containers)
 
 1. Pre-built release wheels on [PyPI](https://pypi.org/project/tensorrt-llm) (see [](installation/linux))
 
 1. [Building from source](installation/build-from-source-linux)
 
-The following examples can most easily be executed using the prebuilt [Docker release container available on NGC](https://registry.ngc.nvidia.com/orgs/nvstaging/teams/tensorrt-llm/containers/release) (see also [release.md](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docker/release.md) on GitHub).
+The following examples can most easily be executed using the prebuilt [Docker release container available on NGC](https://registry.ngc.nvidia.com/orgs/nvstaging/teams/tensorrt-llm/containers/release) (see also [release.md](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docker/release.md) on GitHub). Ensure to run these commands as a user with appropriate permissions, preferably `root`, to streamline the setup process.
 
 
 ## LLM API
@@ -92,7 +94,7 @@ For detailed examples and command syntax, refer to the [trtllm-serve](commands/t
 
 2. Open a new terminal and use the following command to directly attach to the running container:
 
-```bash
+```bash:docs/source/quick-start-guide.md
 docker exec -it <container_id> bash
 ```
 

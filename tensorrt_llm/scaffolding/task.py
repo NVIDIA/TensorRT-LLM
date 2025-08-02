@@ -62,8 +62,6 @@ class GenerationTask(Task):
     worker_tag: Union[str, "Controller.WorkerTag"] = None
 
     # result field
-    _outputs: Optional[List[dict]] = None
-
     # link to TRTLLM's GenerationResult, for async update in streaming mode
     _result: Optional[GenerationResult] = None
 
@@ -74,35 +72,36 @@ class GenerationTask(Task):
     @result.setter
     def result(self, result: GenerationResult) -> None:
         self._result = result
-        self._outputs = result.outputs
+
+    @property
+    def outputs(self) -> Optional[List[dict]]:
+        return self._result.outputs if self._result else None
 
     @property
     def output_tokens(self) -> List[int]:
-        return self._outputs[
-            0].token_ids if self.result and self._outputs else None
+        return self._result.outputs[0].token_ids if self._result else None
 
     @property
     def output_str(self) -> Optional[str]:
-        return self._outputs[0].text if self.result and self._outputs else None
+        return self._result.outputs[0].text if self._result else None
 
     @output_str.setter
     def output_str(self, output) -> Optional[str]:
-        assert self.result and self._outputs
-        self._outputs[0].text = output
+        assert self.result
+        self._result.outputs[0].text = output
 
     @property
     def cumulative_logprob(self) -> Optional[float]:
-        return self._outputs[
-            0].cumulative_logprob if self.result and self._outputs else None
+        return self._result.outputs[
+            0].cumulative_logprob if self._result else None
 
     @property
     def logprobs(self) -> Optional[List[float]]:
-        return self._outputs[
-            0].logprobs if self.result and self._outputs else None
+        return self._result.outputs[0].logprobs if self._result else None
 
     @property
     def context_logits(self) -> Optional[torch.Tensor]:
-        return self.result.context_logits if self.result else None
+        return self._result.context_logits if self._result else None
 
     @staticmethod
     def create_from_prompt(prompt: str) -> "GenerationTask":
@@ -113,7 +112,7 @@ class GenerationTask(Task):
         return task
 
     def create_scaffolding_output(self) -> GenerationResult:
-        return self.result
+        return self._result
 
 
 @dataclass

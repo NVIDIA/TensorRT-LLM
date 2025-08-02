@@ -99,6 +99,10 @@ COPY --from=triton /opt/tritonserver/caches /opt/tritonserver/caches
 COPY docker/common/install_triton.sh install_triton.sh
 RUN bash ./install_triton.sh && rm install_triton.sh
 
+# Install UCX first
+COPY docker/common/install_ucx.sh install_ucx.sh
+RUN bash ./install_ucx.sh && rm install_ucx.sh
+
 # Install NIXL
 COPY docker/common/install_nixl.sh install_nixl.sh
 RUN bash ./install_nixl.sh && rm install_nixl.sh
@@ -123,9 +127,10 @@ RUN mkdir -p /root/.cache/pip /root/.cache/ccache
 ENV CCACHE_DIR=/root/.cache/ccache
 # Build the TRT-LLM wheel
 ARG GITHUB_MIRROR=""
-ARG BUILD_WHEEL_ARGS="--clean --python_bindings --benchmarks"
+ARG BUILD_WHEEL_ARGS="--clean --benchmarks"
+ARG BUILD_WHEEL_SCRIPT="scripts/build_wheel.py"
 RUN --mount=type=cache,target=/root/.cache/pip --mount=type=cache,target=${CCACHE_DIR} \
-    GITHUB_MIRROR=$GITHUB_MIRROR python3 scripts/build_wheel.py ${BUILD_WHEEL_ARGS}
+    GITHUB_MIRROR=$GITHUB_MIRROR python3 ${BUILD_WHEEL_SCRIPT} ${BUILD_WHEEL_ARGS}
 
 FROM ${DEVEL_IMAGE} AS release
 

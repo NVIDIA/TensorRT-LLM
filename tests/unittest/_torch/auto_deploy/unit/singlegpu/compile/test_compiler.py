@@ -8,7 +8,7 @@ from _model_test_utils import (
 from torch.nn import Module
 
 from tensorrt_llm._torch.auto_deploy.compile import compile_and_capture
-from tensorrt_llm._torch.auto_deploy.transformations.export import torch_export_to_gm
+from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 
 
 @pytest.mark.parametrize(

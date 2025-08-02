@@ -109,7 +109,9 @@ class QWenConfig(PretrainedConfig):
         assert qwen_type in valid_types, f"Unsupported Qwen type: {qwen_type}, only {valid_types} are acceptable."
         num_key_value_heads = getattr(hf_config, "num_key_value_heads",
                                       hf_config.num_attention_heads)
-        head_dim = hf_config.hidden_size // hf_config.num_attention_heads
+        head_dim = getattr(
+            hf_config, "head_dim",
+            hf_config.hidden_size // hf_config.num_attention_heads)
         head_size = getattr(hf_config, "kv_channels", head_dim)
         hidden_act = getattr(hf_config, "hidden_act", "silu")
         if qwen_type == "qwen2_moe":

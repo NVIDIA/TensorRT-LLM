@@ -14,11 +14,19 @@
 # limitations under the License.
 
 import os
+import time
 
 import pytest
 from defs.common import (convert_weights, test_multi_lora_support,
                          venv_mpi_check_call)
+from defs.conftest import get_sm_version
 from defs.trt_test_alternative import check_call
+
+# skip trt flow cases on post-Blackwell-Ultra
+if get_sm_version() >= 103:
+    pytest.skip(
+        "TRT workflow tests are not supported on post Blackwell-Ultra architecture",
+        allow_module_level=True)
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -96,7 +104,9 @@ def test_granite_bf16_lora(llama_example_root,
     "Run Granite 3.0 models with multiple dummy LoRAs."
 
     # TODO: Enable fp8 quantization when ModelOpt changes for Granite are available.
+    start_time = time.time()
     print("Converting checkpoint...")
+    convert_start = time.time()
     model_name = os.path.basename(llm_granite_model_root)
     dtype = 'bfloat16'
 
@@ -108,6 +118,11 @@ def test_granite_bf16_lora(llama_example_root,
         model_path=llm_granite_model_root,
         data_type=dtype,
     )
+    convert_end = time.time()
+    print(
+        f"Convert checkpoint completed in {(convert_end - convert_start):.2f} seconds."
+    )
+
     target_hf_modules = [
         "q_proj",
         "k_proj",
@@ -122,6 +137,8 @@ def test_granite_bf16_lora(llama_example_root,
         target_hf_modules += ["moe_h_to_4h", "moe_4h_to_h", "moe_gate"]
         target_trtllm_modules += ["moe_h_to_4h", "moe_4h_to_h", "moe_gate"]
 
+    print("Calling test_multi_lora_support...")
+    test_multi_lora_start = time.time()
     test_multi_lora_support(
         hf_model_dir=llm_granite_model_root,
         tllm_ckpt_dir=ckpt_dir,
@@ -134,3 +151,10 @@ def test_granite_bf16_lora(llama_example_root,
         target_trtllm_modules=target_trtllm_modules,
         zero_lora_weights=True,
     )
+    test_multi_lora_end = time.time()
+    print(
+        f"test_multi_lora_support completed in {(test_multi_lora_end - test_multi_lora_start):.2f} seconds"
+    )
+
+    total_time = time.time() - start_time
+    print(f"Total function execution time: {total_time:.2f} seconds")

@@ -13,7 +13,7 @@ The PyTorch backend of TensorRT-LLM is available in version 0.17 and later. You 
 
 Here is a simple example to show how to use `tensorrt_llm.LLM` API with Llama model.
 
-```{literalinclude} ../../examples/pytorch/quickstart.py
+```{literalinclude} ../../examples/llm-api/quickstart_example.py
     :language: python
     :linenos:
 ```

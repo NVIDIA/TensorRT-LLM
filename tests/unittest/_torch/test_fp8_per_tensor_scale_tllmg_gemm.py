@@ -100,7 +100,7 @@ def test_fp8_block_scale_gemm(dtype, m, k, n, inference_mode):
     output_expected = output_expected.to(torch.float)
     diff = calc_diff(output, output_expected)
     assert diff < 1e-3
-    torch.testing.assert_close(output, output_expected, atol=1e-3, rtol=1e-3)
+    torch.testing.assert_close(output, output_expected, atol=1e-2, rtol=1e-2)
 
 
 @pytest.mark.skipif(

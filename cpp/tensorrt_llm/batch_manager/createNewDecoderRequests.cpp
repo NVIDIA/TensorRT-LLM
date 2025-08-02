@@ -63,7 +63,10 @@ void copySequenceLengths(RequestVector const& contextRequests, DecoderInputBuffe
     SizeType32 batchIdx{0};
     for (auto const& llmReq : contextRequests)
     {
-        auto const currentSequenceLen = llmReq->mPromptLen + llmReq->getMaxNumGeneratedTokens();
+        auto const disaggFirstGenTokenSize
+            = llmReq->getContextPhaseParams() ? llmReq->getContextPhaseParams().value().getFirstGenTokens().size() : 0;
+        auto const currentSequenceLen
+            = llmReq->mPromptLen + llmReq->getMaxNumGeneratedTokens() + disaggFirstGenTokenSize;
         // Get position of the current sequence in the decoder
         auto const seqSlot = llmReq->mSeqSlot.value();
         batchSlotsRange[batchIdx] = seqSlot;

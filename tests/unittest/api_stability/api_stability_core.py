@@ -4,6 +4,7 @@ import inspect
 import os
 import pathlib
 from dataclasses import _HAS_DEFAULT_FACTORY_CLASS, dataclass, fields
+from pprint import pprint
 from types import MethodType, NoneType
 from typing import (Any, Callable, ClassVar, Dict, List, Literal, Optional,
                     Sequence, Tuple, Union, _type_repr)
@@ -18,6 +19,9 @@ from pydantic import BaseModel
 
 import tensorrt_llm
 from tensorrt_llm import LLM
+# Import BaseCheckpointLoader for YAML processing
+from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import \
+    BaseCheckpointLoader
 from tensorrt_llm.executor import GenerationResult
 from tensorrt_llm.executor.result import TokenLogprobs
 from tensorrt_llm.llmapi import (CalibConfig, CompletionOutput,
@@ -72,6 +76,7 @@ class StackTrace(metaclass=Singleton):
 class ParamSnapshot:
     annotation: type
     default: Any = None
+    status: Optional[str] = None
 
     @classmethod
     def from_inspect(cls, param: inspect.Parameter):
@@ -128,6 +133,7 @@ class ParamSnapshot:
 class MethodSnapshot:
     parameters: Dict[str, ParamSnapshot]
     return_annotation: type
+    status: Optional[str] = None
 
     @classmethod
     def from_inspect(cls, method: MethodType):
@@ -401,6 +407,7 @@ class ApiStabilityTestHarness:
     def setup_class(cls):
         with open(f"{cls.REFERENCE_DIR}/{cls.REFERENCE_FILE}") as f:
             cls.reference = ClassSnapshot.from_dict(yaml.safe_load(f))
+            cls.non_committed_reference = copy.deepcopy(cls.reference)
         if os.path.exists(
                 f"{cls.REFERENCE_COMMITTED_DIR}/{cls.REFERENCE_FILE}"):
             with open(
@@ -444,3 +451,85 @@ class ApiStabilityTestHarness:
                 snapshot.assert_equal(self.reference)
             except AssertionError as e:
                 raise AssertionError(self.error_msg) from e
+
+    def test_api_status(self):
+        """ Check that the API status (prototype | beta) matches the llm.yaml.
+        Note that, only the non-committed APIs are checked, the committed APIs
+        are treated as stable.
+        """
+
+        # Only check the API status for llm.yaml
+        if self.REFERENCE_FILE != "llm.yaml":
+            return
+
+        from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+
+        actual_fields = TorchLlmArgs.model_fields
+        reference_data = self.non_committed_reference.to_dict()
+        committed_data = self.reference_committed.to_dict()
+
+        def get_actual_status(field_name):
+            if field_name in actual_fields:
+                field = actual_fields[field_name]
+                return field.json_schema_extra.get(
+                    'status') if field.json_schema_extra else None
+            return None
+
+        def check_status(field_name, reference_status, context=""):
+            # Deprecated fields are not checked
+            if reference_status == "deprecated":
+                return
+
+            actual_status = get_actual_status(field_name)
+            if actual_status is None:
+                raise AssertionError(
+                    f"context: {self.TEST_CLASS} {context}\n"
+                    f"Status is not set for the non-committed '{field_name}', "
+                    "please update the field with Field(..., status='<status>') in llm_args.py, "
+                    "status could be either 'beta' or 'prototype'.")
+
+            if reference_status is None:
+                raise AssertionError(
+                    f"context: {self.TEST_CLASS} {context}\n"
+                    f"Status is not set for '{field_name}' in reference/llm.yaml, "
+                    "please update the field with `status: <status>`, "
+                    "status could be either 'beta' or 'prototype'.")
+
+            if actual_status != reference_status:
+                raise AssertionError(
+                    f"Status mismatch for '{field_name}': "
+                    f"actual='{actual_status}', reference='{reference_status}'")
+
+        from tensorrt_llm.llmapi.utils import get_api_status
+
+        # Check non-committed methods and properties
+        for method_name, method_data in reference_data.get('methods',
+                                                           {}).items():
+
+            # step 1: check the method status
+            method = getattr(self.TEST_CLASS, method_name)
+            if method_name in committed_data.get('methods', {}):
+                continue
+            if method_name != "__init__":
+                method_status = get_api_status(method)
+                if method_status is None:
+                    raise AssertionError(
+                        f"Status is not set for the non-committed {method_name}, "
+                        "please update the method with @set_api_status(<status>), "
+                        "status could be either 'beta' or 'prototype'.")
+                if method_status != method_data.get('status'):
+                    raise AssertionError(
+                        f"Status mismatch for {method_name}: "
+                        f"actual='{method_status}', reference='{method_data.get('status')}'"
+                    )
+
+            # step 2: check the method parameters
+            # Only check the LLM.__init__'s parameters, for other methods, just check the method status
+            # TODO[Superjomn]: support other methods
+            if method_name == "__init__":
+                for param_name, param_data in method_data.get('parameters',
+                                                              {}).items():
+                    print(f"param_name: {param_name}, param_data: {param_data}")
+                    check_status(
+                        param_name, param_data.get('status'),
+                        f"parameter '{param_name}' in method '{method_name}': ")

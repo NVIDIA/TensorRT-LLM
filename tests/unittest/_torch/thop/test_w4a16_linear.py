@@ -3,7 +3,8 @@ import torch
 
 import tensorrt_llm.quantization.functional
 from tensorrt_llm._torch.autotuner import autotune
-from tensorrt_llm._torch.custom_ops.torch_custom_ops import W4A16GemmRunner
+from tensorrt_llm._torch.custom_ops.torch_custom_ops import \
+    FinegrainedMixedDtypeGemm
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
@@ -16,9 +17,10 @@ from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 )
 def test_w4a16_linear(dtype, weights_dtype, has_zero=False):
 
-    if get_sm_version() > W4A16GemmRunner.MAX_SUPPORTED_SM_VERSION:
+    if get_sm_version() > FinegrainedMixedDtypeGemm.MAX_SUPPORTED_SM_VERSION:
         pytest.skip(
-            f"W4A116 is not supported in this SM version {get_sm_version()}")
+            f"W4A16/W4A8 is not supported in this SM version {get_sm_version()}"
+        )
 
     SEQ_LEN = 10
     HIDDEN_SIZE = 128
@@ -72,12 +74,14 @@ def test_w4a16_linear(dtype, weights_dtype, has_zero=False):
         pre_quant_scale = pre_quant_scale.repeat(SEQ_LEN, 1)
         x = torch.mul(x, pre_quant_scale)
 
-        output_ref = torch.ops.trtllm.w4a16_gemm(x.contiguous(),
-                                                 w,
-                                                 weight_scale.type(x.dtype),
-                                                 GROUP_SIZE,
-                                                 has_zero,
-                                                 bias,
-                                                 zeros=None)
+        output_ref = torch.ops.trtllm.finegrained_mixed_dtype_gemm(
+            input=x.contiguous(),
+            weight=w,
+            scales=weight_scale.type(x.dtype),
+            group_size=GROUP_SIZE,
+            has_zero_point=has_zero,
+            bias=bias,
+            output_dtype=x.dtype,
+            zeros=None)
     torch.cuda.synchronize()
     torch.testing.assert_close(output, output_ref)

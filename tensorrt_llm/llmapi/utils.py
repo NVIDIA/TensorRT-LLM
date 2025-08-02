@@ -493,7 +493,7 @@ def generate_api_docs_as_docstring(model: Type[BaseModel],
     for field_name, field_info in schema['properties'].items():
         if field_name.startswith("_"):  # skip private fields
             continue
-        if field_info.get("deprecated", False):
+        if field_info.get("status", None) == "deprecated":
             continue
 
         field_type = field_info.get('type', None)
@@ -546,3 +546,91 @@ def get_type_repr(cls):
     if module_name == 'builtins':  # Special case for built-in types
         return cls.__qualname__
     return f"{module_name}.{cls.__qualname__}"
+
+
+class ApiParamTagger:
+    ''' A helper to tag the api doc according to the status of the fields.
+    The status is set in the json_schema_extra of the field.
+    '''
+
+    def __call__(self, cls: Type[BaseModel]) -> None:
+        self.process_pydantic_model(cls)
+
+    def process_pydantic_model(self, cls: Type[BaseModel]) -> None:
+        """Process the Pydantic model to add tags to the fields.
+        """
+        for field_name, field_info in cls.model_fields.items():
+            if field_info.json_schema_extra and 'status' in field_info.json_schema_extra:
+                status = field_info.json_schema_extra['status']
+                self.amend_pydantic_field_description_with_tags(
+                    cls, [field_name], status)
+
+    def amend_pydantic_field_description_with_tags(self, cls: Type[BaseModel],
+                                                   field_names: list[str],
+                                                   tag: str) -> None:
+        """Amend the description of the fields with tags.
+        e.g. :tag:`beta` or :tag:`prototype`
+        Args:
+            cls: The Pydantic BaseModel class.
+            field_names: The names of the fields to amend.
+            tag: The tag to add to the fields.
+        """
+        assert field_names
+        for field_name in field_names:
+            field = cls.model_fields[field_name]
+            cls.model_fields[
+                field_name].description = f":tag:`{tag}` {field.description}"
+        cls.model_rebuild(force=True)
+
+
+def tag_llm_params():
+    from tensorrt_llm.llmapi.llm_args import LlmArgs
+    ApiParamTagger()(LlmArgs)
+
+
+class ApiStatusRegistry:
+    ''' A registry to store the status of the api.
+
+    usage:
+
+    @ApiStatusRegistry.set_api_status("beta")
+    def my_method(self, *args, **kwargs):
+        pass
+
+    class App:
+        @ApiStatusRegistry.set_api_status("beta")
+        def my_method(self, *args, **kwargs):
+            pass
+    '''
+    method_to_status = {}
+
+    @classmethod
+    def set_api_status(cls, status: str):
+
+        def decorator(func):
+            # Use qualified name to support class methods
+            if func.__qualname__ in cls.method_to_status:
+                logger.debug(
+                    f"Method {func.__qualname__} already has a status, skipping the decorator"
+                )
+                return func
+            cls.method_to_status[func.__qualname__] = status
+            func.__doc__ = cls.amend_api_doc_with_status_tags(func)
+            return func
+
+        return decorator
+
+    @classmethod
+    def get_api_status(cls, method: Callable) -> Optional[str]:
+        return cls.method_to_status.get(method.__qualname__, None)
+
+    @classmethod
+    def amend_api_doc_with_status_tags(cls, method: Callable) -> str:
+        status = cls.get_api_status(method)
+        if status is None:
+            return method.__doc__
+        return f":tag:`{status}` {method.__doc__}"
+
+
+set_api_status = ApiStatusRegistry().set_api_status
+get_api_status = ApiStatusRegistry().get_api_status

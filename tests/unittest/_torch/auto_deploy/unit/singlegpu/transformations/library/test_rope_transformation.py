@@ -18,8 +18,9 @@ from tensorrt_llm._torch.auto_deploy.utils.node_utils import extract_output_tupl
 torch.manual_seed(0)
 
 
-def _precompute_freqs_cis_explicit(seq_len: int, head_dim: int, rope_theta: float):
-    dtype = torch.float32
+def _precompute_freqs_cis_explicit(
+    seq_len: int, head_dim: int, rope_theta: float, dtype: torch.dtype = torch.float32
+):
     inv_freq = 1.0 / (rope_theta ** (torch.arange(0, head_dim, 2, dtype=torch.float32) / head_dim))
     positions = torch.arange(seq_len, dtype=torch.float32)
     freqs = positions.unsqueeze(1) * inv_freq.unsqueeze(0)
@@ -84,7 +85,9 @@ class RoPEModel(torch.nn.Module):
             else:
                 unsq_dim = 2
 
-            cos, sin = _precompute_freqs_cis_explicit(s, self.head_dim, rope_theta=10000)
+            cos, sin = _precompute_freqs_cis_explicit(
+                s, self.head_dim, rope_theta=10000, dtype=x.dtype
+            )
             cos = cos.to(x.device).unsqueeze(0).expand(b, -1, -1)
             sin = sin.to(x.device).unsqueeze(0).expand(b, -1, -1)
 

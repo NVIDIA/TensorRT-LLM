@@ -12,6 +12,7 @@ import subprocess
 import sys
 
 import pygit2
+from docutils import nodes
 
 sys.path.insert(0, os.path.abspath('.'))
 
@@ -60,10 +61,16 @@ extensions = [
     'sphinx_togglebutton',
 ]
 
+autodoc_member_order = 'bysource'
 autodoc_pydantic_model_show_json = True
 autodoc_pydantic_model_show_config_summary = True
 autodoc_pydantic_field_doc_policy = "description"
 autodoc_pydantic_model_show_field_list = True  # Display field list with descriptions
+autodoc_pydantic_model_member_order = "groupwise"
+autodoc_pydantic_model_hide_pydantic_methods = True
+autodoc_pydantic_field_list_validators = False
+autodoc_pydantic_settings_signature_prefix = ""  # remove any prefix
+autodoc_pydantic_settings_hide_reused_validator = True  # hide all the validator should be better
 
 myst_url_schemes = {
     "http":
@@ -143,9 +150,27 @@ CPP_GEN_DIR = os.path.join(SCRIPT_DIR, '_cpp_gen')
 print('CPP_INCLUDE_DIR', CPP_INCLUDE_DIR)
 print('CPP_GEN_DIR', CPP_GEN_DIR)
 
+html_css_files = [
+    'custom.css',
+]
+
+
+def tag_role(name, rawtext, text, lineno, inliner, options=None, content=None):
+    """A custom role for displaying tags."""
+    options = options or {}
+    content = content or []
+    tag_name = text.lower()
+    node = nodes.literal(text, text, classes=['tag', tag_name])
+    return [node], []
+
 
 def setup(app):
     from helper import generate_examples, generate_llmapi
+
+    from tensorrt_llm.llmapi.utils import tag_llm_params
+    tag_llm_params()
+
+    app.add_role('tag', tag_role)
 
     generate_examples()
     generate_llmapi()

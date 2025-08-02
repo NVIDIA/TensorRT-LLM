@@ -228,6 +228,10 @@ class GenerationResultBase:
             output.logprobs = response_tensors.log_probs[src_idx]
             # overcome some WAR in the cpp executor
             if finish_reasons[src_idx] != tllm.FinishReason.CANCELLED:
+                if len(output.logprobs) > output.length:
+                    # LlmResult holds a reference to LogProbStorage, which may be updated by the worker before the result is serialized.
+                    # Therefore, we treat extra logprobs/logits as expected and only consume what's needed.
+                    output.logprobs = output.logprobs[:output.length]
                 assert len(output.logprobs) == output.length
         if response_tensors.generation_logits is not None:
             output.generation_logits = response_tensors.generation_logits[
@@ -389,6 +393,30 @@ class DetokenizedGenerationResultBase(GenerationResultBase):
                 else:
                     beam_output.text = self.tokenizer.decode(
                         beam_output.token_ids, **kwargs)
+
+                is_generating = not self._done
+                is_finished_with_stop_or_length = (
+                    beam_output.finish_reason == 'stop'
+                    or beam_output.finish_reason == 'length')
+
+                if is_generating or is_finished_with_stop_or_length:
+                    for stop_reason, _ in self.sampling_params._get_stop_reasons_and_words(
+                    ):
+                        if isinstance(stop_reason,
+                                      str) and stop_reason in beam_output.text:
+                            stop_pos = beam_output.text.find(stop_reason)
+                            if not self.sampling_params.include_stop_str_in_output:
+                                beam_output.text = beam_output.text[:stop_pos]
+                            else:
+                                beam_output.text = beam_output.text[:stop_pos +
+                                                                    len(stop_reason
+                                                                        )]
+
+                            beam_output.finish_reason = 'stop'
+                            beam_output.stop_reason = stop_reason
+                            self.abort()
+                            self._done = True
+                            break
 
 
 # alias

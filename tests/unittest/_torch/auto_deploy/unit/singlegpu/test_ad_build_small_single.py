@@ -6,35 +6,38 @@ import pytest
 from _model_test_utils import get_small_model_config
 from build_and_run_ad import ExperimentConfig, main
 
-from tensorrt_llm._torch.auto_deploy.llm_args import LlmArgs, _ParallelConfig
+from tensorrt_llm._torch.auto_deploy.llm_args import AutoDeployConfig, LlmArgs, _ParallelConfig
 from tensorrt_llm._torch.auto_deploy.transformations.transform import InferenceOptimizer
 
 
-def _check_ad_config(experiment_config: ExperimentConfig, ad_config: LlmArgs):
-    # Verify that ad_config was captured
-    assert ad_config is not None, "ad_config should have been captured"
+def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
+    # Verify that llm_args was captured
+    assert llm_args is not None, "llm_args should have been captured"
 
-    # Check that ad_config is an instance of LlmArgs
-    assert isinstance(ad_config, LlmArgs), f"Expected AutoDeploy LlmArgs, got {type(ad_config)}"
-
-    # check that ad_config and experiment_config have the same args
-    assert experiment_config.args == ad_config, (
-        f"Expected experiment_config.args {experiment_config.args}, got {ad_config}"
+    # Check that llm_args is an instance of LlmArgs and also an instance of AutoDeployConfig
+    assert isinstance(llm_args, LlmArgs), f"Expected LlmArgs, got {type(llm_args)}"
+    assert isinstance(llm_args, AutoDeployConfig), (
+        f"Expected AutoDeployConfig, got {type(llm_args)}"
     )
+
+    # check that llm_args and experiment_config have the same args
+    expected_ad_config: AutoDeployConfig = experiment_config.args
+    expected_llm_args: LlmArgs = expected_ad_config.to_llm_args()
+    assert expected_llm_args == llm_args, f"Expected llm args {expected_llm_args}, got {llm_args}"
 
     # check expected parallel config
-    world_size = experiment_config.args.world_size
+    world_size = expected_ad_config.world_size
     expected_parallel_config = _ParallelConfig(
-        auto_parallel=True, gpus_per_node=experiment_config.args.gpus_per_node
+        auto_parallel=True, gpus_per_node=expected_llm_args.gpus_per_node
     )
     expected_parallel_config.world_size = world_size
-    assert ad_config._parallel_config == expected_parallel_config, (
-        f"Expected parallel_config {expected_parallel_config}, got {ad_config._parallel_config}"
+    assert llm_args._parallel_config == expected_parallel_config, (
+        f"Expected parallel_config {expected_parallel_config}, got {llm_args._parallel_config}"
     )
 
     # backend should always be "_autodeploy"
-    assert ad_config.backend == "_autodeploy", (
-        f"Expected backend '_autodeploy', got {ad_config.backend}"
+    assert llm_args.backend == "_autodeploy", (
+        f"Expected backend '_autodeploy', got {llm_args.backend}"
     )
 
 
@@ -70,6 +73,16 @@ def _check_ad_config(experiment_config: ExperimentConfig, ad_config: LlmArgs):
             "deepseek-ai/DeepSeek-V3",
             attn_backend="triton",
             compile_backend="torch-simple",
+        ),
+        get_small_model_config(
+            "microsoft/Phi-3-mini-4k-instruct",
+            attn_backend="torch",
+            compile_backend="torch-simple",
+        ),
+        get_small_model_config(
+            "Qwen/Qwen2.5-3B-Instruct",
+            attn_backend="triton",
+            compile_backend="torch-compile",
         ),
     ],
 )

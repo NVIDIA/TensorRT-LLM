@@ -15,8 +15,14 @@
 
 import pytest
 from defs.common import convert_weights, venv_check_call
-from defs.conftest import skip_post_blackwell
+from defs.conftest import get_sm_version, skip_post_blackwell
 from defs.trt_test_alternative import check_call
+
+# skip trt flow cases on post-Blackwell-Ultra
+if get_sm_version() >= 103:
+    pytest.skip(
+        "TRT workflow tests are not supported on post Blackwell-Ultra architecture",
+        allow_module_level=True)
 
 
 @skip_post_blackwell

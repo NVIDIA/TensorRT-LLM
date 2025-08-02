@@ -4779,7 +4779,7 @@ class RopeEmbeddingUtils:
 
         return inv_freq, concat.reshape(1, -1).astype(dtype)
 
-    def create_sinusoidal_positions_long_rope(
+    def create_sinusoidal_positions_long_rope_for_attention_plugin(
             num_pos: int,
             num_orig_pos: int,
             dim: int,
@@ -4833,6 +4833,45 @@ class RopeEmbeddingUtils:
                     scaling_short_factors, True,
                     True), _compute_sinusoidal_positions(
                         scaling_long_factors, False, True), short_mscale
+
+    @staticmethod
+    def create_sinusoidal_positions_long_rope(
+            num_pos: int,
+            dim: int,
+            theta: float,
+            original_max_pos: int,
+            short_factor: List[float],
+            long_factor: List[float],
+            dtype=np.float32,
+            max_seq_len: Optional[int] = None):
+        short_factor = np.array(short_factor, dtype=np.float32)
+        long_factor = np.array(long_factor, dtype=np.float32)
+
+        inv_freq = 1.0 / (theta**(np.arange(0, dim, 2, dtype=np.float32) / dim))
+        t_pos = np.arange(np.max([num_pos, original_max_pos]), dtype=np.float32)
+
+        # Choose proper freqs based on max_seq_len.
+        factor = long_factor if max_seq_len is None or max_seq_len > original_max_pos else short_factor
+        inv_freq = inv_freq / factor
+        freqs = np.einsum("i,j->ij", t_pos, inv_freq)
+        sinusoid_inp = freqs.astype(np.float32)[..., np.newaxis]
+
+        # Apply scaling
+        scale = num_pos / original_max_pos
+        if scale <= 1.0:
+            scaling_factor = 1.0
+        else:
+            scaling_factor = np.sqrt(1.0 +
+                                     np.log(scale) / np.log(original_max_pos))
+
+        # fuse cos/sin into float2 (cos, sin).
+        concat = np.concatenate(
+            (np.cos(sinusoid_inp) * scaling_factor,
+             np.sin(sinusoid_inp) * scaling_factor),
+            axis=-1,
+        )
+
+        return None, concat.reshape(1, -1).astype(dtype)
 
     @staticmethod
     def create_fake_weight(dim: int, dtype=np.half):

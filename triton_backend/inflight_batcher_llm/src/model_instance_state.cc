@@ -698,6 +698,7 @@ executor::ExecutorConfig ModelInstanceState::getExecutorConfigFromParams()
         maxQueueSize, extendedRuntimePerfKnobConfig,
         /*DebugConfig*/ std::nullopt, recvPollPeriodMs};
     execConfig.setSpecDecConfig(specDecConfig);
+    execConfig.setCacheTransceiverConfig(tle::CacheTransceiverConfig(tle::CacheTransceiverConfig::BackendType::MPI));
     if (guidedConfig.has_value())
     {
         execConfig.setGuidedDecodingConfig(guidedConfig.value());

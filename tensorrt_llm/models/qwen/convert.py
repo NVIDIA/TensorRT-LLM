@@ -171,6 +171,30 @@ def smooth_qwen2_model(model, scales, alpha, qwen_qkv_para, qwen_smoother):
         scales[layer_name]["w"] = module.mlp.down_proj.weight.abs().max(
             dim=1)[0]
 
+    scales_keys_to_rename = [
+        key for key in scales.keys() if 'language_model.' in key
+    ]
+
+    qwen_qkv_para_keys_to_rename = [
+        key for key in qwen_qkv_para.keys() if 'language_model.' in key
+    ]
+
+    qwen_smoother_keys_to_rename = [
+        key for key in qwen_smoother.keys() if 'language_model.' in key
+    ]
+
+    for key in scales_keys_to_rename:
+        scales[key.replace('language_model.', '')] = scales[key]
+        del scales[key]
+
+    for key in qwen_qkv_para_keys_to_rename:
+        qwen_qkv_para[key.replace('language_model.', '')] = qwen_qkv_para[key]
+        del qwen_qkv_para[key]
+
+    for key in qwen_smoother_keys_to_rename:
+        qwen_smoother[key.replace('language_model.', '')] = qwen_smoother[key]
+        del qwen_smoother[key]
+
 
 @torch.no_grad()
 def capture_activation_range(model,
@@ -537,19 +561,26 @@ def convert_hf_qwen(hf_model,
                                          tensor_parallel)
                 assert (k_weight.shape[0] % (mapping.tp_size * head_size)) == 0
                 assert (v_weight.shape[0] % (mapping.tp_size * head_size)) == 0
-                assert (k_bias.shape[0] % (mapping.tp_size * head_size)) == 0
-                assert (v_bias.shape[0] % (mapping.tp_size * head_size)) == 0
+
+                if k_bias is not None and v_bias is not None:
+                    assert (k_bias.shape[0] %
+                            (mapping.tp_size * head_size)) == 0
+                    assert (v_bias.shape[0] %
+                            (mapping.tp_size * head_size)) == 0
 
                 wq = split(q_weight, mapping.tp_size, mapping.tp_rank)
                 wk = split(k_weight, mapping.tp_size, mapping.tp_rank)
                 wv = split(v_weight, mapping.tp_size, mapping.tp_rank)
 
-                bq = split(q_bias, mapping.tp_size, mapping.tp_rank)
-                bk = split(k_bias, mapping.tp_size, mapping.tp_rank)
-                bv = split(v_bias, mapping.tp_size, mapping.tp_rank)
-
                 qkv_w = torch.concat((wq, wk, wv))
-                qkv_b = torch.concat((bq, bk, bv))
+
+                if q_bias is not None and k_bias is not None and v_bias is not None:
+                    bq = split(q_bias, mapping.tp_size, mapping.tp_rank)
+                    bk = split(k_bias, mapping.tp_size, mapping.tp_rank)
+                    bv = split(v_bias, mapping.tp_size, mapping.tp_rank)
+                    qkv_b = torch.concat((bq, bk, bv))
+                else:
+                    qkv_b = None
             else:
                 qkv_weight = torch.cat([q_weight, k_weight, v_weight], dim=0)
                 qkv_bias = torch.cat([q_bias, k_bias, v_bias], dim=0)

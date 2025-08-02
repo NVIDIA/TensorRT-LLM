@@ -2,10 +2,11 @@ from itertools import chain
 
 from ordered_set import OrderedSet
 
+from tensorrt_llm.llmapi import NGramDecodingConfig
 from tensorrt_llm.logger import logger
 
 from ..pyexecutor.llm_request import *
-from ..pyexecutor.resource_manager import BaseResourceManager
+from ..pyexecutor.resource_manager import BaseResourceManager, ResourceManager
 from ..pyexecutor.scheduler import ScheduledRequests
 from .drafter import Drafter
 
@@ -59,10 +60,10 @@ class NGramPoolManager(BaseResourceManager):
         self.start_index = {}
 
     def get_max_resource_count(self) -> int:
-        raise self.max_num_requests
+        return self.max_num_requests
 
     def get_needed_resource_to_completion(self, request: LlmRequest) -> int:
-        raise 0
+        return 0
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         pass
@@ -163,17 +164,23 @@ class NGramDrafter(Drafter):
 
     def __init__(
         self,
-        spec_config: "NGramDecodingConfig",
+        spec_config: NGramDecodingConfig,
         ngram_pool_manager: NGramPoolManager = None,
     ):
         assert ngram_pool_manager is not None, "NGram needs a resource manager to maintain the pool."
-        super().__init__(spec_resource_manager=ngram_pool_manager)
+        self.spec_config = spec_config
         self.max_draft_len = spec_config.max_draft_len
+        self.spec_resource_manager = ngram_pool_manager
 
     def prepare_draft_tokens(
         self,
         scheduled_requests: ScheduledRequests,
+        resource_manager: Optional[ResourceManager] = None,
     ) -> None:
+        # Disable NGram speculative decoding auto heuristic for batch size > 32.
+        if self.spec_config.is_auto_heuristic and len(
+                scheduled_requests.all_requests()) > 32:
+            return
         # Sort by request_id when py_batch_idx is None as a fallback.
         # This happens in the disagg case: for a set of new requests, we draft
         # before forward_step, so py_batch_idx is not assigned.

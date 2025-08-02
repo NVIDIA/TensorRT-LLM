@@ -438,7 +438,7 @@ for build heuristics.
 ```
 
 ```shell
-trtllm-bench --model meta-llama/Llama-3.1-8B --model_path /Ckpt/Path/To/Llama-3.1-8B throughput --dataset /tmp/synthetic_128_128.txt --backend pytorch
+trtllm-bench --model meta-llama/Llama-3.1-8B --model_path /Ckpt/Path/To/Llama-3.1-8B throughput --dataset /tmp/synthetic_128_128.txt
 
 # Example output
 <snip verbose logging>
@@ -544,7 +544,6 @@ lora_config:
 trtllm-bench --model /path/to/base/model \
   throughput \
   --dataset synthetic_lora_data.json \
-  --backend pytorch \
   --extra_llm_api_options extra-llm-api-options.yaml
 ```
 
@@ -586,7 +585,6 @@ Run the benchmark:
 trtllm-bench --model Qwen/Qwen2-VL-2B-Instruct \
   throughput \
   --dataset mm_data.jsonl \
-  --backend pytorch \
   --num_requests 10 \
   --max_batch_size 4 \
   --modality image

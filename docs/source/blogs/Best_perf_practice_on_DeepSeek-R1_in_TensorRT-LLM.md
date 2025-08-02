@@ -137,8 +137,8 @@ To do the benchmark, run the following command:
 YOUR_DATA_PATH=<your dataset file following the format>
 
 cat >./extra-llm-api-config.yml<<EOF
-cuda_graph_config: {}
-moe_backend: TRTLLM
+moe_config:
+  backend: TRTLLM
 speculative_config:
     decoding_type: MTP
     num_nextn_predict_layers: 3
@@ -149,7 +149,6 @@ export TRTLLM_ENABLE_PDL=1
 trtllm-bench --model nvidia/DeepSeek-R1-FP4 \
     throughput \
     --dataset $YOUR_DATA_PATH \
-    --backend pytorch \
     --num_requests 10 \
     --concurrency 1 \
     --max_batch_size 1 \
@@ -161,7 +160,6 @@ trtllm-bench --model nvidia/DeepSeek-R1-FP4 \
 Explanation:
 - `trtllm-bench`: A CLI benchmarking utility that aims to make it easier for users to reproduce our officially published. See [TensorRT-LLM Benchmarking](https://nvidia.github.io/TensorRT-LLM/performance/perf-benchmarking.html) for details.
 - `--dataset`: Prompt dataset used to benchmark. Our official benchmark dataset has ISL = 1K, OSL = 2K
-- `--backend`: Inference backend. Here we use PyTorch backend.
 - `--num_requests`: Num requests used for the benchmark.
 - `--concurrency`: Total concurrency for the system.
 - `--max_batch_size`: Max batch size in each rank.
@@ -196,7 +194,7 @@ We are seeing meaningful speedup using FP8 KV cache, thus refreshing the numbers
 ```bash
 cat >./extra-llm-api-config.yml <<EOF
 cuda_graph_config:
-  padding_enabled: true
+  enable_padding: true
   batch_sizes:
   - 896
   - 512
@@ -216,7 +214,6 @@ EOF
 trtllm-bench  --model nvidia/DeepSeek-R1-0528-FP4
      throughput
      --dataset ${YOUR_DATA_PATH}
-     --backend pytorch
      --tp 8  --ep 8
      --extra_llm_api_options ./extra-llm-api-config.yml
      --max_batch_size 896
@@ -263,7 +260,7 @@ YOUR_DATA_PATH=./dataset.txt
 
 cat >./extra-llm-api-config.yml <<EOF
 cuda_graph_config:
-  padding_enabled: true
+  enable_padding: true
   batch_sizes:
   - 1
   - 2
@@ -285,7 +282,6 @@ trtllm-bench -m nvidia/DeepSeek-R1-FP4 \
     --ep 8 \
     --warmup 0 \
     --dataset ${YOUR_DATA_PATH} \
-    --backend pytorch \
     --max_batch_size 384 \
     --max_num_tokens 1536 \
     --num_requests 49152 \
@@ -317,7 +313,6 @@ To do the benchmark, run the following command:
 YOUR_DATA_PATH=<your dataset file following the format>
 
 cat >./extra-llm-api-config.yml<<EOF
-cuda_graph_config: {}
 speculative_config:
     decoding_type: MTP
     num_nextn_predict_layers: 3
@@ -326,7 +321,6 @@ EOF
 trtllm-bench --model deepseek-ai/DeepSeek-R1 \
     throughput \
     --dataset $YOUR_DATA_PATH \
-    --backend pytorch \
     --num_requests 10 \
     --max_batch_size 1 \
     --tp 8 \
@@ -381,7 +375,6 @@ trtllm-bench -m deepseek-ai/DeepSeek-R1 \
     --ep 8 \
     --warmup 0 \
     --dataset $YOUR_DATA_PATH \
-    --backend pytorch \
     --max_batch_size 128 \
     --max_num_tokens 1151 \
     --num_requests 5120 \

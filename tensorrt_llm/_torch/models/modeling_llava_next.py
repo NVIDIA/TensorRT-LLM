@@ -1,6 +1,6 @@
 import copy
 import os
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -195,16 +195,60 @@ class LlavaNextInputProcessor(InputProcessor):
         mm_features = mm_features.view(-1, mm_features.shape[-1])
         return fused_input_ids, mm_features
 
+    def attach_multimodal_embeddings(
+        self, inputs: TextPrompt,
+        multimodal_embedding: Dict[str, List[torch.Tensor]],
+        sampling_params: SamplingParams
+    ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
+        """
+        Attach pre-processed multimodal embeddings into text token stream for LlavaNext model.
+
+        This method skips vision processing and works with externally provided embeddings.
+        It replaces/expands image placeholders in the text with appropriate tokens and prepares
+        the embeddings for model forward pass.
+
+        Args:
+            inputs: Text prompt containing image placeholders
+            multimodal_embedding: Dictionary containing pre-processed image embedding data
+        Returns:
+            Tuple of (token_ids, extra_processed_inputs) where:
+            - token_ids: List of processed token IDs with image placeholders
+            - extra_processed_inputs: Optional dictionary containing multimodal embeddings
+        """
+        text_prompt = inputs.get("prompt")
+        if not text_prompt:
+            raise ValueError("Text prompt is required but not provided")
+
+        if not isinstance(multimodal_embedding, dict):
+            raise ValueError("multimodal_embedding must be a dictionary")
+
+        if 'image' not in multimodal_embedding:
+            raise ValueError(
+                "Only image modality is supported for external multimodal embedding"
+            )
+
+        input_ids = self.tokenizer(
+            text_prompt, return_tensors="pt").input_ids[0].to(self.device)
+        mm_features = torch.stack(multimodal_embedding['image'])
+        fused_input_ids, mm_features = self._postprocess(input_ids, mm_features)
+        multimodal_data = {}
+        multimodal_data["multimodal_embedding"] = mm_features
+        return fused_input_ids.to(torch.int32).tolist(), {
+            "multimodal_data": multimodal_data
+        }
+
     @torch.inference_mode()
     def __call__(
         self, inputs: TextPrompt, sampling_params: SamplingParams
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
         text_prompt, mm_data = inputs.get("prompt"), inputs.get(
             "multi_modal_data", {})
-        assert 'image' in mm_data
 
         input_ids = self.tokenizer(
             text_prompt, return_tensors="pt").input_ids[0].to(self.device)
+
+        if not mm_data:
+            return input_ids.to(torch.int32).tolist(), {}
 
         mm_tensor = self._preprocess(mm_data['image'])
         mm_features = torch.stack(
@@ -274,16 +318,15 @@ class LlavaNextModel(PreTrainedModel):
         logger.debug(f"{num_context_requests=}, {num_generation_requests=}")
 
         multimodal_params = kwargs.get("multimodal_params", [])
-        mm_embed = [
-            multimodal_param.multimodal_data["multimodal_embedding"]
-            for multimodal_param in multimodal_params
-        ]
-        assert mm_embed == [] or len(
-            mm_embed
-        ) == num_context_requests, "Number of multimodal features (if provided) should be equal to number of context requests"
+        mm_embeds = []
+        if len(multimodal_params) > 0:
+            mm_embeds = [
+                multimodal_param.multimodal_data["multimodal_embedding"]
+                for multimodal_param in multimodal_params
+            ]
 
         input_ids, inputs_embeds = fuse_input_embeds(
-            self.llm.model.embed_tokens, input_ids, mm_embed)
+            self.llm.model.embed_tokens, input_ids, mm_embeds)
         logits = self.llm.forward(attn_metadata, input_ids, position_ids,
                                   inputs_embeds, return_context_logits)
         return logits

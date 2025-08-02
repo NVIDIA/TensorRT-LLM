@@ -15,6 +15,7 @@ def prepare_dataset(root_dir: str, temp_dir: str, model_name: str):
     _DATASET_NAME = "synthetic_128_128.txt"
     dataset_path = Path(temp_dir, _DATASET_NAME)
     dataset_tool = Path(root_dir, "benchmarks", "cpp", "prepare_dataset.py")
+    script_dir = Path(root_dir, "benchmarks", "cpp")
 
     # Generate a small dataset to run a test.
     command = [
@@ -36,7 +37,7 @@ def prepare_dataset(root_dir: str, temp_dir: str, model_name: str):
         "10",
     ]
     print(f"Running command: {' '.join(command)}")
-    result = subprocess.run(command, capture_output=True, text=True)
+    result = subprocess.run(command, cwd=str(script_dir), capture_output=True, text=True)
     if result.returncode != 0:
         raise RuntimeError(f"Failed to prepare dataset: {result.stderr}")
     # Grab the stdout and write it to a dataset file for passing to suite.
@@ -59,7 +60,8 @@ def run_benchmark(model_name: str, dataset_path: str, temp_dir: str):
         "--extra_llm_api_options",
         f"{temp_dir}/model_kwargs.yaml",
     ]
-    runner.invoke(main, args, catch_exceptions=False)
+    result = runner.invoke(main, args, catch_exceptions=False)
+    assert result.exit_code == 0
 
 
 def test_trtllm_bench(llm_root):  # noqa: F811

@@ -32,6 +32,7 @@
    ```bash
    pip3 install --upgrade pip setuptools && pip3 install tensorrt_llm
    ```
+   **This project will download and install additional third-party open source software projects. Review the license terms of these open source projects before use.**
 
 2. Sanity check the installation by running the following in Python (tested on Python 3.12):
 

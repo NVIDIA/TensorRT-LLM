@@ -36,6 +36,12 @@ from defs.conftest import (get_device_count, get_device_memory,
 # yapf: enable
 from defs.trt_test_alternative import check_call, exists
 
+# skip trt flow cases on post-Blackwell-Ultra
+# if get_sm_version() >= 103:
+#     pytest.skip(
+#         "TRT workflow tests are not supported on post Blackwell-Ultra architecture",
+#         allow_module_level=True)
+
 INPUT_TEXT_1 = "After Washington had returned to Williamsburg, " + \
                "Dinwiddie ordered him to lead a larger force to assist Trent in his work. " + \
                "While en route, Washington learned of Trent's retreat. " + \
@@ -688,6 +694,7 @@ def test_llm_llama_v2_1gpu_sparsity(llama_example_root, llama_model_root,
     ])
 
 
+@skip_post_blackwell
 @pytest.mark.parametrize("num_beams", [1],
                          ids=lambda num_beams: f'nb:{num_beams}')
 @pytest.mark.parametrize("data_type", ['bfloat16', 'float16'])
@@ -886,6 +893,7 @@ def test_llm_llama_v2_gather_logits_2gpu_pp2(llama_example_root,
                         summary_cmd)
 
 
+@skip_post_blackwell
 @pytest.mark.parametrize("llama_model_root", ['llama-v2-7b-hf'], indirect=True)
 def test_llm_llama_v2_1gpu_auto_parallel(llama_example_root, llama_model_root,
                                          llm_venv, cmodel_dir, engine_dir):
@@ -911,6 +919,7 @@ def test_llm_llama_v2_1gpu_auto_parallel(llama_example_root, llama_model_root,
     check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
 
 
+@skip_post_blackwell
 @pytest.mark.skip_less_device(2)
 @pytest.mark.parametrize("num_beams", [1, 4],
                          ids=lambda num_beams: f'nb:{num_beams}')
@@ -1622,6 +1631,7 @@ def test_llm_llama_v2_1gpu_fp8_gemv(llama_example_root, llama_model_root,
     venv_check_call(llm_venv, summary_cmd)
 
 
+@skip_post_blackwell
 @pytest.mark.skip_less_device_memory(50000)
 @pytest.mark.parametrize("data_type", ['bfloat16', 'float16'])
 @pytest.mark.parametrize("gemm_swiglu_plugin", ["fp8"])
@@ -1697,7 +1707,12 @@ def test_llm_llama_v2_1gpu_gemm_swiglu(llama_example_root, llama_model_root,
 
 
 @pytest.mark.parametrize(
-    "data_type", ['float16', 'fp8', 'sq_ootb', 'awq', 'int8_wo'],
+    "data_type", [
+        'float16', 'fp8',
+        pytest.param('sq_ootb', marks=skip_post_blackwell),
+        pytest.param('awq', marks=skip_post_blackwell),
+        pytest.param('int8_wo', marks=skip_post_blackwell)
+    ],
     ids=['base_fp16', 'base_fp8', 'base_sq_ootb', 'base_awq', 'base_int8_wo'])
 @pytest.mark.parametrize("lora_data_type", ['float16'], ids=['lora_fp16'])
 @pytest.mark.parametrize("llama_model_root", ['llama-v2-13b-hf'], indirect=True)
@@ -2280,6 +2295,7 @@ def test_llm_llama_code_llama_multi_gpus_summary(llama_example_root,
         summary_cmd)
 
 
+@skip_post_blackwell
 @pytest.mark.skip_less_device_memory(30000)
 @pytest.mark.parametrize("num_beams", [1, 4],
                          ids=lambda num_beams: f'nb:{num_beams}')
@@ -2336,6 +2352,7 @@ def test_llm_llama_smooth_quant_1gpu_summary(llama_example_root,
     venv_check_call(llm_venv, summary_cmd)
 
 
+@skip_post_blackwell
 @pytest.mark.skip_less_device_memory(30000)
 @pytest.mark.parametrize("num_beams", [1, 4],
                          ids=lambda num_beams: f'nb:{num_beams}')
@@ -2385,6 +2402,7 @@ def test_llm_llama_int8_kv_1gpu_summary(llama_example_root, llama_model_root,
     venv_check_call(llm_venv, summary_cmd)
 
 
+@skip_post_blackwell
 @pytest.mark.skip_less_device_memory(30000)
 @pytest.mark.parametrize("num_beams", [1, 4],
                          ids=lambda num_beams: f'nb:{num_beams}')
@@ -2429,6 +2447,7 @@ def test_llm_llama_int8_sq_ootb_1gpu_summary(
     venv_check_call(llm_venv, summary_cmd)
 
 
+@skip_post_blackwell
 @pytest.mark.skip_less_device(2)
 @pytest.mark.parametrize("num_beams", [1],
                          ids=lambda num_beams: f'nb:{num_beams}')
@@ -2488,6 +2507,7 @@ def test_llm_llama_v2_int8sq_2gpu_tp2(data_type, llama_example_root,
                         summary_cmd)
 
 
+@skip_post_blackwell
 @pytest.mark.skip_less_device_memory(30000)
 @pytest.mark.parametrize("num_beams", [1, 4],
                          ids=lambda num_beams: f'nb:{num_beams}')
@@ -2543,6 +2563,7 @@ def test_llm_llama_wo_1gpu_summary(llama_example_root, llama_model_root,
     venv_check_call(llm_venv, summary_cmd)
 
 
+@skip_post_blackwell
 @pytest.mark.skip_less_device_memory(30000)
 @pytest.mark.parametrize("num_beams", [1, 4],
                          ids=lambda num_beams: f'nb:{num_beams}')
@@ -2872,7 +2893,9 @@ def test_llm_llama_v2_lora_benchmark_2gpu(llama_example_root, llama_model_root,
 @pytest.mark.skip_less_device(4)
 @pytest.mark.parametrize("num_beams", [1, 4],
                          ids=lambda num_beams: f'nb:{num_beams}')
-@pytest.mark.parametrize("qformat", ["fp8", "int4_awq"])
+@pytest.mark.parametrize(
+    "qformat",
+    ["fp8", pytest.param("int4_awq", marks=skip_post_blackwell)])
 @pytest.mark.parametrize(
     "tp_pp_size", [(4, 1), (2, 2)],
     ids=lambda tp_pp_size: f'tp{tp_pp_size[0]}pp{tp_pp_size[1]}')
@@ -3268,8 +3291,11 @@ def test_llm_llama_1gpu_streaming_llm(llama_example_root, deepseek_model_root,
     assert "上海人工智能实验室" in output, output
 
 
-@pytest.mark.parametrize(
-    "fp8_quant", ['disable_fp8', 'enable_fp8', 'enable_fp8_meta_recipe'])
+@pytest.mark.parametrize("fp8_quant", [
+    'disable_fp8',
+    pytest.param('enable_fp8', marks=skip_post_blackwell),
+    pytest.param('enable_fp8_meta_recipe', marks=skip_post_blackwell)
+])
 @pytest.mark.parametrize("llama_model_root", ['llama-3.1-8b', 'llama-3.2-1b'],
                          indirect=True)
 def test_llm_llama_v3_1_1node_single_gpu(llama_example_root, llama_model_root,
@@ -3368,6 +3394,7 @@ def test_llm_llama_v3_2_smoothquant_1node_single_gpu(
     venv_check_call(llm_venv, summary_cmd)
 
 
+@pytest.mark.timeout(7200)
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.skip_less_device(4)
 @pytest.mark.parametrize("fp8_quant",
@@ -3580,6 +3607,7 @@ def test_llm_llama_v3_1_2nodes_8gpus(test_type, llama_example_root,
         check_call(" ".join(mmlu_cmd), shell=True, env=llm_venv._new_env)
 
 
+@skip_post_blackwell
 @pytest.mark.skip_less_device_memory(50000)
 @pytest.mark.parametrize("low_latency_gemm_plugin", ["fp8"])
 @pytest.mark.parametrize("llama_model_root", ['llama-v2-7b-hf'], indirect=True)
@@ -3812,6 +3840,7 @@ def test_llm_llama_v2_fp8_2gpu_cp2(data_type, llama_example_root,
 
 
 @skip_pre_ada
+@skip_post_blackwell
 @pytest.mark.parametrize("llama_model_root", ['llama-3.1-8b', 'llama-3.2-1b'],
                          indirect=True)
 def test_llm_llama_lookahead_xqa_fp8_1gpu(llama_example_root, llama_model_root,
@@ -4013,6 +4042,7 @@ def test_mistral_nemo_fp8_with_bf16_lora(
     )
 
 
+@skip_post_blackwell
 @pytest.mark.parametrize("llama_model_root", ['llama-3.1-8b'], indirect=True)
 def test_llm_llama_lookahead_single_gpu_summary(llama_example_root,
                                                 llama_model_root, llm_venv,
@@ -4057,3 +4087,46 @@ def test_llm_llama_lookahead_single_gpu_summary(llama_example_root,
                                        lookahead_config='[7, 7, 7]')
 
     venv_check_call(llm_venv, summary_cmd)
+
+
+@pytest.mark.parametrize("model_name,model_path", [
+    ("Llama-3.1-8B-Instruct", "llama-3.1-model/Llama-3.1-8B-Instruct"),
+])
+def test_llm_api_lookahead_decoding_1gpu(model_name, model_path):
+    """
+    RCCA: https://nvbugs/5359218
+    """
+    from defs.conftest import llm_models_root
+
+    from tensorrt_llm._tensorrt_engine import LLM
+    from tensorrt_llm.llmapi import (BuildConfig, KvCacheConfig,
+                                     LookaheadDecodingConfig, SamplingParams)
+    build_config = BuildConfig(max_batch_size=128,
+                               max_input_len=2048,
+                               max_seq_len=32768,
+                               max_num_tokens=8192,
+                               max_draft_len=111)
+    build_config.plugin_config.use_paged_context_fmha = True
+    build_config.plugin_config.multiple_profiles = True
+
+    lookahead_config = LookaheadDecodingConfig(max_window_size=8,
+                                               max_ngram_size=3,
+                                               max_verification_set_size=3)
+
+    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
+    llm = LLM(model=f"{llm_models_root()}/{model_path}",
+              kv_cache_config=kv_cache_config,
+              build_config=build_config,
+              speculative_config=lookahead_config,
+              enable_chunked_prefill=True)
+
+    prompt = """Write a C++ program to find the nth Fibonacci number using
+recursion. Now we define a sequence of numbers in which each number is the
+sum of the three preceding ones. The first three numbers are 0, -1, -1.
+Write a program to find the nth number.""" * 200  # around 13k tokens
+
+    sampling_params = SamplingParams(lookahead_config=lookahead_config)
+
+    output = llm.generate(prompt, sampling_params=sampling_params)
+
+    assert output is not None, "No output generated from LLM"

@@ -186,8 +186,8 @@ texec::kv_cache::CommState MockDataSender::mState;
 class MockDataReceiver : public DataReceiver
 {
 public:
-    MOCK_METHOD(void, sendRequestInfo, (LlmRequest const&), (override));
-    MOCK_METHOD(void, receiveSync, (LlmRequest const&), (override));
+    MOCK_METHOD(TransferSession, sendRequestInfo, (LlmRequest const&), (override));
+    MOCK_METHOD(void, receiveSync, (TransferSession&), (override));
 };
 
 class MockTransceiverTest : public ::testing::Test // NOLINT(cppcoreguidelines-pro-type-member-init)
@@ -237,12 +237,14 @@ TEST_F(MockTransceiverTest, MpiRequesterBasic)
         GTEST_SKIP() << "mpirun with procs<=2 is required to run this test.";
     }
     auto receiver = std::make_unique<MockDataReceiver>();
-    EXPECT_CALL(*receiver, sendRequestInfo).WillOnce(Return());
+    auto state = std::make_unique<texec::DataTransceiverState>();
+    state->setCommState(texec::kv_cache::CommState{std::vector<int>{0}});
+    EXPECT_CALL(*receiver, sendRequestInfo)
+        .WillOnce(Return(TransferSession({nullptr}, DataContext{0}, *state, *state,
+            tensorrt_llm::runtime::BufferManager{std::make_shared<tr::CudaStream>()}, nullptr)));
     EXPECT_CALL(*receiver, receiveSync).WillOnce(Return());
     DataRequester requester{std::move(receiver)};
     auto request = makeLlmRequest(0);
-    auto state = std::make_unique<texec::DataTransceiverState>();
-    state->setCommState(texec::kv_cache::CommState{std::vector<int>{0}});
     auto stats = texec::ContextPhaseParams({}, 0, state.release(), std::nullopt);
     request->setContextPhaseParams(std::move(stats));
     auto future = requester.requestAndReceiveAsync(*request);

@@ -838,28 +838,37 @@ if __name__ == "__main__":
         with open(FLAGS.output_tokens_csv) as csv_file:
             csv_reader = csv.reader(csv_file, delimiter=",")
             for row in csv_reader:
-                expected_output_ids = [int(val) for val in row]
+                expected_output_ids = [[int(val) for val in row]]
                 break
     else:
-        expected_output_ids = ([] if FLAGS.exclude_input_in_output else
-                               input_ids[0]) + [
-                                   21221,
-                                   290,
-                                   373,
-                                   257,
-                                   2888,
-                                   286,
-                                   262,
-                                   4141,
-                                   2351,
-                                   10006,
-                                   13,
-                                   679,
-                                   373,
-                                   7018,
-                                   284,
-                                   262,
-                               ]
+        # expected_output_ids holds a list of lists, each list is a version of "expected" output ids
+        # The expected output could vary on different GPUs
+        expected_output_ids = []
+        expected_output_ids.append(
+            ([] if FLAGS.exclude_input_in_output else input_ids[0]) + [
+                21221,
+                290,
+                373,
+                257,
+                2888,
+                286,
+                262,
+                4141,
+                2351,
+                10006,
+                13,
+                679,
+                373,
+                7018,
+                284,
+                262,
+            ])
+        # Adding a second expected output ids for testing on A100 GPUs
+        expected_output_ids.append(
+            ([] if FLAGS.exclude_input_in_output else input_ids[0]) + [
+                21221, 290, 257, 4255, 379, 262, 1957, 7072, 11, 4689, 347,
+                2852, 2564, 494, 13, 679
+            ])
 
     if FLAGS.num_return_sequences is None:
         num_generations = FLAGS.beam_width
@@ -1186,16 +1195,19 @@ if __name__ == "__main__":
             if FLAGS.check_output and seq_idx == 0:
                 passed = False
                 if FLAGS.correctness_threshold == 1.0:
-                    passed = (output_ids_w_prompt == expected_output_ids)
+                    passed = (output_ids_w_prompt in expected_output_ids)
                 else:
                     # Compare the output tokens one by one
-                    num_same_output_id = 0
-                    expected_len = len(expected_output_ids)
-                    for i in range(min(len(output_ids_w_prompt), expected_len)):
-                        if output_ids_w_prompt[i] == expected_output_ids[i]:
-                            num_same_output_id += 1
+                    num_same_output_id = [0] * len(expected_output_ids)
+                    for i, expect_output in enumerate(expected_output_ids):
+                        for output, expected in zip(output_ids_w_prompt,
+                                                    expect_output):
+                            if output == expected:
+                                num_same_output_id[i] += 1
+
                     # Calculate the match rate
-                    match_rate = num_same_output_id / expected_len
+                    match_rate = max(num_same_output_id) / len(
+                        output_ids_w_prompt)
                     print(f"Output token matching rate: {match_rate}")
                     passed = (match_rate > FLAGS.correctness_threshold)
                     print("expected_output_ids = ", expected_output_ids)
@@ -1208,10 +1220,10 @@ if __name__ == "__main__":
             if FLAGS.check_output and non_deterministic_sampling and seq_idx > 0:
                 # Skip the correctness check under non-deterministic sampling.
                 # Generated sequences should not be identical.
-                passed = output_ids_w_prompt[seq_idx] != expected_output_ids
+                passed = output_ids_w_prompt[seq_idx] not in expected_output_ids
                 if not passed:
                     print(f"Output tokens of sequence {seq_idx} is identical "
-                          f"to the first sequence.")
+                          f"to the expected sequence.")
 
         if FLAGS.return_log_probs:
             print('cum_log_probs:', expand_and_vstack(cum_log_probs))

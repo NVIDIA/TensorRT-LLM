@@ -155,6 +155,32 @@ def test_invalid_model_factory():
 
 
 @pytest.mark.parametrize(
+    "parallel_field,invalid_value",
+    [
+        ("tensor_parallel_size", 2),
+        ("pipeline_parallel_size", 2),
+        ("context_parallel_size", 2),
+        ("moe_cluster_parallel_size", 2),
+        ("moe_tensor_parallel_size", 2),
+        ("moe_expert_parallel_size", 2),
+        ("enable_attention_dp", True),
+        ("cp_config", {"some_key": "some_value"}),
+    ],
+)
+def test_parallel_config_validation(parallel_field, invalid_value):
+    """Test that parallel config fields raise ValueError when set to non-default values."""
+    kwargs = {
+        "model": "test-model",
+        parallel_field: invalid_value,
+    }
+
+    with pytest.raises(
+        ValueError, match="AutoDeploy only supports parallelization via the `world_size` argument."
+    ):
+        LlmArgs(**kwargs)
+
+
+@pytest.mark.parametrize(
     "attn_backend,expected_attn_page_size",
     [
         ("flashinfer", 64),  # Default attn_page_size

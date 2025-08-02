@@ -46,7 +46,7 @@ def test_CachedModelLoader():
     engine_dir, _ = model_loader()
     assert engine_dir
     assert engine_dir.exists() and engine_dir.is_dir()
-    model_format = ModelLoader.get_model_format(engine_dir)
+    model_format = get_model_format(engine_dir, trust_remote_code=True)
     assert model_format is _ModelFormatKind.TLLM_ENGINE
 
 

@@ -180,6 +180,22 @@ _str_to_binding_dtype_dict = dict(
     fp8=DataType.FP8,
 )
 
+_binding_dtype_size = {
+    DataType.INT64: 8,
+    DataType.FLOAT: 4,
+    DataType.INT32: 4,
+    DataType.BF16: 2,
+    DataType.HALF: 2,
+    DataType.BOOL: 1,
+    DataType.FP8: 1,
+    DataType.INT8: 1,
+    DataType.UINT8: 1,
+}
+
+
+def binding_dtype_size(dtype: DataType):
+    return _binding_dtype_size[dtype]
+
 
 def str_dtype_to_binding(dtype):
     ret = _str_to_binding_dtype_dict.get(dtype)
@@ -454,6 +470,10 @@ def mpi_comm():
 local_comm = mpi_comm().Split_type(split_type=OMPI_COMM_TYPE_HOST)
 
 
+def local_mpi_comm():
+    return local_comm
+
+
 def mpi_rank():
     return mpi_comm().Get_rank() if ENABLE_MULTI_DEVICE else 0
 
@@ -492,8 +512,13 @@ def mpi_barrier():
         mpi_comm().Barrier()
 
 
+def local_mpi_barrier():
+    if ENABLE_MULTI_DEVICE:
+        local_comm.Barrier()
+
+
 def mpi_broadcast(obj, root=0):
-    return mpi_comm().bcast(obj, root) if ENABLE_MULTI_DEVICE else obj
+    return mpi_comm().bcast(obj, root) if is_multi_device_enable() else obj
 
 
 def mpi_allgather(obj):
@@ -991,6 +1016,7 @@ class KVCacheEventSerializer:
         return {
             "event_id": event.event_id,
             "data": event_serialize_func(event.data),
+            "window_size": event.window_size
         }
 
     @staticmethod
@@ -1063,3 +1089,14 @@ class KVCacheEventSerializer:
             "token_id": data.token_id,
             "token_extra_id": data.token_extra_id
         }
+
+
+def is_multi_device_enable():
+    """
+    This method evaluates if we are running on multiple GPUs and the flag ENABLE_MULTI_DEVICE is set.
+    So we can avoid broadcast calls on single GPU.
+    Issue: https://github.com/NVIDIA/TensorRT-LLM/issues/5927
+    ENABLE_MULTI_DEVICE is true by default when building tensorrt-llm so we need to also check
+    the number of devices
+    """
+    return local_mpi_size() > 1

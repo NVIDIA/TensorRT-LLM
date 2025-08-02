@@ -12,17 +12,18 @@ from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm.executor import GenerationExecutorProxy
 from tensorrt_llm.llmapi import BuildConfig, KvCacheConfig, SamplingParams
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
+from tensorrt_llm.lora_manager import LoraConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models import PretrainedConfig
 from tensorrt_llm.models.llama.model import LLaMAForCausalLM
 
 # isort: off
+from .lora_test_utils import check_llama_7b_multi_lora_from_request_test_harness
 from .test_llm import (
     DummyError, DummyExecutorWorker3, _test_llm_capture_request_error,
     _test_llm_generate_async, check_llm_return_context_logits,
     check_llm_return_generation_logits, llm_return_logprobs_test_harness,
-    default_model_name, get_model_path,
-    llama_7b_multi_lora_from_request_test_harness, llama_model_path,
+    default_model_name, get_model_path, llama_model_path,
     llama_v2_7b_prompt_adapter_test_harness,
     llama_v2_13b_lora_from_dir_test_harness, llm_check_output,
     llm_get_stats_async_test_harness, llm_get_stats_test_harness,
@@ -261,10 +262,18 @@ def test_llama_v2_13b_lora_tp2():
 @pytest.mark.gpu2
 @pytest.mark.part3
 def test_llama_7b_multi_lora_tp2():
-    llama_7b_multi_lora_from_request_test_harness(
-        tensor_parallel_size=2,
-        max_loras=1,
-        max_cpu_loras=8,
+    # For LoRA checkpoints without finetuned embedding and lm_head, we can either:
+    # (1) specify lora_target_modules, or
+    # (2) provide a lora_dir to infer the lora_target_modules.
+    lora_config = LoraConfig(lora_target_modules=['attn_q', 'attn_k', 'attn_v'],
+                             max_lora_rank=8,
+                             max_loras=1,
+                             max_cpu_loras=8)
+    check_llama_7b_multi_lora_from_request_test_harness(
+        LLM,
+        enable_lora=True,
+        build_config=BuildConfig(lora_config=lora_config),
+        fast_build=True,
         kv_cache_config=global_kv_cache_config)
 
 
@@ -454,7 +463,7 @@ def test_llm_get_stats_async_tp2(pytorch_backend):
 
 
 def test_llm_capture_request_error():
-    _test_llm_capture_request_error(pytorch_backend=False, tp_size=2)
+    _test_llm_capture_request_error(tp_size=2)
 
 
 def test_llm_with_postprocess_parallel_tp2():

@@ -242,23 +242,14 @@ class BMMDynamicModel(nn.Module):
         self.hidden_dim = hidden_dim
         self.batch_size = batch_size
         # Create a linear layer to generate dynamic weights
-        self.weight_generator = nn.Linear(hidden_dim, hidden_dim * hidden_dim)
+        self.weight = nn.Parameter(torch.randn(batch_size, hidden_dim * hidden_dim))
 
     def forward(self, x):
         # x shape: [batch_size, seq_len, hidden_dim]
         batch_size, seq_len, hidden_dim = x.shape
 
         # Generate dynamic weights from input
-        # Take mean across sequence dimension to get [batch_size, hidden_dim]
-        weight_input = x.mean(dim=1)  # [batch_size, hidden_dim]
-
-        # Generate weights: [batch_size, hidden_dim * hidden_dim]
-        weight_flat = self.weight_generator(weight_input)
-
-        # Reshape to BMM weight format: [batch_size, hidden_dim, hidden_dim]
-        dynamic_weights = weight_flat.view(batch_size, hidden_dim, hidden_dim)
-
-        # Perform BMM with dynamic weights
+        dynamic_weights = self.weight.view(batch_size, hidden_dim, hidden_dim)
         return torch.bmm(x, dynamic_weights)
 
 
@@ -435,6 +426,15 @@ _SMALL_MODEL_CONFIGS = {
             "num_key_value_heads": 2,
             "num_experts_per_token": 2,
             "q_lora_rank": 128,
+        },
+    },
+    "Qwen/Qwen2.5-3B-Instruct": {
+        "model": _hf_model_dir_or_hub_id(
+            f"{llm_models_root()}/Qwen/Qwen2.5-3B-Instruct",
+            "Qwen/Qwen2.5-3B-Instruct",
+        ),
+        "model_kwargs": {
+            "num_hidden_layers": 2,
         },
     },
 }

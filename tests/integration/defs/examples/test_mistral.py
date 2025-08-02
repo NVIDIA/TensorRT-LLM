@@ -20,8 +20,14 @@ import psutil
 import pytest
 from defs.common import (convert_weights, quantize_data,
                          test_multi_lora_support, venv_check_call)
-from defs.conftest import skip_post_blackwell, skip_pre_ada
+from defs.conftest import get_sm_version, skip_post_blackwell, skip_pre_ada
 from defs.trt_test_alternative import check_call
+
+# skip trt flow cases on post-Blackwell-Ultra
+if get_sm_version() >= 103:
+    pytest.skip(
+        "TRT workflow tests are not supported on post Blackwell-Ultra architecture",
+        allow_module_level=True)
 
 
 def get_optimal_jobs():

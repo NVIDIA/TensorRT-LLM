@@ -520,7 +520,7 @@ __global__ void __launch_bounds__(1024) allreduce_fusion_kernel_oneshot_lamport(
 }
 
 template <AllReduceFusionPattern Pattern, typename DType, int NRanks, bool Fp32Acc>
-__global__ void allreduce_fusion_kernel_twoshot_sync(
+__global__ void __launch_bounds__(1024) allreduce_fusion_kernel_twoshot_sync(
     AllReduceFusionParams params, std::array<int, NRanks> begin_tokens, std::array<int, NRanks> token_num_per_ranks)
 {
     IndexHelper<DType> index_helper(params);

@@ -1557,21 +1557,20 @@ cat >./extra-llm-api-config.yml <<EOF
 stream_interval: 2
 cuda_graph_config:
   max_batch_size: 1024
-  padding_enabled: true
+  enable_padding: true
 EOF
 ```
 Explanation:
 - `stream_interval`: The iteration interval to create responses under the streaming mode.
 - `cuda_graph_config`: CUDA Graph config.
   - `max_batch_size`: Max CUDA graph batch size to capture.
-  - `padding_enabled`: Whether to enable CUDA graph padding.
+  - `enable_padding`: Whether to enable CUDA graph padding.
 
 
 ### Launch trtllm-serve OpenAI-compatible API server
 TensorRT-LLM supports nvidia TensorRT Model Optimizer quantized FP8 checkpoint
 ``` bash
 trtllm-serve nvidia/Llama-3.3-70B-Instruct-FP8 \
-    --backend pytorch \
     --tp_size 8 \
     --max_batch_size 1024 \
     --trust_remote_code \

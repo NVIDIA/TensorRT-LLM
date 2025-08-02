@@ -3,13 +3,14 @@
 - [About Speculative Sampling](#about-speculative-sampling)
 - [Performance Improvements](#Performance-improvements)
 - [Draft-Target-Model](#Draft-Target-Model)
-- [Prompt-Lookup-Decoding](#prompt-lookup-decoding)
+- [NGram](#ngram)
 - [Medusa](#medusa)
   - [Medusa Tree](#medusa-tree)
   - [Using Medusa with TensorRT-LLM](#using-medusa-with-tensorrt-llm)
     - [Limitations](#limitations)
 - [ReDrafter](#redrafter)
 - [EAGLE](#eagle)
+    - [Disaggregated Serving](#disaggregated-serving)
 - [Lookahead decoding](#lookahead-decoding)
 
 ## About Speculative Sampling
@@ -35,7 +36,7 @@ TensorRT-LLM supports several approaches for generating draft tokens, including:
     1. [Medusa: Simple LLM Inference Acceleration Framework with Multiple Decoding Heads paper](https://arxiv.org/abs/2401.10774).
     2. [Recurrent Drafter for Fast Speculative Decoding in Large Language Models](https://arxiv.org/html/2403.09919v1).
     3. [EAGLE: Speculative Sampling Requires Rethinking Feature Uncertainty](https://arxiv.org/pdf/2401.15077).
-3. Utilizing prompt tokens as draft tokens. For more information, refer to [Prompt Lookup Decoding](https://github.com/apoorvumang/prompt-lookup-decoding/).
+3. Utilizing prompt tokens as draft tokens. For more information, refer to [NGram](https://github.com/apoorvumang/prompt-lookup-decoding/).
 4. Utilizing Jacobi-like decoding to predict and verify draft tokens using the same model which does not need additional fine-tuning. Refer to [Break the Sequential Dependency of LLM Inference Using Lookahead Decoding](https://arxiv.org/pdf/2402.02057).
 
 
@@ -61,13 +62,13 @@ Subsequently, the prompt, now updated with the accepted tokens, is sent back to 
 This iterative process continues until a predefined stop conditions are met.
 An example of this orchestration process can be found in the [TensorRT-LLM Triton backend](https://github.com/triton-inference-server/tensorrtllm_backend/blob/main/inflight_batcher_llm/client/e2e_grpc_speculative_decoding_client.py).
 
-We provide two styles of running Draft-Target-Model now: using TensorRT-LLM-BLS in Triton Inference Server, or using TensorRT-LLM directly. Detailed steps of running can be found in [examples/draft_target_model/README.md](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/draft_target_model/README.md) and the code can be found in [examples/prompt_lookup/run_dtm_pld.py](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/prompt_lookup/run_dtm_pld.py).
+We provide two styles of running Draft-Target-Model now: using TensorRT-LLM-BLS in Triton Inference Server, or using TensorRT-LLM directly. Detailed steps of running can be found in [examples/draft_target_model/README.md](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/draft_target_model/README.md) and the code can be found in [examples/ngram/run_dtm_ngram.py](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/ngram/run_dtm_ngram.py).
 
-## Prompt-Lookup-Decoding
+## NGram
 
-The Prompt-Lookup speculative decoding directly copies from the input prompt and previous generated output as draft tokens while generating the later output. It works like Draft-Target-Model but involves only one Target LLM model without further fine-tuning. The Prompt-Lookup profit from the scenarios which have high n-gram overlap between input prompt and output, such as summarization, document QA, multi-turn chat, code editing, etc.
+The NGram speculative decoding directly copies from the input prompt and previous generated output as draft tokens while generating the later output. It works like Draft-Target-Model but involves only one Target LLM model without further fine-tuning. The NGram profit from the scenarios which have high n-gram overlap between input prompt and output, such as summarization, document QA, multi-turn chat, code editing, etc.
 
-See document in [examples/prompt_lookup/README.md](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/prompt_lookup/README.md) and the code can be found in [examples/prompt_lookup/run_dtm_pld.py](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/prompt_lookup/run_dtm_pld.py).
+See document in [examples/ngram/README.md](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/ngram/README.md) and the code can be found in [examples/ngram/run_dtm_ngram.py](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/ngram/run_dtm_ngram.py).
 
 ## Medusa
 
@@ -168,6 +169,10 @@ TensorRT-LLM implements the ReDrafter model such that logits prediction, beam se
 The EAGLE approach enhances the single-model Medusa method by predicting and verifying tokens using the same model. Similarly to ReDrafter, it predicts draft tokens using a recurrent predictor where each draft token depends on the previous one. However, unlike ReDrafter, it uses a single-layer transformer model to predict draft tokens from previous hidden states and decoded tokens. In the EAGLE-1 decoding tree needs to be known during the decoding. In the EAGLE-2 this tree is asssembled during the execution by searching for the most probable hypothesis along the beam.
 
 Similarly to ReDrafter, TensorRT-LLM implements the EAGLE model such that logits prediction, draft tokens acceptance and draft token generation are performed inside of the TensorRT engine. EAGLE-1 and EAGLE-2 are both supported, while EAGLE-2 is currently in the experimental stage. Please, visit the [EAGLE README](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/eagle/README.md) for information about building and running the model.
+
+### Disaggregated Serving
+
+[Disaggregated Serving](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/advanced/disaggregated-service.md) with EAGLE3 using the two model approach is supported in the Pytorch backend. Please refer to the following [Dynamo example](https://github.com/ai-dynamo/dynamo/blob/main/examples/tensorrt_llm/llama4_plus_eagle.md) on how to run EAGLE3 with Disaggregated Serving for Llama 4 Maverick.
 
 ## Lookahead Decoding
 
