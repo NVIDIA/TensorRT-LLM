@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import math
-from typing import Optional, Sequence, Union
+from typing import List, Optional, Sequence, Union
 
 import numpy as np
 import torch
@@ -21,10 +21,12 @@ import torch
 from .._utils import set_obj_attrs, str_dtype_to_torch, trt_dtype_to_np
 from ..functional import (ACT2FN, Tensor, arange, concat, constant, cos, div,
                           embedding, exp, expand, identity, meshgrid2d, outer,
-                          pad, shape, sin, slice, unsqueeze, where)
+                          pad, repeat_interleave, select, shape, sin, slice,
+                          unsqueeze, where)
 from ..mapping import Mapping
 from ..module import Module
 from ..parameter import Parameter
+from .activation import get_activation
 from .linear import ColumnLinear, Linear, RowLinear
 
 
@@ -670,4 +672,377 @@ class CombinedTimestepLabelEmbeddings(Module):
             timesteps_proj.cast(dtype=hidden_dtype))  # (N, D)
         class_labels = self.class_embedder(class_labels)  # (N, D)
         conditioning = timesteps_emb + class_labels  # (N, D)
+        return conditioning
+
+
+def get_1d_rotary_pos_embed(
+    dim: int,
+    pos: Union[np.ndarray, int],
+    theta: float = 10000.0,
+    use_real=False,
+    linear_factor=1.0,
+    ntk_factor=1.0,
+    repeat_interleave_real=True,
+    freqs_dtype="float32",
+):
+    """
+    Adapted from: https://github.com/huggingface/diffusers/blob/66eef9a6dc8a97815a69fdf97aa20c8ece63d3f6/src/diffusers/models/embeddings.py#L577
+
+    Precompute the frequency tensor for complex exponentials (cis) with given dimensions.
+
+    This function calculates a frequency tensor with complex exponentials using the given dimension 'dim' and the end
+    index 'end'. The 'theta' parameter scales the frequencies. The returned tensor contains complex values in complex64
+    data type.
+
+    Args:
+        dim (`int`): Dimension of the frequency tensor.
+        pos (`np.ndarray` or `int`): Position indices for the frequency tensor. [S] or scalar
+        theta (`float`, *optional*, defaults to 10000.0):
+            Scaling factor for frequency computation. Defaults to 10000.0.
+        use_real (`bool`, *optional*):
+            If True, return real part and imaginary part separately. Otherwise, return complex numbers.
+        linear_factor (`float`, *optional*, defaults to 1.0):
+            Scaling factor for the context extrapolation. Defaults to 1.0.
+        ntk_factor (`float`, *optional*, defaults to 1.0):
+            Scaling factor for the NTK-Aware RoPE. Defaults to 1.0.
+        repeat_interleave_real (`bool`, *optional*, defaults to `True`):
+            If `True` and `use_real`, real part and imaginary part are each interleaved with themselves to reach `dim`.
+            Otherwise, they are concateanted with themselves.
+        freqs_dtype (`float32` or `float64`, *optional*, defaults to `float32`):
+            the dtype of the frequency tensor.
+    Returns:
+        `Tensor`: Precomputed frequency tensor with complex exponentials. [S, D/2]
+    """
+    assert dim % 2 == 0
+
+    if isinstance(pos, int):
+        pos = arange(0, pos, dtype='float32')
+    if isinstance(pos, np.ndarray):
+        pos = constant(pos)
+
+    theta = theta * ntk_factor
+    freqs = (
+        1.0 /
+        (theta**(np.arange(0, dim, 2, dtype=freqs_dtype)[:(dim // 2)] / dim)) /
+        linear_factor)  # [D/2]
+    freqs = constant(freqs)
+    freqs = unsqueeze(pos, 1) * unsqueeze(freqs, 0)  # [S, D/2]
+    if use_real and repeat_interleave_real:
+        # flux, hunyuan-dit, cogvideox
+        freqs_cos = repeat_interleave(cos(freqs), repeats=2,
+                                      dim=1).cast('float32')  # [S, D]
+        freqs_sin = repeat_interleave(sin(freqs), repeats=2,
+                                      dim=1).cast('float32')  # [S, D]
+        return freqs_cos, freqs_sin
+    elif use_real:
+        # stable audio
+        freqs_cos = concat([cos(freqs), cos(freqs)],
+                           dim=-1).cast('float32')  # [S, D]
+        freqs_sin = concat([sin(freqs), sin(freqs)],
+                           dim=-1).cast('float32')  # [S, D]
+        return freqs_cos, freqs_sin
+    else:
+        raise NotImplementedError()
+
+
+class FluxPosEmbed(Module):
+    """
+    Adapted from: https://github.com/huggingface/diffusers/blob/66eef9a6dc8a97815a69fdf97aa20c8ece63d3f6/src/diffusers/models/embeddings.py#L692
+    """
+
+    def __init__(self, theta: int, axes_dim: List[int]):
+        super().__init__()
+        self.theta = theta
+        self.axes_dim = axes_dim
+
+    def forward(self, ids: Tensor) -> Tensor:
+        n_axes = ids.shape[-1]
+        cos_out = []
+        sin_out = []
+        pos = ids.cast("float32")
+        # TODO: TRT don't support float64, so we use float32 here, this might lead to accuracy issue
+        freqs_dtype = "float32"  # "float64"
+        for i in range(n_axes):
+            cos, sin = get_1d_rotary_pos_embed(self.axes_dim[i],
+                                               select(pos, dim=-1, index=i),
+                                               repeat_interleave_real=True,
+                                               use_real=True,
+                                               freqs_dtype=freqs_dtype)
+            cos_out.append(cos)
+            sin_out.append(sin)
+        freqs_cos = concat(cos_out, dim=-1)
+        freqs_sin = concat(sin_out, dim=-1)
+        return freqs_cos, freqs_sin
+
+
+def get_timestep_embedding(
+    timesteps: Tensor,
+    embedding_dim: int,
+    flip_sin_to_cos: bool = False,
+    downscale_freq_shift: float = 1,
+    scale: float = 1,
+    max_period: int = 10000,
+) -> Tensor:
+    """
+    Adapted from: https://github.com/huggingface/diffusers/blob/66eef9a6dc8a97815a69fdf97aa20c8ece63d3f6/src/diffusers/models/embeddings.py#L27
+
+    This matches the implementation in Denoising Diffusion Probabilistic Models: Create sinusoidal timestep embeddings.
+
+    Args
+        timesteps (Tensor):
+            a 1-D Tensor of N indices, one per batch element. These may be fractional.
+        embedding_dim (int):
+            the dimension of the output.
+        flip_sin_to_cos (bool):
+            Whether the embedding order should be `cos, sin` (if True) or `sin, cos` (if False)
+        downscale_freq_shift (float):
+            Controls the delta between frequencies between dimensions
+        scale (float):
+            Scaling factor applied to the embeddings.
+        max_period (int):
+            Controls the maximum frequency of the embeddings
+    Returns
+        Tensor: an [N x dim] Tensor of positional embeddings.
+    """
+    assert len(timesteps.shape) == 1, "Timesteps should be a 1d-array"
+
+    half_dim = embedding_dim // 2
+    exponent = -math.log(max_period) * np.arange(
+        start=0, stop=half_dim, dtype=np.float32)
+    exponent = exponent / (half_dim - downscale_freq_shift)
+    exponent = constant(exponent)
+
+    emb = exp(exponent)
+    emb = unsqueeze(timesteps, -1).cast('float32') * unsqueeze(emb, 0)
+
+    # scale embeddings
+    emb = scale * emb
+
+    # flip sine and cosine embeddings
+    if flip_sin_to_cos:
+        emb = concat([cos(emb), sin(emb)], dim=-1)
+    else:
+        emb = concat([sin(emb), cos(emb)], dim=-1)
+
+    # zero pad
+    if embedding_dim % 2 == 1:
+        raise NotImplementedError()
+    return emb
+
+
+class TimestepEmbedding(Module):
+    """
+    Adapted from: https://github.com/huggingface/diffusers/blob/66eef9a6dc8a97815a69fdf97aa20c8ece63d3f6/src/diffusers/models/embeddings.py#L717
+    """
+
+    def __init__(self,
+                 in_channels: int,
+                 time_embed_dim: int,
+                 act_fn: str = "silu",
+                 out_dim: int = None,
+                 post_act_fn: Optional[str] = None,
+                 cond_proj_dim=None,
+                 sample_proj_bias=True,
+                 mapping=None,
+                 dtype=None):
+        super().__init__()
+        tp_group = mapping.tp_group
+        tp_size = mapping.tp_size
+        self.linear_1 = ColumnLinear(in_channels,
+                                     time_embed_dim,
+                                     sample_proj_bias,
+                                     tp_group=tp_group,
+                                     tp_size=tp_size,
+                                     dtype=dtype,
+                                     gather_output=False)
+
+        if cond_proj_dim is not None:
+            self.cond_proj = Linear(cond_proj_dim,
+                                    in_channels,
+                                    bias=False,
+                                    dtype=dtype)
+        else:
+            self.cond_proj = None
+
+        self.act = get_activation(act_fn)
+
+        if out_dim is not None:
+            time_embed_dim_out = out_dim
+        else:
+            time_embed_dim_out = time_embed_dim
+        self.linear_2 = RowLinear(time_embed_dim,
+                                  time_embed_dim_out,
+                                  sample_proj_bias,
+                                  tp_group=tp_group,
+                                  tp_size=tp_size,
+                                  dtype=dtype)
+
+        if post_act_fn is None:
+            self.post_act = None
+        else:
+            self.post_act = get_activation(post_act_fn)
+
+    def forward(self, sample, condition=None):
+        if condition is not None:
+            sample = sample + self.cond_proj(condition)
+        sample = self.linear_1(sample)
+
+        if self.act is not None:
+            sample = self.act(sample)
+
+        sample = self.linear_2(sample)
+
+        if self.post_act is not None:
+            sample = self.post_act(sample)
+        return sample
+
+
+class Timesteps(Module):
+    """
+    Adapted from: https://github.com/huggingface/diffusers/blob/66eef9a6dc8a97815a69fdf97aa20c8ece63d3f6/src/diffusers/models/embeddings.py#L765
+    """
+
+    def __init__(self,
+                 num_channels: int,
+                 flip_sin_to_cos: bool,
+                 downscale_freq_shift: float,
+                 scale: int = 1):
+        super().__init__()
+        self.num_channels = num_channels
+        self.flip_sin_to_cos = flip_sin_to_cos
+        self.downscale_freq_shift = downscale_freq_shift
+        self.scale = scale
+
+    def forward(self, timesteps) -> Tensor:
+        t_emb = get_timestep_embedding(
+            timesteps,
+            self.num_channels,
+            flip_sin_to_cos=self.flip_sin_to_cos,
+            downscale_freq_shift=self.downscale_freq_shift,
+            scale=self.scale,
+        )
+        return t_emb
+
+
+class PixArtAlphaTextProjection(Module):
+    """
+    Adapted from: https://github.com/huggingface/diffusers/blob/66eef9a6dc8a97815a69fdf97aa20c8ece63d3f6/src/diffusers/models/embeddings.py#L1497
+
+    Projects caption embeddings. Also handles dropout for classifier-free guidance.
+    """
+
+    def __init__(self,
+                 in_features,
+                 hidden_size,
+                 out_features=None,
+                 act_fn="gelu_tanh",
+                 mapping=None,
+                 dtype=None):
+        super().__init__()
+        if out_features is None:
+            out_features = hidden_size
+        tp_group = mapping.tp_group
+        tp_size = mapping.tp_size
+        self.linear_1 = ColumnLinear(in_features=in_features,
+                                     out_features=hidden_size,
+                                     bias=True,
+                                     tp_group=tp_group,
+                                     tp_size=tp_size,
+                                     dtype=dtype,
+                                     gather_output=False)
+        self.act_1 = get_activation(act_fn)
+        self.linear_2 = RowLinear(in_features=hidden_size,
+                                  out_features=out_features,
+                                  bias=True,
+                                  tp_group=tp_group,
+                                  tp_size=tp_size,
+                                  dtype=dtype)
+
+    def forward(self, caption):
+        hidden_states = self.linear_1(caption)
+        hidden_states = self.act_1(hidden_states)
+        hidden_states = self.linear_2(hidden_states)
+        return hidden_states
+
+
+class CombinedTimestepGuidanceTextProjEmbeddings(Module):
+    """
+    Adapted from: https://github.com/huggingface/diffusers/blob/66eef9a6dc8a97815a69fdf97aa20c8ece63d3f6/src/diffusers/models/embeddings.py#L1059
+    """
+
+    def __init__(self,
+                 embedding_dim,
+                 pooled_projection_dim,
+                 mapping=None,
+                 dtype=None):
+        super().__init__()
+
+        self.time_proj = Timesteps(num_channels=256,
+                                   flip_sin_to_cos=True,
+                                   downscale_freq_shift=0)
+        self.timestep_embedder = TimestepEmbedding(in_channels=256,
+                                                   time_embed_dim=embedding_dim,
+                                                   mapping=mapping,
+                                                   dtype=dtype)
+        self.guidance_embedder = TimestepEmbedding(in_channels=256,
+                                                   time_embed_dim=embedding_dim,
+                                                   mapping=mapping,
+                                                   dtype=dtype)
+        self.text_embedder = PixArtAlphaTextProjection(pooled_projection_dim,
+                                                       embedding_dim,
+                                                       act_fn="silu",
+                                                       mapping=mapping,
+                                                       dtype=dtype)
+
+    def forward(self, timestep, guidance, pooled_projection):
+        timesteps_proj = self.time_proj(timestep)
+        timesteps_emb = self.timestep_embedder(
+            timesteps_proj.cast(pooled_projection.dtype))  # (N, D)
+
+        guidance_proj = self.time_proj(guidance)
+        guidance_emb = self.guidance_embedder(
+            guidance_proj.cast(pooled_projection.dtype))  # (N, D)
+
+        time_guidance_emb = timesteps_emb + guidance_emb
+
+        pooled_projections = self.text_embedder(pooled_projection)
+        conditioning = time_guidance_emb + pooled_projections
+
+        return conditioning
+
+
+class CombinedTimestepTextProjEmbeddings(Module):
+    """
+    Adapted from: https://github.com/huggingface/diffusers/blob/66eef9a6dc8a97815a69fdf97aa20c8ece63d3f6/src/diffusers/models/embeddings.py#L1040
+    """
+
+    def __init__(self,
+                 embedding_dim,
+                 pooled_projection_dim,
+                 mapping=None,
+                 dtype=None):
+        super().__init__()
+
+        self.time_proj = Timesteps(num_channels=256,
+                                   flip_sin_to_cos=True,
+                                   downscale_freq_shift=0)
+        self.timestep_embedder = TimestepEmbedding(in_channels=256,
+                                                   time_embed_dim=embedding_dim,
+                                                   mapping=mapping,
+                                                   dtype=dtype)
+        self.text_embedder = PixArtAlphaTextProjection(pooled_projection_dim,
+                                                       embedding_dim,
+                                                       act_fn="silu",
+                                                       mapping=mapping,
+                                                       dtype=dtype)
+
+    def forward(self, timestep: Tensor, pooled_projection: Tensor):
+        timesteps_proj = self.time_proj(timestep)
+        timesteps_emb = self.timestep_embedder(
+            timesteps_proj.cast(dtype=pooled_projection.dtype))  # (N, D)
+
+        pooled_projections = self.text_embedder(pooled_projection)
+
+        conditioning = timesteps_emb + pooled_projections
+
         return conditioning
