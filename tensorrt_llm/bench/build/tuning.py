@@ -53,15 +53,22 @@ def calc_engine_setting(
     byte_per_elem = BYTES_PER_ELEM.get(quant_config.quant_algo, 2)
     byte_per_kv_elem = BYTES_PER_ELEM.get(quant_config.kv_cache_quant_algo, 2)
 
+    # disable optimistic tuning for NemotronHybridConfig
+    disable_optimistic_tuning = isinstance(model_config, NemotronHybridConfig)
+
     # Each GPU in TP group has at least 1 kv head
     adjusted_num_kv_heads = max(tp_size, model_config.num_key_value_heads)
 
-    logger.info(
-        f"Number of attention layers: {model_config.num_attention_layers}")
-
-    gb_per_token = 2 * model_config.num_attention_layers * adjusted_num_kv_heads \
-        * model_config.head_size * byte_per_kv_elem / (1024 ** 3)
-
+    if disable_optimistic_tuning:
+        logger.info(
+            f"Detected NemotronHybridConfig. Disabling optimistic tuning.")
+        logger.info(
+            f"Number of attention layers: {model_config.num_attention_layers}")
+        gb_per_token = 2 * model_config.num_attention_layers * adjusted_num_kv_heads \
+            * model_config.head_size * byte_per_kv_elem / (1024 ** 3)
+    else:
+        gb_per_token = 2 * model_config.num_hidden_layers * adjusted_num_kv_heads \
+            * model_config.head_size * byte_per_kv_elem / (1024 ** 3)
     # Number of GPU used for this run.
     n_gpus = tp_size * pp_size
     # Total engine size.
@@ -99,8 +106,7 @@ def calc_engine_setting(
         target_input_len,
         target_output_len,
         pp_size,
-        disable_optimistic_tuning=isinstance(model_config,
-                                             NemotronHybridConfig))
+        disable_optimistic_tuning=disable_optimistic_tuning)
 
     # Functional and performance
     if total_gpu_memory < engine_size:
