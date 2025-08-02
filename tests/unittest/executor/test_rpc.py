@@ -2,7 +2,8 @@ import time
 
 import pytest
 
-from tensorrt_llm.executor.rpc import RPCClient, RPCError, RPCServer
+from tensorrt_llm.executor.rpc import (RPCCancelled, RPCClient, RPCError,
+                                       RPCServer)
 
 
 def test_rpc_server_basics():
@@ -21,7 +22,7 @@ def test_rpc_server_basics():
 
     time.sleep(1)
     print("shutdown")
-    server.shutdown()
+    server._shutdown()
 
 
 def test_rpc_client_context_manager():
@@ -52,6 +53,155 @@ def test_rpc_hello_without_arg():
         client = RPCClient("ipc:///tmp/rpc_test")
         ret = client.hello()  # sync call
         assert ret == "world"
+
+
+class TestRpcError:
+
+    class CustomError(Exception):
+        pass
+
+    def test_task_error(self):
+        """Test that server-side exceptions are properly wrapped in RPCError with details."""
+
+        class App:
+
+            def hello(self):
+                raise ValueError("Test error message")
+
+            def divide_by_zero(self):
+                return 1 / 0
+
+            def custom_exception(self):
+                raise TestRpcError.CustomError("Custom error occurred")
+
+        with RPCServer(App()) as server:
+            server.bind("ipc:///tmp/rpc_test_error")
+            server.start()
+            time.sleep(0.1)
+            client = RPCClient("ipc:///tmp/rpc_test_error")
+
+            # Test ValueError handling
+            with pytest.raises(RPCError) as exc_info:
+                client.hello()
+
+            error = exc_info.value
+            assert "Test error message" in str(error)
+            assert error.cause is not None
+            assert isinstance(error.cause, ValueError)
+            assert error.traceback is not None
+            assert "ValueError: Test error message" in error.traceback
+
+            # Test ZeroDivisionError handling
+            with pytest.raises(RPCError) as exc_info:
+                client.divide_by_zero()
+
+            error = exc_info.value
+            assert "division by zero" in str(error)
+            assert error.cause is not None
+            assert isinstance(error.cause, ZeroDivisionError)
+            assert error.traceback is not None
+
+            # Test custom exception handling
+            with pytest.raises(RPCError) as exc_info:
+                client.custom_exception()
+
+            error = exc_info.value
+            assert "Custom error occurred" in str(error)
+            assert error.cause is not None
+            assert error.traceback is not None
+
+    def test_shutdown_cancelled_error(self):
+        """Test that pending requests are cancelled with RPCCancelled when server shuts down."""
+
+        class App:
+
+            def task(self):
+                time.sleep(10)
+                return True
+
+        addr = "ipc:///tmp/rpc_test_cancelled"
+
+        server = RPCServer(
+            App(),
+            # only one worker to make it easier to pend requests
+            num_workers=1)
+        server.bind(addr)
+        server.start()
+        time.sleep(0.1)
+
+        client = RPCClient(addr)
+        client.shutdown_server()
+        pending_futures = [client.task(__rpc_mode="future") for _ in range(10)]
+
+        for future in pending_futures:
+            with pytest.raises(RPCCancelled):
+                future.result()
+
+    def test_timeout_error(self):
+        """Test that requests that exceed timeout are handled with proper error."""
+
+        class App:
+
+            def slow_method(self):
+                # Sleep longer than the timeout
+                time.sleep(2.0)
+                return "completed"
+
+        with RPCServer(App()) as server:
+            server.bind("ipc:///tmp/rpc_test_timeout")
+            server.start()
+            time.sleep(0.1)
+
+            # Create client with short timeout
+            client = RPCClient("ipc:///tmp/rpc_test_timeout", timeout=0.5)
+
+            with pytest.raises(RPCError) as exc_info:
+                client.slow_method(__rpc_timeout=0.5)
+
+            error = exc_info.value
+            # Should be either a timeout error or RPC error indicating timeout
+            assert "timed out" in str(error).lower() or "timeout" in str(
+                error).lower()
+
+    def test_method_not_found_error(self):
+        """Test that calling non-existent methods returns proper error."""
+
+        class App:
+
+            def existing_method(self):
+                return "exists"
+
+        with RPCServer(App()) as server:
+            server.bind("ipc:///tmp/rpc_test_not_found")
+            server.start()
+            time.sleep(0.1)
+
+            client = RPCClient("ipc:///tmp/rpc_test_not_found")
+
+            with pytest.raises(RPCError) as exc_info:
+                client.non_existent_method()
+
+            error = exc_info.value
+            assert "not found" in str(error)
+            assert error.traceback is not None
+
+
+def test_rpc_shutdown_server():
+
+    class App:
+
+        def hello(self):
+            return "world"
+
+    with RPCServer(App()) as server:
+        server.bind("ipc:///tmp/rpc_test_shutdown")
+        server.start()
+        time.sleep(0.1)
+        client = RPCClient("ipc:///tmp/rpc_test_shutdown")
+        ret = client.hello()
+        assert ret == "world"
+
+        client.shutdown_server()
 
 
 def test_rpc_hello_with_arg():
@@ -246,3 +396,8 @@ def test_rpc_timeout(use_async: bool):
             result = client.slow_operation(0.1, __rpc_timeout=1.0)
 
         assert result == "completed"
+
+
+if __name__ == "__main__":
+    TestRpcError().test_shutdown_cancelled_error()
+    #test_rpc_shutdown_server()

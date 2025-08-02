@@ -14,11 +14,32 @@ from .ipc import ZeroMqQueue
 
 # --- Custom Exceptions ---
 class RPCError(Exception):
-    """Custom exception for RPC-related errors raised on the client side."""
+    """Custom exception for RPC-related errors raised on the client side.
+
+    Args:
+        message: The error message.
+        cause: The original exception that caused this error.
+        traceback: The traceback of the exception.
+    """
+
+    def __init__(self,
+                 message: str,
+                 cause: Optional[Exception] = None,
+                 traceback: Optional[str] = None):
+        super().__init__(message)
+        self.cause = cause
+        self.traceback = traceback
 
 
 class RPCTimeout(RPCError):
-    """Custom exception for when a client request times out."""
+    """Exception for when a request processing times out."""
+
+
+class RPCCancelled(RPCError):
+    """Exception for when a client request is cancelled.
+    This happens when the server is shutting down and all the pending
+    requests will be cancelled and return with this error.
+    """
 
 
 class RPCRequest(NamedTuple):
@@ -32,8 +53,8 @@ class RPCRequest(NamedTuple):
 
 class RPCResponse(NamedTuple):
     request_id: str
-    status: str
     result: Any
+    error: Optional[RPCError] = None
 
 
 class RPCServer:
@@ -77,6 +98,8 @@ class RPCServer:
 
         self._queue = None
 
+        self._builtin_ops = {"__rpc_shutdown": self.shutdown}
+
         # Automatically register the instance
         self.register_instance(instance)
 
@@ -112,9 +135,15 @@ class RPCServer:
         logger.debug(
             "RPC Server shutdown signal received. Terminating server...")
 
+        if self._stop_event.is_set():
+            return
+        self._stop_event.set()
+
         if self._dispatcher_thread and self._dispatcher_thread.is_alive():
-            self._stop_event.set()
-            self._dispatcher_thread.join()
+            try:
+                self._dispatcher_thread.join()
+            except Exception:
+                pass
             self._dispatcher_thread = None
 
         if self._executor:
@@ -123,8 +152,27 @@ class RPCServer:
         if self._client_socket:
             self._client_socket.close()
 
-        self._client_socket = None
-        self._queue = None
+    async def _refuse_pending_requests(self):
+        """Refuse pending requests."""
+        logger.debug(f"Refusing pending {self._queue.qsize()} requests")
+        assert self._stop_event.is_set(), "Server is not shutting down"
+        if self._queue:
+            cancellation_tasks = []
+            while not self._queue.empty():
+                req = await self._queue.get()
+                logger.debug(f"Refusing pending request: {req}")
+                if req.need_response:
+                    task = self._client_socket.put_async(
+                        RPCResponse(
+                            req.request_id, None,
+                            RPCCancelled(
+                                'Server is shutting down, request cancelled')))
+                    cancellation_tasks.append(task)
+
+            # Wait for all cancellation responses to be sent
+            if cancellation_tasks:
+                await asyncio.gather(*cancellation_tasks,
+                                     return_exceptions=True)
 
     def register_function(self, func, name=None):
         """Exposes a single function to clients."""
@@ -155,10 +203,17 @@ class RPCServer:
                     timeout=0.5)
                 logger.debug(f"RPC dispatcher got request: {req}")
             except asyncio.TimeoutError:
-                logger.debug("RPC dispatcher get request timeout")
+                await asyncio.sleep(0)
+                continue
+
+            if req.method_name in self._builtin_ops:
+                self._builtin_ops[req.method_name](*req.args, **req.kwargs)
+                await asyncio.sleep(0)
                 continue
 
             await self._queue.put(req)  # type: ignore
+
+        await self._refuse_pending_requests()
 
     async def _worker_routine(self, stop_event: threading.Event):
         """The routine executed by each worker thread."""
@@ -171,52 +226,62 @@ class RPCServer:
                     self._queue.get(),  # type: ignore
                     timeout=self._timeout)
             except asyncio.TimeoutError:
-                logger.debug("RPC worker get request timeout")
+                await asyncio.sleep(0)
                 continue
 
-            if req.method_name in self._functions:
-                try:
-                    if self._executor is not None:
-                        # Dispatch to worker thread and await result with timeout
-                        loop = asyncio.get_running_loop()
-
-                        # Create a wrapper function to handle keyword arguments
-                        def call_with_kwargs():
-                            return self._functions[req.method_name](
-                                *req.args, **req.kwargs)
-
-                        result = await asyncio.wait_for(loop.run_in_executor(
-                            self._executor, call_with_kwargs),
-                                                        timeout=req.timeout)
-                    else:
-                        # For synchronous execution, we need to run in executor to support timeout
-                        loop = asyncio.get_running_loop()
-
-                        # Create a wrapper function to handle keyword arguments
-                        def call_with_kwargs():
-                            return self._functions[req.method_name](
-                                *req.args, **req.kwargs)
-
-                        result = await asyncio.wait_for(loop.run_in_executor(
-                            None, call_with_kwargs),
-                                                        timeout=req.timeout)
-                    response = RPCResponse(req.request_id, 'OK', result)
-                except asyncio.TimeoutError:
-                    response = RPCResponse(
-                        req.request_id, 'ERROR',
-                        f"Method '{req.method_name}' timed out after {req.timeout} seconds"
-                    )
-                except Exception:
-                    tb = traceback.format_exc()
-                    response = RPCResponse(req.request_id, 'ERROR', tb)
-            else:
-                response = RPCResponse(
-                    req.request_id, 'ERROR',
-                    f"Method '{req.method_name}' not found.")
+            response = await self._process_request(req)
 
             # Some tasks don't need response, e.g. submit_request or shutdown
             if req.need_response:
                 await self._client_socket.put_async(response)
+
+    async def _process_request(self, req: RPCRequest) -> RPCResponse:
+        if req.method_name not in self._functions:
+            return RPCResponse(
+                req.request_id, None,
+                RPCError(f"Method '{req.method_name}' not found in RPC server.",
+                         traceback=traceback.format_exc()))
+
+        try:
+            if self._executor is not None:
+                # Dispatch to worker thread and await result with timeout
+                loop = asyncio.get_running_loop()
+
+                # Create a wrapper function to handle keyword arguments
+                def call_with_kwargs():
+                    return self._functions[req.method_name](*req.args,
+                                                            **req.kwargs)
+
+                result = await asyncio.wait_for(loop.run_in_executor(
+                    self._executor, call_with_kwargs),
+                                                timeout=req.timeout)
+            else:
+                # For synchronous execution, we need to run in executor to support timeout
+                loop = asyncio.get_running_loop()
+
+                # Create a wrapper function to handle keyword arguments
+                def call_with_kwargs():
+                    return self._functions[req.method_name](*req.args,
+                                                            **req.kwargs)
+
+                result = await asyncio.wait_for(loop.run_in_executor(
+                    None, call_with_kwargs),
+                                                timeout=req.timeout)
+            response = RPCResponse(req.request_id, result)
+
+        except asyncio.TimeoutError:
+            response = RPCResponse(
+                req.request_id, None,
+                RPCTimeout(
+                    f"Method '{req.method_name}' timed out after {req.timeout} seconds",
+                    traceback=traceback.format_exc()))
+
+        except Exception as e:
+            response = RPCResponse(
+                req.request_id, None,
+                RPCError(str(e), cause=e, traceback=traceback.format_exc()))
+
+        return response
 
     def start(self):
         """Binds sockets, starts workers, and begins proxying messages."""
@@ -279,11 +344,23 @@ class RPCClient:
         self._reader_task = None
         self._executor = concurrent.futures.ThreadPoolExecutor(
             max_workers=num_workers, thread_name_prefix="rpc_client")
-        logger.info(f"RPC Client initialized. Connected to {self._address}")
+
+        self._server_stopped = False
+
+        logger.debug(f"RPC Client initialized. Connected to {self._address}")
 
     def __del__(self):
         """Cleanup executor when client is destroyed."""
         self.close()
+
+    def shutdown_server(self):
+        """Shutdown the server."""
+        if self._server_stopped:
+            return
+
+        self.call_sync("__rpc_shutdown", __rpc_need_response=False)
+
+        self._server_stopped = True
 
     def close(self):
         """Gracefully close the client, cleaning up background tasks."""
@@ -301,17 +378,11 @@ class RPCClient:
                 response: RPCResponse = await self._client_socket.get_async()
                 future = self._pending_futures.get(response.request_id)
                 if future and not future.done():
-                    if response.status == 'OK':
+                    if response.error is None:
                         future.set_result(response.result)
-                    elif response.status == 'ERROR':
-                        # TODO: Maybe keep the original Error type?
-                        future.set_exception(
-                            RPCError(
-                                f"Server-side exception:\n{response.result}"))
                     else:
-                        future.set_exception(
-                            RPCError(
-                                f"Unknown response status: {response.status}"))
+                        # Use the original RPCError from the response
+                        future.set_exception(response.error)
                 self._pending_futures.pop(response.request_id, None)
 
             except asyncio.CancelledError:
@@ -349,6 +420,9 @@ class RPCClient:
         logger.debug(
             f"RPC client calling method: {name} with args: {args} and kwargs: {kwargs}"
         )
+        if self._server_stopped:
+            raise RPCCancelled("Server is shutting down, request cancelled")
+
         await self._start_reader_if_needed()
         need_response = kwargs.pop("__rpc_need_response", True)
         timeout = kwargs.pop("__rpc_timeout", self._timeout)
@@ -375,9 +449,15 @@ class RPCClient:
             # If timeout, the remote call should return a timeout error timely,
             # so we add 1 second to the timeout to ensure the client can get
             # that result.
-            return await asyncio.wait_for(future, timeout + 1)
+            res = await asyncio.wait_for(future, timeout + 1)
+            return res
+        except RPCCancelled:
+            self._server_stopped = True
+            raise
         except asyncio.TimeoutError:
             raise RPCTimeout(f"Request '{name}' timed out after {timeout}s")
+        except Exception as e:
+            raise e
         finally:
             self._pending_futures.pop(request_id, None)
 
@@ -458,7 +538,18 @@ class RPCClient:
 
             def __call__(self, *args, **kwargs):
                 """Default synchronous call"""
-                return self.client._call_sync(self.method_name, *args, **kwargs)
+                mode = kwargs.pop("__rpc_mode", "sync")
+                if mode == "sync":
+                    return self.client._call_sync(self.method_name, *args,
+                                                  **kwargs)
+                elif mode == "async":
+                    return self.client._call_async(self.method_name, *args,
+                                                   **kwargs)
+                elif mode == "future":
+                    return self.client.call_future(self.method_name, *args,
+                                                   **kwargs)
+                else:
+                    raise ValueError(f"Invalid RPC mode: {mode}")
 
             def call_async(self, *args, **kwargs):
                 """Async call - returns coroutine"""
