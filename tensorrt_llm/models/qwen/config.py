@@ -204,7 +204,7 @@ class QWenConfig(PretrainedConfig):
             decoder_sparse_step=decoder_sparse_step,
             moe=moe_config,
             mapping=mapping,
-            quant_config=quant_config,
+            quantization=quant_config,
             num_labels=num_labels,
             tie_word_embeddings=tie_word_embeddings,
             **kwargs)
