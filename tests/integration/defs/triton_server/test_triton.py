@@ -511,9 +511,7 @@ def test_cpp_unit_tests(tritonserver_test_root, test_name, llm_root):
     triton_short_tag = subprocess.check_output(
         [f"{llm_root}/jenkins/scripts/get_triton_tag.sh", llm_root],
         text=True).strip()
-    print(
-        f"using triton tag from docker/Dockerfile.multi: {triton_short_tag}"
-    )
+    print(f"using triton tag from docker/Dockerfile.multi: {triton_short_tag}")
     run_shell_command(
         f"cd {llm_root}/triton_backend/inflight_batcher_llm/build && "
         f"cmake .. -DTRTLLM_DIR={llm_root} -DCMAKE_INSTALL_PREFIX=install/ "
