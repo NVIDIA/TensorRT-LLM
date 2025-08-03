@@ -2428,7 +2428,7 @@ class TestOpenAI(LlmapiAccuracyTestHarness):
 
     def get_openai_root(self):
         open_ai_root = os.getenv("OPENAI_MODELS_ROOT")
-        assert open_ai_root, "OPENAI_MODELS_ROOT needs to be set as parent of orangina-real-weight-pre-release_vv1 / orangina-120b-pre-final-weights_vv1. Make sure the config.json in the model folder is also updated."
+        assert open_ai_root, "OPENAI_MODELS_ROOT needs to be set as parent of checkpoints. Make sure the config.json in the model folder is also updated."
         return open_ai_root
 
     @pytest.mark.parametrize("moe_backend", ["CUTLASS", "TRTLLM", "TRITON"],
@@ -2444,14 +2444,13 @@ class TestOpenAI(LlmapiAccuracyTestHarness):
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None)
 
-        llm = LLM(
-            f"{self.get_openai_root()}/orangina-120b-pre-final-weights_vv1",
-            tensor_parallel_size=1,
-            pipeline_parallel_size=1,
-            moe_expert_parallel_size=1,
-            kv_cache_config=self.kv_cache_config,
-            **pytorch_config,
-            moe_config=MoeConfig(backend=moe_backend))
+        llm = LLM(f"{self.get_openai_root()}/gpt-oss-120b",
+                  tensor_parallel_size=1,
+                  pipeline_parallel_size=1,
+                  moe_expert_parallel_size=1,
+                  kv_cache_config=self.kv_cache_config,
+                  **pytorch_config,
+                  moe_config=MoeConfig(backend=moe_backend))
 
         with llm:
             model_name = "OpenAI/MXFP4"
@@ -2483,15 +2482,14 @@ class TestOpenAI(LlmapiAccuracyTestHarness):
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None)
 
-        llm = LLM(
-            f"{self.get_openai_root()}/orangina-120b-pre-final-weights_vv1",
-            tensor_parallel_size=tp_size,
-            pipeline_parallel_size=pp_size,
-            moe_expert_parallel_size=ep_size,
-            kv_cache_config=self.kv_cache_config,
-            **pytorch_config,
-            enable_attention_dp=attention_dp,
-            moe_config=MoeConfig(backend=moe_backend))
+        llm = LLM(f"{self.get_openai_root()}/gpt-oss-120b",
+                  tensor_parallel_size=tp_size,
+                  pipeline_parallel_size=pp_size,
+                  moe_expert_parallel_size=ep_size,
+                  kv_cache_config=self.kv_cache_config,
+                  **pytorch_config,
+                  enable_attention_dp=attention_dp,
+                  moe_config=MoeConfig(backend=moe_backend))
 
         with llm:
             model_name = "OpenAI/MXFP4"
@@ -2519,15 +2517,14 @@ class TestOpenAI(LlmapiAccuracyTestHarness):
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None)
 
-        llm = LLM(
-            f"{self.get_openai_root()}/orangina-real-weight-pre-release_vv1",
-            tensor_parallel_size=tp_size,
-            pipeline_parallel_size=pp_size,
-            moe_expert_parallel_size=ep_size,
-            kv_cache_config=self.kv_cache_config,
-            **pytorch_config,
-            enable_attention_dp=attention_dp,
-            moe_config=MoeConfig(backend=moe_backend))
+        llm = LLM(f"{self.get_openai_root()}/gpt-oss-120b",
+                  tensor_parallel_size=tp_size,
+                  pipeline_parallel_size=pp_size,
+                  moe_expert_parallel_size=ep_size,
+                  kv_cache_config=self.kv_cache_config,
+                  **pytorch_config,
+                  enable_attention_dp=attention_dp,
+                  moe_config=MoeConfig(backend=moe_backend))
         with llm:
             model_name = "OpenAI/BF16"
             task = MMLU(model_name)
@@ -2551,15 +2548,14 @@ class TestOpenAI(LlmapiAccuracyTestHarness):
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None)
 
-        llm = LLM(
-            f"{self.get_openai_root()}/orangina-real-weight-pre-release_vv1",
-            tensor_parallel_size=tp_size,
-            pipeline_parallel_size=pp_size,
-            moe_expert_parallel_size=ep_size,
-            kv_cache_config=self.kv_cache_config,
-            **pytorch_config,
-            enable_attention_dp=attention_dp,
-            moe_backend="TRITON")
+        llm = LLM(f"{self.get_openai_root()}/gpt-oss-120b",
+                  tensor_parallel_size=tp_size,
+                  pipeline_parallel_size=pp_size,
+                  moe_expert_parallel_size=ep_size,
+                  kv_cache_config=self.kv_cache_config,
+                  **pytorch_config,
+                  enable_attention_dp=attention_dp,
+                  moe_backend="TRITON")
         with llm:
             model_name = "OpenAI/BF16"
             task = MMLU(model_name)

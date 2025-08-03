@@ -1942,7 +1942,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
             runLLMDocBuild(pipeline, config=VANILLA_CONFIG)
         }],
     ]
-    //Clear docBuildConfigs for feat/orangina
+    //Clear docBuildConfigs
     docBuildConfigs = [:]
 
     fullSet += docBuildConfigs.keySet()
@@ -1968,7 +1968,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
             DLFW_IMAGE,
             false,
         ],
-        /* Clear unnecessary configs for feat/orangina
+        /* Clear unnecessary configs
         "PY310-UB2204": [
             LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE,
             "A10",
