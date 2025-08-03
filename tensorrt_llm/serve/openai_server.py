@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 import asyncio
+import os
 import signal
 import traceback
 from contextlib import asynccontextmanager
@@ -39,19 +40,21 @@ from tensorrt_llm.serve.postprocess_handlers import (
     ChatPostprocArgs, CompletionPostprocArgs, chat_response_post_processor,
     chat_stream_post_processor, completion_response_post_processor,
     completion_stream_post_processor)
+from tensorrt_llm.executor.request import LoRARequest
 from tensorrt_llm.version import __version__ as VERSION
 
 from .._utils import nvtx_mark
 
 # yapf: enale
 TIMEOUT_KEEP_ALIVE = 5  # seconds.
-
+LORA_DIR = os.getenv("LORA_DIR", "/workspace")
 
 class OpenAIServer:
 
     def __init__(self,
                  llm: LLM,
                  model: str,
+                 served_model_name: Optional[str],
                  server_role: Optional[ServerRole],
                  metadata_server_cfg: MetadataServerConfig):
         self.llm = llm
@@ -73,10 +76,20 @@ class OpenAIServer:
             self.model_config = None
 
         model_dir = Path(model)
-        if model_dir.exists() and model_dir.is_dir():
-            self.model = model_dir.name
+
+        if served_model_name is not None:
+            self.model = served_model_name
         else:
-            self.model = model
+            if model_dir.exists() and model_dir.is_dir():
+                self.model = model_dir.name
+            else:
+                self.model = model
+
+        self.lora_names = set([os.path.basename(d) for d in os.listdir(LORA_DIR) if os.path.isdir(os.path.join(LORA_DIR, d))])
+        if self.model in self.lora_names:
+            self.lora_names.remove(self.model)
+        
+        self.lora_mapper = {k: i for i, k in enumerate(self.lora_names)}
 
         @asynccontextmanager
         async def lifespan(app: FastAPI):
@@ -213,7 +226,21 @@ class OpenAIServer:
         return JSONResponse(content=events)
 
     async def openai_chat(self, request: ChatCompletionRequest, raw_request: Request) -> Response:
+        
+        request_for_lora = request.model != self.model and request.model in self.lora_names
 
+        if request_for_lora and request.lora_request is None:
+            lora_dir = os.path.join(LORA_DIR, request.model)
+            if not os.path.exists(lora_dir):
+                logger.error(f"LORA_DIR {LORA_DIR} does not exist")
+                return self.create_error_response("Model not found")
+            
+            request.lora_request = LoRARequest(
+                lora_name=request.model,
+                lora_int_id=self.lora_mapper[request.model],
+                lora_path=lora_dir
+            )
+        
         def get_role() -> str:
             if request.add_generation_prompt:
                 role = "assistant"
@@ -318,6 +345,24 @@ class OpenAIServer:
             return self.create_error_response(str(e))
 
     async def openai_completion(self, request: CompletionRequest, raw_request: Request) -> Response:
+
+        request_for_lora = request.model != self.model and request.model in self.lora_names
+
+        if request_for_lora and request.lora_request is None:
+            lora_dir = os.path.join(LORA_DIR, request.model)
+            if not os.path.exists(lora_dir):
+                logger.error(f"LORA_DIR {LORA_DIR} does not exist")
+                return self.create_error_response("Model not found")
+            
+            if request.model not in self.lora_mapper:
+                self.adapter_id_counter += 1
+                self.lora_mapper[request.model] = self.adapter_id_counter
+            
+            request.lora_request = LoRARequest(
+                lora_name=request.model,
+                lora_int_id=self.lora_mapper[request.model],
+                lora_path=lora_dir
+            )
 
         async def completion_response(promise: RequestOutput,
                                       postproc_params: Optional[PostprocParams]) -> CompletionResponse:

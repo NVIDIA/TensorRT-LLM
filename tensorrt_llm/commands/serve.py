@@ -84,6 +84,7 @@ def get_llm_args(model: str,
                  num_postprocess_workers: int = 0,
                  trust_remote_code: bool = False,
                  reasoning_parser: Optional[str] = None,
+                 served_model_name: Optional[str] = None,
                  **llm_args_extra_dict: Any):
 
     if gpus_per_node is None:
@@ -125,6 +126,7 @@ def get_llm_args(model: str,
         "num_postprocess_workers": num_postprocess_workers,
         "postprocess_tokenizer_dir": tokenizer or model,
         "reasoning_parser": reasoning_parser,
+        "served_model_name": served_model_name,
     }
 
     return llm_args, llm_args_extra_dict
@@ -139,6 +141,8 @@ def launch_server(host: str,
     backend = llm_args["backend"]
     model = llm_args["model"]
 
+    served_model_name = llm_args.pop("served_model_name", None)
+
     if backend == 'pytorch':
         llm = PyTorchLLM(**llm_args)
     else:
@@ -146,6 +150,7 @@ def launch_server(host: str,
 
     server = OpenAIServer(llm=llm,
                           model=model,
+                          served_model_name=served_model_name,
                           server_role=server_role,
                           metadata_server_cfg=metadata_server_cfg)
 
@@ -216,6 +221,10 @@ def launch_server(host: str,
               default=0.9,
               help="Free GPU memory fraction reserved for KV Cache, "
               "after allocating model weights and buffers.")
+@click.option("--served-model-name",
+              type=str,
+              default=None,
+              help="Name of the model to be served. If not provided, the model name will be used.")
 @click.option(
     "--num_postprocess_workers",
     type=int,
@@ -249,7 +258,7 @@ def launch_server(host: str,
     default=None,
     help="Server role. Specify this value only if running in disaggregated mode."
 )
-def serve(model: str, tokenizer: Optional[str], host: str, port: int,
+def serve(model: str, tokenizer: Optional[str], host: str, port: int, served_model_name: Optional[str],
           log_level: str, backend: str, max_beam_width: int,
           max_batch_size: int, max_num_tokens: int, max_seq_len: int,
           tp_size: int, pp_size: int, ep_size: Optional[int],
@@ -281,7 +290,8 @@ def serve(model: str, tokenizer: Optional[str], host: str, port: int,
         free_gpu_memory_fraction=kv_cache_free_gpu_memory_fraction,
         num_postprocess_workers=num_postprocess_workers,
         trust_remote_code=trust_remote_code,
-        reasoning_parser=reasoning_parser)
+        reasoning_parser=reasoning_parser,
+        served_model_name=served_model_name)
 
     llm_args_extra_dict = {}
     if extra_llm_api_options is not None:

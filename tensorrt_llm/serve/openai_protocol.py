@@ -265,14 +265,6 @@ class CompletionRequest(OpenAIBaseModel):
 
     @model_validator(mode="before")
     @classmethod
-    def validate_stream_options(cls, data):
-        if data.get("stream_options") and not data.get("stream"):
-            raise ValueError(
-                "Stream options can only be defined when stream is true.")
-        return data
-
-    @model_validator(mode="before")
-    @classmethod
     def check_suffix(cls, data):
         if data.get("suffix"):
             raise ValueError("suffix is not supported")
@@ -546,14 +538,6 @@ class ChatCompletionRequest(OpenAIBaseModel):
             _return_log_probs=self.logprobs,
         )
         return sampling_params
-
-    @model_validator(mode='before')
-    @classmethod
-    def validate_stream_options(cls, values):
-        if (values.get('stream_options') is not None
-                and not values.get('stream')):
-            raise ValueError("stream_options can only be set if stream is true")
-        return values
 
     @model_validator(mode="before")
     @classmethod
