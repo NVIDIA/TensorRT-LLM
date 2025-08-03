@@ -418,24 +418,34 @@ class SequenceInfo:
     def _update_position_ids(self, allow_realloc: bool = False) -> None:
         # set new position_ids from input_pos and seq_len
         # Make sure this is done on host to avoid host-device copies.
-        position_ids_list = [
-            num
-            for in_pos, seq_len in zip(self.input_pos_host, self.seq_len_host)
-            for num in range(in_pos, in_pos + seq_len)
-        ]
-        position_ids_host = torch.tensor(position_ids_list, dtype=torch.long, pin_memory=True)
-        if allow_realloc:
-            # Create a new position_ids tensor on the device
-            self.position_ids = position_ids_host.to(self.device).clone()
-        else:
-            self.position_ids_full = self.position_ids_full.flatten()
-            self.position_ids_full[: len(position_ids_list)].copy_(
-                position_ids_host, non_blocking=True
+        with nvtx_range("prepare_list"):
+            # Optimize for the common case where all seq_len values are 1 (generation mode)
+            if torch.all(self.seq_len_host == 1):
+                # Fast path: when all seq_len are 1, position_ids is just input_pos_host
+                position_ids_host = (
+                    self.input_pos_host[: self.num_tokens].to(dtype=torch.long).pin_memory()
+                )
+            else:
+                # General case - can probably be optimized too, but overall impact will be minor.
+                position_ids_list = []
+                for in_pos, seq_len in zip(self.input_pos_host, self.seq_len_host):
+                    position_ids_list.extend(range(in_pos, in_pos + seq_len))
+                position_ids_host = torch.tensor(
+                    position_ids_list, dtype=torch.long, pin_memory=True
+                )
+        with nvtx_range("copy_to_device"):
+            if allow_realloc:
+                # Create a new position_ids tensor on the device
+                self.position_ids = position_ids_host.to(self.device).clone()
+            else:
+                self.position_ids_full = self.position_ids_full.flatten()
+                self.position_ids_full[: self.num_tokens].copy_(
+                    position_ids_host, non_blocking=True
+                )
+        with nvtx_range("maybe_reshape"):
+            self.position_ids = self.maybe_reshape_for_generate(
+                self.position_ids if allow_realloc else self.position_ids_full[: self.num_tokens]
             )
-
-        self.position_ids = self.maybe_reshape_for_generate(
-            self.position_ids if allow_realloc else self.position_ids_full[: self.num_tokens]
-        )
 
     @nvtx_range("ad_update_sequence_lengths")
     def _update_sequence_lengths(self, sequence_lengths: List[int]) -> None:
