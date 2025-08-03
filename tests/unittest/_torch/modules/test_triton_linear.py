@@ -106,6 +106,12 @@ def test_linear_fp8qdq(linear_cls):
 def test_linear_mxfp4(activation_dtype):
     if not IS_TRITON_KERNELS_AVAILABLE:
         pytest.skip("Triton kernels are not available")
+    if torch.cuda.get_device_capability(
+    )[0] < 10 and activation_dtype == torch.float8_e4m3fn:
+        pytest.skip("Latest Triton requires BF16 activation on Hopper")
+    if torch.cuda.get_device_capability(
+    )[0] >= 10 and activation_dtype == torch.bfloat16:
+        pytest.skip("Latest Triton requires FP8 activation on Blackwell")
 
     dtype = torch.bfloat16
     num_tokens = 128

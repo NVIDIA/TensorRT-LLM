@@ -11,13 +11,11 @@ from tensorrt_llm.mapping import Mapping
 from ...models.modeling_utils import QuantConfig
 # Reuse the common Triton import setup
 from .fused_moe.fused_moe_triton import (IS_TRITON_KERNELS_AVAILABLE,
-                                         get_swizzle_type,
-                                         maybe_transpose_weight,
+                                         maybe_update_stride,
                                          swizzle_weight_and_scale)
 
 if IS_TRITON_KERNELS_AVAILABLE:
-    from triton_kernels.matmul_ogs import (FlexCtx, PrecisionConfig, matmul_ogs,
-                                           MicroscalingCtx)
+    from triton_kernels.matmul_ogs import (FlexCtx, PrecisionConfig, matmul_ogs)
     from triton_kernels.numerics import InFlexData
 
 from .linear import (Linear, LinearMethodBase, TensorParallelMode,
@@ -62,8 +60,7 @@ class TritonUnquantizedLinearMethod(LinearMethodBase):
 
     def load_weights_vanilla(self, module: Linear, weights: List[Dict]):
         load_weights_vanilla_helper(module, weights, **self.param_transform)
-        module.weight.data = maybe_transpose_weight(module.dtype,
-                                                    module.weight.data)
+        module.weight.data = maybe_update_stride(module.weight.data)
 
     def load_weights_fused_qkv_linear(self, module: Linear,
                                       weights: List[Dict]):
@@ -73,8 +70,7 @@ class TritonUnquantizedLinearMethod(LinearMethodBase):
             (q_weight, k_weight, v_weight), axis=-1
         )  #Each of them has shape (1, in_features, out_features_part)
         copy_weight(module.weight, fused_weight)
-        module.weight.data = maybe_transpose_weight(module.dtype,
-                                                    module.weight.data)
+        module.weight.data = maybe_update_stride(module.weight.data)
 
     def load_weights_fused_gate_up_linear(self, module: Linear,
                                           weights: List[Dict]):
@@ -84,8 +80,7 @@ class TritonUnquantizedLinearMethod(LinearMethodBase):
             (gate_weight, up_weight), axis=-1
         )  #Each of them has shape (1, in_features, out_features_part)
         copy_weight(module.weight, fused_weight)
-        module.weight.data = maybe_transpose_weight(module.dtype,
-                                                    module.weight.data)
+        module.weight.data = maybe_update_stride(module.weight.data)
 
 
 class TritonFP8QDQLinearMethod(LinearMethodBase):
@@ -168,8 +163,7 @@ class TritonFP8QDQLinearMethod(LinearMethodBase):
             # Dynamic quantization
             module.input_scale = None
         copy_weight(module.weight_scale, weight_scale[0])
-        module.weight.data = maybe_transpose_weight(torch.float8_e4m3fn,
-                                                    module.weight.data)
+        module.weight.data = maybe_update_stride(module.weight.data)
 
     def load_weights_fused_qkv_linear(self, module: Linear,
                                       weights: List[Dict]):
@@ -194,8 +188,7 @@ class TritonFP8QDQLinearMethod(LinearMethodBase):
             torch.float8_e4m3fn)
         copy_weight(module.weight,
                     self.param_transform["weight_transform"](fused_weight))
-        module.weight.data = maybe_transpose_weight(torch.float8_e4m3fn,
-                                                    module.weight.data)
+        module.weight.data = maybe_update_stride(module.weight.data)
 
     def load_weights_fused_gate_up_linear(self, module: Linear,
                                           weights: List[Dict]):
@@ -218,8 +211,7 @@ class TritonFP8QDQLinearMethod(LinearMethodBase):
             torch.float8_e4m3fn)
         copy_weight(module.weight,
                     self.param_transform["weight_transform"](fused_weight))
-        module.weight.data = maybe_transpose_weight(torch.float8_e4m3fn,
-                                                    module.weight.data)
+        module.weight.data = maybe_update_stride(module.weight.data)
 
 
 class TritonMXFP4LinearMethod(LinearMethodBase):
@@ -229,8 +221,6 @@ class TritonMXFP4LinearMethod(LinearMethodBase):
         assert activation_dtype in [torch.float8_e4m3fn, torch.bfloat16], \
             f"TritonMXFP4LinearMethod only supports float8_e4m3fn or bfloat16 activation, got {activation_dtype}"
         self.activation_dtype = activation_dtype
-        self.swizzle_value, self.swizzle_scale = get_swizzle_type(
-            activation_dtype)
 
     def create_weights(self, module: Linear, in_features: int,
                        out_features: int, bias: bool, dtype: torch.dtype):
@@ -281,16 +271,11 @@ class TritonMXFP4LinearMethod(LinearMethodBase):
                 assert module.input_scale is not None
                 input_scale = module.input_scale
 
-        mx_ctx = MicroscalingCtx(
-            weight_scale=module.weight_scale,
-            swizzle_value=self.swizzle_value,
-            swizzle_scale=self.swizzle_scale,
-            actual_weight_scale_shape=self.scale_actual_shape)
         if self.activation_dtype == torch.float8_e4m3fn:
             flex_ctx = FlexCtx(lhs_data=InFlexData(scale=input_scale), )
         else:
             flex_ctx = FlexCtx()
-        pc = PrecisionConfig(mx_ctx=mx_ctx,
+        pc = PrecisionConfig(weight_scale=module.weight_scale,
                              flex_ctx=flex_ctx,
                              allow_tf32=False,
                              out_dtype=module.dtype)
@@ -337,13 +322,15 @@ class TritonMXFP4LinearMethod(LinearMethodBase):
             weight_scales)  # (out_features, in_features//32)
         fused_scale = fused_scale.T.unsqueeze(
             0)  # (1, in_features//32, out_features)
-        fused_weight, fused_scale, scale_actual_shape = swizzle_weight_and_scale(
-            fused_weight, fused_scale, self.swizzle_value, self.swizzle_scale)
+        fused_weight, fused_scale = swizzle_weight_and_scale(
+            fused_weight, fused_scale)
         assert module.weight_scale.dtype == fused_scale.dtype
-        # We don't use copy_weight here because we need to maintain the stride
-        module.weight.data = fused_weight
-        module.weight_scale.data = fused_scale
-        self.scale_actual_shape = scale_actual_shape
+        # We need to use Triton tensor wrapper instead of Torch tensor to maintain the correct swizzling layout
+        module._parameters.pop('weight', None)
+        module._parameters.pop('weight_scale', None)
+        torch.cuda.empty_cache()
+        module.weight = fused_weight
+        module.weight_scale = fused_scale
 
         # handle biases
         if module.bias is not None:
@@ -359,9 +346,6 @@ class TritonMXFP4LinearMethod(LinearMethodBase):
         else:
             # Dynamic quantization
             module.input_scale = None
-
-        module.weight.data = maybe_transpose_weight(self.activation_dtype,
-                                                    module.weight.data)
 
     def load_weights_vanilla(self, module: Linear, weights: List[Dict]):
         assert len(weights) == 1
