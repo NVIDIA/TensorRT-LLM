@@ -310,6 +310,19 @@ class CutlassFusedMoE(MoE):
                     f"unsupported quantization mode: {self.quant_config.quant_mode}"
                 )
 
+        # Prepare additional information for profiling in case padding is applied when using alltoall.
+        # Only the non-alltoall case is considered for profiling in the warmup phase.
+        # Therefore, to get the correct tactics during the actual inference, the inputs to the tuner should be the same as when not using alltoall.
+        if self.enable_alltoall:
+            if all_rank_num_tokens is not None:
+                tuner_num_tokens = sum(all_rank_num_tokens)
+            else:
+                tuner_num_tokens = x.shape[0] * self.mapping.tp_size
+            tuner_top_k = token_selected_experts.shape[1]
+        else:
+            tuner_num_tokens = None
+            tuner_top_k = None
+
         # Alltoall or allgather for attention DP
         token_count = x.shape[0]
         alltoall_info = None  # Store for later combine
@@ -404,6 +417,8 @@ class CutlassFusedMoE(MoE):
             use_mxfp8_act_scaling=use_mxfp8_act_scaling,
             min_latency_mode=False,
             tune_max_num_tokens=self.tune_max_num_tokens,
+            tuner_num_tokens=tuner_num_tokens,
+            tuner_top_k=tuner_top_k,
         )
         # Custom op requires all inputs are in the same type.
         # Only in cutlass_min_latency_mode, the output is a list of tensors.
