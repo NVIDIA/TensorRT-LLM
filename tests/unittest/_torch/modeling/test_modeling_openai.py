@@ -47,7 +47,7 @@ def dump_config_json(dst_dir):
 
 
 @pytest.mark.parametrize("moe_backend", ["CUTLASS", "TRITON"])
-def test_orangina_trtllmgen(moe_backend):
+def test_gpt_oss_trtllmgen(moe_backend):
     if moe_backend == "TRITON" and not IS_TRITON_KERNELS_AVAILABLE:
         pytest.skip("Triton kernels are not available")
 
