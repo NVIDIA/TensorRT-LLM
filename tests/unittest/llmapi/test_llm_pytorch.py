@@ -20,9 +20,7 @@ from .test_llm import (_test_llm_capture_request_error, get_model_path,
                        run_llm_abort_request,
                        run_llm_with_postprocess_parallel_and_result_handler,
                        tinyllama_logits_processor_test_harness)
-from utils.util import (EnvVarsContextManager, force_ampere,
-                        run_function_in_sub_process, similar,
-                        skip_gpu_memory_less_than_40gb,
+from utils.util import (force_ampere, similar, skip_gpu_memory_less_than_40gb,
                         skip_gpu_memory_less_than_80gb,
                         skip_gpu_memory_less_than_138gb)
 from utils.llm_data import llm_models_root
@@ -313,20 +311,7 @@ def test_llama_7b_lora_default_modules() -> None:
         llm.shutdown()
 
 
-@pytest.mark.parametrize(
-    "lora_adapter_count_per_call, max_loras, max_cpu_loras, repeat_calls, repeats_per_call",
-    [
-        # Test eviction and re-loading a previously evicted adapter from the LoRA GPU cache, within a single
-        # llm.generate call, that's repeated twice.
-        ([
-            2,
-        ], 1, 2, 2, 3),
-        # Test eviction and loading of new adapters in the evicted space, over several llm.generate calls, with LoRA GPU
-        # cache size < LoRA CPU cache size
-        ([2, 2, 2], 1, 3, 1, 1),
-    ])
-@skip_gpu_memory_less_than_40gb
-def test_llama_7b_multi_lora_evict_load_new_adapters(
+def _check_llama_7b_multi_lora_evict_load_new_adapters(
         lora_adapter_count_per_call: list[int], max_loras: int,
         max_cpu_loras: int, repeat_calls: int, repeats_per_call: int):
     # For LoRA checkpoints without finetuned embedding and lm_head, we can either:
@@ -347,60 +332,55 @@ def test_llama_7b_multi_lora_evict_load_new_adapters(
         cuda_graph_config=None)
 
 
-@pytest.mark.parametrize(
-    "lora_adapter_count_per_call, max_loras, max_cpu_loras, repeat_calls, repeats_per_call",
-    [
-        # Test eviction, reloading new adapters and reloading previously evicted adapters from the LoRA CPU cache & GPU
-        # cache over multiple llm.generate call repeated twice (two calls with the same requests):
-        # At the end of the 1st llm.generate call:
-        #   The LoRA caches should contain adapters 1, 2 and shouldn't contain adapter 0 (it should have been evicted).
-        # So in the 2nd call, the worker should:
-        # - Send req0 with adapter 0 weights (because it was previously evicted)
-        # - Send the other two requests without their adapter weights as they're already in LoRA CPU cache
-        # Then, handling of req0 that has weights but not in the cache should evict one of the other two adapters from
-        # the cache, causing that evicted adapter's request to fail because its weights aren't with the request and
-        # aren't in LoRA cache.
-        ([
-            3,
-        ], 2, 2, 2, 1),
-    ])
 @skip_gpu_memory_less_than_40gb
-def test_llama_7b_multi_lora_load_previously_cpu_cache_evicted_adapter_fails(
-        lora_adapter_count_per_call: list[int], max_loras: int,
-        max_cpu_loras: int, repeat_calls: int, repeats_per_call: int):
-    """Tests that trying to load a LoRA adapter after it was evicted from CPU cache fails with the expected
-    message, as this feature is currently not supported in favor of the performance improvement of not
-    sending the LoRA weights with every request after the first time.
-    NOTE: This test assumes the requests are handled in the order they're sent, if that's not true, then this test
-          may not get any error at all, which would cause it to fail.
+def test_llama_7b_multi_lora_evict_and_reload_lora_gpu_cache():
+    """Test eviction and re-loading a previously evicted adapter from the LoRA GPU cache, within a single
+    llm.generate call, that's repeated twice.
     """  # noqa: D205
-
-    def _check_contains_expected_message(stdout: str, stderr: str):
-        note_in_message = "Note that currently a request with LoRA task that was already loaded is sent" \
-                          " without its LoRA weights to save its serialization, copy and deserialization, so if this" \
-                          " LoRA task was evicted from LoRA CPU cache, then its reuse is currently not supported."
-        return note_in_message in stderr
-
-    lora_config = LoraConfig(lora_target_modules=['attn_q', 'attn_k', 'attn_v'],
-                             max_lora_rank=8,
-                             max_loras=max_loras,
-                             max_cpu_loras=max_cpu_loras)
-    with EnvVarsContextManager({"TLLM_WORKER_USE_SINGLE_PROCESS": "1"}):
-        child_stdout, child_stderr = run_function_in_sub_process(
-            target=check_llama_7b_multi_unique_lora_adapters_from_request,
-            args=(lora_adapter_count_per_call, repeat_calls, repeats_per_call,
-                  LLM),
-            kwargs={
-                "lora_config": lora_config,
-                # Disable CUDA graph
-                # TODO: remove this once we have a proper fix for CUDA graph in LoRA
-                "cuda_graph_config": None
-            },
-            stop_waiting_criteria=_check_contains_expected_message)
-
-    assert _check_contains_expected_message(child_stdout, child_stderr)
+    _check_llama_7b_multi_lora_evict_load_new_adapters(
+        lora_adapter_count_per_call=[2],
+        max_loras=1,
+        max_cpu_loras=2,
+        repeat_calls=2,
+        repeats_per_call=3)
 
 
+@skip_gpu_memory_less_than_40gb
+def test_llama_7b_multi_lora_evict_and_load_new_adapters_in_cpu_and_gpu_cache():
+    """Test eviction and loading of new adapters in the evicted space, over several llm.generate calls, with LoRA GPU
+    cache size < LoRA CPU cache size.
+    """  # noqa: D205
+    _check_llama_7b_multi_lora_evict_load_new_adapters(
+        lora_adapter_count_per_call=[2, 2, 2],
+        max_loras=1,
+        max_cpu_loras=3,
+        repeat_calls=1,
+        repeats_per_call=1)
+
+
+@skip_gpu_memory_less_than_40gb
+def test_llama_7b_multi_lora_evict_and_reload_evicted_adapters_in_cpu_and_gpu_cache(
+):
+    """Test eviction, reloading new adapters and reloading previously evicted adapters from the LoRA CPU cache & GPU
+    cache over multiple llm.generate call repeated twice (two calls with the same requests):
+    At the end of the 1st llm.generate call:
+      The LoRA caches should contain adapters 1, 2 and shouldn't contain adapter 0 (it should have been evicted).
+    So in the 2nd call, the worker should:
+    - Send req0 with adapter 0 weights (because it was previously evicted)
+    - Send the other two requests without their adapter weights as they're already in LoRA CPU cache
+    Then, handling of req0 that has weights but not in the cache should evict one of the other two adapters from
+    the cache, causing that evicted adapter's request to again load its weights from the file system, as they
+    aren't with the request and aren't in LoRA cache.
+    """  # noqa: D205
+    _check_llama_7b_multi_lora_evict_load_new_adapters(
+        lora_adapter_count_per_call=[3],
+        max_loras=2,
+        max_cpu_loras=2,
+        repeat_calls=2,
+        repeats_per_call=1)
+
+
+@skip_gpu_memory_less_than_40gb
 def test_llama_7b_peft_cache_config_affects_peft_cache_size():
     """Tests that LLM arg of peft_cache_config affects the peft cache sizes.
 
@@ -436,6 +416,7 @@ def test_llama_7b_peft_cache_config_affects_peft_cache_size():
             cuda_graph_config=None)
 
 
+@skip_gpu_memory_less_than_40gb
 def test_llama_7b_lora_config_overrides_peft_cache_config():
     """Tests that cache size args in lora_config LLM arg override the cache size
     parameters in peft_cache_config LLM arg.

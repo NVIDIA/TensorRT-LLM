@@ -5,7 +5,6 @@ import sys
 import unittest
 
 import numpy as np
-import pytest
 import torch
 
 import tensorrt_llm
@@ -17,6 +16,7 @@ from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
 from tensorrt_llm.bindings import executor as tllm
 from tensorrt_llm.bindings.internal.batch_manager import \
     PeftTaskNotCachedException
+from tensorrt_llm.lora_manager import LoraConfig
 
 DataType = tensorrt_llm.bindings.DataType
 LoraModule = tensorrt_llm.bindings.LoraModule
@@ -261,15 +261,13 @@ class TestResourceManager(unittest.TestCase):
         return request
 
     def get_lora_data(self):
-        """Create mock LoRA weights and config that match the C++ validation expectations.
+        """Create mock LoRA weights and config.
 
         Returns:
-            tuple: (weights tensor, config tensor) formatted correctly for the C++ implementation.
+            tuple: (weights tensor, config tensor).
         """
         lora_weights = np.load(self.TP1_WEIGHTS_PATH).astype(np.float16)
-        lora_weights = np.expand_dims(lora_weights, axis=0)
         lora_config = np.load(self.TP1_CONFIG_PATH)
-        lora_config = np.expand_dims(lora_config, axis=0)
         return lora_weights, lora_config
 
     def test_successful_mocked_peft_cache_manager_initialization(self):
@@ -277,6 +275,7 @@ class TestResourceManager(unittest.TestCase):
 
         peft_cache_manager = PeftCacheManager(
             peft_cache_config=peft_cache_config,
+            lora_config=LoraConfig(),
             model_config=self.model_config,
         )
 
@@ -290,6 +289,7 @@ class TestResourceManager(unittest.TestCase):
 
         peft_cache_manager = PeftCacheManager(
             peft_cache_config=peft_cache_config,
+            lora_config=LoraConfig(),
             model_config=self.model_config,
         )
 
@@ -307,6 +307,7 @@ class TestResourceManager(unittest.TestCase):
 
         peft_cache_manager = PeftCacheManager(
             peft_cache_config=peft_cache_config,
+            lora_config=LoraConfig(),
             model_config=self.model_config,
         )
 
@@ -322,6 +323,7 @@ class TestResourceManager(unittest.TestCase):
 
         peft_cache_manager = PeftCacheManager(
             peft_cache_config=peft_cache_config,
+            lora_config=LoraConfig(),
             model_config=self.model_config,
         )
 
@@ -349,13 +351,13 @@ class TestResourceManager(unittest.TestCase):
 
         self.assertEqual(len(peft_table), self.num_lora_modules)
 
-    @pytest.mark.skip(reason="https://nvbugs/5324252")
     def test_put_get(self):
         """Test adding a request with properly configured LoRA weights and config."""
         peft_cache_config = self.create_peft_cache_config()
 
         peft_cache_manager = PeftCacheManager(
             peft_cache_config=peft_cache_config,
+            lora_config=LoraConfig(),
             model_config=self.model_config,
         )
 

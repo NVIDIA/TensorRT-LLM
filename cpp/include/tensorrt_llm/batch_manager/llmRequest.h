@@ -98,7 +98,7 @@ public:
     using RequestPtr = std::shared_ptr<GenericLlmRequest>;
     using MillisecondsType = std::chrono::milliseconds;
 
-    // 49 parameters, 56 items in initialization list
+    // 50 parameters, 57 items in initialization list
     GenericLlmRequest(RequestIdType requestId, SizeType32 maxNewTokens, std::shared_ptr<VecTokens> const& inputTokens,
         runtime::SamplingConfig const& samplingConfig, bool isStreaming, std::optional<SizeType32> endId = std::nullopt,
         std::optional<SizeType32> padId = std::nullopt, std::optional<TensorPtr> embeddingBias = std::nullopt,
@@ -113,7 +113,7 @@ public:
         std::optional<TensorPtr> mropeRotaryCosSin = std::nullopt,
         std::optional<SizeType32> mropePositionDeltas = std::nullopt,
         std::optional<LoraTaskIdType> loraTaskId = std::nullopt, std::optional<TensorPtr> loraWeights = std::nullopt,
-        std::optional<TensorPtr> loraConfig = std::nullopt,
+        std::optional<TensorPtr> loraConfig = std::nullopt, std::optional<std::string> loraAdapterPath = std::nullopt,
         std::optional<executor::LookaheadDecodingConfig> lookaheadConfig = std::nullopt,
         std::optional<executor::KvCacheRetentionConfig> kvCacheRetentionConfig = std::nullopt,
         bool returnLogProbs = false, bool returnContextLogits = false, bool returnGenerationLogits = false,
@@ -163,6 +163,7 @@ public:
         , mLoraTaskId(loraTaskId)
         , mLoraWeights(std::move(loraWeights))
         , mLoraConfig(std::move(loraConfig))
+        , mLoraAdapterPath(std::move(loraAdapterPath))
         , mLookaheadConfig(std::move(lookaheadConfig))
         , mKvCacheRetentionConfig(std::move(kvCacheRetentionConfig))
         , mContextChunkSize{mPromptLen}
@@ -200,7 +201,7 @@ public:
         initialize(*inputTokens, returnLogProbs);
     }
 
-    // 32 parameters, 39 items in initialization list
+    // 33 parameters, 40 items in initialization list
     GenericLlmRequest(RequestIdType requestId, SizeType32 maxNewTokens, VecTokens const& inputTokens,
         runtime::SamplingConfig const& samplingConfig, bool isStreaming, std::optional<SizeType32> endId = std::nullopt,
         std::optional<SizeType32> padId = std::nullopt, std::optional<TensorPtr> embeddingBias = std::nullopt,
@@ -209,7 +210,7 @@ public:
         std::optional<TensorPtr> promptEmbeddingTable = std::nullopt,
         std::optional<SizeType32> promptVocabSize = std::nullopt,
         std::optional<LoraTaskIdType> loraTaskId = std::nullopt, std::optional<TensorPtr> loraWeights = std::nullopt,
-        std::optional<TensorPtr> loraConfig = std::nullopt,
+        std::optional<TensorPtr> loraConfig = std::nullopt, std::optional<std::string> loraAdapterPath = std::nullopt,
         std::optional<executor::LookaheadDecodingConfig> lookaheadConfig = std::nullopt, bool returnLogProbs = false,
         bool returnContextLogits = false, bool returnGenerationLogits = false,
         std::optional<VecTokens> draftTokens = std::nullopt, std::optional<TensorPtr> draftLogits = std::nullopt,
@@ -241,6 +242,7 @@ public:
         , mLoraTaskId(loraTaskId)
         , mLoraWeights(std::move(loraWeights))
         , mLoraConfig(std::move(loraConfig))
+        , mLoraAdapterPath(std::move(loraAdapterPath))
         , mLookaheadConfig(lookaheadConfig)
         , mContextChunkSize(mPromptLen)
         , mLogProbs(samplingConfig.beamWidth)
@@ -390,6 +392,11 @@ public:
                 mLoraConfig = tensorrt_llm::runtime::ITensor::view(
                     executor::detail::toITensor(loraConfig.value().getConfig().value()));
                 mLoraConfig.value()->unsqueeze(0);
+            }
+
+            if (loraConfig.value().getPath())
+            {
+                mLoraAdapterPath = loraConfig.value().getPath();
             }
         }
 
@@ -913,6 +920,16 @@ public:
     void setLoraWeights(TensorPtr weights)
     {
         mLoraWeights = weights;
+    }
+
+    [[nodiscard]] std::optional<std::string> getLoraAdapterPath() const
+    {
+        return mLoraAdapterPath;
+    }
+
+    void setLoraAdapterPath(std::optional<std::string> adapterPath)
+    {
+        mLoraAdapterPath = adapterPath;
     }
 
     void setPromptVocabSize(SizeType32 size)
@@ -1907,6 +1924,7 @@ protected:
     std::optional<LoraTaskIdType> mLoraTaskId{std::nullopt};
     std::optional<TensorPtr> mLoraWeights{std::nullopt};
     std::optional<TensorPtr> mLoraConfig{std::nullopt};
+    std::optional<std::string> mLoraAdapterPath{std::nullopt};
 
     std::optional<executor::LookaheadDecodingConfig> mLookaheadConfig{std::nullopt};
 
@@ -2161,7 +2179,7 @@ public:
     using TokenExtraIdType = Base::TokenExtraIdType;
     using VecTokenExtraIds = Base::VecTokenExtraIds;
 
-    // 49 parameters, 49 parameters in Base class constructor
+    // 50 parameters, 50 parameters in Base class constructor
     LlmRequest(RequestIdType requestId, SizeType32 maxNewTokens, std::shared_ptr<VecTokens> inputTokens,
         runtime::SamplingConfig const& samplingConfig, bool isStreaming, std::optional<SizeType32> endId = std::nullopt,
         std::optional<SizeType32> padId = std::nullopt, std::optional<TensorPtr> embeddingBias = std::nullopt,
@@ -2176,7 +2194,7 @@ public:
         std::optional<TensorPtr> mropeRotaryCosSin = std::nullopt,
         std::optional<SizeType32> mropePositionDeltas = std::nullopt,
         std::optional<LoraTaskIdType> loraTaskId = std::nullopt, std::optional<TensorPtr> loraWeights = std::nullopt,
-        std::optional<TensorPtr> loraConfig = std::nullopt,
+        std::optional<TensorPtr> loraConfig = std::nullopt, std::optional<std::string> loraPath = std::nullopt,
         std::optional<executor::LookaheadDecodingConfig> lookaheadConfig = std::nullopt,
         std::optional<executor::KvCacheRetentionConfig> kvCacheRetentionConfig = std::nullopt,
         bool returnLogProbs = false, bool returnContextLogits = false, bool returnGenerationLogits = false,
@@ -2203,8 +2221,8 @@ public:
             std::move(promptEmbeddingTable), promptVocabSize, std::move(multimodalHashes),
             std::move(multimodalPositions), std::move(multimodalLengths), std::move(multimodalEmbedding),
             std::move(mropeRotaryCosSin), mropePositionDeltas, loraTaskId, std::move(loraWeights),
-            std::move(loraConfig), std::move(lookaheadConfig), std::move(kvCacheRetentionConfig), returnLogProbs,
-            returnContextLogits, returnGenerationLogits, std::move(draftTokens), std::move(draftLogits),
+            std::move(loraConfig), std::move(loraPath), std::move(lookaheadConfig), std::move(kvCacheRetentionConfig),
+            returnLogProbs, returnContextLogits, returnGenerationLogits, std::move(draftTokens), std::move(draftLogits),
             excludeInputFromOutput, std::move(logitsPostProcessor), applyLogitsPostProcessorBatched,
             std::move(encoderInputTokens), returnEncoderOutput, clientId, priority, std::move(encoderInputFeatures),
             std::move(encoderOutputLength), std::move(crossAttentionMask), llmRequestType,
@@ -2213,7 +2231,7 @@ public:
     {
     }
 
-    // 49 parameters, 49 parameters in Base class constructor
+    // 50 parameters, 50 parameters in Base class constructor
     LlmRequest(RequestIdType requestId, SizeType32 maxNewTokens, std::vector<TokenIdType> inputTokens,
         runtime::SamplingConfig const& samplingConfig, bool isStreaming, std::optional<SizeType32> endId = std::nullopt,
         std::optional<SizeType32> padId = std::nullopt, std::optional<TensorPtr> embeddingBias = std::nullopt,
@@ -2228,7 +2246,7 @@ public:
         std::optional<TensorPtr> mropeRotaryCosSin = std::nullopt,
         std::optional<SizeType32> mropePositionDeltas = std::nullopt,
         std::optional<LoraTaskIdType> loraTaskId = std::nullopt, std::optional<TensorPtr> loraWeights = std::nullopt,
-        std::optional<TensorPtr> loraConfig = std::nullopt,
+        std::optional<TensorPtr> loraConfig = std::nullopt, std::optional<std::string> loraPath = std::nullopt,
         std::optional<executor::LookaheadDecodingConfig> lookaheadConfig = std::nullopt,
         std::optional<executor::KvCacheRetentionConfig> kvCacheRetentionConfig = std::nullopt,
         bool returnLogProbs = false, bool returnContextLogits = false, bool returnGenerationLogits = false,
@@ -2264,8 +2282,8 @@ public:
                 ? std::make_shared<std::vector<SizeType32>>(std::move(multimodalLengths.value()))
                 : std::optional<std::shared_ptr<std::vector<SizeType32>>>(std::nullopt),
             std::move(multimodalEmbedding), std::move(mropeRotaryCosSin), mropePositionDeltas, loraTaskId,
-            std::move(loraWeights), std::move(loraConfig), lookaheadConfig, std::move(kvCacheRetentionConfig),
-            returnLogProbs, returnContextLogits, returnGenerationLogits,
+            std::move(loraWeights), std::move(loraConfig), std::move(loraPath), lookaheadConfig,
+            std::move(kvCacheRetentionConfig), returnLogProbs, returnContextLogits, returnGenerationLogits,
             draftTokens.has_value() ? std::make_shared<VecTokens>(std::move(draftTokens.value()))
                                     : std::make_shared<VecTokens>(),
             std::move(draftLogits), excludeInputFromOutput, std::move(logitsPostProcessor),
@@ -2281,7 +2299,7 @@ public:
     {
     }
 
-    // 32 parameters, 32 parameters in Base class constructor
+    // 33 parameters, 33 parameters in Base class constructor
     LlmRequest(RequestIdType requestId, SizeType32 maxNewTokens, VecTokens const& inputTokens,
         runtime::SamplingConfig const& samplingConfig, bool isStreaming, std::optional<SizeType32> endId = std::nullopt,
         std::optional<SizeType32> padId = std::nullopt, std::optional<TensorPtr> embeddingBias = std::nullopt,
@@ -2290,7 +2308,7 @@ public:
         std::optional<TensorPtr> promptEmbeddingTable = std::nullopt,
         std::optional<SizeType32> promptVocabSize = std::nullopt,
         std::optional<LoraTaskIdType> loraTaskId = std::nullopt, std::optional<TensorPtr> loraWeights = std::nullopt,
-        std::optional<TensorPtr> loraConfig = std::nullopt,
+        std::optional<TensorPtr> loraConfig = std::nullopt, std::optional<std::string> loraPath = std::nullopt,
         std::optional<executor::LookaheadDecodingConfig> lookaheadConfig = std::nullopt, bool returnLogProbs = false,
         bool returnContextLogits = false, bool returnGenerationLogits = false,
         std::optional<VecTokens> draftTokens = std::nullopt, std::optional<TensorPtr> draftLogits = std::nullopt,
@@ -2303,8 +2321,8 @@ public:
         : Base(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming, endId, padId,
             std::move(embeddingBias), std::move(badWordsList), std::move(stopWordsList), std::move(positionIds),
             std::move(promptEmbeddingTable), promptVocabSize, loraTaskId, std::move(loraWeights), std::move(loraConfig),
-            lookaheadConfig, returnLogProbs, returnContextLogits, returnGenerationLogits, std::move(draftTokens),
-            std::move(draftLogits), excludeInputFromOutput, std::move(logitsPostProcessor),
+            std::move(loraPath), lookaheadConfig, returnLogProbs, returnContextLogits, returnGenerationLogits,
+            std::move(draftTokens), std::move(draftLogits), excludeInputFromOutput, std::move(logitsPostProcessor),
             applyLogitsPostProcessorBatched, std::move(encoderInputTokens), returnEncoderOutput, clientId, priority,
             numReturnSequences, languageAdapterUid, contextPhaseParams)
     {
@@ -2347,6 +2365,8 @@ public:
     void movePromptEmbeddingTableToGpu(runtime::BufferManager const& manager);
 
     void moveLoraWeightsToGpu(runtime::BufferManager const& manager);
+
+    void removeLoraTensors();
 };
 
 } // namespace tensorrt_llm::batch_manager

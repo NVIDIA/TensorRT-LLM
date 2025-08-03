@@ -381,8 +381,8 @@ class GenerationExecutorWorker(GenerationExecutor):
                 task_id=request.lora_request.adapter_id,
                 weights=self._lora_manager.cpp_lora_weights[uid]
                 if not adapter_in_cache else None,
-                config=self._lora_manager.cpp_lora_config[uid]
-                if not adapter_in_cache else None)
+                config=self._lora_manager.cpp_lora_config[uid],
+                path=request.lora_request.lora_path)
         else:
             lora_config = None
 

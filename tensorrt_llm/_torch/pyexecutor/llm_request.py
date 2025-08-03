@@ -490,6 +490,8 @@ def executor_request_to_llm_request(
         if executor_request.lora_config is not None else None,
         lora_config=executor_request.lora_config.config
         if executor_request.lora_config is not None else None,
+        lora_path=executor_request.lora_config.path
+        if executor_request.lora_config is not None else None,
         mrope_rotary_cos_sin=mrope_rotary_cos_sin,
         mrope_position_deltas=mrope_position_deltas,
         lookahead_config=None,
