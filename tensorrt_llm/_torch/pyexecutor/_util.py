@@ -329,10 +329,9 @@ class KvCacheCreator:
             ]
             kv_cache_manager = MambaHybridCacheManager(
                 # mamba cache parameters
-                config.hidden_size,
                 config.ssm_state_size,
                 config.conv_kernel,
-                config.expand,
+                config.mamba_num_heads,
                 config.n_groups,
                 config.mamba_head_dim,
                 mamba_num_layers,
