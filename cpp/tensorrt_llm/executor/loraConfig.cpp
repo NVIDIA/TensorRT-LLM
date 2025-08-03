@@ -36,13 +36,15 @@ LoraConfig::LoraConfig(
             mConfig.value().getShape().size() == expectedConfigDims, "Expected config tensor to have 2 dimensions");
         TLLM_CHECK_WITH_INFO(mConfig.value().getMemoryType() != MemoryType::kGPU
                 && mConfig.value().getMemoryType() != MemoryType::kUNKNOWN,
-            "Expected lora weights to be in CPU memory");
+            "Expected lora config to be in CPU memory");
         TLLM_CHECK_WITH_INFO(
             mConfig.value().getDataType() == DataType::kINT32, "Expected lora config tensor to have type kINT32");
     }
     if (mWeights.has_value())
     {
         SizeType32 constexpr expectedWeightsDims = 2;
+        TLLM_CHECK_WITH_INFO(
+            mConfig.has_value(), "Request for LoRA inference with lora weights must also have lora config");
 
         TLLM_CHECK_WITH_INFO(
             mWeights.value().getShape().size() == expectedWeightsDims, "Expected weights tensor to have 2 dimensions");
@@ -51,11 +53,8 @@ LoraConfig::LoraConfig(
                 && mWeights.value().getMemoryType() != MemoryType::kUNKNOWN,
             "Expected lora weights to be in CPU memory");
 
-        if (mConfig.has_value())
-        {
-            TLLM_CHECK_WITH_INFO(mConfig.value().getShape()[0] == mWeights.value().getShape()[0],
-                "Expected dim 0 of lora weights and lora config to have the same size");
-        }
+        TLLM_CHECK_WITH_INFO(mConfig.value().getShape()[0] == mWeights.value().getShape()[0],
+            "Expected dim 0 of lora weights and lora config to have the same size");
     }
 }
 
