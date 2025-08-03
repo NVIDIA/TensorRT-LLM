@@ -95,7 +95,7 @@ OpenAI ships a set of Triton kernels optimized for its MoE models. TensorRT-LLM 
 git clone https://github.com/triton-lang/triton.git
 cd triton
 # Specific commit verified with TensorRT-LLM
-git checkout ff57a4dbc81b5e02e6e1f61973eb9cc00f6f646c
+git checkout f3067cd3bd0c29065fa4ecdb724b6f29cbabea5f
 pip install -r python/requirements.txt          # build-time dependencies
 pip install wheel build
 python3 setup.py bdist_wheel

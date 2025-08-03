@@ -1309,6 +1309,10 @@ def test_fused_moe_triton_mxfp4(experts, hidden_size, intermediate_size,
                                 fp8_activation, bias, dynamic_quant):
     if not IS_TRITON_KERNELS_AVAILABLE:
         pytest.skip("Triton kernels are not available")
+    if torch.cuda.get_device_capability()[0] < 10 and fp8_activation:
+        pytest.skip("Latest Triton requires BF16 activation on Hopper")
+    if torch.cuda.get_device_capability()[0] >= 10 and not fp8_activation:
+        pytest.skip("Latest Triton requires FP8 activation on Blackwell")
 
     mapping = Mapping()
     mapping.rank = mpi_rank()

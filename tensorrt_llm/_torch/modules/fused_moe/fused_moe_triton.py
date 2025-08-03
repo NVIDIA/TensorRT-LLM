@@ -12,7 +12,7 @@ import triton.language as tl
 
 IS_TRITON_KERNELS_AVAILABLE = False
 # We expect to find triton_kernels under $TRITON_ROOT/python/triton_kernels
-# Triton upstream commit ff57a4dbc81b5e02e6e1f61973eb9cc00f6f646c has been verified.
+# Triton upstream commit f3067cd3bd0c29065fa4ecdb724b6f29cbabea5f has been verified.
 triton_root = os.getenv('TRITON_ROOT')
 if triton_root:
     triton_root = os.path.abspath(
@@ -22,13 +22,11 @@ if triton_root:
     assert triton.__version__ >= "3.4.0", "Triton kernels are detected but the Triton wheel is too old"
     import triton_kernels.swiglu
     from triton_kernels.matmul_ogs import (FlexCtx, FnSpecs, FusedActivation,
-                                           MicroscalingCtx, PrecisionConfig,
-                                           matmul_ogs)
+                                           PrecisionConfig, matmul_ogs)
     from triton_kernels.numerics import InFlexData
-    from triton_kernels.numerics_details.mxfp import (
-        SwizzlingType, downcast_to_mxfp_torch, perm_tensor_from_contig,
-        perm_tuple_from_contig, swizzle_mx_scale_bw, swizzle_mxfp4_scale_hopper,
-        swizzle_mxfp4_value_hopper)
+    from triton_kernels.numerics_details.mxfp import downcast_to_mxfp_torch
+    from triton_kernels.tensor import FP4, convert_layout, wrap_torch_tensor
+    from triton_kernels.tensor_details import layout
     IS_TRITON_KERNELS_AVAILABLE = True
 
 from ...model_config import ModelConfig
@@ -126,37 +124,36 @@ def _routing_shift_bitmatrix_range(Bitmatrix, stride_bm, stride_bn, Indices,
 
 class TritonEPRouter():
 
-    def prune_routing_range(self, expt_scal, expt_indx, bitmatrix, slice_start,
-                            slice_end):
+    def prune_routing_ep(self, expt_scal, expt_indx, bitmatrix, n_expts_tot,
+                         slice_start, slice_end):
         from triton_kernels.compaction import compaction
         from triton_kernels.routing import _routing_clear_bitmatrix
         n_tokens_pad = expt_scal.shape[0]
-        n_expts_tot = bitmatrix.shape_raw[-1]
         _routing_shift_bitmatrix_range[(n_tokens_pad, )](
-            bitmatrix.handle,
-            bitmatrix.handle.stride(0),
-            bitmatrix.handle.stride(1),
+            bitmatrix.storage.data,
+            bitmatrix.storage.data.stride(0),
+            bitmatrix.storage.data.stride(1),
             expt_indx,
             expt_indx.stride(0),
             expt_indx.stride(1),
-            bitmatrix.handle.shape[1],
+            bitmatrix.storage.data.shape[1],
             expt_indx.shape[1],
             slice_start,
             slice_end,
             BLOCK_N=512,
         )
         _routing_clear_bitmatrix[(n_tokens_pad, )](
-            bitmatrix.handle,
-            bitmatrix.handle.stride(0),
-            bitmatrix.handle.stride(1),
-            bitmatrix.handle.shape[1],
+            bitmatrix.storage.data,
+            bitmatrix.storage.data.stride(0),
+            bitmatrix.storage.data.stride(1),
+            bitmatrix.storage.data.shape[1],
             slice_end - slice_start,
             BLOCK_N=512,
         )
         # perform compaction to update expt_scal / expt_indx
         expt_scal, expt_indx = compaction(expt_scal, expt_indx, bitmatrix)
         n_expts_tot = slice_end - slice_start
-        bitmatrix.shape_raw[-1] = n_expts_tot
+        bitmatrix.shape[-1] = n_expts_tot
         return expt_scal, expt_indx, bitmatrix
 
     def __call__(self,
@@ -172,61 +169,27 @@ class TritonEPRouter():
         slice_start = node_idx * n_expts_local
         slice_end = slice_start + n_expts_local
 
-        from triton_kernels.routing import (GatherIndx, RoutingData,
-                                            ScatterIndx, compute_expt_data,
-                                            sort_tokens)
+        from triton_kernels.routing import routing_from_bitmatrix
         from triton_kernels.topk import topk
         if sm_first:
             logits = torch.softmax(logits, dim=-1)
-        expt_scal, expt_indx, bitmatrix = topk(
-            logits,
-            n_expts_act,  #
-            apply_softmax=not sm_first,
-            y_indx=expt_indx,
-            n_rows=n_rows)
+        expt_scal, expt_indx, bitmatrix = topk(logits,
+                                               n_expts_act,
+                                               apply_softmax=not sm_first,
+                                               y_indx=expt_indx,
+                                               n_rows=n_rows)
         # mutate bitmatrix
         if ep > 1:
-            expt_scal, expt_indx, bitmatrix = self.prune_routing_range(
-                expt_scal, expt_indx, bitmatrix, slice_start, slice_end)
-        hist, topk_indx, gate_indx, gate_scal = sort_tokens(
-            expt_scal, expt_indx, bitmatrix)
-        # pack the matmul data structure
-        gather_indx = GatherIndx(src_indx=topk_indx, dst_indx=gate_indx)
-        scatter_indx = ScatterIndx(src_indx=gate_indx, dst_indx=topk_indx)
-        expt_data = compute_expt_data(hist, n_expts_local, topk_indx.numel())
-        return RoutingData(gate_scal, hist, n_expts_local, n_expts_act,
-                           expt_data), gather_indx, scatter_indx
+            expt_scal, expt_indx, bitmatrix = self.prune_routing_ep(
+                expt_scal, expt_indx, bitmatrix, n_expts_tot, slice_start,
+                slice_end)
+        return routing_from_bitmatrix(bitmatrix, expt_scal, expt_indx,
+                                      n_expts_local, n_expts_act)
 
 
-def require_contiguous_weight(act_dtype, weights):
-    weights_dtype = weights.dtype
-    if weights_dtype == torch.bfloat16:
-        assert act_dtype == torch.bfloat16
-        return True
-    assert torch.cuda.get_device_capability()[0] >= 9
-    if torch.cuda.get_device_capability()[0] < 10:
-        if weights_dtype == torch.float8_e4m3fn:
-            assert act_dtype == torch.float8_e4m3fn
-            return False
-        if weights_dtype == torch.uint8:
-            assert act_dtype in [torch.float8_e4m3fn, torch.bfloat16]
-            return False
-    else:
-        if weights_dtype == torch.float8_e4m3fn:
-            assert act_dtype == torch.float8_e4m3fn
-            return True
-        if weights_dtype == torch.uint8:
-            assert act_dtype in [torch.float8_e4m3fn, torch.bfloat16]
-            return weights.shape[1] % 64 != 0
-    raise ValueError("Unknown dtype combination for contiguous weight check: "
-                     f"act_dtype={act_dtype}, weights_dtype={weights_dtype}")
-
-
-def maybe_transpose_weight(act_dtype, weight):
-    # Make sure the weight has the exact layout the kernels wants to avoid any perf impact
+def maybe_update_stride(weight):
     assert weight.dim() == 3
-    if require_contiguous_weight(act_dtype, weight):
-        return weight.contiguous()
+    # For the latest Triton kernels, w.stride(-2)==1 works universally
     return weight.transpose(1, 2).contiguous().transpose(1, 2)
 
 
@@ -342,10 +305,8 @@ class TritonUnquantizedFusedMoEMethod(FusedMoEMethodBase):
             self, module, weights, weight_loading_mode, load_expert_ids,
             dst_w3_w1_weights_tensor, dst_w2_weights_tensor,
             dst_w3_w1_bias_tensor, dst_w2_bias_tensor)
-        module.w3_w1_weight.data = maybe_transpose_weight(
-            module.dtype, module.w3_w1_weight.data)
-        module.w2_weight.data = maybe_transpose_weight(module.dtype,
-                                                       module.w2_weight.data)
+        module.w3_w1_weight.data = maybe_update_stride(module.w3_w1_weight.data)
+        module.w2_weight.data = maybe_update_stride(module.w2_weight.data)
 
     def apply(self, module: torch.nn.Module, x: torch.Tensor,
               router_logits: torch.Tensor) -> torch.Tensor:
@@ -384,7 +345,7 @@ class TritonUnquantizedFusedMoEMethod(FusedMoEMethodBase):
         if beta == 1.0:
             act = FusedActivation(
                 FnSpecs("swiglu", triton_kernels.swiglu.swiglu_fn,
-                        ("alpha", "limit")), (alpha, None), 2)
+                        ("alpha", "limit")), (alpha, module.swiglu_limit), 2)
             act_out = matmul_ogs(hidden_states,
                                  gemm1_weights,
                                  module.w3_w1_bias if module.bias else None,
@@ -563,10 +524,8 @@ class TritonFP8QDQFusedMoEMethod(TritonUnquantizedFusedMoEMethod):
             self, module, weights, weight_loading_mode, load_expert_ids,
             dst_w3_w1_weights_tensor, dst_w2_weights_tensor,
             dst_w3_w1_bias_tensor, dst_w2_bias_tensor)
-        module.w3_w1_weight.data = maybe_transpose_weight(
-            torch.float8_e4m3fn, module.w3_w1_weight.data)
-        module.w2_weight.data = maybe_transpose_weight(torch.float8_e4m3fn,
-                                                       module.w2_weight.data)
+        module.w3_w1_weight.data = maybe_update_stride(module.w3_w1_weight.data)
+        module.w2_weight.data = maybe_update_stride(module.w2_weight.data)
 
     def apply(self, module: torch.nn.Module, x: torch.Tensor,
               router_logits: torch.Tensor) -> torch.Tensor:
@@ -616,7 +575,7 @@ class TritonFP8QDQFusedMoEMethod(TritonUnquantizedFusedMoEMethod):
         if beta == 1.0:
             act = FusedActivation(
                 FnSpecs("swiglu", triton_kernels.swiglu.swiglu_fn,
-                        ("alpha", "limit")), (alpha, None), 2)
+                        ("alpha", "limit")), (alpha, module.swiglu_limit), 2)
             act_out = matmul_ogs(hidden_states,
                                  gemm1_weights,
                                  module.w3_w1_bias if module.bias else None,
@@ -665,48 +624,25 @@ class TritonMXFP4FusedMoEQuantScales(NamedTuple):
     fc2_input_dequant: torch.Tensor
 
 
-def get_swizzle_type(activation_type):
-    assert activation_type in [torch.float8_e4m3fn, torch.bfloat16]
-    assert torch.cuda.get_device_capability()[0] >= 9
-    if torch.cuda.get_device_capability()[0] < 10:
-        if activation_type == torch.float8_e4m3fn:
-            swizzle_mx_value = None
-            swizzle_mx_scale = SwizzlingType.BLACKWELL
-        else:
-            swizzle_mx_value = SwizzlingType.HOPPER
-            swizzle_mx_scale = SwizzlingType.HOPPER
-    else:
-        swizzle_mx_value = None
-        swizzle_mx_scale = SwizzlingType.BLACKWELL
-    return swizzle_mx_value, swizzle_mx_scale
+def swizzle_weight_and_scale(w: torch.Tensor, w_scale: torch.Tensor):
+    w = w.transpose(-1, -2).contiguous().transpose(-1, -2)
+    #num_warps = 4 if batch <= 512 else 8
+    num_warps = int(os.getenv("TRITON_MOE_MXFP4_NUM_WARPS", 4))
+    assert num_warps in [4, 8], \
+        f"TRITON_MOE_MXFP4_NUM_WARPS should be 4 or 8, got {num_warps}"
+    value_layout, value_layout_opts = layout.make_default_matmul_mxfp4_w_layout(
+        mx_axis=1)
+    scale_layout, scale_layout_opts = layout.make_default_matmul_mxfp4_w_scale_layout(
+        mx_axis=1, num_warps=num_warps)
+    opt = {"value_layout": value_layout, "value_layout_opts": value_layout_opts, \
+            "scale_layout": scale_layout, "scale_layout_opts": scale_layout_opts}
 
-
-def swizzle_weight_and_scale(weight_tensor: torch.Tensor,
-                             scale_tensor: torch.Tensor,
-                             swizzle_value: SwizzlingType,
-                             swizzle_scale: SwizzlingType) -> torch.Tensor:
-    # switch to swizzle shape
-    quant_tensor = weight_tensor.transpose(1, 2).contiguous()
-    scale = scale_tensor.transpose(1, 2).contiguous()
-    # Swizzling
-    if swizzle_value == SwizzlingType.HOPPER:
-        quant_tensor = swizzle_mxfp4_value_hopper(quant_tensor,
-                                                  op_idx=0,
-                                                  mma_version=3)
-    assert quant_tensor.is_contiguous()
-    axis = 1
-    swizzle_axis = 2 if swizzle_scale else None
-    quant_tensor = perm_tensor_from_contig(quant_tensor, axis, swizzle_axis)
-    orig_scale_shape = scale.shape
-    if swizzle_scale == SwizzlingType.BLACKWELL:
-        scale = swizzle_mx_scale_bw(scale, allow_pad=True)
-    elif swizzle_scale == SwizzlingType.HOPPER:
-        scale = swizzle_mxfp4_scale_hopper(scale, num_warps=8)
-    assert scale.is_contiguous()
-    scale = perm_tensor_from_contig(scale, axis, swizzle_axis)
-    actual_scale_shape = perm_tuple_from_contig(orig_scale_shape, axis,
-                                                swizzle_axis)
-    return quant_tensor, scale, actual_scale_shape
+    # w, w_scale = downcast_to_mxfp(tensor.to(torch.bfloat16), torch.uint8, axis=1)
+    w = convert_layout(wrap_torch_tensor(w, dtype=FP4), opt["value_layout"],
+                       **opt["value_layout_opts"])
+    w_scale = convert_layout(wrap_torch_tensor(w_scale), opt["scale_layout"],
+                             **opt["scale_layout_opts"])
+    return w, w_scale
 
 
 # We inherit from TritonUnquantizedFusedMoEMethod to reuse the weight preprocessing logic
@@ -717,8 +653,6 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
         assert activation_dtype in [torch.float8_e4m3fn, torch.bfloat16], \
             f"TritonMXFP4FusedMoEMethod only supports float8_e4m3fn or bfloat16 activation, got {activation_dtype}"
         self.activation_dtype = activation_dtype
-        self.swizzle_value, self.swizzle_scale = get_swizzle_type(
-            activation_dtype)
 
     def create_weights(self, module: torch.nn.Module):
         weight_dtype = torch.uint8
@@ -1013,10 +947,13 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
                 max_fc2_input_scale = None
 
         # Step2: Load weight scales
+        device = module.w3_w1_weight.device
         tmp_w3_w1_weight_scale = torch.empty(module.fc31_dequant.shape,
-                                             dtype=torch.uint8)
+                                             dtype=torch.uint8,
+                                             device=device)
         tmp_w2_weight_scale = torch.empty(module.fc2_dequant.shape,
-                                          dtype=torch.uint8)
+                                          dtype=torch.uint8,
+                                          device=device)
         for local_slot_id, expert_id in enumerate(
                 module.initial_local_expert_ids):
             try:
@@ -1064,9 +1001,9 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
         tmp_w3_w1_weight_scale = shuffle_weight_for_activation_kernel(
             tmp_w3_w1_weight_scale)
 
-        # For Hopper style swizzle, we need to pad the out dim to multiple of 256
+        # For Hopper style swizzle, we need to pad the out dim to multiple of 256 otherwise it sometimes produces nan
         def _maybe_pad_weight_and_scale(weight, scale=None):
-            if self.swizzle_scale == SwizzlingType.HOPPER:
+            if torch.cuda.get_device_capability()[0] == 9:
                 # Both weight and bias are handled here
                 assert weight.dim() in [2,
                                         3], "Weight should be 2D or 3D tensor"
@@ -1077,41 +1014,40 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
                 pad_size = (256 - out_dim % 256) % 256
                 weight = F.pad(
                     weight,
-                    (0, pad_size
-                     )).contiguous()  # Pad the last dimension on right side
+                    (0, pad_size))  # Pad the last dimension on right side
                 if scale is not None:
-                    scale = F.pad(scale, (0, pad_size)).contiguous()
+                    scale = F.pad(scale, (0, pad_size))
             return (weight, scale) if scale is not None else weight
+
+        # Handle w3_w1_weight
 
         tmp_w3_w1_weight, tmp_w3_w1_weight_scale = _maybe_pad_weight_and_scale(
             module.w3_w1_weight, tmp_w3_w1_weight_scale)
 
+        module._parameters.pop('w3_w1_weight', None)
+        module._parameters.pop('fc31_dequant', None)
+        torch.cuda.empty_cache()
+
+        tmp_w3_w1_weight, tmp_w3_w1_weight_scale = swizzle_weight_and_scale(
+            tmp_w3_w1_weight, tmp_w3_w1_weight_scale)
+
+        module.w3_w1_weight = tmp_w3_w1_weight
+        module.fc31_dequant = tmp_w3_w1_weight_scale
+
+        # Handle w2_weight
+
         tmp_w2_weight, tmp_w2_weight_scale = _maybe_pad_weight_and_scale(
             module.w2_weight, tmp_w2_weight_scale)
 
-        # Apply swizzle to the scales
-        tmp_w3_w1_weight, tmp_w3_w1_weight_scale, tmp_w3_w1_scale_shape = swizzle_weight_and_scale(
-            tmp_w3_w1_weight, tmp_w3_w1_weight_scale, self.swizzle_value,
-            self.swizzle_scale)
-        tmp_w2_weight, tmp_w2_weight_scale, tmp_w2_scale_shape = swizzle_weight_and_scale(
-            tmp_w2_weight, tmp_w2_weight_scale, self.swizzle_value,
-            self.swizzle_scale)
+        module._parameters.pop('w2_weight', None)
+        module._parameters.pop('fc2_dequant', None)
+        torch.cuda.empty_cache()
 
-        # Step3: store final loaded weights and scales
-        # Don't use copy_ here, it will break the swizzle stride
-        module.w3_w1_weight.data = tmp_w3_w1_weight
-        device = module.w3_w1_weight.device
-        module.fc31_dequant.data = tmp_w3_w1_weight_scale.to(device)
-        self.w3_w1_scale_shape = tmp_w3_w1_scale_shape  # Triton swizzle needs this original shape as the swizzle may not keep the original shape
-        module.w2_weight.data = tmp_w2_weight
-        module.fc2_dequant.data = tmp_w2_weight_scale.to(device)
-        self.w2_scale_shape = tmp_w2_scale_shape
+        tmp_w2_weight, tmp_w2_weight_scale = swizzle_weight_and_scale(
+            tmp_w2_weight, tmp_w2_weight_scale)
 
-        if module.bias:
-            module.w3_w1_bias.data = _maybe_pad_weight_and_scale(
-                module.w3_w1_bias.data)
-            module.w2_bias.data = _maybe_pad_weight_and_scale(
-                module.w2_bias.data)
+        module.w2_weight = tmp_w2_weight
+        module.fc2_dequant = tmp_w2_weight_scale
 
         if self.activation_dtype == torch.float8_e4m3fn:
             if max_fc31_input_scale is None or max_fc2_input_scale is None:
@@ -1122,11 +1058,6 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
                                                      non_blocking=True)
                 module.fc2_input_dequant.data.copy_(max_fc2_input_scale,
                                                     non_blocking=True)
-
-        module.w3_w1_weight.data = maybe_transpose_weight(
-            self.activation_dtype, module.w3_w1_weight.data)
-        module.w2_weight.data = maybe_transpose_weight(self.activation_dtype,
-                                                       module.w2_weight.data)
 
     def apply(self, module: torch.nn.Module, x: torch.Tensor,
               router_logits: torch.Tensor) -> torch.Tensor:
@@ -1169,17 +1100,12 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
 
         # Step 2: Gemm1
         # Setup quantization context
-        mx_ctx_1 = MicroscalingCtx(
-            weight_scale=gemm1_scales,
-            swizzle_value=self.swizzle_value,
-            swizzle_scale=self.swizzle_scale,
-            actual_weight_scale_shape=self.w3_w1_scale_shape)
         if self.activation_dtype == torch.float8_e4m3fn:
             flex_ctx_1 = FlexCtx(
                 lhs_data=InFlexData(scale=hidden_states_scale), )
         else:
             flex_ctx_1 = FlexCtx()
-        pc1 = PrecisionConfig(mx_ctx=mx_ctx_1,
+        pc1 = PrecisionConfig(weight_scale=gemm1_scales,
                               flex_ctx=flex_ctx_1,
                               allow_tf32=False,
                               out_dtype=module.dtype)
@@ -1211,7 +1137,6 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
         def _maybe_remove_padding(gemm_output, expected_size):
             assert gemm_output.dim() == 2
             if gemm_output.shape[-1] != expected_size:
-                assert self.swizzle_scale == SwizzlingType.HOPPER, "Only Hopper style swizzle can have padding"
                 assert gemm_output.shape[
                     -1] % 128 == 0, "The padding is not done correctly"
                 gemm_output = gemm_output[:, :expected_size]
@@ -1232,16 +1157,11 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
 
         # Step 3: Gemm2
         # Setup quantization context
-        mx_ctx_2 = MicroscalingCtx(
-            weight_scale=gemm2_scales,
-            swizzle_value=self.swizzle_value,
-            swizzle_scale=self.swizzle_scale,
-            actual_weight_scale_shape=self.w2_scale_shape)
         if self.activation_dtype == torch.float8_e4m3fn:
             flex_ctx_2 = FlexCtx(lhs_data=InFlexData(scale=act_scale), )
         else:
             flex_ctx_2 = FlexCtx()
-        pc2 = PrecisionConfig(mx_ctx=mx_ctx_2,
+        pc2 = PrecisionConfig(weight_scale=gemm2_scales,
                               flex_ctx=flex_ctx_2,
                               allow_tf32=False,
                               out_dtype=module.dtype)
@@ -1254,8 +1174,8 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
                                   scatter_indx=scatter_indx,
                                   precision_config=pc2,
                                   gammas=rdata.gate_scal if rdata else None)
-
         gemm2_output = _maybe_remove_padding(gemm2_output, module.hidden_size)
+
         return gemm2_output
 
 
@@ -1292,6 +1212,9 @@ class TritonFusedMoE(MoE):
         )
         if not IS_TRITON_KERNELS_AVAILABLE:
             raise ImportError("Triton kernels are not available.")
+        if torch.cuda.get_device_capability()[0] != 9 and self.ep_size > 1:
+            raise NotImplementedError(
+                "TritonFusedMoE is only supported on Hopper with EP size > 1.")
 
         assert isinstance(self.routing_method, RenormalizeMoeRoutingMethod), \
             "routing_method must be an instance of RenormalizeMoeRoutingMethod for TritonFusedMoE"
@@ -1328,19 +1251,10 @@ class TritonFusedMoE(MoE):
         self.swiglu_alpha = _maybe_squeeze_act_param(swiglu_alpha)
         self.swiglu_beta = _maybe_squeeze_act_param(swiglu_beta)
         self.swiglu_limit = _maybe_squeeze_act_param(swiglu_limit)
+
         self._weights_created = False
         if not model_config.skip_create_weights_in_init:
             self.create_weights()
-
-        if torch.cuda.get_device_capability()[0] >= 10:
-            from triton_kernels.matmul_ogs_details import opt_flags as optf
-            constraints = {
-                "block_m": 128,
-            }
-            # We need to unfortunately fix the block_m to 128 on Blackwell, otherwise it's computed based on x.
-            # And then triton would transpose weights based on heuristics related to block_m. This essentially means
-            # Triton will oaccasionally transpose weights for different input shapes and performance will suffer.
-            optf.update_opt_flags_constraints(constraints)
 
     def _get_quant_method(self):
         if self.quant_config is not None and self.quant_config.layer_quant_mode.has_any_quant(
