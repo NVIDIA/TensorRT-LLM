@@ -59,6 +59,8 @@ meta-llama/Llama-3.2-3B:
     accuracy: 60.60
 meta-llama/Llama-3.3-70B-Instruct:
   - accuracy: 81.31
+  - spec_dec_algo: Eagle
+    accuracy: 81.31
   - quant_algo: NVFP4
     kv_cache_quant_algo: FP8
     accuracy: 79.31
@@ -67,6 +69,10 @@ meta-llama/Llama-3.3-70B-Instruct:
     accuracy: 81.02
 meta-llama/Llama-4-Maverick-17B-128E-Instruct:
   - accuracy: 86.40
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    spec_dec_algo: Eagle
+    accuracy: 86.40
 meta-llama/Llama-4-Scout-17B-16E-Instruct:
   - accuracy: 80.00
   - quant_algo: NVFP4
