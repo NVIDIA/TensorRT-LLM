@@ -96,10 +96,10 @@ struct BatchedGemmOptions : public gemmGatedAct::GemmGatedActOptions
         int tileK, bool useUnrollLoop2xForMma, bool useCustomMmaSchedule, bool useHoistTryWaitForCustomMmaSchedule,
         bool useDeepSeekFp8, bool usePerTokenSfA, bool usePerTokenSfB, bool useTmaStore, bool useTwoTmaLoadWarps,
         bool useTwoMmaWarps, tg::SfLayout sfLayoutA, tg::SfLayout sfLayoutB, tg::SfLayout sfLayoutC,
-        int32_t sfReshapeFactor, gemm::TileScheduler tileScheduler, gemmGatedAct::ActType actType,
+        int32_t sfReshapeFactor, gemm::TileScheduler tileScheduler, gemmGatedAct::ActType actType, bool clampBeforeAct,
         std::vector<int> batchedM, std::vector<int> batchedN, BatchMode batchMode, int numBatches, bool isStaticBatch,
         int numTokens, RouteImpl routeImpl, bool gridWaitForPrimaryRouting, bool fusedAct,
-        int numRegsPerThreadNonEpilogueWarp, int numRegsPerThreadEpilogueWarp, int numRegsCastAWarps)
+        int numRegsPerThreadNonEpilogueWarp, int numRegsPerThreadEpilogueWarp, int numRegsCastAWarps, bool useTmaOobOpt)
         : gemmGatedAct::GemmGatedActOptions(
             gemm::GemmOptions(allReduceAlgo, biasType, blockK, clusterDimX, clusterDimY, clusterDimZ, dtypeAcc, dtypeA,
                 dtypeB, dtypeC, dtypeMmaA, dtypeMmaB, enablesEarlyExit, enablesDelayedEarlyExit, enablesGlobalPtxKnobs,
@@ -112,19 +112,20 @@ struct BatchedGemmOptions : public gemmGatedAct::GemmGatedActOptions
                 useCustomMmaSchedule, useHoistTryWaitForCustomMmaSchedule, useDeepSeekFp8, usePerTokenSfA,
                 usePerTokenSfB, useTmaStore, useTwoTmaLoadWarps, useTwoMmaWarps, sfLayoutA, sfLayoutB, sfLayoutC,
                 sfReshapeFactor, tileScheduler),
-            actType)
+            actType, clampBeforeAct)
         , mBatchedM(batchedM)
         , mBatchedN(batchedN)
         , mBatchMode(BatchMode(batchMode))
-        , mNumBatches(numBatches)
-        , mIsStaticBatch(isStaticBatch)
-        , mNumTokens(numTokens)
-        , mRouteImpl(routeImpl)
-        , mGridWaitForPrimaryRouting(gridWaitForPrimaryRouting)
         , mFusedAct(fusedAct)
+        , mGridWaitForPrimaryRouting(gridWaitForPrimaryRouting)
+        , mIsStaticBatch(isStaticBatch)
+        , mNumBatches(numBatches)
         , mNumRegsPerThreadNonEpilogueWarp(numRegsPerThreadNonEpilogueWarp)
         , mNumRegsPerThreadEpilogueWarp(numRegsPerThreadEpilogueWarp)
         , mNumRegsCastAWarps(numRegsCastAWarps)
+        , mNumTokens(numTokens)
+        , mRouteImpl(routeImpl)
+        , mUseTmaOobOpt(useTmaOobOpt)
     {
     }
 
@@ -134,28 +135,28 @@ struct BatchedGemmOptions : public gemmGatedAct::GemmGatedActOptions
     std::vector<int> mBatchedN;
     // Whether batching M or N.
     BatchMode mBatchMode{BatchMode::BatchM};
-    // Number of Gemm batches.
-    int mNumBatches;
-
-    // Whether the batch size is static (i.e. known at kernel launch time).
-    bool mIsStaticBatch{true};
-    // Total number of tokens.
-    int mNumTokens{32};
-    // Whether load the input tokens and do routing.
-    RouteImpl mRouteImpl{RouteImpl::NoRoute};
+    // Whether to perform a fused gated activation.
+    bool mFusedAct{false};
     // Whether the loads that load from ptrRouteMap, ptrTotalNumPaddedTokens,
     // ptrCtaIdxXyToBatchIdx, etc.. should wait on a grid dependency.
     bool mGridWaitForPrimaryRouting{true};
-
-    // Whether to perform a fused gated activation.
-    bool mFusedAct{false};
-
+    // Whether the batch size is static (i.e. known at kernel launch time).
+    bool mIsStaticBatch{true};
+    // Number of Gemm batches.
+    int mNumBatches;
     // Number of registers per thread for non-epilogue warps
     int mNumRegsPerThreadNonEpilogueWarp{0};
     // Number of registers per thread for epilogue warps
     int mNumRegsPerThreadEpilogueWarp{0};
     // Number of registers for the cast A warps.
     int mNumRegsCastAWarps{0};
+    // Total number of tokens.
+    int mNumTokens{32};
+    // Whether load the input tokens and do routing.
+    RouteImpl mRouteImpl{RouteImpl::NoRoute};
+    // Whether to use TMA out-of-bounds optimization to reduce wasted traffic. See details in
+    // BatchedGemm/KernelParamsDecl.h.
+    bool mUseTmaOobOpt{false};
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -165,6 +166,20 @@ bool checkAndUpdateBatchedGemmOptions(BatchedGemmOptions& options, bool isBlackw
 {
 
     bool isValid = true;
+    if (options.mUseTmaOobOpt && !options.mUseTwoTmaLoadWarps)
+    {
+        if (updateOptions)
+        {
+            // Since any routing (mRouteAct != NoRoute) requires mUseTwoTmaLoadWarps == true.
+            // Single TMA load warp is not the target use case for OOB optimization.
+            options.mUseTmaOobOpt = false;
+        }
+        else
+        {
+            TLLM_CHECK_ERROR(false, "TMA OOB optimization requires two TMA load warps.");
+            return false;
+        }
+    }
     if (options.mFusedAct)
     {
         // ensure that we check the fused options as well
@@ -340,6 +355,7 @@ struct BatchedGemmConfig
     uint32_t const mSharedMemSize{0};
     char const* mFunctionName{nullptr};
     uint32_t const mNumThreadsPerCTA{0};
+    char const* mHash{nullptr};
 #else
     trtllm::gen::CudaRunner* mCudaRunner{nullptr};
 #endif
@@ -366,7 +382,8 @@ inline std::string dumpOptions(BatchedGemmOptions const& options)
     ss << "mFusedAct=" << options.mFusedAct << "," << std::endl;
     ss << "mNumRegsPerThreadNonEpilogueWarp=" << options.mNumRegsPerThreadNonEpilogueWarp << "," << std::endl;
     ss << "mNumRegsPerThreadEpilogueWarp=" << options.mNumRegsPerThreadEpilogueWarp << "," << std::endl;
-    ss << "mNumRegsCastAWarps=" << options.mNumRegsCastAWarps << std::endl;
+    ss << "mNumRegsCastAWarps=" << options.mNumRegsCastAWarps << "," << std::endl;
+    ss << "mUseTmaOobOpt=" << options.mUseTmaOobOpt << std::endl;
     return ss.str();
 }
 

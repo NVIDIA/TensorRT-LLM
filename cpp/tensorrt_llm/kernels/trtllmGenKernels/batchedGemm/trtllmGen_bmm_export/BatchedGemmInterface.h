@@ -244,11 +244,48 @@ struct BatchedGemmData
         // Shape is [B].
         float const* mPtrScaleGate{nullptr};
 
+        // The clamp limit for the accumulator before applying the activation.
+        // Shape is [B].
+        // Clamp is INF if nullptr.
+        // When the input is FP8 or NVFP4, the clamp has to be scaled by limit' = limit / dequantAb.
+        // If applied on SwiGlu, it will be:
+        //
+        //   x_glu    = x_glu.clamp(min=None, max=limit)
+        //   x_linear = x_linear.clamp(min=-limit, max=limit)
+        //
+        // The given clamp limit applies to the dequantized values, so the order of operations would
+        // look something like this:
+        //
+        // x0 = x0 * dqAb
+        // x0 = clamp(x0, none, limit)
+        // x0 = x0 * sigmoid(alpha * x0)
+        // x1 = dqAb * x1
+        // x1 = clamp(x1, -limit, limit)
+        // out = qC * (x1 + beta) * x0
+        //
+        // Given that the dqAb and qC are combined into scaleC, we can bring the dqAb into the clamp
+        // limit and apply the clamping prior to dequantization:
+        //
+        // x0 = clamp(x0, none, limit / dqAb)
+        // x0 = x0 * dqAb
+        // x0 = x0 * sigmoid(alpha * x0)
+        // x1 = clamp(x1, -limit / dqAb, limit / dqAb)
+        // scaleC = dqAb * qC
+        // beta' = beta / dqAb
+        // out = scaleC * (x1 + beta') * x0
+        //
+        // Note this assumes that scaleAb == scaleGate which is true in TRT-LLM MoE use-case
+        //
+        float const* mPtrClampLimit{nullptr};
+
         // The alpha and beta for SwiGlu.
         // gatedActivation <- (x0 + beta) * activation(x1, alpha)
         // Shape is [B].
         // Alpha is 1.f if nullptr.
         // Beta is 0.f if nullptr.
+        // The formula:
+        //
+        //   out_glu  = x_glu * torch.sigmoid(alpha * x_glu) + (x_linear + beta)
         float const* mPtrSwiGluAlpha{nullptr};
         float const* mPtrSwiGluBeta{nullptr};
 
@@ -591,6 +628,7 @@ int32_t BatchedGemmInterface::run(BatchedGemmConfig const& config, void* workspa
 {
     // Might be used.
     (void) usePdl;
+    (void) moduleCache;
     // Get options from config and data.
     auto options = getOptionsFromConfigAndData(config, batchedGemmData);
 
@@ -642,17 +680,17 @@ int32_t BatchedGemmInterface::run(BatchedGemmConfig const& config, void* workspa
     auto const numCtaZ = options.mNumSlicesForSplitK;
     mNumCtas = numCtaX * numCtaY * numCtaZ;
 
-    auto kernelParams = KernelParams::setKernelParams(options, batchM, batchedGemmData.mInputBuffers.mPtrA,
+    auto kernelParams = KernelParamsSetup::setKernelParams(options, batchM, batchedGemmData.mInputBuffers.mPtrA,
         batchedGemmData.mInputBuffers.mPtrB, batchedGemmData.mOutputBuffers.mPtrC,
         batchedGemmData.mInputBuffers.mPtrSfA, batchedGemmData.mInputBuffers.mPtrSfB,
         batchedGemmData.mInputBuffers.mPtrPerTokenSfA, batchedGemmData.mInputBuffers.mPtrPerTokenSfB,
         batchedGemmData.mInputBuffers.mPtrBias, batchedGemmData.mOutputBuffers.mPtrSfC,
         batchedGemmData.mInputBuffers.mPtrScaleC, batchedGemmData.mInputBuffers.mPtrScaleGate,
-        batchedGemmData.mInputBuffers.mPtrSwiGluAlpha, batchedGemmData.mInputBuffers.mPtrSwiGluBeta,
-        batchedGemmData.mInputBuffers.mPtrRouteMap, dPtrRowMax, dPtrRowMaxBars,
-        batchedGemmData.mInputBuffers.mPtrNumNonExitingCtas, batchedGemmData.mInputBuffers.mPtrTotalNumPaddedTokens,
-        batchedGemmData.mInputBuffers.mPtrCtaIdxXyToBatchIdx, batchedGemmData.mInputBuffers.mPtrCtaIdxXyToMnLimit,
-        maxNumCtasInBatchDim);
+        batchedGemmData.mInputBuffers.mPtrClampLimit, batchedGemmData.mInputBuffers.mPtrSwiGluAlpha,
+        batchedGemmData.mInputBuffers.mPtrSwiGluBeta, batchedGemmData.mInputBuffers.mPtrRouteMap, dPtrRowMax,
+        dPtrRowMaxBars, batchedGemmData.mInputBuffers.mPtrNumNonExitingCtas,
+        batchedGemmData.mInputBuffers.mPtrTotalNumPaddedTokens, batchedGemmData.mInputBuffers.mPtrCtaIdxXyToBatchIdx,
+        batchedGemmData.mInputBuffers.mPtrCtaIdxXyToMnLimit, maxNumCtasInBatchDim);
 
     // The size of the grid.
     std::vector<int32_t> grid{numCtaX, numCtaY, numCtaZ};
@@ -660,26 +698,26 @@ int32_t BatchedGemmInterface::run(BatchedGemmConfig const& config, void* workspa
 #ifdef TLLM_GEN_EXPORT_INTERFACE
     CUmodule cuModule;
     CUfunction cuFunction;
+
     if (moduleCache.has_value())
     {
         ModuleCache& moduleCacheRef = moduleCache.value().get();
 
-        // Modules are associated with a specific context so include the ctxId in the key
+        // Modules are associated with a specific context, so the context is included in the key
         CUcontext ctx;
         unsigned long long ctxId;
         cuCtxGetCurrent(&ctx);
         cuCtxGetId(ctx, &ctxId);
 
-        // Reinterpret the ctxId as a string to avoid needing a custom hash or converting it to a string in decimal
-        // representation.
+        // Reinterpret the ctxId as a string to avoid needing a custom hash or converting it to a
+        // string in decimal representation.
         std::string const ctxName
             = std::string(reinterpret_cast<char*>(&ctxId), sizeof(unsigned long long) / sizeof(char));
         std::string const funcName = std::string(config.mFunctionName);
-        // As the ctxName is a fixed number of bytes, the two strings can just be appended without risk of a collision
         auto const moduleKey = ctxName + funcName;
         auto module = moduleCacheRef.find(moduleKey);
 
-        // Check if module exists in cache. Otherwise, load it
+        // Use cache if module is found, otherwise load and insert into cache
         if (module != moduleCacheRef.end())
         {
             cuFunction = std::get<1>(module->second);
@@ -716,7 +754,7 @@ int32_t BatchedGemmInterface::run(BatchedGemmConfig const& config, void* workspa
     {
         return -1;
     }
-    // If a module cache has not been given, unload the module to avoid overflow
+    // If a module cache has not been given, unload the module to avoid leaking
     if (!moduleCache.has_value())
     {
         cuModuleUnload(cuModule);
