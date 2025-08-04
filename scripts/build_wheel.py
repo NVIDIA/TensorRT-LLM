@@ -301,7 +301,7 @@ def main(*,
          install: bool = False,
          skip_building_wheel: bool = False,
          linking_install_binary: bool = False,
-         binding_type: str = "pybind",
+         binding_type: str = "nanobind",
          benchmarks: bool = False,
          micro_benchmarks: bool = False,
          nvtx: bool = False,
@@ -712,7 +712,7 @@ def main(*,
             with working_directory(pkg_dir):
                 if on_windows:
                     if binding_type == "nanobind":
-                        print("Windows not yet supported for nanobind stubs")
+                        print("Windows not supported for nanobind stubs")
                         exit(1)
                     else:
                         stubgen = "stubgen.py"
@@ -915,8 +915,8 @@ def add_arguments(parser: ArgumentParser):
     )
     parser.add_argument("--binding_type",
                         choices=["pybind", "nanobind"],
-                        default="pybind",
-                        help="Which binding type to build: pybind or nanobind")
+                        default="nanobind",
+                        help="Which binding library to use: pybind or nanobind")
     parser.add_argument("--benchmarks",
                         action="store_true",
                         help="Build the benchmarks for the C++ runtime")
