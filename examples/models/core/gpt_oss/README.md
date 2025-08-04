@@ -1,8 +1,26 @@
-# OpenAI MoE
+# GPT_OSS
 
 ## Overview
 
-## Support Matrix
+GPT_OSS is a reasoning model with MoE weights quantized with mxfp4. All the other weights are in bf16.
+
+## MoE Support Matrix
+
+In MoE, the weights are pre-quantized to mxfp4. The activation can be in either bf16 (Hopper) or mxfp8 (Blackwell), with similar accuracy.
+
+| device | Activation | Weight | Supported moe_backend |
+|----------|----------|----------|----------|
+| Hopper | bf16 | mxfp4 | **TRITON**, CUTLASS |
+| Blackwell | mxfp8 | mxfp4 | CUTLASS, TRTLLM |
+
+
+| moe_backend | TP | EP | AlltoAll |
+|----------|----------|----------|----------|
+| CUTLASS | yes | yes | yes |
+| TRTLLM | yes | yes | no |
+| TRITON | no | yes | no |
+
+For best performance, use the `TRITON` backend on Hopper for both latency and throughput cases. Use `CUTLASS` for throughput cases and `TRTLLM` for latency cases.
 
 ## Harmony Examples
 
@@ -42,7 +60,7 @@ python openai_chat_client_function_calling.py \
     --prompt "What is the weather like in SF?"
 ```
 
-The output would look like:
+The output would look similar to:
 
 ```txt
 [USER PROMPT] What is the weather like in SF?
