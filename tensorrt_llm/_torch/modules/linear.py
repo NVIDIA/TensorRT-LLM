@@ -573,23 +573,25 @@ class FP8BlockScalesLinearMethod(LinearMethodBase):
         assert input.dtype == torch.bfloat16
 
         if get_sm_version() == 100:
-            import deep_gemm
-            a, a_sf = fp8_utils.per_token_quant_and_transform(input)
-            output = torch.empty((input.shape[0], module.weight.shape[0]),
-                                 device=input.device,
-                                 dtype=torch.bfloat16)
-            deep_gemm.fp8_gemm_nt((a, a_sf),
-                                  (module.weight, module.weight_scale),
-                                  output,
-                                  disable_ue8m0_cast=True)
+            if module.use_cute_dsl_fp8_block_scale_gemm:
+                act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
+                    input)
+                output = torch.ops.trtllm.cute_dsl_fp8_gemm_blackwell(
+                    act_input_fp8, module.weight, act_input_sf,
+                    module.weight_scale)
+            else:
+                import deep_gemm
+                a, a_sf = fp8_utils.per_token_quant_and_transform(input)
+                output = torch.empty((input.shape[0], module.weight.shape[0]),
+                                     device=input.device,
+                                     dtype=torch.bfloat16)
+                deep_gemm.fp8_gemm_nt((a, a_sf),
+                                      (module.weight, module.weight_scale),
+                                      output,
+                                      disable_ue8m0_cast=True)
         else:
             act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
                 input)
-
-        if module.use_cute_dsl_fp8_block_scale_gemm:
-            output = torch.ops.trtllm.cute_dsl_fp8_gemm_blackwell(
-                act_input_fp8, module.weight, act_input_sf, module.weight_scale)
-        else:
             output = torch.ops.trtllm.fp8_block_scaling_gemm(
                 act_input_fp8, module.weight, act_input_sf, module.weight_scale)
         if bias is not None:
