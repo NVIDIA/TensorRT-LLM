@@ -58,8 +58,7 @@ This directory contains various test configuration files:
 - `llm_perf_full.yml` - Main performance test configuration
 - `llm_perf_cluster.yml` - Cluster-based performance tests
 - `llm_perf_sanity.yml` - Performance sanity checks
-- `llm_perf_l2.yml` - L2 level performance tests
-- `llm_perf_multinode.txt` - Multi-node performance tests
+- `llm_perf_nim.yml` - NIM-specific performance tests
 - `llm_trt_integration_perf.yml` - Integration performance tests
 - `llm_trt_integration_perf_sanity.yml` - Integration performance sanity checks
 
