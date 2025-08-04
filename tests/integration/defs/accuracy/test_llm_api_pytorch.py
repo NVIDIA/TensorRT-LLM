@@ -2204,3 +2204,19 @@ class TestPhi4MM(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
             task = GSM8K(model_name)
             task.evaluate(llm)
+
+
+class TestEXAONE4(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "LGAI-EXAONE/EXAONE-4.0-32B"
+    kv_cache_config = KvCacheConfig(
+        enable_block_reuse=False,
+        enable_partial_reuse=False,
+        max_attention_window=[4096, 4096, 4096, 131072])
+
+    def test_auto_dtype(self):
+        model_path = f"{llm_models_root()}/EXAONE-4.0-32B"
+        with LLM(model_path, kv_cache_config=self.kv_cache_config) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
