@@ -36,6 +36,7 @@ struct TransceiverTag
     static constexpr int32_t kID_TAG{19};
     static constexpr int32_t kINFO_SIZE_TAG{22};
     static constexpr int32_t kINFO_TAG{32};
+    static constexpr int32_t kREADY_SIGNAL_TAG{42};
 };
 
 using BaseCacheFormatter = kv_cache_manager::BaseCacheFormatter;
@@ -51,6 +52,8 @@ public:
     [[nodiscard]] RequestInfo recvRequestInfo() override;
 
     void sendSync(LlmRequest const& llmRequest) override;
+
+    void sendReadySignal(LlmRequest::RequestIdType requestId, bool isReady) override;
 
     [[nodiscard]] executor::kv_cache::CommState const& getCommState() const override;
 
@@ -80,6 +83,8 @@ public:
     TransferSession sendRequestInfo(LlmRequest const& llmRequest) override;
 
     void receiveSync(TransferSession& session) override;
+
+    bool receiveReadySignal(TransferSession& session) override;
 
 private:
     struct ReceiveCacheResource

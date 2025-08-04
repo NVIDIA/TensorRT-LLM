@@ -103,6 +103,18 @@ void DataSenderImpl::sendSync(LlmRequest const& llmRequest)
     mFormatter->format(session);
 }
 
+void DataSenderImpl::sendReadySignal(LlmRequest::RequestIdType requestId, bool isReady)
+{
+    auto it = mRequestToSession.find(requestId);
+    TLLM_CHECK(it != mRequestToSession.end());
+    auto& session = it->second;
+    auto connections = session.getConnections();
+    for (size_t i = 0; i < connections.size(); i++)
+    {
+        connections.at(i)->send(executor::kv_cache::DataContext{kREADY_SIGNAL_TAG}, &isReady, sizeof(isReady));
+    }
+}
+
 [[nodiscard]] executor::kv_cache::CommState const& DataSenderImpl::getCommState() const
 {
     return mSelfState.getCommState().value();
@@ -221,6 +233,21 @@ void DataReceiverImpl::sendRequestInfo(executor::kv_cache::Connection const* con
     connection->send(executor::kv_cache::DataContext{kID_TAG}, &id, sizeof(id));
     connection->send(executor::kv_cache::DataContext{kINFO_SIZE_TAG}, &infoSize, sizeof(infoSize));
     connection->send(executor::kv_cache::DataContext{kINFO_TAG}, serializedInfo.data(), infoSize);
+}
+
+bool DataReceiverImpl::receiveReadySignal(TransferSession& session)
+{
+    bool isReadyFinal = true;
+    bool isReady = false;
+    auto connections = session.getConnections();
+    // TODO: check if the logic is correct
+    for (size_t i = 0; i < connections.size(); i++)
+    {
+        connections.at(i)->recv(executor::kv_cache::DataContext{kREADY_SIGNAL_TAG}, &isReady, sizeof(isReady));
+        isReadyFinal &= isReady;
+    }
+
+    return isReadyFinal;
 }
 
 std::unique_ptr<DataReceiverImpl::ReceiveCacheResource> const& DataReceiverImpl::getReceiveCacheResource(

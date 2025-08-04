@@ -194,6 +194,10 @@ public:
 
     [[nodiscard]] virtual size_t getCounterpartsCount(LlmRequest::RequestIdType requestId) const = 0;
 
+    /// @brief Send a ready signal to the counterpart.
+    /// @param requestId The request ID.
+    virtual void sendReadySignal(LlmRequest::RequestIdType requestId, bool isReady) = 0;
+
     virtual void release(LlmRequest::RequestIdType requestId) = 0;
 
     /// @brief Destructor.
@@ -211,6 +215,11 @@ public:
     /// @brief Synchronously receive data.
     /// @param session The transfer session.
     virtual void receiveSync(TransferSession& session) = 0;
+
+    /// @brief Receive a ready signal from the counterpart.
+    /// @param session The transfer session.
+    /// @return Whether the request is ready to be received.
+    virtual bool receiveReadySignal(TransferSession& session) = 0;
 
     /// @brief Destructor.
     virtual ~DataReceiver() = default;
@@ -237,6 +246,10 @@ public:
     /// @param commState The communicator status.
     void setCommState(executor::kv_cache::CommState commState);
 
+    /// @brief Cancel the request.
+    /// @param llmRequest Request object.
+    void cancelRequest(LlmRequest& llmRequest) const;
+
     /// @brief Destructor.
     ~DataResponder();
 
@@ -257,6 +270,10 @@ public:
     /// data for this request should remain intact only after future synchronization.
     /// @return Once the data is fully received, the future object will become valid.
     [[nodiscard]] std::future<void> requestAndReceiveAsync(LlmRequest& llmRequest) const;
+
+    /// @brief Cancel the request.
+    /// @param llmRequest Request object.
+    void cancelRequest(LlmRequest& llmRequest) const;
 
     /// @brief Destructor.
     ~DataRequester();

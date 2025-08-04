@@ -132,6 +132,28 @@ public:
         mSender->setCommState(std::move(commState));
     }
 
+    void cancelRequest(LlmRequest& llmRequest)
+    {
+        try
+        {
+            std::unique_lock lkResp(mResponderMutex);
+            auto it = mReadyResponses.find(llmRequest.mRequestId);
+            // If the request is not the current request and already in the ready queue, we can cancel it.
+            if (it != mReadyResponses.end() && getCurrentRequestId() != llmRequest.mRequestId)
+            {
+                mCancelledRequests.insert(llmRequest.mRequestId);
+            }
+            else
+            {
+                TLLM_LOG_WARNING("Cannot cancel request %zu", llmRequest.mRequestId);
+            }
+        }
+        catch (std::exception const& e)
+        {
+            TLLM_THROW("%s", e.what());
+        }
+    }
+
     ~Impl()
     {
         terminate();
@@ -184,14 +206,25 @@ private:
                     auto reqId = requestInfo.getRequestId();
                     blockHashes = requestInfo.getBlockHashes();
 
-                    mCurrentRequest = reqId;
+                    bool isReady = true;
+                    {
+                        std::unique_lock lk(mResponderMutex);
+                        mCurrentRequest = reqId;
+                        if (mCancelledRequests.find(reqId) != mCancelledRequests.end())
+                        {
+                            isReady = false;
+                        }
+                    }
+                    mSender->sendReadySignal(reqId, isReady);
+
                     if (mRemainSendCount.find(reqId) == mRemainSendCount.end())
                     {
                         mRemainSendCount[reqId] = mSender->getCounterpartsCount(reqId);
                     }
                 }
                 auto it = getCurrentResponse();
-                if (it != mReadyResponses.end())
+                bool isReady = !isCancelled(mCurrentRequest.value());
+                if (it != mReadyResponses.end() && isReady)
                 {
                     auto reqId = mCurrentRequest.value();
                     auto count = --mRemainSendCount[reqId];
@@ -221,12 +254,22 @@ private:
                 }
                 else
                 {
-                    TLLM_CHECK_WITH_INFO(!mCurrentRequest.has_value(),
-                        "This executor does not have a prepared KV cache for request ID: %zu, and the "
-                        "mReadyResponses size is: %zu. mpi rank :%d     ",
-                        mCurrentRequest.value(), mReadyResponses.size(), mpi::MpiComm::world().getRank());
-                    std::unique_lock lk(mCondMutex);
-                    mResponderCv.wait(lk, [this]() { return (mAnyReady || mTerminate); });
+                    // The request has been cancelled. Release the resources.
+                    auto it = mReadyResponses.find(mCurrentRequest.value());
+                    auto newException = std::make_exception_ptr(std::runtime_error("Request cancelled"));
+                    it->second.mPromise.set_exception(newException);
+                    {
+                        std::unique_lock lkResp(mResponderMutex);
+                        mReadyResponses.erase(it);
+                        mCancelledRequests.erase(mCurrentRequest.value());
+                    }
+                    mCurrentRequest = std::nullopt;
+
+                    if (mReadyResponses.empty())
+                    {
+                        std::unique_lock lk(mCondMutex);
+                        mAnyReady = false;
+                    }
                 }
             }
         }
@@ -280,6 +323,12 @@ private:
         return mReadyResponses.find(getCurrentRequestId());
     }
 
+    [[nodiscard]] bool isCancelled(RequestIdType requestId) const
+    {
+        std::unique_lock lk(mResponderMutex);
+        return mCancelledRequests.find(requestId) != mCancelledRequests.end();
+    }
+
 private:
     std::optional<RequestIdType> mCurrentRequest;
     std::map<RequestIdType, Response> mReadyResponses;
@@ -289,6 +338,7 @@ private:
     std::future<void> mResponseFuture;
     std::unique_ptr<DataSender> mSender;
     std::unordered_map<LlmRequest::RequestIdType, int> mRemainSendCount;
+    std::set<LlmRequest::RequestIdType> mCancelledRequests;
     int mDeviceId{-1};
 };
 
@@ -342,6 +392,38 @@ public:
         }
     }
 
+    void cancelRequest(LlmRequest& llmRequest)
+    {
+        try
+        {
+            std::string processInfo = "default";
+            if (common::getEnvRequestKVCacheConcurrent())
+            {
+                processInfo = llmRequest.getDataTransceiverState().getCommState()->toString();
+            }
+
+            auto& asyncResource = mInstanceToAsyncResource.at(processInfo);
+            {
+                std::unique_lock<std::mutex> lck(asyncResource->mMtxForQueue);
+                auto it = std::find_if(asyncResource->mRequestsQueue.begin(), asyncResource->mRequestsQueue.end(),
+                    [&llmRequest](RequestAndPromise const& requestAndPromise)
+                    { return requestAndPromise.mRequest->mRequestId == llmRequest.mRequestId; });
+                if (it != asyncResource->mRequestsQueue.end())
+                {
+                    asyncResource->mRequestsQueue.erase(it);
+                }
+                else
+                {
+                    TLLM_LOG_WARNING("Cannot cancel request %zu", llmRequest.mRequestId);
+                }
+            }
+        }
+        catch (std::exception const& e)
+        {
+            TLLM_THROW("%s", e.what());
+        }
+    }
+
     ~Impl()
     {
         for (auto&& [processInfo, asyncResource] : mInstanceToAsyncResource)
@@ -364,6 +446,12 @@ private:
         llmRequest.setKvCacheTransferStart(std::chrono::steady_clock::now());
         TLLM_CUDA_CHECK(cudaSetDevice(mDeviceId));
         auto session = mReceiver->sendRequestInfo(llmRequest);
+        bool isReady = mReceiver->receiveReadySignal(session);
+        if (!isReady)
+        {
+            TLLM_THROW("Request %zu is not ready to be received.", llmRequest.mRequestId);
+            return;
+        }
         mReceiver->receiveSync(session);
         llmRequest.setKvCacheTransferEnd(std::chrono::steady_clock::now());
 
@@ -497,6 +585,11 @@ void DataResponder::setCommState(executor::kv_cache::CommState commState)
     mImpl->setCommState(std::move(commState));
 }
 
+void DataResponder::cancelRequest(LlmRequest& llmRequest) const
+{
+    mImpl->cancelRequest(llmRequest);
+}
+
 DataResponder::~DataResponder() = default;
 
 DataRequester::DataRequester(std::unique_ptr<DataReceiver> receiver)
@@ -507,6 +600,11 @@ DataRequester::DataRequester(std::unique_ptr<DataReceiver> receiver)
 std::future<void> DataRequester::requestAndReceiveAsync(LlmRequest& llmRequest) const
 {
     return mImpl->requestAndReceiveAsyncMultiThreads(llmRequest);
+}
+
+void DataRequester::cancelRequest(LlmRequest& llmRequest) const
+{
+    mImpl->cancelRequest(llmRequest);
 }
 
 DataRequester::~DataRequester() = default;
