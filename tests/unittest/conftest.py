@@ -100,6 +100,4 @@ def mpi_pool_executor(request):
     """
     num_workers = request.param
     with MPIPoolExecutor(num_workers) as executor:
-        # make the number of workers visible to tests
-        setattr(executor, "num_workers", num_workers)
         yield executor
