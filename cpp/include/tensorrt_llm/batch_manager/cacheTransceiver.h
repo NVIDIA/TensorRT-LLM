@@ -64,6 +64,8 @@ public:
 
     virtual void checkGenTransferStatus(std::optional<int> const& atLeastRequestNum = std::nullopt) = 0;
 
+    virtual void cancelRequest(LlmRequest* llmRequest) = 0;
+
     [[nodiscard]] virtual bool checkGenTransferComplete() const = 0;
 };
 
@@ -102,6 +104,8 @@ public:
     void checkContextTransferStatus(std::optional<int> const& atLeastRequestNum = std::nullopt) override;
 
     void checkGenTransferStatus(std::optional<int> const& atLeastRequestNum = std::nullopt) override;
+
+    void cancelRequest(LlmRequest* llmRequest) override;
 
     [[nodiscard]] bool checkGenTransferComplete() const override;
 
