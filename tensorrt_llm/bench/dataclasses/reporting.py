@@ -663,23 +663,7 @@ class ReportUtility:
         return self.statistics
 
     def get_max_draft_len(self) -> int:
-        """Get max_draft_len from rt_cfg or speculative_config."""
-        # Try to get from rt_cfg first
-        if (self.rt_cfg.decoding_config
-                and self.rt_cfg.decoding_config.decoding_mode
-                != SpeculativeDecodingMode.NONE):
-            # For C++ backend, max_draft_len is stored in the engine config
-            # We need to read it from the engine config file
-            if self.rt_cfg.engine_dir:
-                config_path = self.rt_cfg.engine_dir / "config.json"
-                try:
-                    with open(config_path, "r") as config:
-                        engine_config = json.load(config)
-                    build_cfg = engine_config["build_config"]
-                    return build_cfg.get("max_draft_len", 0)
-                except (FileNotFoundError, KeyError, json.JSONDecodeError):
-                    pass
-
+        """Get max_draft_len from speculative_config."""
         # Try to get from speculative_config
         if ("speculative_config" in self.kwargs
                 and self.kwargs["speculative_config"] is not None):
