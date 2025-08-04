@@ -430,7 +430,6 @@ class PyTorchModelEngine(ModelEngine):
         self.lora_model_config: Optional[LoraModelConfig] = None
         self.cuda_graph_dummy_request = None
         self.max_cudagraph_meta_buffers = {}
-        self.max_cudagraph_spec_meta_buffers = {}
 
         # Setup the local cache indirection buffer only once and reuse it.
         # This way it can also be used for CUDA graphs.
@@ -929,7 +928,7 @@ class PyTorchModelEngine(ModelEngine):
         idx = bisect.bisect_left(self._cuda_graph_batch_sizes, batch_size)
         return self._cuda_graph_batch_sizes[idx]
 
-    def _update_max_attn_meta_buffers(self, meta_buffers, spec_meta_buffers):
+    def _update_max_attn_meta_buffers(self, meta_buffers):
 
         def update_buffers(old, new):
             if new is None:
@@ -941,7 +940,6 @@ class PyTorchModelEngine(ModelEngine):
                     old[key] = v
 
         update_buffers(self.max_cudagraph_meta_buffers, meta_buffers)
-        update_buffers(self.max_cudagraph_spec_meta_buffers, spec_meta_buffers)
 
     def _maybe_get_cuda_graph(
         self,
@@ -991,14 +989,10 @@ class PyTorchModelEngine(ModelEngine):
         spec_metadata = None
         if self.is_spec_decode:
             spec_metadata = self.spec_metadata.create_cuda_graph_metadata(
-                num_sequences_in_batch, self.max_cudagraph_spec_meta_buffers)
+                num_sequences_in_batch)
             spec_metadata.draft_tokens = self.draft_tokens_cuda
 
-        new_spec_attn_buffers = spec_metadata.get_runtime_buffers(
-        ) if spec_metadata is not None else None
-
-        self._update_max_attn_meta_buffers(new_attn_buffers,
-                                           new_spec_attn_buffers)
+        self._update_max_attn_meta_buffers(new_attn_buffers)
 
         # Initialize nested dictionary if needed
         if batch_size not in self._cuda_graphs:
