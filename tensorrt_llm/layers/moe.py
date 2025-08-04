@@ -54,7 +54,8 @@ activation_str_to_int_map = {
     "silu": 2,
     "swiglu": 3,
     "geglu": 4,
-    "identity": 5,
+    "swiglu_bias": 5,
+    "identity": 6,
 }
 
 
