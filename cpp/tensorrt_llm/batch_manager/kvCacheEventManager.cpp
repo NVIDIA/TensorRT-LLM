@@ -56,10 +56,12 @@ KVCacheEventManager::KVCacheEventManager(size_t maxKVEventEntries, std::optional
             !mAttentionDpSize.has_value(), "If attention DP rank is not set, the attention DP size must not be set");
     }
     mWorkerThread = std::thread([this]() { this->worker(); });
+#if ENABLE_MULTI_DEVICE
     if (mAttentionDpRank)
     {
         mExchangeAttentionDpThread = std::thread([this]() { this->exchangeAttentionDpThread(); });
     }
+#endif
 };
 
 KVCacheEventManager::~KVCacheEventManager()
@@ -68,10 +70,12 @@ KVCacheEventManager::~KVCacheEventManager()
     mPendingEmptyCV.notify_all();
     mEmptyCV.notify_all();
     mWorkerThread.join();
+#if ENABLE_MULTI_DEVICE
     if (mAttentionDpRank)
     {
         mExchangeAttentionDpThread.join();
     }
+#endif
 }
 
 void KVCacheEventManager::enqueueCreatedEvent(
@@ -154,6 +158,7 @@ void KVCacheEventManager::flush()
 
 void KVCacheEventManager::exchangeAttentionDpThread()
 {
+#if ENABLE_MULTI_DEVICE
     while (true)
     {
         TLLM_CHECK(mAttentionDpRank);
@@ -202,6 +207,9 @@ void KVCacheEventManager::exchangeAttentionDpThread()
             std::this_thread::sleep_for(std::chrono::milliseconds(mAttentionDpEventsGatherPeriodMs));
         }
     }
+#else
+    TLLM_THROW("Multi device support is disabled.");
+#endif
 }
 
 void KVCacheEventManager::worker()
