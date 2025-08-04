@@ -235,6 +235,20 @@ class ModelConfig(Generic[TConfig]):
         return quant_config, layer_quant_config
 
     @staticmethod
+    def get_mxfp4_quant_algo(moe_backend, is_dynamic_quant=False):
+        quant_algo = ModelConfig.override_quant_algo()
+        if quant_algo is None and not is_dynamic_quant:
+            if get_sm_version() >= 100:
+                if moe_backend == 'TRITON':
+                    return QuantAlgo.W4A8_MXFP4_FP8
+                else:
+                    return QuantAlgo.W4A8_MXFP4_MXFP8
+            else:
+                return QuantAlgo.W4A16_MXFP4
+        else:
+            return quant_algo
+
+    @staticmethod
     def load_hf_quant_config(hf_quant_config, moe_backend):
         quant_config = QuantConfig()
         layer_quant_config = None
@@ -255,6 +269,15 @@ class ModelConfig(Generic[TConfig]):
             assert tuple(block_size) == (
                 128, 128), "FP8_BLOCK_SCALES only supports block_size=(128,128)"
             quant_config.group_size = block_size[0]
+        # MXFP4 checkpoints.
+        elif hf_quant_config.get("quant_method") == "mxfp4":
+            quant_config.quant_algo = ModelConfig.get_mxfp4_quant_algo(
+                moe_backend)
+            quant_config.group_size = 32
+            quant_config.exclude_modules = [
+                'block.*.attn.out', 'block.*.mlp.gate', 'block.*.attn.qkv',
+                'embedding', 'unembedding'
+            ]
 
         return quant_config, layer_quant_config
 
@@ -285,17 +308,8 @@ class ModelConfig(Generic[TConfig]):
                     has_mxfp4 = True
 
         if has_mxfp4:
-            quant_algo = ModelConfig.override_quant_algo()
-            if quant_algo is None and not is_dynamic_quant:
-                # Get default quant_algo for mxfp4 checkpoints
-                if get_sm_version() >= 100:
-                    if moe_backend == 'TRITON':
-                        quant_algo = QuantAlgo.W4A8_MXFP4_FP8
-                    else:
-                        quant_algo = QuantAlgo.W4A8_MXFP4_MXFP8
-                else:
-                    quant_algo = QuantAlgo.W4A16_MXFP4
-            quant_config.quant_algo = quant_algo
+            quant_config.quant_algo = ModelConfig.get_mxfp4_quant_algo(
+                moe_backend, is_dynamic_quant)
             quant_config.group_size = 32
             quant_config.exclude_modules = list(exclude_modules)
             logger.info(f"Setting quant_config: {quant_config}")

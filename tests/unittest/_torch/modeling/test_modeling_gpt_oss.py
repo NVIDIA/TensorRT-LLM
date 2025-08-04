@@ -12,7 +12,7 @@ from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig, MoeConfig
 configs = """
 {
     "architectures": [
-            "OpenAIMoeForCausalLM"
+        "GptOssForCausalLM"
     ],
     "model_type": "mixtral",
     "torch_dtype": "bfloat16",
