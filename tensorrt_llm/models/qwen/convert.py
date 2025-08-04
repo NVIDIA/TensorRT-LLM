@@ -171,6 +171,30 @@ def smooth_qwen2_model(model, scales, alpha, qwen_qkv_para, qwen_smoother):
         scales[layer_name]["w"] = module.mlp.down_proj.weight.abs().max(
             dim=1)[0]
 
+    scales_keys_to_rename = [
+        key for key in scales.keys() if 'language_model.' in key
+    ]
+
+    qwen_qkv_para_keys_to_rename = [
+        key for key in qwen_qkv_para.keys() if 'language_model.' in key
+    ]
+
+    qwen_smoother_keys_to_rename = [
+        key for key in qwen_smoother.keys() if 'language_model.' in key
+    ]
+
+    for key in scales_keys_to_rename:
+        scales[key.replace('language_model.', '')] = scales[key]
+        del scales[key]
+
+    for key in qwen_qkv_para_keys_to_rename:
+        qwen_qkv_para[key.replace('language_model.', '')] = qwen_qkv_para[key]
+        del qwen_qkv_para[key]
+
+    for key in qwen_smoother_keys_to_rename:
+        qwen_smoother[key.replace('language_model.', '')] = qwen_smoother[key]
+        del qwen_smoother[key]
+
 
 @torch.no_grad()
 def capture_activation_range(model,

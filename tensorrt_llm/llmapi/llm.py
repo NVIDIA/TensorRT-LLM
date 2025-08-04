@@ -30,6 +30,7 @@ from ..inputs import (PromptInputs, create_input_processor,
                       create_input_processor_with_hash, prompt_inputs)
 from ..logger import logger
 from ..sampling_params import SamplingParams
+from ..scheduling_params import SchedulingParams
 from .llm_args import (TORCH_LLMARGS_EXPLICIT_DOCSTRING,
                        TRT_LLMARGS_EXPLICIT_DOCSTRING, NGramDecodingConfig,
                        PeftCacheConfig, PybindMirror, TorchLlmArgs, TrtLlmArgs)
@@ -236,6 +237,8 @@ class BaseLLM:
             KvCacheRetentionConfig, Sequence[KvCacheRetentionConfig]]] = None,
         disaggregated_params: Optional[Union[
             DisaggregatedParams, Sequence[DisaggregatedParams]]] = None,
+        scheduling_params: Optional[Union[SchedulingParams,
+                                          List[SchedulingParams]]] = None,
     ) -> Union[RequestOutput, List[RequestOutput]]:
         """Generate output for the given prompts in the synchronous mode.
         Synchronous generation accepts either single prompt or batched prompts.
@@ -254,6 +257,8 @@ class BaseLLM:
                 Configuration for the request's retention in the KV Cache. Defaults to None.
             disaggregated_params (tensorrt_llm.disaggregated_params.DisaggregatedParams, Sequence[tensorrt_llm.disaggregated_params.DisaggregatedParams], optional):
                 Disaggregated parameters. Defaults to None.
+            scheduling_params (tensorrt_llm.scheduling_params.SchedulingParams, List[tensorrt_llm.scheduling_params.SchedulingParams], optional):
+                Scheduling parameters. Defaults to None.
         Returns:
             Union[tensorrt_llm.llmapi.RequestOutput, List[tensorrt_llm.llmapi.RequestOutput]]: The output data of the completion request to the LLM.
         """
@@ -283,6 +288,7 @@ class BaseLLM:
                 kv_cache_retention_config=_item_at(kv_cache_retention_config,
                                                    i),
                 disaggregated_params=_item_at(disaggregated_params, i),
+                scheduling_params=_item_at(scheduling_params, i),
                 streaming=False)
             futures.append(future)
 
@@ -308,6 +314,7 @@ class BaseLLM:
         kv_cache_retention_config: Optional[KvCacheRetentionConfig] = None,
         disaggregated_params: Optional[DisaggregatedParams] = None,
         _postproc_params: Optional[PostprocParams] = None,
+        scheduling_params: Optional[SchedulingParams] = None,
     ) -> RequestOutput:
         """Generate output for the given prompt in the asynchronous mode.
         Asynchronous generation accepts single prompt only.
@@ -321,6 +328,7 @@ class BaseLLM:
             streaming (bool): Whether to use the streaming mode for the generation. Defaults to False.
             kv_cache_retention_config (tensorrt_llm.bindings.executor.KvCacheRetentionConfig, optional): Configuration for the request's retention in the KV Cache. Defaults to None.
             disaggregated_params (tensorrt_llm.disaggregated_params.DisaggregatedParams, optional): Disaggregated parameters. Defaults to None.
+            scheduling_params (tensorrt_llm.scheduling_params.SchedulingParams, optional): Scheduling parameters. Defaults to None.
 
         Returns:
             tensorrt_llm.llmapi.RequestOutput: The output data of the completion request to the LLM.
@@ -426,6 +434,7 @@ class BaseLLM:
             disaggregated_params=disaggregated_params,
             postproc_params=_postproc_params,
             multimodal_params=multimodal_params,
+            scheduling_params=scheduling_params,
         )
 
         return RequestOutput._from_generation_result(result, prompt,
