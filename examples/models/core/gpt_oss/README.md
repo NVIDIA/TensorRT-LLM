@@ -20,7 +20,7 @@ In MoE, the weights are pre-quantized to mxfp4. The activation can be in either 
 | TRTLLM | yes | yes | no |
 | TRITON | no | yes | no |
 
-For best performance, use the `TRITON` backend on Hopper for both latency and throughput cases. Use `CUTLASS` for throughput cases and `TRTLLM` for latency cases.
+For best performance, use the `TRITON` moe_backend on Hopper for both latency and throughput cases. Use `CUTLASS` for throughput cases and `TRTLLM` for latency cases on Blackwell.
 
 ## Harmony Examples
 
