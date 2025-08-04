@@ -47,15 +47,17 @@ TODO: Support other variants:
 
 import operator
 from collections import defaultdict
-from typing import Any, DefaultDict, Dict, Optional, Sequence
+from typing import Any, DefaultDict, Dict, Optional, Sequence, Tuple, Type
 
 import torch
+from pydantic import Field
 from torch.fx import GraphModule, Node
 
-from ...utils.logger import ad_logger
+from ...models.factory import ModelFactory
+from ...shim.interface import CachedSequenceInterface
 from ...utils.node_utils import extract_op_args, extract_output_tuple, is_op
 from ...utils.pattern_matcher import ADPatternMatcherPass, Match, register_ad_pattern
-from .._graph import canonicalize_graph
+from ..interface import BaseTransform, TransformConfig, TransformInfo, TransformRegistry
 
 
 def _rotate_half(x):
@@ -119,221 +121,256 @@ def _explicit_not_interleaved(match: Match) -> bool:
     return not any(isinstance(n, Node) and _match_input_interleave_pattern(n) for n in (q, k))
 
 
-def match_rope_pattern(gm: GraphModule) -> int:
-    graph = gm.graph
-    patterns = ADPatternMatcherPass()
+@TransformRegistry.register("match_rope_pattern")
+class MatchRopePattern(BaseTransform):
+    def _apply(
+        self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory
+    ) -> Tuple[GraphModule, TransformInfo]:
+        graph = gm.graph
+        patterns = ADPatternMatcherPass()
 
-    # dummy shapes: can be arbitrary
-    batch_size = 8
-    seq_len = 16
-    num_heads = 8
-    hidden_size = 512
-    head_dim = hidden_size // num_heads
+        # dummy shapes: can be arbitrary
+        batch_size = 8
+        seq_len = 16
+        num_heads = 8
+        hidden_size = 512
+        head_dim = hidden_size // num_heads
 
-    dummy_explicit = [
-        torch.randn(batch_size, num_heads, seq_len, head_dim, device="meta", dtype=torch.float16),
-        torch.randn(batch_size, num_heads, seq_len, head_dim, device="meta", dtype=torch.float16),
-        torch.randn(batch_size, seq_len, head_dim, device="meta", dtype=torch.float16),
-        torch.randn(batch_size, seq_len, head_dim, device="meta", dtype=torch.float16),
-    ]
-    dummy_complex = [
-        torch.randn(batch_size, num_heads, seq_len, head_dim, device="meta", dtype=torch.float16),
-        torch.randn(batch_size, num_heads, seq_len, head_dim, device="meta", dtype=torch.float16),
-        torch.randn(batch_size, seq_len, head_dim // 2, device="meta", dtype=torch.float16),
-    ]
-    # float32 input can change the graph when there's .float() in pattern
-    dummy_complex_2 = [
-        torch.randn(batch_size, num_heads, seq_len, head_dim, device="meta", dtype=torch.float32),
-        torch.randn(batch_size, num_heads, seq_len, head_dim, device="meta", dtype=torch.float32),
-        torch.randn(batch_size, seq_len, head_dim // 2, device="meta", dtype=torch.float32),
-    ]
-    register_ad_pattern(
-        search_fn=_explicit_rope_pattern,
-        replace_fn=_explicit_rope_repl,
-        patterns=patterns,
-        dummy_args=dummy_explicit,
-        op_ignore_types={torch.ops.aten.slice.Tensor: (int,)},
-        scalar_workaround={"unsqueeze_dim": 1},
-        extra_check=_explicit_not_interleaved,
+        dummy_explicit = [
+            torch.randn(
+                batch_size, num_heads, seq_len, head_dim, device="meta", dtype=torch.float16
+            ),
+            torch.randn(
+                batch_size, num_heads, seq_len, head_dim, device="meta", dtype=torch.float16
+            ),
+            torch.randn(batch_size, seq_len, head_dim, device="meta", dtype=torch.float16),
+            torch.randn(batch_size, seq_len, head_dim, device="meta", dtype=torch.float16),
+        ]
+        dummy_complex = [
+            torch.randn(
+                batch_size, num_heads, seq_len, head_dim, device="meta", dtype=torch.float16
+            ),
+            torch.randn(
+                batch_size, num_heads, seq_len, head_dim, device="meta", dtype=torch.float16
+            ),
+            torch.randn(batch_size, seq_len, head_dim // 2, device="meta", dtype=torch.float16),
+        ]
+        dummy_complex_2 = [
+            torch.randn(
+                batch_size, num_heads, seq_len, head_dim, device="meta", dtype=torch.float32
+            ),
+            torch.randn(
+                batch_size, num_heads, seq_len, head_dim, device="meta", dtype=torch.float32
+            ),
+            torch.randn(batch_size, seq_len, head_dim // 2, device="meta", dtype=torch.float32),
+        ]
+        register_ad_pattern(
+            search_fn=_explicit_rope_pattern,
+            replace_fn=_explicit_rope_repl,
+            patterns=patterns,
+            dummy_args=dummy_explicit,
+            op_ignore_types={torch.ops.aten.slice.Tensor: (int,)},
+            scalar_workaround={"unsqueeze_dim": 1},
+            extra_check=_explicit_not_interleaved,
+        )
+        register_ad_pattern(
+            search_fn=_interleaved_rope_pattern,
+            replace_fn=_interleaved_rope_repl,
+            patterns=patterns,
+            dummy_args=dummy_explicit,
+            op_ignore_types={
+                torch.ops.aten.slice.Tensor: (int,),
+                torch.ops.aten.reshape.default: (int,),
+                torch.ops.aten.view.default: (int,),
+            },
+            scalar_workaround={"unsqueeze_dim": 1},
+        )
+        register_ad_pattern(
+            search_fn=_complex_rope_pattern,
+            replace_fn=_complex_rope_repl,
+            patterns=patterns,
+            dummy_args=dummy_complex,
+            op_ignore_types={
+                torch.ops.aten.reshape.default: (int,),
+            },
+            scalar_workaround={"unsqueeze_dim": 1},
+        )
+        register_ad_pattern(
+            search_fn=_complex_rope_pattern,
+            replace_fn=_complex_rope_repl,
+            patterns=patterns,
+            dummy_args=dummy_complex_2,
+            op_ignore_types={
+                torch.ops.aten.reshape.default: (int,),
+            },
+            scalar_workaround={"unsqueeze_dim": 1},
+        )
+
+        num_matches = patterns.apply(graph)
+
+        info = TransformInfo(
+            skipped=False, num_matches=num_matches, is_clean=False, has_valid_shapes=False
+        )
+
+        return gm, info
+
+
+class MatchRopeLayoutConfig(TransformConfig):
+    """Configuration for the match rope layout transform."""
+
+    expected_layout: str = Field(
+        default="bsnd",
+        description="The expected layout of the rope operation. Must be one of 'bsnd' or 'bnsd'.",
     )
-    register_ad_pattern(
-        search_fn=_interleaved_rope_pattern,
-        replace_fn=_interleaved_rope_repl,
-        patterns=patterns,
-        dummy_args=dummy_explicit,
-        op_ignore_types={
-            torch.ops.aten.slice.Tensor: (int,),
-            torch.ops.aten.reshape.default: (int,),
-            torch.ops.aten.view.default: (int,),
-        },
-        scalar_workaround={"unsqueeze_dim": 1},
-    )
-    register_ad_pattern(
-        search_fn=_complex_rope_pattern,
-        replace_fn=_complex_rope_repl,
-        patterns=patterns,
-        dummy_args=dummy_complex,
-        op_ignore_types={
-            torch.ops.aten.reshape.default: (int,),
-        },
-        scalar_workaround={"unsqueeze_dim": 1},
-    )
-    register_ad_pattern(
-        search_fn=_complex_rope_pattern,
-        replace_fn=_complex_rope_repl,
-        patterns=patterns,
-        dummy_args=dummy_complex_2,
-        op_ignore_types={
-            torch.ops.aten.reshape.default: (int,),
-        },
-        scalar_workaround={"unsqueeze_dim": 1},
-    )
-
-    num_matches = patterns.apply(graph)
-    canonicalize_graph(gm)
-    ad_logger.info(f"Found and matched {num_matches} RoPE patterns")
-    return num_matches
 
 
-def match_rope_layout(gm: GraphModule, expected_layout: str = "bsnd") -> None:
+@TransformRegistry.register("match_rope_layout")
+class MatchRopeLayout(BaseTransform):
     """
     Match and transform input and output of rope ops to the layout specified to meet requirements of optimized ops.
     Supported layout is 'bsnd' (batch, seq, head, dim).
     """
-    supported = {"bsnd", "bnsd"}
-    if expected_layout.lower() not in supported:
-        ad_logger.warning(
-            f"Unsupported RoPE layout '{expected_layout}'; expected '{supported}'. Skipping RoPE layout matching."
+
+    config: MatchRopeLayoutConfig
+
+    @classmethod
+    def get_config_class(cls) -> Type[TransformConfig]:
+        return MatchRopeLayoutConfig
+
+    def _apply(
+        self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory
+    ) -> Tuple[GraphModule, TransformInfo]:
+        supported = {"bsnd", "bnsd"}
+        if self.config.expected_layout.lower() not in supported:
+            return
+
+        graph = gm.graph
+        rope_ops = {
+            torch.ops.auto_deploy.torch_rope_with_explicit_cos_sin,
+            torch.ops.auto_deploy.torch_rope_with_qk_interleaving,
+            torch.ops.auto_deploy.torch_rope_with_complex_freqs,
+        }
+
+        need_transpose = False
+        num_rope_layout_matches = 0
+        for node in graph.nodes:
+            if not is_op(node, rope_ops):
+                continue
+
+            if is_op(node, torch.ops.auto_deploy.torch_rope_with_complex_freqs):
+                q_node, k_node, freqs_node, unsq = extract_op_args(
+                    node,
+                    "xq",  # argument name in schema
+                    "xk",
+                    "freqs_cis",
+                    "unsqueeze_dim",
+                )
+            else:
+                q_node, k_node, cos_node, sin_node, unsq = extract_op_args(
+                    node, "q", "k", "cos", "sin", "unsqueeze_dim"
+                )
+
+            if unsq == 2:
+                current_layout = "bsnd"
+            elif unsq == 1:
+                current_layout = "bnsd"
+            else:
+                continue
+
+            need_transpose = self.config.expected_layout.lower() != current_layout
+
+            if not need_transpose:
+                continue
+
+            num_rope_layout_matches += 1
+            # retrieve q and k output node from node
+            q_rope_old, k_rope_old = extract_output_tuple(node, 2)
+            if q_rope_old is None or k_rope_old is None:
+                continue
+
+            with graph.inserting_before(node):
+                q_for_op = graph.call_function(torch.ops.aten.transpose, args=(q_node, 1, 2))
+                k_for_op = graph.call_function(torch.ops.aten.transpose, args=(k_node, 1, 2))
+                q_for_op_contig = graph.call_function(torch.ops.aten.contiguous, args=(q_for_op,))
+                k_for_op_contig = graph.call_function(torch.ops.aten.contiguous, args=(k_for_op,))
+
+            q_for_op_contig.meta["val"] = q_node.meta["val"].transpose(1, 2)
+            k_for_op_contig.meta["val"] = k_node.meta["val"].transpose(1, 2)
+
+            if is_op(node, torch.ops.auto_deploy.torch_rope_with_complex_freqs):
+                new_args = (
+                    q_for_op_contig,
+                    k_for_op_contig,
+                    freqs_node,
+                    2 if self.config.expected_layout.lower() == "bsnd" else 1,
+                )  # unsqueeze_dim updated
+            else:
+                new_args = (
+                    q_for_op_contig,
+                    k_for_op_contig,
+                    cos_node,
+                    sin_node,
+                    2 if self.config.expected_layout.lower() == "bsnd" else 1,
+                )  # unsqueeze_dim updated
+            node.args = new_args
+
+            with graph.inserting_after(q_rope_old):
+                q_rope_new = graph.call_function(torch.ops.aten.transpose, args=(q_rope_old, 1, 2))
+            with graph.inserting_after(k_rope_old):
+                k_rope_new = graph.call_function(torch.ops.aten.transpose, args=(k_rope_old, 1, 2))
+
+            # Preserve fake tensor in meta["val"] for the transposed inputs
+            q_rope_new.meta["val"] = q_rope_old.meta["val"]
+            q_rope_old.meta["val"] = q_rope_old.meta["val"].transpose(1, 2)
+            k_rope_new.meta["val"] = k_rope_old.meta["val"]
+            k_rope_old.meta["val"] = k_rope_old.meta["val"].transpose(1, 2)
+
+            q_rope_old.replace_all_uses_with(q_rope_new)
+            k_rope_old.replace_all_uses_with(k_rope_new)
+            q_rope_new.args = (q_rope_old, 1, 2)
+            k_rope_new.args = (k_rope_old, 1, 2)
+
+        info = TransformInfo(
+            skipped=False,
+            num_matches=num_rope_layout_matches,
+            is_clean=False,
+            has_valid_shapes=False,
         )
-        return
 
-    ad_logger.info(f"Match RoPE layout to {expected_layout}")
-
-    graph = gm.graph
-    rope_ops = {
-        torch.ops.auto_deploy.torch_rope_with_explicit_cos_sin,
-        torch.ops.auto_deploy.torch_rope_with_qk_interleaving,
-        torch.ops.auto_deploy.torch_rope_with_complex_freqs,
-    }
-
-    need_transpose = False
-    num_rope_layout_matches = 0
-    for node in graph.nodes:
-        if not is_op(node, rope_ops):
-            continue
-
-        if is_op(node, torch.ops.auto_deploy.torch_rope_with_complex_freqs):
-            q_node, k_node, freqs_node, unsq = extract_op_args(
-                node,
-                "xq",  # argument name in schema
-                "xk",
-                "freqs_cis",
-                "unsqueeze_dim",
-            )
-        else:
-            q_node, k_node, cos_node, sin_node, unsq = extract_op_args(
-                node, "q", "k", "cos", "sin", "unsqueeze_dim"
-            )
-
-        if unsq == 2:
-            current_layout = "bsnd"
-        elif unsq == 1:
-            current_layout = "bnsd"
-        else:
-            ad_logger.warning(
-                "Unsqueeze_dim is not one of [1, 2]. "
-                "Unable to infer layout of q node. Skip layout matching"
-            )
-            continue
-
-        need_transpose = expected_layout.lower() != current_layout
-
-        if not need_transpose:
-            continue
-
-        num_rope_layout_matches += 1
-        # retrieve q and k output node from node
-        q_rope_old, k_rope_old = extract_output_tuple(node, 2)
-        if q_rope_old is None or k_rope_old is None:
-            ad_logger.warning(
-                f"Failed to extract all two outputs from the explicit op, \
-                    get {q_rope_old}, {k_rope_old}, fail to match rope layout with {node} with"
-            )
-            continue
-
-        ad_logger.debug(
-            f"Inferred RoPE input layout: '{current_layout}']Mapping layout to '{expected_layout}']"
-        )
-        with graph.inserting_before(node):
-            q_for_op = graph.call_function(torch.ops.aten.transpose, args=(q_node, 1, 2))
-            k_for_op = graph.call_function(torch.ops.aten.transpose, args=(k_node, 1, 2))
-            q_for_op_contig = graph.call_function(torch.ops.aten.contiguous, args=(q_for_op,))
-            k_for_op_contig = graph.call_function(torch.ops.aten.contiguous, args=(k_for_op,))
-
-        q_for_op_contig.meta["val"] = q_node.meta["val"].transpose(1, 2)
-        k_for_op_contig.meta["val"] = k_node.meta["val"].transpose(1, 2)
-
-        if is_op(node, torch.ops.auto_deploy.torch_rope_with_complex_freqs):
-            new_args = (
-                q_for_op_contig,
-                k_for_op_contig,
-                freqs_node,
-                2 if expected_layout.lower() == "bsnd" else 1,
-            )  # unsqueeze_dim updated
-        else:
-            new_args = (
-                q_for_op_contig,
-                k_for_op_contig,
-                cos_node,
-                sin_node,
-                2 if expected_layout.lower() == "bsnd" else 1,
-            )  # unsqueeze_dim updated
-        node.args = new_args
-
-        with graph.inserting_after(q_rope_old):
-            q_rope_new = graph.call_function(torch.ops.aten.transpose, args=(q_rope_old, 1, 2))
-        with graph.inserting_after(k_rope_old):
-            k_rope_new = graph.call_function(torch.ops.aten.transpose, args=(k_rope_old, 1, 2))
-
-        # Preserve fake tensor in meta["val"] for the transposed inputs
-        q_rope_new.meta["val"] = q_rope_old.meta["val"]
-        q_rope_old.meta["val"] = q_rope_old.meta["val"].transpose(1, 2)
-        k_rope_new.meta["val"] = k_rope_old.meta["val"]
-        k_rope_old.meta["val"] = k_rope_old.meta["val"].transpose(1, 2)
-
-        q_rope_old.replace_all_uses_with(q_rope_new)
-        k_rope_old.replace_all_uses_with(k_rope_new)
-        q_rope_new.args = (q_rope_old, 1, 2)
-        k_rope_new.args = (k_rope_old, 1, 2)
-
-    if num_rope_layout_matches:
-        canonicalize_graph(gm)
-    ad_logger.info(f"Found {num_rope_layout_matches} RoPE layout matches")
+        return gm, info
 
 
-def optimize_rope(gm: GraphModule) -> None:
+@TransformRegistry.register("optimize_rope")
+class OptimizeRope(BaseTransform):
     """
     Scan the FX graph and replace calls to the torch-reference RoPE ops with
     the optimized `rope::flashinfer` kernel.
     Precomputes positional IDs and the fused cosine-sine cache as explicit nodes,
     and reuses those nodes when possible.
     """
-    graph = gm.graph
-    rope_flash_cache: DefaultDict[Any, Optional[Node]] = defaultdict(lambda: None)
-    rope_position_ids_cache: Dict[str, Node] = {}
 
-    num_rope_optimizations = 0
-    for node in list(graph.nodes):
-        if is_op(node, torch.ops.auto_deploy.torch_rope_with_explicit_cos_sin):
-            _optimize_explicit(graph, node, rope_flash_cache, rope_position_ids_cache)
-        elif is_op(node, torch.ops.auto_deploy.torch_rope_with_complex_freqs):
-            _optimize_complex(graph, node, rope_flash_cache, rope_position_ids_cache)
-        else:
-            continue
-        num_rope_optimizations += 1
-    if num_rope_optimizations:
-        canonicalize_graph(gm)
-    ad_logger.info(f"Found {num_rope_optimizations} RoPE optimizations")
+    def _apply(
+        self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory
+    ) -> Tuple[GraphModule, TransformInfo]:
+        graph = gm.graph
+        rope_flash_cache: DefaultDict[Any, Optional[Node]] = defaultdict(lambda: None)
+        rope_position_ids_cache: Dict[str, Node] = {}
+
+        num_rope_optimizations = 0
+        for node in list(graph.nodes):
+            if is_op(node, torch.ops.auto_deploy.torch_rope_with_explicit_cos_sin):
+                _optimize_explicit(graph, node, rope_flash_cache, rope_position_ids_cache)
+            elif is_op(node, torch.ops.auto_deploy.torch_rope_with_complex_freqs):
+                _optimize_complex(graph, node, rope_flash_cache, rope_position_ids_cache)
+            else:
+                continue
+            num_rope_optimizations += 1
+
+        info = TransformInfo(
+            skipped=False, num_matches=num_rope_optimizations, is_clean=False, has_valid_shapes=True
+        )
+
+        return gm, info
 
 
 def _optimize_explicit(
@@ -344,10 +381,6 @@ def _optimize_explicit(
     # retrieve q and k output node from node
     q_rope_old, k_rope_old = extract_output_tuple(node, 2)
     if q_rope_old is None or k_rope_old is None:
-        ad_logger.warning(
-            f"Failed to extract all two outputs from the explicit op, \
-                get {q_rope_old}, {k_rope_old}, fail to replace {node} with flashinfer rope"
-        )
         return
 
     # Sanity check on head_dim
@@ -358,15 +391,8 @@ def _optimize_explicit(
     q_fake = q_node.meta.get("val", None)
     if q_fake is not None and len(q_fake.shape) > 2:
         if not (isinstance(q_fake.shape[1], torch.SymInt) and isinstance(q_fake.shape[2], int)):
-            ad_logger.warning(
-                f"""Sanity check failed: q_fake should have shape [b, s, n, d],
-                s should be symbolic and n should be int, instead got shape {q_fake.shape}"""
-            )
             return
     elif q_fake is not None:
-        ad_logger.warning(
-            f"Sanity check failed: q_fake should be 3D or 4D, but got shape {q_fake.shape}"
-        )
         return
 
     head_dim = cos_node.meta["val"].shape[-1]
@@ -449,15 +475,8 @@ def _optimize_complex(
     q_fake = q_node.meta.get("val", None)
     if q_fake is not None and len(q_fake.shape) > 2:
         if not (isinstance(q_fake.shape[1], torch.SymInt) and isinstance(q_fake.shape[2], int)):
-            ad_logger.warning(
-                f"""Sanity check failed: q_fake should have shape [b, s, n, d],
-                s should be symbolic and n should be int, instead got shape {q_fake.shape}"""
-            )
             return
     elif q_fake is not None:
-        ad_logger.warning(
-            f"Sanity check failed: q_fake should be 3D or 4D, but got shape {q_fake.shape}"
-        )
         return
 
     # Retrieve or register the lookup table for inv_freq_node -> cos_sin_flash
@@ -522,35 +541,6 @@ def _match_input_interleave_pattern(node: Node) -> Optional[Dict[str, Node]]:
     return {"interleaved": raw_node}
 
 
-def _move_node_before_first_user(node: Node) -> Node:
-    """
-    Remove `node` from the graph and re-insert a clone of it immediately
-    before its earliest user. Returns the new node.
-
-    If `node` has no users, or is already right before its first user,
-    this is a no-op and returns the original node.
-    """
-    graph = node.graph
-    ordering = list(graph.nodes)
-
-    users = list(node.users)
-    if not users:
-        return node
-
-    # locate the earliest user in the current ordering
-    first_user = min(users, key=lambda u: ordering.index(u))
-    if ordering.index(node) == ordering.index(first_user) - 1:
-        return node
-
-    with graph.inserting_before(first_user):
-        new_node = graph.node_copy(node, lambda n: n)
-
-    node.replace_all_uses_with(new_node)
-    graph.erase_node(node)
-
-    return new_node
-
-
 def _get_last_node(nodes: Sequence[Node]) -> Node:
     """
     Given a list of FX Nodes,
@@ -581,36 +571,21 @@ def _validate_rope_inputs(q_node: Node, k_node: Node) -> bool:
     for name, node in [("q", q_node), ("k", k_node)]:
         fake_val = node.meta.get("val", None)
         if fake_val is None:
-            ad_logger.warning(
-                f"Meta['val'] for {name} not available; skipping RoPE transformation."
-            )
             return False
 
         # Check dtype
         if fake_val.dtype not in (torch.float16, torch.bfloat16):
-            ad_logger.warning(
-                f"""{name} tensor is {fake_val.dtype},
-                expected half precision (float16 or bfloat16). Skipping RoPE transformation."""
-            )
             return False
 
         # Check head_dim
         if len(fake_val.shape) < 1:
-            ad_logger.warning(f"{name} tensor has invalid shape {fake_val.shape}.")
             return False
         head_dim = fake_val.shape[-1]
         if isinstance(head_dim, int) and head_dim % 64 != 0:
-            ad_logger.warning(
-                f"{name} head_dim = {head_dim} is not a multiple of 64. Skipping RoPE transformation."
-            )
             return False
 
         # Check shape
         if not isinstance(fake_val.shape[1], torch.SymInt):
-            ad_logger.warning(
-                f"{name} has shape {fake_val.shape} that is not supported. Only support [B, S, N, D] layout.\
-                Skipping RoPE transformation."
-            )
             return False
 
     return True

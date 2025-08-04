@@ -31,3 +31,13 @@ transforms:
     stage: pattern_matcher
   match_attention_layout:
     stage: pattern_matcher
+  match_rope_pattern:
+    stage: pattern_matcher
+  match_rope_layout:
+    stage: pattern_matcher
+  eliminate_redundant_transposes:
+    stage: pattern_matcher
+  # TODO (lucaslie): let's move this to perf optimization once TP sharding is improved
+  # see https://github.com/NVIDIA/TensorRT-LLM/pull/3668#discussion_r2052714528
+  optimize_rope:
+    stage: pattern_matcher
