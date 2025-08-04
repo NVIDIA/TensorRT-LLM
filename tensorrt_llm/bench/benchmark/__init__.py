@@ -57,7 +57,6 @@ class GeneralExecSettings(BaseModel):
     request_json: Optional[Path] = Field(
         default=None,
         description="Path where per request information is written")
-    tokenizer = Field(default=None, description="Tokenizer instance")
     warmup: int = Field(default=2,
                         description="Number of requests to warm up benchmark")
 
