@@ -26,6 +26,7 @@
 #include "tensorrt_llm/runtime/decoderState.h"
 #include "tensorrt_llm/runtime/decodingInput.h"
 #include "tensorrt_llm/runtime/decodingOutput.h"
+#include "tensorrt_llm/runtime/iBuffer.h"
 #include "tensorrt_llm/runtime/request.h"
 #include "tensorrt_llm/runtime/runtimeKernels.h"
 #include "tensorrt_llm/runtime/speculativeDecodingMode.h"
@@ -322,48 +323,47 @@ void initializeOutputs(DecodingOutput& dJointOutput, SizeType32 batchSlot, SizeT
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-std::shared_ptr<runtime::ITensor> retrieveDraftLogits(ModelConfig const& modelConfig, WorldConfig const& worldConfig,
-    std::shared_ptr<runtime::ITensor> const& tensor, BufferManager const& bufferManager,
-    bool speculativeDecodingFastLogits, bool isLeaderInOrchMode)
+void retrieveDraftLogits(TensorPtr& draftLogitsHost, std::shared_ptr<runtime::ITensor> const& reqDraftLogits,
+    ModelConfig const& modelConfig, WorldConfig const& worldConfig, bool speculativeDecodingFastLogits,
+    bool isLeaderInOrchMode, BufferManager const& bufferManager)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
     if (!speculativeDecodingFastLogits)
     {
         TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-        return bufferManager.copyFrom(*tensor, MemoryType::kPINNEDPOOL);
+        bufferManager.copy(*reqDraftLogits, *draftLogitsHost);
+        return;
     }
 
     if (isLeaderInOrchMode)
     {
         te::SpeculativeDecodingFastLogitsInfo fastLogitsInfo;
-        std::memcpy(&fastLogitsInfo, tensor->data(), sizeof(fastLogitsInfo));
-        auto logits = utils::targetModelReceiveLogits(fastLogitsInfo, modelConfig).value();
+        std::memcpy(&fastLogitsInfo, reqDraftLogits->data(), sizeof(fastLogitsInfo));
+        utils::targetModelReceiveLogits(draftLogitsHost, fastLogitsInfo, modelConfig.getLogitsDtype());
 
         // Broadcast to other ranks if needed
         if (worldConfig.isTensorParallel())
         {
             auto const& commSession = COMM_SESSION;
-            auto shape = logits->getShape();
+            auto shape = draftLogitsHost->getShape();
             commSession.bcastValue(shape.d[0], 0);
             commSession.bcastValue(shape.d[1], 0);
-            commSession.bcast(logits->data(), logits->getSizeInBytes(), mpi::MpiType::kUINT8, 0);
+            commSession.bcast(draftLogitsHost->data(), draftLogitsHost->getSizeInBytes(), mpi::MpiType::kUINT8, 0);
         }
-        TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-        return logits;
+    }
+    else
+    {
+        // Get logits from leader rank
+        auto const& commSession = COMM_SESSION;
+        int64_t dims[2];
+        commSession.bcastValue(dims[0], 0);
+        commSession.bcastValue(dims[1], 0);
+        draftLogitsHost->reshape(ITensor::makeShape({dims[0], dims[1]}));
+        commSession.bcast(draftLogitsHost->data(), draftLogitsHost->getSizeInBytes(), mpi::MpiType::kUINT8, 0);
     }
 
-    // Get logits from leader rank
-    auto const& commSession = COMM_SESSION;
-    int64_t dims[2];
-    commSession.bcastValue(dims[0], 0);
-    commSession.bcastValue(dims[1], 0);
-    auto const logitsDtype = modelConfig.getLogitsDtype();
-    auto logits = tensorrt_llm::runtime::BufferManager::pinnedPool(ITensor::makeShape({dims[0], dims[1]}), logitsDtype);
-    commSession.bcast(logits->data(), logits->getSizeInBytes(), mpi::MpiType::kUINT8, 0);
-
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-    return logits;
 };
 
 //! @brief Setups decoder internal tensors for new request in Draft model Sps mode
@@ -381,32 +381,26 @@ void newRequestDraftTokensExternal(SizeType32 batchIdx, runtime::decoder_batch::
     auto const useDraftLogits = request.draftLogits.has_value();
     if (useDraftLogits)
     {
-        TensorPtr draftLogitsView = ITensor::view(request.draftLogits.value());
-
-        TensorPtr draftLogitsReqBatchSlice
-            = ITensor::slice(dJointInput.externalDraftTokensInputs->draftLogits, batchIdx, 1);
-        draftLogitsReqBatchSlice->squeeze(0);
-        TensorPtr draftLogitsReqTokensSlice = ITensor::slice(draftLogitsReqBatchSlice, 0, numDraftTokens);
-        manager.copy(*draftLogitsView, *draftLogitsReqTokensSlice);
+        TensorPtr draftLogitsSlice
+            = ITensor::slice(dJointInput.externalDraftTokensInputs->draftLogits, {batchIdx, 0}, numDraftTokens);
+        manager.copy(*request.draftLogits.value(), *draftLogitsSlice);
     }
-    auto* useDraftLogitsHostPtr = runtime::bufferCast<bool>(*dJointInput.externalDraftTokensInputs->useDraftLogitsHost);
-    useDraftLogitsHostPtr[batchIdx] = useDraftLogits;
+    auto useDraftLogitsHostRange
+        = runtime::BufferRange<bool>(*dJointInput.externalDraftTokensInputs->useDraftLogitsHost);
+    useDraftLogitsHostRange[batchIdx] = useDraftLogits;
     auto useDraftLogitsView = ITensor::slice(dJointInput.externalDraftTokensInputs->useDraftLogits, batchIdx, 1);
     runtime::kernels::invokeFill(*useDraftLogitsView, useDraftLogits, decoderStream);
 
     if (numDraftTokens > 0)
     {
-        TensorPtr draftTokensReqBatchSlice
-            = ITensor::slice(dJointInput.externalDraftTokensInputs->draftTokenIds, batchIdx, 1);
-        draftTokensReqBatchSlice->squeeze(0);
-        TensorPtr draftTokensReqTokensSlice = ITensor::slice(draftTokensReqBatchSlice, 0, numDraftTokens);
-        TensorPtr draftTokensView = ITensor::view(request.draftTokens, ITensor::makeShape({numDraftTokens}));
-        manager.copy(*draftTokensView, *draftTokensReqTokensSlice);
+        TensorPtr draftTokensSlice
+            = ITensor::slice(dJointInput.externalDraftTokensInputs->draftTokenIds, {batchIdx, 0}, numDraftTokens);
+        manager.copy(*request.draftTokens, *draftTokensSlice);
     }
 
-    auto* numDraftTokensHostPtr
-        = runtime::bufferCast<SizeType32>(*dJointInput.externalDraftTokensInputs->numDraftTokensHost);
-    numDraftTokensHostPtr[batchIdx] = numDraftTokens;
+    auto numDraftTokensHostRange
+        = runtime::BufferRange<SizeType32>(*dJointInput.externalDraftTokensInputs->numDraftTokensHost);
+    numDraftTokensHostRange[batchIdx] = numDraftTokens;
     auto numDraftTokensView = ITensor::slice(dJointInput.externalDraftTokensInputs->numDraftTokens, batchIdx, 1);
     runtime::kernels::invokeFill(*numDraftTokensView, numDraftTokens, decoderStream);
 
@@ -701,13 +695,22 @@ CreateNewDecoderRequests::createDecoderRequests(RequestVector const& finishedCon
             if (modelConfig.getSpeculativeDecodingMode().isDraftTokensExternal() && llmReq->hasDraftTokens())
             {
                 auto const& draftTokens = llmReq->getDraftTokens();
+                auto const numDraftTokens = decoderRequest.generatedTokensPerEngineStep - 1;
+
+                TensorPtr draftTokenIdsSlice = ITensor::slice(
+                    dJointInput.externalDraftTokensInputs->draftTokenIdsHost, {batchSlot, 0}, numDraftTokens);
                 // Copy to pinned host memory (don't care about stream of bufferManager)
-                decoderRequest.draftTokens = decoderBufferManager.copyFrom(*draftTokens, MemoryType::kPINNEDPOOL);
+                decoderBufferManager.copy(draftTokens->data(), *draftTokenIdsSlice);
+                decoderRequest.draftTokens = draftTokenIdsSlice;
+
                 auto const& draftLogits = llmReq->getDraftLogits();
                 if (draftLogits.has_value())
                 {
-                    decoderRequest.draftLogits = retrieveDraftLogits(modelConfig, worldConfig, draftLogits.value(),
-                        decoderBufferManager, mSpeculativeDecodingFastLogits, mIsLeaderInOrchMode);
+                    TensorPtr draftLogitsSlice = ITensor::slice(
+                        dJointInput.externalDraftTokensInputs->draftLogitsHost, {batchSlot, 0}, numDraftTokens);
+                    retrieveDraftLogits(draftLogitsSlice, draftLogits.value(), modelConfig, worldConfig,
+                        mSpeculativeDecodingFastLogits, mIsLeaderInOrchMode, decoderBufferManager);
+                    decoderRequest.draftLogits = draftLogitsSlice;
                 }
             }
 
