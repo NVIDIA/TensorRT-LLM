@@ -38,7 +38,7 @@ from .modeling_utils import (DecoderModel, duplicate_kv_weight, filter_weights,
 
 
 @dataclass
-class OpenAIMoeConfig:
+class GptOssConfig:
     num_hidden_layers: int = 36
     num_experts: int = 128
     experts_per_token: int = 4
@@ -54,12 +54,13 @@ class OpenAIMoeConfig:
     rope_scaling_factor: float = 32.0
     rope_ntk_alpha: float = 1.0
     rope_ntk_beta: float = 32.0
+    swiglu_limit: float = 7.0
 
     # added for TRT-LLM
     torch_dtype: torch.dtype = torch.bfloat16
     rms_norm_eps: float = 1e-05
     max_position_embeddings: int = 131072
-    model_type: str = "mixtral"
+    model_type: str = "gpt_oss"
     tie_word_embeddings: bool = False
 
 
@@ -67,7 +68,7 @@ class AttentionBlock(Attention):
 
     def __init__(
         self,
-        config: ModelConfig[OpenAIMoeConfig],
+        config: ModelConfig[GptOssConfig],
         layer_idx: int = 0,
     ):
         pretrained_config = config.pretrained_config
@@ -150,7 +151,7 @@ class MLPBlock(torch.nn.Module):
 
     def __init__(
         self,
-        config: ModelConfig[OpenAIMoeConfig],
+        config: ModelConfig[GptOssConfig],
         layer_idx: int,
         reduce_results: bool = True,
     ):
@@ -200,9 +201,8 @@ class MLPBlock(torch.nn.Module):
             'bias': True,
             'swiglu_alpha': self.swiglu_alpha,
             'swiglu_beta': self.swiglu_beta,
+            'swiglu_limit': self.swiglu_limit
         }
-
-        moe_params['swiglu_limit'] = self.swiglu_limit
 
         self.experts = create_moe(**moe_params)
 
@@ -329,7 +329,7 @@ class TransformerBlock(DecoderLayer):
 
     def __init__(
         self,
-        config: ModelConfig[OpenAIMoeConfig],
+        config: ModelConfig[GptOssConfig],
         layer_idx: int,
     ):
         super().__init__()
@@ -478,7 +478,7 @@ class TransformerBlock(DecoderLayer):
 
 class Transformer(DecoderModel):
 
-    def __init__(self, model_config: ModelConfig[OpenAIMoeConfig]):
+    def __init__(self, model_config: ModelConfig[GptOssConfig]):
         super().__init__(model_config)
         config = self.model_config
 
@@ -544,12 +544,11 @@ class Transformer(DecoderModel):
         return hidden_states
 
 
-@register_auto_model("OpenAIMoeForCausalLM")
-class OpenAIMoeForCausalLM(SpecDecOneEngineForCausalLM[Transformer,
-                                                       OpenAIMoeConfig]):
+@register_auto_model("GptOssForCausalLM")
+class GptOssForCausalLM(SpecDecOneEngineForCausalLM[Transformer, GptOssConfig]):
 
     params_map = {
-        # TRTLLM module name : OpenAIMoe module name
+        # TRTLLM module name : GptOss module name
         "qkv_proj": "qkv",
         "o_proj": "out",
         "lm_head": "unembedding",
@@ -568,7 +567,7 @@ class OpenAIMoeForCausalLM(SpecDecOneEngineForCausalLM[Transformer,
 
     def __init__(
         self,
-        model_config: ModelConfig[OpenAIMoeConfig],
+        model_config: ModelConfig[GptOssConfig],
     ):
         # Map config to HF format.
         if hasattr(model_config.pretrained_config, 'num_experts'):
@@ -584,6 +583,8 @@ class OpenAIMoeForCausalLM(SpecDecOneEngineForCausalLM[Transformer,
                 'original_max_position_embeddings':
                 model_config.pretrained_config.initial_context_length,
             }
+        if model_config.pretrained_config.torch_dtype is None:
+            model_config.pretrained_config.torch_dtype = torch.bfloat16
 
         super().__init__(
             Transformer(model_config),

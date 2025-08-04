@@ -7,6 +7,7 @@ from .modeling_deepseekv3 import DeepseekV3ForCausalLM
 from .modeling_exaone4 import Exaone4ForCausalLM
 from .modeling_gemma3 import Gemma3ForCausalLM
 from .modeling_gemma3vl import Gemma3VLM
+from .modeling_gpt_oss import GptOssForCausalLM
 from .modeling_hyperclovax import HCXVisionForCausalLM
 from .modeling_llama import LlamaForCausalLM
 from .modeling_llava_next import LlavaNextModel
@@ -15,7 +16,6 @@ from .modeling_mixtral import MixtralForCausalLM
 from .modeling_nemotron import NemotronForCausalLM
 from .modeling_nemotron_h import NemotronHForCausalLM
 from .modeling_nemotron_nas import NemotronNASForCausalLM
-from .modeling_openai import OpenAIMoeForCausalLM
 from .modeling_phi3 import Phi3ForCausalLM
 from .modeling_phi4mm import Phi4MMForCausalLM
 from .modeling_qwen import (Qwen2ForCausalLM, Qwen2ForProcessRewardModel,
@@ -59,7 +59,7 @@ __all__ = [
     "Qwen2_5_VLModel",
     "Qwen3ForCausalLM",
     "Qwen3MoeForCausalLM",
-    "OpenAIMoeForCausalLM",
+    "GptOssForCausalLM",
 ]
 
 if transformers.__version__ >= "4.45.1":
