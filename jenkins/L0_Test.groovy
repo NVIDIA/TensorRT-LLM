@@ -65,7 +65,7 @@ def LLVM_CONFIG = "LLVM"
 LINUX_AARCH64_CONFIG = "linux_aarch64"
 
 @Field
-def NANOBIND_CONFIG = "Nanobind"
+def PYBIND_CONFIG = "Pybind"
 
 @Field
 def BUILD_CONFIGS = [
@@ -74,7 +74,7 @@ def BUILD_CONFIGS = [
   (SINGLE_DEVICE_CONFIG) : [(TARNAME) : "single-device-TensorRT-LLM.tar.gz"],
   (LLVM_CONFIG) : [(TARNAME) : "llvm-TensorRT-LLM.tar.gz"],
   (LINUX_AARCH64_CONFIG) : [(TARNAME) : "TensorRT-LLM-GH200.tar.gz"],
-  (NANOBIND_CONFIG) : [(TARNAME) : "nanobind-TensorRT-LLM.tar.gz"],
+  (PYBIND_CONFIG) : [(TARNAME) : "pybind-TensorRT-LLM.tar.gz"],
 ]
 
 // TODO: Move common variables to an unified location
@@ -1775,7 +1775,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         "A10-TensorRT-4": ["a10", "l0_a10", 4, 6],
         "A10-TensorRT-5": ["a10", "l0_a10", 5, 6],
         "A10-TensorRT-6": ["a10", "l0_a10", 6, 6],
-        "A10-Nanobind": ["a10", "l0_a10_nanobind", 1, 1],
+        "A10-Pybind": ["a10", "l0_a10_pybind", 1, 1],
         "A30-Triton-1": ["a30", "l0_a30", 1, 1],
         "A30-PyTorch-1": ["a30", "l0_a30", 1, 2],
         "A30-PyTorch-2": ["a30", "l0_a30", 2, 2],
@@ -1852,8 +1852,8 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         if (key.contains("llvm")) {
             config = LLVM_CONFIG
         }
-        if (key.contains("Nanobind")) {
-            config = NANOBIND_CONFIG
+        if (key.contains("Pybind")) {
+            config = PYBIND_CONFIG
         }
         runLLMTestlistOnPlatform(pipeline, values[0], values[1], config, key.contains("Perf"), key, values[2], values[3])
     }]]}
