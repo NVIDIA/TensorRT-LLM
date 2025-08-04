@@ -812,7 +812,6 @@ def convert_hf_qwen(hf_model,
                     plugin_weight_only_quant_type,
                     dtype,
                     use_gemm_woq_plugin))
-                    
 
         else:
             mlp_gate_weight = get_weight(model_params, prefix + key_list[2],
