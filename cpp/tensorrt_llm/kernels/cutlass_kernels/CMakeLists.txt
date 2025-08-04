@@ -138,7 +138,7 @@ function(add_instantiations library base_dir)
     endif()
   endmacro()
 
-  glob_src_create_target(80 "80;86")
+  glob_src_create_target(80 "80;86;90;100f;120f")
   glob_src_create_target(90 90)
   glob_src_create_target(100 100f)
   glob_src_create_target(103 103)
