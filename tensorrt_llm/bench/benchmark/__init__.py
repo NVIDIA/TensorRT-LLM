@@ -48,7 +48,6 @@ class GeneralExecSettings(BaseModel):
     modality: Optional[str] = Field(
         default=None, description="Modality of multimodal requests")
     model: Optional[str] = Field(default=None, description="Model name or path")
-    model_type = Field(default=None, description="Model type")
     num_requests: int = Field(
         default=0, description="Number of requests to cap benchmark run at")
     output_json: Optional[Path] = Field(
@@ -65,6 +64,10 @@ class GeneralExecSettings(BaseModel):
     @property
     def iteration_writer(self) -> IterationWriter:
         return IterationWriter(self.iteration_log)
+
+    @property
+    def model_type(self) -> str:
+        return get_model_config(self.model, self.checkpoint_path).model_type
 
 
 def ignore_trt_only_args(kwargs: dict, backend: str):
@@ -129,7 +132,6 @@ def get_general_cli_options(
     # Add derived values that need to be computed from bench_env
     checkpoint_path = bench_env.checkpoint_path or bench_env.model
     model = bench_env.model
-    model_type = get_model_config(model, checkpoint_path).model_type
     iteration_log = params.get("iteration_log")
     iteration_writer = IterationWriter(iteration_log)
     tokenizer = initialize_tokenizer(checkpoint_path)
@@ -138,7 +140,6 @@ def get_general_cli_options(
     settings_dict.update({
         "checkpoint_path": checkpoint_path,
         "model": model,
-        "model_type": model_type,
         "iteration_writer": iteration_writer,
         "tokenizer": tokenizer,
     })
