@@ -67,8 +67,8 @@ class BaseCheckpointLoader(ABC):
                 f"available formats are: {CHECKPOINT_LOADER_FORMAT_DEFAULT_MAPPING.keys()}"
             )
 
-    def get_initilized_weight_mapper(self, model: nn.Module,
-                                     config: ModelConfig) -> BaseWeightMapper:
+    def get_initialized_weight_mapper(self, model: nn.Module,
+                                      config: ModelConfig) -> BaseWeightMapper:
         weight_mapper = None
         if self.weight_mapper is not None:
             self.weight_mapper.init_model_and_config(model, config)
