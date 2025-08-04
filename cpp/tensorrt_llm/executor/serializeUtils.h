@@ -307,6 +307,22 @@ struct get_variant_alternative_type
     }
 };
 
+template <typename T>
+T deserialize(std::istream& is);
+
+// Helper function to deserialize variant by index using template recursion
+template <typename T, std::size_t... Is>
+T deserializeVariantByIndex(std::istream& is, std::size_t index, std::index_sequence<Is...> /*indices*/)
+{
+    T result;
+    bool found = ((Is == index ? (result = deserialize<std::variant_alternative_t<Is, T>>(is), true) : false) || ...);
+    if (!found)
+    {
+        TLLM_THROW("Invalid variant index during deserialization: " + std::to_string(index));
+    }
+    return result;
+}
+
 // Deserialize
 template <typename T>
 T deserialize(std::istream& is)
@@ -595,23 +611,7 @@ T deserialize(std::istream& is)
         std::size_t index = 0;
         is.read(reinterpret_cast<char*>(&index), sizeof(index));
 
-        // TODO: Is there a better way to implement this?
-        T data;
-        if (index == 0)
-        {
-            using U = std::variant_alternative_t<0, T>;
-            data = deserialize<U>(is);
-        }
-        else if (index == 1)
-        {
-            using U = std::variant_alternative_t<1, T>;
-            data = deserialize<U>(is);
-        }
-        else
-        {
-            TLLM_THROW("Serialization of variant of size > 2 is not supported.");
-        }
-        return data;
+        return deserializeVariantByIndex<T>(is, index, std::make_index_sequence<std::variant_size_v<T>>{});
     }
     else
     {
