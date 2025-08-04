@@ -10,7 +10,8 @@ from .lora_test_utils import (
     check_llama_7b_multi_lora_from_request_test_harness,
     check_llama_7b_multi_unique_lora_adapters_from_request,
     create_mock_nemo_lora_checkpoint)
-from .test_llm import (get_model_path, global_kvcache_config, llama_model_path,
+from .test_llm import (_test_llm_capture_request_error, get_model_path,
+                       global_kvcache_config, llama_model_path,
                        llm_get_stats_async_test_harness,
                        llm_get_stats_test_harness, prompts,
                        run_llm_abort_request,
@@ -74,6 +75,10 @@ def test_llm_get_stats_async(return_context_logits, use_overlap,
         pytorch_backend=True,
         use_overlap=use_overlap,
         enable_iter_req_stats=enable_iter_req_stats)
+
+
+def test_llm_capture_request_error():
+    _test_llm_capture_request_error(pytorch_backend=True, tp_size=1)
 
 
 @force_ampere
