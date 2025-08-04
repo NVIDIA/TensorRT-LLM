@@ -458,11 +458,11 @@ class DecoderModelForCausalLM(nn.Module,
                         if name + '.q_proj' in n:
                             module.quant_config = q
                             break
-                elif hasattr(module, 'fused_a'):
+                elif hasattr(module, 'kv_a_proj_with_mqa'):
                     # DeepseekV3Attention
                     for n, q in quant_config_dict.items():
                         # reuse q_proj quant config as the attention quant config
-                        if name + '.fused_a' in n:
+                        if name + '.kv_a_proj_with_mqa' in n:
                             module.quant_config = q
                             break
 
