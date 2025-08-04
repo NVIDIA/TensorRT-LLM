@@ -310,6 +310,8 @@ class GenerationResultBase:
                 self._outputs[0] = response.res
             else:
                 self._outputs[0]._postprocess_result = response.res
+            if response.metrics:
+                self.metrics_dict = response.metrics
 
             if response.error:
                 if self._background_error_handler is not None and (

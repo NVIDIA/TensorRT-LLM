@@ -10,10 +10,8 @@ import zmq
 import zmq.asyncio
 
 from tensorrt_llm.logger import logger
-from tensorrt_llm.metrics.collector import MetricsCollector
 
-from .._utils import (customized_gc_thresholds, mpi_rank, nvtx_range_debug,
-                      set_prometheus_multiproc_dir)
+from .._utils import customized_gc_thresholds, mpi_rank, nvtx_range_debug
 from ..llmapi.mpi_session import (MpiCommSession, MpiPoolSession, MpiSession,
                                   RemoteMpiCommSessionClient)
 from ..llmapi.tracer import enable_llm_tracer, get_tracer, global_tracer
@@ -22,9 +20,9 @@ from ..llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue,
                             print_colored_debug)
 from .executor import GenerationExecutor
 from .ipc import FusedIpcQueue, IpcQueue
-from .postproc_worker import PostprocWorker, PostprocWorkerConfig
+from .postproc_worker import PostprocWorkerConfig
 from .request import CancellingRequest, GenerationRequest
-from .result import GenerationResult, IterationResult, ResponseWrapper
+from .result import GenerationResult, IterationResult
 from .utils import (ErrorResponse, IntraProcessQueue, WorkerCommIpcAddrs,
                     create_mpi_comm_session, get_spawn_proxy_process_env,
                     is_llm_response, print_alive_threads)
@@ -61,12 +59,6 @@ class GenerationExecutorProxy(GenerationExecutor):
 
         self.workers_started = False
         self.worker_cls = worker_cls
-
-        set_prometheus_multiproc_dir()
-        self.metrics_collector = MetricsCollector({
-            "model_name": "undefined",
-            "engine_type": "undefined"
-        })
 
         mpi_process_pre_spawned: bool = get_spawn_proxy_process_env()
 
@@ -185,16 +177,6 @@ class GenerationExecutorProxy(GenerationExecutor):
                 event_loop = event_loop or queue.loop
             else:
                 queue.put(res)
-
-            # log metrics to prometheus when response is finished and return_perf_metrics is on
-            if isinstance(res, ResponseWrapper):
-                if res._response and res._response.result and res._response.result.is_final:
-                    self._results[client_id]._handle_response(res)
-                if metrics_dict := self._results[client_id].metrics_dict:
-                    self.metrics_collector.log_metrics_dict(metrics_dict)
-            if isinstance(res, PostprocWorker.Output):
-                if metrics_dict := res.metrics:
-                    self.metrics_collector.log_metrics_dict(metrics_dict)
 
             if (is_llm_response(res) and res.result.is_final) or isinstance(
                     res, ErrorResponse):

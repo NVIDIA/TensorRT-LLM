@@ -1116,10 +1116,7 @@ def is_multi_device_enable():
 
 
 def set_prometheus_multiproc_dir() -> object:
-    # Set prometheus multiprocess directory
-    # sglang uses prometheus multiprocess mode
-    # we need to set this before importing prometheus_client
-    # https://prometheus.github.io/client_python/multiprocess/
+    # Adapted from: https://github.com/sgl-project/sglang/blob/v0.4.10/python/sglang/srt/utils.py#L1266
     global prometheus_multiproc_dir
     if "PROMETHEUS_MULTIPROC_DIR" in os.environ:
         logger.info("User set PROMETHEUS_MULTIPROC_DIR detected.")

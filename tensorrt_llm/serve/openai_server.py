@@ -27,6 +27,7 @@ from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.llmapi.disagg_utils import MetadataServerConfig, ServerRole
 from tensorrt_llm.llmapi.llm import RequestOutput
 from tensorrt_llm.logger import logger
+from tensorrt_llm.metrics.collector import MetricsCollector
 from tensorrt_llm.serve.chat_utils import (check_multiple_response,
                                            parse_chat_messages_coroutines)
 from tensorrt_llm.serve.metadata_server import create_metadata_server
@@ -44,7 +45,7 @@ from tensorrt_llm.serve.postprocess_handlers import (
     completion_stream_post_processor)
 from tensorrt_llm.version import __version__ as VERSION
 
-from .._utils import nvtx_mark
+from .._utils import nvtx_mark, set_prometheus_multiproc_dir
 
 # yapf: enale
 TIMEOUT_KEEP_ALIVE = 5  # seconds.
@@ -80,6 +81,13 @@ class OpenAIServer:
             self.model = model_dir.name
         else:
             self.model = model
+
+        if self.llm.args.return_perf_metrics:
+            set_prometheus_multiproc_dir()
+            self.metrics_collector = MetricsCollector({
+                "model_name": "undefined",
+                "engine_type": "undefined"
+            })
 
         @asynccontextmanager
         async def lifespan(app: FastAPI):
@@ -153,8 +161,9 @@ class OpenAIServer:
         self.app.add_api_route("/v1/chat/completions",
                                self.openai_chat,
                                methods=["POST"])
-        # register /prometheus/metrics
-        self.mount_metrics()
+        if self.llm.args.return_perf_metrics:
+            # register /prometheus/metrics
+            self.mount_metrics()
 
     def mount_metrics(self):
         # Lazy import for prometheus multiprocessing.
@@ -255,6 +264,8 @@ class OpenAIServer:
                 post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
             async for res in promise:
                 pp_results = res.outputs[0]._postprocess_result if self.postproc_worker_enabled else post_processor(res, args)
+                if res.finished and self.metrics_collector:
+                    self.metrics_collector.log_metrics_dict(res.metrics_dict)
                 for pp_res in pp_results:
                     yield pp_res
             yield "data: [DONE]\n\n"
@@ -272,6 +283,8 @@ class OpenAIServer:
             # Add prompt_tokens_ids to the response
             if disaggregated_params and disaggregated_params.request_type and disaggregated_params.request_type == "context_only":
                 chat_response.prompt_token_ids = promise.prompt_token_ids
+            if promise.finished and self.metrics_collector:
+                self.metrics_collector.log_metrics_dict(promise.metrics_dict)
             return chat_response
 
         try:
@@ -364,6 +377,8 @@ class OpenAIServer:
             if disaggregated_params and disaggregated_params.request_type and disaggregated_params.request_type == "context_only":
                 # Include prompt token ids for context-only requests
                 pp_result.prompt_token_ids = response.prompt_token_ids
+            if response.finished and self.metrics_collector:
+                self.metrics_collector.log_metrics_dict(response.metrics_dict)
             return pp_result
 
         def merge_completion_responses(responses: List[CompletionResponse]) -> CompletionResponse:
@@ -399,6 +414,8 @@ class OpenAIServer:
                     pp_result = post_processor(output, args)
                 else:
                     pp_result = output.outputs[0]._postprocess_result
+                if output.finished and self.metrics_collector:
+                    self.metrics_collector.log_metrics_dict(output.metrics_dict)
                 for pp_res in pp_result:
                     yield pp_res
 
