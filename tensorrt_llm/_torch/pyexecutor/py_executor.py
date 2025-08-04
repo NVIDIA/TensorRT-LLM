@@ -11,6 +11,7 @@ from contextlib import contextmanager
 from typing import Dict, List, Optional, Union
 
 import torch
+from cuda import cudart
 
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
@@ -25,6 +26,7 @@ from tensorrt_llm.bindings.executor import (DisServingRequestStats,
 from tensorrt_llm.bindings.internal.batch_manager import (LlmRequestType,
                                                           ReqIdsSet)
 from tensorrt_llm.logger import logger
+from tensorrt_llm.runtime.generation import CUASSERT
 
 from ..distributed import Distributed
 from ..speculative.drafter import Drafter
@@ -122,6 +124,7 @@ class BatchState:
 @dataclasses.dataclass
 class BatchStatePP(BatchState):
     microbatch_id: int = -1
+    scheduled_ctx_reqs: list[LlmRequest] = None
 
 
 class PyExecutor:
@@ -140,7 +143,6 @@ class PyExecutor:
                  max_beam_width: int = 1,
                  max_draft_len: int = 0,
                  kv_cache_transceiver: Optional[KvCacheTransceiver] = None,
-                 draft_model_engine: Optional[ModelEngine] = None,
                  guided_decoder: Optional[GuidedDecoder] = None,
                  garbage_collection_gen0_threshold: Optional[int] = None,
                  start_worker: bool = True):
@@ -161,12 +163,11 @@ class PyExecutor:
         self.enable_attention_dp = model_engine.enable_attention_dp
         self.sampler = sampler
         self.drafter = drafter
+        self.draft_model_engine = getattr(self.drafter, "draft_model_engine",
+                                          None)
         self.guided_decoder = guided_decoder
         self.dist = dist
         self.disable_overlap_scheduler = disable_overlap_scheduler
-
-        # Draft model for certain spec decode algorithms, e.g. EAGLE3
-        self.draft_model_engine = draft_model_engine
 
         # enqueue and _fetch_new_requests used data
         self.next_req_id = max_batch_size  # The first max_batch_size request IDs are reserved for dummy requests
@@ -643,7 +644,10 @@ class PyExecutor:
         return False
 
     def _executor_loop_pp(self):
+        logger.debug(f"Starting executor loop for pp_rank {self.dist.pp_rank}")
         torch.cuda.set_device(self.device_id)
+        # ensure the context is created, otherwise, some MPI calls will fail.
+        CUASSERT(cudart.cudaSetDevice(self.device_id))
         microbatch_id = 0
         with self._profiler() as profile_step:
             iter_start_time = time.time()
@@ -656,6 +660,9 @@ class PyExecutor:
                 if self.should_stop_processing:
                     break
 
+                if self.kv_cache_transceiver:
+                    self._check_disagg_gen_transfer_status()
+
                 if self.enable_iter_perf_stats:
                     iter_stats = self._get_init_iter_stats(
                         len(new_requests),
@@ -664,9 +671,23 @@ class PyExecutor:
 
                 self._pad_attention_dp_dummy_request()
 
-                scheduled_batch, _, _ = self._schedule()
+                scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
+                )
+
+                if self.kv_cache_transceiver:
+                    # For requests that are fitting disagg gen init, also prepare resources for KV cache manager
+                    self._prepare_disagg_gen_init(
+                        fitting_disagg_gen_init_requests)
+
+                    if num_fitting_reqs == 0 and not fitting_disagg_gen_init_requests:
+                        logger.warning(
+                            "num_fitting_reqs=0 and fitting_disagg_gen_init_requests is empty, may not have enough kvCache"
+                        )
+                        self.kv_cache_transceiver.check_context_transfer_status(
+                            1)
 
                 self.num_scheduled_requests = scheduled_batch.batch_size
+
                 logger.debug(
                     f'has {len(self.active_requests)} active_request, '
                     f'scheduled {len(scheduled_batch.context_requests)} context requests and '
@@ -679,7 +700,7 @@ class PyExecutor:
                     can_queue = 0 not in tp_batch_sizes
                 else:
                     can_queue = scheduled_batch.batch_size > 0
-                    if not can_queue:
+                    if not can_queue and not self.kv_cache_transceiver:
                         assert len(self.inflight_req_ids) > 0, (
                             "fail to schedule any pending request, probably run out of resource"
                         )
@@ -688,7 +709,27 @@ class PyExecutor:
                     self.micro_batches[microbatch_id] = None
                 else:
                     self._add_inflight_ids(scheduled_batch)
+
+                    if self.kv_cache_transceiver:
+                        # For generation requests which have completed KV cache transfer
+                        self._prepare_disagg_gen_transmission_complete(
+                            scheduled_batch)
+
                     self.resource_manager.prepare_resources(scheduled_batch)
+
+                    # The generation requests that are do not have batch_idx,
+                    # needs to be in front of the batch due to the assumptions
+                    # made in model_engine.py::_forward_step. This is only important
+                    # for disaggregated serving. For non-disaggregated serving,
+                    # the generation requests always have batch_idx.
+                    scheduled_batch.generation_requests = sorted(  # stable sort
+                        scheduled_batch.generation_requests,
+                        key=lambda req: int(req.py_batch_idx is not None),
+                    )
+
+                    if self.kv_cache_transceiver:
+                        # Return the first token to the client
+                        self._handle_first_token_response(scheduled_batch)
 
                     # Stage 1: Async forward (all ranks) and decoding pass (last rank only)
                     if not self.dist.is_last_pp_rank:
@@ -717,6 +758,7 @@ class PyExecutor:
                         iter_start_time=iter_start_time,
                         iter_stats=iter_stats,
                         microbatch_id=microbatch_id,
+                        scheduled_ctx_reqs=scheduled_batch.context_requests,
                     )
 
                     self.micro_batches[microbatch_id] = batch_state
@@ -781,6 +823,11 @@ class PyExecutor:
                 if previous_batch is not None:
                     with torch.cuda.nvtx.range("_handle_previous_batch_pp"):
                         self._update_requests(previous_batch.sample_state)
+
+                        if self.kv_cache_transceiver and previous_batch.scheduled_ctx_reqs:
+                            self._send_disagg_ctx_cache(
+                                previous_batch.scheduled_ctx_reqs)
+
                         self._handle_canceled_requests()
                         finished_requests = self._handle_responses()
                         previous_scheduled_batch = previous_batch.sample_state.scheduled_requests
@@ -788,6 +835,9 @@ class PyExecutor:
                             previous_scheduled_batch)
                         self._remove_inflight_ids(previous_scheduled_batch)
                     self.micro_batches[prev_microbatch_id] = None
+
+                if self.kv_cache_transceiver and self.ctx_in_transmission_requests:
+                    self._terminate_ctx_finished_requests()
 
                 # march forward in microbatch slots
                 microbatch_id = (microbatch_id + 1) % self.num_micro_batches
@@ -815,7 +865,10 @@ class PyExecutor:
         self._pad_attention_dp_dummy_request()
 
         if self.drafter is not None:
-            self._prepare_draft_requests(self.active_requests)
+            self.use_spec_decode = self.drafter.should_use_spec_decode(
+                self.active_requests)
+            self.model_engine.enable_spec_decode = self.use_spec_decode
+            self._prepare_draft_requests()
 
         scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
         )
@@ -848,6 +901,8 @@ class PyExecutor:
 
     def _executor_loop(self):
         torch.cuda.set_device(self.device_id)
+        # ensure the context is created, otherwise, some MPI calls will fail.
+        CUASSERT(cudart.cudaSetDevice(self.device_id))
         with self._profiler() as profile_step:
             sample_state = None
             iter_start_time = time.time()
@@ -876,7 +931,7 @@ class PyExecutor:
                         self._handle_first_token_response(scheduled_batch)
 
                     self.resource_manager.prepare_resources(scheduled_batch)
-                    if self.drafter is not None:
+                    if self.drafter is not None and self.use_spec_decode:
                         self.drafter.prepare_draft_tokens(
                             scheduled_batch, self.resource_manager)
 
@@ -916,18 +971,19 @@ class PyExecutor:
                                    iter_stats=iter_stats,
                                    iter_start_time=iter_start_time))
 
-    def _prepare_draft_requests(self, requests):
+    def _prepare_draft_requests(self):
         try:
             # Set draft tokens here to make the KV cache manager
             # and scheduler aware of them.
-            for req in requests:
+            for req in self.active_requests:
                 if req.state not in (LlmRequestState.GENERATION_IN_PROGRESS,
                                      LlmRequestState.DISAGG_GENERATION_INIT):
                     continue
+
                 req.py_last_draft_tokens = req.py_draft_tokens
                 max_draft_len = self.model_engine.spec_config.max_draft_len
 
-                if max_draft_len > 0:
+                if max_draft_len > 0 and self.use_spec_decode:
                     req.py_draft_tokens = [0] * max_draft_len
                     req.py_draft_pages_allocated = max_draft_len
                 else:
@@ -942,6 +998,8 @@ class PyExecutor:
 
     def _executor_loop_overlap(self):
         torch.cuda.set_device(self.device_id)
+        # ensure the context is created, otherwise, some MPI calls will fail.
+        CUASSERT(cudart.cudaSetDevice(self.device_id))
         if self.dist.rank == 0 and not self.is_warmup and self.benchmark_req_queues_size > 0 and self.kv_cache_transceiver:
             while self.executor_request_queue.get_request_queue_size(
             ) < self.benchmark_req_queues_size:

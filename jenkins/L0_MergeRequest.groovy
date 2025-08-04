@@ -141,11 +141,14 @@ def CACHED_CHANGED_FILE_LIST = "cached_changed_file_list"
 def ACTION_INFO = "action_info"
 @Field
 def IMAGE_KEY_TO_TAG = "image_key_to_tag"
+@Field
+def TARGET_BRANCH = "target_branch"
 def globalVars = [
     (GITHUB_PR_API_URL): gitlabParamsFromBot.get('github_pr_api_url', null),
     (CACHED_CHANGED_FILE_LIST): null,
     (ACTION_INFO): gitlabParamsFromBot.get('action_info', null),
     (IMAGE_KEY_TO_TAG): [:],
+    (TARGET_BRANCH): gitlabParamsFromBot.get('target_branch', null),
 ]
 
 // If not running all test stages in the L0 pre-merge, we will not update the GitLab status at the end.
@@ -301,30 +304,74 @@ def echoNodeAndGpuInfo(pipeline, stageName)
 
 def setupPipelineEnvironment(pipeline, testFilter, globalVars)
 {
+    sh "env | sort"
+    updateGitlabCommitStatus name: "${BUILD_STATUS_NAME}", state: 'running'
+    echo "Using GitLab repo: ${LLM_REPO}."
+    sh "git config --global --add safe.directory \"*\""
+    // NB: getContainerURIs reads files in ${LLM_ROOT}/jenkins/
+    if (env.gitlabMergeRequestLastCommit) {
+        env.gitlabCommit = env.gitlabMergeRequestLastCommit
+        trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
+    } else {
+        branch = env.gitlabBranch ? env.gitlabBranch : "main"
+        trtllm_utils.checkoutSource(LLM_REPO, branch, LLM_ROOT, true, true)
+        checkoutCommit = sh (script: "cd ${LLM_ROOT} && git rev-parse HEAD",returnStdout: true).trim()
+        env.gitlabCommit = checkoutCommit
+    }
+    echo "Env.gitlabMergeRequestLastCommit: ${env.gitlabMergeRequestLastCommit}."
+    echo "Freeze GitLab commit. Branch: ${env.gitlabBranch}. Commit: ${env.gitlabCommit}."
+    testFilter[(MULTI_GPU_FILE_CHANGED)] = getMultiGpuFileChanged(pipeline, testFilter, globalVars)
+    testFilter[(ONLY_ONE_GROUP_CHANGED)] = getOnlyOneGroupChanged(pipeline, testFilter, globalVars)
+    testFilter[(AUTO_TRIGGER_TAG_LIST)] = getAutoTriggerTagList(pipeline, testFilter, globalVars)
+    getContainerURIs().each { k, v ->
+        globalVars[k] = v
+    }
+}
+
+def mergeWaiveList(pipeline, globalVars)
+{
+    // Get current waive list
+    sh "git config --global --add safe.directory \"*\""
+    sh "cp ${LLM_ROOT}/tests/integration/test_lists/waives.txt ./waives_CUR_${env.gitlabCommit}.txt"
+    sh "cp ${LLM_ROOT}/jenkins/scripts/mergeWaiveList.py ./"
+
+    // Get TOT waive list
+    LLM_TOT_ROOT = "llm-tot"
+    targetBranch = env.gitlabTargetBranch ? env.gitlabTargetBranch : globalVars[TARGET_BRANCH]
+    echo "Target branch: ${targetBranch}"
+    trtllm_utils.checkoutSource(LLM_REPO, targetBranch, LLM_TOT_ROOT, true, true)
+    targetBranchTOTCommit = sh (script: "cd ${LLM_TOT_ROOT} && git rev-parse HEAD", returnStdout: true).trim()
+    echo "Target branch TOT commit: ${targetBranchTOTCommit}"
+    sh "cp ${LLM_TOT_ROOT}/tests/integration/test_lists/waives.txt ./waives_TOT_${targetBranchTOTCommit}.txt"
+
+    // Get waive list diff in current MR
+    def diff = getMergeRequestOneFileChanges(pipeline, globalVars, "tests/integration/test_lists/waives.txt")
+
+    // Write diff to a temporary file to avoid shell escaping issues
+    writeFile file: 'diff_content.txt', text: diff
+
+    // Merge waive lists
+    sh """
+        python3 mergeWaiveList.py \
+        --cur-waive-list=waives_CUR_${env.gitlabCommit}.txt \
+        --latest-waive-list=waives_TOT_${targetBranchTOTCommit}.txt \
+        --diff-file=diff_content.txt \
+        --output-file=waives.txt
+    """
+    trtllm_utils.uploadArtifacts("waives*.txt", "${UPLOAD_PATH}/waive_list/")
+    echo "New merged test waive list: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/waive_list/waives.txt"
+}
+
+def preparation(pipeline, testFilter, globalVars)
+{
     image = "urm.nvidia.com/docker/golang:1.22"
     setupPipelineSpec = createKubernetesPodConfig(image, "package")
     trtllm_utils.launchKubernetesPod(pipeline, setupPipelineSpec, "trt-llm", {
-        sh "env | sort"
-        updateGitlabCommitStatus name: "${BUILD_STATUS_NAME}", state: 'running'
-        echo "Using GitLab repo: ${LLM_REPO}."
-        sh "git config --global --add safe.directory \"*\""
-        // NB: getContainerURIs reads files in ${LLM_ROOT}/jenkins/
-        if (env.gitlabMergeRequestLastCommit) {
-            env.gitlabCommit = env.gitlabMergeRequestLastCommit
-            trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
-        } else {
-            branch = env.gitlabBranch ? env.gitlabBranch : "main"
-            trtllm_utils.checkoutSource(LLM_REPO, branch, LLM_ROOT, true, true)
-            checkoutCommit = sh (script: "cd ${LLM_ROOT} && git rev-parse HEAD",returnStdout: true).trim()
-            env.gitlabCommit = checkoutCommit
+        stage("Setup Environment") {
+            setupPipelineEnvironment(pipeline, testFilter, globalVars)
         }
-        echo "Env.gitlabMergeRequestLastCommit: ${env.gitlabMergeRequestLastCommit}."
-        echo "Freeze GitLab commit. Branch: ${env.gitlabBranch}. Commit: ${env.gitlabCommit}."
-        testFilter[(MULTI_GPU_FILE_CHANGED)] = getMultiGpuFileChanged(pipeline, testFilter, globalVars)
-        testFilter[(ONLY_ONE_GROUP_CHANGED)] = getOnlyOneGroupChanged(pipeline, testFilter, globalVars)
-        testFilter[(AUTO_TRIGGER_TAG_LIST)] = getAutoTriggerTagList(pipeline, testFilter, globalVars)
-        getContainerURIs().each { k, v ->
-            globalVars[k] = v
+        stage("Merge Test Waive List") {
+            mergeWaiveList(pipeline, globalVars)
         }
     })
 }
@@ -415,8 +462,8 @@ def launchReleaseCheck(pipeline)
     })
 }
 
-def getMergeRequestChangedFileListGitlab(pipeline) {
-    def changedFileList = []
+def getGitlabMRChangedFile(pipeline, function, filePath="") {
+    def result = null
     def pageId = 0
     withCredentials([
         usernamePassword(
@@ -436,19 +483,34 @@ def getMergeRequestChangedFileListGitlab(pipeline) {
                 returnStdout: true
             )
             def rawDataList = readJSON text: rawDataJson, returnPojo: true
-            rawDataList.each { rawData ->
-                changedFileList += [rawData.get("old_path"), rawData.get("new_path")]
+            if (function == "getOneFileChanges") {
+                if (result == null) {
+                    result = ""
+                }
+                rawDataList.find { rawData ->
+                    if (rawData.get("new_path") == filePath || rawData.get("old_path") == filePath) {
+                        result = rawData.get("diff")
+                        return true
+                    }
+                    return false
+                }
+                if (result != "") { break }
+            } else if (function == "getChangedFileList") {
+                if (result == null) {
+                    result = []
+                }
+                rawDataList.each { rawData ->
+                    result += [rawData.get("old_path"), rawData.get("new_path")]
+                }
             }
             if (!rawDataList) { break }
         }
     }
-    def changedFileListStr = changedFileList.join(",\n")
-    pipeline.echo("The changeset of this MR is: ${changedFileListStr}.")
-    return changedFileList
+    return result
 }
 
-def getMergeRequestChangedFileListGithub(pipeline, githubPrApiUrl) {
-    def changedFileList = []
+def getGithubMRChangedFile(pipeline, githubPrApiUrl, function, filePath="") {
+    def result = null
     def pageId = 0
     withCredentials([
         string(
@@ -467,15 +529,30 @@ def getMergeRequestChangedFileListGithub(pipeline, githubPrApiUrl) {
             )
             echo "rawDataJson: ${rawDataJson}"
             def rawDataList = readJSON text: rawDataJson, returnPojo: true
-            rawDataList.each { rawData ->
-                changedFileList += [rawData.get("filename"), rawData.get("previous_filename")].findAll { it }
+            if (function == "getOneFileChanges") {
+                if (result == null) {
+                    result = ""
+                }
+                rawDataList.find { rawData ->
+                    if (rawData.get("filename") == filePath || rawData.get("previous_filename") == filePath) {
+                        result = rawData.get("patch")
+                        return true
+                    }
+                    return false
+                }
+                if (result != "") { break }
+            } else if (function == "getChangedFileList") {
+                if (result == null) {
+                    result = []
+                }
+                rawDataList.each { rawData ->
+                    result += [rawData.get("filename"), rawData.get("previous_filename")].findAll { it }
+                }
             }
             if (!rawDataList) { break }
         }
     }
-    def changedFileListStr = changedFileList.join(",\n")
-    pipeline.echo("The changeset of this PR is: ${changedFileListStr}.")
-    return changedFileList
+    return result
 }
 
 def getMergeRequestChangedFileList(pipeline, globalVars) {
@@ -491,11 +568,15 @@ def getMergeRequestChangedFileList(pipeline, globalVars) {
         return globalVars[CACHED_CHANGED_FILE_LIST]
     }
     try {
+        def changedFileList = []
         if (githubPrApiUrl != null) {
-            globalVars[CACHED_CHANGED_FILE_LIST] = getMergeRequestChangedFileListGithub(pipeline, githubPrApiUrl)
+            changedFileList = getGithubMRChangedFile(pipeline, githubPrApiUrl, "getChangedFileList")
         } else {
-            globalVars[CACHED_CHANGED_FILE_LIST] = getMergeRequestChangedFileListGitlab(pipeline)
+            changedFileList = getGitlabMRChangedFile(pipeline, "getChangedFileList")
         }
+        def changedFileListStr = changedFileList.join(",\n")
+        pipeline.echo("The changeset of this MR is: ${changedFileListStr}.")
+        globalVars[CACHED_CHANGED_FILE_LIST] = changedFileList
         return globalVars[CACHED_CHANGED_FILE_LIST]
     } catch (InterruptedException e) {
         throw e
@@ -503,6 +584,26 @@ def getMergeRequestChangedFileList(pipeline, globalVars) {
         pipeline.echo("Get merge request changed file list failed. Error: ${e.toString()}")
         globalVars[CACHED_CHANGED_FILE_LIST] = []
         return globalVars[CACHED_CHANGED_FILE_LIST]
+    }
+}
+
+def getMergeRequestOneFileChanges(pipeline, globalVars, filePath) {
+    def githubPrApiUrl = globalVars[GITHUB_PR_API_URL]
+    def diff = ""
+
+    try {
+        if (githubPrApiUrl != null) {
+            diff = getGithubMRChangedFile(pipeline, githubPrApiUrl, "getOneFileChanges", filePath)
+        } else {
+            diff = getGitlabMRChangedFile(pipeline, "getOneFileChanges", filePath)
+        }
+        pipeline.echo("The change of ${filePath} is: ${diff}")
+        return diff
+    } catch (InterruptedException e) {
+        throw e
+    } catch (Exception e) {
+        pipeline.echo("Get merge request one changed file diff failed. Error: ${e.toString()}")
+        return ""
     }
 }
 
@@ -1188,12 +1289,12 @@ pipeline {
         }
     }
     stages {
-        stage("Setup environment")
+        stage("Preparation")
         {
             steps
             {
                 script {
-                    setupPipelineEnvironment(this, testFilter, globalVars)
+                    preparation(this, testFilter, globalVars)
                     println globalVars
                     globalVars[ACTION_INFO] = trtllm_utils.setupPipelineDescription(this, globalVars[ACTION_INFO])
                     echo "enableFailFast is: ${enableFailFast}"

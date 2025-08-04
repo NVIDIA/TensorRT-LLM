@@ -2077,35 +2077,31 @@ int AttentionOp::enqueueGeneration(EnqueueGenerationParams<T> const& params, cud
     debugCheckSemaphores(stream);
 #endif
 
-    // Medusa doesn't support multi-block mode.
-    if (!(mIsSpecDecodingEnabled && mUseSpecDecoding))
+    if (params.runtime_perf_knobs)
     {
-        if (params.runtime_perf_knobs)
-        {
-            int64_t multi_block_mode_val = params.runtime_perf_knobs[0];
-            mMultiBlockMode = multi_block_mode_val == 1;
-            if (common::getEnvForceDeterministicAttention())
-            {
-                mMultiBlockMode = false;
-            }
-        }
-
+        int64_t multi_block_mode_val = params.runtime_perf_knobs[0];
+        mMultiBlockMode = multi_block_mode_val == 1;
         if (common::getEnvForceDeterministicAttention())
         {
             mMultiBlockMode = false;
         }
+    }
 
-        // TODO only for debug usage
-        if (!mMultiBlockMode)
-        {
-            char* isForceMultiBlockModeChar = std::getenv("FORCE_MULTI_BLOCK_MODE");
-            bool isForceMultiBlockMode
-                = (isForceMultiBlockModeChar != nullptr && std::string(isForceMultiBlockModeChar) == "ON");
-            TLLM_CHECK_WITH_INFO(!(common::getEnvForceDeterministicAttention() && isForceMultiBlockMode),
-                "FORCE_MULTI_BLOCK_MODE and FORCE_DETERMINISTIC/FORCE_ATTENTION_KERNEL_DETERMINISTIC can not be set at "
-                "the same time.");
-            mMultiBlockMode = isForceMultiBlockMode;
-        }
+    if (common::getEnvForceDeterministicAttention())
+    {
+        mMultiBlockMode = false;
+    }
+
+    // TODO only for debug usage
+    if (!mMultiBlockMode)
+    {
+        char* isForceMultiBlockModeChar = std::getenv("FORCE_MULTI_BLOCK_MODE");
+        bool isForceMultiBlockMode
+            = (isForceMultiBlockModeChar != nullptr && std::string(isForceMultiBlockModeChar) == "ON");
+        TLLM_CHECK_WITH_INFO(!(common::getEnvForceDeterministicAttention() && isForceMultiBlockMode),
+            "FORCE_MULTI_BLOCK_MODE and FORCE_DETERMINISTIC/FORCE_ATTENTION_KERNEL_DETERMINISTIC can not be set at "
+            "the same time.");
+        mMultiBlockMode = isForceMultiBlockMode;
     }
 
     // Check that the chunked-attention and sliding-window-attention are not enabled at the same time.
@@ -2723,7 +2719,6 @@ int AttentionOp::initialize() noexcept
         {
             fixedParams.outputDataType = DATA_TYPE_E4M3;
             TLLM_CHECK_WITH_INFO(mNumHeads % mNumKVHeads == 0, "mNumHeads should be multiples of mNumKVHeads.");
-            TLLM_CHECK_WITH_INFO(!mMultiBlockMode, "Medusa doesn't support multi-block mode.");
         }
         fixedParams.numQHeads = mNumAttnHeads;
         fixedParams.numKvHeads = mNumAttnKVHeads;

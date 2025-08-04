@@ -61,9 +61,9 @@ def start_context_server(config,
     """Start a context server on specified GPU and port."""
     cmd = [
         "trtllm-serve", config['model_path'], "--host", "localhost", "--port",
-        str(port), "--backend", "pytorch", "--extra_llm_api_options",
-        f"./{CONTEXT_CONFIG_FILE}", "--metadata_server_config_file",
-        ETCD_CONFIG_FILE, "--server_role", "CONTEXT"
+        str(port), "--extra_llm_api_options", f"./{CONTEXT_CONFIG_FILE}",
+        "--metadata_server_config_file", ETCD_CONFIG_FILE, "--server_role",
+        "CONTEXT"
     ]
 
     server_env = env.copy() if env else os.environ.copy()
@@ -87,9 +87,9 @@ def start_generation_server(config,
     """Start a generation server on specified GPU and port."""
     cmd = [
         "trtllm-serve", config['model_path'], "--host", "localhost", "--port",
-        str(port), "--backend", "pytorch", "--extra_llm_api_options",
-        f"./{GENERATION_CONFIG_FILE}", "--metadata_server_config_file",
-        ETCD_CONFIG_FILE, "--server_role", "GENERATION"
+        str(port), "--extra_llm_api_options", f"./{GENERATION_CONFIG_FILE}",
+        "--metadata_server_config_file", ETCD_CONFIG_FILE, "--server_role",
+        "GENERATION"
     ]
 
     server_env = env.copy() if env else os.environ.copy()
