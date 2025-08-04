@@ -312,35 +312,20 @@ class MultimodalParams:
         # For any other type, return as-is
         return input_data
 
-    def _validate_element(self, element: str,
-                          supported_elements: List[str]) -> None:
-        """Validate that the element is supported.
-
-        Args:
-            element: Element name to validate
-            supported_elements: List of supported element names
-
-        Raises:
-            ValueError: If element is not supported
-        """
-        if element not in supported_elements:
-            raise ValueError(
-                f"Unsupported element '{element}'. "
-                f"Supported elements: {', '.join(repr(e) for e in supported_elements)}"
-            )
-
     def to_handle(self, element: str) -> None:
         """Move specified multimodal data element to shared tensor.
 
         Args:
-            element: Element to move ("multimodal_data")
+            element: Element to move (only "multimodal_data" is supported)
 
         Raises:
-            ValueError: If element is not supported
+            ValueError: If element is not "multimodal_data"
             RuntimeError: If tensor conversion fails
         """
-        supported_elements = ["multimodal_data"]
-        self._validate_element(element, supported_elements)
+        if element != "multimodal_data":
+            raise ValueError(
+                f"Unsupported element '{element}'. Only 'multimodal_data' is supported."
+            )
 
         data = getattr(self, element)
         if data is None:
@@ -353,15 +338,16 @@ class MultimodalParams:
         """Move specified multimodal data element from shared tensor.
 
         Args:
-            element: Element to restore ("multimodal_data")
+            element: Element to restore (only "multimodal_data" is supported)
 
         Raises:
-            ValueError: If element is not supported
+            ValueError: If element is not "multimodal_data"
             RuntimeError: If tensor restoration fails
         """
-        supported_elements = ["multimodal_data"]
-
-        self._validate_element(element, supported_elements)
+        if element != "multimodal_data":
+            raise ValueError(
+                f"Unsupported element '{element}'. Only 'multimodal_data' is supported."
+            )
 
         data = getattr(self, element)
         if data is None:
@@ -377,16 +363,18 @@ class MultimodalParams:
         """Move specified multimodal data element to target device.
 
         Args:
-            element: Element to move ("multimodal_data")
+            element: Element to move (only "multimodal_data" is supported)
             device: Target device (e.g., "cuda", "cpu")
             pin_memory: Whether to pin memory for faster transfers
 
         Raises:
-            ValueError: If element is not supported or device is invalid
+            ValueError: If element is not "multimodal_data" or device is invalid
             RuntimeError: If device transfer fails
         """
-        supported_elements = ["multimodal_data"]
-        self._validate_element(element, supported_elements)
+        if element != "multimodal_data":
+            raise ValueError(
+                f"Unsupported element '{element}'. Only 'multimodal_data' is supported."
+            )
 
         data = getattr(self, element)
         if data is None:

@@ -503,10 +503,6 @@ class GenerationExecutorWorker(GenerationExecutor):
             if self._is_pytorch_backend and request.multimodal_params is not None:
                 if request.multimodal_params.multimodal_data is not None:
                     request.multimodal_params.to_tensor("multimodal_data")
-                    # make sure the tensors reside on the local device
-                    request.multimodal_params.to_device("multimodal_data",
-                                                        "cuda",
-                                                        pin_memory=True)
                     executor_request.py_multimodal_data = request.multimodal_params.multimodal_data
 
             if self._is_pytorch_backend and request.sampling_params.logits_processor:
