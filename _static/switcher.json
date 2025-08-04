@@ -25,6 +25,10 @@
         "url": "https://nvidia.github.io/TensorRT-LLM/1.0.0rc0/"
     },
     {
+        "version": "0.21.0",
+        "url": "https://nvidia.github.io/TensorRT-LLM/0.21.0/"
+    },
+    {
         "version": "0.21.0rc2",
         "url": "https://nvidia.github.io/TensorRT-LLM/0.21.0rc2/"
     },
