@@ -55,11 +55,16 @@ class GuidedDecoder:
                                         self.bitmask_size,
                                         dtype=self.bitmask_dtype,
                                         pin_memory=True)
-        # The number of tokens accepted by the grammar matcher.
+
+        # The number of tokens accepted by the grammar matcher in a build step.
         self.num_advanced_tokens: List[int] = [0] * self.max_num_sequences
-        self.num_advanced_draft_tokens: List[int] = [0] * self.max_num_sequences
-        # The number of tokens with filled bitmask.
+        # The number of tokens with filled bitmask in a build step.
         self.num_guided_tokens: List[int] = [0] * self.max_num_sequences
+        # The accumulated number of tokens accepted by the grammar matcher in a drafting loop.
+        self.num_advanced_draft_tokens: List[int] = [0] * self.max_num_sequences
+        # Whether is guided drafting is terminated because of unacceptable drafted tokens.
+        self.is_draft_terminated: List[bool] = [False] * self.max_num_sequences
+
         self._stream = torch.cuda.Stream()
 
     @property
@@ -97,16 +102,24 @@ class GuidedDecoder:
 
             elif self._is_matcher_in_progress(llm_req):
                 matcher = self.grammar_matchers[slot]
-                # The last new token must be acceptable unless the matcher is terminated.
-                if matcher.is_terminated():
+                # The last new token must be acceptable unless the matcher is terminated in a drafting loop.
+                if llm_req.py_is_draft and (matcher.is_terminated()
+                                            or self.is_draft_terminated[slot]):
                     continue
                 # TODO: Fix this.
                 last_new_token = llm_req.get_tokens(0)[-1]
                 accepted = matcher.accept_token(last_new_token)
-                # TODO: Make this an error response.
                 if not accepted:
+                    if llm_req.py_is_draft:
+                        self.is_draft_terminated[slot] = True
+                        logger.debug(
+                            f"Draft request {llm_req.py_request_id} failed to accept last new token: {last_new_token}."
+                        )
+                        continue
+                    # TODO: Make this an error response.
                     raise ValueError(
-                        f"Failed to accept last new token: {last_new_token}.")
+                        f"Request {llm_req.py_request_id} failed to accept last new token: {last_new_token}."
+                    )
 
             else:
                 continue
@@ -175,6 +188,10 @@ class GuidedDecoder:
     @nvtx_range("GuidedDecoder.rollback_rejected_tokens")
     def rollback_rejected_tokens(self,
                                  scheduled_requests: ScheduledRequests) -> None:
+        """This method should be called:
+        - after the verification (so that the accepted tokens are ready) and
+        - before the first guided decoding build of the next drafting loop.
+        """
         if self.max_num_draft_tokens <= 0:
             return
 
@@ -196,6 +213,10 @@ class GuidedDecoder:
     @nvtx_range("GuidedDecoder.rollback_draft_tokens")
     def rollback_draft_tokens(self,
                               scheduled_requests: ScheduledRequests) -> None:
+        """This method should be called:
+        - after the the drafting loop and
+        - before the guided decoding build of the target model.
+        """
         if self.max_num_draft_tokens <= 0:
             return
 
@@ -206,4 +227,6 @@ class GuidedDecoder:
                 continue
             self.grammar_matchers[slot].rollback(
                 self.num_advanced_draft_tokens[slot])
+            # Reset the drafting states.
             self.num_advanced_draft_tokens[slot] = 0
+            self.is_draft_terminated[slot] = False
