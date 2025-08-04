@@ -36,6 +36,7 @@
     <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
     <link rel="stylesheet" type="text/css" href="../_static/autodoc_pydantic.css" />
     <link rel="stylesheet" type="text/css" href="../_static/togglebutton.css?v=13237357" />
+    <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=95073da6" />
   
   <!-- So that users can add custom icons -->
   <script src="../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
@@ -58,7 +59,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc4';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc5';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -70,7 +71,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.0.0rc4" />
+  <meta name="docsearch:version" content="1.0.0rc5" />
 
 
   </head>
@@ -367,6 +368,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client for Multimodal</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client_for_lora.html">Openai Completion Client For Lora</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client_json_schema.html">OpenAI Completion Client with JSON Schema</a></li>
 </ul>
 </details></li>
 </ul>
@@ -521,7 +523,7 @@
 <section id="starting-a-server">
 <h2>Starting a Server<a class="headerlink" href="#starting-a-server" title="Link to this heading">#</a></h2>
 <p>The following abbreviated command syntax shows the commonly used arguments to start a server:</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>trtllm-serve<span class="w"> </span>&lt;model&gt;<span class="w"> </span><span class="o">[</span>--backend<span class="w"> </span>pytorch<span class="w"> </span>--tp_size<span class="w"> </span>&lt;tp&gt;<span class="w"> </span>--pp_size<span class="w"> </span>&lt;pp&gt;<span class="w"> </span>--ep_size<span class="w"> </span>&lt;ep&gt;<span class="w"> </span>--host<span class="w"> </span>&lt;host&gt;<span class="w"> </span>--port<span class="w"> </span>&lt;port&gt;<span class="o">]</span>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>trtllm-serve<span class="w"> </span>&lt;model&gt;<span class="w"> </span><span class="o">[</span>--tp_size<span class="w"> </span>&lt;tp&gt;<span class="w"> </span>--pp_size<span class="w"> </span>&lt;pp&gt;<span class="w"> </span>--ep_size<span class="w"> </span>&lt;ep&gt;<span class="w"> </span>--host<span class="w"> </span>&lt;host&gt;<span class="w"> </span>--port<span class="w"> </span>&lt;port&gt;<span class="o">]</span>
 </pre></div>
 </div>
 <p>For the full syntax and argument descriptions, refer to <a class="reference internal" href="#syntax"><span class="std std-ref">Syntax</span></a>.</p>
@@ -606,24 +608,27 @@
 </section>
 <section id="multimodal-serving">
 <h3>Multimodal Serving<a class="headerlink" href="#multimodal-serving" title="Link to this heading">#</a></h3>
-<p>For multimodal models (e.g., Qwen2-VL), you’ll need to create a configuration file and start the server with additional options:</p>
+<p>For multimodal models, you need to create a configuration file and start the server with additional options due to the following limitations:</p>
+<ul class="simple">
+<li><p>TRT-LLM multimodal is currently not compatible with <code class="docutils literal notranslate"><span class="pre">kv_cache_reuse</span></code></p></li>
+<li><p>Multimodal models require <code class="docutils literal notranslate"><span class="pre">chat_template</span></code>, so only the Chat API is supported</p></li>
+</ul>
+<p>To set up multimodal models:</p>
 <p>First, create a configuration file:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>cat<span class="w"> </span>&gt;./extra-llm-api-config.yml<span class="s">&lt;&lt;EOF</span>
 <span class="s">kv_cache_config:</span>
 <span class="s">    enable_block_reuse: false</span>
-<span class="s">    free_gpu_memory_fraction: 0.6</span>
 <span class="s">EOF</span>
 </pre></div>
 </div>
 <p>Then, start the server with the configuration file:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>trtllm-serve<span class="w"> </span>Qwen/Qwen2-VL-7B-Instruct<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--extra_llm_api_options<span class="w"> </span>./extra-llm-api-config.yml<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--backend<span class="w"> </span>pytorch
+<span class="w">    </span>--extra_llm_api_options<span class="w"> </span>./extra-llm-api-config.yml
 </pre></div>
 </div>
 </section>
-<section id="id1">
-<h3>Completions API<a class="headerlink" href="#id1" title="Link to this heading">#</a></h3>
+<section id="multimodal-chat-api">
+<h3>Multimodal Chat API<a class="headerlink" href="#multimodal-chat-api" title="Link to this heading">#</a></h3>
 <p>You can query Completions API with any http clients, a typical example is OpenAI Python client:</p>
 <p>Another example uses <code class="docutils literal notranslate"><span class="pre">curl</span></code>:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="linenos"> 1</span><span class="ch">#! /usr/bin/env bash</span>
@@ -717,6 +722,71 @@
 </pre></div>
 </div>
 </section>
+<section id="multimodal-modality-coverage">
+<h3>Multimodal Modality Coverage<a class="headerlink" href="#multimodal-modality-coverage" title="Link to this heading">#</a></h3>
+<p>TRT-LLM multimodal supports the following modalities and data types (depending on the model):</p>
+<p><strong>Text</strong></p>
+<ul>
+<li><p>No type specified:</p>
+<div class="highlight-json notranslate"><div class="highlight"><pre><span></span><span class="p">{</span><span class="nt">&quot;role&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;user&quot;</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;content&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;What&#39;s the capital of South Korea?&quot;</span><span class="p">}</span>
+</pre></div>
+</div>
+</li>
+<li><p>Explicit “text” type:</p>
+<div class="highlight-json notranslate"><div class="highlight"><pre><span></span><span class="p">{</span><span class="nt">&quot;role&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;user&quot;</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;content&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[{</span><span class="nt">&quot;type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;text&quot;</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;text&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;What&#39;s the capital of South Korea?&quot;</span><span class="p">}]}</span>
+</pre></div>
+</div>
+</li>
+</ul>
+<p><strong>Image</strong></p>
+<ul>
+<li><p>Using “image_url” with URL:</p>
+<div class="highlight-json notranslate"><div class="highlight"><pre><span></span><span class="p">{</span><span class="nt">&quot;role&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;user&quot;</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;content&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">    </span><span class="p">{</span><span class="nt">&quot;type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;text&quot;</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;text&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;What&#39;s in this image?&quot;</span><span class="p">},</span>
+<span class="w">    </span><span class="p">{</span><span class="nt">&quot;type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;image_url&quot;</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;image_url&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">&quot;url&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;https://example.com/image.png&quot;</span><span class="p">}}</span>
+<span class="p">]}</span>
+</pre></div>
+</div>
+</li>
+<li><p>Using “image_url” with base64-encoded data:</p>
+<div class="highlight-json notranslate"><div class="highlight"><pre><span></span><span class="p">{</span><span class="nt">&quot;role&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;user&quot;</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;content&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">    </span><span class="p">{</span><span class="nt">&quot;type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;text&quot;</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;text&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;What&#39;s in this image?&quot;</span><span class="p">},</span>
+<span class="w">    </span><span class="p">{</span><span class="nt">&quot;type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;image_url&quot;</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;image_url&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">&quot;url&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;data:image/jpeg;base64,{image_base64}&quot;</span><span class="p">}}</span>
+<span class="p">]}</span>
+</pre></div>
+</div>
+</li>
+</ul>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p>To convert images to base64-encoded format, use the utility function
+<code class="xref py py-func docutils literal notranslate"><span class="pre">tensorrt_llm.utils.load_base64_image()</span></code>. Refer to the
+<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/utils/load_base64_image.py">load_base64_image utility</a>
+for implementation details.</p>
+</div>
+<p><strong>Video</strong></p>
+<ul>
+<li><p>Using “video_url”:</p>
+<div class="highlight-json notranslate"><div class="highlight"><pre><span></span><span class="p">{</span><span class="nt">&quot;role&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;user&quot;</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;content&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">    </span><span class="p">{</span><span class="nt">&quot;type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;text&quot;</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;text&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;What&#39;s in this video?&quot;</span><span class="p">},</span>
+<span class="w">    </span><span class="p">{</span><span class="nt">&quot;type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;video_url&quot;</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;video_url&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">&quot;url&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;https://example.com/video.mp4&quot;</span><span class="p">}}</span>
+<span class="p">]}</span>
+</pre></div>
+</div>
+</li>
+</ul>
+<p><strong>Audio</strong></p>
+<ul>
+<li><p>Using “audio_url”:</p>
+<div class="highlight-json notranslate"><div class="highlight"><pre><span></span><span class="p">{</span><span class="nt">&quot;role&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;user&quot;</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;content&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">[</span>
+<span class="w">    </span><span class="p">{</span><span class="nt">&quot;type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;text&quot;</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;text&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;What&#39;s in this audio?&quot;</span><span class="p">},</span>
+<span class="w">    </span><span class="p">{</span><span class="nt">&quot;type&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;audio_url&quot;</span><span class="p">,</span><span class="w"> </span><span class="nt">&quot;audio_url&quot;</span><span class="p">:</span><span class="w"> </span><span class="p">{</span><span class="nt">&quot;url&quot;</span><span class="p">:</span><span class="w"> </span><span class="s2">&quot;https://example.com/audio.mp3&quot;</span><span class="p">}}</span>
+<span class="p">]}</span>
+</pre></div>
+</div>
+</li>
+</ul>
+</section>
 </section>
 <section id="benchmark">
 <h2>Benchmark<a class="headerlink" href="#benchmark" title="Link to this heading">#</a></h2>
@@ -759,7 +829,7 @@ srun<span class="w"> </span>-N<span class="w"> </span><span class="m">2</span><s
 <span class="w">    </span>--container-image<span class="o">=</span>&lt;CONTAINER_IMG&gt;<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--container-mounts<span class="o">=</span>/workspace:/workspace<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--container-workdir<span class="w"> </span>/workspace<span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>bash<span class="w"> </span>-c<span class="w"> </span><span class="s2">&quot;trtllm-llmapi-launch trtllm-serve deepseek-ai/DeepSeek-V3 --backend pytorch --max_batch_size 161 --max_num_tokens 1160 --tp_size 16 --ep_size 4 --kv_cache_free_gpu_memory_fraction 0.95 --extra_llm_api_options ./extra-llm-api-config.yml&quot;</span>
+<span class="w">    </span>bash<span class="w"> </span>-c<span class="w"> </span><span class="s2">&quot;trtllm-llmapi-launch trtllm-serve deepseek-ai/DeepSeek-V3 --max_batch_size 161 --max_num_tokens 1160 --tp_size 16 --ep_size 4 --kv_cache_free_gpu_memory_fraction 0.95 --extra_llm_api_options ./extra-llm-api-config.yml&quot;</span>
 </pre></div>
 </div>
 <p>See <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/llmapi/trtllm-llmapi-launch">the source code</a> of <code class="docutils literal notranslate"><span class="pre">trtllm-llmapi-launch</span></code> for more details.</p>
@@ -775,7 +845,7 @@ srun<span class="w"> </span>-N<span class="w"> </span><span class="m">2</span><s
 </div>
 <p>The <code class="docutils literal notranslate"><span class="pre">/metrics</span></code> endpoint provides runtime-iteration statistics such as GPU memory use and inflight-batching details.
 For the TensorRT backend, these statistics are enabled by default.
-However, for the PyTorch backend, specified with the <code class="docutils literal notranslate"><span class="pre">--backend</span> <span class="pre">pytorch</span></code> argument, you must explicitly enable iteration statistics logging by setting the <cite>enable_iter_perf_stats</cite> field in a YAML configuration file as shown in the following example:</p>
+However, for the PyTorch backend, you must explicitly enable iteration statistics logging by setting the <cite>enable_iter_perf_stats</cite> field in a YAML configuration file as shown in the following example:</p>
 <div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="c1"># extra-llm-api-config.yml</span>
 <span class="nt">pytorch_backend_config</span><span class="p">:</span>
 <span class="w"> </span><span class="nt">enable_iter_perf_stats</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
@@ -784,7 +854,7 @@ However, for the PyTorch backend, specified with the <code class="docutils liter
 <p>Then start the server and specify the <code class="docutils literal notranslate"><span class="pre">--extra_llm_api_options</span></code> argument with the path to the YAML file as shown in the following example:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>trtllm-serve<span class="w"> </span>&lt;model&gt;<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--extra_llm_api_options<span class="w"> </span>&lt;path-to-extra-llm-api-config.yml&gt;<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span><span class="o">[</span>--backend<span class="w"> </span>pytorch<span class="w"> </span>--tp_size<span class="w"> </span>&lt;tp&gt;<span class="w"> </span>--pp_size<span class="w"> </span>&lt;pp&gt;<span class="w"> </span>--ep_size<span class="w"> </span>&lt;ep&gt;<span class="w"> </span>--host<span class="w"> </span>&lt;host&gt;<span class="w"> </span>--port<span class="w"> </span>&lt;port&gt;<span class="o">]</span>
+<span class="w">  </span><span class="o">[</span>--tp_size<span class="w"> </span>&lt;tp&gt;<span class="w"> </span>--pp_size<span class="w"> </span>&lt;pp&gt;<span class="w"> </span>--ep_size<span class="w"> </span>&lt;ep&gt;<span class="w"> </span>--host<span class="w"> </span>&lt;host&gt;<span class="w"> </span>--port<span class="w"> </span>&lt;port&gt;<span class="o">]</span>
 </pre></div>
 </div>
 <p>After at least one inference request is sent to the server, you can fetch the runtime-iteration statistics by polling the <cite>/metrics</cite> endpoint:</p>
@@ -916,7 +986,7 @@ However, for the PyTorch backend, specified with the <code class="docutils liter
 <dd><p>Set to ‘pytorch’ for pytorch path. Default is cpp path.</p>
 <dl class="field-list simple">
 <dt class="field-odd">Options<span class="colon">:</span></dt>
-<dd class="field-odd"><p>pytorch</p>
+<dd class="field-odd"><p>pytorch | trt</p>
 </dd>
 </dl>
 </dd></dl>
@@ -1033,6 +1103,12 @@ However, for the PyTorch backend, specified with the <code class="docutils liter
 <dd><p>Server role. Specify this value only if running in disaggregated mode.</p>
 </dd></dl>
 
+<dl class="std option">
+<dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-fail_fast_on_attention_window_too_large">
+<span class="sig-name descname"><span class="pre">--fail_fast_on_attention_window_too_large</span></span><span class="sig-prename descclassname"></span><a class="headerlink" href="#cmdoption-trtllm-serve-serve-fail_fast_on_attention_window_too_large" title="Link to this definition">#</a></dt>
+<dd><p>Exit with runtime error when attention window is too large to fit even a single sequence in the KV cache.</p>
+</dd></dl>
+
 <p class="rubric">Arguments</p>
 <dl class="std option">
 <dt class="sig sig-object std" id="cmdoption-trtllm-serve-serve-arg-MODEL">
@@ -1100,7 +1176,8 @@ However, for the PyTorch backend, specified with the <code class="docutils liter
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#chat-api">Chat API</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#completions-api">Completions API</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#multimodal-serving">Multimodal Serving</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#id1">Completions API</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#multimodal-chat-api">Multimodal Chat API</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#multimodal-modality-coverage">Multimodal Modality Coverage</a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#benchmark">Benchmark</a></li>
@@ -1209,9 +1286,9 @@ However, for the PyTorch backend, specified with the <code class="docutils liter
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on July 19, 2025.</p>
+  <p>Last updated on August 01, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/69e9f6d">69e9f6d</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/fbee279">fbee279</a>.</p>
   
 </div></div>
       

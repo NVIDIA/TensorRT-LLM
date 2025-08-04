@@ -36,6 +36,7 @@
     <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
     <link rel="stylesheet" type="text/css" href="../_static/autodoc_pydantic.css" />
     <link rel="stylesheet" type="text/css" href="../_static/togglebutton.css?v=13237357" />
+    <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=95073da6" />
   
   <!-- So that users can add custom icons -->
   <script src="../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
@@ -58,7 +59,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc4';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc5';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -70,7 +71,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.0.0rc4" />
+  <meta name="docsearch:version" content="1.0.0rc5" />
 
 
   </head>
@@ -363,6 +364,7 @@
 <li class="toctree-l2"><a class="reference internal" href="openai_chat_client_for_multimodal.html">OpenAI Chat Client for Multimodal</a></li>
 <li class="toctree-l2"><a class="reference internal" href="openai_completion_client.html">OpenAI Completion Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="openai_completion_client_for_lora.html">Openai Completion Client For Lora</a></li>
+<li class="toctree-l2"><a class="reference internal" href="openai_completion_client_json_schema.html">OpenAI Completion Client with JSON Schema</a></li>
 </ul>
 </details></li>
 </ul>
@@ -505,61 +507,60 @@
 <span class="linenos"> 2</span>
 <span class="linenos"> 3</span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLM</span>
 <span class="linenos"> 4</span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.executor</span><span class="w"> </span><span class="kn">import</span> <span class="n">LoRARequest</span>
-<span class="linenos"> 5</span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.llmapi</span><span class="w"> </span><span class="kn">import</span> <span class="n">BuildConfig</span>
-<span class="linenos"> 6</span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.lora_manager</span><span class="w"> </span><span class="kn">import</span> <span class="n">LoraConfig</span>
+<span class="linenos"> 5</span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.lora_manager</span><span class="w"> </span><span class="kn">import</span> <span class="n">LoraConfig</span>
+<span class="linenos"> 6</span>
 <span class="linenos"> 7</span>
-<span class="linenos"> 8</span>
-<span class="linenos"> 9</span><span class="k">def</span><span class="w"> </span><span class="nf">main</span><span class="p">():</span>
-<span class="linenos">10</span>
-<span class="linenos">11</span>    <span class="c1"># Download the LoRA adapters from huggingface hub.</span>
-<span class="linenos">12</span>    <span class="n">lora_dir1</span> <span class="o">=</span> <span class="n">snapshot_download</span><span class="p">(</span><span class="n">repo_id</span><span class="o">=</span><span class="s2">&quot;snshrivas10/sft-tiny-chatbot&quot;</span><span class="p">)</span>
-<span class="linenos">13</span>    <span class="n">lora_dir2</span> <span class="o">=</span> <span class="n">snapshot_download</span><span class="p">(</span>
-<span class="linenos">14</span>        <span class="n">repo_id</span><span class="o">=</span><span class="s2">&quot;givyboy/TinyLlama-1.1B-Chat-v1.0-mental-health-conversational&quot;</span><span class="p">)</span>
-<span class="linenos">15</span>    <span class="n">lora_dir3</span> <span class="o">=</span> <span class="n">snapshot_download</span><span class="p">(</span><span class="n">repo_id</span><span class="o">=</span><span class="s2">&quot;barissglc/tinyllama-tarot-v1&quot;</span><span class="p">)</span>
-<span class="linenos">16</span>
-<span class="linenos">17</span>    <span class="c1"># Currently, we need to pass at least one lora_dir to LLM constructor via build_config.lora_config.</span>
-<span class="linenos">18</span>    <span class="c1"># This is necessary because it requires some configuration in the lora_dir to build the engine with LoRA support.</span>
-<span class="linenos">19</span>    <span class="n">build_config</span> <span class="o">=</span> <span class="n">BuildConfig</span><span class="p">()</span>
-<span class="linenos">20</span>    <span class="n">build_config</span><span class="o">.</span><span class="n">lora_config</span> <span class="o">=</span> <span class="n">LoraConfig</span><span class="p">(</span><span class="n">lora_dir</span><span class="o">=</span><span class="p">[</span><span class="n">lora_dir1</span><span class="p">])</span>
-<span class="linenos">21</span>    <span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="s2">&quot;TinyLlama/TinyLlama-1.1B-Chat-v1.0&quot;</span><span class="p">,</span>
-<span class="linenos">22</span>              <span class="n">enable_lora</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
-<span class="linenos">23</span>              <span class="n">max_lora_rank</span><span class="o">=</span><span class="mi">64</span><span class="p">,</span>
-<span class="linenos">24</span>              <span class="n">build_config</span><span class="o">=</span><span class="n">build_config</span><span class="p">)</span>
-<span class="linenos">25</span>
-<span class="linenos">26</span>    <span class="c1"># Sample prompts</span>
-<span class="linenos">27</span>    <span class="n">prompts</span> <span class="o">=</span> <span class="p">[</span>
+<span class="linenos"> 8</span><span class="k">def</span><span class="w"> </span><span class="nf">main</span><span class="p">():</span>
+<span class="linenos"> 9</span>
+<span class="linenos">10</span>    <span class="c1"># Download the LoRA adapters from huggingface hub.</span>
+<span class="linenos">11</span>    <span class="n">lora_dir1</span> <span class="o">=</span> <span class="n">snapshot_download</span><span class="p">(</span><span class="n">repo_id</span><span class="o">=</span><span class="s2">&quot;snshrivas10/sft-tiny-chatbot&quot;</span><span class="p">)</span>
+<span class="linenos">12</span>    <span class="n">lora_dir2</span> <span class="o">=</span> <span class="n">snapshot_download</span><span class="p">(</span>
+<span class="linenos">13</span>        <span class="n">repo_id</span><span class="o">=</span><span class="s2">&quot;givyboy/TinyLlama-1.1B-Chat-v1.0-mental-health-conversational&quot;</span><span class="p">)</span>
+<span class="linenos">14</span>    <span class="n">lora_dir3</span> <span class="o">=</span> <span class="n">snapshot_download</span><span class="p">(</span><span class="n">repo_id</span><span class="o">=</span><span class="s2">&quot;barissglc/tinyllama-tarot-v1&quot;</span><span class="p">)</span>
+<span class="linenos">15</span>
+<span class="linenos">16</span>    <span class="c1"># Currently, we need to pass at least one lora_dir to LLM constructor via build_config.lora_config.</span>
+<span class="linenos">17</span>    <span class="c1"># This is necessary because it requires some configuration in the lora_dir to build the engine with LoRA support.</span>
+<span class="linenos">18</span>    <span class="n">lora_config</span> <span class="o">=</span> <span class="n">LoraConfig</span><span class="p">(</span><span class="n">lora_dir</span><span class="o">=</span><span class="p">[</span><span class="n">lora_dir1</span><span class="p">],</span>
+<span class="linenos">19</span>                             <span class="n">max_lora_rank</span><span class="o">=</span><span class="mi">64</span><span class="p">,</span>
+<span class="linenos">20</span>                             <span class="n">max_loras</span><span class="o">=</span><span class="mi">3</span><span class="p">,</span>
+<span class="linenos">21</span>                             <span class="n">max_cpu_loras</span><span class="o">=</span><span class="mi">3</span><span class="p">)</span>
+<span class="linenos">22</span>    <span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="s2">&quot;TinyLlama/TinyLlama-1.1B-Chat-v1.0&quot;</span><span class="p">,</span>
+<span class="linenos">23</span>              <span class="n">lora_config</span><span class="o">=</span><span class="n">lora_config</span><span class="p">)</span>
+<span class="linenos">24</span>
+<span class="linenos">25</span>    <span class="c1"># Sample prompts</span>
+<span class="linenos">26</span>    <span class="n">prompts</span> <span class="o">=</span> <span class="p">[</span>
+<span class="linenos">27</span>        <span class="s2">&quot;Hello, tell me a story: &quot;</span><span class="p">,</span>
 <span class="linenos">28</span>        <span class="s2">&quot;Hello, tell me a story: &quot;</span><span class="p">,</span>
-<span class="linenos">29</span>        <span class="s2">&quot;Hello, tell me a story: &quot;</span><span class="p">,</span>
+<span class="linenos">29</span>        <span class="s2">&quot;I&#39;ve noticed you seem a bit down lately. Is there anything you&#39;d like to talk about?&quot;</span><span class="p">,</span>
 <span class="linenos">30</span>        <span class="s2">&quot;I&#39;ve noticed you seem a bit down lately. Is there anything you&#39;d like to talk about?&quot;</span><span class="p">,</span>
-<span class="linenos">31</span>        <span class="s2">&quot;I&#39;ve noticed you seem a bit down lately. Is there anything you&#39;d like to talk about?&quot;</span><span class="p">,</span>
+<span class="linenos">31</span>        <span class="s2">&quot;In this reading, the Justice card represents a situation where&quot;</span><span class="p">,</span>
 <span class="linenos">32</span>        <span class="s2">&quot;In this reading, the Justice card represents a situation where&quot;</span><span class="p">,</span>
-<span class="linenos">33</span>        <span class="s2">&quot;In this reading, the Justice card represents a situation where&quot;</span><span class="p">,</span>
-<span class="linenos">34</span>    <span class="p">]</span>
-<span class="linenos">35</span>
-<span class="linenos">36</span>    <span class="c1"># At runtime, multiple LoRA adapters can be specified via lora_request; None means no LoRA used.</span>
-<span class="linenos">37</span>    <span class="k">for</span> <span class="n">output</span> <span class="ow">in</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">prompts</span><span class="p">,</span>
-<span class="linenos">38</span>                               <span class="n">lora_request</span><span class="o">=</span><span class="p">[</span>
-<span class="linenos">39</span>                                   <span class="kc">None</span><span class="p">,</span>
-<span class="linenos">40</span>                                   <span class="n">LoRARequest</span><span class="p">(</span><span class="s2">&quot;chatbot&quot;</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="n">lora_dir1</span><span class="p">),</span> <span class="kc">None</span><span class="p">,</span>
-<span class="linenos">41</span>                                   <span class="n">LoRARequest</span><span class="p">(</span><span class="s2">&quot;mental-health&quot;</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="n">lora_dir2</span><span class="p">),</span>
-<span class="linenos">42</span>                                   <span class="kc">None</span><span class="p">,</span>
-<span class="linenos">43</span>                                   <span class="n">LoRARequest</span><span class="p">(</span><span class="s2">&quot;tarot&quot;</span><span class="p">,</span> <span class="mi">3</span><span class="p">,</span> <span class="n">lora_dir3</span><span class="p">)</span>
-<span class="linenos">44</span>                               <span class="p">]):</span>
-<span class="linenos">45</span>        <span class="n">prompt</span> <span class="o">=</span> <span class="n">output</span><span class="o">.</span><span class="n">prompt</span>
-<span class="linenos">46</span>        <span class="n">generated_text</span> <span class="o">=</span> <span class="n">output</span><span class="o">.</span><span class="n">outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">text</span>
-<span class="linenos">47</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Prompt: </span><span class="si">{</span><span class="n">prompt</span><span class="si">!r}</span><span class="s2">, Generated text: </span><span class="si">{</span><span class="n">generated_text</span><span class="si">!r}</span><span class="s2">&quot;</span><span class="p">)</span>
-<span class="linenos">48</span>
-<span class="linenos">49</span>    <span class="c1"># Got output like</span>
-<span class="linenos">50</span>    <span class="c1"># Prompt: &#39;Hello, tell me a story: &#39;, Generated text: &#39;1. Start with a question: &quot;What\&#39;s your favorite color?&quot; 2. Ask a question that leads to a story: &quot;What\&#39;s your&#39;</span>
-<span class="linenos">51</span>    <span class="c1"># Prompt: &#39;Hello, tell me a story: &#39;, Generated text: &#39;1. A person is walking down the street. 2. A person is sitting on a bench. 3. A person is reading a book.&#39;</span>
-<span class="linenos">52</span>    <span class="c1"># Prompt: &quot;I&#39;ve noticed you seem a bit down lately. Is there anything you&#39;d like to talk about?&quot;, Generated text: &quot;\n\nJASON: (smiling) No, I&#39;m just feeling a bit overwhelmed lately. I&#39;ve been trying to&quot;</span>
-<span class="linenos">53</span>    <span class="c1"># Prompt: &quot;I&#39;ve noticed you seem a bit down lately. Is there anything you&#39;d like to talk about?&quot;, Generated text: &quot;\n\nJASON: (sighs) Yeah, I&#39;ve been struggling with some personal issues. I&#39;ve been feeling like I&#39;m&quot;</span>
-<span class="linenos">54</span>    <span class="c1"># Prompt: &#39;In this reading, the Justice card represents a situation where&#39;, Generated text: &#39;you are being asked to make a decision that will have a significant impact on your life. The card suggests that you should take the time to consider all the options&#39;</span>
-<span class="linenos">55</span>    <span class="c1"># Prompt: &#39;In this reading, the Justice card represents a situation where&#39;, Generated text: &#39;you are being asked to make a decision that will have a significant impact on your life. It is important to take the time to consider all the options and make&#39;</span>
+<span class="linenos">33</span>    <span class="p">]</span>
+<span class="linenos">34</span>
+<span class="linenos">35</span>    <span class="c1"># At runtime, multiple LoRA adapters can be specified via lora_request; None means no LoRA used.</span>
+<span class="linenos">36</span>    <span class="k">for</span> <span class="n">output</span> <span class="ow">in</span> <span class="n">llm</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span><span class="n">prompts</span><span class="p">,</span>
+<span class="linenos">37</span>                               <span class="n">lora_request</span><span class="o">=</span><span class="p">[</span>
+<span class="linenos">38</span>                                   <span class="kc">None</span><span class="p">,</span>
+<span class="linenos">39</span>                                   <span class="n">LoRARequest</span><span class="p">(</span><span class="s2">&quot;chatbot&quot;</span><span class="p">,</span> <span class="mi">1</span><span class="p">,</span> <span class="n">lora_dir1</span><span class="p">),</span> <span class="kc">None</span><span class="p">,</span>
+<span class="linenos">40</span>                                   <span class="n">LoRARequest</span><span class="p">(</span><span class="s2">&quot;mental-health&quot;</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="n">lora_dir2</span><span class="p">),</span>
+<span class="linenos">41</span>                                   <span class="kc">None</span><span class="p">,</span>
+<span class="linenos">42</span>                                   <span class="n">LoRARequest</span><span class="p">(</span><span class="s2">&quot;tarot&quot;</span><span class="p">,</span> <span class="mi">3</span><span class="p">,</span> <span class="n">lora_dir3</span><span class="p">)</span>
+<span class="linenos">43</span>                               <span class="p">]):</span>
+<span class="linenos">44</span>        <span class="n">prompt</span> <span class="o">=</span> <span class="n">output</span><span class="o">.</span><span class="n">prompt</span>
+<span class="linenos">45</span>        <span class="n">generated_text</span> <span class="o">=</span> <span class="n">output</span><span class="o">.</span><span class="n">outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">text</span>
+<span class="linenos">46</span>        <span class="nb">print</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Prompt: </span><span class="si">{</span><span class="n">prompt</span><span class="si">!r}</span><span class="s2">, Generated text: </span><span class="si">{</span><span class="n">generated_text</span><span class="si">!r}</span><span class="s2">&quot;</span><span class="p">)</span>
+<span class="linenos">47</span>
+<span class="linenos">48</span>    <span class="c1"># Got output like</span>
+<span class="linenos">49</span>    <span class="c1"># Prompt: &#39;Hello, tell me a story: &#39;, Generated text: &#39;1. Start with a question: &quot;What\&#39;s your favorite color?&quot; 2. Ask a question that leads to a story: &quot;What\&#39;s your&#39;</span>
+<span class="linenos">50</span>    <span class="c1"># Prompt: &#39;Hello, tell me a story: &#39;, Generated text: &#39;1. A person is walking down the street. 2. A person is sitting on a bench. 3. A person is reading a book.&#39;</span>
+<span class="linenos">51</span>    <span class="c1"># Prompt: &quot;I&#39;ve noticed you seem a bit down lately. Is there anything you&#39;d like to talk about?&quot;, Generated text: &quot;\n\nJASON: (smiling) No, I&#39;m just feeling a bit overwhelmed lately. I&#39;ve been trying to&quot;</span>
+<span class="linenos">52</span>    <span class="c1"># Prompt: &quot;I&#39;ve noticed you seem a bit down lately. Is there anything you&#39;d like to talk about?&quot;, Generated text: &quot;\n\nJASON: (sighs) Yeah, I&#39;ve been struggling with some personal issues. I&#39;ve been feeling like I&#39;m&quot;</span>
+<span class="linenos">53</span>    <span class="c1"># Prompt: &#39;In this reading, the Justice card represents a situation where&#39;, Generated text: &#39;you are being asked to make a decision that will have a significant impact on your life. The card suggests that you should take the time to consider all the options&#39;</span>
+<span class="linenos">54</span>    <span class="c1"># Prompt: &#39;In this reading, the Justice card represents a situation where&#39;, Generated text: &#39;you are being asked to make a decision that will have a significant impact on your life. It is important to take the time to consider all the options and make&#39;</span>
+<span class="linenos">55</span>
 <span class="linenos">56</span>
-<span class="linenos">57</span>
-<span class="linenos">58</span><span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s1">&#39;__main__&#39;</span><span class="p">:</span>
-<span class="linenos">59</span>    <span class="n">main</span><span class="p">()</span>
+<span class="linenos">57</span><span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s1">&#39;__main__&#39;</span><span class="p">:</span>
+<span class="linenos">58</span>    <span class="n">main</span><span class="p">()</span>
 </pre></div>
 </div>
 </section>
@@ -692,9 +693,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on July 19, 2025.</p>
+  <p>Last updated on August 01, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/69e9f6d">69e9f6d</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/fbee279">fbee279</a>.</p>
   
 </div></div>
       

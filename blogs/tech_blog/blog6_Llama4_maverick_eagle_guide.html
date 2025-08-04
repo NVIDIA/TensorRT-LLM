@@ -36,6 +36,7 @@
     <link rel="stylesheet" type="text/css" href="../../_static/copybutton.css?v=76b2166b" />
     <link rel="stylesheet" type="text/css" href="../../_static/autodoc_pydantic.css" />
     <link rel="stylesheet" type="text/css" href="../../_static/togglebutton.css?v=13237357" />
+    <link rel="stylesheet" type="text/css" href="../../_static/custom.css?v=95073da6" />
   
   <!-- So that users can add custom icons -->
   <script src="../../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
@@ -58,7 +59,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc4';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc5';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -68,7 +69,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.0.0rc4" />
+  <meta name="docsearch:version" content="1.0.0rc5" />
 
 
   </head>
@@ -365,6 +366,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client for Multimodal</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client_for_lora.html">Openai Completion Client For Lora</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client_json_schema.html">OpenAI Completion Client with JSON Schema</a></li>
 </ul>
 </details></li>
 </ul>
@@ -563,11 +565,11 @@
     <span class="o">-</span><span class="n">p</span> <span class="mi">8000</span><span class="p">:</span><span class="mi">8000</span> <span class="o">--</span><span class="n">gpus</span><span class="o">=</span><span class="nb">all</span> <span class="o">-</span><span class="n">e</span> <span class="s2">&quot;TRTLLM_ENABLE_PDL=1&quot;</span> \
     <span class="o">-</span><span class="n">v</span> <span class="o">/</span><span class="n">path</span><span class="o">/</span><span class="n">to</span><span class="o">/</span><span class="n">maverick</span><span class="p">:</span><span class="o">/</span><span class="n">config</span><span class="o">/</span><span class="n">models</span><span class="o">/</span><span class="n">maverick</span> <span class="o">-</span><span class="n">v</span> <span class="o">/</span><span class="n">path</span><span class="o">/</span><span class="n">to</span><span class="o">/</span><span class="n">eagle</span><span class="p">:</span><span class="o">/</span><span class="n">config</span><span class="o">/</span><span class="n">models</span><span class="o">/</span><span class="n">eagle</span> \
     <span class="n">docker</span><span class="o">.</span><span class="n">io</span><span class="o">/&lt;</span><span class="n">username</span><span class="o">&gt;/</span><span class="n">tensorrt_llm</span><span class="p">:</span><span class="n">main</span> <span class="n">sh</span> \
-        <span class="o">-</span><span class="n">c</span> <span class="s2">&quot;echo -e &#39;enable_attention_dp: false</span><span class="se">\n</span><span class="s2">enable_min_latency: true</span><span class="se">\n</span><span class="s2">enable_autotuner: false</span><span class="se">\n</span><span class="s2">cuda_graph_config:</span><span class="se">\n</span><span class="s2">  max_batch_size: 8</span><span class="se">\n</span><span class="s2">speculative_config:</span><span class="se">\n</span><span class="s2">  decoding_type: Eagle</span><span class="se">\n</span><span class="s2">  max_draft_len: 3</span><span class="se">\n</span><span class="s2">  speculative_model_dir: /config/models/eagle</span><span class="se">\n</span><span class="s2">kv_cache_config:</span><span class="se">\n</span><span class="s2">  enable_block_reuse: false&#39; &gt; c.yaml &amp;&amp; </span><span class="se">\</span>
+        <span class="o">-</span><span class="n">c</span> <span class="s2">&quot;echo -e &#39;enable_autotuner: false</span><span class="se">\n</span><span class="s2">enable_attention_dp: false</span><span class="se">\n</span><span class="s2">enable_min_latency: true</span><span class="se">\n</span><span class="s2">cuda_graph_config:</span><span class="se">\n</span><span class="s2">  max_batch_size: 8</span><span class="se">\n</span><span class="s2">speculative_config:</span><span class="se">\n</span><span class="s2">  decoding_type: Eagle</span><span class="se">\n</span><span class="s2">  max_draft_len: 3</span><span class="se">\n</span><span class="s2">  speculative_model_dir: /config/models/eagle</span><span class="se">\n</span><span class="s2">  eagle3_one_model: true</span><span class="se">\n</span><span class="s2">kv_cache_config:</span><span class="se">\n</span><span class="s2">  enable_block_reuse: false&#39; &gt; c.yaml &amp;&amp; </span><span class="se">\</span>
 <span class="s2">        TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL=True </span><span class="se">\</span>
 <span class="s2">        trtllm-serve /config/models/maverick </span><span class="se">\</span>
 <span class="s2">            --host 0.0.0.0 --port 8000 </span><span class="se">\</span>
-<span class="s2">            --backend pytorch --tp_size 8 --ep_size 1 </span><span class="se">\</span>
+<span class="s2">            --tp_size 8 --ep_size 1 </span><span class="se">\</span>
 <span class="s2">            --trust_remote_code --extra_llm_api_options c.yaml </span><span class="se">\</span>
 <span class="s2">            --kv_cache_free_gpu_memory_fraction 0.75&quot;</span>
 </pre></div>
@@ -632,7 +634,8 @@
 </section>
 <section id="performance-tuning">
 <h2>Performance Tuning<a class="headerlink" href="#performance-tuning" title="Link to this heading">#</a></h2>
-<p>The configuration provided is optimized for 8xB200 GPUs, but you can adjust several parameters for your specific workload:</p>
+<p>The configuration provided is optimized for 8xB200 GPUs, but you can adjust several parameters for your specific workload.</p>
+<p><strong>Note:</strong> This configuration is optimized for minimum latency (<code class="docutils literal notranslate"><span class="pre">enable_min_latency:</span> <span class="pre">true</span></code>). When increasing the concurrency of requests, the tokens per second (TPS) per user degrades rapidly. This setup is designed to maximize single-user performance rather than high-concurrency throughput. For workloads with many concurrent users, you may need to adjust the configuration accordingly.</p>
 <ul class="simple">
 <li><p><code class="docutils literal notranslate"><span class="pre">max_batch_size</span></code>: Controls how many requests can be batched together</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">max_draft_len</span></code>: The number of tokens Eagle can speculate ahead</p></li>
@@ -784,9 +787,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on July 19, 2025.</p>
+  <p>Last updated on August 01, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/69e9f6d">69e9f6d</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/fbee279">fbee279</a>.</p>
   
 </div></div>
       

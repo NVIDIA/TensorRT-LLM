@@ -35,6 +35,7 @@
     <link rel="stylesheet" type="text/css" href="../../../_static/copybutton.css?v=76b2166b" />
     <link rel="stylesheet" type="text/css" href="../../../_static/autodoc_pydantic.css" />
     <link rel="stylesheet" type="text/css" href="../../../_static/togglebutton.css?v=13237357" />
+    <link rel="stylesheet" type="text/css" href="../../../_static/custom.css?v=95073da6" />
   
   <!-- So that users can add custom icons -->
   <script src="../../../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
@@ -57,7 +58,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc4';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc5';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -67,7 +68,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.0.0rc4" />
+  <meta name="docsearch:version" content="1.0.0rc5" />
 
 
   </head>
@@ -360,6 +361,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client for Multimodal</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../../examples/openai_completion_client_for_lora.html">Openai Completion Client For Lora</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../examples/openai_completion_client_json_schema.html">OpenAI Completion Client with JSON Schema</a></li>
 </ul>
 </details></li>
 </ul>
@@ -584,7 +586,7 @@
     <span class="n">dtype</span> <span class="o">=</span> <span class="n">builder_config</span><span class="p">[</span><span class="s1">&#39;precision&#39;</span><span class="p">]</span>
     <span class="n">tp_size</span> <span class="o">=</span> <span class="n">builder_config</span><span class="p">[</span><span class="s1">&#39;tensor_parallel&#39;</span><span class="p">]</span>
     <span class="n">pp_size</span> <span class="o">=</span> <span class="n">builder_config</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;pipeline_parallel&#39;</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
-    <span class="n">kv_cache_type</span> <span class="o">=</span> <span class="n">KVCacheType</span><span class="p">(</span><span class="n">builder_config</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;kv_cache_type&#39;</span><span class="p">))</span>
+    <span class="n">kv_cache_type</span> <span class="o">=</span> <span class="n">KVCacheType</span><span class="o">.</span><span class="n">from_string</span><span class="p">(</span><span class="n">builder_config</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="s1">&#39;kv_cache_type&#39;</span><span class="p">))</span>
     <span class="n">world_size</span> <span class="o">=</span> <span class="n">tp_size</span> <span class="o">*</span> <span class="n">pp_size</span>
     <span class="k">assert</span> <span class="n">world_size</span> <span class="o">==</span> <span class="n">mpi_world_size</span><span class="p">(),</span> \
         <span class="sa">f</span><span class="s1">&#39;Engine world size (</span><span class="si">{</span><span class="n">tp_size</span><span class="si">}</span><span class="s1"> * </span><span class="si">{</span><span class="n">pp_size</span><span class="si">}</span><span class="s1">) != Runtime world size (</span><span class="si">{</span><span class="n">mpi_world_size</span><span class="p">()</span><span class="si">}</span><span class="s1">)&#39;</span>
@@ -1151,6 +1153,7 @@
         <span class="n">gpu_weights_percent</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mi">1</span><span class="p">,</span>
         <span class="n">enable_context_fmha_fp32_acc</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">bool</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
         <span class="n">multi_block_mode</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">bool</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+        <span class="n">fail_fast_on_attention_window_too_large</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">,</span>
     <span class="p">)</span> <span class="o">-&gt;</span> <span class="s1">&#39;ModelRunner&#39;</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
 <span class="sd">        Create a ModelRunner instance from an engine directory.</span>
@@ -1172,6 +1175,9 @@
 <span class="sd">                Stream to use.</span>
 <span class="sd">            multi_block_mode (bool):</span>
 <span class="sd">                Whether to distribute the work across multiple CUDA thread-blocks on the GPU for masked MHA kernel.</span>
+<span class="sd">            fail_fast_on_attention_window_too_large (bool):</span>
+<span class="sd">                Exit with runtime error when attention window is too large to fit even a single sequence in the KV cache.</span>
+<span class="sd">                Note: This parameter is only applicable to C++ runtime (ModelRunnerCpp).</span>
 <span class="sd">        Returns:</span>
 <span class="sd">            ModelRunner: An instance of ModelRunner.</span>
 <span class="sd">        &quot;&quot;&quot;</span>
@@ -1613,9 +1619,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on July 19, 2025.</p>
+  <p>Last updated on August 01, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/69e9f6d">69e9f6d</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/fbee279">fbee279</a>.</p>
   
 </div></div>
       

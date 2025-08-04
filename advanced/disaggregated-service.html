@@ -36,6 +36,7 @@
     <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
     <link rel="stylesheet" type="text/css" href="../_static/autodoc_pydantic.css" />
     <link rel="stylesheet" type="text/css" href="../_static/togglebutton.css?v=13237357" />
+    <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=95073da6" />
   
   <!-- So that users can add custom icons -->
   <script src="../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
@@ -58,7 +59,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc4';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc5';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -70,7 +71,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.0.0rc4" />
+  <meta name="docsearch:version" content="1.0.0rc5" />
 
 
   </head>
@@ -367,6 +368,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client for Multimodal</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client_for_lora.html">Openai Completion Client For Lora</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client_json_schema.html">OpenAI Completion Client with JSON Schema</a></li>
 </ul>
 </details></li>
 </ul>
@@ -522,6 +524,10 @@ This feature is currently experimental, and the related API is subjected to chan
 <li><p><code class="docutils literal notranslate"><span class="pre">TRTLLM_KVCACHE_TRANSFER_USE_ASYNC_BUFFER</span></code>: If set to <code class="docutils literal notranslate"><span class="pre">1</span></code>, TRT-LLM will use <code class="docutils literal notranslate"><span class="pre">cudaMallocAsync</span></code> to allocate buffers for KV cache transmission. The default value is <code class="docutils literal notranslate"><span class="pre">0</span></code>. This environment variable only takes effect when <code class="docutils literal notranslate"><span class="pre">TRTLLM_KVCACHE_TRANSFER_BUFFER_SIZE</span></code> is greater than 0.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">TRTLLM_KVCACHE_SEND_MAX_CONCURRENCY_NUM</span></code>: The maximum number of concurrent KV cache sends. The default value is <code class="docutils literal notranslate"><span class="pre">4</span></code>. This environment variable only takes effect when <code class="docutils literal notranslate"><span class="pre">TRTLLM_KVCACHE_TRANSFER_BUFFER_SIZE</span></code> is greater than 0.</p></li>
 </ul>
+<p>There are some other useful environment variables that may help when encountering failures or performance issues.</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">NCCL_GRAPH_MIXING_SUPPORT</span></code>: With the default value <code class="docutils literal notranslate"><span class="pre">1</span></code>, the CUDA driver may create too many CUDA streams while working with one CUDA graph, leading to performance drop. Setting it to <code class="docutils literal notranslate"><span class="pre">0</span></code> will reduce the number of CUDA streams, but please make sure there are no other NCCL ops outside the one CUDA graph, otherwise it’s unsafe.</p></li>
+</ul>
 </section>
 <section id="troubleshooting-and-faq">
 <h2>Troubleshooting and FAQ<a class="headerlink" href="#troubleshooting-and-faq" title="Link to this heading">#</a></h2>
@@ -554,6 +560,13 @@ This feature is currently experimental, and the related API is subjected to chan
 <p>A. Yes, TRT-LLM supports using GPU direct RDMA for inter-node KV cache transfer.</p>
 <p><em>Q. What causes the substantial bandwidth fluctuations in kvCache transfers, especially during the first few requests following service initialization?</em></p>
 <p>A. The communication for kvCache transfer between executors are established dynamically. The connection establishment process incurs significant overhead, which explains the apparently lower kvCache transfer bandwidth observed during the initial requests after service startup. This lower bandwidth reflects the inclusion of connection establishment overhead. When conducting benchmarks, it is recommended to perform a warm-up phase to ensure accurate performance measurements.</p>
+<p>*Q. When my servers are running on different NVLink domains, some servers hang or have a lower performance. How to fix that?</p>
+<p>A. NVLink domain can be found with <code class="docutils literal notranslate"><span class="pre">nvidia-smi</span> <span class="pre">-q</span></code> in the <code class="docutils literal notranslate"><span class="pre">Fabric.ClusterUUID</span></code> field. A few UCX environment variables can be adjusted when your servers have different NVLink domains:</p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">UCX_CUDA_IPC_ENABLE_MNNVL</span></code>: Set to <code class="docutils literal notranslate"><span class="pre">n</span></code>. This also can reduce UCX timeout error messages like <code class="docutils literal notranslate"><span class="pre">UCX</span>&#160; <span class="pre">ERROR</span>&#160;&#160; <span class="pre">cuMemImportFromShareableHandle</span> <span class="pre">failed:</span> <span class="pre">invalid</span> <span class="pre">resource</span> <span class="pre">handle</span></code>, although these errors don’t necessarily cause your trtllm-serve to fail.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">UCX_NET_DEVICES</span></code>: Check if this is set correctly, or unset this variable to allow UCX to use all possible devices.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">UCX_RNDV_SCHEME</span></code>: Set to <code class="docutils literal notranslate"><span class="pre">get_zcopy</span></code> or <code class="docutils literal notranslate"><span class="pre">put_zcopy</span></code> on GB200 for better performance. The default value is <code class="docutils literal notranslate"><span class="pre">auto</span></code>.</p></li>
+</ul>
 </section>
 </section>
 </section>
@@ -707,9 +720,9 @@ This feature is currently experimental, and the related API is subjected to chan
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on July 19, 2025.</p>
+  <p>Last updated on August 01, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/69e9f6d">69e9f6d</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/fbee279">fbee279</a>.</p>
   
 </div></div>
       
