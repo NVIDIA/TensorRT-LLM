@@ -59,7 +59,7 @@ class OpenAIDisaggServer:
         self.max_retries = max_retries
         logger.info(f"Server max retries: {self.max_retries}")
 
-        if (len(self.gen_servers) == 0):
+        if os.getenv("TRTLLM_DISAGG_BENCHMARK_CTX_ONLY") != "1" and len(gen_servers) == 0:
             raise ValueError("At least one generation server must be provided")
 
         if os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") != "1" and len(ctx_servers) == 0:
@@ -210,10 +210,14 @@ class OpenAIDisaggServer:
     async def _send_disagg_request(self, req: Union[CompletionRequest, ChatCompletionRequest]):
         gen_server = None
         need_ctx = False
+        gen_only = os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY", "0") == "1"
+        ctx_only = os.getenv("TRTLLM_DISAGG_BENCHMARK_CTX_ONLY", "0") == "1"
         try:
             # Determine if need context server
             condition = self.conditional_disagg_config
-            if condition is not None:
+            if ctx_only:
+                need_ctx = True
+            elif condition is not None:
                 assert isinstance(self.gen_router, KvCacheAwareRouter)
                 # Query kv cache status and select a best gen_server.
                 # The server is reserved for generation request
@@ -222,7 +226,7 @@ class OpenAIDisaggServer:
                 total_length = sum(len(token_list) for token_list in info["token_lists"])
                 if match_length == 0 or total_length - match_length > condition.max_local_prefill_length:
                     need_ctx = True
-            elif os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") == "1":
+            elif gen_only:
                 # Hard-code first token, ctx_request_id for testing
                 req.disaggregated_params = DisaggregatedParams(
                     request_type="generation_only",
@@ -259,14 +263,14 @@ class OpenAIDisaggServer:
                 ctx_response = None
 
             # Pick a generation server if haven't reserved one, and send request
-            if gen_server is None:
+            if gen_server is None and not ctx_only:
                 gen_server, _ = await self.gen_router.get_next_server(req)
             logger.debug("Sending request to gen server: %s", gen_server)
 
             if not req.stream:
                 try:
                     #If request finished after first token for reason other than length, return right away and skip gen
-                    if ctx_response is not None and ctx_response.choices[0].finish_reason not in ["length","not_finished"]:
+                    if (ctx_response is not None and ctx_response.choices[0].finish_reason not in ["length","not_finished"]) or ctx_only:
                         del ctx_response.choices[0].disaggregated_params
                         return ctx_response
                     else:
@@ -281,6 +285,9 @@ class OpenAIDisaggServer:
                         await self.gen_router.finish_request(req)
 
             else:
+                if ctx_only:
+                    del ctx_response.choices[0].disaggregated_params
+                    return ctx_response
                 # Return a streaming response that combines both context and generation responses
                 return StreamingResponse(
                     self.merge_streaming_responses(ctx_response, gen_server, req),
