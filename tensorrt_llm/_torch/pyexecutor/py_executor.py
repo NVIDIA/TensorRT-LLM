@@ -16,6 +16,7 @@ from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
 from tensorrt_llm._utils import (customized_gc_thresholds, global_mpi_rank,
                                  is_trace_enabled, nvtx_range, trace_func)
+from tensorrt_llm.bindings.exceptions import RequestSpecificException
 from tensorrt_llm.bindings.executor import (DisServingRequestStats,
                                             FinishReason, InflightBatchingStats,
                                             IterationStats, KvCacheStats,
@@ -679,8 +680,7 @@ class PyExecutor:
                         logger.warning(
                             "num_fitting_reqs=0 and fitting_disagg_gen_init_requests is empty, may not have enough kvCache"
                         )
-                        self.kv_cache_transceiver.check_context_transfer_status(
-                            1)
+                        self._check_disagg_ctx_cache_transfer_status(1)
 
                 self.num_scheduled_requests = scheduled_batch.batch_size
 
@@ -877,7 +877,7 @@ class PyExecutor:
                 logger.warning(
                     "num_fitting_reqs=0 and fitting_disagg_gen_init_requests is empty, may not have enough kvCache"
                 )
-                self.kv_cache_transceiver.check_context_transfer_status(1)
+                self._check_disagg_ctx_cache_transfer_status(1)
         else:
             assert scheduled_batch.batch_size > 0, (
                 "fail to schedule any pending request, "
@@ -1148,7 +1148,7 @@ class PyExecutor:
 
         if need_check:
             at_least_num = 1 if need_check_one else 0
-            self.kv_cache_transceiver.check_gen_transfer_status(at_least_num)
+            self._check_disagg_gen_cache_transfer_status(at_least_num)
 
         return
 
@@ -1249,8 +1249,7 @@ class PyExecutor:
             req.is_disagg_generation_transmission_in_progress
             for req in self.active_requests
         ])
-        self.kv_cache_transceiver.check_gen_transfer_status(
-            1 if block_transfer else 0)
+        self._check_disagg_gen_cache_transfer_status(1 if block_transfer else 0)
 
         return
 
@@ -1270,7 +1269,7 @@ class PyExecutor:
                         self.resource_manager.resource_managers[
                             resource_mgr_type].free_resources(req)
 
-        self.kv_cache_transceiver.check_context_transfer_status(0)
+        self._check_disagg_ctx_cache_transfer_status(0)
 
         # Keep track of ctx requests that are in transmission
         ctx_transmission_reqs = [
@@ -1279,6 +1278,38 @@ class PyExecutor:
         ]
 
         return ctx_transmission_reqs
+
+    def _check_cache_transfer_status_helper(self,
+                                            method_name: str,
+                                            method_call,
+                                            atLeastNum: int = 0):
+        """Helper method to handle cache transfer status checking with error handling."""
+        try:
+            method_call(atLeastNum)
+        except RequestSpecificException as e:
+            error_msg = str(e)
+            logger.error(
+                f"Encountered a request-specific error in {method_name}: {error_msg}"
+            )
+            request_ids = [e.request_id]
+            self._handle_errors(error_msg, request_ids)
+        except Exception as e:
+            error_msg = str(e)
+            logger.error(
+                f"Encountered a system error in {method_name}: {error_msg}")
+            self._handle_errors(error_msg)
+
+    @nvtx_range("_check_disagg_ctx_cache_transfer_status")
+    def _check_disagg_ctx_cache_transfer_status(self, atLeastNum: int = 0):
+        self._check_cache_transfer_status_helper(
+            "checking context transfer status",
+            self.kv_cache_transceiver.check_context_transfer_status, atLeastNum)
+
+    @nvtx_range("_check_disagg_gen_cache_transfer_status")
+    def _check_disagg_gen_cache_transfer_status(self, atLeastNum: int = 0):
+        self._check_cache_transfer_status_helper(
+            "checking generation transfer status",
+            self.kv_cache_transceiver.check_gen_transfer_status, atLeastNum)
 
     def _forward_step(self,
                       scheduled_requests,
@@ -1387,10 +1418,14 @@ class PyExecutor:
             logger.error(f"Encountered an error in sampling: {error_msg}")
             self._handle_errors(error_msg)
 
-    def _handle_errors(self, error_msg: Optional[str] = None):
+    def _handle_errors(self,
+                       error_msg: Optional[str] = None,
+                       request_ids: Optional[List[int]] = None):
         error_responses = {}
         error_msg = error_msg or "error"
         for request in self.active_requests:
+            if request_ids is not None and request.py_request_id not in request_ids:
+                continue
             req_id = request.py_request_id
             request.state = LlmRequestState.GENERATION_COMPLETE
             self._terminate_request(request)
@@ -1398,7 +1433,12 @@ class PyExecutor:
                 request_id=req_id,
                 error_msg=error_msg,
                 client_id=request.py_client_id)
-        self.active_requests.clear()
+
+        if request_ids is not None:
+            for req_id in request_ids:
+                self.active_requests.remove(req_id)
+        else:
+            self.active_requests.clear()
         self._enqueue_responses(error_responses)
 
     def _terminate_request(self, request: LlmRequest):
