@@ -767,17 +767,19 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 self.kv_cache_manager.max_blocks_per_seq
             ],
             device='cpu',
+            dtype=torch.int32,
             pin_memory=True,
         )
         if self.kv_cache_manager is not None:
             if "kv_cache_block_offsets" in buffers and buffers[
                     "kv_cache_block_offsets"].numel(
                     ) >= self.host_kv_cache_block_offsets.numel():
+
                 self.kv_cache_block_offsets = buffers["kv_cache_block_offsets"]
             else:
                 self.kv_cache_block_offsets = torch.empty_like(
                     self.host_kv_cache_block_offsets,
-                    dtype=torch.int32,
+                    # dtype=torch.int32,
                     device='cuda',
                 )
 
@@ -813,9 +815,10 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
             if self.enable_paged_context_mla:
                 # for kv cache reuse/chunked context in MLA
-                self.host_ctx_cached_token_indptr = torch.zeros_like(
-                    self.ctx_cached_token_indptr,
+                self.host_ctx_cached_token_indptr = torch.zeros(
+                    (self.max_num_requests + 1, ),
                     device='cpu',
+                    dtype=torch.int64,
                     pin_memory=True,
                 )
 
@@ -826,14 +829,12 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                         "ctx_cached_token_indptr"]
                 else:
                     self.ctx_cached_token_indptr = torch.zeros_like(
-                        self.host_ctx_cached_token_indptr,
-                        device='cuda',
-                        dtype=torch.int64,
-                    )
+                        self.host_ctx_cached_token_indptr, device='cuda')
 
                 self.host_ctx_uncached_token_indptr = torch.zeros(
                     (self.max_num_requests + 1, ),
                     device='cpu',
+                    dtype=torch.int64,
                     pin_memory=True,
                 )
                 if "ctx_uncached_token_indptr" in buffers and buffers[
@@ -845,12 +846,12 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     self.ctx_uncached_token_indptr = torch.zeros_like(
                         self.host_ctx_uncached_token_indptr,
                         device='cuda',
-                        dtype=torch.int64,
                     )
 
                 self.host_ctx_kv_indptr = torch.zeros(
                     (self.max_num_requests + 1, ),
                     device='cpu',
+                    dtype=torch.int64,
                     pin_memory=True,
                 )
                 # context full seqlens include cached tokens and uncached tokens
@@ -861,7 +862,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     self.ctx_kv_indptr = torch.zeros_like(
                         self.host_ctx_kv_indptr,
                         device='cuda',
-                        dtype=torch.int64,
                     )
 
     def prepare(self) -> None:
