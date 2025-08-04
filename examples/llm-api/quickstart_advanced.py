@@ -1,10 +1,10 @@
 import argparse
 
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm.llmapi import (CudaGraphConfig, DraftTargetDecodingConfig,
-                                 EagleDecodingConfig, KvCacheConfig, MoeConfig,
-                                 MTPDecodingConfig, NGramDecodingConfig,
-                                 TorchCompileConfig)
+from tensorrt_llm.llmapi import (AutoDecodingConfig, CudaGraphConfig,
+                                 DraftTargetDecodingConfig, EagleDecodingConfig,
+                                 KvCacheConfig, MoeConfig, MTPDecodingConfig,
+                                 NGramDecodingConfig, TorchCompileConfig)
 
 example_prompts = [
     "Hello, my name is",
@@ -47,11 +47,13 @@ def add_llm_args(parser):
                             'VANILLA', 'TRTLLM', 'FLASHINFER',
                             'FLASHINFER_STAR_ATTENTION'
                         ])
-    parser.add_argument(
-        '--moe_backend',
-        type=str,
-        default='CUTLASS',
-        choices=['CUTLASS', 'TRTLLM', 'VANILLA', 'WIDEEP', 'CUTEDSL'])
+    parser.add_argument('--moe_backend',
+                        type=str,
+                        default='CUTLASS',
+                        choices=[
+                            'CUTLASS', 'TRTLLM', 'VANILLA', 'WIDEEP',
+                            'DEEPGEMM', 'CUTEDSL'
+                        ])
     parser.add_argument('--enable_attention_dp',
                         default=False,
                         action='store_true')
@@ -182,6 +184,8 @@ def setup_llm(args, **kwargs):
             is_use_oldest=True,
             is_public_pool=True,
         )
+    elif spec_decode_algo == "AUTO":
+        spec_config = AutoDecodingConfig()
     else:
         spec_config = None
 
