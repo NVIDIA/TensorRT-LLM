@@ -251,6 +251,8 @@ class LlavaNextVisionModel:
         image_features = self.mm_projector(selected_image_feature)
 
         image_features = torch.split(image_features, image_num_patches, dim=0)
+
+        # NOTE: 'pack_image_features' is directly copied from the HF's code
         image_features, feature_lens = self.pack_image_features(
             image_features,
             image_sizes,
