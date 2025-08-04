@@ -36,6 +36,7 @@
     <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
     <link rel="stylesheet" type="text/css" href="../_static/autodoc_pydantic.css" />
     <link rel="stylesheet" type="text/css" href="../_static/togglebutton.css?v=13237357" />
+    <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=95073da6" />
   
   <!-- So that users can add custom icons -->
   <script src="../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
@@ -58,7 +59,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc4';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc5';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -70,7 +71,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.0.0rc4" />
+  <meta name="docsearch:version" content="1.0.0rc5" />
 
 
   </head>
@@ -367,6 +368,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client for Multimodal</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client_for_lora.html">Openai Completion Client For Lora</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client_json_schema.html">OpenAI Completion Client with JSON Schema</a></li>
 </ul>
 </details></li>
 </ul>
@@ -954,7 +956,7 @@ help text by running the command with <code class="docutils literal notranslate"
 stored checkpoint. When using <code class="docutils literal notranslate"><span class="pre">--model_path</span></code>, the <code class="docutils literal notranslate"><span class="pre">--model</span></code> is still required for reporting reasons and in order to look up parameters
 for build heuristics.</p>
 </div>
-<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>trtllm-bench<span class="w"> </span>--model<span class="w"> </span>meta-llama/Llama-3.1-8B<span class="w"> </span>--model_path<span class="w"> </span>/Ckpt/Path/To/Llama-3.1-8B<span class="w"> </span>throughput<span class="w"> </span>--dataset<span class="w"> </span>/tmp/synthetic_128_128.txt<span class="w"> </span>--backend<span class="w"> </span>pytorch
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>trtllm-bench<span class="w"> </span>--model<span class="w"> </span>meta-llama/Llama-3.1-8B<span class="w"> </span>--model_path<span class="w"> </span>/Ckpt/Path/To/Llama-3.1-8B<span class="w"> </span>throughput<span class="w"> </span>--dataset<span class="w"> </span>/tmp/synthetic_128_128.txt
 
 <span class="c1"># Example output</span>
 &lt;snip<span class="w"> </span>verbose<span class="w"> </span>logging&gt;
@@ -1049,7 +1051,6 @@ Total<span class="w"> </span>Latency<span class="w"> </span><span class="o">(</s
 <div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>trtllm-bench<span class="w"> </span>--model<span class="w"> </span>/path/to/base/model<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>throughput<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--dataset<span class="w"> </span>synthetic_lora_data.json<span class="w"> </span><span class="se">\</span>
-<span class="w">  </span>--backend<span class="w"> </span>pytorch<span class="w"> </span><span class="se">\</span>
 <span class="w">  </span>--extra_llm_api_options<span class="w"> </span>extra-llm-api-options.yaml
 </pre></div>
 </div>
@@ -1088,7 +1089,6 @@ the <code class="docutils literal notranslate"><span class="pre">prompt</span></
 <div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">trtllm</span><span class="o">-</span><span class="n">bench</span> <span class="o">--</span><span class="n">model</span> <span class="n">Qwen</span><span class="o">/</span><span class="n">Qwen2</span><span class="o">-</span><span class="n">VL</span><span class="o">-</span><span class="mi">2</span><span class="n">B</span><span class="o">-</span><span class="n">Instruct</span> \
   <span class="n">throughput</span> \
   <span class="o">--</span><span class="n">dataset</span> <span class="n">mm_data</span><span class="o">.</span><span class="n">jsonl</span> \
-  <span class="o">--</span><span class="n">backend</span> <span class="n">pytorch</span> \
   <span class="o">--</span><span class="n">num_requests</span> <span class="mi">10</span> \
   <span class="o">--</span><span class="n">max_batch_size</span> <span class="mi">4</span> \
   <span class="o">--</span><span class="n">modality</span> <span class="n">image</span>
@@ -1603,9 +1603,9 @@ The choices are specified with a YAML file like the following example (<code cla
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on July 19, 2025.</p>
+  <p>Last updated on August 01, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/69e9f6d">69e9f6d</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/fbee279">fbee279</a>.</p>
   
 </div></div>
       

@@ -9,7 +9,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
-    <title>Disaggregated Inference Benchmark Scripts &#8212; TensorRT-LLM</title>
+    <title>N-Gram Speculative Decoding in TensorRT‑LLM &#8212; TensorRT-LLM</title>
   
   
   
@@ -36,6 +36,7 @@
     <link rel="stylesheet" type="text/css" href="../../_static/copybutton.css?v=76b2166b" />
     <link rel="stylesheet" type="text/css" href="../../_static/autodoc_pydantic.css" />
     <link rel="stylesheet" type="text/css" href="../../_static/togglebutton.css?v=13237357" />
+    <link rel="stylesheet" type="text/css" href="../../_static/custom.css?v=95073da6" />
   
   <!-- So that users can add custom icons -->
   <script src="../../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
@@ -54,11 +55,11 @@
     <script src="../../_static/togglebutton.js?v=4a39c7ea"></script>
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
-    <script>DOCUMENTATION_OPTIONS.pagename = 'scripts/disaggregated/README';</script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'blogs/tech_blog/blog_7_NGram_performance_Analysis_And_Auto_Enablement';</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc4';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc5';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -68,7 +69,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.0.0rc4" />
+  <meta name="docsearch:version" content="1.0.0rc5" />
 
 
   </head>
@@ -365,6 +366,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client for Multimodal</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client_for_lora.html">Openai Completion Client For Lora</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client_json_schema.html">OpenAI Completion Client with JSON Schema</a></li>
 </ul>
 </details></li>
 </ul>
@@ -439,13 +441,13 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
 <ul class="nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="../../blogs/H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../blogs/H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT-LLM</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../blogs/Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../blogs/quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../blogs/XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../blogs/tech_blog/blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
 </ul>
 </div>
 </nav></div>
@@ -480,7 +482,7 @@
         <i class="fa-solid fa-home"></i>
       </a>
     </li>
-    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">Disaggregated Inference Benchmark Scripts</span></li>
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">N-Gram Speculative Decoding in TensorRT‑LLM</span></li>
   </ul>
 </nav>
 </div>
@@ -497,97 +499,273 @@
 <div id="searchbox"></div>
                 <article class="bd-article">
                   
-  <section id="disaggregated-inference-benchmark-scripts">
-<h1>Disaggregated Inference Benchmark Scripts<a class="headerlink" href="#disaggregated-inference-benchmark-scripts" title="Link to this heading">#</a></h1>
-<p>This directory contains scripts to run disaggregated inference benchmarks using TensorRT-LLM and SLURM.</p>
-<section id="overview">
-<h2>Overview<a class="headerlink" href="#overview" title="Link to this heading">#</a></h2>
-<p>The benchmarking process is orchestrated through a set of shell scripts and a Python script that work together:</p>
-<ol class="arabic simple">
-<li><p><code class="docutils literal notranslate"><span class="pre">submit.sh</span></code>: The main entry point for submitting benchmark jobs to SLURM. It runs a parameter sweep by calling <code class="docutils literal notranslate"><span class="pre">sbatch</span></code> with different configurations.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">disaggr_torch.slurm</span></code>: The SLURM script that sets up and runs a single benchmark experiment. It launches a container, generates a configuration file, starts the server and workers, and runs the benchmark client.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">gen_yaml.py</span></code>: A Python script that generates the <code class="docutils literal notranslate"><span class="pre">config.yaml</span></code> file needed by <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code>. It determines the server and worker configuration based on SLURM environment variables and script arguments.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">start_worker.sh</span></code>: A shell script responsible for starting a <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">disaggregated_mpi_worker</span></code> on each allocated machine.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">run_benchmark.sh</span></code>: A shell script that waits for the server to be healthy and then runs the actual benchmark client (<code class="docutils literal notranslate"><span class="pre">run_benchmark.py</span></code>, not included in this directory).</p></li>
-</ol>
+  <section id="n-gram-speculative-decoding-in-tensorrtllm">
+<h1>N-Gram Speculative Decoding in TensorRT‑LLM<a class="headerlink" href="#n-gram-speculative-decoding-in-tensorrtllm" title="Link to this heading">#</a></h1>
+<p>N-Gram speculative decoding leverages the natural repetition in many LLM workloads. It splits previously seen text into configurable (key, value) n‑gram pairs and, during generation, swiftly proposes draft tokens by matching the current key against n-gram pools in memory.</p>
+<p>In this blog, we introduce design choices in TensorRT‑LLM’s N-Gram speculative decoding algorithm, share our experimental results of performance gains, and explain N-Gram’s low barrier to adoption by deriving a simple heuristic to enable it.</p>
+<section id="highlights">
+<h2>Highlights<a class="headerlink" href="#highlights" title="Link to this heading">#</a></h2>
+<ul class="simple">
+<li><p><strong>Fast &amp; lightweight.</strong> N‑Gram algorithm runs on the host with low overhead.</p></li>
+<li><p><strong>Real speed‑ups at low concurrency.</strong> N-Gram achieves accepted length of 1.37 and more on average running on the Magpie-Align/Magpie-Llama-3.1-Pro-MT-300K-Filtered dataset (<a class="reference external" href="https://huggingface.co/datasets/Magpie-Align/Magpie-Llama-3.1-Pro-MT-300K-Filtered/viewer/default/train">link</a>) with the first round of conversation. Results in 10-60% E2E runtime speed-up.</p></li>
+<li><p><strong>Works even better with multi-turn conversations.</strong> With the cache built up during the first round of conversation, the second round achieved a higher accepted length of 1.66 and a 30–90% E2E runtime speed-up.</p></li>
+<li><p><strong>Excels on tasks with natural repetition like translation.</strong> With the translation dataset, the accepted length can exceed 4.0. New requests can benefit from cache generated by previous requests with similar tasks and reduce latency by up to 70%.</p></li>
+<li><p><strong>Heuristic “just works”.</strong> Set <code class="docutils literal notranslate"><span class="pre">spec_decode_algo=AUTO</span></code> to enable N‑Gram by default.</p>
+<ul>
+<li><p>This policy adds less than 15% overhead to iteration latency yet offers nets double‑digit end‑to‑end speed‑ups.</p></li>
+</ul>
+</li>
+</ul>
 </section>
-<section id="file-descriptions">
-<h2>File Descriptions<a class="headerlink" href="#file-descriptions" title="Link to this heading">#</a></h2>
-<section id="submit-sh">
-<h3><code class="docutils literal notranslate"><span class="pre">submit.sh</span></code><a class="headerlink" href="#submit-sh" title="Link to this heading">#</a></h3>
-<p>This script is used to submit multiple SLURM jobs for running benchmarks with different parameters. It iterates through various configurations and uses <code class="docutils literal notranslate"><span class="pre">sbatch</span></code> to submit <code class="docutils literal notranslate"><span class="pre">disaggr_torch.slurm</span></code> for each one.</p>
-<p><strong>Usage:</strong></p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>./submit.sh
+<hr class="docutils" />
+<section id="table-of-contents">
+<h2>Table of Contents<a class="headerlink" href="#table-of-contents" title="Link to this heading">#</a></h2>
+<ul class="simple">
+<li><p><a class="reference internal" href="#background-motivation">Background &amp; Motivation</a></p></li>
+<li><p><a class="reference internal" href="#algorithm-complexity">Algorithm &amp; Complexity</a></p></li>
+<li><p><a class="reference internal" href="#experimental-setup">Performance Study</a></p>
+<ul>
+<li><p><a class="reference internal" href="#experimental-setup">Experimental Setup</a></p></li>
+<li><p><a class="reference internal" href="#case-1-with-conversation-dataset">Case 1 with Conversation Dataset </a></p>
+<ul>
+<li><p><a class="reference internal" href="#speed-up-for-the-first-turn">Speed-up for the First Turn</a></p></li>
+<li><p><a class="reference internal" href="#effect-of-multi-turn-conversation">Effect of Multi-turn conversation</a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#case-2-with-translation-dataset">Case 2 with Translation Dataset</a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#autoenablement-with-heuristic">Auto‑Enablement with Heuristic</a></p></li>
+<li><p><a class="reference internal" href="#featuregaps"><span class="xref myst">Feature Gaps</span></a></p></li>
+</ul>
+</section>
+<hr class="docutils" />
+<section id="background-motivation">
+<h2>Background &amp; Motivation<a class="headerlink" href="#background-motivation" title="Link to this heading">#</a></h2>
+<p>Speculative decoding drafts several tokens, verifies them on the model, and keeps the accepted prefix at each iteration of the generation loop. An N‑Gram proposer can generate drafts without an extra LLM or model heads, making it a low-cost way to improve serving latency. Average accepted length (AL) is ~1.3 in generic chat (MT‑Bench, Magpie with the first round of conversation) and can exceed 4.0 on highly repetitive data like a translation task.</p>
+</section>
+<hr class="docutils" />
+<section id="algorithm-complexity">
+<h2>Algorithm &amp; Complexity<a class="headerlink" href="#algorithm-complexity" title="Link to this heading">#</a></h2>
+<p><code class="docutils literal notranslate"><span class="pre">NGramDecodingConfig</span></code> in TensorRT-LLM:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">spec_config</span> <span class="o">=</span> <span class="n">NGramDecodingConfig</span><span class="p">(</span>
+    <span class="n">max_draft_len</span> <span class="o">=</span> <span class="n">v</span> <span class="p">,</span>             <span class="c1"># max length of draft tokens</span>
+    <span class="n">max_matching_ngram_size</span>  <span class="o">=</span> <span class="n">k</span> <span class="p">,</span>  <span class="c1"># max length for keys</span>
+    <span class="n">is_keep_all</span>   <span class="o">=</span> <span class="kc">True</span><span class="p">,</span>           <span class="c1"># Whether to keep all candidate pattern-matches pairs, only one match is kept for each pattern if False.</span>
+    <span class="n">is_use_oldest</span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span>           <span class="c1"># Whether to provide the oldest match when pattern is hit, the newest one is provided if False.</span>
+    <span class="n">is_public_pool</span><span class="o">=</span> <span class="kc">True</span><span class="p">,</span>           <span class="c1"># Whether to use a common pool for all requests, or the pool is private for each request if False.</span>
+<span class="p">)</span>
 </pre></div>
 </div>
-<p>You can modify the loops in this script to change the parameter space for the benchmark sweep.</p>
+<ul>
+<li><p><strong>Processing New Request</strong> ‑ scan input sequence once to create N-Gram key-value pairs for the new sequence.</p>
+<p>With <em>max_matching_ngram_size = 3, max_draft_len = 5, input_sequence_len=8</em>, Figure 1 shows the 18 new key-value pairs added to the cache pool.</p>
+<p>The number of cache pairs grows proportionally to the product of the maximum key length and the input sequence length.</p>
+</li>
+</ul>
+<div align="center">
+  <figure>
+    <img src="../media/tech_blog7_init_sequence_scan.png" width="auto" height="auto">
+  </figure>
+</div>
+<p align="center"><sub><em>Figure 1. Request initial scan</em></sub></p>
+<ul>
+<li><p><strong>Per‑token update</strong> ‑ slide window and update cache pool</p>
+<p>We now have a new token in the sequence. Figure 2 shows how the cache pool is updated accordingly. For existing key-value pairs whose value length is less than the <code class="docutils literal notranslate"><span class="pre">max_draft_len</span></code>, the new token can be appended. The new token can be the value to new keys as well, which are marked as new pairs in the graph.</p>
+<p>The number of cache update and addition is approximately the product of <code class="docutils literal notranslate"><span class="pre">max_draft_len</span></code> and <code class="docutils literal notranslate"><span class="pre">max_matching_ngram_size</span></code>, which is a constant for fixed parameters.</p>
+</li>
+</ul>
+<div align="center">
+  <figure>
+    <img src="../media/tech_blog7_per_token_update.png" width="auto" height="auto">
+  </figure>
+</div>
+<p align="center"><sub><em>Figure 2. Per-token update</em></sub></p>
+<ul>
+<li><p><strong>Lookup</strong> ‑ construct the last k tokens as the key and propose draft tokens as its value.</p>
+<p>If <code class="docutils literal notranslate"><span class="pre">is_public_pool=</span> <span class="pre">True</span></code>, a global pool is shared by all the requests. If <code class="docutils literal notranslate"><span class="pre">is_public_pool=</span> <span class="pre">False</span></code>, each request will have its own cache pool.</p>
+<p>The lookup time is amortized constant time, but extra latency can be observed once the dictionary outgrows the CPU’s fastest cache.</p>
+</li>
+<li><p><strong>Verification</strong> ‑ Verify proposed draft tokens.</p>
+<p>Run the target model with <code class="docutils literal notranslate"><span class="pre">verification_batch</span> <span class="pre">=</span>&#160; <span class="pre">original_batch</span> <span class="pre">×</span> <span class="pre">(v+1)</span></code>; There will always be at least one new token from verification even if no draft token is correct. In this case, the accepted length (AL) will be <code class="docutils literal notranslate"><span class="pre">1</span></code>. In addition, if <code class="docutils literal notranslate"><span class="pre">w</span></code> out of the <code class="docutils literal notranslate"><span class="pre">v</span></code> draft tokens are accepted, the accepted length (AL) will be <code class="docutils literal notranslate"><span class="pre">w+1</span></code>.</p>
+<p>The iteration latency grows as the verification batch becomes larger than the original batch. As we increase <code class="docutils literal notranslate"><span class="pre">max_draft_len</span> <span class="pre">(v)</span></code>, the overhead grows even more. Therefore, speculative decoding tends to work best with small batch sizes and low concurrency.</p>
+</li>
+</ul>
 </section>
-<section id="disaggr-torch-slurm">
-<h3><code class="docutils literal notranslate"><span class="pre">disaggr_torch.slurm</span></code><a class="headerlink" href="#disaggr-torch-slurm" title="Link to this heading">#</a></h3>
-<p>This is the core SLURM script for a single benchmark run. It is not meant to be run directly, but rather submitted via <code class="docutils literal notranslate"><span class="pre">sbatch</span></code> (e.g., by <code class="docutils literal notranslate"><span class="pre">submit.sh</span></code>).</p>
-<p>It takes the following arguments in order:</p>
-<ol class="arabic simple">
-<li><p><code class="docutils literal notranslate"><span class="pre">num_ctx_servers</span></code>: Number of context servers.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">ctx_tp_size</span></code>: Tensor parallel size for context servers.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">ctx_batch_size</span></code>: Max batch size for context servers.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">ctx_max_num_tokens</span></code>: Max number of tokens for context servers.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">ctx_enable_attention_dp</span></code>: <code class="docutils literal notranslate"><span class="pre">true</span></code> or <code class="docutils literal notranslate"><span class="pre">false</span></code> to enable attention DP for context servers.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">num_gen_servers</span></code>: Number of generation servers.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">gen_tp_size</span></code>: Tensor parallel size for generation servers.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">gen_batch_size</span></code>: Max batch size for generation servers.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">gen_max_num_tokens</span></code>: Max number of tokens for generation servers.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">gen_enable_attention_dp</span></code>: <code class="docutils literal notranslate"><span class="pre">true</span></code> or <code class="docutils literal notranslate"><span class="pre">false</span></code> to enable attention DP for generation servers.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">gen_gpu_memory_fraction</span></code>: GPU memory fraction for generation servers.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">concurrency_list</span></code>: A space-separated list of concurrencies to test (e.g., “1 2 4 8”).</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">sub_file</span></code>: A subdirectory name for logs.</p></li>
-</ol>
+<hr class="docutils" />
+<section id="performance-study">
+<h2>Performance Study<a class="headerlink" href="#performance-study" title="Link to this heading">#</a></h2>
+<section id="experimental-setup">
+<h3>Experimental Setup<a class="headerlink" href="#experimental-setup" title="Link to this heading">#</a></h3>
+<ul class="simple">
+<li><p><strong>Hardware:</strong> 8 × B200 GPUs (Blackwell)</p></li>
+<li><p><strong>Model:</strong> Llama‑4‑Scout‑17B‑16E, FP8 weights</p></li>
+<li><p><strong>Tensor Parallel:</strong> 8</p></li>
+</ul>
 </section>
-<section id="gen-yaml-py">
-<h3><code class="docutils literal notranslate"><span class="pre">gen_yaml.py</span></code><a class="headerlink" href="#gen-yaml-py" title="Link to this heading">#</a></h3>
-<p>This Python script generates the <code class="docutils literal notranslate"><span class="pre">config.yaml</span></code> file that configures the <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code> application. It reads SLURM environment variables (<code class="docutils literal notranslate"><span class="pre">SLURM_JOB_NODELIST</span></code>, <code class="docutils literal notranslate"><span class="pre">SLURM_TASKS_PER_NODE</span></code>) to distribute workers across nodes.</p>
-<p><strong>Usage:</strong></p>
-<p>The script is called from within <code class="docutils literal notranslate"><span class="pre">disaggr_torch.slurm</span></code>. It takes numerous arguments to define the model, parallelism, and server configurations.</p>
+<hr class="docutils" />
+<section id="case-1-with-conversation-dataset">
+<h3>Case 1 with Conversation Dataset<a class="headerlink" href="#case-1-with-conversation-dataset" title="Link to this heading">#</a></h3>
+<p>In this experiment, we used Magpie-Align/Magpie-Llama-3.1-Pro-MT-300K-Filtered dataset (<a class="reference external" href="https://huggingface.co/datasets/Magpie-Align/Magpie-Llama-3.1-Pro-MT-300K-Filtered/viewer/default/train">link</a>) which is a conversational dataset with two turns. The user question on the second turn is related to the previous question and answer.</p>
+<p>The first turn only data represents a general conversation with no context. The repetition comes from the conversational structure and correlation between the question and answers.</p>
+<p>On the second turn, the global cache already has the knowledge of the previous conversation. The additional repetitions come from the correlation between the second answer and previous conversation.</p>
+<section id="speed-up-for-the-first-turn">
+<h4>Speed-up for the First Turn<a class="headerlink" href="#speed-up-for-the-first-turn" title="Link to this heading">#</a></h4>
+<p>For batch size of 1, 4 and 32, we configure the max_batch_size of the model accordingly. We will run <code class="docutils literal notranslate"><span class="pre">20</span> <span class="pre">*</span> <span class="pre">batch_size</span></code> number of requests with the model and compare the E2E runtime with and without N-Gram speculative decoding.</p>
+<div align="center">
+  <figure>
+    <img src="../media/tech_blog7_speed_up_first_turn.png" width="80%" height="auto">
+  </figure>
+</div>
+<p align="center"><sub><em>Figure 3. First Turn Speed-up</em></sub></p>
+<p>We can see that N-Gram can provide speed-ups for batch sizes up to 32 and works best with a single batch. The main overhead with larger batch sizes is the verification cost. With batch size being 1 and 4, <code class="docutils literal notranslate"><span class="pre">k</span> <span class="pre">=</span> <span class="pre">3,</span> <span class="pre">v</span> <span class="pre">=</span> <span class="pre">5</span></code> is the best N-Gram configuration. With batch size = 32, <code class="docutils literal notranslate"><span class="pre">k</span> <span class="pre">=</span> <span class="pre">5,</span> <span class="pre">v</span> <span class="pre">=</span> <span class="pre">3</span></code> is the best configuration since the verification batch size is smaller and the overhead is less.</p>
 </section>
-<section id="start-worker-sh">
-<h3><code class="docutils literal notranslate"><span class="pre">start_worker.sh</span></code><a class="headerlink" href="#start-worker-sh" title="Link to this heading">#</a></h3>
-<p>This script starts a <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span> <span class="pre">disaggregated_mpi_worker</span></code>. It is launched by <code class="docutils literal notranslate"><span class="pre">srun</span></code> from the <code class="docutils literal notranslate"><span class="pre">disaggr_torch.slurm</span></code> script on all allocated nodes.</p>
-<p><strong>Arguments:</strong></p>
-<ol class="arabic simple">
-<li><p><code class="docutils literal notranslate"><span class="pre">config_file</span></code>: Path to the <code class="docutils literal notranslate"><span class="pre">config.yaml</span></code> file.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">enable_pdl</span></code>: <code class="docutils literal notranslate"><span class="pre">true</span></code> or <code class="docutils literal notranslate"><span class="pre">false</span></code>.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">ctx_gpus</span></code>: Number of GPUs used for the context phase.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">work_dir</span></code>: (Optional) Directory to store nsys profiling output.</p></li>
-</ol>
+<section id="effect-of-multi-turn-conversation">
+<h4>Effect of Multi-turn conversation<a class="headerlink" href="#effect-of-multi-turn-conversation" title="Link to this heading">#</a></h4>
+<p>The table below shows the accepted length (AL) derived from 3000 sampled conversations using different N-Gram configurations.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>k</p></th>
+<th class="head"><p>v</p></th>
+<th class="head"><p>AL Turn1</p></th>
+<th class="head"><p>AL Turn2</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>3</p></td>
+<td><p>5</p></td>
+<td><p>1.37</p></td>
+<td><p>1.66</p></td>
+</tr>
+<tr class="row-odd"><td><p>5</p></td>
+<td><p>5</p></td>
+<td><p>1.40</p></td>
+<td><p>1.77</p></td>
+</tr>
+<tr class="row-even"><td><p>5</p></td>
+<td><p>3</p></td>
+<td><p>1.37</p></td>
+<td><p>1.66</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Figure 4 shows the distribution of accepted length (AL) with <code class="docutils literal notranslate"><span class="pre">k=3,</span> <span class="pre">v=5</span></code>. When <code class="docutils literal notranslate"><span class="pre">AL=1</span></code>, it means none of the draft tokens are accepted. AL=6 means all the drafts are accepted.</p>
+<div align="center">
+  <figure>
+    <img src="../media/tech_blog7_magpie_accepted_length_distribution.png" width="90%" height="auto">
+  </figure>
+</div>
+<p align="center"><sub><em>Figure 4. Accepted draft token length distribution</em></sub></p>
+<p>In Figure 5, for each iteration, we plot the average of accepted length (AL) for each request. Transparency is calculated according to the number of requests scheduled on that iteration and normalized by the max capacity among all iterations. If fewer requests are scheduled, the dot is more transparent.</p>
+<div align="center">
+  <figure>
+    <img src="../media/tech_blog7_al_over_iteration_magpie.png" width="auto" height="auto">
+  </figure>
+</div>
+<p align="center"><sub><em>Figure 5. AL over iteration</em></sub></p>
+<p>Figure 6 shows the speed-up with N-Gram speculative decoding for the second turn of conversation only.
+N-Gram with <code class="docutils literal notranslate"><span class="pre">k</span> <span class="pre">=</span> <span class="pre">3,</span> <span class="pre">v</span> <span class="pre">=</span> <span class="pre">5</span></code> delivers 96.13% of speed-up with single batch and 63.99% of speed-up with batch size 4. With batch size 32 and N-Gram <code class="docutils literal notranslate"><span class="pre">k</span> <span class="pre">=</span> <span class="pre">5,</span> <span class="pre">v</span> <span class="pre">=</span> <span class="pre">3</span></code>, the speed up is 33.06%.</p>
+<div align="center">
+  <figure>
+    <img src="../media/tech_blog7_speed_up_second_turn.png" width="80%" height="auto">
+  </figure>
+</div>
+<p align="center"><sub><em>Figure 6. Second Turn Speed-up</em></sub></p>
+<p>We can draw the conclusion that:</p>
+<p><strong>N-Gram speculative decoding improves the runtime of conversational workloads, especially when the conversation has multiple rounds.</strong></p>
 </section>
-<section id="run-benchmark-sh">
-<h3><code class="docutils literal notranslate"><span class="pre">run_benchmark.sh</span></code><a class="headerlink" href="#run-benchmark-sh" title="Link to this heading">#</a></h3>
-<p>This script orchestrates the execution of the benchmark client. It waits for the <code class="docutils literal notranslate"><span class="pre">config.yaml</span></code> to be created and for the server’s <code class="docutils literal notranslate"><span class="pre">/health</span></code> endpoint to respond, then it runs the benchmark.</p>
-<p><strong>Arguments:</strong></p>
-<ol class="arabic simple">
-<li><p><code class="docutils literal notranslate"><span class="pre">isl</span></code>: Input sequence length.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">osl</span></code>: Output sequence length.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">multi_round</span></code>: Number of rounds for the benchmark.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">model_name</span></code>: Name of the model being benchmarked.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">concurrency_list</span></code>: Space-separated list of concurrencies.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">streaming</span></code>: <code class="docutils literal notranslate"><span class="pre">true</span></code> or <code class="docutils literal notranslate"><span class="pre">false</span></code>.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">log_path</span></code>: Path to the log directory.</p></li>
-</ol>
+</section>
+<hr class="docutils" />
+<section id="case-2-with-translation-dataset">
+<h3>Case 2 with Translation Dataset<a class="headerlink" href="#case-2-with-translation-dataset" title="Link to this heading">#</a></h3>
+<p>From the conversational dataset, we learned that N-Gram takes advantage of structural repetition. In the second case study, we unleash the potential of N-Gram by testing it with a translation dataset that exhibits natural repetition in both context and language. The dataset has a single turn, with prompts in English asking for translations into other languages.</p>
+<p>The table below shows the accepted length (AL) measured with 4000 requests. AL grows with increasing <code class="docutils literal notranslate"><span class="pre">max_draft_len</span> <span class="pre">(v)</span></code> and the trend extends beyond <code class="docutils literal notranslate"><span class="pre">max_draft_len</span> <span class="pre">(v)</span> <span class="pre">=</span> <span class="pre">23</span></code> in our measurements.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p></p></th>
+<th class="head"><p>1</p></th>
+<th class="head"><p>2</p></th>
+<th class="head"><p>3</p></th>
+<th class="head"><p>4</p></th>
+<th class="head"><p>5</p></th>
+<th class="head"><p>6</p></th>
+<th class="head"><p>7</p></th>
+<th class="head"><p>8</p></th>
+<th class="head"><p>9</p></th>
+<th class="head"><p>10</p></th>
+<th class="head"><p>11</p></th>
+<th class="head"><p>12</p></th>
+<th class="head"><p>13</p></th>
+<th class="head"><p>14</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>k</p></td>
+<td><p>3</p></td>
+<td><p>5</p></td>
+<td><p>3</p></td>
+<td><p>5</p></td>
+<td><p>3</p></td>
+<td><p>5</p></td>
+<td><p>3</p></td>
+<td><p>5</p></td>
+<td><p>3</p></td>
+<td><p>5</p></td>
+<td><p>5</p></td>
+<td><p>5</p></td>
+<td><p>5</p></td>
+<td><p>5</p></td>
+</tr>
+<tr class="row-odd"><td><p>v</p></td>
+<td><p>7</p></td>
+<td><p>7</p></td>
+<td><p>9</p></td>
+<td><p>9</p></td>
+<td><p>11</p></td>
+<td><p>11</p></td>
+<td><p>13</p></td>
+<td><p>13</p></td>
+<td><p>15</p></td>
+<td><p>15</p></td>
+<td><p>17</p></td>
+<td><p>19</p></td>
+<td><p>21</p></td>
+<td><p>23</p></td>
+</tr>
+<tr class="row-even"><td><p>AL</p></td>
+<td><p>3.44</p></td>
+<td><p>3.62</p></td>
+<td><p>3.708</p></td>
+<td><p>3.925</p></td>
+<td><p>3.878</p></td>
+<td><p>4.092</p></td>
+<td><p>4.079</p></td>
+<td><p>4.214</p></td>
+<td><p>4.198</p></td>
+<td><p>4.36</p></td>
+<td><p>4.43</p></td>
+<td><p>4.55</p></td>
+<td><p>4.59</p></td>
+<td><p>4.73</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Figure 7 shows properties of accepted length with N-Gram configured with k = 5, v = 7.</p>
+<p>From the pie chart on the left, among the seven draft tokens proposed by N-Gram, roughly one-third of the cases accept none of the drafts, which correspond to <code class="docutils literal notranslate"><span class="pre">AL=1</span></code>, while another one-third accept all of them, which correspond to <code class="docutils literal notranslate"><span class="pre">AL=8</span></code>. Compared with the similar pie chart in Case 1 Figure 4, the ratio is very high. The graph on the right plots the accepted length at each iteration with five random requests.</p>
+<div align="center">
+  <figure>
+    <img src="../media/tech_blog7_accepted_length_case2.png" width="auto" height="auto">
+  </figure>
+</div>
+<p align="center"><sub><em>Figure 7. Accepted Tokens from Drafts</em></sub></p>
 </section>
 </section>
-<section id="workflow">
-<h2>Workflow<a class="headerlink" href="#workflow" title="Link to this heading">#</a></h2>
-<ol class="arabic simple">
-<li><p>The user runs <code class="docutils literal notranslate"><span class="pre">./submit.sh</span></code>.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">submit.sh</span></code> submits one or more jobs to SLURM by calling <code class="docutils literal notranslate"><span class="pre">sbatch</span> <span class="pre">disaggr_torch.slurm</span></code> with different parameters.</p></li>
-<li><p>For each job, SLURM allocates resources and runs <code class="docutils literal notranslate"><span class="pre">disaggr_torch.slurm</span></code>.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">disaggr_torch.slurm</span></code> runs <code class="docutils literal notranslate"><span class="pre">gen_yaml.py</span></code> to create a <code class="docutils literal notranslate"><span class="pre">config.yaml</span></code>.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">disaggr_torch.slurm</span></code> uses <code class="docutils literal notranslate"><span class="pre">srun</span></code> to launch <code class="docutils literal notranslate"><span class="pre">start_worker.sh</span></code> on all nodes, starting the MPI workers.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">disaggr_torch.slurm</span></code> starts the main <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code> process.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">disaggr_torch.slurm</span></code> runs <code class="docutils literal notranslate"><span class="pre">run_benchmark.sh</span></code> which waits for the server to be ready.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">run_benchmark.sh</span></code> executes the benchmark for each concurrency level specified.</p></li>
-<li><p>After the benchmark, <code class="docutils literal notranslate"><span class="pre">run_benchmark.sh</span></code> and <code class="docutils literal notranslate"><span class="pre">disaggr_torch.slurm</span></code> attempt to kill the server and worker processes.</p></li>
-<li><p>Logs for each run are stored in a subdirectory specified by the <code class="docutils literal notranslate"><span class="pre">sub_file</span></code> parameter.</p></li>
-</ol>
+<section id="autoenablement-with-heuristic">
+<h2>Auto‑Enablement with Heuristic<a class="headerlink" href="#autoenablement-with-heuristic" title="Link to this heading">#</a></h2>
+<p>A big part of N-Gram’s appeal is the simplicity of deployment. It does not need a carefully selected draft model or additional training of model heads to benefit from speculative decoding. It can be enabled by the serving software to take advantage of the strong performance of the N-Gram speculative decoding algorithm.</p>
+<p>From our experiments, we propose a simple batch-aware policy that keeps iteration overhead under control and yields ~15 % end-to-end speed-up at low to mid concurrency. Give it a try by setting <code class="docutils literal notranslate"><span class="pre">spec_decode_algo=AUTO</span></code>!</p>
 </section>
 </section>
 
@@ -622,16 +800,21 @@
   </div>
   <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="visible nav section-nav flex-column">
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#overview">Overview</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#file-descriptions">File Descriptions</a><ul class="nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#submit-sh"><code class="docutils literal notranslate"><span class="pre">submit.sh</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#disaggr-torch-slurm"><code class="docutils literal notranslate"><span class="pre">disaggr_torch.slurm</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#gen-yaml-py"><code class="docutils literal notranslate"><span class="pre">gen_yaml.py</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#start-worker-sh"><code class="docutils literal notranslate"><span class="pre">start_worker.sh</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#run-benchmark-sh"><code class="docutils literal notranslate"><span class="pre">run_benchmark.sh</span></code></a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#highlights">Highlights</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#table-of-contents">Table of Contents</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#background-motivation">Background &amp; Motivation</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#algorithm-complexity">Algorithm &amp; Complexity</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#performance-study">Performance Study</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#experimental-setup">Experimental Setup</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#case-1-with-conversation-dataset">Case 1 with Conversation Dataset</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#speed-up-for-the-first-turn">Speed-up for the First Turn</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#effect-of-multi-turn-conversation">Effect of Multi-turn conversation</a></li>
 </ul>
 </li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#workflow">Workflow</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#case-2-with-translation-dataset">Case 2 with Translation Dataset</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#autoenablement-with-heuristic">Auto‑Enablement with Heuristic</a></li>
 </ul>
   </nav></div>
 
@@ -726,9 +909,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on July 19, 2025.</p>
+  <p>Last updated on August 01, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/69e9f6d">69e9f6d</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/fbee279">fbee279</a>.</p>
   
 </div></div>
       

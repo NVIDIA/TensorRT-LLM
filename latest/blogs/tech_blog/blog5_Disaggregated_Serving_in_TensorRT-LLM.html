@@ -36,6 +36,7 @@
     <link rel="stylesheet" type="text/css" href="../../_static/copybutton.css?v=76b2166b" />
     <link rel="stylesheet" type="text/css" href="../../_static/autodoc_pydantic.css" />
     <link rel="stylesheet" type="text/css" href="../../_static/togglebutton.css?v=13237357" />
+    <link rel="stylesheet" type="text/css" href="../../_static/custom.css?v=95073da6" />
   
   <!-- So that users can add custom icons -->
   <script src="../../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
@@ -58,7 +59,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc4';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc5';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -68,7 +69,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.0.0rc4" />
+  <meta name="docsearch:version" content="1.0.0rc5" />
 
 
   </head>
@@ -365,6 +366,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client for Multimodal</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client_for_lora.html">Openai Completion Client For Lora</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client_json_schema.html">OpenAI Completion Client with JSON Schema</a></li>
 </ul>
 </details></li>
 </ul>
@@ -501,43 +503,43 @@
 <h1>Disaggregated Serving in TensorRT-LLM<a class="headerlink" href="#disaggregated-serving-in-tensorrt-llm" title="Link to this heading">#</a></h1>
 <p>By NVIDIA TensorRT-LLM Team</p>
 <ul class="simple">
-<li><p><a class="reference internal" href="#Disaggregated-Serving-in-TensorRT-LLM"><span class="xref myst">Disaggregated Serving in TensorRT-LLM</span></a></p>
+<li><p><a class="reference internal" href="#disaggregated-serving-in-tensorrt-llm">Disaggregated Serving in TensorRT-LLM</a></p>
 <ul>
-<li><p><a class="reference internal" href="#motivation"><span class="std std-ref">Motivation</span></a></p></li>
-<li><p><a class="reference internal" href="#Disaggregated-Serving-in-TensorRT-LLM"><span class="xref myst">Disaggregated Serving in TensorRT-LLM</span></a></p>
+<li><p><a class="reference internal" href="#motivation">Motivation</a></p></li>
+<li><p><a class="reference internal" href="#id1">Disaggregated Serving in TensorRT-LLM</a></p>
 <ul>
 <li><p><a class="reference internal" href="#trtllm-serve">trtllm-serve</a></p></li>
-<li><p><a class="reference internal" href="#dynamo"><span class="std std-ref">Dynamo</span></a></p></li>
-<li><p><a class="reference internal" href="#Triton-Inference-Server"><span class="xref myst">Triton Inference Server</span></a></p></li>
+<li><p><a class="reference internal" href="#dynamo">Dynamo</a></p></li>
+<li><p><a class="reference internal" href="#triton-inference-server">Triton Inference Server</a></p></li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="#KV-Cache-Exchange"><span class="xref myst">KV Cache Exchange</span></a></p>
+<li><p><a class="reference internal" href="#kv-cache-exchange">KV Cache Exchange</a></p>
 <ul>
-<li><p><a class="reference internal" href="#Multi-backend-Support"><span class="xref myst">Multi-backend Support</span></a></p></li>
-<li><p><a class="reference internal" href="#Overlap-Optimization"><span class="xref myst">Overlap Optimization</span></a></p></li>
-<li><p><a class="reference internal" href="#Cache-Layout-Transformation"><span class="xref myst">Cache Layout Transformation</span></a></p></li>
+<li><p><a class="reference internal" href="#multi-backend-support">Multi-backend Support</a></p></li>
+<li><p><a class="reference internal" href="#overlap-optimization">Overlap Optimization</a></p></li>
+<li><p><a class="reference internal" href="#cache-layout-transformation">Cache Layout Transformation</a></p></li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="#Performance-Studies"><span class="xref myst">Performance Studies</span></a></p>
+<li><p><a class="reference internal" href="#performance-studies">Performance Studies</a></p>
 <ul>
-<li><p><a class="reference internal" href="#Measurement-Methodology"><span class="xref myst">Measurement Methodology</span></a></p></li>
-<li><p><a class="reference internal" href="#DeepSeek-R1"><span class="xref myst">DeepSeek R1</span></a></p>
+<li><p><a class="reference internal" href="#measurement-methodology">Measurement Methodology</a></p></li>
+<li><p><a class="reference internal" href="#deepseek-r1">DeepSeek R1</a></p>
 <ul>
-<li><p><a class="reference internal" href="#ISL-4400---OSL-1200-Machine-Translation-Dataset"><span class="xref myst">ISL 4400 - OSL 1200 (Machine Translation Dataset)</span></a></p></li>
-<li><p><a class="reference internal" href="#ISL-8192---OSL-256-Synthetic-Dataset"><span class="xref myst">ISL 8192 - OSL 256 (Synthetic Dataset)</span></a></p></li>
-<li><p><a class="reference internal" href="#ISL-4096---OSL-1024-Machine-Translation-Dataset"><span class="xref myst">ISL 4096 - OSL 1024 (Machine Translation Dataset)</span></a></p></li>
+<li><p><a class="reference internal" href="#isl-4400-osl-1200-machine-translation-dataset">ISL 4400 - OSL 1200 (Machine Translation Dataset)</a></p></li>
+<li><p><a class="reference internal" href="#isl-8192-osl-256-synthetic-dataset">ISL 8192 - OSL 256 (Synthetic Dataset)</a></p></li>
+<li><p><a class="reference internal" href="#isl-4096-osl-1024-machine-translation-dataset">ISL 4096 - OSL 1024 (Machine Translation Dataset)</a></p></li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="#Qwen-3"><span class="xref myst">Qwen 3</span></a></p>
+<li><p><a class="reference internal" href="#qwen-3">Qwen 3</a></p>
 <ul>
-<li><p><a class="reference internal" href="#ISL-8192---OSL-1024-Machine-Translation-Dataset"><span class="xref myst">ISL 8192 - OSL 1024 (Machine Translation Dataset)</span></a></p></li>
+<li><p><a class="reference internal" href="#isl-8192-osl-1024-machine-translation-dataset">ISL 8192 - OSL 1024 (Machine Translation Dataset)</a></p></li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="#Reproducing-Steps"><span class="xref myst">Reproducing Steps</span></a></p></li>
+<li><p><a class="reference internal" href="#reproducing-steps">Reproducing Steps</a></p></li>
 </ul>
 </li>
-<li><p><a class="reference internal" href="#Future-Work"><span class="xref myst">Future Work</span></a></p></li>
-<li><p><a class="reference internal" href="#acknowledgement"><span class="std std-ref">Acknowledgement</span></a></p></li>
+<li><p><a class="reference internal" href="#future-work">Future Work</a></p></li>
+<li><p><a class="reference internal" href="#acknowledgement">Acknowledgement</a></p></li>
 </ul>
 </li>
 </ul>
@@ -581,12 +583,12 @@
 <p align="center"><sub><em>Figure 3. `trtllm-serve` integration with disaggregated service</em></sub></p>
 <p>In the example below, two context servers are launched on ports 8001 and 8002, and two generation servers are launched on ports 8003 and 8004. Finally, a disaggregated server is also launched using <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code>. The disaggregated server will receive client requests on port 8000, and do the orchestration between the context and generation servers.</p>
 <div class="highlight-shell notranslate"><div class="highlight"><pre><span></span><span class="c1"># Launching context servers</span>
-trtllm-serve<span class="w"> </span>TinyLlama/TinyLlama-1.1B-Chat-v1.0<span class="w"> </span>--host<span class="w"> </span>localhost<span class="w"> </span>--port<span class="w"> </span><span class="m">8001</span><span class="w"> </span>--kv_cache_free_gpu_memory_fraction<span class="w"> </span><span class="m">0</span>.15<span class="w"> </span>--backend<span class="w"> </span>pytorch<span class="w"> </span><span class="p">&amp;</span>&gt;<span class="w"> </span>output_ctx0<span class="w"> </span><span class="p">&amp;</span>
-trtllm-serve<span class="w"> </span>TinyLlama/TinyLlama-1.1B-Chat-v1.0<span class="w"> </span>--host<span class="w"> </span>localhost<span class="w"> </span>--port<span class="w"> </span><span class="m">8002</span><span class="w"> </span>--kv_cache_free_gpu_memory_fraction<span class="w"> </span><span class="m">0</span>.15<span class="w"> </span>--backend<span class="w"> </span>pytorch<span class="w"> </span><span class="p">&amp;</span>&gt;<span class="w"> </span>output_ctx1<span class="w"> </span><span class="p">&amp;</span>
+trtllm-serve<span class="w"> </span>TinyLlama/TinyLlama-1.1B-Chat-v1.0<span class="w"> </span>--host<span class="w"> </span>localhost<span class="w"> </span>--port<span class="w"> </span><span class="m">8001</span><span class="w"> </span>--kv_cache_free_gpu_memory_fraction<span class="w"> </span><span class="m">0</span>.15<span class="w"> </span><span class="p">&amp;</span>&gt;<span class="w"> </span>output_ctx0<span class="w"> </span><span class="p">&amp;</span>
+trtllm-serve<span class="w"> </span>TinyLlama/TinyLlama-1.1B-Chat-v1.0<span class="w"> </span>--host<span class="w"> </span>localhost<span class="w"> </span>--port<span class="w"> </span><span class="m">8002</span><span class="w"> </span>--kv_cache_free_gpu_memory_fraction<span class="w"> </span><span class="m">0</span>.15<span class="w"> </span><span class="p">&amp;</span>&gt;<span class="w"> </span>output_ctx1<span class="w"> </span><span class="p">&amp;</span>
 
 <span class="c1"># Launching generation servers</span>
-trtllm-serve<span class="w"> </span>TinyLlama/TinyLlama-1.1B-Chat-v1.0<span class="w"> </span>--host<span class="w"> </span>localhost<span class="w"> </span>--port<span class="w"> </span><span class="m">8003</span><span class="w"> </span>--kv_cache_free_gpu_memory_fraction<span class="w"> </span><span class="m">0</span>.15<span class="w"> </span>--backend<span class="w"> </span>pytorch<span class="w"> </span><span class="p">&amp;</span>&gt;<span class="w"> </span>output_gen0<span class="w"> </span><span class="p">&amp;</span>
-trtllm-serve<span class="w"> </span>TinyLlama/TinyLlama-1.1B-Chat-v1.0<span class="w"> </span>--host<span class="w"> </span>localhost<span class="w"> </span>--port<span class="w"> </span><span class="m">8004</span><span class="w"> </span>--kv_cache_free_gpu_memory_fraction<span class="w"> </span><span class="m">0</span>.15<span class="w"> </span>--backend<span class="w"> </span>pytorch<span class="w"> </span><span class="p">&amp;</span>&gt;<span class="w"> </span>output_gen1<span class="w"> </span><span class="p">&amp;</span>
+trtllm-serve<span class="w"> </span>TinyLlama/TinyLlama-1.1B-Chat-v1.0<span class="w"> </span>--host<span class="w"> </span>localhost<span class="w"> </span>--port<span class="w"> </span><span class="m">8003</span><span class="w"> </span>--kv_cache_free_gpu_memory_fraction<span class="w"> </span><span class="m">0</span>.15<span class="w"> </span><span class="p">&amp;</span>&gt;<span class="w"> </span>output_gen0<span class="w"> </span><span class="p">&amp;</span>
+trtllm-serve<span class="w"> </span>TinyLlama/TinyLlama-1.1B-Chat-v1.0<span class="w"> </span>--host<span class="w"> </span>localhost<span class="w"> </span>--port<span class="w"> </span><span class="m">8004</span><span class="w"> </span>--kv_cache_free_gpu_memory_fraction<span class="w"> </span><span class="m">0</span>.15<span class="w"> </span><span class="p">&amp;</span>&gt;<span class="w"> </span>output_gen1<span class="w"> </span><span class="p">&amp;</span>
 
 <span class="c1"># Launching disaggregated server</span>
 trtllm-serve<span class="w"> </span>disaggregated<span class="w"> </span>-c<span class="w"> </span>disagg_config.yaml
@@ -766,7 +768,7 @@ $\frac{\text{Total Output Tokens/sec}}{\left(\frac{\text{NumCtxGPUs} \times \tex
 </section>
 <section id="reproducing-steps">
 <h3>Reproducing Steps<a class="headerlink" href="#reproducing-steps" title="Link to this heading">#</a></h3>
-<p>We provide a set of scripts to reproduce the performance data presented in this paper. Please refer to the usage instructions described in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/docs/source/scripts/disaggregated">this document</a>.</p>
+<p>We provide a set of scripts to reproduce the performance data presented in this paper. Please refer to the usage instructions described in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/disaggregated/slurm">this document</a>.</p>
 </section>
 </section>
 <section id="future-work">
@@ -940,9 +942,9 @@ $\frac{\text{Total Output Tokens/sec}}{\left(\frac{\text{NumCtxGPUs} \times \tex
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on July 19, 2025.</p>
+  <p>Last updated on August 01, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/69e9f6d">69e9f6d</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/fbee279">fbee279</a>.</p>
   
 </div></div>
       

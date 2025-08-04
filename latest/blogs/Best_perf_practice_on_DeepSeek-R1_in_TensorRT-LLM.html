@@ -36,6 +36,7 @@
     <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
     <link rel="stylesheet" type="text/css" href="../_static/autodoc_pydantic.css" />
     <link rel="stylesheet" type="text/css" href="../_static/togglebutton.css?v=13237357" />
+    <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=95073da6" />
   
   <!-- So that users can add custom icons -->
   <script src="../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
@@ -58,7 +59,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc4';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc5';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -68,7 +69,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.0.0rc4" />
+  <meta name="docsearch:version" content="1.0.0rc5" />
 
 
   </head>
@@ -365,6 +366,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client for Multimodal</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client_for_lora.html">Openai Completion Client For Lora</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client_json_schema.html">OpenAI Completion Client with JSON Schema</a></li>
 </ul>
 </details></li>
 </ul>
@@ -650,7 +652,6 @@ The command to generate synthetic dataset will be attached to the max throughput
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">YOUR_DATA_PATH</span><span class="o">=</span>&lt;your<span class="w"> </span>dataset<span class="w"> </span>file<span class="w"> </span>following<span class="w"> </span>the<span class="w"> </span>format&gt;
 
 cat<span class="w"> </span>&gt;./extra-llm-api-config.yml<span class="s">&lt;&lt;EOF</span>
-<span class="s">cuda_graph_config: {}</span>
 <span class="s">moe_config:</span>
 <span class="s">  backend: TRTLLM</span>
 <span class="s">speculative_config:</span>
@@ -663,7 +664,6 @@ cat<span class="w"> </span>&gt;./extra-llm-api-config.yml<span class="s">&lt;&lt
 trtllm-bench<span class="w"> </span>--model<span class="w"> </span>nvidia/DeepSeek-R1-FP4<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>throughput<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--dataset<span class="w"> </span><span class="nv">$YOUR_DATA_PATH</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--backend<span class="w"> </span>pytorch<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--num_requests<span class="w"> </span><span class="m">10</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--concurrency<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--max_batch_size<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
@@ -676,7 +676,6 @@ trtllm-bench<span class="w"> </span>--model<span class="w"> </span>nvidia/DeepSe
 <ul class="simple">
 <li><p><code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code>: A CLI benchmarking utility that aims to make it easier for users to reproduce our officially published. See <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/performance/perf-benchmarking.html">TensorRT-LLM Benchmarking</a> for details.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">--dataset</span></code>: Prompt dataset used to benchmark. Our official benchmark dataset has ISL = 1K, OSL = 2K</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">--backend</span></code>: Inference backend. Here we use PyTorch backend.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">--num_requests</span></code>: Num requests used for the benchmark.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">--concurrency</span></code>: Total concurrency for the system.</p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">--max_batch_size</span></code>: Max batch size in each rank.</p></li>
@@ -730,7 +729,6 @@ trtllm-bench<span class="w"> </span>--model<span class="w"> </span>nvidia/DeepSe
 trtllm-bench<span class="w">  </span>--model<span class="w"> </span>nvidia/DeepSeek-R1-0528-FP4
 <span class="w">     </span>throughput
 <span class="w">     </span>--dataset<span class="w"> </span><span class="si">${</span><span class="nv">YOUR_DATA_PATH</span><span class="si">}</span>
-<span class="w">     </span>--backend<span class="w"> </span>pytorch
 <span class="w">     </span>--tp<span class="w"> </span><span class="m">8</span><span class="w">  </span>--ep<span class="w"> </span><span class="m">8</span>
 <span class="w">     </span>--extra_llm_api_options<span class="w"> </span>./extra-llm-api-config.yml
 <span class="w">     </span>--max_batch_size<span class="w"> </span><span class="m">896</span>
@@ -800,7 +798,6 @@ trtllm-bench<span class="w"> </span>-m<span class="w"> </span>nvidia/DeepSeek-R1
 <span class="w">    </span>--ep<span class="w"> </span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--warmup<span class="w"> </span><span class="m">0</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--dataset<span class="w"> </span><span class="si">${</span><span class="nv">YOUR_DATA_PATH</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--backend<span class="w"> </span>pytorch<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--max_batch_size<span class="w"> </span><span class="m">384</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--max_num_tokens<span class="w"> </span><span class="m">1536</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--num_requests<span class="w"> </span><span class="m">49152</span><span class="w"> </span><span class="se">\</span>
@@ -834,7 +831,6 @@ To do the benchmark, run the following command:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">YOUR_DATA_PATH</span><span class="o">=</span>&lt;your<span class="w"> </span>dataset<span class="w"> </span>file<span class="w"> </span>following<span class="w"> </span>the<span class="w"> </span>format&gt;
 
 cat<span class="w"> </span>&gt;./extra-llm-api-config.yml<span class="s">&lt;&lt;EOF</span>
-<span class="s">cuda_graph_config: {}</span>
 <span class="s">speculative_config:</span>
 <span class="s">    decoding_type: MTP</span>
 <span class="s">    num_nextn_predict_layers: 3</span>
@@ -843,7 +839,6 @@ cat<span class="w"> </span>&gt;./extra-llm-api-config.yml<span class="s">&lt;&lt
 trtllm-bench<span class="w"> </span>--model<span class="w"> </span>deepseek-ai/DeepSeek-R1<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>throughput<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--dataset<span class="w"> </span><span class="nv">$YOUR_DATA_PATH</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--backend<span class="w"> </span>pytorch<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--num_requests<span class="w"> </span><span class="m">10</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--max_batch_size<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--tp<span class="w"> </span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
@@ -898,7 +893,6 @@ trtllm-bench<span class="w"> </span>-m<span class="w"> </span>deepseek-ai/DeepSe
 <span class="w">    </span>--ep<span class="w"> </span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--warmup<span class="w"> </span><span class="m">0</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--dataset<span class="w"> </span><span class="nv">$YOUR_DATA_PATH</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--backend<span class="w"> </span>pytorch<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--max_batch_size<span class="w"> </span><span class="m">128</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--max_num_tokens<span class="w"> </span><span class="m">1151</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--num_requests<span class="w"> </span><span class="m">5120</span><span class="w"> </span><span class="se">\</span>
@@ -1113,9 +1107,9 @@ For more details on <code class="docutils literal notranslate"><span class="pre"
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on July 19, 2025.</p>
+  <p>Last updated on August 01, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/69e9f6d">69e9f6d</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/fbee279">fbee279</a>.</p>
   
 </div></div>
       

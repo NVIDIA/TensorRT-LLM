@@ -36,6 +36,7 @@
     <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
     <link rel="stylesheet" type="text/css" href="../_static/autodoc_pydantic.css" />
     <link rel="stylesheet" type="text/css" href="../_static/togglebutton.css?v=13237357" />
+    <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=95073da6" />
   
   <!-- So that users can add custom icons -->
   <script src="../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
@@ -58,7 +59,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc4';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc5';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -70,7 +71,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.0.0rc4" />
+  <meta name="docsearch:version" content="1.0.0rc5" />
 
 
   </head>
@@ -367,6 +368,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client for Multimodal</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client_for_lora.html">Openai Completion Client For Lora</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client_json_schema.html">OpenAI Completion Client with JSON Schema</a></li>
 </ul>
 </details></li>
 </ul>
@@ -528,15 +530,35 @@
 <td><p><code class="docutils literal notranslate"><span class="pre">deepseek-ai/DeepSeek-V3</span> </code></p></td>
 <td><p>L</p></td>
 </tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Exaone4ForCausalLM</span></code></p></td>
+<td><p>EXAONE 4.0</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">LGAI-EXAONE/EXAONE-4.0-32B</span></code></p></td>
+<td><p>L</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Gemma3ForCausalLM</span></code></p></td>
+<td><p>Gemma 3</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">google/gemma-3-1b-it</span></code></p></td>
+<td><p>L</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Gemma3ForConditionalGeneration</span></code></p></td>
+<td><p>Gemma 3</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">google/gemma-3-27b-it</span></code></p></td>
+<td><p>L + I</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">HCXVisionForCausalLM</span></code></p></td>
+<td><p>HyperCLOVAX-SEED-Vision</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">naver-hyperclovax/HyperCLOVAX-SEED-Vision-Instruct-3B</span></code></p></td>
+<td><p>L + I</p></td>
+</tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">LlavaLlamaModel</span></code></p></td>
 <td><p>VILA</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Efficient-Large-Model/NVILA-8B</span></code></p></td>
-<td><p>L + V</p></td>
+<td><p>L + I + V</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">LlavaNextForConditionalGeneration</span></code></p></td>
 <td><p>LLaVA-NeXT</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">llava-hf/llava-v1.6-mistral-7b-hf</span></code></p></td>
-<td><p>L + V</p></td>
+<td><p>L + I</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">LlamaForCausalLM</span></code></p></td>
 <td><p>Llama 3.1, Llama 3, Llama 2, LLaMA</p></td>
@@ -546,12 +568,22 @@
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Llama4ForConditionalGeneration</span></code></p></td>
 <td><p>Llama 4</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">meta-llama/Llama-4-Scout-17B-16E-Instruct</span></code></p></td>
-<td><p>L</p></td>
+<td><p>L + I</p></td>
 </tr>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">MistralForCausalLM</span></code></p></td>
+<td><p>Bielik</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">speakleash/Bielik-11B-v2.2-Instruct</span></code></p></td>
+<td><p>L</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MistralForCausalLM</span></code></p></td>
 <td><p>Mistral</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">mistralai/Mistral-7B-v0.1</span></code></p></td>
 <td><p>L</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Mistral3ForConditionalGeneration</span></code></p></td>
+<td><p>Mistral3</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">mistralai/Mistral-Small-3.1-24B-Instruct-2503</span></code></p></td>
+<td><p>L + I</p></td>
 </tr>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">MixtralForCausalLM</span></code></p></td>
 <td><p>Mixtral</p></td>
@@ -573,39 +605,55 @@
 <td><p><code class="docutils literal notranslate"><span class="pre">nvidia/Llama-3_3-Nemotron-Super-49B-v1</span></code></p></td>
 <td><p>L</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen2ForCausalLM</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Phi4MMForCausalLM</span></code></p></td>
+<td><p>Phi-4-multimodal</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">microsoft/Phi-4-multimodal-instruct</span></code></p></td>
+<td><p>L + I + A</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen2ForCausalLM</span></code></p></td>
 <td><p>QwQ, Qwen2</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen2-7B-Instruct</span></code></p></td>
 <td><p>L</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen2ForProcessRewardModel</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen2ForProcessRewardModel</span></code></p></td>
 <td><p>Qwen2-based</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen2.5-Math-PRM-7B</span></code></p></td>
 <td><p>L</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen2ForRewardModel</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen2ForRewardModel</span></code></p></td>
 <td><p>Qwen2-based</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen2.5-Math-RM-72B</span></code></p></td>
 <td><p>L</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen2VLForConditionalGeneration</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen2VLForConditionalGeneration</span></code></p></td>
 <td><p>Qwen2-VL</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen2-VL-7B-Instruct</span></code></p></td>
-<td><p>L + V</p></td>
+<td><p>L + I + V</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen2_5_VLForConditionalGeneration</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen2_5_VLForConditionalGeneration</span></code></p></td>
 <td><p>Qwen2.5-VL</p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen2.5-VL-7B-Instruct</span></code></p></td>
-<td><p>L + V</p></td>
+<td><p>L + I + V</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen3ForCausalLM</span></code></p></td>
+<td><p>Qwen3</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3-8B</span></code></p></td>
+<td><p>L</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">Qwen3MoeForCausalLM</span></code></p></td>
+<td><p>Qwen3MoE</p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">Qwen/Qwen3-30B-A3B</span></code></p></td>
+<td><p>L</p></td>
 </tr>
 </tbody>
 </table>
 </div>
 <p>Note:</p>
 <ul class="simple">
-<li><p>L: Language only</p></li>
-<li><p>L + V: Language and Vision multimodal support</p></li>
-<li><p>Llama 3.2 accepts vision input, but our support currently limited to text only.</p></li>
+<li><p>L: Language</p></li>
+<li><p>I: Image</p></li>
+<li><p>V: Video</p></li>
+<li><p>A: Audio</p></li>
 </ul>
 </section>
 <section id="models-tensorrt-backend">
@@ -650,7 +698,7 @@
 <li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/enc_dec">mT5</a></p></li>
 <li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/contrib/opt">OPT</a></p></li>
 <li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/phi">Phi-1.5/Phi-2/Phi-3</a></p></li>
-<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/qwen">Qwen/Qwen1.5/Qwen2</a></p></li>
+<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/qwen">Qwen/Qwen1.5/Qwen2/Qwen3</a></p></li>
 <li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/qwenvl">Qwen-VL</a></p></li>
 <li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/recurrentgemma">RecurrentGemma</a></p></li>
 <li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/contrib/mpt">Replit Code</a> <a class="footnote-reference brackets" href="#replitcode" id="id3" role="doc-noteref"><span class="fn-bracket">[</span>2<span class="fn-bracket">]</span></a></p></li>
@@ -931,9 +979,9 @@ In addition, older architectures can have limitations for newer software release
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on July 19, 2025.</p>
+  <p>Last updated on August 01, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/69e9f6d">69e9f6d</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/fbee279">fbee279</a>.</p>
   
 </div></div>
       

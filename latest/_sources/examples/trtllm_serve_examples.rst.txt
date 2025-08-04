@@ -17,4 +17,5 @@ Online Serving Examples
    openai_chat_client_for_multimodal
    openai_completion_client
    openai_completion_client_for_lora
+   openai_completion_client_json_schema
 

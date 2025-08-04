@@ -35,6 +35,7 @@
     <link rel="stylesheet" type="text/css" href="../../_static/copybutton.css?v=76b2166b" />
     <link rel="stylesheet" type="text/css" href="../../_static/autodoc_pydantic.css" />
     <link rel="stylesheet" type="text/css" href="../../_static/togglebutton.css?v=13237357" />
+    <link rel="stylesheet" type="text/css" href="../../_static/custom.css?v=95073da6" />
   
   <!-- So that users can add custom icons -->
   <script src="../../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
@@ -57,7 +58,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc4';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc5';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -67,7 +68,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.0.0rc4" />
+  <meta name="docsearch:version" content="1.0.0rc5" />
 
 
   </head>
@@ -360,6 +361,7 @@
 <li class="toctree-l2"><a class="reference internal" href="../../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client for Multimodal</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
 <li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client_for_lora.html">Openai Completion Client For Lora</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client_json_schema.html">OpenAI Completion Client with JSON Schema</a></li>
 </ul>
 </details></li>
 </ul>
@@ -5684,9 +5686,9 @@
         <span class="k">return</span> <span class="n">inv_freq</span><span class="p">,</span> <span class="n">concat</span><span class="o">.</span><span class="n">reshape</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="o">-</span><span class="mi">1</span><span class="p">)</span><span class="o">.</span><span class="n">astype</span><span class="p">(</span><span class="n">dtype</span><span class="p">)</span></div>
 
 
-<div class="viewcode-block" id="RopeEmbeddingUtils.create_sinusoidal_positions_long_rope">
-<a class="viewcode-back" href="../../python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.RopeEmbeddingUtils.create_sinusoidal_positions_long_rope">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">create_sinusoidal_positions_long_rope</span><span class="p">(</span>
+<div class="viewcode-block" id="RopeEmbeddingUtils.create_sinusoidal_positions_long_rope_for_attention_plugin">
+<a class="viewcode-back" href="../../python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.RopeEmbeddingUtils.create_sinusoidal_positions_long_rope_for_attention_plugin">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">create_sinusoidal_positions_long_rope_for_attention_plugin</span><span class="p">(</span>
             <span class="n">num_pos</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
             <span class="n">num_orig_pos</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
             <span class="n">dim</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
@@ -5742,40 +5744,37 @@
                         <span class="n">scaling_long_factors</span><span class="p">,</span> <span class="kc">False</span><span class="p">,</span> <span class="kc">True</span><span class="p">),</span> <span class="n">short_mscale</span></div>
 
 
-<div class="viewcode-block" id="RopeEmbeddingUtils.create_sinusoidal_positions_long_rope_for_attention_plugin">
-<a class="viewcode-back" href="../../python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.RopeEmbeddingUtils.create_sinusoidal_positions_long_rope_for_attention_plugin">[docs]</a>
+<div class="viewcode-block" id="RopeEmbeddingUtils.create_sinusoidal_positions_long_rope">
+<a class="viewcode-back" href="../../python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.RopeEmbeddingUtils.create_sinusoidal_positions_long_rope">[docs]</a>
     <span class="nd">@staticmethod</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">create_sinusoidal_positions_long_rope_for_attention_plugin</span><span class="p">(</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">create_sinusoidal_positions_long_rope</span><span class="p">(</span>
             <span class="n">num_pos</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
             <span class="n">dim</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
             <span class="n">theta</span><span class="p">:</span> <span class="nb">float</span><span class="p">,</span>
             <span class="n">original_max_pos</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
             <span class="n">short_factor</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="nb">float</span><span class="p">],</span>
             <span class="n">long_factor</span><span class="p">:</span> <span class="n">List</span><span class="p">[</span><span class="nb">float</span><span class="p">],</span>
-            <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">float32</span><span class="p">):</span>
+            <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">float32</span><span class="p">,</span>
+            <span class="n">max_seq_len</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
         <span class="n">short_factor</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">(</span><span class="n">short_factor</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
         <span class="n">long_factor</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">array</span><span class="p">(</span><span class="n">long_factor</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
 
         <span class="n">inv_freq</span> <span class="o">=</span> <span class="mf">1.0</span> <span class="o">/</span> <span class="p">(</span><span class="n">theta</span><span class="o">**</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="mi">0</span><span class="p">,</span> <span class="n">dim</span><span class="p">,</span> <span class="mi">2</span><span class="p">,</span> <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span> <span class="o">/</span> <span class="n">dim</span><span class="p">))</span>
+        <span class="n">t_pos</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">max</span><span class="p">([</span><span class="n">num_pos</span><span class="p">,</span> <span class="n">original_max_pos</span><span class="p">]),</span> <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
 
-        <span class="c1"># Short part</span>
-        <span class="n">inv_freq_short</span> <span class="o">=</span> <span class="n">inv_freq</span> <span class="o">/</span> <span class="n">short_factor</span>
-        <span class="n">t_short</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">min</span><span class="p">([</span><span class="n">num_pos</span><span class="p">,</span> <span class="n">original_max_pos</span><span class="p">]),</span>
-                            <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span>
-        <span class="n">freqs_short</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">einsum</span><span class="p">(</span><span class="s2">&quot;i,j-&gt;ij&quot;</span><span class="p">,</span> <span class="n">t_short</span><span class="p">,</span> <span class="n">inv_freq_short</span><span class="p">)</span>
-
-        <span class="c1"># Long part</span>
-        <span class="n">inv_freq_long</span> <span class="o">=</span> <span class="n">inv_freq</span> <span class="o">/</span> <span class="n">long_factor</span>
-        <span class="n">t_long</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">arange</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">max</span><span class="p">([</span><span class="mi">0</span><span class="p">,</span> <span class="n">num_pos</span> <span class="o">-</span> <span class="n">original_max_pos</span><span class="p">]),</span>
-                           <span class="n">dtype</span><span class="o">=</span><span class="n">np</span><span class="o">.</span><span class="n">float32</span><span class="p">)</span> <span class="o">+</span> <span class="n">original_max_pos</span>
-        <span class="n">freqs_long</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">einsum</span><span class="p">(</span><span class="s2">&quot;i,j-&gt;ij&quot;</span><span class="p">,</span> <span class="n">t_long</span><span class="p">,</span> <span class="n">inv_freq_long</span><span class="p">)</span>
-
-        <span class="n">freqs</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">concatenate</span><span class="p">([</span><span class="n">freqs_short</span><span class="p">,</span> <span class="n">freqs_long</span><span class="p">],</span> <span class="n">axis</span><span class="o">=</span><span class="mi">0</span><span class="p">)</span>
+        <span class="c1"># Choose proper freqs based on max_seq_len.</span>
+        <span class="n">factor</span> <span class="o">=</span> <span class="n">long_factor</span> <span class="k">if</span> <span class="n">max_seq_len</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="n">max_seq_len</span> <span class="o">&gt;</span> <span class="n">original_max_pos</span> <span class="k">else</span> <span class="n">short_factor</span>
+        <span class="n">inv_freq</span> <span class="o">=</span> <span class="n">inv_freq</span> <span class="o">/</span> <span class="n">factor</span>
+        <span class="n">freqs</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">einsum</span><span class="p">(</span><span class="s2">&quot;i,j-&gt;ij&quot;</span><span class="p">,</span> <span class="n">t_pos</span><span class="p">,</span> <span class="n">inv_freq</span><span class="p">)</span>
         <span class="n">sinusoid_inp</span> <span class="o">=</span> <span class="n">freqs</span><span class="o">.</span><span class="n">astype</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">float32</span><span class="p">)[</span><span class="o">...</span><span class="p">,</span> <span class="n">np</span><span class="o">.</span><span class="n">newaxis</span><span class="p">]</span>
 
         <span class="c1"># Apply scaling</span>
         <span class="n">scale</span> <span class="o">=</span> <span class="n">num_pos</span> <span class="o">/</span> <span class="n">original_max_pos</span>
-        <span class="n">scaling_factor</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">sqrt</span><span class="p">(</span><span class="mf">1.0</span> <span class="o">+</span> <span class="n">np</span><span class="o">.</span><span class="n">log</span><span class="p">(</span><span class="n">scale</span><span class="p">)</span> <span class="o">/</span> <span class="n">np</span><span class="o">.</span><span class="n">log</span><span class="p">(</span><span class="n">original_max_pos</span><span class="p">))</span>
+        <span class="k">if</span> <span class="n">scale</span> <span class="o">&lt;=</span> <span class="mf">1.0</span><span class="p">:</span>
+            <span class="n">scaling_factor</span> <span class="o">=</span> <span class="mf">1.0</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">scaling_factor</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">sqrt</span><span class="p">(</span><span class="mf">1.0</span> <span class="o">+</span>
+                                     <span class="n">np</span><span class="o">.</span><span class="n">log</span><span class="p">(</span><span class="n">scale</span><span class="p">)</span> <span class="o">/</span> <span class="n">np</span><span class="o">.</span><span class="n">log</span><span class="p">(</span><span class="n">original_max_pos</span><span class="p">))</span>
 
         <span class="c1"># fuse cos/sin into float2 (cos, sin).</span>
         <span class="n">concat</span> <span class="o">=</span> <span class="n">np</span><span class="o">.</span><span class="n">concatenate</span><span class="p">(</span>
@@ -8755,9 +8754,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on July 19, 2025.</p>
+  <p>Last updated on August 01, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/69e9f6d">69e9f6d</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/fbee279">fbee279</a>.</p>
   
 </div></div>
       

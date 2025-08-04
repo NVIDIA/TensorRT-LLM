@@ -7,8 +7,9 @@
 
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Overview: module code &#8212; TensorRT-LLM</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>OpenAI Completion Client with JSON Schema &#8212; TensorRT-LLM</title>
   
   
   
@@ -54,7 +55,7 @@
     <script src="../_static/togglebutton.js?v=4a39c7ea"></script>
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
     <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
-    <script>DOCUMENTATION_OPTIONS.pagename = '_modules/index';</script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'examples/openai_completion_client_json_schema';</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
@@ -65,6 +66,8 @@
     <link rel="icon" href="../_static/favicon.png"/>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
+    <link rel="next" title="Layers" href="../python-api/tensorrt_llm.layers.html" />
+    <link rel="prev" title="Openai Completion Client For Lora" href="openai_completion_client_for_lora.html" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
@@ -329,39 +332,39 @@
 <li class="toctree-l1"><a class="reference internal" href="../llm-api/reference.html">API Reference</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Examples</span></p>
-<ul class="nav bd-sidenav">
-<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/index.html">LLM Examples Introduction</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="simple">
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1 has-children"><a class="reference internal" href="index.html">LLM Examples Introduction</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="simple">
 </ul>
 </details></li>
-<li class="toctree-l1"><a class="reference internal" href="../examples/customization.html">LLM Common Customizations</a></li>
-<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/llm_api_examples.html">LLM Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference.html">Generate text</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async.html">Generate text asynchronously</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_async_streaming.html">Generate text in streaming</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_bench.html">Run trtllm-bench with pytorch backend on Slurm</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/llm_mgmn_trtllm_serve.html">Run trtllm-serve with pytorch backend on Slurm</a></li>
+<li class="toctree-l1"><a class="reference internal" href="customization.html">LLM Common Customizations</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="llm_api_examples.html">LLM Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_inference_async.html">Generate text asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_inference_async_streaming.html">Generate text in streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_speculative_decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_runtime.html">Runtime Configuration Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_sampling.html">Sampling Techniques Showcase</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_mgmn_trtllm_bench.html">Run trtllm-bench with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm_mgmn_trtllm_serve.html">Run trtllm-serve with pytorch backend on Slurm</a></li>
 </ul>
 </details></li>
-<li class="toctree-l1 has-children"><a class="reference internal" href="../examples/trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
-<li class="toctree-l2"><a class="reference internal" href="../examples/curl_chat_client.html">Curl Chat Client</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/curl_completion_client.html">Curl Completion Client</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/deepseek_r1_reasoning_parser.html">Deepseek R1 Reasoning Parser</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/genai_perf_client.html">Genai Perf Client</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/genai_perf_client_for_multimodal.html">Genai Perf Client For Multimodal</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/openai_chat_client.html">OpenAI Chat Client</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client for Multimodal</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client_for_lora.html">Openai Completion Client For Lora</a></li>
-<li class="toctree-l2"><a class="reference internal" href="../examples/openai_completion_client_json_schema.html">OpenAI Completion Client with JSON Schema</a></li>
+<li class="toctree-l1 current active has-children"><a class="reference internal" href="trtllm_serve_examples.html">Online Serving Examples</a><details open="open"><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="current">
+<li class="toctree-l2"><a class="reference internal" href="curl_chat_client.html">Curl Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="curl_completion_client.html">Curl Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="deepseek_r1_reasoning_parser.html">Deepseek R1 Reasoning Parser</a></li>
+<li class="toctree-l2"><a class="reference internal" href="genai_perf_client.html">Genai Perf Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="genai_perf_client_for_multimodal.html">Genai Perf Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="openai_chat_client.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="openai_chat_client_for_multimodal.html">OpenAI Chat Client for Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="openai_completion_client.html">OpenAI Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="openai_completion_client_for_lora.html">Openai Completion Client For Lora</a></li>
+<li class="toctree-l2 current active"><a class="current reference internal" href="#">OpenAI Completion Client with JSON Schema</a></li>
 </ul>
 </details></li>
 </ul>
@@ -477,7 +480,10 @@
         <i class="fa-solid fa-home"></i>
       </a>
     </li>
-    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">Overview: module code</span></li>
+    
+    <li class="breadcrumb-item"><a href="trtllm_serve_examples.html" class="nav-link">Online Serving Examples</a></li>
+    
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">OpenAI Completion Client with JSON Schema</span></li>
   </ul>
 </nav>
 </div>
@@ -494,80 +500,55 @@
 <div id="searchbox"></div>
                 <article class="bd-article">
                   
-  <h1>All modules for which code is available</h1>
-<ul><li><a href="tensorrt_llm/bindings.html">tensorrt_llm.bindings</a></li>
-<ul><li><a href="tensorrt_llm/bindings/executor.html">tensorrt_llm.bindings.executor</a></li>
-</ul><li><a href="tensorrt_llm/builder.html">tensorrt_llm.builder</a></li>
-<li><a href="tensorrt_llm/disaggregated_params.html">tensorrt_llm.disaggregated_params</a></li>
-<li><a href="tensorrt_llm/executor/result.html">tensorrt_llm.executor.result</a></li>
-<li><a href="tensorrt_llm/executor/utils.html">tensorrt_llm.executor.utils</a></li>
-<li><a href="tensorrt_llm/functional.html">tensorrt_llm.functional</a></li>
-<li><a href="tensorrt_llm/layers/activation.html">tensorrt_llm.layers.activation</a></li>
-<li><a href="tensorrt_llm/layers/attention.html">tensorrt_llm.layers.attention</a></li>
-<li><a href="tensorrt_llm/layers/cast.html">tensorrt_llm.layers.cast</a></li>
-<li><a href="tensorrt_llm/layers/conv.html">tensorrt_llm.layers.conv</a></li>
-<li><a href="tensorrt_llm/layers/embedding.html">tensorrt_llm.layers.embedding</a></li>
-<li><a href="tensorrt_llm/layers/linear.html">tensorrt_llm.layers.linear</a></li>
-<li><a href="tensorrt_llm/layers/mlp.html">tensorrt_llm.layers.mlp</a></li>
-<li><a href="tensorrt_llm/layers/normalization.html">tensorrt_llm.layers.normalization</a></li>
-<li><a href="tensorrt_llm/layers/pooling.html">tensorrt_llm.layers.pooling</a></li>
-<li><a href="tensorrt_llm/llmapi/build_cache.html">tensorrt_llm.llmapi.build_cache</a></li>
-<li><a href="tensorrt_llm/llmapi/llm.html">tensorrt_llm.llmapi.llm</a></li>
-<li><a href="tensorrt_llm/llmapi/llm_args.html">tensorrt_llm.llmapi.llm_args</a></li>
-<li><a href="tensorrt_llm/llmapi/mpi_session.html">tensorrt_llm.llmapi.mpi_session</a></li>
-<li><a href="tensorrt_llm/models/baichuan/model.html">tensorrt_llm.models.baichuan.model</a></li>
-<li><a href="tensorrt_llm/models/bert/model.html">tensorrt_llm.models.bert.model</a></li>
-<li><a href="tensorrt_llm/models/bloom/model.html">tensorrt_llm.models.bloom.model</a></li>
-<li><a href="tensorrt_llm/models/chatglm/config.html">tensorrt_llm.models.chatglm.config</a></li>
-<li><a href="tensorrt_llm/models/chatglm/model.html">tensorrt_llm.models.chatglm.model</a></li>
-<li><a href="tensorrt_llm/models/clip/model.html">tensorrt_llm.models.clip.model</a></li>
-<li><a href="tensorrt_llm/models/cogvlm/config.html">tensorrt_llm.models.cogvlm.config</a></li>
-<li><a href="tensorrt_llm/models/cogvlm/model.html">tensorrt_llm.models.cogvlm.model</a></li>
-<li><a href="tensorrt_llm/models/commandr/model.html">tensorrt_llm.models.commandr.model</a></li>
-<li><a href="tensorrt_llm/models/dbrx/config.html">tensorrt_llm.models.dbrx.config</a></li>
-<li><a href="tensorrt_llm/models/dbrx/model.html">tensorrt_llm.models.dbrx.model</a></li>
-<li><a href="tensorrt_llm/models/deepseek_v1/model.html">tensorrt_llm.models.deepseek_v1.model</a></li>
-<li><a href="tensorrt_llm/models/deepseek_v2/model.html">tensorrt_llm.models.deepseek_v2.model</a></li>
-<li><a href="tensorrt_llm/models/dit/model.html">tensorrt_llm.models.dit.model</a></li>
-<li><a href="tensorrt_llm/models/eagle/model.html">tensorrt_llm.models.eagle.model</a></li>
-<li><a href="tensorrt_llm/models/enc_dec/model.html">tensorrt_llm.models.enc_dec.model</a></li>
-<li><a href="tensorrt_llm/models/falcon/config.html">tensorrt_llm.models.falcon.config</a></li>
-<li><a href="tensorrt_llm/models/falcon/model.html">tensorrt_llm.models.falcon.model</a></li>
-<li><a href="tensorrt_llm/models/gemma/config.html">tensorrt_llm.models.gemma.config</a></li>
-<li><a href="tensorrt_llm/models/gemma/model.html">tensorrt_llm.models.gemma.model</a></li>
-<li><a href="tensorrt_llm/models/gpt/config.html">tensorrt_llm.models.gpt.config</a></li>
-<li><a href="tensorrt_llm/models/gpt/model.html">tensorrt_llm.models.gpt.model</a></li>
-<li><a href="tensorrt_llm/models/gptj/config.html">tensorrt_llm.models.gptj.config</a></li>
-<li><a href="tensorrt_llm/models/gptj/model.html">tensorrt_llm.models.gptj.model</a></li>
-<li><a href="tensorrt_llm/models/gptneox/model.html">tensorrt_llm.models.gptneox.model</a></li>
-<li><a href="tensorrt_llm/models/llama/config.html">tensorrt_llm.models.llama.config</a></li>
-<li><a href="tensorrt_llm/models/llama/model.html">tensorrt_llm.models.llama.model</a></li>
-<li><a href="tensorrt_llm/models/mamba/model.html">tensorrt_llm.models.mamba.model</a></li>
-<li><a href="tensorrt_llm/models/medusa/config.html">tensorrt_llm.models.medusa.config</a></li>
-<li><a href="tensorrt_llm/models/medusa/model.html">tensorrt_llm.models.medusa.model</a></li>
-<li><a href="tensorrt_llm/models/mllama/model.html">tensorrt_llm.models.mllama.model</a></li>
-<li><a href="tensorrt_llm/models/mmdit_sd3/model.html">tensorrt_llm.models.mmdit_sd3.model</a></li>
-<li><a href="tensorrt_llm/models/modeling_utils.html">tensorrt_llm.models.modeling_utils</a></li>
-<li><a href="tensorrt_llm/models/mpt/model.html">tensorrt_llm.models.mpt.model</a></li>
-<li><a href="tensorrt_llm/models/multimodal_encoders/config.html">tensorrt_llm.models.multimodal_encoders.config</a></li>
-<li><a href="tensorrt_llm/models/multimodal_encoders/model.html">tensorrt_llm.models.multimodal_encoders.model</a></li>
-<li><a href="tensorrt_llm/models/opt/model.html">tensorrt_llm.models.opt.model</a></li>
-<li><a href="tensorrt_llm/models/phi/model.html">tensorrt_llm.models.phi.model</a></li>
-<li><a href="tensorrt_llm/models/phi3/model.html">tensorrt_llm.models.phi3.model</a></li>
-<li><a href="tensorrt_llm/models/recurrentgemma/model.html">tensorrt_llm.models.recurrentgemma.model</a></li>
-<li><a href="tensorrt_llm/models/redrafter/model.html">tensorrt_llm.models.redrafter.model</a></li>
-<li><a href="tensorrt_llm/plugin/plugin.html">tensorrt_llm.plugin.plugin</a></li>
-<li><a href="tensorrt_llm/quantization/mode.html">tensorrt_llm.quantization.mode</a></li>
-<li><a href="tensorrt_llm/quantization/quantize_by_modelopt.html">tensorrt_llm.quantization.quantize_by_modelopt</a></li>
-<li><a href="tensorrt_llm/runtime/enc_dec_model_runner.html">tensorrt_llm.runtime.enc_dec_model_runner</a></li>
-<li><a href="tensorrt_llm/runtime/generation.html">tensorrt_llm.runtime.generation</a></li>
-<li><a href="tensorrt_llm/runtime/kv_cache_manager.html">tensorrt_llm.runtime.kv_cache_manager</a></li>
-<li><a href="tensorrt_llm/runtime/model_runner.html">tensorrt_llm.runtime.model_runner</a></li>
-<li><a href="tensorrt_llm/runtime/model_runner_cpp.html">tensorrt_llm.runtime.model_runner_cpp</a></li>
-<li><a href="tensorrt_llm/runtime/multimodal_model_runner.html">tensorrt_llm.runtime.multimodal_model_runner</a></li>
-<li><a href="tensorrt_llm/runtime/session.html">tensorrt_llm.runtime.session</a></li>
-<li><a href="tensorrt_llm/sampling_params.html">tensorrt_llm.sampling_params</a></li>
-</ul>
+  <section id="openai-completion-client-with-json-schema">
+<h1>OpenAI Completion Client with JSON Schema<a class="headerlink" href="#openai-completion-client-with-json-schema" title="Link to this heading">#</a></h1>
+<p>Refer to the <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/commands/trtllm-serve.html">trtllm-serve documentation</a> for starting a server.</p>
+<p>Source <a class="github reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/serve/openai_completion_client_json_schema.py">NVIDIA/TensorRT-LLM</a>.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="linenos"> 1</span>
+<span class="linenos"> 2</span><span class="kn">from</span><span class="w"> </span><span class="nn">openai</span><span class="w"> </span><span class="kn">import</span> <span class="n">OpenAI</span>
+<span class="linenos"> 3</span>
+<span class="linenos"> 4</span><span class="n">client</span> <span class="o">=</span> <span class="n">OpenAI</span><span class="p">(</span>
+<span class="linenos"> 5</span>    <span class="n">base_url</span><span class="o">=</span><span class="s2">&quot;http://localhost:8000/v1&quot;</span><span class="p">,</span>
+<span class="linenos"> 6</span>    <span class="n">api_key</span><span class="o">=</span><span class="s2">&quot;tensorrt_llm&quot;</span><span class="p">,</span>
+<span class="linenos"> 7</span><span class="p">)</span>
+<span class="linenos"> 8</span>
+<span class="linenos"> 9</span><span class="n">response</span> <span class="o">=</span> <span class="n">client</span><span class="o">.</span><span class="n">chat</span><span class="o">.</span><span class="n">completions</span><span class="o">.</span><span class="n">create</span><span class="p">(</span>
+<span class="linenos">10</span>    <span class="n">model</span><span class="o">=</span><span class="s2">&quot;TinyLlama-1.1B-Chat-v1.0&quot;</span><span class="p">,</span>
+<span class="linenos">11</span>    <span class="n">messages</span><span class="o">=</span><span class="p">[{</span>
+<span class="linenos">12</span>        <span class="s2">&quot;role&quot;</span><span class="p">:</span> <span class="s2">&quot;system&quot;</span><span class="p">,</span>
+<span class="linenos">13</span>        <span class="s2">&quot;content&quot;</span><span class="p">:</span> <span class="s2">&quot;you are a helpful assistant&quot;</span>
+<span class="linenos">14</span>    <span class="p">},</span> <span class="p">{</span>
+<span class="linenos">15</span>        <span class="s2">&quot;role&quot;</span><span class="p">:</span>
+<span class="linenos">16</span>        <span class="s2">&quot;user&quot;</span><span class="p">,</span>
+<span class="linenos">17</span>        <span class="s2">&quot;content&quot;</span><span class="p">:</span>
+<span class="linenos">18</span>        <span class="sa">f</span><span class="s2">&quot;Give me the information of the biggest city of China in the JSON format.&quot;</span><span class="p">,</span>
+<span class="linenos">19</span>    <span class="p">}],</span>
+<span class="linenos">20</span>    <span class="n">max_tokens</span><span class="o">=</span><span class="mi">100</span><span class="p">,</span>
+<span class="linenos">21</span>    <span class="n">temperature</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>
+<span class="linenos">22</span>    <span class="n">response_format</span><span class="o">=</span><span class="p">{</span>
+<span class="linenos">23</span>        <span class="s2">&quot;type&quot;</span><span class="p">:</span> <span class="s2">&quot;json&quot;</span><span class="p">,</span>
+<span class="linenos">24</span>        <span class="s2">&quot;schema&quot;</span><span class="p">:</span> <span class="p">{</span>
+<span class="linenos">25</span>            <span class="s2">&quot;type&quot;</span><span class="p">:</span> <span class="s2">&quot;object&quot;</span><span class="p">,</span>
+<span class="linenos">26</span>            <span class="s2">&quot;properties&quot;</span><span class="p">:</span> <span class="p">{</span>
+<span class="linenos">27</span>                <span class="s2">&quot;name&quot;</span><span class="p">:</span> <span class="p">{</span>
+<span class="linenos">28</span>                    <span class="s2">&quot;type&quot;</span><span class="p">:</span> <span class="s2">&quot;string&quot;</span>
+<span class="linenos">29</span>                <span class="p">},</span>
+<span class="linenos">30</span>                <span class="s2">&quot;population&quot;</span><span class="p">:</span> <span class="p">{</span>
+<span class="linenos">31</span>                    <span class="s2">&quot;type&quot;</span><span class="p">:</span> <span class="s2">&quot;integer&quot;</span>
+<span class="linenos">32</span>                <span class="p">},</span>
+<span class="linenos">33</span>            <span class="p">},</span>
+<span class="linenos">34</span>            <span class="s2">&quot;required&quot;</span><span class="p">:</span> <span class="p">[</span><span class="s2">&quot;name&quot;</span><span class="p">,</span> <span class="s2">&quot;population&quot;</span><span class="p">],</span>
+<span class="linenos">35</span>            <span class="s2">&quot;chat_template_kwargs&quot;</span><span class="p">:</span> <span class="p">{</span>
+<span class="linenos">36</span>                <span class="s2">&quot;enable_thinking&quot;</span><span class="p">:</span> <span class="kc">False</span>
+<span class="linenos">37</span>            <span class="p">}</span>
+<span class="linenos">38</span>        <span class="p">}</span>
+<span class="linenos">39</span>    <span class="p">},</span>
+<span class="linenos">40</span><span class="p">)</span>
+<span class="linenos">41</span><span class="nb">print</span><span class="p">(</span><span class="n">response</span><span class="o">.</span><span class="n">choices</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">message</span><span class="o">.</span><span class="n">content</span><span class="p">)</span>
+</pre></div>
+</div>
+</section>
+
 
                 </article>
               
@@ -578,6 +559,24 @@
                 <footer class="prev-next-footer d-print-none">
                   
 <div class="prev-next-area">
+    <a class="left-prev"
+       href="openai_completion_client_for_lora.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">Openai Completion Client For Lora</p>
+      </div>
+    </a>
+    <a class="right-next"
+       href="../python-api/tensorrt_llm.layers.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">Layers</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
 </div>
                 </footer>
               
