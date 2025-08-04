@@ -19,10 +19,17 @@ from pathlib import Path
 import pytest
 from defs.common import (convert_weights, generate_summary_cmd, quantize_data,
                          venv_check_call, venv_mpi_check_call)
-from defs.conftest import skip_fp8_pre_ada
+from defs.conftest import get_sm_version, skip_fp8_pre_ada, skip_post_blackwell
 from defs.trt_test_alternative import check_call
 
+# skip trt flow cases on post-Blackwell-Ultra
+if get_sm_version() >= 103:
+    pytest.skip(
+        "TRT workflow tests are not supported on post Blackwell-Ultra architecture",
+        allow_module_level=True)
 
+
+@skip_post_blackwell
 @pytest.mark.parametrize("gemm_plugin", [True, False],
                          ids=["enable_gemm_plugin", "disable_gemm_plugin"])
 @pytest.mark.parametrize("gpt_attention_plugin", [True, False],

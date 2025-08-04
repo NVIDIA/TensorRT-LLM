@@ -24,17 +24,10 @@ from .library import (
     fuse_collectives,
     fuse_rmsnorm,
     insert_cached_attention,
-    match_attention_layout,
-    match_causal_attn_mask,
-    match_eager_attention,
-    match_grouped_attention,
     match_moe_pattern,
-    match_repeat_kv,
     match_rope_layout,
     match_rope_pattern,
     optimize_rope,
-    quantize,
-    quantize_moe,
     resize_kv_cache,
     sharding_transform_executor,
     update_in_out_nodes,
@@ -63,6 +56,12 @@ class InferenceOptimizer:
         ############################################################################################
         # RUN MODULAR INFERENCE OPTIMIZER FOR ALREADY-MIGRATED TRANSFORMS
         ############################################################################################
+        # TODO (hg): default values that are not representable in YAML.
+        if "match_attention_layout" in self.ad_config.transforms:
+            self.ad_config.transforms[
+                "match_attention_layout"
+            ].attention_op = AttentionRegistry.get(self.ad_config.attn_backend)
+
         new_optimizer = ModularInferenceOptimizer(self.factory, self.ad_config.transforms)
         egm = new_optimizer(cm)
 
@@ -71,27 +70,9 @@ class InferenceOptimizer:
         ############################################################################################
         # RUN PATTERN MATCHER TRANSFORMATIONS TO STANDARDIZE GRAPH REPRESENTATION
         ############################################################################################
-        # quantization
-        quantize(egm, self.factory.get_quant_config())
-        quantize_moe(egm, self.factory.get_quant_config())
 
         # Match MoE pattern
         match_moe_pattern(egm)
-
-        # Match repeat_kv pattern
-        match_repeat_kv(egm)
-
-        # Match eager attention pattern
-        match_eager_attention(egm)
-
-        # Match grouped attention pattern
-        match_grouped_attention(egm)
-
-        # Match and optimize causal attention masks
-        match_causal_attn_mask(egm)
-
-        # Match attention layout expected by our backend
-        match_attention_layout(egm, AttentionRegistry.get(self.ad_config.attn_backend))
 
         # Match rope
         match_rope_pattern(egm)

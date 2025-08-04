@@ -22,7 +22,7 @@ h5py==3.12.1
 StrEnum
 sentencepiece>=0.1.99
 tensorrt~=10.11.0
-# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-25-05.html#rel-25-05 uses 2.8.0a0.
+# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-25-06.html#rel-25-06 uses 2.8.0a0.
 torch>=2.7.1,<=2.8.0a0
 torchvision
 nvidia-modelopt[torch]~=0.33.0
@@ -61,3 +61,5 @@ etcd3
 blake3
 llguidance==0.7.29
 soundfile
+deep_gemm @ git+https://github.com/zongfeijing/DeepGEMM.git@a9d538ef4dff0326fe521c6ca0bfde115703b56a
+triton==3.3.1; platform_machine == "x86_64"
