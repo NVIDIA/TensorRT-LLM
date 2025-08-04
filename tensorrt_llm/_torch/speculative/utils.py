@@ -140,9 +140,7 @@ def get_spec_drafter(model_engine,
                             guided_decoder=guided_decoder)
 
     if spec_config.spec_dec_mode.is_ngram():
-        return NGramDrafter(spec_config,
-                            ngram_pool_manager=spec_resource_manager,
-                            guided_decoder=guided_decoder)
+        return NGramDrafter(spec_config, spec_resource_manager)
 
     return None
 

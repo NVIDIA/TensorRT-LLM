@@ -6,7 +6,6 @@ from ordered_set import OrderedSet
 from tensorrt_llm.llmapi import NGramDecodingConfig
 from tensorrt_llm.logger import logger
 
-from ..pyexecutor.guided_decoder import GuidedDecoder
 from ..pyexecutor.llm_request import LlmRequest, LlmRequestState
 from ..pyexecutor.resource_manager import BaseResourceManager, ResourceManager
 from ..pyexecutor.scheduler import ScheduledRequests
@@ -168,22 +167,17 @@ class NGramDrafter(Drafter):
         self,
         spec_config: NGramDecodingConfig,
         ngram_pool_manager: NGramPoolManager = None,
-        guided_decoder: Optional[GuidedDecoder] = None,
     ):
         assert ngram_pool_manager is not None, "NGram needs a resource manager to maintain the pool."
         self.spec_config = spec_config
         self.max_draft_len = spec_config.max_draft_len
         self.spec_resource_manager = ngram_pool_manager
-        self.guided_decoder = guided_decoder
 
     def prepare_draft_tokens(
         self,
         scheduled_requests: ScheduledRequests,
         resource_manager: Optional[ResourceManager] = None,
     ) -> None:
-        if self.guided_decoder is not None:
-            self.guided_decoder.rollback_rejected_tokens(scheduled_requests)
-
         # Disable NGram speculative decoding auto heuristic for batch size > 32.
         if self.spec_config.is_auto_heuristic and len(
                 scheduled_requests.all_requests()) > 32:

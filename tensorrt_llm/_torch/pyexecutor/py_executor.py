@@ -932,6 +932,9 @@ class PyExecutor:
 
                     self.resource_manager.prepare_resources(scheduled_batch)
                     if self.drafter is not None and self.use_spec_decode:
+                        if self.guided_decoder is not None:
+                            self.guided_decoder.rollback_rejected_tokens(
+                                scheduled_batch)
                         self.drafter.prepare_draft_tokens(
                             scheduled_batch, self.resource_manager)
 

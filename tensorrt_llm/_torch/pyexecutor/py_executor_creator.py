@@ -331,6 +331,10 @@ def create_py_executor(
             _ExecutorCreationStage.GUIDED_DECODER):
         guided_decoder: Optional[GuidedDecoder] = None
         if executor_config.guided_decoding_config is not None:
+            if spec_config is not None and not has_spec_drafter:
+                raise ValueError(
+                    "Guided decoding is only supported with speculative decoding that has a dedicated drafter (two-model engine)."
+                )
             if mapping.is_last_pp_rank():
                 max_num_draft_tokens = 0
                 if spec_config is not None:

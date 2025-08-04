@@ -346,9 +346,6 @@ class ModelDrafter(Drafter):
             raise ValueError("Resource manager is required")
 
         try:
-            if self.guided_decoder is not None:
-                self.guided_decoder.rollback_rejected_tokens(scheduled_requests)
-
             draft_batch = self._prepare_draft_batch(scheduled_requests)
 
             if draft_batch.batch_size == 0:
