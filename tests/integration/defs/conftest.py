@@ -2374,7 +2374,7 @@ def timeout_from_command_line(request):
 
 @pytest.fixture
 def timeout_manager(timeout_from_command_line, timeout_from_marker):
-    """Create a TimeoutManager instance with priority: command line > marker > config."""
+    """Create a TimeoutManager instance with priority: marker > cmdline > config."""
     from defs.utils.timeout_manager import TimeoutManager
 
     # Priority: marker > command line
