@@ -1,6 +1,6 @@
 # 
 
-# Deployment Guide for SGLang DeepSeekR1 FP8 and NVFP4
+# Deployment Guide for SGLang DeepSeek-R1 FP8 and NVFP4
 
 ## Introduction
 
