@@ -20,7 +20,8 @@
 namespace tensorrt_llm::common
 {
 
-std::uintptr_t constexpr kCudaMemAlign = 128;
+// CuBLAS >= 12.9.1 requires 256-byte alignment.
+std::uintptr_t constexpr kCudaMemAlign = 256;
 
 inline int8_t* alignPtr(int8_t* ptr, uintptr_t to)
 {

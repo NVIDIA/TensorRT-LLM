@@ -1,7 +1,7 @@
 
 import java.lang.InterruptedException
 
-DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.06-py3-x86_64-ubuntu24.04-trt10.11.0.33-skip-tritondevel-202507251001-5678"
+DOCKER_IMAGE = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-staging/tritondevel:x86_64-tritondevel-torch_skip-7dc2865-github-pr-6501-627"
 
 def createKubernetesPodConfig(image, arch = "amd64")
 {
