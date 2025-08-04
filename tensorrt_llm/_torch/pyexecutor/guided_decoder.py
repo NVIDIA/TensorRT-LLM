@@ -106,8 +106,7 @@ class GuidedDecoder:
                 if llm_req.py_is_draft and (matcher.is_terminated()
                                             or self.is_draft_terminated[slot]):
                     continue
-                # TODO: Fix this.
-                last_new_token = llm_req.get_tokens(0)[-1]
+                last_new_token = llm_req.get_last_tokens(0)
                 accepted = matcher.accept_token(last_new_token)
                 if not accepted:
                     if llm_req.py_is_draft:

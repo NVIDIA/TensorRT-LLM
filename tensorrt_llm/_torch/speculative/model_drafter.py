@@ -110,9 +110,7 @@ class ModelDrafter(Drafter):
     def _create_generation_request(self, request: LlmRequest,
                                    input_tokens: Any) -> LlmRequest:
         """Create a generation request when no tokens were accepted."""
-        new_request = self._create_draft_request(request, input_tokens[:-1])
-        # Explicitly add the last token so get_last_tokens() returns the right value
-        new_request.add_new_token(input_tokens[-1], 0)
+        new_request = self._create_draft_request(request, input_tokens)
         new_request.state = LlmRequestState.GENERATION_IN_PROGRESS
         return new_request
 
@@ -135,7 +133,7 @@ class ModelDrafter(Drafter):
         num_draft_tokens, num_accepted_tokens = self._initialize_draft_tokens(
             request)
         input_tokens = get_draft_model_prompt(self.spec_config.spec_dec_mode,
-                                              request.get_tokens()[0])
+                                              request.get_tokens(0))
 
         # First time seeing this request - context request
         if request.max_beam_num_tokens - 1 == request.py_prompt_len:
@@ -197,7 +195,7 @@ class ModelDrafter(Drafter):
                 # We hit this path if we're doing chunked prefill. The target model processed
                 # a prefill chunk on the last iteration. Now, we need to fill in the KV cache
                 # for the draft model too.
-                all_tokens = request.get_tokens()[0]
+                all_tokens = request.get_tokens(0)
                 input_tokens = get_draft_model_prompt(
                     self.spec_config.spec_dec_mode, all_tokens)
 

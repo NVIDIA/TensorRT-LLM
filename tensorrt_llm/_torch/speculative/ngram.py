@@ -198,7 +198,7 @@ class NGramDrafter(Drafter):
             (r.py_batch_idx is None, r.py_batch_idx or r.request_id),
         ):
             # Add new token to a copy of the generated tokens to find new draft tokens
-            prefix = list(request.get_tokens()[0])  # Get a copy
+            prefix = list(request.get_tokens(0))  # Get a copy
 
             # Generate draft tokens
             draft_tokens = self.spec_resource_manager.get_draft_tokens(
