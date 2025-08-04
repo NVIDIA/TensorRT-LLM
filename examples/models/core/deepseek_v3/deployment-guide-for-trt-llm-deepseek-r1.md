@@ -252,7 +252,7 @@ docker exec -it tensorrt_llm /bin/bash
 pip install lm_eval
 ```
 
-FP8 command for GSM8K
+FP8 command for GSM8K:
 
 * Note: The tokenizer will add BOS (beginning of sentence token) before input prompt by default which leads to accuracy regression on GSM8K task for DeepSeek R1 model. So, set add\_special\_tokens=False to avoid it.
 
@@ -262,16 +262,16 @@ MODEL_PATH=deepseek-ai/DeepSeek-R1-0528
 lm_eval --model local-completions  --tasks gsm8k --batch_size 256 --gen_kwargs temperature=0.0,add_special_tokens=False --num_fewshot 5 --model_args model=${MODEL_PATH},base_url=http://localhost:8000/v1/completions,num_concurrent=32,max_retries=20,tokenized_requests=False --log_samples --output_path trtllm.fp8.gsm8k
 ```
 
-Sample result in Blackwell. 
+Sample result in Blackwell:
 
-```
-|Tasks|Version|     Filter     |n-shot|  Metric   |   |Value |   |Stderr|
-|-----|------:|----------------|-----:|-----------|---|-----:|---|-----:|
-|gsm8k|      3|flexible-extract|     5|exact_match|↑  |0.9348|±  |0.0068|
-|     |       |strict-match    |     5|exact_match|↑  |0.8870|±  |0.0087|
+```shell
+|Tasks|Version|     Filter     |n-shot|  Metric   |   | Value |   |Stderr|
+|-----|------:|----------------|-----:|-----------|---|------:|---|-----:|
+|gsm8k|      3|flexible-extract|     5|exact_match|↑  |94.9204|±  |0.6048|
+|     |       |strict-match    |     5|exact_match|↑  |94.8446|±  |0.6091|
 ```
 
-FP4 command for GSM8K
+FP4 command for GSM8K:
 
 * Note: The tokenizer will add BOS before input prompt by default, which leads to accuracy regression on GSM8K task for DeepSeek R1 model. So set add\_special\_tokens=False to avoid it.
 
@@ -281,13 +281,13 @@ MODEL_PATH=nvidia/DeepSeek-R1-0528-FP4
 lm_eval --model local-completions  --tasks gsm8k --batch_size 256 --gen_kwargs temperature=0.0,add_special_tokens=False --num_fewshot 5 --model_args model=${MODEL_PATH},base_url=http://localhost:8000/v1/completions,num_concurrent=32,max_retries=20,tokenized_requests=False --log_samples --output_path trtllm.fp4.gsm8k
 ```
 
-Sample result in Blackwell
+Sample result in Blackwell:
 
 ```shell
-|Tasks|Version|     Filter     |n-shot|  Metric   |   |Value |   |Stderr|
-|-----|------:|----------------|-----:|-----------|---|-----:|---|-----:|
-|gsm8k|      3|flexible-extract|     5|exact_match|↑  |0.9356|±  |0.0068|
-|     |       |strict-match    |     5|exact_match|↑  |0.8393|±  |0.0101|
+|Tasks|Version|     Filter     |n-shot|  Metric   |   | Value |   |Stderr|
+|-----|------:|----------------|-----:|-----------|---|------:|---|-----:|
+|gsm8k|      3|flexible-extract|     5|exact_match|↑  |94.9204|±  |0.6048|
+|     |       |strict-match    |     5|exact_match|↑  |94.8446|±  |0.6091|
 ```
 
 ## Benchmarking Performance
