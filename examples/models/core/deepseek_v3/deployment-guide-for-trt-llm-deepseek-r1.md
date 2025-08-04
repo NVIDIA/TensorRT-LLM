@@ -95,8 +95,8 @@ trtllm-serve deepseek-ai/DeepSeek-R1 \
     --max_num_tokens 2048 \
     --max_seq_len 2048 \
     --kv_cache_free_gpu_memory_fraction 0.9 \
-    --tp_size 4 \
-    --ep_size 4 \
+    --tp_size 8 \
+    --ep_size 8 \
     --trust_remote_code \
     --extra_llm_api_options ${EXTRA_LLM_API_FILE}
 ```
