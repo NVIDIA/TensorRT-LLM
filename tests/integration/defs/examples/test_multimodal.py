@@ -18,8 +18,15 @@ import os
 import pytest
 import torch
 from defs.common import convert_weights, venv_check_call, venv_mpi_check_call
-from defs.conftest import get_device_memory, skip_post_blackwell, skip_pre_ada
+from defs.conftest import (get_device_memory, get_sm_version,
+                           skip_post_blackwell, skip_pre_ada)
 from defs.trt_test_alternative import check_call
+
+# skip trt flow cases on post-Blackwell-Ultra
+if get_sm_version() >= 103:
+    pytest.skip(
+        "TRT workflow tests are not supported on post Blackwell-Ultra architecture",
+        allow_module_level=True)
 
 
 @pytest.fixture(scope="module")
@@ -623,19 +630,19 @@ def _test_llm_multimodal_general(llm_venv,
                                           reason="Skip due to low memory")),
     'llava-onevision-qwen2-7b-ov-hf',
     'llava-onevision-qwen2-7b-ov-hf-video',
-    'nougat-base',
+    pytest.param('nougat-base', marks=skip_post_blackwell),
     'VILA1.5-3b',
     'cogvlm-chat',
     'fuyu-8b',
-    'deplot',
+    pytest.param('deplot', marks=skip_post_blackwell),
     pytest.param('neva-22b',
                  marks=pytest.mark.skip(reason="RCCA https://nvbugs/5220761")),
     'kosmos-2',
-    'video-neva',
+    pytest.param('video-neva', marks=skip_post_blackwell),
     pytest.param('Phi-3-vision-128k-instruct', marks=skip_post_blackwell),
     pytest.param('Phi-3.5-vision-instruct', marks=skip_post_blackwell),
     pytest.param('Phi-4-multimodal-instruct', marks=skip_post_blackwell),
-    'Llama-3.2-11B-Vision',
+    pytest.param('Llama-3.2-11B-Vision', marks=skip_post_blackwell),
     'Qwen2-VL-7B-Instruct',
     'internlm-xcomposer2-vl-7b',
     'Mistral-Small-3.1-24B-Instruct-2503',
@@ -688,8 +695,8 @@ def test_llm_multimodal_general(llm_venv, llm_root, llm_datasets_root,
     'Phi-3-vision-128k-instruct',
     'Phi-3.5-vision-instruct',
     'Phi-4-multimodal-instruct',
-    'Llama-3.2-11B-Vision-Instruct',
-    'Llama-3.2-11B-Vision',
+    pytest.param('Llama-3.2-11B-Vision-Instruct', marks=skip_post_blackwell),
+    pytest.param('Llama-3.2-11B-Vision', marks=skip_post_blackwell),
     'Qwen2-VL-7B-Instruct',
 ],
                          indirect=True)

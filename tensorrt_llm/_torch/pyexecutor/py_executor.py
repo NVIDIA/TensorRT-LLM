@@ -8,9 +8,10 @@ import time
 import traceback
 import weakref
 from contextlib import contextmanager
-from typing import Dict, List, Optional, Union
+from typing import List, Optional, Tuple, Union
 
 import torch
+from cuda import cudart
 
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
@@ -25,6 +26,7 @@ from tensorrt_llm.bindings.executor import (DisServingRequestStats,
 from tensorrt_llm.bindings.internal.batch_manager import (LlmRequestType,
                                                           ReqIdsSet)
 from tensorrt_llm.logger import logger
+from tensorrt_llm.runtime.generation import CUASSERT
 
 from ..distributed import Distributed
 from ..speculative.drafter import Drafter
@@ -168,7 +170,7 @@ class PyExecutor:
         self.disable_overlap_scheduler = disable_overlap_scheduler
 
         # enqueue and _fetch_new_requests used data
-        self.next_req_id = max_batch_size  # The first max_batch_size request IDs are reserved for dummy requests
+        self.active = True
         self.max_beam_width = max_beam_width
         self.max_draft_len = max_draft_len
         self.print_log = model_engine.pytorch_backend_config.print_iter_log
@@ -644,6 +646,8 @@ class PyExecutor:
     def _executor_loop_pp(self):
         logger.debug(f"Starting executor loop for pp_rank {self.dist.pp_rank}")
         torch.cuda.set_device(self.device_id)
+        # ensure the context is created, otherwise, some MPI calls will fail.
+        CUASSERT(cudart.cudaSetDevice(self.device_id))
         microbatch_id = 0
         with self._profiler() as profile_step:
             iter_start_time = time.time()
@@ -861,7 +865,10 @@ class PyExecutor:
         self._pad_attention_dp_dummy_request()
 
         if self.drafter is not None:
-            self._prepare_draft_requests(self.active_requests)
+            self.use_spec_decode = self.drafter.should_use_spec_decode(
+                self.active_requests)
+            self.model_engine.enable_spec_decode = self.use_spec_decode
+            self._prepare_draft_requests()
 
         scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
         )
@@ -894,6 +901,8 @@ class PyExecutor:
 
     def _executor_loop(self):
         torch.cuda.set_device(self.device_id)
+        # ensure the context is created, otherwise, some MPI calls will fail.
+        CUASSERT(cudart.cudaSetDevice(self.device_id))
         with self._profiler() as profile_step:
             sample_state = None
             iter_start_time = time.time()
@@ -922,7 +931,7 @@ class PyExecutor:
                         self._handle_first_token_response(scheduled_batch)
 
                     self.resource_manager.prepare_resources(scheduled_batch)
-                    if self.drafter is not None:
+                    if self.drafter is not None and self.use_spec_decode:
                         self.drafter.prepare_draft_tokens(
                             scheduled_batch, self.resource_manager)
 
@@ -962,18 +971,19 @@ class PyExecutor:
                                    iter_stats=iter_stats,
                                    iter_start_time=iter_start_time))
 
-    def _prepare_draft_requests(self, requests):
+    def _prepare_draft_requests(self):
         try:
             # Set draft tokens here to make the KV cache manager
             # and scheduler aware of them.
-            for req in requests:
+            for req in self.active_requests:
                 if req.state not in (LlmRequestState.GENERATION_IN_PROGRESS,
                                      LlmRequestState.DISAGG_GENERATION_INIT):
                     continue
+
                 req.py_last_draft_tokens = req.py_draft_tokens
                 max_draft_len = self.model_engine.spec_config.max_draft_len
 
-                if max_draft_len > 0:
+                if max_draft_len > 0 and self.use_spec_decode:
                     req.py_draft_tokens = [0] * max_draft_len
                     req.py_draft_pages_allocated = max_draft_len
                 else:
@@ -988,6 +998,8 @@ class PyExecutor:
 
     def _executor_loop_overlap(self):
         torch.cuda.set_device(self.device_id)
+        # ensure the context is created, otherwise, some MPI calls will fail.
+        CUASSERT(cudart.cudaSetDevice(self.device_id))
         if self.dist.rank == 0 and not self.is_warmup and self.benchmark_req_queues_size > 0 and self.kv_cache_transceiver:
             while self.executor_request_queue.get_request_queue_size(
             ) < self.benchmark_req_queues_size:
@@ -1409,7 +1421,7 @@ class PyExecutor:
         self.executor_request_queue.update_waiting_queue()
 
         for request in self.active_requests:
-            req_id = request.py_request_id
+            req_id = request.py_request_id if not request.is_child else request.parent_request_id
             if req_id in self.executor_request_queue.get_canceled_req_ids():
                 # Mark requests as finished, then, we reuse all existing code
                 # to clean up the KV cache resources.
@@ -1423,7 +1435,7 @@ class PyExecutor:
             self.executor_request_queue.clear_canceled_req_ids()
 
     @nvtx_range("_enqueue_responses")
-    def _enqueue_responses(self, responses: Dict[int, LlmResponse]):
+    def _enqueue_responses(self, responses: List[Tuple[int, LlmResponse]]):
         if 0 not in self.dist.mapping.tp_group and not self.gather_all_responses:
             return
 
@@ -1435,18 +1447,18 @@ class PyExecutor:
             else:
                 responses_list = self.dist.allgather(responses)
             if self.dist.rank == 0 or self.gather_all_responses:
-                gather_responses = {}
+                gather_responses = []
                 if responses_list is not None:
                     for resp in responses_list:
                         if resp is not None:
-                            gather_responses.update(resp)
+                            gather_responses.extend(resp)
                     responses = gather_responses
         logger.debug(
             f'after gather, rank = {self.dist.rank}, responses = {responses}')
 
         if self.dist.rank == 0 or self.gather_all_responses:
             with self.response_cv:
-                for req_id, resp in responses.items():
+                for req_id, resp in responses:
                     if req_id in self.responses.keys():
                         self.responses[req_id].append(resp)
                     else:
@@ -1455,20 +1467,20 @@ class PyExecutor:
 
     @nvtx_range("_handle_first_token_response")
     def _handle_first_token_response(self, scheduled_batch):
-        new_responses = {}
+        new_responses = []
         for req in scheduled_batch.generation_requests:
             if req.py_decoding_iter == 1:
                 logger.debug(
                     f'Send first token response for request {req.py_request_id}'
                 )
                 response = req.create_response(False, self.dist.rank)
-                new_responses.update({req.py_request_id: response})
+                new_responses.append((req.py_request_id, response))
 
         self._enqueue_responses(new_responses)
 
     @nvtx_range("_handle_responses")
     def _handle_responses(self):
-        new_responses = {}
+        new_responses = []
         requests_to_terminate = []
         new_active_requests = []
         logger.debug(
@@ -1502,8 +1514,8 @@ class PyExecutor:
                     request.py_decoding_iter % self.stream_interval == 0:
                 response = request.create_response(False, self.dist.rank)
                 if response:
-                    request_done = response.result.is_final
-                    new_responses.update({req_id: response})
+                    request_done = request.is_finished
+                    new_responses.append((req_id, response))
 
             if request_done:
                 if request.is_disagg_context_transmission_state:

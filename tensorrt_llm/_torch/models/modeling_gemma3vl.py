@@ -213,6 +213,7 @@ class Gemma3VLM(PreTrainedModel):
             inputs_embeds=inputs_embeds,
             return_context_logits=return_context_logits,
             image_token_mask=mm_token_mask,
+            lora_params=kwargs.get("lora_params", None),
         )
         return logits
 
