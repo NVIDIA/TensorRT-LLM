@@ -813,23 +813,7 @@ def convert_hf_qwen(hf_model,
                     dtype,
                     use_gemm_woq_plugin))
                     
-            # For Qwen3 MoE: Add standard MLP mappings for quantization compatibility
-            if qwen_type == "qwen3_moe":
-                # Follow the same pattern as other MoE models (DeepSeek V2, LLaMA/Mixtral)
-                # Only create mlp.fc and mlp.proj for quantization compatibility
-                
-                # Create standard MLP weights for quantization compatibility
-                weights.update(
-                    get_tllm_linear_weight(moe_experts_w3w1_weights, tllm_prex + 'mlp.fc.',
-                                           None, use_weight_only,
-                                           plugin_weight_only_quant_type, dtype,
-                                           use_gemm_woq_plugin))
-                                           
-                weights.update(
-                    get_tllm_linear_weight(w2.to(dtype), tllm_prex + 'mlp.proj.',
-                                           None, use_weight_only,
-                                           plugin_weight_only_quant_type, dtype,
-                                           use_gemm_woq_plugin))
+
         else:
             mlp_gate_weight = get_weight(model_params, prefix + key_list[2],
                                          dtype)
