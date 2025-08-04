@@ -113,7 +113,7 @@ def test_fp8_block_scale_gemm(dtype, m, k, n):
     "dtype",
     [torch.bfloat16],
 )
-def test_fp8_cute_dsl_block_scale_gemm(dtype, m, k, n):
+def test_cute_dsl_fp8_block_scale_gemm(dtype, m, k, n):
 
     torch.random.manual_seed(0)
     a = torch.randn((m, k), device='cuda', dtype=dtype) / k
@@ -204,7 +204,7 @@ def test_fp8_block_scale_bmm(dtype, m, k, n, num_groups):
     "dtype",
     [torch.bfloat16],
 )
-def test_fp8_cute_dsl_block_scale_bmm(dtype, m, k, n, num_groups):
+def test_cute_dsl_fp8_block_scale_bmm(dtype, m, k, n, num_groups):
 
     torch.random.manual_seed(0)
     a = torch.randn((m, num_groups, k), device='cuda', dtype=dtype) / k
