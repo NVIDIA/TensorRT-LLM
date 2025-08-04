@@ -1,3 +1,4 @@
+import json
 import os
 import subprocess
 import sys
@@ -58,8 +59,14 @@ def test_trtllm_serve_examples(exe: str, script: str,
                                server: RemoteOpenAIServer, example_root: str):
     client_script = os.path.join(example_root, script)
     # CalledProcessError will be raised if any errors occur
-    subprocess.run([exe, client_script],
-                   stdout=subprocess.PIPE,
-                   stderr=subprocess.PIPE,
-                   text=True,
-                   check=True)
+    result = subprocess.run([exe, client_script],
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            text=True,
+                            check=True)
+    if script.startswith("curl"):
+        # For curl scripts, we expect a JSON response
+        result_stdout = result.stdout.strip()
+        data = json.loads(result_stdout)
+        assert "code" not in data or data[
+            "code"] == 200, f"Unexpected response: {data}"

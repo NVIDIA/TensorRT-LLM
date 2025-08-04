@@ -1,5 +1,9 @@
 ### :title OpenAI Completion Client with JSON Schema
 
+# This example requires to specify `guided_decoding_backend` as
+# `xgrammar` or `llguidance` in the extra_llm_api_options.yaml file.
+import json
+
 from openai import OpenAI
 
 client = OpenAI(
@@ -18,7 +22,6 @@ response = client.chat.completions.create(
         "content":
         f"Give me the information of the biggest city of China in the JSON format.",
     }],
-    max_tokens=100,
     temperature=0,
     response_format={
         "type": "json",
@@ -39,4 +42,11 @@ response = client.chat.completions.create(
         }
     },
 )
-print(response.choices[0].message.content)
+
+content = response.choices[0].message.content
+try:
+    response_json = json.loads(content)
+    assert "name" in response_json and "population" in response_json
+    print(content)
+except json.JSONDecodeError:
+    print("Failed to decode JSON response")
