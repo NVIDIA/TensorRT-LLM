@@ -89,14 +89,15 @@ void DecoderState::setupBuffers(nvinfer1::DataType dtype, BufferManager const& b
 
     dOutput->lengths = bufferManager.emptyTensor(MemoryType::kGPU, nvSizeType);
 
-    // use batchSize many entries instead of the usual 1
     dOutput->finishedSum = bufferManager.emptyTensor(MemoryType::kGPU, nvSizeType);
     // we don't need dOutput->lengths because lengths are passed from outside
     dOutput->cumLogProbs = bufferManager.emptyTensor(MemoryType::kGPU, nvFloatType);
     dOutput->logProbs = bufferManager.emptyTensor(MemoryType::kGPU, nvFloatType);
     dOutput->beamHypotheses.empty(bufferManager);
+
     dOutput->finishReasons
         = bufferManager.emptyTensor(MemoryType::kGPU, TRTDataType<tk::FinishedState::UnderlyingType>::value);
+    dInput->finishReasons = dOutput->finishReasons;
 
     dOutput->logProbsTiled = bufferManager.emptyTensor(MemoryType::kGPU, nvFloatType);
 
@@ -105,8 +106,6 @@ void DecoderState::setupBuffers(nvinfer1::DataType dtype, BufferManager const& b
     dInput->badWordsPtrs = bufferManager.emptyTensor(MemoryType::kPINNEDPOOL, TRTDataType<int32_t*>::value);
     dInput->badWordsLens = bufferManager.emptyTensor(MemoryType::kPINNEDPOOL, nvSizeType);
     dInput->embeddingBias = bufferManager.emptyTensor(MemoryType::kGPU, dtype);
-
-    mFinishedSteps = bufferManager.emptyTensor(MemoryType::kGPU, TRTDataType<tk::FinishedState::UnderlyingType>::value);
 
     mBeamSearchBuffers = std::make_unique<BeamSearchBuffers>(bufferManager);
 
@@ -245,10 +244,6 @@ void DecoderState::reshapeBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWid
     auto& dOutput = *mJointDecodingOutput;
     dOutput.ids->reshape(maxTotalTokensShape);
 
-    auto const maxNewTokensShape = ITensor::makeShape({mMaxDecodingEngineTokens, mMaxBatchSize, mMaxBeamWidth});
-    mFinishedSteps->reshape(maxNewTokensShape);
-    bufferManager.setZero(*mFinishedSteps);
-
     dOutput.finishReasons->reshape(maxBatchSizeXmaxBeamWidthShape);
     bufferManager.setZero(*dOutput.finishReasons);
 
@@ -260,6 +255,7 @@ void DecoderState::reshapeBuffers(SizeType32 maxBatchSize, SizeType32 maxBeamWid
     dOutput.finishedSum->reshape(maxBatchSizeShape);
     bufferManager.setZero(*dOutput.finishedSum);
 
+    auto const maxNewTokensShape = ITensor::makeShape({mMaxDecodingEngineTokens, mMaxBatchSize, mMaxBeamWidth});
     dOutput.newTokensSteps->reshape(maxNewTokensShape);
     bufferManager.setZero(*dOutput.newTokensSteps);
 
@@ -342,8 +338,6 @@ void DecoderState::reshapeSpeculativeDecodingBuffers(SpeculativeDecodingMode con
         mMaxDecodingEngineTokens);
 
     auto const maxNewTokensShape = ITensor::makeShape({mMaxDecodingEngineTokens, mMaxBatchSize, mMaxBeamWidth});
-    mFinishedSteps->reshape(maxNewTokensShape);
-    bufferManager.setZero(*mFinishedSteps);
     dOutput.newTokensSteps->reshape(maxNewTokensShape);
     bufferManager.setZero(*dOutput.newTokensSteps);
 
@@ -454,7 +448,6 @@ void DecoderState::disableLookahead(RequestVector const& genRequests)
 
     auto const maxNewTokensShape = ITensor::makeShape({mMaxDecodingEngineTokens, mMaxBatchSize, mMaxBeamWidth});
     mJointDecodingOutput->newTokensSteps->reshape(maxNewTokensShape);
-    mFinishedSteps->reshape(maxNewTokensShape);
 
     for (auto const& llmReq : genRequests)
     {
@@ -560,11 +553,6 @@ TensorPtr DecoderState::getAcceptedLengthsCumSum() const
 TensorPtr DecoderState::getAcceptedPackedPaths() const
 {
     return mJointDecodingOutput->speculativeDecodingOutputs->pathsOffsets;
-}
-
-TensorPtr DecoderState::getFinishedSteps() const
-{
-    return mFinishedSteps;
 }
 
 SizeType32 DecoderState::getMaxBatchSize() const

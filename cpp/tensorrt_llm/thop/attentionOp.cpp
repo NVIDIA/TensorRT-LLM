@@ -528,7 +528,6 @@ void attention_inplace(torch::Tensor q, torch::optional<torch::Tensor> k, torch:
         "Expecting 2 bools for spec-dec mode, is_spec_decoding_enabled and use_spec_decoding.");
     op->mIsSpecDecodingEnabled = spec_decoding_bool_params[0]; // is_spec_decoding_enabled
     op->mUseSpecDecoding = spec_decoding_bool_params[1];       // use_spec_decoding
-    op->mMultiBlockMode = op->mIsSpecDecodingEnabled ? false : true;
 
     if (is_mla_enable)
     {
