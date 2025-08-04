@@ -49,21 +49,21 @@ class XGrammarMatcherFactory(GrammarMatcherFactory):
     def __init__(self, guided_decoding_config: GuidedDecodingConfig,
                  vocab_size_padded: int):
         super().__init__()
+        vocab_type = xgrammar.VocabType.RAW
+        add_prefix_space = False
         if guided_decoding_config.tokenizer_str is not None:
             metadata = xgrammar.TokenizerInfo._detect_metadata_from_hf(
                 guided_decoding_config.tokenizer_str)
-            tokenizer_info = xgrammar.TokenizerInfo(
-                guided_decoding_config.encoded_vocab,
-                vocab_type=metadata["vocab_type"],
-                vocab_size=vocab_size_padded,
-                stop_token_ids=guided_decoding_config.stop_token_ids,
-                add_prefix_space=metadata["add_prefix_space"])
-        else:
-            tokenizer_info = xgrammar.TokenizerInfo(
-                guided_decoding_config.encoded_vocab,
-                xgrammar.VocabType.RAW,
-                vocab_size=vocab_size_padded,
-                stop_token_ids=guided_decoding_config.stop_token_ids)
+            vocab_type = metadata["vocab_type"]
+            add_prefix_space = metadata["add_prefix_space"]
+
+        tokenizer_info = xgrammar.TokenizerInfo(
+            guided_decoding_config.encoded_vocab,
+            vocab_type=vocab_type,
+            vocab_size=vocab_size_padded,
+            stop_token_ids=guided_decoding_config.stop_token_ids,
+            add_prefix_space=add_prefix_space)
+
         # Default cache limit is 1GB.
         cache_limit_gb = float(os.getenv("XGRAMMAR_CACHE_LIMIT_GB", "1"))
         cache_limit_bytes = int(cache_limit_gb * 1024 * 1024 * 1024)

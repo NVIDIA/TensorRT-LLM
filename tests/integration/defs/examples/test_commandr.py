@@ -18,11 +18,19 @@ import os
 import pytest
 from defs.common import (convert_weights, generate_summary_cmd, venv_check_call,
                          venv_mpi_check_call)
-from defs.conftest import get_gpu_device_list
+from defs.conftest import (get_gpu_device_list, get_sm_version,
+                           skip_post_blackwell)
 from defs.trt_test_alternative import check_call
+
+# skip trt flow cases on post-Blackwell-Ultra
+if get_sm_version() >= 103:
+    pytest.skip(
+        "TRT workflow tests are not supported on post Blackwell-Ultra architecture",
+        allow_module_level=True)
 
 
 @pytest.mark.skip_less_device_memory(80000)
+@skip_post_blackwell
 @pytest.mark.parametrize("use_weight_only", [True, False],
                          ids=["enable_weight_only", "disable_weight_only"])
 def test_llm_commandr_v01_single_gpu_summary(commandr_example_root,
@@ -79,7 +87,8 @@ def test_llm_commandr_v01_single_gpu_summary(commandr_example_root,
 @pytest.mark.skip_less_device(4)
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.skip_less_host_memory(1000000)
-@pytest.mark.parametrize("use_weight_only", [True, False],
+@pytest.mark.parametrize("use_weight_only",
+                         [pytest.param(True, marks=skip_post_blackwell), False],
                          ids=["enable_weight_only", "disable_weight_only"])
 def test_llm_commandr_plus_4gpus_summary(commandr_example_root,
                                          llm_commandr_plus_model_root,

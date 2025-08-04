@@ -347,7 +347,7 @@ void CacheFormatter::format(TransferSession& session)
                     auto copyTargetSlice = runtime::ITensor::slice(preAllocSendBuffer, 0, sendSize);
                     bufferManager.copy(*copySlice, *copyTargetSlice);
                     bufferManager.getStream().synchronize();
-                    session.send(processIdx, copyTargetSlice->data(), sendSize);
+                    session.send(processIdx, copyTargetSlice->data(), copyTargetSlice->getSizeInBytes());
                     remainSendSize -= sendSize;
                 }
             }
@@ -840,6 +840,8 @@ void CacheFormatter::unformat(TransferSession& session)
     if (selfConfig.getModelConfig().mNbKvHeadsPerLayer.size() != destConfig.getModelConfig().mNbKvHeadsPerLayer.size())
     {
         TLLM_LOG_WARNING("CacheFormatter::inquireSupport: only support same number of layers");
+        TLLM_LOG_WARNING("self: %zu dest %zu", selfConfig.getModelConfig().mNbKvHeadsPerLayer.size(),
+            destConfig.getModelConfig().mNbKvHeadsPerLayer.size());
         return false;
     }
     int selfNumLayers = selfConfig.getModelConfig().mNbKvHeadsPerLayer.size();

@@ -500,6 +500,17 @@ class GenerationExecutorWorker(GenerationExecutor):
 
             if self._is_pytorch_backend and request.multimodal_params is not None:
                 if request.multimodal_params.multimodal_data is not None:
+                    # Convert back to tensor, as opposite to `to_handle` in `llm.generate_async`
+                    # for values with non-selected keys, it's no-op
+                    request.multimodal_params.to_tensor(
+                        "multimodal_data", key="multimodal_embedding")
+                    embedding = request.multimodal_params.multimodal_data.get(
+                        "multimodal_embedding")
+                    if embedding is not None and embedding.is_cuda:
+                        # make sure the embedding resides on the local device
+                        request.multimodal_params.multimodal_data[
+                            "multimodal_embedding"] = embedding.to("cuda")
+
                     executor_request.py_multimodal_data = request.multimodal_params.multimodal_data
 
             if self._is_pytorch_backend and request.sampling_params.logits_processor:
@@ -508,6 +519,10 @@ class GenerationExecutorWorker(GenerationExecutor):
                 lp = request.sampling_params.logits_processor
                 executor_request.py_logits_post_processors = lp if isinstance(
                     lp, list) else [lp]
+
+            executor_request.py_scheduling_params = None
+            if self._is_pytorch_backend and request.scheduling_params is not None:
+                executor_request.py_scheduling_params = request.scheduling_params
 
             if request.query_token_ids is not None:
                 # pytorch star attention workflow

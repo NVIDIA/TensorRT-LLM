@@ -1,7 +1,9 @@
 import io
 import json
+import logging
 import re
 import tarfile
+import warnings
 from collections import defaultdict
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -21,6 +23,40 @@ from .models.convert_utils import get_model_path, load_state_dict, split_matrix_
 
 if TYPE_CHECKING:
     from .runtime import ModelConfig
+
+NEMO_SUPPORTED_LORA_MODULES = {"attn_qkv"}
+
+logger = logging.getLogger(__name__)
+
+
+def _check_lora_in_out(
+    layer_idx: int, lora_module: str, available_matrices: Dict, source_identifier: str
+) -> None:
+    """Check that 'in' and 'out' matrices are present."""
+    missing = []
+    if "in" not in available_matrices:
+        missing.append("'in' matrix (lora_A equivalent)")
+    if "out" not in available_matrices:
+        missing.append("'out' matrix (lora_B equivalent)")
+
+    if missing:
+        raise ValueError(
+            f"Layer {layer_idx} is missing required {' and '.join(missing)} for {lora_module} "
+            f"in LoRA weights from {source_identifier}. "
+            f"LoRA adapters must contain both 'in' and 'out' matrices for all layers. "
+            f"Please check if the LoRA checkpoint is complete or was corrupted during loading."
+        )
+
+
+def _is_moe_module_weights(module_weights: Dict) -> bool:
+    """Check if module weights represent MoE (integer expert indices with nested dicts)."""
+    if not module_weights:
+        return False
+
+    # All keys should be integers (expert indices) and values should be dicts
+    return all(isinstance(k, int) for k in module_weights.keys()) and all(
+        isinstance(v, dict) for v in module_weights.values()
+    )
 
 
 def get_all_nemo_lora_weights(
@@ -203,8 +239,8 @@ class LoraConfig(DictConversion):
     max_lora_rank: int = 64
     lora_target_modules: List[str] = field(default_factory=list)
     trtllm_modules_to_hf_modules: Dict[str, str] = field(default_factory=dict)
-    max_loras: int = 4
-    max_cpu_loras: int = 4
+    max_loras: int | None = None
+    max_cpu_loras: int | None = None
 
     def __post_init__(self):
         assert self.lora_ckpt_source in ["hf", "nemo"], (
@@ -370,8 +406,7 @@ class NemoLoraLoader:
             if not path.exists():
                 raise ValueError(f"{path} does not exist")
         self.is_valid = True
-        # Hardcoded since LoraManager only supports this case now
-        self.lora_target_modules = ["attn_qkv"]
+        self.lora_target_modules = list(NEMO_SUPPORTED_LORA_MODULES)
 
     def get_target_modules(self):
         """Get target modules for NeMo LoRA.
@@ -474,11 +509,10 @@ def load_torch_nemo_lora(lora_config: LoraConfig):
             "Please specify lora_target_modules or provide lora_dir to infer lora_target_modules."
         )
 
-    supported_modules = {"attn_qkv"}
-    unsupported_modules = set(lora_config.lora_target_modules) - supported_modules
+    unsupported_modules = set(lora_config.lora_target_modules) - NEMO_SUPPORTED_LORA_MODULES
     if unsupported_modules:
         raise ValueError(
-            f"NeMo LoRA only supports {supported_modules} modules, "
+            f"NeMo LoRA only supports {NEMO_SUPPORTED_LORA_MODULES} modules, "
             f"but got unsupported modules: {unsupported_modules}. "
             f"NeMo LoRA does not support embedding, lm_head, or MLP adapters."
         )
@@ -831,11 +865,24 @@ class LoraManager(object):
                 self._lora_weights_pointers_list[uid][layer_idx] = {}
 
                 for lora_module in self.lora_target_modules:
-                    if lora_module != "attn_qkv":
+                    if lora_module not in NEMO_SUPPORTED_LORA_MODULES:
+                        warnings.warn(
+                            f"LoRA module '{lora_module}' not supported in NeMo loading for "
+                            f"layer {layer_idx}, skipping. NeMo LoRA currently only supports "
+                            f"{NEMO_SUPPORTED_LORA_MODULES} modules."
+                        )
                         self._lora_uid_to_low_ranks[uid][layer_idx][lora_module] = 0
                         continue
 
                     if lora_module == "attn_qkv":
+                        # Validate required matrices are present
+                        _check_lora_in_out(
+                            layer_idx=layer_idx,
+                            lora_module=lora_module,
+                            available_matrices=all_lora_weights[layer_idx],
+                            source_identifier=f"file {model_file}",
+                        )
+
                         t_in = all_lora_weights[layer_idx]["in"]
                         t_out = all_lora_weights[layer_idx]["out"]
                         assert t_out.shape[0] % tp_size == 0
@@ -883,6 +930,8 @@ class LoraManager(object):
             load_from_model_file(uid, model_file)
             release_gc()
 
+        if new_uids:
+            logger.info(f"Successfully loaded NeMo LoRA adapters with UIDs: {new_uids}")
         return new_uids
 
     def load_from_hf(
@@ -1022,29 +1071,45 @@ class LoraManager(object):
                 for hf_module, module_weights in layer_weights.items():
                     lora_module = hf_modules_to_trtllm_modules[hf_module]
                     if lora_module not in self.lora_target_modules:
+                        warnings.warn(
+                            f"LoRA module '{lora_module}' not in target modules {self.lora_target_modules}, skipping."
+                        )
                         self._lora_uid_to_low_ranks[uid][layer_idx][lora_module] = 0
                         continue
-                    if "in" not in module_weights:
-                        is_moe = True
-                        t_in = torch.stack(
-                            [
-                                module_weights[expert_idx]["in"]
-                                for expert_idx in sorted(module_weights.keys())
-                            ]
-                        )
-                        t_out = torch.stack(
-                            [
-                                module_weights[expert_idx]["out"]
-                                for expert_idx in sorted(module_weights.keys())
-                            ]
-                        )
+
+                    has_expert_indices = _is_moe_module_weights(module_weights)
+
+                    if has_expert_indices:  # MoE
+                        # Validate and extract matrices in one pass
+                        expert_indices = sorted(module_weights.keys())
+                        t_in_list, t_out_list = [], []
+                        for expert_idx in expert_indices:
+                            expert_weights = module_weights[expert_idx]
+                            _check_lora_in_out(
+                                layer_idx=layer_idx,
+                                lora_module=f"{lora_module}_expert_{expert_idx}",
+                                available_matrices=expert_weights,
+                                source_identifier=f"directory {model_dir}",
+                            )
+                            t_in_list.append(expert_weights["in"])
+                            t_out_list.append(expert_weights["out"])
+
+                        t_in = torch.stack(t_in_list)
+                        t_out = torch.stack(t_out_list)
                         for weights in module_weights.values():
                             if "mag" in weights:
                                 # TODO(oargov): this might work, but I had no MoE DoRA models to test
                                 raise ValueError("DoRA with MoE is not supported")
                         t_mag = None
                     else:
-                        is_moe = False
+                        # Not MoE - validate required matrices are present
+                        _check_lora_in_out(
+                            layer_idx=layer_idx,
+                            lora_module=lora_module,
+                            available_matrices=module_weights,
+                            source_identifier=f"directory {model_dir}",
+                        )
+
                         t_in = module_weights["in"]
                         t_out = module_weights["out"]
                         t_mag = module_weights.get("magnitude", None)
@@ -1062,14 +1127,14 @@ class LoraManager(object):
                         "moe_4h_to_h",
                     ]:
                         # split by row
-                        dim = 2 if is_moe else 1
+                        dim = 2 if has_expert_indices else 1
                         assert t_in.shape[dim] % tp_size == 0
                         t_in = torch.split(t_in, t_in.shape[dim] // tp_size, dim=dim)[
                             tp_rank
                         ].contiguous()
                     else:
                         # split by column
-                        dim = 1 if is_moe else 0
+                        dim = 1 if has_expert_indices else 0
                         assert t_out.shape[dim] % tp_size == 0
                         t_out = torch.split(t_out, t_out.shape[dim] // tp_size, dim=dim)[
                             tp_rank
@@ -1079,7 +1144,7 @@ class LoraManager(object):
                                 tp_rank
                             ].contiguous()
 
-                    rank_dim = 1 if is_moe else 0
+                    rank_dim = 1 if has_expert_indices else 0
                     effective_rank = t_in.shape[rank_dim]
 
                     t_in = t_in.cuda().contiguous()

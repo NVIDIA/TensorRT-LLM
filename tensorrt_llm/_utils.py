@@ -470,6 +470,10 @@ def mpi_comm():
 local_comm = mpi_comm().Split_type(split_type=OMPI_COMM_TYPE_HOST)
 
 
+def local_mpi_comm():
+    return local_comm
+
+
 def mpi_rank():
     return mpi_comm().Get_rank() if ENABLE_MULTI_DEVICE else 0
 
@@ -506,6 +510,11 @@ def default_gpus_per_node():
 def mpi_barrier():
     if ENABLE_MULTI_DEVICE:
         mpi_comm().Barrier()
+
+
+def local_mpi_barrier():
+    if ENABLE_MULTI_DEVICE:
+        local_comm.Barrier()
 
 
 def mpi_broadcast(obj, root=0):
@@ -1007,6 +1016,7 @@ class KVCacheEventSerializer:
         return {
             "event_id": event.event_id,
             "data": event_serialize_func(event.data),
+            "window_size": event.window_size
         }
 
     @staticmethod
