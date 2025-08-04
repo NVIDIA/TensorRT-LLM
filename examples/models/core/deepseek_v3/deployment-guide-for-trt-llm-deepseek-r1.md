@@ -16,8 +16,8 @@ Python3 and python3-pip (Optional, for accuracy evaluation only)
 
 ## Models
 
-* FP8 model: [DeepSeek-R1](https://huggingface.co/deepseek-ai/DeepSeek-R1)  
-* NVFP4 model: [DeepSeek-R1-FP4](https://huggingface.co/nvidia/DeepSeek-R1-FP4)
+* FP8 model: [DeepSeek-R1-0528](https://huggingface.co/deepseek-ai/DeepSeek-R1-0528)  
+* NVFP4 model: [DeepSeek-R1-0528-FP4](https://huggingface.co/nvidia/DeepSeek-R1-0528-FP4)
 
 
 Note that NVFP4 is only supported on NVIDIA Blackwell platform.
@@ -87,7 +87,7 @@ EOF
 Below is an example command to launch the TRT-LLM server with the DeepSeek-R1 model from within the container. The command is specifically configured for the 1024/1024 Input/Output Sequence Length test. The explanation of each flag is shown in the “Configs and Parameters” section.
 
 ```shell
-trtllm-serve deepseek-ai/DeepSeek-R1 \
+trtllm-serve deepseek-ai/DeepSeek-R1-0528 \
     --host 0.0.0.0 \
     --port 8000 \
     --backend pytorch \
@@ -211,7 +211,7 @@ After the TRT-LLM server is set up and shows Application startup complete, you c
 
 ```shell
 curl http://localhost:8000/v1/completions -H "Content-Type: application/json"  -d '{
-      "model": "deepseek-ai/DeepSeek-R1",
+      "model": "deepseek-ai/DeepSeek-R1-0528",
       "prompt": "Where is New York?",
       "max_tokens": 16,
       "temperature": 0
@@ -221,7 +221,7 @@ curl http://localhost:8000/v1/completions -H "Content-Type: application/json"  -
 Here is an example response, showing that the TRT-LLM server returns “New York is a state located in the northeastern United States. It is bordered by”, completing the input sequence.
 
 ```json
-{"id":"cmpl-bc1393d529ce485c961d9ffee5b25d72","object":"text_completion","created":1753843963,"model":"deepseek-ai/DeepSeek-R1","choices":[{"index":0,"text":" New York is a state located in the northeastern United States. It is bordered by","token_ids":null,"logprobs":null,"context_logits":null,"finish_reason":"length","stop_reason":null,"disaggregated_params":null}],"usage":{"prompt_tokens":6,"total_tokens":22,"completion_tokens":16},"prompt_token_ids":null}
+{"id":"cmpl-bc1393d529ce485c961d9ffee5b25d72","object":"text_completion","created":1753843963,"model":"deepseek-ai/DeepSeek-R1-0528","choices":[{"index":0,"text":" New York is a state located in the northeastern United States. It is bordered by","token_ids":null,"logprobs":null,"context_logits":null,"finish_reason":"length","stop_reason":null,"disaggregated_params":null}],"usage":{"prompt_tokens":6,"total_tokens":22,"completion_tokens":16},"prompt_token_ids":null}
 ```
 
 ### Troubleshooting Tips
@@ -249,7 +249,7 @@ FP8 command for GSM8K
 * Note: The tokenizer will add BOS (beginning of sentence token) before input prompt by default which leads to accuracy regression on GSM8K task for DeepSeek R1 model. So, set add\_special\_tokens=False to avoid it.
 
 ```
-MODEL_PATH=deepseek-ai/DeepSeek-R1
+MODEL_PATH=deepseek-ai/DeepSeek-R1-0528
 
 lm_eval --model local-completions  --tasks gsm8k --batch_size 256 --gen_kwargs temperature=0.0,add_special_tokens=False --num_fewshot 5 --model_args model=${MODEL_PATH},base_url=http://localhost:8000/v1/completions,num_concurrent=32,max_retries=20,tokenized_requests=False --log_samples --output_path trtllm.fp8.gsm8k
 ```
@@ -268,7 +268,7 @@ FP4 command for GSM8K
 * Note: The tokenizer will add BOS before input prompt by default, which leads to accuracy regression on GSM8K task for DeepSeek R1 model. So set add\_special\_tokens=False to avoid it.
 
 ```shell
-MODEL_PATH=nvidia/DeepSeek-R1-FP4
+MODEL_PATH=nvidia/DeepSeek-R1-0528-FP4
 
 lm_eval --model local-completions  --tasks gsm8k --batch_size 256 --gen_kwargs temperature=0.0,add_special_tokens=False --num_fewshot 5 --model_args model=${MODEL_PATH},base_url=http://localhost:8000/v1/completions,num_concurrent=32,max_retries=20,tokenized_requests=False --log_samples --output_path trtllm.fp4.gsm8k
 ```
@@ -297,7 +297,7 @@ result_dir=/tmp/deepseek_r1_output
 for concurrency in ${concurrency_list}; do
     num_prompts=$((concurrency * multi_round))
     python -m tensorrt_llm.serve.scripts.benchmark_serving \
-        --model deepseek-ai/DeepSeek-R1 \
+        --model deepseek-ai/DeepSeek-R1-0528 \
         --backend openai \
         --dataset-name "random" \
         --random-input-len ${isl} \
@@ -314,7 +314,7 @@ EOF
 chmod +x bench.sh
 ```
 
-To benchmark the FP4 model, replace \--model deepseek-ai/DeepSeek-R1 with \--model nvidia/DeepSeek-R1-FP4.
+To benchmark the FP4 model, replace \--model deepseek-ai/DeepSeek-R1-0528 with \--model nvidia/DeepSeek-R1-0528-FP4.
 
 If you want to save the results to a file add the following options.
 
