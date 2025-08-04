@@ -11,11 +11,10 @@ from click_option_group import (MutuallyExclusiveOptionGroup, OptionGroup,
                                 optgroup)
 from huggingface_hub import snapshot_download
 
-from tensorrt_llm.bench.benchmark import get_llm
+from tensorrt_llm.bench.benchmark import get_general_cli_options, get_llm
 from tensorrt_llm.bench.benchmark.utils.asynchronous import async_benchmark
 from tensorrt_llm.bench.benchmark.utils.general import generate_warmup_dataset
 from tensorrt_llm.bench.benchmark.utils.processes import IterationWriter
-from tensorrt_llm.bench.build.build import get_model_config
 from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
 from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
 from tensorrt_llm.bench.dataclasses.reporting import ReportUtility
@@ -23,7 +22,11 @@ from tensorrt_llm.llmapi import CapacitySchedulerPolicy
 from tensorrt_llm.models.modeling_utils import SpeculativeDecodingMode
 
 # isort: off
-from tensorrt_llm.bench.benchmark.utils.general import get_settings_from_engine, get_settings, update_sampler_args_with_extra_options, ALL_SUPPORTED_BACKENDS
+from tensorrt_llm.bench.benchmark.utils.general import (
+    get_settings_from_engine, get_settings,
+    update_sampler_args_with_extra_options,
+    ALL_SUPPORTED_BACKENDS
+)
 # isort: on
 from tensorrt_llm.bench.utils.data import (create_dataset_from_stream,
                                            initialize_tokenizer,
@@ -43,6 +46,13 @@ from tensorrt_llm.sampling_params import SamplingParams
                     resolve_path=True),
     default=None,
     help="Path to a serialized TRT-LLM engine.",
+)
+@optgroup.option(
+    "--extra_llm_api_options",
+    type=str,
+    default=None,
+    help=
+    "Path to a YAML file that overwrites the parameters specified by trtllm-bench."
 )
 @optgroup.option("--backend",
                  type=click.Choice(ALL_SUPPORTED_BACKENDS),
@@ -188,26 +198,12 @@ def latency_command(
     **params,
 ) -> None:
     """Run a latency test on a TRT-LLM engine."""
-
     logger.info("Preparing to run latency benchmark...")
     # Parameters from CLI
     # Model, experiment, and engine params
-    dataset_path: Path = params.get("dataset")
-    num_requests: int = params.get("num_requests")
-    model: str = bench_env.model
-    checkpoint_path: Path = bench_env.checkpoint_path or bench_env.model
-    engine_dir: Path = params.get("engine_dir")
-    concurrency: int = params.get("concurrency")
-    beam_width: int = params.get("beam_width")
-    warmup: int = params.get("warmup")
-    modality: str = params.get("modality")
-    max_input_len: int = params.get("max_input_len")
-    max_seq_len: int = params.get("max_seq_len")
-    backend: str = params.get("backend")
-    model_type = get_model_config(model, checkpoint_path).model_type
+    options = get_general_cli_options(params, bench_env)
 
-    # Runtime Options
-    kv_cache_percent = params.get("kv_cache_free_gpu_mem_fraction")
+    # Speculative Decode Options
     medusa_choices = params.get("medusa_choices")
 
     # Reporting Options
@@ -216,22 +212,22 @@ def latency_command(
     iteration_writer = IterationWriter(iteration_log)
 
     # Initialize the HF tokenizer for the specified model.
-    tokenizer = initialize_tokenizer(checkpoint_path)
+    tokenizer = initialize_tokenizer(options.checkpoint_path)
 
     # Dataset Loading and Preparation
-    with open(dataset_path, "r") as dataset:
+    with open(options.dataset_path, "r") as dataset:
         metadata, requests = create_dataset_from_stream(
             tokenizer,
             dataset,
-            num_requests=num_requests,
-            model_dir=checkpoint_path,
-            model_type=model_type,
-            modality=modality,
-            max_input_seq_len_for_multimodal=max_input_len)
+            num_requests=options.num_requests,
+            model_dir=options.checkpoint_path,
+            model_type=options.model_type,
+            modality=options.modality,
+            max_input_seq_len_for_multimodal=options.max_input_len)
 
-        metadata.dataset_path = dataset_path
+        metadata.dataset_path = options.dataset_path
 
-    if modality is None:
+    if options.modality is None:
         # Log dataset info
         # NOTE: This table is only accurate for non-multimodal models.
         #       The accurate table for multimodal models will be logged after the benchmark is done.
@@ -239,20 +235,20 @@ def latency_command(
 
     # Engine configuration parsing for PyTorch backend
     kwargs = {}
-    if backend and backend.lower() in ALL_SUPPORTED_BACKENDS and backend.lower(
-    ) != "tensorrt":
+    if options.backend and options.backend.lower(
+    ) in ALL_SUPPORTED_BACKENDS and options.backend.lower() != "tensorrt":
         if bench_env.checkpoint_path is None:
-            snapshot_download(model)
+            snapshot_download(options.model)
 
         exec_settings = get_settings(params, metadata, bench_env.model,
                                      bench_env.checkpoint_path)
-        kwargs_max_sql = max_seq_len or metadata.max_sequence_length
+        kwargs_max_sql = options.max_seq_len or metadata.max_sequence_length
         logger.info(f"Setting PyTorch max sequence length to {kwargs_max_sql}")
         kwargs["max_seq_len"] = kwargs_max_sql
-    elif backend.lower() == "tensorrt":
-        assert max_seq_len is None, (
+    elif options.backend.lower() == "tensorrt":
+        assert options.max_seq_len is None, (
             "max_seq_len is not a runtime parameter for C++ backend")
-        exec_settings, build_cfg = get_settings_from_engine(engine_dir)
+        exec_settings, build_cfg = get_settings_from_engine(options.engine_dir)
         engine_max_seq_len = build_cfg["max_seq_len"]
 
         if metadata.max_sequence_length > engine_max_seq_len:
@@ -263,17 +259,18 @@ def latency_command(
                 "support this dataset.")
     else:
         raise RuntimeError(
-            f"Invalid backend: {backend}, please use one of the following: "
+            f"Invalid backend: {options.backend}, please use one of the following: "
             f"{ALL_SUPPORTED_BACKENDS}")
 
-    exec_settings["model"] = model
+    exec_settings["model"] = options.model
     engine_tokens = exec_settings["settings_config"]["max_num_tokens"]
 
     # Update configuration with runtime options
-    exec_settings["settings_config"]["kv_cache_percent"] = kv_cache_percent
+    exec_settings["settings_config"][
+        "kv_cache_percent"] = options.kv_cache_percent
     exec_settings["settings_config"]["max_batch_size"] = 1
     exec_settings["settings_config"]["max_num_tokens"] = engine_tokens
-    exec_settings["settings_config"]["beam_width"] = beam_width
+    exec_settings["settings_config"]["beam_width"] = options.beam_width
     exec_settings["settings_config"]["chunking"] = False
     exec_settings["settings_config"][
         "scheduler_policy"] = CapacitySchedulerPolicy.GUARANTEED_NO_EVICT
@@ -290,6 +287,8 @@ def latency_command(
     exec_settings["performance_options"]["cuda_graphs"] = True
     exec_settings["performance_options"]["multi_block_mode"] = True
 
+    exec_settings["extra_llm_api_options"] = params.get("extra_llm_api_options")
+
     # Decoding Options
     if medusa_choices is not None:
         with open(medusa_choices, "r") as medusa_yml:
@@ -301,7 +300,7 @@ def latency_command(
 
     llm = None
     kwargs = kwargs | runtime_config.get_llm_args()
-    kwargs['backend'] = backend
+    kwargs['backend'] = options.backend
 
     try:
         logger.info("Setting up latency benchmark.")
@@ -315,9 +314,10 @@ def latency_command(
         sampler_args = {
             "end_id": eos_id,
             "pad_id": pad_id,
-            "n": beam_width,
-            "use_beam_search": beam_width > 1
+            "n": options.beam_width,
+            "use_beam_search": options.beam_width > 1
         }
+
         sampler_args = update_sampler_args_with_extra_options(
             sampler_args, params.pop("sampler_options"))
         sampling_params = SamplingParams(**sampler_args)
@@ -325,9 +325,9 @@ def latency_command(
         post_proc_params = None  # No detokenization
 
         # Perform warmup if requested.
-        if warmup > 0:
+        if options.warmup > 0:
             logger.info("Setting up for warmup...")
-            warmup_dataset = generate_warmup_dataset(requests, warmup)
+            warmup_dataset = generate_warmup_dataset(requests, options.warmup)
             logger.info("Running warmup.")
             asyncio.run(
                 async_benchmark(llm,
@@ -335,8 +335,8 @@ def latency_command(
                                 post_proc_params,
                                 warmup_dataset,
                                 False,
-                                concurrency,
-                                modality=modality))
+                                options.concurrency,
+                                modality=options.modality))
             # WAR: IterationResult is a singleton tied to the executor.
             # Since the benchmark calls asyncio.run() multiple times (e.g., during warmup),
             # we must reset it to ensure it attaches to the correct event loop.
@@ -350,13 +350,13 @@ def latency_command(
                                 post_proc_params,
                                 requests,
                                 True,
-                                concurrency,
+                                options.concurrency,
                                 iteration_writer.full_address,
-                                modality=modality))
+                                modality=options.modality))
 
-        logger.info(f"Benchmark done. Reporting results...")
+        logger.info("Benchmark done. Reporting results...")
 
-        if modality is not None:
+        if options.modality is not None:
             # For multimodal models, we need to update the metadata with the correct input lengths
             metadata = update_metadata_for_multimodal(metadata, statistics)
 

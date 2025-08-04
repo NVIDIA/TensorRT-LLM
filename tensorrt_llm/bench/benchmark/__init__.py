@@ -1,7 +1,16 @@
+from pathlib import Path
+from typing import Dict, Optional
+
+from pydantic import BaseModel, Field
+
 from tensorrt_llm import LLM as PyTorchLLM
 from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
+from tensorrt_llm.bench.benchmark.utils.processes import IterationWriter
+from tensorrt_llm.bench.build.build import get_model_config
 from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
+from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
+from tensorrt_llm.bench.utils.data import initialize_tokenizer
 from tensorrt_llm.logger import logger
 
 
@@ -48,3 +57,89 @@ def get_llm(runtime_config: RuntimeConfig, kwargs: dict):
 
     llm = llm_cls(**kwargs)
     return llm
+
+
+class GeneralExecSettings(BaseModel):
+    model_config = {
+        "extra": "ignore"
+    }  # Ignore extra fields not defined in the model
+
+    backend: str = Field(
+        default="pytorch",
+        description="The backend to use when running benchmarking")
+    beam_width: int = Field(default=1, description="Number of search beams")
+    checkpoint_path: Optional[Path] = Field(
+        default=None, description="Path to model checkpoint")
+    concurrency: int = Field(
+        default=-1, description="Desired concurrency rate, <=0 for no limit")
+    dataset_path: Optional[Path] = Field(
+        default=None,
+        alias_choices=["dataset_path", "dataset"],
+        description="Path to dataset file")
+    engine_dir: Optional[Path] = Field(
+        default=None, description="Path to a serialized TRT-LLM engine")
+    eos_id: int = Field(
+        default=-1, description="End-of-sequence token ID, -1 to disable EOS")
+    iteration_log: Optional[Path] = Field(
+        default=None, description="Path where iteration logging is written")
+    iteration_writer = Field(default=None,
+                             description="Iteration writer instance")
+    kv_cache_percent: float = Field(
+        default=0.90,
+        alias_choices=["kv_cache_percent", "kv_cache_free_gpu_mem_fraction"],
+        description="Percentage of memory for KV Cache after model load")
+    max_input_len: int = Field(default=4096,
+                               description="Maximum input sequence length")
+    max_seq_len: Optional[int] = Field(default=None,
+                                       description="Maximum sequence length")
+    modality: Optional[str] = Field(
+        default=None, description="Modality of multimodal requests")
+    model: Optional[str] = Field(default=None, description="Model name or path")
+    model_type = Field(default=None, description="Model type")
+    num_requests: int = Field(
+        default=0, description="Number of requests to cap benchmark run at")
+    output_json: Optional[Path] = Field(
+        default=None, description="Path where output should be written")
+    report_json: Optional[Path] = Field(
+        default=None, description="Path where report should be written")
+    request_json: Optional[Path] = Field(
+        default=None,
+        description="Path where per request information is written")
+    tokenizer = Field(default=None, description="Tokenizer instance")
+    warmup: int = Field(default=2,
+                        description="Number of requests to warm up benchmark")
+
+
+def get_general_cli_options(
+        params: Dict, bench_env: BenchmarkEnvironment) -> GeneralExecSettings:
+    """Get general execution settings from command line parameters.
+
+    Args:
+        params: Dictionary of command line parameters.
+        bench_env: Benchmark environment containing model and checkpoint information.
+
+    Returns:
+        An instance of GeneralExecSettings containing general execution settings.
+    """
+    # Create a copy of params to avoid modifying the original
+    settings_dict = params.copy()
+
+    # Add derived values that need to be computed from bench_env
+    checkpoint_path = bench_env.checkpoint_path or bench_env.model
+    model = bench_env.model
+    model_type = get_model_config(model, checkpoint_path).model_type
+    iteration_log = params.get("iteration_log")
+    iteration_writer = IterationWriter(iteration_log)
+    tokenizer = initialize_tokenizer(checkpoint_path)
+
+    # Override/add the computed values
+    settings_dict.update({
+        "checkpoint_path": checkpoint_path,
+        "model": model,
+        "model_type": model_type,
+        "iteration_writer": iteration_writer,
+        "tokenizer": tokenizer,
+    })
+
+    # Create and return the settings object, ignoring any extra fields
+    return GeneralExecSettings(**settings_dict)
