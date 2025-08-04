@@ -37,8 +37,6 @@ class GeneralExecSettings(BaseModel):
         default=-1, description="End-of-sequence token ID, -1 to disable EOS")
     iteration_log: Optional[Path] = Field(
         default=None, description="Path where iteration logging is written")
-    iteration_writer = Field(default=None,
-                             description="Iteration writer instance")
     kv_cache_percent: float = Field(
         default=0.90,
         alias_choices=["kv_cache_percent", "kv_cache_free_gpu_mem_fraction"],
@@ -63,6 +61,10 @@ class GeneralExecSettings(BaseModel):
     tokenizer = Field(default=None, description="Tokenizer instance")
     warmup: int = Field(default=2,
                         description="Number of requests to warm up benchmark")
+
+    @property
+    def iteration_writer(self) -> IterationWriter:
+        return IterationWriter(self.iteration_log)
 
 
 def ignore_trt_only_args(kwargs: dict, backend: str):
