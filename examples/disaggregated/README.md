@@ -12,7 +12,7 @@ cache_transceiver_config:
   max_tokens_in_buffer: <int>
 ```
 
-`backend` specifies the communication backend for transferring the kvCache, valid options include `DEFAULT`,`UCX`, `NIXL`, and `MPI`, the default backend is UCX.
+`backend` specifies the communication backend for transferring the kvCache, valid options include `default`,`ucx`, `nixl`, and `mpi`, the default backend is ucx.
 
 `max_tokens_in_buffer` defines the buffer size for kvCache transfers, it is recommended to set this value greater than or equal to the maximum ISL (Input Sequence Length) of all requests for optimal performance.
 
@@ -22,14 +22,14 @@ for disaggregated serving. For example, you could launch two context servers and
 ```bash
 # Generate context_extra-llm-api-config.yml
 # Overlap scheduler for context servers are disabled because it's not supported for disaggregated context servers yet
-echo -e "disable_overlap_scheduler: True\ncache_transceiver_config:\n  backend: UCX\n  max_tokens_in_buffer: 2048" > context_extra-llm-api-config.yml
+echo -e "disable_overlap_scheduler: True\ncache_transceiver_config:\n  backend: ucx\n  max_tokens_in_buffer: 2048" > context_extra-llm-api-config.yml
 
 # Start context servers
 CUDA_VISIBLE_DEVICES=0 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8001  --extra_llm_api_options ./context_extra-llm-api-config.yml &> log_ctx_0 &
 CUDA_VISIBLE_DEVICES=1 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8002  --extra_llm_api_options ./context_extra-llm-api-config.yml &> log_ctx_1 &
 
 # Generate gen_extra-llm-api-config.yml
-echo -e "cache_transceiver_config:\n  backend: UCX\n  max_tokens_in_buffer: 2048" > gen_extra-llm-api-config.yml
+echo -e "cache_transceiver_config:\n  backend: ucx\n  max_tokens_in_buffer: 2048" > gen_extra-llm-api-config.yml
 
 # Start generation servers
 CUDA_VISIBLE_DEVICES=2 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8003  --extra_llm_api_options ./gen_extra-llm-api-config.yml &> log_gen_0 &
@@ -159,7 +159,7 @@ context_servers:
   kv_cache_config:
     free_gpu_memory_fraction: 0.9
   cache_transceiver_config:
-    backend: UCX
+    backend: ucx
   urls:
       - "localhost:8001"
       - "localhost:8002"
@@ -168,7 +168,7 @@ generation_servers:
   tensor_parallel_size: 1
   pipeline_parallel_size: 1
   cache_transceiver_config:
-    backend: UCX
+    backend: ucx
   urls:
       - "localhost:8003"
 ```
