@@ -151,8 +151,22 @@ def make_server_with_custom_sampler_fixture(api_type: str) -> Callable:
             yaml.dump(extra_llm_api_options_dict, f)
         args.extend(['--extra_llm_api_options', str(temp_file_path)])
         args.extend(['--num_postprocess_workers', str(num_postprocess_workers)])
-        with RemoteOpenAIServer(model_path, args) as remote_server:
-            yield remote_server
+
+        try:
+            with RemoteOpenAIServer(model_path, args) as remote_server:
+                yield remote_server
+        except Exception as exc:
+            # Check if it's a torch.OutOfMemoryError (could be wrapped in RuntimeError)
+            import torch
+            if isinstance(exc, torch.OutOfMemoryError) or (
+                    hasattr(exc, '__cause__')
+                    and isinstance(exc.__cause__, torch.OutOfMemoryError)
+            ) or 'CUDA out of memory' in str(exc):
+                pytest.skip(
+                    f'Skipping test due to GPU OOM: {exc}. This is likely because multiple RemoteOpenAIServer instances are using GPU memory in parallel.'
+                )
+            else:
+                raise
 
     return server_with_custom_sampler
 
