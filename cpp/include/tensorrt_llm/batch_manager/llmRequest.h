@@ -467,6 +467,9 @@ public:
         initialize(req.getInputTokenIds(), req.getOutputConfig().returnLogProbs);
     }
 
+    GenericLlmRequest(GenericLlmRequest&& request) = default;
+    GenericLlmRequest(GenericLlmRequest const& request) = default;
+
     void setExcludeInputFromOutput(bool exclude)
     {
         mExcludeInputFromOutput = exclude;
@@ -2317,6 +2320,9 @@ public:
         mLookaheadConfig = request.getLookaheadConfig();
         mKvCacheRetentionConfig = request.getKvCacheRetentionConfig();
     }
+
+    LlmRequest(LlmRequest&& request) = default;
+    LlmRequest(LlmRequest const& request) = default;
 
     /// @brief  Create a Response from the current state of the request
     /// @details Note that there is some dependency on the order of operations in this method. Modify with care!
