@@ -265,6 +265,8 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                  kv_cache_config=kv_cache_config,
                  speculative_config=spec_config,
                  build_config=None) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
