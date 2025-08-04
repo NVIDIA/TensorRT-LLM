@@ -566,6 +566,14 @@ class BaseLLM:
                 raise ValueError(
                     f"PyTorch backend currently only supports `logprobs=1`. Received `logprobs={sampling_params.logprobs}` (Top{sampling_params.logprobs} logprobs). Please set `logprobs=1` in `sampling_params` instead."
                 )
+            # Check prompt length and query length against max_num_tokens to filter illegal requests.
+            # Skip check for gen-only requests
+            if self.args.backend == "pytorch" and not self.args.enable_chunked_prefill and not is_gen_only:
+                max_num_tokens = self.args.max_num_tokens
+                if max_num_tokens and prompt_len / self.args.parallel_config.cp_size + query_len > max_num_tokens:
+                    raise ValueError(
+                        f"The sum of prompt length ({prompt_len/self.args.parallel_config.cp_size}), query length ({query_len}) should not exceed "
+                        f"max_num_tokens ({max_num_tokens})")
             return
 
         build_config = self.args.build_config
@@ -582,7 +590,7 @@ class BaseLLM:
             (sampling_params.max_tokens or 0) > max_seq_len):
             raise ValueError(
                 f"The sum of prompt length ({prompt_len/self.args.parallel_config.cp_size}) and query length ({query_len}) max_tokens ({sampling_params.max_tokens}) should not exceed "
-                f"max_seq_len ({build_config.max_seq_len})")
+                f"max_seq_len ({max_seq_len})")
 
         if sampling_params.use_beam_search and sampling_params.best_of > build_config.max_beam_width:
             if sampling_params.n == sampling_params.best_of:

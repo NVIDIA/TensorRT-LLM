@@ -265,6 +265,8 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                  kv_cache_config=kv_cache_config,
                  speculative_config=spec_config,
                  build_config=None) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
@@ -381,6 +383,26 @@ class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm,
                           extra_evaluator_kwargs=dict(apply_chat_template=True))
 
+    @pytest.mark.skip_less_mpi_world_size(8)
+    @parametrize_with_ids("eagle3_one_model", [True, False])
+    def test_eagle3_tp8(self, eagle3_one_model):
+        model_path = f"{llm_models_root()}/llama-3.3-models/Llama-3.3-70B-Instruct"
+        eagle_model_dir = f"{llm_models_root()}/EAGLE3-LLaMA3.3-Instruct-70B"
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
+        spec_config = EagleDecodingConfig(max_draft_len=4,
+                                          speculative_model_dir=eagle_model_dir,
+                                          eagle3_one_model=eagle3_one_model)
+        pytorch_config = dict(disable_overlap_scheduler=True, )
+        with LLM(model_path,
+                 tensor_parallel_size=8,
+                 speculative_config=spec_config,
+                 kv_cache_config=kv_cache_config,
+                 **pytorch_config) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
     @pytest.mark.skip_less_device(4)
     @skip_pre_hopper
     def test_fp8_tp4(self):
@@ -467,6 +489,78 @@ class TestLlama4MaverickInstruct(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @skip_pre_hopper
+    @pytest.mark.skip_less_mpi_world_size(8)
+    @parametrize_with_ids("cuda_graph", [False, True])
+    @pytest.mark.parametrize("tp_size,pp_size,ep_size", [(8, 1, 1), (8, 1, 4),
+                                                         (8, 1, 8)],
+                             ids=["tp8", "tp8ep4", "tp8ep8"])
+    def test_fp8(self, cuda_graph, tp_size, pp_size, ep_size):
+        with LLM(
+                f"{llm_models_root()}/llama4-models/nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8",
+                tensor_parallel_size=tp_size,
+                # Keep this low to avoid warmup OOM in CI
+                max_seq_len=8192,
+                pipeline_parallel_size=pp_size,
+                moe_expert_parallel_size=ep_size,
+                use_cuda_graph=cuda_graph) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
+            assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_pre_hopper
+    @pytest.mark.skip_less_mpi_world_size(8)
+    @parametrize_with_ids("cuda_graph", [False, True])
+    @pytest.mark.parametrize("tp_size,pp_size,ep_size", [(8, 1, 8)],
+                             ids=["tp8ep8"])
+    def test_fp8_chunked_prefill(self, cuda_graph, tp_size, pp_size, ep_size):
+        with LLM(
+                f"{llm_models_root()}/llama4-models/nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8",
+                tensor_parallel_size=tp_size,
+                # Keep this low to avoid warmup OOM in CI
+                max_seq_len=8192,
+                pipeline_parallel_size=pp_size,
+                moe_expert_parallel_size=ep_size,
+                enable_chunked_prefill=True,
+                max_num_tokens=256,
+                use_cuda_graph=cuda_graph) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
+            assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_pre_hopper
+    @pytest.mark.skip_less_mpi_world_size(8)
+    @parametrize_with_ids("torch_compile", [True, False])
+    @pytest.mark.parametrize("tp_size,pp_size,ep_size", [(8, 1, 1)],
+                             ids=["tp8"])
+    def test_fp8_eagle3(self, tp_size, pp_size, ep_size, torch_compile):
+        model_path = f"{llm_models_root()}/llama4-models/nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8"
+        eagle_model_dir = f"{llm_models_root()}/Llama-4-Maverick-17B-128E-Eagle3"
+        spec_config = EagleDecodingConfig(max_draft_len=3,
+                                          speculative_model_dir=eagle_model_dir)
+        kv_cache_config = KvCacheConfig(enable_block_reuse=False,
+                                        free_gpu_memory_fraction=0.75)
+        pytorch_config = dict(
+            cuda_graph_config=CudaGraphConfig(max_batch_size=8),
+            enable_attention_dp=False,
+            torch_compile_config=TorchCompileConfig(
+                enable_fullgraph=torch_compile))
+        with LLM(model_path,
+                 kv_cache_config=kv_cache_config,
+                 tensor_parallel_size=tp_size,
+                 pipeline_parallel_size=pp_size,
+                 moe_expert_parallel_size=ep_size,
+                 **pytorch_config,
+                 speculative_config=spec_config) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
 
 class TestLlama4ScoutInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "meta-llama/Llama-4-Scout-17B-16E-Instruct"
@@ -531,6 +625,50 @@ class TestLlama4ScoutInstruct(LlmapiAccuracyTestHarness):
                 moe_expert_parallel_size=ep_size,
                 cuda_graph_config=CudaGraphConfig()
                 if cuda_graph else None) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+            assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_pre_hopper
+    @pytest.mark.skip_less_mpi_world_size(4)
+    @parametrize_with_ids("cuda_graph", [True])
+    @pytest.mark.parametrize("tp_size,pp_size,ep_size", [(4, 1, 4)],
+                             ids=["tp4ep4"])
+    def test_fp8_chunked_prefill(self, cuda_graph, tp_size, pp_size, ep_size):
+        with LLM(
+                f"{llm_models_root()}/llama4-models/Llama-4-Scout-17B-16E-Instruct-FP8",
+                tensor_parallel_size=tp_size,
+                max_seq_len=22000,
+                pipeline_parallel_size=pp_size,
+                moe_expert_parallel_size=ep_size,
+                enable_chunked_prefill=True,
+                max_num_tokens=256,
+                use_cuda_graph=cuda_graph) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
+            assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_mpi_world_size(8)
+    @parametrize_with_ids("cuda_graph", [True])
+    @pytest.mark.parametrize("tp_size,pp_size,ep_size", [(4, 1, 4)],
+                             ids=["tp4ep4"])
+    def test_fp4_chunked_prefill(self, cuda_graph, tp_size, pp_size, ep_size):
+        with LLM(
+                f"{llm_models_root()}/llama4-models/Llama-4-Scout-17B-16E-Instruct-FP4",
+                tensor_parallel_size=tp_size,
+                pipeline_parallel_size=pp_size,
+                moe_expert_parallel_size=ep_size,
+                max_seq_len=22000,
+                enable_chunked_prefill=True,
+                max_num_tokens=256,
+                use_cuda_graph=cuda_graph) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
             assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
             task = MMLU(self.MODEL_NAME)
@@ -1817,7 +1955,9 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
-    def test_eagle3(self):
+    @parametrize_with_ids("eagle3_one_model", [True, False])
+    @parametrize_with_ids("enable_chunked_prefill", [False, True])
+    def test_eagle3(self, enable_chunked_prefill, eagle3_one_model):
         pytorch_config = dict(
             disable_overlap_scheduler=True,
             cuda_graph_config=CudaGraphConfig(batch_sizes=[1]),
@@ -1829,11 +1969,13 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
 
         draft_len = 4
         spec_config = EagleDecodingConfig(max_draft_len=draft_len,
-                                          speculative_model_dir=eagle_model_dir)
+                                          speculative_model_dir=eagle_model_dir,
+                                          eagle3_one_model=eagle3_one_model)
 
         llm = LLM(model=target_model_dir,
                   **pytorch_config,
                   kv_cache_config=kv_cache_config,
+                  enable_chunked_prefill=enable_chunked_prefill,
                   speculative_config=spec_config,
                   build_config=None)
 
@@ -2154,4 +2296,20 @@ class TestPhi4MM(LlmapiAccuracyTestHarness):
             task = MMLU(model_name)
             task.evaluate(llm)
             task = GSM8K(model_name)
+            task.evaluate(llm)
+
+
+class TestEXAONE4(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "LGAI-EXAONE/EXAONE-4.0-32B"
+    kv_cache_config = KvCacheConfig(
+        enable_block_reuse=False,
+        enable_partial_reuse=False,
+        max_attention_window=[4096, 4096, 4096, 131072])
+
+    def test_auto_dtype(self):
+        model_path = f"{llm_models_root()}/EXAONE-4.0-32B"
+        with LLM(model_path, kv_cache_config=self.kv_cache_config) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)

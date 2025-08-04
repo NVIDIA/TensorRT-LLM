@@ -36,6 +36,8 @@ def get_test_config(test_desc, example_dir, test_root):
     """Get test configuration based on test description."""
     test_configs_root = f"{test_root}/test_configs"
     config_map = {
+        "2_ranks_diff_max_tokens":
+        (2, f"{test_configs_root}/disagg_config_diff_max_tokens.yaml"),
         "2_ranks": (2, f"{example_dir}/disagg_config.yaml"),
         "2_ranks_trt_backend":
         (2, f"{test_configs_root}/disagg_config_trt_backend.yaml"),
@@ -144,7 +146,8 @@ def run_disaggregated_test(example_dir,
                            test_desc,
                            num_iters=5,
                            env=None,
-                           cwd=None):
+                           cwd=None,
+                           prompt_file="prompts.json"):
     """Run disaggregated test with given configuration."""
     cleanup_output_files()
     run_env = env.copy()
@@ -185,10 +188,13 @@ def run_disaggregated_test(example_dir,
                 client_cmd = [
                     'python3', f'{client_dir}/disagg_client.py', '-c',
                     f'{example_dir}/disagg_config.yaml', '-p',
-                    f'{client_dir}/prompts.json', '--ignore-eos',
+                    f'{client_dir}/{prompt_file}', '--ignore-eos',
                     '--server-start-timeout',
                     str(server_start_timeout)
                 ]
+                if prompt_file == "long_prompts.json":
+                    # Use max_tokens 4 for long prompts to reduce test time
+                    client_cmd.extend(['--max-tokens', '4'])
                 check_call(client_cmd,
                            env=env,
                            poll_procs=[workers_proc, server_proc])
@@ -216,6 +222,10 @@ def run_disaggregated_test(example_dir,
                     check_call(streaming_chat_client_cmd,
                                env=env,
                                poll_procs=[workers_proc, server_proc])
+
+                # Skip output verification for long prompts test
+                if prompt_file == "long_prompts.json":
+                    continue
 
                 # Verify outputs
                 not_expected_strings = ["Berlin Berlin"]
@@ -267,6 +277,27 @@ def run_disaggregated_test(example_dir,
         workers_proc.terminate()
         server_proc.wait()
         workers_proc.wait()
+
+
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+def test_disaggregated_diff_max_tokens(disaggregated_test_root,
+                                       disaggregated_example_root, llm_venv,
+                                       llama_model_root):
+    src_dst_dict = {
+        llama_model_root:
+        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+    run_disaggregated_test(disaggregated_example_root,
+                           "2_ranks_diff_max_tokens",
+                           env=llm_venv._new_env,
+                           cwd=llm_venv.get_working_directory(),
+                           prompt_file="long_prompts.json")
 
 
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
