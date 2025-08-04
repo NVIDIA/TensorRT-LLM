@@ -233,10 +233,10 @@ from tensorrt_llm.sampling_params import SamplingParams
     help="Path where per request information is written to.",
 )
 @optgroup.option(
-    "--enable_chunked_context",
-    is_flag=True,
-    default=False,
-    help="Enable chunking in prefill stage for enhanced throughput benchmark.",
+    "--enable_chunked_context/--disable_chunked_context",
+    default=True,
+    help=
+    "Enable/disable chunking in prefill stage for enhanced throughput benchmark. "
 )
 @optgroup.option(
     "--scheduler_policy",
