@@ -357,7 +357,6 @@ accuracy_dict = {
 def test_attention_mla(scenario: Scenario, context_sequence_lengths: List[int],
                        generation_seq_len_q: int,
                        num_generation_steps: List[int]):
-    pytest.skip("broken on main")
     """Test MLA computation for both context and generation phases"""
     num_heads = scenario.num_heads
     num_kv_heads = scenario.num_kv_heads
