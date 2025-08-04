@@ -70,9 +70,9 @@ def test_fp8_block_scale_gemm(dtype, m, k, n):
 
 
 @pytest.mark.skipif(
-    getSMVersion() != 90 and getSMVersion() != 89,
-    reason="The test is for Hopper and Ada only. Current SM is %d." %
-    getSMVersion(),
+    getSMVersion() != 90 and getSMVersion() != 89 and getSMVersion() != 100,
+    reason="The test is for Hopper and Ada and Blackwell only. Current SM is %d."
+    % getSMVersion(),
 )
 @pytest.mark.parametrize(
     "k, n",
@@ -110,9 +110,12 @@ def test_fp8_block_scale_bmm(dtype, m, k, n, num_groups):
     output = torch.empty((num_groups, m, n),
                          device='cuda',
                          dtype=torch.bfloat16)
-
-    torch.ops.trtllm.fp8_block_scaling_bmm_out(a_fp8, b_fp8, a_scales, b_scales,
-                                               output)
+    if getSMVersion() == 100:
+        torch.ops.trtllm.cute_dsl_fp8_bmm_blackwell(a_fp8, b_fp8, a_scales,
+                                                    b_scales, output)
+    else:
+        torch.ops.trtllm.fp8_block_scaling_bmm_out(a_fp8, b_fp8, a_scales,
+                                                   b_scales, output)
     diff = calc_diff(output, output_expected)
     assert diff < 1e-3
     torch.testing.assert_close(output, output_expected, atol=1e-3, rtol=1e-3)
