@@ -151,12 +151,28 @@ public:
 
     void send(size_t idx, void const* data, size_t size)
     {
-        mConnections.at(idx)->send(mDataContext, data, size);
+        try
+        {
+            mConnections.at(idx)->send(mDataContext, data, size);
+        }
+        catch (std::exception const& e)
+        {
+            throw common::RequestSpecificException(
+                __FILE__, __LINE__, e.what(), common::kUNKNOWN_REQUEST_ID, common::RequestErrorCode::kNETWORK_ERROR);
+        }
     }
 
     void recv(size_t idx, void* data, size_t size)
     {
-        mConnections.at(idx)->recv(mDataContext, data, size);
+        try
+        {
+            mConnections.at(idx)->recv(mDataContext, data, size);
+        }
+        catch (std::exception const& e)
+        {
+            throw common::RequestSpecificException(
+                __FILE__, __LINE__, e.what(), common::kUNKNOWN_REQUEST_ID, common::RequestErrorCode::kNETWORK_ERROR);
+        }
     }
 
     [[nodiscard]] LlmRequest const& getLlmRequest() const
