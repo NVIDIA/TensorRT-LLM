@@ -371,6 +371,10 @@ def throughput_command(
     exec_settings["extra_llm_api_options"] = params.pop("extra_llm_api_options")
     exec_settings["iteration_log"] = iteration_log
 
+    if exec_backend := exec_settings.get("backend", None):
+        if isinstance(exec_backend, BackendType):
+            exec_settings["backend"] = exec_backend.canonical_value
+
     # Construct the runtime configuration dataclass.
     runtime_config = RuntimeConfig(**exec_settings)
     llm = None

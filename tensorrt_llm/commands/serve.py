@@ -158,7 +158,12 @@ def launch_server(host: str,
                   metadata_server_cfg: Optional[MetadataServerConfig] = None,
                   server_role: Optional[ServerRole] = None):
 
-    backend = llm_args["backend"]
+    if backend := llm_args.get("backend", None):
+        if isinstance(backend, BackendType):
+            llm_args["backend"] = backend.canonical_value
+    else:
+        backend = BackendType.get_default_backend_with_warning(backend)
+
     model = llm_args["model"]
 
     if backend == BackendType.PYTORCH:
