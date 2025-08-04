@@ -486,7 +486,7 @@ class GenerationExecutorWorker(GenerationExecutor):
                 lora_config=lora_config,
                 prompt_tuning_config=prompt_tuning_config,
                 multimodal_input=multimodal_input,
-                #NOTE: `multimodal_embedding` and `mrope_config` will be in MultimodalParams.multimodal_data. And this will be handled below by `py_multimodal_data`.
+                # NOTE: `multimodal_embedding` and `mrope_config` will be in MultimodalParams.multimodal_data. And this will be handled below by `py_multimodal_data`.
                 multimodal_embedding=None,
                 mrope_config=None,
                 logits_post_processor_name=(
@@ -502,6 +502,7 @@ class GenerationExecutorWorker(GenerationExecutor):
 
             if self._is_pytorch_backend and request.multimodal_params is not None:
                 if request.multimodal_params.multimodal_data is not None:
+                    # NOTE: Deserialize SharedTensor handle to actual tensor
                     request.multimodal_params.to_tensor("multimodal_data")
                     executor_request.py_multimodal_data = request.multimodal_params.multimodal_data
 
