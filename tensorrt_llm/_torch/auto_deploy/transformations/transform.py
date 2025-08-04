@@ -19,15 +19,11 @@ from .library import (
     detect_column_row_shard,
     detect_dp_bmm_shard,
     detect_ep_shard,
-    eliminate_redundant_transposes,
     fuse_allreduce_residual_rmsnorm,
     fuse_collectives,
     fuse_rmsnorm,
     insert_cached_attention,
     match_moe_pattern,
-    match_rope_layout,
-    match_rope_pattern,
-    optimize_rope,
     resize_kv_cache,
     sharding_transform_executor,
     update_in_out_nodes,
@@ -61,6 +57,10 @@ class InferenceOptimizer:
             self.ad_config.transforms[
                 "match_attention_layout"
             ].attention_op = AttentionRegistry.get(self.ad_config.attn_backend)
+        if "match_rope_layout" in self.ad_config.transforms:
+            self.ad_config.transforms["match_rope_layout"].expected_layout = AttentionRegistry.get(
+                self.ad_config.attn_backend
+            ).get_attention_layout()
 
         new_optimizer = ModularInferenceOptimizer(self.factory, self.ad_config.transforms)
         egm = new_optimizer(cm)
@@ -74,26 +74,11 @@ class InferenceOptimizer:
         # Match MoE pattern
         match_moe_pattern(egm)
 
-        # Match rope
-        match_rope_pattern(egm)
-
-        # Match RoPE layout expected by our backend
-        match_rope_layout(
-            egm, AttentionRegistry.get(self.ad_config.attn_backend).get_attention_layout()
-        )
-
         ############################################################################################
         # RUN TRANSFORMATIONS ON STANDARDIZED GRAPH REPRESENTATION
         ############################################################################################
 
         local_rank, world_size = dist_ad.get_rank_world_size()
-
-        # eliminate redundant transpose operations
-        eliminate_redundant_transposes(egm)
-
-        # TODO (lucaslie): let's move this to perf optimization once TP sharding is improved
-        # see https://github.com/NVIDIA/TensorRT-LLM/pull/3668#discussion_r2052714528
-        optimize_rope(egm)
 
         # TODO: Infer sharding parameters (tp_size, row/column sharding) from the model config.
         sharding_config = ShardingConfig()
