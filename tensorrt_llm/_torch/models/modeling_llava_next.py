@@ -72,8 +72,6 @@ class LlavaNextInputProcessor(InputProcessor):
             return_tensors="pt")
         # Postprocess
         fused_input_ids = processed_values['input_ids'][0]
-        if not mm_data:
-            return fused_input_ids.to(torch.int32).tolist(), {}
         fused_input_ids[fused_input_ids ==
                         self.image_token_index] = self.vocab_size + 1
 
@@ -87,10 +85,11 @@ class LlavaNextInputProcessor(InputProcessor):
         }
 
 
-class LlavaNextVisionModel:
+class LlavaNextVisionModel(nn.Module):
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args,
                  **kwargs) -> None:
+        super().__init__()
         self.pretrained_config = model_config.pretrained_config
         self.device = f"cuda:{model_config.mapping.rank}"
         model_path = self.pretrained_config._name_or_path
