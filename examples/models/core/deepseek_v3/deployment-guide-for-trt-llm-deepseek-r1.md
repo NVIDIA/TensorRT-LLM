@@ -59,9 +59,13 @@ cat << EOF > ${EXTRA_LLM_API_FILE}
 enable_attention_dp: true
 cuda_graph_config:
   enable_padding: true
-  max_batch_size: 1024
+  max_batch_size: 128
 kv_cache_config:
   dtype: fp8
+stream_interval: 10
+speculative_config:
+  decoding_type: MTP
+  num_nextn_predict_layers: 3
 EOF
 ```
 
@@ -77,6 +81,10 @@ cuda_graph_config:
   max_batch_size: 1024
 kv_cache_config:
   dtype: fp8
+stream_interval: 10
+speculative_config:
+  decoding_type: MTP
+  num_nextn_predict_layers: 3
 moe_config:
   backend: DEEPGEMM
 EOF
@@ -92,9 +100,9 @@ trtllm-serve deepseek-ai/DeepSeek-R1-0528 \
     --port 8000 \
     --backend pytorch \
     --max_batch_size 1024 \
-    --max_num_tokens 2048 \
+    --max_num_tokens 5248 \
     --max_seq_len 2048 \
-    --kv_cache_free_gpu_memory_fraction 0.9 \
+    --kv_cache_free_gpu_memory_fraction 0.8 \
     --tp_size 8 \
     --ep_size 8 \
     --trust_remote_code \
@@ -288,7 +296,7 @@ To benchmark the performance of your TensorRT-LLM server you can leverage the bu
 
 ```shell
 cat <<EOF >  bench.sh
-concurrency_list="1 2 4 8 16 32 64 128 256"
+concurrency_list="32 64 128 256 512 1024 2048 4096"
 multi_round=5
 isl=1024
 osl=1024
