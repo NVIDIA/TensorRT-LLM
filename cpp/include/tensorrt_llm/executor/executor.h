@@ -1702,6 +1702,12 @@ struct KVCacheUpdatedData
     explicit KVCacheUpdatedData(IdType blockHash)
         : blockHash{blockHash} {};
 
+    explicit KVCacheUpdatedData(IdType blockHash, std::optional<KVCacheEventDiff<SizeType32>> cacheLevel,
+        std::optional<KVCacheEventDiff<SizeType32>> priority)
+        : blockHash{blockHash}
+        , cacheLevel{cacheLevel}
+        , priority{priority} {};
+
     KVCacheUpdatedData& cacheLevelUpdated(SizeType32 oldValue, SizeType32 newValue)
     {
         cacheLevel = KVCacheEventDiff<SizeType32>{oldValue, newValue};
