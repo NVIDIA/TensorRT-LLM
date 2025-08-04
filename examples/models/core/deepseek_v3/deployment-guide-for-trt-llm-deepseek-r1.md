@@ -65,7 +65,7 @@ kv_cache_config:
 stream_interval: 10
 speculative_config:
   decoding_type: MTP
-  num_nextn_predict_layers: 3
+  num_nextn_predict_layers: 1
 EOF
 ```
 
@@ -84,7 +84,7 @@ kv_cache_config:
 stream_interval: 10
 speculative_config:
   decoding_type: MTP
-  num_nextn_predict_layers: 3
+  num_nextn_predict_layers: 1
 moe_config:
   backend: DEEPGEMM
 EOF
@@ -100,7 +100,7 @@ trtllm-serve deepseek-ai/DeepSeek-R1-0528 \
     --port 8000 \
     --backend pytorch \
     --max_batch_size 1024 \
-    --max_num_tokens 5248 \
+    --max_num_tokens 3200 \
     --max_seq_len 2048 \
     --kv_cache_free_gpu_memory_fraction 0.8 \
     --tp_size 8 \
@@ -126,7 +126,7 @@ These options are used directly on the command line when you start the `trtllm-s
 
 &emsp;**Description:** A value between 0.0 and 1.0 that specifies the fraction of free GPU memory to reserve for the KV cache after the model is loaded. Since memory usage can fluctuate, this buffer helps prevent out-of-memory (OOM) errors.
 
-&emsp;**Recommendation:** If you experience OOM errors, try reducing this value to **0.8** or lower.
+&emsp;**Recommendation:** If you experience OOM errors, try reducing this value to **0.7** or lower.
 
 #### `--backend pytorch`
 
@@ -199,7 +199,7 @@ These options provide finer control over performance and are set within a YAML f
 
 &emsp;**Default**: TRTLLM
 
-See the [https://github.com/nvidia/TensorRT-LLM/blob/main/tensorrt\_llm/llmapi/llm\_args.py\#L1894](https://github.com/nvidia/TensorRT-LLM/blob/main/tensorrt_llm/llmapi/llm_args.py#L1894) TorchLlmArgs class for the full list of options which can be used in the extra\_llm\_api\_options`.`
+See the [TorchLlmArgs class](https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs) for the full list of options which can be used in the extra\_llm\_api\_options`.`
 
 ## Testing API Endpoint
 
@@ -229,7 +229,7 @@ curl http://localhost:8000/v1/completions -H "Content-Type: application/json"  -
 Here is an example response, showing that the TRT-LLM server returns “New York is a state located in the northeastern United States. It is bordered by”, completing the input sequence.
 
 ```json
-{"id":"cmpl-bc1393d529ce485c961d9ffee5b25d72","object":"text_completion","created":1753843963,"model":"deepseek-ai/DeepSeek-R1-0528","choices":[{"index":0,"text":" New York is a state located in the northeastern United States. It is bordered by","token_ids":null,"logprobs":null,"context_logits":null,"finish_reason":"length","stop_reason":null,"disaggregated_params":null}],"usage":{"prompt_tokens":6,"total_tokens":22,"completion_tokens":16},"prompt_token_ids":null}
+{"id":"cmpl-e728f08114c042309efeae4df86a50ca","object":"text_completion","created":1754294810,"model":"deepseek-ai/DeepSeek-R1-0528","choices":[{"index":0,"text":" / by Megan Stine ; illustrated by John Hinderliter.\n\nBook | Gross","token_ids":null,"logprobs":null,"context_logits":null,"finish_reason":"length","stop_reason":null,"disaggregated_params":null}],"usage":{"prompt_tokens":6,"total_tokens":22,"completion_tokens":16},"prompt_token_ids":null}
 ```
 
 ### Troubleshooting Tips
