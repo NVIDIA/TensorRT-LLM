@@ -133,12 +133,15 @@ def make_server_with_custom_sampler_fixture(api_type: str) -> Callable:
     '''
 
     @pytest.fixture(scope='function')
-    def server_with_custom_sampler(model_name: str, request: Any,
+    def server_with_custom_sampler(model_name: str, request: Any, backend: str,
                                    tmp_path: Path) -> RemoteOpenAIServer:
-        '''Fixture to launch a server with a custom sampler configuration.'''
+        '''Fixture to launch a server (pytorch backend only) with a custom sampler configuration.'''
         use_trtllm_sampler = getattr(request, 'param',
                                      {}).get('use_trtllm_sampler', True)
-        backend = 'pytorch'
+        if backend != 'pytorch':
+            pytest.skip(
+                f"Server with custom sampler is only supported for pytorch backend, skipping for {backend}"
+            )
         model_path = get_model_path(model_name)
         args = ['--backend', backend]
         temp_file_path = tmp_path / f'test_sampler_config_{request.node.name}.yaml'
