@@ -87,10 +87,6 @@ public:
         SizeType32 maxSequenceLength, OptionalRef<MedusaBuffers const> medusaBuffers) const;
 
 private:
-    [[nodiscard]] std::shared_ptr<runtime::ITensor> retrieveDraftLogits(runtime::ModelConfig const& modelConfig,
-        runtime::WorldConfig const& worldConfig, std::shared_ptr<runtime::ITensor> const& tensor,
-        runtime::BufferManager const& bufferManager) const;
-
     bool mSpeculativeDecodingFastLogits;
     bool mIsLeaderInOrchMode;
     bool mIsNormalizeLogProbs;

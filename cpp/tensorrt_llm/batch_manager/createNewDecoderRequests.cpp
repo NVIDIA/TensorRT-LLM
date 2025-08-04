@@ -322,6 +322,50 @@ void initializeOutputs(DecodingOutput& dJointOutput, SizeType32 batchSlot, SizeT
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
+std::shared_ptr<runtime::ITensor> retrieveDraftLogits(ModelConfig const& modelConfig, WorldConfig const& worldConfig,
+    std::shared_ptr<runtime::ITensor> const& tensor, BufferManager const& bufferManager,
+    bool speculativeDecodingFastLogits, bool isLeaderInOrchMode)
+{
+    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
+
+    if (!speculativeDecodingFastLogits)
+    {
+        TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+        return bufferManager.copyFrom(*tensor, MemoryType::kPINNEDPOOL);
+    }
+
+    if (isLeaderInOrchMode)
+    {
+        te::SpeculativeDecodingFastLogitsInfo fastLogitsInfo;
+        std::memcpy(&fastLogitsInfo, tensor->data(), sizeof(fastLogitsInfo));
+        auto logits = utils::targetModelReceiveLogits(fastLogitsInfo, modelConfig).value();
+
+        // Broadcast to other ranks if needed
+        if (worldConfig.isTensorParallel())
+        {
+            auto const& commSession = COMM_SESSION;
+            auto shape = logits->getShape();
+            commSession.bcastValue(shape.d[0], 0);
+            commSession.bcastValue(shape.d[1], 0);
+            commSession.bcast(logits->data(), logits->getSizeInBytes(), mpi::MpiType::kUINT8, 0);
+        }
+        TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+        return logits;
+    }
+
+    // Get logits from leader rank
+    auto const& commSession = COMM_SESSION;
+    int64_t dims[2];
+    commSession.bcastValue(dims[0], 0);
+    commSession.bcastValue(dims[1], 0);
+    auto const logitsDtype = modelConfig.getLogitsDtype();
+    auto logits = tensorrt_llm::runtime::BufferManager::pinnedPool(ITensor::makeShape({dims[0], dims[1]}), logitsDtype);
+    commSession.bcast(logits->data(), logits->getSizeInBytes(), mpi::MpiType::kUINT8, 0);
+
+    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
+    return logits;
+};
+
 //! @brief Setups decoder internal tensors for new request in Draft model Sps mode
 void newRequestDraftTokensExternal(SizeType32 batchIdx, runtime::decoder_batch::Request const& request,
     SamplingConfig const& samplingConfig, DecodingInput& jointDecodingInput, CudaStream const& decoderStream)
@@ -662,8 +706,8 @@ CreateNewDecoderRequests::createDecoderRequests(RequestVector const& finishedCon
                 auto const& draftLogits = llmReq->getDraftLogits();
                 if (draftLogits.has_value())
                 {
-                    decoderRequest.draftLogits
-                        = retrieveDraftLogits(modelConfig, worldConfig, draftLogits.value(), decoderBufferManager);
+                    decoderRequest.draftLogits = retrieveDraftLogits(modelConfig, worldConfig, draftLogits.value(),
+                        decoderBufferManager, mSpeculativeDecodingFastLogits, mIsLeaderInOrchMode);
                 }
             }
 
@@ -700,49 +744,5 @@ CreateNewDecoderRequests::createDecoderRequests(RequestVector const& finishedCon
 
     return {std::move(lookaheadPrompt), std::move(lookaheadAlgoConfigs)};
 }
-
-std::shared_ptr<runtime::ITensor> CreateNewDecoderRequests::retrieveDraftLogits(ModelConfig const& modelConfig,
-    WorldConfig const& worldConfig, std::shared_ptr<runtime::ITensor> const& tensor,
-    BufferManager const& bufferManager) const
-{
-    TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-
-    if (!mSpeculativeDecodingFastLogits)
-    {
-        TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-        return bufferManager.copyFrom(*tensor, MemoryType::kPINNEDPOOL);
-    }
-
-    if (mIsLeaderInOrchMode)
-    {
-        te::SpeculativeDecodingFastLogitsInfo fastLogitsInfo;
-        std::memcpy(&fastLogitsInfo, tensor->data(), sizeof(fastLogitsInfo));
-        auto logits = utils::targetModelReceiveLogits(fastLogitsInfo, modelConfig).value();
-
-        // Broadcast to other ranks if needed
-        if (worldConfig.isTensorParallel())
-        {
-            auto const& commSession = COMM_SESSION;
-            auto shape = logits->getShape();
-            commSession.bcastValue(shape.d[0], 0);
-            commSession.bcastValue(shape.d[1], 0);
-            commSession.bcast(logits->data(), logits->getSizeInBytes(), mpi::MpiType::kUINT8, 0);
-        }
-        TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-        return logits;
-    }
-
-    // Get logits from leader rank
-    auto const& commSession = COMM_SESSION;
-    int64_t dims[2];
-    commSession.bcastValue(dims[0], 0);
-    commSession.bcastValue(dims[1], 0);
-    auto const logitsDtype = modelConfig.getLogitsDtype();
-    auto logits = tensorrt_llm::runtime::BufferManager::pinnedPool(ITensor::makeShape({dims[0], dims[1]}), logitsDtype);
-    commSession.bcast(logits->data(), logits->getSizeInBytes(), mpi::MpiType::kUINT8, 0);
-
-    TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
-    return logits;
-};
 
 } // namespace tensorrt_llm::batch_manager
