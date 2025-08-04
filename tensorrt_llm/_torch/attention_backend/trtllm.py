@@ -724,7 +724,10 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         return buffers
 
     def __post_init_with_buffers__(self, buffers) -> None:
-        super().__post_init__()
+        if buffers is None or not isinstance(buffers, dict):
+            super().__post_init__()
+            return
+
         # Set a default value, as max_num_sequences is not always set.
         if self.max_num_sequences is None:
             self.max_num_sequences = self.max_num_requests
