@@ -78,7 +78,7 @@ cat << EOF > ${EXTRA_LLM_API_FILE}
 enable_attention_dp: true
 cuda_graph_config:
   enable_padding: true
-  max_batch_size: 1024
+  max_batch_size: 128
 kv_cache_config:
   dtype: fp8
 stream_interval: 10
