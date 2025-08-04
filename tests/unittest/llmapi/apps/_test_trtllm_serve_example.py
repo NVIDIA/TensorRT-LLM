@@ -1,8 +1,10 @@
 import os
 import subprocess
 import sys
+import tempfile
 
 import pytest
+import yaml
 
 from .openai_server import RemoteOpenAIServer
 
@@ -16,10 +18,26 @@ def model_name():
 
 
 @pytest.fixture(scope="module")
-def server(model_name: str):
+def temp_extra_llm_api_options_file():
+    temp_dir = tempfile.gettempdir()
+    temp_file_path = os.path.join(temp_dir, "extra_llm_api_options.yaml")
+    try:
+        extra_llm_api_options_dict = {"guided_decoding_backend": "xgrammar"}
+        with open(temp_file_path, 'w') as f:
+            yaml.dump(extra_llm_api_options_dict, f)
+
+        yield temp_file_path
+    finally:
+        if os.path.exists(temp_file_path):
+            os.remove(temp_file_path)
+
+
+@pytest.fixture(scope="module")
+def server(model_name: str, temp_extra_llm_api_options_file: str):
     model_path = get_model_path(model_name)
     # fix port to facilitate concise trtllm-serve examples
-    with RemoteOpenAIServer(model_path, port=8000) as remote_server:
+    args = ["--extra_llm_api_options", temp_extra_llm_api_options_file]
+    with RemoteOpenAIServer(model_path, args, port=8000) as remote_server:
         yield remote_server
 
 
