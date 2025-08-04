@@ -1363,7 +1363,8 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
 #ifndef MMHA_USE_FP32_ACCUM_FOR_LOGITS
     if (sizeof(Tk) != 4)
     {
-        auto const max_timesteps = min(timestep, min(static_cast<unsigned>(cyclic_kv_cache_len), chunked_attention_size));
+        auto const max_timesteps
+            = min(timestep, min(static_cast<unsigned>(cyclic_kv_cache_len), chunked_attention_size));
         logits_smem_ += divUp(max_timesteps + 1, 4u) * 16;
     }
     Tk* logits_smem = reinterpret_cast<Tk*>(logits_smem_);
