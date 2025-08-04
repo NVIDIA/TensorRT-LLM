@@ -26,6 +26,7 @@ from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
 from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
 from tensorrt_llm.bench.dataclasses.reporting import ReportUtility
 from tensorrt_llm.bench.utils.data import (create_dataset_from_stream,
+                                           initialize_tokenizer,
                                            update_metadata_for_multimodal)
 from tensorrt_llm.llmapi import CapacitySchedulerPolicy
 from tensorrt_llm.logger import logger
@@ -305,6 +306,7 @@ def throughput_command(
 
     # Get general CLI options using the centralized function
     options: GeneralExecSettings = get_general_cli_options(params, bench_env)
+    tokenizer = initialize_tokenizer(options.model, options.checkpoint_path)
 
     # Extract throughput-specific options not handled by GeneralExecSettings
     max_batch_size = params.get("max_batch_size")
@@ -327,7 +329,7 @@ def throughput_command(
     # Dataset Loading and Preparation
     with open(options.dataset_path, "r") as dataset:
         metadata, requests = create_dataset_from_stream(
-            options.tokenizer,
+            tokenizer,
             dataset,
             num_requests=options.num_requests,
             model_dir=options.checkpoint_path,
@@ -464,7 +466,7 @@ def throughput_command(
             metadata = update_metadata_for_multimodal(metadata, statistics)
 
         report_utility = ReportUtility(statistics, metadata, runtime_config,
-                                       logger, kwargs, streaming)
+                                       logger, kwargs, options.streaming)
         if options.report_json:
             logger.info(f"Writing report to '{options.report_json}'.")
             with open(options.report_json, "w") as f:
@@ -473,16 +475,13 @@ def throughput_command(
         if options.output_json:
             logger.info(f"Writing output to {options.output_json}.")
             with open(options.output_json, "w") as f:
-                output_token_info = report_utility.get_output_tokens(
-                    options.tokenizer)
+                output_token_info = report_utility.get_output_tokens(tokenizer)
                 f.write(json.dumps(output_token_info, indent=4))
         if options.request_json:
             logger.info(
                 f"Writing request information to {options.request_json}.")
             with open(options.request_json, "w") as f:
-                f.write(
-                    json.dumps(
-                        report_utility.get_request_info(options.tokenizer)))
+                f.write(json.dumps(report_utility.get_request_info(tokenizer)))
         report_utility.report_statistics()
     except KeyboardInterrupt:
         logger.info("Keyboard interrupt, exiting benchmark...")
