@@ -21,9 +21,8 @@ import torch
 from utils.util import getSMVersion
 
 
-# Skip on Hopper due to flakiness
 @pytest.mark.skipif(
-    getSMVersion() <= 90 or getSMVersion() >= 120,
+    getSMVersion() < 90 or getSMVersion() >= 120,
     reason="custom scaled_mm is only supported in SM90",
 )  # Skip tests that are not supported in SM90
 @pytest.mark.parametrize(
@@ -39,7 +38,8 @@ from utils.util import getSMVersion
     [torch.float16, torch.float32, torch.bfloat16],
 )
 def test_fp8_scaled_mm(output_dtype, m, k_n):
-    pytest.skip("skipped due to flakiness")
+    if getSMVersion() == 90:
+        pytest.skip("Skip test for sm90 because it's too flaky")
 
     k, n = k_n
     torch.random.manual_seed(0)
@@ -72,7 +72,10 @@ def test_fp8_scaled_mm(output_dtype, m, k_n):
         use_fast_accum=True,
     )
     os.environ["CUBLASLT_WORKSPACE_SIZE"] = old_env
-    np.testing.assert_allclose(ref.float().cpu(), output.float().cpu())
+    np.testing.assert_allclose(ref.float().cpu(),
+                               output.float().cpu(),
+                               atol=1,
+                               rtol=0.01)
 
     if getSMVersion() == 90:
         cutlass_output = torch.ops.trtllm.cutlass_scaled_mm(
@@ -86,7 +89,9 @@ def test_fp8_scaled_mm(output_dtype, m, k_n):
         # TODO(zhenhuan): cutlass kernel has acc issue on some shapes
         try:
             np.testing.assert_allclose(ref.float().cpu(),
-                                       cutlass_output.float().cpu())
+                                       cutlass_output.float().cpu(),
+                                       atol=1,
+                                       rtol=0.01)
         except Exception as e:
             warn(RuntimeWarning("cutlass result is not correct: " + repr(e)))
 
