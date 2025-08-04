@@ -133,74 +133,56 @@ void UcxConnection::sendConnectionId(DataContext const& ctx, void const* data, s
 
 void UcxConnection::send(DataContext const& ctx, void const* data, size_t size) const
 {
-    try
+    if (ctx.getTag() == batch_manager::TransceiverTag::kID_TAG)
     {
-        if (ctx.getTag() == batch_manager::TransceiverTag::kID_TAG)
-        {
-            sendConnectionId(ctx, data, size);
-            return;
-        }
-        TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
-            "start UcxConnection::send , mConnectionId: %lu, mConnectionIdInPeer: %lu,fromRequester: %d", mConnectionId,
-            mConnectionIdInPeer, mFromRequester);
-
-        TLLM_CHECK_WITH_INFO((mEndpoint), "sendBuffer called without established communicator channel.");
-        std::promise<void> promise;
-        std::future<void> future = promise.get_future();
-        auto completionCallback = [&](ucs_status_t, ucxx::RequestCallbackUserData) -> void { promise.set_value(); };
-        uint64_t sendTag = ((mSendTagPrefix & 0xFFFFFFFF) << 32) | (static_cast<uint64_t>(ctx.getTag()) & (0xFFFFFFFF));
-
-        auto req = mEndpoint->tagSend(const_cast<void*>(data), size, ucxx::Tag(sendTag), false, completionCallback);
-        if (!req->isCompleted())
-        {
-            future.get();
-        }
-        TLLM_CHECK_WITH_INFO(req->isCompleted(), "send should be completed");
-        // throw if there is error
-        req->checkError();
-        TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
-            "end UcxConnection::send , mConnectionId: %lu, mConnectionIdInPeer: %lu,fromRequester: %d", mConnectionId,
-            mConnectionIdInPeer, mFromRequester);
+        sendConnectionId(ctx, data, size);
+        return;
     }
-    catch (std::exception const& e)
+    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
+        "start UcxConnection::send , mConnectionId: %lu, mConnectionIdInPeer: %lu,fromRequester: %d", mConnectionId,
+        mConnectionIdInPeer, mFromRequester);
+
+    TLLM_CHECK_WITH_INFO((mEndpoint), "sendBuffer called without established communicator channel.");
+    std::promise<void> promise;
+    std::future<void> future = promise.get_future();
+    auto completionCallback = [&](ucs_status_t, ucxx::RequestCallbackUserData) -> void { promise.set_value(); };
+    uint64_t sendTag = ((mSendTagPrefix & 0xFFFFFFFF) << 32) | (static_cast<uint64_t>(ctx.getTag()) & (0xFFFFFFFF));
+
+    auto req = mEndpoint->tagSend(const_cast<void*>(data), size, ucxx::Tag(sendTag), false, completionCallback);
+    if (!req->isCompleted())
     {
-        // Convert any exception to RequestSpecificException
-        // Use unknown request ID and NETWORK_ERROR as error code
-        throw RequestSpecificException(
-            __FILE__, __LINE__, e.what(), tensorrt_llm::common::kUNKNOWN_REQUEST_ID, RequestErrorCode::kNETWORK_ERROR);
+        future.get();
     }
+    TLLM_CHECK_WITH_INFO(req->isCompleted(), "send should be completed");
+    // throw if there is error
+    req->checkError();
+    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
+        "end UcxConnection::send , mConnectionId: %lu, mConnectionIdInPeer: %lu,fromRequester: %d", mConnectionId,
+        mConnectionIdInPeer, mFromRequester);
 }
 
 void UcxConnection::recv(DataContext const& ctx, void* data, size_t size) const
 {
-    try
+    // Guard to ensure CUDA context is initialized for UCX ops
+    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
+        "start UcxConnection::recv , mConnectionId: %lu, mConnectionIdInPeer: %lu,fromRequester: %d", mConnectionId,
+        mConnectionIdInPeer, mFromRequester);
+    TLLM_CHECK_WITH_INFO((mEndpoint), "recvBuffer called without established communicator channel.");
+    std::promise<void> promise;
+    std::future<void> future = promise.get_future();
+    auto completionCallback = [&](ucs_status_t, ucxx::RequestCallbackUserData) -> void { promise.set_value(); };
+    uint64_t recvTag = ((mRecvTagPrefix & 0xFFFFFFFF) << 32) | (static_cast<uint64_t>(ctx.getTag()) & (0xFFFFFFFF));
+    auto req = mEndpoint->tagRecv(data, size, ucxx::Tag(recvTag), ucxx::TagMaskFull, false, completionCallback);
+    if (!req->isCompleted())
     {
-        // Guard to ensure CUDA context is initialized for UCX ops
-        TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
-            "start UcxConnection::recv , mConnectionId: %lu, mConnectionIdInPeer: %lu,fromRequester: %d", mConnectionId,
-            mConnectionIdInPeer, mFromRequester);
-        TLLM_CHECK_WITH_INFO((mEndpoint), "recvBuffer called without established communicator channel.");
-        std::promise<void> promise;
-        std::future<void> future = promise.get_future();
-        auto completionCallback = [&](ucs_status_t, ucxx::RequestCallbackUserData) -> void { promise.set_value(); };
-        uint64_t recvTag = ((mRecvTagPrefix & 0xFFFFFFFF) << 32) | (static_cast<uint64_t>(ctx.getTag()) & (0xFFFFFFFF));
-        auto req = mEndpoint->tagRecv(data, size, ucxx::Tag(recvTag), ucxx::TagMaskFull, false, completionCallback);
-        if (!req->isCompleted())
-        {
-            future.get();
-        }
-        TLLM_CHECK_WITH_INFO(req->isCompleted(), "recv should be completed");
-        // throw if there is error
-        req->checkError();
-        TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
-            "end UcxConnection::recv , mConnectionId: %lu, mConnectionIdInPeer: %lu,fromRequester: %d", mConnectionId,
-            mConnectionIdInPeer, mFromRequester);
+        future.get();
     }
-    catch (std::exception const& e)
-    {
-        throw RequestSpecificException(
-            __FILE__, __LINE__, e.what(), tensorrt_llm::common::kUNKNOWN_REQUEST_ID, RequestErrorCode::kNETWORK_ERROR);
-    }
+    TLLM_CHECK_WITH_INFO(req->isCompleted(), "recv should be completed");
+    // throw if there is error
+    req->checkError();
+    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
+        "end UcxConnection::recv , mConnectionId: %lu, mConnectionIdInPeer: %lu,fromRequester: %d", mConnectionId,
+        mConnectionIdInPeer, mFromRequester);
 }
 
 } // namespace tensorrt_llm::executor::kv_cache
