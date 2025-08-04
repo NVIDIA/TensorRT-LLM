@@ -87,6 +87,7 @@ speculative_config:
   num_nextn_predict_layers: 1
 moe_config:
   backend: DEEPGEMM
+  max_num_tokens: 3200
 EOF
 ```
 
@@ -265,10 +266,10 @@ lm_eval --model local-completions  --tasks gsm8k --batch_size 256 --gen_kwargs t
 Sample result in Blackwell:
 
 ```shell
-|Tasks|Version|     Filter     |n-shot|  Metric   |   | Value |   |Stderr|
-|-----|------:|----------------|-----:|-----------|---|------:|---|-----:|
-|gsm8k|      3|flexible-extract|     5|exact_match|↑  |94.9204|±  |0.6048|
-|     |       |strict-match    |     5|exact_match|↑  |94.8446|±  |0.6091|
+|Tasks|Version|     Filter     |n-shot|  Metric   |   |Value |   |Stderr|
+|-----|------:|----------------|-----:|-----------|---|-----:|---|-----:|
+|gsm8k|      3|flexible-extract|     5|exact_match|↑  |0.9538|±  |0.0058|
+|     |       |strict-match    |     5|exact_match|↑  |0.9500|±  |0.0060|
 ```
 
 FP4 command for GSM8K:
@@ -284,10 +285,10 @@ lm_eval --model local-completions  --tasks gsm8k --batch_size 256 --gen_kwargs t
 Sample result in Blackwell:
 
 ```shell
-|Tasks|Version|     Filter     |n-shot|  Metric   |   | Value |   |Stderr|
-|-----|------:|----------------|-----:|-----------|---|------:|---|-----:|
-|gsm8k|      3|flexible-extract|     5|exact_match|↑  |94.9204|±  |0.6048|
-|     |       |strict-match    |     5|exact_match|↑  |94.8446|±  |0.6091|
+|Tasks|Version|     Filter     |n-shot|  Metric   |   |Value |   |Stderr|
+|-----|------:|----------------|-----:|-----------|---|-----:|---|-----:|
+|gsm8k|      3|flexible-extract|     5|exact_match|↑  |0.9462|±  |0.0062|
+|     |       |strict-match    |     5|exact_match|↑  |0.9447|±  |0.0063|
 ```
 
 ## Benchmarking Performance
