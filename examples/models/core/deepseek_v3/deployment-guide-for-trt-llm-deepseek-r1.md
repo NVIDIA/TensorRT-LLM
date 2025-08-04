@@ -1,12 +1,12 @@
 # Deployment Guide for TensorRT-LLM DeepSeek R1 FP8 and NVFP4
 
-# Introduction
+## Introduction
 
 This deployment guide provides step-by-step instructions for running the DeepSeek R1 model using TensorRT-LLM with FP8 and NVFP4 quantization, optimized for NVIDIA GPUs. It covers the complete setup required; from accessing model weights and preparing the software environment to configuring TensorRT-LLM parameters, launching the server, and validating inference output.
 
 The guide is intended for developers and practitioners seeking high-throughput or low-latency inference using NVIDIA’s accelerated stack—starting with the PyTorch container from NGC, then installing TensorRT-LLM for model serving, FlashInfer for optimized CUDA kernels, and ModelOpt to enable FP8 and NVFP4 quantized execution.
 
-# Prerequisites
+## Prerequisites
 
 GPU: NVIDIA Blackwell or Hopper Architecture  
 OS: Linux  
@@ -14,7 +14,7 @@ Drivers: CUDA Driver 575 or Later
 Docker with NVIDIA Container Toolkit installed  
 Python3 and python3-pip (Optional, for accuracy evaluation only)
 
-# Models
+## Models
 
 * FP8 model: [DeepSeek-R1](https://huggingface.co/deepseek-ai/DeepSeek-R1)  
 * NVFP4 model: [DeepSeek-R1-FP4](https://huggingface.co/nvidia/DeepSeek-R1-FP4)
@@ -22,9 +22,9 @@ Python3 and python3-pip (Optional, for accuracy evaluation only)
 
 Note that NVFP4 is only supported on NVIDIA Blackwell platform.
 
-# Deployment Steps
+## Deployment Steps
 
-## Run Docker Container
+### Run Docker Container
 
 Run the docker container using the TensorRT-LLM NVIDIA NGC image.
 
@@ -48,7 +48,7 @@ Note:
 
 If you want to use latest main branch, you can choose to build from source to install TensorRT-LLM, the steps refer to [https://nvidia.github.io/TensorRT-LLM/latest/installation/build-from-source-linux.html](https://nvidia.github.io/TensorRT-LLM/latest/installation/build-from-source-linux.html) 
 
-## Creating the TRT-LLM Server config
+### Creating the TRT-LLM Server config
 
 We create a YAML configuration file /tmp/config.yml for the TensorRT-LLM Server and populate it with the following recommended performance settings.
 
@@ -82,7 +82,7 @@ moe_config:
 EOF
 ```
 
-## Launch the TRT-LLM Server
+### Launch the TRT-LLM Server
 
 Below is an example command to launch the TRT-LLM server with the DeepSeek-R1 model from within the container. The command is specifically configured for the 1024/1024 Input/Output Sequence Length test. The explanation of each flag is shown in the “Configs and Parameters” section.
 
@@ -103,7 +103,7 @@ trtllm-serve deepseek-ai/DeepSeek-R1 \
 
 After the server is set up, the client can now send prompt requests to the server and receive results.
 
-## Configs and Parameters
+### Configs and Parameters
 
 These options are used directly on the command line when you start the `trtllm-serve` process.
 #### `--tp_size`
@@ -193,9 +193,9 @@ These options provide finer control over performance and are set within a YAML f
 
 See the [https://github.com/nvidia/TensorRT-LLM/blob/main/tensorrt\_llm/llmapi/llm\_args.py\#L1894](https://github.com/nvidia/TensorRT-LLM/blob/main/tensorrt_llm/llmapi/llm_args.py#L1894) TorchLlmArgs class for the full list of options which can be used in the extra\_llm\_api\_options`.`
 
-# Testing API Endpoint
+## Testing API Endpoint
 
-## Basic Test
+### Basic Test
 
 Start a new terminal on the host to test the TensorRT-LLM server you just launched. 
 
@@ -224,7 +224,7 @@ Here is an example response, showing that the TRT-LLM server returns “New York
 {"id":"cmpl-bc1393d529ce485c961d9ffee5b25d72","object":"text_completion","created":1753843963,"model":"deepseek-ai/DeepSeek-R1","choices":[{"index":0,"text":" New York is a state located in the northeastern United States. It is bordered by","token_ids":null,"logprobs":null,"context_logits":null,"finish_reason":"length","stop_reason":null,"disaggregated_params":null}],"usage":{"prompt_tokens":6,"total_tokens":22,"completion_tokens":16},"prompt_token_ids":null}
 ```
 
-## Troubleshooting Tips
+### Troubleshooting Tips
 
 * If you encounter CUDA out-of-memory errors, try reducing max\_batch\_size or max\_seq\_len  
 * Ensure your model checkpoints are compatible with the expected format  
@@ -232,7 +232,7 @@ Here is an example response, showing that the TRT-LLM server returns “New York
 * If the container fails to start, verify that the NVIDIA Container Toolkit is properly installed  
 * For connection issues, make sure port 8000 is not being used by another application
 
-## Running Evaluations to Verify Accuracy (Optional)
+### Running Evaluations to Verify Accuracy (Optional)
 
 We use the lm-eval tool to test the model’s accuracy. For more information see [https://github.com/EleutherAI/lm-evaluation-harness](https://github.com/EleutherAI/lm-evaluation-harness).
 
@@ -282,7 +282,7 @@ Sample result in Blackwell
 |     |       |strict-match    |     5|exact_match|↑  |0.8393|±  |0.0101|
 ```
 
-# Benchmarking Performance
+## Benchmarking Performance
 
 To benchmark the performance of your TensorRT-LLM server you can leverage the built-in “benchmark\_serving.py” script. To do this first creating a wrapper [bench.sh](http://bench.sh) script.
 
@@ -363,7 +363,7 @@ P99 E2EL (ms):                            [result]
 ==================================================
 ```
 
-## Key Metrics
+### Key Metrics
 
 * Median Time to First Token (TTFT)  
   * The typical time elapsed from when a request is sent until the first output token is generated.  
