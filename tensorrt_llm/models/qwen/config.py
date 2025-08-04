@@ -32,6 +32,8 @@ class QWenConfig(PretrainedConfig):
                  use_logn_attn: bool = False,
                  moe: Optional[Union[MoeConfig, dict]] = None,
                  num_labels: int = 1,
+                 mlp_only_layers: Optional[list] = None,
+                 decoder_sparse_step: int = 1,
                  **kwargs):
         self.mlp_bias = mlp_bias
         self.attn_bias = attn_bias
@@ -40,6 +42,8 @@ class QWenConfig(PretrainedConfig):
         self.disable_weight_only_quant_plugin = disable_weight_only_quant_plugin
         self.num_labels = num_labels
         self.use_logn_attn = use_logn_attn
+        self.mlp_only_layers = mlp_only_layers or []
+        self.decoder_sparse_step = decoder_sparse_step
         if moe is None:
             # Legacy MOE config fields
             moe = MoeConfig(num_experts=kwargs.pop('moe_num_experts', 0),
@@ -64,6 +68,8 @@ class QWenConfig(PretrainedConfig):
         output[
             'disable_weight_only_quant_plugin'] = self.disable_weight_only_quant_plugin
         output['use_logn_attn'] = self.use_logn_attn
+        output['mlp_only_layers'] = self.mlp_only_layers
+        output['decoder_sparse_step'] = self.decoder_sparse_step
         output['moe'] = self.moe.to_dict()
         return output
 
@@ -144,6 +150,11 @@ class QWenConfig(PretrainedConfig):
         moe_shared_expert_intermediate_size = getattr(
             hf_config, "shared_expert_intermediate_size", 0)
         moe_normalization_mode = MoeConfig.ExpertScaleNormalizationMode.NONE
+        
+        # Add support for mlp_only_layers and decoder_sparse_step (Qwen3 MoE)
+        mlp_only_layers = getattr(hf_config, "mlp_only_layers", [])
+        decoder_sparse_step = getattr(hf_config, "decoder_sparse_step", 1)
+        
         moe_config = MoeConfig(num_experts=moe_num_experts,
                                top_k=moe_top_k,
                                normalization_mode=moe_normalization_mode)
@@ -189,9 +200,11 @@ class QWenConfig(PretrainedConfig):
             moe_intermediate_size=moe_intermediate_size,
             moe_shared_expert_intermediate_size=
             moe_shared_expert_intermediate_size,
+            mlp_only_layers=mlp_only_layers,
+            decoder_sparse_step=decoder_sparse_step,
             moe=moe_config,
             mapping=mapping,
-            quantization=quant_config,
+            quant_config=quant_config,
             num_labels=num_labels,
             tie_word_embeddings=tie_word_embeddings,
             **kwargs)

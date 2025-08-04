@@ -354,10 +354,15 @@ class QWenForCausalLM(DecoderModelForCausalLM):
                 }
             elif config.qwen_type == "qwen3_moe":
                 custom_dict = {
-                    "fc": ["up_proj",
-                           "gate_proj"],  # MoE experts weight mapping
-                    "q_layernorm": "q_norm",  # Q normalization for Qwen3
-                    "k_layernorm": "k_norm",  # K normalization for Qwen3
+                    # Map MoE experts to standard MLP layers for quantization compatibility
+                    "mlp.fc": ["mlp.experts.up_proj", "mlp.experts.gate_proj"],
+                    "mlp.proj": "mlp.experts.down_proj", 
+                    "mlp.router": "mlp.gate",
+                    # Standard FC mapping for MoE experts
+                    "fc": ["up_proj", "gate_proj"],
+                    # Qwen3 normalization layers
+                    "q_layernorm": "q_norm",
+                    "k_layernorm": "k_norm",
                 }
             elif config.qwen_type in {"qwen2", "qwen2_vl"
                                       } and config.tie_word_embeddings:

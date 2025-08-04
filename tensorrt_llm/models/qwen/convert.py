@@ -812,6 +812,33 @@ def convert_hf_qwen(hf_model,
                     plugin_weight_only_quant_type,
                     dtype,
                     use_gemm_woq_plugin))
+                    
+            # For Qwen3 MoE: Add standard MLP mappings for quantization compatibility
+            if qwen_type == "qwen3_moe":
+                # Use the first expert from the already processed MoE weights 
+                # This ensures compatibility with the quantization system
+                first_expert_up = w3[0] if len(w3.shape) > 2 else w3  # up_proj
+                first_expert_gate = w1[0] if len(w1.shape) > 2 else w1  # gate_proj
+                first_expert_down = w2[0] if len(w2.shape) > 2 else w2  # down_proj
+                
+                # Create standard MLP weights for quantization compatibility
+                weights.update(
+                    get_tllm_linear_weight(first_expert_gate, tllm_prex + 'mlp.gate.',
+                                           None, use_weight_only,
+                                           plugin_weight_only_quant_type, dtype,
+                                           use_gemm_woq_plugin))
+                                           
+                weights.update(
+                    get_tllm_linear_weight(first_expert_up, tllm_prex + 'mlp.fc.',
+                                           None, use_weight_only,
+                                           plugin_weight_only_quant_type, dtype,
+                                           use_gemm_woq_plugin))
+                                           
+                weights.update(
+                    get_tllm_linear_weight(first_expert_down, tllm_prex + 'mlp.proj.',
+                                           None, use_weight_only,
+                                           plugin_weight_only_quant_type, dtype,
+                                           use_gemm_woq_plugin))
         else:
             mlp_gate_weight = get_weight(model_params, prefix + key_list[2],
                                          dtype)
