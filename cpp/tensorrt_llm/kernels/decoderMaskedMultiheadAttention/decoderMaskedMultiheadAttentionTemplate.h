@@ -1336,6 +1336,8 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
     // Note max_attention_window_size is maximum of cyclic_attention_window_size among all layers.
     // By default, you can assume that they are the same.
     auto const cyclic_kv_cache_len = static_cast<unsigned>(params.cyclic_attention_window_size);
+    // The chunked attention size.
+    auto const chunked_attention_size = static_cast<unsigned>(params.chunked_attention_size);
     // The number of sink tokens in kv cache to support streamingllm
     auto const sink_token_len = static_cast<unsigned>(params.sink_token_length);
     // The current timestep (including paddings).
@@ -1361,7 +1363,7 @@ __global__ void __launch_bounds__(MAX_THEADS_PER_BLOCK, MIN_BLOCKS_PER_SM) maske
 #ifndef MMHA_USE_FP32_ACCUM_FOR_LOGITS
     if (sizeof(Tk) != 4)
     {
-        auto const max_timesteps = min(timestep, cyclic_kv_cache_len);
+        auto const max_timesteps = min(timestep, min(cyclic_kv_cache_len, chunked_attention_size));
         logits_smem_ += divUp(max_timesteps + 1, 4u) * 16;
     }
     Tk* logits_smem = reinterpret_cast<Tk*>(logits_smem_);
