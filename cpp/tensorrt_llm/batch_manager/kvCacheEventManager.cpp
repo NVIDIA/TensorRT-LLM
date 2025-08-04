@@ -18,6 +18,8 @@
 #include "tensorrt_llm/batch_manager/kvCacheEventManager.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/executor/executor.h"
+#include "tensorrt_llm/executor/serialization.h"
+#include "tensorrt_llm/runtime/utils/mpiUtils.h"
 
 namespace tle = tensorrt_llm::executor;
 
@@ -25,31 +27,39 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
 
 KVCacheEventManager::KVCacheEventManager(size_t maxKVEventEntries, std::optional<SizeType32> attentionDpRank,
-    std::optional<SizeType32> attentionDpSize, std::optional<attentionDpSize> ppSize)
+    std::optional<SizeType32> attentionDpSize, SizeType32 attentionDpEventsGatherPeriodMs)
     : mRun{true}
     , mMaxSize{maxKVEventEntries}
     , mEventId{0}
     , mAttentionDpRank{attentionDpRank}
     , mAttentionDpSize{attentionDpSize}
+    , mAttentionDpEventsGatherPeriodMs(attentionDpEventsGatherPeriodMs)
 {
+
     TLLM_CHECK(mMaxSize > 0);
     if (mAttentionDpRank)
     {
         TLLM_CHECK_WITH_INFO(
             mAttentionDpSize.has_value(), "If attention DP rank is set, the attention DP size must also be set");
-        TLLM_CHECK(ppSize.has_value());
-        TLLM_CHECK_WITH_INFO(ppSize.value() == 1, "Events with attention DP are not supported with PP > 1");
         TLLM_CHECK_WITH_INFO(mAttentionDpRank.value() < mAttentionDpSize.value(),
             "Attention DP rank must be less than attention DP size");
+        if (mAttentionDpRank.value() == 0)
+        {
+            // Rank 0 will gather events from all other ranks
+            // Need to increase size
+            mMaxSize *= mAttentionDpSize.value();
+        }
     }
     else
     {
         TLLM_CHECK_WITH_INFO(
-            !mAttentionDpSize.has_value(), "If attention DP size is set, the attention DP rank must also be set");
+            !mAttentionDpSize.has_value(), "If attention DP rank is not set, the attention DP size must not be set");
     }
-    // mWorkerThread = std::thread(std::bind(&KVCacheEventManager::worker, this));
     mWorkerThread = std::thread([this]() { this->worker(); });
-    mExchangeAttentionDpThread = std::thread([this]() { this->exchangeAttentionDpEvents(); });
+    if (mAttentionDpRank)
+    {
+        mExchangeAttentionDpThread = std::thread([this]() { this->exchangeAttentionDpThread(); });
+    }
 };
 
 KVCacheEventManager::~KVCacheEventManager()
@@ -58,7 +68,10 @@ KVCacheEventManager::~KVCacheEventManager()
     mPendingEmptyCV.notify_all();
     mEmptyCV.notify_all();
     mWorkerThread.join();
-    mAttentionDpExchangeThread.join();
+    if (mAttentionDpRank)
+    {
+        mExchangeAttentionDpThread.join();
+    }
 }
 
 void KVCacheEventManager::enqueueCreatedEvent(
@@ -84,7 +97,7 @@ void KVCacheEventManager::enqueueStoredEvent(std::vector<BlockPtr> const& blocks
     for (auto const& block : blocks)
     {
         data.blocks.emplace_back(block->getHash(), block->getUniqueTokens(), block->getBlockKey().loraTaskId,
-            block->isPrimary() ? kPrimaryLevel : kSecondaryLevel, block->getPriority(), mAttentionDpRank);
+            block->isPrimary() ? kPrimaryLevel : kSecondaryLevel, block->getPriority());
     }
 
     enqueueEvent({mEventId++, data, windowSize, mAttentionDpRank});
@@ -100,7 +113,7 @@ void KVCacheEventManager::enqueueRemovedEvent(BlockPtr const& block, SizeType32 
     }
     else
     {
-        enqueueEvent({mEventId++, tle::KVCacheRemovedData{{block->getHash()}}, windowSize});
+        enqueueEvent({mEventId++, tle::KVCacheRemovedData{{block->getHash()}}, windowSize, mAttentionDpRank});
     }
 }
 
@@ -136,28 +149,27 @@ void KVCacheEventManager::flush()
     auto eventQueue = std::exchange(mEventQueue, {});
     std::unique_lock<std::mutex> lck(mPendingEventsMutex);
     mPendingEvents.push_back(std::move(eventQueue));
-    // If we have events, we need to notify the worker thread to process them
     mPendingEmptyCV.notify_one();
 }
 
 void KVCacheEventManager::exchangeAttentionDpThread()
 {
-    int32_t pollPeriodMs = 5;
     while (true)
     {
-        // If we are not rank 0, send events asynchronously
+        TLLM_CHECK(mAttentionDpRank);
+        // If we are not rank 0, send events to rank 0
         if (mAttentionDpRank.value() != 0)
         {
             std::vector<char> serializedEvents;
             {
                 std::unique_lock<std::mutex> lck(mEventsMutex);
-                serializedEvents = Serialization::serialize(mEvents);
+                serializedEvents = executor::Serialization::serialize(mEvents);
                 mEvents.clear();
             }
             uint64_t vecSize = serializedEvents.size();
-            COMM_SESSION.send(&vecSize, 1, MpiType::kUINT64, 0, MpiTag::kKVCacheEventSize);
+            COMM_SESSION.send(&vecSize, 1, mpi::MpiType::kUINT64, 0, mpi::MpiTag::kKvCacheEventSize);
             COMM_SESSION.send(
-                serializedEvents.data(), serializedEvents.size(), MpiType::kCHAR, 0, MpiTag::kKVCacheEvent);
+                serializedEvents.data(), serializedEvents.size(), mpi::MpiType::kCHAR, 0, mpi::MpiTag::kKvCacheEvent);
         }
         else
         {
@@ -167,18 +179,18 @@ void KVCacheEventManager::exchangeAttentionDpThread()
             while (numRecvs < mAttentionDpSize.value() - 1)
             {
                 MPI_Status probeStatus;
-                if (COMM_SESSION.iprobe(MPI_ANY_SOURCE, MpiTag::kKVCacheEvent, &status))
+                if (COMM_SESSION.iprobe(MPI_ANY_SOURCE, mpi::MpiTag::kKvCacheEvent, &probeStatus))
                 {
-                    uint64_t vecSize;
+                    uint64_t vecSize{0};
                     COMM_SESSION.recv(
-                        &vecSize, 1, mpi::MpiType::kUINT64, probeStatus.MPI_SOURCE, mpi::MpiTag::kKVCacheEventSize);
+                        &vecSize, 1, mpi::MpiType::kUINT64, probeStatus.MPI_SOURCE, mpi::MpiTag::kKvCacheEventSize);
 
                     std::vector<char> serializedEvents(vecSize);
-                    COMM_SESSION.recv(&serializedEvents.data(), vecSize, mpi::MpiType::kCHAR, probeStatus.MPI_SOURCE,
-                        mpi::MpiTag::kKVCacheEvent);
+                    COMM_SESSION.recv(serializedEvents.data(), vecSize, mpi::MpiType::kCHAR, probeStatus.MPI_SOURCE,
+                        mpi::MpiTag::kKvCacheEvent);
 
                     // Deserialize the events and add them to the local queue
-                    auto rankEvents = Serialization::deserializeKVCacheEvents(serializedEvents);
+                    auto rankEvents = executor::Serialization::deserializeKVCacheEvents(serializedEvents);
                     {
                         std::unique_lock<std::mutex> lck(mEventsMutex);
                         mEvents.insert(mEvents.end(), rankEvents.begin(), rankEvents.end());
@@ -187,47 +199,47 @@ void KVCacheEventManager::exchangeAttentionDpThread()
                     numRecvs++;
                 }
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(pollPeriodMs));
+            std::this_thread::sleep_for(std::chrono::milliseconds(mAttentionDpEventsGatherPeriodMs));
         }
     }
+}
 
-    void KVCacheEventManager::worker()
+void KVCacheEventManager::worker()
+{
+
+    while (true)
     {
-
-        while (true)
+        std::deque<tle::KVCacheEvent> events;
         {
-            std::deque<tle::KVCacheEvent> events;
+            std::unique_lock<std::mutex> pendingLock(mPendingEventsMutex);
+            mPendingEmptyCV.wait(pendingLock, [this] { return !mPendingEvents.empty() || !mRun; });
+            if (!mRun)
             {
-                std::unique_lock<std::mutex> pendingLock(mPendingEventsMutex);
-                mPendingEmptyCV.wait(pendingLock, [this] { return !mPendingEvents.empty() || !mRun; });
-                if (!mRun)
-                {
-                    return;
-                }
-                events = mPendingEvents.front();
-                mPendingEvents.pop_front();
+                return;
             }
-
-            std::unique_lock<std::mutex> lck(mEventsMutex);
-
-            SizeType32 elementsToRemove = mEvents.size() + events.size() - mMaxSize;
-
-            // First, take elements from mEvents since they are the oldest.
-            if (elementsToRemove > 0)
-            {
-                SizeType32 numRemoved = std::min(static_cast<SizeType32>(mEvents.size()), elementsToRemove);
-                mEvents.erase(mEvents.begin(), mEvents.begin() + numRemoved);
-                elementsToRemove -= numRemoved;
-                TLLM_LOG_WARNING(
-                    "The event queue has reached the max size of %d. Events have been discarded.", mMaxSize);
-            }
-
-            // If there's still too many events, take from the front of the events queue.
-            mEvents.insert(mEvents.end(), events.begin() + std::max(0, elementsToRemove), events.end());
-
-            // Notify the empty condition variable to wake up any waiting threads
-            mEmptyCV.notify_one();
+            events = mPendingEvents.front();
+            mPendingEvents.pop_front();
         }
+
+        std::unique_lock<std::mutex> lck(mEventsMutex);
+
+        SizeType32 elementsToRemove = mEvents.size() + events.size() - mMaxSize;
+
+        // First, take elements from mEvents since they are the oldest.
+        if (elementsToRemove > 0)
+        {
+            SizeType32 numRemoved = std::min(static_cast<SizeType32>(mEvents.size()), elementsToRemove);
+            mEvents.erase(mEvents.begin(), mEvents.begin() + numRemoved);
+            elementsToRemove -= numRemoved;
+            TLLM_LOG_WARNING("The event queue has reached the max size of %d. Events have been discarded.", mMaxSize);
+        }
+
+        // If there's still too many events, take from the front of the events queue.
+        mEvents.insert(mEvents.end(), events.begin() + std::max(0, elementsToRemove), events.end());
+
+        // Notify the empty condition variable to wake up any waiting threads
+        mEmptyCV.notify_one();
     }
+}
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager

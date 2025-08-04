@@ -123,6 +123,13 @@ static_assert(!hasSerializedSize<std::string>(size_t()));
 static_assert(!hasSerializedSize<std::optional<float>>(size_t()));
 static_assert(hasSerializedSize<CacheTransceiverConfig>(size_t()));
 static_assert(hasSerializedSize<KVCacheEvent>(size_t()));
+static_assert(hasSerializedSize<KVCacheCreatedData>(size_t()));
+static_assert(hasSerializedSize<KVCacheStoredData>(size_t()));
+static_assert(hasSerializedSize<KVCacheStoredBlockData>(size_t()));
+static_assert(hasSerializedSize<KVCacheRemovedData>(size_t()));
+static_assert(hasSerializedSize<KVCacheEventDiff<SizeType32>>(size_t()));
+static_assert(hasSerializedSize<KVCacheUpdatedData>(size_t()));
+static_assert(hasSerializedSize<tensorrt_llm::runtime::UniqueToken>(size_t()));
 
 template <typename T>
 size_t serializedSize(T const& data)
@@ -221,6 +228,13 @@ static_assert(!hasSerialize<std::string>(nullptr));
 static_assert(!hasSerialize<std::optional<float>>(nullptr));
 static_assert(hasSerialize<CacheTransceiverConfig>(nullptr));
 static_assert(hasSerialize<KVCacheEvent>(nullptr));
+static_assert(hasSerialize<KVCacheCreatedData>(nullptr));
+static_assert(hasSerialize<KVCacheStoredData>(nullptr));
+static_assert(hasSerialize<KVCacheStoredBlockData>(nullptr));
+static_assert(hasSerialize<KVCacheRemovedData>(nullptr));
+static_assert(hasSerialize<KVCacheEventDiff<SizeType32>>(nullptr));
+static_assert(hasSerialize<KVCacheUpdatedData>(nullptr));
+static_assert(hasSerialize<tensorrt_llm::runtime::UniqueToken>(nullptr));
 
 template <typename T>
 void serialize(T const& data, std::ostream& os)
@@ -516,6 +530,34 @@ T deserialize(std::istream& is)
     else if constexpr (std::is_same_v<T, tensorrt_llm::executor::KVCacheEvent>)
     {
         return Serialization::deserializeKVCacheEvent(is);
+    }
+    else if constexpr (std::is_same_v<T, tensorrt_llm::executor::KVCacheCreatedData>)
+    {
+        return Serialization::deserializeKVCacheCreatedData(is);
+    }
+    else if constexpr (std::is_same_v<T, tensorrt_llm::executor::KVCacheStoredData>)
+    {
+        return Serialization::deserializeKVCacheStoredData(is);
+    }
+    else if constexpr (std::is_same_v<T, tensorrt_llm::executor::KVCacheStoredBlockData>)
+    {
+        return Serialization::deserializeKVCacheStoredBlockData(is);
+    }
+    else if constexpr (std::is_same_v<T, tensorrt_llm::executor::KVCacheRemovedData>)
+    {
+        return Serialization::deserializeKVCacheRemovedData(is);
+    }
+    else if constexpr (std::is_same_v<T, tensorrt_llm::executor::KVCacheEventDiff<SizeType32>>)
+    {
+        return Serialization::deserializeKVCacheEventDiff<SizeType32>(is);
+    }
+    else if constexpr (std::is_same_v<T, tensorrt_llm::executor::KVCacheUpdatedData>)
+    {
+        return Serialization::deserializeKVCacheUpdatedData(is);
+    }
+    else if constexpr (std::is_same_v<T, tensorrt_llm::runtime::UniqueToken>)
+    {
+        return Serialization::deserializeUniqueToken(is);
     }
     // Optional
     else if constexpr (std::is_same_v<T, std::optional<typename ValueType<T>::type>>)

@@ -332,14 +332,22 @@ public:
     [[nodiscard]] static KVCacheRemovedData deserializeKVCacheRemovedData(std::istream& is);
 
     // KVCacheEventDiff
-    [[nodiscard]] static size_t serializedSize(KVCacheEventDiff<SizeType32> const& data);
-    static void serialize(KVCacheEventDiff<SizeType32> const& data, std::ostream& os);
-    [[nodiscard]] static KVCacheEventDiff<SizeType32> deserializeKVCacheEventDiff(std::istream& is);
+    template <typename T>
+    [[nodiscard]] static size_t serializedSize(KVCacheEventDiff<T> const& data);
+    template <typename T>
+    static void serialize(KVCacheEventDiff<T> const& data, std::ostream& os);
+    template <typename T>
+    [[nodiscard]] static KVCacheEventDiff<T> deserializeKVCacheEventDiff(std::istream& is);
 
     // KVCacheUpdateData
     [[nodiscard]] static size_t serializedSize(KVCacheUpdatedData const& data);
     static void serialize(KVCacheUpdatedData const& data, std::ostream& os);
     [[nodiscard]] static KVCacheUpdatedData deserializeKVCacheUpdatedData(std::istream& is);
+
+    // UniqueToken
+    [[nodiscard]] static size_t serializedSize(tensorrt_llm::runtime::UniqueToken const& token);
+    static void serialize(tensorrt_llm::runtime::UniqueToken const& token, std::ostream& os);
+    [[nodiscard]] static tensorrt_llm::runtime::UniqueToken deserializeUniqueToken(std::istream& is);
 
     // String
     static std::string deserializeString(std::istream& is);

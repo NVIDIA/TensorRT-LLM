@@ -969,6 +969,11 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         description=
         "Maximum size of the event buffer. If set to 0, the event buffer will not be used."
     )
+    attention_dp_events_gather_period_ms: int = Field(
+        default=5,
+        description=
+        "The period in milliseconds to gather attention DP events across ranks."
+    )
     enable_partial_reuse: bool = Field(
         default=True,
         description=
@@ -999,7 +1004,10 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             event_buffer_max_size=self.event_buffer_max_size,
             enable_partial_reuse=self.enable_partial_reuse,
             copy_on_partial_reuse=self.copy_on_partial_reuse,
-            use_uvm=self.use_uvm)
+            use_uvm=self.use_uvm,
+            attention_dp_events_gather_period_ms=self.
+            attention_dp_events_gather_period_ms,
+        )
 
 
 @PybindMirror.mirror_pybind_fields(_ExtendedRuntimePerfKnobConfig)

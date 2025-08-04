@@ -136,7 +136,7 @@ void initConfigBindings(nb::module_& m)
             nb::arg("onboard_blocks") = true, nb::arg("cross_kv_cache_fraction") = nb::none(),
             nb::arg("secondary_offload_min_priority") = nb::none(), nb::arg("event_buffer_max_size") = 0, nb::kw_only(),
             nb::arg("enable_partial_reuse") = true, nb::arg("copy_on_partial_reuse") = true, nb::arg("use_uvm") = false,
-            nb::arg("runtime_defaults") = nb::none())
+            nb::arg("attention_dp_events_gather_period_ms") = 5, nb::arg("runtime_defaults") = nb::none())
         .def_prop_rw(
             "enable_block_reuse", &tle::KvCacheConfig::getEnableBlockReuse, &tle::KvCacheConfig::setEnableBlockReuse)
         .def_prop_rw("max_tokens", &tle::KvCacheConfig::getMaxTokens, &tle::KvCacheConfig::setMaxTokens)
@@ -159,6 +159,8 @@ void initConfigBindings(nb::module_& m)
         .def_prop_rw("copy_on_partial_reuse", &tle::KvCacheConfig::getCopyOnPartialReuse,
             &tle::KvCacheConfig::setCopyOnPartialReuse)
         .def_prop_rw("use_uvm", &tle::KvCacheConfig::getUseUvm, &tle::KvCacheConfig::setUseUvm)
+        .def_prop_rw("attention_dp_events_gather_period_ms", &tle::KvCacheConfig::getAttentionDpEventsGatherPeriodMs,
+            &tle::KvCacheConfig::setAttentionDpEventsGatherPeriodMs)
         .def("fill_empty_fields_from_runtime_defaults", &tle::KvCacheConfig::fillEmptyFieldsFromRuntimeDefaults)
         .def("__getstate__", kvCacheConfigGetstate)
         .def("__setstate__", kvCacheConfigSetstate);

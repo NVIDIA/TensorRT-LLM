@@ -1163,10 +1163,11 @@ KvCacheConfig Serialization::deserializeKvCacheConfig(std::istream& is)
     auto secondaryOffloadMinPriority = su::deserialize<std::optional<executor::RetentionPriority>>(is);
     auto eventBufferMaxSize = su::deserialize<size_t>(is);
     auto useUvm = su::deserialize<bool>(is);
+    auto attentionDpEventsGatherPeriodMs = su::deserialize<SizeType32>(is);
 
     return KvCacheConfig{enableBlockReuse, maxTokens, maxAttentionWindowVec, sinkTokenLength, freeGpuMemoryFraction,
         hostCacheSize, onboardBlocks, crossKvCacheFraction, secondaryOffloadMinPriority, eventBufferMaxSize,
-        enablePartialReuse, copyOnPartialReuse, useUvm};
+        enablePartialReuse, copyOnPartialReuse, useUvm, attentionDpEventsGatherPeriodMs};
 }
 
 void Serialization::serialize(KvCacheConfig const& kvCacheConfig, std::ostream& os)
@@ -1184,6 +1185,7 @@ void Serialization::serialize(KvCacheConfig const& kvCacheConfig, std::ostream& 
     su::serialize(kvCacheConfig.getSecondaryOffloadMinPriority(), os);
     su::serialize(kvCacheConfig.getEventBufferMaxSize(), os);
     su::serialize(kvCacheConfig.getUseUvm(), os);
+    su::serialize(kvCacheConfig.getAttentionDpEventsGatherPeriodMs(), os);
 }
 
 size_t Serialization::serializedSize(KvCacheConfig const& kvCacheConfig)
@@ -2342,8 +2344,8 @@ KVCacheRemovedData Serialization::deserializeKVCacheRemovedData(std::istream& is
 }
 
 // KVCacheEventDiff
-
-size_t Serialization::serializedSize(KVCacheEventDiff<SizeType32> const& data)
+template <typename T>
+size_t Serialization::serializedSize(KVCacheEventDiff<T> const& data)
 {
     size_t totalSize = 0;
     totalSize += su::serializedSize(data.oldValue);
@@ -2351,17 +2353,19 @@ size_t Serialization::serializedSize(KVCacheEventDiff<SizeType32> const& data)
     return totalSize;
 }
 
-void Serialization::serialize(KVCacheEventDiff<SizeType32> const& data, std::ostream& os)
+template <typename T>
+void Serialization::serialize(KVCacheEventDiff<T> const& data, std::ostream& os)
 {
     su::serialize(data.oldValue, os);
     su::serialize(data.newValue, os);
 }
 
-KVCacheEventDiff<SizeType32> Serialization::deserializeKVCacheEventDiff(std::istream& is)
+template <typename T>
+KVCacheEventDiff<T> Serialization::deserializeKVCacheEventDiff(std::istream& is)
 {
-    auto oldValue = su::deserialize<SizeType32>(is);
-    auto newValue = su::deserialize<SizeType32>(is);
-    return KVCacheEventDiff<SizeType32>{oldValue, newValue};
+    auto oldValue = su::deserialize<T>(is);
+    auto newValue = su::deserialize<T>(is);
+    return KVCacheEventDiff<T>{oldValue, newValue};
 }
 
 // KVCacheUpdatedData
@@ -2387,6 +2391,28 @@ KVCacheUpdatedData Serialization::deserializeKVCacheUpdatedData(std::istream& is
     auto cacheLevel = su::deserialize<std::optional<KVCacheEventDiff<SizeType32>>>(is);
     auto priority = su::deserialize<std::optional<KVCacheEventDiff<SizeType32>>>(is);
     return KVCacheUpdatedData{blockHash, cacheLevel, priority};
+}
+
+// UniqueToken
+size_t Serialization::serializedSize(tensorrt_llm::runtime::UniqueToken const& token)
+{
+    size_t totalSize = 0;
+    totalSize += su::serializedSize(token.tokenId);
+    totalSize += su::serializedSize(token.tokenExtraId);
+    return totalSize;
+}
+
+void Serialization::serialize(tensorrt_llm::runtime::UniqueToken const& token, std::ostream& os)
+{
+    su::serialize(token.tokenId, os);
+    su::serialize(token.tokenExtraId, os);
+}
+
+tensorrt_llm::runtime::UniqueToken Serialization::deserializeUniqueToken(std::istream& is)
+{
+    auto tokenId = su::deserialize<tensorrt_llm::runtime::TokenIdType>(is);
+    auto tokenExtraId = su::deserialize<tensorrt_llm::runtime::TokenExtraIdType>(is);
+    return tensorrt_llm::runtime::UniqueToken{tokenId, tokenExtraId};
 }
 
 // String

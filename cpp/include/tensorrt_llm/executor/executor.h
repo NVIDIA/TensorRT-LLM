@@ -1001,6 +1001,7 @@ public:
         std::optional<FloatType> const& crossKvCacheFraction = std::nullopt,
         std::optional<RetentionPriority> secondaryOffloadMinPriority = std::nullopt, size_t eventBufferMaxSize = 0,
         bool enablePartialReuse = true, bool copyOnPartialReuse = true, bool useUvm = false,
+        SizeType32 attentionDpEventsGatherPeriodMs = 5,
         std::optional<tensorrt_llm::runtime::RuntimeDefaults> const& runtimeDefaults = std::nullopt);
 
     [[nodiscard]] bool getEnableBlockReuse() const;
@@ -1016,6 +1017,7 @@ public:
     [[nodiscard]] std::optional<RetentionPriority> getSecondaryOffloadMinPriority() const;
     [[nodiscard]] size_t getEventBufferMaxSize() const;
     [[nodiscard]] bool getUseUvm() const;
+    [[nodiscard]] SizeType32 getAttentionDpEventsGatherPeriodMs() const;
 
     void setEnableBlockReuse(bool enableBlockReuse);
     void setEnablePartialReuse(bool enablePartialReuse);
@@ -1030,6 +1032,7 @@ public:
     void setSecondaryOffloadMinPriority(std::optional<RetentionPriority> secondaryOffloadMinPriority);
     void setEventBufferMaxSize(size_t eventBufferMaxSize);
     void setUseUvm(bool useUvm);
+    void setAttentionDpEventsGatherPeriodMs(SizeType32 attentionDpEventPollPeriodMs);
 
     void fillEmptyFieldsFromRuntimeDefaults(tensorrt_llm::runtime::RuntimeDefaults const& runtimeDefaults);
 
@@ -1085,6 +1088,9 @@ private:
 
     /// @brief Whether to use UVM for the KV cache.
     bool mUseUvm;
+
+    /// @brief The period in milliseconds to poll for attention DP events across rank
+    SizeType32 mAttentionDpEventsGatherPeriodMs;
 };
 
 /// @brief Configuration class for the runtime perf knobs
@@ -1732,13 +1738,8 @@ using KVCacheEventData = std::variant<KVCacheCreatedData, KVCacheStoredData, KVC
 
 struct KVCacheEvent
 {
-
     KVCacheEvent(IdType eventId, KVCacheEventData data, SizeType32 windowSize,
-        std::optional<SizeType32> attentionDpRank = std::nullopt)
-        : eventId{eventId}
-        , data{std::move(data)}
-        , windowSize{windowSize}
-        , attentionDpRank{attentionDpRank} {};
+        std::optional<SizeType32> attentionDpRank = std::nullopt);
 
     /// @brief The unique id of this event
     IdType eventId;
