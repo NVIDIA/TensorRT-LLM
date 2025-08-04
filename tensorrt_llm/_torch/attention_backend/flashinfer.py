@@ -167,6 +167,12 @@ class FlashInferAttentionMetadata(AttentionMetadata):
                                                  device='cuda',
                                                  dtype=torch.int)
 
+    def get_runtime_buffers(self):
+        return {}
+
+    def __post_init_with_buffers__(self, buffers) -> None:
+        self.__post_init__()
+
     def create_cuda_graph_metadata(self,
                                    max_batch_size: int,
                                    sub_cross_metadata: bool = False,
