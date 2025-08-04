@@ -1,6 +1,6 @@
 import copy
 import os
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -59,10 +59,16 @@ class LlavaNextInputProcessor(InputProcessor):
         text_prompt, mm_data = inputs.get("prompt"), inputs.get(
             "multi_modal_data", {})
         # Preprocess
+        images = mm_data.get('image', [])
+        if not images:
+            return self.processor.tokenizer(
+                text_prompt,
+                return_tensors="pt").input_ids[0].to(torch.int32).tolist(), {}
+
         processed_values = self.processor(
             text=text_prompt,
-            images=mm_data['image'],
-            do_rescale=not isinstance(mm_data['image'][0], torch.Tensor),
+            images=images,
+            do_rescale=not (images and isinstance(images[0], torch.Tensor)),
             return_tensors="pt")
         # Postprocess
         fused_input_ids = processed_values['input_ids'][0]
