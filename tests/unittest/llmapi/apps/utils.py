@@ -133,8 +133,7 @@ def make_server_with_custom_sampler_fixture(api_type: str) -> Callable:
     '''
 
     @pytest.fixture(scope='function')
-    def server_with_custom_sampler(model_name: str,
-                                   num_postprocess_workers: int, request: Any,
+    def server_with_custom_sampler(model_name: str, request: Any,
                                    tmp_path: Path) -> RemoteOpenAIServer:
         '''Fixture to launch a server with a custom sampler configuration.'''
         use_trtllm_sampler = getattr(request, 'param',
@@ -150,58 +149,10 @@ def make_server_with_custom_sampler_fixture(api_type: str) -> Callable:
         with temp_file_path.open('w') as f:
             yaml.dump(extra_llm_api_options_dict, f)
         args.extend(['--extra_llm_api_options', str(temp_file_path)])
-        args.extend(['--num_postprocess_workers', str(num_postprocess_workers)])
+        args.extend(['--num_postprocess_workers',
+                     str(0)])  # disable postprocess workers to avoid OOM
 
-        try:
-            with RemoteOpenAIServer(model_path, args) as remote_server:
-                yield remote_server
-        except Exception as exc:
-            # Check if it's a torch.OutOfMemoryError (could be wrapped in RuntimeError)
-            import torch
-            if isinstance(exc, torch.OutOfMemoryError) or (
-                    hasattr(exc, '__cause__')
-                    and isinstance(exc.__cause__, torch.OutOfMemoryError)
-            ) or 'CUDA out of memory' in str(exc):
-                pytest.skip(
-                    f'Skipping test due to GPU OOM: {exc}. This is likely because multiple RemoteOpenAIServer instances are using GPU memory in parallel.'
-                )
-            else:
-                raise
+        with RemoteOpenAIServer(model_path, args) as remote_server:
+            yield remote_server
 
     return server_with_custom_sampler
-
-
-def make_common_fixtures():
-    '''Factory to create common fixtures used across multiple test files.
-    Returns a dictionary of fixture functions that can be assigned in test files.
-    '''
-
-    @pytest.fixture(scope="module")
-    def model_name():
-        return "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
-
-    @pytest.fixture(scope="module", params=["trt", "pytorch"])
-    def backend(request):
-        return request.param
-
-    @pytest.fixture(scope="module",
-                    params=[0, 2],
-                    ids=["disable_processpool", "enable_processpool"])
-    def num_postprocess_workers(request):
-        return request.param
-
-    @pytest.fixture(scope="module")
-    def client(server):
-        return server.get_client()
-
-    @pytest.fixture(scope="module")
-    def async_client(server):
-        return server.get_async_client()
-
-    return {
-        'model_name': model_name,
-        'backend': backend,
-        'num_postprocess_workers': num_postprocess_workers,
-        'client': client,
-        'async_client': async_client
-    }
