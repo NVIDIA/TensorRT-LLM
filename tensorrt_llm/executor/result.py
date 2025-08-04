@@ -15,7 +15,7 @@ from ..bindings import executor as tllm
 from ..disaggregated_params import DisaggregatedParams
 from ..llmapi.tracer import global_tracer
 from ..llmapi.utils import AsyncQueue
-from ..metrics import MetricsCollector, RequestEventTiming, SupportedMetricNames
+from ..metrics import MetricNames, MetricsCollector, RequestEventTiming
 from ..sampling_params import LogprobParams, SamplingParams
 from .utils import ErrorResponse, has_event_loop, is_llm_response
 
@@ -731,8 +731,7 @@ def compute_logprobs(
 def _process_req_perf_metrics(
         req_perf_metrics_dict: Optional[dict[str, float]],
         output_length: int,
-        is_multiple_response: bool = False
-) -> dict[SupportedMetricNames, float]:
+        is_multiple_response: bool = False) -> dict[MetricNames, float]:
     stat = {}
     if not req_perf_metrics_dict:
         return stat
@@ -743,14 +742,14 @@ def _process_req_perf_metrics(
     request_queue_time = req_perf_metrics_dict.get(RequestEventTiming.FIRST_SCHEDULED_TIME, 0) - \
                          req_perf_metrics_dict.get(RequestEventTiming.ARRIVAL_TIME, 0)
     stat = {
-        SupportedMetricNames.TTFT: ttft,
-        SupportedMetricNames.E2E: e2e,
-        SupportedMetricNames.REQUEST_QUEUE_TIME: request_queue_time
+        MetricNames.TTFT: ttft,
+        MetricNames.E2E: e2e,
+        MetricNames.REQUEST_QUEUE_TIME: request_queue_time
     }
     if output_length > 1 and not is_multiple_response:
         tpot = (req_perf_metrics_dict.get(
             RequestEventTiming.LAST_TOKEN_TIME, 0) - req_perf_metrics_dict.get(
                 RequestEventTiming.FIRST_TOKEN_TIME, 0)) / (output_length - 1)
-        stat.update({SupportedMetricNames.TPOT: tpot})
+        stat.update({MetricNames.TPOT: tpot})
     stat = dict(filter(lambda item: item[1] > 0, stat.items()))
     return stat

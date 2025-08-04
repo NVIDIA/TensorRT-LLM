@@ -3,7 +3,7 @@
 import time
 from typing import Dict, Optional, Union
 
-from .enums import SupportedMetricNames
+from .enums import MetricNames
 
 
 # Adapted from https://github.com/vllm-project/vllm/blob/v0.10.0rc1/vllm/engine/metrics.py#L30
@@ -86,14 +86,13 @@ class MetricsCollector:
         self.last_log_time = time.time()
 
     def log_histogram(self, data: Optional[dict[str, float]]) -> None:
-        if e2e := data.get(SupportedMetricNames.E2E, 0):
+        if e2e := data.get(MetricNames.E2E, 0):
             self._log_histogram(self.histogram_e2e_time_request, e2e)
-        if ttft := data.get(SupportedMetricNames.TTFT, 0):
+        if ttft := data.get(MetricNames.TTFT, 0):
             self._log_histogram(self.histogram_time_to_first_token, ttft)
-        if tpot := data.get(SupportedMetricNames.TPOT, 0):
+        if tpot := data.get(MetricNames.TPOT, 0):
             self._log_histogram(self.histogram_time_per_output_token, tpot)
-        if request_queue_time := data.get(
-                SupportedMetricNames.REQUEST_QUEUE_TIME, 0):
+        if request_queue_time := data.get(MetricNames.REQUEST_QUEUE_TIME, 0):
             self._log_histogram(self.histogram_queue_time_request,
                                 request_queue_time)
         self.last_log_time = time.time()

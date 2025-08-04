@@ -437,9 +437,7 @@ class SamplingParams:
 
         return tllme.SamplingConfig(**llmapi_to_rt_param_map)
 
-    def _get_output_config(
-        self, is_pytorch_backend: bool = False, return_perf_metrics: Optional[bool] = False
-    ) -> tllme.OutputConfig:
+    def _get_output_config(self, is_pytorch_backend: bool = False) -> tllme.OutputConfig:
         sampling_param_fields = set(dir(SamplingParams))
         fields = [
             f
@@ -453,7 +451,6 @@ class SamplingParams:
             config_kwargs["return_log_probs"] = bool(self.logprobs)
         else:
             config_kwargs["return_log_probs"] = self._return_log_probs
-        config_kwargs["return_perf_metrics"] = return_perf_metrics
 
         return tllme.OutputConfig(**config_kwargs)
 

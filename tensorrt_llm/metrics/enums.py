@@ -1,14 +1,14 @@
-from enum import Enum
+from enum import StrEnum
 
 
-class SupportedMetricNames(Enum):
+class MetricNames(StrEnum):
     TTFT = "ttft"
     TPOT = "tpot"
     E2E = "e2e"
     REQUEST_QUEUE_TIME = "request_queue_time"
 
 
-class RequestEventTiming(Enum):
+class RequestEventTiming(StrEnum):
     ARRIVAL_TIME = "arrival_time"
     FIRST_TOKEN_TIME = "first_token_time"  # nosec: B105
     FIRST_SCHEDULED_TIME = "first_scheduled_time"

@@ -473,8 +473,7 @@ class GenerationExecutorWorker(GenerationExecutor):
                 request.sampling_params.end_id,
                 pad_id=request.sampling_params.pad_id,
                 output_config=request.sampling_params._get_output_config(
-                    is_pytorch_backend=self._is_pytorch_backend,
-                    return_perf_metrics=request.return_perf_metrics),
+                    is_pytorch_backend=self._is_pytorch_backend),
                 # Beam search enforces return_all_generated_tokens=True regardless of the passed value
                 return_all_generated_tokens=False,
                 # convert python config into pybind config
