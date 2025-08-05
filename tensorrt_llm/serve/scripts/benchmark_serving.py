@@ -712,6 +712,7 @@ def main(args: argparse.Namespace):
                                       input_len=args.random_input_len,
                                       output_len=args.random_output_len,
                                       range_ratio=args.random_range_ratio,
+                                      use_chat_template=args.use_chat_template,
                                   )
         }
 
@@ -1104,7 +1105,14 @@ if __name__ == "__main__":
         "--tokenize-on-client",
         action="store_true",
         help=
-        "Tokenize on client instead of server. This option only takes effect with random dataset to let the server run exactly the same ISL specified by cli.",
+        "Tokenize on client instead of server. This option only takes effect "
+        "with random dataset to let the server run exactly the same ISL "
+        "specified by cli.",
+    )
+    random_group.add_argument(
+        "--use-chat-template",
+        action="store_true",
+        help="Use chat template to format the prompt.",
     )
 
     hf_group = parser.add_argument_group("hf dataset options")

@@ -22,6 +22,7 @@ import logging
 import random
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from functools import partial
 from typing import Any, Callable, Optional, Union
 
 import numpy as np
@@ -199,6 +200,25 @@ class RandomDataset(BenchmarkDataset):
                 RandomDataset.SHAREGPT_URL, download_path,
                 RandomDataset.SHAREGPT_URL.split("/")[-1], download_timeout)
 
+    def apply_chat_template(prompt, tokenizer):
+        """Apply chat template to a prompt.
+
+        Args:
+            prompt (str): The input prompt.
+            tokenizer (PreTrainedTokenizerBase): The tokenizer to use.
+
+        Returns:
+            str: The chat-templated prompt.
+        """
+        return tokenizer.apply_chat_template(
+            [{
+                "role": "user",
+                "content": prompt
+            }],
+            add_generation_prompt=True,
+            tokenize=False,
+        )
+
     def sample(
         self,
         tokenizer: PreTrainedTokenizerBase,
@@ -207,8 +227,23 @@ class RandomDataset(BenchmarkDataset):
         range_ratio: float = DEFAULT_RANGE_RATIO,
         input_len: int = DEFAULT_INPUT_LEN,
         output_len: int = DEFAULT_OUTPUT_LEN,
+        use_chat_template: bool = False,
         **kwargs,
     ) -> list[SampleRequest]:
+
+        # Define a function to post-process the prompt so that we can use it to
+        # apply the chat template to the prompt if needed.
+        def post_process_prompt(prompt):
+            """Post-process the prompt.
+
+            Args:
+                prompt (str): The input prompt.
+
+            Returns:
+                str: The original prompt.
+            """
+            return prompt
+
         # Enforce range_ratio < 1
         assert range_ratio < 1.0, (
             "random_range_ratio must be < 1.0 to ensure a valid sampling range")
@@ -217,6 +252,22 @@ class RandomDataset(BenchmarkDataset):
 
         prefix_token_ids = (np.random.randint(
             0, vocab_size, size=prefix_len).tolist() if prefix_len > 0 else [])
+
+        # Calculate chat template overhead if needed
+        chat_template_len = 0
+        if use_chat_template:
+            # Set the post_process_prompt to the apply_chat_template function
+            # so that we can use it to apply the chat template to the prompt.
+            post_process_prompt = partial(self.apply_chat_template, tokenizer)
+            # Apply the chat template to a dummy prompt to get the chat template
+            # length.
+            chat_template_dummy = post_process_prompt("a")
+            tokenized_chat_template_dummy = tokenizer.encode(
+                chat_template_dummy, add_special_tokens=False)
+            # The chat template length is the length of the tokenized chat template
+            # minus 1 because the chat template is applied to the dummy prompt.
+            chat_template_len = len(tokenized_chat_template_dummy) - 1
+            input_len = input_len - chat_template_len
 
         # New sampling logic: [X * (1 - b), X * (1 + b)]
         input_low = int(input_len * (1 - range_ratio))
@@ -291,8 +342,13 @@ class RandomDataset(BenchmarkDataset):
 
                 if self.return_text:
                     prompt = tokenizer.decode(prompt)
+                    prompt = post_process_prompt(prompt)
 
-                total_input_len = prefix_len + int(input_lens[i])
+                # We can directly use the chat template length here because
+                # the chat template is conditionally set if use_chat_template
+                # is True.
+                total_input_len = prefix_len + int(
+                    input_lens[i]) + chat_template_len
                 requests.append(
                     SampleRequest(
                         prompt=prompt,
@@ -309,7 +365,18 @@ class RandomDataset(BenchmarkDataset):
                 prompt = prefix_token_ids + inner_seq
                 if self.return_text:
                     prompt = tokenizer.decode(prompt)
+                    if use_chat_template:
+                        prompt = tokenizer.apply_chat_template(
+                            [{
+                                "role": "user",
+                                "content": prompt
+                            }],
+                            add_generation_prompt=True,
+                            tokenize=False,
+                        )
                 total_input_len = prefix_len + int(input_lens[i])
+                if use_chat_template:
+                    total_input_len += chat_template_len
                 requests.append(
                     SampleRequest(
                         prompt=prompt,
@@ -361,13 +428,14 @@ class CustomDataset(BenchmarkDataset):
         random.seed(self.random_seed)
         random.shuffle(self.data)
 
-    def sample(self, tokenizer: PreTrainedTokenizerBase,
-               num_requests: int) -> list[SampleRequest]:
+    def sample(self, tokenizer: PreTrainedTokenizerBase, num_requests: int,
+               **kwargs) -> list[SampleRequest]:
         samples: list = []
         for entry in self.data:
             if len(samples) >= num_requests:
                 break
             prompt = entry["input"]["messages"][1]["content"]
+
             prompt_ids = tokenizer(prompt).input_ids
             prompt_len = len(prompt_ids)
             max_tokens = entry["input"]["max_tokens"]
