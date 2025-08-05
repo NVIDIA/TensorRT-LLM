@@ -1,7 +1,7 @@
 from pathlib import Path
 from typing import Dict, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field
 
 from tensorrt_llm import LLM as PyTorchLLM
 from tensorrt_llm._tensorrt_engine import LLM
@@ -27,10 +27,10 @@ class GeneralExecSettings(BaseModel):
         default=None, description="Path to model checkpoint")
     concurrency: int = Field(
         default=-1, description="Desired concurrency rate, <=0 for no limit")
-    dataset_path: Optional[Path] = Field(
-        default=None,
-        alias_choices=["dataset_path", "dataset"],
-        description="Path to dataset file")
+    dataset_path: Optional[Path] = Field(default=None,
+                                         validation_alias=AliasChoices(
+                                             "dataset_path", "dataset"),
+                                         description="Path to dataset file")
     engine_dir: Optional[Path] = Field(
         default=None, description="Path to a serialized TRT-LLM engine")
     eos_id: int = Field(
@@ -39,7 +39,8 @@ class GeneralExecSettings(BaseModel):
         default=None, description="Path where iteration logging is written")
     kv_cache_percent: float = Field(
         default=0.90,
-        alias_choices=["kv_cache_percent", "kv_cache_free_gpu_mem_fraction"],
+        validation_alias=AliasChoices("kv_cache_percent",
+                                      "kv_cache_free_gpu_mem_fraction"),
         description="Percentage of memory for KV Cache after model load")
     max_input_len: int = Field(default=4096,
                                description="Maximum input sequence length")
