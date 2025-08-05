@@ -1217,9 +1217,9 @@ class PeftCacheManager(BaseResourceManager):
                 # tensor] without the other. Since there's no need for any of them when the LoRA adapter is already
                 # cached, we can safely remove both from the request.
                 request.remove_lora_tensors()
-            elif request.lora_weights is None and request.lora_path:
+            elif request.lora_weights is None and request.py_lora_path:
                 self._lora_manager.load_from_ckpt(
-                    [request.lora_path],
+                    [request.py_lora_path],
                     model_config=self._lora_model_config,
                     runtime_mapping=None,
                     uids=[request.lora_task_id],

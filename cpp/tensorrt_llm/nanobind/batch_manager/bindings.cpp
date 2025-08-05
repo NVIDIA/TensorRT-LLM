@@ -116,7 +116,6 @@ void initBindings(nb::module_& m)
         .def_prop_ro("embedding_bias", &GenLlmReq::getEmbeddingBias)
         .def_prop_rw("lora_config", &GenLlmReq::getLoraConfig, &GenLlmReq::setLoraConfig)
         .def_prop_rw("lora_weights", &GenLlmReq::getLoraWeights, &GenLlmReq::setLoraWeights)
-        .def_prop_rw("lora_path", &GenLlmReq::getLoraAdapterPath, &GenLlmReq::setLoraAdapterPath)
         .def_prop_ro("stop_words_list", &GenLlmReq::getStopWordsList)
         .def_prop_ro("context_logits", &GenLlmReq::getContextLogitsHost)
         .def_prop_ro("generation_logits", &GenLlmReq::getGenerationLogitsHost)
@@ -269,7 +268,7 @@ void initBindings(nb::module_& m)
                 std::optional<at::Tensor> multimodal_embedding, std::optional<at::Tensor> mrope_rotary_cos_sin,
                 std::optional<tb::LlmRequest::SizeType32> mrope_position_deltas,
                 std::optional<LoraTaskIdType> lora_task_id, std::optional<at::Tensor> lora_weights,
-                std::optional<at::Tensor> lora_config, std::optional<std::string> lora_path,
+                std::optional<at::Tensor> lora_config,
                 std::optional<executor::LookaheadDecodingConfig> lookahead_config,
                 std::optional<executor::KvCacheRetentionConfig> kv_cache_retention_config, bool return_log_probs,
                 bool return_context_logits, bool return_generation_logits,
@@ -316,13 +315,13 @@ void initBindings(nb::module_& m)
                 auto cross_attention_mask_tensor_ptr = makeOptionalTensor(cross_attention_mask);
                 auto skip_cross_attn_blocks_tensor_ptr = makeOptionalTensor(skip_cross_attn_blocks);
 
-                // 50 parameters
+                // 49 parameters
                 new (self) tb::LlmRequest{request_id, max_new_tokens, input_tokens, sampling_config, is_streaming,
                     end_id, pad_id, embedding_bias_tensor_ptr, bad_words_list_tensor_ptr, stop_words_list_tensor_ptr,
                     position_ids, prompt_embedding_table_tensor_ptr, prompt_vocab_size, multimodal_hashes,
                     multimodal_positions, multimodal_lengths, multimodal_embedding_tensor_ptr,
                     mrope_rotary_cos_sin_tensor_ptr, mrope_position_deltas, lora_task_id, lora_weights_tensor_ptr,
-                    lora_config_tensor_ptr, lora_path, lookahead_config, kv_cache_retention_config, return_log_probs,
+                    lora_config_tensor_ptr, lookahead_config, kv_cache_retention_config, return_log_probs,
                     return_context_logits, return_generation_logits, draft_tokens, draft_logits_tensor_ptr,
                     exclude_input_from_output, logits_post_processor, apply_logits_post_processor_batched,
                     encoder_input_tokens, return_encoder_output, client_id, priority, encoder_input_features_tensor_ptr,
@@ -339,16 +338,15 @@ void initBindings(nb::module_& m)
             nb::arg("multimodal_lengths") = std::nullopt, nb::arg("multimodal_embedding") = std::nullopt,
             nb::arg("mrope_rotary_cos_sin") = std::nullopt, nb::arg("mrope_position_deltas") = std::nullopt,
             nb::arg("lora_task_id") = std::nullopt, nb::arg("lora_weights") = std::nullopt,
-            nb::arg("lora_config") = std::nullopt, nb::arg("lora_path") = std::nullopt,
-            nb::arg("lookahead_config") = std::nullopt, nb::arg("kv_cache_retention_config") = std::nullopt,
-            nb::arg("return_log_probs") = false, nb::arg("return_context_logits") = false,
-            nb::arg("return_generation_logits") = false, nb::arg("draft_tokens") = std::nullopt,
-            nb::arg("draft_logits") = std::nullopt, nb::arg("exclude_input_from_output") = false,
-            nb::arg("logits_post_processor") = std::nullopt, nb::arg("apply_logits_post_processor_batched") = false,
-            nb::arg("encoder_input_tokens") = std::nullopt, nb::arg("return_encoder_output") = false,
-            nb::arg("client_id") = std::nullopt, nb::arg("priority") = executor::Request::kDefaultPriority,
-            nb::arg("encoder_input_features") = std::nullopt, nb::arg("encoder_output_len") = std::nullopt,
-            nb::arg("cross_attention_mask") = std::nullopt,
+            nb::arg("lora_config") = std::nullopt, nb::arg("lookahead_config") = std::nullopt,
+            nb::arg("kv_cache_retention_config") = std::nullopt, nb::arg("return_log_probs") = false,
+            nb::arg("return_context_logits") = false, nb::arg("return_generation_logits") = false,
+            nb::arg("draft_tokens") = std::nullopt, nb::arg("draft_logits") = std::nullopt,
+            nb::arg("exclude_input_from_output") = false, nb::arg("logits_post_processor") = std::nullopt,
+            nb::arg("apply_logits_post_processor_batched") = false, nb::arg("encoder_input_tokens") = std::nullopt,
+            nb::arg("return_encoder_output") = false, nb::arg("client_id") = std::nullopt,
+            nb::arg("priority") = executor::Request::kDefaultPriority, nb::arg("encoder_input_features") = std::nullopt,
+            nb::arg("encoder_output_len") = std::nullopt, nb::arg("cross_attention_mask") = std::nullopt,
             nb::arg("llm_request_type") = tb::LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION,
             nb::arg("input_token_extra_ids") = std::nullopt, nb::arg("num_return_sequences") = 1,
             nb::arg("eagle_config") = std::nullopt, nb::arg("skip_cross_attn_blocks") = std::nullopt,
@@ -377,8 +375,7 @@ void initBindings(nb::module_& m)
         .def("move_lora_weights_to_gpu", &tb::LlmRequest::moveLoraWeightsToGpu, nb::arg("manager"))
         .def("finish_by_reason", &tb::LlmRequest::finishByReason, nb::arg("finish_reason"))
         .def("set_first_scheduled_time", &tb::LlmRequest::setFirstScheduledTime)
-        .def("update_perf_metrics", &tb::LlmRequest::updatePerfMetrics, nb::arg("iter_counter"))
-        .def("remove_lora_tensors", &tb::LlmRequest::removeLoraTensors);
+        .def("update_perf_metrics", &tb::LlmRequest::updatePerfMetrics, nb::arg("iter_counter"));
 
     nb::class_<tb::SequenceSlotManager>(m, "SequenceSlotManager")
         .def(nb::init<tb::SequenceSlotManager::SlotIdType, uint64_t>(), nb::arg("max_num_slots"),

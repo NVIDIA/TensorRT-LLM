@@ -279,24 +279,22 @@ void initRequestBindings(nb::module_& m)
         .def("__setstate__", promptTuningConfigSetstate);
 
     auto loraConfigGetstate = [](tle::LoraConfig const& self)
-    { return nb::make_tuple(self.getTaskId(), self.getWeights(), self.getConfig(), self.getPath()); };
+    { return nb::make_tuple(self.getTaskId(), self.getWeights(), self.getConfig()); };
     auto loraConfigSetstate = [](tle::LoraConfig& loraConfig, nb::tuple const& state)
     {
-        if (state.size() != 4)
+        if (state.size() != 3)
         {
             throw std::runtime_error("Invalid LoraConfig state!");
         }
         new (&loraConfig) tle::LoraConfig(nb::cast<IdType>(state[0]), nb::cast<std::optional<Tensor>>(state[1]),
-            nb::cast<std::optional<Tensor>>(state[2]), nb::cast<std::optional<std::string>>(state[3]));
+            nb::cast<std::optional<Tensor>>(state[2]));
     };
     nb::class_<tle::LoraConfig>(m, "LoraConfig")
-        .def(nb::init<uint64_t, std::optional<Tensor>, std::optional<Tensor>, std::optional<std::string>>(),
-            nb::arg("task_id"), nb::arg("weights") = nb::none(), nb::arg("config") = nb::none(),
-            nb::arg("path") = nb::none())
+        .def(nb::init<uint64_t, std::optional<Tensor>, std::optional<Tensor>>(), nb::arg("task_id"),
+            nb::arg("weights") = nb::none(), nb::arg("config") = nb::none())
         .def_prop_ro("task_id", &tle::LoraConfig::getTaskId)
         .def_prop_ro("weights", &tle::LoraConfig::getWeights)
         .def_prop_ro("config", &tle::LoraConfig::getConfig)
-        .def_prop_ro("path", &tle::LoraConfig::getPath)
         .def("__getstate__", loraConfigGetstate)
         .def("__setstate__", loraConfigSetstate);
 

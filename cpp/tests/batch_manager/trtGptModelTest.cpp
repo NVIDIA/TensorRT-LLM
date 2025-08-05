@@ -963,10 +963,10 @@ TEST_F(TrtGptModelTest, PauseRequestStats)
     auto llmRequest = std::make_shared<LlmRequest>(correlationId, maxNewTokens, tokens, inSamplingConfig, false,
         std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
         std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
-        std::nullopt, std::nullopt, std::nullopt, std::nullopt, false, false, false, std::nullopt, std::nullopt, false,
-        std::nullopt, false, std::nullopt, false, std::nullopt, executor::Request::kDefaultPriority, std::nullopt,
-        std::nullopt, std::nullopt, LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, std::nullopt, 1,
-        std::nullopt, std::nullopt, true /* returnPerfMetrics */);
+        std::nullopt, std::nullopt, std::nullopt, false, false, false, std::nullopt, std::nullopt, false, std::nullopt,
+        false, std::nullopt, false, std::nullopt, executor::Request::kDefaultPriority, std::nullopt, std::nullopt,
+        std::nullopt, LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, std::nullopt, 1, std::nullopt,
+        std::nullopt, true /* returnPerfMetrics */);
 
     RequestList requestList{llmRequest};
 

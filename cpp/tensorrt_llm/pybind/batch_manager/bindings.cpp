@@ -117,7 +117,6 @@ void initBindings(pybind11::module_& m)
         .def_property_readonly("bad_words_list", &GenLlmReq::getBadWordsList)
         .def_property("draft_logits", &GenLlmReq::getDraftLogits, &GenLlmReq::setDraftLogits)
         .def_property_readonly("embedding_bias", &GenLlmReq::getEmbeddingBias)
-        .def_property("lora_path", &GenLlmReq::getLoraAdapterPath, &GenLlmReq::setLoraAdapterPath)
         .def_property("lora_config", &GenLlmReq::getLoraConfig, &GenLlmReq::setLoraConfig)
         .def_property("lora_weights", &GenLlmReq::getLoraWeights, &GenLlmReq::setLoraWeights)
         .def_property_readonly("stop_words_list", &GenLlmReq::getStopWordsList)
@@ -272,7 +271,7 @@ void initBindings(pybind11::module_& m)
                      std::optional<at::Tensor> multimodal_embedding, std::optional<at::Tensor> mrope_rotary_cos_sin,
                      std::optional<tb::LlmRequest::SizeType32> mrope_position_deltas,
                      std::optional<LoraTaskIdType> lora_task_id, std::optional<at::Tensor> lora_weights,
-                     std::optional<at::Tensor> lora_config, std::optional<std::string> lora_path,
+                     std::optional<at::Tensor> lora_config,
                      std::optional<executor::LookaheadDecodingConfig> lookahead_config,
                      std::optional<executor::KvCacheRetentionConfig> kv_cache_retention_config, bool return_log_probs,
                      bool return_context_logits, bool return_generation_logits,
@@ -320,19 +319,19 @@ void initBindings(pybind11::module_& m)
                      auto cross_attention_mask_tensor_ptr = makeOptionalTensor(cross_attention_mask);
                      auto skip_cross_attn_blocks_tensor_ptr = makeOptionalTensor(skip_cross_attn_blocks);
 
-                     // 50 parameters
+                     // 49 parameters
                      return tb::LlmRequest{request_id, max_new_tokens, input_tokens, sampling_config, is_streaming,
                          end_id, pad_id, embedding_bias_tensor_ptr, bad_words_list_tensor_ptr,
                          stop_words_list_tensor_ptr, position_ids, prompt_embedding_table_tensor_ptr, prompt_vocab_size,
                          multimodal_hashes, multimodal_positions, multimodal_lengths, multimodal_embedding_tensor_ptr,
                          mrope_rotary_cos_sin_tensor_ptr, mrope_position_deltas, lora_task_id, lora_weights_tensor_ptr,
-                         lora_config_tensor_ptr, lora_path, lookahead_config, kv_cache_retention_config,
-                         return_log_probs, return_context_logits, return_generation_logits, draft_tokens,
-                         draft_logits_tensor_ptr, exclude_input_from_output, logits_post_processor,
-                         apply_logits_post_processor_batched, encoder_input_tokens, return_encoder_output, client_id,
-                         priority, encoder_input_features_tensor_ptr, encoder_output_length,
-                         cross_attention_mask_tensor_ptr, llm_request_type, input_token_extra_ids, num_return_sequences,
-                         eagle_config, skip_cross_attn_blocks_tensor_ptr, return_perf_metrics, guided_decoding_params,
+                         lora_config_tensor_ptr, lookahead_config, kv_cache_retention_config, return_log_probs,
+                         return_context_logits, return_generation_logits, draft_tokens, draft_logits_tensor_ptr,
+                         exclude_input_from_output, logits_post_processor, apply_logits_post_processor_batched,
+                         encoder_input_tokens, return_encoder_output, client_id, priority,
+                         encoder_input_features_tensor_ptr, encoder_output_length, cross_attention_mask_tensor_ptr,
+                         llm_request_type, input_token_extra_ids, num_return_sequences, eagle_config,
+                         skip_cross_attn_blocks_tensor_ptr, return_perf_metrics, guided_decoding_params,
                          language_adapter_uid, allotted_time_ms, context_phase_params};
                  }),
             py::arg("request_id"), py::arg("max_new_tokens"), py::arg("input_tokens"), py::arg("sampling_config"),
@@ -344,16 +343,15 @@ void initBindings(pybind11::module_& m)
             py::arg("multimodal_lengths") = std::nullopt, py::arg("multimodal_embedding") = std::nullopt,
             py::arg("mrope_rotary_cos_sin") = std::nullopt, py::arg("mrope_position_deltas") = std::nullopt,
             py::arg("lora_task_id") = std::nullopt, py::arg("lora_weights") = std::nullopt,
-            py::arg("lora_config") = std::nullopt, py::arg("lora_path") = std::nullopt,
-            py::arg("lookahead_config") = std::nullopt, py::arg("kv_cache_retention_config") = std::nullopt,
-            py::arg("return_log_probs") = false, py::arg("return_context_logits") = false,
-            py::arg("return_generation_logits") = false, py::arg("draft_tokens") = std::nullopt,
-            py::arg("draft_logits") = std::nullopt, py::arg("exclude_input_from_output") = false,
-            py::arg("logits_post_processor") = std::nullopt, py::arg("apply_logits_post_processor_batched") = false,
-            py::arg("encoder_input_tokens") = std::nullopt, py::arg("return_encoder_output") = false,
-            py::arg("client_id") = std::nullopt, py::arg("priority") = executor::Request::kDefaultPriority,
-            py::arg("encoder_input_features") = std::nullopt, py::arg("encoder_output_len") = std::nullopt,
-            py::arg("cross_attention_mask") = std::nullopt,
+            py::arg("lora_config") = std::nullopt, py::arg("lookahead_config") = std::nullopt,
+            py::arg("kv_cache_retention_config") = std::nullopt, py::arg("return_log_probs") = false,
+            py::arg("return_context_logits") = false, py::arg("return_generation_logits") = false,
+            py::arg("draft_tokens") = std::nullopt, py::arg("draft_logits") = std::nullopt,
+            py::arg("exclude_input_from_output") = false, py::arg("logits_post_processor") = std::nullopt,
+            py::arg("apply_logits_post_processor_batched") = false, py::arg("encoder_input_tokens") = std::nullopt,
+            py::arg("return_encoder_output") = false, py::arg("client_id") = std::nullopt,
+            py::arg("priority") = executor::Request::kDefaultPriority, py::arg("encoder_input_features") = std::nullopt,
+            py::arg("encoder_output_len") = std::nullopt, py::arg("cross_attention_mask") = std::nullopt,
             py::arg_v("llm_request_type", tb::LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION,
                 "LlmRequestType.LLMREQUEST_TYPE_CONTEXT_AND_GENERATION"),
             py::arg("input_token_extra_ids") = std::nullopt, py::arg("num_return_sequences") = 1,
@@ -383,8 +381,7 @@ void initBindings(pybind11::module_& m)
         .def("move_lora_weights_to_gpu", &tb::LlmRequest::moveLoraWeightsToGpu, py::arg("manager"))
         .def("finish_by_reason", &tb::LlmRequest::finishByReason, py::arg("finish_reason"))
         .def("set_first_scheduled_time", &tb::LlmRequest::setFirstScheduledTime)
-        .def("update_perf_metrics", &tb::LlmRequest::updatePerfMetrics, py::arg("iter_counter"))
-        .def("remove_lora_tensors", &tb::LlmRequest::removeLoraTensors);
+        .def("update_perf_metrics", &tb::LlmRequest::updatePerfMetrics, py::arg("iter_counter"));
 
     py::classh<tb::SequenceSlotManager>(m, "SequenceSlotManager")
         .def(py::init<tb::SequenceSlotManager::SlotIdType, uint64_t>(), py::arg("max_num_slots"),

@@ -22,12 +22,10 @@
 
 namespace tensorrt_llm::executor
 {
-LoraConfig::LoraConfig(
-    IdType taskId, std::optional<Tensor> weights, std::optional<Tensor> config, std::optional<std::string> path)
+LoraConfig::LoraConfig(IdType taskId, std::optional<Tensor> weights, std::optional<Tensor> config)
     : mTaskId(taskId)
     , mWeights(std::move(weights))
     , mConfig(std::move(config))
-    , mPath(std::move(path))
 {
     if (mConfig.has_value())
     {
@@ -71,11 +69,6 @@ std::optional<Tensor> LoraConfig::getWeights() const
 std::optional<Tensor> LoraConfig::getConfig() const
 {
     return mConfig;
-}
-
-std::optional<std::string> LoraConfig::getPath() const
-{
-    return mPath;
 }
 
 } // namespace tensorrt_llm::executor

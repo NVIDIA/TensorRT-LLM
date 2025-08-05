@@ -325,13 +325,12 @@ private:
 class LoraConfig
 {
 public:
-    explicit LoraConfig(IdType taskId, std::optional<Tensor> weights = std::nullopt,
-        std::optional<Tensor> config = std::nullopt, std::optional<std::string> path = std::nullopt);
+    explicit LoraConfig(
+        IdType taskId, std::optional<Tensor> weights = std::nullopt, std::optional<Tensor> config = std::nullopt);
 
     [[nodiscard]] IdType getTaskId() const;
     [[nodiscard]] std::optional<Tensor> getWeights() const;
     [[nodiscard]] std::optional<Tensor> getConfig() const;
-    [[nodiscard]] std::optional<std::string> getPath() const;
 
 private:
     friend class Serialization;
@@ -342,8 +341,6 @@ private:
     std::optional<Tensor> mWeights;
     /// @brief The Lora configuration. See TRT-LLM documentation for detailed description of the config tensor
     std::optional<Tensor> mConfig;
-    /// @brief The Lora adapter path
-    std::optional<std::string> mPath;
 };
 
 /// @brief Configuration for Look-Ahead speculative decoding.
