@@ -1775,6 +1775,31 @@ def test_ptp_quickstart_advanced_ngram(llm_root, llm_venv, model_name,
         _check_mem_usage(running_log, [27.0, 0, 0, 0])
 
 
+@pytest.mark.parametrize("model_name,model_path", [
+    ("Llama-3.1-8B-Instruct", "llama-3.1-model/Llama-3.1-8B-Instruct"),
+])
+def test_ptp_quickstart_advanced_auto(llm_root, llm_venv, model_name,
+                                      model_path):
+    print(f"Testing {model_name}.")
+    example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
+    with tempfile.NamedTemporaryFile(mode='w+t',
+                                     suffix=f".{model_name}.log",
+                                     dir="./",
+                                     delete=True,
+                                     delete_on_close=True) as running_log:
+        llm_venv.run_cmd([
+            str(example_root / "quickstart_advanced.py"),
+            "--model_dir",
+            f"{llm_models_root()}/{model_path}",
+            "--spec_decode_algo",
+            "AUTO",
+            "--use_cuda_graph",
+            "--max_batch_size=4",
+        ],
+                         stdout=running_log)
+        _check_mem_usage(running_log, [27.0, 0, 0, 0])
+
+
 @skip_post_blackwell
 @pytest.mark.skip_less_device_memory(110000)
 @pytest.mark.skip_less_device(8)
@@ -1898,6 +1923,40 @@ def test_ptp_quickstart_advanced_8gpus(llm_root, llm_venv, model_name,
             _check_mem_usage(running_log, [mapping[model_name], 0, 0, 0], 8)
 
 
+@skip_pre_hopper
+@pytest.mark.skip_less_device(8)
+@pytest.mark.parametrize("cuda_graph", [False, True])
+@pytest.mark.parametrize("model_name,model_path", [
+    ("Llama-4-Maverick-17B-128E-Instruct-FP8",
+     "llama4-models/nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8"),
+    ("Llama-4-Scout-17B-16E-Instruct-FP8",
+     "llama4-models/Llama-4-Scout-17B-16E-Instruct-FP8"),
+    pytest.param('Llama-4-Scout-17B-16E-Instruct-FP4',
+                 'llama4-models/Llama-4-Scout-17B-16E-Instruct-FP4',
+                 marks=skip_pre_blackwell),
+])
+def test_ptp_quickstart_advanced_8gpus_chunked_prefill_sq_22k(
+        llm_root, llm_venv, model_name, model_path, cuda_graph):
+    print(f"Testing {model_name} on 8 GPUs.")
+    example_root = Path(os.path.join(llm_root, "examples", "pytorch"))
+    cmd = [
+        str(example_root / "quickstart_advanced.py"),
+        "--enable_chunked_prefill",
+        "--model_dir",
+        f"{llm_models_root()}/{model_path}",
+        "--tp_size=8",
+        "--moe_ep_size=8",
+        "--max_seq_len=22000",
+        "--kv_cache_fraction=0.1",
+    ]
+    if cuda_graph:
+        cmd.extend([
+            "--use_cuda_graph",
+            "--cuda_graph_padding_enabled",
+        ])
+    llm_venv.run_cmd(cmd)
+
+
 # This test is specifically to be run on 2 GPUs on Blackwell RTX 6000 Pro (SM120) architecture
 # TODO: remove once we have a node with 8 GPUs and reuse test_ptp_quickstart_advanced_8gpus
 @skip_no_sm120
@@ -1959,8 +2018,6 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
                                    modality, use_cuda_graph):
     # NOTE: individual tests need to be enabled in
     # tests/integration/test_lists/qa/examples_test_list.txt
-    llm_venv.run_cmd(
-        ['-m', 'pip', 'install', 'flash-attn==2.7.3', '--no-build-isolation'])
 
     example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
     test_data_root = Path(

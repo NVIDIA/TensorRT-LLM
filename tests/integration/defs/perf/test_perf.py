@@ -92,6 +92,7 @@ MODEL_PATH_DICT = {
     "mistral_7b_v0.1": "mistral-7b-v0.1",
     "ministral_8b": "Ministral-8B-Instruct-2410",
     "ministral_8b_fp8": "Ministral-8B-Instruct-2410-FP8",
+    "gemma_3_1b_it": "gemma/gemma-3-1b-it",
     "deepseek_r1_fp8": "DeepSeek-R1/DeepSeek-R1",
     "deepseek_r1_nvfp4": "DeepSeek-R1/DeepSeek-R1-FP4",
     "deepseek_v3_lite_fp8": "DeepSeek-V3-Lite/fp8",
@@ -153,6 +154,7 @@ HF_MODEL_PATH = {
     "ministral_8b_hf": "mistralai/Ministral-8B-Instruct-2410",
     "flan_t5_base_hf": "google/flan-t5-small",
     "phi_4_mini_instruct_hf": "microsoft/Phi-4-mini-instruct",
+    "gemma_3_1b_it_hf": "google/gemma-3-1b-it",
 }
 LORA_MODEL_PATH = {
     "llama_v2_13b":
@@ -163,6 +165,8 @@ LORA_MODEL_PATH = {
     "lora/llama-3-chinese-8b-instruct-v2-lora/",
     "ministral_8b":
     "lora/ministral/Ministral-8B-Instruct-2410-Loras-Dummy",  # Dummy LoRA for Ministral
+    "gemma_3_1b_it":
+    "lora/gemma/gemma-3-1b-it-dummy-lora",  # Dummy LoRA for Gemma-3-1B-Instruct
     "phi_4_multimodal_instruct_image":
     "multimodals/Phi-4-multimodal-instruct/vision-lora",
     "phi_4_multimodal_instruct_audio":
@@ -997,7 +1001,6 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
 
     def get_trtllm_bench_build_command(self, engine_dir) -> list:
         model_dir = self.get_trtllm_bench_model()
-        dataset_path = os.path.join(engine_dir, "synthetic_data.json")
         if model_dir == "":
             pytest.skip("Model Name is not supported by trtllm-bench")
         model_name = self._config.model_name
@@ -1007,13 +1010,19 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
         build_cmd = [
             self._build_script, f"--log_level=info",
             f"--workspace={engine_dir}", f"--model={hf_model_name}",
-            f"--model_path={model_dir}", "build", f"--dataset={dataset_path}",
+            f"--model_path={model_dir}", "build",
             f"--tp_size={self._config.tp_size}",
             f"--pp_size={self._config.pp_size}"
         ]
         max_seq_len = max(self._config.input_lens) + max(
             self._config.output_lens)
         build_cmd.append(f"--max_seq_len={max_seq_len}")
+        # Add max_batch_size and max_num_tokens to ensure build matches runtime configuration
+        # Note: trtllm-bench requires both to be specified together (option group constraint)
+        assert self._config.max_batch_size > 0, f"max_batch_size must be > 0, got {self._config.max_batch_size}"
+        assert self._config.max_num_tokens > 0, f"max_num_tokens must be > 0, got {self._config.max_num_tokens}"
+        build_cmd.append(f"--max_batch_size={self._config.max_batch_size}")
+        build_cmd.append(f"--max_num_tokens={self._config.max_num_tokens}")
         if self._config.quantization:
             build_cmd.append(
                 f"--quantization={self._config.quantization.upper()}")

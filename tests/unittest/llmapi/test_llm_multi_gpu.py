@@ -274,9 +274,6 @@ def test_llama_7b_multi_lora_tp2():
         enable_lora=True,
         build_config=BuildConfig(lora_config=lora_config),
         fast_build=True,
-        max_lora_rank=lora_config.max_lora_rank,
-        max_loras=lora_config.max_loras,
-        max_cpu_loras=lora_config.max_cpu_loras,
         kv_cache_config=global_kv_cache_config)
 
 
@@ -466,7 +463,7 @@ def test_llm_get_stats_async_tp2(pytorch_backend):
 
 
 def test_llm_capture_request_error():
-    _test_llm_capture_request_error(tp_size=2)
+    _test_llm_capture_request_error(pytorch_backend=False, tp_size=2)
 
 
 def test_llm_with_postprocess_parallel_tp2():
