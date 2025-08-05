@@ -2076,10 +2076,7 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
         "llava-v1.6-mistral-7b": {
             "image": [
                 ["ocean", "sky", "large", "waves", "shore", "blue"],
-                [
-                    "landscape", "rock", "landmark", "formation", "smooth",
-                    "mountain"
-                ],
+                ['mountain', 'flat', 'dome', 'formation', 'sky'],
                 ["highway", "vehicles", "traffic", "bus", "suburban"],
             ],
         },
