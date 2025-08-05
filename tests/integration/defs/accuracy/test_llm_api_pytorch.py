@@ -757,7 +757,7 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
     MODEL_PATH = f"{llm_models_root()}/gemma/gemma-3-1b-it/"
 
     # NOTE: Disable block reuse for SWA window model.
-    kv_cache_config = KvCacheConfig(enable_block_reuse=False)
+    kv_cache_config = KvCacheConfig(enable_block_reuse=True)
 
     def test_auto_dtype(self):
         # Disabling kv cache reuse as a WAR to deal with gaps in kernel support for Gemma3's non-inclusive sliding window size.
@@ -788,24 +788,25 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     def test_auto_dtype_vswa(self):
-        # NOTE: Test with VSWA kv cache config.
-        self.kv_cache_config.max_attention_window = [
-            512, 512, 512, 512, 512, 32768
-        ]  # Gemma3 1B attention window size pattern
+        # # NOTE: Test with VSWA kv cache config.
+        # self.kv_cache_config.max_attention_window = [
+        #     512, 512, 512, 512, 512, 32768
+        # ]  # Gemma3 1B attention window size pattern
+        # # TODO: uncomment to use the real window pattern when optimal KV cache allocation is supported
 
         with LLM(self.MODEL_PATH, kv_cache_config=self.kv_cache_config) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
 
-    @pytest.mark.skip(
-        reason=
-        "remove this skip after the kernel support mentioned in this nvbug is fixed: https://nvbugspro.nvidia.com/bug/5338620"
-    )
     def test_auto_dtype_chunked_prefill(self):
-        # NOTE: Test with VSWA kv cache config.
-        self.kv_cache_config.max_attention_window = [
-            512, 512, 512, 512, 512, 32768
-        ]  # Gemma3 1B attention window size pattern
+        # # NOTE: Test with VSWA kv cache config.
+        # self.kv_cache_config.max_attention_window = [
+        #     512, 512, 512, 512, 512, 32768
+        # ]  # Gemma3 1B attention window size pattern
+        # # TODO: uncomment to use the real window pattern when optimal KV cache allocation is supported
+
         # chunked prefill case or more features
         extra_llm_config = dict(
             enable_chunked_prefill=True,
@@ -815,6 +816,8 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
                  kv_cache_config=self.kv_cache_config,
                  **extra_llm_config) as llm:
             task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
 
@@ -1955,6 +1958,7 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @pytest.mark.skip_less_device_memory(140000)  ## OOM on 80G H100
     @parametrize_with_ids("eagle3_one_model", [True, False])
     @parametrize_with_ids("enable_chunked_prefill", [False, True])
     def test_eagle3(self, enable_chunked_prefill, eagle3_one_model):

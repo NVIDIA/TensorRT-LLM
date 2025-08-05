@@ -61,7 +61,8 @@ init_ubuntu() {
     python3-pip \
     python-is-python3 \
     wget \
-    pigz
+    pigz \
+    libzmq3-dev
   if ! command -v mpirun &> /dev/null; then
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends openmpi-bin libopenmpi-dev
   fi
@@ -129,6 +130,7 @@ install_gcctoolset_rockylinux() {
     openmpi-devel \
     pigz \
     rdma-core-devel \
+    zeromq-devel \
     -y
   echo "source scl_source enable gcc-toolset-11" >> "${ENV}"
   echo 'export PATH=/usr/lib64/openmpi/bin:$PATH' >> "${ENV}"
