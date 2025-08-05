@@ -181,6 +181,11 @@ class CutlassFusedMoE(MoE):
         )
 
     @property
+    def has_woq_per_channel(self):
+        return self.quant_config.layer_quant_mode.is_weight_only(
+        ) and not self.quant_config.layer_quant_mode.has_per_group_scaling()
+
+    @property
     def has_woq_per_group_scaling(self):
         return self.quant_config.layer_quant_mode.is_weight_only(
         ) and self.quant_config.layer_quant_mode.has_per_group_scaling()
@@ -205,9 +210,7 @@ class CutlassFusedMoE(MoE):
             elif self.quant_config.layer_quant_mode.is_int4_weight_only_per_group(
             ):
                 return WInt4AFP8FusedMoEMethod()
-            elif self.quant_config.layer_quant_mode.is_weight_only(
-            ) and not self.quant_config.layer_quant_mode.has_per_group_scaling(
-            ):
+            elif self.has_woq_per_channel:
                 return WeightOnlyFusedMoEMethod()
             elif self.quant_config.layer_quant_mode.has_w4a8_mxfp4_fp8():
                 return W4A8MXFP4FP8CutlassFusedMoEMethod()
@@ -266,6 +269,7 @@ class CutlassFusedMoE(MoE):
         # quantize inputs
         use_deepseek_fp8_block_scale = False
         use_w4_group_scaling = False
+        use_woq_per_channel = False
         use_woq_group_scaling = False
         use_mxfp8_act_scaling = False
         weight_dtype = self.w3_w1_weight.dtype
@@ -282,7 +286,8 @@ class CutlassFusedMoE(MoE):
                 use_w4_group_scaling = True
                 use_woq_group_scaling = True
                 weight_dtype = torch.quint4x2
-            # TODO: add support for weight only quantization with per group scaling
+            elif self.has_woq_per_channel:
+                use_woq_per_channel = True
             elif self.has_woq_per_group_scaling:
                 use_woq_group_scaling = True
             elif self.has_w4a16_mxfp4:
@@ -321,10 +326,10 @@ class CutlassFusedMoE(MoE):
                         x, True, alignment=self.quant_method.weight_alignment)
                 # Update x_row and x_col to the padded shape
                 x_row, x_col = x.shape[0], x.shape[1]
-            # else:
-            #     raise ValueError(
-            #         f"unsupported quantization mode: {self.quant_config.quant_mode}"
-            #     )
+            else:
+                raise ValueError(
+                    f"unsupported quantization mode: {self.quant_config.quant_mode}"
+                )
 
         # Prepare additional information for profiling in case padding is applied when using alltoall.
         # Only the non-alltoall case is considered for profiling in the warmup phase.
@@ -431,6 +436,7 @@ class CutlassFusedMoE(MoE):
             enable_alltoall=self.enable_alltoall,
             use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
             use_w4_group_scaling=use_w4_group_scaling,
+            use_woq_per_channel=use_woq_per_channel,
             use_woq_group_scaling=use_woq_group_scaling,
             use_mxfp8_act_scaling=use_mxfp8_act_scaling,
             min_latency_mode=False,

@@ -123,14 +123,15 @@ public:
     }
 
     FusedMoeRunner(c10::ScalarType activation_dtype, c10::ScalarType weight_dtype, c10::ScalarType output_dtype,
-        bool use_deepseek_fp8_block_scale, bool use_w4_group_scaling, bool use_woq_group_scaling,
-        bool use_mxfp8_act_scaling)
+        bool use_deepseek_fp8_block_scale, bool use_w4_group_scaling, bool use_woq_per_channel,
+        bool use_woq_group_scaling, bool use_mxfp8_act_scaling)
     {
         mActivationDtype = activation_dtype;
         mWeightDtype = weight_dtype;
         mOutputDtype = output_dtype;
         mUseDeepSeekFP8BlockScaling = use_deepseek_fp8_block_scale;
         mUseW4GroupScaling = use_w4_group_scaling;
+        mUseWoqPerChannel = use_woq_per_channel;
         mUseWoqGroupScaling = use_woq_group_scaling;
         mUseMxfp8ActScaling = use_mxfp8_act_scaling;
         mInnerDimMultiplier = 1;
@@ -311,13 +312,27 @@ public:
         }
         TORCH_CHECK(fc1_expert_weights.sizes()[0] == fc2_expert_weights.sizes()[0],
             "fc1_expert_weights and fc2_expert_weights must have the same number of experts.");
-        TORCH_CHECK(fc1_expert_weights.sizes()[1] == fc2_expert_weights.sizes()[2] * mInnerDimMultiplier * 2,
-            "fc1_expert_weights inter size must be 2 times fc2_expert_weights inter size.");
+
+        if (mUseWoqPerChannel)
+        {
+            TORCH_CHECK(fc1_expert_weights.sizes()[2] == fc2_expert_weights.sizes()[1] * mInnerDimMultiplier * 2,
+                "fc1_expert_weights inter size must be 2 times fc2_expert_weights inter size.");
+        }
+        else
+        {
+            TORCH_CHECK(fc1_expert_weights.sizes()[1] == fc2_expert_weights.sizes()[2] * mInnerDimMultiplier * 2,
+                "fc1_expert_weights inter size must be fc2_expert_weights inter size.");
+        }
 
         int experts_per_token = token_selected_experts.sizes()[1];
         int64_t num_rows = input.sizes()[0];
         int64_t hidden_size = fc2_expert_weights.sizes()[1];
         int64_t inter_size = fc2_expert_weights.sizes()[2] * mInnerDimMultiplier;
+        if (mUseWoqPerChannel)
+        {
+            hidden_size = fc2_expert_weights.sizes()[2] * mInnerDimMultiplier;
+            inter_size = fc2_expert_weights.sizes()[1];
+        }
 
         if (isWMxfp4AMxfp8Quant() || isWMxfp4AFp8Quant())
         {
@@ -594,8 +609,13 @@ public:
         }
 
         int64_t const num_rows = input.sizes()[0];
-        int64_t const hidden_size = fc2_expert_weights.sizes()[1];
-        int64_t const inter_size = fc2_expert_weights.sizes()[2] * mInnerDimMultiplier;
+        int64_t hidden_size = fc2_expert_weights.sizes()[1];
+        int64_t inter_size = fc2_expert_weights.sizes()[2] * mInnerDimMultiplier;
+        if (mUseWoqPerChannel)
+        {
+            hidden_size = fc2_expert_weights.sizes()[2] * mInnerDimMultiplier;
+            inter_size = fc2_expert_weights.sizes()[1];
+        }
         int64_t const group_size_
             = isInt4Quant() ? TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::int4_group_size : -1;
         int64_t const group_size = isWFP4A16Quant()
@@ -678,6 +698,7 @@ private:
 
     bool mUseDeepSeekFP8BlockScaling = false;
     bool mUseW4GroupScaling = false;
+    bool mUseWoqPerChannel = false;
     bool mUseWoqGroupScaling = false;
     bool mUseMxfp8ActScaling = false;
 
@@ -967,8 +988,8 @@ private:
         }
         else if (isWeightOnlyQuant())
         {
-            TORCH_CHECK(quant_scales.has_value(), "Expecting quant scales for W4 quantization");
-            if (!mUseWoqGroupScaling)
+            TORCH_CHECK(quant_scales.has_value(), "Expecting quant scales for weight only quantization");
+            if (mUseWoqPerChannel)
             {
                 TORCH_CHECK(quant_scales.value().size() == 2, "Expecting 2 quant scales for weight only quantization");
                 auto& fc1_weight_scales = quant_scales.value()[0];
@@ -976,7 +997,7 @@ private:
                 return kernels::QuantParams::Int(static_cast<float const*>(fc1_weight_scales.data_ptr()),
                     static_cast<float const*>(fc2_weight_scales.data_ptr()));
             }
-            // TODO: support groupwise quantization for int8 weight only        
+            // TODO: support groupwise quantization for int8 weight only
             else if (isWFP4A16Quant())
             {
                 TORCH_CHECK(quant_scales.value().size() == 2, "Expecting 2 quant scales for W4A16 quantization");
@@ -988,7 +1009,7 @@ private:
                     static_cast<void const*>(fc2_weight_scales.data_ptr()), nullptr, nullptr, nullptr, nullptr, nullptr,
                     nullptr);
             }
-            else if (isInt4Quant())
+            else if (isInt4Quant() && mUseWoqGroupScaling)
             {
                 TORCH_CHECK(quant_scales.value().size() == 8, "Expecting 8 quant scales for W4A8 quantization");
 
@@ -1077,7 +1098,7 @@ private:
 TORCH_LIBRARY(trtllm, m)
 {
     m.class_<torch_ext::FusedMoeRunner>("FusedMoeRunner")
-        .def(torch::init<c10::ScalarType, c10::ScalarType, c10::ScalarType, bool, bool, bool, bool>())
+        .def(torch::init<c10::ScalarType, c10::ScalarType, c10::ScalarType, bool, bool, bool, bool, bool>())
         .def("run_gemm_profile", &torch_ext::FusedMoeRunner::runGemmProfile)
         .def("get_tactic_num", &torch_ext::FusedMoeRunner::getTacticNum)
         .def("run_moe", &torch_ext::FusedMoeRunner::runMoe)
