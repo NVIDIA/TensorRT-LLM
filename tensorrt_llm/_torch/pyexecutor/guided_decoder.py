@@ -5,6 +5,7 @@ import torch
 
 from ..._utils import nvtx_range
 from ...bindings.executor import GuidedDecodingConfig
+from ..hostfunc import hostfunc
 from .grammar_matcher import (GrammarMatcher, GrammarMatcherFactory,
                               LLGuidanceMatcherFactory, XGrammarMatcherFactory)
 from .scheduler import ScheduledRequests
@@ -93,3 +94,7 @@ class GuidedDecoder:
 
         if len(batched_logits) > 0:
             torch.ops.trtllm.logits_bitmask(batched_logits, batched_bitmask)
+
+    @hostfunc
+    def inc_bitmask_host(self):
+        self.bitmask_host.add_(1)
