@@ -2279,11 +2279,7 @@ def test_ptp_quickstart_multimodal_phi4mm(llm_root, llm_venv, modality):
         ],
         "image_audio": [
             ["image", "depicts", "Grand", "rock", "scene"],
-        ],
     }
-
-    cmd = [
-        str(example_root / "quickstart_multimodal.py"),
         "--model_dir",
         f"{llm_models_root()}/{model_path}",
         "--modality",

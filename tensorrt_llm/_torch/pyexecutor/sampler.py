@@ -463,7 +463,6 @@ class TorchSampler(Sampler):
 
         if fast_path:
             logits = raw_logits[:len(requests)]
-            # Apply embedding bias using utility method
             logits = self._apply_embedding_bias(logits, requests)
             next_tokens = torch.argmax(logits, dim=-1)
             self.append_eagle3(next_tokens, model_outputs)
@@ -488,7 +487,6 @@ class TorchSampler(Sampler):
             steps_per_request = [
                 1 + len(req.py_draft_tokens) for req in requests
             ]
-            # Apply embedding bias using utility method
             logits = self._apply_embedding_bias(logits, requests,
                                                 steps_per_request)
             batched_next_tokens, batched_softmax = sample(
@@ -501,11 +499,9 @@ class TorchSampler(Sampler):
             input_slice = slice(offset, offset + steps)
             logits = raw_logits[input_slice]
 
-            # Get embedding bias for this request
             req = requests[i]
 
             if batched_next_tokens is None:
-                # Apply embedding bias using utility method for single request
                 logits = self._apply_embedding_bias(logits, [req])
                 next_tokens, softmax = sample(strategy, logits)
             else:
