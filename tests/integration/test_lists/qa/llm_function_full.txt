@@ -15,20 +15,20 @@ examples/test_chatglm.py::test_llm_glm_4_9b_single_gpu_summary[glm-4-9b-enable_w
 examples/test_commandr.py::test_llm_commandr_v01_single_gpu_summary[disable_weight_only]
 examples/test_commandr.py::test_llm_commandr_v01_single_gpu_summary[enable_weight_only]
 examples/test_commandr.py::test_llm_commandr_plus_4gpus_summary[disable_weight_only] TIMEOUT (120)
-examples/test_commandr.py::test_llm_commandr_plus_4gpus_summary[enable_weight_only]
+examples/test_commandr.py::test_llm_commandr_plus_4gpus_summary[enable_weight_only] TIMEOUT (120)
 examples/test_eagle.py::test_llm_eagle_1gpu_modelopt_ckpt[llama3.1-eagle-8b-hf_v0.5-float16-bs8]
 examples/test_eagle.py::test_llm_eagle_1gpu[EAGLE-Vicuna-7B-v1.3-float16-bs1-eagle1]
 examples/test_eagle.py::test_llm_eagle_1gpu[EAGLE-Vicuna-7B-v1.3-float16-bs1-eagle2]
-examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-bart-large-cnn-float16-enable_gemm_plugin-enable_attention_plugin-enable_paged_kv_cache-tp:1-pp:1-nb:1-enable_fp8] TIMEOUT (60)
-examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-byt5-small-float32-enable_gemm_plugin-enable_attention_plugin-enable_paged_kv_cache-tp:1-pp:1-nb:1-enable_fp8]
-examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-flan-t5-small-float32-enable_gemm_plugin-enable_attention_plugin-enable_paged_kv_cache-tp:1-pp:1-nb:1-disable_fp8]
-examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-flan-t5-small-float32-enable_gemm_plugin-enable_attention_plugin-enable_paged_kv_cache-tp:2-pp:2-nb:1-enable_fp8]
-examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-mbart-large-50-many-to-one-mmt-float16-enable_gemm_plugin-enable_attention_plugin-enable_paged_kv_cache-tp:1-pp:1-nb:1-disable_fp8]
-examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-mbart-large-50-many-to-one-mmt-float16-enable_gemm_plugin-enable_attention_plugin-enable_paged_kv_cache-tp:2-pp:2-nb:1-enable_fp8]
-examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-t5-small-float32-enable_gemm_plugin-enable_attention_plugin-enable_paged_kv_cache-tp:1-pp:1-nb:1-disable_fp8]
-examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-t5-small-float32-enable_gemm_plugin-enable_attention_plugin-enable_paged_kv_cache-tp:2-pp:1-nb:1-enable_fp8]
-examples/test_enc_dec.py::test_llm_enc_dec_general[no_compare_hf-byt5-small-float32-enable_gemm_plugin-enable_attention_plugin-enable_paged_kv_cache-tp:1-pp:1-nb:1-enable_fp8]
-examples/test_enc_dec.py::test_llm_enc_dec_general[no_compare_hf-byt5-small-float32-enable_gemm_plugin-enable_attention_plugin-enable_paged_kv_cache-tp:2-pp:1-nb:1-disable_fp8]
+examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-bart-large-cnn-float16-enable_gemm_plugin-enable_attention_plugin-enable_paged_kv_cache-tp:1-pp:1-nb:1-enable_fp8] TIMEOUT (90)
+examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-byt5-small-float32-enable_gemm_plugin-enable_attention_plugin-enable_paged_kv_cache-tp:1-pp:1-nb:1-enable_fp8] TIMEOUT (90)
+examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-flan-t5-small-float32-enable_gemm_plugin-enable_attention_plugin-enable_paged_kv_cache-tp:1-pp:1-nb:1-disable_fp8] TIMEOUT (90)
+examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-flan-t5-small-float32-enable_gemm_plugin-enable_attention_plugin-enable_paged_kv_cache-tp:2-pp:2-nb:1-enable_fp8] TIMEOUT (90)
+examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-mbart-large-50-many-to-one-mmt-float16-enable_gemm_plugin-enable_attention_plugin-enable_paged_kv_cache-tp:1-pp:1-nb:1-disable_fp8] TIMEOUT (90)
+examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-mbart-large-50-many-to-one-mmt-float16-enable_gemm_plugin-enable_attention_plugin-enable_paged_kv_cache-tp:2-pp:2-nb:1-enable_fp8] TIMEOUT (90)
+examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-t5-small-float32-enable_gemm_plugin-enable_attention_plugin-enable_paged_kv_cache-tp:1-pp:1-nb:1-disable_fp8] TIMEOUT (90)
+examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-t5-small-float32-enable_gemm_plugin-enable_attention_plugin-enable_paged_kv_cache-tp:2-pp:1-nb:1-enable_fp8] TIMEOUT (90)
+examples/test_enc_dec.py::test_llm_enc_dec_general[no_compare_hf-byt5-small-float32-enable_gemm_plugin-enable_attention_plugin-enable_paged_kv_cache-tp:1-pp:1-nb:1-enable_fp8] TIMEOUT (90)
+examples/test_enc_dec.py::test_llm_enc_dec_general[no_compare_hf-byt5-small-float32-enable_gemm_plugin-enable_attention_plugin-enable_paged_kv_cache-tp:2-pp:1-nb:1-disable_fp8] TIMEOUT (90)
 examples/test_exaone.py::test_llm_exaone_1gpu[disable_weight_only-exaone_3.0_7.8b_instruct-float16-nb:1] TIMEOUT (90)
 examples/test_exaone.py::test_llm_exaone_1gpu[disable_weight_only-exaone_3.0_7.8b_instruct-float16-nb:4] TIMEOUT (90)
 examples/test_exaone.py::test_llm_exaone_1gpu[disable_weight_only-exaone_3.0_7.8b_instruct-float16-nb:4] TIMEOUT (90)
@@ -501,8 +501,31 @@ accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[latency_moe_cutl
 accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[latency_moe_cutlass-torch_compile=True]
 accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[latency_moe_trtllm-torch_compile=False]
 accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[latency_moe_trtllm-torch_compile=True]
+accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_auto_dtype[mtp_nextn=0-overlap_scheduler=True]
+accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_auto_dtype[mtp_nextn=0-overlap_scheduler=False]
+accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_auto_dtype[mtp_nextn=2-overlap_scheduler=True]
+accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_auto_dtype[mtp_nextn=2-overlap_scheduler=False]
+accuracy/test_disaggregated_serving.py::TestGemma3_1BInstruct::test_auto_dtype[False]
+accuracy/test_disaggregated_serving.py::TestGemma3_1BInstruct::test_auto_dtype[True]
 accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_auto_dtype[False]
 accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_auto_dtype[True]
+accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_ngram
+accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_eagle3[eagle3_one_model=True-overlap_scheduler=True]
+accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_eagle3[eagle3_one_model=False-overlap_scheduler=False]
+accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_tp_pp_symmetric[GSM8K-tp1pp2]
+accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_tp_pp_symmetric[GSM8K-tp2pp1]
+accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_tp_pp_symmetric[GSM8K-tp2pp2]
+accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_tp_pp_symmetric[MMLU-tp1pp2]
+accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_tp_pp_symmetric[MMLU-tp2pp2]
+accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_tp_pp_symmetric[MMLU-tp2pp1]
+accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_ctx_pp_gen_tp_asymmetric[GSM8K-gen_tp=1-ctx_pp=2]
+accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_ctx_pp_gen_tp_asymmetric[GSM8K-gen_tp=1-ctx_pp=4]
+accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_ctx_pp_gen_tp_asymmetric[GSM8K-gen_tp=2-ctx_pp=2]
+accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_ctx_pp_gen_tp_asymmetric[GSM8K-gen_tp=2-ctx_pp=4]
+accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_ctx_pp_gen_tp_asymmetric[MMLU-gen_tp=1-ctx_pp=2]
+accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_ctx_pp_gen_tp_asymmetric[MMLU-gen_tp=1-ctx_pp=4]
+accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_ctx_pp_gen_tp_asymmetric[MMLU-gen_tp=2-ctx_pp=2]
+accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_ctx_pp_gen_tp_asymmetric[MMLU-gen_tp=2-ctx_pp=4]
 accuracy/test_disaggregated_serving.py::TestLlama4ScoutInstruct::test_auto_dtype[False]
 accuracy/test_disaggregated_serving.py::TestLlama4ScoutInstruct::test_auto_dtype[True]
 accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_auto_dtype[False]
@@ -638,6 +661,8 @@ disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_qwen3[
 disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_qwen3[False-True-Qwen3-8B-FP8]
 disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_qwen3[True-False-Qwen3-8B-FP8]
 disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_qwen3[True-True-Qwen3-8B-FP8]
+disaggregated/test_disaggregated.py::test_disaggregated_ctxtp2pp2_gentp2pp2[TinyLlama-1.1B-Chat-v1.0]
+disaggregated/test_disaggregated.py::test_disaggregated_ctxpp4_genpp4[TinyLlama-1.1B-Chat-v1.0]
 disaggregated/test_workers.py::test_workers_conditional_disaggregation[TinyLlama-1.1B-Chat-v1.0]
 disaggregated/test_workers.py::test_workers_kv_cache_events[TinyLlama-1.1B-Chat-v1.0]
 disaggregated/test_workers.py::test_workers_kv_cache_aware_router[TinyLlama-1.1B-Chat-v1.0]

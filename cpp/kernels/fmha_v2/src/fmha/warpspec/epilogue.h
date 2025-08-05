@@ -134,7 +134,7 @@ struct Softmax_base
         else
         {
             // The sliding window start is the max of 0 and row - sliding_window_size.
-            return max(0, row - sliding_window_size_);
+            return max(0, row + 1 - sliding_window_size_);
         }
     }
 
