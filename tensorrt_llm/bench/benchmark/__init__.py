@@ -10,7 +10,6 @@ from tensorrt_llm.bench.benchmark.utils.processes import IterationWriter
 from tensorrt_llm.bench.build.build import get_model_config
 from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
 from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
-from tensorrt_llm.bench.utils.data import initialize_tokenizer
 from tensorrt_llm.logger import logger
 
 
@@ -23,8 +22,8 @@ class GeneralExecSettings(BaseModel):
         default="pytorch",
         description="The backend to use when running benchmarking")
     beam_width: int = Field(default=1, description="Number of search beams")
-    checkpoint_path: Optional[Path] = Field(
-        default=None, description="Path to model checkpoint")
+    model_path: Optional[Path] = Field(default=None,
+                                       description="Path to model checkpoint")
     concurrency: int = Field(
         default=-1, description="Desired concurrency rate, <=0 for no limit")
     dataset_path: Optional[Path] = Field(default=None,
@@ -68,6 +67,10 @@ class GeneralExecSettings(BaseModel):
     @property
     def model_type(self) -> str:
         return get_model_config(self.model, self.checkpoint_path).model_type
+
+    @property
+    def checkpoint_path(self) -> Path:
+        return self.model_path or self.model
 
 
 def ignore_trt_only_args(kwargs: dict, backend: str):
@@ -130,18 +133,12 @@ def get_general_cli_options(
     settings_dict = params.copy()
 
     # Add derived values that need to be computed from bench_env
-    checkpoint_path = bench_env.checkpoint_path or bench_env.model
+    model_path = bench_env.checkpoint_path
     model = bench_env.model
-    iteration_log = params.get("iteration_log")
-    iteration_writer = IterationWriter(iteration_log)
-    tokenizer = initialize_tokenizer(checkpoint_path)
-
     # Override/add the computed values
     settings_dict.update({
-        "checkpoint_path": checkpoint_path,
+        "model_path": model_path,
         "model": model,
-        "iteration_writer": iteration_writer,
-        "tokenizer": tokenizer,
     })
 
     # Create and return the settings object, ignoring any extra fields
