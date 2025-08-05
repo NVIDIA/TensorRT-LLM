@@ -218,23 +218,17 @@ class NemotronHybridConfig(ModelConfig):
         "mamba_d_conv",
         "conv_kernel",
     ))
-    expand: int = Field(validation_alias=AliasChoices(
-        "expand",
-        "mamba_expand",
-    ))
+    mamba_num_heads: int
     n_groups: int
     mamba_head_dim: int
     d_inner: Optional[int] = Field(default=None)
-    mamba_num_heads: Optional[int] = Field(default=None)
     num_mamba_layers: Optional[int] = Field(default=None)
 
     @model_validator(mode="after")
     def set_values_if_none(self):
         """ Set the values if cannot get values from HF config.json. """
         if not self.d_inner:
-            self.d_inner = self.hidden_size * self.expand
-        if not self.mamba_num_heads:
-            self.mamba_num_heads = self.d_inner // self.mamba_head_dim
+            self.d_inner = self.mamba_num_heads * self.mamba_head_dim
         if self.num_mamba_layers is None:
             self.num_mamba_layers = self.hybrid_override_pattern.count("M")
         if self.num_attention_layers is None:
