@@ -74,8 +74,8 @@ Welcome to TensorRT-LLM's Documentation!
    :caption: Developer Guide
 
    1.0/architecture/overview.md
-   1.0/architecture/key-components
-   1.0.architecture/developer-guide
+   1.0/developer-guide/perf-analysis.md
+   1.0/developer-guide/perf-benchmarking.md
 
 
 .. toctree::
