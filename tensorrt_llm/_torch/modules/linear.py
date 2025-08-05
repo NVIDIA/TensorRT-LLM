@@ -20,6 +20,7 @@ from tensorrt_llm.quantization.functional import \
     preprocess_weights_for_mixed_gemm
 from tensorrt_llm.quantization.mode import QuantAlgo
 
+from ..._utils import get_sm_version
 from ...models.modeling_utils import QuantConfig
 from ..utils import Fp4QuantizedTensor
 
@@ -1513,6 +1514,9 @@ class Linear(nn.Module):
         self.use_custom_cublas_mm = use_custom_cublas_mm
         self.use_cute_dsl_blockscaling_mm = use_cute_dsl_blockscaling_mm
         self.lora = lora
+        print(
+            f"limin: Linear, use_cute_dsl_blockscaling_mm: {self.use_cute_dsl_blockscaling_mm}"
+        )
 
         self.enable_cuda_core = False
         if torch.cuda.is_available():

@@ -193,6 +193,9 @@ class DeepseekV3Linear(Linear):
     ):
         self.use_cute_dsl_blockscaling_mm = os.getenv(
             "USE_CUTE_DSL_BLOCKSCALING_MM", "0") == "1"
+        print(
+            f"limin: DeepseekV3Linear, use_cute_dsl_blockscaling_mm: {self.use_cute_dsl_blockscaling_mm}"
+        )
         super().__init__(
             in_features,
             out_features,
@@ -433,6 +436,13 @@ class Deepseekv3MoE(nn.Module):
         from ..distributed import AllReduce
 
         super().__init__()
+
+        self.use_cute_dsl_blockscaling_mm = os.getenv(
+            "USE_CUTE_DSL_BLOCKSCALING_MM", "0") == "1"
+        print(
+            f"limin: Deepseekv3MoE, use_cute_dsl_blockscaling_mm: {self.use_cute_dsl_blockscaling_mm}"
+        )
+
         config = model_config.pretrained_config
         self.top_k = top_k
         self.use_dp = model_config.mapping.enable_attention_dp
@@ -478,7 +488,7 @@ class Deepseekv3MoE(nn.Module):
             config=model_config,
             overridden_tp_size=shared_tp_size,
             reduce_output=False,
-        )
+            use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm)
 
         self.allreduce = AllReduce(mapping=model_config.mapping,
                                    strategy=model_config.allreduce_strategy)
@@ -633,6 +643,12 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             model_config, layer_idx)
         self.is_nvfp4 = quant_config.layer_quant_mode.has_nvfp4()
 
+        self.use_cute_dsl_blockscaling_mm = os.getenv(
+            "USE_CUTE_DSL_BLOCKSCALING_MM", "0") == "1"
+        print(
+            f"limin: DeepseekV3DecoderLayer, use_cute_dsl_blockscaling_mm: {self.use_cute_dsl_blockscaling_mm}"
+        )
+
         has_tp = mapping.has_tp()
 
         if (config.n_routed_experts is not None
@@ -673,7 +689,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 config=model_config,
                 overridden_tp_size=self.mlp_tp_size,
                 reduce_output=True,
-            )
+                use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm)
 
         self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                        eps=config.rms_norm_eps,
@@ -931,6 +947,9 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
 
         self.use_cute_dsl_blockscaling_mm = os.getenv(
             "USE_CUTE_DSL_BLOCKSCALING_MM", "0") == "1"
+        print(
+            f"limin: DeepseekV3MTP, use_cute_dsl_blockscaling_mm: {self.use_cute_dsl_blockscaling_mm}"
+        )
 
         self.enorm = RMSNorm(hidden_size=config.hidden_size,
                              eps=config.rms_norm_eps,

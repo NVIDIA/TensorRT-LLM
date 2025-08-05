@@ -166,7 +166,6 @@ class CutlassFusedMoE(MoE):
             return
 
         self.quant_method = self._get_quant_method()
-        print("limin: quant_method = ", self.quant_method)
         self.quant_method.create_weights(self)
 
         self._weights_created = True

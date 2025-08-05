@@ -1,4 +1,5 @@
 import math
+import os
 import weakref
 from typing import Optional, Union, cast
 
@@ -204,6 +205,9 @@ class Attention(nn.Module):
             "USE_CUTE_DSL_BLOCKSCALING_BMM", "0") == "1"
         self.use_cute_dsl_blockscaling_mm = os.getenv(
             "USE_CUTE_DSL_BLOCKSCALING_MM", "0") == "1"
+        print(
+            f"limin: Attention, use_cute_dsl_blockscaling_bmm: {self.use_cute_dsl_blockscaling_bmm}, use_cute_dsl_blockscaling_mm: {self.use_cute_dsl_blockscaling_mm}"
+        )
 
         self.qkv_proj = Linear(
             self.hidden_size,
@@ -669,6 +673,9 @@ class MLA(nn.Module):
             "USE_CUTE_DSL_BLOCKSCALING_BMM", "0") == "1"
         self.use_cute_dsl_blockscaling_mm = os.getenv(
             "USE_CUTE_DSL_BLOCKSCALING_MM", "0") == "1"
+        print(
+            f"limin: MLA, use_cute_dsl_blockscaling_bmm: {self.use_cute_dsl_blockscaling_bmm}, use_cute_dsl_blockscaling_mm: {self.use_cute_dsl_blockscaling_mm}"
+        )
 
         if not self.is_lite:
             self.kv_a_proj_with_mqa = Linear(
