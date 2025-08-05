@@ -233,15 +233,11 @@ def buildImage(config, imageKeyToTag)
     def dependentImageWithTag = "${IMAGE_NAME}/${dependent.dockerfileStage}:${dependentTag}"
     def customImageWithTag = "${IMAGE_NAME}/${dockerfileStage}:${customTag}"
 
-    if (target == "ngc-release") {
-        if (TRIGGER_TYPE == "post-merge") {
-            echo "Use NGC artifacts for post merge build"
-            dependentImageWithTag = "${NGC_IMAGE_NAME}:${dependentTag}"
-            imageWithTag = "${NGC_IMAGE_NAME}:${tag}"
-            customImageWithTag = "${NGC_IMAGE_NAME}:${customTag}"
-        }
-        imageKeyToTag["NGC Devel Image ${config.arch}"] = dependentImageWithTag
-        imageKeyToTag["NGC Release Image ${config.arch}"] = imageWithTag
+    if (target == "ngc-release" && TRIGGER_TYPE == "post-merge") {
+        echo "Use NGC artifacts for post merge build"
+        dependentImageWithTag = "${NGC_IMAGE_NAME}:${dependentTag}"
+        imageWithTag = "${NGC_IMAGE_NAME}:${tag}"
+        customImageWithTag = "${NGC_IMAGE_NAME}:${customTag}"
     }
 
     args += " GITHUB_MIRROR=https://urm.nvidia.com/artifactory/github-go-remote"
@@ -630,7 +626,9 @@ pipeline {
                     status = handle.result
 
                     if (status != "SUCCESS") {
-                        error "Downstream job did not succeed"
+                        catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                            error "Downstream job did not succeed"
+                        }
                     }
                 }
             }
