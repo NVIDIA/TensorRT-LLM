@@ -486,7 +486,8 @@ class RandomDataset(BenchmarkDataset):
         if use_chat_template:
             # Set the post_process_prompt to the apply_chat_template function
             # so that we can use it to apply the chat template to the prompt.
-            post_process_prompt = partial(self.apply_chat_template, tokenizer)
+            post_process_prompt = partial(RandomDataset.apply_chat_template,
+                                          tokenizer)
             # Apply the chat template to a dummy prompt to get the chat template
             # length.
             chat_template_dummy = post_process_prompt("a")
