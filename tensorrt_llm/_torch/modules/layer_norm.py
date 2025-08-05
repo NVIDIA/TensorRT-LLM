@@ -20,6 +20,19 @@ from torch import nn
 
 
 class LayerNorm(nn.Module):
+    """Layer normalization module with configurable weight and bias parameters.
+
+    This implementation provides standard layer normalization with optional
+    learnable parameters and residual connection support.
+
+    Args:
+        hidden_size: The size of the hidden dimension to normalize.
+        eps: Small constant for numerical stability.
+        dtype: Optional data type for parameters.
+        device: Optional device for parameters.
+        has_weights: Whether to include learnable weight parameters.
+        has_bias: Whether to include learnable bias parameters.
+    """
 
     def __init__(
         self,
@@ -57,6 +70,16 @@ class LayerNorm(nn.Module):
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor] = ...,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """Apply layer normalization to input tensor.
+
+        Args:
+            hidden_states: Input tensor to normalize.
+            residual: Optional residual tensor to add before normalization.
+
+        Returns:
+            Normalized tensor, or tuple of (normalized_tensor, residual) if residual provided.
+        """
+
         input_dtype = hidden_states.dtype
         hidden_states = hidden_states.to(torch.float32)
         if isinstance(residual, torch.Tensor):
@@ -79,6 +102,16 @@ class LayerNorm(nn.Module):
         hidden_states: torch.Tensor,
         residual: Optional[torch.Tensor] = ...,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """Skip normalization and return inputs unchanged.
+
+        Args:
+            hidden_states: Input tensor to pass through.
+            residual: Optional residual tensor to pass through.
+
+        Returns:
+            Input tensors unchanged, maintaining same signature as forward.
+        """
+
         if residual is ...:
             return hidden_states
         else:
