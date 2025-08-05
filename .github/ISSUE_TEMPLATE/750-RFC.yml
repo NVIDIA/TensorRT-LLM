@@ -3,6 +3,7 @@ name: 💬 Request for comments (RFC).
 description: Ask for feedback on major architectural changes or design choices.
 title: "[RFC]: "
 labels: ["RFC"]
+assignees: ["laikhtewari"]
 
 body:
 - type: markdown
