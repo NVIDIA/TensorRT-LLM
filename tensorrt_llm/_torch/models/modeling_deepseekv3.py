@@ -1430,26 +1430,27 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
                         attn_module.v_b_proj_scale = nn.Parameter(
                             v_b_proj_scale, requires_grad=False)
 
-                        # if attn_module.k_b_proj_trans_dequant is not None:
-                        #     attn_module.k_b_proj_trans_dequant.data.copy_(
-                        #         weight_dequant(
-                        #             k_b_proj_trans.view(
-                        #                 -1, k_b_proj_trans.shape[-1]).cuda(),
-                        #             k_b_proj_trans_scale.view(
-                        #                 -1,
-                        #                 k_b_proj_trans_scale.shape[-1]).cuda(),
-                        #         ).view(
-                        #             *attn_module.k_b_proj_trans_dequant.shape).
-                        #         to(attn_module.k_b_proj_trans_dequant.dtype))
-                        # if attn_module.v_b_proj_dequant is not None:
-                        #     attn_module.v_b_proj_dequant.data.copy_(
-                        #         weight_dequant(
-                        #             v_b_proj.view(-1,
-                        #                           v_b_proj.shape[-1]).cuda(),
-                        #             v_b_proj_scale.view(
-                        #                 -1, v_b_proj_scale.shape[-1]).cuda(),
-                        #         ).view(*attn_module.v_b_proj_dequant.shape).to(
-                        #             attn_module.v_b_proj_dequant.dtype))
+                        # limin-todo: check if we could keep it for cute dsl ops.
+                        if attn_module.k_b_proj_trans_dequant is not None:
+                            attn_module.k_b_proj_trans_dequant.data.copy_(
+                                weight_dequant(
+                                    k_b_proj_trans.view(
+                                        -1, k_b_proj_trans.shape[-1]).cuda(),
+                                    k_b_proj_trans_scale.view(
+                                        -1,
+                                        k_b_proj_trans_scale.shape[-1]).cuda(),
+                                ).view(
+                                    *attn_module.k_b_proj_trans_dequant.shape).
+                                to(attn_module.k_b_proj_trans_dequant.dtype))
+                        if attn_module.v_b_proj_dequant is not None:
+                            attn_module.v_b_proj_dequant.data.copy_(
+                                weight_dequant(
+                                    v_b_proj.view(-1,
+                                                  v_b_proj.shape[-1]).cuda(),
+                                    v_b_proj_scale.view(
+                                        -1, v_b_proj_scale.shape[-1]).cuda(),
+                                ).view(*attn_module.v_b_proj_dequant.shape).to(
+                                    attn_module.v_b_proj_dequant.dtype))
                 elif names[-1] == "kv_a_proj_with_mqa":
                     fused_a = weights[
                         f"{'.'.join(names[:-1])}.kv_a_proj_with_mqa.weight"][:]
