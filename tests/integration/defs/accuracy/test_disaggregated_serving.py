@@ -258,7 +258,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "meta-llama/Llama-3.1-8B-Instruct"
     MODEL_PATH = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct"
 
-    def test_nixl_backend(self, backend):
+    def test_nixl_backend(self):
         ctx_server_config = {"cache_transceiver_config": {"backend": "nixl"}}
         gen_server_config = {"cache_transceiver_config": {"backend": "nixl"}}
         disaggregated_server_config = {
@@ -477,7 +477,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     MODEL_NAME = "deepseek-ai/DeepSeek-V3-Lite"
     MODEL_PATH = f"{llm_models_root()}/DeepSeek-V3-Lite/bf16"
 
-    def test_nixl_backend(self, backend):
+    def test_nixl_backend(self):
         ctx_server_config = {"cache_transceiver_config": {"backend": "nixl"}}
         gen_server_config = {"cache_transceiver_config": {"backend": "nixl"}}
         disaggregated_server_config = {
