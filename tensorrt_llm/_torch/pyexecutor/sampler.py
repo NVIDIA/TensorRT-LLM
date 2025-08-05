@@ -749,11 +749,12 @@ class TRTLLMSampler(Sampler):
     def setup_sampler_step(self, requests):
         batch_slots, sampling_configs, lookahead_prompt, lookahead_algo_configs = self.algs.create_new_decoder_requests(
             self.model_config, self.world_config, self.decoding_config,
-            requests, self.store["buffer_manager"], self.logits_datatype,
+            requests.context_requests, self.store["buffer_manager"],
+            self.logits_datatype,
             self.store["decoder_input_buffers"][self.micro_batch_idx],
             self.store["decoder_state"], self.store["cuda_stream"],
             self.algs.decoder.decoder_stream, self.executor_config.max_seq_len,
-            self.beam_width(requests))
+            self.beam_width(requests.context_requests))
 
         local_batch_size = len(batch_slots)
         if local_batch_size > 0:
@@ -763,6 +764,16 @@ class TRTLLMSampler(Sampler):
                 self.store["decoder_state"].joint_decoding_output,
                 self.model_config.data_type, lookahead_prompt,
                 lookahead_algo_configs)
+
+        adp = [
+            r for r in requests.generation_requests if r.is_attention_dp_dummy
+        ]
+        batch_size = len(adp)
+        if batch_size == 0:
+            return
+        config = make_sampling_config([r.sampling_config for r in adp])
+        slots = torch.tensor([r.py_seq_slot for r in adp], dtype=torch.int32)
+        self.algs.decoder.underlying_decoder().setup(config, batch_size, slots)
 
     @staticmethod
     @torch.inference_mode()
@@ -798,7 +809,7 @@ class TRTLLMSampler(Sampler):
                 "Beam search is not supported for multiple prompts and logprobs"
             )
 
-        self.setup_sampler_step(scheduled_requests.context_requests)
+        self.setup_sampler_step(scheduled_requests)
 
         num_context_logits_prefix_sum = [0]
         prefix_sum = 0
