@@ -424,6 +424,7 @@ class RandomDataset(BenchmarkDataset):
                 RandomDataset.SHAREGPT_URL, download_path,
                 RandomDataset.SHAREGPT_URL.split("/")[-1], download_timeout)
 
+    @staticmethod
     def apply_chat_template(tokenizer, prompt):
         """Apply chat template to a prompt.
 
