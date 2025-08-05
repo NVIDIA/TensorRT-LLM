@@ -107,11 +107,8 @@ file(COPY ${DEEP_GEMM_SOURCE_DIR}/third-party/cutlass/include/cute
      DESTINATION ${DEEP_GEMM_INCLUDE_DEST})
 file(COPY ${DEEP_GEMM_SOURCE_DIR}/third-party/cutlass/include/cutlass
      DESTINATION ${DEEP_GEMM_INCLUDE_DEST})
-
-# Generate envs.py file similar to deep_gemm's setup.py
-set(ENVS_CONTENT
-    "# Pre-installed environment variables\npersistent_envs = dict()\n")
-file(WRITE ${DEEP_GEMM_PYTHON_DEST}/envs.py "${ENVS_CONTENT}")
+file(COPY ${DEEP_GEMM_SOURCE_DIR}/third-party/fmt/include/fmt
+     DESTINATION ${DEEP_GEMM_INCLUDE_DEST})
 
 # Let CMake generate `fatbinData` for CUDA separable compilation
 set(CMAKE_INTERPROCEDURAL_OPTIMIZATION FALSE)
@@ -128,6 +125,7 @@ set_target_properties(
   deep_gemm_cpp_tllm
   PROPERTIES CXX_STANDARD_REQUIRED ON
              CXX_STANDARD 20
+             CXX_SCAN_FOR_MODULES OFF
              CUDA_SEPARABLE_COMPILATION OFF
              CUDA_ARCHITECTURES "${DEEP_GEMM_CUDA_ARCHITECTURES}"
              LINK_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/deep_gemm_cpp_tllm.version
