@@ -1106,6 +1106,15 @@ public:
         return mWindowBlockManagers.at(windowSize).getPool(relativePoolIndex);
     }
 
+    //! \brief Update cache offsets for blocks initiated from sequence
+    void updateSequenceCacheBlockOffsets(GenerationRequest& seq, SizeType32 windowSize);
+
+    //! \brief Update cache offsets for last block
+    void updateLastCacheBlockOffsets(GenerationRequest& seq, SizeType32 windowSize);
+
+    //! \brief Update cache offsets for block at index
+    void updateCacheBlockOffsetsAtIdx(GenerationRequest& seq, SizeType32 windowSize, SizeType32 blockIdx);
+
 private:
     [[nodiscard]] WindowBlockManager const& windowManagerByLayer(SizeType32 layerIdx) const
     {
@@ -1636,12 +1645,6 @@ public:
     /// @return SizeType32 A maximum attention window in number of tokens.
     [[nodiscard]] static SizeType32 calculateMaxAttentionWindow(SizeType32 inputLength, SizeType32 outputLength,
         SizeType32 sinkTokenLength, SizeType32 blockCapacity, SizeType32 beamWidth, SizeType32 tokensPerBlock);
-
-private:
-    void cacheBlockOffsets(GenerationRequest& seq, SizeType32 windowSize);
-    void cacheNewBlockOffsets(GenerationRequest& seq, SizeType32 windowSize);
-    void updateNewBlockPointer(GenerationRequest& seq, SizeType32 windowSize, SizeType32 blockIdx);
-    void updateToken(GenerationRequest& sequence, bool addToken);
 
 private:
     // Maximum number of sequences
