@@ -7,7 +7,7 @@
 | VILA               | Yes        | No                  | No             | No              |
 | LLaVA-NeXT         | Yes        | No                  | No             | No              |
 | Llama 4            | Yes        | No                  | No             | No              |
-| Mistral            | Yes        | Yes                 | No             | No              |
+| Mistral-Small-3.1  | Yes        | Yes                 | No             | No              |
 | Phi-4-multimodal   | Yes        | Yes                 | No             | No              |
 | Qwen2-VL           | Yes        | Yes                 | Yes            | No              |
 | Qwen2.5-VL         | Yes        | Yes                 | Yes            | No              |
