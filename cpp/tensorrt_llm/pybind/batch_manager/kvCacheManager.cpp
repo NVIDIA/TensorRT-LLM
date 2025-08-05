@@ -334,26 +334,31 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
             py::arg("attention_dp_size") = std::nullopt, py::arg("attention_dp_events_gather_period_ms") = 5);
 
     py::classh<tbk::BaseKVCacheManager, PyKvCacheManager>(m, "BaseKVCacheManager")
-        .def_static("calculate_max_num_blocks", &tbk::BaseKVCacheManager::calculateMaxNumBlocks, py::arg("config"),
-            py::arg("is_cross_attention"), py::arg("dtype"), py::arg("model_config"), py::arg("world_config"),
-            py::arg("window_size_to_layers"), py::arg("allotted_primary_mem_bytes"),
-            py::arg("allotted_secondary_mem_bytes"), py::arg("extra_cost_memory"), py::arg("kv_factor"))
-        .def("allocate_pools", &BaseKVCacheManager::allocatePools)
-        .def("release_pools", &BaseKVCacheManager::releasePools)
-        .def("start_scheduling", &BaseKVCacheManager::startScheduling)
+        .def_static("calculate_max_num_blocks", &tbk::BaseKVCacheManager::calculateMaxNumBlocks,
+            py::call_guard<py::gil_scoped_release>(), py::arg("config"), py::arg("is_cross_attention"),
+            py::arg("dtype"), py::arg("model_config"), py::arg("world_config"), py::arg("window_size_to_layers"),
+            py::arg("allotted_primary_mem_bytes"), py::arg("allotted_secondary_mem_bytes"),
+            py::arg("extra_cost_memory"), py::arg("kv_factor"))
+        .def("allocate_pools", &BaseKVCacheManager::allocatePools, py::call_guard<py::gil_scoped_release>())
+        .def("release_pools", &BaseKVCacheManager::releasePools, py::call_guard<py::gil_scoped_release>())
+        .def("start_scheduling", &BaseKVCacheManager::startScheduling, py::call_guard<py::gil_scoped_release>())
         .def_property_readonly("tokens_per_block", &BaseKVCacheManager::getTokensPerBlock)
         .def_property_readonly("max_num_blocks", &BaseKVCacheManager::getMaxNumBlocks)
         .def_property_readonly("num_pools", &BaseKVCacheManager::getNumPools)
-        .def("get_kv_cache_stats", &BaseKVCacheManager::getKvCacheStats)
+        .def("get_kv_cache_stats", &BaseKVCacheManager::getKvCacheStats, py::call_guard<py::gil_scoped_release>())
         .def_property_readonly("max_blocks_per_seq",
             [](tbk::BaseKVCacheManager& self) { return self.getOffsetTableDimensions().maxBlocksPerSeq; })
-        .def("get_needed_blocks_one_step", &BaseKVCacheManager::getNeededBlocksOneStep)
-        .def("get_remaining_blocks_to_completion", &BaseKVCacheManager::getRemainingBlocksToCompletion)
-        .def("add_token", &BaseKVCacheManager::addToken)
-        .def("add_sequence", &BaseKVCacheManager::addSequence)
-        .def("remove_sequence", &BaseKVCacheManager::removeSequence)
-        .def("scheduling_remove_sequence", &BaseKVCacheManager::schedulingRemoveSequence)
-        .def("get_block_pool_pointers",
+        .def("get_needed_blocks_one_step", &BaseKVCacheManager::getNeededBlocksOneStep,
+            py::call_guard<py::gil_scoped_release>())
+        .def("get_remaining_blocks_to_completion", &BaseKVCacheManager::getRemainingBlocksToCompletion,
+            py::call_guard<py::gil_scoped_release>())
+        .def("add_token", &BaseKVCacheManager::addToken, py::call_guard<py::gil_scoped_release>())
+        .def("add_sequence", &BaseKVCacheManager::addSequence, py::call_guard<py::gil_scoped_release>())
+        .def("remove_sequence", &BaseKVCacheManager::removeSequence, py::call_guard<py::gil_scoped_release>())
+        .def("scheduling_remove_sequence", &BaseKVCacheManager::schedulingRemoveSequence,
+            py::call_guard<py::gil_scoped_release>())
+        .def(
+            "get_block_pool_pointers",
             [](tbk::BaseKVCacheManager& self)
             {
                 std::optional<at::Tensor> block_pool_pointers{std::nullopt};
@@ -364,7 +369,8 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
                     block_pool_pointers = tr::Torch::tensor(_tensor);
                 }
                 return block_pool_pointers;
-            })
+            },
+            py::call_guard<py::gil_scoped_release>())
         .def("get_block_scale_pool_pointers",
             [](tbk::BaseKVCacheManager& self)
             {
@@ -376,8 +382,10 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
                     block_scale_pool_pointers = tr::Torch::tensor(_tensor);
                 }
                 return block_scale_pool_pointers;
-            })
-        .def("get_layer_to_pool_mapping",
+            },
+            py::call_guard<py::gil_scoped_release>())
+            .def(
+                "get_layer_to_pool_mapping",
             [](tbk::BaseKVCacheManager& self)
             {
                 std::optional<at::Tensor> layer_to_pool_mapping{std::nullopt};
@@ -388,15 +396,18 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
                     layer_to_pool_mapping = tr::Torch::tensor(_tensor);
                 }
                 return layer_to_pool_mapping;
-            })
-        .def("get_primary_pool_data",
+            },
+            py::call_guard<py::gil_scoped_release>())
+        .def(
+            "get_primary_pool_data",
             [](tbk::BaseKVCacheManager& self, SizeType32 layer_idx) -> at::Tensor
             {
                 auto pool = tr::Torch::tensor(self.getPrimaryPool(layer_idx));
                 auto pool_layer_idx = self.getPoolLayerIdx(layer_idx);
                 return pool.index({torch::indexing::Slice(), pool_layer_idx});
-            })
-        .def("get_unique_primary_pool", [](tbk::BaseKVCacheManager& self) { return self.getUniquePrimaryPool(); })
+            },
+            py::call_guard<py::gil_scoped_release>())
+        .def("get_unique_primary_pool", [](tbk::BaseKVCacheManager& self) { return self.getUniquePrimaryPool(); }, py::call_guard<py::gil_scoped_release>())
         .def("get_block_offsets_of_batch",
             [](tbk::BaseKVCacheManager& self, at::Tensor output, SizeType32 firstBatchSlotIdx, SizeType32 batchSize,
                 SizeType32 beamWidth)
@@ -404,8 +415,10 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
                 auto _output = from_torch(output);
                 TLLM_CHECK_WITH_INFO(_output.has_value(), "Invalid output tensor.");
                 self.getBlockOffsetsOfBatch(*(_output.value()), firstBatchSlotIdx, batchSize, beamWidth);
-            })
-        .def("copy_block_offsets",
+            },
+            py::call_guard<py::gil_scoped_release>())
+        .def(
+            "copy_block_offsets",
             [](tbk::BaseKVCacheManager& self, at::Tensor output, SizeType32 outputSlotOffset,
                 tb::LlmRequest::RequestIdType requestId)
             {
@@ -413,8 +426,10 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
                 TLLM_CHECK_WITH_INFO(_output.has_value(), "Invalid output tensor.");
                 auto maxBlockCount = self.copyBlockOffsets(*(_output.value()), outputSlotOffset, requestId);
                 return maxBlockCount;
-            })
-        .def("copy_batch_block_offsets",
+            },
+            py::call_guard<py::gil_scoped_release>())
+        .def(
+            "copy_batch_block_offsets",
             [](tbk::BaseKVCacheManager& self, at::Tensor output,
                 std::vector<tb::LlmRequest::RequestIdType> const& requestIds, SizeType32 const beamWidth,
                 SizeType32 const offset)
@@ -425,7 +440,8 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
                 {
                     self.copyBlockOffsets(*(_output.value()), i * beamWidth + offset, requestIds[i]);
                 }
-            })
+            },
+            py::call_guard<py::gil_scoped_release>())
         .def(
             "get_latest_events",
             [](tbk::BaseKVCacheManager& self, std::optional<double> timeout_ms = std::nullopt)
@@ -436,15 +452,18 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
                 }
                 return self.getLatestEvents(std::nullopt);
             },
-            py::arg("timeout_ms") = std::nullopt)
+            py::call_guard<py::gil_scoped_release>(), py::arg("timeout_ms") = std::nullopt)
         .def_property_readonly("enable_block_reuse", &BaseKVCacheManager::isEnableBlockReuse)
-        .def("rewind_kv_cache", &BaseKVCacheManager::rewindKVCache)
+        .def("rewind_kv_cache", &BaseKVCacheManager::rewindKVCache, py::call_guard<py::gil_scoped_release>())
         .def_property_readonly("cross_kv", &BaseKVCacheManager::isCrossKv)
-        .def("store_context_blocks", &BaseKVCacheManager::storeContextBlocks)
-        .def("get_cache_block_ids", &BaseKVCacheManager::getCacheBlockIds)
-        .def("get_batch_cache_block_ids", &BaseKVCacheManager::getBatchCacheBlockIds)
-        .def("get_newly_allocated_block_ids", &BaseKVCacheManager::getNewlyAllocatedBlockIds)
-        .def("flush_iteration_events", &BaseKVCacheManager::flushIterationEvents);
+        .def("store_context_blocks", &BaseKVCacheManager::storeContextBlocks, py::call_guard<py::gil_scoped_release>())
+        .def("get_cache_block_ids", &BaseKVCacheManager::getCacheBlockIds, py::call_guard<py::gil_scoped_release>())
+        .def("get_batch_cache_block_ids", &BaseKVCacheManager::getBatchCacheBlockIds,
+            py::call_guard<py::gil_scoped_release>())
+        .def("get_newly_allocated_block_ids", &BaseKVCacheManager::getNewlyAllocatedBlockIds,
+            py::call_guard<py::gil_scoped_release>())
+        .def("flush_iteration_events", &BaseKVCacheManager::flushIterationEvents,
+            py::call_guard<py::gil_scoped_release>());
 
     py::enum_<tbk::CacheType>(m, "CacheType")
         .value("SELF", tbk::CacheType::kSELF)

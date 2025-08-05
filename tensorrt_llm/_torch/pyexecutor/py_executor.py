@@ -810,12 +810,17 @@ class PyExecutor:
                             scheduled_batch)
                     else:
                         with torch.cuda.nvtx.range("_forward_step_last_pp"):
+                            # init_disagg_gen_requests must be before engine forward, where the prev_seq_slot is updated.
+                            if self.guided_decoder is not None and self.kv_cache_transceiver:
+                                self.guided_decoder.add_batch(scheduled_batch)
+                                self.guided_decoder.init_disagg_gen_requests()
+
                             batch_outputs = self._forward_step(scheduled_batch)
-                            if self.kv_cache_transceiver and self.guided_decoder:
-                                self.guided_decoder.init_disagg_gen_requests(
-                                    scheduled_batch)
-                            self._execute_guided_decoder(
-                                scheduled_batch, batch_outputs['logits'])
+
+                            if self.guided_decoder is not None:
+                                self.guided_decoder.add_batch(scheduled_batch)
+                                self.guided_decoder.execute(
+                                    batch_outputs['logits'])
 
                             sample_state = self._sample_async(
                                 scheduled_batch, batch_outputs)
@@ -952,12 +957,6 @@ class PyExecutor:
             f'{len(scheduled_batch.generation_requests)} generation requests')
         return scheduled_batch, iter_stats
 
-    def _execute_guided_decoder(self, scheduled_batch: ScheduledRequests,
-                                logits: torch.Tensor):
-        if self.guided_decoder is not None:
-            self.guided_decoder.build(scheduled_batch)
-            self.guided_decoder.execute(scheduled_batch, logits)
-
     def _kv_connector_start_batch(self, scheduled_batch):
         if self.kv_connector_manager:
             self.kv_connector_manager.take_scheduled_requests_pending_load(
@@ -1009,24 +1008,30 @@ class PyExecutor:
                         self._handle_first_token_response(scheduled_batch)
                     self.resource_manager.prepare_resources(scheduled_batch)
 
-                    if self.kv_cache_transceiver and self.guided_decoder:
-                        self.guided_decoder.init_disagg_gen_requests(
-                            scheduled_batch)
-
                     self._kv_connector_start_batch(scheduled_batch)
 
                 if scheduled_batch.batch_size > 0 or (
                         self.enable_attention_dp and self.dist.tp_size > 1):
+                    # init_disagg_gen_requests must be before drafter loop, otherwise draft requests do not have initialized matchers.
+                    # init_disagg_gen_requests must be before engine forward, where the prev_seq_slot is updated.
+                    if self.guided_decoder is not None:
+                        self.guided_decoder.add_batch(scheduled_batch)
+                        if self.kv_cache_transceiver:
+                            self.guided_decoder.init_disagg_gen_requests()
 
                     if self.drafter is not None and self.use_spec_decode:
+                        if self.guided_decoder is not None:
+                            self.guided_decoder.rollback_rejected_tokens()
                         with request_context(
-                                is_draft=True,
+                                is_draft=self.draft_model_engine is not None,
                                 scheduled_requests=scheduled_batch):
-                            if self.guided_decoder is not None:
-                                self.guided_decoder.rollback_rejected_tokens(
-                                    scheduled_batch)
                             self.drafter.prepare_draft_tokens(
                                 scheduled_batch, self.resource_manager)
+                        # add_batch must be called again to restore to target requests with updated draft tokens.
+                        if self.guided_decoder is not None:
+                            self.guided_decoder.add_batch(scheduled_batch)
+                            if hasattr(self.drafter, "guided_decoder"):
+                                self.guided_decoder.rollback_draft_tokens()
 
                             # Pad draft tokens to the max draft length. This is for CUDA
                             # graph compatibility.
@@ -1038,8 +1043,8 @@ class PyExecutor:
                                                      num_draft_tokens))
 
                     batch_outputs = self._forward_step(scheduled_batch)
-                    self._execute_guided_decoder(scheduled_batch,
-                                                 batch_outputs['logits'])
+                    if self.guided_decoder is not None:
+                        self.guided_decoder.execute(batch_outputs['logits'])
 
                     sample_state = self._sample_async(scheduled_batch,
                                                       batch_outputs)
@@ -1151,6 +1156,11 @@ class PyExecutor:
                         # Return the first token to the client
                         self._handle_first_token_response(scheduled_batch)
 
+                    # init_disagg_gen_requests must be before engine forward, where the prev_seq_slot is updated.
+                    if self.guided_decoder is not None and self.kv_cache_transceiver:
+                        self.guided_decoder.add_batch(scheduled_batch)
+                        self.guided_decoder.init_disagg_gen_requests()
+
                     previous_tensors_device = self.previous_batch and self.previous_batch.sample_state and self.previous_batch.sample_state.device
 
                     batch_outputs = self._forward_step(scheduled_batch,
@@ -1159,11 +1169,10 @@ class PyExecutor:
                     if self.previous_batch is not None:
                         self._update_requests(self.previous_batch.sample_state)
 
-                    if self.kv_cache_transceiver and self.guided_decoder:
-                        self.guided_decoder.init_disagg_gen_requests(
-                            scheduled_batch)
-                    self._execute_guided_decoder(scheduled_batch,
-                                                 batch_outputs['logits'])
+                    if self.guided_decoder is not None:
+                        # add_batch must be called again to have updated new tokens.
+                        self.guided_decoder.add_batch(scheduled_batch)
+                        self.guided_decoder.execute(batch_outputs['logits'])
 
                     sample_state = self._sample_async(scheduled_batch,
                                                       batch_outputs)

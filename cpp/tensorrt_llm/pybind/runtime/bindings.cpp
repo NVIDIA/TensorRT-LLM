@@ -16,6 +16,7 @@
  */
 
 #include "bindings.h"
+#include "hostfunc.h"
 #include "moeBindings.h"
 #include "tensorrt_llm/kernels/communicationKernels/allReduceWorkspace.h"
 #include "tensorrt_llm/kernels/communicationKernels/customLowPrecisionAllReduceKernels.h"
@@ -461,6 +462,8 @@ void initBindings(pybind11::module_& m)
 
     // Initialize MoeLoadBalancer bindings
     initMoeBindings(m);
+    // Initialize HostFunc bindings
+    initHostFuncBindings(m);
 }
 
 void initBindingsEarly(py::module_& m)
