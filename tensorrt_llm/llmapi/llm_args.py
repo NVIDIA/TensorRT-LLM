@@ -2094,7 +2094,8 @@ class TorchLlmArgs(BaseLlmArgs):
         'AUTO', 'NCCL', 'UB', 'MINLATENCY', 'ONESHOT', 'TWOSHOT',
         'LOWPRECISION', 'MNNVL',
         'NCCL_SYMMETRIC']] = Field(default='AUTO',
-                                   description="Allreduce strategy to use.", status="beta")
+                                   description="Allreduce strategy to use.",
+                                   status="beta")
     checkpoint_loader: Optional[object] = Field(
         default=None,
         description="The checkpoint loader to use for this LLM instance.",

@@ -327,7 +327,7 @@ class PyTorchModelEngine(ModelEngine):
                 and self._init_userbuffers(self.model.config.hidden_size))
             if pytorch_backend_config.torch_compile_enabled:
                 set_torch_compiling(True)
-                use_ub = use_ub_for_nccl or (
+                use_ub = not use_ub_for_nccl and (
                     pytorch_backend_config.torch_compile_enable_userbuffers
                     and self._init_userbuffers(self.model.config.hidden_size))
                 self._torch_compile_backend = Backend(

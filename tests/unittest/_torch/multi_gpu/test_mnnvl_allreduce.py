@@ -21,9 +21,9 @@ import pytest
 import torch
 from mpi4py import MPI
 from mpi4py.futures import MPIPoolExecutor
-from utils.util import skip_pre_blackwell
 
 import tensorrt_llm
+import tensorrt_llm.bindings.internal.userbuffers as ub
 from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
                                              AllReduceParams)
 from tensorrt_llm.functional import AllReduceStrategy
@@ -55,6 +55,7 @@ def run_single_rank(
     dtype,
     fused_add_norm,
     reference_output_list,
+    strategy,
 ):
     rank = tensorrt_llm.mpi_rank()
     torch.cuda.set_device(rank)
@@ -70,6 +71,7 @@ def run_single_rank(
             rank,
             fused_add_norm,
             reference_output_list,
+            strategy,
         )
     except Exception:
         traceback.print_exc()
@@ -89,6 +91,7 @@ def row_linear_residual_norm_fusion_forward(
     tensor_parallel_rank: int,
     fusion: bool,
     reference_output_list: list[tuple[torch.Tensor, ...]],
+    strategy: AllReduceStrategy,
 ):
 
     # Move all tensors to GPU
@@ -100,6 +103,12 @@ def row_linear_residual_norm_fusion_forward(
         for ref_output in reference_output_list
     ]
 
+    if strategy == AllReduceStrategy.NCCL_SYMMETRIC:
+        ub.initialize_userbuffers_manager(
+            tensor_parallel_size, 1, 1, tensor_parallel_rank,
+            torch.cuda.device_count(),
+            x_list[0].nelement() * x_list[0].element_size(), True)
+
     MPI.COMM_WORLD.barrier()
 
     # Create a single AllReduce instance to be reused for all sequence lengths
@@ -109,7 +118,7 @@ def row_linear_residual_norm_fusion_forward(
             tp_size=tensor_parallel_size,
             rank=tensor_parallel_rank,
         ),
-        strategy=AllReduceStrategy.MNNVL,
+        strategy=strategy,
         dtype=dtype,
     )
 
@@ -152,7 +161,6 @@ def row_linear_residual_norm_fusion_forward(
             )
 
 
-@skip_pre_blackwell
 @pytest.mark.skipif(torch.cuda.device_count() < 2,
                     reason="needs 2 GPUs to run this test")
 @pytest.mark.parametrize(
@@ -172,11 +180,15 @@ def row_linear_residual_norm_fusion_forward(
                          [torch.float16, torch.bfloat16, torch.float32],
                          ids=lambda x: f"dtype:{torch.finfo(x).dtype}")
 @pytest.mark.parametrize(
+    "strategy", [AllReduceStrategy.MNNVL, AllReduceStrategy.NCCL_SYMMETRIC],
+    ids=lambda x: f"strategy:{x}")
+@pytest.mark.parametrize(
     "fusion",
     [True, False],
     ids=["fusion", "no_fusion"],
 )
-def test_row_linear_residual_norm_fusion(seq_len, hidden_size, dtype, fusion):
+def test_row_linear_residual_norm_fusion(seq_len, hidden_size, dtype, strategy,
+                                         fusion):
 
     torch.manual_seed(42)
     tensor_parallel_size = 2
@@ -222,6 +234,7 @@ def test_row_linear_residual_norm_fusion(seq_len, hidden_size, dtype, fusion):
                     dtype,
                     fusion,
                     reference_output_list,
+                    strategy,
                 ) for i in range(tensor_parallel_size)
             ]),
         )
