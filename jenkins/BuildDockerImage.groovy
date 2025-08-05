@@ -233,7 +233,7 @@ def buildImage(config, imageKeyToTag)
     def dependentImageWithTag = "${IMAGE_NAME}/${dependent.dockerfileStage}:${dependentTag}"
     def customImageWithTag = "${IMAGE_NAME}/${dockerfileStage}:${customTag}"
 
-    if (target == "ngc-release" && params.triggerType == "post-merge") {
+    if (target == "ngc-release" && TRIGGER_TYPE == "post-merge") {
         echo "Use NGC artifacts for post merge build"
         dependentImageWithTag = "${NGC_IMAGE_NAME}:${dependentTag}"
         imageWithTag = "${NGC_IMAGE_NAME}:${tag}"
