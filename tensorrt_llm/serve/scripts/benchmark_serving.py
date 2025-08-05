@@ -41,8 +41,8 @@ from tensorrt_llm.serve.scripts.backend_request_func import (
     RequestFuncInput, RequestFuncOutput, get_tokenizer)
 from tensorrt_llm.serve.scripts.benchmark_dataset import (
     AIMODataset, BurstGPTDataset, ConversationDataset, CustomDataset,
-    HuggingFaceDataset, InstructCoderDataset, RandomDataset, SampleRequest,
-    ShareGPTDataset, SonnetDataset, VisionArenaDataset)
+    HuggingFaceDataset, InstructCoderDataset, RandomDataset, RandomImageDataset,
+    SampleRequest, ShareGPTDataset, SonnetDataset, VisionArenaDataset)
 from tensorrt_llm.serve.scripts.benchmark_utils import (
     convert_to_pytorch_benchmark_format, write_to_json)
 # isort: on
@@ -288,10 +288,11 @@ async def benchmark(
 
     if not no_test_input:
         print("Starting initial single prompt test run...")
-        test_prompt, test_prompt_len, test_output_len = \
+        test_prompt, test_prompt_len, test_output_len, test_mm_content = \
             input_requests[0].prompt, input_requests[0].prompt_len, \
-            input_requests[0].expected_output_len
+            input_requests[0].expected_output_len, input_requests[0].multi_modal_data
 
+        assert test_mm_content is None or isinstance(test_mm_content, dict)
         test_input = RequestFuncInput(
             model=model_id,
             model_name=model_name,
@@ -302,6 +303,7 @@ async def benchmark(
             logprobs=logprobs,
             ignore_eos=ignore_eos,
             extra_body=extra_body,
+            multi_modal_content=test_mm_content,
         )
 
         test_output = await request_func(request_func_input=test_input,
@@ -323,15 +325,18 @@ async def benchmark(
 
     if profile:
         print("Starting profiler...")
-        profile_input = RequestFuncInput(model=model_id,
-                                         model_name=model_name,
-                                         prompt=test_prompt,
-                                         api_url=base_url + "/start_profile",
-                                         prompt_len=test_prompt_len,
-                                         output_len=test_output_len,
-                                         logprobs=logprobs,
-                                         ignore_eos=ignore_eos,
-                                         extra_body=extra_body)
+        profile_input = RequestFuncInput(
+            model=model_id,
+            model_name=model_name,
+            prompt=test_prompt,
+            api_url=base_url + "/start_profile",
+            prompt_len=test_prompt_len,
+            output_len=test_output_len,
+            logprobs=logprobs,
+            ignore_eos=ignore_eos,
+            extra_body=extra_body,
+            multi_modal_content=test_mm_content,
+        )
         profile_output = await request_func(request_func_input=profile_input,
                                             streaming=streaming)
         if profile_output.success:
@@ -379,23 +384,26 @@ async def benchmark(
 
     i = 0
     async for request in get_request(input_requests, request_rate, burstiness):
-        prompt, prompt_len, output_len = request.prompt, \
-            request.prompt_len, request.expected_output_len
+        prompt, prompt_len, output_len, mm_content = request.prompt, \
+            request.prompt_len, request.expected_output_len, request.multi_modal_data
 
         req_model_id, req_model_name = model_id, model_name
         if lora_modules:
             req_lora_module = next(lora_modules)
             req_model_id, req_model_name = req_lora_module, req_lora_module
 
-        request_func_input = RequestFuncInput(model=req_model_id,
-                                              model_name=req_model_name,
-                                              prompt=prompt,
-                                              api_url=api_url,
-                                              prompt_len=prompt_len,
-                                              output_len=output_len,
-                                              logprobs=logprobs,
-                                              ignore_eos=ignore_eos,
-                                              extra_body=extra_body)
+        request_func_input = RequestFuncInput(
+            model=req_model_id,
+            model_name=req_model_name,
+            prompt=prompt,
+            api_url=api_url,
+            prompt_len=prompt_len,
+            output_len=output_len,
+            logprobs=logprobs,
+            ignore_eos=ignore_eos,
+            extra_body=extra_body,
+            multi_modal_content=mm_content,
+        )
         tasks.append(
             asyncio.create_task(
                 limited_request_func(request_func_input=request_func_input,
@@ -665,6 +673,13 @@ def main(args: argparse.Namespace):
                 f" from one of following: {supported_datasets}. "
                 "Please consider contributing if you would "
                 "like to add support for additional dataset formats.")
+        if dataset_class.IS_MULTIMODAL and backend not in [
+                "openai-chat",
+        ]:
+            # multi-modal benchmark is only available on OpenAI Chat backend.
+            raise ValueError(
+                "Multi-modal content is only supported on 'openai-chat' and "
+                "'openai-audio' backend.")
         input_requests = dataset_class(
             dataset_path=args.dataset_path,
             dataset_subset=args.hf_subset,
@@ -684,41 +699,76 @@ def main(args: argparse.Namespace):
                                        )
 
     else:
-        # For datasets that follow a similar structure, use a mapping.
-        dataset_mapping = {
-            "sharegpt":
-            lambda: ShareGPTDataset(download_path=args.download_path,
-                                    download_timeout=args.download_timeout,
-                                    random_seed=args.seed,
-                                    dataset_path=args.dataset_path).sample(
-                                        tokenizer=tokenizer,
-                                        num_requests=args.num_prompts,
-                                        output_len=args.sharegpt_output_len,
-                                    ),
-            "burstgpt":
-            lambda: BurstGPTDataset(random_seed=args.seed,
-                                    dataset_path=args.dataset_path).
-            sample(tokenizer=tokenizer, num_requests=args.num_prompts),
-            "random":
-            lambda: RandomDataset(sample_from_sharegpt=not args.random_ids,
-                                  return_text=not args.tokenize_on_client,
-                                  dataset_path=args.dataset_path,
-                                  download_path=args.download_path,
-                                  download_timeout=args.download_timeout
-                                  ).sample(
-                                      tokenizer=tokenizer,
-                                      num_requests=args.num_prompts,
-                                      prefix_len=args.random_prefix_len,
-                                      input_len=args.random_input_len,
-                                      output_len=args.random_output_len,
-                                      range_ratio=args.random_range_ratio,
-                                  )
+
+        def create_dataset_and_sample(dataset_name: str):
+            """Factory function to create dataset instance and generate samples."""
+
+            # Dataset factory mapping with lambda functions for lazy evaluation
+            dataset_factories = {
+                "sharegpt":
+                lambda: ShareGPTDataset(download_path=args.download_path,
+                                        download_timeout=args.download_timeout,
+                                        random_seed=args.seed,
+                                        dataset_path=args.dataset_path).
+                sample(tokenizer=tokenizer,
+                       num_requests=args.num_prompts,
+                       output_len=args.sharegpt_output_len),
+                "burstgpt":
+                lambda: BurstGPTDataset(random_seed=args.seed,
+                                        dataset_path=args.dataset_path).
+                sample(tokenizer=tokenizer, num_requests=args.num_prompts),
+                "random":
+                lambda: RandomDataset(sample_from_sharegpt=not args.random_ids,
+                                      return_text=not args.tokenize_on_client,
+                                      dataset_path=args.dataset_path,
+                                      download_path=args.download_path,
+                                      download_timeout=args.download_timeout,
+                                      random_seed=args.seed).sample(
+                                          tokenizer=tokenizer,
+                                          num_requests=args.num_prompts,
+                                          prefix_len=args.random_prefix_len,
+                                          input_len=args.random_input_len,
+                                          output_len=args.random_output_len,
+                                          range_ratio=args.random_range_ratio),
+                "random_image":
+                lambda: RandomImageDataset(
+                    random_seed=args.seed,
+                    return_text=not args.tokenize_on_client,
+                ).sample(tokenizer=tokenizer,
+                         num_requests=args.num_prompts,
+                         prefix_len=args.random_prefix_len,
+                         input_len=args.random_input_len,
+                         output_len=args.random_output_len,
+                         range_ratio=args.random_range_ratio,
+                         width=args.random_image_width,
+                         height=args.random_image_height),
+            }
+
+            if dataset_name not in dataset_factories:
+                raise ValueError(
+                    f"Unknown dataset: {dataset_name}. "
+                    f"Available datasets: {list(dataset_factories.keys())}")
+
+            return dataset_factories[dataset_name]()
+
+        # Check multimodal compatibility before creating dataset
+        dataset_class_mapping = {
+            "sharegpt": ShareGPTDataset,
+            "burstgpt": BurstGPTDataset,
+            "random": RandomDataset,
+            "random_image": RandomImageDataset,
         }
 
-        try:
-            input_requests = dataset_mapping[args.dataset_name]()
-        except KeyError as err:
-            raise ValueError(f"Unknown dataset: {args.dataset_name}") from err
+        dataset_class = dataset_class_mapping.get(args.dataset_name)
+        if dataset_class and dataset_class.IS_MULTIMODAL and backend not in [
+                "openai-chat"
+        ]:
+            raise ValueError(
+                "Multi-modal content is only supported on 'openai-chat' backend."
+            )
+
+        # Create dataset and generate samples
+        input_requests = create_dataset_and_sample(args.dataset_name)
     goodput_config_dict = check_goodput_args(args)
 
     # Collect the sampling parameters.
@@ -856,7 +906,8 @@ if __name__ == "__main__":
         type=str,
         default="sharegpt",
         choices=[
-            "sharegpt", "burstgpt", "sonnet", "random", "hf", "trtllm_custom"
+            "sharegpt", "burstgpt", "sonnet", "random", "random_image", "hf",
+            "trtllm_custom"
         ],
         help="Name of the dataset to benchmark on.",
     )
@@ -1105,6 +1156,20 @@ if __name__ == "__main__":
         action="store_true",
         help=
         "Tokenize on client instead of server. This option only takes effect with random dataset to let the server run exactly the same ISL specified by cli.",
+    )
+    random_image_group = parser.add_argument_group(
+        "random image dataset options")
+    random_image_group.add_argument(
+        "--random-image-width",
+        type=int,
+        default=512,
+        help="Width of the image.",
+    )
+    random_image_group.add_argument(
+        "--random-image-height",
+        type=int,
+        default=512,
+        help="Height of the image.",
     )
 
     hf_group = parser.add_argument_group("hf dataset options")

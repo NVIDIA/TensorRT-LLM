@@ -30,6 +30,7 @@ class RequestFuncInput:
     extra_body: Optional[dict] = None
     ignore_eos: bool = False
     language: Optional[str] = None
+    multi_modal_content: Optional[dict] = None
 
 
 @dataclass
@@ -294,14 +295,10 @@ async def async_request_openai_chat_completions(
     else:
         assert isinstance(request_func_input.prompt,
                           str), "Prompt must be a string or a list of integers"
-        payload["messages"].append({
-            "role":
-            "user",
-            "content": [{
-                "type": "text",
-                "text": request_func_input.prompt
-            }]
-        })
+        content = [{"type": "text", "text": request_func_input.prompt}]
+        if request_func_input.multi_modal_content:
+            content.append(request_func_input.multi_modal_content)
+        payload["messages"].append({"role": "user", "content": content})
 
     if streaming:
         payload["stream_options"] = {"include_usage": True}
