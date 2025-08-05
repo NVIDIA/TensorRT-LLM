@@ -465,7 +465,7 @@ void FusedMHARunnerV2::setupLaunchParams(MHARunnerParams runnerParams)
             && ((!isHopperBF16ContextMLA
                     && mLaunchParams.attention_input_layout == AttentionInputLayout::Q_CONTIGUOUS_KV)
                 || (isHopperBF16ContextMLA
-                    && (mLaunchParams.attention_input_layout == AttentionInputLayout::PACKED_QKV))));
+                    && (mLaunchParams.attention_input_layout == AttentionInputLayout::Q_PAGED_KV))));
     }
 }
 
