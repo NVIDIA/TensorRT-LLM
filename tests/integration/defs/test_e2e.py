@@ -1399,18 +1399,20 @@ def test_openai_misc_example(llm_root, llm_venv, backend: str):
 @pytest.mark.parametrize("backend", ["pytorch", "trt"])
 def test_openai_completions_example(llm_root, llm_venv, backend: str):
     test_root = unittest_path() / "llmapi" / "apps"
+    filter_expr = f"{backend} and not sampler"
     llm_venv.run_cmd([
         "-m", "pytest",
-        str(test_root / "_test_openai_completions.py"), "-k", backend
+        str(test_root / "_test_openai_completions.py"), "-k", filter_expr
     ])
 
 
 @pytest.mark.parametrize("backend", ["pytorch", "trt"])
 def test_openai_chat_example(llm_root, llm_venv, backend: str):
     test_root = unittest_path() / "llmapi" / "apps"
+    filter_expr = f"{backend} and not sampler"
     llm_venv.run_cmd([
         "-m", "pytest",
-        str(test_root / "_test_openai_chat.py"), "-k", backend
+        str(test_root / "_test_openai_chat.py"), "-k", filter_expr
     ])
 
 
@@ -1420,6 +1422,24 @@ def test_openai_reasoning(llm_root, llm_venv, backend: str):
     llm_venv.run_cmd([
         "-m", "pytest",
         str(test_root / "_test_openai_reasoning.py"), "-k", backend
+    ])
+
+
+@pytest.mark.parametrize("sampler", ["torch_sampler", "trtllm_sampler"])
+def test_openai_completions_with_logit_bias(llm_root, llm_venv, sampler: str):
+    test_root = unittest_path() / "llmapi" / "apps"
+    llm_venv.run_cmd([
+        "-m", "pytest",
+        str(test_root / "_test_openai_completions.py"), "-k", sampler
+    ])
+
+
+@pytest.mark.parametrize("sampler", ["torch_sampler", "trtllm_sampler"])
+def test_openai_chat_with_logit_bias(llm_root, llm_venv, sampler: str):
+    test_root = unittest_path() / "llmapi" / "apps"
+    llm_venv.run_cmd([
+        "-m", "pytest",
+        str(test_root / "_test_openai_chat.py"), "-k", sampler
     ])
 
 
