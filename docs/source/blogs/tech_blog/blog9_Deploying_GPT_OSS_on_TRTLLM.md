@@ -2,16 +2,16 @@
 
 In the guide below, we will walk you through how to launch your own
 high-performance TensorRT-LLM server for **gpt-oss-120b** for inference.
-This guide covers both low-latency and max-throughput cases. 
+This guide covers both low-latency and max-throughput cases.
 
-The typical use case for **low-latency**, is when we try to maximize the number of tokens per second per user with a limited concurrency (4, 8 or 16 users). 
+The typical use case for **low-latency**, is when we try to maximize the number of tokens per second per user with a limited concurrency (4, 8 or 16 users).
 
 For **maximum throughput**, the goal is to maximize the amount of tokens produced per GPU per second. The former is an indication of how fast a system can produce tokens, the latter measures how many tokens a "chip" can generate per unit of time.
 
 
 ## Prerequisites
 
-- 1x NVIDIA B200/GB200/H200 GPU (8x NVIDIA B200/H200 GPUs or 4x GB200 GPUs in a single node recommended for higher performance) 
+- 1x NVIDIA B200/GB200/H200 GPU (8x NVIDIA B200/H200 GPUs or 4x GB200 GPUs in a single node recommended for higher performance)
 - CUDA Toolkit 12.8 or later
 - Docker with NVIDIA Container Toolkit installed
 - Fast SSD storage for model weights
@@ -47,7 +47,7 @@ This command:
 - Sets up shared memory and stack limits for optimal performance
 - Maps port 8000 from the container to your host
 - enables PDL for low-latency perf optimization
-- disables parallel weight loading 
+- disables parallel weight loading
 
 Lastly the container mounts your user `.cache` directory to save the downloaded model checkpoints which are saved to `~/.cache/huggingface/hub/` by default. This prevents having to redownload the weights each time you rerun the container.
 
@@ -283,40 +283,40 @@ curl localhost:8000/v1/chat/completions -H "Content-Type: application/json" -d '
         "content": "<|channel|>analysis<|message|>The user asks: \"What is NVIDIA's advantage for inference?\" The user wants:
          \"What is NVIDIA's advantage for inference?\" Likely they want a detailed answer about why NVIDIA has advantages for
           inference tasks (e.g., GPU acceleration, TensorRT, software stack, Tensor Cores, hardware, performance, low latency,
-          etc.). The user wants a short answer? Not specified. The user wants a straightforward answer. Probably a brief 
-          explanation: hardware features like Tensor cores, optimized libraries (TensorRT), ecosystem, software stack, 
-          integration with frameworks, cuDNN, inference GPU architecture, high throughput, low latency, FP16, INT8, etc.\n\nWe 
-          need to produce a response: Provide NVIDIA's advantage for inference. Provide specifics: hardware (Tensor cores, RT 
-          cores, Ampere architecture), software (TensorRT, CUDA, cuDNN, Triton Inference Server), developer ecosystem, network 
+          etc.). The user wants a short answer? Not specified. The user wants a straightforward answer. Probably a brief
+          explanation: hardware features like Tensor cores, optimized libraries (TensorRT), ecosystem, software stack,
+          integration with frameworks, cuDNN, inference GPU architecture, high throughput, low latency, FP16, INT8, etc.\n\nWe
+          need to produce a response: Provide NVIDIA's advantage for inference. Provide specifics: hardware (Tensor cores, RT
+          cores, Ampere architecture), software (TensorRT, CUDA, cuDNN, Triton Inference Server), developer ecosystem, network
           effects, etc.\n\nAlso mention inference performance vs competition, DPUs, etc.\n\nWe'll answer concisely but thorough.
-          \n\nWe also must not mention we are ChatGPT or mention policy. Provide final answer.\n\nLet's produce a clear, 
+          \n\nWe also must not mention we are ChatGPT or mention policy. Provide final answer.\n\nLet's produce a clear,
           well-structured answer.\n\n<|end|><|start|>assistant<|channel|>final<|message|>**NVIDIA’s edge in AI inference comes
-          from a tightly‑integrated stack of hardware, software, and ecosystem tools that together deliver the 
-          highest‑throughput, lowest‑latency execution of deep‑learning models.**\n\n| **Layer** | **Key Advantages** | **Why 
-          It Matters for Inference** |\n|-----------|-------------------|---------------------------------|\n| **GPU 
-          Architecture** | • **Tensor Cores** (FP16/FP8/INT8) – dedicated matrix‑multiply units that give 2–8× higher ops/W 
-          than classic CUDA cores. <br>• **CUDA SMs with mixed‑precision support** – can run FP16/INT8/INT4 with minimal 
-          accuracy loss. <br>• **NVLink / NVSwitch** – high‑bandwidth, low‑latency inter‑GPU communication for multi‑GPU 
-          serving. | Maximizes raw arithmetic density, letting a single GPU handle many concurrent requests. |\n| 
-          **Inference‑focused Silicon** | • **A100 / H100 “Tensor‑Core” GPUs** – FP8 support (H100) and sparsity acceleration 
-          (up to 2× throughput). <br>• **T4/Ti, L40, L4, Jetson edge modules** – power‑optimized variants for data‑center, 
-          edge, and robotics. | Provides the right performance‑per‑watt for cloud, on‑prem, or edge deployments. |\n| 
-          **Software Stack** | • **TensorRT** – a compiler & runtime that fuses layers, applies precision calibration, and 
-          auto‑tunes kernels for each GPU. <br>• **CUDA, cuDNN, cuBLAS** – low‑level libraries tuned for every generation of 
-          GPU. <br>• **Triton Inference Server** – model‑agnostic serving, model‑versioning, batching, GPU sharing, and 
+          from a tightly‑integrated stack of hardware, software, and ecosystem tools that together deliver the
+          highest‑throughput, lowest‑latency execution of deep‑learning models.**\n\n| **Layer** | **Key Advantages** | **Why
+          It Matters for Inference** |\n|-----------|-------------------|---------------------------------|\n| **GPU
+          Architecture** | • **Tensor Cores** (FP16/FP8/INT8) – dedicated matrix‑multiply units that give 2–8× higher ops/W
+          than classic CUDA cores. <br>• **CUDA SMs with mixed‑precision support** – can run FP16/INT8/INT4 with minimal
+          accuracy loss. <br>• **NVLink / NVSwitch** – high‑bandwidth, low‑latency inter‑GPU communication for multi‑GPU
+          serving. | Maximizes raw arithmetic density, letting a single GPU handle many concurrent requests. |\n|
+          **Inference‑focused Silicon** | • **A100 / H100 “Tensor‑Core” GPUs** – FP8 support (H100) and sparsity acceleration
+          (up to 2× throughput). <br>• **T4/Ti, L40, L4, Jetson edge modules** – power‑optimized variants for data‑center,
+          edge, and robotics. | Provides the right performance‑per‑watt for cloud, on‑prem, or edge deployments. |\n|
+          **Software Stack** | • **TensorRT** – a compiler & runtime that fuses layers, applies precision calibration, and
+          auto‑tunes kernels for each GPU. <br>• **CUDA, cuDNN, cuBLAS** – low‑level libraries tuned for every generation of
+          GPU. <br>• **Triton Inference Server** – model‑agnostic serving, model‑versioning, batching, GPU sharing, and
           scaling across CPUs/GPUs. | Turns raw GPU power into production‑ready, low‑latency services with minimal engineering
           effort. |\n| **Model Optimizations** | • **Quantization (INT8/FP8) & Structured Sparsity** – supported natively by
-          TensorRT and the hardware. <br>• **Automatic Mixed‑Precision (AMP)** – retains accuracy while cutting compute. | 
-          Reduces memory bandwidth and compute cost while keeping accuracy within acceptable bounds. |\n| **Ecosystem & 
-          Compatibility** | • **Broad framework support** – TensorFlow, PyTorch, ONNX, JAX, etc., all compile to TensorRT. 
-          <br>• **NVIDIA NGC** – pre‑optimized model zoo, containers, and reference pipelines. <br>• **MLOps tools** – 
-          NVIDIA Merlin, Clara, Metropolis, etc., for recommendation, medical, vision pipelines. | Engineers can 
+          TensorRT and the hardware. <br>• **Automatic Mixed‑Precision (AMP)** – retains accuracy while cutting compute. |
+          Reduces memory bandwidth and compute cost while keeping accuracy within acceptable bounds. |\n| **Ecosystem &
+          Compatibility** | • **Broad framework support** – TensorFlow, PyTorch, ONNX, JAX, etc., all compile to TensorRT.
+          <br>• **NVIDIA NGC** – pre‑optimized model zoo, containers, and reference pipelines. <br>• **MLOps tools** –
+          NVIDIA Merlin, Clara, Metropolis, etc., for recommendation, medical, vision pipelines. | Engineers can
           plug‑and‑play, accelerate, and ship models faster. |\n| **Scalability & Deployment Flexibility** | • **DGX Cloud,
           EGX, Jetson, and Orin** – end‑to‑end solutions from cloud to edge. <br>• **Multi‑Instance GPU (MIG)** – partition
-          a single A100 into up to 7 isolated inference instances. <br>• **NVIDIA AI Enterprise** – managed software suite 
-          for on‑prem data‑centers. | Allows the same code to run on a laptop, an edge device, or a massive data‑center 
-          cluster. |\n| **Performance Benchmarks** | • **Industry‑leading latency/throughput** on MLPerf Inference (FP8, 
-          INT8). <br>• **Sparsity‑aware kernels** give >2× speedup on H100 with < 0.1 % accuracy loss. | Demonstrates 
+          a single A100 into up to 7 isolated inference instances. <br>• **NVIDIA AI Enterprise** – managed software suite
+          for on‑prem data‑centers. | Allows the same code to run on a laptop, an edge device, or a massive data‑center
+          cluster. |\n| **Performance Benchmarks** | • **Industry‑leading latency/throughput** on MLPerf Inference (FP8,
+          INT8). <br>• **Sparsity‑aware kernels** give >2× speedup on H100 with < 0.1 % accuracy loss. | Demonstrates
           real‑world advantage in the most respected benchmark suite. |\n|",
         "reasoning_content": null,
         "tool_calls": []
