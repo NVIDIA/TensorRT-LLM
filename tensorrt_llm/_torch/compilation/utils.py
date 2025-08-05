@@ -1,3 +1,4 @@
+import contextlib
 from typing import Callable, List, Union
 
 import torch
@@ -41,6 +42,16 @@ def set_enable_piecewise_cuda_graph_capture_flag(enable: bool):
 def get_enable_piecewise_cuda_graph_capture_flag() -> bool:
     global _enable_piecewise_cuda_graph_capture
     return _enable_piecewise_cuda_graph_capture
+
+
+@contextlib.contextmanager
+def piecewise_cuda_graph_capture(enable: bool):
+    prev_enable = get_enable_piecewise_cuda_graph_capture_flag()
+    set_enable_piecewise_cuda_graph_capture_flag(enable)
+    try:
+        yield
+    finally:
+        set_enable_piecewise_cuda_graph_capture_flag(prev_enable)
 
 
 def inplace_info():
