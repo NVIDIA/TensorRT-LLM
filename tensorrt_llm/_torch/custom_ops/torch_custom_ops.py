@@ -244,6 +244,7 @@ def _(
     output_dtype: torch.dtype,
     quant_scales: List[torch.Tensor],
     input_sf: Optional[torch.Tensor] = None,
+    swizzled_input_sf: bool = True,
     swiglu_alpha: Optional[torch.Tensor] = None,
     swiglu_beta: Optional[torch.Tensor] = None,
     swiglu_limit: Optional[torch.Tensor] = None,
