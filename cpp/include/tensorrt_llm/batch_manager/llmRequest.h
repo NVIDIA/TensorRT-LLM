@@ -2348,6 +2348,7 @@ public:
 
     void moveLoraWeightsToGpu(runtime::BufferManager const& manager);
 
+    // Remove LoRA weights and LoRA config tensors
     void removeLoraTensors();
 };
 

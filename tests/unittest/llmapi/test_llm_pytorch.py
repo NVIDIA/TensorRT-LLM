@@ -359,6 +359,17 @@ def test_llama_7b_multi_lora_evict_and_load_new_adapters_in_cpu_and_gpu_cache():
 
 
 @skip_gpu_memory_less_than_40gb
+def test_llama_7b_multi_lora_read_from_cache_after_insert():
+    """Test that loading and then using the same adapters loaded in cache works."""
+    _check_llama_7b_multi_lora_evict_load_new_adapters(
+        lora_adapter_count_per_call=[3],
+        max_loras=3,
+        max_cpu_loras=3,
+        repeat_calls=2,
+        repeats_per_call=1)
+
+
+@skip_gpu_memory_less_than_40gb
 def test_llama_7b_multi_lora_evict_and_reload_evicted_adapters_in_cpu_and_gpu_cache(
 ):
     """Test eviction, reloading new adapters and reloading previously evicted adapters from the LoRA CPU cache & GPU
