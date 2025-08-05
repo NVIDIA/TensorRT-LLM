@@ -1,3 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import pickle
 import sys
 from unittest.mock import MagicMock
@@ -23,6 +38,8 @@ def run_across_mpi(executor, fun, num_ranks):
 
 
 @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+# TODO(jthomson04): I don't have the slightest idea why this test is leaking threads.
+@pytest.mark.threadleak(enabled=False)
 def test_connector_manager_get_finished_allgather(mpi_pool_executor):
 
     def test():

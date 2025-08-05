@@ -287,21 +287,24 @@ class PyExecutor:
                     "KV Cache Connector is not supported with pipeline parallelism."
                 )
 
-            # TODO: This does NOT support pipeline parallel.
-            layer_kv_tensors = {
-                layer_idx: self.kv_cache_manager.get_buffers(layer_idx)
+            all_layers = [
+                self.kv_cache_manager.get_buffers(layer_idx)
                 for layer_idx in self.kv_cache_manager.pp_layers
-            }
+            ]
 
-            kv_shape = layer_kv_tensors[list(layer_kv_tensors.keys())[0]].shape
-
-            if not all(t.shape == kv_shape for t in layer_kv_tensors.values()):
+            if not all(t.shape == all_layers[0].shape for t in all_layers):
                 raise ValueError(
-                    "KV Cache Connector is not supported with Variable sliding window attention!"
+                    "KV Cache Connector is not supported with sliding window attention."
                 )
 
-            self.kv_connector_manager.worker.register_kv_caches(
-                layer_kv_tensors)
+            full_kv_tensor = torch.cat(all_layers, dim=1)
+
+            if not full_kv_tensor.is_contiguous():
+                raise ValueError(
+                    "KV Cache Connector is not supported with non-contiguous KV cache."
+                )
+
+            self.kv_connector_manager.worker.register_kv_caches(full_kv_tensor)
 
             # For each of our layers, we need to register the pre/post hooks.
             # These are used for methods like `wait_for_layer_load` and `save_kv_layer`.

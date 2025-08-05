@@ -390,13 +390,13 @@ class KVCacheManager(BaseResourceManager):
                                    == self.mapping.cp_size - 1 else 0),
                         req_beam_width, req, self.kv_connector_manager)
             else:
-                # TODO(jthomson04): This is begging for a mega refactor, and can likely be significantly simplified.
-                # In add sequence, the connector API's get_num_new_matched_tokens is called.
+                # In add_sequence, the connector API's get_num_new_matched_tokens is called.
                 # The result of this call may be that blocks will be loaded asynchronously.
                 # If so, we set the is_kv_cache_connector_async_onboard flag, and set the request state to be DISAGG_GENERATION_TRANS_IN_PROGRESS.
                 # When the async load is complete, we set the request state back to CONTEXT_INIT.
                 # When that happens, the request will go through this same code path, but with is_kv_cache_connector_async_onboard set to True.
                 # Because of this, we need to filter this case out to avoid adding the same sequence twice.
+                # NOTE(jthomson04): Surely there's a better way to do this.
                 if req.is_first_context_chunk and not req.is_kv_cache_connector_async_onboard:
                     self.impl.add_sequence(req.py_request_id, req.prompt_len,
                                            req_beam_width, req,
@@ -406,33 +406,21 @@ class KVCacheManager(BaseResourceManager):
                     for _ in range(get_draft_token_length(req)):
                         self.impl.add_token(req.py_request_id)
 
-                    # If this is not an async load, we can add the new tokens and blocks right away.
-                    if not req.is_kv_cache_connector_async_onboard:
-                        scheduler_output.add_request(
-                            req.request_id, req.get_tokens(0),
-                            self.get_cache_indices(req),
-                            req.context_current_position)
+                    scheduler_output.record_first_prefill_chunk(
+                        req, self.get_cache_indices(req))
                 else:
                     # When using the connector, this code path will be hit after the async load is complete.
                     # Alternatively, with no connector, this is hit after the first chunk of prefill.
 
-                    # If this is the first actual prefill, we can add all of our new tokens and blocks.
+                    # If this is the first prefill chunk, we can add all of our new tokens and blocks.
                     if req.is_first_context_chunk or req.is_kv_cache_connector_async_onboard:
                         req.is_kv_cache_connector_async_onboard = False
-                        scheduler_output.add_request(
-                            req.request_id, req.get_tokens(0),
-                            self.get_cache_indices(req),
-                            req.context_current_position)
+                        scheduler_output.record_first_prefill_chunk(
+                            req, self.get_cache_indices(req))
                     else:
-                        # Otherwise, we just provide the new context position. No new blocks are allocated.
-                        scheduler_output.add_request(
-                            req.request_id, [], [],
-                            req.context_current_position)
+                        scheduler_output.record_nth_prefill_chunk(req)
 
         for req in generation_batch:
-            tokens = req.get_tokens(0)
-            computed_token_position = len(req.get_tokens(0)) - 1
-
             old_block_ids = self.get_cache_indices(req)
 
             self.impl.add_token(req.py_request_id)
@@ -444,9 +432,7 @@ class KVCacheManager(BaseResourceManager):
 
             delta_block_ids = new_block_ids[len(old_block_ids):]
 
-            scheduler_output.add_request(req.request_id, tokens[-1:],
-                                         delta_block_ids,
-                                         computed_token_position)
+            scheduler_output.record_generation_req(req, delta_block_ids)
 
         if self.kv_connector_manager is not None:
             self.kv_connector_manager.set_scheduler_output(scheduler_output)
