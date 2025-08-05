@@ -1,35 +1,6 @@
 add_custom_target(deep_gemm)
 
-# CUDA architectures
-# ==================
-
-# Filter CUDA arch >= 9.0 (deep_gemm requirements)
-set(DEEP_GEMM_CUDA_ARCHITECTURES "")
-foreach(CUDA_ARCH IN LISTS CMAKE_CUDA_ARCHITECTURES)
-  string(REGEX MATCHALL "^([1-9][0-9]*)([0-9])[af]?(-real|-virtual)?$" MATCHES
-               ${CUDA_ARCH})
-  if(NOT CMAKE_MATCH_0)
-    message(FATAL_ERROR "Invalid CUDA arch format: \"${CUDA_ARCH}\"")
-  endif()
-  set(CUDA_ARCH_MAJOR ${CMAKE_MATCH_1})
-  set(CUDA_ARCH_MINOR ${CMAKE_MATCH_2})
-  set(CUDA_ARCH_POSTFIX ${CMAKE_MATCH_3})
-  if(${CUDA_ARCH_MAJOR} GREATER_EQUAL 9)
-    list(APPEND DEEP_GEMM_CUDA_ARCHITECTURES
-         "${CUDA_ARCH_MAJOR}${CUDA_ARCH_MINOR}${CUDA_ARCH_POSTFIX}")
-  endif()
-endforeach()
-
-# Skip build if there is no suitable CUDA arch
 if(WIN32)
-  set(DEEP_GEMM_CUDA_ARCHITECTURES "")
-endif()
-message(
-  STATUS
-    "deep_gemm DEEP_GEMM_CUDA_ARCHITECTURES: ${DEEP_GEMM_CUDA_ARCHITECTURES}")
-file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/cuda_architectures.txt
-     "${DEEP_GEMM_CUDA_ARCHITECTURES}")
-if(NOT DEEP_GEMM_CUDA_ARCHITECTURES)
   return()
 endif()
 
@@ -37,7 +8,7 @@ endif()
 # =============
 
 # Use DeepGEMM submodule
-set(DEEP_GEMM_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../../3rdparty/deepgemm)
+set(DEEP_GEMM_SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../../../3rdparty/DeepGEMM)
 get_filename_component(DEEP_GEMM_SOURCE_DIR ${DEEP_GEMM_SOURCE_DIR} ABSOLUTE)
 
 if(NOT EXISTS ${DEEP_GEMM_SOURCE_DIR})
@@ -107,11 +78,6 @@ file(COPY ${DEEP_GEMM_SOURCE_DIR}/third-party/cutlass/include/cute
      DESTINATION ${DEEP_GEMM_INCLUDE_DEST})
 file(COPY ${DEEP_GEMM_SOURCE_DIR}/third-party/cutlass/include/cutlass
      DESTINATION ${DEEP_GEMM_INCLUDE_DEST})
-file(COPY ${DEEP_GEMM_SOURCE_DIR}/third-party/fmt/include/fmt
-     DESTINATION ${DEEP_GEMM_INCLUDE_DEST})
-
-# Let CMake generate `fatbinData` for CUDA separable compilation
-set(CMAKE_INTERPROCEDURAL_OPTIMIZATION FALSE)
 
 # Find torch_python
 find_library(TORCH_PYTHON_LIB torch_python REQUIRED
@@ -126,8 +92,7 @@ set_target_properties(
   PROPERTIES CXX_STANDARD_REQUIRED ON
              CXX_STANDARD 20
              CXX_SCAN_FOR_MODULES OFF
-             CUDA_SEPARABLE_COMPILATION OFF
-             CUDA_ARCHITECTURES "${DEEP_GEMM_CUDA_ARCHITECTURES}"
+             CUDA_SEPARABLE_COMPILATION ON
              LINK_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/deep_gemm_cpp_tllm.version
              INSTALL_RPATH "${TORCH_INSTALL_PREFIX}/lib"
              BUILD_WITH_INSTALL_RPATH TRUE)

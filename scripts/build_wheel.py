@@ -695,17 +695,13 @@ def main(*,
                 "tensorrt_llm/deep_ep/nvshmem-build/src/lib/nvshmem_transport_ibgda.so.103",
                 lib_dir / "nvshmem")
 
-        deep_gemm_cuda_arch_file = build_dir / "tensorrt_llm" / "deep_gemm" / "cuda_architectures.txt"
-        if deep_gemm_cuda_arch_file.exists():
-            with deep_gemm_cuda_arch_file.open() as f:
-                deep_gemm_cuda_architectures = f.read().strip().strip(";")
-            if deep_gemm_cuda_architectures:
-                install_file(get_binding_lib("deep_gemm", "deep_gemm_cpp_tllm"),
-                             pkg_dir)
-                install_tree(build_dir / "tensorrt_llm" / "deep_gemm" /
-                             "python" / "deep_gemm",
-                             deep_gemm_dir,
-                             dirs_exist_ok=True)
+        install_file(get_binding_lib("deep_gemm", "deep_gemm_cpp_tllm"),
+                     pkg_dir)
+        install_tree(build_dir / "tensorrt_llm" / "deep_gemm" / "python" /
+                     "deep_gemm",
+                     deep_gemm_dir,
+                     dirs_exist_ok=True)
+
         if not skip_stubs:
             with working_directory(project_dir):
                 if binding_type == "nanobind":
@@ -779,10 +775,9 @@ def main(*,
                             build_run(
                                 f"\"{venv_python}\" -m pybind11_stubgen -o . deep_ep_cpp_tllm --exit-code",
                                 env=env_ld)
-                        if deep_gemm_cuda_architectures:
-                            build_run(
-                                f"\"{venv_python}\" -m pybind11_stubgen -o . deep_gemm_cpp_tllm --exit-code",
-                                env=env_ld)
+                        build_run(
+                            f"\"{venv_python}\" -m pybind11_stubgen -o . deep_gemm_cpp_tllm --exit-code",
+                            env=env_ld)
 
     if not skip_building_wheel:
         if dist_dir is None:
