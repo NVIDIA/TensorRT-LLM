@@ -18,7 +18,7 @@ For **maximum throughput**, the goal is to maximize the amount of tokens produce
 - Fast SSD storage for model weights
 - Access to the gpt-oss-120b model checkpoint
 
-We have a forthcoming guide for getting great performance on H100, however the below guide focuses on the above GPUs.
+We have a forthcoming guide for getting great performance on H100, however this guide focuses on the above GPUs.
 
 </br>
 
@@ -239,7 +239,7 @@ export OVERRIDE_QUANT_ALGO=W4A16_MXFP4
 
 ## (H200 Only) Using OpenAI Triton Kernels for MoE
 
-OpenAI ships a set of Triton kernels optimized for its MoE models. TensorRT-LLM can leverage these kernels for Hopper based GPUs like NVIDIA's H200 to gain significant speed-ups. The NGC TensorRT-LLM contrainer image mentioned above already includes the required kernel so you do not need to build or install it. It is highly recommended to enable them with the steps below:
+OpenAI ships a set of Triton kernels optimized for its MoE models. TensorRT-LLM can leverage these kernels for Hopper based GPUs like NVIDIA's H200 for best performance. The NGC TensorRT-LLM container image mentioned above already includes the required kernels so you do not need to build or install them. It is highly recommended to enable them with the steps below:
 
 ### Selecting Triton as the MoE backend
 
