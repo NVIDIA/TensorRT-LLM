@@ -8,7 +8,6 @@ The typical use case for **low-latency**, is when we try to maximize the number 
 
 For **maximum throughput**, the goal is to maximize the amount of tokens produced per GPU per second. The former is an indication of how fast a system can produce tokens, the latter measures how many tokens a "chip" can generate per unit of time.
 
-</br>
 
 ## Prerequisites
 
@@ -20,7 +19,6 @@ For **maximum throughput**, the goal is to maximize the amount of tokens produce
 
 We have a forthcoming guide for getting great performance on H100, however this guide focuses on the above GPUs.
 
-</br>
 
 ## Launching the TensorRT-LLM docker container
 
@@ -41,7 +39,6 @@ docker run --rm --ipc=host -it \
   /bin/bash
 ```
 
-</br>
 
 This command:
 - Automatically removes the container when stopped (`--rm`)
@@ -54,7 +51,6 @@ This command:
 
 Lastly the container mounts your user `.cache` directory to save the downloaded model checkpoints which are saved to `~/.cache/huggingface/hub/` by default. This prevents having to redownload the weights each time you rerun the container.
 
-</br>
 
 ## Running the TensorRT-LLM Server
 
@@ -133,7 +129,6 @@ trtllm-serve  openai/gpt-oss-120b \
 ```
 </details>
 
-</br>
 
 
 
@@ -213,7 +208,6 @@ trtllm-serve  openai/gpt-oss-120b \
 ```
 </details>
 
-</br>
 
 This command:
 - Maps port 8000 from the container to your host
@@ -224,18 +218,6 @@ This command:
 
 The initialization may take several minutes as it loads and optimizes the models.
 
-</br>
-
-##  (Optional) Using the MXFP4 Checkpoints
-
-For MXFP4 checkpoints, default quantization is `W4A8_MXFP4_MXFP8` for CUTLASS and TRTLLM backend and `W4A8_MXFP4_FP8` for Triton backend on Blackwell. Default quantization for MXFP4 checkpoints on Hopper is `W4A16_MXFP4`
-You can override quantization by:
-
-```bash
-export OVERRIDE_QUANT_ALGO=W4A16_MXFP4
-```
-
-</br>
 
 ## (H200 Only) Using OpenAI Triton Kernels for MoE
 
@@ -256,7 +238,6 @@ Alternatively the TRITON backend can be enabled by passing the CLI flag to the t
 --moe_backend TRITON
 ```
 
-</br>
 
 ## Test the Server with a Sample Request
 
@@ -361,7 +342,6 @@ The server exposes a standard OpenAI-compatible API endpoint that accepts JSON
 requests. You can adjust parameters like `max_tokens`, `temperature`, and
 others according to your needs.
 
-</br>
 
 ## Troubleshooting Tips
 
@@ -371,7 +351,6 @@ others according to your needs.
 - If the container fails to start, verify that the NVIDIA Container Toolkit is properly installed
 - For connection issues, make sure port 8000 is not being used by another application
 
-</br>
 
 ## Performance Tuning
 
