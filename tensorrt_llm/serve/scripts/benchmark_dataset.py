@@ -424,12 +424,12 @@ class RandomDataset(BenchmarkDataset):
                 RandomDataset.SHAREGPT_URL, download_path,
                 RandomDataset.SHAREGPT_URL.split("/")[-1], download_timeout)
 
-    def apply_chat_template(prompt, tokenizer):
+    def apply_chat_template(tokenizer, prompt):
         """Apply chat template to a prompt.
 
         Args:
-            prompt (str): The input prompt.
             tokenizer (PreTrainedTokenizerBase): The tokenizer to use.
+            prompt (str): The input prompt.
 
         Returns:
             str: The chat-templated prompt.
