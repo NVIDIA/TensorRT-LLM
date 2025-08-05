@@ -333,6 +333,7 @@ class Attention(nn.Module):
         enable_attn_nvfp4_output: bool = True,
         output: Optional[torch.Tensor] = None,
         output_sf: Optional[torch.Tensor] = None,
+        attention_sinks: Optional[torch.Tensor] = None,
     ):
 
         out_scale = None
@@ -366,7 +367,8 @@ class Attention(nn.Module):
             attention_mask_data=attention_mask_data,
             enable_attn_nvfp4_output=enable_attn_nvfp4_output,
             output=output,
-            output_sf=output_sf)
+            output_sf=output_sf,
+            attention_sinks=attention_sinks)
         if isinstance(attn_output, tuple):
             assert len(
                 attn_output
@@ -457,18 +459,16 @@ class Attention(nn.Module):
                 output=output,
             )
         else:
-            output, output_sf = self._attn_impl(
-                q,
-                k,
-                v,
-                attn_metadata,
-                attention_mask,
-                mrope_rotary_cos_sin,
-                mrope_position_deltas,
-                attention_window_size,
-                attention_mask_data,
-                attention_sinks=attention_sinks
-            )
+            output, output_sf = self._attn_impl(q,
+                                                k,
+                                                v,
+                                                attn_metadata,
+                                                attention_mask,
+                                                mrope_rotary_cos_sin,
+                                                mrope_position_deltas,
+                                                attention_window_size,
+                                                attention_mask_data,
+                                                attention_sinks=attention_sinks)
             if output_sf is not None:
                 output = Fp4QuantizedTensor(output, output_sf)
 

@@ -9,7 +9,6 @@ import weakref
 from pathlib import Path
 from typing import Any, List, Literal, Optional, Sequence, Union
 
-import tiktoken
 from tqdm import tqdm
 from transformers import PreTrainedTokenizerBase
 
@@ -679,100 +678,6 @@ class BaseLLM:
             trust_remote_code=self.args.trust_remote_code,
             use_fast=self.args.tokenizer_mode != 'slow')
 
-        # TODO: Remove the below block once the HF tokenizer files are available in the model repo.
-        if tokenizer is None:
-            logger.info("Using tiktoken")
-            o200k_base = tiktoken.get_encoding("o200k_base")
-            encoding = tiktoken.Encoding(
-                name="o200k_harmony",
-                pat_str=o200k_base._pat_str,
-                mergeable_ranks=o200k_base._mergeable_ranks,
-                special_tokens={
-                    "<|startoftext|>": 199998,
-                    "<|endoftext|>": 199999,
-                    "<|reserved_200000|>": 200000,
-                    "<|reserved_200001|>": 200001,
-                    "<|return|>": 200002,
-                    "<|constrain|>": 200003,
-                    "<|reserved_200004|>": 200004,
-                    "<|channel|>": 200005,
-                    "<|start|>": 200006,
-                    "<|end|>": 200007,
-                    "<|message|>": 200008,
-                    "<|reserved_200009|>": 200009,
-                    "<|reserved_200010|>": 200010,
-                    "<|reserved_200011|>": 200011,
-                    "<|call|>": 200012,
-                    "<|reserved_200013|>": 200013,
-                    "<|reserved_200014|>": 200014,
-                    "<|reserved_200015|>": 200015,
-                    "<|reserved_200016|>": 200016,
-                    "<|reserved_200017|>": 200017,
-                    "<|endofprompt|>": 200018,
-                },
-            )
-
-            from tempfile import TemporaryDirectory
-
-            from transformers import AutoConfig
-            from transformers.integrations.tiktoken import \
-                convert_tiktoken_to_fast
-            with TemporaryDirectory() as tempdir:
-                config = AutoConfig.from_pretrained(self.args.model)
-                config.save_pretrained(tempdir)
-                convert_tiktoken_to_fast(encoding, tempdir)
-                tokenizer = ModelLoader.load_hf_tokenizer(
-                    tempdir,
-                    bos_token="<|startoftext|>",  # nosec B106
-                    eos_token="<|return|>",  # nosec B106
-                    pad_token="<|startoftext|>",  # nosec B106
-                    add_bos_token=False,
-                    add_eos_token=False,
-                    trust_remote_code=self.args.trust_remote_code,
-                    use_fast=self.args.tokenizer_mode != 'slow')
-            assert tokenizer.tokenizer.bos_token_id == 199998  # <|startoftext|>
-            assert tokenizer.tokenizer.eos_token_id == 200002  # <|return|>
-            assert tokenizer.tokenizer.pad_token_id == 199998  # <|startoftext|>
-            tokenizer.tokenizer.chat_template = """{# Harmony chat template --------------------------------------------------
-   This template mirrors the message rendering logic implemented in
-   `harmony/src/encoding.rs`.  It can be consumed by Hugging Face
-   Transformers (``chat_template`` field) so that *text → tokens*
-   conversion of chat conversations happens fully on the Python side
-   without relying on the Rust renderer.
-
-   Supported *message* keys (per ``chat::Message``):
-     - role (user│assistant│system│developer│tool)
-     - name (optional author name)
-     - recipient (optional recipient – omitted or "all" → broadcast)
-     - channel   (optional meta channel)
-     - content_type (optional content-type qualifier)
-     - content (string – the actual message payload)
-
-   The template renders each historical message *fully* (incl. the
-   trailing <|end|>/<|return|> sentinel) and – if ``add_generation_prompt``
-   is True – appends a partial header for the **next** assistant turn
-   exactly like ``render_conversation_for_completion`` does on the Rust
-   side: ``<|start|>assistant``.
-#}
-
-{%- macro harmony_header(m) -%}
-    <|start|>{% if m['role'] == 'tool' %}{{ m['name'] }}{% else %}{{ m['role'] }}{% if m.get('name') %}:{{ m['name'] }}{% endif %}{% endif %}{% if m.get('recipient') and m['recipient'] != 'all' %} to={{ m['recipient'] }}{% endif %}{% if m.get('channel') %}<|channel|>{{ m['channel'] }}{% endif %}{% if m.get('content_type') %} {{ m['content_type'] }}{% endif %}<|message|>
-{%- endmacro -%}
-
-{# ---------------------------------------------------------------------
-   Render complete history
-#}
-{%- for message in messages -%}
-    {{- harmony_header(message) -}}{{ message['content'] }}{%- if message['role'] == 'assistant' -%}<|return|>{%- else -%}<|end|>{%- endif -%}
-{%- endfor -%}
-
-{# ---------------------------------------------------------------------
-   Generation prompt for *next* assistant answer
-#}
-{%- if add_generation_prompt -%}
-<|start|>assistant
-{%- endif -%}
-"""
         return tokenizer
 
     @property

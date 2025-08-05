@@ -156,9 +156,9 @@ microsoft/Phi-4-multimodal-instruct-long-rope:
   - accuracy: 75.85
 microsoft/Phi-4-mini-instruct:
   - accuracy: 82.30
-OpenAI/BF16:
+GPT-OSS/BF16:
   - accuracy: 88.5
-OpenAI/MXFP4:
+GPT-OSS/MXFP4:
   - accuracy: 88.5
   - quant_algo: W4A8_MXFP4_MXFP8
     accuracy: 88.5

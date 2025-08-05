@@ -284,8 +284,3 @@ examples/test_gemma.py::test_hf_gemma_fp8_base_bf16_multi_lora[gemma-2-9b-it] SK
 examples/test_gemma.py::test_hf_gemma_fp8_base_bf16_multi_lora[gemma-2-27b-it] SKIP (https://nvbugs/5434451)
 examples/test_gemma.py::test_hf_gemma_fp8_base_bf16_multi_lora[gemma-3-1b-it] SKIP (https://nvbugs/5434451)
 accuracy/test_llm_api_pytorch.py::TestQwen3_235B_A22B::test_nvfp4[latency_moe_trtllm_eagle3] SKIP (https://nvbugs/5437384)
-unittest/_torch/auto_deploy/unit/singlegpu SKIP (Not supported by new Triton)
-unittest/_torch/auto_deploy/unit/multigpu SKIP (Not supported by new Triton)
-unittest/_torch/multi_gpu SKIP (Not supported by new Triton. This has several torch.compile cases as well.)
-unittest/_torch/speculative/test_eagle3.py::test_llama_eagle3[False-TRTLLM-False-True-True] SKIP (doesn't work with triton 3.4.0)
-unittest/_torch/speculative/test_eagle3.py::test_llama_eagle3[True-TRTLLM-False-True-True] SKIP (doesn't work with triton 3.4.0)

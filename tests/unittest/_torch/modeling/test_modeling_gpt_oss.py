@@ -14,7 +14,7 @@ configs = """
     "architectures": [
         "GptOssForCausalLM"
     ],
-    "model_type": "mixtral",
+    "model_type": "gpt_oss",
     "torch_dtype": "bfloat16",
     "num_hidden_layers": 4,
     "num_experts": 128,
@@ -50,6 +50,8 @@ def dump_config_json(dst_dir):
 def test_gpt_oss_trtllmgen(moe_backend):
     if moe_backend == "TRITON" and not IS_TRITON_KERNELS_AVAILABLE:
         pytest.skip("Triton kernels are not available")
+
+    pytest.skip("Re-enable after adding model to CI.")
 
     prompts = [
         "How are you?",

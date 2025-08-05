@@ -2129,9 +2129,6 @@ def test_ptp_quickstart_advanced_mixed_precision(llm_root, llm_venv):
 ])
 def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
                                    modality, use_cuda_graph):
-    if model_name == "NVILA-8B-FP16":
-        pytest.skip("NVILA-8B-FP16 is broken by tiktoken support.")
-
     # NOTE: individual tests need to be enabled in
     # tests/integration/test_lists/qa/examples_test_list.txt
 

@@ -482,6 +482,10 @@ class Transformer(DecoderModel):
         super().__init__(model_config)
         config = self.model_config
 
+        # Triton MoE kernels require installing Triton main branch,
+        # which may be incompatible with torch.compile due to version mismatch.
+        enable_torch_compile_for_embedding = model_config.moe_backend != "TRITON"
+
         if model_config.mapping.enable_attention_dp:
             # When attention_dp is enabled, we cannot do all_reduce since
             # the problem size of different ranks are different.
@@ -489,7 +493,9 @@ class Transformer(DecoderModel):
             self.embedding = Embedding(
                 config.pretrained_config.vocab_size,
                 config.pretrained_config.hidden_size,
-                dtype=config.pretrained_config.torch_dtype)
+                dtype=config.pretrained_config.torch_dtype,
+                enable_torch_compile_for_embedding=
+                enable_torch_compile_for_embedding)
         else:
             self.embedding = Embedding(
                 config.pretrained_config.vocab_size,
@@ -498,6 +504,8 @@ class Transformer(DecoderModel):
                 mapping=config.mapping,
                 tensor_parallel_mode=TensorParallelMode.COLUMN,
                 gather_output=True,
+                enable_torch_compile_for_embedding=
+                enable_torch_compile_for_embedding,
             )
         # For modeling_speculative, different name expected
         self.embed_tokens = self.embedding

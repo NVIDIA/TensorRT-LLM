@@ -584,8 +584,8 @@ class TorchSampler(Sampler):
             self.append_eagle3(batched_next_tokens, model_outputs)
 
         offset = 0
-        for i, (strategy, slot,
-                steps, request) in enumerate(zip(strategies, seq_slots, num_steps, requests)):
+        for i, (strategy, slot, steps, request) in enumerate(
+                zip(strategies, seq_slots, num_steps, requests)):
             input_slice = slice(offset, offset + steps)
             logits = raw_logits[input_slice]
 
