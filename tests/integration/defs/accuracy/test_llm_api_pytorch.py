@@ -1955,6 +1955,7 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @pytest.mark.skip_less_device_memory(140000)  ## OOM on 80G H100
     @parametrize_with_ids("eagle3_one_model", [True, False])
     @parametrize_with_ids("enable_chunked_prefill", [False, True])
     def test_eagle3(self, enable_chunked_prefill, eagle3_one_model):
