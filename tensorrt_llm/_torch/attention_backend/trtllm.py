@@ -1094,6 +1094,14 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         output_sf: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
+        print(f"[DEBUG] TrtllmAttention.forward - q shape: {q.shape}, dtype: {q.dtype}")
+        print(f"[DEBUG] TrtllmAttention.forward - k shape: {k.shape if k is not None else None}, dtype: {k.dtype if k is not None else None}")
+        print(f"[DEBUG] TrtllmAttention.forward - v shape: {v.shape if v is not None else None}, dtype: {v.dtype if v is not None else None}")
+        print(f"[DEBUG] TrtllmAttention.forward - attention_input_type: {attention_input_type}")
+        print(f"[DEBUG] TrtllmAttention.forward - latent_cache shape: {latent_cache.shape if latent_cache is not None else None}")
+        print(f"[DEBUG] TrtllmAttention.forward - q_pe shape: {q_pe.shape if q_pe is not None else None}")
+        print(f"[DEBUG] TrtllmAttention.forward - output shape: {output.shape if output is not None else None}")
+        
         assert isinstance(
             metadata,
             TrtllmAttentionMetadata,
@@ -1174,6 +1182,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 # TODO(qijun): revisit fp8_context_fmha logic
                 out_dtype = torch.float8_e4m3fn
 
+        print(f"[DEBUG] TrtllmAttention.forward - About to call CUDA kernel with out_dtype: {out_dtype}")
         output, output_sf = self.wrapper.run(
             q,
             k,
@@ -1187,7 +1196,11 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
 
         if out_dtype == torch.uint8:
             assert output_sf is not None
-            return Fp4QuantizedTensor(output, output_sf)
+            result = Fp4QuantizedTensor(output, output_sf)
+            print(f"[DEBUG] TrtllmAttention.forward - Returning Fp4QuantizedTensor with shape: {result.shape}")
+            return result
+        
+        print(f"[DEBUG] TrtllmAttention.forward - Final output shape: {output.shape}, dtype: {output.dtype}")
         return output
 
     @classmethod

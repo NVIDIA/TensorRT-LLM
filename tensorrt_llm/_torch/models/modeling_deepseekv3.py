@@ -68,6 +68,8 @@ from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              register_auto_model)
 
 
+import copy
+
 @triton.jit
 def weight_dequant_kernel(x_ptr, s_ptr, y_ptr, M, N, BLOCK_SIZE: tl.constexpr):
     """
@@ -732,15 +734,60 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
+        
         # Self Attention
-        hidden_states = self.self_attn(
-            position_ids=position_ids,
-            hidden_states=hidden_states,
-            attn_metadata=attn_metadata,
-            all_reduce_params=AllReduceParams(
-                enable_allreduce=not (self.disable_attn_allreduce)),
-            **kwargs,
-        )
+        print(f"[DEBUG] DeepseekV3DecoderLayer.forward - position_ids shape: {position_ids.shape if position_ids is not None else None}")
+        print(f"[DEBUG] DeepseekV3DecoderLayer.forward - hidden_states shape: {hidden_states.shape if hidden_states is not None else None}")
+        print(f"[DEBUG] DeepseekV3DecoderLayer.forward - attn_metadata: {attn_metadata}")
+        print(f"[DEBUG] DeepseekV3DecoderLayer.forward - attn_metadata.kv_cache_manager.kv_cache_pool_pointers: {attn_metadata.kv_cache_manager.kv_cache_pool_pointers.shape}")
+        print(f"[DEBUG] DeepseekV3DecoderLayer.forward - attn_metadata.kv_cache_manager.tokens_per_block: {attn_metadata.kv_cache_manager.tokens_per_block}")
+        print(f"[DEBUG] DeepseekV3DecoderLayer.forward - attn_metadata.kv_cache_manager.max_seq_len: {attn_metadata.kv_cache_manager.max_seq_len}")
+        print(f"[DEBUG] DeepseekV3DecoderLayer.forward - attn_metadata.kv_cache_manager.head_dim: {attn_metadata.kv_cache_manager.head_dim}")
+        print(f"[DEBUG] DeepseekV3DecoderLayer.forward - attn_metadata.kv_cache_manager.kv_cache_block_offsets: {attn_metadata.kv_cache_block_offsets.shape}")
+        print(f"[DEBUG] DeepseekV3DecoderLayer.forward - attn_metadata.kv_cache_manager.host_kv_cache_block_offsets: {attn_metadata.host_kv_cache_block_offsets.shape}")
+        num_requests = position_ids.shape[1]
+        print(f"[DEBUG] DeepseekV3DecoderLayer.forward - num_requests: {num_requests}")
+        
+        if num_requests == 64 :
+            print(f"[DEBUG] DeepseekV3DecoderLayer.forward - num_requests == 64")
+            hidden_states_half1, hidden_states_half2 = hidden_states.chunk(2, dim=0)
+            position_ids_half1, position_ids_half2 = position_ids.chunk(2, dim=1)
+
+            attn_metadata_half1 = copy.copy(attn_metadata)
+            attn_metadata_half1.max_num_requests = 32
+            
+            attn_metadata_half2 = copy.copy(attn_metadata)
+            attn_metadata_half2.max_num_requests = 32
+         
+            hidden_states_half1 = self.self_attn(
+                position_ids=position_ids_half1,
+                hidden_states=hidden_states_half1,
+                attn_metadata=attn_metadata_half1,
+                all_reduce_params=AllReduceParams(
+                    enable_allreduce=not (self.disable_attn_allreduce)),
+                **kwargs,
+            )
+
+            hidden_states_half2 = self.self_attn(
+                position_ids=position_ids_half2,
+                hidden_states=hidden_states_half2,
+                attn_metadata=attn_metadata_half2,
+                all_reduce_params=AllReduceParams(
+                    enable_allreduce=not (self.disable_attn_allreduce)),
+                **kwargs,
+            )
+
+            hidden_states = torch.cat([hidden_states_half1, hidden_states_half2], dim=0)
+            
+        else:
+            hidden_states = self.self_attn(
+                position_ids=position_ids,
+                hidden_states=hidden_states,
+                attn_metadata=attn_metadata,
+                all_reduce_params=AllReduceParams(
+                    enable_allreduce=not (self.disable_attn_allreduce)),
+                **kwargs,
+            )
 
         if isinstance(self.mlp, Deepseekv3MoE):
             return self.forward_MoE(
@@ -1028,25 +1075,34 @@ class DeepseekV3Model(DecoderModel):
         position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
     ) -> torch.Tensor:
+        print(f"[DEBUG] DeepSeekV3Model.forward - input_ids shape: {input_ids.shape if input_ids is not None else None}")
+        print(f"[DEBUG] DeepSeekV3Model.forward - position_ids shape: {position_ids.shape if position_ids is not None else None}")
+        print(f"[DEBUG] DeepSeekV3Model.forward - inputs_embeds shape: {inputs_embeds.shape if inputs_embeds is not None else None}")
+        
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
                 "You cannot specify both input_ids and inputs_embeds at the same time, and must specify either one"
             )
-
+        
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
+            print(f"[DEBUG] DeepSeekV3Model.forward - Computed inputs_embeds shape: {inputs_embeds.shape}, dtype: {inputs_embeds.dtype}")
 
         hidden_states = inputs_embeds
         residual = None
+        print(f"[DEBUG] DeepSeekV3Model.forward - Initial hidden_states shape: {hidden_states.shape}, dtype: {hidden_states.dtype}")
 
-        for decoder_layer in self.layers[:self.num_hidden_layers]:
+        for layer_idx, decoder_layer in enumerate(self.layers[:self.num_hidden_layers]):
+            print(f"[DEBUG] DeepSeekV3Model.forward - Layer {layer_idx} input hidden_states shape: {hidden_states.shape}")
             hidden_states, residual = decoder_layer(
                 position_ids=position_ids,
                 hidden_states=hidden_states,
                 attn_metadata=attn_metadata,
                 residual=residual,
             )
+            print(f"[DEBUG] DeepSeekV3Model.forward - Layer {layer_idx} output hidden_states shape: {hidden_states.shape}")
 
+        print(f"[DEBUG] DeepSeekV3Model.forward - Final hidden_states shape: {hidden_states.shape}, dtype: {hidden_states.dtype}")
         return hidden_states
 
 
@@ -1112,6 +1168,12 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
         return_context_logits: bool = False,
         **kwargs,
     ) -> torch.Tensor:
+        print(f"[DEBUG] DeepSeekV3ForCausalLM.forward - Input keys: {list(kwargs.keys())}")
+        print(f"[DEBUG] DeepSeekV3ForCausalLM.forward - input_ids shape: {input_ids.shape if input_ids is not None else None}")
+        print(f"[DEBUG] DeepSeekV3ForCausalLM.forward - position_ids shape: {position_ids.shape if position_ids is not None else None}")
+        print(f"[DEBUG] DeepSeekV3ForCausalLM.forward - inputs_embeds shape: {inputs_embeds.shape if inputs_embeds is not None else None}")
+        print(f"[DEBUG] DeepSeekV3ForCausalLM.forward - return_context_logits: {return_context_logits}")
+        
         attn_metadata.num_generations_per_batch = self.model_nextn + 1
         hidden_states = self.model(
             input_ids=input_ids,
@@ -1119,6 +1181,7 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
         )
+        print(f"[DEBUG] DeepSeekV3ForCausalLM.forward - Model output hidden_states shape: {hidden_states.shape}, dtype: {hidden_states.dtype}")
 
         if spec_metadata and spec_metadata.spec_dec_mode.is_mtp():
             # get logits
@@ -1128,6 +1191,7 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
                 attn_metadata,
                 True,
             )
+            print(f"[DEBUG] DeepSeekV3ForCausalLM.forward - MTP logits shape: {logits.shape}, dtype: {logits.dtype}")
             # get accepted tokens and next draft tokens
             return self.mtp_worker(
                 input_ids=input_ids,
@@ -1146,6 +1210,7 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
                 attn_metadata,
                 return_context_logits,
             )
+            print(f"[DEBUG] DeepSeekV3ForCausalLM.forward - Final logits shape: {logits.shape}, dtype: {logits.dtype}")
             return logits
 
     def load_weights(self, weights: Dict):

@@ -2103,23 +2103,50 @@ class PyTorchModelEngine(ModelEngine):
                       inputs: Dict[str, Any],
                       gather_ids: Optional[torch.Tensor],
                       gather_context_logits: bool = False) -> Dict[str, Any]:
+        print(f"[DEBUG] _forward_step - Input keys: {list(inputs.keys())}")
+        for key, value in inputs.items():
+            if hasattr(value, 'shape'):
+                print(f"[DEBUG] _forward_step - {key} shape: {value.shape}, dtype: {value.dtype}")
+            elif isinstance(value, (list, tuple)):
+                print(f"[DEBUG] _forward_step - {key}: {type(value)} with {len(value)} elements")
+            else:
+                print(f"[DEBUG] _forward_step - {key}: {type(value)}")
+        
+        if gather_ids is not None:
+            print(f"[DEBUG] _forward_step - gather_ids shape: {gather_ids.shape}, dtype: {gather_ids.dtype}")
+        
         inputs = self._preprocess_inputs(inputs)
+        print(f"[DEBUG] _forward_step - After _preprocess_inputs, keys: {list(inputs.keys())}")
+        
         if inputs.get('spec_metadata', None):
             gather_ids = inputs['spec_metadata'].gather_ids
+            print(f"[DEBUG] _forward_step - Updated gather_ids from spec_metadata: {gather_ids.shape if gather_ids is not None else None}")
+        
         if self.without_logits:
+            print(f"[DEBUG] _forward_step - Calling model_forward without logits")
             outputs = self.model_forward(**inputs)
+            print(f"[DEBUG] _forward_step - Output keys: {list(outputs.keys())}")
+            for key, value in outputs.items():
+                if hasattr(value, 'shape'):
+                    print(f"[DEBUG] _forward_step - output.{key} shape: {value.shape}, dtype: {value.dtype}")
             return outputs
 
         # For simplicity, just return all the the logits if we have special gather_ids
         # from speculative decoding.
+        print(f"[DEBUG] _forward_step - Calling model_forward with return_context_logits={gather_ids is not None or gather_context_logits}")
         logits = self.model_forward(
             **inputs,
             return_context_logits=gather_ids is not None
             or gather_context_logits,
         )
+        print(f"[DEBUG] _forward_step - Raw logits shape: {logits.shape}, dtype: {logits.dtype}")
+        
         if gather_ids is not None:
-            return {'logits': logits[gather_ids]}
+            gathered_logits = logits[gather_ids]
+            print(f"[DEBUG] _forward_step - Gathered logits shape: {gathered_logits.shape}, dtype: {gathered_logits.dtype}")
+            return {'logits': gathered_logits}
         else:
+            print(f"[DEBUG] _forward_step - Returning original logits")
             return {'logits': logits}
 
     def _init_userbuffers(self, hidden_size):
