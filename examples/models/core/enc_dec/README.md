@@ -56,11 +56,11 @@ In this example, we use T5 (`t5-small`) and Flan-T5 (`google/flan-t5-small`) to 
 ### Download weights from HuggingFace Transformers using `git-lfs`
 
 ```bash
-git-lfs clone https://huggingface.co/t5-small tmp/hf_models/t5-small
-git-lfs clone https://huggingface.co/google/flan-t5-small tmp/hf_models/flan-t5-small
-git-lfs clone https://huggingface.co/facebook/bart-large-cnn tmp/hf_models/bart-large-cnn
-git-lfs clone https://huggingface.co/facebook/mbart-large-50-many-to-one-mmt tmp/hf_models/mbart-large-50-many-to-one-mmt
-git-lfs clone https://huggingface.co/google/byt5-small tmp/hf_models/byt5-small
+git lfs clone https://huggingface.co/t5-small tmp/hf_models/t5-small
+git lfs clone https://huggingface.co/google/flan-t5-small tmp/hf_models/flan-t5-small
+git lfs clone https://huggingface.co/facebook/bart-large-cnn tmp/hf_models/bart-large-cnn
+git lfs clone https://huggingface.co/facebook/mbart-large-50-many-to-one-mmt tmp/hf_models/mbart-large-50-many-to-one-mmt
+git lfs clone https://huggingface.co/google/byt5-small tmp/hf_models/byt5-small
 ```
 
 ### Convert and Split Weights
