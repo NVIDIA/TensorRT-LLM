@@ -144,6 +144,7 @@ def fused_moe(
     tune_max_num_tokens: int = 8192,
     tuner_num_tokens: Optional[int] = None,
     tuner_top_k: Optional[int] = None,
+    unpadded_hidden_size: Optional[int] = None,
 ) -> List[torch.Tensor]:
 
     tuner = AutoTuner.get()
@@ -227,6 +228,7 @@ def fused_moe(
         enable_alltoall,
         min_latency_mode,
         [gemm_tactic_1, gemm_tactic_2],
+        unpadded_hidden_size,
     )
 
     return output if min_latency_mode else [output]
@@ -261,6 +263,7 @@ def _(
     min_latency_mode: bool = False,
     use_fused_finalize: bool = True,
     tune_max_num_tokens: int = 8192,
+    unpadded_hidden_size: Optional[int] = None,
 ):
     seq_len = input.shape[0]
     hidden_size = fc2_expert_weights.shape[1]
