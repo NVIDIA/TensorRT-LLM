@@ -1,6 +1,6 @@
 # Multimodal Support in TensorRT-LLM
 
-TensorRT-LLM supports a variety of multimodal models, enabling efficient inference beyond just text.
+TensorRT-LLM supports a variety of multimodal models, enabling efficient inference with inputs beyond just text.
 
 ---
 
@@ -18,7 +18,7 @@ TensorRT-LLM incorporates some key optimizations to enhance the performance of m
 
 * **In-Flight Batching**: Batches multimodal requests within the GPU executor to improve GPU utilization and throughput.
 * **CPU/GPU Concurrency**: Asynchronously overlaps data preprocessing on the CPU with image encoding on the GPU.
-* **Raw data hashing**: Leverages image hashes and token chunk info to improve KV cache reuse and minimize collisions.
+* **Raw data hashing**: Leverages image hashes and token chunk information to improve KV cache reuse and minimize collisions.
 
 Further optimizations are under development and will be updated as they become available.
 
@@ -38,16 +38,16 @@ Quickly try out TensorRT-LLM's multimodal support using our `LLM-API` and a read
 python3 quickstart_multimodal.py --model_dir Efficient-Large-Model/NVILA-8B --modality image
 ```
 
-### OpenAI-Compatible Server via `trtllm-serve`
+### OpenAI-Compatible Server via [`trtllm-serve`](/docs/source/commands/trtllm-serve.rst)
 
-Launch an OpenAI-compatible server with multimodal support using the `trtllm-serve` command, e.g.,
+Launch an OpenAI-compatible server with multimodal support using the `trtllm-serve` command, for example:
 
 ```bash
 trtllm-serve Qwen/Qwen2-VL-7B-Instruct  --backend pytorch
 ```
 
-You can then send OpenAI-compatible requests (e.g., via `curl` or API clients) to the server endpoint — for example, see [this script](/examples/serve/curl_chat_client_for_multimodal.sh).
+You can then send OpenAI-compatible requests, such as via curl or API clients, to the server endpoint. See [curl chat client for multimodal script](/examples/serve/curl_chat_client_for_multimodal.sh) as an example.
 
-### Run with `trtllm-bench`
+### Run with [`trtllm-bench`](/docs/source/commands/trtllm-bench.rst)
 
 Evaluate offline inference performance with multimodal inputs using the `trtllm-bench` tool. For detailed instructions, see the [benchmarking guide](/docs/source/performance/perf-benchmarking.md).
