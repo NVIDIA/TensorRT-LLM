@@ -191,6 +191,8 @@ class DeepseekV3Linear(Linear):
         use_custom_cublas_mm: bool = False,
         lora: Optional[LoraLayer] = None,
     ):
+        self.use_cute_dsl_blockscaling_mm = os.getenv(
+            "USE_CUTE_DSL_BLOCKSCALING_MM", "0") == "1"
         super().__init__(
             in_features,
             out_features,
@@ -205,7 +207,7 @@ class DeepseekV3Linear(Linear):
             skip_create_weights_in_init,
             use_custom_cublas_mm,
             lora,
-        )
+            use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm)
 
     def apply_linear(self,
                      input,
@@ -927,6 +929,9 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
             for key in [EventType.Main, EventType.MoeShared]
         }
 
+        self.use_cute_dsl_blockscaling_mm = os.getenv(
+            "USE_CUTE_DSL_BLOCKSCALING_MM", "0") == "1"
+
         self.enorm = RMSNorm(hidden_size=config.hidden_size,
                              eps=config.rms_norm_eps,
                              dtype=config.torch_dtype)
@@ -942,7 +947,7 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
                 dtype=config.torch_dtype,
                 skip_create_weights_in_init=model_config.
                 skip_create_weights_in_init,
-            )
+                use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm)
         else:
             self.eh_proj = Linear(
                 config.hidden_size * 2,
@@ -954,7 +959,7 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
                 reduce_output=True,
                 skip_create_weights_in_init=model_config.
                 skip_create_weights_in_init,
-            )
+                use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm)
 
         self.shared_head = DeepseekV3MTPHead(model_config)
 
@@ -1122,6 +1127,10 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
             model_config._frozen = False
             model_config.quant_config_dict = quant_config_dict
             model_config._frozen = True
+        self.use_cute_dsl_blockscaling_mm = os.getenv(
+            "USE_CUTE_DSL_BLOCKSCALING_MM", "0") == "1"
+        self.use_cute_dsl_blockscaling_bmm = os.getenv(
+            "USE_CUTE_DSL_BLOCKSCALING_BMM", "0") == "1"
         super().__init__(DeepseekV3Model(model_config),
                          config=model_config,
                          hidden_size=model_config.pretrained_config.hidden_size,
@@ -1354,6 +1363,7 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
         print(
             f"limin: DeepseekV3ForCausalLM load_weights, moe_backend: {moe_backend}"
         )
+        # limin-todo: how to set for cute dsl ops?
         if moe_backend == "DEEPGEMM" and self.model_config.quant_config.layer_quant_mode.has_fp8_block_scales(
         ) and get_sm_version() == 100:
             for name in list(weights.keys()):
