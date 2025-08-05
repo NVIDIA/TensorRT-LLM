@@ -1041,6 +1041,7 @@ int GPTAttentionPlugin::enqueueSome(int32_t seqIdxBeg, int32_t localNbSeq, int32
 
         common_enqueue_params.input_seq_length = max_context_q_len;
         common_enqueue_params.max_past_kv_length = max_context_kv_len;
+
         EnqueueContextParams<T> enqueue_params{common_enqueue_params};
         enqueue_params.attention_packed_mask = attention_packed_mask;
         enqueue_params.host_block_offsets = host_block_offsets;

@@ -186,6 +186,7 @@ struct BuildDecoderInfoParams
     float2* rotaryEmbeddingCoeffCache;
     // Dynamic scaling;
     int rotaryEmbeddingMaxPositions;
+    bool isCrossAttention{false};
 
     bool isBuildDecoderInfoKernelNeeded()
     {
@@ -210,6 +211,10 @@ struct BuildDecoderInfoParams
             return true;
         }
         if (fmhaTileCounter != nullptr || fmhaBmm1Scale != nullptr || fmhaBmm2Scale != nullptr)
+        {
+            return true;
+        }
+        if (isCrossAttention)
         {
             return true;
         }

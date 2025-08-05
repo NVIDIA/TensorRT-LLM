@@ -106,6 +106,13 @@ struct XQAParams
 
     void* quant_q_buffer_ptr = nullptr;
 
+    int num_tokens;
+    // for cross attention
+    int32_t const* encoder_input_lengths = nullptr;
+    // void const* cross_kv = nullptr;
+    // int32_t cross_kv_length = 0;
+    // int32_t num_encoder_tokens = 0;
+
     cudaStream_t stream = 0;
 
     std::string toString() const
@@ -175,6 +182,11 @@ struct XQAParams
            << "total_num_input_tokens :" << total_num_input_tokens << std ::endl
            << "is_fp8_output :" << (is_fp8_output ? "true" : "false") << std ::endl
            << "fp8_out_scale :" << fp8_out_scale << std ::endl
+           << "encoder_input_lengths: " << encoder_input_lengths
+           << std::endl
+           //<< "cross_kv: " << cross_kv << std::endl
+           //<< "cross_kv_length: " << cross_kv_length << std::endl
+           //<< "num_encoder_tokens: " << num_encoder_tokens << std::endl
            << "stream :" << stream;
 
         return ss.str();

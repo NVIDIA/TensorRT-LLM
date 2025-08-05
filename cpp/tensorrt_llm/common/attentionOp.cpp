@@ -30,6 +30,7 @@
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <type_traits>
 
 using namespace tensorrt_llm::kernels;
@@ -284,6 +285,13 @@ bool AttentionOp::convertMMHAParamsToXQAParams(tensorrt_llm::kernels::XQAParams&
     xqaParams.output_sf = generationsParams.context_buf_sf;
     xqaParams.fp4_out_sf_scale = generationsParams.attention_output_sf_scale;
     xqaParams.start_token_idx_sf = generationsParams.start_token_idx_sf;
+
+    xqaParams.num_tokens = generationsParams.num_tokens;
+    // Cross attention parameters.
+    xqaParams.encoder_input_lengths = generationsParams.encoder_input_lengths;
+    // xqaParams.cross_kv = generationsParams.cross_kv;
+    // xqaParams.cross_kv_length = generationsParams.cross_kv_length;
+    // xqaParams.num_encoder_tokens = generationsParams.num_encoder_tokens;
 
     return true;
 }
@@ -2229,6 +2237,10 @@ int AttentionOp::enqueueGeneration(EnqueueGenerationParams<T> const& params, cud
         {
             TLLM_CHECK_WITH_INFO(false, "No available kernels are found for FP4 output.");
         }
+        else
+        {
+            TLLM_LOG_DEBUG("XQA kernels are not selected in the generation phase. mEnableXQA: %d", mEnableXQA);
+        }
     }
 
     // This is the number of kv tokens that q needs to visit, but excluding one as it will be processed before the kv
@@ -2750,7 +2762,7 @@ int AttentionOp::initialize() noexcept
             !useCustomMask() || mEnableContextFMHA, "Only Context FMHA supports custom mask input currently.");
     }
 
-    mEnableXQA = (mEnableXQA || mIsSpecDecodingEnabled) && !mCrossAttention
+    mEnableXQA = (mEnableXQA || mIsSpecDecodingEnabled)
         && (mType == nvinfer1::DataType::kHALF || mType == nvinfer1::DataType::kBF16) && mUseKVCache;
 
     if (mEnableXQA)
