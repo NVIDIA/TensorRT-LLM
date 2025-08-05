@@ -14,7 +14,7 @@ from .lora_test_utils import (
 from .test_llm import (_test_llm_capture_request_error, get_model_path,
                        global_kvcache_config, llama_model_path,
                        llm_get_stats_async_test_harness,
-                       llm_get_stats_test_harness, prompts,
+                       llm_get_stats_test_harness, llm_test_harness, prompts,
                        run_llm_abort_request,
                        run_llm_with_postprocess_parallel_and_result_handler,
                        tinyllama_logits_processor_test_harness)
@@ -33,7 +33,7 @@ import tempfile
 import torch
 from peft import LoraConfig as PeftLoraConfig
 from peft import get_peft_model
-from transformers import AutoModelForCausalLM
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 # isort: on
 
@@ -143,6 +143,46 @@ def test_llm_with_postprocess_parallel_and_result_handler(streaming):
     run_llm_with_postprocess_parallel_and_result_handler(streaming,
                                                          "pytorch",
                                                          tp_size=1)
+
+
+@pytest.mark.parametrize(
+    "enable_mixed_sampler,enable_logprobs",
+    [
+        (False, False),  # Fast path: no mixed sampler, no logits, greedy
+        (True,
+         False),  # Batched strategy path: mixed sampler enabled, same strategy
+        (False,
+         True),  # Per-request path: mixed sampler disabled, logprobs enabled
+    ])
+@pytest.mark.part0
+def test_embedding_bias_with_torch_sampler_strategies(enable_mixed_sampler,
+                                                      enable_logprobs):
+    """Test embedding bias application in all 3 TorchSampler paths: fast, batched strategy, and per-request"""
+    tokenizer = AutoTokenizer.from_pretrained(llama_model_path)
+    biased_word_id = tokenizer.encode("Z", add_special_tokens=False)[-1]
+    vocab_size_padded = 32000
+    embedding_bias = torch.zeros(vocab_size_padded)
+    embedding_bias[biased_word_id] = torch.finfo(torch.float32).max
+
+    sampling_kwargs = {
+        "max_tokens": 6,
+        "embedding_bias": embedding_bias,
+    }
+
+    if enable_logprobs:
+        sampling_kwargs["logprobs"] = 1
+    # All test cases use greedy sampling for simplicity
+
+    sampling_params = SamplingParams(**sampling_kwargs)
+
+    llm_test_harness(
+        llama_model_path,
+        prompts,
+        ["Z Z Z Z Z Z"],
+        sampling_params=sampling_params,
+        backend="pytorch",
+        enable_trtllm_sampler=False,  # Use TorchSampler to test all 3 paths
+        enable_mixed_sampler=enable_mixed_sampler)
 
 
 def llama_7b_lora_from_dir_test_harness(**llm_kwargs) -> None:
