@@ -28,7 +28,7 @@ namespace tensorrt_llm::pybind::thop
 
 void initBindings(pybind11::module_& m)
 {
-    m.def("attention", &torch_ext::attention,
+    m.def("attention", &torch_ext::attention, py::call_guard<py::gil_scoped_release>(),
         // Parameters with default values using std::nullopt for optional arguments
         py::arg("q"), py::arg("k") = std::nullopt, py::arg("v") = std::nullopt, py::arg("output"),
         py::arg("output_sf") = std::nullopt, py::arg("out_dtype") = std::nullopt, py::arg("workspace_") = std::nullopt,

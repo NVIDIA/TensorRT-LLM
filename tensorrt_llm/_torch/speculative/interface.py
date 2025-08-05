@@ -59,6 +59,12 @@ class SpeculativeDecodingMode(IntEnum):
     def support_overlap_scheduler(self):
         return self.is_mtp() or self.is_eagle3_one_model()
 
+    def support_guided_decoder(self):
+        return self.has_spec_drafter()
+
+    def support_guided_worker(self):
+        return self.is_mtp() or self.is_eagle3_one_model()
+
     def has_draft_model(self):
         return self.is_eagle3() or self.is_draft_target()
 
@@ -126,11 +132,11 @@ class SpecMetadata:
     # Whether CUDA graph is enabled.
     is_cuda_graph: bool = field(default=False, repr=False)
     # The mode of speculative decoding.
-    spec_dec_mode: SpeculativeDecodingMode = SpeculativeDecodingMode.NONE,
+    spec_dec_mode: SpeculativeDecodingMode = SpeculativeDecodingMode.NONE
     # Draft tokens.
-    draft_tokens: Optional[torch.Tensor] = None,
+    draft_tokens: Optional[torch.Tensor] = None
     # The length of the draft tokens.
-    draft_lens: Optional[torch.Tensor] = None,
+    draft_lens: Optional[torch.Tensor] = None
     # The request ID of each sequence in the batch.
     # The shape is (batch_size).
     request_ids: Optional[List[int]] = None
