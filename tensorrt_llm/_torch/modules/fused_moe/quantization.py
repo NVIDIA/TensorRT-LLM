@@ -430,7 +430,7 @@ class FP8QDQFusedMoEMethod(FusedMoEMethodBase):
         module.fc31_input_dequant.data.copy_(max_fc31_input_scale)
 
 
-class DeepSeekFP8BlockScalesFusedMoEMethodCuteDsl(FusedMoEMethodBase):
+class DeepSeekFP8BlockScalesFusedMoEMethod(FusedMoEMethodBase):
 
     def create_weights(self, module: torch.nn.Module):
         weight_dtype = torch.float8_e4m3fn
@@ -468,7 +468,6 @@ class DeepSeekFP8BlockScalesFusedMoEMethodCuteDsl(FusedMoEMethodBase):
 
     def load_weights(self, module: torch.nn.Module, weights: List[Dict],
                      weight_loading_mode: MoEWeightLoadingMode):
-        print(f"DeepSeekFP8BlockScalesFusedMoEMethodCuteDsl load_weights")
         super().load_weights(module, weights, weight_loading_mode)
 
     def setup_quant_scales(self, module: torch.nn.Module):
@@ -554,12 +553,11 @@ class DeepSeekFP8BlockScalesFusedMoEMethodCuteDsl(FusedMoEMethodBase):
             })
 
 
-class DeepSeekFP8BlockScalesFusedMoEMethod(
-        DeepSeekFP8BlockScalesFusedMoEMethodCuteDsl):
+class DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm(
+        DeepSeekFP8BlockScalesFusedMoEMethod):
 
     def load_weights(self, module: torch.nn.Module, weights: List[Dict],
                      weight_loading_mode: MoEWeightLoadingMode):
-        print(f"DeepSeekFP8BlockScalesFusedMoEMethod load_weights")
         if get_sm_version() == 100:
             expert_ids = set(module.initial_local_expert_ids)
             if self.need_load_shared_weights(module):

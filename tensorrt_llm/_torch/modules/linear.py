@@ -1483,6 +1483,7 @@ class Linear(nn.Module):
         self.tp_mode = tensor_parallel_mode
         self.gather_output = gather_output
         self.force_dynamic_quantization = force_dynamic_quantization
+        self.use_cute_dsl_blockscaling_mm = use_cute_dsl_blockscaling_mm
 
         local_in_features = in_features
         local_out_features = out_features

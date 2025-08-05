@@ -14,8 +14,7 @@ from _torch.helpers import (per_block_cast_to_fp8, per_block_cast_to_fp8_e8m0,
 from mpi4py import MPI
 from mpi4py.futures import MPIPoolExecutor
 from utils.util import (skip_neither_ada_nor_hopper_unittest,
-                        skip_non_hopper_unittest, skip_pre_blackwell,
-                        skip_pre_hopper)
+                        skip_pre_blackwell, skip_pre_hopper)
 
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -559,7 +558,6 @@ def test_fused_moe_fp8_blockwise_deepgemm(dtype,
     torch.testing.assert_close(output, ref_output, rtol=1e-2, atol=0.1)
 
 
-# @skip_non_hopper_unittest
 @skip_pre_blackwell
 @pytest.mark.parametrize(
     "dtype, num_experts, seq_len, hidden_size, RoutingMethodCls",
@@ -649,18 +647,6 @@ def test_fused_moe_fp8_blockwise_cute_dsl(dtype,
     fused_moe.cuda()
     fused_moe.load_weights([weights])
 
-    # fused_moe_origin = CutlassFusedMoE(
-    #     num_experts=NUM_EXPERTS,
-    #     routing_method=routing_method,
-    #     hidden_size=HIDDEN_SIZE,
-    #     intermediate_size=INTERMEDIATE_SIZE,
-    #     dtype=dtype,
-    #     reduce_results=True,
-    #     model_config=ModelConfig(quant_config=quant_config, mapping=mapping),
-    # )
-    # fused_moe_origin.cuda()
-    # fused_moe_origin.load_weights([weights])
-
     ref_fused_moe = RefGatedMLPFusedMoE(
         num_experts=NUM_EXPERTS,
         routing_method=routing_method,
@@ -668,26 +654,23 @@ def test_fused_moe_fp8_blockwise_cute_dsl(dtype,
         intermediate_size=INTERMEDIATE_SIZE,
         dtype=dtype,
         model_config=ModelConfig(quant_config=quant_config),
+        # Note: use deepgemm mm will cause accuracy error, so we use trtllmgen mm here
+        use_cute_dsl_blockscaling_mm=True,
     )
     ref_fused_moe.load_weights([weights])
     ref_fused_moe.cuda()
 
     with torch.inference_mode():
         output = fused_moe.forward(x, router_logits)
-        # output_origin = fused_moe_origin.forward(x, router_logits)
         ref_output = ref_fused_moe.forward(x, router_logits)
 
     # compare
     torch.cuda.synchronize()
-    # print("limin: output = ", output)
-    # print("limin: ref_output = ", ref_output)
-    # torch.testing.assert_close(output_origin, output, rtol=1e-2, atol=0.1)
-    # torch.testing.assert_close(output_origin, ref_output, rtol=1e-2, atol=0.1)
     torch.testing.assert_close(output, ref_output, rtol=1e-2, atol=0.1)
     return True
 
 
-@skip_non_hopper_unittest
+@skip_pre_blackwell
 @pytest.mark.skipif(torch.cuda.device_count() < 4,
                     reason="needs 4 GPUs to run this test")
 @pytest.mark.parametrize("ep_size", [1, 2, 4])
@@ -964,15 +947,14 @@ def test_fused_moe_w4afp8(dtype):
 
 class RefGatedMLPFusedMoE(nn.Module):
 
-    def __init__(
-            self,
-            num_experts: int,
-            routing_method: BaseMoeRoutingMethod,
-            hidden_size: int,
-            intermediate_size: int,
-            dtype: Optional[torch.dtype] = None,
-            model_config: ModelConfig = ModelConfig(),
-    ):
+    def __init__(self,
+                 num_experts: int,
+                 routing_method: BaseMoeRoutingMethod,
+                 hidden_size: int,
+                 intermediate_size: int,
+                 dtype: Optional[torch.dtype] = None,
+                 model_config: ModelConfig = ModelConfig(),
+                 use_cute_dsl_blockscaling_mm: bool = False):
         super().__init__()
         self.num_experts = num_experts
         self.routing_method = routing_method
@@ -989,6 +971,7 @@ class RefGatedMLPFusedMoE(nn.Module):
                 bias=False,
                 dtype=self.dtype,
                 config=model_config,
+                use_cute_dsl_blockscaling_mm=use_cute_dsl_blockscaling_mm,
             ) for _ in range(self.num_experts)
         ])
 
