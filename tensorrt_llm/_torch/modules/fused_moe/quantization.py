@@ -528,31 +528,44 @@ class DeepSeekFP8BlockScalesFusedMoEMethod(FusedMoEMethodBase):
             load_expert_ids: List[int], dst_w3_w1_weight_scale: torch.Tensor,
             dst_w2_weight_scale: torch.Tensor, device):
         for local_slot_id, expert_id in enumerate(load_expert_ids):
-            w3_scale = load_weight_shard(
-                weights[f"{expert_id}.w3.weight_scale_inv"],
-                module.tp_size,
-                module.tp_rank,
-                TensorParallelMode.COLUMN,
-                device=device)
-            dst_w3_w1_weight_scale[local_slot_id][:dst_w3_w1_weight_scale.
-                                                  shape[-2] //
-                                                  2].copy_(w3_scale)
-            w1_scale = load_weight_shard(
-                weights[f"{expert_id}.w1.weight_scale_inv"],
-                module.tp_size,
-                module.tp_rank,
-                TensorParallelMode.COLUMN,
-                device=device)
-            dst_w3_w1_weight_scale[local_slot_id][dst_w3_w1_weight_scale.
-                                                  shape[-2] //
-                                                  2:].copy_(w1_scale)
-            w2_scale = load_weight_shard(
-                weights[f"{expert_id}.w2.weight_scale_inv"],
-                module.tp_size,
-                module.tp_rank,
-                TensorParallelMode.ROW,
-                device=device)
-            dst_w2_weight_scale[local_slot_id].copy_(w2_scale)
+            if module.weight_loading_mode == MoEWeightLoadingMode.FUSED_GATE_UP_PROJ:
+                w3_scale = weights['gate_up_proj_weight_scale'][
+                    expert_id].transpose(0, 1).contiguous()
+                w1_scale = None
+                w2_scale = weights['down_proj_weight_scale'][
+                    expert_id].transpose(0, 1).contiguous()
+            elif module.weight_loading_mode == MoEWeightLoadingMode.VANILLA:
+                w3_scale = weights[f"{expert_id}.w3.weight_scale_inv"]
+                w1_scale = weights[f"{expert_id}.w1.weight_scale_inv"]
+                w2_scale = weights[f"{expert_id}.w2.weight_scale_inv"]
+            else:
+                raise NotImplementedError(
+                    f"Unknown weight loading mode in MoE: {module.weight_loading_mode}"
+                )
+
+            w3_w1_scale_shard = load_weight_shard(w3_scale,
+                                                  module.tp_size,
+                                                  module.tp_rank,
+                                                  TensorParallelMode.COLUMN,
+                                                  device=device)
+
+            if w1_scale is not None:
+                w1_scale_shard = load_weight_shard(w1_scale,
+                                                   module.tp_size,
+                                                   module.tp_rank,
+                                                   TensorParallelMode.COLUMN,
+                                                   device=device)
+                w3_w1_scale_shard = torch.cat(
+                    [w3_w1_scale_shard, w1_scale_shard], dim=-2)
+
+            dst_w3_w1_weight_scale[local_slot_id].copy_(w3_w1_scale_shard)
+
+            w2_scale_shard = load_weight_shard(w2_scale,
+                                               module.tp_size,
+                                               module.tp_rank,
+                                               TensorParallelMode.ROW,
+                                               device=device)
+            dst_w2_weight_scale[local_slot_id].copy_(w2_scale_shard)
 
     def load_quant_scales(self, module: torch.nn.Module, weights: Dict):
         self.load_expert_all_weight_scale_fp8_block_scale(

@@ -353,6 +353,7 @@ void initBindings(nb::module_& m)
             nb::arg("return_perf_metrics") = false, nb::arg("guided_decoding_params") = std::nullopt,
             nb::arg("language_adapter_uid") = std::nullopt, nb::arg("allotted_time_ms") = std::nullopt,
             nb::arg("context_phase_params") = std::nullopt)
+        .def("check_token_id_range", &tb::LlmRequest::checkTokenIdRange, nb::arg("vocab_size"))
         .def(nb::init<tb::LlmRequest const&>())
         .def("validate", &tb::LlmRequest::validate, nb::arg("max_input_len"), nb::arg("max_seq_len"),
             nb::arg("max_draft_len"), nb::arg("vocab_size_padded"), nb::arg("max_endocer_input_len") = std::nullopt,
