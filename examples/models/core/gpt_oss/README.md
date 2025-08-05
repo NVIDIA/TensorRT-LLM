@@ -1,8 +1,8 @@
-# GPT_OSS
+# GPT-OSS
 
 ## Overview
 
-GPT_OSS is a reasoning model with MoE weights quantized with mxfp4. All the other weights are in bf16.
+GPT-OSS is a reasoning model with MoE weights quantized with mxfp4. All the other weights are in bf16.
 
 ## MoE Support Matrix
 
