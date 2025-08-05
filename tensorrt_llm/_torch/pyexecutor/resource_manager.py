@@ -1156,7 +1156,11 @@ class ResourceManager:
 
     @nvtx_range("prepare_resources")
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
-        for _, resource_manager in self.resource_managers.items():
+        for resource_mgr_type, resource_manager in self.resource_managers.items(
+        ):
+            # Delay the preparation of draft kv cache manager to ModelDrafter.prepare_draft_tokens.
+            if resource_mgr_type == ResourceManagerType.DRAFT_KV_CACHE_MANAGER:
+                continue
             if hasattr(resource_manager, "prepare_resources"):
                 resource_manager.prepare_resources(scheduled_batch)
 
