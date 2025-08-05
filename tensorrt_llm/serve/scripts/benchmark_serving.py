@@ -678,8 +678,8 @@ def main(args: argparse.Namespace):
         ]:
             # multi-modal benchmark is only available on OpenAI Chat backend.
             raise ValueError(
-                "Multi-modal content is only supported on 'openai-chat' and "
-                "'openai-audio' backend.")
+                "Multi-modal content is only supported on 'openai-chat' backend."
+            )
         input_requests = dataset_class(
             dataset_path=args.dataset_path,
             dataset_subset=args.hf_subset,
