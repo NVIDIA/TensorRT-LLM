@@ -1,28 +1,11 @@
-import threading
 from typing import Any, Callable, Dict, Optional, Tuple
 
 import torch
 
 from ..attention_backend.interface import AttentionMetadata
+from ..modules.multi_stream_utils import with_multi_stream
 from ..speculative.interface import SpecMetadata
-from ..utils import make_weak_ref, set_piecewise_cuda_graph_flag
-
-
-class graph_capturing_local(threading.local):
-
-    def __init__(self):
-        self.is_graph_capturing = False
-
-
-_local = graph_capturing_local()
-
-
-def set_graph_capturing(enable: bool):
-    _local.is_graph_capturing = enable
-
-
-def is_graph_capturing() -> bool:
-    return _local.is_graph_capturing
+from ..utils import make_weak_ref, piecewise_cuda_graph
 
 
 class DecodingCUDAGraphRunner:
@@ -97,14 +80,11 @@ class DecodingCUDAGraphRunner:
         # internal states according to the docs:
         # https://pytorch.org/docs/stable/notes/cuda.html#cuda-graph-semantics
         # This also lets us initialize states in the attn_metadata.
-        set_graph_capturing(True)
-        set_piecewise_cuda_graph_flag(False)
-        for _ in range(2):
-            forward_fn(inputs)
-        with torch.cuda.graph(self._graph, pool=pool):
-            output = forward_fn(inputs)
-        set_graph_capturing(False)
-        set_piecewise_cuda_graph_flag(True)
+        with with_multi_stream(True), piecewise_cuda_graph(False):
+            for _ in range(2):
+                forward_fn(inputs)
+            with torch.cuda.graph(self._graph, pool=pool):
+                output = forward_fn(inputs)
         # Mark weak ref here. The output tensor should be freed properly.
         self._output = make_weak_ref(output)
         return self._graph.pool()

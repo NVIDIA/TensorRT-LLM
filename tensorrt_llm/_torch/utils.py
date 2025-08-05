@@ -265,3 +265,13 @@ def set_piecewise_cuda_graph_flag(enable: bool):
 def get_piecewise_cuda_graph_flag() -> bool:
     global _enable_piecewise_cuda_graph
     return _enable_piecewise_cuda_graph
+
+
+@contextlib.contextmanager
+def piecewise_cuda_graph(enable: bool):
+    prev_enable = get_piecewise_cuda_graph_flag()
+    set_piecewise_cuda_graph_flag(enable)
+    try:
+        yield
+    finally:
+        set_piecewise_cuda_graph_flag(prev_enable)
