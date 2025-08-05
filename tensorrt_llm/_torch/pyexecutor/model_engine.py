@@ -475,10 +475,8 @@ class PyTorchModelEngine(ModelEngine):
         if self._torch_compile_enabled:
             if value:
                 self._torch_compile_backend.enable_optimization()
-                set_enable_piecewise_cuda_graph_capture_flag(True)
             else:
                 self._torch_compile_backend.bypass_optimization()
-                set_enable_piecewise_cuda_graph_capture_flag(False)
 
         moe_load_balancer: MoeLoadBalancer = getattr(self, 'moe_load_balancer',
                                                      None)
