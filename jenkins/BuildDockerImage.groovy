@@ -196,7 +196,7 @@ def createKubernetesPodConfig(type, arch = "amd64", build_wheel = false)
 
 def prepareWheelFromBuildStage(dockerfileStage, arch) {
     if (!ENABLE_USE_WHEEL_FROM_BUILD_STAGE) {
-        echo "enableUseWheelFromBuildStage is false, skip preparing wheel from build stage"
+        echo "useWheelFromBuildStage is false, skip preparing wheel from build stage"
         return ""
     }
 
