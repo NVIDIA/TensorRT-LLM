@@ -253,11 +253,13 @@ class OpenAIServer:
             tool_dicts = None if request.tools is None else [
                 tool.model_dump() for tool in request.tools
             ]
-            sampling_params = request.to_sampling_params()
+            # Pass the tokenizer vocabulary size so ``logit_bias`` can be
+            # expanded into an embedding bias tensor in the sampler.
+            sampling_params = request.to_sampling_params(
+                vocab_size=self.tokenizer.tokenizer.vocab_size)
             # TODO: better way to enable metrics
             if len(os.getenv("TRTLLM_KVCACHE_TIME_OUTPUT_PATH", "")) > 0:
                 sampling_params.return_perf_metrics = True
-
             postproc_args = ChatPostprocArgs.from_request(request)
             disaggregated_params = to_llm_disaggregated_params(request.disaggregated_params)
 
@@ -406,7 +408,10 @@ class OpenAIServer:
 
             promises: List[RequestOutput] = []
             postproc_params_collection: List[Optional[PostprocParams]] = []
-            sampling_params = request.to_sampling_params()
+            # Pass the tokenizer vocabulary size so ``logit_bias`` can be
+            # expanded into an embedding bias tensor in the sampler.
+            sampling_params = request.to_sampling_params(
+                vocab_size=self.tokenizer.tokenizer.vocab_size)
             # TODO: better way to enable metrics
             if len(os.getenv("TRTLLM_KVCACHE_TIME_OUTPUT_PATH", "")) > 0:
                 sampling_params.return_perf_metrics = True

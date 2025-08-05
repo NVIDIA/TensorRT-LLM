@@ -347,7 +347,7 @@ void CacheFormatter::format(TransferSession& session)
                     auto copyTargetSlice = runtime::ITensor::slice(preAllocSendBuffer, 0, sendSize);
                     bufferManager.copy(*copySlice, *copyTargetSlice);
                     bufferManager.getStream().synchronize();
-                    session.send(processIdx, copyTargetSlice->data(), sendSize);
+                    session.send(processIdx, copyTargetSlice->data(), copyTargetSlice->getSizeInBytes());
                     remainSendSize -= sendSize;
                 }
             }

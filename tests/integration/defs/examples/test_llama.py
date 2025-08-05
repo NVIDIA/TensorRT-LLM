@@ -3050,7 +3050,8 @@ def test_llm_llama_v3_8b_1048k_long_context_ppl(llama_example_root,
 @pytest.mark.timeout(10800 if get_sm_version() < 89 else 3600)
 def test_llm_llama_v3_1m_long_context_8gpus(llama_example_root,
                                             llama_model_root, llm_venv,
-                                            engine_dir, cmodel_dir):
+                                            engine_dir, cmodel_dir,
+                                            timeout_manager):
     "Build & run llama-3-8B-1048k on long context."
     model_name = os.path.basename(llama_model_root)
     dtype = 'float16'
@@ -3059,51 +3060,66 @@ def test_llm_llama_v3_1m_long_context_8gpus(llama_example_root,
     max_seq_len = 1048576
     max_batch_size = 256
 
+    # Generate evaluation dataset with timeout management
     print("Generate evaluation dataset for passkey.")
-    gen_cmd = [
-        f"{llama_example_root}/../../../infinitebench/construct_synthetic_dataset.py",
-        "--test_case=build_passkey",
-        "--test_level=7",
-    ]
-    venv_check_call(llm_venv, gen_cmd)
+    with timeout_manager.timed_operation("gen"):
+        gen_cmd = [
+            f"{llama_example_root}/../../../infinitebench/construct_synthetic_dataset.py",
+            "--test_case=build_passkey",
+            "--test_level=7",
+        ]
+        venv_check_call(llm_venv,
+                        gen_cmd,
+                        timeout=timeout_manager.remaining_timeout)
 
+    # Convert checkpoint with timeout management
     print("Converting checkpoint...")
-    ckpt_dir = convert_weights(llm_venv=llm_venv,
-                               example_root=llama_example_root,
-                               cmodel_dir=cmodel_dir,
-                               model=model_name,
-                               model_path=llama_model_root,
-                               data_type=dtype,
-                               tp_size=tp_size,
-                               pp_size=pp_size)
+    with timeout_manager.timed_operation("convert"):
+        ckpt_dir = convert_weights(llm_venv=llm_venv,
+                                   example_root=llama_example_root,
+                                   cmodel_dir=cmodel_dir,
+                                   model=model_name,
+                                   model_path=llama_model_root,
+                                   data_type=dtype,
+                                   tp_size=tp_size,
+                                   pp_size=pp_size,
+                                   timeout=timeout_manager.remaining_timeout)
 
+    # Build engines with timeout management
     print("Building engines...")
-    build_cmd = [
-        "trtllm-build", f"--checkpoint_dir={ckpt_dir}",
-        f"--output_dir={engine_dir}", f"--gemm_plugin={dtype}",
-        f"--workers={world_size}", f"--max_seq_len={max_seq_len}",
-        "--max_num_tokens=4096", "--use_paged_context_fmha=enable",
-        f'--max_batch_size={max_batch_size}'
-    ]
+    with timeout_manager.timed_operation("build"):
+        build_cmd = [
+            "trtllm-build", f"--checkpoint_dir={ckpt_dir}",
+            f"--output_dir={engine_dir}", f"--gemm_plugin={dtype}",
+            f"--workers={world_size}", f"--max_seq_len={max_seq_len}",
+            "--max_num_tokens=4096", "--use_paged_context_fmha=enable",
+            f'--max_batch_size={max_batch_size}'
+        ]
 
-    check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
+        check_call(" ".join(build_cmd),
+                   shell=True,
+                   env=llm_venv._new_env,
+                   timeout=timeout_manager.remaining_timeout)
 
+    # Run passkey evaluation with timeout management
     print("Run passkey evaluation...")
-    eval_cmd = [
-        f"{llama_example_root}/../../../eval_long_context.py",
-        f"--engine_dir={engine_dir}",
-        f"--tokenizer_dir={llama_model_root}",
-        f"--max_input_length={max_seq_len-10}",
-        "--max_tokens_in_paged_kv_cache=1100000",
-        "--task=passkey",
-        "--stop_idx=10",
-        "--enable_chunked_context",
-        "--tensorrt_llm_accuracy_threshold=0.9",
-    ]
+    with timeout_manager.timed_operation("eval"):
+        eval_cmd = [
+            f"{llama_example_root}/../../../eval_long_context.py",
+            f"--engine_dir={engine_dir}",
+            f"--tokenizer_dir={llama_model_root}",
+            f"--max_input_length={max_seq_len-10}",
+            "--max_tokens_in_paged_kv_cache=1100000",
+            "--task=passkey",
+            "--stop_idx=10",
+            "--enable_chunked_context",
+            "--tensorrt_llm_accuracy_threshold=0.9",
+        ]
 
-    venv_mpi_check_call(
-        llm_venv, ["mpirun", "-n", f"{world_size}", "--allow-run-as-root"],
-        eval_cmd)
+        venv_mpi_check_call(
+            llm_venv, ["mpirun", "-n", f"{world_size}", "--allow-run-as-root"],
+            eval_cmd,
+            timeout=timeout_manager.remaining_timeout)
 
 
 @pytest.mark.skip_less_device_memory(80000)
@@ -3411,7 +3427,8 @@ def test_llm_llama_v3_2_smoothquant_1node_single_gpu(
 def test_llm_llama_v3_1_1node_multi_gpus(llama_example_root, llama_model_root,
                                          llm_venv, cmodel_dir,
                                          mmlu_dataset_root, engine_dir,
-                                         fp8_quant, gemm_allreduce):
+                                         fp8_quant, gemm_allreduce,
+                                         timeout_manager):
     "Run llama3.1 test on 1 node."
     if ("8B" not in llama_model_root) and (get_host_total_memory() < 1000000):
         pytest.skip("Host memory is insufficient.")
@@ -3429,70 +3446,90 @@ def test_llm_llama_v3_1_1node_multi_gpus(llama_example_root, llama_model_root,
     if not fp8_quant and "Meta-Llama-3.1-405B" == model_name:
         pytest.skip("Build engine will be OOM on 1 node.")
 
+    # Convert weights with timeout management
     print("Convert weight...")
-    model_dir = convert_weights(llm_venv=llm_venv,
-                                example_root=llama_example_root,
-                                cmodel_dir=cmodel_dir,
-                                model=model_name,
-                                model_path=llama_model_root,
-                                data_type=data_type,
-                                tp_size=tp_size,
-                                pp_size=pp_size,
-                                use_fp8_rowwise=fp8_quant,
-                                load_by_shard=True,
-                                workers=world_size)
+    with timeout_manager.timed_operation("convert"):
+        model_dir = convert_weights(llm_venv=llm_venv,
+                                    example_root=llama_example_root,
+                                    cmodel_dir=cmodel_dir,
+                                    model=model_name,
+                                    model_path=llama_model_root,
+                                    data_type=data_type,
+                                    tp_size=tp_size,
+                                    pp_size=pp_size,
+                                    use_fp8_rowwise=fp8_quant,
+                                    load_by_shard=True,
+                                    workers=world_size,
+                                    timeout=timeout_manager.remaining_timeout)
 
+    # Build engines with timeout management
     print("Build engines...")
-    build_cmd = [
-        "trtllm-build",
-        f"--checkpoint_dir={model_dir}",
-        f"--output_dir={engine_dir}",
-        f"--workers={world_size}",
-        f"--max_batch_size={256}",
-        "--use_paged_context_fmha=enable",
-        "--max_num_tokens=4096",
-        "--max_input_len=64000",
-        "--max_seq_len=65000",
-    ]
+    with timeout_manager.timed_operation("build"):
+        build_cmd = [
+            "trtllm-build",
+            f"--checkpoint_dir={model_dir}",
+            f"--output_dir={engine_dir}",
+            f"--workers={world_size}",
+            f"--max_batch_size={256}",
+            "--use_paged_context_fmha=enable",
+            "--max_num_tokens=4096",
+            "--max_input_len=64000",
+            "--max_seq_len=65000",
+        ]
 
-    if gemm_allreduce:
-        build_cmd += [f"--gemm_allreduce_plugin={data_type}"]
+        if gemm_allreduce:
+            build_cmd += [f"--gemm_allreduce_plugin={data_type}"]
 
-    check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
+        check_call(" ".join(build_cmd),
+                   shell=True,
+                   env=llm_venv._new_env,
+                   timeout=timeout_manager.remaining_timeout)
 
-    gen_cmd = [
-        f"{llama_example_root}/../../../infinitebench/construct_synthetic_dataset.py",
-        "--test_case=build_passkey",
-        "--test_level=3",
-    ]
+    # Generate dataset with timeout management
+    with timeout_manager.timed_operation("gen"):
+        gen_cmd = [
+            f"{llama_example_root}/../../../infinitebench/construct_synthetic_dataset.py",
+            "--test_case=build_passkey",
+            "--test_level=3",
+        ]
 
-    venv_check_call(llm_venv, gen_cmd)
+        venv_check_call(llm_venv,
+                        gen_cmd,
+                        timeout=timeout_manager.remaining_timeout)
 
+    # Run evaluation with timeout management
     print("Run eval...")
-    eval_cmd = [
-        f"{llama_example_root}/../../../eval_long_context.py",
-        "--task=passkey",
-        f"--engine_dir={engine_dir}",
-        f"--tokenizer_dir={llama_model_root}",
-        "--stop_idx=6",
-        "--max_input_length=64000",
-        "--enable_chunked_context",
-        "--kv_cache_free_gpu_memory_fraction=0.999",
-        "--max_tokens_in_paged_kv_cache=65064",
-        "--output_dir=64k_context_tp8",
-    ]
+    with timeout_manager.timed_operation("eval"):
+        eval_cmd = [
+            f"{llama_example_root}/../../../eval_long_context.py",
+            "--task=passkey",
+            f"--engine_dir={engine_dir}",
+            f"--tokenizer_dir={llama_model_root}",
+            "--stop_idx=6",
+            "--max_input_length=64000",
+            "--enable_chunked_context",
+            "--kv_cache_free_gpu_memory_fraction=0.999",
+            "--max_tokens_in_paged_kv_cache=65064",
+            "--output_dir=64k_context_tp8",
+        ]
 
-    venv_mpi_check_call(
-        llm_venv, ["mpirun", "-n", f"{world_size}", "--allow-run-as-root"],
-        eval_cmd)
+        venv_mpi_check_call(
+            llm_venv, ["mpirun", "-n", f"{world_size}", "--allow-run-as-root"],
+            eval_cmd,
+            timeout=timeout_manager.remaining_timeout)
 
+    # Run MMLU with timeout management
     print("Run mmlu...")
-    mmlu_cmd = [
-        "trtllm-eval", f"--model={engine_dir}",
-        f"--tokenizer={llama_model_root}", "--backend=tensorrt", "mmlu",
-        f"--dataset_path={mmlu_dataset_root}", "--check_accuracy"
-    ]
-    check_call(" ".join(mmlu_cmd), shell=True, env=llm_venv._new_env)
+    with timeout_manager.timed_operation("mmlu"):
+        mmlu_cmd = [
+            "trtllm-eval", f"--model={engine_dir}",
+            f"--tokenizer={llama_model_root}", "--backend=tensorrt", "mmlu",
+            f"--dataset_path={mmlu_dataset_root}", "--check_accuracy"
+        ]
+        check_call(" ".join(mmlu_cmd),
+                   shell=True,
+                   env=llm_venv._new_env,
+                   timeout=timeout_manager.remaining_timeout)
 
 
 @pytest.mark.skip_less_device_memory(80000)
@@ -4098,8 +4135,7 @@ def test_llm_api_lookahead_decoding_1gpu(model_name, model_path):
     """
     from defs.conftest import llm_models_root
 
-    from tensorrt_llm._tensorrt_engine import LLM
-    from tensorrt_llm.llmapi import (BuildConfig, KvCacheConfig,
+    from tensorrt_llm.llmapi import (LLM, BuildConfig, KvCacheConfig,
                                      LookaheadDecodingConfig, SamplingParams)
     build_config = BuildConfig(max_batch_size=128,
                                max_input_len=2048,

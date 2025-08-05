@@ -14,7 +14,6 @@ from ..attention_backend import AttentionMetadata, FlashInferAttentionMetadata
 from ..attention_backend.interface import (AttentionMask, CustomAttentionMask,
                                            PositionalEmbeddingParams,
                                            PredefinedAttentionMask, RopeParams)
-from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
 from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
@@ -69,7 +68,7 @@ class Gemma3Attention(Attention):
             rope_params.theta = config.rope_local_base_freq
             rope_params.scale_type = RotaryScalingType.none
             rope_params.scale = 1.0
-            self.attention_window_size = config.sliding_window - 1  # Gemma3 sliding window isn't inclusive.
+            self.attention_window_size = config.sliding_window
         pos_embd_params = PositionalEmbeddingParams(
             type=PositionEmbeddingType.rope_gpt_neox,
             rope=rope_params,
@@ -105,9 +104,6 @@ class Gemma3Attention(Attention):
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         attention_mask: AttentionMask = PredefinedAttentionMask.CAUSAL,
-        mrope_config: Optional[dict] = None,
-        all_reduce_params: Optional[AllReduceParams] = None,
-        lora_params: Optional[dict] = None,
         attention_mask_data: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
@@ -121,9 +117,6 @@ class Gemma3Attention(Attention):
                                hidden_states=hidden_states,
                                attn_metadata=attn_metadata,
                                attention_mask=attention_mask,
-                               mrope_config=mrope_config,
-                               all_reduce_params=all_reduce_params,
-                               lora_params=lora_params,
                                attention_window_size=self.attention_window_size,
                                attention_mask_data=attention_mask_data,
                                **kwargs)
@@ -209,7 +202,6 @@ class Gemma3DecoderLayer(DecoderLayer):
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor] = None,
         attention_mask_data: Optional[torch.Tensor] = None,
-        lora_params: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor:
 
@@ -222,14 +214,14 @@ class Gemma3DecoderLayer(DecoderLayer):
             attention_mask=CustomAttentionMask.CUSTOM if attention_mask_data
             is not None else PredefinedAttentionMask.CAUSAL,
             attention_mask_data=attention_mask_data,
-            lora_params=lora_params,
             **kwargs,
         )
         hidden_states = self.post_attention_layernorm(hidden_states)
         hidden_states = residual + hidden_states
         residual = hidden_states
         hidden_states = self.pre_feedforward_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states, lora_params=lora_params)
+        hidden_states = self.mlp(hidden_states,
+                                 lora_params=kwargs.get("lora_params", None))
         hidden_states = self.post_feedforward_layernorm(hidden_states)
         hidden_states = residual + hidden_states
 
@@ -270,7 +262,6 @@ class Gemma3TextModel(DecoderModel):
         inputs_embeds: Optional[torch.FloatTensor] = None,
         local_attention_mask_data: Optional[torch.Tensor] = None,
         global_attention_mask_data: Optional[torch.Tensor] = None,
-        lora_params: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor:
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -291,7 +282,7 @@ class Gemma3TextModel(DecoderModel):
                 attention_mask_data=local_attention_mask_data
                 if decoder_layer.self_attn.is_sliding else
                 global_attention_mask_data,
-                lora_params=lora_params,
+                **kwargs,
             )
 
         hidden_states = self.norm(hidden_states)
@@ -465,6 +456,7 @@ class Gemma3ForCausalLM(DecoderModelForCausalLM[Gemma3TextModel,
             inputs_embeds=inputs_embeds,
             local_attention_mask_data=local_attention_mask_data,
             global_attention_mask_data=global_attention_mask_data,
+            **kwargs,
         )
 
         return self.logits_processor.forward(

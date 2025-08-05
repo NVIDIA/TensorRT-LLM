@@ -644,55 +644,69 @@ def test_llm_gpt3_175b_96layers_build_only(gpt_example_root, llm_venv,
                          ids=["parallel_build", "serial_build"])
 def test_llm_gpt3_175b_1node_8gpus(gpt_example_root, llm_venv, engine_dir,
                                    use_attention_plugin, use_gemm_plugin,
-                                   context_fmha, parallel_build):
+                                   context_fmha, parallel_build,
+                                   timeout_manager):
     "Build & Run GPT-3 175B: 96 layer w/ plugins"
     dtype = 'float16'
-    convert_cmd = [
-        f"{gpt_example_root}/../../../generate_checkpoint_config.py",
-        f"--output_path={engine_dir}/ckpt_config.json",
-        "--architecture=GPTForCausalLM", f"--dtype={dtype}",
-        "--num_hidden_layers=96", "--num_attention_heads=96",
-        "--hidden_size=12288", "--vocab_size=51200", "--tp_size=8"
-    ]
-    venv_check_call(llm_venv, convert_cmd)
 
+    # Convert checkpoint with timeout management
+    with timeout_manager.timed_operation("convert"):
+        convert_cmd = [
+            f"{gpt_example_root}/../../../generate_checkpoint_config.py",
+            f"--output_path={engine_dir}/ckpt_config.json",
+            "--architecture=GPTForCausalLM", f"--dtype={dtype}",
+            "--num_hidden_layers=96", "--num_attention_heads=96",
+            "--hidden_size=12288", "--vocab_size=51200", "--tp_size=8"
+        ]
+        venv_check_call(llm_venv,
+                        convert_cmd,
+                        timeout=timeout_manager.remaining_timeout)
+
+    # Build engines with timeout management
     print("Building engines...")
-    build_cmd = [
-        "trtllm-build",
-        f"--model_config={engine_dir}/ckpt_config.json",
-        f"--output_dir={engine_dir}",
-        f"--max_batch_size={32}",
-        f"--max_input_len={924}",
-        f"--max_seq_len={1024}",
-    ]
+    with timeout_manager.timed_operation("build"):
+        build_cmd = [
+            "trtllm-build",
+            f"--model_config={engine_dir}/ckpt_config.json",
+            f"--output_dir={engine_dir}",
+            f"--max_batch_size={32}",
+            f"--max_input_len={924}",
+            f"--max_seq_len={1024}",
+        ]
 
-    if use_attention_plugin:
-        build_cmd.extend([f"--gpt_attention_plugin={dtype}"])
-        if context_fmha:
-            build_cmd.extend(["--context_fmha=enable"])
+        if use_attention_plugin:
+            build_cmd.extend([f"--gpt_attention_plugin={dtype}"])
+            if context_fmha:
+                build_cmd.extend(["--context_fmha=enable"])
+            else:
+                build_cmd.extend(["--context_fmha=disable"])
         else:
-            build_cmd.extend(["--context_fmha=disable"])
-    else:
-        build_cmd.extend([
-            "--gpt_attention_plugin=disable",
-            "--context_fmha=disable",
-            "--paged_kv_cache=disable",
-            "--remove_input_padding=disable",
-        ])
-    if use_gemm_plugin:
-        build_cmd.extend([f"--gemm_plugin={dtype}"])
-    if parallel_build:
-        build_cmd.extend(["--workers=8"])
+            build_cmd.extend([
+                "--gpt_attention_plugin=disable",
+                "--context_fmha=disable",
+                "--paged_kv_cache=disable",
+                "--remove_input_padding=disable",
+            ])
+        if use_gemm_plugin:
+            build_cmd.extend([f"--gemm_plugin={dtype}"])
+        if parallel_build:
+            build_cmd.extend(["--workers=8"])
 
-    check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
+        check_call(" ".join(build_cmd),
+                   shell=True,
+                   env=llm_venv._new_env,
+                   timeout=timeout_manager.remaining_timeout)
 
+    # Run inference with timeout management
     print('Run gpt3-175b...')
-    venv_mpi_check_call(
-        llm_venv,
-        ["mpirun", "--allow-run-as-root", "--oversubscribe", "-np", "8"], [
-            f"{gpt_example_root}/../../../run.py", "--max_output_len=8",
-            f"--engine_dir={engine_dir}", "--no_add_special_tokens"
-        ])
+    with timeout_manager.timed_operation("run"):
+        venv_mpi_check_call(
+            llm_venv,
+            ["mpirun", "--allow-run-as-root", "--oversubscribe", "-np", "8"], [
+                f"{gpt_example_root}/../../../run.py", "--max_output_len=8",
+                f"--engine_dir={engine_dir}", "--no_add_special_tokens"
+            ],
+            timeout=timeout_manager.remaining_timeout)
 
 
 @skip_post_blackwell
