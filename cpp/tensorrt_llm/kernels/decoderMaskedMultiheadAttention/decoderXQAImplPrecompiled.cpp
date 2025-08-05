@@ -287,14 +287,8 @@ public:
             void* kernelParams[] = {&maxQSeqLen, &launchParams.num_k_heads, &headGrpSize, &cuQSeqLens,
                 &launchParams.output, &xqa_q_input_ptr, &maskPtr, &launchParams.kvCacheParams, &launchParams.batch_size,
                 &launchParams.kv_scale_quant_orig, &launchParams.scratch};
+            // precompiled XQA Spec-dec kernel does not support multi-block mode
             int multi_block = 1;
-            if (xqaParams.multi_block_mode)
-            {
-                multi_block = computeMultiBlockCount(xqaParams, xqaParams.batch_size, multiprocessor_count);
-                check_cuda_error(cudaMemsetAsync(xqaParams.workspaces, 0,
-                    sizeof(int) * xqaParams.batch_size * qSeqLen * xqaParams.num_kv_heads, stream));
-                sync_check_cuda_error(stream);
-            }
             TLLM_CU_CHECK(mDriver->cuLaunchKernel(func, multi_block, xqaParams.num_kv_heads * nbTokenBlocksPerGrp,
                 xqaParams.batch_size, 128, 1, 2, shared_mem_bytes, stream, kernelParams, nullptr));
         }

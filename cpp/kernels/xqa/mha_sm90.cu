@@ -2775,7 +2775,7 @@ __device__ inline void saveTransposedOutput(uint32_t threadRank, uint32_t warpRa
             reinterpret_cast<Vec<InputElem, 4>&>(f16Core)
                 = convert<InputElem>(reinterpret_cast<Vec<float, 4> const&>(core));
             auto const dst = idxMat < 2
-                ? &swizzleBuf.template at<true>(idxRow, 2 * (gmmaWarpsPerGrp * m + warpRank) + idxMat)
+                ? &swizzleBuf.template at<true>(8 * n + idxRow, 2 * (gmmaWarpsPerGrp * m + warpRank) + idxMat)
                 : nullptr;
             stmatrix<true, 2>(dst, f16Core);
 #elif CACHE_ELEM_ENUM == 2

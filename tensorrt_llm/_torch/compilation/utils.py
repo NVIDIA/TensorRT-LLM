@@ -49,9 +49,8 @@ def inplace_info():
             1: "input",
             2: "residual"
         },
-        torch.ops.trtllm.attention_inplace.default: {
+        torch.ops.trtllm.attn_custom_op_inplace.default: {
             1: "output",
-            2: "output_sf"
         },
         torch.ops.trtllm.mla_custom_op_inplace.default: {
             1: "output"

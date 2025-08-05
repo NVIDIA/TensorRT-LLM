@@ -23,6 +23,12 @@ from defs.conftest import (get_device_memory, get_sm_version, skip_fp8_pre_ada,
                            skip_post_blackwell, skip_pre_ada)
 from defs.trt_test_alternative import check_call
 
+# skip trt flow cases on post-Blackwell-Ultra
+if get_sm_version() >= 103:
+    pytest.skip(
+        "TRT workflow tests are not supported on post Blackwell-Ultra architecture",
+        allow_module_level=True)
+
 
 @pytest.fixture(scope="module")
 def phi_example_root(llm_root, llm_venv):
@@ -36,6 +42,7 @@ def phi_example_root(llm_root, llm_venv):
     return example_root
 
 
+@skip_post_blackwell
 @pytest.mark.skip_less_device_memory(40000)
 @pytest.mark.parametrize("num_beams", [1, 2, 4],
                          ids=lambda num_beams: f'nb:{num_beams}')

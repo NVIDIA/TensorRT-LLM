@@ -1,11 +1,12 @@
 from collections import defaultdict
 from functools import partial
-from typing import Any, Dict
+from typing import Dict, Tuple
 
 import torch.nn as nn
 from torch.fx import GraphModule, Node
 
-from ...utils.logger import ad_logger
+from ...models.factory import ModelFactory
+from ...shim.interface import CachedSequenceInterface
 from ...utils.node_utils import (
     extract_param_names_from_lin_node,
     get_quantization_params_from_linear_node,
@@ -20,7 +21,7 @@ from ...utils.quantization_utils import (
     remove_output_quantizers,
     should_skip_quantization,
 )
-from .._graph import canonicalize_graph
+from ..interface import BaseTransform, TransformInfo, TransformRegistry
 
 
 def _insert_quantized_linear(
@@ -138,12 +139,8 @@ def _insert_quantized_bmm(
         scale_target_module = gm  # Register in root module
         scale_name_prefix = ""
 
-        ad_logger.info(f"Quantized BMM with dynamic weight tensor for node {node}")
     else:
         # If we can't determine the shape, skip quantization
-        ad_logger.warning(
-            f"BMM weight is dynamic tensor without shape metadata, skipping quantization for node {node}"
-        )
         return
 
     # Common logic for both parameter and dynamic tensor cases
@@ -169,53 +166,70 @@ def _insert_quantized_bmm(
     node.args = (*node.args, *scale_values)
 
 
-def quantize(gm: GraphModule, quant_config: Dict[str, Any]) -> None:
-    """Quantize the GraphModule and replace linear with quantized linear."""
-    # extract info from quant_config
-    is_quant_graph = is_quantized_graph(gm)
-    quant_algo = quant_config.get("quant_algo")
-    excluded_patterns = quant_config.get("exclude_modules", [])
+@TransformRegistry.register("quantize")
+class Quantization(BaseTransform):
+    """Quantize the GraphModule and replace linear/BMM with quantized linear/BMM."""
 
-    # no quantization to do
-    if not (is_quant_graph or quant_config):
-        ad_logger.info("No quantization to do.")
-        return
-
-    # tracking quantized operations in the graph
-    quantized_nodes: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
-    for n in gm.graph.nodes:
-        if should_skip_quantization(n, excluded_patterns):
-            continue
-
-        # Process linear operations
-        if is_linear_op(n, include_quantization=False):
-            # get per-layer quantization format from the node
-            quant_algo_n: str = (
-                get_quantization_from_linear_node(n) if is_quant_graph else quant_algo
+    def _apply(
+        self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory
+    ) -> Tuple[GraphModule, TransformInfo]:
+        # extract info from quant_config
+        quant_config = factory.get_quant_config()
+        if not quant_config:
+            return gm, TransformInfo(
+                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )
-            if not quant_algo_n:
+
+        is_quant_graph = is_quantized_graph(gm)
+        quant_algo = quant_config.get("quant_algo")
+        excluded_patterns = quant_config.get("exclude_modules", [])
+        if not quant_algo:
+            return gm, TransformInfo(
+                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+            )
+
+        # tracking quantized operations in the graph
+        quantized_nodes: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+        for n in gm.graph.nodes:
+            if should_skip_quantization(n, excluded_patterns):
                 continue
 
-            # insert quantized linear node
-            _insert_quantized_linear(gm, n, QuantizationImpl.create(quant_algo_n), is_quant_graph)
-            quantized_nodes[quant_algo_n]["linear"] += 1
+            # Process linear operations
+            if is_linear_op(n, include_quantization=False):
+                # get per-layer quantization format from the node
+                quant_algo_n: str = (
+                    get_quantization_from_linear_node(n) if is_quant_graph else quant_algo
+                )
+                if not quant_algo_n:
+                    continue
 
-        # Process BMM operations
-        elif is_bmm_op(n):
-            if not quant_algo:
-                continue
+                # insert quantized linear node
+                _insert_quantized_linear(
+                    gm, n, QuantizationImpl.create(quant_algo_n), is_quant_graph
+                )
+                quantized_nodes[quant_algo_n]["linear"] += 1
 
-            # insert quantized bmm node
-            _insert_quantized_bmm(
-                gm, n, QuantizationImpl.create(quant_algo, is_bmm=True), is_quant_graph
-            )
-            quantized_nodes[quant_algo]["bmm"] += 1
+            # Process BMM operations
+            elif is_bmm_op(n):
+                if not quant_algo:
+                    continue
 
-    if is_quant_graph:
-        remove_output_quantizers(gm)
+                # insert quantized bmm node
+                _insert_quantized_bmm(
+                    gm, n, QuantizationImpl.create(quant_algo, is_bmm=True), is_quant_graph
+                )
+                quantized_nodes[quant_algo]["bmm"] += 1
 
-    canonicalize_graph(gm)
-    for quant_algo in quantized_nodes:
-        for op_type, count in quantized_nodes[quant_algo].items():
-            ad_logger.info(f"Found {count} {quant_algo} quantized {op_type} nodes.")
-    ad_logger.debug("After quantization: " + str(gm))
+        if is_quant_graph:
+            remove_output_quantizers(gm)
+
+        num_matches = 0
+        for quant_algo in quantized_nodes:
+            for op_type, count in quantized_nodes[quant_algo].items():
+                num_matches += count
+
+        info = TransformInfo(
+            skipped=False, num_matches=num_matches, is_clean=False, has_valid_shapes=True
+        )
+
+        return gm, info
