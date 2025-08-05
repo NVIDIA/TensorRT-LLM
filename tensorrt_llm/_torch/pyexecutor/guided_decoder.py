@@ -90,6 +90,13 @@ class GuidedDecoder:
     @torch.inference_mode()
     @nvtx_range("GuidedDecoder.build")
     def build(self, scheduled_requests: ScheduledRequests) -> None:
+        """Build the bitmask for requests with guided decoding enabled.
+
+        Specifically, this method:
+        - build and advance the grammar matcher for context and generation requests, respectively;
+        - call the grammar matcher to fill the bitmask on CPU;
+        - asynchronously copy the bitmask to GPU.
+        """
         for llm_req in scheduled_requests.all_requests():
             slot: int = llm_req.py_target_seq_slot if llm_req.py_is_draft else llm_req.py_seq_slot
             self.num_advanced_tokens[slot] = 0
@@ -155,9 +162,13 @@ class GuidedDecoder:
                 scheduled_requests: ScheduledRequests,
                 logits: torch.Tensor,
                 d2t: Optional[torch.Tensor] = None) -> None:
+        """Apply the bitmask to the corresponding logits for requests with guided decoding enabled.
+
+        This method inplace modifies the logits tensor so that any tokens that violate the grammar constraints are masked out.
+        """
         torch.cuda.current_stream().wait_stream(self._stream)
 
-        # TODO: Fuse this to logits_bitmask.
+        # TODO: Fuse index_copy and index_select to logits_bitmask.
         if d2t is not None:
             draft_logits = logits
             d2t_mapping = d2t + torch.arange(d2t.size(0), device=d2t.device)
@@ -187,7 +198,9 @@ class GuidedDecoder:
     @nvtx_range("GuidedDecoder.rollback_rejected_tokens")
     def rollback_rejected_tokens(self,
                                  scheduled_requests: ScheduledRequests) -> None:
-        """This method should be called:
+        """Rollback the grammar matcher for rejected tokens.
+
+        This method should be called:
         - after the verification (so that the accepted tokens are ready) and
         - before the first guided decoding build of the next drafting loop.
         """
@@ -212,7 +225,9 @@ class GuidedDecoder:
     @nvtx_range("GuidedDecoder.rollback_draft_tokens")
     def rollback_draft_tokens(self,
                               scheduled_requests: ScheduledRequests) -> None:
-        """This method should be called:
+        """Rollback the grammar matcher for draft tokens.
+
+        This method should be called:
         - after the the drafting loop and
         - before the guided decoding build of the target model.
         """
