@@ -430,7 +430,7 @@ class FP8QDQFusedMoEMethod(FusedMoEMethodBase):
         module.fc31_input_dequant.data.copy_(max_fc31_input_scale)
 
 
-class DeepSeekFP8BlockScalesFusedMoEMethodCuteDsl(FusedMoEMethodBase):
+class DeepSeekFP8BlockScalesFusedMoEMethod(FusedMoEMethodBase):
 
     def create_weights(self, module: torch.nn.Module):
         weight_dtype = torch.float8_e4m3fn
@@ -553,8 +553,8 @@ class DeepSeekFP8BlockScalesFusedMoEMethodCuteDsl(FusedMoEMethodBase):
             })
 
 
-class DeepSeekFP8BlockScalesFusedMoEMethod(
-        DeepSeekFP8BlockScalesFusedMoEMethodCuteDsl):
+class DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm(
+        DeepSeekFP8BlockScalesFusedMoEMethod):
 
     def load_weights(self, module: torch.nn.Module, weights: List[Dict],
                      weight_loading_mode: MoEWeightLoadingMode):
