@@ -67,6 +67,11 @@ def test_trtllm_serve_examples(exe: str, script: str,
     if script.startswith("curl"):
         # For curl scripts, we expect a JSON response
         result_stdout = result.stdout.strip()
-        data = json.loads(result_stdout)
-        assert "code" not in data or data[
-            "code"] == 200, f"Unexpected response: {data}"
+        try:
+            data = json.loads(result_stdout)
+            assert "code" not in data or data[
+                "code"] == 200, f"Unexpected response: {data}"
+        except json.JSONDecodeError as e:
+            pytest.fail(
+                f"Failed to parse JSON response from {script}: {e}\nStdout: {result_stdout}\nStderr: {result.stderr}"
+            )
