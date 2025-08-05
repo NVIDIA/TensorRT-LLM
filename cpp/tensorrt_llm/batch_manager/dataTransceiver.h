@@ -97,15 +97,23 @@ private:
 class TransferSession
 {
 public:
+    struct Measure
+    {
+        double delay;     // from last token (ctx) or arrival time (gen), in ms
+        double duration;  // in ms
+        double bandwidth; // in Gbps
+    };
+
     TransferSession(std::vector<Connection const*> connections, DataContext dataContext,
         executor::DataTransceiverState const& selfState, executor::DataTransceiverState otherState,
-        runtime::BufferManager const& bufferManager, LlmRequest const* llmRequest = nullptr)
+        runtime::BufferManager const& bufferManager, LlmRequest const* llmRequest = nullptr, bool recordMeasure = false)
         : mConnections(std::move(connections))
         , mDataContext(dataContext)
         , mSelfState(&selfState)
         , mOtherState(std::move(otherState))
         , mBufferManager(&bufferManager)
         , mRequest(llmRequest)
+        , mRecordMeasure(recordMeasure)
     {
         TLLM_CHECK(!mConnections.empty());
     }
@@ -163,6 +171,11 @@ public:
         mRequest = &llmRequest;
     }
 
+    void appendMeasure(double delay, double duration, size_t size);
+
+    // TODO: 1. use global id instead of context request id; 2. export to llm metrics instead of file
+    void exportMeasure(std::ofstream& outFile, bool isContext) const;
+
 private:
     std::vector<Connection const*> mConnections;
     DataContext mDataContext;
@@ -170,6 +183,8 @@ private:
     executor::DataTransceiverState mOtherState;
     runtime::BufferManager const* mBufferManager;
     LlmRequest const* mRequest;
+    bool mRecordMeasure;
+    std::vector<Measure> mMeasures;
 };
 
 // Operators required for data transmission in specific communication protocols.
@@ -264,81 +279,6 @@ public:
 private:
     class Impl;
     std::unique_ptr<Impl> mImpl;
-};
-
-class KvCacheMeasureHelper
-{
-public:
-    struct Measure
-    {
-        double delay;     // from last token (ctx) or arrival time (gen), in ms
-        double duration;  // in ms
-        double bandwidth; // in Gbps
-    };
-
-    KvCacheMeasureHelper(std::string output_path)
-        : mOutputPath(std::move(output_path))
-    {
-    }
-
-    void markAsSender(bool isSender)
-    {
-        mIsSender = isSender;
-    }
-
-    void appendKVCacheTransfer(LlmRequest::RequestIdType requestId, double delay, double duration, size_t size)
-    {
-        auto bandwidth = size * 8 / (duration / 1000) / 1e9;
-        if (mOutputPath.empty())
-        {
-            return;
-        }
-
-        std::lock_guard<std::mutex> lock(mMutex);
-        mRequestKVCacheTranfserMeasure[requestId].emplace_back(Measure{delay, duration, bandwidth});
-    }
-
-    ~KvCacheMeasureHelper()
-    {
-        if (!mRequestKVCacheTranfserMeasure.empty() && !mOutputPath.empty())
-        {
-            TLLM_CHECK(mIsSender.has_value());
-            auto rank = mpi::MpiComm::world().getRank();
-            std::string outFilePath
-                = mOutputPath + "rank_" + std::to_string(rank) + "_" + (mIsSender.value() ? "send" : "recv") + ".csv";
-            std::ofstream outFile(outFilePath);
-
-            TLLM_CHECK_WITH_INFO(outFile.is_open(), "Cannot write to file " + outFilePath);
-
-            size_t numTransferMeasure = mRequestKVCacheTranfserMeasure.begin()->second.size();
-
-            outFile << "RequestID";
-            for (size_t i = 0; i < numTransferMeasure; i++)
-            {
-                outFile << ",Delay(ms),Duration(ms),Bandwidth(Gbps)";
-            }
-            outFile << '\n';
-
-            for (auto const& [requestID, measures] : mRequestKVCacheTranfserMeasure)
-            {
-                outFile << requestID;
-
-                for (auto const& measure : measures)
-                {
-                    outFile << "," << measure.delay << "," << measure.duration << "," << measure.bandwidth;
-                }
-                outFile << '\n';
-            }
-
-            outFile.close();
-        }
-    }
-
-private:
-    std::map<LlmRequest::RequestIdType, std::vector<Measure>> mRequestKVCacheTranfserMeasure;
-    std::string mOutputPath;
-    std::mutex mMutex;
-    std::optional<bool> mIsSender;
 };
 
 } // namespace tensorrt_llm::batch_manager
