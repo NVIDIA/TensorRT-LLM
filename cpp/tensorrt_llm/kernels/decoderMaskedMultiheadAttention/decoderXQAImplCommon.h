@@ -67,6 +67,7 @@ struct XQAKernelRuntimeHashKey
     bool paged_kv_cache;
     bool multi_query_tokens;
     bool is_fp8_output;
+    std::optional<PositionEmbeddingType> position_embedding_type;
 
     bool operator==(XQAKernelRuntimeHashKey const& other) const
     {
@@ -74,7 +75,7 @@ struct XQAKernelRuntimeHashKey
             && num_q_heads_per_kv == other.num_q_heads_per_kv && beam_size == other.beam_size
             && multi_query_tokens == other.multi_query_tokens && m_tilesize == other.m_tilesize
             && tokens_per_page == other.tokens_per_page && paged_kv_cache == other.paged_kv_cache
-            && is_fp8_output == other.is_fp8_output;
+            && is_fp8_output == other.is_fp8_output && position_embedding_type == other.position_embedding_type;
     }
 };
 
@@ -87,22 +88,24 @@ struct XQAKernelRuntimeHasher
     size_t operator()(XQAKernelRuntimeHashKey const& s) const
     {
         size_t key = s.kv_data_type;
-        key <<= 16;
+        key <<= 16; // 16
         key ^= s.head_size;
-        key <<= 8;
+        key <<= 8;  // 24
         key ^= s.num_q_heads_per_kv;
-        key <<= 8;
+        key <<= 8;  // 32
         key ^= s.beam_size;
-        key <<= 6;
+        key <<= 6;  // 38
         key ^= s.m_tilesize;
-        key <<= 10;
+        key <<= 10; // 48
         key ^= s.tokens_per_page;
-        key <<= 1;
+        key <<= 1;  // 49
         key ^= s.paged_kv_cache;
-        key <<= 1;
+        key <<= 1;  // 50
         key ^= s.multi_query_tokens;
-        key <<= 1;
+        key <<= 1;  // 51
         key ^= s.is_fp8_output;
+        key <<= 8;
+        key ^= static_cast<int8_t>(s.position_embedding_type.value_or(static_cast<PositionEmbeddingType>(-1)));
         return key;
     }
 };
@@ -376,6 +379,91 @@ inline int computeMultiBlockCount(XQAParams const& xqaParams, int batch_size, in
 inline int computeMultiBlockCountForMLA(XQAParams const& xqaParams, int multiprocessor_count)
 {
     return 1; // disable multi-block for MLA kernel for now.
+}
+
+inline int computeMultiBlockCountSpecDecGMMA(
+    XQAParams const& xqaParams, int batch_size, int multiprocessor_count, int specDecBlocks)
+{
+    auto const userSpecified = tensorrt_llm::common::getEnvXqaBlocksPerSequence();
+    if (userSpecified.has_value())
+    {
+        return userSpecified.value();
+    }
+    int multi_block_count = 1;
+
+    int num_kv_heads = xqaParams.num_kv_heads;
+    int history_length = xqaParams.max_past_kv_length;
+
+    // skip tuning for large BS or short ISL case.
+    if (batch_size > 32 || history_length < 2048)
+    {
+        return multi_block_count;
+    }
+
+    // gridDim = dim3{specDecBlocks, multi_block, nbKVHeads * xqaParams.batch_size}
+    int single_block_count = specDecBlocks * num_kv_heads * batch_size;
+    double wave_count = (double) single_block_count / (double) multiprocessor_count;
+
+    // Multi block tuning for low CTA: populating CTAs to at most 1 wave of SMs
+    if (wave_count < 1)
+    {
+        auto highestPowerof2 = [](int x)
+        {
+            x |= x >> 1;
+            x |= x >> 2;
+            x |= x >> 4;
+            x |= x >> 8;
+            x |= x >> 16;
+            return x ^ (x >> 1);
+        };
+
+        // calculate the maximum blocks to be populated at most 1 wave
+        multi_block_count = floor(multiprocessor_count / single_block_count);
+        // make multi_block_count a power of 2 for tuning convenience.
+        multi_block_count = highestPowerof2(multi_block_count);
+        // make multi_block_count at most 64 and at least 1.
+        multi_block_count = std::min(multi_block_count, 64);
+        multi_block_count = std::max(multi_block_count, 1);
+
+        // tune only when original CTA is too small, multi_block_count is too big, and history length < 2^16
+        // For Hopper, most cases there are 114, 132, 144 SMs. For H20 about 78.
+        // single_block_count = [1..8]
+        // multi_block_count = [16,32,64,128]
+        // history_length = [1024..65536]
+        if (single_block_count <= 8 && multi_block_count >= 16 && history_length < 65536)
+        {
+            if (history_length < 2048)
+            {
+                // for history length < 2048 and low CTA, scaling is not effective, so we set a hard limit to
+                // multi_block_count = 4
+                multi_block_count = std::min(multi_block_count, 4);
+            }
+            else if (history_length < 65536)
+            {
+                // at single_block == 8, multi_block_count can only be 16. (SM / 8 ~= 16)
+                // tune only 2048 <= kvlen < 8192
+                if (single_block_count == 8 && history_length <= 8192)
+                {
+                    multi_block_count >>= 1;
+                }
+                else
+                {
+                    auto getLog2 = [](int x) { return x ? 31 - __builtin_clz(x) : -1; };
+                    auto history_length_log2 = getLog2(history_length);
+                    // Adjust multi_block_count based on history length using formula:
+                    // shift_amount = 3 - (log2(history_length) - 10) / 2
+                    // This gives us:
+                    // - history_length in [2^11, 2^12): shift by 3
+                    // - history_length in [2^13, 2^14): shift by 2
+                    // - history_length in [2^15, 2^16): shift by 1
+                    multi_block_count >>= 3 - (history_length_log2 - 10) / 2;
+                }
+            }
+        }
+        TLLM_CHECK_WITH_INFO((multi_block_count * single_block_count) <= multiprocessor_count,
+            "The adjusted MultiBlock exceed number of SMs, adding additional wave may result to perf drop.");
+    }
+    return multi_block_count;
 }
 
 } // namespace kernels

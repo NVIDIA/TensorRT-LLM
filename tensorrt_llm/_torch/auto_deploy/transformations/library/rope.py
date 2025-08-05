@@ -141,6 +141,12 @@ def match_rope_pattern(gm: GraphModule) -> int:
         torch.randn(batch_size, num_heads, seq_len, head_dim, device="meta", dtype=torch.float16),
         torch.randn(batch_size, seq_len, head_dim // 2, device="meta", dtype=torch.float16),
     ]
+    # float32 input can change the graph when there's .float() in pattern
+    dummy_complex_2 = [
+        torch.randn(batch_size, num_heads, seq_len, head_dim, device="meta", dtype=torch.float32),
+        torch.randn(batch_size, num_heads, seq_len, head_dim, device="meta", dtype=torch.float32),
+        torch.randn(batch_size, seq_len, head_dim // 2, device="meta", dtype=torch.float32),
+    ]
     register_ad_pattern(
         search_fn=_explicit_rope_pattern,
         replace_fn=_explicit_rope_repl,
@@ -167,6 +173,16 @@ def match_rope_pattern(gm: GraphModule) -> int:
         replace_fn=_complex_rope_repl,
         patterns=patterns,
         dummy_args=dummy_complex,
+        op_ignore_types={
+            torch.ops.aten.reshape.default: (int,),
+        },
+        scalar_workaround={"unsqueeze_dim": 1},
+    )
+    register_ad_pattern(
+        search_fn=_complex_rope_pattern,
+        replace_fn=_complex_rope_repl,
+        patterns=patterns,
+        dummy_args=dummy_complex_2,
         op_ignore_types={
             torch.ops.aten.reshape.default: (int,),
         },

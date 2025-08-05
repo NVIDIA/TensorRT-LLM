@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -35,10 +35,10 @@
 #include "tensorrt_llm/runtime/lookaheadBuffers.h"
 #include "tensorrt_llm/runtime/loraCache.h"
 #include "tensorrt_llm/runtime/mcastGPUBuffer.h"
-#include "tensorrt_llm/runtime/request.h"
 #include "tensorrt_llm/runtime/speculativeDecodingMode.h"
 #include "tensorrt_llm/runtime/tllmRuntime.h"
 #include "tensorrt_llm/runtime/torchView.h"
+#include "tensorrt_llm/runtime/virtualMemory.h"
 
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDAStream.h>
@@ -214,6 +214,10 @@ void initBindings(pybind11::module_& m)
         .def_readwrite("scaling_vec_pointer", &tr::LoraCache::TaskLayerModuleConfig::scalingVecPointer)
         .def(py::self == py::self);
 
+    py::class_<tr::CudaVirtualMemoryManager>(m, "CudaVirtualMemoryManager")
+        .def("release_with_tag", &tr::CudaVirtualMemoryManager::releaseWithTag, py::arg("tag"))
+        .def("materialize_with_tag", &tr::CudaVirtualMemoryManager::materializeWithTag, py::arg("tag"));
+
     py::classh<tr::BufferManager>(m, "BufferManager")
         .def(py::init<tr::BufferManager::CudaStreamPtr, bool>(), py::arg("stream"), py::arg("trim_pool") = false)
         .def_property_readonly("stream", &tr::BufferManager::getStream);
@@ -249,24 +253,6 @@ void initBindings(pybind11::module_& m)
         .def("report_to_profiler", &tr::TllmRuntime::reportToProfiler, py::arg("context_id"))
         .def_property_readonly("logits_dtype_from_engine",
             [](tr::TllmRuntime& self) { return self.getEngine().getTensorDataType("logits"); });
-
-    py::class_<tr::decoder_batch::Request>(m, "Request")
-        .def(py::init<tr::decoder_batch::Request::TensorConstPtr, tr::SizeType32, std::optional<tr::SizeType32>,
-                 std::optional<tr::SizeType32>>(),
-            py::arg("ids"), py::arg("input_len"), py::arg("max_new_tokens") = std::nullopt,
-            py::arg("end_id") = std::nullopt)
-        .def_readwrite("ids", &tr::decoder_batch::Request::ids)
-        .def_readwrite("input_len", &tr::decoder_batch::Request::inputLen)
-        .def_readwrite("max_new_tokens", &tr::decoder_batch::Request::maxNewTokens)
-        .def_readwrite("end_id", &tr::decoder_batch::Request::endId)
-        .def_readwrite("draft_logits", &tr::decoder_batch::Request::draftLogits)
-        .def_readwrite("embedding_bias", &tr::decoder_batch::Request::embeddingBias)
-        .def_readwrite("bad_words_list", &tr::decoder_batch::Request::badWordsList)
-        .def_readwrite("stop_words_list", &tr::decoder_batch::Request::stopWordsList)
-        .def_readwrite("generated_tokens_per_engine_step", &tr::decoder_batch::Request::generatedTokensPerEngineStep)
-        .def_readwrite("medusa_paths", &tr::decoder_batch::Request::medusaPaths)
-        .def_readwrite("medusa_tree_ids", &tr::decoder_batch::Request::medusaTreeIds)
-        .def_readwrite("lookahead_runtime_config", &tr::decoder_batch::Request::lookaheadRuntimeConfig);
 
     py::class_<tr::decoder_batch::Input>(m, "DecoderBatchInput")
         .def(py::init<std::vector<std::vector<tr::ITensor::SharedConstPtr>>, tr::SizeType32>(), py::arg("logits"),
@@ -368,7 +354,6 @@ void initBindings(pybind11::module_& m)
         .def_property_readonly("next_draft_tokens_lengths", &tr::decoder::DecoderState::getNextDraftTokensLengths)
         .def_property_readonly("accepted_lengths_cum_sum", &tr::decoder::DecoderState::getAcceptedLengthsCumSum)
         .def_property_readonly("accepted_packed_paths", &tr::decoder::DecoderState::getAcceptedPackedPaths)
-        .def_property_readonly("finished_steps", &tr::decoder::DecoderState::getFinishedSteps)
         .def_property_readonly("max_beam_width", &tr::decoder::DecoderState::getMaxBeamWidth)
         .def_property_readonly("max_sequence_length", &tr::decoder::DecoderState::getMaxSequenceLength)
         .def_property_readonly("max_decoding_decoder_tokens", &tr::decoder::DecoderState::getMaxDecodingDecoderTokens)
@@ -424,6 +409,29 @@ void initBindings(pybind11::module_& m)
         "max_workspace_size_lowprecision",
         [](int32_t tp_size) { return tensorrt_llm::kernels::max_workspace_size_lowprecision(tp_size); },
         "Calculate the maximum workspace size needed for low precision all-reduce operations");
+
+    py::enum_<tr::CudaVirtualMemoryAllocator::RestoreMode>(m, "CudaVirtualMemoryAllocatorRestoreMode")
+        .value("NONE", tr::CudaVirtualMemoryAllocator::RestoreMode::NONE)
+        .value("CPU", tr::CudaVirtualMemoryAllocator::RestoreMode::CPU)
+        .value("PINNED", tr::CudaVirtualMemoryAllocator::RestoreMode::PINNED)
+        .value("MEMSET", tr::CudaVirtualMemoryAllocator::RestoreMode::MEMSET);
+
+    m.def("get_virtual_memory_manager", &tr::getVirtualMemoryManager, "Get the virtual memory manager",
+        py::return_value_policy::reference);
+
+    m.def(
+        "set_virtual_memory_allocator",
+        [](std::string const& tag, tr::CudaVirtualMemoryAllocator::RestoreMode mode, uintptr_t stream)
+        {
+            static_assert(sizeof(uintptr_t) == sizeof(cudaStream_t));
+            tr::setVirtualMemoryAllocator(tag, mode,
+                std::make_shared<tr::CudaStream>(
+                    reinterpret_cast<cudaStream_t>(stream), tensorrt_llm::common::getDevice(), false));
+        },
+        "Set the virtual memory allocator and start allocating virtual memory for CUDA allocations");
+
+    m.def("clear_virtual_memory_allocator", &tr::clearVirtualMemoryAllocator,
+        "Reset the current virtual memory allocator and stop allocating virtual memory for CUDA allocations");
 
     py::class_<tensorrt_llm::runtime::McastGPUBuffer>(m, "McastGPUBuffer")
         .def(py::init<size_t, uint32_t, uint32_t, at::Device, bool>())

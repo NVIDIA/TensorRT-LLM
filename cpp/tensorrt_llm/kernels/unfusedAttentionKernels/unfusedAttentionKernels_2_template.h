@@ -530,32 +530,10 @@ __global__ void applyBiasRopeUpdateKVCache(QKVPreprocessingParams<T, KVCacheBuff
                 q = mmha::mul<VecType, float, VecType>(logn_scale, q);
             }
             auto const channelIdx{tidx};
-            auto const tokenIdxLowerBound
-                = max(cache_seq_len - params.cyclic_kv_cache_len + params.sink_token_len, params.sink_token_len);
-            bool const useKVCache = params.kv_cache_buffer.data != nullptr;
-            bool valid_kv_cache_pos = useKVCache // In KV-cache-less mode. No need to store KV values
-                && (token_idx_in_seq >= tokenIdxLowerBound || token_idx_in_seq < params.sink_token_len);
-            auto token_idx_in_kv_cache = token_idx_in_seq;
 
-            // Additional kv cache blocks will be allocated if sliding window attention and paged kv context fmha
-            // (!STORE_QKV) are used together as the original kv cache cannot be overwritten. In this case, new tokens'
-            // kv will just be appended to the kv cache instead of overwriting it in a circular way. And the kv cache
-            // will be overwritten after FMHA kernels.
-            if constexpr (STORE_QKV || GEN_PHASE)
-            {
-                // Write the new tokens' kv to the cyclic kv cache.
-                token_idx_in_kv_cache = params.kv_cache_buffer.getKVTokenIdx(token_idx_in_seq);
-            }
-            else
-            {
-                // Write the new tokens' kv to the temporary kv cache (write linearly to the cyclic kv cache first, then
-                // the temporary kv cache).
-                valid_kv_cache_pos = useKVCache;
-                if (past_seq_len >= params.cyclic_kv_cache_len)
-                {
-                    token_idx_in_kv_cache = params.cyclic_kv_cache_len + local_token_idx;
-                }
-            }
+            bool const useKVCache = params.kv_cache_buffer.data != nullptr;
+            auto token_idx_in_kv_cache = token_idx_in_seq;
+            bool valid_kv_cache_pos = useKVCache;
 
             // Make sure pairs of q or v vecs have been read before write.
             // One block will handle single head.
@@ -945,32 +923,8 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
         }
 
         auto const channelIdx = head_dim_vec_idx;
-        auto const tokenIdxLowerBound = max(cache_seq_len - params.cyclic_kv_cache_len, 0);
         bool const useKVCache = GEN_PHASE || params.kv_cache_buffer.data != nullptr;
-        bool valid_kv_cache_pos = useKVCache // In KV-cache-less mode. No need to store KV values
-            && (token_idx_in_kv_cache >= tokenIdxLowerBound);
-        // Additional kv cache blocks will be allocated if sliding window attention and paged kv context fmha
-        // (!STORE_QKV) are used together as the original kv cache cannot be overwritten. In this case, new tokens' kv
-        // will just be appended to the kv cache instead of overwriting it in a circular way. And the kv cache will be
-        // overwritten after FMHA kernels.
-        if constexpr (STORE_QKV || GEN_PHASE)
-        {
-            bool const cyclic_kv_cache = cache_seq_len > params.cyclic_kv_cache_len;
-
-            // Write the new tokens' kv to the cyclic kv cache.
-            token_idx_in_kv_cache
-                = cyclic_kv_cache ? (token_idx_in_kv_cache % params.cyclic_kv_cache_len) : token_idx_in_kv_cache;
-        }
-        else
-        {
-            // Write the new tokens' kv to the temporary kv cache (write linearly to the cyclic kv cache first, then the
-            // temporary kv cache).
-            valid_kv_cache_pos = useKVCache;
-            if (past_seq_len >= params.cyclic_kv_cache_len)
-            {
-                token_idx_in_kv_cache = params.cyclic_kv_cache_len + token_idx_in_seq;
-            }
-        }
+        bool valid_kv_cache_pos = useKVCache;
 
         auto kDst = useKVCache
             ? reinterpret_cast<TCache*>(params.kv_cache_buffer.getKBlockPtr(batch_idx, token_idx_in_kv_cache))
@@ -1111,7 +1065,8 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
         int(divUp(params.batch_size, MIN_SEQUENCES_PER_WARP)));                                                        \
     if (params.position_embedding_type == PositionEmbeddingType::kROPE_GPT_NEOX                                        \
         || params.position_embedding_type == PositionEmbeddingType::kLONG_ROPE                                         \
-        || params.position_embedding_type == PositionEmbeddingType::kROPE_M)                                           \
+        || params.position_embedding_type == PositionEmbeddingType::kROPE_M                                            \
+        || params.position_embedding_type == PositionEmbeddingType::kYARN)                                             \
     {                                                                                                                  \
         applyBiasRopeUpdateKVCache<T, TCache, Dh_MAX, ADD_BIAS, STORE_QKV, KVCacheBuffer,                              \
             RotaryPositionEmbeddingType::GPT_NEOX, DYNAMIC_ROTARY_SCALING, FP8_OUTPUT, GEN_PHASE>                      \
@@ -1275,7 +1230,8 @@ void kernelV1Dispatch(QKVPreprocessingParams<T, KVCacheBuffer> params, cudaStrea
     config.attrs = attrs;                                                                                              \
     if (params.position_embedding_type == PositionEmbeddingType::kROPE_GPT_NEOX                                        \
         || params.position_embedding_type == PositionEmbeddingType::kLONG_ROPE                                         \
-        || params.position_embedding_type == PositionEmbeddingType::kROPE_M)                                           \
+        || params.position_embedding_type == PositionEmbeddingType::kROPE_M                                            \
+        || params.position_embedding_type == PositionEmbeddingType::kYARN)                                             \
     {                                                                                                                  \
         cudaLaunchKernelEx(&config,                                                                                    \
             applyBiasRopeUpdateKVCacheV2<T, TCache, BLOCK_SIZE, Dh, ADD_BIAS, STORE_QKV, FP8_OUTPUT, GEN_PHASE,        \

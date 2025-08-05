@@ -16,6 +16,7 @@ import copy
 import os
 import platform
 import re
+import time
 from difflib import SequenceMatcher
 from pathlib import Path
 
@@ -43,7 +44,7 @@ def venv_check_output(venv, cmd, env=None, **kwargs):
     return venv.run_cmd(cmd, caller=_war_check_output, env=env, **kwargs)
 
 
-def venv_mpi_check_call(venv, mpi_cmd, python_cmd):
+def venv_mpi_check_call(venv, mpi_cmd, python_cmd, **kwargs):
     """
     This function WAR check_call() to run python_cmd with mpi.
     If mpi_cmd = ["mpirun", "-n", "2"] and python_cmd = ["run.py"], the command will be:
@@ -60,10 +61,10 @@ def venv_mpi_check_call(venv, mpi_cmd, python_cmd):
         kwargs["cwd"] = venv.get_working_directory()
         return check_call(merged_cmd, **kwargs)
 
-    venv.run_cmd(python_cmd, caller=_war_check_call)
+    venv.run_cmd(python_cmd, caller=_war_check_call, **kwargs)
 
 
-def venv_mpi_check_output(venv, mpi_cmd, python_cmd, env=None):
+def venv_mpi_check_output(venv, mpi_cmd, python_cmd, env=None, **kwargs):
     """
     This function WAR check_output() to run python_cmd with mpi.
     If mpi_cmd = ["mpirun", "-n", "2"] and python_cmd = ["run.py"], the command will be:
@@ -80,7 +81,7 @@ def venv_mpi_check_output(venv, mpi_cmd, python_cmd, env=None):
         kwargs["cwd"] = venv.get_working_directory()
         return check_output(merged_cmd, **kwargs)
 
-    return venv.run_cmd(python_cmd, caller=_war_check_output, env=env)
+    return venv.run_cmd(python_cmd, caller=_war_check_output, env=env, **kwargs)
 
 
 def parse_mpi_cmd(cmd):
@@ -505,6 +506,7 @@ def convert_weights(llm_venv,
         convert_cmd.append(f"--quant_ckpt_path={quant_ckpt_path}")
     if per_group:
         convert_cmd.append("--per_group")
+    timeout = kwargs.pop('timeout', None)
 
     for key, value in kwargs.items():
         if isinstance(value, bool):
@@ -514,7 +516,7 @@ def convert_weights(llm_venv,
             convert_cmd.extend([f"--{key}={value}"])
 
     if llm_venv:
-        venv_check_call(llm_venv, convert_cmd)
+        venv_check_call(llm_venv, convert_cmd, timeout=timeout)
         return model_dir
     else:
         return convert_cmd, model_dir
@@ -606,6 +608,7 @@ def quantize_data(llm_venv,
 
     if kv_cache_dtype:
         quantize_cmd.append(f"--kv_cache_dtype={kv_cache_dtype}")
+    timeout = kwargs.pop('timeout', None)
 
     for key, value in kwargs.items():
         if isinstance(value, bool):
@@ -616,7 +619,7 @@ def quantize_data(llm_venv,
 
     if llm_venv:
         if not exists(output_dir):
-            venv_check_call(llm_venv, quantize_cmd)
+            venv_check_call(llm_venv, quantize_cmd, timeout=timeout)
         return output_dir
     else:
         return quantize_cmd, output_dir
@@ -771,7 +774,9 @@ def test_multi_lora_support(
     zero_lora_weights=True,
     use_code_prompts=False,
 ):
+    start_time = time.time()
     print("Creating dummy LoRAs...")
+    lora_start = time.time()
     lora_paths = generate_dummy_loras(
         hf_model_dir=hf_model_dir,
         lora_output_dir=llm_venv.get_working_directory(),
@@ -779,8 +784,13 @@ def test_multi_lora_support(
         lora_rank=lora_rank,
         target_modules=target_hf_modules,
         zero_weights=zero_lora_weights)
+    lora_end = time.time()
+    print(
+        f"Creating dummy LoRAs completed in {(lora_end - lora_start):.2f} seconds."
+    )
 
     print("Build engines...")
+    build_start = time.time()
     build_cmd = [
         "trtllm-build",
         f"--checkpoint_dir={tllm_ckpt_dir}",
@@ -801,6 +811,9 @@ def test_multi_lora_support(
         "--max_beam_width=1",
     ]
     check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
+    build_end = time.time()
+    print(
+        f"Build engines completed in {(build_end - build_start):.2f} seconds.")
 
     if use_code_prompts:
         input_prompts = [
@@ -822,6 +835,7 @@ def test_multi_lora_support(
         ]
 
     print("Run inference with C++ runtime with pybind...")
+    inference_start = time.time()
     run_script = f"{example_root}/../../../run.py" if "core" in example_root else f"{example_root}/../run.py"
     run_cmd = [
         run_script,
@@ -842,6 +856,15 @@ def test_multi_lora_support(
         "--max_output_len=30",
     ]
     venv_check_call(llm_venv, run_cmd)
+    inference_end = time.time()
+    print(
+        f"Inference completed in {(inference_end - inference_start):.2f} seconds."
+    )
+
+    total_time = time.time() - start_time
+    print(
+        f"Total test_multi_lora_support execution time: {total_time:.2f} seconds"
+    )
 
 
 def get_dummy_spec_decoding_heads(hf_model_dir,

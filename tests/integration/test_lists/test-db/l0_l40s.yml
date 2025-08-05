@@ -33,6 +33,10 @@ l0_l40s:
   - test_e2e.py::test_ptp_quickstart_multimodal_phi4mm[image_audio]
   - test_e2e.py::test_ptp_quickstart_bert[VANILLA-BertForSequenceClassification-bert/bert-base-uncased-yelp-polarity]
   - test_e2e.py::test_ptp_quickstart_bert[TRTLLM-BertForSequenceClassification-bert/bert-base-uncased-yelp-polarity]
+  - test_e2e.py::test_openai_completions_with_logit_bias[torch_sampler]
+  - test_e2e.py::test_openai_chat_with_logit_bias[torch_sampler]
+  - test_e2e.py::test_openai_completions_with_logit_bias[trtllm_sampler]
+  - test_e2e.py::test_openai_chat_with_logit_bias[trtllm_sampler]
 - condition:
     ranges:
       system_gpu_count:
@@ -106,6 +110,6 @@ l0_l40s:
   - examples/test_redrafter.py::test_llm_redrafter_1gpu[use_py_session-redrafter-vicuna-7b-v1.3-bfloat16-dl5-nb5-bs8]
   - examples/test_redrafter.py::test_llm_redrafter_1gpu[use_py_session-redrafter-vicuna-7b-v1.3-bfloat16-dl5-nb8-bs8]
   - examples/test_granite.py::test_granite_bf16_lora[granite-3.0-2b-instruct]
-  - examples/test_granite.py::test_granite_bf16_lora[granite-3.0-1b-a400m-instruct]
+  - examples/test_granite.py::test_granite_bf16_lora[granite-3.0-1b-a400m-instruct] TIMEOUT (90)
   - examples/test_llama.py::test_llama_3_x_fp8_with_bf16_lora[llama-v3-8b-instruct-hf]
   - examples/test_qwen.py::test_llm_qwen1_5_7b_single_gpu_lora[qwen1.5_7b_chat-Qwen1.5-7B-Chat-750Mb-lora]

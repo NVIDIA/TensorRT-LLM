@@ -162,6 +162,10 @@ static_assert(CACHE_ELEM_ENUM != 0);
 #define OPTIMIZE_FOR_LATENCY 1
 #endif
 
+#ifndef IS_SPEC_DEC_TREE
+#define IS_SPEC_DEC_TREE 1 // by default SPEC_DEC expect tree-based draft token structure
+#endif
+
 #define DBG_BATCH_SIZE 2
 #define DBG_SEQ_LEN 256 * 4 + 3
 #define DBG_NB_CTAS_PER_SEQ 8

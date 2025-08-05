@@ -71,7 +71,8 @@ def test_kv_cache_event_data_serialization():
     flush_events(kv_cache_manager)
     events = kv_cache_manager.get_latest_events(10)
     serialized_event = KVCacheEventSerializer.serialize(events)
-    assert len(serialized_event) == 1 and serialized_event[0]["event_id"] == 0
+    assert len(serialized_event) == 1 and serialized_event[0][
+        "event_id"] == 0 and serialized_event[0]["window_size"] == 256
     assert serialized_event[0]["data"]["type"] == "created"
     assert len(serialized_event[0]["data"]["num_blocks_per_cache_level"]) == 2
 

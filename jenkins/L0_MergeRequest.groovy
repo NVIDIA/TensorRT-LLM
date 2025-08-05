@@ -347,12 +347,15 @@ def mergeWaiveList(pipeline, globalVars)
     // Get waive list diff in current MR
     def diff = getMergeRequestOneFileChanges(pipeline, globalVars, "tests/integration/test_lists/waives.txt")
 
+    // Write diff to a temporary file to avoid shell escaping issues
+    writeFile file: 'diff_content.txt', text: diff
+
     // Merge waive lists
     sh """
         python3 mergeWaiveList.py \
         --cur-waive-list=waives_CUR_${env.gitlabCommit}.txt \
         --latest-waive-list=waives_TOT_${targetBranchTOTCommit}.txt \
-        --diff='${diff}' \
+        --diff-file=diff_content.txt \
         --output-file=waives.txt
     """
     trtllm_utils.uploadArtifacts("waives*.txt", "${UPLOAD_PATH}/waive_list/")
@@ -847,7 +850,7 @@ def collectTestResults(pipeline, testFilter)
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "apk add py3-pip")
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 config set global.break-system-packages true")
             sh """
-                python3 llm/jenkins/test_rerun.py \
+                python3 llm/jenkins/scripts/test_rerun.py \
                 generate_rerun_report \
                 --output-file=rerun/rerun_report.xml \
                 --input-files=${inputfiles}
