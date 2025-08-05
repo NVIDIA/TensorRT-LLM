@@ -193,6 +193,9 @@ def createKubernetesPodConfig(type, arch = "amd64", build_wheel = false)
 
 
 def prepareWheelFromBuildStage(dockerfileStage, arch) {
+    // Temporarily disable this feature due to https://nvbugs/5433581
+    return ""
+
     if (TRIGGER_TYPE != "post-merge") {
         echo "Trigger type is not post-merge, skip preparing wheel from build stage"
         return ""
