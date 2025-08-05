@@ -572,22 +572,30 @@ class FP8BlockScalesLinearMethod(LinearMethodBase):
             input = input.to(torch.bfloat16) * module.input_scale
         assert input.dtype == torch.bfloat16
 
-        if get_sm_version() == 100 and not module.use_trtllmgen_mm:
-            import deep_gemm
-            a, a_sf = fp8_utils.per_token_quant_and_transform(input)
-            output = torch.empty((input.shape[0], module.weight.shape[0]),
-                                 device=input.device,
-                                 dtype=torch.bfloat16)
-            deep_gemm.fp8_gemm_nt((a, a_sf),
-                                  (module.weight, module.weight_scale),
-                                  output,
-                                  disable_ue8m0_cast=True)
+        if get_sm_version() == 100:
+            if module.use_cute_dsl_blockscaling_mm:
+                # TODO (@lmin): replace with cute_dsl gemm
+                act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
+                    input)
+                output = torch.ops.trtllm.fp8_block_scaling_gemm(
+                    act_input_fp8, module.weight, act_input_sf,
+                    module.weight_scale)
+            else:
+                import deep_gemm
+                a, a_sf = fp8_utils.per_token_quant_and_transform(input)
+                output = torch.empty((input.shape[0], module.weight.shape[0]),
+                                     device=input.device,
+                                     dtype=torch.bfloat16)
+                deep_gemm.fp8_gemm_nt((a, a_sf),
+                                      (module.weight, module.weight_scale),
+                                      output,
+                                      disable_ue8m0_cast=True)
         else:
             act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
                 input)
-
             output = torch.ops.trtllm.fp8_block_scaling_gemm(
                 act_input_fp8, module.weight, act_input_sf, module.weight_scale)
+
         if bias is not None:
             output = output + bias
         return output
@@ -1461,7 +1469,7 @@ class Linear(nn.Module):
         lora: Optional[LoraLayer] = None,
         allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO,
         force_dynamic_quantization: bool = False,
-        use_trtllmgen_mm: bool = False,
+        use_cute_dsl_blockscaling_mm: bool = False,
     ):
         from ..distributed import AllReduce
 
@@ -1478,7 +1486,7 @@ class Linear(nn.Module):
         self.tp_mode = tensor_parallel_mode
         self.gather_output = gather_output
         self.force_dynamic_quantization = force_dynamic_quantization
-        self.use_trtllmgen_mm = use_trtllmgen_mm
+        self.use_cute_dsl_blockscaling_mm = use_cute_dsl_blockscaling_mm
 
         local_in_features = in_features
         local_out_features = out_features

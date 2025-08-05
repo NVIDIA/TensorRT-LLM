@@ -654,7 +654,7 @@ def test_fused_moe_fp8_blockwise_cute_dsl(dtype,
         dtype=dtype,
         model_config=ModelConfig(quant_config=quant_config),
         # Note: use deepgemm mm will cause accuracy error, so we use trtllmgen mm here
-        use_trtllmgen_mm=True,
+        use_cute_dsl_blockscaling_mm=True,
     )
     ref_fused_moe.load_weights([weights])
     ref_fused_moe.cuda()
@@ -953,7 +953,7 @@ class RefGatedMLPFusedMoE(nn.Module):
                  intermediate_size: int,
                  dtype: Optional[torch.dtype] = None,
                  model_config: ModelConfig = ModelConfig(),
-                 use_trtllmgen_mm: bool = False):
+                 use_cute_dsl_blockscaling_mm: bool = False):
         super().__init__()
         self.num_experts = num_experts
         self.routing_method = routing_method
@@ -970,7 +970,7 @@ class RefGatedMLPFusedMoE(nn.Module):
                 bias=False,
                 dtype=self.dtype,
                 config=model_config,
-                use_trtllmgen_mm=use_trtllmgen_mm,
+                use_cute_dsl_blockscaling_mm=use_cute_dsl_blockscaling_mm,
             ) for _ in range(self.num_experts)
         ])
 
