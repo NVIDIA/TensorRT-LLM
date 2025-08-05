@@ -39,7 +39,6 @@ def llm():
                kv_cache_config=KvCacheConfig(max_tokens=1000),
                max_batch_size=8,
                max_seq_len=64,
-               enable_trtllm_sampler=True,
                disable_overlap_scheduler=True)
 
 
