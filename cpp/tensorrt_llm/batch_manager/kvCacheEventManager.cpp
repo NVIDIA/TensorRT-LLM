@@ -35,7 +35,6 @@ KVCacheEventManager::KVCacheEventManager(size_t maxKVEventEntries, std::optional
     , mAttentionDpSize{attentionDpSize}
     , mAttentionDpEventsGatherPeriodMs(attentionDpEventsGatherPeriodMs)
 {
-
     TLLM_CHECK(mMaxSize > 0);
     if (mAttentionDpRank)
     {
@@ -49,6 +48,8 @@ KVCacheEventManager::KVCacheEventManager(size_t maxKVEventEntries, std::optional
             // Need to increase size
             mMaxSize *= mAttentionDpSize.value();
         }
+        // Create a communicator to be used for event exchange
+        mMpiComm = std::make_unique<tensorrt_llm::mpi::MpiComm>(COMM_SESSION.split(0, mAttentionDpRank.value()));
     }
     else
     {
@@ -162,37 +163,49 @@ void KVCacheEventManager::exchangeAttentionDpThread()
     while (true)
     {
         TLLM_CHECK(mAttentionDpRank);
+
+        // Check if any of the ranks have been shutdown
+        int32_t numFinished = 0;
+        int32_t finished = mRun ? 0 : 1;
+        mMpiComm->allreduce(&finished, &numFinished, 1, mpi::MpiType::kINT32, mpi::MpiOp::SUM);
+        if (numFinished > 0)
+        {
+            TLLM_LOG_INFO("One of the rank has been shut down, exiting");
+            break;
+        }
+
         // If we are not rank 0, send events to rank 0
         if (mAttentionDpRank.value() != 0)
         {
             std::vector<char> serializedEvents;
+            uint64_t numEvents = 0;
             {
                 std::unique_lock<std::mutex> lck(mEventsMutex);
                 serializedEvents = executor::Serialization::serialize(mEvents);
+                numEvents = mEvents.size();
                 mEvents.clear();
             }
-            uint64_t vecSize = serializedEvents.size();
-            COMM_SESSION.send(&vecSize, 1, mpi::MpiType::kUINT64, 0, mpi::MpiTag::kKvCacheEventSize);
-            COMM_SESSION.send(
-                serializedEvents.data(), serializedEvents.size(), mpi::MpiType::kCHAR, 0, mpi::MpiTag::kKvCacheEvent);
+            uint64_t vecSize = numEvents > 0 ? serializedEvents.size() : 0;
+            mMpiComm->send(&vecSize, 1, mpi::MpiType::kUINT64, 0, mpi::MpiTag::kKvCacheEventSize);
+            if (vecSize > 0)
+            {
+                mMpiComm->send(serializedEvents.data(), serializedEvents.size(), mpi::MpiType::kCHAR, 0,
+                    mpi::MpiTag::kKvCacheEvent);
+            }
         }
         else
         {
             TLLM_CHECK(mAttentionDpSize.has_value());
             // Loop until have received events from all ranks
-            int32_t numRecvs = 0;
-            while (numRecvs < mAttentionDpSize.value() - 1)
+            for (int rank = 1; rank < mAttentionDpSize.value(); ++rank)
             {
-                MPI_Status probeStatus;
-                if (COMM_SESSION.iprobe(MPI_ANY_SOURCE, mpi::MpiTag::kKvCacheEvent, &probeStatus))
+                uint64_t vecSize{0};
+                mMpiComm->recv(&vecSize, 1, mpi::MpiType::kUINT64, rank, mpi::MpiTag::kKvCacheEventSize);
+                if (vecSize > 0)
                 {
-                    uint64_t vecSize{0};
-                    COMM_SESSION.recv(
-                        &vecSize, 1, mpi::MpiType::kUINT64, probeStatus.MPI_SOURCE, mpi::MpiTag::kKvCacheEventSize);
-
                     std::vector<char> serializedEvents(vecSize);
-                    COMM_SESSION.recv(serializedEvents.data(), vecSize, mpi::MpiType::kCHAR, probeStatus.MPI_SOURCE,
-                        mpi::MpiTag::kKvCacheEvent);
+                    mMpiComm->recv(
+                        serializedEvents.data(), vecSize, mpi::MpiType::kCHAR, rank, mpi::MpiTag::kKvCacheEvent);
 
                     // Deserialize the events and add them to the local queue
                     auto rankEvents = executor::Serialization::deserializeKVCacheEvents(serializedEvents);
@@ -201,11 +214,10 @@ void KVCacheEventManager::exchangeAttentionDpThread()
                         mEvents.insert(mEvents.end(), rankEvents.begin(), rankEvents.end());
                         mEmptyCV.notify_one();
                     }
-                    numRecvs++;
                 }
             }
-            std::this_thread::sleep_for(std::chrono::milliseconds(mAttentionDpEventsGatherPeriodMs));
         }
+        std::this_thread::sleep_for(std::chrono::milliseconds(mAttentionDpEventsGatherPeriodMs));
     }
 #else
     TLLM_THROW("Multi device support is disabled.");

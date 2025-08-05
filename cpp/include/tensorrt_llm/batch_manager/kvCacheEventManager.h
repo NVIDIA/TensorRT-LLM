@@ -105,6 +105,9 @@ private:
 
     /// @brief The period in milliseconds to gather attention DP events across rank
     SizeType32 mAttentionDpEventsGatherPeriodMs;
+
+    /// @brief MPI communicator for attention DP
+    std::unique_ptr<tensorrt_llm::mpi::MpiComm> mMpiComm;
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager

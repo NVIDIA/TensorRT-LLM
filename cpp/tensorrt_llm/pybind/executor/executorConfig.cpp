@@ -108,7 +108,7 @@ void initConfigBindings(pybind11::module_& m)
     };
     auto kvCacheConfigSetstate = [](py::tuple const& state)
     {
-        if (state.size() != 13)
+        if (state.size() != 14)
         {
             throw std::runtime_error("Invalid state!");
         }
