@@ -9,13 +9,15 @@ from ..custom_ops import IS_FLASHINFER_AVAILABLE
 
 class RMSNorm(nn.Module):
 
-    def __init__(self,
-                 *,
-                 hidden_size: int,
-                 eps: float,
-                 dtype: Optional[torch.dtype] = None,
-                 device: Optional[torch.device] = None,
-                 has_weights: bool = True):
+    def __init__(
+        self,
+        *,
+        hidden_size: int,
+        eps: float,
+        dtype: Optional[torch.dtype] = None,
+        device: Optional[torch.device] = None,
+        has_weights: bool = True,
+    ):
         super().__init__()
         if has_weights:
             self.weight = nn.Parameter(
@@ -48,6 +50,7 @@ class RMSNorm(nn.Module):
             if isinstance(residual, torch.Tensor):
                 hidden_states = hidden_states + residual.to(torch.float32)
                 residual = hidden_states.to(input_dtype)
+
             variance = hidden_states.pow(2).mean(-1, keepdim=True)
             hidden_states = hidden_states * torch.rsqrt(variance +
                                                         self.variance_epsilon)
