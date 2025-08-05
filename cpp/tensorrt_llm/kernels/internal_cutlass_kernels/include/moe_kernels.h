@@ -67,6 +67,7 @@ struct ActivationParams
     ActivationType activation_type;
     float const* swiglu_alpha = nullptr;
     float const* swiglu_beta = nullptr;
+    float const* swiglu_limit = nullptr;
 
     explicit ActivationParams(ActivationType activation_type)
         : activation_type(activation_type)
@@ -75,10 +76,12 @@ struct ActivationParams
             "SwigluBias is not supported in ActivationParams without swiglu_alpha and swiglu_beta");
     }
 
-    ActivationParams(ActivationType activation_type, float const* swiglu_alpha, float const* swiglu_beta)
+    ActivationParams(
+        ActivationType activation_type, float const* swiglu_alpha, float const* swiglu_beta, float const* swiglu_limit)
         : activation_type(activation_type)
         , swiglu_alpha(swiglu_alpha)
         , swiglu_beta(swiglu_beta)
+        , swiglu_limit(swiglu_limit)
     {
     }
 
@@ -500,13 +503,6 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface
         = tensorrt_llm::kernels::fp8_blockscale_gemm::CutlassFp8BlockScaleGemmRunnerInterface;
     using ScaleBiasType = BackBoneType;
     using Self = CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType>;
-
-#if defined(ENABLE_BF16)
-    static constexpr bool use_wfp4a16
-        = std::is_same_v<WeightType, __nv_fp4_e2m1> && (std::is_same_v<T, half> || std::is_same_v<T, __nv_bfloat16>);
-#else
-    static constexpr bool use_wfp4a16 = std::is_same_v<WeightType, __nv_fp4_e2m1> && std::is_same_v<T, half>;
-#endif
 #if defined(ENABLE_FP8)
     static constexpr bool use_fp8 = (std::is_same_v<T, __nv_fp8_e4m3>
         || std::is_same_v<T, __nv_fp8_e5m2>) &&!std::is_same_v<WeightType, cutlass::uint4b_t>;
@@ -518,7 +514,6 @@ class CutlassMoeFCRunner : public CutlassMoeFCRunnerInterface
     static constexpr bool use_fp8 = false;
     static constexpr bool use_w4afp8 = false;
 #endif
-    static constexpr bool use_w4_groupwise = use_w4afp8 || use_wfp4a16;
 #if defined(ENABLE_FP4)
     static constexpr bool act_fp4 = std::is_same_v<T, __nv_fp4_e2m1>;
     static constexpr bool weight_fp4 = std::is_same_v<WeightType, __nv_fp4_e2m1>;
@@ -760,7 +755,7 @@ private:
     bool mayHaveFinalizeFused() const
     {
         return moe_gemm_runner_.supportsTmaWarpSpecialized() && moe_gemm_runner_.getSM() == 90
-            && !use_deterministic_hopper_reduce_ && !use_w4_groupwise;
+            && !use_deterministic_hopper_reduce_ && !use_w4afp8;
     }
 
     // TODO: This should eventually take the quant params to give more flexibility
