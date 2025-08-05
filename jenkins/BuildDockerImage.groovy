@@ -29,6 +29,8 @@ LLM_DEFAULT_TAG = env.defaultTag ?: "${LLM_SHORT_COMMIT}-${LLM_BRANCH_TAG}-${BUI
 RUN_SANITY_CHECK = params.runSanityCheck ?: false
 TRIGGER_TYPE = env.triggerType ?: "manual"
 
+ENABLE_USE_WHEEL_FROM_BUILD_STAGE = params.useWheelFromBuildStage ?: false
+
 WAIT_TIME_FOR_BUILD_STAGE = 60  // minutes
 
 BUILD_JOBS = "32"
@@ -193,8 +195,10 @@ def createKubernetesPodConfig(type, arch = "amd64", build_wheel = false)
 
 
 def prepareWheelFromBuildStage(dockerfileStage, arch) {
-    // Temporarily disable this feature due to https://nvbugs/5433581
-    return ""
+    if (!ENABLE_USE_WHEEL_FROM_BUILD_STAGE) {
+        echo "enableUseWheelFromBuildStage is false, skip preparing wheel from build stage"
+        return ""
+    }
 
     if (TRIGGER_TYPE != "post-merge") {
         echo "Trigger type is not post-merge, skip preparing wheel from build stage"
