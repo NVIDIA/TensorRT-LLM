@@ -750,6 +750,7 @@ protected:
         auto* d_cu_q_seq_lens_ptr = bufferCast<int64_t>(*(this->d_cu_q_seq_lens));
 
         int const loop_count = (this->mMaxSeqLen + this->mChunkSize - 1) / this->mChunkSize;
+        float bmm1_scale = 1.F / std::sqrt(static_cast<double>(this->mNopeSize + this->mRopeSize));
         // do not apply mask
         for (int _ = 0; _ < loop_count - 1; _++)
         {
@@ -770,8 +771,9 @@ protected:
             cudaMemcpy(d_output_ptr, h_output_ptr, this->m_h_output_tensor->getSizeInBytes(), cudaMemcpyHostToDevice);
             // merge softmax
             tensorrt_llm::kernels::invokeMergeAttnWithSoftmax<DataType>(d_output_accum_ptr, d_softmax_sum_accum_ptr,
-                d_output_accum_ptr, d_softmax_sum_accum_ptr, d_output_ptr, d_softmax_sum_ptr, this->mBatchSize,
-                d_cu_q_seq_lens_ptr, this->mMaxQSeqLen, d_merge_op, this->mNumHeads, this->mNopeSize, mStream->get());
+                d_output_accum_ptr, d_softmax_sum_accum_ptr, d_output_ptr, d_softmax_sum_ptr, bmm1_scale,
+                this->mBatchSize, d_cu_q_seq_lens_ptr, this->mMaxQSeqLen, d_merge_op, this->mNumHeads, this->mNopeSize,
+                mStream->get());
             cudaStreamSynchronize(mStream->get());
             // copy merged softmax sum back to host
             cudaMemcpy(h_softmax_sum_accum_ptr, d_softmax_sum_accum_ptr, this->m_h_softmax_sum_tensor->getSizeInBytes(),
@@ -800,7 +802,7 @@ protected:
             cudaMemcpyHostToDevice);
         cudaMemcpy(d_output_ptr, h_output_ptr, this->m_h_output_tensor->getSizeInBytes(), cudaMemcpyHostToDevice);
         tensorrt_llm::kernels::invokeMergeAttnWithSoftmax<DataType>(d_output_accum_ptr, d_softmax_sum_accum_ptr,
-            d_output_accum_ptr, d_softmax_sum_accum_ptr, d_output_ptr, d_softmax_sum_ptr, this->mBatchSize,
+            d_output_accum_ptr, d_softmax_sum_accum_ptr, d_output_ptr, d_softmax_sum_ptr, bmm1_scale, this->mBatchSize,
             d_cu_q_seq_lens_ptr, this->mMaxQSeqLen, d_merge_op, this->mNumHeads, this->mNopeSize, mStream->get());
         cudaStreamSynchronize(mStream->get());
         // copy merged softmax sum back to host
