@@ -18,7 +18,7 @@ def gpt_oss_attention(
     from transformers.models.gpt_oss.modeling_gpt_oss import apply_rotary_pos_emb
 
     # Add new parameters
-    sliding_window = getattr(self, "sliding_window", -1)  # Default to 128 if not present
+    sliding_window = getattr(self, "sliding_window", -1)  # Default to -1 if not present
 
     input_shape = hidden_states.shape[:-1]
     hidden_shape = (*input_shape, -1, self.head_dim)
