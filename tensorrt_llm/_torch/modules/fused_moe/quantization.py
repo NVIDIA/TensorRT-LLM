@@ -558,7 +558,6 @@ class DeepSeekFP8BlockScalesFusedMoEMethod(
 
     def load_weights(self, module: torch.nn.Module, weights: List[Dict],
                      weight_loading_mode: MoEWeightLoadingMode):
-        print(f"DeepSeekFP8BlockScalesFusedMoEMethod load_weights")
         if get_sm_version() == 100:
             expert_ids = set(module.initial_local_expert_ids)
             if self.need_load_shared_weights(module):
