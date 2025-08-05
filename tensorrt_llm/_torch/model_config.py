@@ -82,6 +82,8 @@ class ModelConfig(Generic[TConfig]):
 
     attn_backend: str = 'TRTLLM'
     moe_backend: str = 'CUTLASS'  # options can be CUTLASS, TRTLLM
+    # use_cute_dsl_fp8_block_scale_gemm: bool = False
+    # use_cute_dsl_fp8_block_scale_bmm: bool = False
     allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO
 
     # If true, enable min-latency mode. Currently only used for Llama4.

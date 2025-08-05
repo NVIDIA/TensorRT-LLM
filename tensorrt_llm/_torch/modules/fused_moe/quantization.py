@@ -430,7 +430,7 @@ class FP8QDQFusedMoEMethod(FusedMoEMethodBase):
         module.fc31_input_dequant.data.copy_(max_fc31_input_scale)
 
 
-class DeepSeekFP8BlockScalesFusedMoEMethod(FusedMoEMethodBase):
+class DeepSeekFP8BlockScalesFusedMoEMethodCuteDsl(FusedMoEMethodBase):
 
     def create_weights(self, module: torch.nn.Module):
         weight_dtype = torch.float8_e4m3fn
@@ -468,44 +468,8 @@ class DeepSeekFP8BlockScalesFusedMoEMethod(FusedMoEMethodBase):
 
     def load_weights(self, module: torch.nn.Module, weights: List[Dict],
                      weight_loading_mode: MoEWeightLoadingMode):
-
-        if get_sm_version() == 100:
-            expert_ids = set(module.initial_local_expert_ids)
-            if self.need_load_shared_weights(module):
-                expert_ids.update(
-                    module.layer_load_balancer.get_load_expert_ids())
-            for name in list(weights.keys()):
-                if name.endswith("weight_scale_inv"):
-                    if int(name.split(".")[0]) not in expert_ids:
-                        continue
-                    weight_name = name.replace("weight_scale_inv", "weight")
-                    logger.debug(f"Resmoothing {weight_name}")
-                    weight = weights[weight_name][:]
-                    scale = weights[name][:]
-                    weights[weight_name], weights[name] = resmooth_to_fp8_e8m0(
-                        weight, scale)
+        print(f"DeepSeekFP8BlockScalesFusedMoEMethodCuteDsl load_weights")
         super().load_weights(module, weights, weight_loading_mode)
-
-        if get_sm_version() == 100:
-            transfromed_w3_w1_scale = transform_sf_into_required_layout(
-                module.quant_scales[0],
-                mn=module.w3_w1_weight.shape[1],
-                k=module.w3_w1_weight.shape[2],
-                recipe=(1, 128, 128),
-                num_groups=module.w3_w1_weight.shape[0],
-                is_sfa=False)
-            module.w3_w1_weight_scaling_factor = nn.Parameter(
-                transfromed_w3_w1_scale, requires_grad=False)
-            transfromed_w2_scale = transform_sf_into_required_layout(
-                module.quant_scales[1],
-                mn=module.w2_weight.shape[1],
-                k=module.w2_weight.shape[2],
-                recipe=(1, 128, 128),
-                num_groups=module.w3_w1_weight.shape[0],
-                is_sfa=False)
-            module.w2_weight_scaling_factor = nn.Parameter(transfromed_w2_scale,
-                                                           requires_grad=False)
-            self.setup_quant_scales(module)
 
     def setup_quant_scales(self, module: torch.nn.Module):
         module.quant_scales = FusedMoEQuantScalesDeepSeekFP8BlockScales(
@@ -588,6 +552,51 @@ class DeepSeekFP8BlockScalesFusedMoEMethod(FusedMoEMethodBase):
                 'w2_weight_scaling_factor':
                 local_shared_w2_scale_tensors,
             })
+
+
+class DeepSeekFP8BlockScalesFusedMoEMethod(
+        DeepSeekFP8BlockScalesFusedMoEMethodCuteDsl):
+
+    def load_weights(self, module: torch.nn.Module, weights: List[Dict],
+                     weight_loading_mode: MoEWeightLoadingMode):
+        print(f"DeepSeekFP8BlockScalesFusedMoEMethod load_weights")
+        if get_sm_version() == 100:
+            expert_ids = set(module.initial_local_expert_ids)
+            if self.need_load_shared_weights(module):
+                expert_ids.update(
+                    module.layer_load_balancer.get_load_expert_ids())
+            for name in list(weights.keys()):
+                if name.endswith("weight_scale_inv"):
+                    if int(name.split(".")[0]) not in expert_ids:
+                        continue
+                    weight_name = name.replace("weight_scale_inv", "weight")
+                    logger.debug(f"Resmoothing {weight_name}")
+                    weight = weights[weight_name][:]
+                    scale = weights[name][:]
+                    weights[weight_name], weights[name] = resmooth_to_fp8_e8m0(
+                        weight, scale)
+        super().load_weights(module, weights, weight_loading_mode)
+
+        if get_sm_version() == 100:
+            transfromed_w3_w1_scale = transform_sf_into_required_layout(
+                module.quant_scales[0],
+                mn=module.w3_w1_weight.shape[1],
+                k=module.w3_w1_weight.shape[2],
+                recipe=(1, 128, 128),
+                num_groups=module.w3_w1_weight.shape[0],
+                is_sfa=False)
+            module.w3_w1_weight_scaling_factor = nn.Parameter(
+                transfromed_w3_w1_scale, requires_grad=False)
+            transfromed_w2_scale = transform_sf_into_required_layout(
+                module.quant_scales[1],
+                mn=module.w2_weight.shape[1],
+                k=module.w2_weight.shape[2],
+                recipe=(1, 128, 128),
+                num_groups=module.w3_w1_weight.shape[0],
+                is_sfa=False)
+            module.w2_weight_scaling_factor = nn.Parameter(transfromed_w2_scale,
+                                                           requires_grad=False)
+            self.setup_quant_scales(module)
 
 
 class WInt4AFP8FusedMoEMethod(FusedMoEMethodBase):

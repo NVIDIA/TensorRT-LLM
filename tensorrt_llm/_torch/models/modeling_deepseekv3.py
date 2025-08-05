@@ -190,6 +190,7 @@ class DeepseekV3Linear(Linear):
         skip_create_weights_in_init: bool = False,
         use_custom_cublas_mm: bool = False,
         lora: Optional[LoraLayer] = None,
+        use_cute_dsl_fp8_block_scale_gemm: bool = False,
     ):
         super().__init__(
             in_features,
@@ -205,6 +206,7 @@ class DeepseekV3Linear(Linear):
             skip_create_weights_in_init,
             use_custom_cublas_mm,
             lora,
+            use_cute_dsl_fp8_block_scale_gemm,
         )
 
     def apply_linear(self,
@@ -261,7 +263,9 @@ class DeepseekV3Attention(MLA):
             quant_config=model_config.get_quant_config(),
             skip_create_weights_in_init=model_config.
             skip_create_weights_in_init,
-            use_custom_cublas_mm=True)
+            use_custom_cublas_mm=True,
+        )
+        # use_cute_dsl_fp8_block_scale_gemm=model_config.use_cute_dsl_fp8_block_scale_gemm)
 
 
 class Deepseekv3RoutingImpl():
@@ -474,7 +478,9 @@ class Deepseekv3MoE(nn.Module):
             dtype=dtype,
             config=model_config,
             overridden_tp_size=shared_tp_size,
-            reduce_output=False)
+            reduce_output=False,
+        )
+        # use_cute_dsl_fp8_block_scale_gemm=model_config.use_cute_dsl_fp8_block_scale_gemm)
 
         self.allreduce = AllReduce(mapping=model_config.mapping,
                                    strategy=model_config.allreduce_strategy)
@@ -661,13 +667,16 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             self.fusion_config.PRE_MLP_FUSION = self.enable_fusion and has_mlp_tp and self.is_nvfp4
             self.fusion_config.POST_MLP_FUSION = self.enable_fusion and has_mlp_tp
 
-            self.mlp = GatedMLP(hidden_size=config.hidden_size,
-                                intermediate_size=config.intermediate_size,
-                                bias=False,
-                                dtype=config.torch_dtype,
-                                config=model_config,
-                                overridden_tp_size=self.mlp_tp_size,
-                                reduce_output=True)
+            self.mlp = GatedMLP(
+                hidden_size=config.hidden_size,
+                intermediate_size=config.intermediate_size,
+                bias=False,
+                dtype=config.torch_dtype,
+                config=model_config,
+                overridden_tp_size=self.mlp_tp_size,
+                reduce_output=True,
+            )
+            # use_cute_dsl_fp8_block_scale_gemm=self.model_config.use_cute_dsl_fp8_block_scale_gemm)
 
         self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                        eps=config.rms_norm_eps,
@@ -1118,6 +1127,7 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
             model_config._frozen = False
             model_config.quant_config_dict = quant_config_dict
             model_config._frozen = True
+        # print(f"limin: DeepseekV3ForCausalLM, model_config.use_cute_dsl_fp8_block_scale_bmm: {model_config.use_cute_dsl_fp8_block_scale_bmm}, model_config.use_cute_dsl_fp8_block_scale_gemm: {model_config.use_cute_dsl_fp8_block_scale_gemm}")
         super().__init__(DeepseekV3Model(model_config),
                          config=model_config,
                          hidden_size=model_config.pretrained_config.hidden_size,
@@ -1260,7 +1270,8 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
             weight_divisor = 1 if self.model_config.mapping.enable_attention_dp else tp_size
             local_num_heads = num_heads // weight_divisor
 
-            k_nope_weight_trans = k_nope_weight.transpose(2, 1).contiguous()
+            # k_nope_weight_trans = k_nope_weight.transpose(2, 1).contiguous()
+            k_nope_weight_trans = k_nope_weight.transpose(2, 1)
 
             kv_b_proj = torch.concat([
                 k_nope_weight.reshape(local_num_heads * local_qk_nope_head_dim,
@@ -1301,7 +1312,8 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
             weight_divisor = 1 if self.model_config.mapping.enable_attention_dp else tp_size
             local_num_heads = num_heads // weight_divisor
 
-            k_nope_weight_trans = k_nope_weight.transpose(2, 1).contiguous()
+            # k_nope_weight_trans = k_nope_weight.transpose(2, 1).contiguous()
+            k_nope_weight_trans = k_nope_weight.transpose(2, 1)
 
             kv_b_proj = torch.concat([
                 k_nope_weight.reshape(local_num_heads * local_qk_nope_head_dim,
@@ -1344,7 +1356,11 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
         params_map = {'gate_up_proj': ['gate_proj', 'up_proj']}
         all_named_modules = dict(self.named_modules())
 
-        if self.model_config.quant_config.layer_quant_mode.has_fp8_block_scales(
+        moe_backend = self.model_config.moe_backend.upper()
+        print(
+            f"limin: DeepseekV3ForCausalLM load_weights, moe_backend: {moe_backend}"
+        )
+        if moe_backend == "DEEPGEMM" and self.model_config.quant_config.layer_quant_mode.has_fp8_block_scales(
         ) and get_sm_version() == 100:
             for name in list(weights.keys()):
                 # Use ".experts." to exclude shared_experts.
@@ -1410,26 +1426,26 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
                         attn_module.v_b_proj_scale = nn.Parameter(
                             v_b_proj_scale, requires_grad=False)
 
-                        if attn_module.k_b_proj_trans_dequant is not None:
-                            attn_module.k_b_proj_trans_dequant.data.copy_(
-                                weight_dequant(
-                                    k_b_proj_trans.view(
-                                        -1, k_b_proj_trans.shape[-1]).cuda(),
-                                    k_b_proj_trans_scale.view(
-                                        -1,
-                                        k_b_proj_trans_scale.shape[-1]).cuda(),
-                                ).view(
-                                    *attn_module.k_b_proj_trans_dequant.shape).
-                                to(attn_module.k_b_proj_trans_dequant.dtype))
-                        if attn_module.v_b_proj_dequant is not None:
-                            attn_module.v_b_proj_dequant.data.copy_(
-                                weight_dequant(
-                                    v_b_proj.view(-1,
-                                                  v_b_proj.shape[-1]).cuda(),
-                                    v_b_proj_scale.view(
-                                        -1, v_b_proj_scale.shape[-1]).cuda(),
-                                ).view(*attn_module.v_b_proj_dequant.shape).to(
-                                    attn_module.v_b_proj_dequant.dtype))
+                        # if attn_module.k_b_proj_trans_dequant is not None:
+                        #     attn_module.k_b_proj_trans_dequant.data.copy_(
+                        #         weight_dequant(
+                        #             k_b_proj_trans.view(
+                        #                 -1, k_b_proj_trans.shape[-1]).cuda(),
+                        #             k_b_proj_trans_scale.view(
+                        #                 -1,
+                        #                 k_b_proj_trans_scale.shape[-1]).cuda(),
+                        #         ).view(
+                        #             *attn_module.k_b_proj_trans_dequant.shape).
+                        #         to(attn_module.k_b_proj_trans_dequant.dtype))
+                        # if attn_module.v_b_proj_dequant is not None:
+                        #     attn_module.v_b_proj_dequant.data.copy_(
+                        #         weight_dequant(
+                        #             v_b_proj.view(-1,
+                        #                           v_b_proj.shape[-1]).cuda(),
+                        #             v_b_proj_scale.view(
+                        #                 -1, v_b_proj_scale.shape[-1]).cuda(),
+                        #         ).view(*attn_module.v_b_proj_dequant.shape).to(
+                        #             attn_module.v_b_proj_dequant.dtype))
                 elif names[-1] == "kv_a_proj_with_mqa":
                     fused_a = weights[
                         f"{'.'.join(names[:-1])}.kv_a_proj_with_mqa.weight"][:]
@@ -1477,7 +1493,7 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
                         for n, p in module.named_parameters():
                             p.data.copy_(module_weights[n][:])
 
-                if self.model_config.quant_config.layer_quant_mode.has_fp8_block_scales(
+                if moe_backend == "DEEPGEMM" and self.model_config.quant_config.layer_quant_mode.has_fp8_block_scales(
                 ) and get_sm_version() == 100 and hasattr(
                         module, "weight_scale"):
                     transfromed_scale = transform_sf_into_required_layout(

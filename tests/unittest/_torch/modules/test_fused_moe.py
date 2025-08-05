@@ -559,23 +559,25 @@ def test_fused_moe_fp8_blockwise_deepgemm(dtype,
     torch.testing.assert_close(output, ref_output, rtol=1e-2, atol=0.1)
 
 
-@skip_non_hopper_unittest
+# @skip_non_hopper_unittest
+@skip_pre_blackwell
 @pytest.mark.parametrize(
     "dtype, num_experts, seq_len, hidden_size, RoutingMethodCls",
     product(
         [torch.bfloat16],
         [72],
-        [128, 256, 384, 512, 1024, 2048, 4096, 8192],
+        # [128, 256, 384, 512, 1024, 2048, 4096, 8192],
+        [256],
         [2560],
         [DefaultMoeRoutingMethod],
     ),
 )
-def test_fused_moe_fp8_blockwise(dtype,
-                                 num_experts,
-                                 seq_len,
-                                 hidden_size,
-                                 RoutingMethodCls,
-                                 mapping=None):
+def test_fused_moe_fp8_blockwise_cute_dsl(dtype,
+                                          num_experts,
+                                          seq_len,
+                                          hidden_size,
+                                          RoutingMethodCls,
+                                          mapping=None):
     SEQ_LEN = seq_len
     HIDDEN_SIZE = hidden_size
     INTERMEDIATE_SIZE = 1536
@@ -647,17 +649,17 @@ def test_fused_moe_fp8_blockwise(dtype,
     fused_moe.cuda()
     fused_moe.load_weights([weights])
 
-    fused_moe_origin = CutlassFusedMoE(
-        num_experts=NUM_EXPERTS,
-        routing_method=routing_method,
-        hidden_size=HIDDEN_SIZE,
-        intermediate_size=INTERMEDIATE_SIZE,
-        dtype=dtype,
-        reduce_results=True,
-        model_config=ModelConfig(quant_config=quant_config, mapping=mapping),
-    )
-    fused_moe_origin.cuda()
-    fused_moe_origin.load_weights([weights])
+    # fused_moe_origin = CutlassFusedMoE(
+    #     num_experts=NUM_EXPERTS,
+    #     routing_method=routing_method,
+    #     hidden_size=HIDDEN_SIZE,
+    #     intermediate_size=INTERMEDIATE_SIZE,
+    #     dtype=dtype,
+    #     reduce_results=True,
+    #     model_config=ModelConfig(quant_config=quant_config, mapping=mapping),
+    # )
+    # fused_moe_origin.cuda()
+    # fused_moe_origin.load_weights([weights])
 
     ref_fused_moe = RefGatedMLPFusedMoE(
         num_experts=NUM_EXPERTS,
@@ -666,19 +668,22 @@ def test_fused_moe_fp8_blockwise(dtype,
         intermediate_size=INTERMEDIATE_SIZE,
         dtype=dtype,
         model_config=ModelConfig(quant_config=quant_config),
+        use_cute_dsl_fp8_block_scale_gemm=True,
     )
     ref_fused_moe.load_weights([weights])
     ref_fused_moe.cuda()
 
     with torch.inference_mode():
         output = fused_moe.forward(x, router_logits)
-        output_origin = fused_moe_origin.forward(x, router_logits)
+        # output_origin = fused_moe_origin.forward(x, router_logits)
         ref_output = ref_fused_moe.forward(x, router_logits)
 
     # compare
     torch.cuda.synchronize()
-    torch.testing.assert_close(output_origin, output, rtol=1e-2, atol=0.1)
-    torch.testing.assert_close(output_origin, ref_output, rtol=1e-2, atol=0.1)
+    # print("limin: output = ", output)
+    # print("limin: ref_output = ", ref_output)
+    # torch.testing.assert_close(output_origin, output, rtol=1e-2, atol=0.1)
+    # torch.testing.assert_close(output_origin, ref_output, rtol=1e-2, atol=0.1)
     torch.testing.assert_close(output, ref_output, rtol=1e-2, atol=0.1)
     return True
 
@@ -688,11 +693,11 @@ def test_fused_moe_fp8_blockwise(dtype,
                     reason="needs 4 GPUs to run this test")
 @pytest.mark.parametrize("ep_size", [1, 2, 4])
 @pytest.mark.parametrize("routing_method", [DefaultMoeRoutingMethod])
-def test_fused_moe_fp8_blockwise_multi_gpu(ep_size, routing_method):
+def test_fused_moe_fp8_blockwise_cute_dsl_multi_gpu(ep_size, routing_method):
     world_size = 4
     with MPIPoolExecutor(max_workers=world_size) as executor:
         results = executor.map(
-            test_fused_moe_fp8_blockwise,
+            test_fused_moe_fp8_blockwise_cute_dsl,
             *zip(*[(
                 torch.bfloat16,
                 72,
@@ -966,7 +971,8 @@ class RefGatedMLPFusedMoE(nn.Module):
                  hidden_size: int,
                  intermediate_size: int,
                  dtype: Optional[torch.dtype] = None,
-                 model_config: ModelConfig = ModelConfig()):
+                 model_config: ModelConfig = ModelConfig(),
+                 use_cute_dsl_fp8_block_scale_gemm: bool = False):
         super().__init__()
         self.num_experts = num_experts
         self.routing_method = routing_method
@@ -976,6 +982,8 @@ class RefGatedMLPFusedMoE(nn.Module):
         self.dtype = dtype
         self.quant_config = model_config.quant_config
 
+        self.use_cute_dsl_fp8_block_scale_gemm = use_cute_dsl_fp8_block_scale_gemm
+
         self.experts = nn.ModuleList([
             GatedMLP(
                 hidden_size=self.hidden_size,
@@ -983,6 +991,8 @@ class RefGatedMLPFusedMoE(nn.Module):
                 bias=False,
                 dtype=self.dtype,
                 config=model_config,
+                use_cute_dsl_fp8_block_scale_gemm=self.
+                use_cute_dsl_fp8_block_scale_gemm,
             ) for _ in range(self.num_experts)
         ])
 

@@ -9,7 +9,8 @@ from tensorrt_llm._utils import get_sm_version
 from ...model_config import ModelConfig
 from ...utils import Fp4QuantizedTensor
 from .fused_moe_cutlass import CutlassFusedMoE
-from .quantization import MoEWeightLoadingMode
+from .quantization import (DeepSeekFP8BlockScalesFusedMoEMethodCuteDsl,
+                           MoEWeightLoadingMode, UnquantizedFusedMoEMethod)
 from .routing import BaseMoeRoutingMethod
 
 
@@ -32,6 +33,8 @@ def cute_dsl_fp8_group_blockwise_gemm_ref(
     # Note: view(int8) will cause error.
     a_tmp = a.as_strided((m, k, 1), (k, 1, m * k))
     b_tmp = b.permute(1, 2, 0)
+    # print(f"limin: a.shape = {a.shape}, a_sf.shape = {a_sf.shape}")
+    # print(f"limin: b.shape = {b.shape}, b_sf.shape = {b_sf.shape}")
 
     # Note: we have different output scale shape for fp8_quantize_1x128, so we need to handle it differently for sm100 and other archs.
     if get_sm_version() == 100:
@@ -139,6 +142,18 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             layer_idx=layer_idx,
         )
 
+    def _get_quant_method(self):
+        if self.quant_config is not None and self.quant_config.layer_quant_mode.has_any_quant(
+                exclude_kv_cache=True):
+            if self.quant_config.layer_quant_mode.has_fp8_block_scales():
+                return DeepSeekFP8BlockScalesFusedMoEMethodCuteDsl()
+            else:
+                raise ValueError(
+                    f"Unsupported quantization mode: {self.quant_config.quant_mode}"
+                )
+        else:
+            return UnquantizedFusedMoEMethod()
+
     def forward_chunk(
         self,
         x: Union[torch.Tensor, Fp4QuantizedTensor],
@@ -209,6 +224,10 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         )
         act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
             permuted_data_tensor)
+        # print("limin: act_input_fp8.shape = ", act_input_fp8.shape)
+        # print("limin: act_input_sf.shape = ", act_input_sf.shape)
+        # print("limin: w3_w1_weight.shape = ", self.w3_w1_weight.shape)
+        # print("limin: quant_scales[0].shape = ", self.quant_scales[0].shape)
         h1 = cute_dsl_fp8_group_blockwise_gemm_ref(
             a=act_input_fp8,
             b=self.w3_w1_weight.view(weight_dtype),
