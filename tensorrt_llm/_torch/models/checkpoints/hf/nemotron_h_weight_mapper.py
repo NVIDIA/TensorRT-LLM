@@ -13,10 +13,11 @@ class NemotronHHfWeightMapper(HfWeightMapper):
         config = self.config.pretrained_config
         tp_size = self.config.mapping.tp_size
         tp_rank = self.config.mapping.tp_rank
-        d_inner = config.hidden_size * config.expand
+        d_inner = config.mamba_head_dim * config.mamba_num_heads
+
         n_groups = config.n_groups
         d_state = config.ssm_state_size
-        nheads = d_inner // config.mamba_head_dim
+        nheads = config.mamba_num_heads
 
         new_weights = {}
         for name, _ in weights.items():

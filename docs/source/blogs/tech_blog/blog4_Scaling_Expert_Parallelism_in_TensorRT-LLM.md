@@ -503,7 +503,7 @@ Let's use some representative workloads to illustrate the performance impact wit
 </div>
 <p align="center"><sub><em>Figure 24: EP impact over MoE Group GEMM and EP communication</em></sub></p>
 In Figure 24, it can be observed that by increasing the EP size from 4 to 72, the MoE Group GEMM computation time gets reduced, while the EP communication time (for EP4/EP8 Reduce/Scatter is used, while for EP>8 All2All is used) stays almost constant.
-When the EP size increases from 18 to 32, the speed-up diminishes. We are working on optimizing it.
+When the EP size increases from 18 to 72, the speed-up diminishes. We are working on optimizing it.
 
 Next, let's use some representative workloads to understand the performance impact with EPLB.
 <div align="center">
