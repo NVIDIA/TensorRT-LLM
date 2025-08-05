@@ -1,17 +1,17 @@
-from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
-
-import torch
-
-from tensorrt_llm._utils import mpi_allgather, mpi_broadcast, mpi_rank
-from tensorrt_llm.bindings import LlmRequestState
-from tensorrt_llm.bindings.executor import ExecutorConfig
-from tensorrt_llm.bindings.internal.batch_manager import \
-    KvCacheConnectorManager as KvCacheConnectorManagerCpp
-from tensorrt_llm.bindings.internal.batch_manager import LlmRequest
-
-from .scheduler import ScheduledRequests
+# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """
 This file contains the primary interface for the KV Cache Connector.
 
@@ -33,6 +33,21 @@ The Connector API is split into two parts:
 
 To implement a custom KV connector, you need to implement both the scheduler and worker-side interfaces.
 """
+
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from typing import Any, Callable, Optional
+
+import torch
+
+from tensorrt_llm._utils import mpi_allgather, mpi_broadcast, mpi_rank
+from tensorrt_llm.bindings import LlmRequestState
+from tensorrt_llm.bindings.executor import ExecutorConfig
+from tensorrt_llm.bindings.internal.batch_manager import \
+    KvCacheConnectorManager as KvCacheConnectorManagerCpp
+from tensorrt_llm.bindings.internal.batch_manager import LlmRequest
+
+from .scheduler import ScheduledRequests
 
 
 # Used to store data for a single inflight request.
@@ -60,6 +75,26 @@ class SchedulerOutput:
             RequestData(request_id, new_tokens, new_block_ids,
                         computed_position))
 
+    def record_first_prefill_chunk(self, req: LlmRequest, block_ids: list[int]):
+        if not req.is_kv_cache_connector_async_onboard:
+            self.requests.append(
+                RequestData(req.request_id, req.get_tokens(0), block_ids,
+                            req.context_current_position))
+
+    def record_nth_prefill_chunk(self, req: LlmRequest):
+        self.requests.append(
+            RequestData(req.request_id, [], [], req.context_current_position))
+
+    def record_generation_req(self, req: LlmRequest,
+                              delta_block_ids: list[int]):
+
+        tokens = req.get_tokens(0)
+        computed_position = len(tokens) - 1
+
+        self.requests.append(
+            RequestData(req.request_id, tokens[-1:], delta_block_ids,
+                        computed_position))
+
 
 class KvCacheConnectorWorker(ABC):
 
@@ -77,13 +112,13 @@ class KvCacheConnectorWorker(ABC):
         self._metadata = None
 
     @abstractmethod
-    def register_kv_caches(self, kv_cache_data: dict[int, torch.Tensor]):
+    def register_kv_caches(self, kv_cache_tensor: torch.Tensor):
         """
         Register the KV cache tensors to the worker.
         This can be used for something like NIXL registration.
 
         Args:
-            kv_cache_data: The data for all the KV cache pools.
+            kv_cache_tensor: The contiguous KV cache tensor.
         """
 
     @abstractmethod
@@ -222,12 +257,14 @@ class AsyncRequests:
 
         return new_async_requests
 
+    @property
     def saving_ids(self) -> set[int]:
         """
         Get the IDs of the requests that are being saved asynchronously.
         """
         return set(self.saving.keys())
 
+    @property
     def loading_ids(self) -> set[int]:
         """
         Get the IDs of the requests that are being loaded asynchronously.
@@ -300,7 +337,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         return num_tokens
 
     def take_scheduled_requests_pending_load(
-            self, scheduled_requests: ScheduledRequests) -> ScheduledRequests:
+            self, scheduled_requests: ScheduledRequests):
         """
         Remove context requests from our list of scheduled requests that are being loaded asynchronously.
         This is done to prevent the runtime from attempting to load the KV cache for these requests.
@@ -361,8 +398,8 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         Returns:
             The requests that have newly finished saving.
         """
-        started_loading_req_ids = list(self.new_async_requests.loading_ids())
-        finished_gen_req_ids = list(self.new_async_requests.saving_ids())
+        started_loading_req_ids = list(self.new_async_requests.loading_ids)
+        finished_gen_req_ids = list(self.new_async_requests.saving_ids)
 
         # Add the requests to our list of outstanding (still in progress) requests.
         self.pending_async_requests.add_from(self.new_async_requests)
@@ -381,9 +418,8 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             new_local_finished_async_requests)
 
         # Broadcast this whole list to all other workers.
-        finished_saving = list(self.local_finished_async_requests.saving_ids())
-        finished_loading = list(
-            self.local_finished_async_requests.loading_ids())
+        finished_saving = list(self.local_finished_async_requests.saving_ids)
+        finished_loading = list(self.local_finished_async_requests.loading_ids)
 
         all_results = mpi_allgather((finished_saving, finished_loading))
 
