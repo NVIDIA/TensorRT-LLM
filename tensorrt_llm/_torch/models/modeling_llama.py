@@ -80,7 +80,6 @@ class Llama4Attention(Attention):
             if attention_chunk_size and model_config.max_num_tokens < attention_chunk_size:
                 attention_chunk_size = None
 
-
         super().__init__(
             hidden_size=config.hidden_size,
             num_attention_heads=config.num_attention_heads,
