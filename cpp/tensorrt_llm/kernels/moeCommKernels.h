@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2019-2025, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -19,24 +19,16 @@
 #include <map>
 
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/kernels/moeCommKernelsCommon.h"
 
 namespace tensorrt_llm::kernels
 {
-
-#ifdef __CUDACC__
-#define ALIGN_256 __align__(256)
-#else
-#define ALIGN_256 alignas(256)
-#endif
 
 struct ALIGN_256 MoeCommFifoConnInfo
 {
     volatile uint64_t head; // write position
     volatile uint64_t tail; // read position
 };
-
-constexpr int WARP_SIZE = 32;
-constexpr uint32_t WARP_MASK = 0xffffffff;
 
 constexpr int RECV_FIFO_DEPTH = 8;
 constexpr int RECV_FIFO_ENTRY_BYTES = 256 * 1024;
@@ -142,18 +134,6 @@ inline size_t getMoeCommWorkspaceSize(int epSize)
     int channelCount = AllToAllChannelCommunicatorBase::getMoeCommChannelCount(epSize);
     return RECV_FIFO_TOTAL_BYTES * epSize * channelCount + sizeof(MoeCommFifoConnInfo) * epSize * channelCount;
 }
-
-struct MoeEpWorldInfo
-{
-    int epSize;
-    int epRank;
-};
-
-struct MoeExpertParallelInfo
-{
-    int expertCount = -1;
-    int topK = 1;
-};
 
 struct SendRecvDataInfo
 {
