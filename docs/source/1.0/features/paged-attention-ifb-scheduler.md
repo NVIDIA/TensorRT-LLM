@@ -4,21 +4,21 @@
 
 TensorRT-LLM supports in-flight batching of requests (also known as continuous
 batching or iteration-level batching) for higher serving throughput. With this feature,
-sequences in context phase can be processed together with sequences in
+sequences in the context phase can be processed together with sequences in the
 generation phase. The purpose of that technique is to better interleave
 requests to reduce latency as well as make better use of the GPUs.
 For efficiency reasons (1), the support for inflight batching ***requires the
 input tensors to be packed (no padding)***.
 
 ***In the current implementation, the sequences that are going through the
-context phase must be before the sequences in the generation phase in the input
+context phase must come before the sequences in the generation phase in the input
 tensor. For example, for sequences `S0`, `S1` and `S2`, if `S0` and `S2` are in
 context phase (and `S1` in generation), tokens from `S0` and `S2` must appear
 before the tokens of `S1` in the input tensor***. The constraint may or may not
 be relaxed in a future version.
 
-_(1) Padding sequences in the generation phase, that contain a single token, to
-the length of the maximum input sequence is inefficient use of resources_.
+_(1) Padding sequences in the generation phase that contain a single token to
+the length of the maximum input sequence is inefficient use of resources.
 
 ### `max_batch_size`, `max_seq_len` and `max_num_tokens`
 
@@ -32,7 +32,7 @@ the length of the maximum input sequence is inefficient use of resources_.
 
 It controls the maximum number of requests that can be scheduled at runtime.
 
-Set high enough `max_batch_size` when building the engine so that it does not become the bottleneck of the throughput, and use runtime `max_batch_size` to tune it without re-building the engine if you want to get better user throughput or lower latency.
+Set a sufficiently high  `max_batch_size` when building the engine so that it does not become the bottleneck of the throughput, and use runtime `max_batch_size` to tune throughput or latency without rebuilding the engine.
 
 #### `max_seq_len`
 
@@ -40,18 +40,17 @@ Set high enough `max_batch_size` when building the engine so that it does not be
 
 Starting from TensorRT-LLM v0.11, when `--remove_input_padding` and `--context_fmha` are enabled, `max_seq_len` can replace `max_input_len` and `max_output_len`, and is set to `max_position_embeddings` by default.
 
-Use default `max_seq_len` (which is `max_position_embeddings`), no need to tune it unless you are very sure what max sequence lengths would be on your workloads. If the GPU memory is so limited that it cannot make sure even one request to reach `max_seq_len`, you'll need to reduce it.
+Use default `max_seq_len` (which is `max_position_embeddings`), no need to tune it unless you are very sure what max sequence lengths would be on your workloads. If GPU memory is so limited that it cannot support even one request reaching `max_seq_len`, you need to reduce it.
 
 #### `max_num_tokens`
 
 `max_num_tokens` defines the maximum number of batched input tokens after padding is removed in each batch.​
 
-`max_num_tokens` is set to 8192 by default starting from v0.11, you can tune it using the runtime `max_num_tokens` without re-buliding the engine. It is recommended to tune `--max_num_tokens` for better performance.
+`max_num_tokens` is set to 8192 by default starting from v0.11. You can tune it using the runtime `max_num_tokens` without re-buliding the engine. It is recommended to tune `--max_num_tokens` for better performance.
 
-The maximum number of tokens equals will not take effects when input padding is
-not removed. When input padding is removed, the tokens from different sequences are
+The maximum number of tokens will not take effect when input padding is not removed. When input padding is removed, the tokens from different sequences are
 packed together and the maximum number of the tokens can be set to a different
-(lower) value, which by default to be 8192.
+(lower) value, which by default is 8192.
 
 There are two aspects that must be considered. Firstly, some input sequences
 will be shorter than the maximum input length. Secondly, when in-flight
@@ -71,13 +70,11 @@ total end-to-end latency.
 
 ## Chunked Context (a.k.a Chunked Prefill)
 
-In the original state, the common behavior was to process all context tokens at
-once. This feature splits the context into several chunks. In this way, the
+The original behavior was to process all context tokens at once. However, this feature splits the context into several chunks. In this way, the
 context chunks can be batched with more tokens during the generation phase,
-which is expected to increase the total throughput. Chunking contexts also removes
+which should increase overall throughput. Chunking contexts also removes
 constraints on input length. To enable this feature, the FMHA paged kv-cache also
-needs to be enabled. Except for the last one, the size of the context chunk needs
-to be an integer multiple of the kv-cache block size. Refer to
+needs to be enabled. Except for the last chunk, the size of each context chunk needs to be an integer multiple of the kv-cache block size. Refer to
 [the performance best practices](../performance/perf-best-practices.md#chunked-context) for usage.
 
 ## KV Cache
@@ -97,17 +94,13 @@ The contiguous KV cache is a monolithic tensor. Its shape is:
 [max_batch_size * max_beam_width, 2, num_heads, max_seqlen, hidden_dim_per_head].
 ```
 
-That implementation uses a lot more memory than needed when the sequences are
-shorter than the maximum sequence length (even if they end up close to the
-limit after the generation of many output tokens, it may take a lot of steps to
-reach that point).
+This implementation uses much more memory than needed when sequences are shorter than the maximum sequence length. Even if they approach the limit after generating many output tokens, it may take many steps to reach that point.
 
 ### Paged KV Cache
 
 The paged KV cache decomposes the KV cache into blocks that are distributed to
 the different requests by a cache manager during processing. That cache manager
-keeps track of the sequences, allocate new blocks from a pool and recycle those
-blocks when required. See the simplified implementation of
+keeps track of the sequences, allocates new blocks from a pool, and recycles those blocks when required. See the simplified implementation of
 [`tensorrt_llm.runtime.KVCacheManager`](source:tensorrt_llm/runtime/kv_cache_manager.py).
 A more efficient C++ implementation is included in the
 [Batch Manager](source:cpp/include/tensorrt_llm/batch_manager).
@@ -131,22 +124,22 @@ TRT-LLM prioritizes scheduling requests in generation phase first so the two gen
 
 ![TRT-LLM Scheduler Visualization 3](../../media/TRTLLM_Scheduler_Vis_3.svg)
 
-After the next iteration of execution, the second tokens for Requests 1 and 2 have been generated, and the first tokens for Request 3 and 4 have been generated. Lets say that G2 that was generated for Request 1 is the stop token, signifying that Request 1 is completed. In this case the scheduler would evict Request 1 before performing another execution iteration and prepare to return it to the user. This eviction puts the state of the engine below the max batch size limit and allows Request 5 to be scheduled.
+After the next iteration of execution, the second tokens for Requests 1 and 2 have been generated, and the first tokens for Request 3 and 4 have been generated. Let's say that G2, which was generated for Request 1, is the stop token signifying that Request 1 is completed. In this case the scheduler would evict Request 1 before performing another execution iteration and prepare to return it to the user. This eviction puts the state of the engine below the max batch size limit and allows Request 5 to be scheduled.
 
-Another thing to note is that G1 that was generated for Request 2 has been added to the kv-cache for request 2, representing how kv-cache for a request grows as more and more tokens are generated.
+Also note that G1, which was generated for Request 2, has been added to the kv-cache for Request 2, illustrating how the kv-cache for a request grows as more tokens are generated.
 
 ![TRT-LLM Scheduler Visualization 4](../../media/TRTLLM_Scheduler_Vis_4.svg)
 
-Overall, the max batch size and max num tokens limits play a key part in deciding when requests are actually executed, and tuning them can have significant impacts on throughput numbers as well as how the engine balances previously scheduled requests in generation phase with context phase on new requests
+Overall, the max batch size and max num tokens limits play a key role in determining when requests are executed. Tuning these parameters can significantly impact throughput, as well as how the engine balances previously scheduled requests in the generation phase with new requests in the context phase.
 
 > Note: This presents a simplified visualization of the scheduler to highlight how max batch size and max num tokens affect it. The scheduler also considers things like amount of free memory available to be used for kv-cache and has other configurable options that can affect its behavior. See the Runtime Flags of the Additional Options page for more on this.
 
 ## Revisiting Paged Context Attention and Context Chunking
 
-[Previously](./useful-build-time-flags.md#paged-context-attention) we recommended enabling paged context attention even though in our case study it didn't affect performance significantly. Having now understood the TensorRT-LLM scheduler we can now explain why this is beneficial. In short, we recommend enabling it because it enables context chunking, which allows the context phase of a request to be broken up into pieces and processed over several execution iterations, allowing the engine to provide a more stable balance of context and generation phase execution.
+[Previously](./useful-build-time-flags.md#paged-context-attention) we recommended enabling paged context attention even though in our case study it didn't affect performance significantly. Now that we understand the TensorRT-LLM scheduler, we can explain why this is beneficial. In short, we recommend enabling it because it enables context chunking, which allows the context phase of a request to be broken up into pieces and processed over several execution iterations, allowing the engine to provide a more stable balance of context and generation phase execution.
 
-The [visualization](#understanding-the-trt-llm-scheduler) of the TensorRT-LLM scheduler showed that initially Request 3 couldn't be scheduled because it would put the scheduler over the max-num tokens limit. However with context chunking, this is no longer the case, and the first chunk of Request 3 would be able to be scheduled.
+The [visualization](#understanding-the-trt-llm-scheduler) of the TensorRT-LLM scheduler showed that initially Request 3 couldn't be scheduled because it would put the scheduler over the max-num tokens limit. However, with context chunking, this is no longer the case, and the first chunk of Request 3 can be scheduled.
 
 ![TRT-LLM Scheduler Visualization Chunked Context 1](../../media/TRTLLM_Scheduler_Vis_Chunked_Context_1.svg)
 
-This is extremely beneficial for several reasons. Firstly it eliminates the possibility of requests with large prompts relative to max num tokens being unable to be scheduled due to other requests that are already in-flight. In production workloads, this can help improve worst case TTFT numbers. Secondly it allows for setting smaller values of max num tokens since you no longer need max num tokens to be at least as large as the longest prompt you want to support. For long-context cases this is extremely important, because setting extremely large values of max-num tokens takes away from memory available to be used as kv-cache. Given that in the worst case scenario chunked context has minimal impact on performance but can significantly benefit it in many scenarios, it's recommended that you always enable it.
+This is extremely beneficial for several reasons. First, it eliminates the possibility of requests with large prompts (relative to max num tokens) not being scheduled due to other requests already in-flight. In production workloads, this can help improve worst case TTFT numbers. Second, it allows for setting smaller values of max num tokens, since you no longer need max num tokens to be at least as large as the longest prompt you want to support. For long-context cases this is extremely important, because setting extremely large values of max-num tokens takes away from memory available to be used as kv-cache. Given that, in the worst-case scenario, chunked context has minimal impact on performance but can significantly benefit it in many situations, NVIDIA recommends that you always enable it.
