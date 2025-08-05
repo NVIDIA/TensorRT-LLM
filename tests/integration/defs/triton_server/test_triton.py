@@ -64,9 +64,9 @@ def model_path(test_name):
         "llava": "llava-1.5-7b-hf",
         "llava_fp8": "llava-1.5-7b-hf"
     }
-    model_cache_dir = os.environ.get("MODEL_CACHE_DIR",
-                                     "/scratch.trt_llm_data/llm-models")
-    return os.path.join(model_cache_dir, model_mapping.get(test_name, ""))
+    model_cache_root = os.environ.get("LLM_MODELS_ROOT",
+                                      "/scratch.trt_llm_data/llm-models")
+    return os.path.join(model_cache_root, model_mapping.get(test_name, ""))
 
 
 @pytest.fixture
@@ -506,9 +506,20 @@ def test_cpp_unit_tests(tritonserver_test_root, test_name, llm_root):
         "rm -rf build && "
         "mkdir -p build", llm_root)
 
+    # Get the value of TRITON_SHORT_TAG from docker/Dockerfile.multi
+    import subprocess
+    triton_short_tag = subprocess.check_output(
+        [f"{llm_root}/jenkins/scripts/get_triton_tag.sh", llm_root],
+        text=True).strip()
+    print(f"using triton tag from docker/Dockerfile.multi: {triton_short_tag}")
     run_shell_command(
         f"cd {llm_root}/triton_backend/inflight_batcher_llm/build && "
-        f"cmake .. -DTRTLLM_DIR={llm_root} -DCMAKE_INSTALL_PREFIX=install/ -DBUILD_TESTS=ON -DUSE_CXX11_ABI=ON "
+        f"cmake .. -DTRTLLM_DIR={llm_root} -DCMAKE_INSTALL_PREFIX=install/ "
+        f"-DBUILD_TESTS=ON  -DUSE_CXX11_ABI=ON "
+        f"-DTRITON_COMMON_REPO_TAG={triton_short_tag} "
+        f"-DTRITON_CORE_REPO_TAG={triton_short_tag} "
+        f"-DTRITON_THIRD_PARTY_REPO_TAG={triton_short_tag} "
+        f"-DTRITON_BACKEND_REPO_TAG={triton_short_tag} "
         "&& make -j8 install", llm_root)
 
     # Run the cpp unit tests

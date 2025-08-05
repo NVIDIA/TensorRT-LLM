@@ -1,3 +1,4 @@
+import copy
 import dataclasses
 import os
 from typing import List, Optional, Tuple
@@ -6,6 +7,9 @@ import torch
 from transformers import AutoProcessor, Gemma3Config, PreTrainedModel
 from transformers.modeling_utils import no_init_weights
 from transformers.models.gemma3.modeling_gemma3 import Gemma3MultiModalProjector
+
+from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
+    BaseWeightMapper
 
 from ..._utils import nvtx_range
 from ...inputs import (ExtraProcessedInputs, InputProcessor, TextPrompt,
@@ -45,18 +49,12 @@ class Gemma3InputProcessor(InputProcessor):
             raise KeyError("Expected image data in multimodal data for Gemma3.")
 
         images = mm_data.get("image")
-        if images and len(images) != 1:
-            raise ValueError(
-                f"Expected at most one image for processing, got {len(images)}."
-            )
-
-        image = images[0] if images else None
         do_rescale = self.processor.image_processor.do_rescale
-        if isinstance(image, torch.Tensor):
+        if images is not None and isinstance(images[0], torch.Tensor):
             do_rescale = False
         processor_output = self.processor(
             text=text_prompt,
-            images=image,
+            images=images,
             do_rescale=do_rescale,
             return_tensors="pt",
             device=self.device).to(dtype=torch.bfloat16)
@@ -104,13 +102,14 @@ class Gemma3VLM(PreTrainedModel):
                                             dtype=torch.int32,
                                             device=self._device)
 
-        self.model_config = model_config
+        model_config_cp = copy.deepcopy(model_config)
+        self.model_config = model_config_cp
 
-        llm_model_config = self.get_sub_model_config(model_config,
+        llm_model_config = self.get_sub_model_config(model_config_cp,
                                                      "text_config")
         self.llm = Gemma3ForCausalLM(llm_model_config)
 
-        vision_model_config = self.get_sub_model_config(model_config,
+        vision_model_config = self.get_sub_model_config(model_config_cp,
                                                         "vision_config")
         self.siglip_tower = SiglipVisionModel(vision_model_config,
                                               use_post_layernorm=True)
@@ -147,9 +146,9 @@ class Gemma3VLM(PreTrainedModel):
             sub_model_config.pretrained_config.torch_dtype = model_config.pretrained_config.torch_dtype
         return sub_model_config
 
-    def load_weights(self, weights):
+    def load_weights(self, weights, weight_mapper: BaseWeightMapper):
         llm_weights = filter_weights("language_model", weights)
-        self.llm.load_weights(llm_weights)
+        self.llm.load_weights(llm_weights, weight_mapper)
 
         vit_weights = filter_weights("vision_tower", weights)
         self.siglip_tower.load_weights(vit_weights)
@@ -188,9 +187,6 @@ class Gemma3VLM(PreTrainedModel):
             multimodal_param.multimodal_data["image"]["pixel_values"]
             for multimodal_param in multimodal_params
         ]
-        assert pixel_values == [] or len(
-            pixel_values
-        ) == num_context_requests, "Number of multimodal features (if provided) should be equal to number of context requests"
 
         mm_embeds = []
         mm_token_mask = None
@@ -217,6 +213,7 @@ class Gemma3VLM(PreTrainedModel):
             inputs_embeds=inputs_embeds,
             return_context_logits=return_context_logits,
             image_token_mask=mm_token_mask,
+            lora_params=kwargs.get("lora_params", None),
         )
         return logits
 

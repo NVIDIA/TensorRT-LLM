@@ -30,7 +30,7 @@ from torch._inductor.pattern_matcher import (
 )
 from torch.fx import GraphModule
 
-from tensorrt_llm._torch.auto_deploy.transformations.export import torch_export_to_gm
+from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 
 
 @contextlib.contextmanager
@@ -153,6 +153,8 @@ def register_ad_pattern(
     5. register_replacement can auto-generate `search_fn_pattern` if you input `example_inputs`,
         but that approach will fail when symbolic shapes are involved. Here
         we explicitly trace & convert via `fx_to_pattern`.
+    6. The PatternMatcherPass would check num_users of the nodes, meaning that the pattern is required
+        to be functionally isolated, no intermediate nodes are shared with the rest of the graph.
 
     """
     argnames = list(inspect.signature(search_fn).parameters.keys())

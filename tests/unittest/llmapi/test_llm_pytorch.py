@@ -1,16 +1,28 @@
 import pytest
 
 from tensorrt_llm import LLM
+from tensorrt_llm.llmapi import KvCacheConfig
+from tensorrt_llm.llmapi.llm_args import PeftCacheConfig
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
 from tensorrt_llm.sampling_params import SamplingParams
 
 # isort: off
-from .test_llm import (
-    get_model_path, global_kvcache_config, llama_model_path,
-    llm_get_stats_async_test_harness, llm_get_stats_test_harness, prompts,
-    run_llm_abort_request, run_llm_with_postprocess_parallel_and_result_handler,
-    tinyllama_logits_processor_test_harness, _test_llm_capture_request_error)
-from utils.util import force_ampere, similar, skip_gpu_memory_less_than_40gb, skip_gpu_memory_less_than_80gb, skip_gpu_memory_less_than_138gb
+from .lora_test_utils import (
+    check_llama_7b_multi_lora_from_request_test_harness,
+    check_llama_7b_multi_unique_lora_adapters_from_request,
+    create_mock_nemo_lora_checkpoint)
+from .test_llm import (_test_llm_capture_request_error, get_model_path,
+                       global_kvcache_config, llama_model_path,
+                       llm_get_stats_async_test_harness,
+                       llm_get_stats_test_harness, prompts,
+                       run_llm_abort_request,
+                       run_llm_with_postprocess_parallel_and_result_handler,
+                       tinyllama_logits_processor_test_harness)
+from utils.util import (EnvVarsContextManager, force_ampere,
+                        run_function_in_sub_process, similar,
+                        skip_gpu_memory_less_than_40gb,
+                        skip_gpu_memory_less_than_80gb,
+                        skip_gpu_memory_less_than_138gb)
 from utils.llm_data import llm_models_root
 from tensorrt_llm.lora_manager import LoraConfig
 from tensorrt_llm.executor.request import LoRARequest
@@ -27,8 +39,10 @@ from transformers import AutoModelForCausalLM
 
 
 @force_ampere
-def test_tinyllama_logits_processor():
-    tinyllama_logits_processor_test_harness(backend="pytorch")
+@pytest.mark.parametrize("enable_chunked_prefill,", [False, True])
+def test_tinyllama_logits_processor(enable_chunked_prefill):
+    tinyllama_logits_processor_test_harness(
+        backend="pytorch", enable_chunked_prefill=enable_chunked_prefill)
 
 
 @pytest.mark.parametrize(
@@ -134,7 +148,9 @@ def test_llm_with_postprocess_parallel_and_result_handler(streaming):
 def llama_7b_lora_from_dir_test_harness(**llm_kwargs) -> None:
     lora_config = LoraConfig(
         lora_dir=[f"{llm_models_root()}/llama-models/luotuo-lora-7b-0.1"],
-        max_lora_rank=8)
+        max_lora_rank=8,
+        max_loras=2,
+        max_cpu_loras=2)
     llm = LLM(model=f"{llm_models_root()}/llama-models/llama-7b-hf",
               lora_config=lora_config,
               **llm_kwargs)
@@ -161,55 +177,6 @@ def llama_7b_lora_from_dir_test_harness(**llm_kwargs) -> None:
         llm.shutdown()
 
 
-def llama_7b_multi_lora_from_request_test_harness(**llm_kwargs) -> None:
-    hf_model_dir = f"{llm_models_root()}/llama-models/llama-7b-hf"
-    hf_lora_dir1 = f"{llm_models_root()}/llama-models/luotuo-lora-7b-0.1"
-    hf_lora_dir2 = f"{llm_models_root()}/llama-models/Japanese-Alpaca-LoRA-7b-v0"
-
-    # For LoRA checkpoints without finetuned embedding and lm_head, we can either:
-    # (1) specify lora_target_modules, or
-    # (2) provide a lora_dir to infer the lora_target_modules.
-    lora_config = LoraConfig(lora_target_modules=['attn_q', 'attn_k', 'attn_v'],
-                             max_lora_rank=8)
-    # Disable CUDA graph
-    # TODO: remove this once we have a proper fix for CUDA graph in LoRA
-    llm = LLM(hf_model_dir,
-              lora_config=lora_config,
-              cuda_graph_config=None,
-              **llm_kwargs)
-
-    try:
-        prompts = [
-            "美国的首都在哪里? \n答案:",
-            "美国的首都在哪里? \n答案:",
-            "美国的首都在哪里? \n答案:",
-            "アメリカ合衆国の首都はどこですか? \n答え:",
-            "アメリカ合衆国の首都はどこですか? \n答え:",
-            "アメリカ合衆国の首都はどこですか? \n答え:",
-        ]
-        references = [
-            "沃尔玛\n\n## 新闻\n\n* ",
-            "美国的首都是华盛顿。\n\n美国的",
-            "纽约\n\n### カンファレンスの",
-            "Washington, D.C.\nWashington, D.C. is the capital of the United",
-            "华盛顿。\n\n英国の首都是什",
-            "ワシントン\nQ1. アメリカ合衆国",
-        ]
-        lora_req1 = LoRARequest("luotuo", 1, hf_lora_dir1)
-        lora_req2 = LoRARequest("Japanese", 2, hf_lora_dir2)
-        sampling_params = SamplingParams(max_tokens=20)
-        outputs = llm.generate(prompts,
-                               sampling_params,
-                               lora_request=[
-                                   None, lora_req1, lora_req2, None, lora_req1,
-                                   lora_req2
-                               ])
-        for output, ref in zip(outputs, references):
-            assert similar(output.outputs[0].text, ref)
-    finally:
-        llm.shutdown()
-
-
 @skip_gpu_memory_less_than_40gb
 def test_llama_7b_lora():
     llama_7b_lora_from_dir_test_harness()
@@ -217,7 +184,7 @@ def test_llama_7b_lora():
 
 @skip_gpu_memory_less_than_40gb
 def test_llama_7b_lora_default_modules() -> None:
-    lora_config = LoraConfig(max_lora_rank=64)
+    lora_config = LoraConfig(max_lora_rank=64, max_loras=2, max_cpu_loras=2)
 
     hf_model_dir = f"{llm_models_root()}/llama-models/llama-7b-hf"
 
@@ -247,14 +214,150 @@ def test_llama_7b_lora_default_modules() -> None:
         llm.shutdown()
 
 
+@pytest.mark.parametrize(
+    "lora_adapter_count_per_call, max_loras, max_cpu_loras, repeat_calls, repeats_per_call",
+    [
+        # Test eviction and re-loading a previously evicted adapter from the LoRA GPU cache, within a single
+        # llm.generate call, that's repeated twice.
+        ([
+            2,
+        ], 1, 2, 2, 3),
+        # Test eviction and loading of new adapters in the evicted space, over several llm.generate calls, with LoRA GPU
+        # cache size < LoRA CPU cache size
+        ([2, 2, 2], 1, 3, 1, 1),
+    ])
 @skip_gpu_memory_less_than_40gb
-def test_llama_7b_multi_lora():
-    llama_7b_multi_lora_from_request_test_harness()
+def test_llama_7b_multi_lora_evict_load_new_adapters(
+        lora_adapter_count_per_call: list[int], max_loras: int,
+        max_cpu_loras: int, repeat_calls: int, repeats_per_call: int):
+    # For LoRA checkpoints without finetuned embedding and lm_head, we can either:
+    # (1) specify lora_target_modules, or
+    # (2) provide a lora_dir to infer the lora_target_modules.
+    lora_config = LoraConfig(lora_target_modules=['attn_q', 'attn_k', 'attn_v'],
+                             max_lora_rank=8,
+                             max_loras=max_loras,
+                             max_cpu_loras=max_cpu_loras)
+    check_llama_7b_multi_unique_lora_adapters_from_request(
+        lora_adapter_count_per_call,
+        repeat_calls,
+        repeats_per_call,
+        LLM,
+        lora_config=lora_config,
+        # Disable CUDA graph
+        # TODO: remove this once we have a proper fix for CUDA graph in LoRA
+        cuda_graph_config=None)
+
+
+@pytest.mark.parametrize(
+    "lora_adapter_count_per_call, max_loras, max_cpu_loras, repeat_calls, repeats_per_call",
+    [
+        # Test eviction, reloading new adapters and reloading previously evicted adapters from the LoRA CPU cache & GPU
+        # cache over multiple llm.generate call repeated twice (two calls with the same requests):
+        # At the end of the 1st llm.generate call:
+        #   The LoRA caches should contain adapters 1, 2 and shouldn't contain adapter 0 (it should have been evicted).
+        # So in the 2nd call, the worker should:
+        # - Send req0 with adapter 0 weights (because it was previously evicted)
+        # - Send the other two requests without their adapter weights as they're already in LoRA CPU cache
+        # Then, handling of req0 that has weights but not in the cache should evict one of the other two adapters from
+        # the cache, causing that evicted adapter's request to fail because its weights aren't with the request and
+        # aren't in LoRA cache.
+        ([
+            3,
+        ], 2, 2, 2, 1),
+    ])
+@skip_gpu_memory_less_than_40gb
+def test_llama_7b_multi_lora_load_previously_cpu_cache_evicted_adapter_fails(
+        lora_adapter_count_per_call: list[int], max_loras: int,
+        max_cpu_loras: int, repeat_calls: int, repeats_per_call: int):
+    """Tests that trying to load a LoRA adapter after it was evicted from CPU cache fails with the expected
+    message, as this feature is currently not supported in favor of the performance improvement of not
+    sending the LoRA weights with every request after the first time.
+    NOTE: This test assumes the requests are handled in the order they're sent, if that's not true, then this test
+          may not get any error at all, which would cause it to fail.
+    """  # noqa: D205
+
+    def _check_contains_expected_message(stdout: str, stderr: str):
+        note_in_message = "Note that currently a request with LoRA task that was already loaded is sent" \
+                          " without its LoRA weights to save its serialization, copy and deserialization, so if this" \
+                          " LoRA task was evicted from LoRA CPU cache, then its reuse is currently not supported."
+        return note_in_message in stderr
+
+    lora_config = LoraConfig(lora_target_modules=['attn_q', 'attn_k', 'attn_v'],
+                             max_lora_rank=8,
+                             max_loras=max_loras,
+                             max_cpu_loras=max_cpu_loras)
+    with EnvVarsContextManager({"TLLM_WORKER_USE_SINGLE_PROCESS": "1"}):
+        child_stdout, child_stderr = run_function_in_sub_process(
+            target=check_llama_7b_multi_unique_lora_adapters_from_request,
+            args=(lora_adapter_count_per_call, repeat_calls, repeats_per_call,
+                  LLM),
+            kwargs={
+                "lora_config": lora_config,
+                # Disable CUDA graph
+                # TODO: remove this once we have a proper fix for CUDA graph in LoRA
+                "cuda_graph_config": None
+            },
+            stop_waiting_criteria=_check_contains_expected_message)
+
+    assert _check_contains_expected_message(child_stdout, child_stderr)
+
+
+def test_llama_7b_peft_cache_config_affects_peft_cache_size():
+    """Tests that LLM arg of peft_cache_config affects the peft cache sizes.
+
+    NOTE: The caller can't get the actual LoRA cache sizes, so we instead we
+    test that it fails when configured with a value too small to contain a
+    single adapter.
+    """
+    # For LoRA checkpoints without finetuned embedding and lm_head, we can either:
+    # (1) specify lora_target_modules, or
+    # (2) provide a lora_dir to infer the lora_target_modules.
+    lora_config_no_cache_size_values = LoraConfig(
+        lora_target_modules=['attn_q', 'attn_k', 'attn_v'], max_lora_rank=8)
+
+    # Test that too small PeftCacheConfig.host_cache_size causes failure
+    with pytest.raises(RuntimeError):
+        check_llama_7b_multi_lora_from_request_test_harness(
+            LLM,
+            lora_config=lora_config_no_cache_size_values,
+            peft_cache_config=PeftCacheConfig(
+                host_cache_size=1),  # size in bytes
+            # Disable CUDA graph
+            # TODO: remove this once we have a proper fix for CUDA graph in LoRA
+            cuda_graph_config=None)
+
+    # Test that too small PeftCacheConfig.device_cache_percent causes failure
+    with pytest.raises(RuntimeError):
+        check_llama_7b_multi_lora_from_request_test_harness(
+            LLM,
+            lora_config=lora_config_no_cache_size_values,
+            peft_cache_config=PeftCacheConfig(device_cache_percent=0.0000001),
+            # Disable CUDA graph
+            # TODO: remove this once we have a proper fix for CUDA graph in LoRA
+            cuda_graph_config=None)
+
+
+def test_llama_7b_lora_config_overrides_peft_cache_config():
+    """Tests that cache size args in lora_config LLM arg override the cache size
+    parameters in peft_cache_config LLM arg.
+    """    # noqa: D205
+    check_llama_7b_multi_lora_from_request_test_harness(
+        LLM,
+        lora_config=LoraConfig(
+            lora_target_modules=['attn_q', 'attn_k', 'attn_v'],
+            max_lora_rank=8,
+            max_loras=2,
+            max_cpu_loras=2),
+        peft_cache_config=PeftCacheConfig(
+            host_cache_size=1,  # size in bytes
+            device_cache_percent=0.0000001),
+        # Disable CUDA graph
+        # TODO: remove this once we have a proper fix for CUDA graph in LoRA
+        cuda_graph_config=None)
 
 
 # TODO smor: currently Nemotron-Super-49B-v1 with LoRA memory consumption is overly high
 # https://jirasw.nvidia.com/browse/TRTLLM-5045
-@pytest.mark.skip(reason="https://nvbugs/5401210")
 @skip_gpu_memory_less_than_138gb
 def test_nemotron_nas_lora() -> None:
     lora_config = LoraConfig(lora_dir=[
@@ -324,7 +427,9 @@ def test_codellama_fp8_with_bf16_lora() -> None:
 
         lora_config = LoraConfig(lora_dir=lora_paths,
                                  lora_target_modules=target_modules,
-                                 max_lora_rank=8)
+                                 max_lora_rank=8,
+                                 max_loras=2,
+                                 max_cpu_loras=2)
 
         llm = LLM(model_dir, quant_config=quant_config, lora_config=lora_config)
 
@@ -374,7 +479,9 @@ def test_bielik_11b_v2_2_instruct_multi_lora() -> None:
 
         trtllm_lora_config = LoraConfig(lora_dir=lora_paths,
                                         lora_target_modules=target_modules,
-                                        max_lora_rank=8)
+                                        max_lora_rank=8,
+                                        max_loras=2,
+                                        max_cpu_loras=2)
         llm = LLM(model_dir, lora_config=trtllm_lora_config)
 
         prompts = [
@@ -391,3 +498,197 @@ def test_bielik_11b_v2_2_instruct_multi_lora() -> None:
                                lora_request=lora_requests)
 
         assert len(outputs) == 2
+
+
+def test_gemma3_1b_instruct_multi_lora() -> None:
+    model_dir = f"{llm_models_root()}/gemma/gemma-3-1b-it"
+
+    target_modules = ['attn_q', 'attn_k', 'attn_v']
+
+    # Set up temporary directory for LoRA adapters
+    with tempfile.TemporaryDirectory() as lora_dir:
+        print("Creating dummy LoRAs...")
+
+        model = AutoModelForCausalLM.from_pretrained(model_dir,
+                                                     torch_dtype=torch.bfloat16,
+                                                     device_map="auto")
+        hf_modules = ["q_proj", "k_proj", "v_proj"]
+        peft_lora_config = PeftLoraConfig(r=8,
+                                          target_modules=hf_modules,
+                                          bias="none",
+                                          task_type="CAUSAL_LM")
+        lora_paths = []
+        for i in range(2):
+            lora_model = get_peft_model(model, peft_lora_config)
+            for param in lora_model.parameters():
+                param.data.zero_()
+            lora_path = f"{lora_dir}/lora_{i}"
+            lora_model.save_pretrained(lora_path)
+            lora_paths.append(lora_path)
+
+        trtllm_lora_config = LoraConfig(lora_dir=lora_paths,
+                                        lora_target_modules=target_modules,
+                                        max_lora_rank=8,
+                                        max_loras=2,
+                                        max_cpu_loras=2)
+        # Disabling kv cache reuse as a WAR to deal with gaps in kernel support for Gemma3's non-inclusive sliding window size.
+        kv_cache_config = KvCacheConfig(
+            enable_block_reuse=False,
+            enable_partial_reuse=False,
+        )
+        llm = LLM(model_dir,
+                  lora_config=trtllm_lora_config,
+                  kv_cache_config=kv_cache_config)
+
+        prompts = [
+            "Is it ok to fill diesel in a petrol car?",
+            "What is the capital of France?",
+        ]
+        lora_req1 = LoRARequest("lora-1", 0, lora_paths[0])
+        lora_req2 = LoRARequest("lora-2", 1, lora_paths[1])
+        lora_requests = [lora_req1, lora_req2]
+        sampling_params = SamplingParams(max_tokens=200)
+
+        outputs = llm.generate(prompts,
+                               sampling_params,
+                               lora_request=lora_requests)
+
+        assert len(outputs) == 2
+
+
+@pytest.mark.parametrize(
+    "lora_rank,max_lora_rank,description",
+    [
+        # (lora_rank, max_lora_rank, description)
+        (8, 8, "rank_8"),
+        (16, 16, "rank_16"),
+        (4, 8, "rank_4_max_8"),
+    ])
+def test_load_torch_nemo_lora_function(tmp_path, lora_rank, max_lora_rank,
+                                       description):
+    """Test load_torch_nemo_lora function with different LoRA rank configurations."""
+    from tensorrt_llm.lora_manager import load_torch_nemo_lora
+
+    nemo_path = create_mock_nemo_lora_checkpoint(
+        tmp_path,
+        hidden_size=2048,
+        num_layers=16,
+        lora_rank=lora_rank,
+    )
+
+    lora_config = LoraConfig(
+        lora_dir=[str(nemo_path)],
+        lora_ckpt_source="nemo",
+        max_lora_rank=max_lora_rank,
+    )
+
+    # This should not raise an error
+    load_torch_nemo_lora(lora_config)
+
+    assert lora_config.lora_target_modules == [
+        "attn_qkv"
+    ], f"Expected attn_qkv modules for {description}"
+    assert lora_config.trtllm_modules_to_hf_modules == {
+        "attn_qkv": "attn_qkv"
+    }, f"Expected correct module mapping for {description}"
+
+
+def test_nemo_lora_unsupported_modules_validation(tmp_path):
+    """Test validation of unsupported modules in NeMo LoRA."""
+    from tensorrt_llm.lora_manager import load_torch_nemo_lora
+
+    nemo_path = create_mock_nemo_lora_checkpoint(
+        tmp_path,
+        hidden_size=2048,
+        num_layers=16,
+        lora_rank=8,
+    )
+
+    # Test validation: should fail with unsupported modules
+    invalid_config = LoraConfig(
+        lora_dir=[str(nemo_path)],
+        lora_ckpt_source="nemo",
+        lora_target_modules=["attn_qkv",
+                             "mlp_h_to_4h"],  # mlp_h_to_4h not supported
+        max_lora_rank=8,
+    )
+
+    with pytest.raises(ValueError, match="NeMo LoRA only supports"):
+        load_torch_nemo_lora(invalid_config)
+
+
+@force_ampere
+def test_gqa_nemo_lora(tmp_path):
+    """
+    Test NeMo-format LoRA checkpoint loading and GQA support in TinyLlama.
+
+    This test verifies two properties:
+    1. That a NeMo-format LoRA checkpoint with GQA (grouped query attention) can be loaded and applied to a TinyLlama model,
+       and that generation with this LoRA produces a deterministic, expected output for a fixed prompt and temperature=0.0.
+    2. That the LoRA weights have a significant effect: generating with LoRA produces a different output than generating
+       without LoRA, confirming that the LoRA adapter is actually being applied.
+
+    The test uses a deterministic dummy LoRA checkpoint (seed=42) and checks both the positive (LoRA applied) and negative
+    (no LoRA) cases for output text.
+    """
+    # TinyLlama's exact GQA configuration
+    hidden_size = 2048
+    num_layers = 22
+    num_q_heads = 32  # Query attention heads
+    num_kv_heads = 4  # Key/Value heads (GQA)
+    lora_rank = 8
+
+    nemo_path = create_mock_nemo_lora_checkpoint(
+        tmp_path,
+        hidden_size=hidden_size,
+        num_layers=num_layers,
+        lora_rank=lora_rank,
+        num_attention_heads=num_q_heads,
+        num_kv_heads=num_kv_heads,
+        seed=42,  # NOTE: the seed=42 is important for the test to pass.
+    )
+    expected_lora_text_output = "Paris. The capital of France is Paris. The"
+    test_prompts = ["The capital of France is"]
+    sampling_params = SamplingParams(max_tokens=10, temperature=0.0)
+
+    lora_config = LoraConfig(
+        lora_dir=[str(nemo_path)],
+        lora_ckpt_source="nemo",
+        max_lora_rank=lora_rank,
+    )
+
+    model_path = get_model_path("llama-models-v2/TinyLlama-1.1B-Chat-v1.0")
+
+    llm = LLM(
+        model=model_path,
+        lora_config=lora_config,
+        kv_cache_config=global_kvcache_config,
+    )
+
+    try:
+        lora_req = LoRARequest("tinyllama-gqa-test",
+                               0,
+                               str(nemo_path),
+                               lora_ckpt_source="nemo")
+
+        lora_outputs = llm.generate(test_prompts,
+                                    sampling_params,
+                                    lora_request=[lora_req])
+
+        # For the above deterministic dummy LoRA checkpoint,
+        # with temperature=0.0,
+        # the expected output text should always be the same.
+        assert lora_outputs[0].outputs[0].text == expected_lora_text_output, \
+            f"Expected output text: {expected_lora_text_output}, " \
+            f"got: {lora_outputs[0].outputs[0].text}"
+        assert len(lora_outputs) == 1
+
+        # Generate without LoRA.
+        # The LoRA weights are tuned/large enough that
+        # they differ from a no-LoRA run.
+        base_outputs = llm.generate(test_prompts, sampling_params)
+        assert base_outputs[0].outputs[0].text != expected_lora_text_output, \
+            f"No-LoRA output should differ from expected output text: {expected_lora_text_output}, " \
+            f"got: {base_outputs[0].outputs[0].text}"
+    finally:
+        llm.shutdown()

@@ -101,7 +101,9 @@ public:
 
         // Always reserve SemaphoreArray (for multi-block mode) as MMHA may enable multi-block mode when shared memory
         // is not enough.
-        op.reserveSemaphoreArray(op.mNumHeads * max_num_requests);
+        // The attention kernel might split the heads into multiple blocks, so we might need to reserve more semaphores.
+        // Use mMultiProcessorCount as the lower-bound to make sure we reserve enough semaphores.
+        op.reserveSemaphoreArray(std::max(op.mNumHeads * max_num_requests, op.getMultiProcessorCount()));
     }
 
     int64_t getWorkspaceSize(AttentionOp const& op, int const num_tokens, int const max_attention_window_size,
@@ -526,7 +528,6 @@ void attention_inplace(torch::Tensor q, torch::optional<torch::Tensor> k, torch:
         "Expecting 2 bools for spec-dec mode, is_spec_decoding_enabled and use_spec_decoding.");
     op->mIsSpecDecodingEnabled = spec_decoding_bool_params[0]; // is_spec_decoding_enabled
     op->mUseSpecDecoding = spec_decoding_bool_params[1];       // use_spec_decoding
-    op->mMultiBlockMode = op->mIsSpecDecodingEnabled ? false : true;
 
     if (is_mla_enable)
     {
@@ -671,7 +672,8 @@ bool attention_supports_nvfp4_output(int64_t const num_heads, int64_t const num_
     bool const use_paged_context_fmha, bool is_mla_enable)
 {
     // Only Blackwell supports NVFP4 output.
-    if (tensorrt_llm::common::getSMVersion() < 100)
+    // SM 120 does not support NVFP4 output.
+    if (tensorrt_llm::common::getSMVersion() < 100 || tensorrt_llm::common::getSMVersion() == 120)
     {
         return false;
     }

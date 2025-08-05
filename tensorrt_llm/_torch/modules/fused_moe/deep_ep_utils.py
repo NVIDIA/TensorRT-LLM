@@ -100,7 +100,7 @@ class VariableLengthLowLatencyBuffer:
     def __init__(self, mapping: Mapping):
         self.comm = mpi_comm().Split(mapping.pp_rank, mapping.moe_ep_rank)
         self.buffer = None
-        self.num_max_dispatch_tokens_per_rank = None
+        self.num_experts = None
 
     def __del__(self):
         self.comm.Free()
@@ -120,6 +120,7 @@ class VariableLengthLowLatencyBuffer:
         allow_nvlink_for_low_latency_mode = (os.environ.get(
             "TRTLLM_DEEP_EP_DISABLE_P2P_FOR_LOW_LATENCY_MODE", "0") == "0")
 
+        assert self.num_experts is None or self.num_experts == num_experts
         # Allocate a buffer if not existed or not enough buffer size
         if self.buffer is None or self.buffer.num_rdma_bytes < num_rdma_bytes:
             # NOTES: for best performance, the QP number **must** be equal to the number of the local experts
@@ -133,17 +134,13 @@ class VariableLengthLowLatencyBuffer:
                                  allow_nvlink_for_low_latency_mode=
                                  allow_nvlink_for_low_latency_mode,
                                  comm=self.comm)
+            self.num_experts = num_experts
 
     def low_latency_dispatch(self, hidden_states: torch.Tensor,
                              topk_idx: torch.Tensor,
                              num_max_dispatch_tokens_per_rank: int,
                              num_experts: int):
-        if self.num_max_dispatch_tokens_per_rank is None:
-            self.num_max_dispatch_tokens_per_rank = num_max_dispatch_tokens_per_rank
-        if num_max_dispatch_tokens_per_rank != self.num_max_dispatch_tokens_per_rank:
-            raise NotImplementedError(
-                "There are issues if `low_latency_dispatch` calls use different `num_max_dispatch_tokens_per_rank` values"
-            )
+        assert num_experts == self.num_experts
 
         # Do MoE dispatch, compatible with CUDA graph (but you may restore some buffer status once you replay)
         recv_hidden_states, recv_expert_count, handle, event, hook = \
@@ -156,6 +153,24 @@ class VariableLengthLowLatencyBuffer:
         # If you don't want to overlap, please set `return_recv_hook=False`
         # Later, you can use our GEMM library to do the computation with this specific format
         return recv_hidden_states, recv_expert_count, handle
+
+    def low_latency_dispatch_fp4(self, hidden_states: torch.Tensor,
+                                 scales: torch.Tensor, topk_idx: torch.Tensor,
+                                 num_max_dispatch_tokens_per_rank: int,
+                                 num_experts: int):
+        assert num_experts == self.num_experts
+
+        # Do MoE dispatch, compatible with CUDA graph (but you may restore some buffer status once you replay)
+        recv_hidden_states, recv_scales, recv_expert_count, handle, event, hook = \
+            self.buffer.low_latency_dispatch_fp4(hidden_states, scales, topk_idx, num_max_dispatch_tokens_per_rank, num_experts)
+        assert event.event is None
+        assert hook is None
+
+        # NOTES: the actual tensor will not be received only if you call `hook()`,
+        # it is useful for double-batch overlapping, but **without any SM occupation**
+        # If you don't want to overlap, please set `return_recv_hook=False`
+        # Later, you can use our GEMM library to do the computation with this specific format
+        return recv_hidden_states, recv_scales, recv_expert_count, handle
 
     def low_latency_combine(self, hidden_states: torch.Tensor,
                             topk_idx: torch.Tensor, topk_weights: torch.Tensor,

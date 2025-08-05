@@ -487,9 +487,9 @@ def draft_target_model_example_root(llm_root, llm_venv):
 
 
 @pytest.fixture(scope="module")
-def prompt_lookup_example_root(llm_root, llm_venv):
-    "Get Prompt-Lookup example root"
-    example_root = os.path.join(llm_root, "examples", "prompt_lookup")
+def ngram_example_root(llm_root, llm_venv):
+    "Get NGram example root"
+    example_root = os.path.join(llm_root, "examples", "ngram")
     llm_venv.run_cmd([
         "-m", "pip", "install", "-r",
         os.path.join(example_root, "requirements.txt")
@@ -1084,7 +1084,7 @@ def draft_target_model_roots(request):
 
 
 @pytest.fixture(scope="function")
-def prompt_lookup_root(request):
+def ngram_root(request):
     models_root = llm_models_root()
     assert models_root, "Did you set LLM_MODELS_ROOT?"
     if request.param == "gpt2":
@@ -1094,7 +1094,7 @@ def prompt_lookup_root(request):
                                    "llama-models-v2/llama-v2-13b-hf")
     assert os.path.exists(
         models_root
-    ), f"Prompt-Lookup model path {models_root} does not exist under NFS LLM_MODELS_ROOT dir"
+    ), f"NGram model path {models_root} does not exist under NFS LLM_MODELS_ROOT dir"
     return models_root
 
 
@@ -1891,6 +1891,10 @@ skip_pre_blackwell = pytest.mark.skipif(
 skip_post_blackwell = pytest.mark.skipif(
     get_sm_version() >= 100,
     reason="This test is not supported in post-Blackwell architecture")
+
+skip_post_blackwell_ultra = pytest.mark.skipif(
+    get_sm_version() >= 103,
+    reason="This test is not supported in post-Blackwell-Ultra architecture")
 
 skip_device_contain_gb200 = pytest.mark.skipif(
     check_device_contain(["GB200"]),

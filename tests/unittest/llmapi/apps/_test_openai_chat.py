@@ -20,9 +20,7 @@ def model_name():
     return "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
 
 
-@pytest.fixture(scope="module",
-                params=[None, 'pytorch'],
-                ids=["trt", "pytorch"])
+@pytest.fixture(scope="module", params=["trt", "pytorch"])
 def backend(request):
     return request.param
 
@@ -67,10 +65,9 @@ def temp_extra_llm_api_options_file(request):
 def server(model_name: str, backend: str, extra_llm_api_options: bool,
            temp_extra_llm_api_options_file: str, num_postprocess_workers: int):
     model_path = get_model_path(model_name)
-    if backend == "pytorch":
-        args = ["--backend", f"{backend}"]
-    else:
-        args = ["--max_beam_width", "4"]
+    args = ["--backend", f"{backend}"]
+    if backend == "trt":
+        args.extend(["--max_beam_width", "4"])
     if extra_llm_api_options:
         args.extend(
             ["--extra_llm_api_options", temp_extra_llm_api_options_file])
@@ -524,3 +521,41 @@ def test_stop_reason(client: openai.OpenAI, model_name: str, backend: str):
     )
     assert resp.choices[0].finish_reason == "stop"
     assert resp.choices[0].stop_reason == "two"
+
+
+@pytest.mark.asyncio
+async def test_chat_completion_with_logit_bias(async_client: openai.AsyncOpenAI,
+                                               model_name: str):
+    """Test logit_bias in chat completions"""
+    logit_bias = {
+        "1000": 2.0,
+        "2000": -2.0,
+    }
+
+    chat_completion = await async_client.chat.completions.create(
+        model=model_name,
+        messages=[{
+            "role": "user",
+            "content": "Tell me a fact about Paris"
+        }],
+        max_tokens=20,
+        logit_bias=logit_bias,
+        temperature=0.0,
+    )
+    assert chat_completion.choices[0].message.content
+
+
+@pytest.mark.asyncio
+async def test_chat_completion_with_invalid_logit_bias(
+        async_client: openai.AsyncOpenAI, model_name: str):
+    """Test with invalid token IDs (non-integer keys)"""
+    with pytest.raises(openai.BadRequestError):
+        await async_client.chat.completions.create(
+            model=model_name,
+            messages=[{
+                "role": "user",
+                "content": "Tell me a fact about Paris"
+            }],
+            logit_bias={"invalid_token": 1.0},  # Non-integer key
+            max_tokens=5,
+        )

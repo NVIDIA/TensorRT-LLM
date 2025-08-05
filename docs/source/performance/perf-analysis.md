@@ -52,7 +52,7 @@ Append “python-gil” to Nsys “-t” option.
 2. Set environment variable `TLLM_TORCH_PROFILE_TRACE=<path>`, and the results will be saved to `<path>`.
 
 ### Visualize the PyTorch profiler results
-Use [chrome://tracing/](chrome://tracing/) to inspect the saved profile.
+Use <chrome://tracing/> to inspect the saved profile.
 
 
 ## Examples
@@ -83,10 +83,9 @@ TLLM_PROFILE_START_STOP=100-150 nsys profile \
     --model_path ${MODEL_PATH} \
     throughput \
     --dataset /tmp/dataset.txt --warmup 0 \
-    --backend pytorch \
     --streaming
 ```
 
 The Nsight Systems reports will be saved to `trace.nsys-rep`. Use NVIDIA Nsight Systems application to open it.
 
-The PyTorch profiler results will be saved to `trace.json`. Use [chrome://tracing/](chrome://tracing/) to inspect the saved profile.
+The PyTorch profiler results will be saved to `trace.json`. Use <chrome://tracing/> to inspect the saved profile.

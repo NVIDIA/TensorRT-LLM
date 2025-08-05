@@ -39,6 +39,7 @@ PLATFORM           ?= $(shell uname -m | grep -q 'aarch64' && echo "arm64" || ec
 CUDA_ARCHS         ?= $(if $(filter arm64,$(PLATFORM)),'90-real;100-real;120-real',)
 BUILD_WHEEL_OPTS   ?=
 BUILD_WHEEL_ARGS   ?= $(shell grep '^ARG BUILD_WHEEL_ARGS=' Dockerfile.multi | grep -o '=.*' | tr -d '="')$(if $(CUDA_ARCHS), --cuda_architectures $(CUDA_ARCHS))$(if $(BUILD_WHEEL_OPTS), $(BUILD_WHEEL_OPTS))
+BUILD_WHEEL_SCRIPT ?=
 TORCH_INSTALL_TYPE ?= skip
 CUDA_VERSION       ?=
 CUDNN_VERSION      ?=
@@ -80,6 +81,7 @@ endef
 		$(if $(BASE_IMAGE), --build-arg BASE_IMAGE=$(BASE_IMAGE)) \
 		$(if $(BASE_TAG), --build-arg BASE_TAG=$(BASE_TAG)) \
 		$(if $(BUILD_WHEEL_ARGS), --build-arg BUILD_WHEEL_ARGS="$(BUILD_WHEEL_ARGS)") \
+		$(if $(BUILD_WHEEL_SCRIPT), --build-arg BUILD_WHEEL_SCRIPT="$(BUILD_WHEEL_SCRIPT)") \
 		$(if $(TORCH_INSTALL_TYPE), --build-arg TORCH_INSTALL_TYPE="$(TORCH_INSTALL_TYPE)") \
 		$(if $(CUDA_VERSION), --build-arg CUDA_VER="$(CUDA_VERSION)") \
 		$(if $(CUDNN_VERSION), --build-arg CUDNN_VER="$(CUDNN_VERSION)") \
@@ -184,16 +186,16 @@ jenkins-rockylinux8_%: PYTHON_VERSION_TAG_ID = $(if $(findstring 3.12,${PYTHON_V
 jenkins-rockylinux8_%: IMAGE_WITH_TAG = $(shell . ../jenkins/current_image_tags.properties && echo $$LLM_ROCKYLINUX8_${PYTHON_VERSION_TAG_ID}_DOCKER_IMAGE)
 jenkins-rockylinux8_%: STAGE = tritondevel
 jenkins-rockylinux8_%: BASE_IMAGE = nvidia/cuda
-jenkins-rockylinux8_%: BASE_TAG = 12.9.0-devel-rockylinux8
+jenkins-rockylinux8_%: BASE_TAG = 12.9.1-devel-rockylinux8
 
 rockylinux8_%: STAGE = tritondevel
 rockylinux8_%: BASE_IMAGE = nvidia/cuda
-rockylinux8_%: BASE_TAG = 12.9.0-devel-rockylinux8
+rockylinux8_%: BASE_TAG = 12.9.1-devel-rockylinux8
 
 # For x86_64 and aarch64
 ubuntu22_%: STAGE = tritondevel
 ubuntu22_%: BASE_IMAGE = nvidia/cuda
-ubuntu22_%: BASE_TAG = 12.9.0-devel-ubuntu22.04
+ubuntu22_%: BASE_TAG = 12.9.1-devel-ubuntu22.04
 
 trtllm_%: STAGE = release
 trtllm_%: PUSH_TO_STAGING := 0

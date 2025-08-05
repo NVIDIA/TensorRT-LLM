@@ -28,6 +28,7 @@ from transformers.utils import (
 )
 
 from ..custom_ops.attention_interface import CacheConfig
+from ..utils._config import deep_merge_dicts
 from ..utils.logger import ad_logger
 from .factory import ModelFactory, ModelFactoryRegistry
 
@@ -62,25 +63,37 @@ def hf_load_state_dict_with_device(device: DeviceLikeType):
 
 @ModelFactoryRegistry.register("AutoModelForCausalLM")
 class AutoModelForCausalLMFactory(ModelFactory):
+    _tokenizer_defaults = {
+        "legacy": False,
+        "padding_side": "left",
+        "truncation_side": "left",
+        "trust_remote_code": True,
+        "use_fast": True,
+    }
+
+    _model_defaults = {
+        "use_cache": False,
+        "max_position_embeddings": 1024,
+    }
+
+    def _get_max_position_embeddings_config(self) -> Dict[str, Any]:
+        """Get the max position embeddings config for the model."""
+        return {
+            "max_position_embeddings": self.max_seq_len,
+        }
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
         self._quant_config: Optional[Dict] = None
 
-        # Relevant default tokenizer kwargs for HF-style tokenizer
-        defaults = {
-            "legacy": False,
-            "padding_side": "left",
-            "truncation_side": "left",
-            "trust_remote_code": True,
-            "use_fast": True,
-        }
-        self.tokenizer_kwargs = {**defaults, **self.tokenizer_kwargs}
-
-        # NEVER use cache
-        self.model_kwargs["use_cache"] = False
-        # Ensure max_seq_len is propagated to model_kwargs
-        self.model_kwargs["max_position_embeddings"] = self.max_seq_len
+        # Ingest defaults for tokenizer and model kwargs
+        self.tokenizer_kwargs = deep_merge_dicts(self._tokenizer_defaults, self.tokenizer_kwargs)
+        self.model_kwargs = deep_merge_dicts(
+            self._model_defaults,
+            self.model_kwargs,
+            self._get_max_position_embeddings_config(),
+        )
 
         # special handling for torch_dtype in model_kwargs since HF does not correctly update
         # torch_dtype string to an actual torch.dtype object (only with default)
@@ -114,7 +127,7 @@ class AutoModelForCausalLMFactory(ModelFactory):
 
     def _recursive_update_config(self, config: PretrainedConfig, update_dict: Dict[str, Any]):
         """
-        Recursively update a PretrainedConfig object with values from update_dict.
+        Deep-merge a PretrainedConfig object with values from update_dict.
 
         Args:
             config: PretrainedConfig object to update
@@ -292,7 +305,7 @@ class AutoModelForCausalLMFactory(ModelFactory):
         # at this point it should be a directory (either the original one or the download dir)
         assert os.path.isdir(fetched_dir), f"Checkpoint path {fetched_dir} is not a directory."
 
-        self._load_quantization_config()
+        self._load_quantization_config(fetched_dir)
 
         return fetched_dir
 
@@ -302,15 +315,21 @@ class AutoModelForCausalLMFactory(ModelFactory):
         ckpt_file = self._get_checkpoint_file(self.model)
         # reuse the load checkpoint utility from accelerate
         with hf_load_state_dict_with_device(device):
-            load_checkpoint_in_model(model, checkpoint=ckpt_file)
+            # Set `full_state_dict=False` to skip Accelerate's FSDP weight sync logic.
+            # Internally, load_checkpoint_in_model → set_model_state_dict → _load_model_state_dict,
+            # which collects local model params, syncs weights from checkpoint, and applies them via
+            # model.load_state_dict.
+            # This sync step can interfere with load_hooks by mixing raw checkpoint weights and
+            # model-transformed weights,leading to unexpected key mismatches or format issues.
+            load_checkpoint_in_model(model, checkpoint=ckpt_file, full_state_dict=False)
 
-    def _load_quantization_config(self):
+    def _load_quantization_config(self, fetched_dir: str):
         """Load the quantization config from the model directory if not done already."""
         if self._quant_config is not None:
             return
 
         assert self.model
-        hf_quant_config_file = os.path.join(self.model, "hf_quant_config.json")
+        hf_quant_config_file = os.path.join(fetched_dir, "hf_quant_config.json")
         if os.path.exists(hf_quant_config_file):
             with open(hf_quant_config_file, "r") as file:
                 quantization_config = json.load(file)
@@ -326,21 +345,23 @@ class AutoModelForCausalLMFactory(ModelFactory):
 
 @ModelFactoryRegistry.register("AutoModelForImageTextToText")
 class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
+    _model_defaults = {
+        "use_cache": False,
+        "max_position_embeddings": 1024,
+        "text_config": {
+            "max_position_embeddings": 1024,
+            "use_cache": False,
+        },
+    }
 
-        # additional heuristic to propagate "important keys"
-        # TODO (lucaslie): WAR until we have better support on dashboard to control model_kwargs
-        keys_to_propagate = [
-            "num_hidden_layers",
-            "max_position_embeddings",
-            "use_cache",
-            "torch_dtype",
-        ]
-        self.model_kwargs["text_config"] = self.model_kwargs.get("text_config", {})
-        for key in keys_to_propagate:
-            if key in self.model_kwargs:
-                self.model_kwargs["text_config"][key] = self.model_kwargs[key]
+    def _get_max_position_embeddings_config(self) -> Dict[str, Any]:
+        """Get the max position embeddings config for the model."""
+        return {
+            "max_position_embeddings": self.max_seq_len,
+            "text_config": {
+                "max_position_embeddings": self.max_seq_len,
+            },
+        }
 
     @property
     def automodel_from_config(self):

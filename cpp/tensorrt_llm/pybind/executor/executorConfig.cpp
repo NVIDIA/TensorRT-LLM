@@ -336,7 +336,7 @@ void initConfigBindings(pybind11::module_& m)
             throw std::runtime_error("Invalid extendedRuntimePerfKnobConfig state!");
         }
         return tle::ExtendedRuntimePerfKnobConfig(
-            state[0].cast<bool>(), state[1].cast<bool>(), state[2].cast<bool>(), state[2].cast<SizeType32>());
+            state[0].cast<bool>(), state[1].cast<bool>(), state[2].cast<bool>(), state[3].cast<SizeType32>());
     };
     auto extendedRuntimePerfKnobConfigGetstate = [](tle::ExtendedRuntimePerfKnobConfig const& self)
     {
@@ -424,7 +424,7 @@ void initConfigBindings(pybind11::module_& m)
         .value("MPI", tle::CacheTransceiverConfig::BackendType::MPI)
         .value("UCX", tle::CacheTransceiverConfig::BackendType::UCX)
         .value("NIXL", tle::CacheTransceiverConfig::BackendType::NIXL)
-        .def(py::init(
+        .def("from_string",
             [](std::string const& str)
             {
                 if (str == "DEFAULT" || str == "default")
@@ -436,9 +436,7 @@ void initConfigBindings(pybind11::module_& m)
                 if (str == "NIXL" || str == "nixl")
                     return tle::CacheTransceiverConfig::BackendType::NIXL;
                 throw std::runtime_error("Invalid backend type: " + str);
-            }));
-
-    py::implicitly_convertible<std::string, tle::CacheTransceiverConfig::BackendType>();
+            });
 
     py::class_<tle::CacheTransceiverConfig>(m, "CacheTransceiverConfig")
         .def(py::init<std::optional<tle::CacheTransceiverConfig::BackendType>, std::optional<size_t>>(),
@@ -461,7 +459,7 @@ void initConfigBindings(pybind11::module_& m)
             c.getExtendedRuntimePerfKnobConfig(), c.getDebugConfig(), c.getRecvPollPeriodMs(),
             c.getMaxSeqIdleMicroseconds(), c.getSpecDecConfig(), c.getGuidedDecodingConfig(),
             c.getAdditionalModelOutputs(), c.getCacheTransceiverConfig(), c.getGatherGenerationLogits(),
-            c.getPromptTableOffloading(), c.getEnableTrtOverlap());
+            c.getPromptTableOffloading(), c.getEnableTrtOverlap(), c.getFailFastOnAttentionWindowTooLarge());
         auto pickle_tuple = py::make_tuple(cpp_states, py::getattr(self, "__dict__"));
         return pickle_tuple;
     };
@@ -474,7 +472,7 @@ void initConfigBindings(pybind11::module_& m)
 
         // Restore C++ data
         auto cpp_states = state[0].cast<py::tuple>();
-        if (cpp_states.size() != 28)
+        if (cpp_states.size() != 29)
         {
             throw std::runtime_error("Invalid cpp_states!");
         }
@@ -507,7 +505,8 @@ void initConfigBindings(pybind11::module_& m)
             cpp_states[24].cast<std::optional<tle::CacheTransceiverConfig>>(),             // CacheTransceiverConfig
             cpp_states[25].cast<bool>(),                                                   // GatherGenerationLogits
             cpp_states[26].cast<bool>(),                                                   // PromptTableOffloading
-            cpp_states[27].cast<bool>()                                                    // EnableTrtOverlap
+            cpp_states[27].cast<bool>(),                                                   // EnableTrtOverlap
+            cpp_states[28].cast<bool>() // FailFastOnAttentionWindowTooLarge
         );
 
         auto py_state = state[1].cast<py::dict>();
@@ -544,7 +543,8 @@ void initConfigBindings(pybind11::module_& m)
                  std::optional<tle::CacheTransceiverConfig>,             // CacheTransceiverConfig
                  bool,                                                   // GatherGenerationLogits
                  bool,                                                   // PromptTableOffloading
-                 bool                                                    // EnableTrtOverlap
+                 bool,                                                   // EnableTrtOverlap
+                 bool                                                    // FailFastOnAttentionWindowTooLarge
                  >(),
             py::arg("max_beam_width") = 1, py::arg_v("scheduler_config", tle::SchedulerConfig(), "SchedulerConfig()"),
             py::arg_v("kv_cache_config", tle::KvCacheConfig(), "KvCacheConfig()"),
@@ -565,7 +565,7 @@ void initConfigBindings(pybind11::module_& m)
             py::arg("spec_dec_config") = py::none(), py::arg("guided_decoding_config") = py::none(),
             py::arg("additional_model_outputs") = py::none(), py::arg("cache_transceiver_config") = py::none(),
             py::arg("gather_generation_logits") = false, py::arg("mm_embedding_offloading") = false,
-            py::arg("enable_trt_overlap") = false)
+            py::arg("enable_trt_overlap") = false, py::arg("fail_fast_on_attention_window_too_large") = false)
         .def_property("max_beam_width", &tle::ExecutorConfig::getMaxBeamWidth, &tle::ExecutorConfig::setMaxBeamWidth)
         .def_property("max_batch_size", &tle::ExecutorConfig::getMaxBatchSize, &tle::ExecutorConfig::setMaxBatchSize)
         .def_property("max_num_tokens", &tle::ExecutorConfig::getMaxNumTokens, &tle::ExecutorConfig::setMaxNumTokens)
@@ -615,6 +615,9 @@ void initConfigBindings(pybind11::module_& m)
             &tle::ExecutorConfig::setPromptTableOffloading)
         .def_property(
             "enable_trt_overlap", &tle::ExecutorConfig::getEnableTrtOverlap, &tle::ExecutorConfig::setEnableTrtOverlap)
+        .def_property("fail_fast_on_attention_window_too_large",
+            &tle::ExecutorConfig::getFailFastOnAttentionWindowTooLarge,
+            &tle::ExecutorConfig::setFailFastOnAttentionWindowTooLarge)
         .def(py::pickle(executorConfigGetState, executorConfigSetState));
 }
 

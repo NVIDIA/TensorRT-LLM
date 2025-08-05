@@ -166,6 +166,9 @@ void CacheFormatter::format(TransferSession& session)
     auto const numPools = blockManager.getNumPools();
     // TODO(oargov): are we sure the other side has the same number of pools? this might not hold for pp_size>1...
 
+    auto lastTokenTime = llmRequest.getPerfMetrics().timingMetrics.lastTokenTime;
+    bool recordDelay = lastTokenTime != std::chrono::steady_clock::time_point();
+
     bool layerWise = common::getEnvDisaggLayerwise() && numPools == 1;
     if (layerWise)
     {
@@ -344,15 +347,20 @@ void CacheFormatter::format(TransferSession& session)
                     auto copyTargetSlice = runtime::ITensor::slice(preAllocSendBuffer, 0, sendSize);
                     bufferManager.copy(*copySlice, *copyTargetSlice);
                     bufferManager.getStream().synchronize();
-                    session.send(processIdx, copyTargetSlice->data(), sendSize);
+                    session.send(processIdx, copyTargetSlice->data(), copyTargetSlice->getSizeInBytes());
                     remainSendSize -= sendSize;
                 }
             }
 
             auto endTime = std::chrono::steady_clock::now();
+            double delay = 0.0;
+            if (recordDelay)
+            {
+                delay = std::chrono::duration<double, std::milli>(startTime - lastTokenTime).count();
+            }
             double cacheTransferTime
                 = std::max(0.0, std::chrono::duration<double, std::milli>(endTime - startTime).count());
-            kvCacheMeasureHelper.appendKVCacheTransfer(llmRequest.mRequestId, cacheTransferTime, size);
+            kvCacheMeasureHelper.appendKVCacheTransfer(llmRequest.mRequestId, delay, cacheTransferTime, size);
         };
 
         if (connections.size() > 1)
@@ -408,15 +416,18 @@ void CacheFormatter::unformat(TransferSession& session)
 {
     NVTX3_SCOPED_RANGE(CacheFormatter_unformat);
     auto const& llmRequest = session.getLlmRequest();
+    auto const ctxReqId = llmRequest.getContextPhaseParams().value().getReqId();
     TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
-        "Start receiving KV cache for request ID: %ld, context request ID: %ld.", llmRequest.mRequestId,
-        llmRequest.getContextPhaseParams().value().getReqId());
+        "Start receiving KV cache for request ID: %ld, context request ID: %ld.", llmRequest.mRequestId, ctxReqId);
     auto const& connections = session.getConnections();
     auto const& selfConfig = session.getSelfState().getCacheState().value();
     auto const& destConfig = session.getOtherState().getCacheState().value();
     auto const selfIdx = session.getSelfState().getCommState().value().getSelfIdx();
     auto& bufferManager = session.getBufferManager();
     auto blockRange = getBlockRangeForReceiving(mCacheManager, llmRequest);
+
+    auto arrivalTime = llmRequest.getPerfMetrics().timingMetrics.arrivalTime;
+    bool recordDelay = arrivalTime != std::chrono::steady_clock::time_point();
 
     auto pickUpConnections = pickRecvConnections(connections.size(), selfConfig, selfIdx, destConfig);
 
@@ -546,7 +557,7 @@ void CacheFormatter::unformat(TransferSession& session)
                 }
                 TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
                     "End receiving KV cache for request ID: %ld, context request ID: %ld.", llmRequest.mRequestId,
-                    llmRequest.getContextPhaseParams().value().getReqId());
+                    ctxReqId);
                 return;
             }
             // legacyPath: context executor rank only send data to one gen executor rank. it sends multiple cache
@@ -634,6 +645,8 @@ void CacheFormatter::unformat(TransferSession& session)
                 TLLM_CUDA_CHECK(cudaSetDevice(deviceId));
                 TLLM_CHECK(pickUpConnections.size() > processIdx);
                 TLLM_CHECK(recvSplitCaches.size() > processIdx);
+                auto startTime = std::chrono::steady_clock::now();
+                size_t size = 0;
                 if (legacyPath)
                 {
                     size_t idx = processIdx * blockNum;
@@ -645,6 +658,7 @@ void CacheFormatter::unformat(TransferSession& session)
                         size_t recvBufferIdx = blockIdx * pickUpConnections.size() + commIdx;
                         llmRequest.updateKvCacheSize((*recvSplitCaches[recvBufferIdx]).getSizeInBytes());
                         auto& buffer = recvSplitCaches.at(recvBufferIdx);
+                        size += buffer->getSizeInBytes();
                         session.recv(pickUpConnections[processIdx], buffer->data(), buffer->getSizeInBytes());
                         idx++;
                     }
@@ -655,6 +669,7 @@ void CacheFormatter::unformat(TransferSession& session)
                     {
                         llmRequest.updateKvCacheSize((*recvSplitCaches.at(processIdx)).getSizeInBytes());
                         auto& buffer = recvSplitCaches[processIdx];
+                        size = buffer->getSizeInBytes();
                         session.recv(pickUpConnections[processIdx], buffer->data(), buffer->getSizeInBytes());
                     }
                     else if (bufferCoverTargetNum > 0)
@@ -663,6 +678,7 @@ void CacheFormatter::unformat(TransferSession& session)
                             + remainNoCoverTargetNum; // caches.at(recvBufferIdx) is allocated by cudaMalloc
                         llmRequest.updateKvCacheSize((*recvSplitCaches.at(recvBufferIdx)).getSizeInBytes());
                         auto& buffer = recvSplitCaches.at(recvBufferIdx);
+                        size = buffer->getSizeInBytes();
                         session.recv(pickUpConnections[processIdx], buffer->data(), buffer->getSizeInBytes());
                         bufferManager.copy(*recvSplitCaches.at(recvBufferIdx), *recvSplitCaches[processIdx]);
                         bufferManager.getStream().synchronize();
@@ -679,6 +695,7 @@ void CacheFormatter::unformat(TransferSession& session)
                             auto recvSlice = runtime::ITensor::slice(preAllocRecvBuffer, 0, recvSize);
                             auto copySlice = runtime::ITensor::slice(
                                 recvSplitCaches[processIdx], targetBufferSize - remainRecvSize, recvSize);
+                            size += recvSlice->getSizeInBytes();
                             llmRequest.updateKvCacheSize((*recvSlice).getSizeInBytes());
                             session.recv(pickUpConnections[processIdx], recvSlice->data(), recvSlice->getSizeInBytes());
                             bufferManager.copy(*recvSlice, *copySlice);
@@ -687,6 +704,15 @@ void CacheFormatter::unformat(TransferSession& session)
                         }
                     }
                 }
+                auto endTime = std::chrono::steady_clock::now();
+                double delay = 0.0;
+                if (recordDelay)
+                {
+                    delay = std::chrono::duration<double, std::milli>(startTime - arrivalTime).count();
+                }
+                double cacheTransferTime
+                    = std::max(0.0, std::chrono::duration<double, std::milli>(endTime - startTime).count());
+                kvCacheMeasureHelper.appendKVCacheTransfer(ctxReqId, delay, cacheTransferTime, size);
             };
             if (pickUpConnections.size() > 1)
             {
@@ -814,6 +840,8 @@ void CacheFormatter::unformat(TransferSession& session)
     if (selfConfig.getModelConfig().mNbKvHeadsPerLayer.size() != destConfig.getModelConfig().mNbKvHeadsPerLayer.size())
     {
         TLLM_LOG_WARNING("CacheFormatter::inquireSupport: only support same number of layers");
+        TLLM_LOG_WARNING("self: %zu dest %zu", selfConfig.getModelConfig().mNbKvHeadsPerLayer.size(),
+            destConfig.getModelConfig().mNbKvHeadsPerLayer.size());
         return false;
     }
     int selfNumLayers = selfConfig.getModelConfig().mNbKvHeadsPerLayer.size();

@@ -68,11 +68,11 @@ docker run -d --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 \
     -p 8000:8000 --gpus=all -e "TRTLLM_ENABLE_PDL=1" \
     -v /path/to/maverick:/config/models/maverick -v /path/to/eagle:/config/models/eagle \
     docker.io/<username>/tensorrt_llm:main sh \
-        -c "echo -e 'enable_attention_dp: false\nenable_min_latency: true\nenable_autotuner: false\ncuda_graph_config:\n  max_batch_size: 8\nspeculative_config:\n  decoding_type: Eagle\n  max_draft_len: 3\n  speculative_model_dir: /config/models/eagle\nkv_cache_config:\n  enable_block_reuse: false' > c.yaml && \
+        -c "echo -e 'enable_autotuner: false\nenable_attention_dp: false\nenable_min_latency: true\ncuda_graph_config:\n  max_batch_size: 8\nspeculative_config:\n  decoding_type: Eagle\n  max_draft_len: 3\n  speculative_model_dir: /config/models/eagle\n  eagle3_one_model: true\nkv_cache_config:\n  enable_block_reuse: false' > c.yaml && \
         TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL=True \
         trtllm-serve /config/models/maverick \
             --host 0.0.0.0 --port 8000 \
-            --backend pytorch --tp_size 8 --ep_size 1 \
+            --tp_size 8 --ep_size 1 \
             --trust_remote_code --extra_llm_api_options c.yaml \
             --kv_cache_free_gpu_memory_fraction 0.75"
 ```
@@ -141,7 +141,9 @@ docker kill <container_id>
 
 ## Performance Tuning
 
-The configuration provided is optimized for 8xB200 GPUs, but you can adjust several parameters for your specific workload:
+The configuration provided is optimized for 8xB200 GPUs, but you can adjust several parameters for your specific workload.
+
+**Note:** This configuration is optimized for minimum latency (`enable_min_latency: true`). When increasing the concurrency of requests, the tokens per second (TPS) per user degrades rapidly. This setup is designed to maximize single-user performance rather than high-concurrency throughput. For workloads with many concurrent users, you may need to adjust the configuration accordingly.
 
 - `max_batch_size`: Controls how many requests can be batched together
 - `max_draft_len`: The number of tokens Eagle can speculate ahead

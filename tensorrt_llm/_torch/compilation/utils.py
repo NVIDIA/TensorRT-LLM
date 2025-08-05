@@ -41,3 +41,22 @@ def set_enable_piecewise_cuda_graph_capture_flag(enable: bool):
 def get_enable_piecewise_cuda_graph_capture_flag() -> bool:
     global _enable_piecewise_cuda_graph_capture
     return _enable_piecewise_cuda_graph_capture
+
+
+def inplace_info():
+    inplace_map = {
+        torch.ops.trtllm.flashinfer_fused_add_rmsnorm.default: {
+            1: "input",
+            2: "residual"
+        },
+        torch.ops.trtllm.attn_custom_op_inplace.default: {
+            1: "output",
+        },
+        torch.ops.trtllm.mla_custom_op_inplace.default: {
+            1: "output"
+        },
+        torch.ops.trtllm.fused_qk_norm_rope.default: {
+            1: "qkv"
+        }
+    }
+    return inplace_map

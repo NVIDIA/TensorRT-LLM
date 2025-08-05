@@ -51,7 +51,11 @@ if [[ "$BUILD_UNIT_TESTS" == "true" ]]; then
   BUILD_TESTS_ARG="-DBUILD_TESTS=ON -DUSE_CXX11_ABI=ON"
 fi
 
-cmake -DCMAKE_INSTALL_PREFIX:PATH=`pwd`/install ${BUILD_TESTS_ARG} ..
+# TODO: Remove specifying Triton version after cmake version is upgraded to 3.31.8
+# Get TRITON_SHORT_TAG from docker/Dockerfile.multi
+LLM_ROOT="$(dirname $0)/../../../.."
+TRITON_SHORT_TAG=$("$LLM_ROOT/jenkins/scripts/get_triton_tag.sh" "$LLM_ROOT")
+cmake -DCMAKE_INSTALL_PREFIX:PATH=`pwd`/install ${BUILD_TESTS_ARG} -DTRITON_COMMON_REPO_TAG=${TRITON_SHORT_TAG} -DTRITON_CORE_REPO_TAG=${TRITON_SHORT_TAG} -DTRITON_THIRD_PARTY_REPO_TAG=${TRITON_SHORT_TAG} -DTRITON_BACKEND_REPO_TAG=${TRITON_SHORT_TAG} ..
 make install
 
 mkdir -p /opt/tritonserver/backends/tensorrtllm

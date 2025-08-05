@@ -1,7 +1,7 @@
 """Graph transformation to automatically add kv cache into fused MHA op."""
 
 import operator
-from typing import Dict
+from typing import Dict, Type
 
 import torch
 from torch.fx import Graph, GraphModule, Node
@@ -14,7 +14,7 @@ from ...utils.node_utils import get_all_input_output_nodes, is_op
 from .._graph import add_graph_input, canonicalize_graph
 
 
-def update_in_out_nodes(egm: GraphModule, cm: CachedSequenceInterface) -> GraphModule:
+def update_in_out_nodes(egm: GraphModule, cm: CachedSequenceInterface) -> None:
     """Modify the graph module by adding new input nodes and canonicalizing the graph.
 
     The new input nodes correspond to the extra arguments needed for cached and flattened attention.
@@ -22,9 +22,6 @@ def update_in_out_nodes(egm: GraphModule, cm: CachedSequenceInterface) -> GraphM
     Args:
         egm: The graph module to analyze and modify.
         cm: Cached sequence interface containing extra argument information.
-
-    Returns:
-        The updated GraphModule with new input nodes and a canonicalized graph.
     """
     # loop through nodes to get input, output, and get_attr nodes
     input_nodes, output_nodes = get_all_input_output_nodes(egm.graph)
@@ -45,17 +42,15 @@ def update_in_out_nodes(egm: GraphModule, cm: CachedSequenceInterface) -> GraphM
         input_nodes.append(add_graph_input(egm, name))
     ad_logger.info(f"Added {len(new_args)} new input nodes for cached attention metadata")
 
-    egm = canonicalize_graph(egm)
-
-    return egm
+    canonicalize_graph(egm)
 
 
 def insert_cached_attention(
     egm: GraphModule,
     cm: CachedSequenceInterface,
-    attn_descriptor: AttentionDescriptor,
+    attn_descriptor: Type[AttentionDescriptor],
     cache_config: CacheConfig,
-) -> GraphModule:
+) -> None:
     """Replace uncached source attention node with corresponding cached attn node."""
     # Get all attention nodes and their info objects
     source_op = attn_descriptor.get_source_attention_op()
@@ -68,7 +63,7 @@ def insert_cached_attention(
 
     if not source_attn_nodes:
         # If there are no nodes for kv cache insertion found, return current graph
-        return egm
+        return
 
     # Sanity check
     if cm.info.is_paged:
@@ -131,14 +126,12 @@ def insert_cached_attention(
         graph.erase_node(attn_node)
         num_cached_attn_replacements += 1
 
-    egm = canonicalize_graph(egm)
+    canonicalize_graph(egm)
     ad_logger.info(
         f"Replaced {num_cached_attn_replacements} {source_op} ops "
         f"with {attn_descriptor.get_cached_attention_op()}"
     )
     ad_logger.debug(f"After inserting {attn_descriptor=} with cache: {egm}")
-
-    return egm
 
 
 def resize_kv_cache(
@@ -150,8 +143,13 @@ def resize_kv_cache(
 
     free_mem_ratio specifies the fraction of available memory to occupy.
     """
-    free_mem, total_mem = torch.cuda.mem_get_info()
-    ad_logger.info(f"Free memory: {free_mem}, Total memory: {total_mem}")
+
+    def _get_mem_info_in_mb():
+        free_mem, total_mem = torch.cuda.mem_get_info()
+        return free_mem // 1024**2, total_mem // 1024**2
+
+    free_mem, total_mem = _get_mem_info_in_mb()
+    ad_logger.info(f"Free memory (MB): {free_mem}, Total memory (MB): {total_mem}")
     current_cache_size = cm.current_cache_size_bytes()
     current_num_pages = cm.info.num_pages
     ad_logger.info(
@@ -165,16 +163,18 @@ def resize_kv_cache(
     try:
         # Let's run a forward pass to get the memory usage
         cm.info._set_max_num_tokens_sample()
-        free_mem_pre, _ = torch.cuda.mem_get_info()
-        ad_logger.info(f"Free memory before forward pass: {free_mem_pre}")
+        free_mem_pre, _ = _get_mem_info_in_mb()
+        ad_logger.info(f"Free memory before forward pass (MB): {free_mem_pre}")
+
         egm(*cm.args)
-        free_mem_post, _ = torch.cuda.mem_get_info()
-        ad_logger.info(f"Free memory after forward pass: {free_mem_post}")
+
+        free_mem_post, _ = _get_mem_info_in_mb()
+        ad_logger.info(f"Free memory after forward pass (MB): {free_mem_post}")
 
         memory_for_forward_pass = free_mem_pre - free_mem_post
-        ad_logger.info(f"Memory for forward pass: {memory_for_forward_pass}")
+        ad_logger.info(f"Memory for forward pass (MB): {memory_for_forward_pass}")
 
-        new_cache_size = free_mem_post * free_mem_ratio + current_cache_size
+        new_cache_size = free_mem_post * 1024 * 1024 * free_mem_ratio + current_cache_size
         new_num_pages = int(new_cache_size // (current_cache_size // current_num_pages))
 
         # Need to sync all the GPUs

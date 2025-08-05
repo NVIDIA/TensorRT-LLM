@@ -11,14 +11,15 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
 from tensorrt_llm._utils import str_dtype_to_binding, torch_dtype_to_str
 from tensorrt_llm.bindings.executor import DecodingMode, ExecutorConfig
+from tensorrt_llm.llmapi.llm_args import PeftCacheConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_manager import (LoraConfig,
                                        get_default_trtllm_modules_to_hf_modules,
-                                       load_torch_hf_lora)
+                                       load_torch_lora)
 from tensorrt_llm.mapping import Mapping
 
 from ..model_config import ModelConfig
-from ..speculative import get_spec_decoder
+from ..speculative import get_num_extra_kv_tokens, get_spec_decoder
 from .config import PyTorchConfig
 from .config_utils import is_mla, is_nemotron_hybrid
 from .guided_decoder import GuidedDecoder
@@ -143,6 +144,8 @@ class KvCacheCreator:
                                      end_id=-1)
             requests.append(request)
             remaining_tokens -= input_seq_len
+        if self._mapping.enable_attention_dp:
+            requests = requests * self._mapping.tp_size
         return requests
 
     def _get_token_num_for_estimation(self) -> int:
@@ -164,7 +167,7 @@ class KvCacheCreator:
 
         if spec_cfg is not None:
             num_extra_tokens_per_seq += spec_cfg.max_draft_len
-            num_extra_tokens_per_seq += spec_cfg.num_extra_kv_tokens
+            num_extra_tokens_per_seq += get_num_extra_kv_tokens(spec_cfg)
         for req in self._dummy_reqs:
             num_req_tokens = len(req.input_token_ids) + num_extra_tokens_per_seq
             # Requests cannot share KV cache blocks. Round up to nearest integer multiple of block size.
@@ -411,7 +414,6 @@ def create_py_executor_instance(
         executor_config,
         ctx_chunk_config,
         model_engine,
-        draft_model_engine,
         start_worker,
         sampler,
         drafter,
@@ -432,11 +434,13 @@ def create_py_executor_instance(
                 f"Cannot overwrite existing resource manager {key}.")
         resources[key] = value
 
+    peft_cache_manager = None
     if lora_config is not None:
         from tensorrt_llm.bindings import LoraModule
 
         if len(lora_config.lora_dir) == 1:
-            load_torch_hf_lora(lora_config)
+            # Route to appropriate loader based on checkpoint source
+            load_torch_lora(lora_config)
         else:
             assert len(lora_config.lora_target_modules
                        ) >= 1, "Expecting at least one lora target module"
@@ -449,12 +453,23 @@ def create_py_executor_instance(
 
         num_experts = _try_infer_num_experts(model_engine.model.model_config)
 
+        num_kv_attention_heads_per_layer = model_binding_config.num_kv_heads_per_layer
+        if max(num_kv_attention_heads_per_layer) != min(
+                num_kv_attention_heads_per_layer):
+            logger.warning(
+                "Defining LORA with per-layer KV heads is not supported for LORA, using the max number of KV heads per layer"
+            )
+            num_kv_attention_heads = max(num_kv_attention_heads_per_layer)
+        else:
+            # all layers have the same number of KV heads
+            num_kv_attention_heads = num_kv_attention_heads_per_layer[0]
+
         lora_modules = LoraModule.create_lora_modules(
             lora_module_names=lora_config.lora_target_modules,
             hidden_size=model_binding_config.hidden_size,
             mlp_hidden_size=model_binding_config.mlp_hidden_size,
             num_attention_heads=model_binding_config.num_heads,
-            num_kv_attention_heads=model_binding_config.num_heads,
+            num_kv_attention_heads=num_kv_attention_heads,
             attention_head_size=model_binding_config.head_size,
             tp_size=mapping.tp_size,
             num_experts=num_experts)
@@ -466,12 +481,17 @@ def create_py_executor_instance(
         num_lora_modules = model_engine.model.model_config.pretrained_config.num_hidden_layers * \
             len(lora_config.lora_target_modules + lora_config.missing_qkv_modules)
 
-        executor_config.peft_cache_config = trtllm.PeftCacheConfig(
-            num_device_module_layer=max_lora_rank * num_lora_modules *
-            lora_config.max_loras,
-            num_host_module_layer=max_lora_rank * num_lora_modules *
-            lora_config.max_cpu_loras,
+        peft_cache_config_model = PeftCacheConfig.from_pybind(
+            executor_config.peft_cache_config
+        ) if executor_config.peft_cache_config is not None else PeftCacheConfig(
         )
+        if lora_config.max_loras is not None:
+            peft_cache_config_model.num_device_module_layer = \
+                max_lora_rank * num_lora_modules * lora_config.max_loras
+        if lora_config.max_cpu_loras is not None:
+            peft_cache_config_model.num_host_module_layer = \
+                max_lora_rank * num_lora_modules * lora_config.max_cpu_loras
+        executor_config.peft_cache_config = peft_cache_config_model._to_pybind()
 
         from tensorrt_llm.bindings import WorldConfig
         world_config = WorldConfig(
@@ -507,6 +527,7 @@ def create_py_executor_instance(
     capacity_scheduler = BindCapacityScheduler(
         max_num_sequences,
         kv_cache_manager.impl if kv_cache_manager is not None else None,
+        peft_cache_manager.impl if peft_cache_manager is not None else None,
         executor_config.scheduler_config.capacity_scheduler_policy,
         two_step_lookahead=mapping.has_pp())
     mb_scheduler = BindMicroBatchScheduler(executor_config.max_batch_size,
@@ -535,7 +556,6 @@ def create_py_executor_instance(
         max_draft_len=spec_config.max_draft_len
         if spec_config is not None else 0,
         kv_cache_transceiver=kv_cache_transceiver,
-        draft_model_engine=draft_model_engine,
         guided_decoder=guided_decoder,
         start_worker=start_worker,
         garbage_collection_gen0_threshold=garbage_collection_gen0_threshold)

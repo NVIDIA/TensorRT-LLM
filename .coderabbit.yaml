@@ -14,9 +14,25 @@
 # limitations under the License.
 
 # yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+# https://docs.coderabbit.ai/getting-started/configure-coderabbit/
+# In PR, comment "@coderabbitai configuration" to get the full config including defaults
 language: "en-US"
 reviews:
+  profile: chill
+  auto_title_placeholder: '@coderabbitai title'
+  auto_title_instructions: 'Should follow the format: "[fix/feat/doc/infra/...] \<summary of this PR\>". Keep it concise.'
+  commit_status: false
+  collapse_walkthrough: true
+  assess_linked_issues: true
+  related_issues: true
+  related_prs: true
+  suggested_labels: true
+  suggested_reviewers: true
+  poem: false
   auto_review:
     drafts: true
     base_branches: ["main", "release/.+"]
-  commit_status: false
+knowledge_base:
+  code_guidelines:
+    enabled: true
+    filePatterns: ["**/CODING_GUIDELINES.md"]

@@ -1,5 +1,8 @@
 google/gemma-3-1b-it:
   - accuracy: 22.988
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 20.699
 google/gemma-3-27b-it:
   - accuracy: 28.90
 gpt2:
@@ -40,6 +43,8 @@ microsoft/Phi-3-small-128k-instruct:
   - accuracy: 27.208
 microsoft/Phi-3.5-mini-instruct:
   - accuracy: 31.354
+microsoft/Phi-4-mini-instruct:
+  - accuracy: 32.921
 state-spaces/mamba-130m-hf:
   - accuracy: 19.470
 lmsys/vicuna-7b-v1.3:
@@ -117,6 +122,8 @@ meta-llama/Llama-3.1-8B:
     accuracy: 22.721
 meta-llama/Llama-3.1-8B-Instruct:
   - accuracy: 33.640
+  - spec_dec_algo: Eagle
+    accuracy: 33.640
   - quant_algo: FP8
     accuracy: 33.841
   - quant_algo: FP8
@@ -162,6 +169,8 @@ meta-llama/Llama-3.2-3B:
     kv_cache_quant_algo: FP8
     accuracy: 33.629
 meta-llama/Llama-3.3-70B-Instruct:
+  - spec_dec_algo: Eagle
+    accuracy: 33.244
   - quant_algo: NVFP4
     kv_cache_quant_algo: FP8
     accuracy: 34.383
@@ -188,6 +197,8 @@ mistralai/Mistral-7B-Instruct-v0.3:
     accuracy: 31.457
   - quant_algo: W4A8_AWQ
     accuracy: 31.201
+mistralai/Mistral-Small-3.1-24B-Instruct-2503:
+  - accuracy: 29.20
 mistralai/Mistral-Nemo-Base-2407:
   - quant_algo: FP8
     kv_cache_quant_algo: FP8

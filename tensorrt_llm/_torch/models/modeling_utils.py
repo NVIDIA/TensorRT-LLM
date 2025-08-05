@@ -364,11 +364,13 @@ class DecoderModelForCausalLM(nn.Module,
             if (hasattr(config, 'lora_config')
                     and config.lora_config is not None
                     and len(config.lora_config.lora_dir) == 1):
-                lora_loader = HfLoraLoader(config.lora_config.lora_dir)
-                if lora_loader.lm_head is not None and lora_loader.vocab_size != 0:
-                    weight = lora_loader.lm_head
-                    self.has_custom_lm_head = True
-                    vocab_size = lora_loader.vocab_size
+                # Only check for custom lm_head in HF LoRA, not NeMo
+                if config.lora_config.lora_ckpt_source == "hf":
+                    lora_loader = HfLoraLoader(config.lora_config.lora_dir)
+                    if lora_loader.lm_head is not None and lora_loader.vocab_size != 0:
+                        weight = lora_loader.lm_head
+                        self.has_custom_lm_head = True
+                        vocab_size = lora_loader.vocab_size
 
             self.lm_head = LMHead(
                 vocab_size,
@@ -456,11 +458,11 @@ class DecoderModelForCausalLM(nn.Module,
                         if name + '.q_proj' in n:
                             module.quant_config = q
                             break
-                elif hasattr(module, 'fused_a'):
+                elif hasattr(module, 'kv_a_proj_with_mqa'):
                     # DeepseekV3Attention
                     for n, q in quant_config_dict.items():
                         # reuse q_proj quant config as the attention quant config
-                        if name + '.fused_a' in n:
+                        if name + '.kv_a_proj_with_mqa' in n:
                             module.quant_config = q
                             break
 
@@ -863,7 +865,7 @@ def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
                           skip_modules: List[str] = [],
                           params_map: Optional[Dict[str, str]] = None,
                           preload_weight_modules: Optional[List[str]] = None):
-    # TODO: remove preload_weight_modules - it is a workaround for min-latency llama4 model loading where
+    # TODO: remove preload_weight_modules - it is a workaround for min-latency llama4 and Qwen3 model loading where
     # we need some order in the module loading. Once this is resolved, we can remove this workaround.
     weight_mapper.add_skip_modules(skip_modules)
     if params_map is not None:

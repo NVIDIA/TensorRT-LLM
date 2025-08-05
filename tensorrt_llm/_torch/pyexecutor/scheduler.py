@@ -5,7 +5,7 @@ from typing import Optional
 from tensorrt_llm.bindings import executor as tb_executor
 from tensorrt_llm.bindings import internal as tb_internal
 
-from .llm_request import LlmRequest, LlmRequestState
+from .llm_request import LlmRequest, LlmRequestState, get_draft_token_length
 
 RequestList = list[LlmRequest]
 
@@ -73,12 +73,14 @@ class BindCapacityScheduler(CapacityScheduler):
         self,
         max_num_requests: int,
         kv_cache_manager,
+        peft_cache_manager: tb_internal.batch_manager.PeftCacheManager | None,
         scheduler_policy: tb_executor.CapacitySchedulerPolicy = tb_executor.
         CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
         two_step_lookahead: bool = False,
     ):
         super(BindCapacityScheduler, self).__init__()
         self.kv_cache_manager = kv_cache_manager
+        self.peft_cache_manager = peft_cache_manager
 
         self.impl = tb_internal.algorithms.CapacityScheduler(
             max_num_requests=max_num_requests,
@@ -91,7 +93,8 @@ class BindCapacityScheduler(CapacityScheduler):
     def schedule_request(
         self, active_requests: RequestList
     ) -> tuple[list[LlmRequest], list[LlmRequest], list[LlmRequest]]:
-        return self.impl(active_requests, self.kv_cache_manager)
+        return self.impl(active_requests, self.kv_cache_manager,
+                         self.peft_cache_manager)
 
 
 class GuaranteedNoEvictScheduler(CapacityScheduler):
@@ -182,7 +185,7 @@ class BindMicroBatchScheduler(MicroBatchScheduler):
         self, active_requests: RequestList, inflight_request_ids: set[int]
     ) -> tuple[list[LlmRequest], list[LlmRequest]]:
         for request in active_requests:
-            if len(request.py_draft_tokens) > 0:
+            if get_draft_token_length(request) > 0:
                 request.draft_tokens = request.py_draft_tokens
         return self.impl(active_requests, inflight_request_ids,
                          self.max_batch_size, self.max_num_tokens)

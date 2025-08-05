@@ -137,7 +137,8 @@ class TestLlama3_2_1B(LlmapiAccuracyTestHarness):
         with LLM(self.MODEL_PATH,
                  pipeline_parallel_size=2,
                  quant_config=quant_config,
-                 kv_cache_config=kv_cache_config) as llm:
+                 kv_cache_config=kv_cache_config,
+                 max_batch_size=64) as llm:
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
 
