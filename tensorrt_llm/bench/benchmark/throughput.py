@@ -297,7 +297,6 @@ def throughput_command(
     **params,
 ) -> None:
     """Run a throughput test on a TRT-LLM engine."""
-
     logger.info("Preparing to run throughput benchmark...")
     # Parameters from CLI
     image_data_format: str = params.get("image_data_format", "pt")
@@ -306,7 +305,7 @@ def throughput_command(
 
     # Get general CLI options using the centralized function
     options: GeneralExecSettings = get_general_cli_options(params, bench_env)
-    tokenizer = initialize_tokenizer(options.model, options.checkpoint_path)
+    tokenizer = initialize_tokenizer(options.checkpoint_path)
 
     # Extract throughput-specific options not handled by GeneralExecSettings
     max_batch_size = params.get("max_batch_size")
