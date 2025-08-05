@@ -50,7 +50,7 @@ def test_fp8_block_scale_deep_gemm(dtype, m, k, n):
     act_b_fp8, act_b_sf = per_block_cast_to_fp8_e8m0(b)
 
     output_expected = a @ b.t()
-    import deep_gemm
+    from tensorrt_llm import deep_gemm
     output = torch.empty((act_a_fp8.shape[0], act_b_fp8.shape[0]),
                          device=act_a_fp8.device,
                          dtype=torch.bfloat16)

@@ -26,3 +26,6 @@
 [submodule "3rdparty/cppzmq"]
 	path = 3rdparty/cppzmq
 	url = https://github.com/zeromq/cppzmq.git
+[submodule "3rdparty/deepgemm"]
+	path = 3rdparty/deepgemm
+	url = https://github.com/zongfeijing/DeepGEMM.git

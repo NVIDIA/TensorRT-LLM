@@ -1,12 +1,12 @@
 from typing import List, Optional, Union
 
-import deep_gemm
 import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
 
 import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
+from tensorrt_llm import deep_gemm
 from tensorrt_llm._utils import nvtx_range
 
 from ...distributed import allgather
