@@ -668,7 +668,6 @@ def test_fused_moe_fp8_blockwise_cute_dsl(dtype,
         intermediate_size=INTERMEDIATE_SIZE,
         dtype=dtype,
         model_config=ModelConfig(quant_config=quant_config),
-        use_cute_dsl_fp8_block_scale_gemm=True,
     )
     ref_fused_moe.load_weights([weights])
     ref_fused_moe.cuda()
@@ -965,14 +964,15 @@ def test_fused_moe_w4afp8(dtype):
 
 class RefGatedMLPFusedMoE(nn.Module):
 
-    def __init__(self,
-                 num_experts: int,
-                 routing_method: BaseMoeRoutingMethod,
-                 hidden_size: int,
-                 intermediate_size: int,
-                 dtype: Optional[torch.dtype] = None,
-                 model_config: ModelConfig = ModelConfig(),
-                 use_cute_dsl_fp8_block_scale_gemm: bool = False):
+    def __init__(
+            self,
+            num_experts: int,
+            routing_method: BaseMoeRoutingMethod,
+            hidden_size: int,
+            intermediate_size: int,
+            dtype: Optional[torch.dtype] = None,
+            model_config: ModelConfig = ModelConfig(),
+    ):
         super().__init__()
         self.num_experts = num_experts
         self.routing_method = routing_method
@@ -982,8 +982,6 @@ class RefGatedMLPFusedMoE(nn.Module):
         self.dtype = dtype
         self.quant_config = model_config.quant_config
 
-        self.use_cute_dsl_fp8_block_scale_gemm = use_cute_dsl_fp8_block_scale_gemm
-
         self.experts = nn.ModuleList([
             GatedMLP(
                 hidden_size=self.hidden_size,
@@ -991,8 +989,6 @@ class RefGatedMLPFusedMoE(nn.Module):
                 bias=False,
                 dtype=self.dtype,
                 config=model_config,
-                use_cute_dsl_fp8_block_scale_gemm=self.
-                use_cute_dsl_fp8_block_scale_gemm,
             ) for _ in range(self.num_experts)
         ])
 

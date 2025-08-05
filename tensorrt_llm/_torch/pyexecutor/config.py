@@ -95,10 +95,6 @@ class PyTorchConfig:
 
     force_dynamic_quantization: bool = False
 
-    # # use cute dsl fp8 block scale bmm/gemm
-    # use_cute_dsl_fp8_block_scale_bmm: bool = False
-    # use_cute_dsl_fp8_block_scale_gemm: bool = False
-
     # If true, adjust PyTorch CUDA memory fraction to correspond to the
     # total GPU memory minus the statically allocated engine memory.
     # If false, set the PyTorch CUDA memory fraction to 1.0.

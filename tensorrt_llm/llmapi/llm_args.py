@@ -2092,17 +2092,6 @@ class TorchLlmArgs(BaseLlmArgs):
         status="prototype",
     )
 
-    # use_cute_dsl_fp8_block_scale_bmm: bool = Field(
-    #     default=False,
-    #     description="If true, use cute dsl fp8 block scale bmm.",
-    #     status="prototype",
-    # )
-    # use_cute_dsl_fp8_block_scale_gemm: bool = Field(
-    #     default=False,
-    #     description="If true, use cute dsl fp8 block scale gemm.",
-    #     status="prototype",
-    # )
-
     # PrivateVars
     _quant_config: Optional[QuantConfig] = PrivateAttr(default=None)
 
@@ -2316,8 +2305,6 @@ class TorchLlmArgs(BaseLlmArgs):
             force_dynamic_quantization=self.force_dynamic_quantization,
             allreduce_strategy=self.allreduce_strategy,
         )
-        # use_cute_dsl_fp8_block_scale_bmm=self.use_cute_dsl_fp8_block_scale_bmm,
-        # use_cute_dsl_fp8_block_scale_gemm=self.use_cute_dsl_fp8_block_scale_gemm)
 
 
 def update_llm_args_with_extra_dict(

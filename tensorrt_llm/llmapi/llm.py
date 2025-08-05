@@ -134,9 +134,6 @@ class BaseLLM:
                 llm_args_cls = TrtLlmArgs
 
             # check the kwargs and raise ValueError directly
-            # valid_keys = set(
-            #     list(llm_args_cls.model_fields.keys()) +
-            #     ['_mpi_session', 'backend', 'use_cute_dsl_fp8_block_scale_bmm', 'use_cute_dsl_fp8_block_scale_gemm'])
             valid_keys = set(
                 list(llm_args_cls.model_fields.keys()) + [
                     '_mpi_session',

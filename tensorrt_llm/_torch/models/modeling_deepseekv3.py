@@ -190,7 +190,6 @@ class DeepseekV3Linear(Linear):
         skip_create_weights_in_init: bool = False,
         use_custom_cublas_mm: bool = False,
         lora: Optional[LoraLayer] = None,
-        use_cute_dsl_fp8_block_scale_gemm: bool = False,
     ):
         super().__init__(
             in_features,
@@ -206,7 +205,6 @@ class DeepseekV3Linear(Linear):
             skip_create_weights_in_init,
             use_custom_cublas_mm,
             lora,
-            use_cute_dsl_fp8_block_scale_gemm,
         )
 
     def apply_linear(self,
@@ -265,7 +263,6 @@ class DeepseekV3Attention(MLA):
             skip_create_weights_in_init,
             use_custom_cublas_mm=True,
         )
-        # use_cute_dsl_fp8_block_scale_gemm=model_config.use_cute_dsl_fp8_block_scale_gemm)
 
 
 class Deepseekv3RoutingImpl():
@@ -480,7 +477,6 @@ class Deepseekv3MoE(nn.Module):
             overridden_tp_size=shared_tp_size,
             reduce_output=False,
         )
-        # use_cute_dsl_fp8_block_scale_gemm=model_config.use_cute_dsl_fp8_block_scale_gemm)
 
         self.allreduce = AllReduce(mapping=model_config.mapping,
                                    strategy=model_config.allreduce_strategy)
@@ -676,7 +672,6 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 overridden_tp_size=self.mlp_tp_size,
                 reduce_output=True,
             )
-            # use_cute_dsl_fp8_block_scale_gemm=self.model_config.use_cute_dsl_fp8_block_scale_gemm)
 
         self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                        eps=config.rms_norm_eps,
@@ -1127,7 +1122,6 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
             model_config._frozen = False
             model_config.quant_config_dict = quant_config_dict
             model_config._frozen = True
-        # print(f"limin: DeepseekV3ForCausalLM, model_config.use_cute_dsl_fp8_block_scale_bmm: {model_config.use_cute_dsl_fp8_block_scale_bmm}, model_config.use_cute_dsl_fp8_block_scale_gemm: {model_config.use_cute_dsl_fp8_block_scale_gemm}")
         super().__init__(DeepseekV3Model(model_config),
                          config=model_config,
                          hidden_size=model_config.pretrained_config.hidden_size,

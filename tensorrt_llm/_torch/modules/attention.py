@@ -199,10 +199,6 @@ class Attention(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_key_value_heads * self.head_dim
 
-        # self.use_cute_dsl_fp8_block_scale_bmm = config.use_cute_dsl_fp8_block_scale_bmm
-        # self.use_cute_dsl_fp8_block_scale_gemm = config.use_cute_dsl_fp8_block_scale_gemm
-        # print(f"limin: attention.py, use_cute_dsl_fp8_block_scale_bmm: {self.use_cute_dsl_fp8_block_scale_bmm}, use_cute_dsl_fp8_block_scale_gemm: {self.use_cute_dsl_fp8_block_scale_gemm}")
-
         # limin-todo: WARNING:
         self.use_cute_dsl_fp8_block_scale_bmm = True
         self.use_cute_dsl_fp8_block_scale_gemm = True
@@ -221,7 +217,6 @@ class Attention(nn.Module):
             allreduce_strategy=config.allreduce_strategy,
             force_dynamic_quantization=config.force_dynamic_quantization,
         )
-        # use_cute_dsl_fp8_block_scale_gemm=config.use_cute_dsl_fp8_block_scale_gemm)
         self.o_lora = LoraLayer([LoraModuleType.ATTENTION_DENSE],
                                 [self.hidden_size])
 
@@ -238,7 +233,6 @@ class Attention(nn.Module):
             allreduce_strategy=config.allreduce_strategy,
             force_dynamic_quantization=config.force_dynamic_quantization,
         )
-        # use_cute_dsl_fp8_block_scale_gemm=config.use_cute_dsl_fp8_block_scale_gemm)
 
         self.quant_config = config.get_quant_config()
         self.attn_backend = config.attn_backend
@@ -668,11 +662,6 @@ class MLA(nn.Module):
         quant_config = config.get_quant_config()
         self.quant_config = quant_config
 
-        # print(f"limin: attention.py, MLA, config.use_cute_dsl_fp8_block_scale_bmm: {config.use_cute_dsl_fp8_block_scale_bmm}, config.use_cute_dsl_fp8_block_scale_gemm: {config.use_cute_dsl_fp8_block_scale_gemm}")
-
-        # self.use_cute_dsl_fp8_block_scale_bmm = config.use_cute_dsl_fp8_block_scale_bmm
-        # self.use_cute_dsl_fp8_block_scale_gemm = config.use_cute_dsl_fp8_block_scale_gemm
-
         ## limin-TODO: WARNING:
         self.use_cute_dsl_fp8_block_scale_bmm = True
         self.use_cute_dsl_fp8_block_scale_gemm = True
@@ -688,7 +677,6 @@ class MLA(nn.Module):
                 use_custom_cublas_mm=True,
                 force_dynamic_quantization=config.force_dynamic_quantization,
             )
-            # use_cute_dsl_fp8_block_scale_gemm=config.use_cute_dsl_fp8_block_scale_gemm)
 
             self.q_a_layernorm = RMSNorm(hidden_size=self.q_lora_rank,
                                          eps=rms_norm_eps,
@@ -706,7 +694,6 @@ class MLA(nn.Module):
                 allreduce_strategy=config.allreduce_strategy,
                 force_dynamic_quantization=config.force_dynamic_quantization,
             )
-            # use_cute_dsl_fp8_block_scale_gemm=config.use_cute_dsl_fp8_block_scale_gemm)
         else:
             self.kv_a_proj_with_mqa = Linear(
                 hidden_size,
@@ -718,7 +705,6 @@ class MLA(nn.Module):
                 use_custom_cublas_mm=True,
                 force_dynamic_quantization=config.force_dynamic_quantization,
             )
-            # use_cute_dsl_fp8_block_scale_gemm=config.use_cute_dsl_fp8_block_scale_gemm)
 
             self.q_proj = Linear(
                 self.q_lora_rank,
@@ -732,7 +718,6 @@ class MLA(nn.Module):
                 allreduce_strategy=config.allreduce_strategy,
                 force_dynamic_quantization=config.force_dynamic_quantization,
             )
-            # use_cute_dsl_fp8_block_scale_gemm=config.use_cute_dsl_fp8_block_scale_gemm)
             self.q_b_proj = self.q_proj
 
         self.kv_a_layernorm = RMSNorm(hidden_size=kv_lora_rank,
@@ -752,7 +737,6 @@ class MLA(nn.Module):
             allreduce_strategy=config.allreduce_strategy,
             force_dynamic_quantization=config.force_dynamic_quantization,
         )
-        # use_cute_dsl_fp8_block_scale_gemm=config.use_cute_dsl_fp8_block_scale_gemm)
         # This parameter will view into self.kv_b_proj.weight after loading weights.
         # For dummy weight initialization, this parameter is initialized with empty tensor.
         # Used in forward_generation only
@@ -776,8 +760,6 @@ class MLA(nn.Module):
             allreduce_strategy=config.allreduce_strategy,
             force_dynamic_quantization=config.force_dynamic_quantization,
         )
-
-        # use_cute_dsl_fp8_block_scale_gemm=config.use_cute_dsl_fp8_block_scale_gemm)
 
         def yarn_get_mscale(scale=1, mscale=1):
             if scale <= 1:

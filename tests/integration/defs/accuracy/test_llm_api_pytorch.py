@@ -1017,8 +1017,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
             torch_compile_config=torch_compile_config,
             moe_config=MoeConfig(backend="CUTEDSL"),
-            # use_cute_dsl_fp8_block_scale_bmm=True,
-            # use_cute_dsl_fp8_block_scale_gemm=True,
         )
 
         if fp8kv:
