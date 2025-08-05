@@ -129,7 +129,7 @@ void initConfigBindings(nb::module_& m)
         .def(nb::init<bool, std::optional<SizeType32> const&, std::optional<std::vector<SizeType32>> const&,
                  std::optional<SizeType32> const&, std::optional<float> const&, std::optional<size_t> const&, bool,
                  std::optional<float> const&, std::optional<tle::RetentionPriority>, size_t const&, bool, bool, bool,
-                 std::optional<RuntimeDefaults> const&>(),
+                 SizeType32, std::optional<RuntimeDefaults> const&>(),
             nb::arg("enable_block_reuse") = true, nb::arg("max_tokens") = nb::none(),
             nb::arg("max_attention_window") = nb::none(), nb::arg("sink_token_length") = nb::none(),
             nb::arg("free_gpu_memory_fraction") = nb::none(), nb::arg("host_cache_size") = nb::none(),
