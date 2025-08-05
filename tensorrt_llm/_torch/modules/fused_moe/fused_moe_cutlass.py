@@ -89,6 +89,9 @@ class CutlassFusedMoE(MoE):
             swiglu_limit=swiglu_limit,
         )
 
+        # Store original hidden size before any potential padding
+        self.unpadded_hidden_size = self.hidden_size
+
         if model_config.quant_config and model_config.quant_config.layer_quant_mode.has_w4a16_mxfp4(
         ):
             self.hidden_size = ((self.hidden_size + 127) // 128) * 128
@@ -285,7 +288,6 @@ class CutlassFusedMoE(MoE):
                 weight_dtype = torch.quint4x2
             elif self.has_w4a16_mxfp4:
                 pad_size = self.hidden_size - x.shape[1]
-                original_hidden_size = x.shape[1]
                 x = torch.nn.functional.pad(x, (0, pad_size))
                 use_w4_group_scaling = True
                 weight_dtype = torch.uint8
@@ -437,19 +439,12 @@ class CutlassFusedMoE(MoE):
             tune_max_num_tokens=self.tune_max_num_tokens,
             tuner_num_tokens=tuner_num_tokens,
             tuner_top_k=tuner_top_k,
+            unpadded_hidden_size=self.unpadded_hidden_size,
         )
         # Custom op requires all inputs are in the same type.
         # Only in cutlass_min_latency_mode, the output is a list of tensors.
         # Otherwise, the output should be unpacked as a single tensor.
         final_hidden_states = final_hidden_states[0]
-        # TODO: Fuse this for padded MXFP4.
-        final_hidden_states = final_hidden_states[:, :self.
-                                                  hidden_size].contiguous()
-
-        if self.has_w4a16_mxfp4:
-            final_hidden_states = final_hidden_states[:, :
-                                                      original_hidden_size].contiguous(
-                                                      )
 
         # Combine results if using alltoall
         if self.enable_alltoall and alltoall_info is not None:
