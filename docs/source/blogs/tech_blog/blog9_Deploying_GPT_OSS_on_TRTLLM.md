@@ -22,7 +22,7 @@ We have a forthcoming guide for getting great performance on H100, however the b
 
 </br>
 
-## Launching the TRTLLM docker container
+## Launching the TensorRT-LLM docker container
 
 The container image that you will use will be pulled from NVIDIA's NGC. This container is multi-platform and will run on both x64 and arm64 architectures: `nvcr.io/nvidia/tensorrt-llm/release:gpt-oss-dev`
 
@@ -83,7 +83,7 @@ EOF
 
 #### Launching TensorRT-LLM Serve
 
-To launch the TensorRT-LLM Server to serve the model with the **low latency** config, run the following command. Commands for different GPU configures are provided (1xGPU, 8xGPU, 4xGPU):
+To launch the TensorRT-LLM Server to serve the model with the **low latency** config, run the following command. Commands for different GPU configurations are provided (1xGPU, 8xGPU, 4xGPU):
 
 <details open> <summary>1x B200/GB200/H200</summary>
 
@@ -160,7 +160,7 @@ EOF
 
 #### Launching TensorRT-LLM Serve
 
-To launch the TensorRT-LLM Server to serve the model with the **max throughput** config, run the following command. Commands for different GPU configures are provided (1xGPU, 8xGPU, 4xGPU):
+To launch the TensorRT-LLM Server to serve the model with the **max throughput** config, run the following command. Commands for different GPU configurations are provided (1xGPU, 8xGPU, 4xGPU):
 
 <details open> <summary>1x B200/GB200/H200</summary>
 
