@@ -106,4 +106,25 @@ std::string TllmException::demangle(char const* name)
 #endif
 }
 
+RequestSpecificException::RequestSpecificException(
+    char const* file, std::size_t line, char const* msg, uint64_t requestID, RequestErrorCode errorCode)
+    : std::runtime_error{fmtstr(
+        "%s (Request ID: %lu, Error Code: %u) (%s:%zu)", msg, requestID, static_cast<uint32_t>(errorCode), file, line)}
+    , mRequestID{requestID}
+    , mErrorCode{errorCode}
+{
+}
+
+RequestSpecificException::~RequestSpecificException() noexcept = default;
+
+uint64_t RequestSpecificException::getRequestId() const noexcept
+{
+    return mRequestID;
+}
+
+RequestErrorCode RequestSpecificException::getErrorCode() const noexcept
+{
+    return mErrorCode;
+}
+
 } // namespace tensorrt_llm::common
