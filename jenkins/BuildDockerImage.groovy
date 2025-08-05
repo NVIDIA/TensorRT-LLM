@@ -626,7 +626,9 @@ pipeline {
                     status = handle.result
 
                     if (status != "SUCCESS") {
-                        error "Downstream job did not succeed"
+                        catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                            error "Downstream job did not succeed"
+                        }
                     }
                 }
             }
