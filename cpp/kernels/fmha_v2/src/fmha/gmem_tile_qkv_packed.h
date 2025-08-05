@@ -796,7 +796,6 @@ struct Gmem_tile_contiguous_kv
     template <typename Smem_tile>
     inline __device__ void load(Smem_tile& smem_tile)
     {
-        // TODO(perkzz): add remap_kv_row for sliding window attention.
         uint32_t preds[LDGS];
 #pragma unroll
         for (int ii = 0; ii < LDGS; ++ii)
@@ -1091,42 +1090,6 @@ struct Gmem_tile_paged_kv
         }
     }
 
-    ////////////////////////////////////////////////////////////////////////////////////////////////////
-    // Remap the row to the one in cyclic kv cache.
-    inline __device__ void remap_kv_row(int& row)
-    {
-        // Sliding window attention + chunked context needs special handling.
-        if constexpr (SLIDING_WINDOW_ATTENTION)
-        {
-            // For chunked context (i.e. separate q and kv layout), the kv cache might be overwritten
-            // after last chunk is processed.
-            // To deal with this issue, the new tokens' kv will be appended to the kv cache first, and
-            // overwrite the kv cache after FMHA is done.
-            // The kv input layout is like: [cyclic kv cache] + [new tokens' kv].
-            // There are two possible cases:
-            // 1. The kv cache hasn't been overwritten while processing previous chunks, so we can take
-            //    it normally, where we have full kv cache.
-            // 2. The kv cache has been overwritten while processing previous chunks. we need to mask
-            //    out the tokens in the kv cache based on the sliding window size. It needs to track the
-            //    last kv cache token's position in a circular way.
-
-            // Remap the kv row when kv cache has been overwritten in a circular way.
-            if (past_seqlen_ > sliding_window_size_)
-            {
-                // Map the kv row to the new tokens' kv.
-                if (row >= past_seqlen_)
-                {
-                    row = sliding_window_size_ + (row - past_seqlen_);
-                }
-                else
-                {
-                    // Map the kv row to the cyclic kv cache.
-                    row = row % sliding_window_size_;
-                }
-            }
-        }
-    }
-
     // Load data from memory.
     template <typename Smem_tile>
     inline __device__ void load(Smem_tile& smem_tile)
@@ -1144,13 +1107,6 @@ struct Gmem_tile_paged_kv
         for (int ii = 0; ii < LDGS; ++ii)
         {
             int row_idx = row_ + ii * (int) ROWS_PER_LDG;
-
-            // Remap row_idx if sliding window attention is used.
-            // This will be removed later as the remapping will be handled by the kvCacheManger in TRTLLM.
-#ifdef GENERATE_CUBIN
-            remap_kv_row(row_idx);
-#endif
-
             int paged_kv_block_idx = (row_idx >> paged_kv_log2_block_size_);
             char const* local_kv_ptr = reinterpret_cast<char*>(paged_kv_block_pool_ptr_
                 + params_kv_block_size_in_bytes_ * paged_kv_global_block_offsets_[paged_kv_block_idx]);
