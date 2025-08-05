@@ -600,18 +600,13 @@ class RandomDataset(BenchmarkDataset):
                 prompt = prefix_token_ids + inner_seq
                 if self.return_text:
                     prompt = tokenizer.decode(prompt)
-                    if use_chat_template:
-                        prompt = tokenizer.apply_chat_template(
-                            [{
-                                "role": "user",
-                                "content": prompt
-                            }],
-                            add_generation_prompt=True,
-                            tokenize=False,
-                        )
-                total_input_len = prefix_len + int(input_lens[i])
-                if use_chat_template:
-                    total_input_len += chat_template_len
+                    prompt = post_process_prompt(prompt)
+
+                # We can directly use the chat template length here because
+                # the chat template is conditionally set if use_chat_template
+                # is True.
+                total_input_len = prefix_len + int(
+                    input_lens[i]) + chat_template_len
                 requests.append(
                     SampleRequest(
                         prompt=prompt,
