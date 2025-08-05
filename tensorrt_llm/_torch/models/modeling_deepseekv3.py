@@ -1344,9 +1344,6 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
         params_map = {'gate_up_proj': ['gate_proj', 'up_proj']}
         all_named_modules = dict(self.named_modules())
 
-        # moe_backend: cute_dsl_group_gemm
-        # use_cute_dsl_gemm, use_cute_dsl_bmm; use_cute_dsl
-        # attention/mla, gated_mlp, linear
         if self.model_config.quant_config.layer_quant_mode.has_fp8_block_scales(
         ) and get_sm_version() == 100:
             for name in list(weights.keys()):
