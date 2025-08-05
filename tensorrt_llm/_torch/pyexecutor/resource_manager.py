@@ -1227,13 +1227,11 @@ class PeftCacheManager(BaseResourceManager):
                 request.lora_weights = self._lora_manager.cpp_lora_weights[
                     request.lora_task_id]
 
-            # CPP implementation expects an extra dim
+            # PeftCacheManager CPP implementation expects an extra dim at index 0
             if request.lora_weights is not None:
-                request.lora_weights = request.lora_weights.reshape(
-                    [1] + list(request.lora_weights.shape))
+                request.lora_weights = request.lora_weights.unsqueeze(0)
             if request.lora_config is not None:
-                request.lora_config = request.lora_config.reshape(
-                    [1] + list(request.lora_config.shape))
+                request.lora_config = request.lora_config.unsqueeze(0)
         self.impl.add_request_peft(request, True)
 
     def ensure_batch(self,
