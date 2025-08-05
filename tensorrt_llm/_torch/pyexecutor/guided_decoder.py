@@ -6,6 +6,7 @@ import torch
 from ..._utils import nvtx_range
 from ...bindings.executor import GuidedDecodingConfig
 from ...logger import logger
+from ..hostfunc import hostfunc
 from .grammar_matcher import (GrammarMatcher, GrammarMatcherFactory,
                               LLGuidanceMatcherFactory, XGrammarMatcherFactory)
 from .llm_request import LlmRequest
@@ -267,3 +268,7 @@ class GuidedDecoder:
                 self.grammar_matchers[
                     slot] = self.grammar_matcher_factory.create(
                         llm_req.guided_decoding_params)
+
+    @hostfunc
+    def inc_bitmask_host(self):
+        self.bitmask_host.add_(1)
