@@ -21,6 +21,7 @@
 
 #include "tensorrt_llm/plugins/bertAttentionPlugin/bertAttentionPlugin.h"
 #include "tensorrt_llm/plugins/doraPlugin/doraPlugin.h"
+#include "tensorrt_llm/plugins/fa3Plugin/fa3Plugin.h"
 #include "tensorrt_llm/plugins/fp8RowwiseGemmPlugin/fp8RowwiseGemmPlugin.h"
 #include "tensorrt_llm/plugins/fusedLayernormPlugin/fusedLayernormPlugin.h"
 #include "tensorrt_llm/plugins/gemmPlugin/gemmPlugin.h"
@@ -208,6 +209,7 @@ extern "C"
     {
         static tensorrt_llm::plugins::IdentityPluginCreator identityPluginCreator;
         static tensorrt_llm::plugins::BertAttentionPluginCreator bertAttentionPluginCreator;
+        static tensorrt_llm::plugins::Fa3PluginCreator fa3PluginCreator;
         static tensorrt_llm::plugins::FusedLayernormPluginCreator fusedLayernormPluginCreator;
         static tensorrt_llm::plugins::GPTAttentionPluginCreator gptAttentionPluginCreator;
         static tensorrt_llm::plugins::GemmPluginCreator gemmPluginCreator;
@@ -253,6 +255,7 @@ extern "C"
                   creatorPtr(gptAttentionPluginCreator),
                   creatorPtr(gemmPluginCreator),
                   creatorPtr(gemmSwigluPluginCreator),
+                  creatorPtr(fa3PluginCreator),
                   creatorPtr(fp8RowwiseGemmPluginCreator),
                   creatorPtr(moePluginCreator),
 #if ENABLE_MULTI_DEVICE

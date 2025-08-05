@@ -171,11 +171,9 @@ template int Fa3Plugin::enqueueImpl<float>(nvinfer1::PluginTensorDesc const* inp
     nvinfer1::PluginTensorDesc const* outputDesc, void const* const* inputs, void* const* outputs, void* workspace,
     bool is_bf16, cudaStream_t stream);
 
-#ifdef ENABLE_BF16
 template int Fa3Plugin::enqueueImpl<__nv_bfloat16>(nvinfer1::PluginTensorDesc const* inputDesc,
     nvinfer1::PluginTensorDesc const* outputDesc, void const* const* inputs, void* const* outputs, void* workspace,
     bool is_bf16, cudaStream_t stream);
-#endif
 
 int Fa3Plugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfer1::PluginTensorDesc const* outputDesc,
     void const* const* inputs, void* const* outputs, void* workspace, cudaStream_t stream) noexcept
@@ -274,8 +272,6 @@ IPluginV2* Fa3PluginCreator::createPlugin(char const* name, PluginFieldCollectio
     PluginField const* fields = fc->fields;
     int num_heads{};
     int head_size{};
-    ContextFMHAType context_fmha_type{};
-    float q_scaling{};
     nvinfer1::DataType type{};
     // Read configurations from each fields
     for (int i = 0; i < fc->nbFields; ++i)
@@ -290,16 +286,6 @@ IPluginV2* Fa3PluginCreator::createPlugin(char const* name, PluginFieldCollectio
         {
             TLLM_CHECK(fields[i].type == PluginFieldType::kINT32);
             head_size = static_cast<int>(*(static_cast<int const*>(fields[i].data)));
-        }
-        else if (!strcmp(attrName, "q_scaling"))
-        {
-            TLLM_CHECK(fields[i].type == PluginFieldType::kFLOAT32);
-            q_scaling = static_cast<float>(*(static_cast<float const*>(fields[i].data)));
-        }
-        else if (!strcmp(attrName, "context_fmha_type"))
-        {
-            TLLM_CHECK(fields[i].type == PluginFieldType::kINT8);
-            context_fmha_type = static_cast<ContextFMHAType>(*(static_cast<int8_t const*>(fields[i].data)));
         }
         else if (!strcmp(attrName, "type_id"))
         {

@@ -50,6 +50,7 @@ set(PLUGIN_CU_SOURCES)
 set(PLUGIN_LISTS
     bertAttentionPlugin
     cpSplitPlugin
+    fa3Plugin
     fusedLayernormPlugin
     gptAttentionCommon
     gptAttentionPlugin
