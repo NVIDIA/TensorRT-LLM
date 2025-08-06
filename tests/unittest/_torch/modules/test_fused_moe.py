@@ -828,12 +828,49 @@ def test_fused_moe_fp8_blockwise_cutlass(dtype,
     return True
 
 
+@skip_non_hopper_unittest
+@pytest.mark.skipif(torch.cuda.device_count() < 4,
+                    reason="needs 4 GPUs to run this test")
+@pytest.mark.parametrize("ep_size", [1, 2, 4])
+@pytest.mark.parametrize("routing_method", [DefaultMoeRoutingMethod])
+@pytest.mark.parametrize(
+    "weight_loading_mode",
+    [MoEWeightLoadingMode.VANILLA, MoEWeightLoadingMode.FUSED_GATE_UP_PROJ])
+def test_fused_moe_fp8_blockwise_cutlass_multi_gpu(ep_size, routing_method,
+                                                   weight_loading_mode):
+    world_size = 4
+    with MPIPoolExecutor(max_workers=world_size) as executor:
+        results = executor.map(
+            test_fused_moe_fp8_blockwise_cutlass,
+            *zip(*[(
+                torch.bfloat16,
+                72,
+                384,
+                384,
+                routing_method,
+                weight_loading_mode,
+                Mapping(
+                    world_size=world_size,
+                    tp_size=world_size,
+                    moe_ep_size=ep_size,
+                    moe_tp_size=world_size // ep_size,
+                ),
+            )] * world_size),
+        )
+        for r in results:
+            assert r is True
+
+
 @skip_pre_blackwell
 @pytest.mark.skipif(torch.cuda.device_count() < 4,
                     reason="needs 4 GPUs to run this test")
 @pytest.mark.parametrize("ep_size", [1, 2, 4])
 @pytest.mark.parametrize("routing_method", [DefaultMoeRoutingMethod])
-def test_fused_moe_fp8_blockwise_cute_dsl_multi_gpu(ep_size, routing_method):
+@pytest.mark.parametrize(
+    "weight_loading_mode",
+    [MoEWeightLoadingMode.VANILLA, MoEWeightLoadingMode.FUSED_GATE_UP_PROJ])
+def test_fused_moe_fp8_blockwise_cute_dsl_multi_gpu(ep_size, routing_method,
+                                                    weight_loading_mode):
     world_size = 4
     with MPIPoolExecutor(max_workers=world_size) as executor:
         results = executor.map(
@@ -844,7 +881,7 @@ def test_fused_moe_fp8_blockwise_cute_dsl_multi_gpu(ep_size, routing_method):
                 384,
                 384,
                 routing_method,
-                MoEWeightLoadingMode.VANILLA,
+                weight_loading_mode,
                 Mapping(
                     world_size=world_size,
                     tp_size=world_size,
