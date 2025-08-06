@@ -38,6 +38,12 @@ trt_llm_release_perf_sanity_test:
   - perf/test_perf.py::test_perf[llama_v3.1_8b_instruct-bench-bfloat16-input_output_len:512,32]
   #pytorch backend
   - perf/test_perf.py::test_perf[llama_v3.1_8b-bench-pytorch-bfloat16-input_output_len:128,128]
+  # Phi-4-multimodal-instruct
+  - perf/test_perf.py::test_perf[phi_4_multimodal_instruct-bench-pytorch-bfloat16-input_output_len:128,128]
+  # Bielik-11B-v2.2-Instruct
+  - perf/test_perf.py::test_perf[bielik_11b_v2.2_instruct-bench-pytorch-bfloat16-input_output_len:128,128]
+  # Ministral-8B
+  - perf/test_perf.py::test_perf[ministral_8b-bench-pytorch-bfloat16-input_output_len:500,2000-reqs:500-con:250]
 
   # Test list validation
   - test_list_validation.py::test_list_validation
