@@ -330,9 +330,6 @@ class KvCacheCreator:
                 char == "M" for char in config.hybrid_override_pattern
             ]
 
-            print(
-                "SMOR, mamba_ssm_cache_dtype: ", model_engine.model.
-                model_config.quant_config.mamba_ssm_cache_dtype)
             kv_cache_manager = MambaHybridCacheManager(
                 # mamba cache parameters
                 config.ssm_state_size,

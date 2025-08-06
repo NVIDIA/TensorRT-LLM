@@ -148,8 +148,6 @@ class Mamba2Mixer(nn.Module):
                                allreduce_strategy=config.allreduce_strategy)
 
         self._mamba_ssm_cache_dtype = config.quant_config.mamba_ssm_cache_dtype
-        print("SMOR, Mamba2Mixer init done, mamba_ssm_cache_dtype: ",
-              self._mamba_ssm_cache_dtype)
 
     def forward(
         self,
