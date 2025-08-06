@@ -174,7 +174,9 @@ if __name__ == "__main__":
     parser.add_argument("--prompt",
                         type=str,
                         default="What's the weather like in Shanghai today?")
-    parser.add_argument("--specify_output_format", type=bool, default=False)
+    parser.add_argument("--specify_output_format",
+                        action="store_true",
+                        default=False)
 
     args = parser.parse_args()
 

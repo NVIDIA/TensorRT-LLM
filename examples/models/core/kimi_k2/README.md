@@ -102,7 +102,7 @@ Let's try another query, "What's the weather like in beijing today?", using a pr
 python kimi_k2_tool_calling_example.py \
     --model "moonshotai/Kimi-K2-Instruct" \
     --prompt "What's the weather like in beijing today?"
-    --specify_output_format True
+    --specify_output_format
 ```
 
 The output would look like:
