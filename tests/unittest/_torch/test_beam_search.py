@@ -63,7 +63,8 @@ def llm_cuda_graph(fixed_params, input_prompts):
         enable_trtllm_sampler=True,
         max_beam_width=fixed_params["max_beam_width"],
         disable_overlap_scheduler=False,
-        cuda_graph_config=CudaGraphConfig(batch_sizes=[1, 2, 4, 8]),
+        cuda_graph_config=CudaGraphConfig(batch_sizes=[1, 2, 4, 8],
+                                          enable_padding=True),
     )
 
 
