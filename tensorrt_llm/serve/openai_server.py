@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 import asyncio
+import os
 import signal
 import traceback
 from contextlib import asynccontextmanager
@@ -67,7 +68,7 @@ class OpenAIServer:
             logger.debug("Failed to load AutoProcessor or AutoConfig for %s", hf_tokenizer_path)
             self.processor = None
         try:
-            self.model_config = AutoConfig.from_pretrained(hf_tokenizer_path)
+            self.model_config = AutoConfig.from_pretrained(hf_tokenizer_path, trust_remote_code=trust_remote_code)
         except Exception:
             logger.debug("Failed to load AutoConfig for %s", hf_tokenizer_path)
             self.model_config = None
@@ -252,7 +253,13 @@ class OpenAIServer:
             tool_dicts = None if request.tools is None else [
                 tool.model_dump() for tool in request.tools
             ]
-            sampling_params = request.to_sampling_params()
+            # Pass the tokenizer vocabulary size so ``logit_bias`` can be
+            # expanded into an embedding bias tensor in the sampler.
+            sampling_params = request.to_sampling_params(
+                vocab_size=self.tokenizer.tokenizer.vocab_size)
+            # TODO: better way to enable metrics
+            if len(os.getenv("TRTLLM_KVCACHE_TIME_OUTPUT_PATH", "")) > 0:
+                sampling_params.return_perf_metrics = True
             postproc_args = ChatPostprocArgs.from_request(request)
             disaggregated_params = to_llm_disaggregated_params(request.disaggregated_params)
 
@@ -401,7 +408,13 @@ class OpenAIServer:
 
             promises: List[RequestOutput] = []
             postproc_params_collection: List[Optional[PostprocParams]] = []
-            sampling_params = request.to_sampling_params()
+            # Pass the tokenizer vocabulary size so ``logit_bias`` can be
+            # expanded into an embedding bias tensor in the sampler.
+            sampling_params = request.to_sampling_params(
+                vocab_size=self.tokenizer.tokenizer.vocab_size)
+            # TODO: better way to enable metrics
+            if len(os.getenv("TRTLLM_KVCACHE_TIME_OUTPUT_PATH", "")) > 0:
+                sampling_params.return_perf_metrics = True
             disaggregated_params = to_llm_disaggregated_params(request.disaggregated_params)
             for idx, prompt in enumerate(prompts):
                 postproc_args = CompletionPostprocArgs.from_request(request)

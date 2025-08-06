@@ -25,6 +25,7 @@
 # SOFTWARE.
 # --------------------------------------------------
 
+import copy
 import math
 import os
 import warnings
@@ -38,12 +39,15 @@ from torch import nn
 from tqdm import tqdm
 from transformers import PretrainedConfig
 
+from tensorrt_llm import logger
 from tensorrt_llm._ipc_utils import can_access_peer
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.llmapi.utils import enable_llm_debug
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.utils.fp8_utils import (
+    resmooth_to_fp8_e8m0, transform_sf_into_required_layout)
 
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
@@ -248,7 +252,7 @@ class DeepseekV3Attention(MLA):
                          dtype=config.torch_dtype,
                          config=model_config,
                          aux_stream=aux_stream)
-        self.fused_a = DeepseekV3Linear(
+        self.kv_a_proj_with_mqa = DeepseekV3Linear(
             config.hidden_size,
             self.kv_lora_rank + self.qk_rope_head_dim +
             (self.q_lora_rank if not self.is_lite else 0),
@@ -1102,6 +1106,18 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
                                                     PretrainedConfig]):
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
+        # Rename some keys of quant_config_dict to support legacy checkpoints
+        if model_config.quant_config_dict is not None:
+            model_config = copy.deepcopy(model_config)
+            quant_config_dict = {}
+            for key, val in model_config.quant_config_dict.items():
+                key_split = key.split(".")
+                if key_split[-1] == "fused_a":
+                    key = ".".join(key_split[:-1] + ["kv_a_proj_with_mqa"])
+                quant_config_dict[key] = val
+            model_config._frozen = False
+            model_config.quant_config_dict = quant_config_dict
+            model_config._frozen = True
         super().__init__(DeepseekV3Model(model_config),
                          config=model_config,
                          hidden_size=model_config.pretrained_config.hidden_size,
@@ -1244,7 +1260,7 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
             weight_divisor = 1 if self.model_config.mapping.enable_attention_dp else tp_size
             local_num_heads = num_heads // weight_divisor
 
-            k_nope_weight_trans = k_nope_weight.transpose(2, 1)
+            k_nope_weight_trans = k_nope_weight.transpose(2, 1).contiguous()
 
             kv_b_proj = torch.concat([
                 k_nope_weight.reshape(local_num_heads * local_qk_nope_head_dim,
@@ -1255,11 +1271,6 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
                                      dim=0)
 
             return kv_b_proj, k_nope_weight_trans
-
-        def check_weight_dtype(module_name: str, dtype):
-            weight_name = "weight"
-            w_dtype = weights[f"{module_name}.{weight_name}"].dtype
-            return w_dtype == dtype
 
         def load_kv_b_proj_and_k_b_proj_trans_dequant(
                 module_name: str) -> torch.Tensor:
@@ -1290,7 +1301,7 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
             weight_divisor = 1 if self.model_config.mapping.enable_attention_dp else tp_size
             local_num_heads = num_heads // weight_divisor
 
-            k_nope_weight_trans = k_nope_weight.transpose(2, 1)
+            k_nope_weight_trans = k_nope_weight.transpose(2, 1).contiguous()
 
             kv_b_proj = torch.concat([
                 k_nope_weight.reshape(local_num_heads * local_qk_nope_head_dim,
@@ -1332,6 +1343,21 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
 
         params_map = {'gate_up_proj': ['gate_proj', 'up_proj']}
         all_named_modules = dict(self.named_modules())
+
+        if self.model_config.quant_config.layer_quant_mode.has_fp8_block_scales(
+        ) and get_sm_version() == 100:
+            for name in list(weights.keys()):
+                # Use ".experts." to exclude shared_experts.
+                if name.endswith(
+                        "weight_scale_inv") and ".experts." not in name:
+                    weight_name = name.replace("weight_scale_inv", "weight")
+                    logger.debug(f"Resmoothing {weight_name}")
+                    weight = weights[weight_name][:]
+                    scale = weights[name][:]
+                    weights[weight_name], weights[name] = resmooth_to_fp8_e8m0(
+                        weight, scale)
+                    weights[weight_name] = weights[weight_name].cpu()
+                    weights[name] = weights[name].cpu()
 
         for name, module in tqdm(all_named_modules.items(),
                                  desc="Loading weights"):
@@ -1384,7 +1410,27 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
                         attn_module.v_b_proj_scale = nn.Parameter(
                             v_b_proj_scale, requires_grad=False)
 
-                elif names[-1] == "fused_a":
+                        if attn_module.k_b_proj_trans_dequant is not None:
+                            attn_module.k_b_proj_trans_dequant.data.copy_(
+                                weight_dequant(
+                                    k_b_proj_trans.view(
+                                        -1, k_b_proj_trans.shape[-1]).cuda(),
+                                    k_b_proj_trans_scale.view(
+                                        -1,
+                                        k_b_proj_trans_scale.shape[-1]).cuda(),
+                                ).view(
+                                    *attn_module.k_b_proj_trans_dequant.shape).
+                                to(attn_module.k_b_proj_trans_dequant.dtype))
+                        if attn_module.v_b_proj_dequant is not None:
+                            attn_module.v_b_proj_dequant.data.copy_(
+                                weight_dequant(
+                                    v_b_proj.view(-1,
+                                                  v_b_proj.shape[-1]).cuda(),
+                                    v_b_proj_scale.view(
+                                        -1, v_b_proj_scale.shape[-1]).cuda(),
+                                ).view(*attn_module.v_b_proj_dequant.shape).to(
+                                    attn_module.v_b_proj_dequant.dtype))
+                elif names[-1] == "kv_a_proj_with_mqa":
                     fused_a = weights[
                         f"{'.'.join(names[:-1])}.kv_a_proj_with_mqa.weight"][:]
                     if not is_lite:
@@ -1430,6 +1476,18 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
                     else:
                         for n, p in module.named_parameters():
                             p.data.copy_(module_weights[n][:])
+
+                if self.model_config.quant_config.layer_quant_mode.has_fp8_block_scales(
+                ) and get_sm_version() == 100 and hasattr(
+                        module, "weight_scale"):
+                    transfromed_scale = transform_sf_into_required_layout(
+                        module.weight_scale,
+                        mn=module.weight.shape[0],
+                        k=module.weight.shape[1],
+                        recipe=(1, 128, 128),
+                        is_sfa=False)
+                    module.weight_scale = nn.Parameter(transfromed_scale,
+                                                       requires_grad=False)
 
         for idx, layer in enumerate(
                 self.model.layers[:self.config.num_hidden_layers]):

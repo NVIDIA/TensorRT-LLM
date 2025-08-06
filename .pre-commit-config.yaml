@@ -27,7 +27,7 @@ repos:
         args: [--allow-multiple-documents]
         exclude: ".*/gitlab/.*.yml"
     -   id: trailing-whitespace
-        exclude: '\.patch$'
+        exclude: '\.(patch|md)$'
     -   id: check-toml
     -   id: mixed-line-ending
         args: [--fix=lf]

@@ -32,6 +32,7 @@ from typing import Any, Dict, List, Optional, Sequence, Union
 import numpy as np
 import nvtx
 from mpi4py import MPI
+from mpi4py.util import pkl5
 from packaging import version
 
 # isort: off
@@ -455,7 +456,7 @@ def dim_resolve_negative(dim, ndim):
 # mpi4py only exports MPI_COMM_TYPE_SHARED, so we define OMPI_COMM_TYPE_HOST here
 OMPI_COMM_TYPE_HOST = 9
 
-comm = MPI.COMM_WORLD
+comm = pkl5.Intracomm(MPI.COMM_WORLD)
 
 
 def set_mpi_comm(new_comm):
@@ -468,6 +469,10 @@ def mpi_comm():
 
 
 local_comm = mpi_comm().Split_type(split_type=OMPI_COMM_TYPE_HOST)
+
+
+def local_mpi_comm():
+    return local_comm
 
 
 def mpi_rank():
@@ -506,6 +511,11 @@ def default_gpus_per_node():
 def mpi_barrier():
     if ENABLE_MULTI_DEVICE:
         mpi_comm().Barrier()
+
+
+def local_mpi_barrier():
+    if ENABLE_MULTI_DEVICE:
+        local_comm.Barrier()
 
 
 def mpi_broadcast(obj, root=0):
@@ -1007,6 +1017,7 @@ class KVCacheEventSerializer:
         return {
             "event_id": event.event_id,
             "data": event_serialize_func(event.data),
+            "window_size": event.window_size
         }
 
     @staticmethod

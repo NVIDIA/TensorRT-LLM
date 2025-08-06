@@ -35,10 +35,12 @@ from tensorrt_llm.llmapi import (BuildCacheConfig, EagleDecodingConfig,
                                  LookaheadDecodingConfig, MedusaDecodingConfig,
                                  RequestOutput)
 from tensorrt_llm.llmapi import TrtLlmArgs as LlmArgs
-from tensorrt_llm.llmapi.llm_args import DynamicBatchConfig, SchedulerConfig
+from tensorrt_llm.llmapi.llm_args import (DynamicBatchConfig, PeftCacheConfig,
+                                          SchedulerConfig)
 from tensorrt_llm.llmapi.llm_utils import (BuildConfig, QuantAlgo, QuantConfig,
                                            _ParallelConfig)
-from tensorrt_llm.llmapi.tokenizer import TokenizerBase, TransformersTokenizer
+from tensorrt_llm.llmapi.tokenizer import (TokenizerBase, TransformersTokenizer,
+                                           load_hf_tokenizer)
 from tensorrt_llm.llmapi.utils import get_total_gpu_memory
 from tensorrt_llm.lora_manager import LoraConfig
 from tensorrt_llm.models.automodel import AutoConfig, AutoModelForCausalLM
@@ -49,7 +51,9 @@ from tensorrt_llm.sampling_params import (BatchedLogitsProcessor,
 # isort: off
 sys.path.append(os.path.dirname(os.path.abspath(__file__)) + "/..")
 from gc_utils import assert_resource_freed
-from llmapi.lora_test_utils import check_llama_7b_multi_unique_lora_adapters_from_request
+from llmapi.lora_test_utils import (
+    check_llama_7b_multi_lora_from_request_test_harness,
+    check_llama_7b_multi_unique_lora_adapters_from_request)
 from utils.llm_data import llm_models_root
 from utils.util import force_ampere, similar, skip_gpu_memory_less_than_40gb, skip_pre_hopper, skip_single_gpu
 # isort: on
@@ -704,6 +708,7 @@ def test_generate_with_beam_search(llm_for_sampling_params: LLM):
     check_output(outputs, references)
 
 
+@pytest.mark.skip(reason="https://nvbugs/5435714")
 @force_ampere
 @pytest.mark.part0
 def test_generate_with_streaming_llm():
@@ -840,6 +845,93 @@ def test_generate_with_stop_words():
                                                     stop_token_ids=[stop_id]),
                      finish_reasons=['stop'],
                      stop_reasons=["I J"])
+
+
+@force_ampere
+@pytest.mark.part0
+@pytest.mark.parametrize("model_path", [
+    get_model_path('gemma/gemma-3-1b-it'),
+])
+def test_generate_with_detokenization_stop_words(model_path):
+    llm = LLM(
+        model=model_path,
+        kv_cache_config=global_kvcache_config,
+        fast_build=True,
+    )
+
+    # Format the prompt using chat template
+    messages = [{
+        "role": "user",
+        "content": "Say exactly: Hello there! How can I help"
+    }]
+
+    formatted_prompt = llm.tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True)
+
+    detokenization_prompts = [formatted_prompt]
+
+    # Test case 1: Stop word "How" should be detected after detokenization
+    llm_check_output(llm,
+                     detokenization_prompts, ["Hello there!"],
+                     sampling_params=SamplingParams(stop="How", max_tokens=10),
+                     finish_reasons=['stop'],
+                     stop_reasons=["How"])
+
+    # Test case 2: Stop word "there" should be detected after detokenization
+    llm_check_output(llm,
+                     detokenization_prompts, ["Hello"],
+                     sampling_params=SamplingParams(stop="there",
+                                                    max_tokens=10),
+                     finish_reasons=['stop'],
+                     stop_reasons=["there"])
+
+    # Test case 3: Stop word that should not be found after detokenization
+    llm_check_output(llm,
+                     detokenization_prompts, ["Hello there! How can I help"],
+                     sampling_params=SamplingParams(stop="XYZ", max_tokens=10),
+                     finish_reasons=['length'],
+                     stop_reasons=[None])
+
+    # Test case 4: Multiple stop words, one should be found after detokenization
+    llm_check_output(llm,
+                     detokenization_prompts, ["Hello"],
+                     sampling_params=SamplingParams(stop=["XYZ", "there"],
+                                                    max_tokens=10),
+                     finish_reasons=['stop'],
+                     stop_reasons=["there"])
+
+
+@force_ampere
+@pytest.mark.part0
+@pytest.mark.parametrize("model_path", [
+    get_model_path('gemma/gemma-3-1b-it'),
+])
+def test_generate_with_detokenization_stop_words_streaming(model_path):
+    llm = LLM(
+        model=model_path,
+        kv_cache_config=global_kvcache_config,
+        fast_build=True,
+    )
+
+    # Format the prompt using chat template
+    messages = [{
+        "role": "user",
+        "content": "Say exactly: Hello there! How can I help"
+    }]
+
+    formatted_prompt = llm.tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True)
+
+    sampling_params = SamplingParams(stop="How", max_tokens=10)
+
+    for output in llm.generate_async(formatted_prompt,
+                                     sampling_params=sampling_params,
+                                     streaming=True):
+        if output.outputs[0].finish_reason == 'stop':
+            assert output.outputs[0].stop_reason == "How"
+            break
+        elif output.outputs[0].finish_reason == 'length':
+            assert False, f"Expected to find stop word 'How' but reached max_tokens. Generated: {output.outputs[0].text}"
 
 
 @force_ampere
@@ -1057,6 +1149,11 @@ def tinyllama_logits_processor_test_harness(backend=None, **llm_kwargs):
     biased_word_id = tokenizer.encode("Z", add_special_tokens=False)[-1]
     sampling_params = SamplingParams(
         max_tokens=6, logits_processor=MyLogitsProcessor(biased_word_id))
+
+    prompts = ["A B C"]
+    if llm_kwargs.get('enable_chunked_prefill', None):
+        prompts[0] = prompts[0] * 256
+        llm_kwargs["max_num_tokens"] = 256
 
     llm_test_harness(
         llama_model_path,
@@ -1336,11 +1433,11 @@ def llama_v2_13b_lora_from_dir_test_harness(**llm_kwargs):
     hf_lora_dir = get_model_path("llama-models-v2/chinese-llama-2-lora-13b")
 
     # For LoRA checkpoints with finetuned embedding and lm_head, lora_dir must be provided at build time.
-    build_config = BuildConfig(lora_config=LoraConfig(lora_dir=[hf_lora_dir]))
+    build_config = BuildConfig(lora_config=LoraConfig(
+        lora_dir=[hf_lora_dir], max_lora_rank=64, max_loras=2, max_cpu_loras=2))
     llm = LLM(hf_model_dir,
               tokenizer=hf_lora_dir,
               enable_lora=True,
-              max_lora_rank=64,
               build_config=build_config,
               fast_build=True,
               **llm_kwargs)
@@ -1393,10 +1490,64 @@ def test_llama_7b_multi_lora_evict_load_new_adapters(
         LLM,
         enable_lora=True,
         build_config=build_config,
+        fast_build=True)
+
+
+def test_llama_7b_peft_cache_config_affects_peft_cache_size():
+    """Tests that LLM arg of peft_cache_config affects the peft cache sizes.
+
+    NOTE: The caller can't get the actual LoRA cache sizes, so we instead we
+    test that it fails when configured with a value too small to contain a
+    single adapter.
+    """
+    # For LoRA checkpoints without finetuned embedding and lm_head, we can either:
+    # (1) specify lora_target_modules, or
+    # (2) provide a lora_dir to infer the lora_target_modules.
+    lora_config_no_cache_size_values = LoraConfig(
+        lora_target_modules=['attn_q', 'attn_k', 'attn_v'], max_lora_rank=8)
+    build_config = BuildConfig(lora_config=lora_config_no_cache_size_values)
+
+    # Test that too small PeftCacheConfig.host_cache_size causes failure
+    with pytest.raises(RuntimeError):
+        check_llama_7b_multi_lora_from_request_test_harness(
+            LLM,
+            enable_lora=True,
+            build_config=build_config,
+            fast_build=True,
+            lora_config=lora_config_no_cache_size_values,
+            peft_cache_config=PeftCacheConfig(
+                host_cache_size=1))  # size in bytes
+
+    # Test that too small PeftCacheConfig.device_cache_percent causes failure
+    with pytest.raises(RuntimeError):
+        check_llama_7b_multi_lora_from_request_test_harness(
+            LLM,
+            enable_lora=True,
+            build_config=build_config,
+            fast_build=True,
+            lora_config=lora_config_no_cache_size_values,
+            peft_cache_config=PeftCacheConfig(device_cache_percent=0.0000001))
+
+
+def test_llama_7b_lora_config_overrides_peft_cache_config():
+    """Tests that cache size args in lora_config LLM arg override the cache size
+    parameters in peft_cache_config LLM arg.
+    """    # noqa: D205
+    build_config = BuildConfig(lora_config=LoraConfig(
+        lora_target_modules=['attn_q', 'attn_k', 'attn_v'], max_lora_rank=8))
+    check_llama_7b_multi_lora_from_request_test_harness(
+        LLM,
+        enable_lora=True,
+        build_config=build_config,
         fast_build=True,
-        max_lora_rank=8,
-        max_loras=max_loras,
-        max_cpu_loras=max_cpu_loras)
+        lora_config=LoraConfig(
+            lora_target_modules=['attn_q', 'attn_k', 'attn_v'],
+            max_lora_rank=8,
+            max_loras=2,
+            max_cpu_loras=2),
+        peft_cache_config=PeftCacheConfig(
+            host_cache_size=1,  # size in bytes
+            device_cache_percent=0.0000001))
 
 
 @skip_gpu_memory_less_than_40gb
@@ -2089,24 +2240,36 @@ def test_llm_chunked_prefill():
     success_path()
 
 
-def _test_llm_capture_request_error(tp_size: int = 1):
-    build_config = BuildConfig()
-    build_config.max_num_tokens = 64
+def _test_llm_capture_request_error(pytorch_backend: bool, tp_size: int = 1):
+    llm_args_extra = {}
+    if pytorch_backend:
+        LLM_CLASS = LLM_torch
+        llm_args_extra["max_num_tokens"] = 64
+    else:
+        LLM_CLASS = LLM
+        build_config = BuildConfig()
+        build_config.max_num_tokens = 64
+        llm_args_extra["fast_build"] = True
+        llm_args_extra["build_config"] = build_config
 
-    llm = LLM(
+    llm = LLM_CLASS(
         model=llama_model_path,
-        build_config=build_config,
-        fast_build=True,
+        tensor_parallel_size=tp_size,
+        **llm_args_extra,
     )
 
     prompt = 'A ' * 65  # the minimum max_num_tokens is 64
-
-    with pytest.raises(RequestError):
-        llm.generate(prompt)
+    if pytorch_backend:
+        # pytorch backend will raise ValueError for max_num_tokens
+        with pytest.raises(ValueError):
+            llm.generate(prompt)
+    else:
+        with pytest.raises(RequestError):
+            llm.generate(prompt)
 
 
 def test_llm_capture_request_error():
-    _test_llm_capture_request_error(tp_size=1)
+    _test_llm_capture_request_error(pytorch_backend=False, tp_size=1)
 
 
 def test_llm_shutdown_executor():
@@ -2180,7 +2343,8 @@ def run_llm_with_postprocess_parallel_and_result_handler(
     from .run_llm_with_postproc import get_concatenated_content
 
     sampling_params = SamplingParams(max_tokens=6)
-    post_proc_args = ChatPostprocArgs(tokenizer=llama_model_path,
+    tokenizer = load_hf_tokenizer(llama_model_path)
+    post_proc_args = ChatPostprocArgs(tokenizer=tokenizer,
                                       role="assistant",
                                       model=llama_model_path)
     post_proc_params = PostprocParams(post_processor=chat_stream_post_processor,

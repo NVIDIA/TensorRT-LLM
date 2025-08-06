@@ -4,7 +4,8 @@ from ..sampling_params import GuidedDecodingParams, SamplingParams
 from .build_cache import BuildCacheConfig
 from .llm import LLM, RequestOutput
 # yapf: disable
-from .llm_args import (BatchingType, CacheTransceiverConfig, CalibConfig,
+from .llm_args import (AttentionDpConfig, AutoDecodingConfig, BatchingType,
+                       CacheTransceiverConfig, CalibConfig,
                        CapacitySchedulerPolicy, ContextChunkingPolicy,
                        CudaGraphConfig, DraftTargetDecodingConfig,
                        DynamicBatchConfig, EagleDecodingConfig,
@@ -53,4 +54,6 @@ __all__ = [
     'LlmArgs',
     'TorchLlmArgs',
     'TrtLlmArgs',
+    'AutoDecodingConfig',
+    'AttentionDpConfig',
 ]

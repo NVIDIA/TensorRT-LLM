@@ -1,14 +1,22 @@
+from contextlib import contextmanager, nullcontext
+
 import pytest
 
 from tensorrt_llm import LLM
+from tensorrt_llm.llmapi import KvCacheConfig
+from tensorrt_llm.llmapi.llm_args import PeftCacheConfig
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
 from tensorrt_llm.sampling_params import SamplingParams
 
 # isort: off
-from .lora_test_utils import check_llama_7b_multi_unique_lora_adapters_from_request, create_mock_nemo_lora_checkpoint
-from .test_llm import (get_model_path, global_kvcache_config, llama_model_path,
+from .lora_test_utils import (
+    check_llama_7b_multi_lora_from_request_test_harness,
+    check_llama_7b_multi_unique_lora_adapters_from_request,
+    create_mock_nemo_lora_checkpoint)
+from .test_llm import (_test_llm_capture_request_error, get_model_path,
+                       global_kvcache_config, llama_model_path,
                        llm_get_stats_async_test_harness,
-                       llm_get_stats_test_harness, prompts,
+                       llm_get_stats_test_harness, llm_test_harness, prompts,
                        run_llm_abort_request,
                        run_llm_with_postprocess_parallel_and_result_handler,
                        tinyllama_logits_processor_test_harness)
@@ -27,14 +35,16 @@ import tempfile
 import torch
 from peft import LoraConfig as PeftLoraConfig
 from peft import get_peft_model
-from transformers import AutoModelForCausalLM
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 # isort: on
 
 
 @force_ampere
-def test_tinyllama_logits_processor():
-    tinyllama_logits_processor_test_harness(backend="pytorch")
+@pytest.mark.parametrize("enable_chunked_prefill,", [False, True])
+def test_tinyllama_logits_processor(enable_chunked_prefill):
+    tinyllama_logits_processor_test_harness(
+        backend="pytorch", enable_chunked_prefill=enable_chunked_prefill)
 
 
 @pytest.mark.parametrize(
@@ -70,6 +80,10 @@ def test_llm_get_stats_async(return_context_logits, use_overlap,
         enable_iter_req_stats=enable_iter_req_stats)
 
 
+def test_llm_capture_request_error():
+    _test_llm_capture_request_error(pytorch_backend=True, tp_size=1)
+
+
 @force_ampere
 @pytest.mark.parametrize(
     "sampling_params",
@@ -79,6 +93,63 @@ def test_llm_get_stats_async(return_context_logits, use_overlap,
 def test_llm_abort_request(sampling_params):
     llm = LLM(model=llama_model_path, kv_cache_config=global_kvcache_config)
     run_llm_abort_request(llm=llm, sampling_params=sampling_params)
+
+
+@contextmanager
+def _validate_invalid_token_error_scope():
+    with pytest.raises(RuntimeError) as exc_info:
+        yield
+    assert "Token ID out of range" in str(exc_info.value)
+
+
+@force_ampere
+def test_llm_invalid_input_token():
+    llm = LLM(model=llama_model_path, kv_cache_config=global_kvcache_config)
+    prompts = [
+        [-1],
+    ]
+    # NB: exc_info in _validate_invalid_token_error_scope creates a reference
+    #     to a traceback which outlives the scope of 'exc_info' and prevents
+    #     deletion of 'llm'. However, using the context manager protocol is
+    #     anyways more robust than delegating cleanup to __del__.
+    with llm:
+        with _validate_invalid_token_error_scope():
+            llm.generate(
+                prompts,
+                sampling_params=SamplingParams(max_tokens=5),
+            )
+
+
+@force_ampere
+def test_llm_invalid_input_token_async():
+    llm = LLM(model=llama_model_path, kv_cache_config=global_kvcache_config)
+    # NB: exc_info in _validate_invalid_token_error_scope creates a reference
+    #     to a traceback which outlives the scope of 'exc_info' and prevents
+    #     deletion of 'llm'. However, using the context manager protocol is
+    #     anyways more robust than delegating cleanup to __del__.
+    with llm:
+        prompts = [
+            [-1],
+            [42],
+        ]
+        fail_idx = [0]
+        for submit_order in [[0, 1], [1, 0]]:
+            for collect_order in [[0, 1], [1, 0]]:
+                print(f"submitting {submit_order}")
+                futures = [
+                    llm.generate_async(
+                        prompts[submit_idx],
+                        sampling_params=SamplingParams(max_tokens=5),
+                    ) for submit_idx in submit_order
+                ]
+                for collect_idx in collect_order:
+                    with _validate_invalid_token_error_scope(
+                    ) if submit_order[collect_idx] in fail_idx else nullcontext(
+                    ):
+                        print(
+                            f"collect order {collect_order}, collecting {collect_idx}"
+                        )
+                        futures[collect_idx].result()
 
 
 def test_llm_reward_model():
@@ -133,10 +204,52 @@ def test_llm_with_postprocess_parallel_and_result_handler(streaming):
                                                          tp_size=1)
 
 
+@pytest.mark.parametrize(
+    "enable_mixed_sampler,enable_logprobs",
+    [
+        (False, False),  # Fast path: no mixed sampler, no logits, greedy
+        (True,
+         False),  # Batched strategy path: mixed sampler enabled, same strategy
+        (False,
+         True),  # Per-request path: mixed sampler disabled, logprobs enabled
+    ])
+@pytest.mark.part0
+def test_embedding_bias_with_torch_sampler_strategies(enable_mixed_sampler,
+                                                      enable_logprobs):
+    """Test embedding bias application in all 3 TorchSampler paths: fast, batched strategy, and per-request"""
+    tokenizer = AutoTokenizer.from_pretrained(llama_model_path)
+    biased_word_id = tokenizer.encode("Z", add_special_tokens=False)[-1]
+    vocab_size_padded = 32000
+    embedding_bias = torch.zeros(vocab_size_padded)
+    embedding_bias[biased_word_id] = torch.finfo(torch.float32).max
+
+    sampling_kwargs = {
+        "max_tokens": 6,
+        "embedding_bias": embedding_bias,
+    }
+
+    if enable_logprobs:
+        sampling_kwargs["logprobs"] = 1
+    # All test cases use greedy sampling for simplicity
+
+    sampling_params = SamplingParams(**sampling_kwargs)
+
+    llm_test_harness(
+        llama_model_path,
+        prompts,
+        ["Z Z Z Z Z Z"],
+        sampling_params=sampling_params,
+        backend="pytorch",
+        enable_trtllm_sampler=False,  # Use TorchSampler to test all 3 paths
+        enable_mixed_sampler=enable_mixed_sampler)
+
+
 def llama_7b_lora_from_dir_test_harness(**llm_kwargs) -> None:
     lora_config = LoraConfig(
         lora_dir=[f"{llm_models_root()}/llama-models/luotuo-lora-7b-0.1"],
-        max_lora_rank=8)
+        max_lora_rank=8,
+        max_loras=2,
+        max_cpu_loras=2)
     llm = LLM(model=f"{llm_models_root()}/llama-models/llama-7b-hf",
               lora_config=lora_config,
               **llm_kwargs)
@@ -170,7 +283,7 @@ def test_llama_7b_lora():
 
 @skip_gpu_memory_less_than_40gb
 def test_llama_7b_lora_default_modules() -> None:
-    lora_config = LoraConfig(max_lora_rank=64)
+    lora_config = LoraConfig(max_lora_rank=64, max_loras=2, max_cpu_loras=2)
 
     hf_model_dir = f"{llm_models_root()}/llama-models/llama-7b-hf"
 
@@ -288,9 +401,62 @@ def test_llama_7b_multi_lora_load_previously_cpu_cache_evicted_adapter_fails(
     assert _check_contains_expected_message(child_stdout, child_stderr)
 
 
+def test_llama_7b_peft_cache_config_affects_peft_cache_size():
+    """Tests that LLM arg of peft_cache_config affects the peft cache sizes.
+
+    NOTE: The caller can't get the actual LoRA cache sizes, so we instead we
+    test that it fails when configured with a value too small to contain a
+    single adapter.
+    """
+    # For LoRA checkpoints without finetuned embedding and lm_head, we can either:
+    # (1) specify lora_target_modules, or
+    # (2) provide a lora_dir to infer the lora_target_modules.
+    lora_config_no_cache_size_values = LoraConfig(
+        lora_target_modules=['attn_q', 'attn_k', 'attn_v'], max_lora_rank=8)
+
+    # Test that too small PeftCacheConfig.host_cache_size causes failure
+    with pytest.raises(RuntimeError):
+        check_llama_7b_multi_lora_from_request_test_harness(
+            LLM,
+            lora_config=lora_config_no_cache_size_values,
+            peft_cache_config=PeftCacheConfig(
+                host_cache_size=1),  # size in bytes
+            # Disable CUDA graph
+            # TODO: remove this once we have a proper fix for CUDA graph in LoRA
+            cuda_graph_config=None)
+
+    # Test that too small PeftCacheConfig.device_cache_percent causes failure
+    with pytest.raises(RuntimeError):
+        check_llama_7b_multi_lora_from_request_test_harness(
+            LLM,
+            lora_config=lora_config_no_cache_size_values,
+            peft_cache_config=PeftCacheConfig(device_cache_percent=0.0000001),
+            # Disable CUDA graph
+            # TODO: remove this once we have a proper fix for CUDA graph in LoRA
+            cuda_graph_config=None)
+
+
+def test_llama_7b_lora_config_overrides_peft_cache_config():
+    """Tests that cache size args in lora_config LLM arg override the cache size
+    parameters in peft_cache_config LLM arg.
+    """    # noqa: D205
+    check_llama_7b_multi_lora_from_request_test_harness(
+        LLM,
+        lora_config=LoraConfig(
+            lora_target_modules=['attn_q', 'attn_k', 'attn_v'],
+            max_lora_rank=8,
+            max_loras=2,
+            max_cpu_loras=2),
+        peft_cache_config=PeftCacheConfig(
+            host_cache_size=1,  # size in bytes
+            device_cache_percent=0.0000001),
+        # Disable CUDA graph
+        # TODO: remove this once we have a proper fix for CUDA graph in LoRA
+        cuda_graph_config=None)
+
+
 # TODO smor: currently Nemotron-Super-49B-v1 with LoRA memory consumption is overly high
 # https://jirasw.nvidia.com/browse/TRTLLM-5045
-@pytest.mark.skip(reason="https://nvbugs/5401210")
 @skip_gpu_memory_less_than_138gb
 def test_nemotron_nas_lora() -> None:
     lora_config = LoraConfig(lora_dir=[
@@ -360,7 +526,9 @@ def test_codellama_fp8_with_bf16_lora() -> None:
 
         lora_config = LoraConfig(lora_dir=lora_paths,
                                  lora_target_modules=target_modules,
-                                 max_lora_rank=8)
+                                 max_lora_rank=8,
+                                 max_loras=2,
+                                 max_cpu_loras=2)
 
         llm = LLM(model_dir, quant_config=quant_config, lora_config=lora_config)
 
@@ -410,12 +578,70 @@ def test_bielik_11b_v2_2_instruct_multi_lora() -> None:
 
         trtllm_lora_config = LoraConfig(lora_dir=lora_paths,
                                         lora_target_modules=target_modules,
-                                        max_lora_rank=8)
+                                        max_lora_rank=8,
+                                        max_loras=2,
+                                        max_cpu_loras=2)
         llm = LLM(model_dir, lora_config=trtllm_lora_config)
 
         prompts = [
             "Kim był Mikołaj Kopernik i z czego zasłynął?",
             "Gdzie znajduje się stolica Polski?",
+        ]
+        lora_req1 = LoRARequest("lora-1", 0, lora_paths[0])
+        lora_req2 = LoRARequest("lora-2", 1, lora_paths[1])
+        lora_requests = [lora_req1, lora_req2]
+        sampling_params = SamplingParams(max_tokens=200)
+
+        outputs = llm.generate(prompts,
+                               sampling_params,
+                               lora_request=lora_requests)
+
+        assert len(outputs) == 2
+
+
+def test_gemma3_1b_instruct_multi_lora() -> None:
+    model_dir = f"{llm_models_root()}/gemma/gemma-3-1b-it"
+
+    target_modules = ['attn_q', 'attn_k', 'attn_v']
+
+    # Set up temporary directory for LoRA adapters
+    with tempfile.TemporaryDirectory() as lora_dir:
+        print("Creating dummy LoRAs...")
+
+        model = AutoModelForCausalLM.from_pretrained(model_dir,
+                                                     torch_dtype=torch.bfloat16,
+                                                     device_map="auto")
+        hf_modules = ["q_proj", "k_proj", "v_proj"]
+        peft_lora_config = PeftLoraConfig(r=8,
+                                          target_modules=hf_modules,
+                                          bias="none",
+                                          task_type="CAUSAL_LM")
+        lora_paths = []
+        for i in range(2):
+            lora_model = get_peft_model(model, peft_lora_config)
+            for param in lora_model.parameters():
+                param.data.zero_()
+            lora_path = f"{lora_dir}/lora_{i}"
+            lora_model.save_pretrained(lora_path)
+            lora_paths.append(lora_path)
+
+        trtllm_lora_config = LoraConfig(lora_dir=lora_paths,
+                                        lora_target_modules=target_modules,
+                                        max_lora_rank=8,
+                                        max_loras=2,
+                                        max_cpu_loras=2)
+        # Disabling kv cache reuse as a WAR to deal with gaps in kernel support for Gemma3's non-inclusive sliding window size.
+        kv_cache_config = KvCacheConfig(
+            enable_block_reuse=False,
+            enable_partial_reuse=False,
+        )
+        llm = LLM(model_dir,
+                  lora_config=trtllm_lora_config,
+                  kv_cache_config=kv_cache_config)
+
+        prompts = [
+            "Is it ok to fill diesel in a petrol car?",
+            "What is the capital of France?",
         ]
         lora_req1 = LoRARequest("lora-1", 0, lora_paths[0])
         lora_req2 = LoRARequest("lora-2", 1, lora_paths[1])

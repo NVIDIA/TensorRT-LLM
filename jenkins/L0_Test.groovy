@@ -39,7 +39,7 @@ LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE = env.wheelDockerImagePy310
 LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE = env.wheelDockerImagePy312
 
 // DLFW torch image
-DLFW_IMAGE = "nvcr.io/nvidia/pytorch:25.05-py3"
+DLFW_IMAGE = "nvcr.io/nvidia/pytorch:25.06-py3"
 
 //Ubuntu base image
 UBUNTU_22_04_IMAGE = "urm.nvidia.com/docker/ubuntu:22.04"
@@ -1132,7 +1132,7 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine) {
     // Generate rerun test lists
     def failSignaturesList = trtllm_utils.getFailSignaturesList().join(",")
     sh """
-        python3 ${llmSrc}/jenkins/test_rerun.py \
+        python3 ${llmSrc}/jenkins/scripts/test_rerun.py \
         generate_rerun_tests_list \
         --output-dir=${WORKSPACE}/${stageName}/ \
         --input-file=${WORKSPACE}/${stageName}/results.xml \
@@ -1213,7 +1213,7 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine) {
                   "${WORKSPACE}/${stageName}/rerun_results_1.xml",
                   "${WORKSPACE}/${stageName}/rerun_results_2.xml"]
     sh """
-        python3 ${llmSrc}/jenkins/test_rerun.py \
+        python3 ${llmSrc}/jenkins/scripts/test_rerun.py \
         generate_rerun_report \
         --output-file=${WORKSPACE}/${stageName}/rerun_results.xml \
         --input-files=${inputFiles.join(",")}
@@ -1221,7 +1221,7 @@ def rerunFailedTests(stageName, llmSrc, testCmdLine) {
 
     // Update original results xml file with rerun results xml files for junit
     sh """
-        python3 ${llmSrc}/jenkins/test_rerun.py \
+        python3 ${llmSrc}/jenkins/scripts/test_rerun.py \
         merge_junit_xmls \
         --output-file=${WORKSPACE}/${stageName}/results.xml \
         --input-files=${inputFiles.join(",")} \
@@ -1289,6 +1289,22 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         def llmTarfile = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/${tarName}"
         trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && wget -nv ${llmTarfile}")
         sh "cd ${llmPath} && tar -zxf ${tarName}"
+
+        // Download the new merged waives.txt
+        def waivesTxt = "https://urm.nvidia.com/artifactory/${ARTIFACT_PATH}/waive_list/waives.txt"
+        try {
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget -nv ${waivesTxt}")
+            if (!fileExists("waives.txt")) {
+                error "There is no merged waives.txt file, use the default waives.txt."
+            }
+            sh "rm ${llmSrc}/tests/integration/test_lists/waives.txt"
+            sh "mv waives.txt ${llmSrc}/tests/integration/test_lists/waives.txt"
+            echo "Download merged waives.txt successfully"
+        } catch (InterruptedException e) {
+            throw e
+        } catch (Exception e) {
+            echo "Failed to download merged waives.txt, use the default waives.txt. Error: ${e.message}"
+        }
 
         // install python package
         if (env.alternativeTRT) {
@@ -1843,7 +1859,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
 
     x86SlurmTestConfigs = [
         "RTXPro6000-PyTorch-Post-Merge-1": ["rtx-pro-6000", "l0_rtx_pro_6000", 1, 1],
-        "DGX_B200-4_GPUs-PyTorch-Post-Merge-1": ["b200-4-gpus", "l0_dgx_b200", 1, 1, 4],
+        "DGX_B200-4_GPUs-PyTorch-Post-Merge-1": ["b200-x4", "l0_dgx_b200", 1, 1, 4],
     ]
     fullSet += x86SlurmTestConfigs.keySet()
 
@@ -1869,17 +1885,19 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
     fullSet += SBSATestConfigs.keySet()
 
     SBSASlurmTestConfigs = [
-        "GB200-4_GPUs-PyTorch-1": ["gb200-4-gpus", "l0_gb200", 1, 1, 4],
-        "GB200-4_GPUs-PyTorch-Post-Merge-1": ["gb200-4-gpus", "l0_gb200", 1, 1, 4],
+        "GB200-4_GPUs-PyTorch-1": ["gb200-x4", "l0_gb200", 1, 1, 4],
+        "GB200-4_GPUs-PyTorch-Post-Merge-1": ["gb200-x4", "l0_gb200", 1, 1, 4],
     ]
     fullSet += SBSASlurmTestConfigs.keySet()
 
     multiNodesSBSAConfigs = [
         // Each stage test 1 testcase with 8 GPUs and 2 nodes.
-        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-1": ["gb200-multi-node", "l0_gb200_multi_nodes", 1, 4, 8, 2],
-        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-2": ["gb200-multi-node", "l0_gb200_multi_nodes", 2, 4, 8, 2],
-        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-3": ["gb200-multi-node", "l0_gb200_multi_nodes", 3, 4, 8, 2],
-        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-4": ["gb200-multi-node", "l0_gb200_multi_nodes", 4, 4, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-1": ["gb200-multi-node", "l0_gb200_multi_nodes", 1, 6, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-2": ["gb200-multi-node", "l0_gb200_multi_nodes", 2, 6, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-3": ["gb200-multi-node", "l0_gb200_multi_nodes", 3, 6, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-4": ["gb200-multi-node", "l0_gb200_multi_nodes", 4, 6, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-5": ["gb200-multi-node", "l0_gb200_multi_nodes", 5, 6, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-6": ["gb200-multi-node", "l0_gb200_multi_nodes", 6, 6, 8, 2],
     ]
     fullSet += multiNodesSBSAConfigs.keySet()
 
@@ -2075,14 +2093,14 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 uninstall -y tensorrt")
                         if (values[5] != DLFW_IMAGE) {
                             def ubuntu_version = key.contains("UB2404") ? "ubuntu2404" : "ubuntu2204"
-                            def platform = values[2] == X86_64_TRIPLE ? "x86_64" : "sbsa"
+                            def platform = cpu_arch == X86_64_TRIPLE ? "x86_64" : "sbsa"
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget https://developer.download.nvidia.com/compute/cuda/repos/${ubuntu_version}/${platform}/cuda-keyring_1.1-1_all.deb")
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "dpkg -i cuda-keyring_1.1-1_all.deb")
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update")
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get -y install cuda-toolkit-12-9")
                         }
 
-                        // Extra PyTorch CUDA 12.8 install
+                        // Extra PyTorch CUDA 12.8 install for SBSA platform and Blackwell GPUs bare-metal environments
                         if (values[6]) {
                             echo "###### Extra PyTorch CUDA 12.8 install Start ######"
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.7.1 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128")
@@ -2446,7 +2464,8 @@ pipeline {
                                 // We add a special marker to the parent job's description.
                                 // This will be used to decide whether to run multi-GPU test stage.
                                 def parentJob = globalVars[ACTION_INFO]['parents'][-2]
-                                trtllm_utils.appendBuildDescription(this, parentJob['name'], parentJob['build_number'], "====Require Multi-GPU Testing====<br/>")
+                                def archStr = (env.targetArch == X86_64_TRIPLE) ? "x86_64" : (env.targetArch == AARCH64_TRIPLE ? "SBSA" : "Unknown")
+                                trtllm_utils.appendBuildDescription(this, parentJob['name'], parentJob['build_number'], "====Require ${archStr} Multi-GPU Testing====<br/>")
                             } else {
                                 echo "No parent job found to add the special marker for executing multi-GPU test stage."
                             }

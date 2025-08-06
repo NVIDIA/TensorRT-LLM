@@ -91,6 +91,8 @@ struct XQAParams
     int max_distance = 0;
     bool multi_block_mode;
     bool multi_query_tokens = false;
+    bool is_spec_dec_tree
+        = true; // by default, XQA spec-dec expect tree-based draft token, only affective when multi_query_tokens = true
 
     float const* logn_scaling_ptr = nullptr; // for logn scaling in XQA
 

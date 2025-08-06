@@ -15,7 +15,8 @@ from tensorrt_llm.sampling_params import SamplingParams
 from ..._utils import binding_dtype_size, nvtx_range
 from ...logger import logger
 from ...mapping import Mapping
-from .llm_request import LlmRequest, LlmRequestState, SamplingConfig
+from .llm_request import (LlmRequest, LlmRequestState, SamplingConfig,
+                          get_draft_token_length)
 from .scheduler import ScheduledRequests
 
 if ENABLE_MULTI_DEVICE:
@@ -155,18 +156,33 @@ class KVCacheManager(BaseResourceManager):
                 (num_kv_heads + tp_size - 1) // tp_size
                 for _ in range(self.num_local_layers)
             ]
+            self.total_num_kv_heads_per_layer = [
+                (num_kv_heads + tp_size - 1) // tp_size
+                for _ in range(self.num_layers)
+            ]
         else:
             assert len(num_kv_heads) == self.num_layers
+
+            def append_to_kv_heads_per_layer(num_kv_heads_per_layer: List[int],
+                                             kv_head: Optional[int]):
+                if kv_head is not None:
+                    num_kv_heads_per_layer.append(
+                        (kv_head + tp_size - 1) // tp_size)
+                else:
+                    num_kv_heads_per_layer.append(0)
 
             self.num_kv_heads_per_layer = []
             if self.num_local_layers > 0:
                 for i in self.pp_layers:
                     kv_head = num_kv_heads[i]
-                    if kv_head is not None:
-                        self.num_kv_heads_per_layer.append(
-                            (kv_head + tp_size - 1) // tp_size)
-                    else:
-                        self.num_kv_heads_per_layer.append(0)
+                    append_to_kv_heads_per_layer(self.num_kv_heads_per_layer,
+                                                 kv_head)
+
+            self.total_num_kv_heads_per_layer = []
+            for i in range(self.num_layers):
+                kv_head = num_kv_heads[i]
+                append_to_kv_heads_per_layer(self.total_num_kv_heads_per_layer,
+                                             kv_head)
 
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
@@ -189,6 +205,13 @@ class KVCacheManager(BaseResourceManager):
         else:
             self.max_attention_window_vec = kv_cache_config.max_attention_window.copy(
             )  # Make a copy to avoid modifying original
+
+            # Clamp all window sizes to max_seq_len before calculating the
+            # number of KV cache blocks. This prevents the KV cache pool from
+            # being skewed by the largest window values.
+            self.max_attention_window_vec = [
+                min(max_seq_len, w) for w in self.max_attention_window_vec
+            ]
 
         sink_token_length = (kv_cache_config.sink_token_length
                              if kv_cache_config.sink_token_length is not None
@@ -353,12 +376,12 @@ class KVCacheManager(BaseResourceManager):
                                            req_beam_width, req)
                     for _ in range(self.num_extra_kv_tokens):
                         self.impl.add_token(req.py_request_id)
-                    for _ in range(len(req.py_draft_tokens)):
+                    for _ in range(get_draft_token_length(req)):
                         self.impl.add_token(req.py_request_id)
 
         for req in generation_batch:
             self.impl.add_token(req.py_request_id)
-            for _ in range(len(req.py_draft_tokens)):
+            for _ in range(get_draft_token_length(req)):
                 self.impl.add_token(req.py_request_id)
 
     def add_dummy_requests(
@@ -865,10 +888,9 @@ class MambaCacheManager(BaseResourceManager):
 
     def __init__(
         self,
-        d_model: int,
         d_state: int,
         d_conv: int,
-        expand: int,
+        num_heads: int,
         n_groups: int,
         head_dim: int,
         num_layers: int,
@@ -882,9 +904,9 @@ class MambaCacheManager(BaseResourceManager):
         tp_size = mapping.tp_size
 
         # derive mamba parameters for conv and ssm states
-        d_inner = d_model * expand
+        d_inner = head_dim * num_heads
         conv_dim = d_inner + 2 * n_groups * d_state
-        nheads = d_inner // head_dim
+        nheads = num_heads
 
         # check that can be partitioned
         assert nheads % tp_size == 0, "nheads must be divisible by tp_size"
@@ -1000,10 +1022,9 @@ class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
     def __init__(
         self,
         # mamba cache parameters
-        mamba_d_model: int,
         mamba_d_state: int,
         mamba_d_conv: int,
-        mamba_expand: int,
+        mamba_num_heads: int,
         mamba_n_groups: int,
         mamba_head_dim: int,
         mamba_num_layers: int,
@@ -1033,10 +1054,9 @@ class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
         # initialize mamba cache manager
         MambaCacheManager.__init__(
             self,
-            mamba_d_model,
             mamba_d_state,
             mamba_d_conv,
-            mamba_expand,
+            mamba_num_heads,
             mamba_n_groups,
             mamba_head_dim,
             mamba_num_layers,

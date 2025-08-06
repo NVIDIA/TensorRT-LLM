@@ -234,6 +234,152 @@ class MultimodalParams:
                 f"MultimodalParams: Unsupported element '{element}' to move to device. "
                 f"Supported elements: 'multimodal_data', 'multimodal_input'")
 
+    def to_handle(self, element: str, key: Optional[str] = None) -> None:
+        """Convert multimodal data to tensor handle.
+
+        Converts torch.Tensor objects to SharedTensorContainer handles (serializable dictionaries)
+        for efficient IPC. This function is a in-place operation.
+
+        Args:
+            element: Element to convert ("multimodal_data" or "multimodal_input")
+            key: Specific key to convert. If None, converts all tensor values in multimodal_data.
+                 Defaults to None.
+
+        Example:
+            # Convert all tensors in multimodal_data to handles
+            params.to_handle("multimodal_data", key=None)
+
+            # Convert only multimodal_embedding section tensors to handles
+            params.to_handle("multimodal_data", key="multimodal_embedding")
+        """
+        # Lazy import to avoid circular dependency
+        from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
+
+        def _to_tensor_handle(data):
+            for k, v in data.items():
+                if isinstance(v, torch.Tensor):
+                    # Convert tensor to handle
+                    handle = SharedTensorContainer.from_tensor(v).dump_to_dict()
+                    data[k] = handle
+                elif isinstance(v, dict):
+                    _to_tensor_handle(v)
+                elif isinstance(v, list):
+                    for i, item in enumerate(v):
+                        if isinstance(item, torch.Tensor):
+                            handle = SharedTensorContainer.from_tensor(
+                                item).dump_to_dict()
+                            v[i] = handle
+
+        if element == "multimodal_data":
+            if self.multimodal_data is None:
+                return
+            if key is None:
+                _to_tensor_handle(self.multimodal_data)
+            else:
+                if key not in self.multimodal_data:
+                    return  # no-op if key not found
+
+                value = self.multimodal_data[key]
+                if isinstance(value, torch.Tensor):
+                    handle = SharedTensorContainer.from_tensor(
+                        value).dump_to_dict()
+                    self.multimodal_data[key] = handle
+                elif isinstance(value, dict):
+                    _to_tensor_handle(value)
+                else:
+                    raise ValueError(
+                        f"Unsupported value type for multimodal_data: {type(value)}"
+                    )
+        elif element == "multimodal_input":
+            # No-op for multimodal_input
+            return
+        else:
+            raise ValueError(
+                f"Unsupported element '{element}' to convert to handle.")
+
+    def to_tensor(self, element: str, key: Optional[str] = None) -> None:
+        """Convert multimodal tensor handles back to tensors. This is the dual operation to to_handle.
+
+        Converts SharedTensorContainer handles (serializable dictionaries) back to torch.Tensor objects
+        for local computation. This function performs in-place modifications to the multimodal_data.
+
+        Args:
+            element: Element to convert ("multimodal_data" or "multimodal_input")
+            key: Specific key to convert. If None, converts all tensor handles in multimodal_data.
+                 Defaults to None.
+
+        Example:
+            # Convert all handles back to tensors
+            params.to_tensor("multimodal_data", key=None)
+
+            # Convert only multimodal_embedding section handles back to tensors
+            params.to_tensor("multimodal_data", key="multimodal_embedding")
+        """
+        # Lazy import to avoid circular dependency
+        from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
+
+        def _to_tensor(data):
+            for k, v in data.items():
+                if isinstance(v, dict) and 'method_key' in v:
+                    # This is a tensor handle (dict with method_key)
+                    try:
+                        tensor = SharedTensorContainer.from_dict(
+                            v).get_local_view()
+                        data[k] = tensor
+                    except Exception as e:
+                        raise ValueError(
+                            f"Failed to convert handle to tensor for key '{k}': {e}"
+                        )
+                elif isinstance(v, dict):
+                    _to_tensor(v)
+                elif isinstance(v, list):
+                    for i, item in enumerate(v):
+                        if isinstance(item, dict) and 'method_key' in item:
+                            try:
+                                tensor = SharedTensorContainer.from_dict(
+                                    item).get_local_view()
+                                v[i] = tensor
+                            except Exception as e:
+                                raise ValueError(
+                                    f"Failed to convert handle to tensor in list at index {i}: {e}"
+                                )
+
+        if element == "multimodal_data":
+            if self.multimodal_data is None:
+                return
+
+            if key is None:
+                _to_tensor(self.multimodal_data)
+            else:
+                if key not in self.multimodal_data:
+                    return  # no-op if key not found
+
+                value = self.multimodal_data[key]
+                if isinstance(
+                        value, dict
+                ) and 'method_key' in value:  # This is a tensor handle
+                    try:
+                        tensor = SharedTensorContainer.from_dict(
+                            value).get_local_view()
+                        self.multimodal_data[key] = tensor
+                    except Exception as e:
+                        raise ValueError(
+                            f"Failed to convert handle to tensor for key '{key}': {e}"
+                        )
+                elif isinstance(value, dict):
+                    _to_tensor(value)
+                else:
+                    raise ValueError(
+                        f"Unsupported value type for multimodal_data: {type(value)}"
+                    )
+
+        elif element == "multimodal_input":
+            # No-op for multimodal_input
+            return
+        else:
+            raise ValueError(
+                f"Unsupported element '{element}' to convert to tensor.")
+
     def strip_for_context(self) -> None:
         """Strip multimodal data for context processing.
 

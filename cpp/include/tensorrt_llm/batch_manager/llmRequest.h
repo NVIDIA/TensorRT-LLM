@@ -467,6 +467,9 @@ public:
         initialize(req.getInputTokenIds(), req.getOutputConfig().returnLogProbs);
     }
 
+    GenericLlmRequest(GenericLlmRequest&& request) = default;
+    GenericLlmRequest(GenericLlmRequest const& request) = default;
+
     void setExcludeInputFromOutput(bool exclude)
     {
         mExcludeInputFromOutput = exclude;
@@ -2318,6 +2321,9 @@ public:
         mKvCacheRetentionConfig = request.getKvCacheRetentionConfig();
     }
 
+    LlmRequest(LlmRequest&& request) = default;
+    LlmRequest(LlmRequest const& request) = default;
+
     /// @brief  Create a Response from the current state of the request
     /// @details Note that there is some dependency on the order of operations in this method. Modify with care!
     /// @return An optional Response
@@ -2327,6 +2333,11 @@ public:
 
     void createSerializedResult(
         std::vector<char>& serializedResult, bool& isFinal, bool useFastLogits = false, int32_t mpiWorldRank = 0);
+
+    /// @brief Check if the (user-provided) tokens fall within the vocabulary range.
+    /// @details Currently only supports invocation before context phase is completed.
+    /// @return True if tokens are within range.
+    bool checkTokenIdRange(SizeType32 vocabSize);
 
     void validate(SizeType32 maxInputLen, SizeType32 maxSequenceLen, SizeType32 maxDraftLen, SizeType32 vocabSizePadded,
         std::optional<SizeType32> maxEncoderInputLen = std::nullopt, bool enableKVCacheReuse = false);

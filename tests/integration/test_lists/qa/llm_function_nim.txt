@@ -1,0 +1,23 @@
+test_e2e.py::test_ptp_quickstart_advanced_8gpus[Nemotron-Ultra-253B-nemotron-nas/Llama-3_1-Nemotron-Ultra-253B-v1]
+test_e2e.py::test_ptp_quickstart_advanced[Nemotron4_4B-BF16-nemotron/Minitron-4B-Base]
+test_e2e.py::test_ptp_quickstart_advanced[Nemotron-H-8B-Nemotron-H-8B-Base-8K]
+accuracy/test_llm_api_pytorch.py::TestLlama3_3NemotronSuper49Bv1::test_auto_dtype_tp2
+accuracy/test_cli_flow.py::TestLlama3_3NemotronSuper49Bv1::test_auto_dtype_tp2
+accuracy/test_cli_flow.py::TestLlama3_3NemotronSuper49Bv1::test_fp8_prequantized_tp2
+accuracy/test_cli_flow.py::TestLlama3_1NemotronNano8Bv1::test_auto_dtype
+accuracy/test_cli_flow.py::TestLlama3_1NemotronNano8Bv1::test_fp8_prequantized
+accuracy/test_cli_flow.py::TestNemotronMini4BInstruct::test_fp8_prequantized
+accuracy/test_cli_flow.py::TestNemotronUltra::test_auto_dtype[tp8-cuda_graph=True] TIMEOUT (240)
+accuracy/test_cli_flow.py::TestNemotronUltra::test_fp8_prequantized[tp8-cuda_graph=True]
+accuracy/test_llm_api_pytorch.py::TestLlama3_3NemotronSuper49Bv1::test_fp8_prequantized_tp2
+accuracy/test_llm_api_pytorch.py::TestLlama3_1NemotronNano8Bv1::test_auto_dtype
+accuracy/test_llm_api_pytorch.py::TestLlama3_1NemotronNano8Bv1::test_fp8_prequantized
+accuracy/test_llm_api_pytorch.py::TestNemotronH::test_auto_dtype[cuda_graph=True]
+accuracy/test_llm_api_pytorch.py::TestNemotronH::test_auto_dtype[cuda_graph=False]
+accuracy/test_llm_api_pytorch.py::TestNemotronH::test_reasoning_fp8_prequantized[cuda_graph=True]
+accuracy/test_llm_api_pytorch.py::TestNemotronH_47B_Base::test_auto_dtype[tp8ep4-cuda_graph=True]
+accuracy/test_llm_api_pytorch.py::TestNemotronH_47B_Base::test_reasoning_fp8_prequantized[tp8ep8-cuda_graph=True]
+accuracy/test_llm_api_pytorch.py::TestNemotronH_56B_Base::test_auto_dtype[tp8-cuda_graph=True]
+accuracy/test_llm_api_pytorch.py::TestNemotronUltra::test_auto_dtype[tp8ep4-cuda_graph=True]
+accuracy/test_llm_api_pytorch.py::TestNemotronUltra::test_fp8_prequantized[tp8ep4-cuda_graph=True]
+accuracy/test_llm_api_pytorch.py::TestNemotronUltra::test_fp8_prequantized[tp8-cuda_graph=True]
