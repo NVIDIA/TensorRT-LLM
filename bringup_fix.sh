@@ -9,8 +9,6 @@ wget https://github.com/Kitware/CMake/releases/download/v4.0.3/cmake-4.0.3-linux
     bash cmake-4.0.3-linux-x86_64.sh --skip-license --prefix=/usr/local/cmake --exclude-subdir
 
 apt update
-apt remove -y ibverbs-providers libibverbs1
-apt install -y libibverbs-dev
 apt install -y libstdc++-14-dev
 
 elif [ $ARCH == "aarch64" ]; then
@@ -24,9 +22,6 @@ wget https://github.com/Kitware/CMake/releases/download/v4.0.3/cmake-4.0.3-linux
     bash cmake-4.0.3-linux-aarch64.sh --skip-license --prefix=/usr/local/cmake --exclude-subdir
 
 apt update
-# fix NXIL
-apt remove -y ibverbs-providers libibverbs1 # package version conflict with libibverbs-dev
-apt install -y libibverbs-dev
 # fix LLVM build
 apt install -y libstdc++-14-dev
 
