@@ -56,13 +56,6 @@ DataSenderImpl::DataSenderImpl(executor::kv_cache::ConnectionManager* manager,
 {
     TLLM_CHECK(mManager);
     TLLM_CHECK(mManager->getCommState().getSelfIdx() == selfIndex);
-    auto outputPath = getTransferOutputPath("send");
-    if (!outputPath.empty())
-    {
-        mMeasuresFile.open(outputPath);
-        TLLM_CHECK_WITH_INFO(
-            mMeasuresFile.is_open(), "Failed to open transfer output file: %s", outputPath.string().c_str());
-    }
 }
 
 [[nodiscard]] RequestInfo DataSenderImpl::recvRequestInfo()
@@ -149,8 +142,15 @@ void DataSenderImpl::release(LlmRequest::RequestIdType requestId)
     auto it = mRequestToSession.find(requestId);
     TLLM_CHECK(it != mRequestToSession.end());
     std::unique_lock<std::mutex> lk(mMtxForMap);
-    if (mMeasuresFile.is_open())
+    if (!common::getEnvKVCacheTransferOutputPath().empty())
     {
+        if (!mMeasuresFile.is_open())
+        {
+            auto outputPath = getTransferOutputPath("send");
+            mMeasuresFile.open(outputPath);
+            TLLM_CHECK_WITH_INFO(
+                mMeasuresFile.is_open(), "Failed to open transfer output file: %s", outputPath.string().c_str());
+        }
         it->second.exportMeasure(mMeasuresFile, true);
     }
     mRequestToSession.erase(it);
@@ -165,13 +165,6 @@ DataReceiverImpl::DataReceiverImpl(executor::kv_cache::ConnectionManager* manage
     TLLM_CHECK(mManager);
     TLLM_CHECK(mManager->getCommState().getSelfIdx() == selfIndex);
     TLLM_CHECK(mFormatter);
-    auto outputPath = getTransferOutputPath("recv");
-    if (!outputPath.empty())
-    {
-        mMeasuresFile.open(outputPath);
-        TLLM_CHECK_WITH_INFO(
-            mMeasuresFile.is_open(), "Failed to open transfer output file: %s", outputPath.string().c_str());
-    }
 }
 
 TransferSession DataReceiverImpl::sendRequestInfo(LlmRequest const& llmRequest)
@@ -243,9 +236,16 @@ TransferSession DataReceiverImpl::sendRequestInfo(LlmRequest const& llmRequest)
 void DataReceiverImpl::receiveSync(TransferSession& session)
 {
     mFormatter->unformat(session);
-    if (mMeasuresFile.is_open())
+    if (!common::getEnvKVCacheTransferOutputPath().empty())
     {
         std::unique_lock<std::mutex> lock(mMeasuresFileMutex);
+        if (!mMeasuresFile.is_open())
+        {
+            auto outputPath = getTransferOutputPath("recv");
+            mMeasuresFile.open(outputPath);
+            TLLM_CHECK_WITH_INFO(
+                mMeasuresFile.is_open(), "Failed to open transfer output file: %s", outputPath.string().c_str());
+        }
         session.exportMeasure(mMeasuresFile, false);
     }
 }

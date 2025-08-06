@@ -103,6 +103,10 @@ void TransferSession::appendMeasure(double delay, double duration, size_t size)
 
 void TransferSession::exportMeasure(std::ofstream& outFile, bool isContext) const
 {
+    if (mMeasures.empty())
+    {
+        return;
+    }
     // write header if not exist
     if (outFile.tellp() == 0)
     {
