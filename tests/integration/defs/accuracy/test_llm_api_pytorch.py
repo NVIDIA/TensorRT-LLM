@@ -325,6 +325,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     @pytest.mark.parametrize("backend", ["xgrammar", "llguidance"])
     def test_guided_decoding_with_eagle3(self, backend: str, mocker):
         mocker.patch.dict(os.environ, {"TRTLLM_XGUIDANCE_LENIENT": "1"})
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
         spec_config = EagleDecodingConfig(
             max_draft_len=3,
             speculative_model_dir=
@@ -332,6 +333,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             eagle3_one_model=False)
         llm = LLM(self.MODEL_PATH,
                   guided_decoding_backend=backend,
+                  kv_cache_config=kv_cache_config,
                   speculative_config=spec_config,
                   disable_overlap_scheduler=True)
         with llm:
@@ -342,10 +344,12 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     @pytest.mark.parametrize("backend", ["xgrammar", "llguidance"])
     def test_guided_decoding_with_ngram(self, backend: str, mocker):
         mocker.patch.dict(os.environ, {"TRTLLM_XGUIDANCE_LENIENT": "1"})
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
         spec_config = NGramDecodingConfig(max_draft_len=3,
                                           max_matching_ngram_size=3)
         llm = LLM(self.MODEL_PATH,
                   guided_decoding_backend=backend,
+                  kv_cache_config=kv_cache_config,
                   speculative_config=spec_config,
                   disable_overlap_scheduler=True)
         with llm:
