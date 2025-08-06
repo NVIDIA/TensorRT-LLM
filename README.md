@@ -18,7 +18,7 @@ TensorRT-LLM
 <div align="left">
 
 ## Tech Blogs
-* [08/06] Running a High Performance GPT-OSS-120B Inference Server with TensorRT-LLM 
+* [08/06] Running a High Performance GPT-OSS-120B Inference Server with TensorRT-LLM
 ✨ [➡️ link](./docs/source/blogs/tech_blog/blog9_Deploying_GPT_OSS_on_TRTLLM.md)
 
 
