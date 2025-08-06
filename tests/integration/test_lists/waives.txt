@@ -285,3 +285,6 @@ examples/test_gemma.py::test_hf_gemma_fp8_base_bf16_multi_lora[gemma-2-9b-it] SK
 examples/test_gemma.py::test_hf_gemma_fp8_base_bf16_multi_lora[gemma-2-27b-it] SKIP (https://nvbugs/5434451)
 examples/test_gemma.py::test_hf_gemma_fp8_base_bf16_multi_lora[gemma-3-1b-it] SKIP (https://nvbugs/5434451)
 accuracy/test_llm_api_pytorch.py::TestQwen3_235B_A22B::test_nvfp4[latency_moe_trtllm_eagle3] SKIP (https://nvbugs/5437384)
+qa/test_nvregress_debug_tests.py::test_failed_output_on_stdout SKIP (https://nvbugs/5440781)
+qa/test_nvregress_debug_tests.py::test_failed_output_on_stderr SKIP (https://nvbugs/5440781)
+qa/test_nvregress_debug_tests.py::test_failed_output_on_both SKIP (https://nvbugs/5440781)
