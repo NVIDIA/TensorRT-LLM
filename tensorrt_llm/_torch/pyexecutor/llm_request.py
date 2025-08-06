@@ -336,6 +336,14 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
                                   exclude_last_generation_logits)
         self.child_requests = []
 
+        self._py_embedding_bias_1d = None
+        if hasattr(self, 'embedding_bias') and self.embedding_bias is not None:
+            # Pre-squeeze to 1D if needed (remove batch dimension)
+            if self.embedding_bias.dim() > 1:
+                self._py_embedding_bias_1d = self.embedding_bias.squeeze(0)
+            else:
+                self._py_embedding_bias_1d = self.embedding_bias
+
     def is_generation_only_request(self):
         return self.py_llm_request_type == LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY
 
@@ -463,9 +471,7 @@ def executor_request_to_llm_request(
         is_streaming=executor_request.streaming,
         end_id=executor_request.end_id,
         pad_id=executor_request.pad_id,
-        embedding_bias=torch.tensor(executor_request.embedding_bias,
-                                    dtype=torch.int32)
-        if executor_request.embedding_bias else None,
+        embedding_bias=executor_request.embedding_bias,
         bad_words_list=torch.tensor(
             convert_wordlist(executor_request.bad_words), dtype=torch.int32)
         if executor_request.bad_words else None,
