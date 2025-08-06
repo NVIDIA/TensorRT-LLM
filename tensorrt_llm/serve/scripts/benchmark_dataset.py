@@ -25,15 +25,16 @@ import random
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from io import BytesIO
 from typing import Any, Callable, Mapping, Optional, Union
 
 import numpy as np
 import pandas as pd
+import torch
 from datasets import load_dataset
 from PIL import Image
 from transformers import PreTrainedTokenizerBase
 
+from tensorrt_llm.inputs.utils import convert_image_mode
 from tensorrt_llm.serve.scripts.benchmark_utils import download_and_cache_file
 
 logger = logging.getLogger(__name__)
@@ -235,11 +236,14 @@ class BenchmarkDataset(ABC):
             sampling. Defaults to DEFAULT_SEED.
         """
         self.dataset_path = dataset_path
+        self.data = None
         # Set the random seed, ensuring that a None value is replaced with the
         # default seed.
         self.random_seed = (random_seed
                             if random_seed is not None else self.DEFAULT_SEED)
-        self.data = None
+        self.rng = torch.Generator()
+        self.rng.manual_seed(self.random_seed)
+        random.seed(self.random_seed)
 
     def load_data(self) -> None:
         """
@@ -286,7 +290,6 @@ class BenchmarkDataset(ABC):
             requests.  num_requests (int): The target number of requests.
         """
         if len(requests) < num_requests:
-            random.seed(self.random_seed)
             additional = random.choices(requests,
                                         k=num_requests - len(requests))
             requests.extend(additional)
@@ -340,26 +343,6 @@ def is_valid_sequence(
                 or combined_too_long)
 
 
-def rgba_to_rgb(
-    image: Image.Image,
-    background_color: Union[tuple[int, int, int], list[int]] = (255, 255, 255)
-) -> Image.Image:
-    """Convert an RGBA image to RGB with filled background color."""
-    assert image.mode == "RGBA"
-    converted = Image.new("RGB", image.size, background_color)
-    converted.paste(image, mask=image.split()[3])  # 3 is the alpha channel
-    return converted
-
-
-def convert_image_mode(image: Image.Image, to_mode: str):
-    if image.mode == to_mode:
-        return image
-    elif image.mode == "RGBA" and to_mode == "RGB":
-        return rgba_to_rgb(image)
-    else:
-        return image.convert(to_mode)
-
-
 def process_image(image: Any) -> Mapping[str, Any]:
     """
     Process a single image input and return a multimedia content dictionary.
@@ -378,10 +361,10 @@ def process_image(image: Any) -> Mapping[str, Any]:
        "file://".  - Returns a dictionary with the image URL.
 
     Raises:
-        ValueError: If the input is not a supported type.
+        TypeError: If the input is not a supported type.
     """
     if isinstance(image, dict) and "bytes" in image:
-        image = Image.open(BytesIO(image["bytes"]))
+        image = Image.open(io.BytesIO(image["bytes"]))
     if isinstance(image, Image.Image):
         image = convert_image_mode(image, "RGB")
         with io.BytesIO() as image_data:
@@ -400,8 +383,8 @@ def process_image(image: Any) -> Mapping[str, Any]:
             ("http://", "file://")) else f"file://{image}")
         return {"type": "image_url", "image_url": {"url": image_url}}
 
-    raise ValueError(f"Invalid image input {image}. Must be a PIL.Image.Image"
-                     " or str or dictionary with raw image bytes.")
+    raise TypeError(f"Invalid image input {image}. Must be a PIL.Image.Image"
+                    " or str or dictionary with raw image bytes.")
 
 
 # -----------------------------------------------------------------------------
@@ -451,13 +434,16 @@ class RandomDataset(BenchmarkDataset):
         **kwargs,
     ) -> list[SampleRequest]:
         # Enforce range_ratio < 1
-        assert range_ratio < 1.0, (
-            "random_range_ratio must be < 1.0 to ensure a valid sampling range")
+        if range_ratio >= 1.0:
+            raise ValueError(
+                "random_range_ratio must be < 1.0 to ensure a valid sampling range"
+            )
 
         vocab_size = tokenizer.vocab_size
 
-        prefix_token_ids = (np.random.randint(
-            0, vocab_size, size=prefix_len).tolist() if prefix_len > 0 else [])
+        prefix_token_ids = (torch.randint(
+            0, vocab_size, size=(prefix_len, ), generator=self.rng).tolist()
+                            if prefix_len > 0 else [])
 
         # New sampling logic: [X * (1 - b), X * (1 + b)]
         input_low = int(input_len * (1 - range_ratio))
@@ -466,17 +452,22 @@ class RandomDataset(BenchmarkDataset):
         output_high = int(output_len * (1 + range_ratio))
 
         # Add logging for debugging
-        logger.info("Sampling input_len from [%s, %s]", input_low, input_high)
-        logger.info("Sampling output_len from [%s, %s]", output_low,
-                    output_high)
+        logger.debug("Sampling input_len from [%s, %s]", input_low, input_high)
+        logger.debug("Sampling output_len from [%s, %s]", output_low,
+                     output_high)
 
-        input_lens = np.random.randint(input_low,
-                                       input_high + 1,
-                                       size=num_requests)
-        output_lens = np.random.randint(output_low,
-                                        output_high + 1,
-                                        size=num_requests)
-        offsets = np.random.randint(0, vocab_size, size=num_requests)
+        input_lens = torch.randint(input_low,
+                                   input_high + 1,
+                                   size=(num_requests, ),
+                                   generator=self.rng).tolist()
+        output_lens = torch.randint(output_low,
+                                    output_high + 1,
+                                    size=(num_requests, ),
+                                    generator=self.rng).tolist()
+        offsets = torch.randint(0,
+                                vocab_size,
+                                size=(num_requests, ),
+                                generator=self.rng).tolist()
 
         requests = []
         if self.sample_from_sharegpt:
@@ -575,6 +566,8 @@ class RandomImageDataset(BenchmarkDataset):
     DEFAULT_OUTPUT_LEN = 128
     DEFAULT_WIDTH = 512
     DEFAULT_HEIGHT = 512
+    DEFAULT_IMAGE_SIZE = 512
+    DEFAULT_NUM_IMAGES = 1
     IS_MULTIMODAL = True
 
     def __init__(
@@ -595,17 +588,22 @@ class RandomImageDataset(BenchmarkDataset):
         output_len: int = DEFAULT_OUTPUT_LEN,
         width: int = DEFAULT_WIDTH,
         height: int = DEFAULT_HEIGHT,
+        image_size: int = DEFAULT_IMAGE_SIZE,
+        num_images: int = DEFAULT_NUM_IMAGES,
         enable_multimodal_chat: bool = False,
         **kwargs,
     ) -> list[SampleRequest]:
         # Enforce range_ratio < 1
-        assert range_ratio < 1.0, (
-            "random_range_ratio must be < 1.0 to ensure a valid sampling range")
+        if range_ratio >= 1.0:
+            raise ValueError(
+                "random_range_ratio must be < 1.0 to ensure a valid sampling range"
+            )
 
         vocab_size = tokenizer.vocab_size
 
-        prefix_token_ids = (np.random.randint(
-            0, vocab_size, size=prefix_len).tolist() if prefix_len > 0 else [])
+        prefix_token_ids = (torch.randint(
+            0, vocab_size, size=(prefix_len, ), generator=self.rng).tolist()
+                            if prefix_len > 0 else [])
 
         # New sampling logic: [X * (1 - b), X * (1 + b)]
         input_low = int(input_len * (1 - range_ratio))
@@ -614,17 +612,36 @@ class RandomImageDataset(BenchmarkDataset):
         output_high = int(output_len * (1 + range_ratio))
 
         # Add logging for debugging
-        logger.info("Sampling input_len from [%s, %s]", input_low, input_high)
-        logger.info("Sampling output_len from [%s, %s]", output_low,
-                    output_high)
+        logger.debug("Sampling input_len from [%s, %s]", input_low, input_high)
+        logger.debug("Sampling output_len from [%s, %s]", output_low,
+                     output_high)
 
-        input_lens = np.random.randint(input_low,
-                                       input_high + 1,
-                                       size=num_requests)
-        output_lens = np.random.randint(output_low,
-                                        output_high + 1,
-                                        size=num_requests)
-        offsets = np.random.randint(0, vocab_size, size=num_requests)
+        input_lens = torch.randint(input_low,
+                                   input_high + 1,
+                                   size=(num_requests, ),
+                                   generator=self.rng).tolist()
+        output_lens = torch.randint(output_low,
+                                    output_high + 1,
+                                    size=(num_requests, ),
+                                    generator=self.rng).tolist()
+        offsets = torch.randint(0,
+                                vocab_size,
+                                size=(num_requests, ),
+                                generator=self.rng).tolist()
+
+        # Determine final image dimensions
+        # When both width/height and image_size are provided, prioritize width/height
+        final_width = width
+        final_height = height
+
+        # If width and height are still at default values but image_size is different, use image_size
+        if (width == self.DEFAULT_WIDTH and height == self.DEFAULT_HEIGHT
+                and image_size != self.DEFAULT_IMAGE_SIZE):
+            final_width = image_size
+            final_height = image_size
+        logger.info("Using width: %s, height: %s for random image dimensions",
+                    final_width, final_height)
+        logger.info("Generating %d images per request", num_images)
 
         sampled_requests = []
         for i in range(num_requests):
@@ -636,12 +653,21 @@ class RandomImageDataset(BenchmarkDataset):
                 prompt = tokenizer.decode(prompt)
             total_input_len = prefix_len + int(input_lens[i])
 
-            # Generate random image
-            random_image = np.random.randint(0,
-                                             256, (height, width, 3),
-                                             dtype=np.uint8)
-            pil_image = Image.fromarray(random_image)
-            mm_content = process_image(pil_image)
+            # Generate random images (support multiple images per request)
+            images = []
+            for _ in range(num_images):
+                random_image = torch.randint(0,
+                                             256,
+                                             (final_height, final_width, 3),
+                                             dtype=torch.uint8,
+                                             generator=self.rng).numpy()
+                pil_image = Image.fromarray(random_image)
+                images.append(pil_image)
+
+            # Process images for multimodal content
+            mm_content = [process_image(img) for img in images]
+
+            # Handle multimodal chat transformation
             if enable_multimodal_chat:
                 prompt = self.apply_multimodal_chat_transformation(
                     prompt, mm_content)
@@ -692,7 +718,6 @@ class CustomDataset(BenchmarkDataset):
         with open(self.dataset_path, encoding="utf-8") as f:
             for line in f:
                 self.data.append(json.loads(line))
-        random.seed(self.random_seed)
         random.shuffle(self.data)
 
     def sample(self, tokenizer: PreTrainedTokenizerBase,
@@ -765,7 +790,6 @@ class ShareGPTDataset(BenchmarkDataset):
             entry for entry in self.data
             if "conversations" in entry and len(entry["conversations"]) >= 2
         ]
-        random.seed(self.random_seed)
         random.shuffle(self.data)
 
     def sample(
