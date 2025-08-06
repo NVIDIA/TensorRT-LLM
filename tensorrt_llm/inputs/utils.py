@@ -24,10 +24,38 @@ from tensorrt_llm.llmapi.tokenizer import TokenizerBase, TransformersTokenizer
 logger = logging.get_logger(__name__)
 
 
+def rgba_to_rgb(
+    image: Image.Image,
+    background_color: Union[tuple[int, int, int], list[int]] = (255, 255, 255)
+) -> Image.Image:
+    """Convert an RGBA image to RGB with filled background color.
+
+    Uses white (255, 255, 255) as the default background color because:
+    1. It's the most neutral and commonly expected background for images
+    2. Maintains backward compatibility with existing code
+    """
+    if image.mode != "RGBA":
+        raise ValueError(
+            f"Expected image mode to be 'RGBA', but got '{image.mode}'")
+    converted = Image.new("RGB", image.size, background_color)
+    converted.paste(image, mask=image.split()[3])  # 3 is the alpha channel
+    return converted
+
+
+def convert_image_mode(image: Image.Image, to_mode: str) -> Image.Image:
+    """Convert image to specified mode with proper handling of RGBA to RGB conversion."""
+    if image.mode == to_mode:
+        return image
+    elif image.mode == "RGBA" and to_mode == "RGB":
+        return rgba_to_rgb(image)
+    else:
+        return image.convert(to_mode)
+
+
 def _load_and_convert_image(image):
     image = Image.open(image)
     image.load()
-    return image.convert("RGB")
+    return convert_image_mode(image, "RGB")
 
 
 def load_base64_image(parsed_url: str) -> Image.Image:

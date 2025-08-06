@@ -292,7 +292,9 @@ async def benchmark(
             input_requests[0].prompt, input_requests[0].prompt_len, \
             input_requests[0].expected_output_len, input_requests[0].multi_modal_data
 
-        assert test_mm_content is None or isinstance(test_mm_content, dict)
+        assert test_mm_content is None or isinstance(
+            test_mm_content, list) and all(
+                isinstance(item, dict) for item in test_mm_content)
         test_input = RequestFuncInput(
             model=model_id,
             model_name=model_name,
@@ -611,6 +613,9 @@ def main(args: argparse.Namespace):
     tokenizer_id = args.tokenizer if args.tokenizer is not None else args.model
     tokenizer_mode = args.tokenizer_mode
 
+    if backend == "openai-chat":
+        args.endpoint = "/v1/chat/completions"
+
     if args.base_url is not None:
         api_url = f"{args.base_url}{args.endpoint}"
         base_url = f"{args.base_url}"
@@ -741,7 +746,9 @@ def main(args: argparse.Namespace):
                          output_len=args.random_output_len,
                          range_ratio=args.random_range_ratio,
                          width=args.random_image_width,
-                         height=args.random_image_height),
+                         height=args.random_image_height,
+                         image_size=args.random_image_size,
+                         num_images=args.random_num_images),
             }
 
             if dataset_name not in dataset_factories:
@@ -1170,6 +1177,18 @@ if __name__ == "__main__":
         type=int,
         default=512,
         help="Height of the image.",
+    )
+    random_image_group.add_argument(
+        "--random-image-size",
+        type=int,
+        default=512,
+        help="Squared size of the image.",
+    )
+    random_image_group.add_argument(
+        "--random-num-images",
+        type=int,
+        default=1,
+        help="Number of images per request.",
     )
 
     hf_group = parser.add_argument_group("hf dataset options")
