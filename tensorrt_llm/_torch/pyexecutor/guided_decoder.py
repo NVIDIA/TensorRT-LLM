@@ -98,3 +98,11 @@ class GuidedDecoder:
     @hostfunc
     def inc_bitmask_host(self):
         self.bitmask_host.add_(1)
+
+    @hostfunc
+    def run(self, token_ids: torch.Tensor):
+        self.grammar_matchers[0].accept_token(token_ids[0].item())
+        self.grammar_matchers[0].fill_next_token_bitmask(self.bitmask_host, 0)
+        if not hasattr(self, "token_ids"):
+            self.token_ids = []
+        self.token_ids.append(token_ids[0].item())
