@@ -211,6 +211,7 @@ l0_a10_nanobind:
       linux_distribution_name: ubuntu*
     terms:
       stage: pre_merge
-      backend: tensorrt
   tests:
   - unittest/bindings
+  - test_e2e.py::test_openai_chat_example[trt]
+  - test_e2e.py::test_openai_chat_example[pytorch] TIMEOUT (90)
