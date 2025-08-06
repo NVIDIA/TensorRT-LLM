@@ -123,7 +123,7 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
 {
     NVTX3_SCOPED_RANGE(MLACacheFormatter_format);
     auto const& llmRequest = session.getLlmRequest();
-    TLLM_LOG_INFO(
+    TLLM_LOG_DEBUG(
         mpi::MpiComm::world().getRank(), "Start sending KV cache for request ID: %ld.", llmRequest.mRequestId);
     auto const& selfConfig = session.getSelfState().getCacheState().value();
     auto const& destConfig = session.getOtherState().getCacheState().value();
@@ -161,7 +161,7 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
         && destConfig.getParallelConfig().mPipelineParallelism == selfConfig.getParallelConfig().mPipelineParallelism)
     {
 
-        TLLM_LOG_INFO("Try using zero-copy for the KV cache.");
+        TLLM_LOG_DEBUG("Try using zero-copy for the KV cache.");
         NVTX3_SCOPED_RANGE(sendBufferFun);
 
         TLLM_CUDA_CHECK(cudaSetDevice(deviceId));
@@ -173,7 +173,7 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
             }
         }
 
-        TLLM_LOG_INFO(mpi::MpiComm::world().getRank(), "End the sending of KV cache for the request ID: %ld.",
+        TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), "End the sending of KV cache for the request ID: %ld.",
             llmRequest.mRequestId);
 
         return;
@@ -287,7 +287,7 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
     {
         if (!common::getEnvEnableReceiveKVCacheParallel())
         {
-            TLLM_LOG_INFO("Disable parallel receiving of the KV cache.");
+            TLLM_LOG_DEBUG("Disable parallel receiving of the KV cache.");
             for (size_t i = 0; i < connections.size(); i++)
             {
                 sendBufferFun(deviceId, i);
@@ -326,7 +326,7 @@ void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& ses
     }
     mCacheTransBufferManager->freeBufferIndexForSend(cacheBufferId);
 
-    TLLM_LOG_INFO(
+    TLLM_LOG_DEBUG(
         mpi::MpiComm::world().getRank(), "End the sending of KV cache for the request ID: %ld.", llmRequest.mRequestId);
 }
 
@@ -336,7 +336,7 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
     auto const& llmRequest = session.getLlmRequest();
     TLLM_CHECK_WITH_INFO(llmRequest.mSamplingConfig.beamWidth == 1, "Currently only supports beam width 1.");
     auto const ctxReqId = llmRequest.getContextPhaseParams().value().getReqId();
-    TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
+    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
         "Start receiving KV cache for request ID: %ld, context request ID: %ld.", llmRequest.mRequestId, ctxReqId);
     auto const& selfConfig = session.getSelfState().getCacheState().value();
     auto const& destConfig = session.getOtherState().getCacheState().value();
@@ -370,7 +370,7 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
         && destConfig.getParallelConfig().mPipelineParallelism == selfConfig.getParallelConfig().mPipelineParallelism)
     {
         // recv
-        TLLM_LOG_INFO("Try zcopy for KV cache");
+        TLLM_LOG_DEBUG("Try zcopy for KV cache");
         NVTX3_SCOPED_RANGE(recvBufferFun);
         TLLM_CUDA_CHECK(cudaSetDevice(deviceId));
         TLLM_CHECK(pickUpConnections.size() == 1);
@@ -382,7 +382,7 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
                 session.recv(pickUpConnections[i], block->data(), block->getSizeInBytes());
             }
         }
-        TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
+        TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
             "End receiving KV cache for request ID: %ld, context request ID: %ld.", llmRequest.mRequestId,
             llmRequest.getContextPhaseParams().value().getReqId());
         return;
@@ -555,7 +555,7 @@ void MLACacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& s
         mCacheTransBufferManager->freeBufferIndexForRecv(cacheBufferId);
     }
 
-    TLLM_LOG_INFO(mpi::MpiComm::world().getRank(),
+    TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
         "End receiving KV cache for request ID: %ld, context request ID: %ld.", llmRequest.mRequestId,
         llmRequest.getContextPhaseParams().value().getReqId());
 }
