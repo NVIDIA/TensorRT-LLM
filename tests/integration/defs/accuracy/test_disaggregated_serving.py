@@ -177,16 +177,19 @@ def launch_disaggregated_llm(disaggregated_server_config: Dict[str, Any],
                     stack.enter_context(proc) for proc in processes
                 ]
                 yield opened_processes
-        finally:
-            pass
+        except Exception as e:
+            logger.error(
+                f"Failed to start disaggregated server processes in multi_popen: {e}"
+            )
+            raise
 
     with (MyThreadPoolExecutor(max_workers=16) as thread_pool, temp_dir):
-        with multi_popen(ctx_servers + gen_servers) as server_processes:
+        with multi_popen(ctx_servers + gen_servers):
             with popen([
                     trtllm_serve_path, "disaggregated", "-c",
                     disaggregated_serving_config_path, "--server_start_timeout",
                     "3600"
-            ]) as disaggregated_server:
+            ]):
                 while True:
                     time.sleep(1)
                     try:
@@ -238,11 +241,13 @@ def launch_disaggregated_llm(disaggregated_server_config: Dict[str, Any],
 
 
 def run_parallel_test(model_name: str, model_path: str, ctx_pp: int,
-                      ctx_tp: int, gen_pp: int, gen_tp: int,
-                      test_set: LlmapiAccuracyTestHarness):
-    if ctx_tp * ctx_pp + gen_tp * gen_pp > get_device_count():
+                      ctx_tp: int, gen_pp: int, gen_tp: int, ctx_instances: int,
+                      gen_instances: int, test_set: LlmapiAccuracyTestHarness):
+    total_ctx_gpus = ctx_tp * ctx_pp * ctx_instances
+    total_gen_gpus = gen_tp * gen_pp * gen_instances
+    if total_ctx_gpus + total_gen_gpus > get_device_count():
         pytest.fail(
-            f"Not enough devices for ctx_pp={ctx_pp}+ctx_tp={ctx_tp} and gen_pp={gen_pp}+gen_tp={gen_tp} test"
+            f"Not enough devices for {ctx_instances} ctx instances (ctx_pp={ctx_pp}*ctx_tp={ctx_tp}) + {gen_instances} gen instances (gen_pp={gen_pp}*gen_tp={gen_tp}), total: {total_ctx_gpus + total_gen_gpus}"
         )
 
     kv_cache_config = {
@@ -267,17 +272,21 @@ def run_parallel_test(model_name: str, model_path: str, ctx_pp: int,
             "backend": "default"
         }
     }
+
+    ctx_urls = [f"localhost:{8001 + i * 2}" for i in range(ctx_instances)]
+    gen_urls = [f"localhost:{8002 + i * 2}" for i in range(gen_instances)]
+
     disaggregated_server_config = {
         "hostname": "localhost",
         "port": 8000,
         "backend": "pytorch",
         "context_servers": {
-            "num_instances": 1,
-            "urls": ["localhost:8001"]
+            "num_instances": ctx_instances,
+            "urls": ctx_urls
         },
         "generation_servers": {
-            "num_instances": 1,
-            "urls": ["localhost:8002"]
+            "num_instances": gen_instances,
+            "urls": gen_urls
         }
     }
     with launch_disaggregated_llm(disaggregated_server_config,
@@ -433,59 +442,21 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     @pytest.mark.parametrize("testset", ["GSM8K", "MMLU"])
     def test_tp_pp_symmetric(self, tp, pp, testset):
         return run_parallel_test(self.MODEL_NAME, self.MODEL_PATH, pp, tp, pp,
-                                 tp, get_accuracy_task(testset))
+                                 tp, 1, 1, get_accuracy_task(testset))
 
+    @pytest.mark.skip_less_device(4)
     @parametrize_with_ids("ctx_pp", [2, 4])
     @parametrize_with_ids("gen_tp", [1, 2])
     @pytest.mark.parametrize("testset", ["GSM8K", "MMLU"])
     def test_ctx_pp_gen_tp_asymmetric(self, ctx_pp, gen_tp, testset):
         return run_parallel_test(self.MODEL_NAME, self.MODEL_PATH, ctx_pp, 1, 1,
-                                 gen_tp, get_accuracy_task(testset))
+                                 gen_tp, 1, 1, get_accuracy_task(testset))
 
     @pytest.mark.skip_less_device(4)
-    def test_multi_instance(self):
-        kv_cache_config = {
-            "free_gpu_memory_fraction": 0.5,
-            "enable_block_reuse": False
-        }
-        ctx_server_config = {
-            "pipeline_parallel_size": 1,
-            "tensor_parallel_size": 1,
-            "disable_overlap_scheduler": True,
-            "kv_cache_config": kv_cache_config,
-            "cache_transceiver_config": {
-                "backend": "default"
-            }
-        }
-        gen_server_config = {
-            "tensor_parallel_size": 1,
-            "pipeline_parallel_size": 1,
-            "disable_overlap_scheduler": True,
-            "kv_cache_config": kv_cache_config,
-            "cache_transceiver_config": {
-                "backend": "default"
-            }
-        }
-        disaggregated_server_config = {
-            "hostname": "localhost",
-            "port": 8000,
-            "backend": "pytorch",
-            "context_servers": {
-                "num_instances": 2,
-                "urls": ["localhost:8001", "localhost:8003"]
-            },
-            "generation_servers": {
-                "num_instances": 2,
-                "urls": ["localhost:8002", "localhost:8004"]
-            }
-        }
-        with launch_disaggregated_llm(disaggregated_server_config,
-                                      ctx_server_config, gen_server_config,
-                                      self.MODEL_PATH) as llm:
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
+    @pytest.mark.parametrize("testset", ["GSM8K", "MMLU"])
+    def test_multi_instance(self, testset):
+        return run_parallel_test(self.MODEL_NAME, self.MODEL_PATH, 1, 1, 1, 1,
+                                 2, 2, get_accuracy_task(testset))
 
 
 @pytest.mark.skip_less_device_memory(140000)
