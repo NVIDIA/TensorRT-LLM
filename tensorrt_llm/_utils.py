@@ -676,6 +676,14 @@ def get_sm_version():
     return prop.major * 10 + prop.minor
 
 
+@lru_cache(maxsize=1)
+def get_sm_family():
+    sm_version = get_sm_version()
+    if sm_version == 100 or sm_version == 103:
+        return 100
+    return sm_version
+
+
 def is_trace_enabled(env_var: str):
     value = os.environ.get(env_var, "-1")
     if value == "ALL":
