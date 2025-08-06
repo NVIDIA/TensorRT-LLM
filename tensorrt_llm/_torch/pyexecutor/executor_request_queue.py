@@ -233,8 +233,7 @@ class ExecutorRequestQueue:
 
     def can_enqueue_request(self) -> bool:
         with self.enqueue_lock:
-            can_enqueue = self.active
-        return can_enqueue and self.dist.rank == 0
+            return self.active and self.dist.rank == 0
 
     def _fetch_and_process_requests(
         self,
