@@ -2467,8 +2467,10 @@ void doTokenComparisonChangeBeamWidth(bool enableReuse, SizeType32 maxWaitMs)
         beamResult.contextLogitsFile = resultsPath / PathUtil::FP16_PLUGIN_PACKED_PAGED_CONTEXT_LOGITS_FILE();
         beamResult.genLogitsFile = resultsPath / PathUtil::FP16_PLUGIN_PACKED_PAGED_GENERATION_LOGITS_FILE();
 
+        auto const numReturnSequences = beamWidth;
+
         runTest(executor, inputPath, modelIds, flakyTestInfo, streaming, vocabSizePadded, beamResult, outConfig,
-            isSpeculativeDecoding, maxWaitMs, false, 1, false, 1);
+            isSpeculativeDecoding, maxWaitMs, false, numReturnSequences, false, 1);
     }
 }
 
