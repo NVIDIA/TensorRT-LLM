@@ -14,6 +14,7 @@ from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
                                              AllReduceParams, MoEAllReduce)
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_manager import HfLoraLoader
@@ -69,6 +70,9 @@ class Llama4Attention(Attention):
             # TODO: support chunked attention for other backends.
             # This is safe to do because we limit seqlen to 8k for
             # non TRTLLM backends.
+            attention_chunk_size = None
+        elif get_sm_version() <= 90 and model_config.spec_config is not None:
+            # pre-Blackwell spec-dec kernel does not support
             attention_chunk_size = None
 
         super().__init__(

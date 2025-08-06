@@ -175,26 +175,6 @@ TRT-LLM multimodal supports the following modalities and data types (depending o
      ]}
 
 
-Benchmark
----------
-
-You can use any benchmark clients compatible with OpenAI API to test serving performance of ``trtllm_serve``, we recommend ``genai-perf`` and here is a benchmarking recipe.
-
-First, install ``genai-perf`` with ``pip``:
-
-.. code-block:: bash
-
-   pip install genai-perf
-
-Then, :ref:`start a server<Starting a Server>` with ``trtllm-serve`` and ``TinyLlama-1.1B-Chat-v1.0``.
-
-Finally, test performance with the following command:
-
-.. literalinclude:: ../../../examples/serve/genai_perf_client.sh
-    :language: bash
-    :linenos:
-
-Refer to `README <https://github.com/triton-inference-server/perf_analyzer/blob/main/genai-perf/README.md>`_ of ``genai-perf`` for more guidance.
 
 Multi-node Serving with Slurm
 -----------------------------
@@ -278,3 +258,6 @@ Syntax
 .. click:: tensorrt_llm.commands.serve:main
    :prog: trtllm-serve
    :nested: full
+
+Besides the above examples, `trtllm-serve` is also used as an entrypoint for performance benchmarking.
+Please refer to `Performance Benchmarking with `trtllm-serve` <https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/commands/trtllm-serve/trtllm-serve-bench.md>` for more details.

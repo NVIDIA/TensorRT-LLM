@@ -1892,10 +1892,12 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
 
     multiNodesSBSAConfigs = [
         // Each stage test 1 testcase with 8 GPUs and 2 nodes.
-        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-1": ["gb200-multi-node", "l0_gb200_multi_nodes", 1, 4, 8, 2],
-        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-2": ["gb200-multi-node", "l0_gb200_multi_nodes", 2, 4, 8, 2],
-        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-3": ["gb200-multi-node", "l0_gb200_multi_nodes", 3, 4, 8, 2],
-        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-4": ["gb200-multi-node", "l0_gb200_multi_nodes", 4, 4, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-1": ["gb200-multi-node", "l0_gb200_multi_nodes", 1, 6, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-2": ["gb200-multi-node", "l0_gb200_multi_nodes", 2, 6, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-3": ["gb200-multi-node", "l0_gb200_multi_nodes", 3, 6, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-4": ["gb200-multi-node", "l0_gb200_multi_nodes", 4, 6, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-5": ["gb200-multi-node", "l0_gb200_multi_nodes", 5, 6, 8, 2],
+        "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-6": ["gb200-multi-node", "l0_gb200_multi_nodes", 6, 6, 8, 2],
     ]
     fullSet += multiNodesSBSAConfigs.keySet()
 
@@ -2091,17 +2093,29 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 uninstall -y tensorrt")
                         if (values[5] != DLFW_IMAGE) {
                             def ubuntu_version = key.contains("UB2404") ? "ubuntu2404" : "ubuntu2204"
-                            def platform = values[2] == X86_64_TRIPLE ? "x86_64" : "sbsa"
+                            def platform = cpu_arch == X86_64_TRIPLE ? "x86_64" : "sbsa"
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget https://developer.download.nvidia.com/compute/cuda/repos/${ubuntu_version}/${platform}/cuda-keyring_1.1-1_all.deb")
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "dpkg -i cuda-keyring_1.1-1_all.deb")
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update")
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get -y install cuda-toolkit-12-9")
                         }
 
-                        // Extra PyTorch CUDA 12.8 install
+                        // Extra PyTorch CUDA 12.8 install for SBSA platform and Blackwell GPUs bare-metal environments
                         if (values[6]) {
                             echo "###### Extra PyTorch CUDA 12.8 install Start ######"
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.7.1 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128")
+                        }
+
+                        // Workaround for https://nvbugs/5433581 where deep_gemm installation fails on SBSA platform
+                        if (cpu_arch == AARCH64_TRIPLE) {
+                              echo "###### Workaround for https://nvbugs/5433581 Start ######"
+                              def deepGemmLine = readFile("${LLM_ROOT}/requirements.txt").readLines().find { it.trim().startsWith('deep_gemm') }
+                              if (deepGemmLine) {
+                                  trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install '${deepGemmLine.trim()}' --extra-index-url https://download.pytorch.org/whl/cu128")
+                              }
+                              else {
+                                echo "deep_gemm package not found in requirements.txt"
+                              }
                         }
 
                         def libEnv = []

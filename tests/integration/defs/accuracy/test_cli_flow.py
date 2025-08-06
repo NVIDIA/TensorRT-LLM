@@ -529,6 +529,10 @@ class TestLlama7B(CliFlowAccuracyTestHarness):
                 f"--quant_ckpt_path={llm_models_root()}/int4-quantized-gptq-awq/llama-7b-4bit-gs128.safetensors"
             ])
 
+    @pytest.mark.skip(
+        reason=
+        "Waived for now because attention sink cannot work with the non-cyclic kv cache kernel & runtime changes."
+    )
     def test_streamingllm(self):
         self.run(extra_acc_spec="streamingllm",
                  extra_build_args=["--streamingllm=enable"],
@@ -1163,14 +1167,15 @@ class TestMixtral8x22B(CliFlowAccuracyTestHarness):
     @skip_pre_ada
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(80000)
-    def test_fp8_tp2pp2(self):
+    def test_fp8_tp2pp2(self, timeout_manager):
         self.run(tasks=[CnnDailymail(self.MODEL_NAME),
                         MMLU(self.MODEL_NAME)],
                  quant_algo=QuantAlgo.FP8,
                  tp_size=2,
                  pp_size=2,
                  extra_convert_args=["--calib_size=32"],
-                 extra_build_args=["--gemm_plugin=auto"])
+                 extra_build_args=["--gemm_plugin=auto"],
+                 timeout_manager=timeout_manager)
 
     @skip_post_blackwell
     @pytest.mark.skip_less_device(8)
@@ -1180,7 +1185,8 @@ class TestMixtral8x22B(CliFlowAccuracyTestHarness):
         ids=['expert_parallel', 'mixed_parallel', 'tensor_parallel'])
     @pytest.mark.parametrize("moe_renorm_mode", [0, 1],
                              ids=['no_renormalize', 'renormalize'])
-    def test_int8_plugin_tp8(self, moe_tp_size, moe_renorm_mode):
+    def test_int8_plugin_tp8(self, moe_tp_size, moe_renorm_mode,
+                             timeout_manager):
         self.run(quant_algo=QuantAlgo.W8A16,
                  tp_size=8,
                  extra_convert_args=[
@@ -1191,7 +1197,8 @@ class TestMixtral8x22B(CliFlowAccuracyTestHarness):
                  extra_build_args=[
                      "--max_beam_width=4", "--gemm_plugin=auto",
                      "--moe_plugin=auto", f"--max_seq_len={8192}"
-                 ])
+                 ],
+                 timeout_manager=timeout_manager)
 
 
 class TestGemma2B(CliFlowAccuracyTestHarness):

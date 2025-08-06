@@ -84,6 +84,12 @@ bool DecoderXQAImplJIT::mayHavePerfGain(XQAParams const& xqaParams) const
         // Always use at least 1 block regardless of history length
         multi_block_count = std::max(1, history_length / kMinHistoryTokensPerBlock);
     }
+    // Disable XQA for sliding window when cyclic_attention_window_size <= 256.
+    if (xqaParams.max_past_kv_length + 1 > xqaParams.cyclic_attention_window_size
+        && xqaParams.cyclic_attention_window_size <= 256)
+    {
+        return false;
+    }
     int block_count = num_kv_heads * batch_size * multi_block_count;
     return static_cast<float>(block_count) * kEnableMinBlockFactor >= static_cast<float>(mRunner->mMultiProcessorCount);
 }
@@ -394,7 +400,9 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
     else
     {
         appendParam(&launchParams.num_k_heads);
-        bool const allowSlidingWindow = !isSpecDec;
+        bool const allowSlidingWindow
+            = !(isSpecDec && xqaParams.is_spec_dec_tree); // sliding windows does not support spec dec with tree-based
+                                                          // token, only chained tokens
         if (allowSlidingWindow)
         {
             appendParam(&launchParams.slidingWindowSize);

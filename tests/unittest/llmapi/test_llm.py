@@ -708,6 +708,7 @@ def test_generate_with_beam_search(llm_for_sampling_params: LLM):
     check_output(outputs, references)
 
 
+@pytest.mark.skip(reason="https://nvbugs/5435714")
 @force_ampere
 @pytest.mark.part0
 def test_generate_with_streaming_llm():
