@@ -114,6 +114,7 @@ void TransferSession::exportMeasure(std::ofstream& outFile, bool isContext) cons
         outFile << '\n';
     }
     // write measures
+    TLLM_CHECK(isContext || mRequest->getContextPhaseParams().has_value());
     auto reqId = isContext ? mRequest->mRequestId : mRequest->getContextPhaseParams().value().getReqId();
     outFile << reqId;
     for (auto const& measure : mMeasures)

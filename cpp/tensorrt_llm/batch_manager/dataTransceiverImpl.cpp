@@ -34,7 +34,7 @@ static int32_t tagFromRequestId(LlmRequest::RequestIdType requestId)
 
 namespace fs = std::filesystem;
 
-static fs::path getOutputPath(char const* tag)
+static fs::path getTransferOutputPath(char const* tag)
 {
     auto outputPath = common::getEnvKVCacheTransferOutputPath();
     if (!outputPath.empty())
@@ -56,10 +56,12 @@ DataSenderImpl::DataSenderImpl(executor::kv_cache::ConnectionManager* manager,
 {
     TLLM_CHECK(mManager);
     TLLM_CHECK(mManager->getCommState().getSelfIdx() == selfIndex);
-    auto outputPath = getOutputPath("send");
+    auto outputPath = getTransferOutputPath("send");
     if (!outputPath.empty())
     {
-        mMeasuresFile.open(outputPath.string());
+        mMeasuresFile.open(outputPath);
+        TLLM_CHECK_WITH_INFO(
+            mMeasuresFile.is_open(), "Failed to open transfer output file: %s", outputPath.string().c_str());
     }
 }
 
@@ -163,10 +165,12 @@ DataReceiverImpl::DataReceiverImpl(executor::kv_cache::ConnectionManager* manage
     TLLM_CHECK(mManager);
     TLLM_CHECK(mManager->getCommState().getSelfIdx() == selfIndex);
     TLLM_CHECK(mFormatter);
-    auto outputPath = getOutputPath("recv");
+    auto outputPath = getTransferOutputPath("recv");
     if (!outputPath.empty())
     {
-        mMeasuresFile.open(outputPath.string());
+        mMeasuresFile.open(outputPath);
+        TLLM_CHECK_WITH_INFO(
+            mMeasuresFile.is_open(), "Failed to open transfer output file: %s", outputPath.string().c_str());
     }
 }
 
