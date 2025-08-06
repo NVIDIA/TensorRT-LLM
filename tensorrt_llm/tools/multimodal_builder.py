@@ -1750,9 +1750,13 @@ def build_eclair_engine(args):
         def __init__(self):
             super().__init__()
 
-            self.model_encoder = torch.hub.load("NVlabs/RADIO",
-                                                "radio_model",
-                                                version="radio_v2.5-h")
+            try:
+                self.model_encoder = torch.hub.load("NVlabs/RADIO",
+                                                    "radio_model",
+                                                    version="radio_v2.5-h")
+            except Exception as e:
+                raise RuntimeError(
+                    f"Failed to load RADIO model from torch.hub: {e}")
             self.model_encoder.summary_idxs = torch.tensor(4)
 
             self.conv1 = torch.nn.Conv1d(1280, 1024, 1)
@@ -1789,7 +1793,11 @@ def build_eclair_engine(args):
     model.decoder.resize_token_embeddings(len(processor.tokenizer))
     model.config.decoder_start_token_id = processor.tokenizer.eos_token_id  # 2
     model.config.pad_token_id = processor.tokenizer.pad_token_id  # 1
-    load_model(model, os.path.join(args.model_path, "model.safetensors"))
+    checkpoint_path = os.path.join(args.model_path, "model.safetensors")
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(
+            f"Model checkpoint not found at {checkpoint_path}")
+    load_model(model, checkpoint_path)
 
     wrapper = model.encoder.to(args.device)
     # temporary fix due to TRT onnx export bug
@@ -1798,7 +1806,7 @@ def build_eclair_engine(args):
 
     image = torch.randn((1, 3, 2048, 1648),
                         device=args.device,
-                        dtype=torch.float16)
+                        dtype=torch.bfloat16)
     export_onnx(wrapper, image, f'{args.output_dir}/onnx')
     build_trt_engine(
         args.model_type,

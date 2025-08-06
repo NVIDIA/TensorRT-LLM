@@ -1591,15 +1591,10 @@ def get_model(args):
             model.config.pad_token_id = processor.tokenizer.pad_token_id  # 1
             from transformers.models.mbart.modeling_mbart import \
                 MBartLearnedPositionalEmbedding
-            device, d_model = model.device, model.config.decoder.d_model
+            _, d_model = model.device, model.config.decoder.d_model
 
             with torch.inference_mode():
                 # Inspect checkpoint shapes
-                checkpoint_path = os.path.join(args.model_dir,
-                                               "model.safetensors")
-                # with safetensors.safe_open(checkpoint_path, framework="pt") as f:
-                #     if "decoder.model.decoder.embed_tokens.weight" in f.keys():
-                #         embed_shape = f.get_tensor("decoder.model.decoder.embed_tokens.weight").shape
                 safetensors.torch.load_model(model,
                                              os.path.join(
                                                  args.model_dir,
