@@ -103,7 +103,7 @@ DataSenderImpl::DataSenderImpl(executor::kv_cache::ConnectionManager* manager,
         {
             auto session = TransferSession(std::vector<Connection const*>(peerRelativeRanks.size(), nullptr),
                 DataContext{tagFromRequestId(requestId)}, mSelfState, info.getTransState(), mBufferManager, nullptr,
-                mMeasuresFile.is_open());
+                !common::getEnvKVCacheTransferOutputPath().empty());
             it = mRequestToSession.emplace(requestId, std::move(session)).first;
         }
         it->second.setConnection(peerIdx, connection);
@@ -230,7 +230,7 @@ TransferSession DataReceiverImpl::sendRequestInfo(LlmRequest const& llmRequest)
     }
     auto const& resource = getReceiveCacheResource(llmRequest);
     return TransferSession(std::move(counterPartConnections), DataContext{tagFromRequestId(requestId)}, mSelfState,
-        contextState, resource->mBufferManager, &llmRequest, mMeasuresFile.is_open());
+        contextState, resource->mBufferManager, &llmRequest, !common::getEnvKVCacheTransferOutputPath().empty());
 }
 
 void DataReceiverImpl::receiveSync(TransferSession& session)
