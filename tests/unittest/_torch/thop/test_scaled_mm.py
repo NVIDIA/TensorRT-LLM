@@ -39,7 +39,9 @@ from utils.util import getSMVersion
 )
 def test_fp8_scaled_mm(output_dtype, m, k_n):
     if getSMVersion() == 90:
-        pytest.skip("Skip test for sm90 because it's too flaky")
+        pytest.skip(
+            "Skip test for sm90 because it's too flaky. https://nvbugspro.nvidia.com/bug/5441734"
+        )
 
     k, n = k_n
     torch.random.manual_seed(0)

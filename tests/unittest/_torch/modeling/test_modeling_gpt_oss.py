@@ -51,7 +51,7 @@ def test_gpt_oss_trtllmgen(moe_backend):
     if moe_backend == "TRITON" and not IS_TRITON_KERNELS_AVAILABLE:
         pytest.skip("Triton kernels are not available")
 
-    pytest.skip("Re-enable after adding model to CI.")
+    pytest.skip("https://nvbugspro.nvidia.com/bug/5441721")
 
     prompts = [
         "How are you?",

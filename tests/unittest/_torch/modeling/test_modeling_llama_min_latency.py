@@ -268,8 +268,8 @@ class TestLlama4MinLatency(unittest.TestCase):
 
         if transformers.__version__ >= "4.55.0":
             self.skipTest(
-                "The transformers 4.55.0 has accuracy issues while 4.33.1 works fine."
-            )
+                "The transformers 4.55.0 has accuracy issues while 4.33.1 works fine. "
+                "https://nvbugspro.nvidia.com/bug/5441729")
 
         torch.random.manual_seed(0)
         config_dict = deepcopy(LLAMA_4_MAVERICK_TWO_LAYER_CONFIG)
