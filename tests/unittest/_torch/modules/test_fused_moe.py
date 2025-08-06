@@ -14,7 +14,8 @@ from _torch.helpers import (per_block_cast_to_fp8, per_block_cast_to_fp8_e8m0,
 from mpi4py import MPI
 from mpi4py.futures import MPIPoolExecutor
 from utils.util import (skip_neither_ada_nor_hopper_unittest,
-                        skip_pre_blackwell, skip_pre_hopper)
+                        skip_non_hopper_unittest, skip_pre_blackwell,
+                        skip_pre_hopper)
 
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -658,6 +659,140 @@ def test_fused_moe_fp8_blockwise_cute_dsl(dtype,
     quant_config = QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES)
 
     fused_moe = CuteDslFusedMoE(
+        num_experts=NUM_EXPERTS,
+        routing_method=routing_method,
+        hidden_size=HIDDEN_SIZE,
+        intermediate_size=INTERMEDIATE_SIZE,
+        dtype=dtype,
+        reduce_results=True,
+        model_config=ModelConfig(quant_config=quant_config, mapping=mapping),
+        weight_loading_mode=WeightLoadingMode,
+    )
+    fused_moe.cuda()
+    fused_moe.load_weights([weights])
+
+    ref_fused_moe = RefGatedMLPFusedMoE(
+        num_experts=NUM_EXPERTS,
+        routing_method=routing_method,
+        hidden_size=HIDDEN_SIZE,
+        intermediate_size=INTERMEDIATE_SIZE,
+        dtype=dtype,
+        model_config=ModelConfig(quant_config=quant_config),
+        # Note: use deepgemm mm will cause accuracy error, so we use trtllmgen mm here
+        use_cute_dsl_blockscaling_mm=True,
+    )
+    ref_fused_moe.load_weights([weights])
+    ref_fused_moe.cuda()
+
+    with torch.inference_mode():
+        output = fused_moe.forward(x, router_logits)
+        ref_output = ref_fused_moe.forward(x, router_logits)
+
+    # compare
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output, ref_output, rtol=1e-2, atol=0.1)
+    return True
+
+
+@skip_non_hopper_unittest
+@pytest.mark.parametrize(
+    "dtype, num_experts, seq_len, hidden_size, RoutingMethodCls, WeightLoadingMode",
+    product(
+        [torch.bfloat16],
+        [72],
+        [128, 256, 384, 512, 1024, 2048, 4096, 8192],
+        [2560],
+        [DefaultMoeRoutingMethod],
+        [MoEWeightLoadingMode.VANILLA, MoEWeightLoadingMode.FUSED_GATE_UP_PROJ],
+    ),
+)
+def test_fused_moe_fp8_blockwise_cutlass(dtype,
+                                         num_experts,
+                                         seq_len,
+                                         hidden_size,
+                                         RoutingMethodCls,
+                                         WeightLoadingMode,
+                                         mapping=None):
+    SEQ_LEN = seq_len
+    HIDDEN_SIZE = hidden_size
+    INTERMEDIATE_SIZE = 1536
+    NUM_EXPERTS = num_experts
+    TOP_K = 6
+
+    routing_method = RoutingMethodCls(top_k=TOP_K)
+
+    mapping = mapping or Mapping()
+    mapping.rank = mpi_rank()
+    torch.cuda.set_device(mapping.rank)
+    torch.manual_seed(0)
+    torch.cuda.manual_seed(0)
+
+    x = torch.randn((SEQ_LEN, HIDDEN_SIZE), dtype=dtype, device="cuda")
+    # Note: we use some special values init x and weight, otherwise the test will false positive failed.
+    set_tensor_value_2(x, SEQ_LEN, HIDDEN_SIZE)
+
+    x = x.cuda()
+    router_logits = torch.randn((SEQ_LEN, NUM_EXPERTS),
+                                dtype=dtype,
+                                device="cuda")
+
+    weights = {}
+
+    if WeightLoadingMode == MoEWeightLoadingMode.FUSED_GATE_UP_PROJ:
+        weights['gate_up_proj'] = {}
+        weights['down_proj'] = {}
+        weights['gate_up_proj_weight_scale'] = {}
+        weights['down_proj_weight_scale'] = {}
+
+    for expert_id in range(NUM_EXPERTS):
+        w1_weight = torch.randn((INTERMEDIATE_SIZE, HIDDEN_SIZE),
+                                dtype=dtype,
+                                device="cuda")
+        w2_weight = torch.randn((HIDDEN_SIZE, INTERMEDIATE_SIZE),
+                                dtype=dtype,
+                                device="cuda")
+        w3_weight = torch.randn((INTERMEDIATE_SIZE, HIDDEN_SIZE),
+                                dtype=dtype,
+                                device="cuda")
+        set_tensor_value_3(w1_weight, INTERMEDIATE_SIZE, HIDDEN_SIZE)
+        set_tensor_value_4(w2_weight, HIDDEN_SIZE, INTERMEDIATE_SIZE)
+        set_tensor_value_3(w3_weight, INTERMEDIATE_SIZE, HIDDEN_SIZE)
+
+        w1_weight_fp8, w1_weight_scale = per_block_cast_to_fp8(w1_weight)
+        w1_weight_fp8 = w1_weight_fp8.view(torch.float8_e4m3fn).cuda()
+
+        w2_weight_fp8, w2_weight_scale = per_block_cast_to_fp8(w2_weight)
+        w2_weight_fp8 = w2_weight_fp8.view(torch.float8_e4m3fn).cuda()
+
+        w3_weight_fp8, w3_weight_scale = per_block_cast_to_fp8(w3_weight)
+        w3_weight_fp8 = w3_weight_fp8.view(torch.float8_e4m3fn).cuda()
+
+        weights[f"{expert_id}.w1.weight"] = w1_weight_fp8
+        weights[f"{expert_id}.w2.weight"] = w2_weight_fp8
+        weights[f"{expert_id}.w3.weight"] = w3_weight_fp8
+        weights[f"{expert_id}.w1.weight_scale"] = w1_weight_scale
+        weights[f"{expert_id}.w2.weight_scale"] = w2_weight_scale
+        weights[f"{expert_id}.w3.weight_scale"] = w3_weight_scale
+
+        if WeightLoadingMode == MoEWeightLoadingMode.FUSED_GATE_UP_PROJ:
+            weights['gate_up_proj'][expert_id] = torch.cat(
+                [w3_weight_fp8, w1_weight_fp8],
+                dim=-2).transpose(0, 1).contiguous()
+            weights['down_proj'][expert_id] = w2_weight_fp8.transpose(
+                0, 1).contiguous()
+            weights['gate_up_proj_weight_scale'][expert_id] = torch.cat(
+                [w3_weight_scale, w1_weight_scale],
+                dim=-2).transpose(0, 1).contiguous()
+            weights['down_proj_weight_scale'][
+                expert_id] = w2_weight_scale.transpose(0, 1).contiguous()
+        elif WeightLoadingMode == MoEWeightLoadingMode.VANILLA:
+            weights[f"{expert_id}.w1.weight_scale_inv"] = w1_weight_scale
+            weights[f"{expert_id}.w2.weight_scale_inv"] = w2_weight_scale
+            weights[f"{expert_id}.w3.weight_scale_inv"] = w3_weight_scale
+
+    quant_config = QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES)
+
+    fused_moe = CutlassFusedMoE(
         num_experts=NUM_EXPERTS,
         routing_method=routing_method,
         hidden_size=HIDDEN_SIZE,
