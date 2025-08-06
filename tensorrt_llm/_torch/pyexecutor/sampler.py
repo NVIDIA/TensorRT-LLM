@@ -151,6 +151,48 @@ def top_p_sampling_batch(logits: torch.Tensor, top_p: float = 0.9):
     return next_tokens, softmax
 
 
+def top_k_top_p_sampling_batch(logits: torch.Tensor,
+                               top_k: int,
+                               top_p: float,
+                               temperature: float = 1.0):
+    logits_dim = logits.dim()
+    if logits_dim == 1:
+        logits = logits.unsqueeze(0)
+    assert logits_dim == 2, "logits should be 2D: [batch_size, vocab_size]"
+    if temperature != 0:
+        logits = logits / max(temperature, 1e-5)
+    # get first top_k logits of each sample and their indices
+    values, indices = torch.topk(logits, top_k, dim=-1)
+    min_values = values[:, -1].unsqueeze(-1).expand(batch_size, vocab_size)
+
+    # set the logits who is less than first top_k logits to -inf
+    logits = torch.where(logits < min_values,
+                         torch.full_like(logits, float('-inf')), logits)
+
+    sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+
+    # compute  cumulative probability distribution of each sample
+    cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1),
+                                    dim=-1)
+
+    # get the location of top_p
+    sorted_indices_to_remove = cumulative_probs > top_p
+    sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
+    sorted_indices_to_remove[:, 0] = 0
+
+    # set the logits to -inf whose is outside top_p
+    indices_to_remove = sorted_indices_to_remove.scatter(
+        1, sorted_indices, sorted_indices_to_remove)
+    logits = logits.masked_fill(indices_to_remove, float('-inf'))
+
+    # compute probability distribution
+    softmax = torch.softmax(logits, dim=-1)
+
+    # sample from the distribution and generate result of [batch_size, 1]
+    next_tokens = torch.multinomial(softmax, num_samples=1).squeeze(-1)
+    return next_tokens, softmax
+
+
 def greedy_search_sampling_batch(logits):
     next_tokens = torch.argmax(logits, dim=-1)
     softmax = torch.softmax(logits, dim=-1)
@@ -159,12 +201,20 @@ def greedy_search_sampling_batch(logits):
 
 TopK = tuple[Literal["top_k"], int]
 TopP = tuple[Literal["top_p"], float]
+TopKTopP = tuple[Literal["top_k_top_p"], int, float, float]
 Greedy = tuple[Literal["greedy"], None]
 GREEDY: Greedy = ("greedy", None)
-Strategy = TopK | TopP | Greedy
+Strategy = TopK | TopP | TopKTopP | Greedy
 
 
 def request_strategy(request: LlmRequest) -> Strategy:
+    if request.sampling_config.top_k is not None and len(
+            request.sampling_config.top_k
+    ) > 0 and request.sampling_config.top_p is not None and len(
+            request.sampling_config.top_p) > 0:
+        return ("top_k_top_p", request.sampling_config.top_k[0],
+                request.sampling_config.top_p[0],
+                request.sampling_config.temperature[0])
     if request.sampling_config.top_p is not None and len(
             request.sampling_config.top_p) > 0:
         return ("top_p", request.sampling_config.top_p[0])
@@ -185,6 +235,8 @@ def sample(strategy: Strategy, logits: torch.Tensor):
             return top_k_sampling_batch(logits, top_k)
         case ("top_p", top_p):
             return top_p_sampling_batch(logits, top_p)
+        case ("top_k_top_p", top_k, top_p, temperature):
+            return top_k_top_p_sampling_batch(logits, top_k, top_p, temperature)
         case ("greedy", None):
             return greedy_search_sampling_batch(logits)
 
