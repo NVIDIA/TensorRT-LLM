@@ -9,6 +9,7 @@ import torch
 
 import tensorrt_llm
 import tensorrt_llm.bindings
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import (KVCacheManager,
                                                              PeftCacheConfig,
                                                              PeftCacheManager)
@@ -247,7 +248,7 @@ class TestResourceManager(unittest.TestCase):
             lora_config = torch.from_numpy(lora_config)
 
         input_tokens = [i + 1 for i in range(max_new_tokens)]
-        request = tensorrt_llm.bindings.internal.batch_manager.LlmRequest(
+        request = LlmRequest(
             request_id=request_id,
             max_new_tokens=max_new_tokens,
             input_tokens=input_tokens,
