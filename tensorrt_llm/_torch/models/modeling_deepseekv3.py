@@ -750,7 +750,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         num_requests = position_ids.shape[1]
         print(f"[DEBUG] DeepseekV3DecoderLayer.forward - num_requests: {num_requests}")
         
-        if num_requests == 64 :
+        if num_requests == 64 and os.environ.get("ENABLE_TRTLLM_SPLIT_BATCH_OVERLAP") == "1" and attn_metadata.num_contexts == 0:
             
             stream_half1 = torch.cuda.Stream()
             stream_half2 = torch.cuda.Stream()
@@ -766,10 +766,10 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             attn_metadata_half1 = copy.copy(attn_metadata)
             attn_metadata_half1.max_num_requests = 32
             attn_metadata_half1.max_num_sequences = 32
-            attn_metadata_half1.all_rank_num_tokens = [32, 32]
-            attn_metadata_half1.all_rank_max_num_tokens = 32
-            attn_metadata_half1.kv_cache_manager = attn_metadata.kv_cache_manager
-            attn_metadata_half1.kv_cache_manager.kv_cache_pool_pointers = attn_metadata.kv_cache_manager.kv_cache_pool_pointers[:32]
+            #attn_metadata_half1.all_rank_num_tokens = [32, 32]
+            #attn_metadata_half1.all_rank_max_num_tokens = 32
+            attn_metadata_half1.kv_cache_manager = copy.copy(attn_metadata.kv_cache_manager)
+            #attn_metadata_half1.kv_cache_manager.kv_cache_pool_pointers = attn_metadata.kv_cache_manager.kv_cache_pool_pointers[:32]
             attn_metadata_half1.kv_cache_manager.tokens_per_block = 32  
             attn_metadata_half1.kv_cache_block_offsets = attn_metadata.kv_cache_block_offsets[:,:32,:,:]
             attn_metadata_half1.host_kv_cache_block_offsets = attn_metadata.host_kv_cache_block_offsets[:,:32,:,:]
@@ -783,10 +783,10 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             attn_metadata_half2 = copy.copy(attn_metadata)
             attn_metadata_half2.max_num_requests = 32
             attn_metadata_half2.max_num_sequences = 32
-            attn_metadata_half2.all_rank_num_tokens = [32, 32]
-            attn_metadata_half2.all_rank_max_num_tokens = 32
-            attn_metadata_half2.kv_cache_manager = attn_metadata.kv_cache_manager
-            attn_metadata_half2.kv_cache_manager.kv_cache_pool_pointers = attn_metadata.kv_cache_manager.kv_cache_pool_pointers[32:]
+            #attn_metadata_half2.all_rank_num_tokens = [32, 32]
+            #attn_metadata_half2.all_rank_max_num_tokens = 32
+            attn_metadata_half2.kv_cache_manager = copy.copy(attn_metadata.kv_cache_manager)
+            #attn_metadata_half2.kv_cache_manager.kv_cache_pool_pointers = attn_metadata.kv_cache_manager.kv_cache_pool_pointers[32:]
             attn_metadata_half2.kv_cache_manager.tokens_per_block = 32  
             attn_metadata_half2.kv_cache_manager.max_seq_len = 32
             attn_metadata_half2.kv_cache_block_offsets = attn_metadata.kv_cache_block_offsets[:,32:,:,:]
@@ -821,6 +821,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             event_half1_complete.record()
 
             with torch.cuda.stream(stream_half1):
+                event_half1_complete.wait()
                 if isinstance(self.mlp, Deepseekv3MoE):
                     hidden_states_half1 = self.forward_MoE(
                         hidden_states=hidden_states_half1,
@@ -864,6 +865,13 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             # Wait for both streams to complete before concatenating
             torch.cuda.current_stream().wait_stream(stream_half1)
             torch.cuda.current_stream().wait_stream(stream_half2)
+            
+            # Debug prints to check tensor shapes
+            print(f"[DEBUG] DeepseekV3DecoderLayer.forward - hidden_states_half1 shape: {hidden_states_half1.shape if hidden_states_half1 is not None else None}")
+            print(f"[DEBUG] DeepseekV3DecoderLayer.forward - hidden_states_half2 shape: {hidden_states_half2.shape if hidden_states_half2 is not None else None}")
+            print(f"[DEBUG] DeepseekV3DecoderLayer.forward - hidden_states_half1 dtype: {hidden_states_half1.dtype if hidden_states_half1 is not None else None}")
+            print(f"[DEBUG] DeepseekV3DecoderLayer.forward - hidden_states_half2 dtype: {hidden_states_half2.dtype if hidden_states_half2 is not None else None}")
+            
             hidden_states = torch.cat([hidden_states_half1, hidden_states_half2], dim=0)
         else:
             hidden_states = self.self_attn(

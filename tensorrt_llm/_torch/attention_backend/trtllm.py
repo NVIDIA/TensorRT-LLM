@@ -1157,6 +1157,22 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 use_paged_context_fmha=use_paged_context_fmha,
                 is_mla_enable=self.is_mla_enable,
             )
+        print(f"[DEBUG] TrtllmAttention.forward wrapper.plan layer_idx: {self.get_local_layer_idx(metadata)}\
+              tokens_per_block: {metadata.tokens_per_block}, max_num_requests: {metadata.max_num_requests},\
+              max_seq_len: {metadata.max_seq_len}, max_num_tokens: {metadata.max_num_tokens}\
+              attention_window_size: {attention_window_size}, sink_token_length: {0}, beam_width: {metadata.beam_width}\
+              sequence_length: {metadata.kv_lens_cuda_runtime.shape if metadata.kv_lens_cuda_runtime is not None else None}, host_past_key_value_lengths: {metadata.kv_lens_runtime.shape if metadata.kv_lens_runtime is not None else None}\
+              context_lengths: {metadata.prompt_lens_cuda_runtime.shape if metadata.prompt_lens_cuda_runtime is not None else None}, host_context_lengths: {metadata.prompt_lens_cpu_runtime.shape if metadata.prompt_lens_cpu_runtime is not None else None}\
+              host_request_types: {metadata.host_request_types_runtime.shape if metadata.host_request_types_runtime is not None else None}, kv_cache_block_offsets: {metadata.kv_cache_block_offsets.shape if metadata.kv_cache_block_offsets is not None else None}\
+              host_kv_cache_block_offsets: {metadata.host_kv_cache_block_offsets.shape if metadata.host_kv_cache_block_offsets is not None else None}, host_kv_cache_pool_pointers: {metadata.host_kv_cache_pool_pointers.shape if metadata.host_kv_cache_pool_pointers is not None else None}\
+              host_kv_cache_pool_mapping: {metadata.host_kv_cache_pool_mapping.shape if metadata.host_kv_cache_pool_mapping is not None else None}, block_ids_per_seq: {metadata.block_ids_per_seq.shape if metadata.block_ids_per_seq is not None else None}\
+              workspace: {metadata.workspace.shape if metadata.workspace is not None else None}, cache_indirection: {metadata.cache_indirection.shape if metadata.cache_indirection is not None else None}, kv_scale_orig_quant: {self.kv_scale_orig_quant}\
+              kv_scale_quant_orig: {self.kv_scale_quant_orig}, out_scale: {out_scale.shape if out_scale is not None else None}, out_scale_sf: {out_scale_sf.shape if out_scale_sf is not None else None}\
+              latent_cache: {latent_cache.shape if latent_cache is not None else None}, q_pe: {q_pe.shape if q_pe is not None else None}, mrope_config: {mrope_config}, mla_context_paged_kv: {mla_context_paged_kv.shape if mla_context_paged_kv is not None else None}\
+              mla_context_kv_cache_block_offsets: {mla_context_kv_cache_block_offsets.shape if mla_context_kv_cache_block_offsets is not None else None}, softmax_stats_tensor: {softmax_stats_tensor.shape if softmax_stats_tensor is not None else None}\
+              is_spec_decoding_enabled: {metadata.is_spec_decoding_enabled}, use_spec_decoding: {metadata.use_spec_decoding}\
+              spec_decoding_position_offsets: {metadata.spec_decoding_position_offsets.shape if metadata.spec_decoding_position_offsets is not None else None}, spec_decoding_packed_mask: {metadata.spec_decoding_packed_mask.shape if metadata.spec_decoding_packed_mask is not None else None}\
+              spec_decoding_generation_lengths: {metadata.spec_decoding_generation_lengths}")
         self.wrapper.plan(
             layer_idx=self.get_local_layer_idx(metadata),
             tokens_per_block=metadata.tokens_per_block,

@@ -1444,14 +1444,13 @@ class PyTorchModelEngine(ModelEngine):
         
         attn_metadata_half1 = None
         attn_metadata_half2 = None
-        if attn_metadata.num_contexts == 0 and len(attn_metadata.request_ids) == 64:
+        if attn_metadata.num_contexts == 0 and len(attn_metadata.request_ids) == 64 and os.environ.get("ENABLE_TRTLLM_SPLIT_BATCH_OVERLAP") == "1":
+            print(f"[DEBUG] TrtllmAttention.prepare - {attn_metadata}")
             attn_metadata_half1 = copy.copy(attn_metadata)
             attn_metadata_half1.max_num_requests = 32
             attn_metadata_half1.max_num_sequences = 32
-            attn_metadata_half1.all_rank_num_tokens = [32, 32]
-            attn_metadata_half1.all_rank_max_num_tokens = 32
             attn_metadata_half1.kv_cache_manager = copy.copy(attn_metadata.kv_cache_manager)
-            attn_metadata_half1.kv_cache_manager.kv_cache_pool_pointers = attn_metadata.kv_cache_manager.kv_cache_pool_pointers[:32]
+            #attn_metadata_half1.kv_cache_manager.kv_cache_pool_pointers = attn_metadata.kv_cache_manager.kv_cache_pool_pointers[:32]
             attn_metadata_half1.kv_cache_manager.tokens_per_block = 32  
             attn_metadata_half1.kv_cache_block_offsets = attn_metadata.kv_cache_block_offsets[:,:32,:,:]
             attn_metadata_half1.host_kv_cache_block_offsets = attn_metadata.host_kv_cache_block_offsets[:,:32,:,:]
@@ -1469,10 +1468,8 @@ class PyTorchModelEngine(ModelEngine):
             attn_metadata_half2 = copy.copy(attn_metadata)
             attn_metadata_half2.max_num_requests = 32
             attn_metadata_half2.max_num_sequences = 32
-            attn_metadata_half2.all_rank_num_tokens = [32, 32]
-            attn_metadata_half2.all_rank_max_num_tokens = 32
             attn_metadata_half2.kv_cache_manager = copy.copy(attn_metadata.kv_cache_manager)
-            attn_metadata_half2.kv_cache_manager.kv_cache_pool_pointers = attn_metadata.kv_cache_manager.kv_cache_pool_pointers[32:]
+            #attn_metadata_half2.kv_cache_manager.kv_cache_pool_pointers = attn_metadata.kv_cache_manager.kv_cache_pool_pointers[32:]
             attn_metadata_half2.kv_cache_manager.tokens_per_block = 32
             attn_metadata_half2.kv_cache_block_offsets = attn_metadata.kv_cache_block_offsets[:,32:,:,:]
             attn_metadata_half2.host_kv_cache_block_offsets = attn_metadata.host_kv_cache_block_offsets[:,32:,:,:]

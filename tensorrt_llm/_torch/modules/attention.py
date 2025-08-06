@@ -1278,7 +1278,7 @@ class MLA(nn.Module):
         else:
             raise NotImplementedError(
                 f"Missing bmm impl for dtype: {self.v_b_proj.dtype}.")
-
+        print(f"[DEBUG] MLA.forward_generation - output shape: {output.shape}, dtype: {output.dtype}")
         return output
 
     def forward(
