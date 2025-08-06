@@ -1,4 +1,4 @@
-# Deployment Guide for TensorRT-LLM DeepSeek R1 FP8 and NVFP4
+# Quick Start Recipe for DeepSeek R1 on TensorRT-LLM - Blackwell & Hopper Hardware
 
 ## Introduction
 
