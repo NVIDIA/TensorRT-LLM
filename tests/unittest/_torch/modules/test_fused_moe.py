@@ -812,8 +812,6 @@ def test_fused_moe_fp8_blockwise_cutlass(dtype,
         intermediate_size=INTERMEDIATE_SIZE,
         dtype=dtype,
         model_config=ModelConfig(quant_config=quant_config),
-        # Note: use deepgemm mm will cause accuracy error, so we use trtllmgen mm here
-        use_cute_dsl_blockscaling_mm=True,
     )
     ref_fused_moe.load_weights([weights])
     ref_fused_moe.cuda()
