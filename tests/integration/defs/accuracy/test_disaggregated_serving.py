@@ -548,17 +548,14 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "Qwen3/Qwen3-8B"
     MODEL_PATH = f"{llm_models_root()}/Qwen3/Qwen3-8B-FP8"
 
-    @pytest.mark.parametrize("overlap_scheduler", [False, True])
-    def test_auto_dtype(self, overlap_scheduler):
+    def _get_default_config(self,):
         ctx_server_config = {
-            "disable_overlap_scheduler": True,
             "cuda_graph_config": None,
             "cache_transceiver_config": {
                 "backend": "default"
             }
         }
         gen_server_config = {
-            "disable_overlap_scheduler": overlap_scheduler,
             "cuda_graph_config": None,
             "cache_transceiver_config": {
                 "backend": "default"
@@ -577,6 +574,14 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
                 "urls": ["localhost:8002"]
             }
         }
+        return ctx_server_config, gen_server_config, disaggregated_server_config
+
+    @pytest.mark.parametrize("overlap_scheduler", [False, True])
+    def test_auto_dtype(self, overlap_scheduler):
+        ctx_server_config, gen_server_config, disaggregated_server_config = self._get_default_config()
+        ctx_server_config["disable_overlap_scheduler"] = True
+        gen_server_config["disable_overlap_scheduler"] = overlap_scheduler
+
         with launch_disaggregated_llm(disaggregated_server_config,
                                       ctx_server_config, gen_server_config,
                                       self.MODEL_PATH) as llm:
