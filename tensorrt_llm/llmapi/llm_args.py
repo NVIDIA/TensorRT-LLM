@@ -59,7 +59,16 @@ from .utils import generate_api_docs_as_docstring, get_type_repr
 
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
 
-
+class SplitBatchAttnMoeOverlapConfig(BaseModel):
+    """
+    Configuration for split batch attention and MoE overlap.
+        Baseline batch_size = 2N |Attention|MOE||Attention|MOE| 
+        Split batch_size = N |Attention|MOE|           |Attention|MOE|
+                         = N           |Attention|MOE|           |Attention|MOE|
+    """
+    enable_split_batch_attn_moe_overlap: bool = Field(default=False, description="Enable split batch attention.")
+    split_batch_size: int = Field(default=0, description="Split batch size.")
+    
 class CudaGraphConfig(BaseModel):
     """
     Configuration for CUDA graphs.

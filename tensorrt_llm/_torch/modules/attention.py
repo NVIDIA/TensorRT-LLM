@@ -315,14 +315,24 @@ class Attention(nn.Module):
             q, k = self.rotary_emb(position_ids, [q, k])
         return q, k, v
 
-
+ping = 0
 def extract_extra_attrs(layer_idx: str):
+    global ping
     extra_attrs = get_model_extra_attrs()
     assert extra_attrs is not None, "Model extra attrs is not set"
-
     metadata_ref = extra_attrs.get("attention_metadata", None)
+    metadata_ref_half1 = extra_attrs.get("attention_metadata_half1", None)
+    metadata_ref_half2 = extra_attrs.get("attention_metadata_half2", None)
     assert metadata_ref is not None, "Attention metadata is not set"
-    metadata = metadata_ref()
+    if metadata_ref_half1 is not None and metadata_ref_half2 is not None:
+        if ping % 2 == 0:
+            metadata = metadata_ref_half1()
+
+        else:
+            metadata = metadata_ref_half2()
+        ping += 1
+    else:
+        metadata = metadata_ref()
     assert isinstance(
         metadata,
         TrtllmAttentionMetadata,
@@ -333,6 +343,8 @@ def extract_extra_attrs(layer_idx: str):
     mla_layer_ref = mla_layers.get(layer_idx, None)
     assert mla_layer_ref is not None, f"Cannot find MLA layer for layer {layer_idx}"
     mla_layer = mla_layer_ref()
+    print(f"[DEBUG] extract_extra_attrs - mla_layer: {mla_layer}")
+    print(f"[DEBUG] extract_extra_attrs - mla_layer type: {type(mla_layer)}")
     assert isinstance(
         mla_layer,
         MLA), "MLA layer must be a subclass of MLA or an instance of MLA"
@@ -349,6 +361,7 @@ def mla_custom_op_inplace(
     output: torch.Tensor,
 ) -> None:
     metadata, mla_layer = extract_extra_attrs(layer_idx)
+    print(f"[DEBUG] MLA.forward_impl.mla_custom_op_inplace - metadata: {metadata}")
     mla_layer.forward_impl(position_ids, hidden_states, metadata, output=output)
 
 
@@ -781,7 +794,7 @@ class MLA(nn.Module):
         num_tokens = attn_metadata.num_tokens
 
         assert q.shape[
-            0] == num_tokens, f"Expect q.shape[0] to be {num_tokens}, but got {q.shape[0]}"
+            0] == num_tokens, f"Expect q.shape[0] to be {num_tokens}, but got {q.shape[0]}, attn_metadata: {attn_metadata}"
 
         if num_contexts > 0:
             q_ctx = q[:num_ctx_tokens, ...]
@@ -1224,7 +1237,7 @@ class MLA(nn.Module):
 
         # out_scale = getattr(self.o_proj, "inv_input_scale", None)
         out_scale = None  # Although we use FP8 MLA for generation phase, the output is still in BF16
-
+        print(f"[DEBUG] MLA.forward_genertion {attn_metadata.is_cross} {attn_metadata}")
         attn_out_latent = self.mqa.forward(
             fused_q,
             None,
@@ -1277,6 +1290,7 @@ class MLA(nn.Module):
     ) -> torch.Tensor:
         print(f"[DEBUG] MLA.forward - hidden_states shape: {hidden_states.shape}, dtype: {hidden_states.dtype}")
         print(f"[DEBUG] MLA.forward - position_ids shape: {position_ids.shape if position_ids is not None else None}")
+        print(f"[DEBUG] MLA.forward - attn_metadata: {attn_metadata}")
         
         attn_output = self.create_output(hidden_states)
         print(f"[DEBUG] MLA.forward - Created output tensor shape: {attn_output.shape}, dtype: {attn_output.dtype}")

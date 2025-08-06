@@ -257,6 +257,7 @@ class AttentionMetadata:
         """
         Is this metadata for cross attention.
         """
+        print(f"[DEBUG] AttentionMetadata.is_cross - self.seq_lens: {self.seq_lens}, self.seq_lens_kv: {self.seq_lens_kv}")
         return self.seq_lens is not self.seq_lens_kv
 
     @property

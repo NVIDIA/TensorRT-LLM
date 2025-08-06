@@ -11,6 +11,8 @@ from abc import ABC, abstractmethod
 from contextlib import contextmanager
 from typing import Any, Dict, Optional, Tuple
 
+import copy
+
 import torch
 import torch._dynamo.config
 
@@ -1434,14 +1436,60 @@ class PyTorchModelEngine(ModelEngine):
             self.spec_config.num_extra_kv_tokens)
         attn_metadata.kv_cache_manager = kv_cache_manager
 
+        print(f"[DEBUG] TrtllmAttention.prepare (full)) - attn_metadata.kv_cache_params.num_cached_tokens_per_seq: {attn_metadata.kv_cache_params.num_cached_tokens_per_seq}")
         attn_metadata.prepare()
 
         lora_params = self._get_lora_params_from_requests(
             scheduled_requests, attn_metadata)
+        
+        attn_metadata_half1 = None
+        attn_metadata_half2 = None
+        if attn_metadata.num_contexts == 0 and len(attn_metadata.request_ids) == 64:
+            attn_metadata_half1 = copy.copy(attn_metadata)
+            attn_metadata_half1.max_num_requests = 32
+            attn_metadata_half1.max_num_sequences = 32
+            attn_metadata_half1.all_rank_num_tokens = [32, 32]
+            attn_metadata_half1.all_rank_max_num_tokens = 32
+            attn_metadata_half1.kv_cache_manager = copy.copy(attn_metadata.kv_cache_manager)
+            attn_metadata_half1.kv_cache_manager.kv_cache_pool_pointers = attn_metadata.kv_cache_manager.kv_cache_pool_pointers[:32]
+            attn_metadata_half1.kv_cache_manager.tokens_per_block = 32  
+            attn_metadata_half1.kv_cache_block_offsets = attn_metadata.kv_cache_block_offsets[:,:32,:,:]
+            attn_metadata_half1.host_kv_cache_block_offsets = attn_metadata.host_kv_cache_block_offsets[:,:32,:,:]
+            attn_metadata_half1.seq_lens = attn_metadata.seq_lens[:32]
+            # This is done as is_cross check is seq_lens_kv and seq_lens are the same tensor
+            attn_metadata_half1.seq_lens_kv = attn_metadata_half1.seq_lens
+            attn_metadata_half1.prompt_lens = attn_metadata.prompt_lens[:32]
+            attn_metadata_half1.request_ids = attn_metadata.request_ids[:32]
+            attn_metadata_half1.kv_cache_params = copy.copy(attn_metadata.kv_cache_params)
+            attn_metadata_half1.kv_cache_params.num_cached_tokens_per_seq = copy.copy(attn_metadata.kv_cache_params.num_cached_tokens_per_seq[:32])
+            attn_metadata_half1.on_update()
+            print(f"[DEBUG] TrtllmAttention.prepare (half1) - attn_metadata_half1.kv_cache_params.num_cached_tokens_per_seq: {attn_metadata_half1.kv_cache_params.num_cached_tokens_per_seq}")
+            attn_metadata_half1.prepare(splitBatchOverlap=1)
 
+            attn_metadata_half2 = copy.copy(attn_metadata)
+            attn_metadata_half2.max_num_requests = 32
+            attn_metadata_half2.max_num_sequences = 32
+            attn_metadata_half2.all_rank_num_tokens = [32, 32]
+            attn_metadata_half2.all_rank_max_num_tokens = 32
+            attn_metadata_half2.kv_cache_manager = copy.copy(attn_metadata.kv_cache_manager)
+            attn_metadata_half2.kv_cache_manager.kv_cache_pool_pointers = attn_metadata.kv_cache_manager.kv_cache_pool_pointers[32:]
+            attn_metadata_half2.kv_cache_manager.tokens_per_block = 32
+            attn_metadata_half2.kv_cache_block_offsets = attn_metadata.kv_cache_block_offsets[:,32:,:,:]
+            attn_metadata_half2.host_kv_cache_block_offsets = attn_metadata.host_kv_cache_block_offsets[:,32:,:,:]
+            attn_metadata_half2.seq_lens = attn_metadata.seq_lens[32:]
+            attn_metadata_half2.seq_lens_kv = attn_metadata_half2.seq_lens
+            attn_metadata_half2.prompt_lens = attn_metadata.prompt_lens[32:]
+            attn_metadata_half2.request_ids = attn_metadata.request_ids[32:]
+            attn_metadata_half2.kv_cache_params = copy.copy(attn_metadata.kv_cache_params)
+            attn_metadata_half2.kv_cache_params.num_cached_tokens_per_seq = copy.copy(attn_metadata.kv_cache_params.num_cached_tokens_per_seq[32:])
+            attn_metadata_half2.on_update() 
+            print(f"[DEBUG] TrtllmAttention.prepare (half2) - attn_metadata_half2.kv_cache_params.num_cached_tokens_per_seq: {attn_metadata_half2.kv_cache_params.num_cached_tokens_per_seq}")
+            attn_metadata_half2.prepare(splitBatchOverlap=2)
         # Prepare inputs
         inputs = {
             'attn_metadata': attn_metadata,
+            'attn_metadata_half1': attn_metadata_half1,
+            'attn_metadata_half2': attn_metadata_half2,
             'input_ids': self.input_ids_cuda[:total_num_tokens],
             'position_ids':
             self.position_ids_cuda[:total_num_tokens].unsqueeze(0),
@@ -2001,11 +2049,13 @@ class PyTorchModelEngine(ModelEngine):
         gather_context_logits: bool = False,
         cache_indirection_buffer: Optional[torch.Tensor] = None,
     ):
-
+        
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
+        
+        #kgoyal TODO: This is where the 
+        attn_metadata = self._set_up_attn_metadata(kv_cache_manager)   
 
-        attn_metadata = self._set_up_attn_metadata(kv_cache_manager)
         if self.is_spec_decode:
             spec_resource_manager = resource_manager.get_resource_manager(
                 ResourceManagerType.SPEC_RESOURCE_MANAGER)
@@ -2050,6 +2100,9 @@ class PyTorchModelEngine(ModelEngine):
                 if self.is_spec_decode:
                     spec_metadata = self.spec_metadata
 
+            # inputs is a dict with keys:
+            # 'attn_metadata', 'input_ids', 'position_ids', 'inputs_embeds'
+            
             inputs, gather_ids = self._prepare_inputs(
                 scheduled_requests, kv_cache_manager, attn_metadata,
                 spec_metadata, new_tensors_device, cache_indirection_buffer)
@@ -2090,7 +2143,12 @@ class PyTorchModelEngine(ModelEngine):
     def model_forward(self, **kwargs):
         attrs = get_model_extra_attrs()
         assert attrs is not None, "Model extra attrs is not set"
+        print(f"[DEBUG] model_forward - kwargs: {kwargs['attn_metadata']}")
         attrs["attention_metadata"] = weakref.ref(kwargs['attn_metadata'])
+        if 'attn_metadata_half1' in kwargs and kwargs['attn_metadata_half1'] is not None:
+            attrs["attention_metadata_half1"] = weakref.ref(kwargs['attn_metadata_half1'])
+        if 'attn_metadata_half2' in kwargs and kwargs['attn_metadata_half2'] is not None:
+            attrs["attention_metadata_half2"] = weakref.ref(kwargs['attn_metadata_half2'])
         attrs.update(self.model.model_config.extra_attrs)
 
         if is_trace_enabled("TLLM_TRACE_MODEL_FORWARD"):

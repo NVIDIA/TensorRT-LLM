@@ -66,9 +66,11 @@ from ..utils import AuxStreamType, EventType, Fp4QuantizedTensor
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
                              EagerFusionConfig, filter_weights,
                              register_auto_model)
-
+from ..utils import (get_model_extra_attrs, set_torch_compiling,
+                     with_model_extra_attrs)
 
 import copy
+import weakref
 
 @triton.jit
 def weight_dequant_kernel(x_ptr, s_ptr, y_ptr, M, N, BLOCK_SIZE: tl.constexpr):
@@ -749,36 +751,120 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         print(f"[DEBUG] DeepseekV3DecoderLayer.forward - num_requests: {num_requests}")
         
         if num_requests == 64 :
+            
+            stream_half1 = torch.cuda.Stream()
+            stream_half2 = torch.cuda.Stream()
+
+            # Create CUDA event to synchronize between streams
+            event_half1_complete = torch.cuda.Event()
+
             print(f"[DEBUG] DeepseekV3DecoderLayer.forward - num_requests == 64")
             hidden_states_half1, hidden_states_half2 = hidden_states.chunk(2, dim=0)
             position_ids_half1, position_ids_half2 = position_ids.chunk(2, dim=1)
-
+            residual_half1, residual_half2 = residual.chunk(2, dim=0)
+            
             attn_metadata_half1 = copy.copy(attn_metadata)
             attn_metadata_half1.max_num_requests = 32
-            
+            attn_metadata_half1.max_num_sequences = 32
+            attn_metadata_half1.all_rank_num_tokens = [32, 32]
+            attn_metadata_half1.all_rank_max_num_tokens = 32
+            attn_metadata_half1.kv_cache_manager = attn_metadata.kv_cache_manager
+            attn_metadata_half1.kv_cache_manager.kv_cache_pool_pointers = attn_metadata.kv_cache_manager.kv_cache_pool_pointers[:32]
+            attn_metadata_half1.kv_cache_manager.tokens_per_block = 32  
+            attn_metadata_half1.kv_cache_block_offsets = attn_metadata.kv_cache_block_offsets[:,:32,:,:]
+            attn_metadata_half1.host_kv_cache_block_offsets = attn_metadata.host_kv_cache_block_offsets[:,:32,:,:]
+            attn_metadata_half1.seq_lens = attn_metadata.seq_lens[:32]
+            attn_metadata_half1.seq_lens_kv = attn_metadata.seq_lens_kv[:32]
+            attn_metadata_half1.prompt_lens = attn_metadata.prompt_lens[:32]
+            attn_metadata_half1.request_ids = attn_metadata.request_ids[:32]
+            attn_metadata_half1.kv_cache_params.num_cached_tokens_per_seq = attn_metadata.kv_cache_params.num_cached_tokens_per_seq[:32]
+            attn_metadata_half1.on_update()
+
             attn_metadata_half2 = copy.copy(attn_metadata)
             attn_metadata_half2.max_num_requests = 32
-         
-            hidden_states_half1 = self.self_attn(
-                position_ids=position_ids_half1,
-                hidden_states=hidden_states_half1,
-                attn_metadata=attn_metadata_half1,
-                all_reduce_params=AllReduceParams(
-                    enable_allreduce=not (self.disable_attn_allreduce)),
-                **kwargs,
-            )
+            attn_metadata_half2.max_num_sequences = 32
+            attn_metadata_half2.all_rank_num_tokens = [32, 32]
+            attn_metadata_half2.all_rank_max_num_tokens = 32
+            attn_metadata_half2.kv_cache_manager = attn_metadata.kv_cache_manager
+            attn_metadata_half2.kv_cache_manager.kv_cache_pool_pointers = attn_metadata.kv_cache_manager.kv_cache_pool_pointers[32:]
+            attn_metadata_half2.kv_cache_manager.tokens_per_block = 32  
+            attn_metadata_half2.kv_cache_manager.max_seq_len = 32
+            attn_metadata_half2.kv_cache_block_offsets = attn_metadata.kv_cache_block_offsets[:,32:,:,:]
+            attn_metadata_half2.host_kv_cache_block_offsets = attn_metadata.host_kv_cache_block_offsets[:,32:,:,:]
+            attn_metadata_half2.seq_lens = attn_metadata.seq_lens[32:]
+            attn_metadata_half2.seq_lens_kv = attn_metadata.seq_lens_kv[32:]
+            attn_metadata_half2.prompt_lens = attn_metadata.prompt_lens[32:]
+            attn_metadata_half2.request_ids = attn_metadata.request_ids[32:]
+            attn_metadata_half2.kv_cache_params.num_cached_tokens_per_seq = attn_metadata.kv_cache_params.num_cached_tokens_per_seq[32:]
+            attn_metadata_half2.on_update()
 
-            hidden_states_half2 = self.self_attn(
-                position_ids=position_ids_half2,
-                hidden_states=hidden_states_half2,
-                attn_metadata=attn_metadata_half2,
-                all_reduce_params=AllReduceParams(
-                    enable_allreduce=not (self.disable_attn_allreduce)),
-                **kwargs,
-            )
+            print(f"[DEBUG] DeepseekV3DecoderLayer.forward - attn_metadata_half1: {attn_metadata_half1}")
+            print(f"[DEBUG] DeepseekV3DecoderLayer.forward - attn_metadata_half2: {attn_metadata_half2}")
 
+            print(f"[DEBUG] DeepseekV3DecoderLayer.forward - kwargs: {kwargs}")
+
+            kwargs_half1 = kwargs.copy()
+            if 'attn_metadata' in kwargs_half1:
+                print(f"[DEBUG] DeepseekV3DecoderLayer.forward - kwargs_half1: {kwargs_half1}")
+                del kwargs_half1['attn_metadata']
+           
+            with torch.cuda.stream(stream_half1):
+                hidden_states_half1 = self.self_attn(
+                    position_ids=position_ids_half1,
+                    hidden_states=hidden_states_half1,
+                    attn_metadata=attn_metadata_half1,
+                    all_reduce_params=AllReduceParams(
+                        enable_allreduce=not (self.disable_attn_allreduce)),
+                    **kwargs_half1,
+                )
+            # Record event when half1 is complete
+            event_half1_complete.record()
+
+            with torch.cuda.stream(stream_half1):
+                if isinstance(self.mlp, Deepseekv3MoE):
+                    hidden_states_half1 = self.forward_MoE(
+                        hidden_states=hidden_states_half1,
+                        attn_metadata=attn_metadata_half1,
+                        residual=residual_half1,
+                    )
+                else:
+                    assert isinstance(self.mlp, GatedMLP)
+                    hidden_states_half1 = self.forward_mlp(
+                        hidden_states=hidden_states_half1,
+                        residual=residual_half1,
+                    )
+
+            kwargs_half2 = kwargs.copy()
+            if 'attn_metadata' in kwargs_half2:
+                del kwargs_half2['attn_metadata']
+
+            with torch.cuda.stream(stream_half2):
+                # Wait for half1 to complete before starting half2
+                event_half1_complete.wait()
+                hidden_states_half2 = self.self_attn(
+                    position_ids=position_ids_half2,
+                    hidden_states=hidden_states_half2,
+                    attn_metadata=attn_metadata_half2,
+                    all_reduce_params=AllReduceParams(
+                    enable_allreduce=not (self.disable_attn_allreduce)),
+                    **kwargs_half2,
+                )
+                if isinstance(self.mlp, Deepseekv3MoE):
+                    hidden_states_half2 = self.forward_MoE(
+                        hidden_states=hidden_states_half2,
+                        attn_metadata=attn_metadata_half2,
+                        residual=residual_half2,
+                    )
+                else:
+                    assert isinstance(self.mlp, GatedMLP)
+                    hidden_states_half2 = self.forward_mlp(
+                        hidden_states=hidden_states_half2,
+                        residual=residual_half2,
+                    )
+            # Wait for both streams to complete before concatenating
+            torch.cuda.current_stream().wait_stream(stream_half1)
+            torch.cuda.current_stream().wait_stream(stream_half2)
             hidden_states = torch.cat([hidden_states_half1, hidden_states_half2], dim=0)
-            
         else:
             hidden_states = self.self_attn(
                 position_ids=position_ids,

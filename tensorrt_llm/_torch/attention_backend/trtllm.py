@@ -405,6 +405,16 @@ class TrtllmAttentionWrapper:
             self.spec_decoding_generation_lengths,
             self.spec_decoding_position_offsets, self.spec_decoding_packed_mask
         ]
+        
+        print(f"[DEBUG] TrtllmAttention.forward - q shape: {q.shape}, \
+            sequence_length shape: {self.sequence_length.shape}, \
+            host_past_key_value_lengths shape: {self.host_past_key_value_lengths.shape}, \
+            context_lengths shape: {self.context_lengths.shape}, \
+            host_context_lengths shape: {self.host_context_lengths.shape}, \
+            host_request_types shape: {self.host_request_types.shape}, \
+            kv_cache_block_offsets shape: {self.kv_cache_block_offsets.shape if self.kv_cache_block_offsets is not None else None}, \
+            k shape: {k.shape if k is not None else None}, v shape: {v.shape if v is not None else None}, output shape: {output.shape if output is not None else None}, output_sf shape: {output_sf.shape if output_sf is not None else None}, \
+            out_dtype: {out_dtype if out_dtype is not None else None}, is_fused_qkv: {is_fused_qkv}, update_kv_cache: {update_kv_cache}, attention_mask: {attention_mask}")
 
         torch.ops.trtllm.attention_inplace(
             q,
@@ -685,11 +695,22 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     pin_memory=True,
                 )
 
-    def prepare(self) -> None:
+    def prepare(self, splitBatchOverlap: Optional[int] = None) -> None:
+        print(f"[DEBUG] TrtllmAttention.prepare")
         extra_attrs = get_model_extra_attrs()
         # If model extra attrs is set, attention_metadata is setup in executor.
         if extra_attrs is None:
-            get_global_attrs().attention_metadata = weakref.ref(self)
+            if splitBatchOverlap is not None:
+                print(f"[DEBUG] TrtllmAttention.prepare - splitBatchOverlap is not None")
+                if splitBatchOverlap == 1:
+                    print(f"[DEBUG] TrtllmAttention.prepare - splitBatchOverlap is 1")
+                    get_global_attrs().attention_metadata_half1 = weakref.ref(self)
+                else:
+                    print(f"[DEBUG] TrtllmAttention.prepare - splitBatchOverlap is not 1")
+                    get_global_attrs().attention_metadata_half2 = weakref.ref(self)
+            else:
+                print(f"[DEBUG] TrtllmAttention.prepare - extra_attrs is None Setting self refrence to global attention_metadata")
+                get_global_attrs().attention_metadata = weakref.ref(self)
         if self.kv_cache_manager is None:
             # Convert the attention metadata to a TRT-LLM no cache attention metadata.
             assert self.kv_cache_manager is None, "no cache attention should not have KV cache manager"
@@ -711,17 +732,21 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             dtype=torch.int,
             device='cpu',
         )
+        print(f"[DEBUG] TrtllmAttention.prepare - num_seqs: {self.num_seqs}")
         self.prompt_lens_cpu[:self.num_seqs].copy_(prompt_lens)
         self.prompt_lens_cuda[:self.num_seqs].copy_(
             self.prompt_lens_cpu[:self.num_seqs], non_blocking=True)
 
         # number of tokens in the kv cache for each sequence in the batch
+        print(f"[DEBUG] TrtllmAttention.prepare - self.kv_cache_params.use_cache: {self.kv_cache_params.use_cache}")
+        print(f"[DEBUG] TrtllmAttention.prepare - self.kv_cache_params.num_cached_tokens_per_seq: {self.kv_cache_params.num_cached_tokens_per_seq}")
         cached_token_lens = torch.tensor(
             self.kv_cache_params.num_cached_tokens_per_seq,
             dtype=torch.int,
             device='cpu',
         ) if self.kv_cache_params.use_cache else None
-
+        print(f"[DEBUG] TrtllmAttention.prepare - cached_token_lens: {cached_token_lens}")
+        print(f"[DEBUG] TrtllmAttention.prepare - self.seq_lens_kv: {self.seq_lens_kv}")
         if self.enable_flash_mla:
             self.prepare_flash_mla()
         # number of tokens needed in the kv cache for each sequence after the next pass
@@ -754,6 +779,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             self.kv_cache_block_offsets[:, :self.num_seqs].copy_(
                 self.host_kv_cache_block_offsets[:, :self.num_seqs],
                 non_blocking=True)
+            print(f"[DEBUG] TrtllmAttention.prepare {splitBatchOverlap} - self.kv_lens[:self.num_seqs]: {self.kv_lens[:self.num_seqs]}")
+            print(f"[DEBUG] TrtllmAttention.prepare {splitBatchOverlap} - self.kv_cache_manager.max_seq_len: {self.kv_cache_manager.max_seq_len}")
             assert self.kv_lens[:self.num_seqs].max(
             ) <= self.kv_cache_manager.max_seq_len, f"Please set max_seq_len to at least {self.kv_lens[:self.num_seqs].max()} for kv cache manager."
 
@@ -765,6 +792,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                                                                   num_seqs]
 
     def prepare_flash_mla(self) -> None:
+        print(f"[DEBUG] TrtllmAttention.prepare_flash_mla - self.request_ids: {self.request_ids}")
         block_ids_per_seq = self.kv_cache_manager.get_block_ids_per_seq(
             self.request_ids).pin_memory()
         num_blocks = block_ids_per_seq.shape[1]
@@ -1101,6 +1129,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         print(f"[DEBUG] TrtllmAttention.forward - latent_cache shape: {latent_cache.shape if latent_cache is not None else None}")
         print(f"[DEBUG] TrtllmAttention.forward - q_pe shape: {q_pe.shape if q_pe is not None else None}")
         print(f"[DEBUG] TrtllmAttention.forward - output shape: {output.shape if output is not None else None}")
+        print(f"[DEBUG] TrtllmAttention.forward - attn_metadata: {metadata}")
         
         assert isinstance(
             metadata,
