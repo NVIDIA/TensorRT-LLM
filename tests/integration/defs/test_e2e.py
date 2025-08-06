@@ -2226,7 +2226,7 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
             ],
             "mixture_text_image":
             [["invention", "person", "scientists", "Lick", "engineers"],
-             ["landscape", "dome", "yosemite", "altitude", "scattered"]]
+             ["landscape", "trees", "road", "natural", "rock"]]
         },
         "gemma-3-27b-it": {
             "image": [
