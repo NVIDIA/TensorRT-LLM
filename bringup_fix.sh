@@ -25,9 +25,6 @@ apt update
 # fix LLVM build
 apt install -y libstdc++-14-dev
 
-# wait for https://github.com/NVIDIA/TensorRT-LLM/pull/6588
-pip install deep_gemm@git+https://github.com/VALLIS-NERIA/DeepGEMM.git@97d97a20c2ecd53a248ab64242219d780cf822b8 --no-build-isolation
-
 else
     echo "Unsupported architecture: $ARCH"
     exit 1
