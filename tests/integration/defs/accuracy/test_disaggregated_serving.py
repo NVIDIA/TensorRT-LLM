@@ -550,6 +550,7 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
 
     def _get_default_config(self,):
         ctx_server_config = {
+            "disable_overlap_scheduler": True,
             "cuda_graph_config": None,
             "cache_transceiver_config": {
                 "backend": "default"
@@ -579,9 +580,17 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
     @pytest.mark.parametrize("overlap_scheduler", [False, True])
     def test_auto_dtype(self, overlap_scheduler):
         ctx_server_config, gen_server_config, disaggregated_server_config = self._get_default_config()
-        ctx_server_config["disable_overlap_scheduler"] = True
         gen_server_config["disable_overlap_scheduler"] = overlap_scheduler
+        with launch_disaggregated_llm(disaggregated_server_config,
+                                      ctx_server_config, gen_server_config,
+                                      self.MODEL_PATH) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
 
+    def test_chunked_prefill(self,):
+        ctx_server_config, gen_server_config, disaggregated_server_config = self._get_default_config()
+        ctx_server_config["enable_chunked_prefill"] = True
+        ctx_server_config["max_num_tokens"] = 256
         with launch_disaggregated_llm(disaggregated_server_config,
                                       ctx_server_config, gen_server_config,
                                       self.MODEL_PATH) as llm:
