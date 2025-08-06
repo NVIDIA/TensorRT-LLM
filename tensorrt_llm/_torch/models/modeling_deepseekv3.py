@@ -760,6 +760,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
 
             print(f"[DEBUG] DeepseekV3DecoderLayer.forward - num_requests == 64")
             hidden_states_half1, hidden_states_half2 = hidden_states.chunk(2, dim=0)
+            print(f"[DEBUG] DeepseekV3DecoderLayer.forward - hidden_states_half1: {hidden_states_half1.shape} {hidden_states_half2.shape}")
             position_ids_half1, position_ids_half2 = position_ids.chunk(2, dim=1)
             residual_half1, residual_half2 = residual.chunk(2, dim=0)
             
@@ -817,24 +818,27 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                         enable_allreduce=not (self.disable_attn_allreduce)),
                     **kwargs_half1,
                 )
+                print(f"[DEBUG] DeepseekV3DecoderLayer.forward - hidden_states_half1: {hidden_states_half1.shape}")
             # Record event when half1 is complete
             event_half1_complete.record()
 
             with torch.cuda.stream(stream_half1):
                 event_half1_complete.wait()
                 if isinstance(self.mlp, Deepseekv3MoE):
-                    hidden_states_half1 = self.forward_MoE(
+                    print(f"[DEBUG] DeepseekV3DecoderLayer.forward - self.mlp is Deepseekv3MoE")
+                    hidden_states_half1, residual_half1 = self.forward_MoE(
                         hidden_states=hidden_states_half1,
                         attn_metadata=attn_metadata_half1,
                         residual=residual_half1,
                     )
                 else:
                     assert isinstance(self.mlp, GatedMLP)
-                    hidden_states_half1 = self.forward_mlp(
+                    print(f"[DEBUG] DeepseekV3DecoderLayer.forward - self.mlp is GatedMLP")
+                    hidden_states_half1, residual_half1 = self.forward_mlp(
                         hidden_states=hidden_states_half1,
                         residual=residual_half1,
                     )
-
+                print(f"[DEBUG] DeepseekV3DecoderLayer.forward - hidden_states_half1 after MOE/GatedMLP: {hidden_states_half1.shape}")
             kwargs_half2 = kwargs.copy()
             if 'attn_metadata' in kwargs_half2:
                 del kwargs_half2['attn_metadata']
@@ -851,14 +855,14 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                     **kwargs_half2,
                 )
                 if isinstance(self.mlp, Deepseekv3MoE):
-                    hidden_states_half2 = self.forward_MoE(
+                    hidden_states_half2, residual_half2 = self.forward_MoE(
                         hidden_states=hidden_states_half2,
                         attn_metadata=attn_metadata_half2,
                         residual=residual_half2,
                     )
                 else:
                     assert isinstance(self.mlp, GatedMLP)
-                    hidden_states_half2 = self.forward_mlp(
+                    hidden_states_half2, residual_half2 = self.forward_mlp(
                         hidden_states=hidden_states_half2,
                         residual=residual_half2,
                     )
@@ -866,13 +870,12 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             torch.cuda.current_stream().wait_stream(stream_half1)
             torch.cuda.current_stream().wait_stream(stream_half2)
             
-            # Debug prints to check tensor shapes
-            print(f"[DEBUG] DeepseekV3DecoderLayer.forward - hidden_states_half1 shape: {hidden_states_half1.shape if hidden_states_half1 is not None else None}")
-            print(f"[DEBUG] DeepseekV3DecoderLayer.forward - hidden_states_half2 shape: {hidden_states_half2.shape if hidden_states_half2 is not None else None}")
-            print(f"[DEBUG] DeepseekV3DecoderLayer.forward - hidden_states_half1 dtype: {hidden_states_half1.dtype if hidden_states_half1 is not None else None}")
-            print(f"[DEBUG] DeepseekV3DecoderLayer.forward - hidden_states_half2 dtype: {hidden_states_half2.dtype if hidden_states_half2 is not None else None}")
-            
+            print(f"[DEBUG] DeepseekV3DecoderLayer.forward - hidden_states_half1: {hidden_states_half1[0].shape} {hidden_states_half1[1].shape}")
+            print(f"[DEBUG] DeepseekV3DecoderLayer.forward - hidden_states_half2: {hidden_states_half2[0].shape} {hidden_states_half2[1].shape}")
+                 
             hidden_states = torch.cat([hidden_states_half1, hidden_states_half2], dim=0)
+            residual = torch.cat([residual_half1, residual_half2], dim=0)
+            return hidden_states, residual
         else:
             hidden_states = self.self_attn(
                 position_ids=position_ids,
@@ -883,18 +886,18 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 **kwargs,
             )
 
-        if isinstance(self.mlp, Deepseekv3MoE):
-            return self.forward_MoE(
-                hidden_states=hidden_states,
-                attn_metadata=attn_metadata,
-                residual=residual,
-            )
-        else:
-            assert isinstance(self.mlp, GatedMLP)
-            return self.forward_mlp(
-                hidden_states=hidden_states,
-                residual=residual,
-            )
+            if isinstance(self.mlp, Deepseekv3MoE):
+                return self.forward_MoE(
+                    hidden_states=hidden_states,
+                    attn_metadata=attn_metadata,
+                    residual=residual,
+                )
+            else:
+                assert isinstance(self.mlp, GatedMLP)
+                return self.forward_mlp(
+                    hidden_states=hidden_states,
+                    residual=residual,
+                )
 
     def forward_MoE(
         self,
