@@ -1603,9 +1603,14 @@ class PyExecutor:
         self._enqueue_responses(error_responses.items())
 
     def _terminate_request(self, request: LlmRequest):
-        if self.kv_connector_manager is None or not self.kv_connector_manager.request_finished(
-                request):
+        if self.kv_connector_manager is None:
             self.resource_manager.free_resources(request)
+        else:
+            cache_block_ids = self.kv_cache_manager.get_cache_indices(request)
+
+            if not self.kv_connector_manager.request_finished(
+                    request, cache_block_ids):
+                self.resource_manager.free_resources(request)
 
     @nvtx_range("_handle_canceled_requests")
     def _handle_canceled_requests(self):

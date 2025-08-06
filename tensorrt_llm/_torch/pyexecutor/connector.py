@@ -205,7 +205,8 @@ class KvCacheConnectorScheduler(ABC):
         """
 
     @abstractmethod
-    def request_finished(self, request: LlmRequest) -> bool:
+    def request_finished(self, request: LlmRequest,
+                         cache_block_ids: list[int]) -> bool:
         """
         Called when a request is finished generating tokens.
 
@@ -366,7 +367,8 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
 
         self.worker.bind_connector_meta(metadata)
 
-    def request_finished(self, req: LlmRequest) -> bool:
+    def request_finished(self, req: LlmRequest,
+                         cache_block_ids: list[int]) -> bool:
         """
         Called when a request is finished generating tokens.
 
@@ -378,7 +380,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         """
 
         saving_async = self._run_on_leader(
-            lambda: self.scheduler.request_finished(req))
+            lambda: self.scheduler.request_finished(req, cache_block_ids))
 
         # This is similar to take_scheduled_requests_pending_load.
         # We need to update the request's state to indicate that it's still being used, but isn't schedulable.

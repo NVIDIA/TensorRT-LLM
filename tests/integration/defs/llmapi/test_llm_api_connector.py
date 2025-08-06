@@ -114,6 +114,9 @@ def test_connector_simple(model_with_connector, use_overlap_scheduler):
         use_overlap_scheduler)
 
     assert scheduler.request_finished.call_count == 1
+
+    assert len(scheduler.request_finished.call_args.args[1]) == 1
+
     assert worker.get_finished.call_count == NUM_TOKENS + int(
         use_overlap_scheduler)
 
@@ -179,6 +182,8 @@ def test_connector_async_save(model_with_connector, use_overlap_scheduler):
     model.generate(["Hello, world"], sampling_params)
 
     assert scheduler.request_finished.call_count == 1
+
+    assert len(scheduler.request_finished.call_args.args[1]) == 1
 
     # On the last call to get_finished, we should be providing the async saving request. One extra token when using the overlap scheduler.
     assert worker.get_finished.call_count == NUM_TOKENS + int(
@@ -248,6 +253,9 @@ def test_connector_scheduler_output(model_with_connector,
 
     scheduler.get_num_new_matched_tokens.return_value = 8, False
 
+    assert len(scheduler.request_finished.call_args.args[1]) == math.ceil(
+        (NUM_INPUT_TOKENS + NUM_TOKENS) / BLOCK_SIZE)
+
     model.generate([0] * NUM_INPUT_TOKENS, sampling_params)
 
     assert scheduler.build_connector_meta.call_args_list[0].args[0].requests[
@@ -278,7 +286,7 @@ def test_connector_scheduler_output_chunked_context(model_with_connector,
 
     worker.get_finished.return_value = [], []
 
-    sampling_params = SamplingParams(max_tokens=32, ignore_eos=True)
+    sampling_params = SamplingParams(max_tokens=BLOCK_SIZE, ignore_eos=True)
 
     model.generate([0] * (CHUNK_SIZE * 2), sampling_params)
 
@@ -303,3 +311,6 @@ def test_connector_scheduler_output_chunked_context(model_with_connector,
             assert len(req.new_block_ids) == 0
         else:
             assert len(req.new_tokens) == 1
+
+    assert len(scheduler.request_finished.call_args.args[1]) == math.ceil(
+        (CHUNK_SIZE * 2 + BLOCK_SIZE) / BLOCK_SIZE)
