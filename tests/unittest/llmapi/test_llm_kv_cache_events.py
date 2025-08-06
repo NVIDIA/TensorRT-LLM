@@ -249,13 +249,6 @@ def test_llm_kv_events_api():
 @pytest.mark.threadleak(enabled=False)
 def test_llm_api_attention_dp_kv_events():
 
-    kvcache_config = KvCacheConfig(free_gpu_memory_fraction=0.4,
-                                   event_buffer_max_size=1024,
-                                   attention_dp_events_gather_period_ms=10,
-                                   enable_block_reuse=True,
-                                   onboard_blocks=True,
-                                   max_tokens=256)
-
     llm = LLM(model=llama_model_path,
               tensor_parallel_size=2,
               enable_attention_dp=True,

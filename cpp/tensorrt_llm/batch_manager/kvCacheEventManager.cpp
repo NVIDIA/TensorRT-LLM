@@ -180,7 +180,7 @@ void KVCacheEventManager::exchangeAttentionDpThread()
             std::vector<char> serializedEvents;
             uint64_t numEvents = 0;
             {
-                std::unique_lock<std::mutex> lck(mEventsMutex);
+                std::lock_guard<std::mutex> lck(mEventsMutex);
                 serializedEvents = executor::Serialization::serialize(mEvents);
                 numEvents = mEvents.size();
                 mEvents.clear();
@@ -210,7 +210,7 @@ void KVCacheEventManager::exchangeAttentionDpThread()
                     // Deserialize the events and add them to the local queue
                     auto rankEvents = executor::Serialization::deserializeKVCacheEvents(serializedEvents);
                     {
-                        std::unique_lock<std::mutex> lck(mEventsMutex);
+                        std::lock_guard<std::mutex> lck(mEventsMutex);
                         mEvents.insert(mEvents.end(), rankEvents.begin(), rankEvents.end());
                         mEmptyCV.notify_one();
                     }

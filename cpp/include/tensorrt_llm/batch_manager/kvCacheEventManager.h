@@ -62,7 +62,7 @@ public:
     // Worker thread which adds events to mEvents.
     void worker();
 
-    // Thread which exchange events if attentionDP is enabled
+    // Thread which exchanges events if attentionDP is enabled
     void exchangeAttentionDpThread();
 
 private:

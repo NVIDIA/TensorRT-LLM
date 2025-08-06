@@ -925,7 +925,7 @@ TEST(SerializeUtilsTest, KVCacheCreatedEvent)
 }
 
 // Test for KVCacheEvent with KVCacheRemovedData
-TEST(SerializeUtilsTest, KVCacheEvents)
+TEST(SerializeUtilsTest, KVCacheRemovedEvents)
 {
     texec::KVCacheEvent kvCacheEvent(1, texec::KVCacheRemovedData{{3, 4}}, 32);
     auto kvCacheEvent2 = serializeDeserialize(kvCacheEvent);
