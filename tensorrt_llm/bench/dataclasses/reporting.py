@@ -292,9 +292,9 @@ class ReportUtility:
                 "backend":
                 "Pytorch",
                 "dtype":
-                torch_dtype_to_str(
-                    model_config.pretrained_config.torch_dtype
-                    or model_config.pretrained_config.text_config.torch_dtype),
+                torch_dtype_to_str(model_config.pretrained_config.torch_dtype
+                                   or model_config.pretrained_config.
+                                   get_text_config().torch_dtype),
                 "kv_cache_dtype":
                 model_config.quant_config.kv_cache_quant_algo,
                 "quantization":
