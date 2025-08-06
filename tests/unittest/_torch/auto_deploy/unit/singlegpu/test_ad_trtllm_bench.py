@@ -96,7 +96,7 @@ def run_benchmark(
         print(f"📋 Using TLLM_OVERRIDE_LAYER_NUM from env: {env['TLLM_OVERRIDE_LAYER_NUM']}")
         cmd.extend(["--kv_cache_free_gpu_mem_fraction", str(free_mem_ratio)])
     print(f"🚀 Running benchmark command ({backend} backend): {' '.join(cmd)}")
-    result = subprocess.run(cmd, capture_output=True, text=True, env=env)
+    result = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=600)
 
     # Check if the command succeeded
     assert result.returncode == 0, (
@@ -254,7 +254,9 @@ def prepare_dataset(root_dir: str, temp_dir: str, model_name: str):
         "10",
     ]
     print(f"Running command: {' '.join(command)}")
-    result = subprocess.run(command, cwd=str(script_dir), capture_output=True, text=True)
+    result = subprocess.run(
+        command, cwd=str(script_dir), capture_output=True, text=True, timeout=300
+    )
     if result.returncode != 0:
         raise RuntimeError(f"Failed to prepare dataset: {result.stderr}")
     # Grab the stdout and write it to a dataset file for passing to suite.
