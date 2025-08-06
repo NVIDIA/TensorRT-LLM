@@ -178,7 +178,7 @@ def launch_disaggregated_llm(disaggregated_server_config: Dict[str, Any],
                 ]
                 yield opened_processes
         except Exception as e:
-            logger.error(
+            print(
                 f"Failed to start disaggregated server processes in multi_popen: {e}"
             )
             raise
