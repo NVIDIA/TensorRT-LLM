@@ -1,3 +1,5 @@
+from contextlib import contextmanager, nullcontext
+
 import pytest
 
 from tensorrt_llm import LLM
@@ -91,6 +93,63 @@ def test_llm_capture_request_error():
 def test_llm_abort_request(sampling_params):
     llm = LLM(model=llama_model_path, kv_cache_config=global_kvcache_config)
     run_llm_abort_request(llm=llm, sampling_params=sampling_params)
+
+
+@contextmanager
+def _validate_invalid_token_error_scope():
+    with pytest.raises(RuntimeError) as exc_info:
+        yield
+    assert "Token ID out of range" in str(exc_info.value)
+
+
+@force_ampere
+def test_llm_invalid_input_token():
+    llm = LLM(model=llama_model_path, kv_cache_config=global_kvcache_config)
+    prompts = [
+        [-1],
+    ]
+    # NB: exc_info in _validate_invalid_token_error_scope creates a reference
+    #     to a traceback which outlives the scope of 'exc_info' and prevents
+    #     deletion of 'llm'. However, using the context manager protocol is
+    #     anyways more robust than delegating cleanup to __del__.
+    with llm:
+        with _validate_invalid_token_error_scope():
+            llm.generate(
+                prompts,
+                sampling_params=SamplingParams(max_tokens=5),
+            )
+
+
+@force_ampere
+def test_llm_invalid_input_token_async():
+    llm = LLM(model=llama_model_path, kv_cache_config=global_kvcache_config)
+    # NB: exc_info in _validate_invalid_token_error_scope creates a reference
+    #     to a traceback which outlives the scope of 'exc_info' and prevents
+    #     deletion of 'llm'. However, using the context manager protocol is
+    #     anyways more robust than delegating cleanup to __del__.
+    with llm:
+        prompts = [
+            [-1],
+            [42],
+        ]
+        fail_idx = [0]
+        for submit_order in [[0, 1], [1, 0]]:
+            for collect_order in [[0, 1], [1, 0]]:
+                print(f"submitting {submit_order}")
+                futures = [
+                    llm.generate_async(
+                        prompts[submit_idx],
+                        sampling_params=SamplingParams(max_tokens=5),
+                    ) for submit_idx in submit_order
+                ]
+                for collect_idx in collect_order:
+                    with _validate_invalid_token_error_scope(
+                    ) if submit_order[collect_idx] in fail_idx else nullcontext(
+                    ):
+                        print(
+                            f"collect order {collect_order}, collecting {collect_idx}"
+                        )
+                        futures[collect_idx].result()
 
 
 def test_llm_reward_model():

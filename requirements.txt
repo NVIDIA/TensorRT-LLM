@@ -61,6 +61,5 @@ etcd3
 blake3
 llguidance==0.7.29
 soundfile
-deep_gemm @ git+https://github.com/zongfeijing/DeepGEMM.git@a9d538ef4dff0326fe521c6ca0bfde115703b56a
 triton==3.3.1; platform_machine == "x86_64"
 blobfile

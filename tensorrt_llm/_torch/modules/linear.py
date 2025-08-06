@@ -573,7 +573,7 @@ class FP8BlockScalesLinearMethod(LinearMethodBase):
         assert input.dtype == torch.bfloat16
 
         if get_sm_version() == 100:
-            import deep_gemm
+            from tensorrt_llm import deep_gemm
             a, a_sf = fp8_utils.per_token_quant_and_transform(input)
             output = torch.empty((input.shape[0], module.weight.shape[0]),
                                  device=input.device,
