@@ -3,17 +3,15 @@ hostname: localhost
 port: 8000
 backend: pytorch
 cuda_graph_config: null
+disable_overlap_scheduler: True
 context_servers:
   num_instances: 1
   max_batch_size: 1
-  max_num_tokens: 3000
-  max_seq_len: 4096
   free_gpu_memory_fraction: 0.85
   tensor_parallel_size: 2
   moe_expert_parallel_size: 2
   enable_attention_dp: true
   pipeline_parallel_size: 1
-  disable_overlap_scheduler: true
   kv_cache_config:
     enable_block_reuse: false
     free_gpu_memory_fraction: 0.85
@@ -29,8 +27,6 @@ generation_servers:
   enable_attention_dp: true
   pipeline_parallel_size: 1
   max_batch_size: 1
-  max_num_tokens: 4
-  max_seq_len: 2251
   free_gpu_memory_fraction: 0.7
   kv_cache_config:
     enable_block_reuse: false

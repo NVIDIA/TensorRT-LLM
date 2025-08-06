@@ -388,9 +388,9 @@ def test_disaggregated_benchmark_gen_only_trt_backend(
 @pytest.mark.skip_less_device(4)
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
                          indirect=True)
-def test_disaggregated_benchmark_genbs1(disaggregated_test_root,
-                                        disaggregated_example_root, llm_venv,
-                                        llama_model_root):
+def test_disaggregated_genbs1(disaggregated_test_root,
+                              disaggregated_example_root, llm_venv,
+                              llama_model_root):
     src_dst_dict = {
         llama_model_root:
         f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
@@ -403,8 +403,7 @@ def test_disaggregated_benchmark_genbs1(disaggregated_test_root,
     run_disaggregated_test(disaggregated_example_root,
                            "genbs1",
                            env=llm_venv._new_env,
-                           cwd=llm_venv.get_working_directory(),
-                           prompt_file="long_prompts.json")
+                           cwd=llm_venv.get_working_directory())
 
 
 @pytest.mark.skip_less_device(2)
