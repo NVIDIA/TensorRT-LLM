@@ -871,6 +871,10 @@ class PyExecutor:
             self.use_spec_decode = self.drafter.should_use_spec_decode(
                 self.active_requests)
             self.model_engine.enable_spec_decode = self.use_spec_decode
+            # If speculation is off, this function sets py_draft_tokens to None
+            # for all active requests. If it's on, we initialize py_draft_tokens
+            # with dummy draft tokens to make the scheduler aware of the fact
+            # that speculation is about to happen.
             self._prepare_draft_requests()
 
         scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(

@@ -342,6 +342,11 @@ class DecodingBaseConfig(StrictBaseModel):
     max_draft_len: Optional[int] = None
     speculative_model_dir: Optional[Union[str, Path]] = None
 
+    # PyTorch only.
+    # When specified, speculation will be disabled at batch sizes above
+    # this value. Otherwise, speculation will always be on.
+    max_concurrency: Optional[int] = None
+
     @classmethod
     def from_dict(cls, data: dict):
         # dispatch to the correct decoding config
@@ -469,9 +474,6 @@ class NGramDecodingConfig(DecodingBaseConfig):
     is_keep_all: bool = True
     is_use_oldest: bool = True
     is_public_pool: bool = True
-    # Flag to indicate the NGramDecodingConfig is instantiated by auto heuristic.
-    # User should not set this flag. Use AutoDecodingConfig instead.
-    is_auto_heuristic: bool = False
 
     @classmethod
     def from_dict(cls, data: dict):
@@ -535,13 +537,10 @@ class AutoDecodingConfig(DecodingBaseConfig):
     """
     Configuration for auto speculative decoding.
 
-    This config is used to automatically select the best speculative decoding algorithm.
+    This config will automatically select a good, draft-model free
+    speculation algorithm with some heuristic.
 
-    According to benchmark results, the best algorithm in general is NGRAM with low concurrency <= 32.
-    Default heuristic:
-        With concurrency <= 4, max_draft_len = 5, max_matching_ngram_size = 3
-        With concurrency <= 32, max_draft_len = 3, max_matching_ngram_size = 5
-        With concurrency > 32, speculative decoding is disabled.
+    Attributes that are inherited from the base class are ignored.
     """
 
     @classmethod

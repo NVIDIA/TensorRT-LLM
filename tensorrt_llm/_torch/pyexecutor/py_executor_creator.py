@@ -170,6 +170,14 @@ def _mangle_executor_config(executor_config: ExecutorConfig):
         )
         executor_config.enable_chunked_context = False
 
+    spec_config = executor_config.speculative_config
+    if not executor_config.pytorch_backend_config.disable_overlap_scheduler and spec_config is not None:
+        if not spec_config.spec_dec_mode.support_overlap_scheduler():
+            logger.warning(
+                f"Disable overlap scheduler for speculation mode {spec_config.spec_dec_mode.name}"
+            )
+            executor_config.pytorch_backend_config.disable_overlap_scheduler = True
+
 
 def _get_mapping(executor_config: ExecutorConfig) -> Mapping:
     if executor_config.mapping is None:
