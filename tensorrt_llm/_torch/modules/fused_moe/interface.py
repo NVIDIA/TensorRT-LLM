@@ -6,6 +6,7 @@ import torch
 from torch import nn
 
 from ...model_config import ModelConfig
+from .moe_prefetch_manager import MoEPrefetchProxy
 from .routing import BaseMoeRoutingMethod
 
 
@@ -41,6 +42,7 @@ class MoE(nn.Module):
         model_config: ModelConfig = ModelConfig(),
         weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.
         VANILLA,
+        moe_prefetch_proxy: Optional[MoEPrefetchProxy] = None,
     ):
         from ...distributed import AllReduce
 
@@ -79,6 +81,34 @@ class MoE(nn.Module):
 
         self.all_reduce = AllReduce(mapping=self.mapping,
                                     strategy=model_config.allreduce_strategy)
+
+        # weight prefetching config
+        self.use_prefetch = False
+        if moe_prefetch_proxy is not None:
+            self.use_prefetch = True
+            self.prefetch_proxy = moe_prefetch_proxy
+            self.prefetch_param_lists = ['w3_w1_weight', 'w2_weight']
+
+    # support weight prefetching, avoid moving weight tensors to GPU when init
+    def _apply(self, fn):
+        if self.use_prefetch and (fn.__name__ == 'to'
+                                  or fn.__name__ == 'convert'):
+            target_device = None
+            if fn.__closure__:
+                for cell in fn.__closure__:
+                    if hasattr(cell, 'cell_contents') and isinstance(
+                            cell.cell_contents, torch.device):
+                        target_device = cell.cell_contents
+
+            if target_device == torch.device('cuda'):
+                cpu_params = {
+                    param: self._parameters.pop(param)
+                    for param in self.prefetch_param_lists
+                }
+                module = super()._apply(fn)
+                self._parameters.update(cpu_params)
+                return module
+        return super()._apply(fn)
 
     @abstractmethod
     def create_weights(self):
