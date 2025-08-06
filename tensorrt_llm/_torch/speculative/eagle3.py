@@ -168,7 +168,6 @@ class Eagle3SpecMetadata(SpecMetadata):
             if captured_layer_id == layer_id:
                 to_save = hidden_states + residual if residual is not None else hidden_states
                 to_save = to_save.to(dtype=eagle3_hidden_states.dtype)
-                                     self.hidden_size].shape}.   {to_save.shape}")
                 eagle3_hidden_states[:, i * self.hidden_size:(i + 1) *
                                      self.hidden_size].index_copy_(
                                          0, token_idx, to_save)
