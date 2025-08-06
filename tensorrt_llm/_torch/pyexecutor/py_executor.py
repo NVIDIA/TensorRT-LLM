@@ -293,14 +293,14 @@ class PyExecutor:
             ]
 
             if not all(t.shape == all_layers[0].shape for t in all_layers):
-                raise ValueError(
+                raise NotImplementedError(
                     "KV Cache Connector is not supported with sliding window attention."
                 )
 
             full_kv_tensor = torch.cat(all_layers, dim=1)
 
             if not full_kv_tensor.is_contiguous():
-                raise ValueError(
+                raise NotImplementedError(
                     "KV Cache Connector is not supported with non-contiguous KV cache."
                 )
 

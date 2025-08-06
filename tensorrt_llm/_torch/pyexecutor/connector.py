@@ -69,12 +69,6 @@ class RequestData:
 class SchedulerOutput:
     requests: list[RequestData] = field(default_factory=list)
 
-    def add_request(self, request_id: int, new_tokens: list[int],
-                    new_block_ids: list[int], computed_position: int):
-        self.requests.append(
-            RequestData(request_id, new_tokens, new_block_ids,
-                        computed_position))
-
     def record_first_prefill_chunk(self, req: LlmRequest, block_ids: list[int]):
         if not req.is_kv_cache_connector_async_onboard:
             self.requests.append(
@@ -129,22 +123,25 @@ class KvCacheConnectorWorker(ABC):
         """
 
     @abstractmethod
-    def wait_for_layer_load(self, layer_idx: int):
+    def wait_for_layer_load(self, layer_idx: int, stream: torch.cuda.Stream):
         """
         Wait for a layer to finish being loaded before proceeding with the forward pass on the layer.
+        Note: This function is called immediately before the layer's work is enqueued into the stream.
 
         Args:
             layer_idx: The index of the layer to wait for.
+            stream: The stream the forward pass is being executed on.
         """
 
     @abstractmethod
-    def save_kv_layer(self, layer_idx: int):
+    def save_kv_layer(self, layer_idx: int, stream: torch.cuda.Stream):
         """
         Begin saving the KV cache for a layer.
-        This is called after the forward pass on the layer has completed.
+        Note: This function is called immediately after the layer's work is enqueued into the stream.
 
         Args:
             layer_idx: The index of the layer to save.
+            stream: The stream the forward pass is being executed on.
         """
 
     @abstractmethod
@@ -445,7 +442,8 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         self._scheduler_output = scheduler_output
 
     def layer_pre_hook(self, module, *args):
-        self.worker.wait_for_layer_load(module.layer_idx)
+        self.worker.wait_for_layer_load(module.layer_idx,
+                                        torch.cuda.current_stream())
 
     def layer_post_hook(self, module, *args):
-        self.worker.save_kv_layer(module.layer_idx)
+        self.worker.save_kv_layer(module.layer_idx, torch.cuda.current_stream())

@@ -329,7 +329,7 @@ class KvCacheCreator:
                 )
 
             if not for_estimation and self._kv_connector_manager is not None:
-                raise ValueError(
+                raise NotImplementedError(
                     "Connector manager is not supported for MambaHybridCacheManager."
                 )
 
@@ -406,7 +406,7 @@ class KvCacheCreator:
             self._model_engine, for_estimation)
 
         if not for_estimation and self._kv_connector_manager is not None and self._draft_model_engine is not None:
-            raise ValueError(
+            raise NotImplementedError(
                 "Connector manager is not supported for draft model.")
 
         draft_kv_cache_manager = self._create_kv_cache_manager(

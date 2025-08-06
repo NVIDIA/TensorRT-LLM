@@ -367,6 +367,9 @@ def create_py_executor(
         logger.info(
             f"Initializing kv connector with config: {kv_connector_config}")
 
+        if pytorch_backend_config.use_cuda_graph:
+            raise NotImplementedError(
+                "CUDA graphs are not supported with KV connector hooks.")
         try:
             module = importlib.import_module(
                 kv_connector_config.connector_module)
