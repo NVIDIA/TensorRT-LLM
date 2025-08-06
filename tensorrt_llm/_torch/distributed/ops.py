@@ -183,7 +183,7 @@ def allgather(
                     print(f"[DEBUG] allgather - sizes[mapping.tp_rank]: {sizes[mapping.tp_rank]}")
             if os.environ.get("ENABLE_TRTLLM_SPLIT_BATCH_OVERLAP", "0") == "1":
                 assert all([
-                    val.shape[dim] == sizes[mapping.tp_rank] / 2 for val in input
+                    val.shape[dim] == sizes[mapping.tp_rank] / 2 or val.shape[dim] == sizes[mapping.tp_rank] for val in input
                     if val is not None
                 ])
             else:

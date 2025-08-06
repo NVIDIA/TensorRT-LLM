@@ -709,7 +709,8 @@ class WideEPMoE(MoE):
         if self.layer_load_balancer and not self.layer_load_balancer.is_static_routing(
         ) and is_last_call:
             self.layer_load_balancer.maybe_cudagraph_done_set_cpu_stage()
-
+            
+        print(f"[DEBUG] FusedMoEWideEP.forward - final_hidden_states shape: {final_hidden_states.shape}, dtype: {final_hidden_states.dtype}")
         return final_hidden_states
 
     def forward(

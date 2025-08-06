@@ -521,9 +521,10 @@ class Deepseekv3MoE(nn.Module):
                                           self.mapping,
                                           dim=0,
                                           sizes=all_rank_num_tokens)
-
+        print(f"[DEBUG] Deepseekv3MoE.compute_routed_output.gather - hidden_states shape: {hidden_states.shape}, dtype: {hidden_states.dtype}")
         router_logits = self.gate(hidden_states)
 
+        print(f"[DEBUG] Deepseekv3MoE.compute_routed_output.gate - router_logits shape: {router_logits.shape}, dtype: {router_logits.dtype}")
         routed_output = self.experts(
             hidden_states_fp4 or hidden_states,
             router_logits,
@@ -549,7 +550,7 @@ class Deepseekv3MoE(nn.Module):
             assert not self.use_dp
 
         def _compute_shared_output():
-            print(f"[DEBUG] Deepseekv3MoE.forward - _compute_shared_output - hidden_states shape: {hidden_states.shape}, dtype: {hidden_states.dtype}")
+            print(f"[DEBUG] Deepseekv3MoE.forward - _compute_shared_output - hidden_states shape: {hidden_states.shape}, dtype: {hidden_states.dtype}, all_rank_num_tokens: {all_rank_num_tokens}")
             shared_output = self.shared_experts(hidden_states_fp4
                                                 or hidden_states)
             if self.shared_output_scale is not None:
@@ -574,7 +575,7 @@ class Deepseekv3MoE(nn.Module):
             return [shared_output, *routed_output]
         else:
             assert shared_output.size() == routed_output.size(
-            ), f'unmatched tensor shape'
+            ), f'unmatched tensor shape shared_output: {shared_output.shape}, routed_output: {routed_output.shape}'
             final_hidden_states = shared_output + routed_output
             if not self.use_dp and self.mapping.tp_size > 1:
                 final_hidden_states = self.allreduce(
@@ -770,8 +771,8 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             attn_metadata_half1 = copy.copy(attn_metadata)
             attn_metadata_half1.max_num_requests = 32
             attn_metadata_half1.max_num_sequences = 32
-            #attn_metadata_half1.all_rank_num_tokens = [32, 32]
-            #attn_metadata_half1.all_rank_max_num_tokens = 32
+            attn_metadata_half1.all_rank_num_tokens = [32, 32]
+            attn_metadata_half1.all_rank_max_num_tokens = 32
             attn_metadata_half1.kv_cache_manager = copy.copy(attn_metadata.kv_cache_manager)
             #attn_metadata_half1.kv_cache_manager.kv_cache_pool_pointers = attn_metadata.kv_cache_manager.kv_cache_pool_pointers[:32]
             attn_metadata_half1.kv_cache_manager.tokens_per_block = 32  
@@ -787,8 +788,8 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             attn_metadata_half2 = copy.copy(attn_metadata)
             attn_metadata_half2.max_num_requests = 32
             attn_metadata_half2.max_num_sequences = 32
-            #attn_metadata_half2.all_rank_num_tokens = [32, 32]
-            #attn_metadata_half2.all_rank_max_num_tokens = 32
+            attn_metadata_half2.all_rank_num_tokens = [32, 32]
+            attn_metadata_half2.all_rank_max_num_tokens = 32
             attn_metadata_half2.kv_cache_manager = copy.copy(attn_metadata.kv_cache_manager)
             #attn_metadata_half2.kv_cache_manager.kv_cache_pool_pointers = attn_metadata.kv_cache_manager.kv_cache_pool_pointers[32:]
             attn_metadata_half2.kv_cache_manager.tokens_per_block = 32  
