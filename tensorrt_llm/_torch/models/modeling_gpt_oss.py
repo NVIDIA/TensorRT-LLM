@@ -704,10 +704,11 @@ class GptOssForCausalLM(SpecDecOneEngineForCausalLM[Transformer, GptOssConfig]):
                     if self.model_config.quant_config.quant_algo == 'W4A16_MXFP4':
                         for i in range(num_expert):
                             moe_weights[
-                                f"{i}.w1.weight_scale_inv"] = gate_weight[
+                                f"{i}.w1.weight_scale_inv"] = gate_weight_scale[
                                     i, :, :]
-                            moe_weights[f"{i}.w3.weight_scale_inv"] = up_weight[
-                                i, :, :]
+                            moe_weights[
+                                f"{i}.w3.weight_scale_inv"] = up_weight_scale[
+                                    i, :, :]
                             moe_weights[
                                 f"{i}.w2.weight_scale_inv"] = module_weights[
                                     'down_proj_scales'][i, :, :]
