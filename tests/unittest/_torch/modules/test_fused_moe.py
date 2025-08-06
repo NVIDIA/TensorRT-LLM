@@ -1601,7 +1601,7 @@ def test_fused_moe_triton_mxfp4(experts, hidden_size, intermediate_size,
         check_accuracy(output, ref_output, rtol=0.6, atol=0.6, percent=0.945)
 
 
-@pytest.mark.parametrize("dtype", [torch.float16])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("weight_dtype", [torch.int8])
 def test_fused_moe_weight_only(dtype, weight_dtype):
 
@@ -1705,7 +1705,7 @@ def test_fused_moe_weight_only(dtype, weight_dtype):
     # compare
     torch.cuda.synchronize()
     atol = calc_woq_tolerence(ref_output, weight_dtype)
-    torch.testing.assert_close(output, ref_output, rtol=1e-27, atol=atol)
+    torch.testing.assert_close(output, ref_output, rtol=1e-7, atol=atol)
 
 
 class RefGatedMLPFusedMoE(nn.Module):

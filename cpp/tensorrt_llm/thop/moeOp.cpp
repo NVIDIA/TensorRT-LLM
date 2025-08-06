@@ -113,8 +113,9 @@ public:
             {
                 return std::make_unique<kernels::CutlassMoeFCRunner<TypeAct, cutlass::uint4b_t>>();
             }
-#endif
+#else
             return std::make_unique<kernels::CutlassMoeFCRunner<TypeAct, cutlass::uint4b_t>>();
+#endif
         }
         else
         {
