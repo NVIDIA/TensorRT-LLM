@@ -447,7 +447,7 @@ def runLLMBuild(pipeline, buildFlags, tarName, is_linux_x86_64)
     def llmPath = sh (script: "realpath ${LLM_ROOT}",returnStdout: true).trim()
     // TODO: Remove after the cmake version is upgraded to 3.31.8
     // Get triton tag from docker/dockerfile.multi
-    def tritonShortTag = sh(script: "${LLM_ROOT}/jenkins/scripts/get_triton_tag.sh ${LLM_ROOT}", returnStdout: true).trim()
+    def tritonShortTag = "r25.08"
     sh "cd ${LLM_ROOT}/triton_backend/inflight_batcher_llm && mkdir build && cd build && cmake .. -DTRTLLM_DIR=${llmPath} -DTRITON_COMMON_REPO_TAG=${tritonShortTag} -DTRITON_CORE_REPO_TAG=${tritonShortTag} -DTRITON_THIRD_PARTY_REPO_TAG=${tritonShortTag} -DTRITON_BACKEND_REPO_TAG=${tritonShortTag} -DUSE_CXX11_ABI=ON && make -j${BUILD_JOBS} install"
 
     // Step 3: packaging wheels into tarfile
