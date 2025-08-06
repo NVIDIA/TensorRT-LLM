@@ -112,12 +112,11 @@ void initConfigBindings(nb::module_& m)
             self.getSinkTokenLength(), self.getFreeGpuMemoryFraction(), self.getHostCacheSize(),
             self.getOnboardBlocks(), self.getCrossKvCacheFraction(), self.getSecondaryOffloadMinPriority(),
             self.getEventBufferMaxSize(), self.getEnablePartialReuse(), self.getCopyOnPartialReuse(), self.getUseUvm(),
-            self.getAttentionDpEventsGatherPeriodMs(),
-            self.getMaxGpuTotalBytes());
+            self.getAttentionDpEventsGatherPeriodMs(), self.getMaxGpuTotalBytes());
     };
     auto kvCacheConfigSetstate = [](tle::KvCacheConfig& self, nb::tuple const& state)
     {
-        if (state.size() != 14)
+        if (state.size() != 15)
         {
             throw std::runtime_error("Invalid state!");
         }
@@ -127,7 +126,7 @@ void initConfigBindings(nb::module_& m)
             nb::cast<bool>(state[6]), nb::cast<std::optional<float>>(state[7]),
             nb::cast<std::optional<tle::RetentionPriority>>(state[8]), nb::cast<size_t>(state[9]),
             nb::cast<bool>(state[10]), nb::cast<bool>(state[11]), nb::cast<bool>(state[12]),
-            nb::cast<SizeType32>(state[13]), nb::cast<uint64_t>(state[14]));
+            nb::cast<SizeType32>(state[13]), std::nullopt, nb::cast<uint64_t>(state[14]));
     };
     nb::class_<tle::KvCacheConfig>(m, "KvCacheConfig")
         .def(nb::init<bool, std::optional<SizeType32> const&, std::optional<std::vector<SizeType32>> const&,
@@ -140,7 +139,8 @@ void initConfigBindings(nb::module_& m)
             nb::arg("onboard_blocks") = true, nb::arg("cross_kv_cache_fraction") = nb::none(),
             nb::arg("secondary_offload_min_priority") = nb::none(), nb::arg("event_buffer_max_size") = 0, nb::kw_only(),
             nb::arg("enable_partial_reuse") = true, nb::arg("copy_on_partial_reuse") = true, nb::arg("use_uvm") = false,
-            nb::arg("attention_dp_events_gather_period_ms") = 5, nb::arg("runtime_defaults") = nb::none(), nb::arg("max_gpu_total_bytes") = 0)
+            nb::arg("attention_dp_events_gather_period_ms") = 5, nb::arg("runtime_defaults") = nb::none(),
+            nb::arg("max_gpu_total_bytes") = 0)
         .def_prop_rw(
             "enable_block_reuse", &tle::KvCacheConfig::getEnableBlockReuse, &tle::KvCacheConfig::setEnableBlockReuse)
         .def_prop_rw("max_tokens", &tle::KvCacheConfig::getMaxTokens, &tle::KvCacheConfig::setMaxTokens)

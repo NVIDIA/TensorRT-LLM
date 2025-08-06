@@ -28,8 +28,7 @@ KvCacheConfig::KvCacheConfig(bool enableBlockReuse, std::optional<SizeType32> co
     std::optional<FloatType> const& crossKvCacheFraction, std::optional<RetentionPriority> secondaryOffloadMinPriority,
     size_t eventBufferMaxSize, bool enablePartialReuse, bool copyOnPartialReuse, bool useUvm,
     SizeType32 attentionDpEventsGatherPeriodMs,
-    std::optional<tensorrt_llm::runtime::RuntimeDefaults> const& runtimeDefaults,
-    std::optional<uint64_t> const& maxGpuTotalBytes)
+    std::optional<tensorrt_llm::runtime::RuntimeDefaults> const& runtimeDefaults, uint64_t const& maxGpuTotalBytes)
     : mEnableBlockReuse(enableBlockReuse)
     , mHostCacheSize(hostCacheSize)
     , mOnboardBlocks(onboardBlocks)
@@ -67,7 +66,7 @@ KvCacheConfig::KvCacheConfig(bool enableBlockReuse, std::optional<SizeType32> co
     }
     if (maxGpuTotalBytes)
     {
-        setMaxGpuTotalBytes(maxGpuTotalBytes.value());
+        setMaxGpuTotalBytes(maxGpuTotalBytes);
     }
     TLLM_CHECK_WITH_INFO(
         mAttentionDpEventsGatherPeriodMs > 0, "Attention DP events gather period must be greater than 0");

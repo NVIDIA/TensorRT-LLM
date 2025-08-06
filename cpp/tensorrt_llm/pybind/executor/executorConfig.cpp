@@ -108,7 +108,7 @@ void initConfigBindings(pybind11::module_& m)
     };
     auto kvCacheConfigSetstate = [](py::tuple const& state)
     {
-        if (state.size() != 14)
+        if (state.size() != 15)
         {
             throw std::runtime_error("Invalid state!");
         }
@@ -117,7 +117,7 @@ void initConfigBindings(pybind11::module_& m)
             state[4].cast<std::optional<float>>(), state[5].cast<std::optional<size_t>>(), state[6].cast<bool>(),
             state[7].cast<std::optional<float>>(), state[8].cast<std::optional<tle::RetentionPriority>>(),
             state[9].cast<size_t>(), state[10].cast<bool>(), state[11].cast<bool>(), state[12].cast<bool>(),
-            state[13].cast<SizeType32>());
+            state[13].cast<SizeType32>(), std::nullopt, state[14].cast<uint64_t>());
     };
     py::class_<tle::KvCacheConfig>(m, "KvCacheConfig")
         .def(py::init<bool, std::optional<SizeType32> const&, std::optional<std::vector<SizeType32>> const&,
@@ -130,7 +130,8 @@ void initConfigBindings(pybind11::module_& m)
             py::arg("onboard_blocks") = true, py::arg("cross_kv_cache_fraction") = py::none(),
             py::arg("secondary_offload_min_priority") = py::none(), py::arg("event_buffer_max_size") = 0, py::kw_only(),
             py::arg("enable_partial_reuse") = true, py::arg("copy_on_partial_reuse") = true, py::arg("use_uvm") = false,
-            py::arg("attention_dp_events_gather_period_ms") = 5, py::arg("runtime_defaults") = py::none(), py::arg("max_gpu_total_bytes") = py::none())
+            py::arg("attention_dp_events_gather_period_ms") = 5, py::arg("runtime_defaults") = py::none(),
+            py::arg("max_gpu_total_bytes") = 0)
         .def_property(
             "enable_block_reuse", &tle::KvCacheConfig::getEnableBlockReuse, &tle::KvCacheConfig::setEnableBlockReuse)
         .def_property("max_tokens", &tle::KvCacheConfig::getMaxTokens, &tle::KvCacheConfig::setMaxTokens)
