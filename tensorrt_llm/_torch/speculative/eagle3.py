@@ -268,7 +268,7 @@ class Eagle3OneModelWorker(nn.Module):
 
     # Skip torch.compile for now since current Torch is not compatible with Triton 3.4
     # @torch.compile(options={"max-autotune": True})
-    def forward(self, input_ids, position_ids, hidden_states, logits,
+    def forward(self, input_ids, position_ids, hidden_states, logits, lm_head,
                 attn_metadata, spec_metadata, draft_model):
         batch_size = attn_metadata.num_seqs
         num_contexts = attn_metadata.num_contexts
