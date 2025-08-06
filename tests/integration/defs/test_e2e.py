@@ -2174,7 +2174,7 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
     expected_keywords = {
         "NVILA-8B-FP16": {
             "image": [
-                ["stormy", "ocean", "waves", "clouds", "gray", "sky"],
+                ["stormy", "ocean", "waves", "cloudy", "sunlight", "sky"],
                 ["rock", "formation", "sunny", "sky", "clouds"],
                 ["road", "busy", "car", "black", "blue"],
             ],
