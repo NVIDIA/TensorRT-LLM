@@ -8,7 +8,7 @@ import time
 import traceback
 import weakref
 from contextlib import contextmanager
-from typing import List, Optional, Tuple, Union
+from typing import Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 from cuda import cudart
@@ -29,6 +29,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.runtime.generation import CUASSERT
 
 from ..distributed import Distributed
+from ..models.modeling_utils import DecoderModelForCausalLM
 from ..speculative.drafter import Drafter
 from .executor_request_queue import ExecutorRequestQueue, RequestQueueItem
 from .guided_decoder import GuidedDecoder
@@ -177,6 +178,9 @@ class PyExecutor:
         self.enable_iter_perf_stats = model_engine.pytorch_backend_config.enable_iter_perf_stats
         self.enable_iter_req_stats = model_engine.pytorch_backend_config.enable_iter_req_stats
         self.stream_interval = model_engine.pytorch_backend_config.stream_interval
+        self.attention_dp_enable_balance = model_engine.pytorch_backend_config.attention_dp_enable_balance
+        self.attention_dp_time_out_iters = model_engine.pytorch_backend_config.attention_dp_time_out_iters
+        self.attention_dp_batching_wait_iters = model_engine.pytorch_backend_config.attention_dp_batching_wait_iters
         self.num_fetch_requests_cur_rank = 0
         self.num_fetch_requests = 0
         self.shutdown_event = threading.Event()
@@ -215,6 +219,9 @@ class PyExecutor:
             self.draft_model_engine.warmup(self.resource_manager)
 
         self.is_shutdown = False
+        self.max_batch_size = max_batch_size
+        self.adp_ctx_waiting_iters_count = 0
+        self.adp_ctx_batching_wait_iters_count = 0
 
         # request fetcher initialization
         self.executor_request_queue = ExecutorRequestQueue(
@@ -284,7 +291,7 @@ class PyExecutor:
     def __exit__(self):
         self.shutdown()
 
-    def enqueue_requests(self, requests: List[ExecutorRequest]):
+    def enqueue_requests(self, requests: List[ExecutorRequest]) -> List[int]:
         """
         Enqueue new requests
         """
@@ -376,7 +383,7 @@ class PyExecutor:
 
     def enqueue_request(self,
                         request: ExecutorRequest,
-                        query: Optional[List] = None):
+                        query: Optional[List] = None) -> int:
         """
         Enqueue a new request, query is only used in `StarAttention`.
         """
@@ -656,7 +663,7 @@ class PyExecutor:
                 profile_step()
                 if self.enable_iter_perf_stats:
                     iter_start_time = time.time()
-                new_requests = self._fetch_new_requests()
+                new_requests = self._fetch_and_activate_new_requests()
                 if self.should_stop_processing:
                     break
 
@@ -700,10 +707,6 @@ class PyExecutor:
                     can_queue = 0 not in tp_batch_sizes
                 else:
                     can_queue = scheduled_batch.batch_size > 0
-                    if not can_queue and not self.kv_cache_transceiver:
-                        assert len(self.inflight_req_ids) > 0, (
-                            "fail to schedule any pending request, probably run out of resource"
-                        )
 
                 if not can_queue:
                     self.micro_batches[microbatch_id] = None
@@ -848,7 +851,7 @@ class PyExecutor:
                                              previous_batch)
 
     def _prepare_and_schedule_batch(self):
-        new_requests = self._fetch_new_requests()
+        new_requests = self._fetch_and_activate_new_requests()
         if self.should_stop_processing:
             return None, None
 
@@ -882,10 +885,6 @@ class PyExecutor:
                     "num_fitting_reqs=0 and fitting_disagg_gen_init_requests is empty, may not have enough kvCache"
                 )
                 self.kv_cache_transceiver.check_context_transfer_status(1)
-        else:
-            assert scheduled_batch.batch_size > 0, (
-                "fail to schedule any pending request, "
-                "probably run out of resource.")
 
         self.num_scheduled_requests = scheduled_batch.batch_size
         logger.debug(
@@ -1110,17 +1109,48 @@ class PyExecutor:
             sampler_event=sampler_event,
         )
 
-    @nvtx_range("_fetch_new_requests")
-    def _fetch_new_requests(self) -> List[RequestQueueItem]:
-        new_requests = self.executor_request_queue.fetch_new_requests(
-            len(self.active_requests))
-        self.active_requests.extend(new_requests)
+    def _validate_request(self, request: LlmRequest):
+        if isinstance(self.model_engine.model, DecoderModelForCausalLM):
+            # FIXME: This check is necessary because of how Qwen2ForProcessRewardModel
+            #        subclasses DecoderModelForCausalLM. Perhaps the functionality
+            #        of DecoderModelForCausalLM reused by Qwen2ForProcessRewardModel
+            #        should be factored out into a separate class instead.
+            if not hasattr(self.model_engine.model, "lm_head"):
+                return
 
+            if not request.check_token_id_range(
+                    self.model_engine.model.lm_head.num_embeddings):
+                raise ValueError("Token ID out of range")
+
+    @nvtx_range("_fetch_and_activate_new_requests")
+    def _fetch_and_activate_new_requests(self) -> List[LlmRequest]:
+
+        def _respond_if_invalid(request: LlmRequest) -> bool:
+            """Immediately fail invalid request.
+
+            Return True if invalid request was encountered and
+            handled.
+            """
+            try:
+                self._validate_request(request)
+                return False
+            except Exception as e:
+                self._handle_errors(str(e), requests=[request])
+                return True
+
+        new_requests_cur_rank = self.executor_request_queue.fetch_new_requests(
+            len(self.active_requests))
         self.is_shutdown = self.executor_request_queue.is_shutdown
         self.expected_num_active_requests = self.executor_request_queue.get_expected_num_active_requests(
         )
 
-        return new_requests
+        validated_requests = [
+            request for request in new_requests_cur_rank
+            if not _respond_if_invalid(request)
+        ]
+
+        self.active_requests.extend(validated_requests)
+        return validated_requests
 
     def _add_kv_cache_events(self):
         kv_cache_manager = self.resource_manager.resource_managers.get(
@@ -1131,13 +1161,68 @@ class PyExecutor:
         # to be transferred to main thread when user needs them.
         kv_cache_manager.flush_iteration_events()
 
+    def _balance_adp_requests(self, context_requests: list[LlmRequest],
+                              generation_requests: list[LlmRequest]):
+        balanced_context_requests = context_requests
+        num_scheduled_context_requests = len(context_requests)
+        num_scheduled_generation_requests = len(generation_requests)
+        num_scheduled_tokens = sum(
+            [len(req.get_tokens(0))
+             for req in context_requests]) + num_scheduled_generation_requests
+        responses_list = self.dist.tp_allgather([
+            num_scheduled_context_requests, num_scheduled_generation_requests,
+            num_scheduled_tokens
+        ])
+        all_ranks_num_scheduled_context_requests = [
+            response[0] for response in responses_list
+        ]
+        all_ranks_num_scheduled_generation_requests = [
+            response[1] for response in responses_list
+        ]
+        all_ranks_have_free_ctx_slots = all([
+            num_gen < self.max_batch_size
+            for num_gen in all_ranks_num_scheduled_generation_requests
+        ])
+        all_ranks_have_ctx_requests = all([
+            num_ctx > 0 for num_ctx in all_ranks_num_scheduled_context_requests
+        ])
+        all_ranks_have_gen_requests = all([
+            num_gen > 0
+            for num_gen in all_ranks_num_scheduled_generation_requests
+        ])
+
+        if self.attention_dp_enable_balance:
+            # wait for all ranks have context requests
+            if all_ranks_have_free_ctx_slots and all_ranks_have_ctx_requests:
+                self.adp_ctx_waiting_iters_count = 0
+                # balance number of context requests across ranks
+                if all_ranks_have_gen_requests:
+                    if self.adp_ctx_batching_wait_iters_count < self.attention_dp_batching_wait_iters:
+                        self.adp_ctx_batching_wait_iters_count += 1
+                        balanced_context_requests = []
+                    else:
+                        self.adp_ctx_batching_wait_iters_count = 0
+            else:
+                self.adp_ctx_waiting_iters_count += 1
+                balanced_context_requests = []
+                timeout_reached = self.adp_ctx_waiting_iters_count >= self.attention_dp_time_out_iters
+                if timeout_reached or not all_ranks_have_gen_requests:
+                    self.adp_ctx_waiting_iters_count = 0
+                    balanced_context_requests = context_requests
+        return balanced_context_requests
+
     @nvtx_range("_schedule")
     def _schedule(self):
         scheduler_output = self.scheduler.schedule_request(
             self.active_requests, self.inflight_req_ids)
-        scheduled_requests = ScheduledRequests()
+        scheduled_context_requests = scheduler_output.context_requests
+        if self.enable_attention_dp and self.attention_dp_enable_balance:
+            scheduled_context_requests = self._balance_adp_requests(
+                scheduler_output.context_requests,
+                scheduler_output.generation_requests)
 
-        scheduled_requests.context_requests = scheduler_output.context_requests
+        scheduled_requests = ScheduledRequests()
+        scheduled_requests.context_requests = scheduled_context_requests
         scheduled_requests.generation_requests = scheduler_output.generation_requests
         scheduled_requests.paused_requests = scheduler_output.paused_requests
         return scheduled_requests, scheduler_output.fitting_disagg_gen_init_requests, scheduler_output.num_fitting_requests
@@ -1397,10 +1482,14 @@ class PyExecutor:
             logger.error(f"Encountered an error in sampling: {error_msg}")
             self._handle_errors(error_msg)
 
-    def _handle_errors(self, error_msg: Optional[str] = None):
-        error_responses = {}
+    def _handle_errors(self,
+                       error_msg: Optional[str] = None,
+                       *,
+                       requests: Optional[List[LlmRequest]] = None):
+        error_responses: Dict[int, LlmResponse] = {}
         error_msg = error_msg or "error"
-        for request in self.active_requests:
+        failed_requests = requests if requests is not None else self.active_requests
+        for request in failed_requests:
             req_id = request.py_request_id
             request.state = LlmRequestState.GENERATION_COMPLETE
             self._terminate_request(request)
@@ -1408,8 +1497,14 @@ class PyExecutor:
                 request_id=req_id,
                 error_msg=error_msg,
                 client_id=request.py_client_id)
-        self.active_requests.clear()
-        self._enqueue_responses(error_responses)
+        if requests is None:
+            self.active_requests.clear()
+        else:
+            self.active_requests = [
+                request for request in self.active_requests
+                if request not in requests
+            ]
+        self._enqueue_responses(error_responses.items())
 
     def _terminate_request(self, request: LlmRequest):
         self.resource_manager.free_resources(request)
@@ -1437,7 +1532,7 @@ class PyExecutor:
             self.executor_request_queue.clear_canceled_req_ids()
 
     @nvtx_range("_enqueue_responses")
-    def _enqueue_responses(self, responses: List[Tuple[int, LlmResponse]]):
+    def _enqueue_responses(self, responses: Iterable[Tuple[int, LlmResponse]]):
         if 0 not in self.dist.mapping.tp_group and not self.gather_all_responses:
             return
 

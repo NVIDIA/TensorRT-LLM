@@ -222,6 +222,21 @@ std::optional<executor::Result> LlmRequest::createResult(bool useFastLogits, int
     return result;
 }
 
+bool LlmRequest::checkTokenIdRange(SizeType32 vocabSize)
+{
+    TLLM_CHECK_WITH_INFO(!isContextFinished(), "not supported after prefill");
+
+    if (mSamplingConfig.beamWidth == 0)
+    {
+        return true;
+    }
+
+    // Before generation, all beams contain the same tokens
+    auto const& tokens = getTokens(0);
+    return std::all_of(
+        tokens.begin(), tokens.end(), [&vocabSize](auto const& token) { return token >= 0 && token < vocabSize; });
+}
+
 void LlmRequest::validate(SizeType32 maxInputLen, SizeType32 maxSequenceLen, SizeType32 maxDraftLen,
     SizeType32 vocabSizePadded, std::optional<SizeType32> maxEncoderInputLen, bool enableKVCacheReuse)
 {
