@@ -987,7 +987,7 @@ class PyTorchModelEngine(ModelEngine):
         assert attn_metadata.is_cuda_graph
 
         spec_metadata = None
-        if self.is_spec_decode:
+        if self.enable_spec_decode:
             spec_metadata = self.spec_metadata.create_cuda_graph_metadata(
                 num_sequences_in_batch)
             spec_metadata.draft_tokens = self.draft_tokens_cuda
