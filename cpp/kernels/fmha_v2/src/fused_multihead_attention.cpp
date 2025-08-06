@@ -1578,7 +1578,7 @@ int main(int argc, char** argv)
                     }
                     else
                     {
-                        valid = valid && (si >= std::max(int(so - sliding_window_size), 0));
+                        valid = valid && (si >= std::max(int(so + 1 - sliding_window_size), 0));
                     }
                 }
                 if (is_mtp)

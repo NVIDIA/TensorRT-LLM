@@ -23,3 +23,6 @@
 [submodule "3rdparty/nanobind"]
 	path = 3rdparty/nanobind
 	url = https://github.com/wjakob/nanobind
+[submodule "3rdparty/cppzmq"]
+	path = 3rdparty/cppzmq
+	url = https://github.com/zeromq/cppzmq.git

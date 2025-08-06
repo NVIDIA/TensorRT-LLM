@@ -784,17 +784,37 @@ def main(*,
 
 
 def add_arguments(parser: ArgumentParser):
-    parser.add_argument("--build_type",
-                        "-b",
-                        default="Release",
-                        choices=["Release", "RelWithDebInfo", "Debug"])
-    parser.add_argument("--generator", "-G", default="")
-    parser.add_argument("--cuda_architectures", "-a")
-    parser.add_argument("--install", "-i", action="store_true")
-    parser.add_argument("--clean", "-c", action="store_true")
-    parser.add_argument("--clean_wheel",
+    parser.add_argument(
+        "--build_type",
+        "-b",
+        default="Release",
+        choices=["Release", "RelWithDebInfo", "Debug"],
+        help="Build type, will be passed to cmake `CMAKE_BUILD_TYPE` variable")
+    parser.add_argument(
+        "--generator",
+        "-G",
+        default="",
+        help="CMake generator to use (e.g., 'Ninja', 'Unix Makefiles')")
+    parser.add_argument(
+        "--cuda_architectures",
+        "-a",
+        help=
+        "CUDA architectures to build for, will be passed to cmake `CUDA_ARCHITECTURES` variable. Example: `--cuda_architectures=90-real;100-real`"
+    )
+    parser.add_argument("--install",
+                        "-i",
                         action="store_true",
-                        help="Clear dist_dir folder creating wheel")
+                        help="Install the built python package after building")
+    parser.add_argument("--clean",
+                        "-c",
+                        action="store_true",
+                        help="Clean the build directory before building")
+    parser.add_argument(
+        "--clean_wheel",
+        action="store_true",
+        help=
+        "Clear dist_dir folder when creating wheel. Will be set to `true` if `--clean` is set"
+    )
     parser.add_argument("--configure_cmake",
                         action="store_true",
                         help="Always configure cmake before building")
@@ -802,7 +822,7 @@ def add_arguments(parser: ArgumentParser):
                         "-ccache",
                         default=False,
                         action="store_true",
-                        help="Use ccache compiler driver")
+                        help="Use ccache compiler driver for faster rebuilds")
     parser.add_argument(
         "--fast_build",
         "-f",
@@ -811,11 +831,14 @@ def add_arguments(parser: ArgumentParser):
         help=
         "Skip compiling some kernels to accelerate compilation -- for development only"
     )
-    parser.add_argument("--job_count",
-                        "-j",
-                        const=cpu_count(),
-                        nargs="?",
-                        help="Parallel job count")
+    parser.add_argument(
+        "--job_count",
+        "-j",
+        const=cpu_count(),
+        nargs="?",
+        help=
+        "Number of parallel jobs for compilation (default: number of CPU cores)"
+    )
     parser.add_argument(
         "--cpp_only",
         "-l",
@@ -826,72 +849,78 @@ def add_arguments(parser: ArgumentParser):
         "-D",
         action="append",
         help=
-        "Extra cmake variable definition which can be specified multiple times, example: -D \"key1=value1\" -D \"key2=value2\"",
+        "Extra cmake variable definitions which can be specified multiple times. Example: -D \"key1=value1\" -D \"key2=value2\"",
         default=[])
     parser.add_argument(
         "--extra-make-targets",
-        help="A list of additional make targets, example: \"target_1 target_2\"",
+        help="Additional make targets to build. Example: \"target_1 target_2\"",
         nargs="+",
         default=[])
-    parser.add_argument("--trt_root",
-                        default="/usr/local/tensorrt",
-                        help="Directory to find TensorRT headers/libs")
+    parser.add_argument(
+        "--trt_root",
+        default="/usr/local/tensorrt",
+        help="Directory containing TensorRT headers and libraries")
     parser.add_argument("--nccl_root",
-                        help="Directory to find NCCL headers/libs")
+                        help="Directory containing NCCL headers and libraries")
     parser.add_argument("--nixl_root",
-                        help="Directory to find NIXL headers/libs")
+                        help="Directory containing NIXL headers and libraries")
     parser.add_argument(
         "--internal-cutlass-kernels-root",
         default="",
         help=
-        "Directory to the internal_cutlass_kernels sources. If specified, the internal_cutlass_kernels and NVRTC wrapper libraries will be built from source."
+        "Directory containing internal_cutlass_kernels sources. If specified, the internal_cutlass_kernels and NVRTC wrapper libraries will be built from source."
     )
-    parser.add_argument("--build_dir",
-                        type=Path,
-                        help="Directory where cpp sources are built")
-    parser.add_argument("--dist_dir",
-                        type=Path,
-                        help="Directory where python wheels are built")
+    parser.add_argument(
+        "--build_dir",
+        type=Path,
+        help=
+        "Directory where C++ sources are built (default: cpp/build or cpp/build_<build_type>)"
+    )
+    parser.add_argument(
+        "--dist_dir",
+        type=Path,
+        help="Directory where Python wheels are built (default: build/)")
     parser.add_argument(
         "--skip_building_wheel",
         "-s",
         action="store_true",
         help=
-        "Do not build the *.whl files (they are only needed for distribution).")
+        "Skip building the *.whl files (they are only needed for distribution)")
     parser.add_argument(
         "--linking_install_binary",
         action="store_true",
-        help="Install the built binary by symbolic linking instead of copying.")
+        help=
+        "Install the built binary by creating symbolic links instead of copying files"
+    )
     parser.add_argument("--binding_type",
                         choices=["pybind", "nanobind"],
                         default="pybind",
-                        help="Which binding type to build: pybind, nanobind")
+                        help="Which binding type to build: pybind or nanobind")
     parser.add_argument("--benchmarks",
                         action="store_true",
-                        help="Build the benchmarks for the C++ runtime.")
+                        help="Build the benchmarks for the C++ runtime")
     parser.add_argument("--micro_benchmarks",
                         action="store_true",
-                        help="Build the micro benchmarks for C++ components.")
+                        help="Build the micro benchmarks for C++ components")
     parser.add_argument("--nvtx",
                         action="store_true",
-                        help="Enable NVTX features.")
+                        help="Enable NVTX profiling features")
     parser.add_argument("--skip-stubs",
                         action="store_true",
-                        help="Skip building python stubs")
+                        help="Skip building Python type stubs")
     parser.add_argument("--generate_fmha",
                         action="store_true",
-                        help="Generate the FMHA cu files.")
+                        help="Generate the FMHA CUDA files")
     parser.add_argument(
         "--no-venv",
         action="store_true",
         help=
-        "Use the current Python interpreter without creating a virtual environment."
+        "Use the current Python interpreter without creating a virtual environment"
     )
     parser.add_argument(
         "--nvrtc_dynamic_linking",
         action="store_true",
-        help="Link against the dynamic NVRTC libraries and not the static ones."
-    )
+        help="Link against dynamic NVRTC libraries instead of static ones")
 
 
 if __name__ == "__main__":

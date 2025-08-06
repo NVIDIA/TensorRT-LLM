@@ -850,7 +850,7 @@ def collectTestResults(pipeline, testFilter)
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "apk add py3-pip")
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 config set global.break-system-packages true")
             sh """
-                python3 llm/jenkins/test_rerun.py \
+                python3 llm/jenkins/scripts/test_rerun.py \
                 generate_rerun_report \
                 --output-file=rerun/rerun_report.xml \
                 --input-files=${inputfiles}

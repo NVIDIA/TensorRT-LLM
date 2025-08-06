@@ -4,7 +4,7 @@ import asyncio
 import time
 from contextlib import asynccontextmanager
 from itertools import chain
-from typing import List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import tqdm
 from zmq import PUSH
@@ -36,21 +36,14 @@ class LlmManager:
         self._stop = asyncio.Event()
         self._running = asyncio.Event()
         self._tasks: Set[asyncio.Task] = set()
-        self._backend_task = None
-        self._iteration_log_task = None
+        self._task_errors: List[BaseException] = []
+        self._backend_task: Optional[asyncio.Task] = None
+        self._iteration_log_task: Optional[asyncio.Task] = None
         self._concurrency_semaphore = asyncio.Semaphore(
             concurrency) if concurrency > 0 else None
         self.streaming = streaming
         self.request_seen = asyncio.Event()
         self.modality = modality
-
-    def _task_done_callback(self, task: asyncio.Task) -> None:
-        self._tasks.discard(task)
-        if task.exception() is not None and not self._stop.is_set():
-            logger.error(
-                f"Stopping benchmarking due to following exception raised during inference: {task.exception()}"
-            )
-            self.stop()
 
     async def process_request(self, request: InferenceRequest,
                               sampling_params: SamplingParams,
@@ -59,62 +52,93 @@ class LlmManager:
         self.request_seen.set()
         sampling_params.max_tokens = request.output_tokens
 
-        try:
-            async with semaphore_guard(self._concurrency_semaphore):
-                request_start_timestamp = time.perf_counter_ns()
-                time_on_first_token = None
-                # Schedule the request in the LLM API (asynchronously)
-                logger.debug(f"request.lora_request: {request.lora_request}")
-                output: RequestOutput = self.llm.generate_async(
-                    request.input_ids
-                    if self.modality is None else request.prompt,
-                    sampling_params=sampling_params,
-                    _postproc_params=post_proc_params,
-                    streaming=self.streaming,
-                    lora_request=request.lora_request)
-                if self.streaming:
-                    async for stream_output in output:
-                        if time_on_first_token is None:
-                            time_on_first_token = time.perf_counter_ns()
-                            response = stream_output
-                else:
-                    # Wait for the response to return to us.
-                    response: RequestOutput = await output.aresult()
+        async with semaphore_guard(self._concurrency_semaphore):
+            request_start_timestamp = time.perf_counter_ns()
+            time_on_first_token = None
+            # Schedule the request in the LLM API (asynchronously)
+            logger.debug(f"request.lora_request: {request.lora_request}")
+            output: RequestOutput = self.llm.generate_async(
+                request.input_ids if self.modality is None else request.prompt,
+                sampling_params=sampling_params,
+                _postproc_params=post_proc_params,
+                streaming=self.streaming,
+                lora_request=request.lora_request)
+            if self.streaming:
+                async for stream_output in output:
+                    if time_on_first_token is None:
+                        time_on_first_token = time.perf_counter_ns()
+                        response = stream_output
+            else:
+                # Wait for the response to return to us.
+                response: RequestOutput = await output.aresult()
 
-            response_end_timestamp = time.perf_counter_ns()
+        response_end_timestamp = time.perf_counter_ns()
 
-            # Mark that the response returned. Construct a record to send to statistics.
-            tokens = list(chain(*[beam.token_ids for beam in response.outputs]))
-            request_perf_item = PerfItemTuple(
-                start_timestamp=request_start_timestamp,
-                end_timestamp=response_end_timestamp,
-                request_id=response.id,
-                num_input_tokens=len(output.prompt_token_ids),
-                response_is_final=response.finished,
-                error=False,
-                tokens=tokens,
-                decoding_iteration=response.decoding_iter,
-                time_on_first_token=time_on_first_token,
-            )
+        # Mark that the response returned. Construct a record to send to statistics.
+        tokens = list(chain(*(beam.token_ids for beam in response.outputs)))
+        request_perf_item = PerfItemTuple(
+            start_timestamp=request_start_timestamp,
+            end_timestamp=response_end_timestamp,
+            request_id=response.id,
+            num_input_tokens=len(output.prompt_token_ids),
+            response_is_final=response.finished,
+            error=False,
+            tokens=tokens,
+            decoding_iteration=response.decoding_iter,
+            time_on_first_token=time_on_first_token,
+        )
 
-            # Register the new request perf items in the outbound queue for statistics keeping
-            await self._outbox.put(request_perf_item)
-        except asyncio.CancelledError:
-            pass
+        # Register the new request perf items in the outbound queue for statistics keeping
+        await self._outbox.put(request_perf_item)
+
+    def _raise_for_failed_tasks(self):
+        if not self._task_errors:
+            return
+
+        error_counts: Dict[str, int] = {}
+        for error in self._task_errors:
+            error_str = str(error)
+            error_counts[error_str] = error_counts.get(error_str, 0) + 1
+
+        task_errors_str = ", ".join(f"{error} ({count} requests)"
+                                    for error, count in error_counts.items())
+        raise ValueError(f"Requests failed: {task_errors_str}")
+
+    def _task_done_callback(self, task: asyncio.Task):
+        self._tasks.discard(task)
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            self._task_errors.append(error)
 
     async def worker(self) -> None:
-        while not self._stop.is_set():
-            try:
-                request, sampling_params, post_proc_params = await self._inbox.get(
-                )
+        try:
+            while not self._stop.is_set():
+                self._raise_for_failed_tasks()
+                try:
+                    request, sampling_params, post_proc_params = self._inbox.get_nowait(
+                    )
+                except asyncio.QueueEmpty:
+                    await asyncio.sleep(0)  # yield to concurrent tasks
+                    continue
                 task = asyncio.create_task(
                     self.process_request(request,
                                          sampling_params=sampling_params,
                                          post_proc_params=post_proc_params))
-                self._tasks.add(task)
                 task.add_done_callback(self._task_done_callback)
-            except asyncio.CancelledError:
-                logger.info("Worker task cancelled.")
+                self._tasks.add(task)
+            logger.debug("Worker task finishing...")
+        except asyncio.CancelledError:
+            logger.info("Worker task cancelled.")
+        finally:
+            logger.debug("Worker task cancelling remaining requests...")
+            for task in self._tasks:
+                task.cancel()
+            logger.debug("Waiting for requests...")
+            if self._tasks:
+                await asyncio.wait(self._tasks)
+            self._raise_for_failed_tasks()
 
     # This asynchronous function acts as a worker that logs iteration statistics.
     # It connects to a given address using a PUSH socket and sends JSON-encoded
@@ -167,25 +191,24 @@ class LlmManager:
 
         logger.info("Iteration log worker exiting.")
 
-    def stop(self) -> None:
+    async def stop(self) -> None:
         logger.info("Stopping LLM backend.")
         self._stop.set()
-        logger.info(f"Cancelling all {len(self._tasks)} tasks to complete.")
-        for task in self._tasks:
-            task.cancel()
-        logger.info("All tasks cancelled.")
         if self._iteration_log_task:
-            asyncio.gather(self._iteration_log_task)
+            await self._iteration_log_task
+        assert self._backend_task is not None
+        await self._backend_task
         logger.info("LLM Backend stopped.")
 
     @property
     def busy(self) -> bool:
-        return bool(self._tasks)
+        return not self._inbox.empty() or any(not task.done()
+                                              for task in self._tasks)
 
     def run(self, iteration_addr: str = None) -> None:
         self._backend_task = asyncio.create_task(self.worker())
         if iteration_addr is not None:
-            self._iteration_task = asyncio.create_task(
+            self._iteration_log_task = asyncio.create_task(
                 self.iteration_worker(iteration_addr))
 
     async def enqueue(self, request: InferenceRequest,
@@ -237,13 +260,14 @@ async def async_benchmark(
     statistics = StatsKeeper()
     submit_finished = asyncio.Event()
 
+    logger.info("Starting benchmarking async task.")
+    backend = LlmManager(llm,
+                         outbox,
+                         streaming,
+                         concurrency=concurrency,
+                         modality=modality)
+    enqueue_task: Optional[asyncio.Task] = None
     try:
-        logger.info("Starting benchmarking async task.")
-        backend = LlmManager(llm,
-                             outbox,
-                             streaming,
-                             concurrency=concurrency,
-                             modality=modality)
         backend.run(iteration_addr=iteration_log_addr)
 
         enqueue_task = asyncio.create_task(
@@ -270,7 +294,8 @@ async def async_benchmark(
 
         return statistics
 
-    except asyncio.CancelledError:
-        enqueue_task.cancel()
     finally:
-        backend.stop()
+        if enqueue_task is not None and not enqueue_task.done():
+            enqueue_task.cancel()
+            await enqueue_task
+        await backend.stop()

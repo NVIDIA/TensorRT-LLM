@@ -75,11 +75,11 @@ Welcome to TensorRT-LLM's Documentation!
 .. toctree::
    :maxdepth: 2
    :caption: Command-Line Reference
-   :hidden:
+   :name: Command-Line Reference
 
    commands/trtllm-bench
    commands/trtllm-build
-   commands/trtllm-serve
+   commands/trtllm-serve/index
 
 
 .. toctree::

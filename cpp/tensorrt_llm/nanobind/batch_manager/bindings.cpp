@@ -187,6 +187,8 @@ void initBindings(nb::module_& m)
         .def_prop_ro("missed_blocks", &GenLlmReq::getMissedBlocksPerRequest)
         .def_prop_ro("kv_cache_hit_rate", &GenLlmReq::getKVCacheHitRatePerRequest)
         .def_prop_ro("llm_request_type", &GenLlmReq::getLlmRequestType)
+        .def_prop_ro("parent_request_id", &GenLlmReq::getParentRequestId)
+        .def_prop_ro("is_child", &GenLlmReq::isChild)
         .def_prop_ro("multimodal_hashes",
             [](GenLlmReq& self)
             {
@@ -351,11 +353,14 @@ void initBindings(nb::module_& m)
             nb::arg("return_perf_metrics") = false, nb::arg("guided_decoding_params") = std::nullopt,
             nb::arg("language_adapter_uid") = std::nullopt, nb::arg("allotted_time_ms") = std::nullopt,
             nb::arg("context_phase_params") = std::nullopt)
+        .def("check_token_id_range", &tb::LlmRequest::checkTokenIdRange, nb::arg("vocab_size"))
+        .def(nb::init<tb::LlmRequest const&>())
         .def("validate", &tb::LlmRequest::validate, nb::arg("max_input_len"), nb::arg("max_seq_len"),
             nb::arg("max_draft_len"), nb::arg("vocab_size_padded"), nb::arg("max_endocer_input_len") = std::nullopt,
             nb::arg("enable_kv_cache_reuse") = false)
         .def("create_response", &tb::LlmRequest::createResponse, nb::arg("use_fast_logits") = false,
             nb::arg("mpi_world_rank") = 0)
+        .def("create_child_request", &tb::LlmRequest::createChildRequest, nb::arg("child_id"))
         .def("create_result", &tb::LlmRequest::createResult, nb::arg("use_fast_logits") = false,
             nb::arg("mpi_world_rank") = 0)
         .def("create_serialized_result",

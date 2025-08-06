@@ -391,6 +391,58 @@ class TorchSampler(Sampler):
             d2t = model_outputs["d2t"][tokens]
             tokens += d2t
 
+    @staticmethod
+    def _apply_embedding_bias(
+            logits: torch.Tensor,
+            requests: list[LlmRequest],
+            steps_per_request: list[int] = None) -> torch.Tensor:
+        """Apply embedding bias (aka logit bias) to logits.
+        If steps_per_request is None, assumes 1 step per request (non-batched path).
+        """
+        # Collect biases and their associated data
+        bias_list = []
+        bias_data = []  # Either indices (fast path) or steps (batched path)
+
+        for i, req in enumerate(requests):
+            bias = req._py_embedding_bias_1d
+            if bias is not None:
+                bias_list.append(bias)
+                bias_data.append(i if steps_per_request is
+                                 None else steps_per_request[i])
+
+        if not bias_list:
+            return logits
+
+        bias_tensor = torch.stack(bias_list).to(logits.device,
+                                                non_blocking=True)
+        logits = logits.clone()
+
+        if steps_per_request is None:
+            # Fast path: direct indexing
+            indices = torch.tensor(bias_data, device=logits.device)
+            logits[indices] += bias_tensor
+        else:
+            # Batched path: expand biases and use boolean mask
+            expanded_biases = torch.repeat_interleave(bias_tensor,
+                                                      torch.tensor(
+                                                          bias_data,
+                                                          device=logits.device),
+                                                      dim=0)
+
+            mask = torch.zeros(sum(steps_per_request),
+                               dtype=torch.bool,
+                               device=logits.device)
+            offset = 0
+            for i, req in enumerate(requests):
+                steps = steps_per_request[i]
+                if req._py_embedding_bias_1d is not None:
+                    mask[offset:offset + steps] = True
+                offset += steps
+
+            logits[mask] += expanded_biases
+
+        return logits
+
     def _process_requests(self,
                           requests: list[LlmRequest],
                           model_outputs: dict[str, torch.Tensor],
@@ -411,6 +463,7 @@ class TorchSampler(Sampler):
 
         if fast_path:
             logits = raw_logits[:len(requests)]
+            logits = self._apply_embedding_bias(logits, requests)
             next_tokens = torch.argmax(logits, dim=-1)
             self.append_eagle3(next_tokens, model_outputs)
             int_next_tokens = next_tokens.to(torch.int, non_blocking=True)
@@ -430,17 +483,29 @@ class TorchSampler(Sampler):
 
         if batched_strategy is not None:
             logits = raw_logits[:sum_steps]
+            # Collect steps per request for batched strategy
+            steps_per_request = [
+                1 + len(req.py_draft_tokens) for req in requests
+            ]
+            logits = self._apply_embedding_bias(logits, requests,
+                                                steps_per_request)
             batched_next_tokens, batched_softmax = sample(
                 batched_strategy, logits)
             self.append_eagle3(batched_next_tokens, model_outputs)
 
         offset = 0
-        for strategy, slot, steps in zip(strategies, seq_slots, num_steps):
+        for i, (strategy, slot,
+                steps) in enumerate(zip(strategies, seq_slots, num_steps)):
             input_slice = slice(offset, offset + steps)
             logits = raw_logits[input_slice]
+
+            req = requests[i]
+
             if batched_next_tokens is None:
+                logits = self._apply_embedding_bias(logits, [req])
                 next_tokens, softmax = sample(strategy, logits)
             else:
+                # Batched processing already applied bias, just use the results
                 next_tokens = batched_next_tokens[input_slice]
                 softmax = batched_softmax[input_slice]
             current_slice = slice(0, steps), slot, beam

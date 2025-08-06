@@ -40,28 +40,37 @@ if get_sm_version() >= 103:
 def test_llm_exaone_1gpu(data_type, exaone_example_root, llm_exaone_model_root,
                          llama_example_root, llm_datasets_root, llm_rouge_root,
                          llm_venv, cmodel_dir, engine_dir, num_beams,
-                         use_weight_only):
+                         use_weight_only, timeout_manager):
 
     print("Build engines...")
     model_name = "exaone"
-    model_dir = convert_weights(
-        llm_venv=llm_venv,
-        # NOTE
-        # EXAONE is based on llama so reuse llama's checkpoint converter
-        example_root=llama_example_root,
-        cmodel_dir=cmodel_dir,
-        model=model_name,
-        model_path=llm_exaone_model_root,
-        data_type=data_type,
-        use_weight_only=use_weight_only)
 
-    build_cmd = [
-        "trtllm-build",
-        f"--checkpoint_dir={model_dir}",
-        f"--output_dir={engine_dir}",
-        f"--max_beam_width={num_beams}",
-    ]
-    check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
+    # Convert weights with timeout management
+    with timeout_manager.timed_operation("convert"):
+        model_dir = convert_weights(
+            llm_venv=llm_venv,
+            # NOTE
+            # EXAONE is based on llama so reuse llama's checkpoint converter
+            example_root=llama_example_root,
+            cmodel_dir=cmodel_dir,
+            model=model_name,
+            model_path=llm_exaone_model_root,
+            data_type=data_type,
+            use_weight_only=use_weight_only,
+            timeout=timeout_manager.remaining_timeout)
+
+    # Build engines with timeout management
+    with timeout_manager.timed_operation("build"):
+        build_cmd = [
+            "trtllm-build",
+            f"--checkpoint_dir={model_dir}",
+            f"--output_dir={engine_dir}",
+            f"--max_beam_width={num_beams}",
+        ]
+        check_call(" ".join(build_cmd),
+                   shell=True,
+                   env=llm_venv._new_env,
+                   timeout=timeout_manager.remaining_timeout)
 
     rouge1_threshold = {
         1: 22,
@@ -69,6 +78,7 @@ def test_llm_exaone_1gpu(data_type, exaone_example_root, llm_exaone_model_root,
         4: 23,
     }[num_beams]
 
+    # Run summary with timeout management
     print("Run summarize...")
     summary_cmd = generate_summary_cmd(
         exaone_example_root,
@@ -82,7 +92,10 @@ def test_llm_exaone_1gpu(data_type, exaone_example_root, llm_exaone_model_root,
         num_beams=num_beams,
     )
 
-    venv_check_call(llm_venv, summary_cmd)
+    with timeout_manager.timed_operation("summary"):
+        venv_check_call(llm_venv,
+                        summary_cmd,
+                        timeout=timeout_manager.remaining_timeout)
 
 
 @pytest.mark.skip_less_device(2)
@@ -94,29 +107,40 @@ def test_llm_exaone_1gpu(data_type, exaone_example_root, llm_exaone_model_root,
                          indirect=True)
 def test_llm_exaone_2gpu(data_type, exaone_example_root, llm_exaone_model_root,
                          llama_example_root, llm_datasets_root, llm_rouge_root,
-                         llm_venv, cmodel_dir, engine_dir, num_beams):
+                         llm_venv, cmodel_dir, engine_dir, num_beams,
+                         timeout_manager):
 
     tp_size = 2
     print("Build engines...")
     model_name = "exaone"
-    model_dir = convert_weights(
-        llm_venv=llm_venv,
-        # NOTE
-        # EXAONE is based on llama so reuse llama's checkpoint converter
-        example_root=llama_example_root,
-        cmodel_dir=cmodel_dir,
-        model=model_name,
-        model_path=llm_exaone_model_root,
-        data_type=data_type,
-        tp_size=tp_size,
-        pp_size=1)
 
-    build_cmd = [
-        "trtllm-build", f"--checkpoint_dir={model_dir}",
-        f"--output_dir={engine_dir}", f"--max_beam_width={num_beams}"
-    ]
-    check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
+    # Convert weights with timeout management
+    with timeout_manager.timed_operation("convert"):
+        model_dir = convert_weights(
+            llm_venv=llm_venv,
+            # NOTE
+            # EXAONE is based on llama so reuse llama's checkpoint converter
+            example_root=llama_example_root,
+            cmodel_dir=cmodel_dir,
+            model=model_name,
+            model_path=llm_exaone_model_root,
+            data_type=data_type,
+            tp_size=tp_size,
+            pp_size=1,
+            timeout=timeout_manager.remaining_timeout)
 
+    # Build engines with timeout management
+    with timeout_manager.timed_operation("build"):
+        build_cmd = [
+            "trtllm-build", f"--checkpoint_dir={model_dir}",
+            f"--output_dir={engine_dir}", f"--max_beam_width={num_beams}"
+        ]
+        check_call(" ".join(build_cmd),
+                   shell=True,
+                   env=llm_venv._new_env,
+                   timeout=timeout_manager.remaining_timeout)
+
+    # Run summary with timeout management
     print("Run summarize...")
     summary_cmd = generate_summary_cmd(
         exaone_example_root,
@@ -130,6 +154,8 @@ def test_llm_exaone_2gpu(data_type, exaone_example_root, llm_exaone_model_root,
         num_beams=num_beams,
     )
 
-    venv_mpi_check_call(llm_venv,
-                        ["mpirun", "-n", f"{tp_size}", "--allow-run-as-root"],
-                        summary_cmd)
+    with timeout_manager.timed_operation("summary"):
+        venv_mpi_check_call(
+            llm_venv, ["mpirun", "-n", f"{tp_size}", "--allow-run-as-root"],
+            summary_cmd,
+            timeout=timeout_manager.remaining_timeout)

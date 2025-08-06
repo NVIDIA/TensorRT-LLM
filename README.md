@@ -9,7 +9,7 @@ TensorRT-LLM
 [![python](https://img.shields.io/badge/python-3.10-green)](https://www.python.org/downloads/release/python-31012/)
 [![cuda](https://img.shields.io/badge/cuda-12.9.1-green)](https://developer.nvidia.com/cuda-downloads)
 [![trt](https://img.shields.io/badge/TRT-10.11.0-green)](https://developer.nvidia.com/tensorrt)
-[![version](https://img.shields.io/badge/release-1.0.0rc5-green)](./tensorrt_llm/version.py)
+[![version](https://img.shields.io/badge/release-1.0.0rc6-green)](./tensorrt_llm/version.py)
 [![license](https://img.shields.io/badge/license-Apache%202-blue)](./LICENSE)
 
 [Architecture](./docs/source/torch/arch_overview.md)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Performance](./docs/source/performance/perf-overview.md)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Examples](https://nvidia.github.io/TensorRT-LLM/quick-start-guide.html)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Documentation](./docs/source/)&nbsp;&nbsp;&nbsp;|&nbsp;&nbsp;&nbsp;[Roadmap](https://github.com/NVIDIA/TensorRT-LLM/issues?q=is%3Aissue%20state%3Aopen%20label%3Aroadmap)
@@ -18,12 +18,15 @@ TensorRT-LLM
 <div align="left">
 
 ## Tech Blogs
+* [08/06] Running a High Performance GPT-OSS-120B Inference Server with TensorRT-LLM
+✨ [➡️ link](./docs/source/blogs/tech_blog/blog9_Deploying_GPT_OSS_on_TRTLLM.md)
+
 
 * [08/01] Scaling Expert Parallelism in TensorRT-LLM (Part 2: Performance Status and Optimization)
 ✨ [➡️ link](./docs/source/blogs/tech_blog/blog8_Scaling_Expert_Parallelism_in_TensorRT-LLM_part2.md)
 
 * [07/26] N-Gram Speculative Decoding in TensorRT‑LLM
-✨ [➡️ link](./docs/source/blogs/tech_blog/blog_7_NGram_performance_Analysis_And_Auto_Enablement.md)
+✨ [➡️ link](./docs/source/blogs/tech_blog/blog7_NGram_performance_Analysis_And_Auto_Enablement.md)
 
 * [06/19] Disaggregated Serving in TensorRT-LLM
 ✨ [➡️ link](./docs/source/blogs/tech_blog/blog5_Disaggregated_Serving_in_TensorRT-LLM.md)

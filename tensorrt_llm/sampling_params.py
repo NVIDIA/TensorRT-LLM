@@ -2,7 +2,7 @@ import json
 import os
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field, fields
-from typing import Dict, List, NamedTuple, Optional, Tuple, Union
+from typing import List, NamedTuple, Optional, Tuple, Union
 
 import torch
 from pydantic import BaseModel
@@ -106,55 +106,6 @@ class BatchedLogitsProcessor(ABC):
             client_ids (List[Optional[int]]): A batch of optional client ids.
         """
         pass  # noqa
-
-
-class LogitBiasLogitsProcessor(LogitsProcessor):
-    def __init__(self, logit_bias: Dict[str, float]) -> None:
-        super().__init__()
-        self.logit_bias = logit_bias
-        self.tokens_to_adjust = self.process_logit_bias(logit_bias)
-        if not self.tokens_to_adjust:
-            raise ValueError("Empty logit_bias provided - no tokens to adjust")
-
-    def process_logit_bias(self, logit_bias: Dict[str, float]) -> Dict[int, float]:
-        valid = {}
-        invalid = {}
-
-        for k, v in logit_bias.items():
-            try:
-                token_id = int(k)
-                valid[token_id] = v
-            except (ValueError, TypeError):
-                invalid[k] = v
-
-        if invalid:
-            raise ValueError(
-                f"Invalid token_ids in logit_bias: {list(invalid.keys())}. "
-                f"All keys must be integers."
-            )
-        return valid
-
-    def __call__(
-        self,
-        req_id: int,
-        logits: torch.Tensor,
-        token_ids: List[List[int]],
-        stream_ptr: Optional[int],
-        client_id: Optional[int],
-    ) -> None:
-        vocab_size = logits.size(-1)
-        token_ids_list = list(self.tokens_to_adjust.keys())
-        bias_values = torch.tensor(list(self.tokens_to_adjust.values()), device=logits.device)
-
-        invalid_token_ids = [tid for tid in token_ids_list if tid >= vocab_size]
-        if invalid_token_ids:
-            raise ValueError(
-                f"Token ID(s) {invalid_token_ids} exceed vocabulary size (vocab_size={vocab_size})"
-            )
-
-        stream = None if stream_ptr is None else torch.cuda.ExternalStream(stream_ptr)
-        with torch.cuda.stream(stream):
-            logits[:, :, token_ids_list] += bias_values
 
 
 @dataclass(slots=True, kw_only=True)
@@ -327,6 +278,12 @@ class SamplingParams:
             self.pad_id = self.end_id
 
         self.best_of = self.best_of or self.n
+
+        if self.embedding_bias is not None:
+            if isinstance(self.embedding_bias, torch.Tensor):
+                self.embedding_bias = self.embedding_bias.detach().clone()
+            else:
+                self.embedding_bias = torch.tensor(self.embedding_bias, dtype=torch.float32)
 
         self._validate()
 

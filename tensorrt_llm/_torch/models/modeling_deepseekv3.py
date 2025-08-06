@@ -25,6 +25,7 @@
 # SOFTWARE.
 # --------------------------------------------------
 
+import copy
 import math
 import os
 import warnings
@@ -1105,6 +1106,18 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
                                                     PretrainedConfig]):
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
+        # Rename some keys of quant_config_dict to support legacy checkpoints
+        if model_config.quant_config_dict is not None:
+            model_config = copy.deepcopy(model_config)
+            quant_config_dict = {}
+            for key, val in model_config.quant_config_dict.items():
+                key_split = key.split(".")
+                if key_split[-1] == "fused_a":
+                    key = ".".join(key_split[:-1] + ["kv_a_proj_with_mqa"])
+                quant_config_dict[key] = val
+            model_config._frozen = False
+            model_config.quant_config_dict = quant_config_dict
+            model_config._frozen = True
         super().__init__(DeepseekV3Model(model_config),
                          config=model_config,
                          hidden_size=model_config.pretrained_config.hidden_size,
