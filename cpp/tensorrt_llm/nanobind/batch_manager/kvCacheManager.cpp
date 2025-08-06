@@ -326,8 +326,8 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
 
     nb::class_<tbk::KVCacheEventManager>(m, "KVCacheEventManager")
         .def(nb::init<size_t, std::optional<SizeType32>, std::optional<SizeType32>, SizeType32>(),
-            nb::arg("max_kv_event_entries"), nb::arg("attention_dp_rank"), nb::arg("attention_dp_size"),
-            nb::arg("attention_dp_events_gather_period_ms"));
+            nb::arg("max_kv_event_entries"), nb::arg("attention_dp_rank") = std::nullopt,
+            nb::arg("attention_dp_size") = std::nullopt, nb::arg("attention_dp_events_gather_period_ms") = 5);
 
     nb::class_<tbk::BaseKVCacheManager, PyKvCacheManager>(m, "BaseKVCacheManager")
         .def_static("calculate_max_num_blocks", &tbk::BaseKVCacheManager::calculateMaxNumBlocks, nb::arg("config"),
