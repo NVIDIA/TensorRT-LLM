@@ -169,15 +169,28 @@ def allgather(
     if mapping.tp_size == 1:
         return input
 
+    print(f"[DEBUG] allgather - input shape: {mapping.tp_group}")
+    print(f"[DEBUG] allgather - input shape: {mapping}")
     if sizes is not None:
         assert len(sizes) == len(mapping.tp_group)
         if isinstance(input, torch.Tensor):
             assert input.shape[dim] == sizes[mapping.tp_rank]
         else:
-            assert all([
-                val.shape[dim] == sizes[mapping.tp_rank] for val in input
-                if val is not None
-            ])
+            for val in input:
+                if val is not None:
+                    print(f"[DEBUG] allgather - val shape: {val.shape}, dtype: {val.dtype}")
+                    print(f"[DEBUG] allgather - val shape: {val.shape[dim]}, dtype: {val.dtype}")
+                    print(f"[DEBUG] allgather - sizes[mapping.tp_rank]: {sizes[mapping.tp_rank]}")
+            if os.environ.get("ENABLE_TRTLLM_SPLIT_BATCH_OVERLAP", "0") == "1":
+                assert all([
+                    val.shape[dim] == sizes[mapping.tp_rank] / 2 for val in input
+                    if val is not None
+                ])
+            else:
+                assert all([
+                    val.shape[dim] == sizes[mapping.tp_rank] for val in input
+                    if val is not None
+                ])
 
     # Inputs are reshaped in this way to pass necessary shape information to the allgather op
     if isinstance(input, torch.Tensor):
@@ -192,7 +205,10 @@ def allgather(
             val.contiguous().view(-1, val_info['numel_base'])
             for val, val_info in zip(input, output_info)
         ]
-
+    for val in input:
+        print(f"[DEBUG] allgather - input shape: {val.shape}")
+    for size in sizes:
+        print(f"[DEBUG] allgather - size: {size}")
     output = torch_op(
         input,
         sizes,
@@ -546,7 +562,7 @@ class MoEAllReduce(nn.Module):
                 hidden_states: hidden_states of the model
                 residual: residual tensor
             """
-
+            print(f"[DEBUG] MoEAllReduce.forward - input shape: {input.shape}, dtype: {input.dtype}")
             return torch.ops.trtllm.moe_allreduce(
                 active_experts_token_input=input,
                 residual=all_reduce_params.residual,

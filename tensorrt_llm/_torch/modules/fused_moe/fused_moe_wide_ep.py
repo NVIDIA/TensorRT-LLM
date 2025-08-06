@@ -365,6 +365,7 @@ class WideEPMoE(MoE):
             use_dp_padding: Optional[bool] = None,
             repeating_info: Tuple = (True, True),
     ) -> torch.Tensor:
+        print(f"[DEBUG] FusedMoEWideEP.forward_chunk - x shape: {x.shape}, dtype: {x.dtype}")
         if isinstance(x, Fp4QuantizedTensor):
             assert output_dtype is not None
             output_dtype = output_dtype
@@ -724,6 +725,7 @@ class WideEPMoE(MoE):
         assert all_rank_num_tokens is not None
         assert use_dp_padding is not None
 
+        print(f"[DEBUG] FusedMoEWideEP.forward - x shape: {x.shape}, dtype: {x.dtype}")
         # in case of num_rows is larger than max_chunk_size, we need to split the input into multiple chunks
         num_chunks = self.calculate_num_chunks(all_rank_num_tokens)
         use_all_to_all = self.can_use_alltoall(x, all_rank_num_tokens)

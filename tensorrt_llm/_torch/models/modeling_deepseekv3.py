@@ -516,6 +516,7 @@ class Deepseekv3MoE(nn.Module):
         use_dp_padding = False
         if self.use_dp and self.mapping.tp_size > 1:
             if isinstance(self.experts, TRTLLMGenFusedMoE):
+                print(f"[DEBUG] Deepseekv3MoE.compute_routed_output - all_rank_num_tokens: {all_rank_num_tokens}")
                 hidden_states = allgather(hidden_states,
                                           self.mapping,
                                           dim=0,
@@ -548,6 +549,7 @@ class Deepseekv3MoE(nn.Module):
             assert not self.use_dp
 
         def _compute_shared_output():
+            print(f"[DEBUG] Deepseekv3MoE.forward - _compute_shared_output - hidden_states shape: {hidden_states.shape}, dtype: {hidden_states.dtype}")
             shared_output = self.shared_experts(hidden_states_fp4
                                                 or hidden_states)
             if self.shared_output_scale is not None:
@@ -555,6 +557,7 @@ class Deepseekv3MoE(nn.Module):
             return shared_output
 
         def _compute_routed_output():
+            print(f"[DEBUG] Deepseekv3MoE.forward - _compute_routed_output - hidden_states shape: {hidden_states.shape}, dtype: {hidden_states.dtype}, all_rank_num_tokens: {all_rank_num_tokens}")
             routed_output = self.compute_routed_output(hidden_states,
                                                        hidden_states_fp4,
                                                        all_rank_num_tokens,
@@ -907,6 +910,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
     ) -> torch.Tensor:
 
         def _run_MoE(hidden_states, hidden_states_fp4, do_finalize):
+            print(f"[DEBUG] DeepseekV3DecoderLayer.forward_MoE - hidden_states shape: {hidden_states.shape}, dtype: {hidden_states.dtype}")
             return self.mlp(
                 hidden_states,
                 hidden_states_fp4,
@@ -921,6 +925,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         if self.fusion_config.PRE_MOE_FUSION:
             # moe_backend can be either CUTLASS or TRTLLM here
             # TODO: unify the two min-latency MoE backends by enabling quant fusion
+            print(f"[DEBUG] DeepseekV3DecoderLayer.forward_MoE - self.fusion_config.PRE_MOE_FUSION: {self.fusion_config.PRE_MOE_FUSION}")
             hidden_states, residual = self.allreduce(
                 hidden_states,
                 all_reduce_params=AllReduceParams(
@@ -932,6 +937,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 ))
         else:
             # No fusion
+            print(f"[DEBUG] DeepseekV3DecoderLayer.forward_MoE - No fusion")
             hidden_states, residual = self.post_attention_layernorm(
                 hidden_states, residual)
 
@@ -941,11 +947,11 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                  and self.fusion_config.POST_MOE_FUSION
                  and self.model_config.moe_backend == "TRTLLM"
                  and self.mlp.experts.has_nvfp4))
-
+        print(f"[DEBUG] DeepseekV3DecoderLayer.forward_MoE - do_finalize: {do_finalize}")
         hidden_states = _run_MoE(hidden_states,
                                  hidden_states_fp4=None,
                                  do_finalize=do_finalize)
-
+        print(f"[DEBUG] DeepseekV3DecoderLayer.forward_MoE - hidden_states after MoE: {hidden_states.shape}, dtype: {hidden_states.dtype}")
         if self.fusion_config.POST_MOE_FUSION:
             if do_finalize:
                 hidden_states, residual = self.allreduce(

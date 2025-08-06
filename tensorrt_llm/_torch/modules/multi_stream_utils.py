@@ -31,6 +31,7 @@ def maybe_execute_in_parallel(
     """
 
     do_multi_stream = is_graph_capturing() and aux_stream is not None
+    print(f"[DEBUG] maybe_execute_in_parallel - do_multi_stream: {do_multi_stream}")
 
     if do_multi_stream:
         event0.record()
