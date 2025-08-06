@@ -448,10 +448,12 @@ def main(*,
     if cpp_only:
         build_pyt = "OFF"
         build_deep_ep = "OFF"
+        build_deep_gemm = "OFF"
     else:
-        targets.extend(["th_common", "bindings", "deep_ep"])
+        targets.extend(["th_common", "bindings", "deep_ep", "deep_gemm"])
         build_pyt = "ON"
         build_deep_ep = "ON"
+        build_deep_gemm = "ON"
 
     if benchmarks:
         targets.append("benchmarks")
@@ -490,7 +492,7 @@ def main(*,
                 )
             cmake_def_args = " ".join(cmake_def_args)
             cmake_configure_command = (
-                f'cmake -DCMAKE_BUILD_TYPE="{build_type}" -DBUILD_PYT="{build_pyt}" -DBINDING_TYPE="{binding_type}" -DBUILD_DEEP_EP="{build_deep_ep}"'
+                f'cmake -DCMAKE_BUILD_TYPE="{build_type}" -DBUILD_PYT="{build_pyt}" -DBINDING_TYPE="{binding_type}" -DBUILD_DEEP_EP="{build_deep_ep}" -DBUILD_DEEP_GEMM="{build_deep_gemm}"'
                 f' -DNVTX_DISABLE="{disable_nvtx}" -DBUILD_MICRO_BENCHMARKS={build_micro_benchmarks}'
                 f' -DBUILD_WHEEL_TARGETS="{";".join(targets)}"'
                 f' -DPython_EXECUTABLE={venv_python} -DPython3_EXECUTABLE={venv_python}'
@@ -637,6 +639,14 @@ def main(*,
         clear_folder(deep_ep_dir)
         deep_ep_dir.rmdir()
 
+    # Handle deep_gemm installation
+    deep_gemm_dir = pkg_dir / "deep_gemm"
+    if deep_gemm_dir.is_symlink():
+        deep_gemm_dir.unlink()
+    elif deep_gemm_dir.is_dir():
+        clear_folder(deep_gemm_dir)
+        deep_gemm_dir.rmdir()
+
     bin_dir = pkg_dir / "bin"
     if bin_dir.exists():
         clear_folder(bin_dir)
@@ -684,6 +694,14 @@ def main(*,
                 build_dir /
                 "tensorrt_llm/deep_ep/nvshmem-build/src/lib/nvshmem_transport_ibgda.so.103",
                 lib_dir / "nvshmem")
+
+        install_file(get_binding_lib("deep_gemm", "deep_gemm_cpp_tllm"),
+                     pkg_dir)
+        install_tree(build_dir / "tensorrt_llm" / "deep_gemm" / "python" /
+                     "deep_gemm",
+                     deep_gemm_dir,
+                     dirs_exist_ok=True)
+
         if not skip_stubs:
             with working_directory(project_dir):
                 if binding_type == "nanobind":
@@ -757,6 +775,9 @@ def main(*,
                             build_run(
                                 f"\"{venv_python}\" -m pybind11_stubgen -o . deep_ep_cpp_tllm --exit-code",
                                 env=env_ld)
+                        build_run(
+                            f"\"{venv_python}\" -m pybind11_stubgen -o . deep_gemm_cpp_tllm --exit-code",
+                            env=env_ld)
 
     if not skip_building_wheel:
         if dist_dir is None:

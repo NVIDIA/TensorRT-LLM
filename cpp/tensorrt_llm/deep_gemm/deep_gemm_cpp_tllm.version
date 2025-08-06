@@ -1,0 +1,4 @@
+{
+  global: PyInit_deep_gemm_cpp_tllm;
+  local: *;
+};

@@ -16,11 +16,6 @@
    # Optional step: Only required for NVIDIA Blackwell GPUs and SBSA platform
    pip3 install torch==2.7.1 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
 
-   # Optional step: Workaround for deep_gemm installation failure on SBSA platform
-   # The actual deep_gemm package and version should be obtained from the requirements.txt file.
-   pip3 install 'deep_gemm @ git+https://github.com/zongfeijing/DeepGEMM.git@a9d538ef4dff0326fe521c6ca0bfde115703b56a' \
-       --extra-index-url https://download.pytorch.org/whl/cu128
-
    sudo apt-get -y install libopenmpi-dev
    ```
 

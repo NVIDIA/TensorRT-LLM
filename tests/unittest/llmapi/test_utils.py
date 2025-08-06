@@ -13,7 +13,9 @@ def test_api_status_registry():
     def _my_method(self, *args, **kwargs):
         pass
 
-    assert ApiStatusRegistry.get_api_status(_my_method) == "prototype"
+    # will always keep the first status, and the behaviour will be unknown if
+    # one method is registered with a different status in different files.
+    assert ApiStatusRegistry.get_api_status(_my_method) == "beta"
 
     class App:
 

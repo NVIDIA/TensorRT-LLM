@@ -658,7 +658,11 @@ CUBIN_EXPORT __global__
             uint32_t const batchSize,
             float const* __restrict__ const kvCacheScale, // Device memory scalar. Same scale for K and V cache. Used
                                                           // only for int8/fp8 KV cache.
+#if PAGED_KV_CACHE_LAYOUT == 1
+            __grid_constant__ CUtensorMap const tensorMapVLLMK, __grid_constant__ CUtensorMap const tensorMapVLLMV,
+#else
             __grid_constant__ CUtensorMap const tensorMap,
+#endif
 #if SPEC_DEC
             SpecDecParams const specDecParams,
 #endif
@@ -746,12 +750,18 @@ CUBIN_EXPORT __global__
     uint32_t const ctaInputTokBeg = reqInputTokBeg + ctaTokOffset;
     auto const warpIdx = getWarpIdx(uint3{128, 1, 3});
     auto const wid = warpIdx.z * 4 + warpIdx.x;
-
+#if PAGED_KV_CACHE_LAYOUT == 1
+    if (wid == 0 && warpElectSync())
+    {
+        tma::prefetchTensorMap(tensorMapVLLMK);
+        tma::prefetchTensorMap(tensorMapVLLMV);
+    }
+#else
     if (wid == 0 && warpElectSync())
     {
         tma::prefetchTensorMap(tensorMap);
     }
-
+#endif
     extern __shared__ char smemByteBuf[];
     assert(dynamicSmemSize() >= sizeof(SharedMem));
     SharedMem& smem = *reinterpret_cast<SharedMem*>(&smemByteBuf[0]);
@@ -1341,10 +1351,16 @@ CUBIN_EXPORT __global__
         { // load k
             KVTilePartLoader kTilePartLoader
             {
-                true, nbKHeads, cacheList, idxReq, idxHeadGrp, tensorMap
+                true, nbKHeads, cacheList, idxReq, idxHeadGrp,
 #if USE_PAGED_KV_CACHE
-                    ,
+#if PAGED_KV_CACHE_LAYOUT == 1
+                    tensorMapVLLMK,
+#else
+                    tensorMap,
+#endif
                     nbPages, smem.pages[0]
+#else
+                    tensorMap
 #endif
             };
             for (uint32_t idxIter = 0; idxIter < nbIters; idxIter++)
@@ -1409,10 +1425,16 @@ CUBIN_EXPORT __global__
         { // load v
             KVTilePartLoader vTileLoader
             {
-                false, nbKHeads, cacheList, idxReq, idxHeadGrp, tensorMap
+                false, nbKHeads, cacheList, idxReq, idxHeadGrp,
 #if USE_PAGED_KV_CACHE
-                    ,
+#if PAGED_KV_CACHE_LAYOUT == 1
+                    tensorMapVLLMV,
+#else
+                    tensorMap,
+#endif
                     nbPages, smem.pages[1]
+#else
+                    tensorMap
 #endif
             };
             for (uint32_t idxIter = 0; idxIter < nbIters; idxIter++)
@@ -1774,7 +1796,11 @@ __device__ inline KVTilePartLoader::KVTilePartLoader(bool isK, uint32_t nbKHeads
 #if USE_PAGED_KV_CACHE
     , nbPages{nbPages}
     , pages{pageBuf}
+#if PAGED_KV_CACHE_LAYOUT == 1
+    , baseOffset{idxReq * cacheList.maxNbPagesPerSeq}
+#else
     , baseOffset{((idxReq * beamWidth) * 2 + (isK ? 0 : 1)) * cacheList.maxNbPagesPerSeq}
+#endif
 #else
     , baseOffset{(idxReq * beamWidth) * 2 + (isK ? 0 : 1)}
 #endif
@@ -1794,15 +1820,24 @@ __device__ inline void KVTilePartLoader::loadData(
     {
         assert(nbPagesPerTile == 1);
         uint32_t const offset = nbTokens * (idxTile % exactDiv(tokensPerPage, nbTokens));
+#if PAGED_KV_CACHE_LAYOUT == 1
+        tma::loadAsync(&dst, tensorMap, DimsLE<4>{partElems * idxPart, idxHeadGrp, offset, (uint32_t) pages[0]}, bar);
+#else
         tma::loadAsync(&dst, tensorMap, DimsLE<4>{partElems * idxPart, offset, idxHeadGrp, (uint32_t) pages[0]}, bar);
+#endif
     }
     else
     {
 #pragma unroll
         for (uint32_t i = 0; i < nbPagesPerTile; i++)
         {
+#if PAGED_KV_CACHE_LAYOUT == 1
+            tma::loadAsync(&dst(tokensPerPage * i, 0), tensorMap,
+                DimsLE<4>{partElems * idxPart, idxHeadGrp, 0, (uint32_t) pages[i]}, bar);
+#else
             tma::loadAsync(&dst(tokensPerPage * i, 0), tensorMap,
                 DimsLE<4>{partElems * idxPart, 0, idxHeadGrp, (uint32_t) pages[i]}, bar);
+#endif
         }
     }
 #else
@@ -1835,10 +1870,16 @@ __device__ inline GMemKVCacheHead& KVTilePartLoader::getHead(uint32_t pos)
 {
     constexpr uint32_t nbTokens = gemm0CtaTileNbTokens;
 #if USE_PAGED_KV_CACHE
+#if PAGED_KV_CACHE_LAYOUT == 1
+    // Raise a runtime error indicating not implemented
+    assert(false && "KVTilePartLoader::getHead is not implemented for PAGED_KV_CACHE_LAYOUT == 1");
+    __trap();
+#else
     uint32_t const idxTile = pos / nbTokens;
     assert(idxTile == idxTileRef);
     uint32_t const offset = pos % tokensPerPage;
     return cacheList.pool[tokensPerPage * (nbKHeads * pages[pos % nbTokens / tokensPerPage] + idxHeadGrp) + offset];
+#endif
 #else
     // shape: KVCacheHead[batchSize][beamWidth][2][nbKHeads][capacity]
     return cacheList.data[cacheList.capacity * (baseOffset * nbKHeads + idxHeadGrp) + pos];
@@ -3135,7 +3176,11 @@ void launchHopperF8MHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
     InputHead const* q,
 #endif
 #if USE_PAGED_KV_CACHE
+#if PAGED_KV_CACHE_LAYOUT == 1
+    GMemCacheHead* kCacheVLLM, GMemCacheHead* vCacheVLLM,
+#else
     GMemCacheHead* pool, // global pool of pages
+#endif
     KVCachePageIndex const*
         kvCachePageList, // device pointer. shape: KVCachePage[batchSize][beamWidth][2][maxNbPagesPerSeq]
 #else
@@ -3195,7 +3240,6 @@ void launchHopperF8MHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
     auto const launchCfg = makeLaunchConfig(dimGrid, dimCta, hostSmemSize, stream, ENABLE_PDL != 0);
 #if USE_PAGED_KV_CACHE
     uint32_t const maxNbPagesPerSeq = exactDiv(maxSeqLen, tokensPerPage);
-    KVCacheList<true> const cacheList{pool, kvCachePageList, seqLen, maxNbPagesPerSeq};
     auto const dtype = []
     {
         if (std::is_same_v<CacheElem, half>)
@@ -3212,8 +3256,20 @@ void launchHopperF8MHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
         }
         throw std::runtime_error("unsupported cache element type");
     }();
+
+#if PAGED_KV_CACHE_LAYOUT == 1
+    KVCacheList<true> const cacheList{kCacheVLLM, vCacheVLLM, kvCachePageList, seqLen, maxNbPagesPerSeq};
+
+    auto const tensorMapVLLMK = makeTensorMapForPagedKVCache(
+        kCacheVLLM, dtype, validElemsPerHead, nbKHeads, tokensPerPage, cacheHeadPartElems, gemm0CtaTileNbTokens);
+    auto const tensorMapVLLMV = makeTensorMapForPagedKVCache(
+        vCacheVLLM, dtype, validElemsPerHead, nbKHeads, tokensPerPage, cacheHeadPartElems, gemm0CtaTileNbTokens);
+#else
+    KVCacheList<true> const cacheList{pool, kvCachePageList, seqLen, maxNbPagesPerSeq};
     auto const tensorMap = makeTensorMapForPagedKVCache(
         pool, dtype, validElemsPerHead, nbKHeads, tokensPerPage, cacheHeadPartElems, gemm0CtaTileNbTokens);
+#endif
+
     cudaError_t const err = cudaLaunchKernelEx(&launchCfg, &kernel_mha, nbKHeads,
 #if SLIDING_WINDOW
         slidingWinSize,
@@ -3234,7 +3290,12 @@ void launchHopperF8MHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
 #if USE_BEAM_SEARCH
         beamSearchParams,
 #endif
-        batchSize, kvCacheScale, tensorMap,
+        batchSize, kvCacheScale,
+#if PAGED_KV_CACHE_LAYOUT == 1
+        tensorMapVLLMK, tensorMapVLLMV,
+#else
+        tensorMap,
+#endif
 #if SPEC_DEC
         specDecParams,
 #endif

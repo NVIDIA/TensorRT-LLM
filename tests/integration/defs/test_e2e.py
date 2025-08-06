@@ -1875,6 +1875,45 @@ def test_ptp_quickstart_advanced_auto(llm_root, llm_venv, model_name,
 
 
 @skip_post_blackwell
+@pytest.mark.skip_less_device_memory(80000)
+@pytest.mark.skip_less_device(4)
+@pytest.mark.parametrize("model_name,model_path", [
+    pytest.param(
+        'DeepSeek-V3-Lite-FP8', 'DeepSeek-V3-Lite/fp8', marks=skip_pre_hopper),
+])
+def test_ptp_quickstart_advanced_deepseek_v3_lite_4gpus_adp_balance(
+        llm_root, llm_venv, model_name, model_path):
+    print(f"Testing {model_name}.")
+    example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
+    with tempfile.NamedTemporaryFile(mode='w+t',
+                                     suffix=f".{model_name}.log",
+                                     dir="./",
+                                     delete=True,
+                                     delete_on_close=True) as running_log:
+        llm_venv.run_cmd([
+            str(example_root / "quickstart_advanced.py"),
+            "--model_dir",
+            f"{llm_models_root()}/{model_path}",
+            "--moe_tp_size=1",
+            "--moe_ep_size=4",
+            "--tp_size=4",
+            "--use_cuda_graph",
+            "--enable_attention_dp",
+            f"--kv_cache_fraction={_MEM_FRACTION_95}",
+            "--max_batch_size=1",
+            "--max_seq_len=3000",
+            "--disable_kv_cache_reuse",
+            "--attention_dp_enable_balance",
+            "--attention_dp_time_out_iters",
+            "10",
+            "--attention_dp_batching_wait_iters",
+            "10",
+        ],
+                         stdout=running_log)
+        _check_mem_usage(running_log, [106.3, 0, 0, 0], 8)
+
+
+@skip_post_blackwell
 @pytest.mark.skip_less_device_memory(110000)
 @pytest.mark.skip_less_device(8)
 @pytest.mark.parametrize("model_name,model_path", [
@@ -2126,8 +2165,8 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
                 "Describe the scene in the image briefly.",
             ],
             "media": [
-                [],
-                [str(test_data_root / "inpaint.png")],
+                "",
+                str(test_data_root / "inpaint.png"),
             ],
         }
     }
@@ -2150,10 +2189,7 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
         "llava-v1.6-mistral-7b": {
             "image": [
                 ["ocean", "sky", "large", "waves", "shore", "blue"],
-                [
-                    "landscape", "rock", "landmark", "formation", "smooth",
-                    "mountain"
-                ],
+                ['mountain', 'flat', 'dome', 'formation', 'sky'],
                 ["highway", "vehicles", "traffic", "bus", "suburban"],
             ],
         },
@@ -2190,7 +2226,7 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
             ],
             "mixture_text_image":
             [["invention", "person", "scientists", "Lick", "engineers"],
-             ["landscape", "dome", "yosemite", "altitude", "scattered"]]
+             ["landscape", "trees", "road", "natural", "rock"]]
         },
         "gemma-3-27b-it": {
             "image": [

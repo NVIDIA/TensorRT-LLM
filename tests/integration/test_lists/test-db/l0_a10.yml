@@ -99,6 +99,11 @@ l0_a10:
   - unittest/test_model_runner_cpp.py
   - unittest/llmapi/test_build_cache.py
   - unittest/llmapi/test_llm_utils.py
+  - unittest/llmapi/test_gc_utils.py
+  - unittest/llmapi/test_reasoning_parser.py
+  - unittest/llmapi/test_serialization.py
+  - unittest/llmapi/test_utils.py
+  - unittest/llmapi/test_llm_args.py
   - accuracy/test_cli_flow.py::TestGpt2::test_auto_dtype # 1 min
   - accuracy/test_cli_flow.py::TestGpt2::test_beam_search # 1 min
   - accuracy/test_cli_flow.py::TestGpt2::test_beam_search_large # 6 mins
