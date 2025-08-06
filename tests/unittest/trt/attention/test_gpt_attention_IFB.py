@@ -566,18 +566,17 @@ class TestFunctional(unittest.TestCase):
             ConfigCls = GPTBigCodeConfig
             AttentionCls = GPTBigCodeAttention
 
-        configuration = ConfigCls(
-            hidden_size=hidden_size,
-            num_hidden_layers=1,
-            num_attention_heads=num_heads,
-            vocab_size=51200,
-            use_cache=True,
-            resid_pdrop=0,
-            embd_pdrop=0,
-            attn_pdrop=0,
-            hidden_act='gelu',
-            torch_dtype=dtype,
-        )
+        configuration = ConfigCls(hidden_size=hidden_size,
+                                  num_hidden_layers=1,
+                                  num_attention_heads=num_heads,
+                                  vocab_size=51200,
+                                  use_cache=True,
+                                  resid_pdrop=0,
+                                  embd_pdrop=0,
+                                  attn_pdrop=0,
+                                  hidden_act='gelu',
+                                  torch_dtype=dtype,
+                                  attn_implementation='eager')
         if attention_type == 'llama_attention':
             configuration.num_key_value_heads = num_kv_heads
             configuration.rope_theta = rope_base
