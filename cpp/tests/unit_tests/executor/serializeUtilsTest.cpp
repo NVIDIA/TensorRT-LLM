@@ -915,6 +915,40 @@ void compareKvCacheEvents(texec::KVCacheEvent const& kvCacheEvent, texec::KVCach
     }
 }
 
+TEST(SerializeUtilsTest, KvCacheEventsDeque)
+{
+    // Created event
+    texec::KVCacheCreatedData kvCacheCreatedData{{1, 2}};
+    texec::KVCacheEvent kvCacheCreatedEvent(1, kvCacheCreatedData, 32);
+
+    // Removed event
+    texec::KVCacheEvent kvCacheRemovedEvent(1, texec::KVCacheRemovedData{{3, 4}}, 32);
+
+    // Stored event
+    auto storedBlockData1 = texec::KVCacheStoredBlockData(77, {{1, 2}, {3, 4}, {5, 6}}, 88, 0, 99);
+    auto storedBlockData2 = texec::KVCacheStoredBlockData(99, {{11, 12}, {3, 4}, {15, 6}}, 77, 1, 101);
+    texec::KVCacheStoredData kvCacheStoredData{177, {storedBlockData1, storedBlockData2}};
+    texec::KVCacheEvent kvCacheStoredEvent(1, kvCacheStoredData, 32);
+
+    // Updated event
+    texec::KVCacheEventDiff<texec::SizeType32> diff{0, 1};
+    texec::KVCacheEventDiff<texec::SizeType32> diff2{90, 99};
+    texec::KVCacheUpdatedData kvCacheUpdatedData(999, diff, diff2);
+    texec::KVCacheEvent kvCacheEvent(1, kvCacheUpdatedData, 32);
+
+    std::deque<texec::KVCacheEvent> kvCacheEvents{
+        kvCacheCreatedEvent, kvCacheRemovedEvent, kvCacheStoredEvent, kvCacheEvent};
+
+    auto serializedEvents = texec::Serialization::serialize(kvCacheEvents);
+    auto kvCacheEvents2 = texec::Serialization::deserializeKVCacheEvents(serializedEvents);
+
+    EXPECT_EQ(kvCacheEvents.size(), kvCacheEvents2.size());
+    for (size_t i = 0; i < kvCacheEvents.size(); ++i)
+    {
+        compareKvCacheEvents(kvCacheEvents[i], kvCacheEvents2[i]);
+    }
+}
+
 // Test for KVCacheEvent with KVCacheCreatedData
 TEST(SerializeUtilsTest, KVCacheCreatedEvent)
 {

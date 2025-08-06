@@ -125,7 +125,7 @@ void initConfigBindings(nb::module_& m)
             nb::cast<bool>(state[6]), nb::cast<std::optional<float>>(state[7]),
             nb::cast<std::optional<tle::RetentionPriority>>(state[8]), nb::cast<size_t>(state[9]),
             nb::cast<bool>(state[10]), nb::cast<bool>(state[11]), nb::cast<bool>(state[12]),
-            nb::cast<SizeTyp32>(state[13]));
+            nb::cast<SizeType32>(state[13]));
     };
     nb::class_<tle::KvCacheConfig>(m, "KvCacheConfig")
         .def(nb::init<bool, std::optional<SizeType32> const&, std::optional<std::vector<SizeType32>> const&,
