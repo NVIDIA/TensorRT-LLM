@@ -1,11 +1,11 @@
 import os
-from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
 import torch
 from torch import nn
 from torch.nn.parameter import Parameter
 from tqdm import tqdm
+from transformers import GptOssConfig
 
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 
@@ -35,33 +35,6 @@ from ..utils import Fp4QuantizedTensor
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import (DecoderModel, duplicate_kv_weight, filter_weights,
                              register_auto_model)
-
-
-@dataclass
-class GptOssConfig:
-    num_hidden_layers: int = 36
-    num_experts: int = 128
-    experts_per_token: int = 4
-    vocab_size: int = 201088
-    hidden_size: int = 2880
-    intermediate_size: int = 2880
-    head_dim: int = 64
-    num_attention_heads: int = 64
-    num_key_value_heads: int = 8
-    sliding_window: int = 128
-    initial_context_length: int = 4096
-    rope_theta: float = 150000.0
-    rope_scaling_factor: float = 32.0
-    rope_ntk_alpha: float = 1.0
-    rope_ntk_beta: float = 32.0
-    swiglu_limit: float = 7.0
-
-    # added for TRT-LLM
-    torch_dtype: torch.dtype = torch.bfloat16
-    rms_norm_eps: float = 1e-05
-    max_position_embeddings: int = 131072
-    model_type: str = "gpt_oss"
-    tie_word_embeddings: bool = False
 
 
 class AttentionBlock(Attention):
@@ -353,7 +326,7 @@ class TransformerBlock(DecoderLayer):
             dtype=pretrained_config.torch_dtype)
 
         self.mlp = MLPBlock(config, layer_idx, reduce_results=not self.is_tp)
-        self.enable_attention_dp = config.mapping.enable_attention_dp
+
         self.mapping = config.mapping
 
         self.next_layer_layernorm = RMSNorm(
