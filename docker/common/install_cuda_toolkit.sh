@@ -18,10 +18,10 @@ check_cuda_version() {
         ENV_CUDA_VER="${CUDA_VERSION_SHORT}_${CUDA_DRIVER_VERSION}"
         if [ "$ENV_CUDA_VER" = "$CUDA_VER" ]; then
             echo "CUDA version matches ($ENV_CUDA_VER), skipping reinstallation"
-            return 1
+            return 0
         fi
     fi
-    return 0
+    return 1
 }
 
 reinstall_rockylinux_cuda() {
