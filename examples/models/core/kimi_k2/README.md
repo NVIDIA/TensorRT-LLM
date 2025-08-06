@@ -29,11 +29,11 @@ tools = [{
         "description": "Get weather information. Call this tool when the user needs to get weather information",
          "parameters": {
               "type": "object",
-              "required": ["city"],
+              "required": ["location"],
               "properties": {
-                  "city": {
+                  "location": {
                       "type": "string",
-                      "description": "City name",
+                      "description": "location name",
                 }
             }
         }
