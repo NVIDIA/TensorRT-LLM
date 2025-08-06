@@ -1402,6 +1402,12 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
 
             expert_idx = local_slot_id
 
+            if not torch.allclose(w1_weight_scale_2, w3_weight_scale_2):
+                logger.warning(
+                    f"w1_weight_scale_2 != w3_weight_scale_2 ({w1_weight_scale_2} != {w3_weight_scale_2}), setting w3_weight_scale_2 to w1_weight_scale_2 value. Accuracy may be affected."
+                )
+                w3_weight_scale_2 = w1_weight_scale_2
+
             self.load_expert_w3_w1_weight_scale_nvfp4(
                 module, w1_weight_scale, w3_weight_scale,
                 dst_w3_w1_weight_scale[expert_idx])
