@@ -2,22 +2,23 @@
 
 ```{note}
 Note:
-This project is in active development and is currently in an early (beta) stage. The code is experimental, subject to change, and may include backward-incompatible updates. While we strive for correctness, we provide no guarantees regarding functionality, stability, or reliability.
+This project is in active development and is currently in a prototype stage. The code is experimental, subject to change, and may include backward-incompatible updates. While we strive for correctness, we provide no guarantees regarding functionality, stability, or reliability.
 ```
 
 <h4> Seamless Model Deployment from PyTorch to TRT-LLM</h4>
 
-AutoDeploy is an experimental feature in beta stage designed to simplify and accelerate the deployment of PyTorch models, including off-the-shelf models like those from Hugging Face, to TensorRT-LLM. It automates graph transformations to integrate inference optimizations such as tensor parallelism, KV-caching and quantization. AutoDeploy supports optimized in-framework deployment, minimizing the amount of manual modification needed.
+AutoDeploy is a prototype designed to simplify and accelerate the deployment of PyTorch models, including off-the-shelf models like those from HuggingFace transformers library, to TensorRT-LLM.
 
-## Motivation & Approach
+<div align="center">
+  <img src="./ad_overview.png" alt="AutoDeploy integration with LLM API" width="70%">
+  <p><em>AutoDeploy overview and relation with TensorRT-LLM's LLM api</em></p>
+</div>
 
-Deploying large language models (LLMs) can be challenging, especially when balancing ease of use with high performance. Teams need simple, intuitive deployment solutions that reduce engineering effort, speed up the integration of new models, and support rapid experimentation without compromising performance.
-
-AutoDeploy addresses these challenges with a streamlined, (semi-)automated pipeline that transforms in-framework PyTorch models, including Hugging Face models, into optimized inference-ready models for TRT-LLM. It simplifies deployment, optimizes models for efficient inference, and bridges the gap between simplicity and performance.
+AutoDeploy provides an alternative path for deploying models using the LLM API that does not require users to rewrite the source model (e.g., HuggingFace Transformers models) or manually implement various inference optimizations such as KV-caches, multi-GPU parallelism, quantization, etc. Instead, AutoDeploy extracts a computation graph from the source model and applies inference optimizations through a series of automated graph transformations. AutoDeploy generates an inference-optimized graph that can be directly executed in the TensorRT-LLM PyTorch runtime and leverages various runtime optimizations including in-flight batching, paging, and overlap scheduling.
 
 ### **Key Features:**
 
-- **Seamless Model Transition:** Automatically converts PyTorch/Hugging Face models to TRT-LLM without manual rewrites.
+- **Seamless Model Translation:** Automatically converts PyTorch/Hugging Face models to TRT-LLM without manual rewrites.
 - **Unified Model Definition:** Maintain a single source of truth with your original PyTorch/Hugging Face model.
 - **Optimized Inference:** Built-in transformations for sharding, quantization, KV-cache integration, MHA fusion, and CudaGraph optimization.
 - **Immediate Deployment:** Day-0 support for models with continuous performance enhancements.
@@ -50,7 +51,7 @@ python build_and_run_ad.py --model "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 
 AutoDeploy streamlines the model deployment process through an automated workflow designed for efficiency and performance. The workflow begins with a PyTorch model, which is exported using `torch.export` to generate a standard Torch graph. This graph contains core PyTorch ATen operations alongside custom attention operations, determined by the attention backend specified in the configuration.
 
-The exported graph then undergoes a series of automated transformations, including graph sharding, KV-cache insertion, and GEMM fusion, to optimize model performance. After these transformations, the graph is compiled using one of the supported compile backends (like `torch-opt`), followed by deploying it via the TRT-LLM runtime.
+The exported graph then undergoes a series of automated transformations, including graph sharding, KV-cache insertion, and GEMM fusion, to optimize model performance. After these transformations, the graph is compiled using one of the supported compile backends (like `torch-opt`), followed by deploying it via the TensorRT-LLM runtime.
 
 - [Supported Matrix](support_matrix.md)
 
@@ -60,6 +61,7 @@ The exported graph then undergoes a series of automated transformations, includi
 - [Logging Level](./advanced/logging.md)
 - [Incorporating AutoDeploy into Your Own Workflow](./advanced/workflow.md)
 - [Expert Configurations](./advanced/expert_configurations.md)
+- [Performance benchmarking](./advanced/benchmarking_with_trtllm_bench.md)
 
 ## Roadmap
 
