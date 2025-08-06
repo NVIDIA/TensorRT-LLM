@@ -161,6 +161,7 @@ def top_k_top_p_sampling_batch(logits: torch.Tensor,
     assert logits_dim == 2, "logits should be 2D: [batch_size, vocab_size]"
     if temperature != 0:
         logits = logits / max(temperature, 1e-5)
+    batch_size, vocab_size = logits.size()
     # get first top_k logits of each sample and their indices
     values, indices = torch.topk(logits, top_k, dim=-1)
     min_values = values[:, -1].unsqueeze(-1).expand(batch_size, vocab_size)
