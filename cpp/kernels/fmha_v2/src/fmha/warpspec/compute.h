@@ -288,7 +288,7 @@ struct Compute
             // The kv_left_mask_end is the start of the chunk.
             kv_left_mask_end = div_up(is_chunked_attention
                     ? ((tile_offset_end >> params.log2_chunked_attention_size) << params.log2_chunked_attention_size)
-                    : (tile_offset_end - params.sliding_window_size),
+                    : (tile_offset_end + 1 - params.sliding_window_size),
                 STEP_KV);
         }
 

@@ -79,6 +79,10 @@ methods:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.CudaGraphConfig]
         default: null
         status: beta
+      attention_dp_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.AttentionDpConfig]
+        default: null
+        status: beta
       checkpoint_loader:
         annotation: Optional[tensorrt_llm._torch.models.checkpoints.BaseCheckpointLoader]
         default: null
@@ -106,10 +110,6 @@ methods:
       enable_trtllm_sampler:
         annotation: bool
         default: False
-        status: prototype
-      kv_cache_dtype:
-        annotation: str
-        default: auto
         status: prototype
       enable_iter_perf_stats:
         annotation: bool
@@ -160,6 +160,9 @@ methods:
       kv_cache_retention_config:
         annotation: Union[tensorrt_llm.bindings.executor.KvCacheRetentionConfig, Sequence[tensorrt_llm.bindings.executor.KvCacheRetentionConfig], NoneType]
         default: null
+      scheduling_params:
+        annotation: Union[tensorrt_llm.scheduling_params.SchedulingParams, List[tensorrt_llm.scheduling_params.SchedulingParams], NoneType]
+        default: null
     return_annotation: Union[tensorrt_llm.llmapi.llm.RequestOutput, List[tensorrt_llm.llmapi.llm.RequestOutput]]
   generate_async:
     parameters:
@@ -169,6 +172,10 @@ methods:
       kv_cache_retention_config:
         annotation: Optional[tensorrt_llm.bindings.executor.KvCacheRetentionConfig]
         default: null
+      scheduling_params:
+        annotation: Optional[tensorrt_llm.scheduling_params.SchedulingParams]
+        default: null
+        status: prototype
     return_annotation: tensorrt_llm.llmapi.llm.RequestOutput
   get_kv_cache_events:
     parameters:

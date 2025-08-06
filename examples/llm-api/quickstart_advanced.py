@@ -1,7 +1,8 @@
 import argparse
 
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm.llmapi import (CudaGraphConfig, DraftTargetDecodingConfig,
+from tensorrt_llm.llmapi import (AttentionDpConfig, AutoDecodingConfig,
+                                 CudaGraphConfig, DraftTargetDecodingConfig,
                                  EagleDecodingConfig, KvCacheConfig, MoeConfig,
                                  MTPDecodingConfig, NGramDecodingConfig,
                                  TorchCompileConfig)
@@ -50,10 +51,20 @@ def add_llm_args(parser):
     parser.add_argument('--moe_backend',
                         type=str,
                         default='CUTLASS',
-                        choices=['CUTLASS', 'TRTLLM', 'VANILLA', 'WIDEEP'])
+                        choices=[
+                            'CUTLASS', 'TRTLLM', 'VANILLA', 'WIDEEP',
+                            'DEEPGEMM', 'CUTEDSL'
+                        ])
     parser.add_argument('--enable_attention_dp',
                         default=False,
                         action='store_true')
+    parser.add_argument('--attention_dp_enable_balance',
+                        default=False,
+                        action='store_true')
+    parser.add_argument('--attention_dp_time_out_iters', type=int, default=0)
+    parser.add_argument('--attention_dp_batching_wait_iters',
+                        type=int,
+                        default=0)
     parser.add_argument('--enable_trtllm_sampler',
                         default=False,
                         action='store_true')
@@ -104,6 +115,8 @@ def add_llm_args(parser):
     parser.add_argument("--top_k", type=int, default=None)
     parser.add_argument("--top_p", type=float, default=None)
     parser.add_argument('--load_format', type=str, default='auto')
+    parser.add_argument('--n', type=int, default=1)
+    parser.add_argument('--best_of', type=int, default=None)
     parser.add_argument('--max_beam_width', type=int, default=1)
 
     # Speculative decoding
@@ -181,6 +194,8 @@ def setup_llm(args, **kwargs):
             is_use_oldest=True,
             is_public_pool=True,
         )
+    elif spec_decode_algo == "AUTO":
+        spec_config = AutoDecodingConfig()
     else:
         spec_config = None
 
@@ -188,6 +203,13 @@ def setup_llm(args, **kwargs):
         batch_sizes=args.cuda_graph_batch_sizes,
         enable_padding=args.cuda_graph_padding_enabled,
     ) if args.use_cuda_graph else None
+
+    attention_dp_config = AttentionDpConfig(
+        enable_balance=args.attention_dp_enable_balance,
+        timeout_iters=args.attention_dp_time_out_iters,
+        batching_wait_iters=args.attention_dp_batching_wait_iters,
+    )
+
     llm = LLM(
         model=args.model_dir,
         backend='pytorch',
@@ -210,6 +232,7 @@ def setup_llm(args, **kwargs):
         max_batch_size=args.max_batch_size,
         max_num_tokens=args.max_num_tokens,
         enable_attention_dp=args.enable_attention_dp,
+        attention_dp_config=attention_dp_config,
         tensor_parallel_size=args.tp_size,
         pipeline_parallel_size=args.pp_size,
         moe_expert_parallel_size=args.moe_ep_size,
@@ -223,6 +246,15 @@ def setup_llm(args, **kwargs):
         **kwargs,
     )
 
+    use_beam_search = args.max_beam_width > 1
+    best_of = args.best_of or args.n
+    if use_beam_search:
+        if args.n == 1 and args.best_of is None:
+            args.n = args.max_beam_width
+        assert best_of <= args.max_beam_width, f"beam width: {best_of}, should be less or equal to max_beam_width: {args.max_beam_width}"
+
+    assert best_of >= args.n, f"In sampling mode best_of value: {best_of} should be less or equal to n: {args.n}"
+
     sampling_params = SamplingParams(
         max_tokens=args.max_tokens,
         temperature=args.temperature,
@@ -231,8 +263,9 @@ def setup_llm(args, **kwargs):
         return_context_logits=args.return_context_logits,
         return_generation_logits=args.return_generation_logits,
         logprobs=args.logprobs,
-        n=args.max_beam_width,
-        use_beam_search=args.max_beam_width > 1)
+        n=args.n,
+        best_of=best_of,
+        use_beam_search=use_beam_search)
     return llm, sampling_params
 
 
@@ -245,23 +278,23 @@ def main():
 
     for i, output in enumerate(outputs):
         prompt = output.prompt
-        for beam_idx, beam in enumerate(output.outputs):
-            generated_text = beam.text
+        for sequence_idx, sequence in enumerate(output.outputs):
+            generated_text = sequence.text
             # Skip printing the beam_idx if no beam search was used
-            beam_id_text = f"[{beam_idx}]" if args.max_beam_width > 1 else ""
+            sequence_id_text = f"[{sequence_idx}]" if args.max_beam_width > 1 or args.n > 1 else ""
             print(
-                f"[{i}]{beam_id_text} Prompt: {prompt!r}, Generated text: {generated_text!r}"
+                f"[{i}]{sequence_id_text} Prompt: {prompt!r}, Generated text: {generated_text!r}"
             )
             if args.return_context_logits:
                 print(
-                    f"[{i}]{beam_id_text} Context logits: {output.context_logits}"
+                    f"[{i}]{sequence_id_text} Context logits: {output.context_logits}"
                 )
             if args.return_generation_logits:
                 print(
-                    f"[{i}]{beam_id_text} Generation logits: {beam.generation_logits}"
+                    f"[{i}]{sequence_id_text} Generation logits: {sequence.generation_logits}"
                 )
             if args.logprobs:
-                print(f"[{i}]{beam_id_text} Logprobs: {beam.logprobs}")
+                print(f"[{i}]{sequence_id_text} Logprobs: {sequence.logprobs}")
 
 
 if __name__ == '__main__':

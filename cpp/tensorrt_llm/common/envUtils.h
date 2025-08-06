@@ -27,6 +27,8 @@ std::optional<int32_t> getIntEnv(char const* name);
 
 std::optional<size_t> getUInt64Env(char const* name);
 
+std::optional<float> getFloatEnv(char const* name);
+
 bool getBoolEnv(char const* name);
 
 // XQA kernels (optimized kernels for generation phase).

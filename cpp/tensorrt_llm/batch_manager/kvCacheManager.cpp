@@ -477,9 +477,9 @@ std::map<SizeType32, float> BlockManager::calculateWindowSizeToShare(
         windowSizeToContribution[windowSize] = cacheSizeWeight;
     }
 
-    for (auto const& [windowSize, layers] : windowSizeToLayers)
+    for (auto const& [windowSize, _] : windowSizeToLayers)
     {
-        windowSizeToContribution.at(windowSize) *= windowSize * layers.size();
+        windowSizeToContribution.at(windowSize) *= windowSize;
     }
     auto const windowSizesTotalSum = std::accumulate(windowSizeToContribution.begin(), windowSizeToContribution.end(),
         0.0, [](auto sum, auto const& windowSize) { return sum + windowSize.second; });

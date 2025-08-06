@@ -50,7 +50,6 @@
 
 namespace nb = nanobind;
 namespace tb = tensorrt_llm::batch_manager;
-namespace tbk = tensorrt_llm::batch_manager::kv_cache_manager;
 namespace tpb = tensorrt_llm::nanobind::batch_manager;
 namespace tc = tensorrt_llm::common;
 namespace tr = tensorrt_llm::runtime;

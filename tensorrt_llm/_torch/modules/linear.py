@@ -12,6 +12,7 @@ from torch import nn
 from torch.nn.parameter import Parameter
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
+import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
 from tensorrt_llm._torch.peft.lora.layer import LoraLayer
 from tensorrt_llm.functional import (AllReduceFusionOp, AllReduceParams,
                                      AllReduceStrategy)
@@ -20,6 +21,7 @@ from tensorrt_llm.quantization.functional import \
     preprocess_weights_for_mixed_gemm
 from tensorrt_llm.quantization.mode import QuantAlgo
 
+from ..._utils import get_sm_version
 from ...models.modeling_utils import QuantConfig
 from ..utils import Fp4QuantizedTensor
 
@@ -340,7 +342,7 @@ class FP8QDQLinearMethod(LinearMethodBase):
             qinput = input
 
         # This op does not support bias now.
-        if qinput.shape[0] <= 8 and module.enable_cuda_core:
+        if module.enable_cuda_core and qinput.shape[0] <= 8:
             # use cuda core for small m dimension
             output = torch.ops.trtllm.cuda_scaled_mm(
                 qinput,
@@ -570,10 +572,22 @@ class FP8BlockScalesLinearMethod(LinearMethodBase):
             input = input.to(torch.bfloat16) * module.input_scale
         assert input.dtype == torch.bfloat16
 
-        act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(input)
+        if get_sm_version() == 100:
+            from tensorrt_llm import deep_gemm
+            a, a_sf = fp8_utils.per_token_quant_and_transform(input)
+            output = torch.empty((input.shape[0], module.weight.shape[0]),
+                                 device=input.device,
+                                 dtype=torch.bfloat16)
+            deep_gemm.fp8_gemm_nt((a, a_sf),
+                                  (module.weight, module.weight_scale),
+                                  output,
+                                  disable_ue8m0_cast=True)
+        else:
+            act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
+                input)
 
-        output = torch.ops.trtllm.fp8_block_scaling_gemm(
-            act_input_fp8, module.weight, act_input_sf, module.weight_scale)
+            output = torch.ops.trtllm.fp8_block_scaling_gemm(
+                act_input_fp8, module.weight, act_input_sf, module.weight_scale)
         if bias is not None:
             output = output + bias
         return output
@@ -603,7 +617,6 @@ class FP8BlockScalesLinearMethod(LinearMethodBase):
         q_weight, k_weight, v_weight = load_weights_fused_qkv_helper(
             module, weights)
         fused_weight = torch.cat((q_weight, k_weight, v_weight))
-        copy_weight(module.weight, fused_weight)
 
         scale_name = self._get_scale_name(weights)
         q_scale = load_weight_shard(weights[0][scale_name], module.tp_size,
@@ -614,6 +627,7 @@ class FP8BlockScalesLinearMethod(LinearMethodBase):
                                     module.tp_rank, module.tp_mode)
         fused_fp8_block_scale = torch.cat((q_scale, k_scale, v_scale)).squeeze()
 
+        copy_weight(module.weight, fused_weight)
         copy_weight(module.weight_scale, fused_fp8_block_scale)
 
     def load_weights_fused_gate_up_linear(self, module: Linear,
@@ -621,7 +635,6 @@ class FP8BlockScalesLinearMethod(LinearMethodBase):
         gate_weight, up_weight = load_weights_fused_gate_up_helper(
             module, weights)
         fused_weight = torch.cat((gate_weight, up_weight))
-        copy_weight(module.weight, fused_weight)
 
         scale_name = self._get_scale_name(weights)
         left_scale = load_weight_shard(weights[0][scale_name], module.tp_size,
@@ -629,6 +642,7 @@ class FP8BlockScalesLinearMethod(LinearMethodBase):
         right_scale = load_weight_shard(weights[1][scale_name], module.tp_size,
                                         module.tp_rank, module.tp_mode)
         fused_scale = torch.cat([left_scale, right_scale], dim=0).squeeze()
+        copy_weight(module.weight, fused_weight)
         copy_weight(module.weight_scale, fused_scale)
 
 

@@ -59,20 +59,28 @@ meta-llama/Llama-3.2-3B:
     accuracy: 60.60
 meta-llama/Llama-3.3-70B-Instruct:
   - accuracy: 81.31
+  - spec_dec_algo: Eagle
+    accuracy: 81.31
   - quant_algo: NVFP4
     kv_cache_quant_algo: FP8
     accuracy: 79.31
   - quant_algo: FP8
+    kv_cache_quant_algo: FP8
     accuracy: 81.02
 meta-llama/Llama-4-Maverick-17B-128E-Instruct:
   - accuracy: 86.40
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    spec_dec_algo: Eagle
+    accuracy: 86.40
 meta-llama/Llama-4-Scout-17B-16E-Instruct:
   - accuracy: 80.00
   - quant_algo: NVFP4
     kv_cache_quant_algo: FP8
-    accuracy: 88.63
+    accuracy: 79.60
   - quant_algo: FP8
-    accuracy: 89.46
+    kv_cache_quant_algo: FP8
+    accuracy: 78.58
 mistralai/Mistral-7B-v0.1:
   - accuracy: 66
 mistralai/Mistral-7B-Instruct-v0.3:
@@ -95,8 +103,15 @@ mistralai/Mixtral-8x7B-Instruct-v0.1:
 mistralai/Mixtral-8x22B-v0.1:
   - quant_algo: FP8
     accuracy: 77.63
+mistralai/Mistral-Small-3.1-24B-Instruct-2503:
+  - accuracy: 81.7
 google/gemma-2-9b-it:
   - accuracy: 73.05
+google/gemma-3-1b-it:
+  - accuracy: 39.0
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 37.5
 google/gemma-3-27b-it:
   - accuracy: 77.80
 Qwen/Qwen2-0.5B-Instruct:
@@ -168,6 +183,13 @@ Qwen3/Qwen3-235B-A22B:
   - quant_algo: NVFP4
     kv_cache_quant_algo: FP8
     accuracy: 86
+  - spec_dec_algo: Eagle
+    quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    accuracy: 86
+moonshotai/Kimi-K2-Instruct:
+  - quant_algo: FP8_BLOCK_SCALES
+    accuracy: 87.65
 nvidia/Llama-3_3-Nemotron-Super-49B-v1:
   - accuracy: 79.43
   - quant_algo: FP8
@@ -183,6 +205,16 @@ nvidia/Nemotron-H-8B-Base-8K:
   - quant_algo: FP8
     kv_cache_quant_algo: FP8
     accuracy: 69.180
+nvidia/Nemotron-H-47B-Base-8K:
+  - accuracy: 83.26
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 82.68
+nvidia/Nemotron-H-56B-Base-8K:
+  - accuracy: 83.82
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 83.82
 microsoft/Phi-4-mini-instruct:
   - accuracy: 68.98
 # Created a dummy accuracy to track tp_size=2 for phi4-mini model.
@@ -208,3 +240,7 @@ mistralai/Ministral-8B-Instruct-2410:
     accuracy: 65.96
 microsoft/Phi-4-multimodal-instruct:
   - accuracy: 69.69
+microsoft/Phi-4-multimodal-instruct-long-rope:
+  - accuracy: 65.98
+LGAI-EXAONE/EXAONE-4.0-32B:
+  - accuracy: 78.52

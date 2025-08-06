@@ -76,6 +76,15 @@ public:
 
     /// @brief Destructor.
     virtual ~BaseCacheFormatter() = default;
+
+    // TODO: better way for context/generation tagging
+    void markAsSender(bool isSender)
+    {
+        kvCacheMeasureHelper.markAsSender(isSender);
+    }
+
+protected:
+    KvCacheMeasureHelper kvCacheMeasureHelper{common::getEnvKVCacheTransferOutputPath()};
 };
 
 // Simple cache block copy. Because it does not involve data splitting or merging, it performs best when the
@@ -115,7 +124,6 @@ public:
 private:
     BaseKVCacheManager* mCacheManager;
     CacheTransBufferManager* mCacheTransBufferManager;
-    KvCacheMeasureHelper kvCacheMeasureHelper{common::getEnvKVCacheTransferOutputPath()};
 };
 
 std::unique_ptr<BaseCacheFormatter> createCacheFormatter(
