@@ -800,7 +800,7 @@ class PyExecutor:
                     # Second last rank does not need to since last rank has original decoded tokens
                     if not self.dist.is_second_last_pp_rank:
                         if self.send_handles[prev_microbatch_id] is not None:
-                            self.send_handles[prev_microbatch_id].Wait()
+                            self.send_handles[prev_microbatch_id].wait()
                         needs_logits = (
                             self._need_return_logits(scheduled_batch)
                             or (self._need_return_log_probs(scheduled_batch)
