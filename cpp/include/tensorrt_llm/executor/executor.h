@@ -1032,7 +1032,7 @@ public:
     void setSecondaryOffloadMinPriority(std::optional<RetentionPriority> secondaryOffloadMinPriority);
     void setEventBufferMaxSize(size_t eventBufferMaxSize);
     void setUseUvm(bool useUvm);
-    void setAttentionDpEventsGatherPeriodMs(SizeType32 attentionDpEventPollPeriodMs);
+    void setAttentionDpEventsGatherPeriodMs(SizeType32 attentionDpEventsGatherPeriodMs);
 
     void fillEmptyFieldsFromRuntimeDefaults(tensorrt_llm::runtime::RuntimeDefaults const& runtimeDefaults);
 
@@ -1089,7 +1089,7 @@ private:
     /// @brief Whether to use UVM for the KV cache.
     bool mUseUvm;
 
-    /// @brief The period in milliseconds to poll for attention DP events across rank
+    /// @brief The period in milliseconds to gather attention DP events across ranks
     SizeType32 mAttentionDpEventsGatherPeriodMs;
 };
 

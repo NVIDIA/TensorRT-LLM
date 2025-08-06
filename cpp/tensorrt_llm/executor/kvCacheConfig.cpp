@@ -213,10 +213,10 @@ void KvCacheConfig::setUseUvm(bool useUvm)
     mUseUvm = useUvm;
 }
 
-void KvCacheConfig::setAttentionDpEventsGatherPeriodMs(SizeType32 attentionDpEventPollPeriodMs)
+void KvCacheConfig::setAttentionDpEventsGatherPeriodMs(SizeType32 attentionDpEventsGatherPeriodMs)
 {
-    TLLM_CHECK(attentionDpEventPollPeriodMs > 0);
-    mAttentionDpEventsGatherPeriodMs = attentionDpEventPollPeriodMs;
+    TLLM_CHECK(attentionDpEventsGatherPeriodMs > 0);
+    mAttentionDpEventsGatherPeriodMs = attentionDpEventsGatherPeriodMs;
 }
 
 void KvCacheConfig::fillEmptyFieldsFromRuntimeDefaults(tensorrt_llm::runtime::RuntimeDefaults const& runtimeDefaults)

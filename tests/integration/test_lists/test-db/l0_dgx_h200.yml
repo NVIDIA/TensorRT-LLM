@@ -152,7 +152,7 @@ l0_dgx_h200:
   - examples/test_bert.py::test_llm_bert_general[compare_hf-enable_remove_input_padding-disable_attention_plugin-disable_context_fmha-tp:2-pp:1-float16-RobertaForSequenceClassification-bert/twitter-roberta-base-emotion]
   - examples/test_recurrentgemma.py::test_llm_recurrentgemma_2gpu[recurrentgemma-2b]
   - examples/test_mamba.py::test_llm_mamba2_2gpu[mamba-codestral-7B-v0.1]
-  - accuracy/test_cli_flow.py::TestLlama2_7B::eest_smooth_quant_ootb_tp2
+  - accuracy/test_cli_flow.py::TestLlama2_7B::test_smooth_quant_ootb_tp2
   - accuracy/test_cli_flow.py::TestLlama2_7B::test_int4_awq_tp2
   - accuracy/test_cli_flow.py::TestLlama2_7B::test_int4_awq_prequantized_tp2
   - accuracy/test_cli_flow.py::TestLlama2_7B::test_int4_gptq_prequantized_tp2

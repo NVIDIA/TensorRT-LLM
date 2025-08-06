@@ -300,14 +300,16 @@ class KVCacheManager(BaseResourceManager):
             'copy_on_partial_reuse': kv_cache_config.copy_on_partial_reuse,
         }
         if self.event_buffer_max_size > 0:
-            kwargs['event_manager'] = KVCacheEventManagerCpp(
-                max_kv_event_entries=self.event_buffer_max_size,
-                attention_dp_rank=mapping.rank
-                if mapping.enable_attention_dp else None,
-                attention_dp_size=mapping.world_size
-                if mapping.enable_attention_dp else None,
-                attention_dp_events_gather_period_ms=self.
-                attention_dp_events_gather_period_ms)
+            if mapping.enable_attention_dp:
+                 kwargs['event_manager'] = KVCacheEventManagerCpp(
+                     max_kv_event_entries=self.event_buffer_max_size,
+                     attention_dp_rank=mapping.rank,
+                     attention_dp_size=mapping.world_size,
+                     attention_dp_events_gather_period_ms=self.attention_dp_events_gather_period_ms,
+                 )
+             else:
+                 kwargs['event_manager'] = KVCacheEventManagerCpp(
+                     max_kv_event_entries=self.event_buffer_max_size)
 
         self.impl = KVCacheManagerCpp(**kwargs)
 

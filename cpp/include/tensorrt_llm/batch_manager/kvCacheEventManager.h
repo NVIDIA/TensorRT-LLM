@@ -18,6 +18,7 @@
 
 #include "tensorrt_llm/executor/executor.h"
 
+#include <atomic>
 #include <chrono>
 #include <condition_variable>
 #include <deque>
@@ -70,7 +71,7 @@ private:
     void enqueueEvent(executor::KVCacheEvent&& event);
 
     /// @brief Flag to terminate the worker
-    bool mRun;
+    std::atomic<bool> mRun;
     /// @brief Worker thread
     std::thread mWorkerThread;
     /// @brief Exchange thread for attention DP events

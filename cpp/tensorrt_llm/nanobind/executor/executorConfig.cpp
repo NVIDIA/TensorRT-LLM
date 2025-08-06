@@ -110,11 +110,12 @@ void initConfigBindings(nb::module_& m)
         return nb::make_tuple(self.getEnableBlockReuse(), self.getMaxTokens(), self.getMaxAttentionWindowVec(),
             self.getSinkTokenLength(), self.getFreeGpuMemoryFraction(), self.getHostCacheSize(),
             self.getOnboardBlocks(), self.getCrossKvCacheFraction(), self.getSecondaryOffloadMinPriority(),
-            self.getEventBufferMaxSize(), self.getEnablePartialReuse(), self.getCopyOnPartialReuse(), self.getUseUvm());
+            self.getEventBufferMaxSize(), self.getEnablePartialReuse(), self.getCopyOnPartialReuse(), self.getUseUvm(),
+            self.getAttentionDpEventsGatherPeriodMs());
     };
     auto kvCacheConfigSetstate = [](tle::KvCacheConfig& self, nb::tuple const& state)
     {
-        if (state.size() != 13)
+        if (state.size() != 14)
         {
             throw std::runtime_error("Invalid state!");
         }
@@ -123,7 +124,8 @@ void initConfigBindings(nb::module_& m)
             nb::cast<std::optional<float>>(state[4]), nb::cast<std::optional<size_t>>(state[5]),
             nb::cast<bool>(state[6]), nb::cast<std::optional<float>>(state[7]),
             nb::cast<std::optional<tle::RetentionPriority>>(state[8]), nb::cast<size_t>(state[9]),
-            nb::cast<bool>(state[10]), nb::cast<bool>(state[11]), nb::cast<bool>(state[12]));
+            nb::cast<bool>(state[10]), nb::cast<bool>(state[11]), nb::cast<bool>(state[12]),
+            nb::cast<SizeTyp32>(state[13]));
     };
     nb::class_<tle::KvCacheConfig>(m, "KvCacheConfig")
         .def(nb::init<bool, std::optional<SizeType32> const&, std::optional<std::vector<SizeType32>> const&,
