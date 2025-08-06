@@ -8,7 +8,7 @@ This document shows how to run Llama4-Maverick on B200 with PyTorch workflow and
 - [Performance Benchmarks](#performance-benchmarks)
   - [B200 Max-throughput](#b200-max-throughput)
   - [B200 Min-latency](#b200-min-latency)
-  - [B200 Hybrid](#b200-hybrid)
+  - [B200 Balanced](#b200-balanced)
 - [Advanced Configuration](#advanced-configuration)
   - [Configuration tuning](#configuration-tuning)
   - [Troubleshooting](#troubleshooting)
@@ -120,7 +120,7 @@ python -m tensorrt_llm.serve.scripts.benchmark_serving \
         --max-concurrency 1 \
 ```
 
-### B200 Hybrid
+### B200 Balanced
 
 
 #### 1. Prepare TensorRT-LLM extra configs
