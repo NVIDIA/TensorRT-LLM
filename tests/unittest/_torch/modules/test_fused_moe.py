@@ -29,6 +29,7 @@ from tensorrt_llm._torch.modules.fused_moe.fused_moe_deepgemm import \
     DeepGemmFusedMoE
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_wide_ep import \
     AlltoallMethodType
+from tensorrt_llm._torch.modules.fused_moe.interface import MoEWeightLoadingMode
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._utils import mpi_rank
 from tensorrt_llm.mapping import Mapping
@@ -560,13 +561,14 @@ def test_fused_moe_fp8_blockwise_deepgemm(dtype,
 
 @skip_pre_blackwell
 @pytest.mark.parametrize(
-    "dtype, num_experts, seq_len, hidden_size, RoutingMethodCls",
+    "dtype, num_experts, seq_len, hidden_size, RoutingMethodCls, WeightLoadingMode",
     product(
         [torch.bfloat16],
         [72],
         [128, 256, 384, 512, 1024, 2048, 4096, 8192],
         [2560],
         [DefaultMoeRoutingMethod],
+        [MoEWeightLoadingMode.VANILLA, MoEWeightLoadingMode.FUSED_GATE_UP_PROJ],
     ),
 )
 def test_fused_moe_fp8_blockwise_cute_dsl(dtype,
@@ -574,6 +576,7 @@ def test_fused_moe_fp8_blockwise_cute_dsl(dtype,
                                           seq_len,
                                           hidden_size,
                                           RoutingMethodCls,
+                                          WeightLoadingMode,
                                           mapping=None):
     SEQ_LEN = seq_len
     HIDDEN_SIZE = hidden_size
@@ -599,6 +602,13 @@ def test_fused_moe_fp8_blockwise_cute_dsl(dtype,
                                 device="cuda")
 
     weights = {}
+
+    if WeightLoadingMode == MoEWeightLoadingMode.FUSED_GATE_UP_PROJ:
+        weights['gate_up_proj'] = {}
+        weights['down_proj'] = {}
+        weights['gate_up_proj_weight_scale'] = {}
+        weights['down_proj_weight_scale'] = {}
+
     for expert_id in range(NUM_EXPERTS):
         w1_weight = torch.randn((INTERMEDIATE_SIZE, HIDDEN_SIZE),
                                 dtype=dtype,
@@ -625,12 +635,25 @@ def test_fused_moe_fp8_blockwise_cute_dsl(dtype,
         weights[f"{expert_id}.w1.weight"] = w1_weight_fp8
         weights[f"{expert_id}.w2.weight"] = w2_weight_fp8
         weights[f"{expert_id}.w3.weight"] = w3_weight_fp8
-        weights[f"{expert_id}.w1.weight_scale_inv"] = w1_weight_scale
-        weights[f"{expert_id}.w2.weight_scale_inv"] = w2_weight_scale
-        weights[f"{expert_id}.w3.weight_scale_inv"] = w3_weight_scale
         weights[f"{expert_id}.w1.weight_scale"] = w1_weight_scale
         weights[f"{expert_id}.w2.weight_scale"] = w2_weight_scale
         weights[f"{expert_id}.w3.weight_scale"] = w3_weight_scale
+
+        if WeightLoadingMode == MoEWeightLoadingMode.FUSED_GATE_UP_PROJ:
+            weights['gate_up_proj'][expert_id] = torch.cat(
+                [w3_weight_fp8, w1_weight_fp8],
+                dim=-2).transpose(0, 1).contiguous()
+            weights['down_proj'][expert_id] = w2_weight_fp8.transpose(
+                0, 1).contiguous()
+            weights['gate_up_proj_weight_scale'][expert_id] = torch.cat(
+                [w3_weight_scale, w1_weight_scale],
+                dim=-2).transpose(0, 1).contiguous()
+            weights['down_proj_weight_scale'][
+                expert_id] = w2_weight_scale.transpose(0, 1).contiguous()
+        elif WeightLoadingMode == MoEWeightLoadingMode.VANILLA:
+            weights[f"{expert_id}.w1.weight_scale_inv"] = w1_weight_scale
+            weights[f"{expert_id}.w2.weight_scale_inv"] = w2_weight_scale
+            weights[f"{expert_id}.w3.weight_scale_inv"] = w3_weight_scale
 
     quant_config = QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES)
 
@@ -642,6 +665,7 @@ def test_fused_moe_fp8_blockwise_cute_dsl(dtype,
         dtype=dtype,
         reduce_results=True,
         model_config=ModelConfig(quant_config=quant_config, mapping=mapping),
+        weight_loading_mode=WeightLoadingMode,
     )
     fused_moe.cuda()
     fused_moe.load_weights([weights])
@@ -685,6 +709,7 @@ def test_fused_moe_fp8_blockwise_cute_dsl_multi_gpu(ep_size, routing_method):
                 384,
                 384,
                 routing_method,
+                MoEWeightLoadingMode.VANILLA,
                 Mapping(
                     world_size=world_size,
                     tp_size=world_size,

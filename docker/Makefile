@@ -130,6 +130,7 @@ else
 endif
 SOURCE_DIR        ?= $(shell readlink -f ..)
 CODE_DIR          ?= /code/tensorrt_llm
+EXTRA_VOLUMES     ?=
 CCACHE_DIR        ?= $(CODE_DIR)/cpp/.ccache
 CONAN_DIR         ?= $(CODE_DIR)/cpp/.conan
 USER_CACHE_DIR    ?= $(HOME_DIR)/.cache
@@ -151,6 +152,7 @@ endif
 	docker run $(DOCKER_RUN_OPTS) $(DOCKER_RUN_ARGS) \
     		$(GPU_OPTS) \
     		--volume $(SOURCE_DIR):$(CODE_DIR) \
+    		$(EXTRA_VOLUMES) \
     		$(if $(and $(filter 1,$(LOCAL_USER)),$(shell [ -w "$(USER_CACHE_DIR)" ] && echo 1)),--volume $(USER_CACHE_DIR):/home/$(USER_NAME)/.cache:rw) \
     		--env "CCACHE_DIR=$(CCACHE_DIR)" \
     		--env "CCACHE_BASEDIR=$(CODE_DIR)" \

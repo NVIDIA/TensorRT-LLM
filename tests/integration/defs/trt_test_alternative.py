@@ -216,9 +216,10 @@ def call(*popenargs,
         while True:
             try:
                 return p.wait(timeout=spin_time)
-            except subprocess.TimeoutExpired:
+            except subprocess.TimeoutExpired as e:
                 elapsed_time += spin_time
                 if timeout is not None and elapsed_time >= timeout:
+                    e.timeout = timeout
                     raise
             for p_poll in poll_procs:
                 if p_poll.poll() is None:
