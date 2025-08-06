@@ -2350,7 +2350,6 @@ class TorchLlmArgs(BaseLlmArgs):
             stream_interval=self.stream_interval,
             force_dynamic_quantization=self.force_dynamic_quantization,
             allreduce_strategy=self.allreduce_strategy,
-            enable_perfect_router=self.enable_perfect_router,
             attention_dp_enable_balance=bool(
                 self.attention_dp_config is not None
                 and self.attention_dp_config.enable_balance),
