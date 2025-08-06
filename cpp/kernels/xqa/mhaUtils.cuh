@@ -80,10 +80,17 @@ struct HeadPtr
 
     __device__ inline Head* operator+(uint32_t i) const
     {
+#if PAGED_KV_CACHE_LAYOUT == 1 && USE_PAGED_KV_CACHE
+        auto const pageIdx = pageIndices[nbPages == 1 ? 0U : i / tokensPerPage];
+        return (pageIdx & (1U << 31))
+            ? nullptr
+            : pool + (tokensPerPage * nbKHeads * pageIdx + offset + (i % tokensPerPage) * nbKHeads);
+#else
         assert(nbPages == 1 || offset % tokensPerPage == 0);
         auto const pageIdx = pageIndices[nbPages == 1 ? 0U : i / tokensPerPage];
         return (pageIdx & (1U << 31)) ? nullptr
                                       : pool + (tokensPerPage * nbKHeads * pageIdx + offset + i % tokensPerPage);
+#endif
     }
 };
 
@@ -239,7 +246,12 @@ struct KVCacheList;
 template <>
 struct KVCacheList<true>
 {
+#if PAGED_KV_CACHE_LAYOUT == 1
+    GMemCacheHead* kCacheVLLM;
+    GMemCacheHead* vCacheVLLM;
+#else
     GMemKVCacheHead* pool;
+#endif
     KVCachePageIndex const* kvCachePageList; // shape: KVCachePageIndex[batchSize][beamWidth][2][maxNbPagesPerSeq].
     SeqLenDataType const* seqLenList;        // shape: [batchSize][beamWidth] (for compatibility)
     uint32_t maxNbPagesPerSeq;
@@ -289,9 +301,13 @@ __device__ inline Vec<KVCachePageIndex, nbLoadedPages> getPage(KVCacheList<true>
     for (uint32_t i = 0; i < nbLoadedPages; i++)
     {
         uint32_t const idxPage = idxPageBeg + i;
+#if PAGED_KV_CACHE_LAYOUT == 1 && USE_PAGED_KV_CACHE
+        ret[i] = (idxPage < nbPages ? cacheList.kvCachePageList[maxNbPagesPerSeq * idxReq + idxPage] : kBAD_PAGE_INDEX);
+#else
         ret[i] = (idxPage < nbPages ? cacheList.kvCachePageList[beamWidth * 2 * maxNbPagesPerSeq * idxReq
                       + 2 * maxNbPagesPerSeq * idxBeam + maxNbPagesPerSeq * (isK ? 0U : 1U) + idxPage]
                                     : kBAD_PAGE_INDEX);
+#endif
     }
     return ret;
 }
