@@ -2459,6 +2459,7 @@ void doTokenComparisonChangeBeamWidth(bool enableReuse, SizeType32 maxWaitMs)
 
     for (SizeType32 beamWidth : {1, 2})
     {
+        TLLM_LOG_INFO("Running beam width: %d", beamWidth);
         BeamResult beamResult{beamWidth};
         auto const resultsPath
             = GPT_DATA_PATH / ((beamWidth == 1) ? "sampling" : "beam_search_" + std::to_string(beamWidth));
