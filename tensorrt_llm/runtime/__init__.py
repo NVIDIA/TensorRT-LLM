@@ -22,6 +22,7 @@ from .kv_cache_manager import GenerationSequence, KVCacheManager
 from .model_runner import ModelRunner
 from .multimodal_model_runner import MultimodalModelRunner
 from .session import Session, TensorInfo
+from .engine import get_engine_version
 
 try:
     import tensorrt_llm.bindings  # NOQA
