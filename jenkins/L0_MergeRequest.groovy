@@ -386,35 +386,33 @@ def launchReleaseCheck(pipeline)
         sh "git config --global --add safe.directory \"*\""
         // Step 1: cloning tekit source code
         trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
-        sh "cd ${LLM_ROOT} && find . -type f | sort"
         sh "cd ${LLM_ROOT} && git config --unset-all core.hooksPath"
-        sh "cd ${LLM_ROOT} && find . -type f | sort"
 
         // Step 2: Run guardwords scan
-        // def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
-        // if (env.alternativeTRT || isOfficialPostMergeJob) {
-        trtllm_utils.checkoutSource(SCAN_REPO, SCAN_COMMIT, SCAN_ROOT, true, true)
-        trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${SCAN_ROOT} && pip3 install -e .")
-        try {
-            ignoreList = [
-                "*/.git/*",
-                "*/3rdparty/*",
-                "*/cpp/tensorrt_llm/deep_ep/nvshmem_src_*.txz",
-                "*/examples/scaffolding/contrib/mcp/weather/weather.py",
-                "*/tensorrt_llm_internal_cutlass_kernels_static.tar.xz"
-            ]
-            sh "cd ${LLM_ROOT} && confidentiality-scan \$(find . -type f ${ignoreList.collect { "-not -path \"${it}\"" }.join(' ')}) 2>&1 | tee scan.log"
-            def lastLine = sh(script: "tail -n 1 ${LLM_ROOT}/scan.log", returnStdout: true).trim()
-            if (lastLine.toLowerCase().contains("error")) {
-                error "Guardwords Scan Failed."
+        def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
+        if (env.alternativeTRT || isOfficialPostMergeJob) {
+            trtllm_utils.checkoutSource(SCAN_REPO, SCAN_COMMIT, SCAN_ROOT, true, true)
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${SCAN_ROOT} && pip3 install -e .")
+            try {
+                ignoreList = [
+                    "*/.git/*",
+                    "*/3rdparty/*",
+                    "*/cpp/tensorrt_llm/deep_ep/nvshmem_src_*.txz",
+                    "*/examples/scaffolding/contrib/mcp/weather/weather.py",
+                    "*/tensorrt_llm_internal_cutlass_kernels_static.tar.xz"
+                ]
+                sh "cd ${LLM_ROOT} && confidentiality-scan \$(find . -type f ${ignoreList.collect { "-not -path \"${it}\"" }.join(' ')}) 2>&1 | tee scan.log"
+                def lastLine = sh(script: "tail -n 1 ${LLM_ROOT}/scan.log", returnStdout: true).trim()
+                if (lastLine.toLowerCase().contains("error")) {
+                    error "Guardwords Scan Failed."
+                }
+            } catch (Exception e) {
+                throw e
+            } finally {
+                trtllm_utils.uploadArtifacts("${LLM_ROOT}/scan.log", "${UPLOAD_PATH}/guardwords-scan-results/")
+                echo "Guardwords Scan Results: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/guardwords-scan-results/scan.log"
             }
-        } catch (Exception e) {
-            throw e
-        } finally {
-            trtllm_utils.uploadArtifacts("${LLM_ROOT}/scan.log", "${UPLOAD_PATH}/guardwords-scan-results/")
-            echo "Guardwords Scan Results: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/guardwords-scan-results/scan.log"
         }
-        // }
 
         // Step 3: Run release check
         trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${LLM_ROOT} && python3 -u scripts/release_check.py || (git restore . && false)")
