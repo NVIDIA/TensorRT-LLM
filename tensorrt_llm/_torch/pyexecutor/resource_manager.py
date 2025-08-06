@@ -388,7 +388,7 @@ class KVCacheManager(BaseResourceManager):
                         req.py_request_id,
                         seq_len + (len(req.query_id) if self.mapping.cp_rank
                                    == self.mapping.cp_size - 1 else 0),
-                        req_beam_width, req, self.kv_connector_manager)
+                        req_beam_width, req, None)
             else:
                 # In add_sequence, the connector API's get_num_new_matched_tokens is called.
                 # The result of this call may be that blocks will be loaded asynchronously.
