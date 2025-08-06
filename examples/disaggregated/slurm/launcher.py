@@ -38,6 +38,10 @@ def setup_argparse():
                         type=str,
                         required=True,
                         help="Container mount points")
+    parser.add_argument("--num-gpus",
+                        type=int,
+                        required=True,
+                        help="Number of GPUs on each node")
     parser.add_argument("--config-file",
                         type=str,
                         default="./config.yaml",
@@ -194,14 +198,14 @@ def main():
         elif args.sweep_config and args.use_single_allocation:
             # For manual sweep with single allocation, calculate based on base config
             # This is a conservative estimate - actual sweep configs might need more
-            base_nodes = calculate_nodes_needed(base_config)
+            base_nodes = calculate_nodes_needed(base_config, args.num_gpus)
             print(
                 f"Manual sweep mode: using {base_nodes} nodes based on base configuration"
             )
             num_nodes = base_nodes
         elif not args.sweep_config and not is_multi_config:
             # For single configuration mode
-            num_nodes = calculate_nodes_needed(base_config)
+            num_nodes = calculate_nodes_needed(base_config, args.num_gpus)
             print(
                 f"Single config mode: calculated {num_nodes} nodes needed based on configuration"
             )

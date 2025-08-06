@@ -883,6 +883,7 @@ class JobManager:
                         'use_benchmark_serving']:
                 pid = self.run_benchmark_serving_for_concurrency(
                     hostname, port, concurrency, concurrency_output_folder)
+                pid.wait()
             print(
                 f"DEBUG JobManager: Completed loadgen for concurrency {concurrency}"
             )
