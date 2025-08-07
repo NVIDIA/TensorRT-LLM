@@ -652,6 +652,15 @@ class JobManager:
         if 'unset_env' in config:
             for key in config['unset_env']:
                 unset_env += f" -u {key}"
+        nsys = False
+        nsys_prefix = ''
+        if 'nsys' in config:
+            nsys = config['nsys']
+        if nsys:
+            envs += " TLLM_PROFILE_RECORD_GC=1"
+            envs += " TLLM_NVTX_DEBUG=1"
+            nsys_file = os.path.join(self.output_folder, f"{log_file}.nsys-rep")
+            nsys_prefix = f"nsys profile -e \"NSYS_MPI_STORE_TEAMS_PER_RANK=1\" -o {nsys_file} -f true -t cuda,nvtx,python-gil -c cudaProfilerApi --cuda-graph-trace node --capture-range-end=stop --gpu-metrics-devices=none"
         log_file = os.path.join(self.output_folder, log_file)
 
         # Build the command
@@ -680,7 +689,7 @@ class JobManager:
             "bash",
             "-c",
             envs +
-            " env " + unset_env + " trtllm-llmapi-launch trtllm-serve " +
+            " env " + unset_env + " " + nsys_prefix + " trtllm-llmapi-launch trtllm-serve " +
             self.config['exec']['model_path'] + " --host 0.0.0.0 --port " +
             str(node_port) + " --backend pytorch --extra_llm_api_options " +
             config_path + " --tp_size " + str(tp) + " --ep_size " + str(ep) +
