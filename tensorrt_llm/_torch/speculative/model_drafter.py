@@ -8,8 +8,9 @@ import torch
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.logger import logger
 
+from ..pyexecutor.guided_decoder import GuidedDecoder
 from ..pyexecutor.llm_request import (LlmRequest, LlmRequestState,
-                                      SamplingConfig, get_draft_token_length)
+                                      get_draft_token_length)
 from ..pyexecutor.resource_manager import BaseResourceManager, ResourceManager
 from ..pyexecutor.sampler import Sampler, SampleState, TorchSampler
 from ..pyexecutor.scheduler import ScheduledRequests
@@ -45,6 +46,7 @@ class ModelDrafter(Drafter):
         draft_seq_slot_manager: SeqSlotManager,
         sampler: Sampler,
         spec_resource_manager: Optional[BaseResourceManager] = None,
+        guided_decoder: Optional[GuidedDecoder] = None,
     ):
         # Validate required parameters
         if draft_model_engine is None:
@@ -65,17 +67,18 @@ class ModelDrafter(Drafter):
         self._request_draft_logits = False
         if isinstance(sampler, TorchSampler):
             self._request_draft_logits = sampler.enable_mixed_sampler
+        self.guided_decoder = guided_decoder
 
-    def _create_draft_request(self, request_id: int, max_new_tokens: int,
-                              input_tokens: Optional[List],
-                              sampling_config: SamplingConfig,
-                              return_perf_metrics: bool) -> LlmRequest:
+    def _create_draft_request(self, request: LlmRequest,
+                              input_tokens: Optional[List]) -> LlmRequest:
         """Create a draft request with common parameters."""
-        return LlmRequest(request_id=request_id,
-                          max_new_tokens=max_new_tokens,
-                          input_tokens=input_tokens,
-                          sampling_config=sampling_config,
-                          return_perf_metrics=return_perf_metrics,
+        return LlmRequest(input_tokens=input_tokens,
+                          request_id=request.py_request_id,
+                          max_new_tokens=request.py_max_new_tokens,
+                          sampling_config=request.sampling_config,
+                          guided_decoding_params=request.guided_decoding_params,
+                          target_seq_slot=request.py_seq_slot,
+                          return_perf_metrics=request.return_perf_metrics,
                           is_streaming=False,
                           is_draft=True,
                           return_generation_logits=self._request_draft_logits)
@@ -96,11 +99,7 @@ class ModelDrafter(Drafter):
     def _create_context_request(self, request: LlmRequest,
                                 input_tokens: Any) -> LlmRequest:
         """Create a context request for first-time drafting."""
-        new_request = self._create_draft_request(request.py_request_id,
-                                                 request.py_max_new_tokens,
-                                                 input_tokens,
-                                                 request.sampling_config,
-                                                 request.return_perf_metrics)
+        new_request = self._create_draft_request(request, input_tokens)
 
         begin_compute, end_compute = request.py_last_context_chunk
         if begin_compute is not None:
@@ -111,13 +110,7 @@ class ModelDrafter(Drafter):
     def _create_generation_request(self, request: LlmRequest,
                                    input_tokens: Any) -> LlmRequest:
         """Create a generation request when no tokens were accepted."""
-        new_request = self._create_draft_request(request.py_request_id,
-                                                 request.py_max_new_tokens,
-                                                 input_tokens[:-1],
-                                                 request.sampling_config,
-                                                 request.return_perf_metrics)
-        # Explicitly add the last token so get_last_tokens() returns the right value
-        new_request.add_new_token(input_tokens[-1], 0)
+        new_request = self._create_draft_request(request, input_tokens)
         new_request.state = LlmRequestState.GENERATION_IN_PROGRESS
         return new_request
 
@@ -128,11 +121,7 @@ class ModelDrafter(Drafter):
         Create a chunked context request for accepted tokens.
         Only applicable if the draft model needs to recompute KV cache for accepted tokens (e.g. eagle 3)
         """
-        new_request = self._create_draft_request(request.py_request_id,
-                                                 request.py_max_new_tokens,
-                                                 input_tokens,
-                                                 request.sampling_config,
-                                                 request.return_perf_metrics)
+        new_request = self._create_draft_request(request, input_tokens)
         new_request.context_chunk_size = num_accepted_tokens + 1
         new_request.context_current_position = len(
             input_tokens) - num_accepted_tokens - 1
@@ -144,7 +133,7 @@ class ModelDrafter(Drafter):
         num_draft_tokens, num_accepted_tokens = self._initialize_draft_tokens(
             request)
         input_tokens = get_draft_model_prompt(self.spec_config.spec_dec_mode,
-                                              request.get_tokens()[0])
+                                              request.get_tokens(0))
 
         # First time seeing this request - context request
         if request.max_beam_num_tokens - 1 == request.py_prompt_len:
@@ -206,7 +195,7 @@ class ModelDrafter(Drafter):
                 # We hit this path if we're doing chunked prefill. The target model processed
                 # a prefill chunk on the last iteration. Now, we need to fill in the KV cache
                 # for the draft model too.
-                all_tokens = request.get_tokens()[0]
+                all_tokens = request.get_tokens(0)
                 input_tokens = get_draft_model_prompt(
                     self.spec_config.spec_dec_mode, all_tokens)
 
@@ -329,6 +318,14 @@ class ModelDrafter(Drafter):
             req.py_draft_tokens.extend(
                 0 for _ in range(max_draft_tokens - num_draft_tokens))
 
+    def _execute_guided_decoder(self,
+                                scheduled_batch: ScheduledRequests,
+                                logits: torch.Tensor,
+                                d2t: Optional[torch.Tensor] = None):
+        if self.guided_decoder is not None:
+            self.guided_decoder.build(scheduled_batch)
+            self.guided_decoder.execute(scheduled_batch, logits, d2t=d2t)
+
     @nvtx_range("prepare_draft_tokens")
     def prepare_draft_tokens(
         self,
@@ -363,6 +360,9 @@ class ModelDrafter(Drafter):
 
             # Initial forward pass
             outputs = self._forward_draft_model(draft_batch, resource_manager)
+            self._execute_guided_decoder(draft_batch,
+                                         outputs['logits'],
+                                         d2t=outputs.get('d2t'))
             sample_state = self._sample_async(draft_batch, outputs)
             previous_batch = sample_state
 
@@ -380,10 +380,14 @@ class ModelDrafter(Drafter):
                 outputs = self._forward_draft_model(draft_batch,
                                                     resource_manager,
                                                     previous_batch)
+                if previous_batch is not None:
+                    self._update_requests(previous_batch)
+                self._execute_guided_decoder(draft_batch,
+                                             outputs['logits'],
+                                             d2t=outputs.get('d2t'))
                 sample_state = self._sample_async(draft_batch, outputs)
                 self._update_request_states(draft_batch)
                 if previous_batch is not None:
-                    self._update_requests(previous_batch)
                     new_requests = self._process_decoded_tokens(
                         previous_batch.scheduled_requests,
                         req_id_to_old_request)
@@ -398,6 +402,9 @@ class ModelDrafter(Drafter):
                 self._process_decoded_tokens(previous_batch.scheduled_requests,
                                              req_id_to_old_request)
             self._pad_to_max_draft_tokens(scheduled_requests)
+
+            if self.guided_decoder is not None:
+                self.guided_decoder.rollback_draft_tokens(scheduled_requests)
 
         except Exception as e:
             traceback.print_exc()

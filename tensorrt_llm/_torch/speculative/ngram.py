@@ -1,11 +1,12 @@
 from itertools import chain
+from typing import Optional
 
 from ordered_set import OrderedSet
 
 from tensorrt_llm.llmapi import NGramDecodingConfig
 from tensorrt_llm.logger import logger
 
-from ..pyexecutor.llm_request import *
+from ..pyexecutor.llm_request import LlmRequest, LlmRequestState
 from ..pyexecutor.resource_manager import BaseResourceManager, ResourceManager
 from ..pyexecutor.scheduler import ScheduledRequests
 from .drafter import Drafter
@@ -181,6 +182,7 @@ class NGramDrafter(Drafter):
         if self.spec_config.is_auto_heuristic and len(
                 scheduled_requests.all_requests()) > 32:
             return
+
         # Sort by request_id when py_batch_idx is None as a fallback.
         # This happens in the disagg case: for a set of new requests, we draft
         # before forward_step, so py_batch_idx is not assigned.
@@ -190,7 +192,7 @@ class NGramDrafter(Drafter):
             (r.py_batch_idx is None, r.py_batch_idx or r.request_id),
         ):
             # Add new token to a copy of the generated tokens to find new draft tokens
-            prefix = list(request.get_tokens()[0])  # Get a copy
+            prefix = list(request.get_tokens(0))  # Get a copy
 
             # Generate draft tokens
             draft_tokens = self.spec_resource_manager.get_draft_tokens(
