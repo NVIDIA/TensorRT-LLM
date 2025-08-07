@@ -601,7 +601,7 @@ class TorchSampler(Sampler):
             current_slice = slice(0, steps), slot, beam
             new_tokens[current_slice] = next_tokens
             if request.py_draft_logits is not None:
-                # Could be cleaner, Izzy
+                # Could be cleaner
                 request.py_target_probs = softmax.clone()
             if gen_logits_host is not None:
                 gen_logits_host[current_slice].copy_(logits, non_blocking=True)
