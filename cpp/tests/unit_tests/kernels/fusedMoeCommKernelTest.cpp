@@ -106,6 +106,73 @@ protected:
         delete[] static_cast<char*>(hostPtr);
         TLLM_CUDA_CHECK(cudaFree(devicePtr));
     }
+
+    // Generate a one-to-one mapping, extending with random permutation if needed
+    std::vector<int> generateOneToOneMapping(std::vector<int> const& partialMapping, int totalSize)
+    {
+        std::vector<int> fullMapping(totalSize);
+        std::vector<bool> used(totalSize, false);
+
+        // First, copy the provided mapping and mark used indices
+        int providedSize = static_cast<int>(partialMapping.size());
+        for (int i = 0; i < std::min(providedSize, totalSize); i++)
+        {
+            int target = partialMapping[i];
+            if (target >= 0 && target < totalSize && !used[target])
+            {
+                fullMapping[i] = target;
+                used[target] = true;
+            }
+            else
+            {
+                // Invalid mapping, will be handled later
+                fullMapping[i] = -1;
+            }
+        }
+
+        // Collect unused indices
+        std::vector<int> unusedIndices;
+        for (int i = 0; i < totalSize; i++)
+        {
+            if (!used[i])
+            {
+                unusedIndices.push_back(i);
+            }
+        }
+
+        // Shuffle unused indices for random assignment
+        std::srand(42); // Fixed seed for reproducible tests
+        std::random_shuffle(unusedIndices.begin(), unusedIndices.end());
+
+        // Fill in any invalid mappings and extend with remaining unused indices
+        int unusedIdx = 0;
+        for (int i = 0; i < totalSize; i++)
+        {
+            if (i < providedSize && fullMapping[i] == -1)
+            {
+                // Fix invalid mapping
+                if (unusedIdx < unusedIndices.size())
+                {
+                    fullMapping[i] = unusedIndices[unusedIdx++];
+                }
+            }
+            else if (i >= providedSize)
+            {
+                // Extend mapping
+                if (unusedIdx < unusedIndices.size())
+                {
+                    fullMapping[i] = unusedIndices[unusedIdx++];
+                }
+                else
+                {
+                    // Fallback: identity mapping for remaining
+                    fullMapping[i] = i;
+                }
+            }
+        }
+
+        return fullMapping;
+    }
 };
 
 // Test class for launchSingleG2S function
@@ -454,7 +521,310 @@ private:
     }
 };
 
-// Test class for launchG2SPackUnpackS2G function (loopback test)
+// Test class for launchLocalSendRecv function (local send/recv simulation)
+class FusedMoeCommLocalSendRecvTest : public FusedMoeCommTestBase
+{
+protected:
+    void runLocalSendRecvTest(int topK, bool hasScales, bool hasBasicFields, int fieldCount,
+        std::vector<size_t> const& elementSizes, std::vector<uint16_t> const& vectorSizes,
+        std::vector<int> const& recvIndexMappingVec, int tokenCount = 128, int warpsPerBlock = 2,
+        int blockChannelCount = 2)
+    {
+        // Setup expert parallel info
+        MoeExpertParallelInfo expertParallelInfo;
+        expertParallelInfo.topK = topK;
+        expertParallelInfo.expertCount = 8;
+
+        // Setup field info - for local send/recv test, send and recv fields should be identical
+        FusedMoeFieldInfo sendFieldInfo = {};
+        sendFieldInfo.isBasicInterleaved = false;
+        sendFieldInfo.fieldCount = fieldCount;
+
+        FusedMoeFieldInfo recvFieldInfo = {};
+        recvFieldInfo.isBasicInterleaved = false;
+        recvFieldInfo.fieldCount = fieldCount;
+
+        // Allocate token selected slots and expert scales if needed
+        int* hostSendTokenSlots = nullptr;
+        int* deviceSendTokenSlots = nullptr;
+        float* hostSendScales = nullptr;
+        float* deviceSendScales = nullptr;
+        int* hostRecvTokenSlots = nullptr;
+        int* deviceRecvTokenSlots = nullptr;
+        float* hostRecvScales = nullptr;
+        float* deviceRecvScales = nullptr;
+
+        if (hasBasicFields)
+        {
+            // Send side basic fields
+            allocateAndInitializeData<int>(&hostSendTokenSlots, &deviceSendTokenSlots, tokenCount * topK,
+                [](size_t i) { return static_cast<int>(i % 16); });
+            sendFieldInfo.tokenSelectedSlots = deviceSendTokenSlots;
+
+            // Recv side basic fields (initialized to zero, will be filled by local send/recv)
+            allocateAndInitializeData<int>(
+                &hostRecvTokenSlots, &deviceRecvTokenSlots, tokenCount * topK, [](size_t) { return 0; });
+            recvFieldInfo.tokenSelectedSlots = deviceRecvTokenSlots;
+
+            if (hasScales)
+            {
+                allocateAndInitializeData<float>(&hostSendScales, &deviceSendScales, tokenCount * topK,
+                    [](size_t i) -> float { return 1.0f + static_cast<float>(i) * 0.01f; });
+                sendFieldInfo.expertScales = deviceSendScales;
+
+                allocateAndInitializeData<float>(
+                    &hostRecvScales, &deviceRecvScales, tokenCount * topK, [](size_t) { return 0.0f; });
+                recvFieldInfo.expertScales = deviceRecvScales;
+            }
+        }
+
+        // Setup field info - both send and recv use same layout for local test
+        std::vector<void*> hostSendFieldPtrs(fieldCount);
+        std::vector<void*> deviceSendFieldPtrs(fieldCount);
+        std::vector<void*> hostRecvFieldPtrs(fieldCount);
+        std::vector<void*> deviceRecvFieldPtrs(fieldCount);
+
+        for (int i = 0; i < fieldCount; i++)
+        {
+            size_t elementSize = elementSizes[i % elementSizes.size()];
+            uint16_t vectorSize = vectorSizes[i % vectorSizes.size()];
+            size_t fieldSize = elementSize * vectorSize * tokenCount;
+
+            // Allocate send field data with specific pattern
+            uint8_t* hostSendField;
+            uint8_t* deviceSendField;
+            allocateAndInitializeData<uint8_t>(&hostSendField, &deviceSendField, fieldSize,
+                [i](size_t idx) { return static_cast<uint8_t>((i * 127 + idx + 13) % 256); });
+
+            // Allocate recv field data (initially zero, will be filled by local send/recv)
+            uint8_t* hostRecvField;
+            uint8_t* deviceRecvField;
+            allocateAndInitializeData<uint8_t>(
+                &hostRecvField, &deviceRecvField, fieldSize, [](size_t) { return static_cast<uint8_t>(0); });
+
+            hostSendFieldPtrs[i] = hostSendField;
+            deviceSendFieldPtrs[i] = deviceSendField;
+            hostRecvFieldPtrs[i] = hostRecvField;
+            deviceRecvFieldPtrs[i] = deviceRecvField;
+
+            // Fill field info for both send and recv
+            sendFieldInfo.fieldsInfo[i].fillFieldInfo(deviceSendField, elementSize, vectorSize, vectorSize);
+            recvFieldInfo.fieldsInfo[i].fillFieldInfo(deviceRecvField, elementSize, vectorSize, vectorSize);
+        }
+
+        // Fill field placement info
+        sendFieldInfo.fillFieldPlacementInfo(topK, hasBasicFields);
+        recvFieldInfo.fillFieldPlacementInfo(topK, hasBasicFields);
+
+        // Setup recvIndexMapping - ensure one-to-one mapping
+        std::vector<int> fullMapping = generateOneToOneMapping(recvIndexMappingVec, tokenCount);
+        int* hostRecvIndexMapping;
+        int* deviceRecvIndexMapping;
+        allocateAndInitializeData<int>(&hostRecvIndexMapping, &deviceRecvIndexMapping, tokenCount,
+            [&fullMapping](size_t i) { return fullMapping[i]; });
+
+        // Calculate and allocate workspace
+        int totalChannelCount = warpsPerBlock * blockChannelCount;
+        size_t workspaceSize = FusedMoeWorkspace::computeWorkspaceSizePreRank(1, totalChannelCount);
+
+        uint64_t* deviceWorkspacePtr;
+        TLLM_CUDA_CHECK(cudaMalloc(&deviceWorkspacePtr, workspaceSize));
+
+        // Setup FusedMoeWorkspace
+        FusedMoeWorkspace fusedMoeWorkspace;
+        fusedMoeWorkspace.workspacePtr = deviceWorkspacePtr;
+        fusedMoeWorkspace.rankStrideInU64 = workspaceSize / sizeof(uint64_t);
+
+        // Initialize workspace
+        FusedMoeWorldInfo worldInfo;
+        worldInfo.epInfo.epRank = 0;
+        worldInfo.epInfo.epSize = 1;
+        fusedMoeWorkspace.initializeLocalWorkspace(worldInfo, totalChannelCount);
+
+        // Launch local send/recv kernel
+        fused_moe_comm_tests::launchLocalSendRecv(sendFieldInfo, recvFieldInfo, expertParallelInfo,
+            deviceRecvIndexMapping, fusedMoeWorkspace, tokenCount, warpsPerBlock, blockChannelCount, hasBasicFields,
+            stream);
+
+        TLLM_CUDA_CHECK(cudaStreamSynchronize(stream));
+
+        // Copy back results and verify
+        verifyLocalSendRecvResults(hostSendTokenSlots, hostSendScales, hostSendFieldPtrs, hostRecvFieldPtrs,
+            deviceRecvTokenSlots, deviceRecvScales, deviceRecvFieldPtrs, fullMapping, topK, hasScales, hasBasicFields,
+            fieldCount, elementSizes, vectorSizes, tokenCount);
+
+        // Cleanup
+        if (hasBasicFields)
+        {
+            cleanup(hostSendTokenSlots, deviceSendTokenSlots);
+            cleanup(hostRecvTokenSlots, deviceRecvTokenSlots);
+            if (hasScales)
+            {
+                cleanup(hostSendScales, deviceSendScales);
+                cleanup(hostRecvScales, deviceRecvScales);
+            }
+        }
+        for (int i = 0; i < fieldCount; i++)
+        {
+            cleanup(hostSendFieldPtrs[i], deviceSendFieldPtrs[i]);
+            cleanup(hostRecvFieldPtrs[i], deviceRecvFieldPtrs[i]);
+        }
+        cleanup(hostRecvIndexMapping, deviceRecvIndexMapping);
+        TLLM_CUDA_CHECK(cudaFree(deviceWorkspacePtr));
+    }
+
+private:
+    void verifyLocalSendRecvResults(int const* expectedSendTokenSlots, float const* expectedSendScales,
+        std::vector<void*> const& expectedSendFields, std::vector<void*> const& hostRecvFields,
+        int* deviceRecvTokenSlots, float* deviceRecvScales, std::vector<void*> const& deviceRecvFields,
+        std::vector<int> const& fullMapping, int topK, bool hasScales, bool hasBasicFields, int fieldCount,
+        std::vector<size_t> const& elementSizes, std::vector<uint16_t> const& vectorSizes, int tokenCount)
+    {
+        // Copy back device results for verification
+        int* resultRecvTokenSlots = nullptr;
+        float* resultRecvScales = nullptr;
+
+        if (hasBasicFields)
+        {
+            resultRecvTokenSlots = new int[tokenCount * topK];
+            TLLM_CUDA_CHECK(cudaMemcpy(
+                resultRecvTokenSlots, deviceRecvTokenSlots, tokenCount * topK * sizeof(int), cudaMemcpyDeviceToHost));
+
+            if (hasScales)
+            {
+                resultRecvScales = new float[tokenCount * topK];
+                TLLM_CUDA_CHECK(cudaMemcpy(
+                    resultRecvScales, deviceRecvScales, tokenCount * topK * sizeof(float), cudaMemcpyDeviceToHost));
+            }
+        }
+
+        // Copy back field data
+        std::vector<uint8_t*> resultRecvFields(fieldCount);
+        for (int i = 0; i < fieldCount; i++)
+        {
+            size_t elementSize = elementSizes[i % elementSizes.size()];
+            uint16_t vectorSize = vectorSizes[i % vectorSizes.size()];
+            size_t fieldSize = elementSize * vectorSize * tokenCount;
+
+            resultRecvFields[i] = new uint8_t[fieldSize];
+            TLLM_CUDA_CHECK(cudaMemcpy(resultRecvFields[i], deviceRecvFields[i], fieldSize, cudaMemcpyDeviceToHost));
+        }
+
+        // Verify the local send/recv: recv[fullMapping[sendIndex]] should equal send[sendIndex]
+        int tokenSlotErrorCount = 0;
+        int scaleErrorCount = 0;
+        std::vector<int> fieldErrorCounts(fieldCount, 0);
+
+        for (int sendIndex = 0; sendIndex < tokenCount; sendIndex++)
+        {
+            int recvIndex = fullMapping[sendIndex];
+            ASSERT_GE(recvIndex, 0) << "Invalid recv index mapping at " << sendIndex;
+            ASSERT_LT(recvIndex, tokenCount) << "Recv index out of bounds at " << sendIndex;
+
+            // Verify basic fields if present
+            if (hasBasicFields)
+            {
+                // Verify token slots
+                if (expectedSendTokenSlots && resultRecvTokenSlots)
+                {
+                    for (int k = 0; k < topK; k++)
+                    {
+                        int expected = expectedSendTokenSlots[sendIndex * topK + k];
+                        int actual = resultRecvTokenSlots[recvIndex * topK + k];
+                        if (expected != actual)
+                        {
+                            if (tokenSlotErrorCount < 16)
+                            {
+                                EXPECT_EQ(expected, actual)
+                                    << "Token slot local send/recv mismatch: send[" << sendIndex << "][" << k
+                                    << "] -> recv[" << recvIndex << "][" << k << "]";
+                            }
+                            tokenSlotErrorCount++;
+                        }
+                    }
+                }
+
+                // Verify scales if present
+                if (hasScales && expectedSendScales && resultRecvScales)
+                {
+                    for (int k = 0; k < topK; k++)
+                    {
+                        float expected = expectedSendScales[sendIndex * topK + k];
+                        float actual = resultRecvScales[recvIndex * topK + k];
+                        if (std::abs(expected - actual) > 1e-6f)
+                        {
+                            if (scaleErrorCount < 16)
+                            {
+                                EXPECT_NEAR(expected, actual, 1e-6f)
+                                    << "Scale local send/recv mismatch: send[" << sendIndex << "][" << k << "] -> recv["
+                                    << recvIndex << "][" << k << "]";
+                            }
+                            scaleErrorCount++;
+                        }
+                    }
+                }
+            }
+
+            // Verify field data
+            for (int fieldIdx = 0; fieldIdx < fieldCount; fieldIdx++)
+            {
+                size_t elementSize = elementSizes[fieldIdx % elementSizes.size()];
+                uint16_t vectorSize = vectorSizes[fieldIdx % vectorSizes.size()];
+                size_t fieldSize = elementSize * vectorSize;
+
+                uint8_t const* expectedSendField = static_cast<uint8_t const*>(expectedSendFields[fieldIdx]);
+                uint8_t const* actualRecvField = resultRecvFields[fieldIdx];
+
+                for (size_t byteIdx = 0; byteIdx < fieldSize; byteIdx++)
+                {
+                    uint8_t expected = expectedSendField[sendIndex * fieldSize + byteIdx];
+                    uint8_t actual = actualRecvField[recvIndex * fieldSize + byteIdx];
+                    if (expected != actual)
+                    {
+                        if (fieldErrorCounts[fieldIdx] < 16)
+                        {
+                            EXPECT_EQ(expected, actual)
+                                << "Field local send/recv mismatch: field[" << fieldIdx << "] send[" << sendIndex
+                                << "][" << byteIdx << "] -> recv[" << recvIndex << "][" << byteIdx << "]";
+                        }
+                        fieldErrorCounts[fieldIdx]++;
+                    }
+                }
+            }
+        }
+
+        // Report summary for truncated error messages
+        if (tokenSlotErrorCount > 16)
+        {
+            ADD_FAILURE() << "Token slot errors: Showed first 16 of " << tokenSlotErrorCount << " total mismatches.";
+        }
+        if (scaleErrorCount > 16)
+        {
+            ADD_FAILURE() << "Scale errors: Showed first 16 of " << scaleErrorCount << " total mismatches.";
+        }
+        for (int fieldIdx = 0; fieldIdx < fieldCount; fieldIdx++)
+        {
+            if (fieldErrorCounts[fieldIdx] > 16)
+            {
+                ADD_FAILURE() << "Field[" << fieldIdx << "] errors: Showed first 16 of " << fieldErrorCounts[fieldIdx]
+                              << " total mismatches.";
+            }
+        }
+
+        // Cleanup temporary arrays
+        if (resultRecvTokenSlots)
+            delete[] resultRecvTokenSlots;
+        if (resultRecvScales)
+            delete[] resultRecvScales;
+        for (int i = 0; i < fieldCount; i++)
+        {
+            if (resultRecvFields[i])
+                delete[] resultRecvFields[i];
+        }
+    }
+};
+
+// Test class for launchLoopback function (loopback test)
 class FusedMoeCommLoopbackTest : public FusedMoeCommTestBase
 {
 protected:
@@ -548,11 +918,12 @@ protected:
         sendFieldInfo.fillFieldPlacementInfo(topK, hasBasicFields);
         recvFieldInfo.fillFieldPlacementInfo(topK, hasBasicFields);
 
-        // Setup recvIndexMapping
+        // Setup recvIndexMapping - ensure one-to-one mapping
+        std::vector<int> fullMapping = generateOneToOneMapping(recvIndexMappingVec, tokenCount);
         int* hostRecvIndexMapping;
         int* deviceRecvIndexMapping;
         allocateAndInitializeData<int>(&hostRecvIndexMapping, &deviceRecvIndexMapping, tokenCount,
-            [&recvIndexMappingVec](size_t i) { return recvIndexMappingVec[i]; });
+            [&fullMapping](size_t i) { return fullMapping[i]; });
 
         // Launch loopback kernel
         fused_moe_comm_tests::launchLoopback(sendFieldInfo, recvFieldInfo, expertParallelInfo, deviceRecvIndexMapping,
@@ -562,8 +933,8 @@ protected:
 
         // Copy back results and verify
         verifyLoopbackResults(hostSendTokenSlots, hostSendScales, hostSendFieldPtrs, hostRecvFieldPtrs,
-            deviceRecvTokenSlots, deviceRecvScales, deviceRecvFieldPtrs, recvIndexMappingVec, topK, hasScales,
-            hasBasicFields, fieldCount, elementSizes, vectorSizes, tokenCount);
+            deviceRecvTokenSlots, deviceRecvScales, deviceRecvFieldPtrs, fullMapping, topK, hasScales, hasBasicFields,
+            fieldCount, elementSizes, vectorSizes, tokenCount);
 
         // Cleanup
         if (hasBasicFields)
@@ -588,7 +959,7 @@ private:
     void verifyLoopbackResults(int const* expectedSendTokenSlots, float const* expectedSendScales,
         std::vector<void*> const& expectedSendFields, std::vector<void*> const& hostRecvFields,
         int* deviceRecvTokenSlots, float* deviceRecvScales, std::vector<void*> const& deviceRecvFields,
-        std::vector<int> const& recvIndexMappingVec, int topK, bool hasScales, bool hasBasicFields, int fieldCount,
+        std::vector<int> const& fullMapping, int topK, bool hasScales, bool hasBasicFields, int fieldCount,
         std::vector<size_t> const& elementSizes, std::vector<uint16_t> const& vectorSizes, int tokenCount)
     {
         // Copy back device results for verification
@@ -621,10 +992,14 @@ private:
             TLLM_CUDA_CHECK(cudaMemcpy(resultRecvFields[i], deviceRecvFields[i], fieldSize, cudaMemcpyDeviceToHost));
         }
 
-        // Verify the loopback: recv[recvIndexMapping[sendIndex]] should equal send[sendIndex]
+        // Verify the loopback: recv[fullMapping[sendIndex]] should equal send[sendIndex]
+        int tokenSlotErrorCount = 0;
+        int scaleErrorCount = 0;
+        std::vector<int> fieldErrorCounts(fieldCount, 0);
+
         for (int sendIndex = 0; sendIndex < tokenCount; sendIndex++)
         {
-            int recvIndex = recvIndexMappingVec[sendIndex];
+            int recvIndex = fullMapping[sendIndex];
             ASSERT_GE(recvIndex, 0) << "Invalid recv index mapping at " << sendIndex;
             ASSERT_LT(recvIndex, tokenCount) << "Recv index out of bounds at " << sendIndex;
 
@@ -901,4 +1276,124 @@ TEST_F(FusedMoeCommLoopbackTest, LoopbackWithoutBasicFieldsLargeFields)
 {
     std::vector<int> mapping = {2, 0, 3, 1};                                   // Reorder mapping
     runLoopbackTest(0, false, false, 3, {1, 4, 16}, {128, 256, 512}, mapping); // No basic fields, large field data
+}
+
+// Tests for Local Send/Recv functionality (single GPU simulation)
+TEST_F(FusedMoeCommLocalSendRecvTest, BasicLocalSendRecvWithoutScales)
+{
+    std::vector<int> mapping = {0, 1, 2, 3};                              // Identity mapping
+    runLocalSendRecvTest(2, false, true, 1, {4}, {64}, mapping, 4, 1, 1); // Basic test with minimal parameters
+}
+
+TEST_F(FusedMoeCommLocalSendRecvTest, BasicLocalSendRecvWithScales)
+{
+    std::vector<int> mapping = {0, 1, 2, 3};                             // Identity mapping
+    runLocalSendRecvTest(4, true, true, 1, {4}, {32}, mapping, 4, 2, 1); // With scales
+}
+
+TEST_F(FusedMoeCommLocalSendRecvTest, LocalSendRecvWithReordering)
+{
+    std::vector<int> mapping = {3, 0, 2, 1}; // Reorder mapping
+    runLocalSendRecvTest(2, true, true, 2, {4, 8}, {32, 64}, mapping, 256, 2, 2);
+}
+
+TEST_F(FusedMoeCommLocalSendRecvTest, LocalSendRecvWithComplexMapping)
+{
+    std::vector<int> mapping = {7, 2, 5, 0, 3, 6, 1, 4}; // Complex 8-element mapping
+    runLocalSendRecvTest(3, false, true, 1, {2}, {128}, mapping, 512, 2, 2);
+}
+
+TEST_F(FusedMoeCommLocalSendRecvTest, LocalSendRecvMultipleFields)
+{
+    std::vector<int> mapping = {1, 3, 0, 2}; // Complex reordering
+    runLocalSendRecvTest(2, true, true, 3, {1, 2, 4}, {16, 32, 64}, mapping, 256, 2, 2);
+}
+
+TEST_F(FusedMoeCommLocalSendRecvTest, LocalSendRecvLargeTopK)
+{
+    std::vector<int> mapping = {2, 0, 3, 1}; // Reorder mapping
+    runLocalSendRecvTest(8, true, true, 2, {4, 8}, {128, 256}, mapping, 512, 3, 2);
+}
+
+TEST_F(FusedMoeCommLocalSendRecvTest, LocalSendRecvPerfectAlignment)
+{
+    std::vector<int> mapping = {0, 2, 1, 3}; // Partial reordering
+    runLocalSendRecvTest(4, false, true, 2, {16}, {32}, mapping, 256, 2, 3);
+}
+
+TEST_F(FusedMoeCommLocalSendRecvTest, LocalSendRecvMixedAlignments)
+{
+    std::vector<int> mapping = {1, 0, 3, 2}; // Pair swap
+    runLocalSendRecvTest(3, true, true, 4, {1, 2, 4, 8}, {8, 16, 32, 64}, mapping, 512, 2, 2);
+}
+
+TEST_F(FusedMoeCommLocalSendRecvTest, LocalSendRecvSingleByteAlignment)
+{
+    std::vector<int> mapping = {2, 3, 0, 1}; // Cyclic shift
+    runLocalSendRecvTest(2, false, true, 2, {1}, {128}, mapping, 256, 3, 1);
+}
+
+TEST_F(FusedMoeCommLocalSendRecvTest, LocalSendRecvEdgeCaseTopKOne)
+{
+    std::vector<int> mapping = {1, 0, 3, 2}; // Simple reordering
+    runLocalSendRecvTest(1, false, true, 1, {4}, {16}, mapping, 128, 2, 1);
+}
+
+TEST_F(FusedMoeCommLocalSendRecvTest, LocalSendRecvEdgeCaseNoExtraFields)
+{
+    std::vector<int> mapping = {3, 1, 0, 2};                            // Random reordering
+    runLocalSendRecvTest(2, true, true, 0, {}, {}, mapping, 256, 2, 2); // Only basic fields
+}
+
+TEST_F(FusedMoeCommLocalSendRecvTest, LocalSendRecvLargeTokenCount)
+{
+    std::vector<int> mapping = {7, 0, 5, 2, 3, 6, 1, 4, 15, 8, 11, 10, 9, 14, 13, 12}; // Complex 16-element mapping
+    runLocalSendRecvTest(4, true, true, 2, {4, 8}, {64, 128}, mapping, 1024, 3, 3);    // Large scale test
+}
+
+TEST_F(FusedMoeCommLocalSendRecvTest, LocalSendRecvVeryLargeScale)
+{
+    std::vector<int> mapping = {31, 0, 29, 2, 27, 4, 25, 6, 23, 8, 21, 10, 19, 12, 17, 14, 15, 16, 13, 18, 11, 20, 9,
+        22, 7, 24, 5, 26, 3, 28, 1, 30};                                     // Complex 32-element mapping
+    runLocalSendRecvTest(4, true, true, 1, {8}, {256}, mapping, 2048, 3, 3); // Very large scale test
+}
+
+// Tests for no basic fields scenario
+TEST_F(FusedMoeCommLocalSendRecvTest, LocalSendRecvWithoutBasicFields)
+{
+    std::vector<int> mapping = {1, 3, 0, 2};                                        // Reorder mapping
+    runLocalSendRecvTest(0, false, false, 2, {4, 8}, {32, 64}, mapping, 256, 2, 2); // No basic fields, only field data
+}
+
+TEST_F(FusedMoeCommLocalSendRecvTest, LocalSendRecvWithoutBasicFieldsLargeFields)
+{
+    std::vector<int> mapping = {2, 0, 3, 1};                                  // Reorder mapping
+    runLocalSendRecvTest(
+        0, false, false, 3, {1, 4, 16}, {128, 256, 512}, mapping, 512, 3, 2); // No basic fields, large field data
+}
+
+TEST_F(FusedMoeCommLocalSendRecvTest, LocalSendRecvWithoutBasicFieldsLargeScale)
+{
+    std::vector<int> mapping = {15, 0, 13, 2, 11, 4, 9, 6, 7, 8, 5, 10, 3, 12, 1, 14}; // Complex 16-element mapping
+    runLocalSendRecvTest(
+        0, false, false, 4, {1, 2, 4, 8}, {64, 128, 256, 512}, mapping, 1024, 3, 3); // Large scale without basic fields
+}
+
+// Stress tests with various configurations, should not exceed 1M for one channel for this test
+TEST_F(FusedMoeCommLocalSendRecvTest, LocalSendRecvStressTestSmallChannels)
+{
+    std::vector<int> mapping = {3, 1, 0, 2};                                               // Simple reordering
+    runLocalSendRecvTest(8, true, true, 3, {1, 4, 16}, {32, 64, 128}, mapping, 400, 1, 1); // Minimal channels
+}
+
+TEST_F(FusedMoeCommLocalSendRecvTest, LocalSendRecvStressTestManyChannels)
+{
+    std::vector<int> mapping = {7, 2, 5, 0, 3, 6, 1, 4};                             // Complex mapping
+    runLocalSendRecvTest(4, true, true, 2, {8, 16}, {128, 256}, mapping, 512, 3, 4); // Many channels
+}
+
+TEST_F(FusedMoeCommLocalSendRecvTest, LocalSendRecvStressTestManyWarps)
+{
+    std::vector<int> mapping = {1, 0, 3, 2};                                // Simple reordering
+    runLocalSendRecvTest(2, false, true, 1, {4}, {64}, mapping, 256, 4, 2); // Many warps per block
 }

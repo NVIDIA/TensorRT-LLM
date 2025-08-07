@@ -239,7 +239,8 @@ void FusedMoeWorkspace::initializeLocalWorkspace(FusedMoeWorldInfo const& worldI
     size_t senderSideInfoSize = sizeof(SenderSideFifoInfo) * epSize * channelCount;
     size_t receiverSideInfoSize = sizeof(ReceiverSideFifoInfo) * epSize * channelCount;
     uint64_t* localWorkspacePtr = workspacePtr + epRank * rankStrideInU64;
-    TLLM_CUDA_CHECK(cudaMemset(localWorkspacePtr, -1, fifoSize));
+    TLLM_CU_CHECK(cuMemsetD32(reinterpret_cast<CUdeviceptr>(localWorkspacePtr), FusedMoeCommunicator::INVALID_VALUE,
+        fifoSize / sizeof(uint32_t)));
     TLLM_CUDA_CHECK(cudaMemset(
         reinterpret_cast<uint8_t*>(localWorkspacePtr) + fifoSize, 0, senderSideInfoSize + receiverSideInfoSize));
 }
@@ -282,24 +283,30 @@ __device__ __forceinline__ void startFieldS2G(
     if (copyByteCount > 0 && laneId == 0)
     {
 #ifdef DEBUG_PRINT
+#if 0
         printf(
             "startFieldS2G, alignedShmStoreOffset=%d, blockIdx.x=%d, warpId=%d, laneId=%d, copy aligned "
             "copyByteCount=%d bytes.\n",
             alignedShmStoreOffset, blockIdx.x, warpId, laneId, copyByteCount);
 #endif
+#endif
         cp_async_bulk_s2g(storePtr, sharedMemoryStorePtr + MoeCommFieldInfo::BYTES_PER_16B_BLOCK, copyByteCount);
     }
 #ifdef DEBUG_PRINT
+#if 0
     printf("startFieldS2G, blockIdx.x=%d, warpId=%d, laneId=%d, headTailShmIdx=%d to headTailGlobalIdx=%d\n",
         blockIdx.x, warpId, laneId, headTailShmIdx, headTailGlobalIdx);
+#endif
 #endif
     if (headTailGlobalIdx >= 0)
     {
 #ifdef DEBUG_PRINT
+#if 0
         printf(
             "startFieldS2G, blockIdx.x=%d, warpId=%d, laneId=%d, copy headtail from headTailShmIdx=%d to "
             "headTailGlobalIdx=%d\n",
             blockIdx.x, warpId, laneId, headTailShmIdx, headTailGlobalIdx);
+#endif
 #endif
         // copy head and tail
         fieldInfo.getRawPtr(dataIndex, nullptr)[headTailGlobalIdx] = sharedMemoryStorePtr[headTailShmIdx];
@@ -385,6 +392,7 @@ __device__ __forceinline__ void packAllFields(
     {
         memmoveFieldOnSharedMemory<true>(sendFieldInfo.fieldsInfo[i], dataIndex, sharedMemoryBase, laneId);
     }
+    __syncwarp();
 }
 
 __device__ __forceinline__ void unpackAllFields(
@@ -394,6 +402,7 @@ __device__ __forceinline__ void unpackAllFields(
     {
         memmoveFieldOnSharedMemory<false>(recvFieldInfo.fieldsInfo[i], dataIndex, sharedMemoryBase, laneId);
     }
+    __syncwarp();
 }
 
 __device__ __forceinline__ void initSmemBar(uint64_t* smemBar, int laneId)
@@ -405,11 +414,12 @@ __device__ __forceinline__ void initSmemBar(uint64_t* smemBar, int laneId)
     __syncwarp();
 }
 
-__device__ __forceinline__ void smemBarWait(uint64_t* smemBar, uint32_t state)
+__device__ __forceinline__ void smemBarWait(uint64_t* smemBar, uint32_t* phaseParity)
 {
-    while (!mbarrier_try_wait_parity(smemBar, state))
+    while (!mbarrier_try_wait_parity(smemBar, *phaseParity))
     {
     }
+    *phaseParity = 1 - *phaseParity;
 }
 
 __device__ __forceinline__ void fixInvalidData(
@@ -432,6 +442,7 @@ __device__ __forceinline__ void fixInvalidData(
                 = FusedMoeCommunicator::FIXED_VALUE;
         }
     }
+    __syncwarp();
 }
 
 __device__ __forceinline__ void startWorkspaceS2G(
@@ -502,6 +513,15 @@ __device__ __forceinline__ int dataReceivedInShm(uint8_t* sharedMemoryBase, int 
             }
         }
         totalValidCount += validCount;
+#ifdef DEBUG_PRINT
+        if (laneId == 0)
+        {
+            printf(
+                "warpId=%d, blockIdx=(%d, %d, %d), in dataReceivedInShm idxBase=%d, validMask=%x, validCount=%d, "
+                "totalValidCount=%d\n",
+                warpId, blockIdx.x, blockIdx.y, blockIdx.z, idxBase, validMask, validCount, totalValidCount);
+        }
+#endif
         if (validCount != WARP_SIZE)
         {
             break;
@@ -524,7 +544,7 @@ __device__ __forceinline__ void g2sBasicFields(FusedMoeFieldInfo const& sendFiel
 // May commit 1 group for basic fields(tokenSelectedSlots and scales) if HAS_BASIC_FIELDS is true
 // For other fields, use smemBar.
 template <bool HAS_BASIC_FIELDS = true>
-__device__ __forceinline__ uint32_t g2sAllFields(FusedMoeFieldInfo const& sendFieldInfo,
+__device__ __forceinline__ uint64_t g2sAllFields(FusedMoeFieldInfo const& sendFieldInfo,
     MoeExpertParallelInfo const& expertParallelInfo, int dataIndex, uint8_t* sharedMemoryBase, int warpId, int laneId,
     uint64_t* smemBar)
 {
@@ -572,16 +592,16 @@ __device__ __forceinline__ void waitG2SBasicFields()
     }
 }
 
-__device__ __forceinline__ void waitG2SOtherFields(uint64_t* memBar, uint32_t waitToken)
+__device__ __forceinline__ void waitG2SOtherFields(uint64_t* memBar, uint32_t* phaseParity)
 {
-    tensorrt_llm::kernels::fused_moe_impl::smemBarWait(memBar, waitToken);
+    tensorrt_llm::kernels::fused_moe_impl::smemBarWait(memBar, phaseParity);
 }
 
 template <bool HAS_BASIC_FIELDS = true>
-__device__ __forceinline__ void waitG2SSmemBar(uint64_t* memBar, uint32_t waitToken)
+__device__ __forceinline__ void waitG2SAllFields(uint64_t* memBar, uint32_t* phaseParity)
 {
     waitG2SBasicFields<HAS_BASIC_FIELDS>();
-    tensorrt_llm::kernels::fused_moe_impl::smemBarWait(memBar, waitToken);
+    waitG2SOtherFields(memBar, phaseParity);
 }
 
 __device__ __forceinline__ void waitS2GBulkRead()
@@ -653,30 +673,28 @@ __global__ void g2sKernel(FusedMoeFieldInfo allFieldInfo, MoeExpertParallelInfo 
 #endif
 
     tensorrt_llm::kernels::fused_moe_impl::initSmemBar(&allWarpSmemBar[warpId], laneId);
+    uint32_t phaseParity = 0;
 
     uint8_t* sharedMemoryBase
         = reinterpret_cast<uint8_t*>(allWarpShm) + singleCommMeta.singleUnpackedAlignedSize * warpId;
 
-    uint32_t waitToken;
-
     if (hasBasicFields)
     {
-        waitToken = tensorrt_llm::kernels::fused_moe_impl::g2sAllFields<true>(
+        tensorrt_llm::kernels::fused_moe_impl::g2sAllFields<true>(
             allFieldInfo, expertParallelInfo, tokenIndex, sharedMemoryBase, warpId, laneId, &allWarpSmemBar[warpId]);
-        tensorrt_llm::kernels::fused_moe_impl::waitG2SSmemBar<true>(&allWarpSmemBar[warpId], waitToken);
+        tensorrt_llm::kernels::fused_moe_impl::waitG2SAllFields<true>(&allWarpSmemBar[warpId], &phaseParity);
     }
     else
     {
-        waitToken = tensorrt_llm::kernels::fused_moe_impl::g2sAllFields<false>(
+        tensorrt_llm::kernels::fused_moe_impl::g2sAllFields<false>(
             allFieldInfo, expertParallelInfo, tokenIndex, sharedMemoryBase, warpId, laneId, &allWarpSmemBar[warpId]);
-        tensorrt_llm::kernels::fused_moe_impl::waitG2SSmemBar<false>(&allWarpSmemBar[warpId], waitToken);
+        tensorrt_llm::kernels::fused_moe_impl::waitG2SAllFields<false>(&allWarpSmemBar[warpId], &phaseParity);
     }
 
-    tensorrt_llm::kernels::fused_moe_impl::smemBarWait(&allWarpSmemBar[warpId], waitToken);
 #ifdef DEBUG_PRINT
     if (laneId == 0)
     {
-        printf("warpId=%d, blockIdx.x=%d, after smemBarWait token=%u\n", warpId, blockIdx.x, waitToken);
+        printf("warpId=%d, blockIdx.x=%d, after smemBarWait phaseParity=%u\n", warpId, blockIdx.x, phaseParity);
     }
 #endif
 
@@ -783,26 +801,30 @@ __global__ void loopbackKernel(FusedMoeFieldInfo sendFieldInfo, FusedMoeFieldInf
 #endif
 
     tensorrt_llm::kernels::fused_moe_impl::initSmemBar(&allWarpSmemBar[warpId], laneId);
+    uint32_t phaseParity = 0;
 
     uint8_t* sharedMemoryBase
         = reinterpret_cast<uint8_t*>(allWarpShm) + sendCommMeta.singleUnpackedAlignedSize * warpId;
 
-    uint32_t waitToken;
-
     if (hasBasicFields)
     {
-        waitToken = tensorrt_llm::kernels::fused_moe_impl::g2sAllFields<true>(
+        tensorrt_llm::kernels::fused_moe_impl::g2sAllFields<true>(
             sendFieldInfo, expertParallelInfo, tokenIndex, sharedMemoryBase, warpId, laneId, &allWarpSmemBar[warpId]);
-        cp_async_wait_group<0>();
-        __syncwarp();
     }
     else
     {
-        waitToken = tensorrt_llm::kernels::fused_moe_impl::g2sAllFields<false>(
+        tensorrt_llm::kernels::fused_moe_impl::g2sAllFields<false>(
             sendFieldInfo, expertParallelInfo, tokenIndex, sharedMemoryBase, warpId, laneId, &allWarpSmemBar[warpId]);
     }
 
-    tensorrt_llm::kernels::fused_moe_impl::smemBarWait(&allWarpSmemBar[warpId], waitToken);
+    if (hasBasicFields)
+    {
+        tensorrt_llm::kernels::fused_moe_impl::waitG2SAllFields<true>(&allWarpSmemBar[warpId], &phaseParity);
+    }
+    else
+    {
+        tensorrt_llm::kernels::fused_moe_impl::waitG2SAllFields<false>(&allWarpSmemBar[warpId], &phaseParity);
+    }
 
     tensorrt_llm::kernels::fused_moe_impl::packAllFields(sendFieldInfo, tokenIndex, sharedMemoryBase, laneId);
 
@@ -874,10 +896,10 @@ __device__ __forceinline__ void localSendFunc(FusedMoeFieldInfo const& sendField
 {
     int laneId = threadIdx.x % WARP_SIZE;
     int warpId = threadIdx.x / WARP_SIZE;
-    int warpCount = blockDim.x / WARP_SIZE;
     int tokenIndex = pairInfo.channel;
 
     tensorrt_llm::kernels::fused_moe_impl::initSmemBar(&allWarpSmemBar[warpId], laneId);
+    uint32_t phaseParity = 0;
 
     uint8_t* sharedMemoryBase
         = reinterpret_cast<uint8_t*>(allWarpShm) + sendCommMeta.singleUnpackedAlignedSize * warpId;
@@ -890,23 +912,58 @@ __device__ __forceinline__ void localSendFunc(FusedMoeFieldInfo const& sendField
 
     for (; tokenIndex < tokenCount; tokenIndex += pairInfo.channelCount)
     {
-        uint32_t waitToken;
+#ifdef DEBUG_PRINT
+        __syncwarp();
+        if (laneId == 0)
+        {
+            printf("[localSendFunc] block=(%d, %d, %d), warpId=%d, start tokenIndex=%d.\n", blockIdx.x, blockIdx.y,
+                blockIdx.z, warpId, tokenIndex);
+        }
+#endif
 
         if (hasBasicFields)
         {
-            waitToken = tensorrt_llm::kernels::fused_moe_impl::g2sAllFields<true>(sendFieldInfo, expertParallelInfo,
-                tokenIndex, sharedMemoryBase, warpId, laneId, &allWarpSmemBar[warpId]);
-            cp_async_wait_group<0>();
-            __syncwarp();
+            tensorrt_llm::kernels::fused_moe_impl::g2sAllFields<true>(sendFieldInfo, expertParallelInfo, tokenIndex,
+                sharedMemoryBase, warpId, laneId, &allWarpSmemBar[warpId]);
         }
         else
         {
-            waitToken = tensorrt_llm::kernels::fused_moe_impl::g2sAllFields<false>(sendFieldInfo, expertParallelInfo,
-                tokenIndex, sharedMemoryBase, warpId, laneId, &allWarpSmemBar[warpId]);
+            tensorrt_llm::kernels::fused_moe_impl::g2sAllFields<false>(sendFieldInfo, expertParallelInfo, tokenIndex,
+                sharedMemoryBase, warpId, laneId, &allWarpSmemBar[warpId]);
         }
 
-        tensorrt_llm::kernels::fused_moe_impl::smemBarWait(&allWarpSmemBar[warpId], waitToken);
+#ifdef DEBUG_PRINT
+        __syncwarp();
+        if (laneId == 0)
+        {
+            printf("[localSendFunc] block=(%d, %d, %d), warpId=%d, tokenIndex=%d started G2S, phaseParity=%x.\n",
+                blockIdx.x, blockIdx.y, blockIdx.z, warpId, tokenIndex, phaseParity);
+        }
+#endif
 
+        if (hasBasicFields)
+        {
+            tensorrt_llm::kernels::fused_moe_impl::waitG2SAllFields<true>(&allWarpSmemBar[warpId], &phaseParity);
+        }
+        else
+        {
+            tensorrt_llm::kernels::fused_moe_impl::waitG2SAllFields<false>(&allWarpSmemBar[warpId], &phaseParity);
+        }
+
+#ifdef DEBUG_PRINT
+        __syncwarp();
+        if (laneId == 0)
+        {
+            printf("[localSendFunc] block=(%d, %d, %d), warpId=%d, tokenIndex=%d G2S done.\n", blockIdx.x, blockIdx.y,
+                blockIdx.z, warpId, tokenIndex);
+        }
+        if (hasBasicFields && laneId < expertParallelInfo.topK)
+        {
+            printf("[localSendFunc] block=(%d, %d, %d), warpId=%d, tokenIndex=%d, tokenSelectedSlot[%d]=%d\n",
+                blockIdx.x, blockIdx.y, blockIdx.z, warpId, tokenIndex, laneId,
+                reinterpret_cast<int*>(sharedMemoryBase)[laneId]);
+        }
+#endif
         tensorrt_llm::kernels::fused_moe_impl::packAllFields(sendFieldInfo, tokenIndex, sharedMemoryBase, laneId);
 
         tensorrt_llm::kernels::fused_moe_impl::fixInvalidData(
@@ -918,7 +975,24 @@ __device__ __forceinline__ void localSendFunc(FusedMoeFieldInfo const& sendField
         tensorrt_llm::kernels::fused_moe_impl::waitS2GBulkRead();
 
         fifoEntry128ByteIndexBase += countIn128Bytes;
+#ifdef DEBUG_PRINT
+        __syncwarp();
+        if (laneId == 0)
+        {
+            printf(
+                "[localSendFunc] block=(%d, %d, %d), warpId=%d, tokenIndex=%d waitS2GBulkRead done, "
+                "fifoEntry128ByteIndexBase=%d.\n",
+                blockIdx.x, blockIdx.y, blockIdx.z, warpId, tokenIndex, fifoEntry128ByteIndexBase);
+        }
+#endif
     }
+#ifdef DEBUG_PRINT
+    __syncwarp();
+    if (laneId == 0)
+    {
+        printf("[localSendFunc] block=(%d, %d, %d), warpId=%d, done.\n", blockIdx.x, blockIdx.y, blockIdx.z, warpId);
+    }
+#endif
 }
 
 __device__ __forceinline__ void localRecvFunc(FusedMoeFieldInfo const& recvFieldInfo,
@@ -930,9 +1004,9 @@ __device__ __forceinline__ void localRecvFunc(FusedMoeFieldInfo const& recvField
     int warpId = threadIdx.x / WARP_SIZE;
     int warpCount = blockDim.x / WARP_SIZE;
     int globalIdx = warpId + blockIdx.z * warpCount;
-    int tokenIndex = recvIndexMapping[globalIdx];
 
     tensorrt_llm::kernels::fused_moe_impl::initSmemBar(&allWarpSmemBar[warpId], laneId);
+    uint32_t phaseParity = 0;
 
     uint8_t* sharedMemoryBase
         = reinterpret_cast<uint8_t*>(allWarpShm) + recvCommMeta.singleUnpackedAlignedSize * warpId;
@@ -945,17 +1019,43 @@ __device__ __forceinline__ void localRecvFunc(FusedMoeFieldInfo const& recvField
 
     for (; globalIdx < tokenCount; globalIdx += pairInfo.channelCount)
     {
+        int tokenIndex = recvIndexMapping[globalIdx];
+#ifdef DEBUG_PRINT
+        __syncwarp();
+        if (laneId == 0)
+        {
+            printf("[localRecvFunc] block=(%d, %d, %d), warpId=%d, start globalIdx=%d, tokenIndex=%d.\n", blockIdx.x,
+                blockIdx.y, blockIdx.z, warpId, globalIdx, tokenIndex);
+        }
+#endif
         int loaded128ByteCount = 0;
         while (loaded128ByteCount < countIn128Bytes)
         {
-            auto waitToken
-                = tensorrt_llm::kernels::fused_moe_impl::startWorkspaceG2S(sharedMemoryBase, fifoEntry, countIn128Bytes,
-                    fifoEntry128ByteIndexBase, loaded128ByteCount, &allWarpSmemBar[warpId], warpId, laneId);
+            tensorrt_llm::kernels::fused_moe_impl::startWorkspaceG2S(sharedMemoryBase, fifoEntry, countIn128Bytes,
+                fifoEntry128ByteIndexBase, loaded128ByteCount, &allWarpSmemBar[warpId], warpId, laneId);
             // maybe set flag (release) for send side fifo here.
-            tensorrt_llm::kernels::fused_moe_impl::smemBarWait(&allWarpSmemBar[warpId], waitToken);
+            tensorrt_llm::kernels::fused_moe_impl::smemBarWait(&allWarpSmemBar[warpId], &phaseParity);
             loaded128ByteCount += tensorrt_llm::kernels::fused_moe_impl::dataReceivedInShm<false>(
                 sharedMemoryBase, countIn128Bytes, fifoEntry128ByteIndexBase, loaded128ByteCount, warpId, laneId);
         }
+#ifdef DEBUG_PRINT
+        __syncwarp();
+        if (laneId == 0)
+        {
+            printf(
+                "[localRecvFunc] block=(%d, %d, %d), warpId=%d, globalIdx=%d, tokenIndex=%d, workspace G2S done, "
+                "loaded128ByteCount=%d.\n",
+                blockIdx.x, blockIdx.y, blockIdx.z, warpId, globalIdx, tokenIndex, loaded128ByteCount);
+        }
+        if (hasBasicFields && laneId < expertParallelInfo.topK)
+        {
+            printf(
+                "[localRecvFunc] block=(%d, %d, %d), warpId=%d, globalIdx=%d, tokenIndex=%d, "
+                "tokenSelectedSlot[%d]=%d\n",
+                blockIdx.x, blockIdx.y, blockIdx.z, warpId, globalIdx, tokenIndex, laneId,
+                reinterpret_cast<int*>(sharedMemoryBase)[laneId]);
+        }
+#endif
         tensorrt_llm::kernels::fused_moe_impl::unpackAllFields(recvFieldInfo, tokenIndex, sharedMemoryBase, laneId);
         if (hasBasicFields)
         {
@@ -972,7 +1072,24 @@ __device__ __forceinline__ void localRecvFunc(FusedMoeFieldInfo const& recvField
         // may need set lamport buffer to invalid value here.
 
         fifoEntry128ByteIndexBase += countIn128Bytes;
+#ifdef DEBUG_PRINT
+        __syncwarp();
+        if (laneId == 0)
+        {
+            printf(
+                "[localRecvFunc] block=(%d, %d, %d), warpId=%d, globalIdx=%d, tokenIndex=%d waitS2GBulkRead done, "
+                "fifoEntry128ByteIndexBase=%d.\n",
+                blockIdx.x, blockIdx.y, blockIdx.z, warpId, globalIdx, tokenIndex, fifoEntry128ByteIndexBase);
+        }
+#endif
     }
+#ifdef DEBUG_PRINT
+    __syncwarp();
+    if (laneId == 0)
+    {
+        printf("[localRecvFunc] block=(%d, %d, %d), warpId=%d, done.\n", blockIdx.x, blockIdx.y, blockIdx.z, warpId);
+    }
+#endif
 }
 
 __global__ void localSendRecvKernel(FusedMoeFieldInfo sendFieldInfo, FusedMoeFieldInfo recvFieldInfo,
