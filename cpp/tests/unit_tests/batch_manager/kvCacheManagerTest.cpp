@@ -18,6 +18,7 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/memoryUtils.h"
+#include "tensorrt_llm/executor/transferAgent.h"
 #include "tensorrt_llm/executor/types.h"
 #include "tensorrt_llm/kernels/kvCacheIndex.h"
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
@@ -32,6 +33,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstddef>
+#include <filesystem>
 #include <memory>
 #include <set>
 #include <thread>
@@ -45,6 +47,7 @@ namespace tk = tensorrt_llm::kernels;
 namespace tlk = tensorrt_llm::batch_manager::kv_cache_manager;
 namespace tle = tensorrt_llm::executor;
 namespace tr = tensorrt_llm::runtime;
+namespace fs = std::filesystem;
 
 using BlocksPerWindow = std::map<SizeType32, std::tuple<SizeType32, SizeType32>>;
 
@@ -182,7 +185,39 @@ TEST_F(KVCacheManagerTest, BlockManagerTest)
         std::runtime_error);
 }
 
-template <typename T, nvinfer1::DataType type, int mask>
+template <typename T>
+void writePatternToOffloadedBlocksDRAM(T* rawBlockPtr, int blockSize, int mask)
+{
+    for (int i = 0; i < blockSize; ++i)
+    {
+        rawBlockPtr[i] = i & mask;
+    }
+}
+
+template <typename T>
+void writePatternToOffloadedBlocksGDS(
+    std::string const& directory, int blockId, SizeType32 numPools, int blockSize, int mask)
+{
+    for (size_t poolIdx = 0; poolIdx < numPools; ++poolIdx)
+    {
+        std::string filename
+            = directory + "/block_" + std::to_string(blockId) + "_pool_" + std::to_string(poolIdx) + ".bin";
+        int fd = ::open(filename.c_str(), O_WRONLY);
+        if (fd >= 0)
+        {
+            auto poolBlockSize = blockSize / numPools;
+            std::vector<T> buffer(poolBlockSize);
+            for (int i = 0; i < poolBlockSize; ++i)
+            {
+                buffer[i] = i & mask;
+            }
+            ::write(fd, buffer.data(), poolBlockSize * sizeof(T));
+            ::close(fd);
+        }
+    }
+}
+
+template <typename T, nvinfer1::DataType type, int mask, KvCacheTransferMode transferMode>
 void runPartialCopyTest()
 {
     auto constexpr numLayers = 12;
@@ -202,6 +237,16 @@ void runPartialCopyTest()
     auto constexpr maxAttentionWindowAllLayer = 4096;
     auto constexpr sinkTokenLen = 0;
     auto constexpr canUseOneMoreBlock = true;
+    std::string directory = "";
+    static int file_num = 0;
+
+    if constexpr (transferMode == KvCacheTransferMode::GDS)
+    {
+        std::string filename = std::string("test_copy") + std::to_string(file_num++);
+        auto dirPath = fs::absolute(filename);
+        fs::create_directories(dirPath);
+        directory = dirPath.string();
+    }
 
     SizeType32 constexpr maxNewTokens{0};
     auto constexpr beamWidth = 1;
@@ -256,7 +301,7 @@ void runPartialCopyTest()
         auto block = blockManager.getBlockById(cacheBlockId, maxAttentionWindow);
         EXPECT_TRUE(block->isPrimary());
         // offload so we can write to block in CPU code
-        blockManager.offloadBlock(block, maxAttentionWindow);
+        blockManager.offloadBlock(block, maxAttentionWindow, transferMode, directory);
         EXPECT_FALSE(block->isPrimary());
         // need to sync so D2H transfer is done before accessing blocks
         EXPECT_EQ(cudaDeviceSynchronize(), cudaSuccess);
@@ -264,12 +309,19 @@ void runPartialCopyTest()
         auto memoryPoolIndex = block->getMemoryPoolBlockIndex();
         auto blockPtr{tr::ITensor::slice(secondaryPoolPtr, memoryPoolIndex, 1)};
         auto rawBlockPtr = reinterpret_cast<T*>(blockPtr->data());
-        for (int i = 0; i < blockSize; ++i)
+        // Write value
+        if constexpr (transferMode == KvCacheTransferMode::DRAM)
         {
-            rawBlockPtr[i] = i & mask;
+            writePatternToOffloadedBlocksDRAM<T>(rawBlockPtr, blockSize, mask);
+        }
+        else if constexpr (transferMode == KvCacheTransferMode::GDS)
+        {
+            auto block_id = block->getBlockId();
+            auto numPools = blockManager.getNumPools(false);
+            writePatternToOffloadedBlocksGDS<T>(directory, block_id, numPools, blockSize, mask);
         }
         // onboard
-        blockManager.onboardBlock(block, maxAttentionWindow);
+        blockManager.onboardBlock(block, maxAttentionWindow, transferMode, directory);
         EXPECT_TRUE(block->isPrimary());
         EXPECT_EQ(cudaDeviceSynchronize(), cudaSuccess);
         EXPECT_TRUE(blockManager.verifyQueueIntegrity(maxAttentionWindow));
@@ -344,60 +396,72 @@ void runPartialCopyTest()
         }
     }
     EXPECT_EQ(numBad, 0);
-    blockManager.onboardBlock(block2, maxAttentionWindow);
+    blockManager.onboardBlock(block2, maxAttentionWindow, transferMode, directory);
     EXPECT_TRUE(block2->isPrimary());
     EXPECT_EQ(cudaDeviceSynchronize(), cudaSuccess);
 
     blockManager.releaseBlocks(seq1, llmRequest1);
     blockManager.releaseBlocks(seq2, llmRequest2);
+
+    if constexpr (transferMode == KvCacheTransferMode::GDS)
+        fs::remove_all(directory);
 }
 
 TEST_F(KVCacheManagerTest, BlockManagerTestPartialCopyINT64)
 {
-    runPartialCopyTest<std::uint64_t, nvinfer1::DataType::kINT64, -1>();
+    runPartialCopyTest<std::uint64_t, nvinfer1::DataType::kINT64, -1, KvCacheTransferMode::DRAM>();
+    runPartialCopyTest<std::uint64_t, nvinfer1::DataType::kINT64, -1, KvCacheTransferMode::GDS>();
 }
 
 TEST_F(KVCacheManagerTest, BlockManagerTestPartialCopyINT32)
 {
-    runPartialCopyTest<std::uint32_t, nvinfer1::DataType::kINT32, -1>();
+    runPartialCopyTest<std::uint32_t, nvinfer1::DataType::kINT32, -1, KvCacheTransferMode::DRAM>();
+    runPartialCopyTest<std::uint32_t, nvinfer1::DataType::kINT32, -1, KvCacheTransferMode::GDS>();
 }
 
 TEST_F(KVCacheManagerTest, BlockManagerTestPartialCopyFLOAT)
 {
-    runPartialCopyTest<std::uint32_t, nvinfer1::DataType::kFLOAT, -1>();
+    runPartialCopyTest<std::uint32_t, nvinfer1::DataType::kFLOAT, -1, KvCacheTransferMode::DRAM>();
+    runPartialCopyTest<std::uint32_t, nvinfer1::DataType::kFLOAT, -1, KvCacheTransferMode::GDS>();
 }
 
 #ifdef ENABLE_BF16
 TEST_F(KVCacheManagerTest, BlockManagerTestPartialCopyBF16)
 {
-    runPartialCopyTest<std::uint16_t, nvinfer1::DataType::kBF16, 65535>();
+    runPartialCopyTest<std::uint16_t, nvinfer1::DataType::kBF16, 65535, KvCacheTransferMode::DRAM>();
+    runPartialCopyTest<std::uint16_t, nvinfer1::DataType::kBF16, 65535, KvCacheTransferMode::GDS>();
 }
 #endif
 
 TEST_F(KVCacheManagerTest, BlockManagerTestPartialCopyHALF)
 {
-    runPartialCopyTest<std::uint16_t, nvinfer1::DataType::kHALF, 65535>();
+    runPartialCopyTest<std::uint16_t, nvinfer1::DataType::kHALF, 65535, KvCacheTransferMode::DRAM>();
+    runPartialCopyTest<std::uint16_t, nvinfer1::DataType::kHALF, 65535, KvCacheTransferMode::GDS>();
 }
 
 TEST_F(KVCacheManagerTest, BlockManagerTestPartialCopyBOOL)
 {
-    runPartialCopyTest<std::uint8_t, nvinfer1::DataType::kBOOL, 255>();
+    runPartialCopyTest<std::uint8_t, nvinfer1::DataType::kBOOL, 255, KvCacheTransferMode::DRAM>();
+    runPartialCopyTest<std::uint8_t, nvinfer1::DataType::kBOOL, 255, KvCacheTransferMode::GDS>();
 }
 
 TEST_F(KVCacheManagerTest, BlockManagerTestPartialCopyUINT8)
 {
-    runPartialCopyTest<std::uint8_t, nvinfer1::DataType::kUINT8, 255>();
+    runPartialCopyTest<std::uint8_t, nvinfer1::DataType::kUINT8, 255, KvCacheTransferMode::DRAM>();
+    runPartialCopyTest<std::uint8_t, nvinfer1::DataType::kUINT8, 255, KvCacheTransferMode::GDS>();
 }
 
 TEST_F(KVCacheManagerTest, BlockManagerTestPartialCopyINT8)
 {
-    runPartialCopyTest<std::uint8_t, nvinfer1::DataType::kINT8, 255>();
+    runPartialCopyTest<std::uint8_t, nvinfer1::DataType::kINT8, 255, KvCacheTransferMode::DRAM>();
+    runPartialCopyTest<std::uint8_t, nvinfer1::DataType::kINT8, 255, KvCacheTransferMode::GDS>();
 }
 
 #ifdef ENABLE_FP8
 TEST_F(KVCacheManagerTest, BlockManagerTestPartialCopyFP8)
 {
-    runPartialCopyTest<std::uint8_t, nvinfer1::DataType::kFP8, 255>();
+    runPartialCopyTest<std::uint8_t, nvinfer1::DataType::kFP8, 255, KvCacheTransferMode::DRAM>();
+    runPartialCopyTest<std::uint8_t, nvinfer1::DataType::kFP8, 255, KvCacheTransferMode::GDS>();
 }
 #endif
 
