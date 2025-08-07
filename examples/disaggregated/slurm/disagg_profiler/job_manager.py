@@ -672,7 +672,7 @@ class JobManager:
             envs += " TLLM_NVTX_DEBUG=1"
             if 'TLLM_PROFILE_START_STOP' in config['nsys']:
                 envs += f" TLLM_PROFILE_START_STOP={config['nsys']['TLLM_PROFILE_START_STOP']}"
-            nsys_file = os.path.join(self.output_folder, f"{log_file}.nsys-rep")
+            nsys_file = os.path.join(self.output_folder, f"{log_file}.$SLURM_PROCID.nsys-rep")
             nsys_prefix = f"nsys profile -e \"NSYS_MPI_STORE_TEAMS_PER_RANK=1\" -o {nsys_file} -f true -t cuda,nvtx,python-gil -c cudaProfilerApi --cuda-graph-trace node --capture-range-end=stop --gpu-metrics-devices=none"
         log_file = os.path.join(self.output_folder, log_file)
 
