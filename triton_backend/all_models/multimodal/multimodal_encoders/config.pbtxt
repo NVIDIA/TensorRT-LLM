@@ -76,7 +76,7 @@ input [
     {
         name: "image_sizes"
         data_type: TYPE_INT64
-        dims: [ 2 ]
+        dims: [ -1, 2 ]
         optional: true
     },
     {

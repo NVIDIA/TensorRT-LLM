@@ -35,7 +35,7 @@ import numpy as np
 import requests
 import triton_python_backend_utils as pb_utils
 from PIL import Image
-from transformers import AutoProcessor, AutoTokenizer, T5Tokenizer
+from transformers import AutoConfig, AutoProcessor, AutoTokenizer, T5Tokenizer
 
 
 class TritonPythonModel:
@@ -136,7 +136,7 @@ class TritonPythonModel:
                 'model_type']
 
             assert self.model_type in [
-                'llava', 'blip2-opt', 'vila', 'mllama', 'llava_onevision',
+                'llava', 'blip2-opt','pixtral', 'vila', 'mllama', 'llava_onevision',
                 'qwen2_vl'
             ], f"[TensorRT-LLM][ERROR] Currently supported multi-modal models are llava, blip2-opt, vila, mllama, llava_onevision and qwen2_vl. Got {self.model_type}."
 
@@ -151,10 +151,19 @@ class TritonPythonModel:
                 llm_model_config["pretrained_config"]["vocab_size"])
             self._setup_ptable_shape(llm_model_config)
 
-            if self.model_type in ['mllama', 'llava_onevision', 'qwen2_vl']:
+            if self.model_type in ['mllama', 'llava_onevision', 'qwen2_vl', 'pixtral']:
+                # Read the correct path from the config
+                hf_model_path = model_config['parameters']['hf_model_path']['string_value']
+
+                # Load the full processor from the hf_model_path, not the tokenizer_dir
+                full_processor = AutoProcessor.from_pretrained(hf_model_path, trust_remote_code=True)
+                self.hf_config = AutoConfig.from_pretrained(hf_model_path)
                 self.vision_preprocessor = VisionPreProcessor(
                     self.model_type,
-                    AutoProcessor.from_pretrained(tokenizer_dir), model_config)
+                    full_processor,
+                    model_config,
+                    self.hf_config,
+                )
 
         # Parse model output configs and convert Triton types to numpy types
         output_names = [
@@ -279,13 +288,12 @@ class TritonPythonModel:
 
             # Preprocessing vision input passed as a url or bytes tensor
             img_urls = pb_utils.get_input_tensor_by_name(request, 'IMAGE_URL')
-            image_bytes = pb_utils.get_input_tensor_by_name(
-                request, 'IMAGE_BYTES')
-            video_bytes = pb_utils.get_input_tensor_by_name(
-                request, 'VIDEO_BYTES')
+            image_bytes = pb_utils.get_input_tensor_by_name(request, 'IMAGE_BYTES')
+            video_bytes = pb_utils.get_input_tensor_by_name(request, 'VIDEO_BYTES')
+            input_images = pb_utils.get_input_tensor_by_name(request, 'IMAGES')
             vision_processed_tensors = []
             visual_tokens = []
-            if self.is_multimodal and (img_urls or image_bytes or video_bytes):
+            if self.is_multimodal and (img_urls or image_bytes or input_images or video_bytes):
                 assert self.vision_preprocessor != None, "Vision preprocessor for preparing images before encoding is None"
                 processed_tensors = {}
                 if self.model_type == 'mllama':
@@ -317,6 +325,15 @@ class TritonPythonModel:
                     qwen2vl_input_length_tensor = processed_tensors.get(
                         "REQUEST_INPUT_LEN")
                     processed_tensors.pop("REQUEST_INPUT_LEN")
+                elif self.model_type == 'pixtral':
+                    processed_tensors, visual_tokens = self.vision_preprocessor.pixtral_process(
+                        queries=query.astype(str).tolist(),
+                        img_urls=img_urls,
+                        image_bytes=image_bytes,
+                        input_images=input_images,
+                    )
+                    pixtral_input_id_tensor = processed_tensors.pop("INPUT_IDS")
+                    request_input_len = np.array([[len(input_ids_for_batch) for input_ids_for_batch in pixtral_input_id_tensor]])
                 else:
                     raise ValueError(
                         "Unsupported model type for IMAGE_BYTES or IMAGE_URL inputs"
@@ -330,8 +347,8 @@ class TritonPythonModel:
 
             # Preprocessing input data.
             # For the LLaVA_OneVision model, num_multimodal_features is not a fixed value
-            input_id, request_input_len = self._create_request(
-                query, visual_tokens)
+            if self.model_type != 'pixtral':
+                input_id, request_input_len = self._create_request(query, visual_tokens)
             if decoder_query is not None:
                 decoder_input_id, request_decoder_input_len = self._create_request(
                     decoder_query)
@@ -362,6 +379,11 @@ class TritonPythonModel:
                     'INPUT_ID', qwen2vl_input_id_tensor)
                 request_input_len_tensor = pb_utils.Tensor.from_dlpack(
                     'REQUEST_INPUT_LEN', qwen2vl_input_length_tensor)
+            elif self.model_type == 'pixtral':
+                input_id_tensor = pb_utils.Tensor(
+                    'INPUT_ID', pixtral_input_id_tensor.numpy().astype(self.input_id_dtype))
+                request_input_len_tensor = pb_utils.Tensor(
+                    'REQUEST_INPUT_LEN', request_input_len.astype(self.request_input_len_dtype))
             else:
                 input_id_tensor = pb_utils.Tensor(
                     'INPUT_ID', input_id.astype(self.input_id_dtype))
@@ -719,7 +741,8 @@ class VisionPreProcessor:
     def __init__(self,
                  vision_model_type,
                  vision_model_processor,
-                 preprocessor_model_config={}):
+                 preprocessor_model_config,
+                 hf_config):
         # import libraries that are only relevant for multimodal models
         import torch
         from torch.utils.dlpack import from_dlpack
@@ -766,6 +789,11 @@ class VisionPreProcessor:
         # create model-specific processor
         self.vision_model_processor = vision_model_processor
         self.vision_model_type = vision_model_type
+
+        # TODO: Cover the case where those values are missing
+        self.vocab_size = hf_config.text_config.vocab_size
+        self.image_size = hf_config.vision_config.image_size
+        self.image_token_index = hf_config.image_token_index
 
     def load_images_from_urls(self, img_urls):
         images = []
@@ -1001,3 +1029,80 @@ class VisionPreProcessor:
                     val, self.output_str_dtypes[key])
             vision_processed_tensors[key] = val
         return vision_processed_tensors
+
+    def pixtral_process(self, queries, img_urls=None, image_bytes=None, input_images=None):
+        import torch
+        if img_urls is None and image_bytes is None and input_images is None:
+            return {}
+        vision_processed_tensors = {}
+        if img_urls is not None:
+            # download and read images
+            images = [
+                self.load_images_from_urls(urls)
+                for urls in img_urls.as_numpy()
+            ]
+        elif image_bytes is not None:
+            images = [
+                img for img_list in self.load_images_tensor(image_bytes)
+                for img in img_list
+            ]
+        else:  # input_images is not None:
+            input_images = input_images.as_numpy()
+            assert input_images.ndim == 2
+            images = []
+            for input_images_per_batch in input_images:
+                images.append([Image.open(io.BytesIO(image)).convert("RGB") for image in input_images_per_batch])
+
+        batch_size = len(images)
+        assert len(queries) == batch_size, f"Image must have the same batch size as Query."
+
+        preprocessor_outputs = {}
+        possible_output_names = ['PIXEL_VALUES', 'IMAGE_SIZES', 'INPUT_IDS']
+        visual_tokens = []
+        for batch_id in range(batch_size):
+            # Preprocess images and query
+            processed_vision_data = self.vision_model_processor(
+                images=images[batch_id],
+                text=queries[batch_id],
+                return_tensors="pt")
+            visual_tokens.append(processed_vision_data['input_ids'].shape[1])
+            # Pad to self.image_size x self.image_size
+            processed_vision_data['pixel_values'] = torch.nn.functional.pad(
+                processed_vision_data['pixel_values'],
+                (
+                    0,
+                    self.image_size - processed_vision_data['pixel_values'].shape[-1],
+                    0,
+                    self.image_size - processed_vision_data['pixel_values'].shape[-2],
+                ),
+                mode='constant')
+            # Create vision output tensors
+            for key in possible_output_names:
+                val = processed_vision_data.get(key.lower())
+                if val is not None:
+                    if key not in preprocessor_outputs:
+                        preprocessor_outputs[key] = []
+                    if key != 'INPUT_IDS':
+                        val.unsqueeze_(0)  # unsqueeze to add batch dimension
+                    preprocessor_outputs[key].append(val)
+
+        for key, tensor_list in preprocessor_outputs.items():
+            val = self.convert_tensor_list_to_tensor(tensor_list)
+            if key in self.output_str_dtypes:
+                val = self.convert_tensor_to_str_dtype(
+                    val, self.output_str_dtypes[key])
+            vision_processed_tensors[key] = val
+
+        # Replace all image tokens with a unique token_id > vocab_size.
+        # This shall be used to lookup the prompt table.
+        for batch_id in range(batch_size):
+            # Note: We reset replacer to vocab_size for each sample. This is as opposed to doing `replacer = vocab_size + img_idx * tokens_per_task`.
+            # That part of the look-up manipulation is done by the `task_ids` input to PromptEmbedding forward.
+            replacer = self.vocab_size
+            input_ids = vision_processed_tensors['INPUT_IDS'][batch_id]
+            for token_idx in range(len(input_ids)):
+                if input_ids[token_idx] == self.image_token_index:
+                    input_ids[token_idx] = replacer
+                    replacer += 1
+
+        return vision_processed_tensors, visual_tokens
