@@ -1109,7 +1109,7 @@ def test_fused_moe_w4afp8(dtype, weight_loading_mode):
             "weight",
             "weight_scale":
             ("weight_scale_inv" if weight_loading_mode
-            == MoEWeightLoadingMode.W4A8_CUSTOM else "weight_scale"),
+             == MoEWeightLoadingMode.W4A8_CUSTOM else "weight_scale"),
             "weight_scale_2":
             "weight_scale_2",
             "pre_quant_scale":
@@ -1133,16 +1133,23 @@ def test_fused_moe_w4afp8(dtype, weight_loading_mode):
                 w3_shape = (INTERMEDIATE_SIZE, HIDDEN_SIZE // 2)
 
             # The weights in int4 precision.
-            w1_weight = torch.randint(-128, 127, w1_shape, dtype=torch.int8).cuda()
-            w2_weight = torch.randint(-128, 127, w2_shape, dtype=torch.int8).cuda()
-            w3_weight = torch.randint(-128, 127, w3_shape, dtype=torch.int8).cuda()
+            w1_weight = torch.randint(-128, 127, w1_shape,
+                                      dtype=torch.int8).cuda()
+            w2_weight = torch.randint(-128, 127, w2_shape,
+                                      dtype=torch.int8).cuda()
+            w3_weight = torch.randint(-128, 127, w3_shape,
+                                      dtype=torch.int8).cuda()
 
             # The pre-quant scale to be multiplied with the input activation.
-            w1_pre_quant_scale = torch.ones(HIDDEN_SIZE, dtype=dtype, device="cuda")
+            w1_pre_quant_scale = torch.ones(HIDDEN_SIZE,
+                                            dtype=dtype,
+                                            device="cuda")
             w2_pre_quant_scale = torch.ones(INTERMEDIATE_SIZE,
                                             dtype=dtype,
                                             device="cuda")
-            w3_pre_quant_scale = torch.ones(HIDDEN_SIZE, dtype=dtype, device="cuda")
+            w3_pre_quant_scale = torch.ones(HIDDEN_SIZE,
+                                            dtype=dtype,
+                                            device="cuda")
 
             # The weight scale to dequantize int4 weights (by multiplication).
             w1_scale = torch.randn(
@@ -1160,12 +1167,14 @@ def test_fused_moe_w4afp8(dtype, weight_loading_mode):
 
             # The input scale to quantize the input activation (by division).
             w1_input_scale = torch.randn(1, dtype=torch.float32,
-                                        device="cuda") * 0.2
+                                         device="cuda") * 0.2
             w2_input_scale = w1_input_scale
             w3_input_scale = w1_input_scale
 
             # The weight scale 2 to quantize the dequantized weights (by division).
-            w1_weight_scale_2 = torch.ones([1], dtype=torch.float32, device="cuda")
+            w1_weight_scale_2 = torch.ones([1],
+                                           dtype=torch.float32,
+                                           device="cuda")
             w2_weight_scale_2 = w1_weight_scale_2
             w3_weight_scale_2 = w1_weight_scale_2
 
@@ -1179,12 +1188,18 @@ def test_fused_moe_w4afp8(dtype, weight_loading_mode):
             weights[f"{expert_id}.w1.{lut['weight_scale']}"] = w1_scale
             weights[f"{expert_id}.w2.{lut['weight_scale']}"] = w2_scale
             weights[f"{expert_id}.w3.{lut['weight_scale']}"] = w3_scale
-            weights[f"{expert_id}.w1.{lut['pre_quant_scale']}"] = w1_pre_quant_scale
-            weights[f"{expert_id}.w2.{lut['pre_quant_scale']}"] = w2_pre_quant_scale
-            weights[f"{expert_id}.w3.{lut['pre_quant_scale']}"] = w3_pre_quant_scale
-            weights[f"{expert_id}.w1.{lut['weight_scale_2']}"] = w1_weight_scale_2
-            weights[f"{expert_id}.w2.{lut['weight_scale_2']}"] = w2_weight_scale_2
-            weights[f"{expert_id}.w3.{lut['weight_scale_2']}"] = w3_weight_scale_2
+            weights[
+                f"{expert_id}.w1.{lut['pre_quant_scale']}"] = w1_pre_quant_scale
+            weights[
+                f"{expert_id}.w2.{lut['pre_quant_scale']}"] = w2_pre_quant_scale
+            weights[
+                f"{expert_id}.w3.{lut['pre_quant_scale']}"] = w3_pre_quant_scale
+            weights[
+                f"{expert_id}.w1.{lut['weight_scale_2']}"] = w1_weight_scale_2
+            weights[
+                f"{expert_id}.w2.{lut['weight_scale_2']}"] = w2_weight_scale_2
+            weights[
+                f"{expert_id}.w3.{lut['weight_scale_2']}"] = w3_weight_scale_2
 
         quant_config = QuantConfig(quant_algo=QuantAlgo.W4A8_AWQ)
         fused_moe = CutlassFusedMoE(
@@ -1209,7 +1224,7 @@ def test_fused_moe_w4afp8(dtype, weight_loading_mode):
                 if act.shape[0] == 0:
                     continue
                 final_scale = (final_scales *
-                            mask).sum(1)[activated_tokens].unsqueeze(1)
+                               mask).sum(1)[activated_tokens].unsqueeze(1)
 
                 # weights
                 def unpack_weights(weight: torch.Tensor) -> torch.Tensor:
@@ -1243,14 +1258,14 @@ def test_fused_moe_w4afp8(dtype, weight_loading_mode):
                 a1 = a2 = a3 = a1_a3 = None
                 if weight_loading_mode == MoEWeightLoadingMode.VANILLA:
                     a1 = weights[
-                        f"{e_idx}.w1.{lut['pre_quant_scale']}"].T.contiguous().cuda(
-                        )
+                        f"{e_idx}.w1.{lut['pre_quant_scale']}"].T.contiguous(
+                        ).cuda()
                     a2 = weights[
-                        f"{e_idx}.w2.{lut['pre_quant_scale']}"].T.contiguous().cuda(
-                        )
+                        f"{e_idx}.w2.{lut['pre_quant_scale']}"].T.contiguous(
+                        ).cuda()
                     a3 = weights[
-                        f"{e_idx}.w3.{lut['pre_quant_scale']}"].T.contiguous().cuda(
-                        )
+                        f"{e_idx}.w3.{lut['pre_quant_scale']}"].T.contiguous(
+                        ).cuda()
                     a1_a3 = torch.max(a1, a3)
 
                 # weight_scale_2
@@ -1273,7 +1288,7 @@ def test_fused_moe_w4afp8(dtype, weight_loading_mode):
                     if pre_quant_scale is not None:
                         act = act * pre_quant_scale
                     act = (torch.clamp((act / input_scale), -448.0,
-                                    448.0).to(torch.float8_e4m3fn).to(dtype))
+                                       448.0).to(torch.float8_e4m3fn).to(dtype))
                     weight = (weight.float() * weight_scale.repeat_interleave(
                         128, dim=0).float()).to(dtype)
                     if weight_scale_2 is not None:
