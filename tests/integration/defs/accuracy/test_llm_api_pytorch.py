@@ -21,10 +21,10 @@ from tensorrt_llm import LLM
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_triton import \
     IS_TRITON_KERNELS_AVAILABLE
 from tensorrt_llm._torch.pyexecutor.config import MoeLoadBalancerConfig
-from tensorrt_llm.llmapi import (CudaGraphConfig, EagleDecodingConfig,
-                                 KvCacheConfig, MoeConfig, MTPDecodingConfig,
-                                 NGramDecodingConfig, SamplingParams,
-                                 TorchCompileConfig)
+from tensorrt_llm.llmapi import (AutoDecodingConfig, CudaGraphConfig,
+                                 EagleDecodingConfig, KvCacheConfig, MoeConfig,
+                                 MTPDecodingConfig, NGramDecodingConfig,
+                                 SamplingParams, TorchCompileConfig)
 from tensorrt_llm.quantization import QuantAlgo
 
 from ..conftest import (llm_models_root, parametrize_with_ids, skip_no_hopper,
@@ -354,6 +354,23 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                   disable_overlap_scheduler=True)
         with llm:
             task = JsonModeEval(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_pre_hopper
+    def test_auto_spec_decode(self):
+        pytorch_config = {
+            "cuda_graph_config":
+            CudaGraphConfig(batch_sizes=[1, 32, 64], enable_padding=True)
+        }
+        kv_cache_config = KvCacheConfig(enable_block_reuse=False,
+                                        free_gpu_memory_fraction=0.5)
+        spec_config = AutoDecodingConfig()
+        with LLM(model=self.MODEL_PATH,
+                 **pytorch_config,
+                 kv_cache_config=kv_cache_config,
+                 speculative_config=spec_config,
+                 max_batch_size=64) as llm:
+            task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
 

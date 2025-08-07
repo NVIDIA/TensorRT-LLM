@@ -875,11 +875,12 @@ class PyTorchModelEngine(ModelEngine):
             if available_blocks < 1:
                 return 0
 
+            max_draft_len = self.max_draft_len if self.enable_spec_decode else 0
             cuda_graph_dummy_request_ids = [MAX_UINT64 - 1]
             self.cuda_graph_dummy_request = kv_cache_manager.add_dummy_requests(
                 cuda_graph_dummy_request_ids,
                 is_gen=True,
-                max_num_draft_tokens=self.max_draft_len,
+                max_num_draft_tokens=max_draft_len,
                 use_mrope=self.use_mrope,
                 max_beam_width=self.max_beam_width)[0]
             self.cuda_graph_dummy_request.is_cuda_graph_dummy = True
