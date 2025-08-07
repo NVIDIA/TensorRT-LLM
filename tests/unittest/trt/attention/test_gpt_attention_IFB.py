@@ -566,18 +566,17 @@ class TestFunctional(unittest.TestCase):
             ConfigCls = GPTBigCodeConfig
             AttentionCls = GPTBigCodeAttention
 
-        configuration = ConfigCls(
-            hidden_size=hidden_size,
-            num_hidden_layers=1,
-            num_attention_heads=num_heads,
-            vocab_size=51200,
-            use_cache=True,
-            resid_pdrop=0,
-            embd_pdrop=0,
-            attn_pdrop=0,
-            hidden_act='gelu',
-            torch_dtype=dtype,
-        )
+        configuration = ConfigCls(hidden_size=hidden_size,
+                                  num_hidden_layers=1,
+                                  num_attention_heads=num_heads,
+                                  vocab_size=51200,
+                                  use_cache=True,
+                                  resid_pdrop=0,
+                                  embd_pdrop=0,
+                                  attn_pdrop=0,
+                                  hidden_act='gelu',
+                                  torch_dtype=dtype,
+                                  attn_implementation='eager')
         if attention_type == 'llama_attention':
             configuration.num_key_value_heads = num_kv_heads
             configuration.rope_theta = rope_base
@@ -787,18 +786,19 @@ class TestFunctional(unittest.TestCase):
                     position_ids=position_ids,
                     attention_mask=attention_mask,
                     use_cache=True)
+                torch_present = layer_past
             elif attention_type == 'gpt_bigcode_attention':
-                # source shape = (b, 1, s_query or 1, s_key)
-                # target shape = (b, s_query or 1, h, s_key)
-                attention_mask = (attention_mask >= 0).permute(
-                    [0, 2, 1,
-                     3]).expand(input.shape[0], in_len if step == 0 else 1,
-                                num_heads, in_len + step)
+                # target shape = (b, h, s_query or 1, s_key)
+                attention_mask = (attention_mask
+                                  >= 0).expand(input.shape[0], num_heads,
+                                               in_len if step == 0 else 1,
+                                               in_len + step)
                 torch_output, torch_present = attention(
                     input,
                     layer_past=layer_past,
                     attention_mask=attention_mask,
                     use_cache=True)
+                torch_present = layer_past
             else:
                 raise RuntimeError("attention_type not properly set")
 
@@ -1010,23 +1010,16 @@ class TestFunctional(unittest.TestCase):
                         (local_beam_width, input_length, hidden_size))
 
                 # llama/gpt2 uses DynamicCache
-                if attention_type in ['llama_attention', 'gpt2_attention']:
-                    past_key_values = DynamicCache.from_legacy_cache(
-                        torch_cache_list[req_idx])
-                else:
-                    past_key_values = torch_cache_list[req_idx]
+                past_key_values = DynamicCache.from_legacy_cache(
+                    torch_cache_list[req_idx])
 
                 torch_out, past_key_values = torch_exec(
                     step, torch_in, ctx_attention_mask_list[req_idx], req_idx,
                     past_key_values)
 
                 # llama/gpt2 uses DynamicCache
-                if attention_type in ['llama_attention', 'gpt2_attention']:
-                    torch_cache_list[req_idx] = past_key_values.to_legacy_cache(
-                    )
-                    past_key_values = torch_cache_list[req_idx][0]
-                else:
-                    torch_cache_list[req_idx] = past_key_values
+                torch_cache_list[req_idx] = past_key_values.to_legacy_cache()
+                past_key_values = torch_cache_list[req_idx][0]
 
                 if use_fp8_kv_cache or use_int8_kv_cache:
                     max_kv_cache = max(

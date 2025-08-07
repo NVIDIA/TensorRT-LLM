@@ -544,7 +544,7 @@ public:
         // * Quant
         invokeFP4Quantization(token_num, hidden_dim, m_norm_out.device_data<DType>(),
             m_scale_factor.device_data<float>(), ref_output.device_data<int64_t>(), ref_scale.device_data<int32_t>(),
-            false, tensorrt_llm::FP4QuantizationSFLayout::SWIZZLED, 128, 0);
+            false, tensorrt_llm::QuantizationSFLayout::SWIZZLED, 128, 0);
         compare<int8_t>(m_rank, m_quant_out.host_data(), ref_output.host_data(), message_size / 2, 1e-3, "quant out");
         compare<int8_t>(m_rank, m_scale_out.host_data(), ref_scale.host_data(), message_size / 16, 1e-3, "scale out");
     }
@@ -584,7 +584,7 @@ public:
             m_scale_factor.device_data<float>(), // input sf
             m_quant_out.device_data<int64_t>(),  // output
             m_scale_out.device_data<int32_t>(),  // output sf
-            false, tensorrt_llm::FP4QuantizationSFLayout::SWIZZLED, 128, m_stream->get());
+            false, tensorrt_llm::QuantizationSFLayout::SWIZZLED, 128, m_stream->get());
     }
 
     void run_kernel(int token_num, int hidden_dim)

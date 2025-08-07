@@ -263,6 +263,8 @@ struct MHARunnerParams
     void* outputSfPtr;
     // The softmax_status ptr for RingAttention.
     void* softmaxStatsPtr;
+    // The attention sinks ptr.
+    float const* attentionSinksPtr;
     // The packed mask ptr.
     void const* packedMaskPtr;
     // The cumulative Q sequence lengths.
@@ -352,6 +354,8 @@ struct Fused_multihead_attention_params_v2
     KVBlockArrayForContextFMHA paged_kv_cache;
     // The mask to implement drop-out.
     void const* packed_mask_ptr;
+    // The attention sinks.
+    float const* attention_sinks_ptr;
     // The O matrix (output).
     void* o_ptr;
     // The Softmax stats vector of layout [2, B, S, H], including softmax_sum and softmax_max

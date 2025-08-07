@@ -322,7 +322,7 @@ private:
                 {
                     // Consider that the first tileKv might contain tokensKv that is out of the attention window.
                     maxAttentionWindow
-                        = std::min(params.mMaxSeqLenKv, params.mAttentionWindowSize + kernelMeta.mStepKv - 1);
+                        = std::min(params.mMaxSeqLenKv, params.mAttentionWindowSize + kernelMeta.mTileSizeKv - 1);
                 }
                 else
                 {

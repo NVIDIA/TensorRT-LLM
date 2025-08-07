@@ -84,12 +84,6 @@ bool DecoderXQAImplJIT::mayHavePerfGain(XQAParams const& xqaParams) const
         // Always use at least 1 block regardless of history length
         multi_block_count = std::max(1, history_length / kMinHistoryTokensPerBlock);
     }
-    // Disable XQA for sliding window when cyclic_attention_window_size <= 256.
-    if (xqaParams.max_past_kv_length + 1 > xqaParams.cyclic_attention_window_size
-        && xqaParams.cyclic_attention_window_size <= 256)
-    {
-        return false;
-    }
     int block_count = num_kv_heads * batch_size * multi_block_count;
     return static_cast<float>(block_count) * kEnableMinBlockFactor >= static_cast<float>(mRunner->mMultiProcessorCount);
 }
@@ -418,6 +412,7 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
         {
             appendParam(&launchParams.ropeCosSin);
         }
+        appendParam(&xqaParams.attention_sinks);
         appendParam(&launchParams.kvCacheParams);
         if (xqaParams.beam_width > 1)
         {

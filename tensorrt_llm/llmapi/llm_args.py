@@ -149,7 +149,7 @@ class CudaGraphConfig(StrictBaseModel):
 
         # Add powers of 2 up to max_batch_size
         batch_sizes += [
-            2**i for i in range(8, math.floor(math.log(max_batch_size, 2)))
+            2**i for i in range(8, math.ceil(math.log(max_batch_size, 2)))
         ]
 
         # Filter and sort batch sizes
@@ -168,8 +168,9 @@ class MoeConfig(StrictBaseModel):
     Configuration for MoE.
     """
     backend: Literal["CUTLASS", "CUTEDSL", "WIDEEP", "TRTLLM", "DEEPGEMM",
-                     "VANILLA"] = Field(default='CUTLASS',
-                                        description="MoE backend to use.")
+                     "VANILLA",
+                     "TRITON"] = Field(default='CUTLASS',
+                                       description="MoE backend to use.")
 
     max_num_tokens: Optional[int] = Field(
         default=None,

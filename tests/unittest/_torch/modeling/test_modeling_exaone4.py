@@ -65,7 +65,7 @@ EXAONE4_SINGLE_LAYER_CONFIG = {
     },
     "rope_theta": 1000000,
     "sliding_window": 4,  # NOTE: For testing, we use 4 instead of 4096
-    "sliding_window_pattern": "LLLG",
+    "sliding_window_pattern": 4,
     "tie_word_embeddings": False,
     "torch_dtype": "bfloat16",
     "transformers_version": "4.54.0.dev0",

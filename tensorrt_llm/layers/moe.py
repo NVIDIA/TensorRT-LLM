@@ -54,7 +54,8 @@ activation_str_to_int_map = {
     "silu": 2,
     "swiglu": 3,
     "geglu": 4,
-    "identity": 5,
+    "swiglu_bias": 5,
+    "identity": 6,
 }
 
 
@@ -692,7 +693,7 @@ class MOEWeightWrapper(Module):
             weights = stack_weights(tllm_key, weights)
         if tllm_key.endswith("weights_block_scaling_factor_interleaved"):
             weights = stack_weights(tllm_key, weights)
-            weights = torch.ops.trtllm.nvfp4_block_scale_interleave(
+            weights = torch.ops.trtllm.block_scale_interleave(
                 weights.to(torch.float8_e4m3fn).view(
                     torch.uint8).cpu().contiguous()).reshape(
                         weights.shape).view(torch.float8_e4m3fn)

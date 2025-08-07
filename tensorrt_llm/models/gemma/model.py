@@ -74,7 +74,7 @@ class GemmaDecoderLayer(Module):
                 gemma3_config.query_pre_attn_scalar) / math.sqrt(
                     config.head_size)
             is_sliding = bool(
-                (layer_idx + 1) % gemma3_config.sliding_window_pattern)
+                (layer_idx + 1) % gemma3_config._sliding_window_pattern)
             rotary_base_local = config.rope_local_base_freq
 
         self.attention = Attention(
