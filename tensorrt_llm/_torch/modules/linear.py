@@ -697,6 +697,8 @@ class NVFP4LinearMethod(LinearMethodBase):
               bias: Optional[torch.Tensor]):
         if isinstance(input, Fp4QuantizedTensor):
             act_fp4, act_sf = input.fp4_tensor, input.scaling_factor
+        elif isinstance(input, tuple):
+            act_fp4, act_sf = input
         else:
             act_fp4, act_sf = torch.ops.trtllm.fp4_quantize(
                 input, module.input_scale, module.scaling_vector_size, False)
