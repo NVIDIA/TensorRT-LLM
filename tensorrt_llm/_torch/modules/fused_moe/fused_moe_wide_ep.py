@@ -143,17 +143,14 @@ class WideEPMoE(MoE):
         max_num_tokens *= model_config.mapping.world_size
         self.moe_max_num_tokens = model_config.moe_max_num_tokens if model_config.moe_max_num_tokens is not None else max_num_tokens
         # The auxiliary CUDA stream and CUDA events are only used when MoE chunking is applied
+        self.aux_stream = aux_stream if aux_stream is not None else torch.cuda.Stream(
+        )
+        self.event_dict = {
+            key: torch.cuda.Event()
+            for key in [EventType.Main, EventType.MoeAlltoall]
+        }
         if self.moe_max_num_tokens < max_num_tokens:
-            self.aux_stream = aux_stream if aux_stream is not None else torch.cuda.Stream(
-            )
-            self.event_dict = {
-                key: torch.cuda.Event()
-                for key in [EventType.Main, EventType.MoeChunkingOverlap]
-            }
-        else:
-            self.aux_stream = None
-            self.event_dict = None
-
+            self.event_dict[EventType.MoeChunkingOverlap] = torch.cuda.Event()
         # The profiler converges on the same best tactic when the number of tokens is large enough.
         # To avoid long profiling time, the max number of tokens used in the profiling is capped to
         # around 16k tokens per expert, which is well into the compute bound domain.
@@ -184,6 +181,8 @@ class WideEPMoE(MoE):
                 MnnvlMemory.initialize()
                 self.alltoall_workspace = MnnvlMoe.get_moe_workspaces(
                     model_config.mapping)
+                self.alltoall_workspace_aux = MnnvlMoe.get_moe_workspace_aux(
+                    model_config.mapping)
                 if self.enable_alltoall_without_allgather:
                     self.alltoall_prepare_workspace = MnnvlMoe.get_moe_prepare_workspace(
                         model_config.mapping)
@@ -210,6 +209,12 @@ class WideEPMoE(MoE):
         self._weights_created = False
         if not model_config.skip_create_weights_in_init:
             self.create_weights()
+
+        self.use_low_precision_alltoall_combine = os.environ.get(
+            "TRTLLM_MOE_USE_LOW_PRECISION_ALLTOALL_COMBINE", "0") == "1"
+        self.low_precision_alltoall_combine_dtype = os.environ.get(
+            "TRTLLM_MOE_LOW_PRECISION_ALLTOALL_COMBINE_DTYPE", "fp4")
+        assert self.low_precision_alltoall_combine_dtype in ["fp8", "fp4"]
 
         # Debug function for eliminating imbalance during performance analysis.
         self.enable_dummy_allreduce = os.environ.get(
@@ -249,11 +254,8 @@ class WideEPMoE(MoE):
         if os.environ.get("TRTLLM_MOE_DISABLE_ALLTOALLV", "0") == "1":
             return AlltoallMethodType.NotEnabled
 
-        if mapping.moe_ep_size <= top_k:
+        if mapping.moe_ep_size < top_k:
             return AlltoallMethodType.NotEnabled
-
-        if MnnvlMemory.supports_mnnvl():
-            return AlltoallMethodType.MNNVL
 
         if os.environ.get("TRTLLM_CAN_USE_DEEP_EP", "0") == "1":
             if deep_ep_installed and dtype == torch.bfloat16:
@@ -263,6 +265,9 @@ class WideEPMoE(MoE):
                 else:
                     # Here we can choose DeepEP or DeepEPLowLatency if both are available. Now DeepEP is faster.
                     return AlltoallMethodType.DeepEP
+
+        if MnnvlMemory.supports_mnnvl():
+            return AlltoallMethodType.MNNVL
 
         return AlltoallMethodType.NotEnabled
 
@@ -930,19 +935,21 @@ class WideEPMoE(MoE):
 
     def alltoall_postquant_dispatch(self, x: torch.Tensor, x_sf: torch.Tensor,
                                     alltoall_info: MoEAlltoallInfo):
+        self.event_dict[EventType.Main].record()
         x = MnnvlMoe.mnnvl_moe_alltoallv(x, alltoall_info,
                                          self.alltoall_workspace, self.ep_rank,
                                          self.ep_size)
-
         if x_sf is not None:
-            x_sf = MnnvlMoe.mnnvl_moe_alltoallv(x_sf, alltoall_info,
-                                                self.alltoall_workspace,
-                                                self.ep_rank, self.ep_size)
-
-            if self.has_nvfp4:
-                x_sf = swizzle_sf(x_sf, x.shape[0], x.shape[1] * 2,
-                                  self.scaling_vector_size)
-
+            with torch.cuda.stream(self.aux_stream):
+                self.event_dict[EventType.Main].wait()
+                x_sf = MnnvlMoe.mnnvl_moe_alltoallv(x_sf, alltoall_info,
+                                                    self.alltoall_workspace_aux,
+                                                    self.ep_rank, self.ep_size)
+                if self.has_nvfp4:
+                    x_sf = swizzle_sf(x_sf, x.shape[0], x.shape[1] * 2,
+                                      self.scaling_vector_size)
+                self.event_dict[EventType.MoeAlltoall].record()
+            self.event_dict[EventType.MoeAlltoall].wait()
         return x, x_sf
 
     def alltoall_combine(self, final_hidden_states: torch.Tensor,
@@ -950,6 +957,31 @@ class WideEPMoE(MoE):
         top_k = self.routing_method.experts_per_token
         if isinstance(final_hidden_states, list):
             final_hidden_states = final_hidden_states[0]
+
+        if self.use_low_precision_alltoall_combine:
+            if self.low_precision_alltoall_combine_dtype == "fp4":
+                # Notes: this global scale is token-wise global scale
+                low_precision_global_scale = (
+                    448 * 6) / final_hidden_states.abs().max(
+                        dim=-1, keepdim=True).values.to(torch.float32)
+                final_hidden_states, final_hidden_states_sf = torch.ops.trtllm.fp4_quantize(
+                    final_hidden_states, low_precision_global_scale, 16, False,
+                    False)
+                final_hidden_states_sf = final_hidden_states_sf.view(
+                    final_hidden_states.shape[0], -1)
+            elif self.low_precision_alltoall_combine_dtype == "fp8":
+                # Notes: use fp8
+                final_hidden_states, low_precision_global_scale = torch.ops.tensorrt_llm.quantize_e4m3_activation(
+                    final_hidden_states)
+                final_hidden_states_sf = None
+            else:
+                raise ValueError(
+                    f"Invalid low_precision_alltoall_combine_dtype: {self.low_precision_alltoall_combine_dtype}"
+                )
+        else:
+            final_hidden_states_sf = None
+            low_precision_global_scale = None
+
         final_hidden_states = MnnvlMoe.mnnvl_moe_alltoallv_combine(
             final_hidden_states,
             alltoall_info,
@@ -957,7 +989,10 @@ class WideEPMoE(MoE):
             ep_rank=self.ep_rank,
             ep_size=self.ep_size,
             top_k=top_k,
-            token_count=token_count)
+            token_count=token_count,
+            x_sf=final_hidden_states_sf,
+            is_sf_swizzled=False,
+            low_precision_global_scale=low_precision_global_scale)
 
         return final_hidden_states
 
