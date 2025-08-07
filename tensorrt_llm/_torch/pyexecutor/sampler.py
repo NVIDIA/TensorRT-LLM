@@ -277,24 +277,6 @@ class TorchSampler(Sampler):
         # So, we temporarily exit inference mode.
         with torch.inference_mode(False):
             self.store = self.create_store()
-            # Initialize seed for multi-GPU consistency
-        self._global_seed = 42
-        self._generator = None
-
-    def get_generator(self, device: torch.device) -> torch.Generator:
-        """Get a deterministic generator for the specified device.
-
-        Args:
-            device: The device to create the generator on
-
-        Returns:
-            A torch.Generator with the global seed set
-        """
-        if self._generator is None:
-            # Fallback to a default seed if not set
-            self._generator = torch.Generator(device=device)
-            self._generator.manual_seed(self._global_seed)
-        return self._generator
 
         # Initialize seed for multi-GPU consistency
         self._global_seed = 42
