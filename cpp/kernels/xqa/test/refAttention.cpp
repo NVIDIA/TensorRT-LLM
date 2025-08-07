@@ -45,7 +45,7 @@ using Vector = Matrix<Type, Size, 1>;
 template <typename MathElem, uint32_t tileSize, bool isPaged, bool useBeamSearch>
 Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor> refFlashAttention(IOHead const* q,
     CacheSeq<isPaged, useBeamSearch> const& k, CacheSeq<isPaged, useBeamSearch> const& v, uint32_t seqLen, float qScale,
-    float kvScale, float xScale, uint32_t slidingWinSize)
+    float kvScale, float xScale, uint32_t slidingWinSize, float* attentionSinks)
 {
     uint32_t const nbTiles = divUp(seqLen, tileSize);
     auto gemm1Acc = Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor>::Zero().eval();
@@ -113,6 +113,16 @@ Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor> refFlashAt
         }
         rowSum += tileRowSum;
     }
+
+    // Add the attention sinks.
+    if (attentionSinks != nullptr)
+    {
+        for (uint32_t i = 0; i < headGrpSize; i++)
+        {
+            rowSum[i] += expf(attentionSinks[i] - rowMax[i]);
+        }
+    }
+
     Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor> out
         = gemm1Acc.array().colwise() * (xScale * kvScale / rowSum.array());
     std::for_each(out.data(), out.data() + out.size(), [](float& e) { e = float(OutputElem(e)); });
@@ -123,7 +133,7 @@ Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor> refFlashAt
     template Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor>                                     \
     refFlashAttention<prec, tileSize, isPaged, useBeamSearch>(IOHead const* q,                                         \
         CacheSeq<isPaged, useBeamSearch> const& k, CacheSeq<isPaged, useBeamSearch> const& v, uint32_t seqLen,         \
-        float qScale, float kvScale, float xScale, uint32_t slidingWinSize)
+        float qScale, float kvScale, float xScale, uint32_t slidingWinSize, float* attentionSinks)
 
 INSTANTIATE_refFlashAttention(CacheElem, 64, false, false);
 INSTANTIATE_refFlashAttention(CacheElem, 64, false, true);
@@ -143,7 +153,7 @@ Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor> refAttenti
 #else
 Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor> refAttention(IOHead const* q,
     CacheSeq<isPaged, useBeamSearch> const& k, CacheSeq<isPaged, useBeamSearch> const& v, uint32_t seqLen, float qScale,
-    float kvScale, float xScale, uint32_t slidingWinSize)
+    float kvScale, float xScale, uint32_t slidingWinSize, float* attentionSinks)
 {
 #endif
     float const rcpXScale = 1.f / xScale;
@@ -184,7 +194,7 @@ Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor> refAttenti
 
     Eigen::Matrix<float, headGrpSize, Eigen::Dynamic, Eigen::RowMajor> x
         = (gemm0Acc.colwise() - rowMax).array().exp().eval();
-    Eigen::Vector<float, headGrpSize> const rowSum = x.rowwise().sum().eval();
+    Eigen::Vector<float, headGrpSize> rowSum = x.rowwise().sum().eval();
 
     std::for_each(x.data(), x.data() + x.size(), [&](float& e) { e = float(MathElem(e * rcpXScale)); });
 
@@ -200,6 +210,18 @@ Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor> refAttenti
             }
         }
     }
+
+    // Add the attention sinks.
+#if !SPEC_DEC
+    if (attentionSinks != nullptr)
+    {
+        for (uint32_t i = 0; i < headGrpSize; i++)
+        {
+            rowSum[i] += expf(attentionSinks[i] - rowMax[i]);
+        }
+    }
+#endif
+
     Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor> out
         = gemm1Acc.array().colwise() * (xScale * kvScale / rowSum.array());
     std::for_each(out.data(), out.data() + out.size(), [](float& e) { e = float(OutputElem(e)); });
@@ -217,7 +239,7 @@ Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor> refAttenti
     template Eigen::Matrix<float, headGrpSize, validElemsPerHead, Eigen::RowMajor>                                     \
     refAttention<prec, isPaged, useBeamSearch>(IOHead const* q, CacheSeq<isPaged, useBeamSearch> const& k,             \
         CacheSeq<isPaged, useBeamSearch> const& v, uint32_t seqLen, float qScale, float kvScale, float xScale,         \
-        uint32_t slidingWinSize)
+        uint32_t slidingWinSize, float* attentionSinks)
 #endif
 INSTANTIATE_refAttention(InputElem, false, false);
 INSTANTIATE_refAttention(InputElem, false, true);

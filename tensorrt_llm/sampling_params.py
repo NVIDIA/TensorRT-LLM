@@ -346,17 +346,20 @@ class SamplingParams:
             if self.pad_id is None:
                 self.pad_id = self.end_id
 
+        def _encode(tokenizer, text, add_special_tokens):
+            try:
+                return tokenizer.encode(text, add_special_tokens=add_special_tokens)
+            except TypeError:
+                # For tiktokenizer, the encode method does not have add_special_tokens argument
+                return tokenizer.encode(text)
+
         if self.bad is not None:
             strs = [self.bad] if isinstance(self.bad, str) else self.bad
-            self._bad_word_ids = [
-                tokenizer.encode(s, add_special_tokens=add_special_tokens) for s in strs
-            ]
+            self._bad_word_ids = [_encode(tokenizer, s, add_special_tokens) for s in strs]
 
         if self.stop is not None:
             strs = [self.stop] if isinstance(self.stop, str) else self.stop
-            self._stop_word_ids = [
-                tokenizer.encode(s, add_special_tokens=add_special_tokens) for s in strs
-            ]
+            self._stop_word_ids = [_encode(tokenizer, s, add_special_tokens) for s in strs]
 
         return self
 

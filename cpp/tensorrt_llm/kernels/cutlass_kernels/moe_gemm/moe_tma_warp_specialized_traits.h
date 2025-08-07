@@ -67,7 +67,9 @@ constexpr bool isValidHopperMOESpecialisation()
 #if defined(CUTLASS_ARCH_MMA_MODIFIABLE_TMA_SM90_SUPPORTED)
     return (cutlass::platform::is_same<T, WeightType>::value
                || (cutlass::platform::is_same<cutlass::uint4b_t, WeightType>::value
-                   && cutlass::platform::is_same<T, __nv_fp8_e4m3>::value))
+                   && cutlass::platform::is_same<T, __nv_fp8_e4m3>::value)
+               || (cutlass::platform::is_same<__nv_fp4_e2m1, WeightType>::value
+                   && !cutlass::platform::is_same<T, __nv_fp8_e4m3>::value))
 #ifdef ENABLE_FP4
         && !cutlass::platform::is_same<T, __nv_fp4_e2m1>::value
 #endif

@@ -30,7 +30,7 @@ l0_dgx_h200:
   - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_ctx_pp_gen_tp_asymmetric[MMLU-gen_tp=1-ctx_pp=4]
   - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_ctx_pp_gen_tp_asymmetric[MMLU-gen_tp=2-ctx_pp=4]
   - disaggregated/test_disaggregated.py::test_disaggregated_ctxtp2pp2_gentp2pp2[TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_disaggregated.py::test_disaggregated_ctxpp4_genpp4[TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated.py::test_disaggregated_ctxpp4_genpp4[llama-3.1-8b]
   - unittest/_torch/multi_gpu_modeling/test_llama4.py::test_llama4[pp1-ep1-disable_adp-enable_graph-tp8-trtllm-scout]
   - unittest/_torch/multi_gpu_modeling/test_llama4.py::test_llama4[pp1-ep4-enable_adp-enable_graph-tp8-trtllm-scout]
   - unittest/llmapi/test_llm_pytorch.py::test_nemotron_nas_lora
@@ -136,6 +136,7 @@ l0_dgx_h200:
   - unittest/llmapi/test_llm_multi_gpu.py -m "gpu2 and part3"
   - unittest/llmapi/test_llm_multi_gpu.py -m "gpu4 and part0"
   - unittest/llmapi/test_llm_multi_gpu.py -m "not (gpu2 or gpu4)"
+  - unittest/llmapi/test_llm_kv_cache_events.py::test_llm_api_attention_dp_kv_events
   - examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-t5-small-float32-enable_gemm_plugin-enable_attention_plugin-enable_paged_kv_cache-tp:2-pp:2-nb:1-enable_fp8]
   - llmapi/test_llm_e2e.py::test_llmapi_exit_multi_gpu
   - test_e2e.py::test_trtllm_bench_llmapi_launch[trt_backend-llama-v3-llama3-8b]

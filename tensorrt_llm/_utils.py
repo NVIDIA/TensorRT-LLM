@@ -180,6 +180,7 @@ _str_to_binding_dtype_dict = dict(
     bool=DataType.BOOL,
     fp8=DataType.FP8,
 )
+_binding_to_str_dtype = {v: k for k, v in _str_to_binding_dtype_dict.items()}
 
 _binding_dtype_size = {
     DataType.INT64: 8,
@@ -192,6 +193,12 @@ _binding_dtype_size = {
     DataType.INT8: 1,
     DataType.UINT8: 1,
 }
+
+
+def binding_to_str_dtype(binding_dtype) -> str:
+    ret = _binding_to_str_dtype.get(binding_dtype)
+    assert ret is not None, f'Unsupported binding dtype: {binding_dtype}'
+    return ret
 
 
 def binding_dtype_size(dtype: DataType):
@@ -1014,11 +1021,15 @@ class KVCacheEventSerializer:
         if event_serialize_func is None:
             raise ValueError(f"Unknown KVCache event data type: {event_type}")
 
-        return {
+        json_str = {
             "event_id": event.event_id,
             "data": event_serialize_func(event.data),
-            "window_size": event.window_size
+            "window_size": event.window_size,
         }
+        if event.attention_dp_rank is not None:
+            json_str["attention_dp_rank"] = event.attention_dp_rank
+
+        return json_str
 
     @staticmethod
     def _created_to_json(data):

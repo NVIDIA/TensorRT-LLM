@@ -65,6 +65,8 @@ public:
         T const* qkv_bias = nullptr;
         // Attention mask input, which has shape of [batch_size, attention_mask_stride].
         bool const* attention_mask = nullptr;
+        // Attention sinks with shape of [num_heads_q] float.
+        float const* attention_sinks = nullptr;
         // Rotary inv_freq cache buffer to avoid re-computing.
         float const* rotary_inv_freq = nullptr;
         // Rotary cos sin cache buffer to avoid re-computing.
@@ -386,6 +388,7 @@ public:
     bool mPosShiftEnabled = false;
     bool mPagedContextFMHA = false;
     bool mFP8ContextFMHA = false;
+    bool mFP8ContextMLA = false;
     bool mFP8GenerationMLA = false;
     bool mDenseContextFMHA = false;
     bool mHasFullAttentionMask = false;

@@ -453,7 +453,7 @@ class PyTorchModelEngine(ModelEngine):
                 'type'] == 'mrope'
         except Exception:
             pass
-        logger.info(f"Detected use_mrope: {use_mrope}")
+        logger.debug(f"Detected use_mrope: {use_mrope}")
         return use_mrope
 
     @property
