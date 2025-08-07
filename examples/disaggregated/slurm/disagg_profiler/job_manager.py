@@ -419,6 +419,12 @@ class JobManager:
             if gpu_index % self.num_gpus == 0:
                 gpu_index = 0
                 server_id += 1
+
+        # If the last context server is not on a full node, add a generation server to the next node
+        if gpu_index % self.num_gpus != 0:
+            server_id += 1
+            gpu_index = 0
+
         for gen_server in range(total_gen_servers):
             gpu_indices = []
             server_ids = []
