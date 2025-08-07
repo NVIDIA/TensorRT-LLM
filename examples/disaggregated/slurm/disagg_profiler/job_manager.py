@@ -104,6 +104,8 @@ class JobManager:
         self.generation_jobs = []
         self.ifb_jobs = []
         self.disagg_jobs = []
+        # Track jobs that have nsys enabled with their nsys file paths
+        self.nsys_jobs = []
         self.experiment_path = args.experiment_path
 
         # Clean up any previous node info files
@@ -620,15 +622,99 @@ class JobManager:
         for loadgen_job in load_gen_jobs:
             loadgen_job.wait()
 
+        
         self.terminate_jobs(self.context_jobs + self.generation_jobs +
                             self.ifb_jobs + self.disagg_jobs)
         print("DEBUG JobManager: launch_jobs completed")
+    
+    def stop_nsys_sessions(self):
+        """Stop nsys sessions for all tracked nsys jobs."""
+        if not self.nsys_jobs:
+            return
+        
+        print("Stopping nsys sessions...")
+        
+        # Group jobs by hostname to minimize srun calls
+        jobs_by_hostname = {}
+        for nsys_job in self.nsys_jobs:
+            if nsys_job['process'] and nsys_job['process'].poll() is None:
+                # Use the first hostname for the job
+                hostname = nsys_job['hostnames'][0]
+                if hostname not in jobs_by_hostname:
+                    jobs_by_hostname[hostname] = []
+                jobs_by_hostname[hostname].append(nsys_job)
+        
+        # Process each hostname
+        for hostname, jobs in jobs_by_hostname.items():
+            try:
+                print(f"Checking nsys sessions on node {hostname}")
+                
+                # First, get list of active sessions on this node
+                list_cmd = [
+                    "srun", "--overlap", "--oversubscribe", "-A", self.account, "-p", self.partition,
+                    "-N", "1", "-n", "1", "-t", "00:05:00", "-w", hostname,
+                    f"--container-image={self.container_image}",
+                    f"--container-mounts={self.mounts}",
+                    f"--container-workdir={self.workdir}",
+                    "nsys", "sessions", "list", "--show-header=false"
+                ]
+                
+                result = subprocess.run(list_cmd, capture_output=True, text=True, timeout=60)
+                
+                if result.returncode != 0:
+                    print(f"Warning: Could not list nsys sessions on {hostname}")
+                    print(f"Error output: {result.stderr}")
+                    continue
+                    
+                active_sessions = []
+                for line in result.stdout.strip().split('\n'):
+                    if line.strip():
+                        # Sessions list format: typically session_id followed by other info
+                        parts = line.strip().split()
+                        if parts:
+                            active_sessions.append(parts[0])  # First column is session ID
+                
+                print(f"Found {len(active_sessions)} active nsys sessions on {hostname}")
+                
+                # Stop sessions for jobs on this hostname
+                for nsys_job in jobs:
+                    session_name = nsys_job['session_name']
+                    print(f"Stopping nsys session '{session_name}' for {nsys_job['server_type']} server (node {nsys_job['node_id']}) on {hostname}")
+                    
+                    # Try to stop by session name first
+                    stop_cmd = [
+                        "srun", "--overlap", "--oversubscribe", "-A", self.account, "-p", self.partition,
+                        "-N", "1", "-n", "1", "-t", self.time, "-w", hostname,
+                        f"--container-image={self.container_image}",
+                        f"--container-mounts={self.mounts}",
+                        f"--container-workdir={self.workdir}",
+                        "nsys", "stop", f"--session={session_name}"
+                    ]
+                    
+                    result = subprocess.run(stop_cmd, capture_output=True, text=True, timeout=60)
+                    
+                    if result.returncode == 0:
+                        print(f"Successfully stopped nsys session '{session_name}' on {hostname}")
+                    else:
+                        print(f"Warning: Could not stop session '{session_name}' on {hostname}. Error: {result.stderr}")
+                    
+                # Give nsys some time to write the profile data
+                time.sleep(3)
+                    
+            except (subprocess.TimeoutExpired, subprocess.SubprocessError) as e:
+                print(f"Warning: Could not stop nsys sessions on {hostname}: {e}")
+                    
+        print("Finished stopping nsys sessions.")
 
     def _build_server_launch_command(self, config, hostnames, gpu_indices,
                                      node_port, config_path, log_file):
-        """Build the command to launch a server (context or generation)."""
+        """Build the command to launch a server (context or generation).
+        
+        Returns:
+            tuple: (cmd, nsys_info) where nsys_info is a dict with nsys details or None
+        """
         if not gpu_indices or not config_path:
-            return None
+            return None, None
 
         # Get configuration based on server type
         server_config = config
@@ -660,13 +746,22 @@ class JobManager:
                 unset_env += f" -u {key}"
         nsys = False
         nsys_prefix = ''
+        nsys_info = None
         if 'nsys' in config:
             nsys = config['nsys']
         if nsys:
             envs += " TLLM_PROFILE_RECORD_GC=1"
             envs += " TLLM_NVTX_DEBUG=1"
             nsys_file = os.path.join(self.output_folder, f"{log_file}.nsys-rep")
-            nsys_prefix = f"nsys profile -e \"NSYS_MPI_STORE_TEAMS_PER_RANK=1\" -o {nsys_file} -f true -t cuda,nvtx,python-gil -c cudaProfilerApi --cuda-graph-trace node --capture-range-end=stop --gpu-metrics-devices=none"
+            # Use a session name that includes the log file basename for easier identification
+            session_name = f"trtllm_{os.path.basename(log_file)}"
+            nsys_prefix = f"nsys profile -e \"NSYS_MPI_STORE_TEAMS_PER_RANK=1\" -o {nsys_file} -f true -t cuda,nvtx,python-gil -c cudaProfilerApi --cuda-graph-trace node --capture-range-end=stop --gpu-metrics-devices=none --session={session_name}"
+            nsys_info = {
+                'enabled': True,
+                'nsys_file': nsys_file,
+                'session_name': session_name,
+                'hostnames': hostnames
+            }
         log_file = os.path.join(self.output_folder, log_file)
 
         # Build the command
@@ -704,14 +799,14 @@ class JobManager:
             " --pp_size " + str(pp) + " &> " + log_file
         ]
 
-        return cmd
+        return cmd, nsys_info
 
     def launch_context_server(self, node_id, hostnames, gpu_indices, node_port,
                               log_file):
         """Launch context server on a specific node."""
         launched_jobs = []
 
-        cmd = self._build_server_launch_command(
+        cmd, nsys_info = self._build_server_launch_command(
             self.config['exec']['config']['context'], hostnames, gpu_indices,
             node_port, self.context_config_path, log_file)
         if not cmd:
@@ -720,6 +815,13 @@ class JobManager:
         print(f"Running command: {' '.join(cmd)}")
         proc = subprocess.Popen(cmd)
         launched_jobs.append(proc)
+
+        # Track nsys information if enabled
+        if nsys_info:
+            nsys_info['process'] = proc
+            nsys_info['server_type'] = 'context'
+            nsys_info['node_id'] = node_id
+            self.nsys_jobs.append(nsys_info)
 
         # Small delay to avoid race conditions in resource allocation
         time.sleep(2)
@@ -731,7 +833,7 @@ class JobManager:
         """Launch generation server on a specific node."""
         launched_jobs = []
 
-        cmd = self._build_server_launch_command(
+        cmd, nsys_info = self._build_server_launch_command(
             self.config['exec']['config']['generation'], hostnames, gpu_indices,
             node_port, self.generation_config_path, log_file)
         if not cmd:
@@ -740,6 +842,13 @@ class JobManager:
         print(f"Running command: {' '.join(cmd)}")
         proc = subprocess.Popen(cmd)
         launched_jobs.append(proc)
+
+        # Track nsys information if enabled
+        if nsys_info:
+            nsys_info['process'] = proc
+            nsys_info['server_type'] = 'generation'
+            nsys_info['node_id'] = node_id
+            self.nsys_jobs.append(nsys_info)
 
         # Small delay to avoid race conditions in resource allocation
         time.sleep(2)
@@ -751,7 +860,7 @@ class JobManager:
         """Launch IFB server on a specific node."""
         launched_jobs = []
 
-        cmd = self._build_server_launch_command(
+        cmd, nsys_info = self._build_server_launch_command(
             self.config['exec']['config']['ifb'], hostnames, gpu_indices,
             node_port, self.ifb_config_path, log_file)
         if not cmd:
@@ -760,6 +869,14 @@ class JobManager:
         print(f"Running command: {' '.join(cmd)}")
         proc = subprocess.Popen(cmd)
         launched_jobs.append(proc)
+
+        # Track nsys information if enabled
+        if nsys_info:
+            nsys_info['process'] = proc
+            nsys_info['server_type'] = 'ifb'
+            nsys_info['node_id'] = node_id
+            self.nsys_jobs.append(nsys_info)
+
         return launched_jobs
 
     def launch_disaggregated_server(self, hostname, context_servers,
@@ -1006,6 +1123,10 @@ class JobManager:
 
     def terminate_jobs(self, jobs):
         """Terminate all running jobs."""
+        # First, stop any nsys sessions for jobs that have nsys enabled
+        self.stop_nsys_sessions()
+        
+        # Then terminate the jobs
         for job in jobs:
             if job and job.poll() is None:
                 try:
