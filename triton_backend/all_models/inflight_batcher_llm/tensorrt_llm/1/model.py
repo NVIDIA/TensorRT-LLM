@@ -280,7 +280,8 @@ def get_prompt_tuning_config_from_request(request,
     kwargs = {}
     prompt_embedding_table = get_input_tensor_by_name(request,
                                                       'prompt_embedding_table',
-                                                      batch_size, batch_index)
+                                                      batch_size, batch_index,
+                                                      force_on_torch=True)
     prompt_table_extra_ids = get_input_tensor_by_name(request,
                                                       'prompt_table_extra_ids',
                                                       batch_size, batch_index)

@@ -161,6 +161,20 @@ class TritonPythonModel:
                 self.video_token_id = hf_config.video_token_id
                 self.vocab_size = hf_config.vocab_size
                 self.qwen2vl_utils = Qwen2VLUtils(hf_config)
+            
+            if self.model_type == 'pixtral':
+                from transformers import AutoConfig
+                hf_model_path = model_config['parameters'].get('hf_model_path', None)
+                assert hf_model_path is not None and hf_model_path[
+                    'string_value'] != "${hf_model_path}", "Need to provide hf_model_path for the Pixtral model"
+                hf_config = AutoConfig.from_pretrained(
+                    hf_model_path['string_value'])
+                self.image_size = hf_config.vision_config.image_size
+                self.patch_size = hf_config.vision_config.patch_size
+                self.vocab_size = hf_config.text_config.vocab_size
+                self.image_token_index = hf_config.image_token_index
+                self.spatial_merge_size = hf_config.spatial_merge_size
+                self.relevant_patch_size = self.patch_size * self.spatial_merge_size
 
     def get_requests(self, request: List) -> Dict[str, torch.Tensor]:
         """
@@ -276,6 +290,19 @@ class TritonPythonModel:
             input_tensors['attention_mask_llm'].append(attention_mask)
             input_tensors['image_grid_thw'].append(image_grid_thw)
 
+        elif self.model_type == 'pixtral':
+            assert batch_size == 1, "Only support batch size 1 for Pixtral, because each batch can contain a different number of images"
+            d_min = torch.finfo(self.vision_output_dtype).min
+            total_images = img_tensor.shape[0] * img_tensor.shape[1]
+            num_patches = self.image_size // self.patch_size
+            input_tensors['input'].append(img_tensor.view(-1, img_tensor.shape[2], img_tensor.shape[3], img_tensor.shape[4]))
+            attention_mask_shape = (total_images, num_patches, num_patches)
+            attention_mask = torch.full(attention_mask_shape, fill_value=d_min, dtype=self.vision_output_dtype, device="cuda")
+            image_sizes = from_dlpack(pb_utils.get_input_tensor_by_name(request, 'image_sizes').to_dlpack()).reshape(total_images, 2)
+            for image_idx in range(total_images):
+                image_h, image_w = image_sizes[image_idx][0], image_sizes[image_idx][1]
+                attention_mask[image_idx, : image_h // self.patch_size, : image_w // self.patch_size] = 0
+            input_tensors['attention_mask'].append(attention_mask)
         else:
             input_tensors['input'].append(
                 img_tensor.view(-1, img_tensor.shape[2], img_tensor.shape[3],
@@ -500,6 +527,32 @@ class TritonPythonModel:
                 inference_response = pb_utils.InferenceResponse(
                     output_tensors=output_tensors)
                 responses.append(inference_response)
+        elif self.model_type == 'pixtral':
+            assert len(requests) == 1, "Pixtral only supports batch size 1"
+            visual_embed_dim = output_tensor.shape[-1]
+            total_images = output_tensor.shape[0]
+            output_img_size = self.image_size // self.relevant_patch_size
+            image_sizes = from_dlpack(pb_utils.get_input_tensor_by_name(requests[0], 'image_sizes').to_dlpack()).reshape(total_images, 2)
+            complete_visual_features = []
+            for image_idx in range(total_images):
+                image_h, image_w = image_sizes[image_idx][0], image_sizes[image_idx][1]
+                h_patches, w_patches = image_h // self.relevant_patch_size, image_w // self.relevant_patch_size
+                relevant_visual_features = torch.zeros(1, h_patches * w_patches, visual_embed_dim)
+                visual_features = output_tensor[image_idx].reshape(output_img_size, output_img_size, visual_embed_dim)
+                flattened_features = visual_features[:h_patches, :w_patches, :].flatten(0, 1)
+                relevant_visual_features[0, : h_patches * w_patches, :] = flattened_features
+                complete_visual_features.append(relevant_visual_features)
+            complete_visual_features = torch.cat(complete_visual_features, dim=1)
+
+            prompt_embedding_table_tensor = pb_utils.Tensor.from_dlpack(
+                    'OUT_PROMPT_EMBEDDING_TABLE', to_dlpack(complete_visual_features.type(self.vision_output_dtype)))
+            prompt_vocab_size_tensor = pb_utils.Tensor(
+                    'OUT_PROMPT_VOCAB_SIZE',
+                    np.array([[complete_visual_features.shape[1]]], dtype=np.int32))
+
+            output_tensors = [prompt_embedding_table_tensor, prompt_vocab_size_tensor]
+            inference_response = pb_utils.InferenceResponse(output_tensors=output_tensors)
+            responses.append(inference_response)
         else:
             for req_idx, embeddings in enumerate(
                     torch.tensor_split(output_tensor,
@@ -584,6 +637,12 @@ class TritonPythonModel:
                 input_tensor, bs, num_image = self.get_requests(
                     requests[end_idx])
                 # Check if adding this request to the current batch would exceed the maximum batch size
+
+                # TODO: Each batch might contain different number of images, so we need to check the total number of images
+                # that correspond to the encoder's maximum batch size instead of the batch size of the requests.
+                # It can happen that even for one batch, the number of images is larger than the maximum batch size of the encoder.
+                # In this case, the images need to be broken up into smaller batches to run the encoder and concatenate the results.
+
                 if micro_batch_size + bs <= self.max_batch_size:
                     is_skip_encoder = False
                     for tensor_name, tensor in input_tensor.items():
