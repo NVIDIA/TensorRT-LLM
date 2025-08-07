@@ -369,6 +369,7 @@ class TestLlama3_2_3B(LlmapiAccuracyTestHarness):
 
 @pytest.mark.timeout(7200)
 @pytest.mark.skip_less_host_memory(1000000)
+@pytest.mark.skip_less_device_memory(80000)
 # 1TB is basic requirement for large model tests. CG4 120G only has 800G host memory, and 480G is shared with GPUs. the test will cause the system crash.
 class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "meta-llama/Llama-3.3-70B-Instruct"

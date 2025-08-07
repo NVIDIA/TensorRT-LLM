@@ -146,7 +146,8 @@ def launch_disaggregated_llm(disaggregated_server_config: Dict[str, Any],
               disaggregated_serving_config_path, "--server_start_timeout",
               "3600"
           ]) as disaggregated_server):
-        while True:
+        start_time = time.time()
+        while time.time() - start_time < 3600:
             time.sleep(1)
             try:
                 print("Checking health endpoint")
