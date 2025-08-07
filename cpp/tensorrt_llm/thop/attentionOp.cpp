@@ -153,7 +153,10 @@ public:
             {
                 rotary_inv_freq_ptr = rotary_inv_freq.value().data_ptr<float>();
             }
-            rotary_cos_sin_ptr = static_cast<float2 const*>(rotary_cos_sin.value().data_ptr());
+            if (rotary_cos_sin.has_value())
+            {
+                rotary_cos_sin_ptr = static_cast<float2 const*>(rotary_cos_sin.value().data_ptr());
+            }
         }
 
         void* workspace_ptr = workspace.data_ptr();
@@ -208,22 +211,30 @@ public:
         // Commonly, cyclic_attention_window_size, and max_attention_window_size will be the same
         // unless each layer has different attention window sizes.
         // the kv_cache capacity.
-        int const max_attention_window_size
-            = beam_width == 1 ? attention_window_size : cache_indirection.value().size(2);
+        int const max_attention_window_size = beam_width == 1 ? attention_window_size
+            : cache_indirection.has_value()                   ? cache_indirection.value().size(2)
+                                                              : attention_window_size;
         // The cyclic_attention_window_size will determine the cyclic kv cache position of new tokens.
         // Note that this cyclic_attention_window_size might be smaller than the actual kv cache capactity.
         int const cyclic_attention_window_size = attention_window_size;
         bool const can_use_one_more_block = beam_width > 1;
 
-        int max_blocks_per_sequence = op.useKVCache() ? kv_cache_block_offsets.value().size(-1) : 0;
-        int32_t const pool_index
-            = op.useKVCache() ? host_kv_cache_pool_mapping.value().index({op.mLayerIdx, 0}).item<int32_t>() : 0;
-        int32_t const layer_idx_in_cache_pool
-            = op.useKVCache() ? host_kv_cache_pool_mapping.value().index({op.mLayerIdx, 1}).item<int32_t>() : 0;
-        KVBlockArray::DataType* block_offsets = static_cast<KVBlockArray::DataType*>(
-            op.useKVCache() ? kv_cache_block_offsets.value().index({pool_index, seq_offset}).data_ptr() : nullptr);
-        KVBlockArray::DataType* host_block_offsets = static_cast<KVBlockArray::DataType*>(
-            op.useKVCache() ? host_kv_cache_block_offsets.value().index({pool_index, seq_offset}).data_ptr() : nullptr);
+        int max_blocks_per_sequence
+            = op.useKVCache() && kv_cache_block_offsets.has_value() ? kv_cache_block_offsets.value().size(-1) : 0;
+        int32_t const pool_index = op.useKVCache() && host_kv_cache_pool_mapping.has_value()
+            ? host_kv_cache_pool_mapping.value().index({op.mLayerIdx, 0}).item<int32_t>()
+            : 0;
+        int32_t const layer_idx_in_cache_pool = op.useKVCache() && host_kv_cache_pool_mapping.has_value()
+            ? host_kv_cache_pool_mapping.value().index({op.mLayerIdx, 1}).item<int32_t>()
+            : 0;
+        KVBlockArray::DataType* block_offsets
+            = static_cast<KVBlockArray::DataType*>(op.useKVCache() && kv_cache_block_offsets.has_value()
+                    ? kv_cache_block_offsets.value().index({pool_index, seq_offset}).data_ptr()
+                    : nullptr);
+        KVBlockArray::DataType* host_block_offsets
+            = static_cast<KVBlockArray::DataType*>(op.useKVCache() && host_kv_cache_block_offsets.has_value()
+                    ? host_kv_cache_block_offsets.value().index({pool_index, seq_offset}).data_ptr()
+                    : nullptr);
 
         auto const cache_elem_size = (op.mKVCacheQuantMode.hasKvCacheQuant() ? 1 : sizeof(T));
         auto const block_size = op.mTokensPerBlock * op.mNumKVHeads * op.mHeadSize;
@@ -231,12 +242,12 @@ public:
         int32_t const kv_factor = op.isMLAEnabled() ? 1 : 2;
         auto const intra_pool_offset = layer_idx_in_cache_pool * kv_factor * bytes_per_block;
 
-        void* host_primary_pool_pointer = op.useKVCache()
+        void* host_primary_pool_pointer = op.useKVCache() && host_kv_cache_pool_pointers.has_value()
             ? reinterpret_cast<void*>(
                 reinterpret_cast<char*>(host_kv_cache_pool_pointers.value().index({pool_index, 0}).item<int64_t>())
                 + intra_pool_offset)
             : nullptr;
-        void* host_secondary_pool_pointer = op.useKVCache()
+        void* host_secondary_pool_pointer = op.useKVCache() && host_kv_cache_pool_pointers.has_value()
             ? reinterpret_cast<void*>(
                 reinterpret_cast<char*>(host_kv_cache_pool_pointers.value().index({pool_index, 1}).item<int64_t>())
                 + intra_pool_offset)
@@ -244,16 +255,19 @@ public:
 
         float const* kv_scale_orig_quant_ptr = nullptr;
         float const* kv_scale_quant_orig_ptr = nullptr;
-        if (op.mKVCacheQuantMode.hasKvCacheQuant())
+        if (op.mKVCacheQuantMode.hasKvCacheQuant() && kv_scale_orig_quant.has_value()
+            && kv_scale_quant_orig.has_value())
         {
             kv_scale_orig_quant_ptr = kv_scale_orig_quant.value().data_ptr<float>();
             kv_scale_quant_orig_ptr = kv_scale_quant_orig.value().data_ptr<float>();
         }
         // For FP8 output, out_scale represents the output scale.
-        float const* out_scale_ptr
-            = (op.mFP8ContextFMHA && !op.mFuseFp4Quant) ? out_scale.value().data_ptr<float>() : nullptr;
+        float const* out_scale_ptr = (op.mFP8ContextFMHA && !op.mFuseFp4Quant && out_scale.has_value())
+            ? out_scale.value().data_ptr<float>()
+            : nullptr;
         // For NVFP4 output, out_scale holds the global scale for scaling factors.
-        float const* out_sf_scale_ptr = op.mFuseFp4Quant ? out_scale.value().data_ptr<float>() : nullptr;
+        float const* out_sf_scale_ptr
+            = op.mFuseFp4Quant && out_scale.has_value() ? out_scale.value().data_ptr<float>() : nullptr;
 
         // The attention_sinks is a float tensor with shape [num_heads_q]
         float const* attention_sinks_ptr = nullptr;
@@ -329,7 +343,9 @@ public:
             AttentionOp::EnqueueGenerationParams<T> enqueue_params{common_enqueue_params};
             enqueue_params.beam_width = beam_width;
             enqueue_params.num_requests = num_requests;
-            enqueue_params.cache_indir = beam_width == 1 ? nullptr : cache_indirection.value().data_ptr<int32_t>();
+            enqueue_params.cache_indir = beam_width == 1
+                ? nullptr
+                : (cache_indirection.has_value() ? cache_indirection.value().data_ptr<int32_t>() : nullptr);
             enqueue_params.semaphores = op.multiBlockSemaphores();
             enqueue_params.host_past_key_value_lengths = host_past_key_value_lengths.data_ptr<int32_t>();
             enqueue_params.start_token_idx_sf = token_offset;
@@ -557,6 +573,7 @@ void attention_inplace(torch::Tensor q, torch::optional<torch::Tensor> k, torch:
             static_cast<int>(v_head_dim.value()), static_cast<int>(predicted_tokens_per_seq),
             static_cast<int>(layer_num)};
 
+        op->mFP8ContextMLA = tensorrt_llm::common::getSMVersion() == 120 && op->mKVCacheQuantMode.hasFp8KvCache();
         op->mIsGenerationMLA = head_size == op->mMLAParams.kv_lora_rank + op->mMLAParams.qk_rope_head_dim;
         op->mFP8GenerationMLA = op->mKVCacheQuantMode.hasFp8KvCache();
         // only enable flash mla on sm90 and head_size == 576 and tokens_per_block == 64
