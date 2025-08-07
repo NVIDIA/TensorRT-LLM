@@ -189,5 +189,6 @@ l0_dgx_h100:
     terms:
       stage: post_merge
       backend: triton
+      auto_trigger: others
   tests:
   - triton_server/test_triton_llm.py::test_llmapi_backend[4-0-disableDecoupleMode-tensorrt_llm]
