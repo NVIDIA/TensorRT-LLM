@@ -1,5 +1,5 @@
 from ..disaggregated_params import DisaggregatedParams
-from ..executor import CompletionOutput, RequestError
+from ..executor import CompletionOutput, LoRARequest, RequestError
 from ..sampling_params import GuidedDecodingParams, SamplingParams
 from .build_cache import BuildCacheConfig
 from .llm import LLM, RequestOutput
@@ -56,4 +56,5 @@ __all__ = [
     'TrtLlmArgs',
     'AutoDecodingConfig',
     'AttentionDpConfig',
+    'LoRARequest',
 ]

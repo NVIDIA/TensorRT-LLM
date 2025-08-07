@@ -133,9 +133,9 @@ Next, consider this linear layer is a `RowLinear` layer. When we partition the w
 
 #### DoRA
 
-TRTLLM supports DoRA as described in https://arxiv.org/abs/2402.09353 . To enable DoRA, you must add the additional `--dora_plugin enable` flag to the `trtllm-build` command.
+TensorRT-LLM supports DoRA as described in https://arxiv.org/abs/2402.09353 . To enable DoRA, you must add the additional `--dora_plugin enable` flag to the `trtllm-build` command.
 
-The DoRA scales must be normalized before they are submitted to TRTLLM in an inference request. The normalization requires the base model weights. To normalize your adapter you may use the script provided in `tensorrt_llm/examples/dora/normalize_weights.py`.
+The DoRA scales must be normalized before they are submitted to TensorRT-LLM in an inference request. The normalization requires the base model weights. To normalize your adapter you may use the script provided in `tensorrt_llm/examples/dora/normalize_weights.py`.
 
 When using DoRA, the format of `LoraWeights` and `LoraConfig` changes slightly.
 The shape of `LoraConfig` becomes `[module_id, layer_idx, adapter_size D (i.e. R value), is_dora]`, with `is_dora` a boolean flag that determines whether the supplied adapter contains DoRA scales or not. If the old config shape is used, it is assumed the adapter does not have DoRA scales.
