@@ -591,26 +591,15 @@ SizeType32 PeftCacheManager::determineNumPages(std::shared_ptr<LlmRequest> llmRe
     TLLM_LOG_DEBUG("%s start", __PRETTY_FUNCTION__);
     if (llmRequest->getLoraTaskId().has_value())
     {
-        auto taskId = llmRequest->getLoraTaskId().value();
         try
         {
-            return mHostLoraCache->determineNumPages(taskId);
+            return mHostLoraCache->determineNumPages(llmRequest->getLoraTaskId().value());
         }
         catch (std::runtime_error& e)
         {
             if (llmRequest->getLoraConfig().has_value())
             {
                 return mHostLoraCache->determineNumPages(llmRequest->getLoraConfig().value());
-            }
-            if (!llmRequest->getLoraWeights().has_value())
-            {
-                auto const reqId = llmRequest->mRequestId;
-                std::string errMsg
-                    = "Request ID " + std::to_string(reqId) + " has no LoRA adapter weights while configured with LoRA task "
-                    + std::to_string(taskId) + " that's not found in LoRA CPU cache."
-                    " Note that currently a request with LoRA task that was already loaded is sent without its LoRA weights to save its serialization, copy and deserialization,"
-                    " so if this LoRA task was evicted from LoRA CPU cache, then its reuse is currently not supported.";
-                throw PeftTaskNotCachedException(errMsg);
             }
             throw;
         }
