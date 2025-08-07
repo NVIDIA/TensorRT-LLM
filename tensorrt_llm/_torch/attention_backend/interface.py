@@ -320,7 +320,6 @@ class AttentionMetadata:
 
         cuda_graph_metadata.num_contexts = 0
         cuda_graph_metadata.__post_init_with_buffers__(buffers)
-        # cuda_graph_metadata.__post_init__()
         return cuda_graph_metadata
 
     def update_spec_dec_param(self, is_spec_decoding_enabled, is_spec_dec_tree,

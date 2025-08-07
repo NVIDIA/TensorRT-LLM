@@ -935,11 +935,12 @@ class PyTorchModelEngine(ModelEngine):
                 return
             for key, v in new.items():
                 if key not in old:
-                    old[key] = v
-                elif v.numel() > old[key].numel():
-                    old[key] = v
+                    old[key] = [v]
+                else:
+                    old[key].append(v)
 
         update_buffers(self.max_cudagraph_meta_buffers, meta_buffers)
+        end, total_gpu_memory = torch.cuda.mem_get_info()
 
     def _maybe_get_cuda_graph(
         self,
@@ -1160,6 +1161,10 @@ class PyTorchModelEngine(ModelEngine):
         torch.cuda.empty_cache()
         del self._cuda_graph_mem_pool
         self._cuda_graph_mem_pool = None
+        for _, caches in self.max_cudagraph_meta_buffers.items():
+            for cache in caches:
+                del cache
+        torch.cuda.empty_cache()
 
     def get_max_num_sequences(self) -> int:
         """
