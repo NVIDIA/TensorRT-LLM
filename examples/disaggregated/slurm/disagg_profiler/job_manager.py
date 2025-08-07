@@ -786,7 +786,7 @@ class JobManager:
             f"--container-image={self.container_image}",
             f"--container-mounts={self.mounts}",
             f"--container-workdir={self.workdir}",
-            "--export=\"'CUDA_VISIBLE_DEVICES=" + cuda_visible_devices + "\"",
+            "--export=\"'CUDA_VISIBLE_DEVICES=" + cuda_visible_devices + "'\"",
             "bash",
             "-c",
             envs +
