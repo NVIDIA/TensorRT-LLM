@@ -1662,8 +1662,7 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
 
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
-            cuda_graph_config=CudaGraphConfig(
-                enable_padding=True) if cuda_graph else None,
+            cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
             moe_config=moe_config,
         )
 
