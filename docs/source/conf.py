@@ -106,7 +106,7 @@ container published for a previous
 [GitHub pre-release or release](https://github.com/NVIDIA/TensorRT-LLM/releases)
 (see also [NGC Catalog](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release/tags)).
 ```
-    """,
+    """
 }
 
 autosummary_generate = True

@@ -42,7 +42,7 @@ Our initial kernel breakdown and analysis revealed several key observations abou
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog8_kernel_breakdown.png" width="1000">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog8_kernel_breakdown.png" width="1000">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 1: Kernel breakdown when scaling EP without EPLB.</em></sub></p>
@@ -57,7 +57,7 @@ Before MoE group GEMMs, `M` tokens are expanded to `M * topK` tokens, which are 
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog8_moe_aux_kernels1.png" width="400">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog8_moe_aux_kernels1.png" width="400">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 2: Sparsity of valid expanded tokens. For DeepSeek-R1 deployed with EP 32, a batch of 12 tokens are expanded to 96 tokens, but only 3 are valid on rank 0.</em></sub></p>
@@ -70,7 +70,7 @@ This optimization was implemented in [PR 5215](https://github.com/NVIDIA/TensorR
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog8_moe_aux_kernels2.png">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog8_moe_aux_kernels2.png">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 3: Optimization effect on MoE auxiliary kernels. (Left) Before optimization, kernel time increases with EP size. (Right) After optimization, kernel time remains constant with EP size.</em></sub></p>
@@ -87,7 +87,7 @@ This optimization was implemented in [PR 5570](https://github.com/NVIDIA/TensorR
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog8_communication_kernel.png">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog8_communication_kernel.png">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 4: Optimization effect on communication kernels.</em></sub></p>
@@ -279,21 +279,21 @@ We explored different workloads including 1k-ISL 1k-OSL, 4k-ISL 1k-OSL, and 8k-I
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog8_perf-1k-1k-dep.png" width="800">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog8_perf-1k-1k-dep.png" width="800">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 5: DeepSeek R1 throughput on ISL/OSL 1k/1k.</em></sub></p>
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog8_perf-4k-1k-dep.png" width="800">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog8_perf-4k-1k-dep.png" width="800">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 6: DeepSeek R1 throughput on ISL/OSL 4k/1k.</em></sub></p>
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog8_perf-8k-1k-dep.png" width="800">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog8_perf-8k-1k-dep.png" width="800">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 7: DeepSeek R1 throughput on ISL/OSL 8k/1k.</em></sub></p>
@@ -302,7 +302,7 @@ When enabling MTP, there is an extra performance boost compared to the baseline.
 
 <div align="center">
 <figure>
-  <img src="../media/tech_blog8_perf-8k-1k-e2e-mtp.png" width="800">
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog8_perf-8k-1k-e2e-mtp.png" width="800">
 </figure>
 </div>
 <p align="center"><sub><em>Figure 8: DeepSeek R1 throughput on ISL/OSL 8k/1k with MTP enabled.</em></sub></p>
