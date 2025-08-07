@@ -23,7 +23,7 @@ services:
 
     volumes:
       - ${SOURCE_DIR}:/workspaces/tensorrt_llm
-      - ${LOCAL_HF_HOME}:/huggingface  # HF cache
+        #- ${LOCAL_HF_HOME}:/huggingface  # HF cache
 
     environment:
       - CCACHE_DIR=/workspaces/tensorrt_llm/cpp/.ccache
