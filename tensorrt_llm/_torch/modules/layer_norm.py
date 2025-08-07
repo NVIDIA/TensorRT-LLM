@@ -68,7 +68,7 @@ class LayerNorm(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        residual: Optional[torch.Tensor] = ...,
+        residual: Union[torch.Tensor, None, ...] = ...,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """Apply layer normalization to input tensor.
 

@@ -48,7 +48,7 @@ class RMSNorm(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        residual: Optional[torch.Tensor] = ...,
+        residual: Union[torch.Tensor, None, ...] = ...,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         if IS_FLASHINFER_AVAILABLE:
             from ..custom_ops import (flashinfer_fused_add_rmsnorm,
