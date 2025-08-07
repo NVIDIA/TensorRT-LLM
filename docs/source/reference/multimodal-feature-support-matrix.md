@@ -1,6 +1,6 @@
 # Multimodal Feature Support Matrix (PyTorch Backend)
 
-| Model              | CUDA Graph | IFB w/ SharedTensor | KV Cache Reuse | Chunked Prefill |
+| Model              | CUDA Graph | Encoder IFB         | KV Cache Reuse | Chunked Prefill |
 | :----------------- | :--------- | :------------------ | :------------- | :-------------- |
 | Gemma 3            | Yes        | Yes                 | No             | No              |
 | HyperCLOVA         | Yes        | Yes                 | No             | No              |
