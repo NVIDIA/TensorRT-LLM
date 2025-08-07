@@ -257,7 +257,7 @@ parameters: {
 parameters: {
   key: "max_num_images"
   value: {
-    string_value: "100"
+    string_value: "${max_num_images}"
   }
 }
 
