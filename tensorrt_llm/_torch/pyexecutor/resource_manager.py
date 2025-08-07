@@ -16,7 +16,7 @@ from tensorrt_llm.sampling_params import SamplingParams
 from ..._utils import binding_dtype_size, binding_to_str_dtype, nvtx_range
 from ...logger import logger
 from ...mapping import Mapping
-from .connector import KvCacheConnectorManager, SchedulerOutput
+from .kv_cache_connector import KvCacheConnectorManager, SchedulerOutput
 from .llm_request import (LlmRequest, LlmRequestState, SamplingConfig,
                           get_draft_token_length)
 from .scheduler import ScheduledRequests

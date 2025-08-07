@@ -22,7 +22,8 @@ import mpi4py
 import pytest
 
 from tensorrt_llm import mpi_rank
-from tensorrt_llm._torch.pyexecutor.connector import KvCacheConnectorManager
+from tensorrt_llm._torch.pyexecutor.kv_cache_connector import \
+    KvCacheConnectorManager
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 
 cloudpickle.register_pickle_by_value(sys.modules[__name__])

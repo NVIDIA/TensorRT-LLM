@@ -21,13 +21,13 @@ from .._utils import mpi_world_size
 from ..bindings import executor as tllm
 from ..builder import Engine
 from ..disaggregated_params import DisaggregatedParams
+from ..llmapi.llm_args import KvCacheConnectorConfig
 from ..llmapi.llm_utils import KvCacheRetentionConfig
 from ..llmapi.mpi_session import (MpiSession, external_mpi_comm_available,
                                   need_spawn_mpi_workers)
 from ..llmapi.utils import (AsyncQueue, enable_llm_debug,
                             enable_worker_single_process_for_tp1, print_colored,
                             print_colored_debug)
-from ..models.modeling_utils import KvCacheConnectorConfig
 from ..sampling_params import (BatchedLogitsProcessor, LogprobParams,
                                SamplingParams)
 from ..scheduling_params import SchedulingParams

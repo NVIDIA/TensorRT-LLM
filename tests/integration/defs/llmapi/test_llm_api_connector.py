@@ -20,8 +20,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig
-from tensorrt_llm.models.modeling_utils import KvCacheConnectorConfig
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig, KvCacheConnectorConfig
 
 
 @pytest.fixture(scope="function")

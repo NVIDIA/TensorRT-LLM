@@ -52,8 +52,7 @@ from ..builder import BuildConfig, EngineConfig
 from ..logger import logger
 from ..mapping import Mapping
 from ..models.automodel import AutoConfig
-from ..models.modeling_utils import (KvCacheConnectorConfig, PretrainedConfig,
-                                     QuantAlgo, QuantConfig,
+from ..models.modeling_utils import (PretrainedConfig, QuantAlgo, QuantConfig,
                                      SpeculativeDecodingMode)
 from ..sampling_params import BatchedLogitsProcessor
 from .build_cache import BuildCacheConfig
@@ -394,6 +393,21 @@ class DecodingBaseConfig(StrictBaseModel):
             SpeculativeDecodingMode as TorchSpeculativeDecodingMode
         return TorchSpeculativeDecodingMode.from_string(
             self.decoding_type.upper())
+
+
+class KvCacheConnectorConfig(StrictBaseModel):
+    """
+    Configuration for the KV Cache Connector.
+    """
+    connector_module: str = Field(
+        ...,
+        description=
+        "The import path to the connector module. It will be imported with `importlib.import_module`."
+    )
+    connector_scheduler_class: str = Field(
+        ..., description="The class name of the scheduler within the module.")
+    connector_worker_class: str = Field(
+        ..., description="The class name of the worker within the module.")
 
 
 class MedusaDecodingConfig(DecodingBaseConfig):
