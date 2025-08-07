@@ -199,7 +199,7 @@ input [
   },
   {
     name: "prompt_embedding_table"
-    data_type: TYPE_FP16
+    data_type: ${prompt_embedding_table_data_type}
     dims: [ -1, -1 ]
     optional: true
   },
