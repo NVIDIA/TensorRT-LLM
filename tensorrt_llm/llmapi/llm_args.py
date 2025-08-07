@@ -1973,16 +1973,12 @@ class TorchCompileConfig(StrictBaseModel):
 
     @field_validator('capture_num_tokens')
     @classmethod
-    def _validate_capture_num_tokens(cls, v, values):
+    def validate_capture_num_tokens(cls, v):
         if v is None:
             return v
-        if not values.get('enable_piecewise_cuda_graph', False):
-            raise ValueError(
-                "capture_num_tokens is set but enable_piecewise_cuda_graph "
-                "is False; either remove the list or enable the feature.")
         if any(t <= 0 for t in v):
             raise ValueError("capture_num_tokens must contain positive ints.")
-        return sorted(set(v))
+        return sorted(set(v), reverse=True)
 
     enable_userbuffers: bool = Field(
         default=True,
