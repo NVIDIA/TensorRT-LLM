@@ -1011,6 +1011,7 @@ class PyTorchModelEngine(ModelEngine):
             moe_load_balancer=moe_load_balancer,
             lora_config=lora_config,
             allreduce_strategy=self.pytorch_backend_config.allreduce_strategy,
+            mm_encoder_only=self.pytorch_backend_config.mm_encoder_only,
             **kwargs)
 
         validate_and_set_kv_cache_quant(
@@ -2126,12 +2127,15 @@ class PyTorchModelEngine(ModelEngine):
                                                      moe_enable_update)
 
         if kv_cache_manager is None:
+            # here you need to add logic for prepare_tp_inputs_no_cache and forward_step for mm encoder only
             inputs, gather_ids = self._prepare_tp_inputs_no_cache(
                 scheduled_requests, attn_metadata, spec_metadata)
 
             with MoeLoadBalancerIterContext(moe_load_balancer):
+                # need to add key ['logits']=None to the output of forward_step for mm encoder only
                 return self._forward_step(inputs, gather_ids,
                                           gather_context_logits)
+                # lets update requst state here after this 1step finished
         with self._maybe_pad_batch(scheduled_requests, kv_cache_manager,
                                    spec_resource_manager) as scheduled_requests:
             maybe_graph = self._maybe_get_cuda_graph(scheduled_requests)

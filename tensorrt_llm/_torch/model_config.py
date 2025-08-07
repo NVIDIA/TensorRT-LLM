@@ -96,6 +96,9 @@ class ModelConfig(Generic[TConfig]):
 
     _frozen: bool = field(default=False, init=False, repr=False)
 
+    # If true, ONLY the vision encoder part of the full model is loaded/executed.
+    mm_encoder_only: bool = False
+
     def __setattr__(self, key, value):
         """
         Prevent modification of frozen instance attributes.
@@ -115,7 +118,7 @@ class ModelConfig(Generic[TConfig]):
         if self.pretrained_config and hasattr(self.pretrained_config,
                                               "architectures"):
             self.is_generation = self.is_generation_model(
-                self.pretrained_config.architectures)
+                self.pretrained_config.architectures, mm_encoder_only=self.mm_encoder_only)
 
         def get_all_reduce_strategy(strategy: str = "AUTO"):
             maps = {
@@ -164,12 +167,14 @@ class ModelConfig(Generic[TConfig]):
         raise ValueError(f'quant config of {name} is not found')
 
     @staticmethod
-    def is_generation_model(model_architectures: Optional[List[str]]) -> bool:
+    def is_generation_model(model_architectures: Optional[List[str]], mm_encoder_only: bool = False) -> bool:
         if model_architectures is None:
             logger.warning(
                 "Model architectures is None, default to is_generation_model=True"
             )
             return True
+        if mm_encoder_only:
+            return False
         return model_architectures[0] not in [
             "BertForSequenceClassification", "Qwen2ForProcessRewardModel",
             "Qwen2ForRewardModel", "LlamaForTextEmbedding"

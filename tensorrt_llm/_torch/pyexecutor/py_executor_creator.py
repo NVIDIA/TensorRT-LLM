@@ -169,6 +169,8 @@ def _mangle_executor_config(executor_config: ExecutorConfig):
         )
         executor_config.enable_chunked_context = False
 
+    if executor_config.mm_encoder_only:
+        pytorch_backend_config.mm_encoder_only = True
 
 def _get_mapping(executor_config: ExecutorConfig) -> Mapping:
     if executor_config.mapping is None:

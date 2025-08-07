@@ -594,6 +594,9 @@ def instantiate_sampler(engine: PyTorchModelEngine,
         return TRTLLMSampler(executor_config, engine.model, engine.dtype,
                              mapping, decoding_mode,
                              pytorch_backend_config.disable_overlap_scheduler)
+    if executor_config.mm_encoder_only:
+        # NOTE: handle model outputs specially for mm encoder executor/engine
+        return EarlyStopWithMMResult()
     if not engine.model.model_config.is_generation:
         # NOTE: choose sampler based on model type
         return EarlyStopSampler()

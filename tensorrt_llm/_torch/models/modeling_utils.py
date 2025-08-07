@@ -573,6 +573,7 @@ class DecoderModelForCausalLM(nn.Module,
 
 
 MODEL_CLASS_MAPPING = {}
+MODEL_CLASS_VISION_ENCODER_MAPPING = {}
 MODEL_CLASS_MAPPER_MAPPING = {}
 MODEL_CLASS_CHECKPOINT_WEIGHT_LOADER_DEFAULT_MAPPING = {}
 MODEL_CLASS_CONFIG_LOADER_DEFAULT_MAPPING = {}
@@ -587,6 +588,20 @@ def register_auto_model(name: str):
 
     return decorator
 
+# Need to register the model class before the vision encoder class
+# to ensure that the key (the architecture name) is available here
+def register_vision_encoder(vision_encoder_cls: Type[nn.Module],
+                            vlm_base_model: Optional[Type[nn.Module]] = None):
+
+    def wrapper(model_cls: Type[nn.Module]) -> Type[nn.Module]:
+        for arch_name, registered_cls in MODEL_CLASS_MAPPING.items():
+            if registered_cls == model_cls:
+                MODEL_CLASS_VISION_ENCODER_MAPPING[arch_name] = (vision_encoder_cls, vlm_base_model)
+                break
+
+        return model_cls
+
+    return wrapper
 
 def register_mapper(format: str, name: Optional[str] = None):
 

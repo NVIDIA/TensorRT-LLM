@@ -53,6 +53,7 @@ class RequestOutput(DetokenizedGenerationResultBase, GenerationResult):
         prompt_token_ids (List[int]): The token ids of the prompt.
         outputs (List[CompletionOutput]): The output sequences of the request.
         context_logits (torch.Tensor, optional): The logits on the prompt token ids.
+        mm_embeddings (torch.Tensor, optional): The multimodal embeddings of the request.
         finished (bool): Whether the whole request is finished.
     """
 

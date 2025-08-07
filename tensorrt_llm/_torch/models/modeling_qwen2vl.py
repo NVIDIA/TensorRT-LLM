@@ -21,7 +21,7 @@ from ..model_config import ModelConfig
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_utils import (find_uncached_mm_embeds,
                                         fuse_input_embeds)
-from .modeling_utils import register_auto_model
+from .modeling_utils import register_auto_model, register_vision_encoder
 
 DISAGG = os.getenv('TLLM_MULTIMODAL_DISAGGREGATED', '0') == '1'
 
@@ -645,6 +645,7 @@ class Qwen2VLModelBase(PreTrainedModel):
 
 
 @register_auto_model("Qwen2VLForConditionalGeneration")
+@register_vision_encoder(Qwen2VisionModelBase, vlm_base_model=Qwen2VLForConditionalGeneration)
 @register_input_processor(Qwen2VLInputProcessorBase, model_type="qwen2_vl")
 class Qwen2VLModel(Qwen2VLModelBase):
 
@@ -657,6 +658,7 @@ class Qwen2VLModel(Qwen2VLModelBase):
 
 
 @register_auto_model("Qwen2_5_VLForConditionalGeneration")
+@register_vision_encoder(Qwen2VisionModelBase, vlm_base_model=Qwen2_5_VLForConditionalGeneration)
 @register_input_processor(Qwen2VLInputProcessorBase, model_type="qwen2_5_vl")
 class Qwen2_5_VLModel(Qwen2VLModelBase):
 

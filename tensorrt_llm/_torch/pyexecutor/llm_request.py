@@ -172,6 +172,7 @@ class PyResult:
             max_new_tokens, use_device_memory, exclude_last_generation_logits
         ) if return_generation_logits else None
         self._log_probs = LogProbStorage() if return_log_probs else None
+        self._mm_embeddings = None
 
     def append_context_logits(self, context_logits: torch.Tensor):
         if self._context_logits:
@@ -186,6 +187,10 @@ class PyResult:
                          cum_log_probs: Optional[list[float]] = None):
         if self._log_probs:
             self._log_probs.append(log_probs, cum_log_probs)
+
+    def append_mm_embeddings(self, mm_embeddings: torch.Tensor):
+        # TODO: add to_handle to use shared tensor support
+        self._mm_embeddings = mm_embeddings.to(device='cpu', non_blocking=True)
 
     def set_log_probs(self, log_probs: list[TokenLogprobs],
                       cum_log_probs: list[float]):
