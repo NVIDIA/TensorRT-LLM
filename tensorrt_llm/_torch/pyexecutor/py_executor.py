@@ -893,7 +893,8 @@ class PyExecutor:
             f'{len(scheduled_batch.generation_requests)} generation requests')
         return scheduled_batch, iter_stats
 
-    def _execute_guided_decoder(self, scheduled_batch, logits):
+    def _execute_guided_decoder(self, scheduled_batch: ScheduledRequests,
+                                logits: torch.Tensor):
         if self.guided_decoder is not None:
             self.guided_decoder.build(scheduled_batch)
             self.guided_decoder.execute(scheduled_batch, logits)
@@ -931,6 +932,9 @@ class PyExecutor:
 
                     self.resource_manager.prepare_resources(scheduled_batch)
                     if self.drafter is not None and self.use_spec_decode:
+                        if self.guided_decoder is not None:
+                            self.guided_decoder.rollback_rejected_tokens(
+                                scheduled_batch)
                         self.drafter.prepare_draft_tokens(
                             scheduled_batch, self.resource_manager)
 
