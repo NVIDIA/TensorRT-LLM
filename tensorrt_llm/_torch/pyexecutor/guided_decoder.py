@@ -76,6 +76,10 @@ class GuidedDecoder:
             return False
         if llm_req.py_is_draft:
             return False
+        if llm_req.context_phase_params is not None and llm_req.py_decoding_iter == 1:
+            # The request is in the first generation forward step at the disagg gen instance.
+            # Need to initialize the matcher and accept the first token.
+            return True
         # The request is in the last chunk of a context forward step.
         return llm_req.is_context_init_state and llm_req.is_last_context_chunk
 
@@ -102,12 +106,16 @@ class GuidedDecoder:
             self.num_advanced_tokens[slot] = 0
             self.num_guided_tokens[slot] = 0
 
+            if not (self._is_matcher_init(llm_req)
+                    or self._is_matcher_in_progress(llm_req)):
+                continue
+
             if self._is_matcher_init(llm_req):
                 matcher = self.grammar_matcher_factory.create(
                     llm_req.guided_decoding_params)
                 self.grammar_matchers[slot] = matcher
 
-            elif self._is_matcher_in_progress(llm_req):
+            if self._is_matcher_in_progress(llm_req):
                 matcher = self.grammar_matchers[slot]
                 # The last new token must be acceptable unless the matcher is terminated in a drafting loop.
                 if llm_req.py_is_draft and (matcher.is_terminated()
@@ -126,9 +134,6 @@ class GuidedDecoder:
                     raise ValueError(
                         f"Request {llm_req.py_request_id} failed to accept last new token: {last_new_token}."
                     )
-
-            else:
-                continue
 
             self.num_advanced_tokens[slot] += 1
             if not matcher.is_terminated():
