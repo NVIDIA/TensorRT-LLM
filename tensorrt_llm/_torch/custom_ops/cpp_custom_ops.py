@@ -26,6 +26,12 @@ def _register_fake():
         from tensorrt_llm.functional import AllReduceFusionOp
         if op == int(AllReduceFusionOp.NONE):
             return [torch.empty_like(input)]
+        elif op == int(AllReduceFusionOp.ALLGATHER):
+            # For AllGather, return a tensor with expanded size along first dimension
+            group_size = len(group) if group else 1
+            output_shape = list(input.shape)
+            output_shape[0] = output_shape[0] * group_size
+            return [torch.empty(output_shape, dtype=input.dtype, device=input.device)] #FIXME
         elif op == int(AllReduceFusionOp.RESIDUAL_RMS_NORM):
             norm_out = torch.empty_like(input)
             residual_out = torch.empty_like(input)
