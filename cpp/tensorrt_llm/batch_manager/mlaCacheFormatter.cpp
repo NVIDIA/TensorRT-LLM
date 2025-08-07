@@ -45,10 +45,12 @@ std::vector<size_t> MLACacheFormatter::pickRecvConnections(
     auto targetInfo = executor::kv_cache::targetIRanks(destConfig, selfConfig, selfIdx);
     TLLM_CHECK(numConnections == targetInfo.mIRanks.size());
     std::vector<size_t> ret;
-    // targetInfo , mRanks [tpranks, dpranks]
+    // targetInfo , mRanks [tpranks, ppranks]
+    int dpRank = selfConfig.getParallelConfig().mEnableAttentionDP ? selfConfig.getParallelConfig().mDPrank : 0;
+
     for (int i = 0; i < targetInfo.mDomainPPSize; i++)
     {
-        ret.push_back(i);
+        ret.push_back(i + (dpRank % (targetInfo.mDomainTPSize)) * targetInfo.mDomainPPSize);
     }
     return ret;
 }
@@ -58,19 +60,24 @@ bool MLACacheFormatter::needSendCache(
 {
     int selfTpRank = selfIdx % selfConfig.getParallelConfig().mTensorParallelism;
 
+    int destTPNumInDPGroup = destConfig.getParallelConfig().mEnableAttentionDP
+        ? destConfig.getParallelConfig().mTensorParallelism / destConfig.getParallelConfig().mDPsize
+        : destConfig.getParallelConfig().mTensorParallelism;
+    int destDPRank = destConfig.getParallelConfig().mEnableAttentionDP ? destConfig.getParallelConfig().mDPrank : 0;
+
     if (selfConfig.getParallelConfig().mEnableAttentionDP)
     {
         int selfTPNumInDPGroup
             = selfConfig.getParallelConfig().mTensorParallelism / selfConfig.getParallelConfig().mDPsize;
-        int destTPNumInDPGroup = destConfig.getParallelConfig().mEnableAttentionDP
-            ? destConfig.getParallelConfig().mTensorParallelism / destConfig.getParallelConfig().mDPsize
-            : destConfig.getParallelConfig().mTensorParallelism;
+
         int selfTPrankINDPGroup = selfTpRank % selfTPNumInDPGroup;
         if (selfTPNumInDPGroup <= destTPNumInDPGroup)
         {
             return true;
         }
-        return selfTPrankINDPGroup % (selfTPNumInDPGroup / destTPNumInDPGroup) == 0;
+
+        int dupHeadFactor = selfTPNumInDPGroup / destTPNumInDPGroup;
+        return selfTPrankINDPGroup % dupHeadFactor == destDPRank;
     }
 
     int destTPNum = destConfig.getParallelConfig().mEnableAttentionDP
@@ -81,7 +88,8 @@ bool MLACacheFormatter::needSendCache(
     {
         return true;
     }
-    return selfTpRank % (selfTPNum / destTPNum) == 0;
+    int dupHeadFactor = selfTPNum / destTPNum;
+    return selfTpRank % dupHeadFactor == destDPRank;
 }
 
 void MLACacheFormatter::format(TransferSession& session)
