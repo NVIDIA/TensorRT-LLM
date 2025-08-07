@@ -2137,11 +2137,14 @@ void KVCacheManager::storeContextBlocks(LlmRequest const& llmRequest)
 void KVCacheManager::storeNewBlock(LlmRequest const& llmRequest)
 {
     auto const requestId = llmRequest.mRequestId;
-    auto& sequence = getSequence(requestId);
-    bool const storeBlocksForReuse = sequence.getBeamWidth() == 1 && !sequence.isCyclic();
-    if (mEnableBlockReuse && storeBlocksForReuse)
+    if (mSequences.find(requestId) != mSequences.end())
     {
-        mBlockManager.storeNewBlock(sequence, llmRequest);
+        auto& sequence = getSequence(requestId);
+        bool const storeBlocksForReuse = sequence.getBeamWidth() == 1 && !sequence.isCyclic();
+        if (mEnableBlockReuse && storeBlocksForReuse)
+        {
+            mBlockManager.storeNewBlock(sequence, llmRequest);
+        }
     }
 }
 

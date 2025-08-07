@@ -102,6 +102,12 @@ public:
             void, tbk::BaseKVCacheManager, addSequence, requestId, inputLength, beamWidth, llmRequest);
     }
 
+    void storeNewBlock(tb::LlmRequest const& llmRequest) override
+    {
+        TLLM_LOG_INFO("%s start", __PRETTY_FUNCTION__);
+        PYBIND11_OVERLOAD_PURE(void, tbk::BaseKVCacheManager, storeNewBlock, llmRequest);
+    }
+
     void removeSequence(tb::LlmRequest::RequestIdType requestId,
         tensorrt_llm::common::OptionalRef<tb::LlmRequest const> llmRequest = std::nullopt) override
     {
@@ -344,6 +350,7 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
         .def("add_token", &BaseKVCacheManager::addToken)
         .def("add_sequence", &BaseKVCacheManager::addSequence)
         .def("remove_sequence", &BaseKVCacheManager::removeSequence)
+        .def("store_new_block", &BaseKVCacheManager::storeNewBlock)
         .def("scheduling_remove_sequence", &BaseKVCacheManager::schedulingRemoveSequence)
         .def("get_block_pool_pointers",
             [](tbk::BaseKVCacheManager& self)
