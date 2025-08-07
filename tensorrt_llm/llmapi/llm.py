@@ -673,12 +673,10 @@ class BaseLLM:
                 tokenizer_path = self.args.model
         else:
             tokenizer_path = self.args.model
-        tokenizer = ModelLoader.load_hf_tokenizer(
+        return ModelLoader.load_hf_tokenizer(
             tokenizer_path,
             trust_remote_code=self.args.trust_remote_code,
             use_fast=self.args.tokenizer_mode != 'slow')
-
-        return tokenizer
 
     @property
     def tokenizer(self) -> Optional[TokenizerBase]:
