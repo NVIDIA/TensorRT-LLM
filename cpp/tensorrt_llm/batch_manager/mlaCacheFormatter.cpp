@@ -104,7 +104,7 @@ bool MLACacheFormatter::needSendCache(
         }
 
         int dupHeadFactor = selfTPNumInDPGroup / destTPNumInDPGroup;
-        return selfTPrankINDPGroup % dupHeadFactor == destDPRank;
+        return selfTPrankINDPGroup % dupHeadFactor == destDPRank % dupHeadFactor;
     }
 
     int destTPNum = destConfig.getParallelConfig().mEnableAttentionDP
@@ -116,7 +116,7 @@ bool MLACacheFormatter::needSendCache(
         return true;
     }
     int dupHeadFactor = selfTPNum / destTPNum;
-    return selfTpRank % dupHeadFactor == destDPRank;
+    return selfTpRank % dupHeadFactor == destDPRank % dupHeadFactor;
 }
 
 void MLACacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& session)
