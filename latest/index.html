@@ -59,7 +59,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc5';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc6';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -70,7 +70,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.0.0rc5" />
+  <meta name="docsearch:version" content="1.0.0rc6" />
 
 
   </head>
@@ -390,7 +390,11 @@
 <li class="toctree-l1"><a class="reference internal" href="commands/trtllm-bench.html">trtllm-bench</a></li>
 
 <li class="toctree-l1"><a class="reference internal" href="commands/trtllm-build.html">trtllm-build</a></li>
-<li class="toctree-l1"><a class="reference internal" href="commands/trtllm-serve.html">trtllm-serve</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="commands/trtllm-serve/index.html">trtllm-serve</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="commands/trtllm-serve/trtllm-serve.html">trtllm-serve</a></li>
+<li class="toctree-l2"><a class="reference internal" href="commands/trtllm-serve/run-benchmark-with-trtllm-serve.html">Run benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></a></li>
+</ul>
+</details></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Architecture</span></p>
 <ul class="nav bd-sidenav">
@@ -488,9 +492,9 @@
 </li>
 <li class="toctree-l1"><a class="reference internal" href="quick-start-guide.html">Quick Start Guide</a><ul>
 <li class="toctree-l2"><a class="reference internal" href="quick-start-guide.html#installation">Installation</a></li>
-<li class="toctree-l2"><a class="reference internal" href="quick-start-guide.html#llm-api">LLM API</a></li>
-<li class="toctree-l2"><a class="reference internal" href="quick-start-guide.html#deploy-with-trtllm-serve">Deploy with trtllm-serve</a></li>
-<li class="toctree-l2"><a class="reference internal" href="quick-start-guide.html#model-definition-api">Model Definition API</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quick-start-guide.html#launch-docker-on-a-node-with-nvidia-gpus-deployed">Launch Docker on a node with NVIDIA GPUs deployed.</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quick-start-guide.html#run-offline-inference-with-llm-api">Run Offline inference with LLM API</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quick-start-guide.html#deploy-online-serving-with-trtllm-serve">Deploy online serving with trtllm-serve</a></li>
 <li class="toctree-l2"><a class="reference internal" href="quick-start-guide.html#next-steps">Next Steps</a></li>
 <li class="toctree-l2"><a class="reference internal" href="quick-start-guide.html#related-information">Related Information</a></li>
 </ul>
@@ -547,7 +551,35 @@
 </div>
 <div class="toctree-wrapper compound">
 </div>
-<div class="toctree-wrapper compound">
+<div class="toctree-wrapper compound" id="command-line-reference">
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="commands/trtllm-bench.html">trtllm-bench</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="commands/trtllm-bench.html#trtllm-bench">trtllm-bench</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="commands/trtllm-bench.html#prepare-dataset-py">prepare_dataset.py</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="commands/trtllm-bench.html#prepare-dataset">prepare_dataset</a></li>
+<li class="toctree-l2"><a class="reference internal" href="commands/trtllm-bench.html#dataset">dataset</a></li>
+<li class="toctree-l2"><a class="reference internal" href="commands/trtllm-bench.html#token-norm-dist">token_norm_dist</a></li>
+<li class="toctree-l2"><a class="reference internal" href="commands/trtllm-bench.html#token-unif-dist">token_unif_dist</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="commands/trtllm-build.html">trtllm-build</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="commands/trtllm-build.html#tensorrt_llm.commands.build-parse_arguments-named-arguments">Named Arguments</a></li>
+<li class="toctree-l2"><a class="reference internal" href="commands/trtllm-build.html#tensorrt_llm.commands.build-parse_arguments-logits-arguments">Logits arguments</a></li>
+<li class="toctree-l2"><a class="reference internal" href="commands/trtllm-build.html#tensorrt_llm.commands.build-parse_arguments-lora-arguments">LoRA arguments</a></li>
+<li class="toctree-l2"><a class="reference internal" href="commands/trtllm-build.html#tensorrt_llm.commands.build-parse_arguments-speculative-decoding-arguments">Speculative decoding arguments</a></li>
+<li class="toctree-l2"><a class="reference internal" href="commands/trtllm-build.html#tensorrt_llm.commands.build-parse_arguments-auto-parallel-arguments">Auto parallel arguments</a></li>
+<li class="toctree-l2"><a class="reference internal" href="commands/trtllm-build.html#tensorrt_llm.commands.build-parse_arguments-plugin-config-arguments">Plugin config arguments</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="commands/trtllm-serve/index.html">trtllm-serve</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="commands/trtllm-serve/trtllm-serve.html">trtllm-serve</a></li>
+<li class="toctree-l2"><a class="reference internal" href="commands/trtllm-serve/run-benchmark-with-trtllm-serve.html">Run benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></a></li>
+</ul>
+</li>
+</ul>
 </div>
 <div class="toctree-wrapper compound" id="architecture">
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Architecture</span></p>
@@ -911,9 +943,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on August 01, 2025.</p>
+  <p>Last updated on August 06, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/fbee279">fbee279</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/a16ba64">a16ba64</a>.</p>
   
 </div></div>
       

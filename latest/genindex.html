@@ -58,7 +58,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc5';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc6';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -68,7 +68,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.0.0rc5" />
+  <meta name="docsearch:version" content="1.0.0rc6" />
 
 
   </head>
@@ -384,7 +384,11 @@
 <li class="toctree-l1"><a class="reference internal" href="commands/trtllm-bench.html">trtllm-bench</a></li>
 
 <li class="toctree-l1"><a class="reference internal" href="commands/trtllm-build.html">trtllm-build</a></li>
-<li class="toctree-l1"><a class="reference internal" href="commands/trtllm-serve.html">trtllm-serve</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="commands/trtllm-serve/index.html">trtllm-serve</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="commands/trtllm-serve/trtllm-serve.html">trtllm-serve</a></li>
+<li class="toctree-l2"><a class="reference internal" href="commands/trtllm-serve/run-benchmark-with-trtllm-serve.html">Run benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></a></li>
+</ul>
+</details></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Architecture</span></p>
 <ul class="nav bd-sidenav">
@@ -514,7 +518,7 @@
 </li>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-throughput-backend">trtllm-bench-throughput command line option</a>
 </li>
-        <li><a href="commands/trtllm-serve.html#cmdoption-trtllm-serve-serve-backend">trtllm-serve-serve command line option</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-backend">trtllm-serve-serve command line option</a>
 </li>
       </ul></li>
       <li>
@@ -532,7 +536,7 @@
       <ul>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-throughput-cluster_size">trtllm-bench-throughput command line option</a>
 </li>
-        <li><a href="commands/trtllm-serve.html#cmdoption-trtllm-serve-serve-cluster_size">trtllm-serve-serve command line option</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-cluster_size">trtllm-serve-serve command line option</a>
 </li>
       </ul></li>
       <li>
@@ -548,9 +552,9 @@
     --config_file
 
       <ul>
-        <li><a href="commands/trtllm-serve.html#cmdoption-trtllm-serve-disaggregated-c">trtllm-serve-disaggregated command line option</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-disaggregated-c">trtllm-serve-disaggregated command line option</a>
 </li>
-        <li><a href="commands/trtllm-serve.html#cmdoption-trtllm-serve-disaggregated_mpi_worker-c">trtllm-serve-disaggregated_mpi_worker command line option</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-disaggregated_mpi_worker-c">trtllm-serve-disaggregated_mpi_worker command line option</a>
 </li>
       </ul></li>
       <li>
@@ -562,6 +566,13 @@
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-latency-dataset">trtllm-bench-latency command line option</a>
 </li>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-throughput-dataset">trtllm-bench-throughput command line option</a>
+</li>
+      </ul></li>
+      <li>
+    --disable_chunked_context
+
+      <ul>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-throughput-enable_chunked_context">trtllm-bench-throughput command line option</a>
 </li>
       </ul></li>
       <li>
@@ -600,7 +611,7 @@
     --ep_size
 
       <ul>
-        <li><a href="commands/trtllm-serve.html#cmdoption-trtllm-serve-serve-ep_size">trtllm-serve-serve command line option</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-ep_size">trtllm-serve-serve command line option</a>
 </li>
       </ul></li>
       <li>
@@ -609,28 +620,28 @@
       <ul>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-throughput-extra_llm_api_options">trtllm-bench-throughput command line option</a>
 </li>
-        <li><a href="commands/trtllm-serve.html#cmdoption-trtllm-serve-serve-extra_llm_api_options">trtllm-serve-serve command line option</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-extra_llm_api_options">trtllm-serve-serve command line option</a>
 </li>
       </ul></li>
       <li>
     --fail_fast_on_attention_window_too_large
 
       <ul>
-        <li><a href="commands/trtllm-serve.html#cmdoption-trtllm-serve-serve-fail_fast_on_attention_window_too_large">trtllm-serve-serve command line option</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-fail_fast_on_attention_window_too_large">trtllm-serve-serve command line option</a>
 </li>
       </ul></li>
       <li>
     --gpus_per_node
 
       <ul>
-        <li><a href="commands/trtllm-serve.html#cmdoption-trtllm-serve-serve-gpus_per_node">trtllm-serve-serve command line option</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-gpus_per_node">trtllm-serve-serve command line option</a>
 </li>
       </ul></li>
       <li>
     --host
 
       <ul>
-        <li><a href="commands/trtllm-serve.html#cmdoption-trtllm-serve-serve-host">trtllm-serve-serve command line option</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-host">trtllm-serve-serve command line option</a>
 </li>
       </ul></li>
       <li>
@@ -655,7 +666,7 @@
     --kv_cache_free_gpu_memory_fraction
 
       <ul>
-        <li><a href="commands/trtllm-serve.html#cmdoption-trtllm-serve-serve-kv_cache_free_gpu_memory_fraction">trtllm-serve-serve command line option</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-kv_cache_free_gpu_memory_fraction">trtllm-serve-serve command line option</a>
 </li>
       </ul></li>
       <li>
@@ -664,11 +675,11 @@
       <ul>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-log_level">trtllm-bench command line option</a>
 </li>
-        <li><a href="commands/trtllm-serve.html#cmdoption-trtllm-serve-disaggregated-l">trtllm-serve-disaggregated command line option</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-disaggregated-l">trtllm-serve-disaggregated command line option</a>
 </li>
-        <li><a href="commands/trtllm-serve.html#cmdoption-trtllm-serve-disaggregated_mpi_worker-log_level">trtllm-serve-disaggregated_mpi_worker command line option</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-disaggregated_mpi_worker-log_level">trtllm-serve-disaggregated_mpi_worker command line option</a>
 </li>
-        <li><a href="commands/trtllm-serve.html#cmdoption-trtllm-serve-serve-log_level">trtllm-serve-serve command line option</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-log_level">trtllm-serve-serve command line option</a>
 </li>
       </ul></li>
       <li>
@@ -679,14 +690,14 @@
 </li>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-throughput-max_batch_size">trtllm-bench-throughput command line option</a>
 </li>
-        <li><a href="commands/trtllm-serve.html#cmdoption-trtllm-serve-serve-max_batch_size">trtllm-serve-serve command line option</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-max_batch_size">trtllm-serve-serve command line option</a>
 </li>
       </ul></li>
       <li>
     --max_beam_width
 
       <ul>
-        <li><a href="commands/trtllm-serve.html#cmdoption-trtllm-serve-serve-max_beam_width">trtllm-serve-serve command line option</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-max_beam_width">trtllm-serve-serve command line option</a>
 </li>
       </ul></li>
       <li>
@@ -706,7 +717,7 @@
 </li>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-throughput-max_num_tokens">trtllm-bench-throughput command line option</a>
 </li>
-        <li><a href="commands/trtllm-serve.html#cmdoption-trtllm-serve-serve-max_num_tokens">trtllm-serve-serve command line option</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-max_num_tokens">trtllm-serve-serve command line option</a>
 </li>
       </ul></li>
       <li>
@@ -719,7 +730,7 @@
 </li>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-throughput-max_seq_len">trtllm-bench-throughput command line option</a>
 </li>
-        <li><a href="commands/trtllm-serve.html#cmdoption-trtllm-serve-serve-max_seq_len">trtllm-serve-serve command line option</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-max_seq_len">trtllm-serve-serve command line option</a>
 </li>
       </ul></li>
       <li>
@@ -733,9 +744,9 @@
     --metadata_server_config_file
 
       <ul>
-        <li><a href="commands/trtllm-serve.html#cmdoption-trtllm-serve-disaggregated-m">trtllm-serve-disaggregated command line option</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-disaggregated-m">trtllm-serve-disaggregated command line option</a>
 </li>
-        <li><a href="commands/trtllm-serve.html#cmdoption-trtllm-serve-serve-metadata_server_config_file">trtllm-serve-serve command line option</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-metadata_server_config_file">trtllm-serve-serve command line option</a>
 </li>
       </ul></li>
       <li>
@@ -747,6 +758,8 @@
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-throughput-modality">trtllm-bench-throughput command line option</a>
 </li>
       </ul></li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li>
     --model
 
@@ -754,8 +767,6 @@
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-m">trtllm-bench command line option</a>
 </li>
       </ul></li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li>
     --model_path
 
@@ -774,7 +785,7 @@
     --num_postprocess_workers
 
       <ul>
-        <li><a href="commands/trtllm-serve.html#cmdoption-trtllm-serve-serve-num_postprocess_workers">trtllm-serve-serve command line option</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-num_postprocess_workers">trtllm-serve-serve command line option</a>
 </li>
       </ul></li>
       <li>
@@ -797,7 +808,7 @@
     --port
 
       <ul>
-        <li><a href="commands/trtllm-serve.html#cmdoption-trtllm-serve-serve-port">trtllm-serve-serve command line option</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-port">trtllm-serve-serve command line option</a>
 </li>
       </ul></li>
       <li>
@@ -815,7 +826,7 @@
       <ul>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-build-pp">trtllm-bench-build command line option</a>
 </li>
-        <li><a href="commands/trtllm-serve.html#cmdoption-trtllm-serve-serve-pp_size">trtllm-serve-serve command line option</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-pp_size">trtllm-serve-serve command line option</a>
 </li>
       </ul></li>
       <li>
@@ -829,7 +840,7 @@
     --reasoning_parser
 
       <ul>
-        <li><a href="commands/trtllm-serve.html#cmdoption-trtllm-serve-serve-reasoning_parser">trtllm-serve-serve command line option</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-reasoning_parser">trtllm-serve-serve command line option</a>
 </li>
       </ul></li>
       <li>
@@ -852,7 +863,7 @@
     --request_timeout
 
       <ul>
-        <li><a href="commands/trtllm-serve.html#cmdoption-trtllm-serve-disaggregated-r">trtllm-serve-disaggregated command line option</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-disaggregated-r">trtllm-serve-disaggregated command line option</a>
 </li>
       </ul></li>
       <li>
@@ -866,14 +877,14 @@
     --server_role
 
       <ul>
-        <li><a href="commands/trtllm-serve.html#cmdoption-trtllm-serve-serve-server_role">trtllm-serve-serve command line option</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-server_role">trtllm-serve-serve command line option</a>
 </li>
       </ul></li>
       <li>
     --server_start_timeout
 
       <ul>
-        <li><a href="commands/trtllm-serve.html#cmdoption-trtllm-serve-disaggregated-t">trtllm-serve-disaggregated command line option</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-disaggregated-t">trtllm-serve-disaggregated command line option</a>
 </li>
       </ul></li>
       <li>
@@ -905,7 +916,7 @@
     --tokenizer
 
       <ul>
-        <li><a href="commands/trtllm-serve.html#cmdoption-trtllm-serve-serve-tokenizer">trtllm-serve-serve command line option</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-tokenizer">trtllm-serve-serve command line option</a>
 </li>
       </ul></li>
       <li>
@@ -923,7 +934,7 @@
       <ul>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-build-tp">trtllm-bench-build command line option</a>
 </li>
-        <li><a href="commands/trtllm-serve.html#cmdoption-trtllm-serve-serve-tp_size">trtllm-serve-serve command line option</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-tp_size">trtllm-serve-serve command line option</a>
 </li>
       </ul></li>
       <li>
@@ -932,7 +943,7 @@
       <ul>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-build-trust_remote_code">trtllm-bench-build command line option</a>
 </li>
-        <li><a href="commands/trtllm-serve.html#cmdoption-trtllm-serve-serve-trust_remote_code">trtllm-serve-serve command line option</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-trust_remote_code">trtllm-serve-serve command line option</a>
 </li>
       </ul></li>
       <li>
@@ -955,16 +966,16 @@
     -c
 
       <ul>
-        <li><a href="commands/trtllm-serve.html#cmdoption-trtllm-serve-disaggregated-c">trtllm-serve-disaggregated command line option</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-disaggregated-c">trtllm-serve-disaggregated command line option</a>
 </li>
-        <li><a href="commands/trtllm-serve.html#cmdoption-trtllm-serve-disaggregated_mpi_worker-c">trtllm-serve-disaggregated_mpi_worker command line option</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-disaggregated_mpi_worker-c">trtllm-serve-disaggregated_mpi_worker command line option</a>
 </li>
       </ul></li>
       <li>
     -l
 
       <ul>
-        <li><a href="commands/trtllm-serve.html#cmdoption-trtllm-serve-disaggregated-l">trtllm-serve-disaggregated command line option</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-disaggregated-l">trtllm-serve-disaggregated command line option</a>
 </li>
       </ul></li>
       <li>
@@ -973,7 +984,7 @@
       <ul>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-m">trtllm-bench command line option</a>
 </li>
-        <li><a href="commands/trtllm-serve.html#cmdoption-trtllm-serve-disaggregated-m">trtllm-serve-disaggregated command line option</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-disaggregated-m">trtllm-serve-disaggregated command line option</a>
 </li>
       </ul></li>
       <li>
@@ -994,14 +1005,14 @@
     -r
 
       <ul>
-        <li><a href="commands/trtllm-serve.html#cmdoption-trtllm-serve-disaggregated-r">trtllm-serve-disaggregated command line option</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-disaggregated-r">trtllm-serve-disaggregated command line option</a>
 </li>
       </ul></li>
       <li>
     -t
 
       <ul>
-        <li><a href="commands/trtllm-serve.html#cmdoption-trtllm-serve-disaggregated-t">trtllm-serve-disaggregated command line option</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-disaggregated-t">trtllm-serve-disaggregated command line option</a>
 </li>
       </ul></li>
       <li>
@@ -1024,9 +1035,11 @@
 <h2 id="_">_</h2>
 <table style="width: 100%" class="indextable genindextable"><tr>
   <td style="width: 33%; vertical-align: top;"><ul>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.__init__">__init__() (tensorrt_llm.llmapi.AutoDecodingConfig method)</a>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AttentionDpConfig.__init__">__init__() (tensorrt_llm.llmapi.AttentionDpConfig method)</a>
 
       <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.__init__">(tensorrt_llm.llmapi.AutoDecodingConfig method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.BatchingType.__init__">(tensorrt_llm.llmapi.BatchingType method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.BuildCacheConfig.__init__">(tensorrt_llm.llmapi.BuildCacheConfig method)</a>
@@ -1166,10 +1179,10 @@
 </li>
       <li><a href="python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.RopeEmbeddingUtils.apply_llama3_scaling">apply_llama3_scaling() (tensorrt_llm.functional.RopeEmbeddingUtils static method)</a>
 </li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.RopeEmbeddingUtils.apply_rotary_pos_emb">apply_rotary_pos_emb() (tensorrt_llm.functional.RopeEmbeddingUtils static method)</a>
 </li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.RopeEmbeddingUtils.apply_rotary_pos_emb_chatglm">apply_rotary_pos_emb_chatglm() (tensorrt_llm.functional.RopeEmbeddingUtils static method)</a>
 </li>
       <li><a href="python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.RopeEmbeddingUtils.apply_rotary_pos_emb_cogvlm">apply_rotary_pos_emb_cogvlm() (tensorrt_llm.functional.RopeEmbeddingUtils static method)</a>
@@ -1187,6 +1200,12 @@
       <li><a href="python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.assertion">assertion() (in module tensorrt_llm.functional)</a>
 </li>
       <li><a href="python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.Attention">Attention (class in tensorrt_llm.layers.attention)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.attention_dp_config">attention_dp_config (tensorrt_llm.llmapi.TorchLlmArgs attribute)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AttentionDpConfig">AttentionDpConfig (class in tensorrt_llm.llmapi)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AttentionDpConfig.Config">AttentionDpConfig.Config (class in tensorrt_llm.llmapi)</a>
 </li>
       <li><a href="python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.AttentionMaskParams">AttentionMaskParams (class in tensorrt_llm.layers.attention)</a>
 </li>
@@ -1262,6 +1281,8 @@
       </ul></li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TrtLlmArgs.batching_type">batching_type (tensorrt_llm.llmapi.TrtLlmArgs attribute)</a>
 </li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AttentionDpConfig.batching_wait_iters">batching_wait_iters (tensorrt_llm.llmapi.AttentionDpConfig attribute)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.BatchingType">BatchingType (class in tensorrt_llm.llmapi)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SamplingParams.beam_search_diversity_rate">beam_search_diversity_rate (tensorrt_llm.llmapi.SamplingParams attribute)</a>
@@ -1272,10 +1293,10 @@
       </ul></li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SamplingParams.beam_width_array">beam_width_array (tensorrt_llm.llmapi.SamplingParams attribute)</a>
 </li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.BEGIN_THINKING_PHASE_TOKEN">BEGIN_THINKING_PHASE_TOKEN (tensorrt_llm.llmapi.MTPDecodingConfig attribute)</a>
-</li>
   </ul></td>
   <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.BEGIN_THINKING_PHASE_TOKEN">BEGIN_THINKING_PHASE_TOKEN (tensorrt_llm.llmapi.MTPDecodingConfig attribute)</a>
+</li>
       <li><a href="python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.bert_attention">bert_attention() (in module tensorrt_llm.functional)</a>
 </li>
       <li><a href="python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.BertAttention">BertAttention (class in tensorrt_llm.layers.attention)</a>
@@ -1520,11 +1541,11 @@
 </li>
       <li><a href="python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.constants_to_tensors_">constants_to_tensors_() (in module tensorrt_llm.functional)</a>
 </li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.construct">construct() (tensorrt_llm.llmapi.AutoDecodingConfig class method)</a>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AttentionDpConfig.construct">construct() (tensorrt_llm.llmapi.AttentionDpConfig class method)</a>
 
       <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.construct">(tensorrt_llm.llmapi.AutoDecodingConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CacheTransceiverConfig.construct">(tensorrt_llm.llmapi.CacheTransceiverConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CalibConfig.construct">(tensorrt_llm.llmapi.CalibConfig class method)</a>
@@ -1558,6 +1579,8 @@
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.construct">(tensorrt_llm.llmapi.UserProvidedDecodingConfig class method)</a>
 </li>
       </ul></li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.Session.context">context (tensorrt_llm.runtime.Session property)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SchedulerConfig.context_chunking_policy">context_chunking_policy (tensorrt_llm.llmapi.SchedulerConfig attribute)</a>
@@ -1606,9 +1629,11 @@
 </li>
       <li><a href="python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.conv.ConvTranspose2d">ConvTranspose2d (class in tensorrt_llm.layers.conv)</a>
 </li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.copy">copy() (tensorrt_llm.llmapi.AutoDecodingConfig method)</a>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AttentionDpConfig.copy">copy() (tensorrt_llm.llmapi.AttentionDpConfig method)</a>
 
       <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.copy">(tensorrt_llm.llmapi.AutoDecodingConfig method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CacheTransceiverConfig.copy">(tensorrt_llm.llmapi.CacheTransceiverConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CalibConfig.copy">(tensorrt_llm.llmapi.CalibConfig method)</a>
@@ -1806,9 +1831,11 @@
         <li><a href="python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.GenerationSession.device">(tensorrt_llm.runtime.GenerationSession attribute)</a>
 </li>
       </ul></li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.dict">dict() (tensorrt_llm.llmapi.AutoDecodingConfig method)</a>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AttentionDpConfig.dict">dict() (tensorrt_llm.llmapi.AttentionDpConfig method)</a>
 
       <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.dict">(tensorrt_llm.llmapi.AutoDecodingConfig method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CacheTransceiverConfig.dict">(tensorrt_llm.llmapi.CacheTransceiverConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CalibConfig.dict">(tensorrt_llm.llmapi.CalibConfig method)</a>
@@ -1960,6 +1987,8 @@
       </ul></li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.enable_autotuner">enable_autotuner (tensorrt_llm.llmapi.TorchLlmArgs attribute)</a>
 </li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AttentionDpConfig.enable_balance">enable_balance (tensorrt_llm.llmapi.AttentionDpConfig attribute)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DynamicBatchConfig.enable_batch_size_tuning">enable_batch_size_tuning (tensorrt_llm.llmapi.DynamicBatchConfig attribute)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.KvCacheConfig.enable_block_reuse">enable_block_reuse (tensorrt_llm.llmapi.KvCacheConfig attribute)</a>
@@ -2094,9 +2123,11 @@
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig.Config">ExtendedRuntimePerfKnobConfig.Config (class in tensorrt_llm.llmapi)</a>
 </li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.Config.extra">extra (tensorrt_llm.llmapi.AutoDecodingConfig.Config attribute)</a>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AttentionDpConfig.Config.extra">extra (tensorrt_llm.llmapi.AttentionDpConfig.Config attribute)</a>
 
       <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.Config.extra">(tensorrt_llm.llmapi.AutoDecodingConfig.Config attribute)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CacheTransceiverConfig.Config.extra">(tensorrt_llm.llmapi.CacheTransceiverConfig.Config attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CalibConfig.Config.extra">(tensorrt_llm.llmapi.CalibConfig.Config attribute)</a>
@@ -2406,9 +2437,11 @@
       </ul></li>
       <li><a href="python-api/tensorrt_llm.models.html#tensorrt_llm.models.PretrainedModel.from_config">from_config() (tensorrt_llm.models.PretrainedModel class method)</a>
 </li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.from_dict">from_dict() (tensorrt_llm.llmapi.AutoDecodingConfig class method)</a>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AttentionDpConfig.from_dict">from_dict() (tensorrt_llm.llmapi.AttentionDpConfig class method)</a>
 
       <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.from_dict">(tensorrt_llm.llmapi.AutoDecodingConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.BuildConfig.from_dict">(tensorrt_llm.llmapi.BuildConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CalibConfig.from_dict">(tensorrt_llm.llmapi.CalibConfig class method)</a>
@@ -2526,9 +2559,11 @@
         <li><a href="python-api/tensorrt_llm.models.html#tensorrt_llm.models.GPTForCausalLM.from_nemo">(tensorrt_llm.models.GPTForCausalLM class method)</a>
 </li>
       </ul></li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.from_orm">from_orm() (tensorrt_llm.llmapi.AutoDecodingConfig class method)</a>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AttentionDpConfig.from_orm">from_orm() (tensorrt_llm.llmapi.AttentionDpConfig class method)</a>
 
       <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.from_orm">(tensorrt_llm.llmapi.AutoDecodingConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CacheTransceiverConfig.from_orm">(tensorrt_llm.llmapi.CacheTransceiverConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CalibConfig.from_orm">(tensorrt_llm.llmapi.CalibConfig class method)</a>
@@ -3144,9 +3179,11 @@
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.GuidedDecodingParams.json">json (tensorrt_llm.llmapi.GuidedDecodingParams attribute)</a>
 </li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.json">json() (tensorrt_llm.llmapi.AutoDecodingConfig method)</a>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AttentionDpConfig.json">json() (tensorrt_llm.llmapi.AttentionDpConfig method)</a>
 
       <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.json">(tensorrt_llm.llmapi.AutoDecodingConfig method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CacheTransceiverConfig.json">(tensorrt_llm.llmapi.CacheTransceiverConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CalibConfig.json">(tensorrt_llm.llmapi.CalibConfig method)</a>
@@ -3710,7 +3747,7 @@
     MODEL
 
       <ul>
-        <li><a href="commands/trtllm-serve.html#cmdoption-trtllm-serve-serve-arg-MODEL">trtllm-serve-serve command line option</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-arg-MODEL">trtllm-serve-serve command line option</a>
 </li>
       </ul></li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.model">model (tensorrt_llm.llmapi.TorchLlmArgs attribute)</a>
@@ -3719,9 +3756,11 @@
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TrtLlmArgs.model">(tensorrt_llm.llmapi.TrtLlmArgs attribute)</a>
 </li>
       </ul></li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.model_computed_fields">model_computed_fields (tensorrt_llm.llmapi.AutoDecodingConfig attribute)</a>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AttentionDpConfig.model_computed_fields">model_computed_fields (tensorrt_llm.llmapi.AttentionDpConfig attribute)</a>
 
       <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.model_computed_fields">(tensorrt_llm.llmapi.AutoDecodingConfig attribute)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CacheTransceiverConfig.model_computed_fields">(tensorrt_llm.llmapi.CacheTransceiverConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CalibConfig.model_computed_fields">(tensorrt_llm.llmapi.CalibConfig attribute)</a>
@@ -3755,9 +3794,11 @@
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.model_computed_fields">(tensorrt_llm.llmapi.UserProvidedDecodingConfig attribute)</a>
 </li>
       </ul></li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.model_config">model_config (tensorrt_llm.llmapi.AutoDecodingConfig attribute)</a>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AttentionDpConfig.model_config">model_config (tensorrt_llm.llmapi.AttentionDpConfig attribute)</a>
 
       <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.model_config">(tensorrt_llm.llmapi.AutoDecodingConfig attribute)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CacheTransceiverConfig.model_config">(tensorrt_llm.llmapi.CacheTransceiverConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CalibConfig.model_config">(tensorrt_llm.llmapi.CalibConfig attribute)</a>
@@ -3791,9 +3832,11 @@
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.model_config">(tensorrt_llm.llmapi.UserProvidedDecodingConfig attribute)</a>
 </li>
       </ul></li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.model_construct">model_construct() (tensorrt_llm.llmapi.AutoDecodingConfig class method)</a>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AttentionDpConfig.model_construct">model_construct() (tensorrt_llm.llmapi.AttentionDpConfig class method)</a>
 
       <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.model_construct">(tensorrt_llm.llmapi.AutoDecodingConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CacheTransceiverConfig.model_construct">(tensorrt_llm.llmapi.CacheTransceiverConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CalibConfig.model_construct">(tensorrt_llm.llmapi.CalibConfig class method)</a>
@@ -3827,9 +3870,11 @@
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.model_construct">(tensorrt_llm.llmapi.UserProvidedDecodingConfig class method)</a>
 </li>
       </ul></li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.model_copy">model_copy() (tensorrt_llm.llmapi.AutoDecodingConfig method)</a>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AttentionDpConfig.model_copy">model_copy() (tensorrt_llm.llmapi.AttentionDpConfig method)</a>
 
       <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.model_copy">(tensorrt_llm.llmapi.AutoDecodingConfig method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CacheTransceiverConfig.model_copy">(tensorrt_llm.llmapi.CacheTransceiverConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CalibConfig.model_copy">(tensorrt_llm.llmapi.CalibConfig method)</a>
@@ -3863,9 +3908,11 @@
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.model_copy">(tensorrt_llm.llmapi.UserProvidedDecodingConfig method)</a>
 </li>
       </ul></li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.model_dump">model_dump() (tensorrt_llm.llmapi.AutoDecodingConfig method)</a>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AttentionDpConfig.model_dump">model_dump() (tensorrt_llm.llmapi.AttentionDpConfig method)</a>
 
       <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.model_dump">(tensorrt_llm.llmapi.AutoDecodingConfig method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CacheTransceiverConfig.model_dump">(tensorrt_llm.llmapi.CacheTransceiverConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CalibConfig.model_dump">(tensorrt_llm.llmapi.CalibConfig method)</a>
@@ -3899,9 +3946,11 @@
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.model_dump">(tensorrt_llm.llmapi.UserProvidedDecodingConfig method)</a>
 </li>
       </ul></li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.model_dump_json">model_dump_json() (tensorrt_llm.llmapi.AutoDecodingConfig method)</a>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AttentionDpConfig.model_dump_json">model_dump_json() (tensorrt_llm.llmapi.AttentionDpConfig method)</a>
 
       <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.model_dump_json">(tensorrt_llm.llmapi.AutoDecodingConfig method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CacheTransceiverConfig.model_dump_json">(tensorrt_llm.llmapi.CacheTransceiverConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CalibConfig.model_dump_json">(tensorrt_llm.llmapi.CalibConfig method)</a>
@@ -3935,11 +3984,11 @@
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.model_dump_json">(tensorrt_llm.llmapi.UserProvidedDecodingConfig method)</a>
 </li>
       </ul></li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.model_extra">model_extra (tensorrt_llm.llmapi.AutoDecodingConfig property)</a>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AttentionDpConfig.model_extra">model_extra (tensorrt_llm.llmapi.AttentionDpConfig property)</a>
 
       <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.model_extra">(tensorrt_llm.llmapi.AutoDecodingConfig property)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CacheTransceiverConfig.model_extra">(tensorrt_llm.llmapi.CacheTransceiverConfig property)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CalibConfig.model_extra">(tensorrt_llm.llmapi.CalibConfig property)</a>
@@ -3973,9 +4022,13 @@
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.model_extra">(tensorrt_llm.llmapi.UserProvidedDecodingConfig property)</a>
 </li>
       </ul></li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.model_fields">model_fields (tensorrt_llm.llmapi.AutoDecodingConfig attribute)</a>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AttentionDpConfig.model_fields">model_fields (tensorrt_llm.llmapi.AttentionDpConfig attribute)</a>
 
       <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.model_fields">(tensorrt_llm.llmapi.AutoDecodingConfig attribute)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CacheTransceiverConfig.model_fields">(tensorrt_llm.llmapi.CacheTransceiverConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CalibConfig.model_fields">(tensorrt_llm.llmapi.CalibConfig attribute)</a>
@@ -4009,9 +4062,11 @@
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.model_fields">(tensorrt_llm.llmapi.UserProvidedDecodingConfig attribute)</a>
 </li>
       </ul></li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.model_fields_set">model_fields_set (tensorrt_llm.llmapi.AutoDecodingConfig property)</a>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AttentionDpConfig.model_fields_set">model_fields_set (tensorrt_llm.llmapi.AttentionDpConfig property)</a>
 
       <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.model_fields_set">(tensorrt_llm.llmapi.AutoDecodingConfig property)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CacheTransceiverConfig.model_fields_set">(tensorrt_llm.llmapi.CacheTransceiverConfig property)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CalibConfig.model_fields_set">(tensorrt_llm.llmapi.CalibConfig property)</a>
@@ -4051,9 +4106,11 @@
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TrtLlmArgs.model_format">(tensorrt_llm.llmapi.TrtLlmArgs property)</a>
 </li>
       </ul></li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.model_json_schema">model_json_schema() (tensorrt_llm.llmapi.AutoDecodingConfig class method)</a>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AttentionDpConfig.model_json_schema">model_json_schema() (tensorrt_llm.llmapi.AttentionDpConfig class method)</a>
 
       <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.model_json_schema">(tensorrt_llm.llmapi.AutoDecodingConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CacheTransceiverConfig.model_json_schema">(tensorrt_llm.llmapi.CacheTransceiverConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CalibConfig.model_json_schema">(tensorrt_llm.llmapi.CalibConfig class method)</a>
@@ -4089,9 +4146,11 @@
       </ul></li>
       <li><a href="python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.ModelConfig.model_name">model_name (tensorrt_llm.runtime.ModelConfig attribute)</a>
 </li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.model_parametrized_name">model_parametrized_name() (tensorrt_llm.llmapi.AutoDecodingConfig class method)</a>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AttentionDpConfig.model_parametrized_name">model_parametrized_name() (tensorrt_llm.llmapi.AttentionDpConfig class method)</a>
 
       <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.model_parametrized_name">(tensorrt_llm.llmapi.AutoDecodingConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CacheTransceiverConfig.model_parametrized_name">(tensorrt_llm.llmapi.CacheTransceiverConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CalibConfig.model_parametrized_name">(tensorrt_llm.llmapi.CalibConfig class method)</a>
@@ -4125,9 +4184,11 @@
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.model_parametrized_name">(tensorrt_llm.llmapi.UserProvidedDecodingConfig class method)</a>
 </li>
       </ul></li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.model_post_init">model_post_init() (tensorrt_llm.llmapi.AutoDecodingConfig method)</a>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AttentionDpConfig.model_post_init">model_post_init() (tensorrt_llm.llmapi.AttentionDpConfig method)</a>
 
       <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.model_post_init">(tensorrt_llm.llmapi.AutoDecodingConfig method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CacheTransceiverConfig.model_post_init">(tensorrt_llm.llmapi.CacheTransceiverConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CalibConfig.model_post_init">(tensorrt_llm.llmapi.CalibConfig method)</a>
@@ -4161,9 +4222,11 @@
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.model_post_init">(tensorrt_llm.llmapi.UserProvidedDecodingConfig method)</a>
 </li>
       </ul></li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.model_rebuild">model_rebuild() (tensorrt_llm.llmapi.AutoDecodingConfig class method)</a>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AttentionDpConfig.model_rebuild">model_rebuild() (tensorrt_llm.llmapi.AttentionDpConfig class method)</a>
 
       <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.model_rebuild">(tensorrt_llm.llmapi.AutoDecodingConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CacheTransceiverConfig.model_rebuild">(tensorrt_llm.llmapi.CacheTransceiverConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CalibConfig.model_rebuild">(tensorrt_llm.llmapi.CalibConfig class method)</a>
@@ -4197,9 +4260,11 @@
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.model_rebuild">(tensorrt_llm.llmapi.UserProvidedDecodingConfig class method)</a>
 </li>
       </ul></li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.model_validate">model_validate() (tensorrt_llm.llmapi.AutoDecodingConfig class method)</a>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AttentionDpConfig.model_validate">model_validate() (tensorrt_llm.llmapi.AttentionDpConfig class method)</a>
 
       <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.model_validate">(tensorrt_llm.llmapi.AutoDecodingConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CacheTransceiverConfig.model_validate">(tensorrt_llm.llmapi.CacheTransceiverConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CalibConfig.model_validate">(tensorrt_llm.llmapi.CalibConfig class method)</a>
@@ -4233,9 +4298,11 @@
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.model_validate">(tensorrt_llm.llmapi.UserProvidedDecodingConfig class method)</a>
 </li>
       </ul></li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.model_validate_json">model_validate_json() (tensorrt_llm.llmapi.AutoDecodingConfig class method)</a>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AttentionDpConfig.model_validate_json">model_validate_json() (tensorrt_llm.llmapi.AttentionDpConfig class method)</a>
 
       <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.model_validate_json">(tensorrt_llm.llmapi.AutoDecodingConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CacheTransceiverConfig.model_validate_json">(tensorrt_llm.llmapi.CacheTransceiverConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CalibConfig.model_validate_json">(tensorrt_llm.llmapi.CalibConfig class method)</a>
@@ -4269,9 +4336,11 @@
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.model_validate_json">(tensorrt_llm.llmapi.UserProvidedDecodingConfig class method)</a>
 </li>
       </ul></li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.model_validate_strings">model_validate_strings() (tensorrt_llm.llmapi.AutoDecodingConfig class method)</a>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AttentionDpConfig.model_validate_strings">model_validate_strings() (tensorrt_llm.llmapi.AttentionDpConfig class method)</a>
 
       <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.model_validate_strings">(tensorrt_llm.llmapi.AutoDecodingConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CacheTransceiverConfig.model_validate_strings">(tensorrt_llm.llmapi.CacheTransceiverConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CalibConfig.model_validate_strings">(tensorrt_llm.llmapi.CalibConfig class method)</a>
@@ -4610,9 +4679,11 @@
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TrtLlmArgs.parallel_config">(tensorrt_llm.llmapi.TrtLlmArgs property)</a>
 </li>
       </ul></li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.parse_file">parse_file() (tensorrt_llm.llmapi.AutoDecodingConfig class method)</a>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AttentionDpConfig.parse_file">parse_file() (tensorrt_llm.llmapi.AttentionDpConfig class method)</a>
 
       <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.parse_file">(tensorrt_llm.llmapi.AutoDecodingConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CacheTransceiverConfig.parse_file">(tensorrt_llm.llmapi.CacheTransceiverConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CalibConfig.parse_file">(tensorrt_llm.llmapi.CalibConfig class method)</a>
@@ -4646,9 +4717,11 @@
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.parse_file">(tensorrt_llm.llmapi.UserProvidedDecodingConfig class method)</a>
 </li>
       </ul></li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.parse_obj">parse_obj() (tensorrt_llm.llmapi.AutoDecodingConfig class method)</a>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AttentionDpConfig.parse_obj">parse_obj() (tensorrt_llm.llmapi.AttentionDpConfig class method)</a>
 
       <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.parse_obj">(tensorrt_llm.llmapi.AutoDecodingConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CacheTransceiverConfig.parse_obj">(tensorrt_llm.llmapi.CacheTransceiverConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CalibConfig.parse_obj">(tensorrt_llm.llmapi.CalibConfig class method)</a>
@@ -4682,9 +4755,11 @@
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.parse_obj">(tensorrt_llm.llmapi.UserProvidedDecodingConfig class method)</a>
 </li>
       </ul></li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.parse_raw">parse_raw() (tensorrt_llm.llmapi.AutoDecodingConfig class method)</a>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AttentionDpConfig.parse_raw">parse_raw() (tensorrt_llm.llmapi.AttentionDpConfig class method)</a>
 
       <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.parse_raw">(tensorrt_llm.llmapi.AutoDecodingConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CacheTransceiverConfig.parse_raw">(tensorrt_llm.llmapi.CacheTransceiverConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CalibConfig.parse_raw">(tensorrt_llm.llmapi.CalibConfig class method)</a>
@@ -4740,12 +4815,12 @@
         <li><a href="python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.Tensor.permute">(tensorrt_llm.functional.Tensor method)</a>
 </li>
       </ul></li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="python-api/tensorrt_llm.models.html#tensorrt_llm.models.Phi3ForCausalLM">Phi3ForCausalLM (class in tensorrt_llm.models)</a>
 </li>
       <li><a href="python-api/tensorrt_llm.models.html#tensorrt_llm.models.Phi3Model">Phi3Model (class in tensorrt_llm.models)</a>
 </li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="python-api/tensorrt_llm.models.html#tensorrt_llm.models.PhiForCausalLM">PhiForCausalLM (class in tensorrt_llm.models)</a>
 </li>
       <li><a href="python-api/tensorrt_llm.models.html#tensorrt_llm.models.PhiModel">PhiModel (class in tensorrt_llm.models)</a>
@@ -5296,9 +5371,11 @@
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SchedulerConfig.Config">SchedulerConfig.Config (class in tensorrt_llm.llmapi)</a>
 </li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.schema">schema() (tensorrt_llm.llmapi.AutoDecodingConfig class method)</a>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AttentionDpConfig.schema">schema() (tensorrt_llm.llmapi.AttentionDpConfig class method)</a>
 
       <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.schema">(tensorrt_llm.llmapi.AutoDecodingConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CacheTransceiverConfig.schema">(tensorrt_llm.llmapi.CacheTransceiverConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CalibConfig.schema">(tensorrt_llm.llmapi.CalibConfig class method)</a>
@@ -5332,9 +5409,11 @@
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.schema">(tensorrt_llm.llmapi.UserProvidedDecodingConfig class method)</a>
 </li>
       </ul></li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.schema_json">schema_json() (tensorrt_llm.llmapi.AutoDecodingConfig class method)</a>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AttentionDpConfig.schema_json">schema_json() (tensorrt_llm.llmapi.AttentionDpConfig class method)</a>
 
       <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.schema_json">(tensorrt_llm.llmapi.AutoDecodingConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CacheTransceiverConfig.schema_json">(tensorrt_llm.llmapi.CacheTransceiverConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CalibConfig.schema_json">(tensorrt_llm.llmapi.CalibConfig class method)</a>
@@ -5476,10 +5555,10 @@
       </ul></li>
       <li><a href="python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.slice">slice() (in module tensorrt_llm.functional)</a>
 </li>
-      <li><a href="python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.SliceInputType">SliceInputType (class in tensorrt_llm.functional)</a>
-</li>
   </ul></td>
   <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.SliceInputType">SliceInputType (class in tensorrt_llm.functional)</a>
+</li>
       <li><a href="python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.AttentionMaskType.sliding_window_causal">sliding_window_causal (tensorrt_llm.functional.AttentionMaskType attribute)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantConfig.smoothquant_val">smoothquant_val (tensorrt_llm.llmapi.QuantConfig attribute)</a>
@@ -5727,7 +5806,7 @@
         <li><a href="python-api/tensorrt_llm.functional.html#module-tensorrt_llm">module</a>, <a href="python-api/tensorrt_llm.layers.html#module-tensorrt_llm">[1]</a>, <a href="python-api/tensorrt_llm.models.html#module-tensorrt_llm">[2]</a>, <a href="python-api/tensorrt_llm.plugin.html#module-tensorrt_llm">[3]</a>, <a href="python-api/tensorrt_llm.quantization.html#module-tensorrt_llm">[4]</a>, <a href="python-api/tensorrt_llm.runtime.html#module-tensorrt_llm">[5]</a>
 </li>
       </ul></li>
-      <li><a href="_cpp_gen/executor.html#_CPPv412tensorrt_llm">tensorrt_llm (C++ type)</a>, <a href="_cpp_gen/executor.html#_CPPv412tensorrt_llm">[1]</a>, <a href="_cpp_gen/executor.html#_CPPv412tensorrt_llm">[2]</a>, <a href="_cpp_gen/executor.html#_CPPv412tensorrt_llm">[3]</a>, <a href="_cpp_gen/executor.html#_CPPv412tensorrt_llm">[4]</a>, <a href="_cpp_gen/executor.html#_CPPv412tensorrt_llm">[5]</a>, <a href="_cpp_gen/executor.html#_CPPv412tensorrt_llm">[6]</a>, <a href="_cpp_gen/executor.html#_CPPv412tensorrt_llm">[7]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[8]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[9]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[10]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[11]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[12]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[13]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[14]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[15]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[16]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[17]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[18]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[19]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[20]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[21]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[22]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[23]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[24]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[25]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[26]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[27]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[28]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[29]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[30]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[31]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[32]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[33]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[34]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[35]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[36]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[37]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[38]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[39]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[40]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[41]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[42]</a>
+      <li><a href="_cpp_gen/executor.html#_CPPv412tensorrt_llm">tensorrt_llm (C++ type)</a>, <a href="_cpp_gen/executor.html#_CPPv412tensorrt_llm">[1]</a>, <a href="_cpp_gen/executor.html#_CPPv412tensorrt_llm">[2]</a>, <a href="_cpp_gen/executor.html#_CPPv412tensorrt_llm">[3]</a>, <a href="_cpp_gen/executor.html#_CPPv412tensorrt_llm">[4]</a>, <a href="_cpp_gen/executor.html#_CPPv412tensorrt_llm">[5]</a>, <a href="_cpp_gen/executor.html#_CPPv412tensorrt_llm">[6]</a>, <a href="_cpp_gen/executor.html#_CPPv412tensorrt_llm">[7]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[8]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[9]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[10]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[11]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[12]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[13]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[14]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[15]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[16]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[17]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[18]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[19]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[20]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[21]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[22]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[23]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[24]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[25]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[26]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[27]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[28]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[29]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[30]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[31]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[32]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[33]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[34]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[35]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[36]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[37]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[38]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[39]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[40]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[41]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[42]</a>, <a href="_cpp_gen/runtime.html#_CPPv412tensorrt_llm">[43]</a>
 </li>
       <li>
     tensorrt_llm.functional
@@ -8393,7 +8472,7 @@
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm3mpiE">tensorrt_llm::mpi (C++ type)</a>
 </li>
-      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm7runtimeE">tensorrt_llm::runtime (C++ type)</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm7runtimeE">[1]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[2]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[3]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[4]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[5]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[6]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[7]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[8]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[9]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[10]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[11]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[12]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[13]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[14]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[15]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[16]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[17]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[18]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[19]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[20]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[21]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[22]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[23]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[24]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[25]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[26]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[27]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[28]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[29]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[30]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[31]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[32]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[33]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[34]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[35]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[36]</a>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm7runtimeE">tensorrt_llm::runtime (C++ type)</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm7runtimeE">[1]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[2]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[3]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[4]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[5]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[6]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[7]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[8]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[9]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[10]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[11]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[12]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[13]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[14]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[15]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[16]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[17]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[18]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[19]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[20]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[21]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[22]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[23]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[24]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[25]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[26]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[27]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[28]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[29]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[30]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[31]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[32]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[33]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[34]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[35]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[36]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimeE">[37]</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime16AllReduceBuffersE">tensorrt_llm::runtime::AllReduceBuffers (C++ class)</a>
 </li>
@@ -8503,6 +8582,8 @@
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime13canAccessPeerERK11WorldConfig">tensorrt_llm::runtime::canAccessPeer (C++ function)</a>
 </li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime27clearVirtualMemoryAllocatorEv">tensorrt_llm::runtime::clearVirtualMemoryAllocator (C++ function)</a>
+</li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4I00EN12tensorrt_llm7runtime16constPointerCastENSt10shared_ptrINSt14remove_const_tI1TEEEERRNSt10unique_ptrI1T1DEE">tensorrt_llm::runtime::constPointerCast (C++ function)</a>, <a href="_cpp_gen/runtime.html#_CPPv4I0EN12tensorrt_llm7runtime16constPointerCastENSt10shared_ptrINSt14remove_const_tI1TEEEERKNSt10shared_ptrI1TEE">[1]</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime9CudaEventE">tensorrt_llm::runtime::CudaEvent (C++ class)</a>
@@ -8557,6 +8638,158 @@
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4NK12tensorrt_llm7runtime10CudaStream4waitEN9CudaEvent7pointerE">tensorrt_llm::runtime::CudaStream::wait (C++ function)</a>, <a href="_cpp_gen/runtime.html#_CPPv4NK12tensorrt_llm7runtime10CudaStream4waitERK9CudaEvent">[1]</a>
 </li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime26CudaVirtualMemoryAllocatorE">tensorrt_llm::runtime::CudaVirtualMemoryAllocator (C++ class)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4NK12tensorrt_llm7runtime26CudaVirtualMemoryAllocator8allocateEP7PointerNSt6size_tEi">tensorrt_llm::runtime::CudaVirtualMemoryAllocator::allocate (C++ function)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime26CudaVirtualMemoryAllocator13ConfigurationE">tensorrt_llm::runtime::CudaVirtualMemoryAllocator::Configuration (C++ class)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime26CudaVirtualMemoryAllocator13Configuration23backgroundConfigurationE">tensorrt_llm::runtime::CudaVirtualMemoryAllocator::Configuration::backgroundConfiguration (C++ member)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime26CudaVirtualMemoryAllocator13Configuration13ConfigurationER24CudaVirtualMemoryManagerNSt6stringE11RestoreMode13CudaStreamPtr">tensorrt_llm::runtime::CudaVirtualMemoryAllocator::Configuration::Configuration (C++ function)</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime26CudaVirtualMemoryAllocator13Configuration13ConfigurationER24CudaVirtualMemoryManagerNSt6stringE11RestoreMode13CudaStreamPtrb">[1]</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime26CudaVirtualMemoryAllocator13Configuration11mBackgroundE">tensorrt_llm::runtime::CudaVirtualMemoryAllocator::Configuration::mBackground (C++ member)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime26CudaVirtualMemoryAllocator13Configuration11mBackStreamE">tensorrt_llm::runtime::CudaVirtualMemoryAllocator::Configuration::mBackStream (C++ member)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime26CudaVirtualMemoryAllocator13Configuration8mManagerE">tensorrt_llm::runtime::CudaVirtualMemoryAllocator::Configuration::mManager (C++ member)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime26CudaVirtualMemoryAllocator13Configuration5mModeE">tensorrt_llm::runtime::CudaVirtualMemoryAllocator::Configuration::mMode (C++ member)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime26CudaVirtualMemoryAllocator13Configuration9mPageSizeE">tensorrt_llm::runtime::CudaVirtualMemoryAllocator::Configuration::mPageSize (C++ member)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime26CudaVirtualMemoryAllocator13Configuration4mTagE">tensorrt_llm::runtime::CudaVirtualMemoryAllocator::Configuration::mTag (C++ member)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4NK12tensorrt_llm7runtime26CudaVirtualMemoryAllocator13Configuration11pageAlignedENSt6size_tE">tensorrt_llm::runtime::CudaVirtualMemoryAllocator::Configuration::pageAligned (C++ function)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime26CudaVirtualMemoryAllocator13Configuration25setVirtualMemoryAllocatorERKNSt6stringE11RestoreModeNSt10shared_ptrI10CudaStreamEE">tensorrt_llm::runtime::CudaVirtualMemoryAllocator::Configuration::setVirtualMemoryAllocator (C++ function)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime26CudaVirtualMemoryAllocator13CudaStreamPtrE">tensorrt_llm::runtime::CudaVirtualMemoryAllocator::CudaStreamPtr (C++ type)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime26CudaVirtualMemoryAllocator26CudaVirtualMemoryAllocatorENSt10shared_ptrI13ConfigurationEE">tensorrt_llm::runtime::CudaVirtualMemoryAllocator::CudaVirtualMemoryAllocator (C++ function)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4NK12tensorrt_llm7runtime26CudaVirtualMemoryAllocator10deallocateE7PointerNSt6size_tE">tensorrt_llm::runtime::CudaVirtualMemoryAllocator::deallocate (C++ function)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime26CudaVirtualMemoryAllocator7mConfigE">tensorrt_llm::runtime::CudaVirtualMemoryAllocator::mConfig (C++ member)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4NK12tensorrt_llm7runtime26CudaVirtualMemoryAllocatorcvbEv">tensorrt_llm::runtime::CudaVirtualMemoryAllocator::operator bool (C++ function)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime26CudaVirtualMemoryAllocator7PointerE">tensorrt_llm::runtime::CudaVirtualMemoryAllocator::Pointer (C++ type)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime26CudaVirtualMemoryAllocator11RestoreModeE">tensorrt_llm::runtime::CudaVirtualMemoryAllocator::RestoreMode (C++ enum)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime26CudaVirtualMemoryAllocator11RestoreMode3CPUE">tensorrt_llm::runtime::CudaVirtualMemoryAllocator::RestoreMode::CPU (C++ enumerator)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime26CudaVirtualMemoryAllocator11RestoreMode6MEMSETE">tensorrt_llm::runtime::CudaVirtualMemoryAllocator::RestoreMode::MEMSET (C++ enumerator)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime26CudaVirtualMemoryAllocator11RestoreMode4NONEE">tensorrt_llm::runtime::CudaVirtualMemoryAllocator::RestoreMode::NONE (C++ enumerator)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime26CudaVirtualMemoryAllocator11RestoreMode6PINNEDE">tensorrt_llm::runtime::CudaVirtualMemoryAllocator::RestoreMode::PINNED (C++ enumerator)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime22CUDAVirtualMemoryChunkE">tensorrt_llm::runtime::CUDAVirtualMemoryChunk (C++ class)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime22CUDAVirtualMemoryChunk8_releaseEb">tensorrt_llm::runtime::CUDAVirtualMemoryChunk::_release (C++ function)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime22CUDAVirtualMemoryChunk12ConfiguratorE">tensorrt_llm::runtime::CUDAVirtualMemoryChunk::Configurator (C++ struct)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime22CUDAVirtualMemoryChunk12Configurator12ConfiguratorERK12Configurator">tensorrt_llm::runtime::CUDAVirtualMemoryChunk::Configurator::Configurator (C++ function)</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime22CUDAVirtualMemoryChunk12Configurator12ConfiguratorERR12Configurator">[1]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime22CUDAVirtualMemoryChunk12Configurator12ConfiguratorEv">[2]</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime22CUDAVirtualMemoryChunk12ConfiguratoraSERK12Configurator">tensorrt_llm::runtime::CUDAVirtualMemoryChunk::Configurator::operator= (C++ function)</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime22CUDAVirtualMemoryChunk12ConfiguratoraSERR12Configurator">[1]</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime22CUDAVirtualMemoryChunk12Configurator5setupE28CUmemGenericAllocationHandle">tensorrt_llm::runtime::CUDAVirtualMemoryChunk::Configurator::setup (C++ function)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime22CUDAVirtualMemoryChunk12Configurator8teardownE28CUmemGenericAllocationHandleb">tensorrt_llm::runtime::CUDAVirtualMemoryChunk::Configurator::teardown (C++ function)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime22CUDAVirtualMemoryChunk12ConfiguratorD0Ev">tensorrt_llm::runtime::CUDAVirtualMemoryChunk::Configurator::~Configurator (C++ function)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime22CUDAVirtualMemoryChunk15ConfiguratorPtrE">tensorrt_llm::runtime::CUDAVirtualMemoryChunk::ConfiguratorPtr (C++ type)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime22CUDAVirtualMemoryChunk13ConfiguratorsE">tensorrt_llm::runtime::CUDAVirtualMemoryChunk::Configurators (C++ type)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime22CUDAVirtualMemoryChunk7CreatorE">tensorrt_llm::runtime::CUDAVirtualMemoryChunk::Creator (C++ struct)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime22CUDAVirtualMemoryChunk7Creator6createEv">tensorrt_llm::runtime::CUDAVirtualMemoryChunk::Creator::create (C++ function)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime22CUDAVirtualMemoryChunk7Creator7CreatorERK7Creator">tensorrt_llm::runtime::CUDAVirtualMemoryChunk::Creator::Creator (C++ function)</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime22CUDAVirtualMemoryChunk7Creator7CreatorERR7Creator">[1]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime22CUDAVirtualMemoryChunk7Creator7CreatorEv">[2]</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime22CUDAVirtualMemoryChunk7CreatoraSERK7Creator">tensorrt_llm::runtime::CUDAVirtualMemoryChunk::Creator::operator= (C++ function)</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime22CUDAVirtualMemoryChunk7CreatoraSERR7Creator">[1]</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime22CUDAVirtualMemoryChunk7Creator7releaseE28CUmemGenericAllocationHandleb">tensorrt_llm::runtime::CUDAVirtualMemoryChunk::Creator::release (C++ function)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime22CUDAVirtualMemoryChunk7CreatorD0Ev">tensorrt_llm::runtime::CUDAVirtualMemoryChunk::Creator::~Creator (C++ function)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime22CUDAVirtualMemoryChunk10CreatorPtrE">tensorrt_llm::runtime::CUDAVirtualMemoryChunk::CreatorPtr (C++ type)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime22CUDAVirtualMemoryChunk22CUDAVirtualMemoryChunkERK22CUDAVirtualMemoryChunk">tensorrt_llm::runtime::CUDAVirtualMemoryChunk::CUDAVirtualMemoryChunk (C++ function)</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime22CUDAVirtualMemoryChunk22CUDAVirtualMemoryChunkERR10CreatorPtrRR13Configurators">[1]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime22CUDAVirtualMemoryChunk22CUDAVirtualMemoryChunkERR22CUDAVirtualMemoryChunk">[2]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime22CUDAVirtualMemoryChunk22CUDAVirtualMemoryChunkEv">[3]</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime22CUDAVirtualMemoryChunk13INVALID_STATEE">tensorrt_llm::runtime::CUDAVirtualMemoryChunk::INVALID_STATE (C++ member)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime22CUDAVirtualMemoryChunk11materializeEv">tensorrt_llm::runtime::CUDAVirtualMemoryChunk::materialize (C++ function)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime22CUDAVirtualMemoryChunk14mConfiguratorsE">tensorrt_llm::runtime::CUDAVirtualMemoryChunk::mConfigurators (C++ member)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime22CUDAVirtualMemoryChunk8mCreatorE">tensorrt_llm::runtime::CUDAVirtualMemoryChunk::mCreator (C++ member)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime22CUDAVirtualMemoryChunk7mHandleE">tensorrt_llm::runtime::CUDAVirtualMemoryChunk::mHandle (C++ member)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime22CUDAVirtualMemoryChunk6mStateE">tensorrt_llm::runtime::CUDAVirtualMemoryChunk::mState (C++ member)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4NK12tensorrt_llm7runtime22CUDAVirtualMemoryChunkcvbEv">tensorrt_llm::runtime::CUDAVirtualMemoryChunk::operator bool (C++ function)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime22CUDAVirtualMemoryChunkaSERK22CUDAVirtualMemoryChunk">tensorrt_llm::runtime::CUDAVirtualMemoryChunk::operator= (C++ function)</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime22CUDAVirtualMemoryChunkaSERR22CUDAVirtualMemoryChunk">[1]</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime22CUDAVirtualMemoryChunk7releaseEv">tensorrt_llm::runtime::CUDAVirtualMemoryChunk::release (C++ function)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime22CUDAVirtualMemoryChunk6StatusE">tensorrt_llm::runtime::CUDAVirtualMemoryChunk::Status (C++ enum)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4NK12tensorrt_llm7runtime22CUDAVirtualMemoryChunk6statusEv">tensorrt_llm::runtime::CUDAVirtualMemoryChunk::status (C++ function)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime22CUDAVirtualMemoryChunk6Status7ERROREDE">tensorrt_llm::runtime::CUDAVirtualMemoryChunk::Status::ERRORED (C++ enumerator)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime22CUDAVirtualMemoryChunk6Status7INVALIDE">tensorrt_llm::runtime::CUDAVirtualMemoryChunk::Status::INVALID (C++ enumerator)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime22CUDAVirtualMemoryChunk6Status12MATERIALIZEDE">tensorrt_llm::runtime::CUDAVirtualMemoryChunk::Status::MATERIALIZED (C++ enumerator)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime22CUDAVirtualMemoryChunk6Status8RELEASEDE">tensorrt_llm::runtime::CUDAVirtualMemoryChunk::Status::RELEASED (C++ enumerator)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime22CUDAVirtualMemoryChunkD0Ev">tensorrt_llm::runtime::CUDAVirtualMemoryChunk::~CUDAVirtualMemoryChunk (C++ function)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime24CudaVirtualMemoryManagerE">tensorrt_llm::runtime::CudaVirtualMemoryManager (C++ class)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4IDpEN12tensorrt_llm7runtime24CudaVirtualMemoryManager3addEv9uintptr_tNSt6stringERRN22CUDAVirtualMemoryChunk10CreatorPtrEDpRR13Configurators">tensorrt_llm::runtime::CudaVirtualMemoryManager::add (C++ function)</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime24CudaVirtualMemoryManager3addE9uintptr_tNSt6stringERR22CUDAVirtualMemoryChunk">[1]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime24CudaVirtualMemoryManager3addE9uintptr_tNSt6stringERRN22CUDAVirtualMemoryChunk10CreatorPtrERRN22CUDAVirtualMemoryChunk13ConfiguratorsE">[2]</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime24CudaVirtualMemoryManager12addBadHandleE9uintptr_t">tensorrt_llm::runtime::CudaVirtualMemoryManager::addBadHandle (C++ function)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime24CudaVirtualMemoryManager5EntryE">tensorrt_llm::runtime::CudaVirtualMemoryManager::Entry (C++ struct)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime24CudaVirtualMemoryManager5Entry8mEntryItE">tensorrt_llm::runtime::CudaVirtualMemoryManager::Entry::mEntryIt (C++ member)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime24CudaVirtualMemoryManager5Entry7mMemoryE">tensorrt_llm::runtime::CudaVirtualMemoryManager::Entry::mMemory (C++ member)</a>
+</li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime24CudaVirtualMemoryManager18materializeWithTagERKNSt6stringE">tensorrt_llm::runtime::CudaVirtualMemoryManager::materializeWithTag (C++ function)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime24CudaVirtualMemoryManager11mBadHandlesE">tensorrt_llm::runtime::CudaVirtualMemoryManager::mBadHandles (C++ member)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime24CudaVirtualMemoryManager8mEntriesE">tensorrt_llm::runtime::CudaVirtualMemoryManager::mEntries (C++ member)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime24CudaVirtualMemoryManager9mMemoriesE">tensorrt_llm::runtime::CudaVirtualMemoryManager::mMemories (C++ member)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime24CudaVirtualMemoryManager6mMutexE">tensorrt_llm::runtime::CudaVirtualMemoryManager::mMutex (C++ member)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime24CudaVirtualMemoryManager16PointerMemoryMapE">tensorrt_llm::runtime::CudaVirtualMemoryManager::PointerMemoryMap (C++ type)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime24CudaVirtualMemoryManager14releaseWithTagERKNSt6stringE">tensorrt_llm::runtime::CudaVirtualMemoryManager::releaseWithTag (C++ function)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime24CudaVirtualMemoryManager6removeE9uintptr_t">tensorrt_llm::runtime::CudaVirtualMemoryManager::remove (C++ function)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime24CudaVirtualMemoryManager18retrieveBadHandlesEv">tensorrt_llm::runtime::CudaVirtualMemoryManager::retrieveBadHandles (C++ function)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime24CudaVirtualMemoryManager11TagEntryMapE">tensorrt_llm::runtime::CudaVirtualMemoryManager::TagEntryMap (C++ type)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime24CudaVirtualMemoryManager12unsafeRemoveE9uintptr_t">tensorrt_llm::runtime::CudaVirtualMemoryManager::unsafeRemove (C++ function)</a>
+</li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4I_N8nvinfer18DataTypeE_b_bEN12tensorrt_llm7runtime14DataTypeTraitsE">tensorrt_llm::runtime::DataTypeTraits (C++ struct)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4I_N8nvinfer18DataTypeE_bEN12tensorrt_llm7runtime14DataTypeTraitsI9kDataType9kUnsignedXL1EEEE">tensorrt_llm::runtime::DataTypeTraits&lt;kDataType, kUnsigned, true&gt; (C++ struct)</a>
@@ -8569,8 +8802,6 @@
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4I_bEN12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType5kBOOLE9kUnsignedEE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kBOOL, kUnsigned&gt; (C++ struct)</a>
 </li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType5kBOOLE9kUnsignedE4nameE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kBOOL, kUnsigned&gt;::name (C++ member)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType5kBOOLE9kUnsignedE4sizeE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kBOOL, kUnsigned&gt;::size (C++ member)</a>
@@ -8683,8 +8914,6 @@
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4NK12tensorrt_llm7runtime7decoder12DecoderState29getExplicitDraftTokensBuffersEv">tensorrt_llm::runtime::decoder::DecoderState::getExplicitDraftTokensBuffers (C++ function)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4NK12tensorrt_llm7runtime7decoder12DecoderState16getFinishedStepsEv">tensorrt_llm::runtime::decoder::DecoderState::getFinishedSteps (C++ function)</a>
-</li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4NK12tensorrt_llm7runtime7decoder12DecoderState14getFinishedSumEv">tensorrt_llm::runtime::decoder::DecoderState::getFinishedSum (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4NK12tensorrt_llm7runtime7decoder12DecoderState16getFinishReasonsEv">tensorrt_llm::runtime::decoder::DecoderState::getFinishReasons (C++ function)</a>
@@ -8730,8 +8959,6 @@
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime7decoder12DecoderState13LlmRequestPtrE">tensorrt_llm::runtime::decoder::DecoderState::LlmRequestPtr (C++ type)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime7decoder12DecoderState18mBeamSearchBuffersE">tensorrt_llm::runtime::decoder::DecoderState::mBeamSearchBuffers (C++ member)</a>
-</li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime7decoder12DecoderState14mFinishedStepsE">tensorrt_llm::runtime::decoder::DecoderState::mFinishedSteps (C++ member)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime7decoder12DecoderState19mJointDecodingInputE">tensorrt_llm::runtime::decoder::DecoderState::mJointDecodingInput (C++ member)</a>
 </li>
@@ -9353,6 +9580,10 @@
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime20getDefaultBatchSlotsEN7runtime10SizeType32E">tensorrt_llm::runtime::getDefaultBatchSlots (C++ function)</a>
 </li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime25getVirtualMemoryAllocatorEv">tensorrt_llm::runtime::getVirtualMemoryAllocator (C++ function)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime23getVirtualMemoryManagerEv">tensorrt_llm::runtime::getVirtualMemoryManager (C++ function)</a>
+</li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4I0EN12tensorrt_llm7runtime10GptDecoderE">tensorrt_llm::runtime::GptDecoder (C++ class)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime10GptDecoder13CudaStreamPtrE">tensorrt_llm::runtime::GptDecoder::CudaStreamPtr (C++ type)</a>
@@ -9680,6 +9911,18 @@
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime7ITensorD0Ev">tensorrt_llm::runtime::ITensor::~ITensor (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime20lamportInitializeAllEPvPvPv6size_t">tensorrt_llm::runtime::lamportInitializeAll (C++ function)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4I_bEN12tensorrt_llm7runtime12LocalCreatorE">tensorrt_llm::runtime::LocalCreator (C++ struct)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime12LocalCreator6createEv">tensorrt_llm::runtime::LocalCreator::create (C++ function)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime12LocalCreator12LocalCreatorERK19CUmemAllocationProp6size_t">tensorrt_llm::runtime::LocalCreator::LocalCreator (C++ function)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime12LocalCreator5mPropE">tensorrt_llm::runtime::LocalCreator::mProp (C++ member)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime12LocalCreator5mSizeE">tensorrt_llm::runtime::LocalCreator::mSize (C++ member)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime12LocalCreator7releaseE28CUmemGenericAllocationHandleb">tensorrt_llm::runtime::LocalCreator::release (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime24LookaheadDecodingBuffersE">tensorrt_llm::runtime::LookaheadDecodingBuffers (C++ class)</a>
 </li>
@@ -10197,6 +10440,24 @@
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime16MemoryTypeStringIN10MemoryType4kUVMEE5valueE">tensorrt_llm::runtime::MemoryTypeString&lt;MemoryType::kUVM&gt;::value (C++ member)</a>
 </li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime18MemsetConfiguratorE">tensorrt_llm::runtime::MemsetConfigurator (C++ struct)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime18MemsetConfigurator8mAddressE">tensorrt_llm::runtime::MemsetConfigurator::mAddress (C++ member)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime18MemsetConfigurator18MemsetConfiguratorE11CUdeviceptr6size_t7uint8_t8CUstream">tensorrt_llm::runtime::MemsetConfigurator::MemsetConfigurator (C++ function)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime18MemsetConfigurator10mFirstTimeE">tensorrt_llm::runtime::MemsetConfigurator::mFirstTime (C++ member)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime18MemsetConfigurator5mSizeE">tensorrt_llm::runtime::MemsetConfigurator::mSize (C++ member)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime18MemsetConfigurator7mStreamE">tensorrt_llm::runtime::MemsetConfigurator::mStream (C++ member)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime18MemsetConfigurator6mValueE">tensorrt_llm::runtime::MemsetConfigurator::mValue (C++ member)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime18MemsetConfigurator5setupE28CUmemGenericAllocationHandle">tensorrt_llm::runtime::MemsetConfigurator::setup (C++ function)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime18MemsetConfigurator8teardownE28CUmemGenericAllocationHandleb">tensorrt_llm::runtime::MemsetConfigurator::teardown (C++ function)</a>
+</li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime11ModelConfigE">tensorrt_llm::runtime::ModelConfig (C++ class)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime11ModelConfig20computeContextLogitsEb">tensorrt_llm::runtime::ModelConfig::computeContextLogits (C++ function)</a>, <a href="_cpp_gen/runtime.html#_CPPv4NK12tensorrt_llm7runtime11ModelConfig20computeContextLogitsEv">[1]</a>
@@ -10603,6 +10864,40 @@
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime17MPI_group_barrierENSt3setIiEE">tensorrt_llm::runtime::MPI_group_barrier (C++ function)</a>
 </li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime21MulticastConfiguratorE">tensorrt_llm::runtime::MulticastConfigurator (C++ struct)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime21MulticastConfigurator11mBindOffsetE">tensorrt_llm::runtime::MulticastConfigurator::mBindOffset (C++ member)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime21MulticastConfigurator7mDeviceE">tensorrt_llm::runtime::MulticastConfigurator::mDevice (C++ member)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime21MulticastConfigurator10mMulticastE">tensorrt_llm::runtime::MulticastConfigurator::mMulticast (C++ member)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime21MulticastConfigurator5mSizeE">tensorrt_llm::runtime::MulticastConfigurator::mSize (C++ member)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime21MulticastConfigurator5setupE28CUmemGenericAllocationHandle">tensorrt_llm::runtime::MulticastConfigurator::setup (C++ function)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime21MulticastConfigurator8teardownE28CUmemGenericAllocationHandleb">tensorrt_llm::runtime::MulticastConfigurator::teardown (C++ function)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime19OffloadConfiguratorE">tensorrt_llm::runtime::OffloadConfigurator (C++ struct)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime19OffloadConfigurator8mAddressE">tensorrt_llm::runtime::OffloadConfigurator::mAddress (C++ member)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime19OffloadConfigurator14mBackedStorageE">tensorrt_llm::runtime::OffloadConfigurator::mBackedStorage (C++ member)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime19OffloadConfigurator9mBackTypeE">tensorrt_llm::runtime::OffloadConfigurator::mBackType (C++ member)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime19OffloadConfigurator9mOndemandE">tensorrt_llm::runtime::OffloadConfigurator::mOndemand (C++ member)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime19OffloadConfigurator5mSizeE">tensorrt_llm::runtime::OffloadConfigurator::mSize (C++ member)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime19OffloadConfigurator7mStreamE">tensorrt_llm::runtime::OffloadConfigurator::mStream (C++ member)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime19OffloadConfigurator19OffloadConfiguratorE11CUdeviceptr6size_t10MemoryType8CUstreamb">tensorrt_llm::runtime::OffloadConfigurator::OffloadConfigurator (C++ function)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime19OffloadConfigurator5setupE28CUmemGenericAllocationHandle">tensorrt_llm::runtime::OffloadConfigurator::setup (C++ function)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime19OffloadConfigurator8teardownE28CUmemGenericAllocationHandleb">tensorrt_llm::runtime::OffloadConfigurator::teardown (C++ function)</a>
+</li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimelsERNSt7ostreamERK10LoraModule">tensorrt_llm::runtime::operator&lt;&lt; (C++ function)</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimelsERNSt7ostreamERK26LoraCachePageManagerConfig">[1]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimelsERNSt7ostreamERK7IBuffer">[2]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimelsERNSt7ostreamERK7ITensor">[3]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimelsERNSt7ostreamERKN7ITensor5ShapeE">[4]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtimelsERNSt7ostreamERKN9LoraCache21TaskLayerModuleConfigE">[5]</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4I0EN12tensorrt_llm7runtime18PointerElementTypeE">tensorrt_llm::runtime::PointerElementType (C++ type)</a>
@@ -10744,6 +11039,8 @@
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14SamplingConfig8validateEv">tensorrt_llm::runtime::SamplingConfig::validate (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4I0EN12tensorrt_llm7runtime14SamplingConfig11validateVecEbNSt6stringERK6OptVecI1TE1TNSt8optionalI1TEE">tensorrt_llm::runtime::SamplingConfig::validateVec (C++ function)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime25setVirtualMemoryAllocatorERKNSt6stringEN26CudaVirtualMemoryAllocator11RestoreModeENSt10shared_ptrI10CudaStreamEE">tensorrt_llm::runtime::setVirtualMemoryAllocator (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime10SizeType32E">tensorrt_llm::runtime::SizeType32 (C++ type)</a>
 </li>
@@ -10925,6 +11222,20 @@
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime11TRTDataTypeIPvE5valueE">tensorrt_llm::runtime::TRTDataType&lt;void*&gt;::value (C++ member)</a>
 </li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime19UnicastConfiguratorE">tensorrt_llm::runtime::UnicastConfigurator (C++ struct)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime19UnicastConfigurator8mAddressE">tensorrt_llm::runtime::UnicastConfigurator::mAddress (C++ member)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime19UnicastConfigurator5mDescE">tensorrt_llm::runtime::UnicastConfigurator::mDesc (C++ member)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime19UnicastConfigurator5mSizeE">tensorrt_llm::runtime::UnicastConfigurator::mSize (C++ member)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime19UnicastConfigurator5setupE28CUmemGenericAllocationHandle">tensorrt_llm::runtime::UnicastConfigurator::setup (C++ function)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime19UnicastConfigurator8teardownE28CUmemGenericAllocationHandleb">tensorrt_llm::runtime::UnicastConfigurator::teardown (C++ function)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime19UnicastConfigurator19UnicastConfiguratorE11CUdeviceptr6size_tRK15CUmemAccessDesc">tensorrt_llm::runtime::UnicastConfigurator::UnicastConfigurator (C++ function)</a>
+</li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime11UniqueTokenE">tensorrt_llm::runtime::UniqueToken (C++ struct)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4NK12tensorrt_llm7runtime11UniqueTokeneqERK11UniqueToken">tensorrt_llm::runtime::UniqueToken::operator== (C++ function)</a>
@@ -11023,6 +11334,8 @@
         <li><a href="llm-api/reference.html#id4">(tensorrt_llm.llmapi.CompletionOutput property)</a>
 </li>
       </ul></li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AttentionDpConfig.timeout_iters">timeout_iters (tensorrt_llm.llmapi.AttentionDpConfig attribute)</a>
+</li>
       <li><a href="python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.embedding.TimestepEmbedding">TimestepEmbedding (class in tensorrt_llm.layers.embedding)</a>
 </li>
       <li><a href="python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.embedding.Timesteps">Timesteps (class in tensorrt_llm.layers.embedding)</a>
@@ -11294,6 +11607,8 @@
 </li>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-throughput-dataset">--dataset</a>
 </li>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-throughput-enable_chunked_context">--disable_chunked_context</a>
+</li>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-throughput-enable_chunked_context">--enable_chunked_context</a>
 </li>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-throughput-engine_dir">--engine_dir</a>
@@ -11345,87 +11660,87 @@
     trtllm-serve-disaggregated command line option
 
       <ul>
-        <li><a href="commands/trtllm-serve.html#cmdoption-trtllm-serve-disaggregated-c">--config_file</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-disaggregated-c">--config_file</a>
 </li>
-        <li><a href="commands/trtllm-serve.html#cmdoption-trtllm-serve-disaggregated-l">--log_level</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-disaggregated-l">--log_level</a>
 </li>
-        <li><a href="commands/trtllm-serve.html#cmdoption-trtllm-serve-disaggregated-m">--metadata_server_config_file</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-disaggregated-m">--metadata_server_config_file</a>
 </li>
-        <li><a href="commands/trtllm-serve.html#cmdoption-trtllm-serve-disaggregated-r">--request_timeout</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-disaggregated-r">--request_timeout</a>
 </li>
-        <li><a href="commands/trtllm-serve.html#cmdoption-trtllm-serve-disaggregated-t">--server_start_timeout</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-disaggregated-t">--server_start_timeout</a>
 </li>
-        <li><a href="commands/trtllm-serve.html#cmdoption-trtllm-serve-disaggregated-c">-c</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-disaggregated-c">-c</a>
 </li>
-        <li><a href="commands/trtllm-serve.html#cmdoption-trtllm-serve-disaggregated-l">-l</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-disaggregated-l">-l</a>
 </li>
-        <li><a href="commands/trtllm-serve.html#cmdoption-trtllm-serve-disaggregated-m">-m</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-disaggregated-m">-m</a>
 </li>
-        <li><a href="commands/trtllm-serve.html#cmdoption-trtllm-serve-disaggregated-r">-r</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-disaggregated-r">-r</a>
 </li>
-        <li><a href="commands/trtllm-serve.html#cmdoption-trtllm-serve-disaggregated-t">-t</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-disaggregated-t">-t</a>
 </li>
       </ul></li>
       <li>
     trtllm-serve-disaggregated_mpi_worker command line option
 
       <ul>
-        <li><a href="commands/trtllm-serve.html#cmdoption-trtllm-serve-disaggregated_mpi_worker-c">--config_file</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-disaggregated_mpi_worker-c">--config_file</a>
 </li>
-        <li><a href="commands/trtllm-serve.html#cmdoption-trtllm-serve-disaggregated_mpi_worker-log_level">--log_level</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-disaggregated_mpi_worker-log_level">--log_level</a>
 </li>
-        <li><a href="commands/trtllm-serve.html#cmdoption-trtllm-serve-disaggregated_mpi_worker-c">-c</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-disaggregated_mpi_worker-c">-c</a>
 </li>
       </ul></li>
       <li>
     trtllm-serve-serve command line option
 
       <ul>
-        <li><a href="commands/trtllm-serve.html#cmdoption-trtllm-serve-serve-backend">--backend</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-backend">--backend</a>
 </li>
-        <li><a href="commands/trtllm-serve.html#cmdoption-trtllm-serve-serve-cluster_size">--cluster_size</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-cluster_size">--cluster_size</a>
 </li>
-        <li><a href="commands/trtllm-serve.html#cmdoption-trtllm-serve-serve-ep_size">--ep_size</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-ep_size">--ep_size</a>
 </li>
-        <li><a href="commands/trtllm-serve.html#cmdoption-trtllm-serve-serve-extra_llm_api_options">--extra_llm_api_options</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-extra_llm_api_options">--extra_llm_api_options</a>
 </li>
-        <li><a href="commands/trtllm-serve.html#cmdoption-trtllm-serve-serve-fail_fast_on_attention_window_too_large">--fail_fast_on_attention_window_too_large</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-fail_fast_on_attention_window_too_large">--fail_fast_on_attention_window_too_large</a>
 </li>
-        <li><a href="commands/trtllm-serve.html#cmdoption-trtllm-serve-serve-gpus_per_node">--gpus_per_node</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-gpus_per_node">--gpus_per_node</a>
 </li>
-        <li><a href="commands/trtllm-serve.html#cmdoption-trtllm-serve-serve-host">--host</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-host">--host</a>
 </li>
-        <li><a href="commands/trtllm-serve.html#cmdoption-trtllm-serve-serve-kv_cache_free_gpu_memory_fraction">--kv_cache_free_gpu_memory_fraction</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-kv_cache_free_gpu_memory_fraction">--kv_cache_free_gpu_memory_fraction</a>
 </li>
-        <li><a href="commands/trtllm-serve.html#cmdoption-trtllm-serve-serve-log_level">--log_level</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-log_level">--log_level</a>
 </li>
-        <li><a href="commands/trtllm-serve.html#cmdoption-trtllm-serve-serve-max_batch_size">--max_batch_size</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-max_batch_size">--max_batch_size</a>
 </li>
-        <li><a href="commands/trtllm-serve.html#cmdoption-trtllm-serve-serve-max_beam_width">--max_beam_width</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-max_beam_width">--max_beam_width</a>
 </li>
-        <li><a href="commands/trtllm-serve.html#cmdoption-trtllm-serve-serve-max_num_tokens">--max_num_tokens</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-max_num_tokens">--max_num_tokens</a>
 </li>
-        <li><a href="commands/trtllm-serve.html#cmdoption-trtllm-serve-serve-max_seq_len">--max_seq_len</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-max_seq_len">--max_seq_len</a>
 </li>
-        <li><a href="commands/trtllm-serve.html#cmdoption-trtllm-serve-serve-metadata_server_config_file">--metadata_server_config_file</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-metadata_server_config_file">--metadata_server_config_file</a>
 </li>
-        <li><a href="commands/trtllm-serve.html#cmdoption-trtllm-serve-serve-num_postprocess_workers">--num_postprocess_workers</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-num_postprocess_workers">--num_postprocess_workers</a>
 </li>
-        <li><a href="commands/trtllm-serve.html#cmdoption-trtllm-serve-serve-port">--port</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-port">--port</a>
 </li>
-        <li><a href="commands/trtllm-serve.html#cmdoption-trtllm-serve-serve-pp_size">--pp_size</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-pp_size">--pp_size</a>
 </li>
-        <li><a href="commands/trtllm-serve.html#cmdoption-trtllm-serve-serve-reasoning_parser">--reasoning_parser</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-reasoning_parser">--reasoning_parser</a>
 </li>
-        <li><a href="commands/trtllm-serve.html#cmdoption-trtllm-serve-serve-server_role">--server_role</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-server_role">--server_role</a>
 </li>
-        <li><a href="commands/trtllm-serve.html#cmdoption-trtllm-serve-serve-tokenizer">--tokenizer</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-tokenizer">--tokenizer</a>
 </li>
-        <li><a href="commands/trtllm-serve.html#cmdoption-trtllm-serve-serve-tp_size">--tp_size</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-tp_size">--tp_size</a>
 </li>
-        <li><a href="commands/trtllm-serve.html#cmdoption-trtllm-serve-serve-trust_remote_code">--trust_remote_code</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-trust_remote_code">--trust_remote_code</a>
 </li>
-        <li><a href="commands/trtllm-serve.html#cmdoption-trtllm-serve-serve-arg-MODEL">MODEL</a>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-arg-MODEL">MODEL</a>
 </li>
       </ul></li>
       <li><a href="python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.ModelConfig.trtllm_modules_to_hf_modules">trtllm_modules_to_hf_modules (tensorrt_llm.runtime.ModelConfig attribute)</a>
@@ -11476,9 +11791,11 @@
         <li><a href="python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.SamplingConfig.update">(tensorrt_llm.runtime.SamplingConfig method)</a>
 </li>
       </ul></li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.update_forward_refs">update_forward_refs() (tensorrt_llm.llmapi.AutoDecodingConfig class method)</a>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AttentionDpConfig.update_forward_refs">update_forward_refs() (tensorrt_llm.llmapi.AttentionDpConfig class method)</a>
 
       <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.update_forward_refs">(tensorrt_llm.llmapi.AutoDecodingConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CacheTransceiverConfig.update_forward_refs">(tensorrt_llm.llmapi.CacheTransceiverConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CalibConfig.update_forward_refs">(tensorrt_llm.llmapi.CalibConfig class method)</a>
@@ -11598,9 +11915,11 @@
 <h2 id="V">V</h2>
 <table style="width: 100%" class="indextable genindextable"><tr>
   <td style="width: 33%; vertical-align: top;"><ul>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.validate">validate() (tensorrt_llm.llmapi.AutoDecodingConfig method)</a>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AttentionDpConfig.validate">validate() (tensorrt_llm.llmapi.AttentionDpConfig class method)</a>
 
       <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.validate">(tensorrt_llm.llmapi.AutoDecodingConfig method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CacheTransceiverConfig.validate">(tensorrt_llm.llmapi.CacheTransceiverConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.CalibConfig.validate">(tensorrt_llm.llmapi.CalibConfig class method)</a>
@@ -11640,6 +11959,8 @@
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TrtLlmArgs.validate_and_init_tokenizer">(tensorrt_llm.llmapi.TrtLlmArgs method)</a>
 </li>
       </ul></li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.validate_attention_dp_config">validate_attention_dp_config() (tensorrt_llm.llmapi.TorchLlmArgs method)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TrtLlmArgs.validate_auto_parallel">validate_auto_parallel() (tensorrt_llm.llmapi.TrtLlmArgs method)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.validate_build_config_remaining">validate_build_config_remaining() (tensorrt_llm.llmapi.TorchLlmArgs method)</a>
@@ -11968,9 +12289,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on August 01, 2025.</p>
+  <p>Last updated on August 06, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/fbee279">fbee279</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/a16ba64">a16ba64</a>.</p>
   
 </div></div>
       

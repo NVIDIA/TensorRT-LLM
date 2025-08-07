@@ -59,7 +59,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc5';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc6';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -71,7 +71,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.0.0rc5" />
+  <meta name="docsearch:version" content="1.0.0rc6" />
 
 
   </head>
@@ -387,7 +387,11 @@
 <li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-bench.html">trtllm-bench</a></li>
 
 <li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-build.html">trtllm-build</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-serve.html">trtllm-serve</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../commands/trtllm-serve/index.html">trtllm-serve</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../commands/trtllm-serve/trtllm-serve.html">trtllm-serve</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../commands/trtllm-serve/run-benchmark-with-trtllm-serve.html">Run benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></a></li>
+</ul>
+</details></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Architecture</span></p>
 <ul class="nav bd-sidenav">
@@ -504,13 +508,15 @@
 <p class="rubric" id="install-prerequisites">Install prerequisites</p>
 <p>Before the pre-built Python wheel can be installed via <code class="docutils literal notranslate"><span class="pre">pip</span></code>, a few
 prerequisites must be put into place:</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Optional step: Only required for Blackwell and Grace Hopper</span>
+<p>Install CUDA Toolkit following the <a class="reference external" href="https://docs.nvidia.com/cuda/cuda-installation-guide-linux/">CUDA Installation Guide for Linux</a> and
+make sure <code class="docutils literal notranslate"><span class="pre">CUDA_HOME</span></code> environment variable is properly set.</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Optional step: Only required for NVIDIA Blackwell GPUs and SBSA platform</span>
 pip3<span class="w"> </span>install<span class="w"> </span><span class="nv">torch</span><span class="o">==</span><span class="m">2</span>.7.1<span class="w"> </span>torchvision<span class="w"> </span>torchaudio<span class="w"> </span>--index-url<span class="w"> </span>https://download.pytorch.org/whl/cu128
 
 sudo<span class="w"> </span>apt-get<span class="w"> </span>-y<span class="w"> </span>install<span class="w"> </span>libopenmpi-dev
 </pre></div>
 </div>
-<p>PyTorch CUDA 12.8 package is required for supporting NVIDIA Blackwell and Grace Hopper GPUs. On prior GPUs, this extra installation is not required.</p>
+<p>PyTorch CUDA 12.8 package is required for supporting NVIDIA Blackwell GPUs and SBSA platform. On prior GPUs or Linux x86_64 platform, this extra installation is not required.</p>
 <div class="admonition tip">
 <p class="admonition-title">Tip</p>
 <p>Instead of manually installing the preqrequisites as described
@@ -575,17 +581,6 @@ The setup methods depends on your slurm configuration, pls check with your admin
 <span class="n">to</span> <span class="n">discover</span> <span class="n">a</span> <span class="n">SLURM</span> <span class="n">installation</span> <span class="ow">in</span> <span class="n">the</span> <span class="n">usual</span> <span class="n">places</span><span class="o">.</span>
 </pre></div>
 </div>
-</li>
-<li><p>CUDA Toolkit</p>
-<p><code class="docutils literal notranslate"><span class="pre">pip</span> <span class="pre">install</span> <span class="pre">tensorrt-llm</span></code> won’t install CUDA toolkit in your system, and the CUDA Toolkit is not required if want to just deploy a TensorRT-LLM engine.
-TensorRT-LLM uses the <a class="reference external" href="https://nvidia.github.io/TensorRT-Model-Optimizer/">ModelOpt</a> to quantize a model, while the ModelOpt requires CUDA toolkit to jit compile certain kernels which is not included in the pytorch to do quantization effectively.
-Please install CUDA toolkit when you see the following message when running ModelOpt quantization.</p>
-<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="o">/</span><span class="n">usr</span><span class="o">/</span><span class="n">local</span><span class="o">/</span><span class="n">lib</span><span class="o">/</span><span class="n">python3</span><span class="mf">.10</span><span class="o">/</span><span class="n">dist</span><span class="o">-</span><span class="n">packages</span><span class="o">/</span><span class="n">modelopt</span><span class="o">/</span><span class="n">torch</span><span class="o">/</span><span class="n">utils</span><span class="o">/</span><span class="n">cpp_extension</span><span class="o">.</span><span class="n">py</span><span class="p">:</span><span class="mi">65</span><span class="p">:</span>
-<span class="ne">UserWarning</span><span class="p">:</span> <span class="n">CUDA_HOME</span> <span class="n">environment</span> <span class="n">variable</span> <span class="ow">is</span> <span class="ow">not</span> <span class="nb">set</span><span class="o">.</span> <span class="n">Please</span> <span class="nb">set</span> <span class="n">it</span> <span class="n">to</span> <span class="n">your</span> <span class="n">CUDA</span> <span class="n">install</span> <span class="n">root</span><span class="o">.</span>
-<span class="n">Unable</span> <span class="n">to</span> <span class="n">load</span> <span class="n">extension</span> <span class="n">modelopt_cuda_ext</span> <span class="ow">and</span> <span class="n">falling</span> <span class="n">back</span> <span class="n">to</span> <span class="n">CPU</span> <span class="n">version</span><span class="o">.</span>
-</pre></div>
-</div>
-<p>The installation of CUDA toolkit can be found in <a class="reference external" href="https://docs.nvidia.com/cuda/">CUDA Toolkit Documentation</a>.</p>
 </li>
 </ol>
 </section>
@@ -718,9 +713,9 @@ Please install CUDA toolkit when you see the following message when running Mode
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on August 01, 2025.</p>
+  <p>Last updated on August 06, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/fbee279">fbee279</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/a16ba64">a16ba64</a>.</p>
   
 </div></div>
       
