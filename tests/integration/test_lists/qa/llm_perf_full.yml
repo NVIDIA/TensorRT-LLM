@@ -1,5 +1,5 @@
 version: 0.0.1
-trt_llm_release_perf_test:
+llm_perf_full:
 # one gpu test
 - condition:
     ranges:
