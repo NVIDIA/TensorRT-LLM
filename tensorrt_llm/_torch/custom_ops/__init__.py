@@ -1,6 +1,6 @@
+from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from ..modules.attention import attn_custom_op_inplace, mla_custom_op_inplace
 from .cpp_custom_ops import _register_fake
-from .flashinfer_custom_ops import IS_FLASHINFER_AVAILABLE
 from .torch_custom_ops import bmm_out
 from .trtllm_gen_custom_ops import fp8_block_scale_moe_runner
 from .userbuffers_custom_ops import add_to_ub, copy_to_userbuffers, matmul_to_ub
