@@ -216,10 +216,16 @@ public:
             std::deque<tensorrt_llm::executor::KVCacheEvent>, tbk::BaseKVCacheManager, getLatestEvents, timeout);
     }
 
-    tensorrt_llm::runtime::ITensor::SharedPtr getPrimaryPool(SizeType32 layer_idx) const override
+    tensorrt_llm::runtime::ITensor::SharedPtr getPrimaryPool(SizeType32 poolIdx) const override
     {
         PYBIND11_OVERLOAD_PURE(
-            tensorrt_llm::runtime::ITensor::SharedPtr, tbk::BaseKVCacheManager, getPrimaryPool, layer_idx);
+            tensorrt_llm::runtime::ITensor::SharedPtr, tbk::BaseKVCacheManager, getPrimaryPool, poolIdx);
+    }
+
+    tensorrt_llm::runtime::ITensor::SharedPtr getUniquePrimaryPool() const override
+    {
+        PYBIND11_OVERLOAD_PURE(
+            tensorrt_llm::runtime::ITensor::SharedPtr, tbk::BaseKVCacheManager, getUniquePrimaryPool);
     }
 
     SizeType32 getPoolLayerIdx(SizeType32 layer_idx) const override
@@ -380,6 +386,7 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
                 auto pool_layer_idx = self.getPoolLayerIdx(layer_idx);
                 return pool.index({torch::indexing::Slice(), pool_layer_idx});
             })
+        .def("get_unique_primary_pool", [](tbk::BaseKVCacheManager& self) { return self.getUniquePrimaryPool(); })
         .def("get_block_offsets_of_batch",
             [](tbk::BaseKVCacheManager& self, at::Tensor output, SizeType32 firstBatchSlotIdx, SizeType32 batchSize,
                 SizeType32 beamWidth)

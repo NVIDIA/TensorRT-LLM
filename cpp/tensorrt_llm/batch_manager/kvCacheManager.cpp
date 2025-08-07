@@ -2522,6 +2522,13 @@ std::vector<SizeType32> KVCacheManager::getNewlyAllocatedBlockIds(
     return mBlockManager.getNewlyAllocatedBlockIds(getSequence(requestId), windowSize);
 }
 
+runtime::ITensor::SharedPtr KVCacheManager::getUniquePrimaryPool() const
+{
+    TLLM_CHECK_WITH_INFO(mBlockManager.getWindowSizesMetadata().size() == 1,
+        "getUniquePrimaryPool is only supported for a single window size");
+    return mBlockManager.getPrimaryPool(0);
+}
+
 runtime::ITensor::SharedPtr KVCacheManager::getPrimaryPool(SizeType32 layer_idx) const
 {
     return mBlockManager.getPrimaryPool(mBlockManager.getLayerPoolIdx(layer_idx));
