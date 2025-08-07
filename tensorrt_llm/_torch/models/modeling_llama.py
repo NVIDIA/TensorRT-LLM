@@ -75,9 +75,9 @@ class Llama4Attention(Attention):
             # pre-Blackwell spec-dec kernel does not support
             attention_chunk_size = None
         else:
-            # Disable chunked attention when max_num_tokens is smaller than attention_chunk_size
+            # Disable chunked attention when max_seq_len is smaller than attention_chunk_size
             # TODO: Remove this after all attention kernels in TRTLLM backend support chunked attention
-            if attention_chunk_size and model_config.max_num_tokens < attention_chunk_size:
+            if attention_chunk_size and model_config.max_seq_len < attention_chunk_size:
                 attention_chunk_size = None
 
         super().__init__(
