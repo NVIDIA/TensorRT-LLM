@@ -398,7 +398,7 @@ IPluginV2* SmoothQuantGemmPluginCreator::createPlugin(char const* name, PluginFi
         // Create plugin profiler with shared tactics map
         auto pluginProfiler = gemmPluginProfileManager.createGemmPluginProfiler(/* inference */ false);
         QuantMode quantMode = QuantMode::fromDescription(true, true, perTokenScaling, perChannelScaling, false, false,
-            false, false, false, false, false, false, false, false);
+            false, false, false, false, false, false, false, false, false, false);
         auto* obj = new SmoothQuantGemmPlugin(quantMode, type, pluginProfiler);
         obj->setPluginNamespace(mNamespace.c_str());
         return obj;

@@ -27,6 +27,7 @@ KvCacheConfig::KvCacheConfig(bool enableBlockReuse, std::optional<SizeType32> co
     std::optional<size_t> const& hostCacheSize, bool onboardBlocks,
     std::optional<FloatType> const& crossKvCacheFraction, std::optional<RetentionPriority> secondaryOffloadMinPriority,
     size_t eventBufferMaxSize, bool enablePartialReuse, bool copyOnPartialReuse, bool useUvm,
+    SizeType32 attentionDpEventsGatherPeriodMs,
     std::optional<tensorrt_llm::runtime::RuntimeDefaults> const& runtimeDefaults)
     : mEnableBlockReuse(enableBlockReuse)
     , mHostCacheSize(hostCacheSize)
@@ -36,6 +37,7 @@ KvCacheConfig::KvCacheConfig(bool enableBlockReuse, std::optional<SizeType32> co
     , mEnablePartialReuse{enablePartialReuse}
     , mCopyOnPartialReuse{copyOnPartialReuse}
     , mUseUvm{useUvm}
+    , mAttentionDpEventsGatherPeriodMs(attentionDpEventsGatherPeriodMs)
 {
     if (maxTokens)
     {
@@ -61,6 +63,8 @@ KvCacheConfig::KvCacheConfig(bool enableBlockReuse, std::optional<SizeType32> co
     {
         fillEmptyFieldsFromRuntimeDefaults(runtimeDefaults.value());
     }
+    TLLM_CHECK_WITH_INFO(
+        mAttentionDpEventsGatherPeriodMs > 0, "Attention DP events gather period must be greater than 0");
 }
 
 bool KvCacheConfig::getEnableBlockReuse() const
@@ -126,6 +130,11 @@ size_t KvCacheConfig::getEventBufferMaxSize() const
 bool KvCacheConfig::getUseUvm() const
 {
     return mUseUvm;
+}
+
+SizeType32 KvCacheConfig::getAttentionDpEventsGatherPeriodMs() const
+{
+    return mAttentionDpEventsGatherPeriodMs;
 }
 
 void KvCacheConfig::setEnableBlockReuse(bool enableBlockReuse)
@@ -202,6 +211,12 @@ void KvCacheConfig::setEventBufferMaxSize(size_t eventBufferMaxSize)
 void KvCacheConfig::setUseUvm(bool useUvm)
 {
     mUseUvm = useUvm;
+}
+
+void KvCacheConfig::setAttentionDpEventsGatherPeriodMs(SizeType32 attentionDpEventsGatherPeriodMs)
+{
+    TLLM_CHECK(attentionDpEventsGatherPeriodMs > 0);
+    mAttentionDpEventsGatherPeriodMs = attentionDpEventsGatherPeriodMs;
 }
 
 void KvCacheConfig::fillEmptyFieldsFromRuntimeDefaults(tensorrt_llm::runtime::RuntimeDefaults const& runtimeDefaults)

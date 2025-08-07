@@ -1,5 +1,5 @@
 version: 0.0.1
-trt_llm_release_perf_sanity_test:
+llm_perf_sanity:
 - condition:
     ranges:
       system_gpu_count:

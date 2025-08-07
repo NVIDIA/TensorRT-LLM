@@ -12,6 +12,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import ctypes
+import os
 import platform
 import sys
 from dataclasses import dataclass
@@ -19,7 +21,11 @@ from typing import Optional
 
 import pynvml
 import torch
-from cuda import cuda
+
+try:
+    from cuda.bindings import driver as cuda
+except ImportError:
+    from cuda import cuda
 
 from ._dlpack_utils import pack_strided_memory
 from ._utils import mpi_comm
@@ -110,9 +116,19 @@ class MnnvlMemory:
         location.id = dev_id
         allocation_prop = cuda.CUmemAllocationProp()
         allocation_prop.type = cuda.CUmemAllocationType.CU_MEM_ALLOCATION_TYPE_PINNED
-        allocation_prop.requestedHandleTypes = (
-            cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
-        )
+
+        # TODO: We differentiate FABRIC for GB200 (aarch64) and POSIX_FILE_DESCRIPTOR for BB200 (x86_64).
+        # May need to find a better way to handle this.
+        arch = platform.machine().lower()
+        is_on_aarch64 = "aarch64" in arch
+        if is_on_aarch64:
+            allocation_prop.requestedHandleTypes = (
+                cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
+            )
+        else:
+            allocation_prop.requestedHandleTypes = (
+                cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_POSIX_FILE_DESCRIPTOR
+            )
         allocation_prop.location = location
         return allocation_prop
 
@@ -174,10 +190,48 @@ class MnnvlMemory:
         )
         exported_fabric_handle = _check_cu_result(
             cuda.cuMemExportToShareableHandle(
-                allocated_mem_handle, cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC, 0
+                allocated_mem_handle, allocation_prop.requestedHandleTypes, 0
             )
         )
-        all_handles_data = comm.allgather(exported_fabric_handle.data)
+        if (
+            allocation_prop.requestedHandleTypes
+            == cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
+        ):
+            all_handles_data = comm.allgather(exported_fabric_handle.data)
+        else:
+            all_handles_data = comm.allgather(exported_fabric_handle)
+            all_pids = comm.allgather(os.getpid())
+            libc = ctypes.CDLL(None, use_errno=True)
+            syscall = libc.syscall
+            SYS_pidfd_open = 434
+            SYS_pidfd_getfd = 438
+            pidfds = []
+            for i, pid in enumerate(all_pids):
+                pidfd = syscall(SYS_pidfd_open, pid, 0)
+                if pidfd < 0:
+                    err = ctypes.get_errno()
+                    raise RuntimeError(
+                        f"pidfd_open({pid}) failed with errno {err}: {os.strerror(err)}"
+                    )
+                pidfds.append(pidfd)
+
+            remote_fds = []
+            for i, (pidfd, fd) in enumerate(zip(pidfds, all_handles_data)):
+                remote_fd = syscall(SYS_pidfd_getfd, pidfd, fd, 0)
+                if remote_fd < 0:
+                    err = ctypes.get_errno()
+                    error_msg = f"pidfd_getfd(pidfd={pidfd}, fd={fd}) failed with errno {err}: {os.strerror(err)}."
+                    if err == 1:  # EPERM
+                        error_msg += (
+                            " Permission denied. If running in a container, try adding --cap-add=SYS_PTRACE "
+                            "to your docker run command."
+                        )
+                    else:
+                        error_msg += " This may be due to kernel version (requires Linux 5.6+)."
+                    raise RuntimeError(error_msg)
+                remote_fds.append(remote_fd)
+
+            all_handles_data = remote_fds
         # all_handles_data like b'\x00\x00\x00 \x00\x00\x00\x00\x8f\xec\x02\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\t\x00\x00\x00\x00\x00\x1d\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00'  # noqa: E501
         # can use buf = memoryview(data) to import if using plain buffer for data.
 
@@ -201,7 +255,7 @@ class MnnvlMemory:
                 # Fabric memory mapping
                 imported_mem_handle = _check_cu_result(
                     cuda.cuMemImportFromShareableHandle(
-                        remote_handle_data, cuda.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
+                        remote_handle_data, allocation_prop.requestedHandleTypes
                     )
                 )
                 mem_handles[i] = imported_mem_handle
@@ -275,13 +329,11 @@ class MnnvlMemory:
     @staticmethod
     def supports_mnnvl() -> bool:
         # TODO:
-        # We check if it is an aarch64 platform and has all NVLink up now.
+        # We check if it has all NVLink up now.
         # But it is not equivalent to MNNVL support.
         # May need better support check.
-        arch = platform.machine().lower()
-        is_on_aarch64 = "aarch64" in arch
         support_nvlink_and_all_up = MnnvlMemory.support_nvlink(True)
-        return is_on_aarch64 and support_nvlink_and_all_up
+        return support_nvlink_and_all_up
 
 
 @dataclass

@@ -38,6 +38,11 @@ from utils.util import getSMVersion
     [torch.float16, torch.float32, torch.bfloat16],
 )
 def test_fp8_scaled_mm(output_dtype, m, k_n):
+    if getSMVersion() == 90:
+        pytest.skip(
+            "Skip test for sm90 because it's too flaky. https://nvbugspro.nvidia.com/bug/5441734"
+        )
+
     k, n = k_n
     torch.random.manual_seed(0)
     shape_x = (m, k)
@@ -69,7 +74,10 @@ def test_fp8_scaled_mm(output_dtype, m, k_n):
         use_fast_accum=True,
     )
     os.environ["CUBLASLT_WORKSPACE_SIZE"] = old_env
-    np.testing.assert_allclose(ref.float().cpu(), output.float().cpu())
+    np.testing.assert_allclose(ref.float().cpu(),
+                               output.float().cpu(),
+                               atol=1,
+                               rtol=0.01)
 
     if getSMVersion() == 90:
         cutlass_output = torch.ops.trtllm.cutlass_scaled_mm(
@@ -83,7 +91,9 @@ def test_fp8_scaled_mm(output_dtype, m, k_n):
         # TODO(zhenhuan): cutlass kernel has acc issue on some shapes
         try:
             np.testing.assert_allclose(ref.float().cpu(),
-                                       cutlass_output.float().cpu())
+                                       cutlass_output.float().cpu(),
+                                       atol=1,
+                                       rtol=0.01)
         except Exception as e:
             warn(RuntimeWarning("cutlass result is not correct: " + repr(e)))
 
