@@ -400,6 +400,7 @@ class KVCacheManager(BaseResourceManager):
         max_num_draft_tokens: int = 0,
         use_mrope: bool = False,
         max_beam_width: int = 1,
+        lora_request=None,
     ):
         beam_width = max_beam_width
         requests = []
@@ -419,6 +420,17 @@ class KVCacheManager(BaseResourceManager):
             # Using 1 instead of 0 prevents NaN during warmup in e.g. Deepseek
             mrope_position_deltas = torch.zeros(
                 1, device="cuda", dtype=torch.int32) if use_mrope else None
+
+            lora_task_id = None
+            lora_weights = None
+            lora_config = None
+
+            if lora_request is not None:
+                # TODO smor currently work with single adapter only, not sure how this should work with request ids
+                lora_task_id = lora_request.task_id
+                lora_weights = lora_request.weights
+                lora_config = lora_request.config
+
             req = LlmRequest(request_id=req_id,
                              max_new_tokens=1,
                              input_tokens=[1] * token_num,
@@ -426,7 +438,10 @@ class KVCacheManager(BaseResourceManager):
                                  sampling_params._get_sampling_config()),
                              is_streaming=False,
                              mrope_position_deltas=mrope_position_deltas,
-                             encoder_input_tokens=encoder_input_tokens)
+                             encoder_input_tokens=encoder_input_tokens,
+                             lora_task_id=lora_task_id,
+                             lora_weights=lora_weights,
+                             lora_config=lora_config)
             req.is_dummy_request = True
             req.paged_kv_block_ids = []
             if prepare_resource:

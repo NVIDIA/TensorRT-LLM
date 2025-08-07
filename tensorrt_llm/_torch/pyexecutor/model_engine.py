@@ -26,7 +26,7 @@ from tensorrt_llm._utils import (is_trace_enabled, nvtx_range, release_gc,
 from tensorrt_llm.inputs.multimodal import (MultimodalParams,
                                             MultimodalRuntimeData)
 from tensorrt_llm.logger import logger
-from tensorrt_llm.lora_manager import LoraConfig, LoraModelConfig
+from tensorrt_llm.lora_manager import LoraConfig, LoraManager, LoraModelConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 from tensorrt_llm.quantization.utils.fp4_utils import float4_e2m1x2
@@ -287,6 +287,16 @@ class PyTorchModelEngine(ModelEngine):
         )
 
         attn_backend = pytorch_backend_config.attn_backend
+
+        self.lora_manager: Optional[LoraManager] = None
+        if lora_config is not None:
+            self.lora_manager = LoraManager()
+
+        self.lora_prefetch_requests_list = None  # TODO smor - fix "LoRARequest" import
+        if lora_config is not None and lora_config.lora_request is not None:
+            self.lora_prefetch_requests_list = lora_config.lora_request
+            self.has_lora_prefetched = False
+
         self.model = self._load_model(
             model_path,
             mapping=self.mapping,
@@ -445,6 +455,27 @@ class PyTorchModelEngine(ModelEngine):
             hidden_size=self.model.config.hidden_size,
             dtype=torch_dtype_to_str(self.model.config.torch_dtype))
 
+    def set_lora_manager_cpp_peft_cache_manager(
+            self, resource_manager: ResourceManager):
+        cpp_peft_cache_manager = resource_manager.get_resource_manager(
+            ResourceManagerType.PEFT_CACHE_MANAGER)
+        if cpp_peft_cache_manager is not None and self.lora_manager is not None:
+            self.lora_manager.set_cpp_peft_cache_manager(
+                cpp_peft_cache_manager.impl)
+
+    def prefetch_lora_dirs(self):
+        if self.lora_prefetch_requests_list is None:
+            return
+
+        for request in self.lora_prefetch_requests_list:
+            self.lora_manager.load_from_ckpt(
+                [request.path],
+                model_config=self.lora_model_config,
+                runtime_mapping=None,
+                uids=[request.adapter_id])
+
+        self.has_lora_prefetched = True
+
     @property
     def use_mrope(self):
         use_mrope = False
@@ -503,6 +534,16 @@ class PyTorchModelEngine(ModelEngine):
         self.cuda_graph_dummy_request = None
 
         def get_cuda_graph_warmup_request(batch_size, draft_len):
+            lora_config = None
+            if self.has_lora_prefetched:
+                # TODO smor currently I assume a single adapter with uid 0, change this
+                uid = 0
+                from tensorrt_llm.bindings import executor as tllm
+                lora_config = tllm.LoraConfig(
+                    task_id=uid,
+                    weights=self.lora_manager.cpp_lora_weights[uid],
+                    config=self.lora_manager.cpp_lora_config[uid])
+
             # Divide by max_beam_width to get an approximation of the number of requests that can be run in parallel.
             available_blocks = kv_cache_manager.get_num_free_blocks(
             ) // self.max_beam_width
@@ -516,7 +557,10 @@ class PyTorchModelEngine(ModelEngine):
                     is_gen=True,
                     max_num_draft_tokens=draft_len,
                     use_mrope=use_mrope,
-                    max_beam_width=self.max_beam_width)
+                    max_beam_width=self.max_beam_width,
+                    lora_request=
+                    lora_config,  # TODO smor- tests assume BS1 then this will be ignored for now, need to resolve
+                )
                 # Divide by max_beam_width to get an approximation of the number of tokens that can be added to the final request.
                 available_tokens = kv_cache_manager.get_num_available_tokens(
                     draft_len)
@@ -530,7 +574,8 @@ class PyTorchModelEngine(ModelEngine):
                     is_gen=True,
                     max_num_draft_tokens=draft_len,
                     use_mrope=use_mrope,
-                    max_beam_width=self.max_beam_width)[0]
+                    max_beam_width=self.max_beam_width,
+                    lora_request=lora_config)[0]
                 # Add the longest request before all other seq_len=1 request to simulate the padding CUDA graph case.
                 # This batch contains both the longest request and the shortest requests,
                 # it also contains the maximum number of requests and the maximum token number,
@@ -926,6 +971,7 @@ class PyTorchModelEngine(ModelEngine):
     def _maybe_get_cuda_graph(
         self,
         batch: ScheduledRequests,
+        resource_manager: Optional[ResourceManager] = None
     ) -> Optional[DecodingCUDAGraphRunner]:
         """
         Get a CUDA graph runner or return None (e.g. if CUDA graphs are disabled
@@ -972,13 +1018,60 @@ class PyTorchModelEngine(ModelEngine):
         else:
             spec_metadata = None
 
+        lora_params = None
+        if self.has_lora_prefetched:
+            peft_cache_manager = resource_manager.get_resource_manager(
+                ResourceManagerType.PEFT_CACHE_MANAGER)
+
+            context_requests = batch.context_requests
+            generation_requests = batch.generation_requests
+
+            if len(context_requests) > 0 and len(generation_requests) > 0:
+                raise ValueError(
+                    "SMOR, non empty context and generation requests isn't tested yet"
+                )
+
+            if len(context_requests) > 0:
+                raise ValueError("SMOR, context requests isn't tested yet")
+
+            if len(generation_requests) > 1:
+                raise ValueError("SMOR, generation requests isn't tested yet")
+
+            generation_request = generation_requests[0]
+            # TODO smor I have no idea why this is happening
+            generation_request.lora_weights = generation_request.lora_weights.reshape(
+                [1] + list(generation_request.lora_weights.shape))
+            generation_request.lora_config = generation_request.lora_config.reshape(
+                [1] + list(generation_request.lora_config.shape))
+            peft_cache_manager.impl.add_request_peft(generation_request, True)
+
+            py_lora_task_layer_module_configs = peft_cache_manager.impl.ensure_batch(
+                context_requests, generation_requests, False)
+            for req in context_requests:
+                req.py_lora_task_layer_module_configs = py_lora_task_layer_module_configs[
+                    req.
+                    py_request_id] if req.py_request_id in py_lora_task_layer_module_configs else None
+            for req in generation_requests:
+                req.py_lora_task_layer_module_configs = py_lora_task_layer_module_configs[
+                    req.
+                    py_request_id] if req.py_request_id in py_lora_task_layer_module_configs else None
+
+            # TODO smor - look at get lora params from requests
+            # You need something that isn't scheduled requests
+            # It also appears that you should make sure resource manager is called, because prefetch
+            # has to be added to peftCacheManager as well. So it still shouldn't work
+
+            lora_params = self._get_lora_params_from_requests(
+                batch, attn_metadata)
+            print(f"SMOR, not failed on lora_params in maybe_get_cuda_graph")
+
         # Initialize nested dictionary if needed
         if batch_size not in self._cuda_graphs:
             self._cuda_graphs[batch_size] = {}
 
         self._cuda_graphs[batch_size][draft_len] = DecodingCUDAGraphRunner(
             num_sequences_in_batch, "cuda", attn_metadata, spec_metadata,
-            self.use_mrope)
+            self.use_mrope, lora_params)
         return self._cuda_graphs[batch_size][draft_len]
 
     def __del__(self) -> None:
@@ -2134,7 +2227,8 @@ class PyTorchModelEngine(ModelEngine):
                                           gather_context_logits)
         with self._maybe_pad_batch(scheduled_requests, kv_cache_manager,
                                    spec_resource_manager) as scheduled_requests:
-            maybe_graph = self._maybe_get_cuda_graph(scheduled_requests)
+            maybe_graph = self._maybe_get_cuda_graph(
+                scheduled_requests, resource_manager=resource_manager)
             if maybe_graph is not None:
                 attn_metadata = maybe_graph.attn_metadata
                 spec_metadata = maybe_graph.spec_metadata

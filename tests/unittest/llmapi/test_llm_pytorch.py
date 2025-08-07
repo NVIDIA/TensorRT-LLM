@@ -783,3 +783,33 @@ def test_gqa_nemo_lora(tmp_path):
             f"got: {base_outputs[0].outputs[0].text}"
     finally:
         llm.shutdown()
+
+
+def test_lora_dir_with_graph():
+    lora_req = LoRARequest(
+        "task-0", 0, f"{llm_models_root()}/llama-models/luotuo-lora-7b-0.1")
+
+    lora_config = LoraConfig(
+        lora_dir=[f"{llm_models_root()}/llama-models/luotuo-lora-7b-0.1"],
+        max_lora_rank=8,
+        lora_request=[lora_req])
+
+    llm = LLM(model=f"{llm_models_root()}/llama-models/llama-7b-hf",
+              lora_config=lora_config,
+              cuda_graph_config=None)
+    #   cuda_graph_config=CudaGraphConfig(max_batch_size=1))
+
+    prompts = [
+        "美国的首都在哪里? \n答案:",
+    ]
+    references = [
+        "美国的首都是华盛顿。\n\n美国的",
+    ]
+    sampling_params = SamplingParams(max_tokens=20)
+    lora_request = [lora_req]
+
+    outputs = llm.generate(prompts, sampling_params, lora_request=lora_request)
+
+    assert similar(outputs[0].outputs[0].text, references[0])
+    print(f"lora output: {outputs[0].outputs[0].text}")
+    print(f"ref  output: {references[0]}")
