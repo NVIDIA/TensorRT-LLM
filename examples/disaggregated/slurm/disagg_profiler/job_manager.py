@@ -648,6 +648,10 @@ class JobManager:
         if 'env' in config:
             for key, value in config['env'].items():
                 envs += f" {key}={value}"
+        unset_env = ''
+        if 'unset_env' in config:
+            for key in config['unset_env']:
+                unset_env += f" -u {key}"
         log_file = os.path.join(self.output_folder, log_file)
 
         # Build the command
@@ -672,13 +676,11 @@ class JobManager:
             f"--container-image={self.container_image}",
             f"--container-mounts={self.mounts}",
             f"--container-workdir={self.workdir}",
-            f"--container-env=FREE_PORT",
-            "--export=\"'CUDA_VISIBLE_DEVICES=" + cuda_visible_devices +
-            "',FREE_PORT=" + str(node_port - 1000) + "\"",
+            "--export=\"'CUDA_VISIBLE_DEVICES=" + cuda_visible_devices + "\"",
             "bash",
             "-c",
             envs +
-            " env -u UCX_NET_DEVICES trtllm-llmapi-launch trtllm-serve " +
+            " env " + unset_env + " trtllm-llmapi-launch trtllm-serve " +
             self.config['exec']['model_path'] + " --host 0.0.0.0 --port " +
             str(node_port) + " --backend pytorch --extra_llm_api_options " +
             config_path + " --tp_size " + str(tp) + " --ep_size " + str(ep) +
