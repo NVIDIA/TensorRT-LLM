@@ -1063,7 +1063,7 @@ def get_weight_scale_interleave_factor(interleaved_dim: int,
             factor = 1
         else:
             raise NotImplementedError(
-                f"Group dimension is required to be multiple of 128, received {interleaved_dim}."
+                f"Interleaved dimension must be a multiple of group_size ({group_size}), received {interleaved_dim}."
             )
     return factor
 
