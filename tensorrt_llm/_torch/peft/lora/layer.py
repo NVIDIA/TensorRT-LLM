@@ -10,6 +10,7 @@ class LoraModuleType(IntEnum):
     This enum maps to the different attention and MLP components in a transformer model
     that can be adapted using LoRA weights.
     """
+
     ATTENTION_QKV = 0  # Combined QKV projection
     ATTENTION_Q = 1  # Query projection
     ATTENTION_K = 2  # Key projection
@@ -60,32 +61,37 @@ class LoraModuleType(IntEnum):
     def is_attention(self) -> bool:
         """Check if this is an attention module type."""
         return self in {
-            self.ATTENTION_QKV, self.ATTENTION_Q, self.ATTENTION_K,
-            self.ATTENTION_V, self.ATTENTION_DENSE, self.CROSS_ATTENTION_QKV,
-            self.CROSS_ATTENTION_Q, self.CROSS_ATTENTION_K,
-            self.CROSS_ATTENTION_V, self.CROSS_ATTENTION_DENSE
+            self.ATTENTION_QKV,
+            self.ATTENTION_Q,
+            self.ATTENTION_K,
+            self.ATTENTION_V,
+            self.ATTENTION_DENSE,
+            self.CROSS_ATTENTION_QKV,
+            self.CROSS_ATTENTION_Q,
+            self.CROSS_ATTENTION_K,
+            self.CROSS_ATTENTION_V,
+            self.CROSS_ATTENTION_DENSE,
         }
 
     @property
     def is_mlp(self) -> bool:
         """Check if this is an MLP module type."""
         return self in {
-            self.MLP_H_TO_4H, self.MLP_4H_TO_H, self.MLP_GATE, self.MLP_GATE_UP,
-            self.MLP_ROUTER
+            self.MLP_H_TO_4H,
+            self.MLP_4H_TO_H,
+            self.MLP_GATE,
+            self.MLP_GATE_UP,
+            self.MLP_ROUTER,
         }
 
     @property
     def is_moe(self) -> bool:
         """Check if this is a Mixture of Experts (MoE) module type."""
-        return self in {
-            self.MOE_H_TO_4H, self.MOE_4H_TO_H, self.MOE_GATE, self.MOE_ROUTER
-        }
+        return self in {self.MOE_H_TO_4H, self.MOE_4H_TO_H, self.MOE_GATE, self.MOE_ROUTER}
 
 
 class LoraLayer(torch.nn.Module):
-
-    def __init__(self, lora_module_types: List[LoraModuleType],
-                 output_hidden_sizes: List[int]):
+    def __init__(self, lora_module_types: List[LoraModuleType], output_hidden_sizes: List[int]):
         super().__init__()
 
         self.lora_module_types = lora_module_types
@@ -98,7 +104,6 @@ class LoraLayer(torch.nn.Module):
         lora_params: Dict,
         layer_idx: int,
     ) -> Optional[torch.Tensor]:
-
         if bool(lora_params):
             lora_ranks = []
             lora_weight_pointers = []
@@ -108,23 +113,23 @@ class LoraLayer(torch.nn.Module):
                 if module_idx in lora_params[layer_idx]:
                     active_lora_module_ids.append(module_idx)
                     # TODO (dafrimi): needs to pass this is_dora arg
-                    lora_params[layer_idx][module_idx]['is_dora']
-                    lora_ranks.append(
-                        lora_params[layer_idx][module_idx]['adapter_size'])
+                    lora_params[layer_idx][module_idx]["is_dora"]
+                    lora_ranks.append(lora_params[layer_idx][module_idx]["adapter_size"])
                     lora_weight_pointers.append(
-                        lora_params[layer_idx][module_idx]['weight_pointers'])
+                        lora_params[layer_idx][module_idx]["weight_pointers"]
+                    )
 
-            num_seqs = lora_params['num_seqs']
+            num_seqs = lora_params["num_seqs"]
 
             if len(active_lora_module_ids) == 0:
                 return None
             else:
                 lora_outputs = torch.ops.trtllm.lora_grouped_gemm(
                     x,
-                    lora_params['host_request_types'][:num_seqs],
+                    lora_params["host_request_types"][:num_seqs],
                     lora_ranks,
                     lora_weight_pointers,
-                    lora_params['prompt_lens_cpu'][:num_seqs],
+                    lora_params["prompt_lens_cpu"][:num_seqs],
                     self.output_hidden_sizes,
                     False,  # transA
                     True,  # transB
@@ -144,13 +149,17 @@ class LoraLayer(torch.nn.Module):
                             lora_output.append(lora_outputs.pop(0))
                         else:
                             lora_output.append(
-                                torch.zeros(list(x.shape[:-1]) + [
-                                    self.output_hidden_sizes[
-                                        self.lora_module_types.index(
-                                            module_idx)]
-                                ],
-                                            dtype=x.dtype,
-                                            device=x.device))
+                                torch.zeros(
+                                    list(x.shape[:-1])
+                                    + [
+                                        self.output_hidden_sizes[
+                                            self.lora_module_types.index(module_idx)
+                                        ]
+                                    ],
+                                    dtype=x.dtype,
+                                    device=x.device,
+                                )
+                            )
                     lora_output = torch.cat(lora_output, dim=-1)
                     return lora_output
 

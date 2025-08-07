@@ -33,6 +33,20 @@ extend_skip_glob = [
     "tensorrt_llm/top_model_mixin.py",
     "tests/unittest/_torch/modeling/test_modeling_mistral.py",
     "tests/unittest/_torch/modeling/test_modeling_pixtral.py",
+    # Phase 2.
+    "tensorrt_llm/_tensorrt_engine/*.py",
+    "tensorrt_llm/_torch/auto_deploy/custom_ops/torch_libs/*.py",
+    "tensorrt_llm/_torch/debug/*.py",
+    "tensorrt_llm/_torch/shared_tensor/*.py",
+    "tensorrt_llm/_torch/peft/*.py",
+    "tensorrt_llm/evaluate/lm_eval_tasks/gpqa/cot_zeroshot_aa/*.py",
+    "tensorrt_llm/models/clip/*.py",
+    "tensorrt_llm/models/internlm/*.py",
+    "tensorrt_llm/models/mmdit_sd3/*.py",
+    "tensorrt_llm/models/multimodal_encoders/*.py",
+    "tensorrt_llm/models/skywork/*.py",
+    "tensorrt_llm/models/stdit/*.py",
+    "tensorrt_llm/scaffolding/contrib/**/*.py",
 ]
 
 [tool.yapf]
@@ -63,6 +77,20 @@ ignore_patterns = [
     "tensorrt_llm/top_model_mixin.py",
     "tests/unittest/_torch/modeling/test_modeling_mistral.py",
     "tests/unittest/_torch/modeling/test_modeling_pixtral.py",
+    # Phase 2.
+    "tensorrt_llm/_tensorrt_engine/*.py",
+    "tensorrt_llm/_torch/auto_deploy/custom_ops/torch_libs/*.py",
+    "tensorrt_llm/_torch/debug/*.py",
+    "tensorrt_llm/_torch/shared_tensor/*.py",
+    "tensorrt_llm/_torch/peft/*.py",
+    "tensorrt_llm/evaluate/lm_eval_tasks/gpqa/cot_zeroshot_aa/*.py",
+    "tensorrt_llm/models/clip/*.py",
+    "tensorrt_llm/models/internlm/*.py",
+    "tensorrt_llm/models/mmdit_sd3/*.py",
+    "tensorrt_llm/models/multimodal_encoders/*.py",
+    "tensorrt_llm/models/skywork/*.py",
+    "tensorrt_llm/models/stdit/*.py",
+    "tensorrt_llm/scaffolding/contrib/**/*.py",
 ]
 
 [tool.codespell]
@@ -74,8 +102,7 @@ ignore-words-list = "rouge,inout,atleast,strat,nd,subtile,thrid,improbe,NotIn,te
 in-place = true
 remove_all_unused_imports = true
 remove_unused_variables = true
-# This should match the `include` in `[tool.ruff]`. See the comments in that section for why this
-# is necessary.
+# This should match the `include` in `[tool.ruff]`. The reason is that it is setup to run on the entire codebase.
 exclude = [
     "**/auto_deploy/**",
     "tensorrt_llm/_common.py",
@@ -97,6 +124,20 @@ exclude = [
     "tensorrt_llm/top_model_mixin.py",
     "tests/unittest/_torch/modeling/test_modeling_mistral.py",
     "tests/unittest/_torch/modeling/test_modeling_pixtral.py",
+    # Phase 2.
+    "tensorrt_llm/_tensorrt_engine/*.py",
+    "tensorrt_llm/_torch/auto_deploy/custom_ops/torch_libs/*.py",
+    "tensorrt_llm/_torch/debug/*.py",
+    "tensorrt_llm/_torch/shared_tensor/*.py",
+    "tensorrt_llm/_torch/peft/*.py",
+    "tensorrt_llm/evaluate/lm_eval_tasks/gpqa/cot_zeroshot_aa/*.py",
+    "tensorrt_llm/models/clip/*.py",
+    "tensorrt_llm/models/internlm/*.py",
+    "tensorrt_llm/models/mmdit_sd3/*.py",
+    "tensorrt_llm/models/multimodal_encoders/*.py",
+    "tensorrt_llm/models/skywork/*.py",
+    "tensorrt_llm/models/stdit/*.py",
+    "tensorrt_llm/scaffolding/contrib/**/*.py",
 ]
 
 
@@ -140,6 +181,20 @@ include = [
     "tensorrt_llm/top_model_mixin.py",
     "tests/unittest/_torch/modeling/test_modeling_mistral.py",
     "tests/unittest/_torch/modeling/test_modeling_pixtral.py",
+    # Phase 2.
+    "tensorrt_llm/_tensorrt_engine/*.py",
+    "tensorrt_llm/_torch/auto_deploy/custom_ops/torch_libs/*.py",
+    "tensorrt_llm/_torch/debug/*.py",
+    "tensorrt_llm/_torch/shared_tensor/*.py",
+    "tensorrt_llm/_torch/peft/*.py",
+    "tensorrt_llm/evaluate/lm_eval_tasks/gpqa/cot_zeroshot_aa/*.py",
+    "tensorrt_llm/models/clip/*.py",
+    "tensorrt_llm/models/internlm/*.py",
+    "tensorrt_llm/models/mmdit_sd3/*.py",
+    "tensorrt_llm/models/multimodal_encoders/*.py",
+    "tensorrt_llm/models/skywork/*.py",
+    "tensorrt_llm/models/stdit/*.py",
+    "tensorrt_llm/scaffolding/contrib/**/*.py",
 ]
 exclude = [
     "**3rdparty/**",
