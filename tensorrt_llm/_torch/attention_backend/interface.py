@@ -135,6 +135,9 @@ class AttentionMetadata:
     _num_ctx_tokens: int = field(init=False, default=0, repr=False)
     _num_tokens: int = field(init=False, default=0, repr=False)
 
+    # The number of tokens in the padded sequence.
+    padded_num_tokens: Optional[int] = None
+
     # This buffer is currently only used for TrtllmAttentionMetadata.
     cache_indirection: Optional[torch.Tensor] = None
 

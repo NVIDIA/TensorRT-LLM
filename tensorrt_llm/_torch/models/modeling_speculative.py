@@ -425,6 +425,9 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
             **kwargs,
         )
 
+        if attn_metadata.padded_num_tokens is not None:
+            hidden_states = hidden_states[:attn_metadata.num_tokens]
+
         if self.draft_model is not None:
             # get logits
             logits = self.logits_processor.forward(
@@ -433,9 +436,20 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                 attn_metadata,
                 True,
             )
+            mtp_input_ids = input_ids
+            mtp_position_ids = position_ids
+            if attn_metadata.padded_num_tokens is not None:
+                if input_ids is not None:
+                    # Slice along the first dimension
+                    mtp_input_ids = input_ids[:attn_metadata.num_tokens]
+                if position_ids is not None:
+                    # Slice along the last dimension
+                    mtp_position_ids = position_ids[:, :attn_metadata.
+                                                    num_tokens]
+
             # get accepted tokens and next draft tokens
-            return self.spec_worker(input_ids=input_ids,
-                                    position_ids=position_ids,
+            return self.spec_worker(input_ids=mtp_input_ids,
+                                    position_ids=mtp_position_ids,
                                     hidden_states=hidden_states,
                                     logits=logits,
                                     attn_metadata=attn_metadata,
