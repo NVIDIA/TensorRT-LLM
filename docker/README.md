@@ -44,6 +44,11 @@ Containers can be started with the local user instead of `root` by appending `LO
 make -C docker devel_run LOCAL_USER=1
 ```
 
+Extra docker volumes can be mounted in addition to the code repository by appending `EXTRA_VOLUMES=` to the run target:
+```bash
+make -C docker devel_run LOCAL_USER=1 EXTRA_VOLUMES="-v /pathA:/pathA -v /pathB:/pathB"
+```
+
 Specific CUDA architectures supported by the `wheel` can be specified with `CUDA_ARCHS`:
 
 ```bash

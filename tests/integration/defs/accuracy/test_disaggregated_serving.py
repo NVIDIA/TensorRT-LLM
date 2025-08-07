@@ -146,7 +146,8 @@ def launch_disaggregated_llm(disaggregated_server_config: Dict[str, Any],
               disaggregated_serving_config_path, "--server_start_timeout",
               "3600"
           ]) as disaggregated_server):
-        while True:
+        start_time = time.time()
+        while time.time() - start_time < 3600:
             time.sleep(1)
             try:
                 print("Checking health endpoint")
@@ -259,7 +260,6 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     MODEL_PATH = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct"
 
     @pytest.mark.skip_less_device_memory(32000)
-    @pytest.mark.skip_device_not_contain(["H100", "H200"])
     @pytest.mark.parametrize("disable_overlap_scheduler", [False, True])
     def test_auto_dtype(self, disable_overlap_scheduler):
         ctx_server_config = {"disable_overlap_scheduler": True}
@@ -394,6 +394,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @pytest.mark.skip_less_device(2)
     @pytest.mark.parametrize("tp,pp", [(1, 2), (2, 1), (2, 2)],
                              ids=["tp1pp2", "tp2pp1", "tp2pp2"])
     @pytest.mark.parametrize("testset", ["GSM8K", "MMLU"])
@@ -501,6 +502,10 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
 
     @pytest.mark.parametrize("overlap_scheduler", [False, True])
     def test_auto_dtype(self, overlap_scheduler):
+        pytest.skip(
+            "Currently we require full kvcache for variable sliding window. "
+            "This test only transfers the kvcache inside the sliding window.")
+
         ctx_server_config = {
             "disable_overlap_scheduler": True,
             "cuda_graph_config": None,
@@ -516,12 +521,12 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             }
         }
         ctx_server_config["kv_cache_config"] = {
-            "max_attention_window": [512, 512, 512, 512, 512, 32768],
-            "enable_block_reuse": False
+            # "max_attention_window": [512, 512, 512, 512, 512, 32768],
+            "enable_block_reuse": True
         }
         gen_server_config["kv_cache_config"] = {
-            "max_attention_window": [512, 512, 512, 512, 512, 32768],
-            "enable_block_reuse": False
+            # "max_attention_window": [512, 512, 512, 512, 512, 32768],
+            "enable_block_reuse": True
         }
         disaggregated_server_config = {
             "hostname": "localhost",
@@ -540,6 +545,8 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
                                       ctx_server_config, gen_server_config,
                                       self.MODEL_PATH) as llm:
             task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
 
@@ -581,4 +588,6 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
                                       ctx_server_config, gen_server_config,
                                       self.MODEL_PATH) as llm:
             task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)

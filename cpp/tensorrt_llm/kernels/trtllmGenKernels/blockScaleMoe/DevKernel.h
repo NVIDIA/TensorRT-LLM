@@ -395,7 +395,10 @@ struct Data
     int32_t numTokens;
     int32_t numExperts;
     int32_t topK;
+    // Hidden dimension output of MoE block. It is not padded.
     int32_t hiddenDim;
+    // Hidden dimension output of FC2. It might be padded.
+    int32_t hiddenDimPadded;
     int32_t const* totalNumPaddedTokens;
 };
 
@@ -416,6 +419,7 @@ struct KernelParams
     int32_t* expandedIdxToPermutedIdx;
 
     int32_t hiddenDim;
+    int32_t hiddenDimPadded;
     int32_t numTokens;
     int32_t numExperts;
     int32_t topK;
@@ -434,6 +438,7 @@ struct KernelParams
         params.expandedIdxToPermutedIdx = data.expandedIdxToPermutedIdx;
 
         params.hiddenDim = data.hiddenDim;
+        params.hiddenDimPadded = data.hiddenDimPadded;
         params.numTokens = data.numTokens;
         params.numExperts = data.numExperts;
         params.topK = data.topK;

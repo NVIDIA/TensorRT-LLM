@@ -29,6 +29,8 @@ LLM_DEFAULT_TAG = env.defaultTag ?: "${LLM_SHORT_COMMIT}-${LLM_BRANCH_TAG}-${BUI
 RUN_SANITY_CHECK = params.runSanityCheck ?: false
 TRIGGER_TYPE = env.triggerType ?: "manual"
 
+ENABLE_USE_WHEEL_FROM_BUILD_STAGE = params.useWheelFromBuildStage ?: false
+
 WAIT_TIME_FOR_BUILD_STAGE = 60  // minutes
 
 BUILD_JOBS = "32"
@@ -193,6 +195,11 @@ def createKubernetesPodConfig(type, arch = "amd64", build_wheel = false)
 
 
 def prepareWheelFromBuildStage(dockerfileStage, arch) {
+    if (!ENABLE_USE_WHEEL_FROM_BUILD_STAGE) {
+        echo "useWheelFromBuildStage is false, skip preparing wheel from build stage"
+        return ""
+    }
+
     if (TRIGGER_TYPE != "post-merge") {
         echo "Trigger type is not post-merge, skip preparing wheel from build stage"
         return ""
@@ -233,15 +240,11 @@ def buildImage(config, imageKeyToTag)
     def dependentImageWithTag = "${IMAGE_NAME}/${dependent.dockerfileStage}:${dependentTag}"
     def customImageWithTag = "${IMAGE_NAME}/${dockerfileStage}:${customTag}"
 
-    if (target == "ngc-release") {
-        if (TRIGGER_TYPE == "post-merge") {
-            echo "Use NGC artifacts for post merge build"
-            dependentImageWithTag = "${NGC_IMAGE_NAME}:${dependentTag}"
-            imageWithTag = "${NGC_IMAGE_NAME}:${tag}"
-            customImageWithTag = "${NGC_IMAGE_NAME}:${customTag}"
-        }
-        imageKeyToTag["NGC Devel Image ${config.arch}"] = dependentImageWithTag
-        imageKeyToTag["NGC Release Image ${config.arch}"] = imageWithTag
+    if (target == "ngc-release" && TRIGGER_TYPE == "post-merge") {
+        echo "Use NGC artifacts for post merge build"
+        dependentImageWithTag = "${NGC_IMAGE_NAME}:${dependentTag}"
+        imageWithTag = "${NGC_IMAGE_NAME}:${tag}"
+        customImageWithTag = "${NGC_IMAGE_NAME}:${customTag}"
     }
 
     args += " GITHUB_MIRROR=https://urm.nvidia.com/artifactory/github-go-remote"
@@ -630,7 +633,9 @@ pipeline {
                     status = handle.result
 
                     if (status != "SUCCESS") {
-                        error "Downstream job did not succeed"
+                        catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                            error "Downstream job did not succeed"
+                        }
                     }
                 }
             }

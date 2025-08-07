@@ -32,6 +32,7 @@ from typing import Any, Dict, List, Optional, Sequence, Union
 import numpy as np
 import nvtx
 from mpi4py import MPI
+from mpi4py.util import pkl5
 from packaging import version
 
 # isort: off
@@ -179,6 +180,7 @@ _str_to_binding_dtype_dict = dict(
     bool=DataType.BOOL,
     fp8=DataType.FP8,
 )
+_binding_to_str_dtype = {v: k for k, v in _str_to_binding_dtype_dict.items()}
 
 _binding_dtype_size = {
     DataType.INT64: 8,
@@ -191,6 +193,12 @@ _binding_dtype_size = {
     DataType.INT8: 1,
     DataType.UINT8: 1,
 }
+
+
+def binding_to_str_dtype(binding_dtype) -> str:
+    ret = _binding_to_str_dtype.get(binding_dtype)
+    assert ret is not None, f'Unsupported binding dtype: {binding_dtype}'
+    return ret
 
 
 def binding_dtype_size(dtype: DataType):
@@ -455,7 +463,7 @@ def dim_resolve_negative(dim, ndim):
 # mpi4py only exports MPI_COMM_TYPE_SHARED, so we define OMPI_COMM_TYPE_HOST here
 OMPI_COMM_TYPE_HOST = 9
 
-comm = MPI.COMM_WORLD
+comm = pkl5.Intracomm(MPI.COMM_WORLD)
 
 
 def set_mpi_comm(new_comm):

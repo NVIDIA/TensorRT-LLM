@@ -33,6 +33,10 @@ l0_l40s:
   - test_e2e.py::test_ptp_quickstart_multimodal_phi4mm[image_audio]
   - test_e2e.py::test_ptp_quickstart_bert[VANILLA-BertForSequenceClassification-bert/bert-base-uncased-yelp-polarity]
   - test_e2e.py::test_ptp_quickstart_bert[TRTLLM-BertForSequenceClassification-bert/bert-base-uncased-yelp-polarity]
+  - test_e2e.py::test_openai_completions_with_logit_bias[torch_sampler]
+  - test_e2e.py::test_openai_chat_with_logit_bias[torch_sampler]
+  - test_e2e.py::test_openai_completions_with_logit_bias[trtllm_sampler]
+  - test_e2e.py::test_openai_chat_with_logit_bias[trtllm_sampler]
 - condition:
     ranges:
       system_gpu_count:

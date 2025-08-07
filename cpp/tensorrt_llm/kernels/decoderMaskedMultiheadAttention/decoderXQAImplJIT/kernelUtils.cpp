@@ -153,12 +153,6 @@ bool supportConfigHMMA(XQAParams const& xqaParams, int SM, bool forConfigurePlug
         {
             return false;
         }
-        // @fixme: should work but it triggers illegal mem address in invokeQKVPreprocessing.
-        // Hopper XQA is fine because it does not use invokeQKVPreprocessing.
-        if (xqaParams.max_past_kv_length + 1 > xqaParams.cyclic_attention_window_size)
-        {
-            return false;
-        }
     }
     if (xqaParams.head_size % 16 != 0 || xqaParams.head_size < 16 || xqaParams.head_size > 256)
     {

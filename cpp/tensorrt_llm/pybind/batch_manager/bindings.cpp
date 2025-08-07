@@ -359,6 +359,7 @@ void initBindings(pybind11::module_& m)
             py::arg("return_perf_metrics") = false, py::arg("guided_decoding_params") = std::nullopt,
             py::arg("language_adapter_uid") = std::nullopt, py::arg("allotted_time_ms") = std::nullopt,
             py::arg("context_phase_params") = std::nullopt)
+        .def("check_token_id_range", &tb::LlmRequest::checkTokenIdRange, py::arg("vocab_size"))
         .def(py::init<tb::LlmRequest const&>())
         .def("validate", &tb::LlmRequest::validate, py::arg("max_input_len"), py::arg("max_seq_len"),
             py::arg("max_draft_len"), py::arg("vocab_size_padded"), py::arg("max_endocer_input_len") = std::nullopt,
@@ -380,7 +381,8 @@ void initBindings(pybind11::module_& m)
         .def("move_lora_weights_to_gpu", &tb::LlmRequest::moveLoraWeightsToGpu, py::arg("manager"))
         .def("finish_by_reason", &tb::LlmRequest::finishByReason, py::arg("finish_reason"))
         .def("set_first_scheduled_time", &tb::LlmRequest::setFirstScheduledTime)
-        .def("update_perf_metrics", &tb::LlmRequest::updatePerfMetrics, py::arg("iter_counter"));
+        .def("update_perf_metrics", &tb::LlmRequest::updatePerfMetrics, py::arg("iter_counter"))
+        .def("remove_lora_tensors", &tb::LlmRequest::removeLoraTensors);
 
     py::classh<tb::SequenceSlotManager>(m, "SequenceSlotManager")
         .def(py::init<tb::SequenceSlotManager::SlotIdType, uint64_t>(), py::arg("max_num_slots"),

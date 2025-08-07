@@ -129,6 +129,8 @@ struct Multihead_attention_params_base
     float rotary_embedding_scale = 1.0f;
     // The pre-computed rotary inv freq when building the engines (as constant weights).
     float const* rotary_embedding_inv_freq_cache = nullptr;
+    // The pre-computed cos/sin cache.
+    float2 const* rotary_embedding_cos_sin_cache = nullptr;
     float rotary_embedding_short_m_scale = 1.0f;
     float rotary_embedding_long_m_scale = 1.0f;
     int rotary_embedding_max_positions = 0;
@@ -151,6 +153,9 @@ struct Multihead_attention_params_base
     // The attention mask [batch_size, attention_mask_stride (i.e. max_kv_seqlen)]
     bool const* attention_mask = nullptr;
     int attention_mask_stride = 0;
+
+    // The attention sinks [num_heads_q].
+    float const* attention_sinks = nullptr;
 
     // If relative position embedding is used
     T const* relative_attention_bias = nullptr;
