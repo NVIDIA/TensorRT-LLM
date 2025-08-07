@@ -18,6 +18,8 @@ import pytest
 from defs.conftest import get_sm_version
 
 from tensorrt_llm import LLM
+from tensorrt_llm._torch.modules.fused_moe.fused_moe_triton import \
+    IS_TRITON_KERNELS_AVAILABLE
 from tensorrt_llm._torch.pyexecutor.config import MoeLoadBalancerConfig
 from tensorrt_llm.llmapi import (CudaGraphConfig, EagleDecodingConfig,
                                  KvCacheConfig, MoeConfig, MTPDecodingConfig,
@@ -788,6 +790,9 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @pytest.mark.skip(
+        reason=
+        "Skipped because cyclic kv cache is disabled on the feature branch")
     def test_auto_dtype_vswa(self):
         # # NOTE: Test with VSWA kv cache config.
         # self.kv_cache_config.max_attention_window = [
@@ -1009,7 +1014,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             max_num_streams=3) if torch_compile else None)
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
-            use_cuda_graph=cuda_graph,
+            cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
             torch_compile_config=torch_compile_config,
             moe_config=MoeConfig(backend="CUTEDSL"),
         )
@@ -1167,7 +1172,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             max_num_streams=3) if torch_compile else None)
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
-            use_cuda_graph=cuda_graph,
+            cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
             torch_compile_config=torch_compile_config,
             moe_config=MoeConfig(backend="CUTEDSL"),
         )
@@ -2014,6 +2019,29 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @skip_pre_blackwell
+    @pytest.mark.parametrize(
+        "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler",
+        [(1, 1, 1, False, True, True)],
+        ids=["latency"])
+    @pytest.mark.parametrize("activation_dtype", ["fp8", "mxfp8"])
+    def test_w4a8_mxfp4(self, tp_size, pp_size, ep_size, attention_dp,
+                        cuda_graph, overlap_scheduler, activation_dtype):
+        pytorch_config = dict(
+            disable_overlap_scheduler=not overlap_scheduler,
+            cuda_graph_config=CudaGraphConfig() if cuda_graph else None)
+
+        llm = LLM(
+            f"{llm_models_root()}/mxfp4-qwen3/saved_models_Qwen3-8B_w4a8_mxfp4_{activation_dtype}_kv_none_hf",
+            tensor_parallel_size=tp_size,
+            pipeline_parallel_size=pp_size,
+            moe_expert_parallel_size=ep_size,
+            **pytorch_config,
+            enable_attention_dp=attention_dp)
+        with llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
 
 class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "Qwen3/Qwen3-30B-A3B"
@@ -2151,6 +2179,72 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
 
         with llm:
             task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @pytest.mark.parametrize("moe_backend", ["CUTLASS", "TRITON", "TRTLLM"])
+    @pytest.mark.parametrize(
+        "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler", [
+            (1, 1, 1, False, True, True),
+            (2, 1, 2, False, True, True),
+            (4, 1, 4, False, True, True),
+        ],
+        ids=["latency", "ep2", "ep4"])
+    @pytest.mark.parametrize("activation_dtype", ["static_fp8", "mxfp8"],
+                             ids=["fp8", "mxfp8"])
+    def test_w4a8_mxfp4(self, moe_backend, tp_size, pp_size, ep_size,
+                        attention_dp, cuda_graph, overlap_scheduler,
+                        activation_dtype):
+        if moe_backend == "TRITON":
+            if not IS_TRITON_KERNELS_AVAILABLE:
+                pytest.skip("TRITON moe backend is not available.")
+            if get_sm_version() < 90:
+                pytest.skip("TRITON moe backend requires Hopper or newer.")
+        if moe_backend in ["CUTLASS", "TRTLLM"] and get_sm_version() < 100:
+            pytest.skip(
+                "CUTLASS or TRTLLM moe backend requires Blackwell or newer.")
+        if activation_dtype == "mxfp8" and moe_backend not in [
+                "TRTLLM", "CUTLASS"
+        ]:
+            pytest.skip(
+                "Mxfp8 is only supported for TRTLLM or CUTLASS moe backend.")
+
+        pytorch_config = dict(
+            disable_overlap_scheduler=not overlap_scheduler,
+            cuda_graph_config=CudaGraphConfig() if cuda_graph else None)
+
+        llm = LLM(
+            f"{llm_models_root()}/mxfp4-qwen3/saved_models_Qwen3-30B-A3B_w4a8_mxfp4_{activation_dtype}_kv_none_hf_moeonly",
+            tensor_parallel_size=tp_size,
+            pipeline_parallel_size=pp_size,
+            moe_expert_parallel_size=ep_size,
+            **pytorch_config,
+            enable_attention_dp=attention_dp,
+            moe_config=MoeConfig(backend=moe_backend))
+        with llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_pre_blackwell
+    @pytest.mark.parametrize(
+        "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler,moe_backend",
+        [(1, 1, 1, False, True, True, "TRTLLM")],
+        ids=["latency-TRTLLM"])
+    def test_w4a16_mxfp4(self, tp_size, pp_size, ep_size, attention_dp,
+                         cuda_graph, overlap_scheduler, moe_backend):
+        pytorch_config = dict(
+            disable_overlap_scheduler=not overlap_scheduler,
+            cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
+            moe_config=MoeConfig(backend=moe_backend))
+
+        llm = LLM(
+            f"{llm_models_root()}/mxfp4-qwen3/saved_models_Qwen3-30B-A3B_w4a16_mxfp4_kv_none_hf_moeonly",
+            tensor_parallel_size=tp_size,
+            pipeline_parallel_size=pp_size,
+            moe_expert_parallel_size=ep_size,
+            enable_attention_dp=attention_dp,
+            **pytorch_config)
+        with llm:
+            task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
 
@@ -2324,6 +2418,113 @@ class TestPhi4MM(LlmapiAccuracyTestHarness):
         # Set max_seq_len larger than 4096 to use long rope factor.
         model_name = "microsoft/Phi-4-multimodal-instruct-long-rope"
         with LLM(self.MODEL_PATH, max_seq_len=8192) as llm:
+            task = MMLU(model_name)
+            task.evaluate(llm)
+            task = GSM8K(model_name)
+            task.evaluate(llm)
+
+
+class TestGPTOSS(LlmapiAccuracyTestHarness):
+    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5)
+
+    def get_gpt_oss_root(self):
+        gpt_oss_root = os.getenv("GPT_OSS_MODELS_ROOT")
+        assert gpt_oss_root, "GPT_OSS_MODELS_ROOT needs to be set as parent of checkpoints."
+        return gpt_oss_root
+
+    @pytest.mark.parametrize("moe_backend", ["CUTLASS", "TRTLLM", "TRITON"],
+                             ids=["cutlass", "trtllm", "triton"])
+    @pytest.mark.parametrize("cuda_graph,overlap_scheduler", [
+        (True, True),
+    ])
+    def test_w4_1gpu(self, moe_backend, cuda_graph, overlap_scheduler):
+        if moe_backend == "TRITON" and not IS_TRITON_KERNELS_AVAILABLE:
+            pytest.skip("Triton kernels are not available")
+
+        pytorch_config = dict(
+            disable_overlap_scheduler=not overlap_scheduler,
+            cuda_graph_config=CudaGraphConfig() if cuda_graph else None)
+
+        llm = LLM(f"{self.get_gpt_oss_root()}/gpt-oss-120b",
+                  tensor_parallel_size=1,
+                  pipeline_parallel_size=1,
+                  moe_expert_parallel_size=1,
+                  kv_cache_config=self.kv_cache_config,
+                  **pytorch_config,
+                  moe_config=MoeConfig(backend=moe_backend))
+
+        with llm:
+            model_name = "GPT-OSS/MXFP4"
+            task = MMLU(model_name)
+            task.evaluate(llm)
+            task = GSM8K(model_name)
+            task.evaluate(llm)
+
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.parametrize("moe_backend", ["CUTLASS", "TRTLLM", "TRITON"])
+    @pytest.mark.parametrize(
+        "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler", [
+            (4, 1, 1, False, True, True),
+            (4, 1, 4, False, True, True),
+            (4, 1, 4, True, True, True),
+        ],
+        ids=["tp4", "ep4", "dp4"])
+    def test_w4_4gpus(self, moe_backend, tp_size, pp_size, ep_size,
+                      attention_dp, cuda_graph, overlap_scheduler):
+        if moe_backend == "TRITON":
+            if not IS_TRITON_KERNELS_AVAILABLE:
+                pytest.skip("Triton kernels are not available")
+            if tp_size != ep_size:
+                pytest.skip(
+                    "TRITON moe backend currently doesn't supported mxfp4 tp for this size"
+                )
+
+        pytorch_config = dict(
+            disable_overlap_scheduler=not overlap_scheduler,
+            cuda_graph_config=CudaGraphConfig() if cuda_graph else None)
+
+        llm = LLM(f"{self.get_gpt_oss_root()}/gpt-oss-120b",
+                  tensor_parallel_size=tp_size,
+                  pipeline_parallel_size=pp_size,
+                  moe_expert_parallel_size=ep_size,
+                  kv_cache_config=self.kv_cache_config,
+                  **pytorch_config,
+                  enable_attention_dp=attention_dp,
+                  moe_config=MoeConfig(backend=moe_backend))
+
+        with llm:
+            model_name = "GPT-OSS/MXFP4"
+            task = MMLU(model_name)
+            task.evaluate(llm)
+            task = GSM8K(model_name)
+            task.evaluate(llm)
+
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.parametrize(
+        "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler", [
+            (4, 1, 4, True, True, True),
+        ],
+        ids=["dp4"])
+    def test_w4a16(self, tp_size, pp_size, ep_size, attention_dp, cuda_graph,
+                   overlap_scheduler, monkeypatch):
+        if not IS_TRITON_KERNELS_AVAILABLE:
+            pytest.skip("Triton kernels are not available")
+        monkeypatch.setenv("OVERRIDE_QUANT_ALGO", "W4A16_MXFP4")
+
+        pytorch_config = dict(
+            disable_overlap_scheduler=not overlap_scheduler,
+            cuda_graph_config=CudaGraphConfig() if cuda_graph else None)
+
+        llm = LLM(f"{self.get_openai_root()}/gpt-oss-120b",
+                  tensor_parallel_size=tp_size,
+                  pipeline_parallel_size=pp_size,
+                  moe_expert_parallel_size=ep_size,
+                  kv_cache_config=self.kv_cache_config,
+                  **pytorch_config,
+                  enable_attention_dp=attention_dp,
+                  moe_backend="TRITON")
+        with llm:
+            model_name = "GPT-OSS/BF16"
             task = MMLU(model_name)
             task.evaluate(llm)
             task = GSM8K(model_name)

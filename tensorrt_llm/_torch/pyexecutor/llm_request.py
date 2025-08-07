@@ -285,6 +285,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
 
         self.py_logits_post_processors = kwargs.pop("py_logits_post_processors",
                                                     None)
+        self.py_lora_path: str | None = kwargs.pop("py_lora_path", None)
         # Multimodal data
         self.py_multimodal_data = kwargs.pop("py_multimodal_data", None)
         if llm_request is not None:
@@ -311,6 +312,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_rewind_len = 0
         self.py_draft_tokens = [] if self.draft_tokens is None else self.draft_tokens
         self.py_last_context_chunk = (None, None)
+        self.py_draft_logits = None
+        self.py_target_probs = None
         self.py_last_draft_tokens = None
         self.py_num_accepted_draft_tokens = 0
         self.py_decoding_iter = 0
@@ -490,6 +493,7 @@ def executor_request_to_llm_request(
         if executor_request.lora_config is not None else None,
         lora_config=executor_request.lora_config.config
         if executor_request.lora_config is not None else None,
+        py_lora_path=getattr(executor_request, "py_lora_path", None),
         mrope_rotary_cos_sin=mrope_rotary_cos_sin,
         mrope_position_deltas=mrope_position_deltas,
         lookahead_config=None,

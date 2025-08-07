@@ -55,6 +55,7 @@ struct FusedQKVMaskedAttentionDispatchParams
     T const* qkv_bias;
     T const* relative_attention_bias;
     bool const* attention_mask;
+    float const* attention_sinks;
     float const* logn_scaling_ptr;
     int const* cache_indir;
     void* context_buf;
@@ -71,6 +72,7 @@ struct FusedQKVMaskedAttentionDispatchParams
     RotaryScalingType rotary_embedding_scale_type;
     float rotary_embedding_scale;
     float const* rotary_embedding_inv_freq_cache;
+    float2 const* rotary_embedding_cos_sin_cache;
     float rotary_embedding_short_m_scale;
     float rotary_embedding_long_m_scale;
     int rotary_embedding_max_positions;
@@ -225,6 +227,7 @@ bool AttentionOp::convertMMHAParamsToXQAParams(tensorrt_llm::kernels::XQAParams&
     xqaParams.output = generationsParams.context_buf;
     xqaParams.qkv = generationsParams.attention_input;
     xqaParams.cache_indir = generationsParams.cache_indir;
+    xqaParams.attention_sinks = generationsParams.attention_sinks;
     xqaParams.kv_scale_orig_quant = generationsParams.kv_scale_orig_quant;
     xqaParams.kv_scale_quant_orig = generationsParams.kv_scale_quant_orig;
     xqaParams.host_past_key_value_lengths = generationsParams.host_past_key_value_lengths;
@@ -596,6 +599,7 @@ void fusedQKV_masked_attention_dispatch(Multihead_attention_params<T_MMHA, CROSS
     params.rotary_embedding_scale_type = input_params.rotary_embedding_scale_type;
     params.rotary_embedding_scale = input_params.rotary_embedding_scale;
     params.rotary_embedding_inv_freq_cache = input_params.rotary_embedding_inv_freq_cache;
+    params.rotary_embedding_cos_sin_cache = input_params.rotary_embedding_cos_sin_cache;
     params.rotary_embedding_short_m_scale = input_params.rotary_embedding_short_m_scale;
     params.rotary_embedding_long_m_scale = input_params.rotary_embedding_long_m_scale;
     params.rotary_embedding_max_positions = input_params.rotary_embedding_max_positions;
@@ -619,6 +623,9 @@ void fusedQKV_masked_attention_dispatch(Multihead_attention_params<T_MMHA, CROSS
     // Attention mask input.
     params.attention_mask = input_params.attention_mask;
     params.attention_mask_stride = input_params.attention_mask_stride;
+
+    // Attention sinks.
+    params.attention_sinks = input_params.attention_sinks;
 
     // The slope of linear position bias per head, e.g., ALiBi.
     if (input_params.linear_bias_slopes != nullptr)
@@ -1691,6 +1698,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         fmhaParams.outputPtr
             = mCpSize > 1 ? gatherOutBuffer : params.context_buf; // only use [totalLength, h / cpSize, Dh]
         fmhaParams.outputSfPtr = params.context_buf_sf;
+        fmhaParams.attentionSinksPtr = params.attention_sinks;
         fmhaParams.packedMaskPtr = params.attention_packed_mask;
         if constexpr (std::is_same_v<KVCacheBuffer, KVBlockArray>)
         {
@@ -2220,6 +2228,7 @@ int AttentionOp::enqueueGeneration(EnqueueGenerationParams<T> const& params, cud
     dispatch_params.relative_attention_bias_stride = relative_attention_bias_stride;
     dispatch_params.attention_mask = params.attention_mask;
     dispatch_params.attention_mask_stride = params.attention_mask_stride;
+    dispatch_params.attention_sinks = params.attention_sinks;
     dispatch_params.max_distance = max_distance;
     dispatch_params.cache_indir = params.cache_indir;
     dispatch_params.context_buf = mCpSize > 1 ? mhaOutput : params.context_buf; //
@@ -2267,6 +2276,7 @@ int AttentionOp::enqueueGeneration(EnqueueGenerationParams<T> const& params, cud
     dispatch_params.rotary_embedding_scale_type = mRotaryEmbeddingScaleType;
     dispatch_params.rotary_embedding_scale = mRotaryEmbeddingScale;
     dispatch_params.rotary_embedding_inv_freq_cache = params.rotary_inv_freq;
+    dispatch_params.rotary_embedding_cos_sin_cache = params.rotary_cos_sin;
     dispatch_params.rotary_embedding_short_m_scale = mRotaryEmbeddingShortMscale;
     dispatch_params.rotary_embedding_long_m_scale = mRotaryEmbeddingLongMscale;
     dispatch_params.rotary_embedding_max_positions = mRotaryEmbeddingMaxPositions;

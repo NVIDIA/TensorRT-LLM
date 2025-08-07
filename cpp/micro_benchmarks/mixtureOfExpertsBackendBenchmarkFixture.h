@@ -53,6 +53,7 @@ using namespace CUTLASS_MOE_GEMM_KERNELS_NAMESPACE;
 using CUTLASS_MOE_GEMM_NAMESPACE::TmaWarpSpecializedGroupedGemmInput;
 using CUTLASS_MOE_GEMM_KERNELS_NAMESPACE::CutlassMoeFCRunner;
 using CUTLASS_MOE_GEMM_NAMESPACE::ActivationType;
+using CUTLASS_MOE_GEMM_KERNELS_NAMESPACE::ActivationParams;
 using CUTLASS_MOE_GEMM_NAMESPACE::isGatedActivation;
 
 static BufferManager::CudaStreamPtr streamPtr;
@@ -984,7 +985,7 @@ public:
                 mSelectedExperts + mSelectedExpertsSize * mBufferIndex,
                 mUseFinalScale ? mScaleProbs + mScaleProbsSize * mBufferIndex : nullptr,
                 mExpertWeight1 + mExpertWeight1Size * mBufferIndex, mExpertBias1 + mExpertBias1Size * mBufferIndex,
-                mActType, mExpertWeight2 + mExpertWeight2Size * mBufferIndex,
+                ActivationParams(mActType), mExpertWeight2 + mExpertWeight2Size * mBufferIndex,
                 mExpertBias2 + mExpertBias2Size * mBufferIndex, mQuantParams[mBufferIndex], mTotalTokens, mHiddenSize,
                 mInterSize, mNumExperts, mK, mWorkspace + mWorkspaceSize * mBufferIndex,
                 mFinalOutput + mFinalOutputSize * mBufferIndex,
@@ -996,7 +997,7 @@ public:
                 mSelectedExperts + mSelectedExpertsSize * mBufferIndex,
                 mUseFinalScale ? mScaleProbs + mScaleProbsSize * mBufferIndex : nullptr,
                 mExpertWeight1 + mExpertWeight1Size * mBufferIndex, mExpertBias1 + mExpertBias1Size * mBufferIndex,
-                mActType, mExpertWeight2 + mExpertWeight2Size * mBufferIndex,
+                ActivationParams(mActType), mExpertWeight2 + mExpertWeight2Size * mBufferIndex,
                 mExpertBias2 + mExpertBias2Size * mBufferIndex, mQuantParams[mBufferIndex], mTotalTokens, mHiddenSize,
                 mInterSize, mNumExperts, mK, mWorkspace + mWorkspaceSize * mBufferIndex,
                 mFinalOutput + mFinalOutputSize * mBufferIndex,

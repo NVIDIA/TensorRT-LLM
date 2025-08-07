@@ -454,7 +454,7 @@ struct Softmax_base
 #pragma unroll
             for (int mi = 0; mi < Mma_tile_o::CORES_M; mi++)
             {
-                uint32_t const scale = float_to_half2(correction_[mi]);
+                const uint32_t scale = float_to_half2(correction_[mi]);
 
 // Assume only N has multiple MMAs (MMAS_M = 1).
 // MMAS_N > 1 when N dimension is split.
@@ -477,9 +477,15 @@ struct Softmax_base
     }
 
     // BMM1 scale.
-    uint32_t const scale_bmm1_;
+    const uint32_t scale_bmm1_;
     // BMM1 softcapping scale.
     float const softcapping_scale_bmm1_;
+
+    // The sliding window size.
+    int const sliding_window_size_;
+    // The log2 attention chunk size.
+    int const log2_chunked_attention_size_;
+
     // The thread idx in the warp group.
     int tidx_;
     // The col index for the mma thread layout.
@@ -487,15 +493,10 @@ struct Softmax_base
     // The row index for the mma thread layout.
     int quad_row_;
 
-    // The sliding window size.
-    int const sliding_window_size_;
-    // The log2 attention chunk size.
-    int const log2_chunked_attention_size_;
-
     // The packed mask ptr.
     uint32_t const* packed_mask_ptr_;
     // The packed mask k-dim stride in bytes;
-    int64_t const params_packed_mask_stride_in_bytes_;
+    const int64_t params_packed_mask_stride_in_bytes_;
 
     // Unpacked BMM1 output buffer.
     float elt_[Mma_tile_p::CORES_M][Mma_tile_p::CORES_N * 2];
@@ -1072,20 +1073,53 @@ struct Tile_o_epilogue_base
     // The MMA tile for the BMM2.
     using Mma_tile_o = typename Kernel_traits::Mma_tile_o;
 
-    template <typename Params>
-    inline __device__ Tile_o_epilogue_base(Params const& params)
+    // Apply the exp2f optimization (fuse bmm1_scale and -max into FMAs).
+    enum
     {
-        ; // nothing to construct.
+        EXP2F_OPTIMIZATION = Kernel_traits::EXP2F_OPTIMIZATION
     };
 
+    template <typename Params, typename Block_info>
+    inline __device__ Tile_o_epilogue_base(Params const& params, Block_info& block_info)
+    {
+        has_attention_sink_ = params.attention_sinks != nullptr;
+        head_idx_ = block_info.bidh;
+        attention_sink_ = has_attention_sink_ ? params.attention_sinks[block_info.bidh] : 0.f;
+        // It is only need when the exp2f optimization is enabled, so params.scale_bmm1 is always float.
+        scale_bmm1_f_ = reinterpret_cast<float const&>(params.scale_bmm1_d ? *params.scale_bmm1_d : params.scale_bmm1);
+    };
+
+    // The attention sinks.
+    inline __device__ void add_attention_sink(float& sum, float max)
+    {
+        if (has_attention_sink_)
+        {
+            // The global max needs to be scaled by the bmm1 scale if exp2f optimization is enabled.
+            if constexpr (EXP2F_OPTIMIZATION)
+            {
+                sum += exp2f(attention_sink_ * M_LOG2E - max * scale_bmm1_f_);
+            }
+            else
+            {
+                sum += expf(attention_sink_ - max);
+            }
+        }
+    }
+
     // Scale ctile_o output by 1/sum
-    inline __device__ void scale(Compute_tile_o& ctile_o, float (&global_sum)[Mma_tile_o::CORES_M])
+    inline __device__ void scale(
+        Compute_tile_o& ctile_o, float (&global_max)[Mma_tile_o::CORES_M], float (&global_sum)[Mma_tile_o::CORES_M])
     {
 // Final step's update.
 #pragma unroll
         for (int mi = 0; mi < Mma_tile_o::CORES_M; mi++)
         {
-            global_sum[mi] = global_sum[mi] == 0.f ? 1.f : 1.0f / global_sum[mi];
+            // The global sum.
+            float global_sum_mi = global_sum[mi];
+            // Add the attention sink to the global sum.
+            add_attention_sink(global_sum_mi, global_max[mi]);
+            // The scale.
+            float scale = global_sum_mi == 0.f ? 1.f : 1.0f / global_sum_mi;
 
 // Assume only N has multiple MMAs (MMAS_M = 1).
 #pragma unroll
@@ -1096,12 +1130,21 @@ struct Tile_o_epilogue_base
                 {
                     float& reg0 = ctile_o.acc_[0][mma_ni].elt(2 * ni * Mma_tile_o::CORES_M + 2 * mi);
                     float& reg1 = ctile_o.acc_[0][mma_ni].elt(2 * ni * Mma_tile_o::CORES_M + 2 * mi + 1);
-                    reg0 *= global_sum[mi];
-                    reg1 *= global_sum[mi];
+                    reg0 *= scale;
+                    reg1 *= scale;
                 }
             }
         }
     }
+
+    // Whether the attention sink is enabled.
+    bool has_attention_sink_ = false;
+    // The attention sink value.
+    float attention_sink_ = 0.f;
+    // The float scale of bmm1 outputs.
+    float scale_bmm1_f_ = 1.f;
+    // The head idx.
+    int head_idx_ = 0;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1138,14 +1181,21 @@ struct Tile_o_epilogue<Hopper_hgmma_fp16_traits, Kernel_traits>
     using Base::Tile_o_epilogue_base;
 
     // Scale ctile_o output by 1/sum
-    inline __device__ void scale(Compute_tile_o& ctile_o, float (&global_sum)[Mma_tile_o::CORES_M])
+    inline __device__ void scale(
+        Compute_tile_o& ctile_o, float (&global_max)[Mma_tile_o::CORES_M], float (&global_sum)[Mma_tile_o::CORES_M])
     {
 // Final step's update.
 #pragma unroll
         for (int mi = 0; mi < Mma_tile_o::CORES_M; mi++)
         {
-            global_sum[mi] = global_sum[mi] == 0.f ? 1.f : 1.0f / global_sum[mi];
-            uint32_t const scale = float_to_half2(global_sum[mi]);
+            // The global sum.
+            float global_sum_mi = global_sum[mi];
+            // Add the attention sink to the global sum.
+            this->add_attention_sink(global_sum_mi, global_max[mi]);
+            // The scale.
+            float scale = global_sum_mi == 0.f ? 1.f : 1.0f / global_sum_mi;
+            // The scale.
+            const uint32_t scale_h = float_to_half2(scale);
 
 // Assume only N has multiple MMAs (MMAS_M = 1).
 #pragma unroll
@@ -1155,7 +1205,7 @@ struct Tile_o_epilogue<Hopper_hgmma_fp16_traits, Kernel_traits>
                 for (int ni = 0; ni < Mma_tile_o::CORES_N; ni++)
                 {
                     uint32_t& reg = ctile_o.acc_[0][mma_ni].reg(ni * Mma_tile_o::CORES_M + mi);
-                    reg = hmul2(reg, scale);
+                    reg = hmul2(reg, scale_h);
                 }
             }
         }
@@ -1215,27 +1265,58 @@ struct Tile_o_epilogue<Hopper_qgmma_e4m3_fp32_traits, Kernel_traits>
     // The MMA tile for the BMM2.
     using Mma_tile_o = typename Base::Mma_tile_o;
 
+    // Apply the exp2f optimization (fuse bmm1_scale and -max into FMAs).
+    enum
+    {
+        EXP2F_OPTIMIZATION = Base::EXP2F_OPTIMIZATION
+    };
+
     // Ctor.
-    template <typename Params>
-    inline __device__ Tile_o_epilogue(Params const& params)
-        : Base(params)
+    template <typename Params, typename Block_info>
+    inline __device__ Tile_o_epilogue(Params const& params, Block_info& block_info)
+        : Base(params, block_info)
         , scale_bmm2_(*params.scale_bmm2_d)
     {
     }
 
+    // Add the attention sink to the global sum.
+    inline __device__ void add_attention_sink(float& sum, float max)
+    {
+        if (this->has_attention_sink_)
+        {
+            // The global max needs to be scaled by the bmm1 scale if exp2f optimization is enabled.
+            // Take the log2f(Traits_o::SOFTMAX_FP_QUANT_SCALE) into account as the same scale has been applied to sum.
+            float quant_scale_in_log2 = log2f(Traits_o::SOFTMAX_FP_QUANT_SCALE);
+            if constexpr (EXP2F_OPTIMIZATION)
+            {
+                sum += exp2f(this->attention_sink_ * M_LOG2E - max * this->scale_bmm1_f_ + quant_scale_in_log2);
+            }
+            else
+            {
+                sum += expf(this->attention_sink_ - max + quant_scale_in_log2);
+            }
+        }
+    }
+
     // Scale ctile_o output by 1/sum
-    inline __device__ void scale(Compute_tile_o& ctile_o, float (&global_sum)[Mma_tile_o::CORES_M])
+    inline __device__ void scale(
+        Compute_tile_o& ctile_o, float (&global_max)[Mma_tile_o::CORES_M], float (&global_sum)[Mma_tile_o::CORES_M])
     {
 // Final step's update.
 #pragma unroll
         for (int mi = 0; mi < Mma_tile_o::CORES_M; mi++)
         {
+            // The global sum.
+            float global_sum_mi = global_sum[mi];
+            // Add the attention sink to the global sum.
+            add_attention_sink(global_sum_mi, global_max[mi]);
 #ifdef UNIFIED_EPILOGUE_SCALE
             // Descaling factor
             float const scale_bmm2_f_ = reinterpret_cast<float&>(scale_bmm2_);
-            global_sum[mi] = global_sum[mi] == 0.f ? scale_bmm2_f_ : scale_bmm2_f_ / global_sum[mi];
+            // The scale.
+            float scale = global_sum_mi == 0.f ? scale_bmm2_f_ : scale_bmm2_f_ / global_sum_mi;
 #else
-            global_sum[mi] = global_sum[mi] == 0.f ? 1.0f : 1.0f / global_sum[mi];
+            float scale = global_sum_mi == 0.f ? 1.0f : 1.0f / global_sum_mi;
 #endif
 // Assume only N has multiple MMAs (MMAS_M = 1).
 #pragma unroll
@@ -1246,8 +1327,8 @@ struct Tile_o_epilogue<Hopper_qgmma_e4m3_fp32_traits, Kernel_traits>
                 {
                     float& reg0 = ctile_o.acc_[0][mma_ni].elt(2 * ni * Mma_tile_o::CORES_M + 2 * mi);
                     float& reg1 = ctile_o.acc_[0][mma_ni].elt(2 * ni * Mma_tile_o::CORES_M + 2 * mi + 1);
-                    reg0 *= global_sum[mi];
-                    reg1 *= global_sum[mi];
+                    reg0 *= scale;
+                    reg1 *= scale;
                 }
             }
         }
