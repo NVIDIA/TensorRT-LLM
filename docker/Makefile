@@ -1,6 +1,8 @@
 # Default base image for the docker build as defined in Dockerfile.multi
 BASE_IMAGE         ?= $(shell grep '^ARG BASE_IMAGE=' Dockerfile.multi | grep -o '=.*' | tr -d '="')
 BASE_TAG           ?= $(shell grep '^ARG BASE_TAG=' Dockerfile.multi | grep -o '=.*' | tr -d '="')
+TRITON_IMAGE       ?= $(shell grep '^ARG TRITON_IMAGE=' Dockerfile.multi | grep -o '=.*' | tr -d '="')
+TRITON_BASE_TAG    ?= $(shell grep '^ARG TRITON_BASE_TAG=' Dockerfile.multi | grep -o '=.*' | tr -d '="')
 # Name of the new image
 IMAGE_NAME         ?= tensorrt_llm
 IMAGE_TAG          ?= latest
@@ -80,6 +82,8 @@ endef
 		--progress $(DOCKER_PROGRESS) \
 		$(if $(BASE_IMAGE), --build-arg BASE_IMAGE=$(BASE_IMAGE)) \
 		$(if $(BASE_TAG), --build-arg BASE_TAG=$(BASE_TAG)) \
+		$(if $(TRITON_IMAGE), --build-arg TRITON_IMAGE=$(TRITON_IMAGE)) \
+		$(if $(TRITON_BASE_TAG), --build-arg TRITON_BASE_TAG=$(TRITON_BASE_TAG)) \
 		$(if $(BUILD_WHEEL_ARGS), --build-arg BUILD_WHEEL_ARGS="$(BUILD_WHEEL_ARGS)") \
 		$(if $(BUILD_WHEEL_SCRIPT), --build-arg BUILD_WHEEL_SCRIPT="$(BUILD_WHEEL_SCRIPT)") \
 		$(if $(TORCH_INSTALL_TYPE), --build-arg TORCH_INSTALL_TYPE="$(TORCH_INSTALL_TYPE)") \
@@ -187,16 +191,16 @@ jenkins-aarch64_%: STAGE = tritondevel
 jenkins-rockylinux8_%: PYTHON_VERSION_TAG_ID = $(if $(findstring 3.12,${PYTHON_VERSION}),PY312,$(if $(findstring 3.10,${PYTHON_VERSION}),PY310,$(error Unknown PYTHON_VERSION specified)))
 jenkins-rockylinux8_%: IMAGE_WITH_TAG = $(shell . ../jenkins/current_image_tags.properties && echo $$LLM_ROCKYLINUX8_${PYTHON_VERSION_TAG_ID}_DOCKER_IMAGE)
 jenkins-rockylinux8_%: STAGE = tritondevel
-jenkins-rockylinux8_%: BASE_IMAGE = nvidia/cuda
+jenkins-rockylinux8_%: BASE_IMAGE = nvcr.io/nvidia/cuda
 jenkins-rockylinux8_%: BASE_TAG = 12.9.1-devel-rockylinux8
 
 rockylinux8_%: STAGE = tritondevel
-rockylinux8_%: BASE_IMAGE = nvidia/cuda
+rockylinux8_%: BASE_IMAGE = nvcr.io/nvidia/cuda
 rockylinux8_%: BASE_TAG = 12.9.1-devel-rockylinux8
 
 # For x86_64 and aarch64
 ubuntu22_%: STAGE = tritondevel
-ubuntu22_%: BASE_IMAGE = nvidia/cuda
+ubuntu22_%: BASE_IMAGE = nvcr.io/nvidia/cuda
 ubuntu22_%: BASE_TAG = 12.9.1-devel-ubuntu22.04
 
 trtllm_%: STAGE = release
