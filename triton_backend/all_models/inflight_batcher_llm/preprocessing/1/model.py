@@ -29,6 +29,7 @@ import io
 import json
 import os
 from collections import defaultdict
+from contextlib import suppress
 from typing import List
 
 import numpy as np
@@ -800,10 +801,11 @@ class VisionPreProcessor:
         self.vision_model_processor = vision_model_processor
         self.vision_model_type = vision_model_type
 
-        # TODO: Cover the case where those values are missing
-        self.vocab_size = hf_config.text_config.vocab_size
-        self.image_size = hf_config.vision_config.image_size
-        self.image_token_index = hf_config.image_token_index
+        with suppress(AttributeError):
+            # Only for pixtral models
+            self.vocab_size = hf_config.text_config.vocab_size
+            self.image_size = hf_config.vision_config.image_size
+            self.image_token_index = hf_config.image_token_index
 
     def load_images_from_urls(self, img_urls):
         images = []
