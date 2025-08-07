@@ -39,7 +39,7 @@ class GuidedDecoder:
                 guided_decoding_config, vocab_size_padded)
         else:
             raise ValueError(
-                f"invalid guided decoding backend: {self.guided_decoding_backend}"
+                f"Invalid guided decoding backend: {self.guided_decoding_backend}"
             )
         logger.info(
             f"Guided decoder initialized with backend: {self.guided_decoding_backend}"
@@ -71,7 +71,7 @@ class GuidedDecoder:
     def bitmask_size(self) -> int:
         return math.ceil(self.vocab_size_padded / 32)
 
-    def _is_matcher_init(self, llm_req: LlmRequest) -> bool:
+    def _require_matcher_init(self, llm_req: LlmRequest) -> bool:
         if llm_req.guided_decoding_params is None:
             return False
         if llm_req.py_is_draft:
@@ -83,7 +83,7 @@ class GuidedDecoder:
         # The request is in the last chunk of a context forward step.
         return llm_req.is_context_init_state and llm_req.is_last_context_chunk
 
-    def _is_matcher_in_progress(self, llm_req: LlmRequest) -> bool:
+    def _require_matcher_advance(self, llm_req: LlmRequest) -> bool:
         if llm_req.guided_decoding_params is None:
             return False
         if llm_req.py_is_draft:
@@ -106,16 +106,17 @@ class GuidedDecoder:
             self.num_advanced_tokens[slot] = 0
             self.num_guided_tokens[slot] = 0
 
-            if not (self._is_matcher_init(llm_req)
-                    or self._is_matcher_in_progress(llm_req)):
+            matcher_init: bool = self._require_matcher_init(llm_req)
+            matcher_advance: bool = self._require_matcher_advance(llm_req)
+            if not (matcher_init or matcher_advance):
                 continue
 
-            if self._is_matcher_init(llm_req):
+            if matcher_init:
                 matcher = self.grammar_matcher_factory.create(
                     llm_req.guided_decoding_params)
                 self.grammar_matchers[slot] = matcher
 
-            if self._is_matcher_in_progress(llm_req):
+            if matcher_advance:
                 matcher = self.grammar_matchers[slot]
                 # The last new token must be acceptable unless the matcher is terminated in a drafting loop.
                 if llm_req.py_is_draft and (matcher.is_terminated()
