@@ -76,10 +76,6 @@ class GuidedDecoder:
             return False
         if llm_req.py_is_draft:
             return False
-        if llm_req.context_phase_params is not None and llm_req.py_decoding_iter == 1:
-            # The request is in the first generation forward step at the disagg gen instance.
-            # Need to initialize the matcher and accept the first token.
-            return True
         # The request is in the last chunk of a context forward step.
         return llm_req.is_context_init_state and llm_req.is_last_context_chunk
 
@@ -250,3 +246,19 @@ class GuidedDecoder:
             # Reset the drafting states.
             self.num_advanced_draft_tokens[slot] = 0
             self.is_draft_terminated[slot] = False
+
+    @nvtx_range("GuidedDecoder.init_disagg_gen_requests")
+    def init_disagg_gen_requests(self,
+                                 scheduled_requests: ScheduledRequests) -> None:
+        """Initialize the grammar matchers for disagg gen requests.
+        """
+        for llm_req in scheduled_requests.generation_requests:
+            if llm_req.guided_decoding_params is None:
+                continue
+            assert not llm_req.py_is_draft
+            slot: int = llm_req.py_seq_slot
+            if llm_req.context_phase_params is not None and llm_req.py_decoding_iter == 1:
+                # The request is in the first generation forward step at the disagg gen instance.
+                self.grammar_matchers[
+                    slot] = self.grammar_matcher_factory.create(
+                        llm_req.guided_decoding_params)

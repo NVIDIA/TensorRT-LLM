@@ -417,16 +417,71 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     @pytest.mark.skip_less_device_memory(32000)
-    def test_guided_decoding(self):
+    @pytest.mark.parametrize("backend", ["xgrammar", "llguidance"])
+    def test_guided_decoding(self, backend: str, mocker):
+        mocker.patch.dict(os.environ, {"TRTLLM_XGUIDANCE_LENIENT": "1"})
         ctx_server_config = {
             "disable_overlap_scheduler": True,
-            "guided_decoding_backend": "xgrammar",
+            "guided_decoding_backend": backend,
             "cache_transceiver_config": {
                 "backend": "default"
             }
         }
         gen_server_config = {
-            "guided_decoding_backend": "xgrammar",
+            "guided_decoding_backend": backend,
+            "cache_transceiver_config": {
+                "backend": "default"
+            }
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "port": 8000,
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1,
+                "urls": ["localhost:8001"]
+            },
+            "generation_servers": {
+                "num_instances": 1,
+                "urls": ["localhost:8002"]
+            }
+        }
+        with launch_disaggregated_llm(disaggregated_server_config,
+                                      ctx_server_config, gen_server_config,
+                                      self.MODEL_PATH) as llm:
+            task = JsonModeEval(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @pytest.mark.skip_less_device_memory(32000)
+    @pytest.mark.parametrize("backend", ["xgrammar", "llguidance"])
+    def test_guided_decoding_with_eagle3(self, backend: str, mocker):
+        mocker.patch.dict(os.environ, {"TRTLLM_XGUIDANCE_LENIENT": "1"})
+        speculative_decoding_config = {
+            "decoding_type": "Eagle",
+            "max_draft_len": 3,
+            "speculative_model_dir":
+            f"{llm_models_root()}/EAGLE3-LLaMA3.1-Instruct-8B",
+            "eagle3_one_model": False
+        }
+
+        ctx_server_config = {
+            "disable_overlap_scheduler": True,
+            "speculative_config": speculative_decoding_config,
+            "kv_cache_config": {
+                "free_gpu_memory_fraction": 0.8,
+            },
+            "guided_decoding_backend": backend,
+            "cache_transceiver_config": {
+                "backend": "default"
+            }
+        }
+        gen_server_config = {
+            "disable_overlap_scheduler": True,
+            "speculative_config": speculative_decoding_config,
+            "kv_cache_config": {
+                "free_gpu_memory_fraction": 0.8,
+            },
+            "guided_decoding_backend": backend,
             "cache_transceiver_config": {
                 "backend": "default"
             }
