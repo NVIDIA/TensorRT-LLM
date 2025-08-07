@@ -1198,13 +1198,15 @@ void WindowBlockManager::refreshBlocks()
 }
 
 void BlockManager::addSequence(GenerationRequest& sequence, SizeType32 inputLength, SizeType32 numContextBlocks,
-    LlmRequest& llmRequest, SizeType32 windowSize)
+    LlmRequest& llmRequest, OptionalRef<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager,
+    SizeType32 windowSize)
 {
-    mWindowBlockManagers.at(windowSize).addSequence(sequence, inputLength, numContextBlocks, llmRequest);
+    mWindowBlockManagers.at(windowSize)
+        .addSequence(sequence, inputLength, numContextBlocks, llmRequest, kvCacheConnectorManager);
 }
 
-void WindowBlockManager::addSequence(
-    GenerationRequest& sequence, SizeType32 inputLength, SizeType32 numContextBlocks, LlmRequest& llmRequest)
+void WindowBlockManager::addSequence(GenerationRequest& sequence, SizeType32 inputLength, SizeType32 numContextBlocks,
+    LlmRequest& llmRequest, OptionalRef<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager)
 {
     auto const requestId = sequence.getRequestId();
     auto const [seqIt, emplaceDone] = mAllocatedBlocksPerSeq.emplace(requestId, std::vector<BlockPtr>{});
@@ -1235,9 +1237,18 @@ void WindowBlockManager::addSequence(
     auto const prepopulatedPromptLen = loadOrAllocateBlocks(blockKeys, numContextBlocks, sequence, perBlockRetentions);
     mReusedTokens += static_cast<double>(prepopulatedPromptLen);
     mTotalInputTokens += static_cast<double>(uniqueTokens.size());
-    llmRequest.setPrepopulatedPromptLen(prepopulatedPromptLen, getTokensPerBlock());
-    TLLM_LOG_DEBUG("addSequence: Request %lu, inputLength %d, prepopulatedPromptLen %d", llmRequest.mRequestId,
-        inputLength, prepopulatedPromptLen);
+
+    SizeType32 numConnectorMatchedTokens = 0;
+
+    // If we're using a KV cache connector, check if any additional blocks can be loaded.
+    if (kvCacheConnectorManager)
+    {
+        numConnectorMatchedTokens = kvCacheConnectorManager->getNumNewMatchedTokens(llmRequest, prepopulatedPromptLen);
+    }
+
+    llmRequest.setPrepopulatedPromptLen(prepopulatedPromptLen + numConnectorMatchedTokens, getTokensPerBlock());
+    TLLM_LOG_DEBUG("addSequence: Request %lu, inputLength %d, prepopulatedPromptLen %d, numConnectorMatchedTokens %d",
+        llmRequest.mRequestId, inputLength, prepopulatedPromptLen, numConnectorMatchedTokens);
 }
 
 void BlockManager::addSequence(
@@ -2022,11 +2033,16 @@ std::optional<BlockKey> KVCacheManager::findNewContextBlock(
     return newContextBlockOpt;
 }
 
-void KVCacheManager::addSequence(
-    RequestIdType requestId, SizeType32 inputLength, SizeType32 beamWidth, OptionalRef<LlmRequest> llmRequest)
+void KVCacheManager::addSequence(RequestIdType requestId, SizeType32 inputLength, SizeType32 beamWidth,
+    OptionalRef<LlmRequest> llmRequest, OptionalRef<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager)
 {
     // Need to add the bubble after the sink tokens to use even block size
     inputLength += mSinkBubbleLength;
+
+    if (kvCacheConnectorManager)
+    {
+        TLLM_CHECK_WITH_INFO(beamWidth == 1, "KV Cache Connector is not supported with beam search");
+    }
 
     auto kvCacheRetentionConfig = llmRequest
         ? llmRequest->getKvCacheRetentionConfig().value_or(executor::KvCacheRetentionConfig())
@@ -2071,7 +2087,8 @@ void KVCacheManager::addSequence(
         auto const numContextBlocks = tc::ceilDiv(effectiveInputLength, getTokensPerBlock());
         if (!sequence.isCyclic() && mEnableBlockReuse)
         {
-            mBlockManager.addSequence(sequence, effectiveInputLength, numContextBlocks, *llmRequest, windowSize);
+            mBlockManager.addSequence(
+                sequence, effectiveInputLength, numContextBlocks, *llmRequest, kvCacheConnectorManager, windowSize);
         }
         else
         {
@@ -2083,6 +2100,12 @@ void KVCacheManager::addSequence(
                     "will "
                     "have no effect.",
                     llmRequest->mRequestId);
+                if (kvCacheConnectorManager.has_value())
+                {
+                    TLLM_LOG_WARNING(
+                        "KV Cache Connector specified when block reuse is disabled. The KV Cache Connector will be "
+                        "ignored.");
+                }
             }
             mBlockManager.addSequence(sequence, numContextBlocks, unsharedBlockIdx, windowSize);
             if (mEnableHashKey && llmRequest.has_value() && beamWidth == 1)
@@ -2497,6 +2520,13 @@ std::vector<SizeType32> KVCacheManager::getNewlyAllocatedBlockIds(
     return mBlockManager.getNewlyAllocatedBlockIds(getSequence(requestId), windowSize);
 }
 
+runtime::ITensor::SharedPtr KVCacheManager::getUniquePrimaryPool() const
+{
+    TLLM_CHECK_WITH_INFO(mBlockManager.getWindowSizesMetadata().size() == 1,
+        "getUniquePrimaryPool is only supported for a single window size");
+    return mBlockManager.getPrimaryPool(0);
+}
+
 runtime::ITensor::SharedPtr KVCacheManager::getPrimaryPool(SizeType32 layer_idx) const
 {
     return mBlockManager.getPrimaryPool(mBlockManager.getLayerPoolIdx(layer_idx));
@@ -2576,4 +2606,5 @@ SizeType32 KVCacheManager::calculateMaxBlockRequirements(SizeType32 inputLength,
     auto const leftoverBlockCapacity = blockCapacity - outputBlockRequirements;
     return std::min(outputLength + leftoverBlockCapacity * tokensPerBlock, inputLength + outputLength);
 }
+
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager

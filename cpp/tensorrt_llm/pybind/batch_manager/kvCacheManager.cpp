@@ -96,10 +96,12 @@ public:
     }
 
     void addSequence(tb::LlmRequest::RequestIdType requestId, SizeType32 inputLength, SizeType32 beamWidth,
-        tensorrt_llm::common::OptionalRef<tb::LlmRequest> llmRequest = std::nullopt) override
+        tensorrt_llm::common::OptionalRef<tb::LlmRequest> llmRequest = std::nullopt,
+        tensorrt_llm::common::OptionalRef<tb::kv_connector::KvCacheConnectorManager> kvCacheConnectorManager
+        = std::nullopt) override
     {
-        PYBIND11_OVERLOAD_PURE(
-            void, tbk::BaseKVCacheManager, addSequence, requestId, inputLength, beamWidth, llmRequest);
+        PYBIND11_OVERLOAD_PURE(void, tbk::BaseKVCacheManager, addSequence, requestId, inputLength, beamWidth,
+            llmRequest, kvCacheConnectorManager);
     }
 
     void removeSequence(tb::LlmRequest::RequestIdType requestId,
@@ -214,10 +216,16 @@ public:
             std::deque<tensorrt_llm::executor::KVCacheEvent>, tbk::BaseKVCacheManager, getLatestEvents, timeout);
     }
 
-    tensorrt_llm::runtime::ITensor::SharedPtr getPrimaryPool(SizeType32 layer_idx) const override
+    tensorrt_llm::runtime::ITensor::SharedPtr getPrimaryPool(SizeType32 poolIdx) const override
     {
         PYBIND11_OVERLOAD_PURE(
-            tensorrt_llm::runtime::ITensor::SharedPtr, tbk::BaseKVCacheManager, getPrimaryPool, layer_idx);
+            tensorrt_llm::runtime::ITensor::SharedPtr, tbk::BaseKVCacheManager, getPrimaryPool, poolIdx);
+    }
+
+    tensorrt_llm::runtime::ITensor::SharedPtr getUniquePrimaryPool() const override
+    {
+        PYBIND11_OVERLOAD_PURE(
+            tensorrt_llm::runtime::ITensor::SharedPtr, tbk::BaseKVCacheManager, getUniquePrimaryPool);
     }
 
     SizeType32 getPoolLayerIdx(SizeType32 layer_idx) const override
@@ -342,7 +350,9 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
         .def("get_needed_blocks_one_step", &BaseKVCacheManager::getNeededBlocksOneStep)
         .def("get_remaining_blocks_to_completion", &BaseKVCacheManager::getRemainingBlocksToCompletion)
         .def("add_token", &BaseKVCacheManager::addToken)
-        .def("add_sequence", &BaseKVCacheManager::addSequence)
+        .def("add_sequence", &BaseKVCacheManager::addSequence, py::arg("request_id"), py::arg("input_length"),
+            py::arg("beam_width"), py::arg("llm_request") = std::nullopt,
+            py::arg("kv_cache_connector_manager") = std::nullopt)
         .def("remove_sequence", &BaseKVCacheManager::removeSequence)
         .def("scheduling_remove_sequence", &BaseKVCacheManager::schedulingRemoveSequence)
         .def("get_block_pool_pointers",
@@ -376,6 +386,7 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
                 auto pool_layer_idx = self.getPoolLayerIdx(layer_idx);
                 return pool.index({torch::indexing::Slice(), pool_layer_idx});
             })
+        .def("get_unique_primary_pool", [](tbk::BaseKVCacheManager& self) { return self.getUniquePrimaryPool(); })
         .def("get_block_offsets_of_batch",
             [](tbk::BaseKVCacheManager& self, at::Tensor output, SizeType32 firstBatchSlotIdx, SizeType32 batchSize,
                 SizeType32 beamWidth)
