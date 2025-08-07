@@ -229,6 +229,10 @@ class SequenceInfo:
         return self._sequence_lengths
 
     @property
+    def input_positions(self) -> List[int]:
+        return self.input_pos_host[: self.num_sequences].tolist()
+
+    @property
     def is_generate(self) -> bool:
         return all(sl == 1 for sl in self.sequence_lengths)
 
@@ -356,6 +360,7 @@ class SequenceInfo:
         """
         # reset input_pos
         self.input_pos.zero_()
+        self.input_pos_host.zero_()
 
         # set a dummy sequence corresponding to a generate-only batch (will also reset position_ids)
         self.nest_sequences([[1]] * self.max_batch_size, allow_realloc=True)
@@ -535,7 +540,7 @@ class SequenceInfo:
         if reset:
             self.input_pos_host[:bs].copy_(seq_len, non_blocking=True)
         else:
-            self.input_pos_host[:bs] += seq_len.to(self.device)
+            self.input_pos_host[:bs] += seq_len
 
         # update position_ids
         self._update_position_ids()
