@@ -264,7 +264,7 @@ parameters: {
 parameters: {
   key: "hf_model_path"
   value: {
-    string_value: "/model_hf"
+    string_value: "${hf_model_path}"
   }
 }
 
