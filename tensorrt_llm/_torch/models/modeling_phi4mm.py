@@ -13,7 +13,7 @@ from ...executor.request import LoRARequest
 from ...inputs import (ExtraProcessedInputs, InputProcessor, TextPrompt,
                        register_input_processor)
 from ...logger import logger
-from ...lora_manager import LoraConfig
+from ...lora_helper import LoraConfig
 from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
 from ..model_config import ModelConfig

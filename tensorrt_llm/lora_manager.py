@@ -21,7 +21,7 @@ from .layers.linear import ColumnLinear
 from .lora_helper import (
     LoraConfig,
     get_default_trtllm_modules_to_hf_modules,
-    get_missing_qkv_modules,
+    get_missing_qkv_modules_from_lora_modules,
 )
 from .mapping import Mapping
 from .models.convert_utils import get_model_path, load_state_dict, split_matrix_tp
@@ -717,8 +717,8 @@ class LoraManager(object):
         )
 
     @staticmethod
-    def get_missing_qkv_modules(lora_target_modules):
-        return get_missing_qkv_modules(lora_target_modules)
+    def get_missing_qkv_modules(lora_target_modules: List[str]) -> List[str]:
+        return get_missing_qkv_modules_from_lora_modules(lora_target_modules)
 
     @property
     def missing_qkv_modules(self) -> List[str]:

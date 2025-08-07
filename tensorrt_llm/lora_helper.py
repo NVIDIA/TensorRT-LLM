@@ -19,7 +19,8 @@ from typing import Dict, List, Optional
 from ._utils import DictConversion
 
 
-def get_missing_qkv_modules(lora_target_modules: List[str]) -> List[str]:
+def get_missing_qkv_modules_from_lora_modules(
+        lora_target_modules: List[str]) -> List[str]:
     """Get missing QKV modules from LoRA target modules.
 
     In current design, q_lora_params, k_lora_params and v_lora_params should be all enabled or
@@ -85,8 +86,8 @@ class LoraConfig(DictConversion):
     max_lora_rank: int = 64
     lora_target_modules: List[str] = field(default_factory=list)
     trtllm_modules_to_hf_modules: Dict[str, str] = field(default_factory=dict)
-    max_loras: int | None = None
-    max_cpu_loras: int | None = None
+    max_loras: Optional[int] = None
+    max_cpu_loras: Optional[int] = None
 
     def __post_init__(self):
         assert self.lora_ckpt_source in [
@@ -96,4 +97,5 @@ class LoraConfig(DictConversion):
 
     @property
     def missing_qkv_modules(self) -> List[str]:
-        return get_missing_qkv_modules(self.lora_target_modules)
+        return get_missing_qkv_modules_from_lora_modules(
+            self.lora_target_modules)
