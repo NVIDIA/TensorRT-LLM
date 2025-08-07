@@ -274,6 +274,12 @@ class Eagle3OneModelWorker(nn.Module):
         num_contexts = attn_metadata.num_contexts
         num_gens = batch_size - num_contexts
 
+        if attn_metadata.padded_num_tokens is not None:
+            input_ids = input_ids[:attn_metadata.num_tokens]
+            position_ids = position_ids[:attn_metadata.num_tokens]
+            hidden_states = hidden_states[:attn_metadata.num_tokens]
+            logits = logits[:attn_metadata.num_tokens]
+
         raw_logits = logits
 
         # Sample and accept tokens

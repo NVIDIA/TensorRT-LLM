@@ -67,8 +67,8 @@ class PyTorchConfig:
     enable_iter_perf_stats: bool = False
     # If true, enables per request stats per iteration
     # Must also set enable_iter_perf_stats to true to get request stats
-    enable_iter_req_stats: bool = False
-    print_iter_log: bool = False
+    enable_iter_req_stats: bool = True
+    print_iter_log: bool = True
 
     torch_compile_enabled: bool = False
     torch_compile_fullgraph: bool = True

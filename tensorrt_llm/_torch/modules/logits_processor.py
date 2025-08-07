@@ -16,6 +16,11 @@ class LogitsProcessor(nn.Module):
                 attn_metadata: AttentionMetadata,
                 return_context_logits: bool = False) -> torch.Tensor:
 
+        # Slicing out the actual
+        if (attn_metadata is not None
+                and attn_metadata.padded_num_tokens is not None):
+            hidden_states = hidden_states[:attn_metadata.num_tokens, ...]
+
         if not return_context_logits:
             if attn_metadata is not None:
                 last_tokens = torch.cumsum(
