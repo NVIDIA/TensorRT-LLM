@@ -1,3 +1,5 @@
+from contextlib import contextmanager, nullcontext
+
 import pytest
 
 from tensorrt_llm import LLM
@@ -14,7 +16,7 @@ from .lora_test_utils import (
 from .test_llm import (_test_llm_capture_request_error, get_model_path,
                        global_kvcache_config, llama_model_path,
                        llm_get_stats_async_test_harness,
-                       llm_get_stats_test_harness, prompts,
+                       llm_get_stats_test_harness, llm_test_harness, prompts,
                        run_llm_abort_request,
                        run_llm_with_postprocess_parallel_and_result_handler,
                        tinyllama_logits_processor_test_harness)
@@ -33,7 +35,7 @@ import tempfile
 import torch
 from peft import LoraConfig as PeftLoraConfig
 from peft import get_peft_model
-from transformers import AutoModelForCausalLM
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 # isort: on
 
@@ -93,6 +95,63 @@ def test_llm_abort_request(sampling_params):
     run_llm_abort_request(llm=llm, sampling_params=sampling_params)
 
 
+@contextmanager
+def _validate_invalid_token_error_scope():
+    with pytest.raises(RuntimeError) as exc_info:
+        yield
+    assert "Token ID out of range" in str(exc_info.value)
+
+
+@force_ampere
+def test_llm_invalid_input_token():
+    llm = LLM(model=llama_model_path, kv_cache_config=global_kvcache_config)
+    prompts = [
+        [-1],
+    ]
+    # NB: exc_info in _validate_invalid_token_error_scope creates a reference
+    #     to a traceback which outlives the scope of 'exc_info' and prevents
+    #     deletion of 'llm'. However, using the context manager protocol is
+    #     anyways more robust than delegating cleanup to __del__.
+    with llm:
+        with _validate_invalid_token_error_scope():
+            llm.generate(
+                prompts,
+                sampling_params=SamplingParams(max_tokens=5),
+            )
+
+
+@force_ampere
+def test_llm_invalid_input_token_async():
+    llm = LLM(model=llama_model_path, kv_cache_config=global_kvcache_config)
+    # NB: exc_info in _validate_invalid_token_error_scope creates a reference
+    #     to a traceback which outlives the scope of 'exc_info' and prevents
+    #     deletion of 'llm'. However, using the context manager protocol is
+    #     anyways more robust than delegating cleanup to __del__.
+    with llm:
+        prompts = [
+            [-1],
+            [42],
+        ]
+        fail_idx = [0]
+        for submit_order in [[0, 1], [1, 0]]:
+            for collect_order in [[0, 1], [1, 0]]:
+                print(f"submitting {submit_order}")
+                futures = [
+                    llm.generate_async(
+                        prompts[submit_idx],
+                        sampling_params=SamplingParams(max_tokens=5),
+                    ) for submit_idx in submit_order
+                ]
+                for collect_idx in collect_order:
+                    with _validate_invalid_token_error_scope(
+                    ) if submit_order[collect_idx] in fail_idx else nullcontext(
+                    ):
+                        print(
+                            f"collect order {collect_order}, collecting {collect_idx}"
+                        )
+                        futures[collect_idx].result()
+
+
 def test_llm_reward_model():
     rm_model_path = get_model_path("Qwen2.5-Math-PRM-7B")
     tokenizer = TransformersTokenizer.from_pretrained(rm_model_path)
@@ -143,6 +202,46 @@ def test_llm_with_postprocess_parallel_and_result_handler(streaming):
     run_llm_with_postprocess_parallel_and_result_handler(streaming,
                                                          "pytorch",
                                                          tp_size=1)
+
+
+@pytest.mark.parametrize(
+    "enable_mixed_sampler,enable_logprobs",
+    [
+        (False, False),  # Fast path: no mixed sampler, no logits, greedy
+        (True,
+         False),  # Batched strategy path: mixed sampler enabled, same strategy
+        (False,
+         True),  # Per-request path: mixed sampler disabled, logprobs enabled
+    ])
+@pytest.mark.part0
+def test_embedding_bias_with_torch_sampler_strategies(enable_mixed_sampler,
+                                                      enable_logprobs):
+    """Test embedding bias application in all 3 TorchSampler paths: fast, batched strategy, and per-request"""
+    tokenizer = AutoTokenizer.from_pretrained(llama_model_path)
+    biased_word_id = tokenizer.encode("Z", add_special_tokens=False)[-1]
+    vocab_size_padded = 32000
+    embedding_bias = torch.zeros(vocab_size_padded)
+    embedding_bias[biased_word_id] = torch.finfo(torch.float32).max
+
+    sampling_kwargs = {
+        "max_tokens": 6,
+        "embedding_bias": embedding_bias,
+    }
+
+    if enable_logprobs:
+        sampling_kwargs["logprobs"] = 1
+    # All test cases use greedy sampling for simplicity
+
+    sampling_params = SamplingParams(**sampling_kwargs)
+
+    llm_test_harness(
+        llama_model_path,
+        prompts,
+        ["Z Z Z Z Z Z"],
+        sampling_params=sampling_params,
+        backend="pytorch",
+        enable_trtllm_sampler=False,  # Use TorchSampler to test all 3 paths
+        enable_mixed_sampler=enable_mixed_sampler)
 
 
 def llama_7b_lora_from_dir_test_harness(**llm_kwargs) -> None:

@@ -10,7 +10,6 @@ from torch.fx import GraphModule, Interpreter
 from torch.fx.passes.split_module import split_module
 
 from tensorrt_llm.llmapi.utils import enable_llm_debug
-from tensorrt_llm.logger import logger
 
 from ..utils import (get_model_extra_attrs, get_piecewise_cuda_graph_flag,
                      make_weak_ref)
@@ -169,14 +168,11 @@ class PiecewiseRunner(object):
         if entry.cuda_graph is None:
 
             if not get_enable_piecewise_cuda_graph_capture_flag():
-                logger.warning(
-                    f"Unexpectedly capture cuda graph for {self.name} with runtime_num_of_token {runtime_num_of_token}. Will fallback to non-CUDA graph execution."
-                )
                 return entry.callable(*args)
 
-            if entry.warmup_count < 2:
+            if entry.warmup_count < 3:
                 entry.warmup_count += 1
-                return self.default_callable(*args)
+                return entry.callable(*args)
 
             entry.input_addresses = [
                 i.data_ptr() for i in args if isinstance(i, torch.Tensor)
@@ -203,6 +199,8 @@ class PiecewiseRunner(object):
             entry.output_addresses = [
                 i.data_ptr() for i in output if isinstance(i, torch.Tensor)
             ]
+
+            entry.cuda_graph.replay()
 
             return output
 

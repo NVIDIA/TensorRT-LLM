@@ -111,14 +111,39 @@ if self._config.backend == "pytorch":
 
 ### 3.1 Full Test Cycles
 
-1. **trt_llm_release_perf_test.yml** - Release performance test
-2. **trt_llm_perf_cluster_test.yml** - Cluster performance test
+1. **llm_perf_full.yml** - Release performance test
+   - [test_lists/qa/llm_perf_full.yml](../../test_lists/qa/llm_perf_full.yml)
+2. **llm_perf_cluster.yml** - Cluster performance test(for Blackwell)
+   - [test_lists/qa/llm_perf_cluster.yml](../../test_lists/qa/llm_perf_cluster.yml)
+3. **llm_perf_nim.yml** - NIM performance test
+   - [test_lists/qa/llm_perf_nim.yml](../../test_lists/qa/llm_perf_nim.yml)
 
 ### 3.2 Sanity Test Cycles
 
-- **trt_llm_release_perf_sanity.yml** - Release performance sanity test
+- **llm_perf_sanity.yml** - Release performance sanity test
+  - [test_lists/qa/llm_perf_sanity.yml](../../test_lists/qa/llm_perf_sanity.yml)
 
 ## 4. Test Configuration Description
+
+### 4.1 PyTorch Model Configuration
+
+The default PyTorch configuration is defined in [pytorch_model_config.py](pytorch_model_config.py) and can be overridden for specific test patterns. For example:
+
+```python
+{
+    'patterns': [
+        'qwen3_235b_a22b_fp4-bench-pytorch-float4-maxbs:512-maxnt:2048-input_output_len:1000,2000-con:8-ep:8-gpus:8',
+    ],
+    'config': {
+        'enable_attention_dp': False,
+        'moe_config': {
+            'backend': 'TRTLLM'
+        }
+    }
+}
+```
+
+This configuration allows you to customize PyTorch-specific settings for different model patterns while maintaining the base configuration as a fallback.
 
 ### 4.1 Test Case Configuration
 - Test cases are defined in YAML configuration files
