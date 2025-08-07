@@ -28,10 +28,7 @@ from tensorrt_llm.logger import logger
 
 def cleanup_output_files():
     """Clean up output files from previous runs."""
-    for file in [
-            'output.json', 'output_streaming.json', 'ucx_config.yaml',
-            'nixl_config.yaml'
-    ]:
+    for file in ['output.json', 'output_streaming.json']:
         try:
             os.remove(file)
         except FileNotFoundError:
