@@ -1,3 +1,4 @@
+from ..modules.attention import attn_custom_op_inplace, mla_custom_op_inplace
 from .cpp_custom_ops import _register_fake
 from .flashinfer_custom_ops import IS_FLASHINFER_AVAILABLE
 from .torch_custom_ops import bmm_out
@@ -12,6 +13,8 @@ __all__ = [
     'add_to_ub',
     'copy_to_userbuffers',
     'matmul_to_ub',
+    'attn_custom_op_inplace',
+    'mla_custom_op_inplace',
 ]
 
 if IS_FLASHINFER_AVAILABLE:
