@@ -21,7 +21,10 @@ import pytest
 import torch
 # isort: on
 
-from cuda import cudart
+try:
+    from cuda.bindings import runtime as cudart
+except ImportError:
+    from cuda import cudart
 from parameterized import parameterized
 from utils.util import create_session, run_session, unittest_name_func
 
