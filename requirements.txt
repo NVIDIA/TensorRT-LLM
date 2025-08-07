@@ -28,7 +28,7 @@ torchvision
 nvidia-modelopt[torch]~=0.33.0
 nvidia-nccl-cu12
 nvidia-cuda-nvrtc-cu12
-transformers==4.53.1
+transformers==4.55.0
 pydantic>=2.9.1
 pydantic-settings[yaml]
 omegaconf
@@ -62,4 +62,5 @@ blake3
 llguidance==0.7.29
 soundfile
 triton==3.3.1; platform_machine == "x86_64"
+tiktoken
 blobfile
