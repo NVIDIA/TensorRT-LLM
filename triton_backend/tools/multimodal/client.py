@@ -4,9 +4,9 @@ import argparse
 import base64
 import io
 import os
-from pathlib import Path
 import sys
 from datetime import datetime
+from pathlib import Path
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 
@@ -239,7 +239,7 @@ if __name__ == "__main__":
                         required=True,
                         choices=[
                             'blip2', 'llava', 'vila', 'mllama',
-                            'llava_onevision', 'qwen2_vl','pixtral'
+                            'llava_onevision', 'qwen2_vl', 'pixtral'
                         ],
                         help="Model type")
     parser.add_argument("--hf_model_dir",
