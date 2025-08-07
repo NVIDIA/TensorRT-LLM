@@ -124,6 +124,8 @@ meta-llama/Llama-3.1-8B-Instruct:
   - accuracy: 33.640
   - spec_dec_algo: Eagle
     accuracy: 33.640
+  - extra_acc_spec: logprobs=2
+    accuracy: 30.522
   - quant_algo: FP8
     accuracy: 33.841
   - quant_algo: FP8
@@ -199,10 +201,11 @@ mistralai/Mistral-7B-Instruct-v0.3:
     accuracy: 31.201
 mistralai/Mistral-Small-3.1-24B-Instruct-2503:
   - accuracy: 29.20
-mistralai/Mistral-Nemo-Base-2407:
+mistralai/Mistral-Nemo-12b-Base:
+  - accuracy: 28.906
   - quant_algo: FP8
     kv_cache_quant_algo: FP8
-    accuracy: 24.0
+    accuracy: 28.663
 nvidia/Mistral-NeMo-Minitron-8B-Instruct:
   - quant_algo: FP8
     accuracy: 32.553
@@ -230,6 +233,10 @@ mistralai/Mixtral-8x22B-v0.1:
     accuracy: 25.519
   - quant_algo: W8A16
     accuracy: 27.427
+microsoft/Phi-4-mini-instruct:
+  - accuracy: 32.958
+  - quant_algo: FP8
+    accuracy: 32.823
 google/gemma-2b:
   - accuracy: 23.194
   - quant_algo: W8A16
