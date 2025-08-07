@@ -8,6 +8,7 @@ from torch import nn
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.quantization.utils import fp4_utils
 
 from ..attention_backend import (AttentionInputType, AttentionMetadata,
                                  FlashInferAttentionMetadata, TrtllmAttention,
@@ -336,6 +337,21 @@ class Attention(nn.Module):
         attention_sinks: Optional[torch.Tensor] = None,
     ):
 
+        padded_num_tokens = attn_metadata.padded_num_tokens
+        num_tokens = attn_metadata.num_tokens
+
+        if padded_num_tokens is not None:
+            assert q.shape[0] == padded_num_tokens
+            q = q[:num_tokens, :]
+            if k is not None:
+                assert k.shape[0] == padded_num_tokens
+                k = k[:num_tokens, :]
+            if v is not None:
+                assert v.shape[0] == padded_num_tokens
+                v = v[:num_tokens, :]
+            assert output is not None
+            assert output_sf is None
+
         out_scale = None
         out_scale_sf = None
         has_quant_scale = (self.o_proj.has_fp8_qdq or self.o_proj.has_nvfp4
@@ -366,7 +382,7 @@ class Attention(nn.Module):
             attention_window_size=attention_window_size,
             attention_mask_data=attention_mask_data,
             enable_attn_nvfp4_output=enable_attn_nvfp4_output,
-            output=output,
+            output=output[:num_tokens, :] if output is not None else None,
             output_sf=output_sf,
             attention_sinks=attention_sinks)
         if isinstance(attn_output, tuple):
@@ -374,6 +390,11 @@ class Attention(nn.Module):
                 attn_output
             ) == 2, "attn_output should be a tuple of (output, output_sf)"
             return attn_output[0], attn_output[1]
+        if output is not None and output.shape[0] != num_tokens:
+            output[num_tokens:].fill_(0)
+        if output_sf is not None and output_sf.shape[0] != fp4_utils.pad_up(
+                num_tokens, 128):
+            output_sf[fp4_utils.pad_up(num_tokens, 128):].fill_(0)
         return attn_output, None
 
     def forward(
@@ -908,11 +929,10 @@ class MLA(nn.Module):
         return hidden_states.new_empty([num_tokens, hidden_size],
                                        dtype=hidden_states.dtype)
 
-    def forward_impl(self,
-                     position_ids: Optional[torch.Tensor],
+    def forward_impl(self, position_ids: Optional[torch.Tensor],
                      hidden_states: torch.Tensor,
                      attn_metadata: AttentionMetadata,
-                     output: Optional[torch.Tensor] = None) -> torch.Tensor:
+                     output: torch.Tensor) -> None:
         """
         Forward pass for the MLA module.
 
@@ -925,6 +945,18 @@ class MLA(nn.Module):
         Returns:
             torch.Tensor: The output tensor.
         """
+        # split q, k, v into context and gen batches
+        num_contexts = attn_metadata.num_contexts
+        num_generations = attn_metadata.num_generations
+        num_ctx_tokens = attn_metadata.num_ctx_tokens
+        num_tokens = attn_metadata.num_tokens
+        padded_num_tokens = attn_metadata.padded_num_tokens
+
+        if padded_num_tokens is not None:
+            hidden_states = hidden_states[:num_tokens, ...]
+            if position_ids is not None:
+                position_ids = position_ids[:num_tokens, ...]
+
         if self.is_lite:
             compressed_kv, k_pe = self.kv_a_proj_with_mqa(hidden_states).split(
                 [self.kv_lora_rank, self.qk_rope_head_dim], -1)
@@ -952,14 +984,10 @@ class MLA(nn.Module):
             self.aux_stream,
         )
 
-        # split q, k, v into context and gen batches
-        num_contexts = attn_metadata.num_contexts
-        num_generations = attn_metadata.num_generations
-        num_ctx_tokens = attn_metadata.num_ctx_tokens
-        num_tokens = attn_metadata.num_tokens
-
         assert q.shape[
             0] == num_tokens, f"Expect q.shape[0] to be {num_tokens}, but got {q.shape[0]}"
+
+        assert output is not None, "output must be provided"
 
         if num_contexts > 0:
             q_ctx = q[:num_ctx_tokens, ...]
@@ -970,17 +998,14 @@ class MLA(nn.Module):
                 assert position_ids is not None
                 k_pe_ctx = self.apply_rope(q_ctx, k_pe_ctx, position_ids)
 
-            attn_output_context = self.forward_context(
+            self.forward_context(
                 q_ctx,
                 compressed_kv_ctx,
                 k_pe_ctx,
                 attn_metadata,
+                output[:num_ctx_tokens, :],
                 latent_cache_ctx,
-                output=output if num_generations == 0 else None)
-            if num_generations == 0:
-                return attn_output_context
-        else:
-            attn_output_context = None
+            )
 
         if num_generations > 0:
             q_gen = q[num_ctx_tokens:, ...]
@@ -991,39 +1016,17 @@ class MLA(nn.Module):
                 assert position_ids is not None
                 k_pe_gen = self.apply_rope(q_gen, k_pe_gen, position_ids)
 
-            attn_output_gen = self.forward_generation(
+            self.forward_generation(
                 q_gen,
                 compressed_kv_gen,
                 k_pe_gen,
                 attn_metadata,
+                output[num_ctx_tokens:num_tokens, :],
                 latent_cache_gen,
-                output=output if num_contexts == 0 else None)
-            if num_contexts == 0:
-                return attn_output_gen
-        else:
-            attn_output_gen = None
+            )
 
-        # release pytorch activation memory
-        q = None
-        compressed_kv = None
-        k_pe = None
-
-        assert attn_output_context is not None and attn_output_gen is not None
-        assert (
-            len(attn_output_context.shape) == 2
-        ), f"attn_output_context must be rank 2, not {len(attn_output_context.shape)}"
-        assert (
-            len(attn_output_gen.shape) == 2
-        ), f"attn_output_gen must be rank 2, not {len(attn_output_gen.shape)}"
-        output = output if output is not None else torch.empty(
-            (num_tokens, attn_output_context.shape[1]),
-            dtype=attn_output_context.dtype,
-            device=attn_output_context.device)
-        output[:attn_output_context.shape[0], :] = attn_output_context
-        output[attn_output_context.shape[0]:, :] = attn_output_gen
-        attn_output_context = None
-        attn_output_gen = None
-        return output
+        if padded_num_tokens is not None:
+            output[num_tokens:].fill_(0)
 
     def _maybe_concat_qkv(self, q, k, v):
         if k is not None and v is not None and self.support_fused_qkv:
@@ -1032,13 +1035,14 @@ class MLA(nn.Module):
         return q, k, v
 
     def forward_context_default(
-            self,
-            q: torch.Tensor,
-            compressed_kv: torch.Tensor,
-            k_pe: torch.Tensor,
-            attn_metadata: AttentionMetadata,
-            latent_cache: Optional[torch.Tensor] = None,
-            output: Optional[torch.Tensor] = None) -> torch.Tensor:
+        self,
+        q: torch.Tensor,
+        compressed_kv: torch.Tensor,
+        k_pe: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        output: torch.Tensor,
+        latent_cache: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         kv = self.kv_b_proj(compressed_kv)
         k_nope, v = kv.split(
             [
@@ -1080,7 +1084,7 @@ class MLA(nn.Module):
         q: torch.Tensor,
         latent_cache: torch.Tensor,
         attn_metadata: AttentionMetadata,
-        output: Optional[torch.Tensor] = None,
+        output: torch.Tensor,
     ) -> torch.Tensor:
         assert latent_cache is not None
         trtllm_attention = cast(TrtllmAttention, self.mha)
@@ -1166,7 +1170,7 @@ class MLA(nn.Module):
         latent_cache: torch.
         Tensor,  # compressed_kv + k_pe [context_tokens, 1, lora_size + rope_size]
         attn_metadata: TrtllmAttentionMetadata,
-        output: Optional[torch.Tensor] = None,
+        output: torch.Tensor,
     ) -> torch.Tensor:
         trtllm_attention = cast(TrtllmAttention, self.mha)
         # apply RoPE, append compressed_kv + k_pe to paged kv cache and assign q_pe to q
@@ -1189,11 +1193,8 @@ class MLA(nn.Module):
             dtype=torch.float,
             device='cuda',
         )
-        if output is None:
-            attn_output = q.new_empty(
-                (q.size(0), self.num_heads * self.v_head_dim), dtype=q.dtype)
-        else:
-            attn_output = output
+
+        attn_output = output
         temp_attn_output = q.new_empty(
             (q.size(0), self.num_heads * self.v_head_dim), dtype=q.dtype)
 
@@ -1325,8 +1326,8 @@ class MLA(nn.Module):
         compressed_kv: torch.Tensor,
         k_pe: torch.Tensor,
         attn_metadata: AttentionMetadata,
+        output: torch.Tensor,
         latent_cache: Optional[torch.Tensor] = None,
-        output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if isinstance(self.mha, TrtllmAttention):
             assert isinstance(attn_metadata, TrtllmAttentionMetadata)
@@ -1339,16 +1340,17 @@ class MLA(nn.Module):
                 return self.forward_context_with_cached_kv(
                     q, latent_cache, attn_metadata, output)
         return self.forward_context_default(q, compressed_kv, k_pe,
-                                            attn_metadata, latent_cache, output)
+                                            attn_metadata, output, latent_cache)
 
     def forward_generation(
-            self,
-            q: torch.Tensor,
-            compressed_kv: torch.Tensor,
-            k_pe: torch.Tensor,
-            attn_metadata: AttentionMetadata,
-            latent_cache: Optional[torch.Tensor] = None,
-            output: Optional[torch.Tensor] = None) -> torch.Tensor:
+        self,
+        q: torch.Tensor,
+        compressed_kv: torch.Tensor,
+        k_pe: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        output: torch.Tensor,
+        latent_cache: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         num_tokens = q.shape[0]
         q_nope, q_pe = q.view([-1, self.num_heads, self.qk_head_dim]).split(
             [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
@@ -1419,12 +1421,6 @@ class MLA(nn.Module):
         # [seq, num_heads, kv_lora_rank]
         attn_out_latent = attn_out_latent.view(
             [-1, self.num_heads, self.kv_lora_rank])
-
-        # [seq, num_heads * v_head_dim]
-        output = output if output is not None else torch.empty(
-            [num_tokens, self.num_heads * self.v_head_dim],
-            dtype=attn_out_latent.dtype,
-            device=attn_out_latent.device)
 
         attn_output = output.view([num_tokens, self.num_heads, self.v_head_dim])
 

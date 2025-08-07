@@ -80,7 +80,6 @@ def test_register_fake(custom_ops):
         "trtllm::fp4_batched_quantize",
         "trtllm::fp4_gemm_trtllmgen",
         "trtllm::fp4_bmm",
-        "trtllm::merge_chunked_attention_for_mla",
         "trtllm::cuda_scaled_mm",
         "trtllm::initialize_static_lowprecision_buffers",
         "trtllm::cutlass_scaled_mm",

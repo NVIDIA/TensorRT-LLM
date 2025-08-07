@@ -1185,6 +1185,9 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
             inputs_embeds=inputs_embeds,
         )
 
+        if attn_metadata.padded_num_tokens is not None:
+            hidden_states = hidden_states[:attn_metadata.num_tokens]
+
         if spec_metadata and spec_metadata.spec_dec_mode.is_mtp():
             # get logits
             logits = self.logits_processor.forward(
@@ -1193,10 +1196,16 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
                 attn_metadata,
                 True,
             )
+            mtp_input_ids = input_ids
+            mtp_position_ids = position_ids
+            if attn_metadata.padded_num_tokens is not None:
+                mtp_input_ids = input_ids[:attn_metadata.num_tokens]
+                mtp_position_ids = position_ids[:attn_metadata.num_tokens]
+
             # get accepted tokens and next draft tokens
             return self.mtp_worker(
-                input_ids=input_ids,
-                position_ids=position_ids,
+                input_ids=mtp_input_ids,
+                position_ids=mtp_position_ids,
                 hidden_states=hidden_states,
                 logits=logits,
                 lm_head=self.lm_head,
