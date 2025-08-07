@@ -79,6 +79,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     def test_gather_generation_logits_cuda_graph(self):
+        "RCCA: https://nvbugs/5365525"
         extended_runtime_perf_knob_config = ExtendedRuntimePerfKnobConfig(
             cuda_graph_mode=True, cuda_graph_cache_size=1)
         llm = LLM(

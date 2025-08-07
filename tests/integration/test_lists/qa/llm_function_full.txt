@@ -550,7 +550,6 @@ accuracy/test_llm_api_pytorch.py::TestPhi4MM::test_auto_dtype
 accuracy/test_llm_api_pytorch.py::TestPhi4MM::test_auto_dtype_long_rope
 accuracy/test_llm_api_pytorch.py::TestPhi4MiniInstruct::test_auto_dtype
 accuracy/test_llm_api_pytorch.py::TestEXAONE4::test_auto_dtype
-accuracy/test_llm_api_pytorch.py::TestPhi4MiniInstruct::test_auto_dtype
 accuracy/test_llm_api_pytorch.py::TestMistralNemo12B::test_auto_dtype
 accuracy/test_llm_api_pytorch.py::TestMistralNemo12B::test_auto_dtype_tp2
 
