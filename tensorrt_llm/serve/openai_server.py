@@ -81,7 +81,7 @@ class OpenAIServer:
             self.model = model_dir.name
         else:
             self.model = model
-
+        self.metrics_collector = None
         if self.llm.args.return_perf_metrics:
             set_prometheus_multiproc_dir()
             self.metrics_collector = MetricsCollector({
