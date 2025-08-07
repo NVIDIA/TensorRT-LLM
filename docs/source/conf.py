@@ -107,6 +107,18 @@ container published for a previous
 (see also [NGC Catalog](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release/tags)).
 ```
     """,
+    "trtllm_serve_tag_admonition":
+    r"""
+```{admonition} trtllm-serve requests
+:class: dropdown note
+If you are running trtllm-server inside a Docker container, you have two options for sending API requests:
+1. Expose port 8000 to access the server from outside the container.
+2. Open a new terminal and use the following command to directly attach to the running container:
+```bash
+docker exec -it <container_id> bash
+
+```
+    """,
 }
 
 autosummary_generate = True
