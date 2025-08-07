@@ -10,7 +10,7 @@ This project is in active development and is currently in a prototype stage. The
 AutoDeploy is a prototype designed to simplify and accelerate the deployment of PyTorch models, including off-the-shelf models like those from HuggingFace transformers library, to TensorRT-LLM.
 
 <div align="center">
-  <img src="./ad_overview.png" alt="AutoDeploy integration with LLM API" width="70%">
+  <img src="../../media/ad_overview.png" alt="AutoDeploy integration with LLM API" width="70%">
   <p><em>AutoDeploy overview and relation with TensorRT-LLM's LLM api</em></p>
 </div>
 

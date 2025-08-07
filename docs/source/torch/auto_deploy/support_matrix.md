@@ -9,24 +9,81 @@ The exported graph then undergoes a series of automated transformations, includi
 **Bring Your Own Model**: AutoDeploy leverages `torch.export` and dynamic graph pattern matching, enabling seamless integration for a wide variety of models without relying on hard-coded architectures.
 
 We support Hugging Face models that are compatible with `AutoModelForCausalLM` and `AutoModelForImageTextToText`.
-Additionally, we have officially verified support for the following models:
+In addition, we have officially validated the following models using the default configuration: runtime=trtllm, compile_backend=torch-compile, and attn_backend=flashinfer
 
 <details>
 <summary>Click to expand supported models list</summary>
 
-| Model Series | HF Model Card | Model Factory | Precision | World Size | Runtime | Compile Backend ||| Attention Backend |||
-|--------------|----------------------|----------------|-----------|------------|---------|-----------------|--------------------|--------------------|--------------------|----------|----------|
-|              |               |            |           |            |         | torch-simple    | torch-compile    | torch-opt          | triton | flashinfer | MultiHeadLatentAttention |
-| LLaMA        | meta-llama/Llama-2-7b-chat-hf<br>meta-llama/Meta-Llama-3.1-8B-Instruct<br>meta-llama/Llama-3.1-70B-Instruct<br>codellama/CodeLlama-13b-Instruct-hf | AutoModelForCausalLM | BF16 | 1,2,4 | demollm, trtllm | ✅ | ✅ | ✅ | ✅ | ✅ | n/a |
-| LLaMA-4      | meta-llama/Llama-4-Scout-17B-16E-Instruct<br>meta-llama/Llama-4-Maverick-17B-128E-Instruct | AutoModelForImageTextToText | BF16 | 1,2,4,8 | demollm, trtllm | ✅ | ✅ | ❌ | ✅ | ✅ | n/a |
-| Nvidia Minitron | nvidia/Llama-3_1-Nemotron-51B-Instruct<br>nvidia/Llama-3.1-Minitron-4B-Width-Base<br>nvidia/Llama-3.1-Minitron-4B-Depth-Base | AutoModelForCausalLM | BF16 | 1,2,4 | demollm, trtllm | ✅ | ✅ | ✅ | ✅ | ✅ | n/a |
-| Nvidia Model Optimizer | nvidia/Llama-3.1-8B-Instruct-FP8<br>nvidia/Llama-3.1-405B-Instruct-FP8 | AutoModelForCausalLM | FP8 | 1,2,4 | demollm, trtllm | ✅ | ✅ | ✅ | ✅ | ✅ | n/a |
-| DeepSeek     | deepseek-ai/DeepSeek-R1-Distill-Llama-70B | AutoModelForCausalLM | BF16 | 1,2,4 | demollm, trtllm | ✅ | ✅ | ✅ | ✅ | ✅ | n/a |
-| Mistral      | mistralai/Mixtral-8x7B-Instruct-v0.1<br>mistralai/Mistral-7B-Instruct-v0.3 | AutoModelForCausalLM | BF16 | 1,2,4 | demollm, trtllm | ✅ | ✅ | ✅ | ✅ | ✅ | n/a |
-| BigCode      | bigcode/starcoder2-15b | AutoModelForCausalLM | FP32 | 1,2,4 | demollm, trtllm | ✅ | ✅ | ✅ | ✅ | ✅ | n/a |
-| Deepseek-V3      | deepseek-ai/DeepSeek-V3 | AutoModelForCausalLM | BF16 | 1,2,4 | demollm | ✅ | ❌ | ❌ | n/a | n/a | ✅ |
-| Phi4      | microsoft/phi-4<br>microsoft/Phi-4-reasoning<br>microsoft/Phi-4-reasoning-plus | AutoModelForCausalLM | BF16 | 1,2,4 | demollm, trtllm | ✅ | ✅ | ✅ | ✅ | ✅ | n/a |
-| Phi3/2      | microsoft/Phi-3-mini-4k-instruct<br>microsoft/Phi-3-mini-128k-instruct<br>microsoft/Phi-3-medium-4k-instruct<br>microsoft/Phi-3-medium-128k-instruct<br>microsoft/Phi-3.5-mini-instruct | AutoModelForCausalLM | BF16 | 1,2,4 | demollm, trtllm | ✅ | ✅ | ✅(partly) | ✅ | ❌ | n/a |
+- Qwen/QwQ-32B
+- Qwen/Qwen2.5-0.5B-Instruct
+- Qwen/Qwen2.5-1.5B-Instruct
+- Qwen/Qwen2.5-3B-Instruct
+- Qwen/Qwen2.5-7B-Instruct
+- Qwen/Qwen3-0.6B
+- Qwen/Qwen3-235B-A22B
+- Qwen/Qwen3-30B-A3B
+- Qwen/Qwen3-4B
+- Qwen/Qwen3-8B
+- TinyLlama/TinyLlama-1.1B-Chat-v1.0
+- apple/OpenELM-1_1B-Instruct
+- apple/OpenELM-270M-Instruct
+- apple/OpenELM-3B-Instruct
+- apple/OpenELM-450M-Instruct
+- bigcode/starcoder2-15b-instruct-v0.1
+- bigcode/starcoder2-7b
+- deepseek-ai/DeepSeek-Prover-V1.5-SFT
+- deepseek-ai/DeepSeek-Prover-V2-7B
+- deepseek-ai/DeepSeek-R1-Distill-Llama-70B
+- deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
+- deepseek-ai/DeepSeek-R1-Distill-Qwen-32B
+- google/codegemma-7b-it
+- google/gemma-1.1-7b-it
+- google/gemma-2-27b-it
+- google/gemma-2-2b-it
+- google/gemma-2-9b-it
+- google/gemma-2b
+- google/gemma-3-1b-it
+- ibm-granite/granite-3.1-2b-instruct
+- ibm-granite/granite-3.1-8b-instruct
+- ibm-granite/granite-3.3-2b-instruct
+- ibm-granite/granite-3.3-8b-instruct
+- ibm-granite/granite-guardian-3.1-2b
+- ibm-granite/granite-guardian-3.2-5b
+- meta-llama/CodeLlama-34b-Instruct-hf
+- meta-llama/CodeLlama-7b-Instruct-hf
+- meta-llama/CodeLlama-7b-Python-hf
+- meta-llama/Llama-2-13b-chat-hf
+- meta-llama/Llama-2-7b-chat-hf
+- meta-llama/Llama-3.1-8B-Instruct
+- meta-llama/Llama-3.2-1B-Instruct
+- meta-llama/Llama-3.2-3B-Instruct
+- meta-llama/Llama-3.3-70B-Instruct
+- meta-llama/Llama-4-Maverick-17B-128E-Instruct
+- meta-llama/Llama-4-Scout-17B-16E-Instruct
+- microsoft/Phi-3-medium-128k-instruct
+- microsoft/Phi-3-medium-4k-instruct
+- microsoft/Phi-4-mini-instruct
+- microsoft/Phi-4-mini-reasoning
+- microsoft/Phi-4-reasoning
+- microsoft/Phi-4-reasoning-plus
+- microsoft/phi-4
+- mistralai/Codestral-22B-v0.1
+- mistralai/Mistral-7B-Instruct-v0.2
+- mistralai/Mistral-7B-Instruct-v0.3
+- mistralai/Mixtral-8x22B-Instruct-v0.1
+- nvidia/Llama-3.1-405B-Instruct-FP8
+- nvidia/Llama-3.1-70B-Instruct-FP8
+- nvidia/Llama-3.1-8B-Instruct-FP8
+- nvidia/Llama-3.1-Minitron-4B-Depth-Base
+- nvidia/Llama-3.1-Minitron-4B-Width-Base
+- nvidia/Llama-3.1-Nemotron-70B-Instruct-HF
+- nvidia/Llama-3.1-Nemotron-Nano-8B-v1
+- nvidia/Llama-3_1-Nemotron-51B-Instruct
+- nvidia/Llama-3_1-Nemotron-Ultra-253B-v1
+- nvidia/Llama-3_1-Nemotron-Ultra-253B-v1-FP8
+- nvidia/Llama-3_3-Nemotron-Super-49B-v1
+- nvidia/Mistral-NeMo-Minitron-8B-Base
+- perplexity-ai/r1-1776-distill-llama-70b
 
 </details>
 
