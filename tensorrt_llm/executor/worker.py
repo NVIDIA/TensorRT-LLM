@@ -163,12 +163,7 @@ class GenerationExecutorWorker(GenerationExecutor):
 
         if getattr(executor_config, "backend",
                    "") == "pytorch" and lora_config is not None:
-            from tensorrt_llm._torch.pyexecutor.resource_manager import \
-                ResourceManagerType
-            peft_cache_manager = self.engine.resource_manager.resource_managers.get(
-                ResourceManagerType.PEFT_CACHE_MANAGER)
-            self._lora_manager = LoraManager(
-                cpp_peft_cache_manager=peft_cache_manager.impl)
+            self._lora_manager = self.engine.get_lora_manager()
             lora_model_config = self.engine.model_engine.lora_model_config
             assert lora_model_config is not None
             self._lora_model_config = lora_model_config

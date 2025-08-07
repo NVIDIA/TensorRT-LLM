@@ -14,7 +14,7 @@
 # limitations under the License.
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from ._utils import DictConversion
 
@@ -88,6 +88,7 @@ class LoraConfig(DictConversion):
     trtllm_modules_to_hf_modules: Dict[str, str] = field(default_factory=dict)
     max_loras: Optional[int] = None
     max_cpu_loras: Optional[int] = None
+    lora_request: Optional[List[Any]] = None  # TODO smor fix
 
     def __post_init__(self):
         assert self.lora_ckpt_source in [

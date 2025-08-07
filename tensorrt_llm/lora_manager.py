@@ -8,7 +8,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
 
 import numpy as np
 import torch
@@ -702,6 +702,11 @@ class LoraManager(object):
         self._cpp_lora_weights: Dict[str, torch.Tensor] = {}  # on cpu
         self._cpp_lora_config: Dict[str, torch.Tensor] = {}  # on cpu
         self.lora_target_modules: List[str] = []
+        self._cpp_peft_cache_manager: Optional[tb_internal.batch_manager.PeftCacheManager] = None
+
+    def set_cpp_peft_cache_manager(
+        self, cpp_peft_cache_manager: tb_internal.batch_manager.PeftCacheManager
+    ):
         self._cpp_peft_cache_manager = cpp_peft_cache_manager
 
     def is_adapter_in_cpu_cache(self, adapter_uid: int) -> bool:

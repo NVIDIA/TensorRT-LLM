@@ -217,6 +217,8 @@ class PyExecutor:
         self.micro_batches: List[BatchStatePP
                                  | None] = [None] * self.num_micro_batches
         self.send_handles = [None] * self.num_micro_batches
+        self.model_engine.set_lora_manager(self.resource_manager)
+        self.model_engine.prefetch_lora_dirs()
 
         self.inflight_req_ids = ReqIdsSet()
 
@@ -295,6 +297,9 @@ class PyExecutor:
         self.model_engine.is_warmup = value
         if self.draft_model_engine is not None:
             self.draft_model_engine.is_warmup = value
+
+    def get_lora_manager(self):
+        return self.model_engine.lora_manager
 
     def start_worker(self):
         with self.worker_lock:

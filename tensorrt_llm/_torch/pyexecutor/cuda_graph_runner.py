@@ -18,6 +18,7 @@ class DecodingCUDAGraphRunner:
         spec_metadata: Optional[SpecMetadata] = None,
         use_mrope: bool = False,
         max_beam_width: int = 1,
+        lora_params: Optional[dict] = None,
     ) -> None:
         """
         Stores a CUDA graph and its associated input buffers.
@@ -54,6 +55,7 @@ class DecodingCUDAGraphRunner:
 
         self.attn_metadata = attn_metadata
         self.spec_metadata = spec_metadata
+        self.lora_params = lora_params
         self._output = None
         self._graph = None
         self.optional_extra_model_inputs = ["mrope_position_deltas"]
@@ -74,8 +76,8 @@ class DecodingCUDAGraphRunner:
             "inputs_embeds": None,
             "spec_metadata": self.spec_metadata,
             "mrope_position_deltas": self.mrope_position_deltas,
+            "lora_params": self.lora_params,
         }
-
         # We have to do warm up runs to initialize PyTorch's
         # internal states according to the docs:
         # https://pytorch.org/docs/stable/notes/cuda.html#cuda-graph-semantics
@@ -107,6 +109,9 @@ class DecodingCUDAGraphRunner:
             assert spec_metadata is self.spec_metadata, (
                 "spec_metadata does not match the spec_metadata instance that was used to "
                 "capture this graph.")
+
+        if "lora_params" in inputs:
+            self.lora_params = inputs["lora_params"]
 
         input_ids = inputs["input_ids"]
         position_ids = inputs["position_ids"]

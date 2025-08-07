@@ -428,20 +428,21 @@ class KVCacheManager(BaseResourceManager):
                     self.impl.add_token(req.py_request_id)
 
     def add_dummy_requests(
-        self,
-        request_ids: List[int],
-        # Note that token_nums should be past_kv_len + input_len (without
-        # spec decoding). The draft tokens will be added in this function,
-        # so we don't need to take care of it in the caller. When preparing
-        # token_nums, we should not take the draft tokens into account, so
-        # don't use the kv_cache_manager.max_seq_len, which includes both
-        # extra tokens and draft tokens.
-        token_nums: Optional[List[int]] = None,
-        is_gen: bool = False,
-        prepare_resource: bool = True,
-        max_num_draft_tokens: int = 0,
-        use_mrope: bool = False,
-        max_beam_width: int = 1,
+            self,
+            request_ids: List[int],
+            # Note that token_nums should be past_kv_len + input_len (without
+            # spec decoding). The draft tokens will be added in this function,
+            # so we don't need to take care of it in the caller. When preparing
+            # token_nums, we should not take the draft tokens into account, so
+            # don't use the kv_cache_manager.max_seq_len, which includes both
+            # extra tokens and draft tokens.
+            token_nums: Optional[List[int]] = None,
+            is_gen: bool = False,
+            prepare_resource: bool = True,
+            max_num_draft_tokens: int = 0,
+            use_mrope: bool = False,
+            max_beam_width: int = 1,
+            lora_request: Optional[List] = None,  # TODO smor fill type hint
     ):
         beam_width = max_beam_width
         requests = []
@@ -461,6 +462,16 @@ class KVCacheManager(BaseResourceManager):
             # Using 1 instead of 0 prevents NaN during warmup in e.g. Deepseek
             mrope_position_deltas = torch.zeros(
                 1, device="cuda", dtype=torch.int32) if use_mrope else None
+
+            lora_task_id = None
+            lora_weights = None
+            lora_config = None
+
+            if lora_request is not None and i < len(lora_request):
+                lora_task_id = lora_request[i].task_id
+                lora_weights = lora_request[i].weights
+                lora_config = lora_request[i].config
+
             req = LlmRequest(request_id=req_id,
                              max_new_tokens=1,
                              input_tokens=[1] * token_num,
@@ -468,7 +479,10 @@ class KVCacheManager(BaseResourceManager):
                                  sampling_params._get_sampling_config()),
                              is_streaming=False,
                              mrope_position_deltas=mrope_position_deltas,
-                             encoder_input_tokens=encoder_input_tokens)
+                             encoder_input_tokens=encoder_input_tokens,
+                             lora_task_id=lora_task_id,
+                             lora_weights=lora_weights,
+                             lora_config=lora_config)
             req.is_dummy_request = True
             req.paged_kv_block_ids = []
             if prepare_resource:
@@ -1009,7 +1023,6 @@ class PeftCacheManager(BaseResourceManager):
                  model_config: ModelConfig,
                  world_config: WorldConfig | None = None):
         import tensorrt_llm.bindings as _tb
-
         peft_cache_manager_config = _tb.PeftCacheManagerConfig(
             num_host_module_layer=peft_cache_config.num_host_module_layer,
             num_device_module_layer=peft_cache_config.num_device_module_layer,
@@ -1074,6 +1087,10 @@ class PeftCacheManager(BaseResourceManager):
                      reset_gpu_cache: bool = False) -> List[LlmRequest]:
         return self.impl.ensure_batch(context_batch, generation_batch,
                                       reset_gpu_cache)
+
+    def get_lora_manager(self):
+        assert self._lora_manager is not None, "Lora manager not initialized"
+        return self._lora_manager
 
     def get_max_resource_count(self) -> int:
         return 0
