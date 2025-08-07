@@ -374,7 +374,8 @@ class KVCacheManager(BaseResourceManager):
         generation_batch = scheduled_batch.generation_requests
 
         # Build the scheduler output for the connector.
-        scheduler_output = SchedulerOutput()
+        scheduler_output = SchedulerOutput(
+        ) if self.kv_connector_manager is not None else None
 
         # allocate KV Cache
         for req in context_batch:
@@ -406,9 +407,10 @@ class KVCacheManager(BaseResourceManager):
                     for _ in range(get_draft_token_length(req)):
                         self.impl.add_token(req.py_request_id)
 
-                    scheduler_output.record_first_prefill_chunk(
-                        req, self.get_cache_indices(req))
-                else:
+                    if self.kv_connector_manager is not None:
+                        scheduler_output.record_first_prefill_chunk(
+                            req, self.get_cache_indices(req))
+                elif self.kv_connector_manager is not None:
                     # When using the connector, this code path will be hit after the async load is complete.
                     # Alternatively, with no connector, this is hit after the first chunk of prefill.
 
@@ -421,18 +423,20 @@ class KVCacheManager(BaseResourceManager):
                         scheduler_output.record_nth_prefill_chunk(req)
 
         for req in generation_batch:
-            old_block_ids = self.get_cache_indices(req)
+            if self.kv_connector_manager is not None:
+                old_block_ids = self.get_cache_indices(req)
 
             self.impl.add_token(req.py_request_id)
 
             for _ in range(get_draft_token_length(req)):
                 self.impl.add_token(req.py_request_id)
 
-            new_block_ids = self.get_cache_indices(req)
+            if self.kv_connector_manager is not None:
+                new_block_ids = self.get_cache_indices(req)
 
-            delta_block_ids = new_block_ids[len(old_block_ids):]
+                delta_block_ids = new_block_ids[len(old_block_ids):]
 
-            scheduler_output.record_generation_req(req, delta_block_ids)
+                scheduler_output.record_generation_req(req, delta_block_ids)
 
         if self.kv_connector_manager is not None:
             self.kv_connector_manager.set_scheduler_output(scheduler_output)

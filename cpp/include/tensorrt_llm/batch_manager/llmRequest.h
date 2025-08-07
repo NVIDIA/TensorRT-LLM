@@ -2027,6 +2027,7 @@ protected:
 
     bool mIsDummyRequest{false};
 
+    /// Whether any blocks for this request are being asynchronously onboarded via the kv cache connector.
     bool mIsKvCacheConnectorAsyncOnboard{false};
 
 private:

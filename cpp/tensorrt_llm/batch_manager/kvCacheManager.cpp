@@ -1244,8 +1244,6 @@ void WindowBlockManager::addSequence(GenerationRequest& sequence, SizeType32 inp
     if (kvCacheConnectorManager)
     {
         numConnectorMatchedTokens = kvCacheConnectorManager->getNumNewMatchedTokens(llmRequest, prepopulatedPromptLen);
-        TLLM_CHECK_WITH_INFO(prepopulatedPromptLen + numConnectorMatchedTokens < llmRequest.getPromptLen(),
-            "There must be at least one uncomputed token in the prompt!");
     }
 
     llmRequest.setPrepopulatedPromptLen(prepopulatedPromptLen + numConnectorMatchedTokens, getTokensPerBlock());

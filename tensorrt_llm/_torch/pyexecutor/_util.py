@@ -278,7 +278,7 @@ class KvCacheCreator:
     def _create_kv_cache_manager(
             self,
             model_engine: PyTorchModelEngine,
-            for_estimation: bool = False) -> KVCacheManager:
+            estimating_kv_cache: bool = False) -> KVCacheManager:
         executor_config = self._executor_config
         mapping = self._mapping
         assert model_engine.model.model_config.is_generation, "Only construct KV cache for generation models."
@@ -320,7 +320,7 @@ class KvCacheCreator:
                 spec_config=spec_config,
                 max_beam_width=executor_config.max_beam_width,
                 kv_connector_manager=self._kv_connector_manager
-                if not for_estimation else None,
+                if not estimating_kv_cache else None,
             )
         elif is_nemotron_hybrid(config):
             if executor_config.max_beam_width > 1:
@@ -328,7 +328,7 @@ class KvCacheCreator:
                     "MambaHybridCacheManager + beam search is not supported yet."
                 )
 
-            if not for_estimation and self._kv_connector_manager is not None:
+            if not estimating_kv_cache and self._kv_connector_manager is not None:
                 raise NotImplementedError(
                     "Connector manager is not supported for MambaHybridCacheManager."
                 )
@@ -390,7 +390,7 @@ class KvCacheCreator:
                 model_config=binding_model_config,
                 max_beam_width=executor_config.max_beam_width,
                 kv_connector_manager=self._kv_connector_manager
-                if not for_estimation else None,
+                if not estimating_kv_cache else None,
             )
         # KVCacheManager (Non-draft) modifies the max_seq_len field, update it to executor_config
         if model_engine.kv_cache_manager_key == ResourceManagerType.KV_CACHE_MANAGER:
@@ -400,18 +400,18 @@ class KvCacheCreator:
 
     def build_managers(self,
                        resources: Dict,
-                       for_estimation: bool = False) -> None:
+                       estimating_kv_cache: bool = False) -> None:
         """Construct KV caches for model and draft model (if applicable)."""
         kv_cache_manager = self._create_kv_cache_manager(
-            self._model_engine, for_estimation)
+            self._model_engine, estimating_kv_cache)
 
-        if not for_estimation and self._kv_connector_manager is not None and self._draft_model_engine is not None:
+        if not estimating_kv_cache and self._kv_connector_manager is not None and self._draft_model_engine is not None:
             raise NotImplementedError(
                 "Connector manager is not supported for draft model.")
 
         draft_kv_cache_manager = self._create_kv_cache_manager(
-            self._draft_model_engine,
-            for_estimation) if self._draft_model_engine is not None else None
+            self._draft_model_engine, estimating_kv_cache
+        ) if self._draft_model_engine is not None else None
 
         resources[ResourceManagerType.KV_CACHE_MANAGER] = kv_cache_manager
         resources[
