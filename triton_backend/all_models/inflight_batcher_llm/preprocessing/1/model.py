@@ -29,7 +29,6 @@ import io
 import json
 import os
 from collections import defaultdict
-from contextlib import suppress
 from typing import List
 
 import numpy as np
@@ -139,7 +138,7 @@ class TritonPythonModel:
             assert self.model_type in [
                 'llava', 'blip2-opt', 'pixtral', 'vila', 'mllama',
                 'llava_onevision', 'qwen2_vl'
-            ], f"[TensorRT-LLM][ERROR] Currently supported multi-modal models are llava, blip2-opt, vila, mllama, llava_onevision and qwen2_vl. Got {self.model_type}."
+            ], f"[TensorRT-LLM][ERROR] Currently supported multi-modal models are llava, blip2-opt, pixtral, vila, mllama, llava_onevision and qwen2_vl. Got {self.model_type}."
 
             assert self.model_type != 'llava_onevison' or self.max_num_images is None or self.max_num_images <= 1, f"LLaVA-OneVsion is not support multi image inference currently."
 
@@ -801,8 +800,7 @@ class VisionPreProcessor:
         self.vision_model_processor = vision_model_processor
         self.vision_model_type = vision_model_type
 
-        with suppress(AttributeError):
-            # Only for pixtral models
+        if vision_model_type == 'pixtral':
             self.vocab_size = hf_config.text_config.vocab_size
             self.image_size = hf_config.vision_config.image_size
             self.image_token_index = hf_config.image_token_index
@@ -1062,9 +1060,12 @@ class VisionPreProcessor:
                 img for img_list in self.load_images_tensor(image_bytes)
                 for img in img_list
             ]
-        else:  # input_images is not None:
+        else:  # input_images is not None
             input_images = input_images.as_numpy()
-            assert input_images.ndim == 2
+            if input_images.ndim != 2:
+                raise ValueError(
+                    f"Expected input_images to have 2 dimensions, got {input_images.ndim}"
+                )
             images = []
             for input_images_per_batch in input_images:
                 images.append([
