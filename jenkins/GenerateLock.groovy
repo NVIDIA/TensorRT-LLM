@@ -55,7 +55,7 @@ def generate()
         sh "cd ${env.WORKSPACE}"
         sh "/root/.local/bin/poetry -h"
         sh "export PATH=\"/root/.local/bin:\$PATH\" && python3 scripts/generate_lock_file.py"
-        def count = sh(script: "git status --porcelain | grep -E '.toml\$|poetry.lock\$' | wc -l", returnStdout: true).trim()
+        def count = sh(script: "git status --porcelain security_scanning/ | wc -l", returnStdout: true).trim()
         echo "Changed/untracked file count: ${count}"
         if (count == "0") {
             echo "No changes in Git"

@@ -36,7 +36,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.getcwd())
 
-FOLDER_MAIN_TOML = "nspect_main_toml"
+FOLDER_SECURITY_SCANNING = "security_scanning"
 
 url_mapping = {}
 
@@ -90,33 +90,20 @@ if __name__ == "__main__":
         # get paths to all files names requirements.txt
         paths = Path.cwd().rglob('requirements.txt')
 
+    if os.path.exists(FOLDER_SECURITY_SCANNING):
+        shutil.rmtree(FOLDER_SECURITY_SCANNING)
+    os.mkdir(FOLDER_SECURITY_SCANNING)
+
     # generate pyproject.toml and poetry.lock files in the same location
     for path in paths:
         file_path, file_name = os.path.split(path)
+        curr_path = Path.cwd()
         if "3rdparty" in file_path:
             continue
 
         # init poetry
-        toml_file = os.path.join(file_path, 'pyproject.toml')
-        if file_path != os.getcwd():
-            try:
-                os.remove(toml_file)
-            except OSError:
-                pass
-        else:
-            # for the main requirements, need to back up the existing pyproject.toml
-            # and keep the generated toml and lock file under FOLDER_MAIN_TOML
-            os.rename("pyproject.toml", "pyproject.toml.bak")
-            if os.path.exists(FOLDER_MAIN_TOML):
-                shutil.rmtree(FOLDER_MAIN_TOML)
-            os.mkdir(FOLDER_MAIN_TOML)
-
-        lock_file = os.path.join(file_path, 'poetry.lock')
-        if os.path.isfile(lock_file):
-            try:
-                os.remove(lock_file)
-            except OSError:
-                pass
+        save_path = os.path.join(FOLDER_SECURITY_SCANNING, Path(file_path).relative_to(curr_path))
+        os.makedirs(save_path, exist_ok=True)
         print(f"Initializing PyProject.toml in {file_path}")
         project_info = get_project_info(file_path)
         name = project_info["name"]
@@ -126,7 +113,7 @@ if __name__ == "__main__":
         poetry_init_cmd = f'poetry init --no-interaction --name {name} --author {author} --python {py_version}'
         if name == "tensorrt-llm":
             poetry_init_cmd += " -l Apache-2.0"
-        subprocess.run(poetry_init_cmd, shell=True, cwd=file_path)
+        subprocess.run(poetry_init_cmd, shell=True, cwd=save_path)
         if version != "0.1.0":
             subprocess.run(f"poetry version {version}",
                            shell=True,
@@ -147,7 +134,6 @@ if __name__ == "__main__":
                 "#" in package or \
                 package.startswith('--'):
                 continue
-            print(package)
 
             curr_env = None
             if ';' in package:
@@ -176,8 +162,5 @@ if __name__ == "__main__":
                     poetry_cmd = f"poetry add '{package_name}'"
                     if package_name in url_mapping:
                         poetry_cmd = f"poetry add '{url_mapping[package_name]}'"
-                    subprocess.run(poetry_cmd, shell=True, cwd=file_path)
-        if file_path == os.getcwd():
-            os.rename("pyproject.toml", f"{FOLDER_MAIN_TOML}/pyproject.toml")
-            os.rename("poetry.lock", f"{FOLDER_MAIN_TOML}/poetry.lock")
-            os.rename("pyproject.toml.bak", toml_file)
+                    subprocess.run(poetry_cmd, shell=True, cwd=save_path)
+
