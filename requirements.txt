@@ -8,7 +8,7 @@ diffusers>=0.27.0
 lark
 mpi4py
 numpy<2
-onnx>=1.12.0
+onnx>=1.18.0
 onnx_graphsurgeon>=0.5.2
 openai
 polygraphy
@@ -61,6 +61,5 @@ etcd3
 blake3
 llguidance==0.7.29
 soundfile
-deep_gemm @ git+https://github.com/zongfeijing/DeepGEMM.git@a9d538ef4dff0326fe521c6ca0bfde115703b56a
 triton==3.3.1; platform_machine == "x86_64"
 blobfile
