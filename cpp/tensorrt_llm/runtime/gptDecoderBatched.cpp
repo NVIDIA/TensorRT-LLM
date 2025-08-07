@@ -19,7 +19,7 @@
 #include "common.h"
 #include "decoderState.h"
 #include "iBuffer.h"
-#include "tensorrt_llm/batch_manager/createNewDecoderRequests.h"
+#include "tensorrt_llm/batch_manager/decoderBuffers.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/executor/types.h"
@@ -33,6 +33,7 @@
 #include <vector>
 
 using namespace tensorrt_llm::runtime;
+namespace tb = tensorrt_llm::batch_manager;
 using TensorPtr = ITensor::SharedPtr;
 
 GptDecoderBatched::GptDecoderBatched(GptDecoderBatched::CudaStreamPtr stream)
@@ -102,7 +103,7 @@ namespace
 {
 //! @brief Prepare Input and Output for decoder step.
 // TODO: produce new input and output objects
-void prepareForward(decoder::DecoderState const& decoderState, SizeType32 step, decoder_batch::Input const& input,
+void prepareForward(decoder::DecoderState const& decoderState, SizeType32 step, tb::DecoderInputBuffers const& input,
     BufferManager const& bufferManager)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
@@ -112,9 +113,9 @@ void prepareForward(decoder::DecoderState const& decoderState, SizeType32 step, 
     auto& dInput = decoderState.getJointDecodingInput();
     auto& dOutput = decoderState.getJointDecodingOutput();
 
-    dInput.batchSlots = input.batchSlots.at(step);
+    dInput.batchSlots = input.forwardBatchSlots.at(step);
     dInput.batchSize = static_cast<SizeType32>(dInput.batchSlots->getSize());
-    dInput.logitsVec = input.logits.at(step);
+    dInput.logitsVec = input.batchLogits.at(step);
 
     if (speculativeDecodingMode.isDraftTokensExternal())
     {
@@ -139,7 +140,7 @@ void prepareForward(decoder::DecoderState const& decoderState, SizeType32 step, 
 
 } // namespace
 
-void GptDecoderBatched::forwardDispatch(decoder::DecoderState const& decoderState, decoder_batch::Input const& input)
+void GptDecoderBatched::forwardDispatch(decoder::DecoderState const& decoderState, tb::DecoderInputBuffers const& input)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -157,7 +158,8 @@ void GptDecoderBatched::forwardDispatch(decoder::DecoderState const& decoderStat
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-CudaEvent GptDecoderBatched::forwardAsync(decoder::DecoderState const& decoderState, decoder_batch::Input const& input)
+CudaEvent GptDecoderBatched::forwardAsync(
+    decoder::DecoderState const& decoderState, tb::DecoderInputBuffers const& input)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
 
@@ -177,7 +179,7 @@ CudaEvent GptDecoderBatched::forwardAsync(decoder::DecoderState const& decoderSt
     return eventStop;
 }
 
-void GptDecoderBatched::forward(decoder::DecoderState const& decoderState, decoder_batch::Input const& input)
+void GptDecoderBatched::forward(decoder::DecoderState const& decoderState, tb::DecoderInputBuffers const& input)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto decoderFinishEvent = forwardAsync(decoderState, input);
