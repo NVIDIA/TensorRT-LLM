@@ -581,7 +581,7 @@ class FP8BlockScalesLinearMethod(LinearMethodBase):
                     act_input_fp8, module.weight, act_input_sf,
                     module.weight_scale)
             else:
-                import deep_gemm
+                from tensorrt_llm import deep_gemm
                 a, a_sf = fp8_utils.per_token_quant_and_transform(input)
                 output = torch.empty((input.shape[0], module.weight.shape[0]),
                                      device=input.device,
