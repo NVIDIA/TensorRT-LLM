@@ -43,7 +43,7 @@ def generate()
     sh "pwd && ls -alh"
 
     container("alpine") {
-        LLM_REPO = "https://github.com/yuanjingx87/TensorRT-LLM.git"
+        LLM_REPO = "https://github.com/NVIDIA/TensorRT-LLM.git"
         sh "apt update"
         sh "apt install -y python3-dev git curl"
         sh "git config --global --add safe.directory ${env.WORKSPACE}"
