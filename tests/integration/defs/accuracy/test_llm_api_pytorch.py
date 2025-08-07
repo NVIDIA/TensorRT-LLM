@@ -1653,15 +1653,17 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
     def test_fp8_blockscale(self, tp_size, pp_size, ep_size, mtp_nextn, fp8kv,
                             attention_dp, cuda_graph, overlap_scheduler,
                             max_batch_size):
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
         if get_sm_version() == 100:
-            moe_config = MoeConfig(backend="DEEPGEMM")
+            moe_config = MoeConfig(backend="DEEPGEMM", max_num_tokens=16384)
+            kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
         else:
             moe_config = MoeConfig()
+            kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
 
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
-            cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
+            cuda_graph_config=CudaGraphConfig(
+                enable_padding=True) if cuda_graph else None,
             moe_config=moe_config,
         )
 
