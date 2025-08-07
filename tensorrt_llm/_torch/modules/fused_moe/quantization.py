@@ -1021,27 +1021,28 @@ class WInt4AFP8FusedMoEMethod(FusedMoEMethodBase):
         if w4a8_custom:
             # In custom W4A8 ckpt, per-tensor input_scale and per-channel pre_quant_scale are fused into input_scale
             module.fc31_act_scale.data.copy_(
-                torch.ones_like(module.fc31_act_scale).cpu() *
+                torch.ones_like(module.fc31_act_scale, device=self.device) *
                 (1 / all_w3_w1_input_scales_max))
-            module.fc31_alpha.data.copy_((torch.ones_like(module.fc31_alpha) *
-                                          all_w3_w1_input_scales_max).float())
+            module.fc31_alpha.data.copy_(
+                (torch.ones_like(module.fc31_alpha, device=self.device) *
+                 all_w3_w1_input_scales_max).float())
         else:
             # In vanilla ckpt (at least from ModelOpt), per-tensor input_scale and per-channel pre_quant_scale are separately stored
             all_w3_pre_quant_scales = [
-                load_weight_shard(
-                    weights[f"{expert_id}.w3.pre_quant_scale"],
-                    module.tp_size,
-                    module.tp_rank,
-                    TensorParallelMode.ROW,
-                ) for expert_id in module.initial_local_expert_ids
+                load_weight_shard(weights[f"{expert_id}.w3.pre_quant_scale"],
+                                  module.tp_size,
+                                  module.tp_rank,
+                                  TensorParallelMode.ROW,
+                                  device=self.device)
+                for expert_id in module.initial_local_expert_ids
             ]
             all_w1_pre_quant_scales = [
-                load_weight_shard(
-                    weights[f"{expert_id}.w1.pre_quant_scale"],
-                    module.tp_size,
-                    module.tp_rank,
-                    TensorParallelMode.ROW,
-                ) for expert_id in module.initial_local_expert_ids
+                load_weight_shard(weights[f"{expert_id}.w1.pre_quant_scale"],
+                                  module.tp_size,
+                                  module.tp_rank,
+                                  TensorParallelMode.ROW,
+                                  device=self.device)
+                for expert_id in module.initial_local_expert_ids
             ]
             all_w3_w1_pre_quant_scales_max = torch.max(
                 torch.stack(all_w3_pre_quant_scales +
@@ -1049,16 +1050,18 @@ class WInt4AFP8FusedMoEMethod(FusedMoEMethodBase):
                 dim=0,
             ).values
             module.fc31_act_scale.data.copy_(
-                torch.ones_like(module.fc31_act_scale).cpu() *
+                torch.ones_like(module.fc31_act_scale, device=self.device) *
                 (all_w3_w1_pre_quant_scales_max) *
                 (1 / all_w3_w1_input_scales_max))
             # In vanilla ckpt (at least from ModelOpt), per-tensor weight_scale_2 is separately stored
             all_w3_weight_scale_2 = [
-                load_weight_shard(weights[f"{expert_id}.w3.weight_scale_2"])
+                load_weight_shard(weights[f"{expert_id}.w3.weight_scale_2"],
+                                  device=self.device)
                 for expert_id in module.initial_local_expert_ids
             ]
             all_w1_weight_scale_2 = [
-                load_weight_shard(weights[f"{expert_id}.w1.weight_scale_2"])
+                load_weight_shard(weights[f"{expert_id}.w1.weight_scale_2"],
+                                  device=self.device)
                 for expert_id in module.initial_local_expert_ids
             ]
             all_w3_w1_weight_scale_2_max = torch.max(
@@ -1119,29 +1122,33 @@ class WInt4AFP8FusedMoEMethod(FusedMoEMethodBase):
         if w4a8_custom:
             # In custom W4A8 ckpt, per-tensor input_scale and per-channel pre_quant_scale are fused into input_scale
             module.fc2_act_scale.data.copy_(
-                torch.ones_like(module.fc2_act_scale).cpu() *
+                torch.ones_like(module.fc2_act_scale, device=self.device) *
                 (1 / all_w2_input_scales_max))
             # In custom W4A8 ckpt, per-tensor weight_scale_2 is fused into alpha
-            module.fc2_alpha.data.copy_((torch.ones_like(module.fc2_alpha) *
-                                         all_w2_input_scales_max).float())
+            module.fc2_alpha.data.copy_(
+                (torch.ones_like(module.fc2_alpha, device=self.device) *
+                 all_w2_input_scales_max).float())
         else:
             # In vanilla ckpt (at least from ModelOpt), per-tensor input_scale and per-channel pre_quant_scale are separately stored
             all_w2_pre_quant_scales = [
                 load_weight_shard(weights[f"{expert_id}.w2.pre_quant_scale"],
-                                  module.tp_size, module.tp_rank,
-                                  TensorParallelMode.COLUMN)
+                                  module.tp_size,
+                                  module.tp_rank,
+                                  TensorParallelMode.COLUMN,
+                                  device=self.device)
                 for expert_id in module.initial_local_expert_ids
             ]
             all_w2_pre_quant_scales_max = torch.max(
                 torch.stack(all_w2_pre_quant_scales).to(module.dtype),
                 dim=0).values
             module.fc2_act_scale.data.copy_(
-                torch.ones_like(module.fc2_act_scale).cpu() *
+                torch.ones_like(module.fc2_act_scale, device=self.device) *
                 (all_w2_pre_quant_scales_max.unsqueeze(-1)) *
                 (1 / all_w2_input_scales_max))
             # In vanilla ckpt (at least from ModelOpt), per-tensor weight_scale_2 is separately stored
             all_w2_weight_scale_2 = [
-                load_weight_shard(weights[f"{expert_id}.w2.weight_scale_2"])
+                load_weight_shard(weights[f"{expert_id}.w2.weight_scale_2"],
+                                  device=self.device)
                 for expert_id in module.initial_local_expert_ids
             ]
             all_w2_weight_scale_2_max = torch.stack(all_w2_weight_scale_2).to(
