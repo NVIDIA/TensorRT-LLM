@@ -36,7 +36,7 @@ To implement a custom KV connector, you need to implement both the scheduler and
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from typing import Any, Callable, List, Optional
 
 import torch
 
@@ -56,9 +56,9 @@ class RequestData:
     # The request ID.
     request_id: int
     # The new tokens that were generated in the prior forward pass.
-    new_tokens: list[int]
+    new_tokens: List[int]
     # The new block IDs allocated in the prior forward pass.
-    new_block_ids: list[int]
+    new_block_ids: List[int]
     # The position of the latest token with computed (valid) kv cache values.
     computed_position: int
 
@@ -67,10 +67,13 @@ class RequestData:
 # This is used when calling `build_connector_meta` on the scheduler.
 @dataclass
 class SchedulerOutput:
-    new_requests: list[RequestData] = field(default_factory=list)
-    cached_requests: list[RequestData] = field(default_factory=list)
+    # Requests being scheduled for the first time. Requests will show up in `new_request` exactly once.
+    new_requests: List[RequestData] = field(default_factory=list)
 
-    def record_first_prefill_chunk(self, req: LlmRequest, block_ids: list[int]):
+    # Requests being scheduled, that have already shown up in `new_requests`.
+    cached_requests: List[RequestData] = field(default_factory=list)
+
+    def record_first_prefill_chunk(self, req: LlmRequest, block_ids: List[int]):
         if not req.is_kv_cache_connector_async_onboard:
             self.new_requests.append(
                 RequestData(req.request_id, req.get_tokens(0), block_ids,
@@ -81,7 +84,7 @@ class SchedulerOutput:
             RequestData(req.request_id, [], [], req.context_current_position))
 
     def record_generation_req(self, req: LlmRequest,
-                              delta_block_ids: list[int]):
+                              delta_block_ids: List[int]):
 
         tokens = req.get_tokens(0)
         computed_position = len(tokens) - 1
@@ -153,8 +156,8 @@ class KvCacheConnectorWorker(ABC):
 
     @abstractmethod
     def get_finished(
-            self, finished_gen_req_ids: list[int],
-            started_loading_req_ids: list[int]) -> tuple[list[int], list[int]]:
+            self, finished_gen_req_ids: List[int],
+            started_loading_req_ids: List[int]) -> tuple[List[int], List[int]]:
         """
         Get the requests that have finished loading and saving.
 
@@ -189,6 +192,7 @@ class KvCacheConnectorScheduler(ABC):
             The metadata for the workers.
         """
 
+    @abstractmethod
     def get_num_new_matched_tokens(
             self, request: LlmRequest,
             num_computed_tokens: int) -> tuple[int, bool]:
@@ -207,7 +211,7 @@ class KvCacheConnectorScheduler(ABC):
 
     @abstractmethod
     def request_finished(self, request: LlmRequest,
-                         cache_block_ids: list[int]) -> bool:
+                         cache_block_ids: List[int]) -> bool:
         """
         Called when a request is finished generating tokens.
 
@@ -236,8 +240,8 @@ class AsyncRequests:
         other.saving = dict()
         other.loading = dict()
 
-    def extract_by_id(self, saving_ids: list[int],
-                      loading_ids: list[int]) -> 'AsyncRequests':
+    def extract_by_id(self, saving_ids: List[int],
+                      loading_ids: List[int]) -> 'AsyncRequests':
         """
         Extract the requests with the given IDs from this `AsyncRequests` object.
 
@@ -369,7 +373,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         self.worker.bind_connector_meta(metadata)
 
     def request_finished(self, req: LlmRequest,
-                         cache_block_ids: list[int]) -> bool:
+                         cache_block_ids: List[int]) -> bool:
         """
         Called when a request is finished generating tokens.
 
@@ -391,7 +395,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
 
         return saving_async
 
-    def get_finished(self) -> list[LlmRequest]:
+    def get_finished(self) -> List[LlmRequest]:
         """
         Process requests that have finished loading and saving.
 

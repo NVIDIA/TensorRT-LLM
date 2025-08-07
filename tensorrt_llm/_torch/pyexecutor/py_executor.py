@@ -919,12 +919,6 @@ class PyExecutor:
                     "num_fitting_reqs=0 and fitting_disagg_gen_init_requests is empty, may not have enough kvCache"
                 )
                 self.kv_cache_transceiver.check_context_transfer_status(1)
-        elif self.kv_connector_manager is None:
-            # The kv cache connector also puts requests to sleep similar to the transceiver.
-            # Thus, this assertion is only applicable when both the cache transceiver and connector are disabled.
-            assert scheduled_batch.batch_size > 0, (
-                "fail to schedule any pending request, "
-                "probably run out of resource.")
 
         self.num_scheduled_requests = scheduled_batch.batch_size
         logger.debug(
@@ -939,7 +933,7 @@ class PyExecutor:
             self.guided_decoder.build(scheduled_batch)
             self.guided_decoder.execute(scheduled_batch, logits)
 
-    def _handle_kv_connector(self, scheduled_batch):
+    def _kv_connector_start_batch(self, scheduled_batch):
         if self.kv_connector_manager:
             self.kv_connector_manager.take_scheduled_requests_pending_load(
                 scheduled_batch)
@@ -947,7 +941,7 @@ class PyExecutor:
             self.kv_connector_manager.worker.start_load_kv(
                 torch.cuda.current_stream())
 
-    def _terminate_async_save_requests(self):
+    def _kv_connector_terminate_requests(self):
         if self.kv_connector_manager:
             reqs_to_terminate = self.kv_connector_manager.get_finished()
             for req in reqs_to_terminate:
@@ -989,7 +983,7 @@ class PyExecutor:
                         self.guided_decoder.init_disagg_gen_requests(
                             scheduled_batch)
 
-                    self._handle_kv_connector(scheduled_batch)
+                    self._kv_connector_start_batch(scheduled_batch)
 
                 if scheduled_batch.batch_size > 0 or (
                         self.enable_attention_dp and self.dist.tp_size > 1):
@@ -1027,7 +1021,7 @@ class PyExecutor:
                 if self.kv_cache_transceiver and self.ctx_in_transmission_requests:
                     self._terminate_ctx_finished_requests()
 
-                self._terminate_async_save_requests()
+                self._kv_connector_terminate_requests()
 
                 if self.enable_iter_perf_stats:
                     iter_stats.inflight_batching_stats.num_ctx_tokens = self.model_engine.iter_states[
@@ -1097,7 +1091,7 @@ class PyExecutor:
                             scheduled_batch)
                     self.resource_manager.prepare_resources(scheduled_batch)
 
-                    self._handle_kv_connector(scheduled_batch)
+                    self._kv_connector_start_batch(scheduled_batch)
 
                 if scheduled_batch.batch_size > 0:
 
@@ -1156,7 +1150,7 @@ class PyExecutor:
                 if self.kv_cache_transceiver and self.ctx_in_transmission_requests:
                     self._terminate_ctx_finished_requests()
 
-                self._terminate_async_save_requests()
+                self._kv_connector_terminate_requests()
 
     def _process_previous_batch(self):
         if self.kv_cache_transceiver and self.previous_batch.ctx_transmission_reqs:

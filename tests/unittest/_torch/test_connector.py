@@ -58,7 +58,7 @@ def test_connector_manager_get_finished_allgather(mpi_pool_executor):
 
         req.request_id = 42
 
-        manager.request_finished(req)
+        manager.request_finished(req, [])
 
         # To start, make both workers return nothing.
         worker.get_finished.return_value = ([], [])
