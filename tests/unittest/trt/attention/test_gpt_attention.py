@@ -873,18 +873,17 @@ class TestFunctional(unittest.TestCase):
             ConfigCls = GPTBigCodeConfig
             AttentionCls = GPTBigCodeAttention
 
-        configuration = ConfigCls(
-            hidden_size=hidden_size,
-            num_hidden_layers=1,
-            num_attention_heads=num_heads,
-            vocab_size=51200,
-            use_cache=True,
-            resid_pdrop=0,
-            embd_pdrop=0,
-            attn_pdrop=0,
-            hidden_act='gelu',
-            torch_dtype=dtype,
-        )
+        configuration = ConfigCls(hidden_size=hidden_size,
+                                  num_hidden_layers=1,
+                                  num_attention_heads=num_heads,
+                                  vocab_size=51200,
+                                  use_cache=True,
+                                  resid_pdrop=0,
+                                  embd_pdrop=0,
+                                  attn_pdrop=0,
+                                  hidden_act='gelu',
+                                  torch_dtype=dtype,
+                                  attn_implementation='eager')
 
         if attention_type in ['gptj_attention', 'llama_attention']:
             configuration.rotary_dim = head_size
@@ -1259,38 +1258,35 @@ class TestFunctional(unittest.TestCase):
                         use_cache=True)[0]
                     torch_present = torch_present.to_legacy_cache()
                 elif attention_type == 'gptj_attention':
-                    torch_output, torch_present = attention(
-                        input_tensor,
-                        layer_past=None,
-                        position_ids=position_ids,
-                        attention_mask=attention_mask,
-                        use_cache=True)
+                    torch_present = DynamicCache()
+                    torch_output = attention(input_tensor,
+                                             layer_past=torch_present,
+                                             position_ids=position_ids,
+                                             attention_mask=attention_mask,
+                                             use_cache=True)[0]
+                    torch_present = torch_present.to_legacy_cache()
                 elif attention_type == 'gpt_bigcode_attention':
                     attention_mask = _prepare_4d_attention_mask(
                         ctx_attention_mask,
                         dtype=str_dtype_to_torch(dtype),
                         tgt_len=in_len)
-                    # source shape = (b, 1, s_query, s_key)
-                    # target shape = (b, s_query, h, s_key)
+                    # target shape = (b, h, s_query, s_key)
                     attention_mask = (attention_mask
-                                      >= 0).permute([0, 2, 1, 3]).expand(
-                                          batch_size, in_len, num_heads, in_len)
-                    torch_output, torch_present = attention(
-                        input_tensor,
-                        layer_past=None,
-                        attention_mask=attention_mask,
-                        use_cache=True)
+                                      >= 0).expand(batch_size, num_heads,
+                                                   in_len, in_len)
+                    torch_present = DynamicCache()
+                    torch_output = attention(input_tensor,
+                                             layer_past=torch_present,
+                                             attention_mask=attention_mask,
+                                             use_cache=True)[0]
+                    torch_present = torch_present.to_legacy_cache()
                 else:
                     raise RuntimeError("attention_type not properly set")
 
                 torch.cuda.synchronize()
 
-                if attention_type in ['llama_attention', 'gpt2_attention']:
-                    kv_dequant_scale, kv_quant_scale = get_kv_quant_scale(
-                        torch_present[0])
-                else:
-                    kv_dequant_scale, kv_quant_scale = get_kv_quant_scale(
-                        torch_present)
+                kv_dequant_scale, kv_quant_scale = get_kv_quant_scale(
+                    torch_present[0])
 
                 if enable_remove_input_padding:
                     shape_dict['input'] = (batch_size * (in_len // 2),
@@ -1330,10 +1326,7 @@ class TestFunctional(unittest.TestCase):
                         torch_output[:, :in_len // 2, :].to(
                             torch.float32).cpu().numpy(),
                         atol=5e-3)
-                if attention_type in ['llama_attention', 'gpt2_attention']:
-                    verify_kv_cache(torch_present[0])
-                else:
-                    verify_kv_cache(torch_present)
+                verify_kv_cache(torch_present[0])
 
             else:
                 # Generation stage
@@ -1408,24 +1401,27 @@ class TestFunctional(unittest.TestCase):
                         use_cache=True)[0]
                     torch_present = torch_present.to_legacy_cache()
                 elif attention_type == 'gptj_attention':
-                    torch_output, torch_present = attention(
-                        input_tensor,
-                        layer_past=torch_present,
-                        position_ids=position_ids,
-                        attention_mask=attention_mask,
-                        use_cache=True)
+                    torch_present = DynamicCache.from_legacy_cache(
+                        torch_present)
+                    torch_output = attention(input_tensor,
+                                             layer_past=torch_present,
+                                             position_ids=position_ids,
+                                             attention_mask=attention_mask,
+                                             use_cache=True)[0]
+                    torch_present = torch_present.to_legacy_cache()
                 elif attention_type == 'gpt_bigcode_attention':
-                    # source shape = (b, 1, 1, s_key)
-                    # target shape = (b, 1, h, s_key)
+                    # target shape = (b, h, 1, s_key)
                     key_seqlen = in_len + step  # ctx_attention_mask.shape[1]
                     attention_mask = (attention_mask
-                                      >= 0).permute([0, 2, 1, 3]).expand(
-                                          batch_size, 1, num_heads, key_seqlen)
-                    torch_output, torch_present = attention(
-                        input_tensor,
-                        layer_past=torch_present,
-                        use_cache=True,
-                        attention_mask=attention_mask)
+                                      >= 0).expand(batch_size, num_heads, 1,
+                                                   key_seqlen)
+                    torch_present = DynamicCache.from_legacy_cache(
+                        torch_present)
+                    torch_output = attention(input_tensor,
+                                             layer_past=torch_present,
+                                             use_cache=True,
+                                             attention_mask=attention_mask)[0]
+                    torch_present = torch_present.to_legacy_cache()
 
                 def tile_beam_width(tensor: torch.Tensor, num_beams: int):
                     if num_beams == 1:

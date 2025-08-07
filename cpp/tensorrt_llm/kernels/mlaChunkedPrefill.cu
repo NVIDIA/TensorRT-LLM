@@ -188,9 +188,6 @@ __global__ void mergeAttnWithSoftmaxKernel(T* merged_attn, float2* merged_softma
         // load softmax stat
         int const global_softmax_stats_offset = (global_q_offset + local_token_idx) * num_heads + head_idx;
         float2 curr_stats = curr_softmax_stats[global_softmax_stats_offset];
-        // hack, current softmax stats max is not multiplied by bmm1_scale
-        // TODO: delete this line when trtllm gen kernel return the right max value.
-        curr_stats.x *= 0.072168784; // 1 / sqrt(128 + 64), head_size is 128 for output, but for bmm1 is 192
         float2 pre_stats = pre_softmax_stats[global_softmax_stats_offset];
 
         // load attn
