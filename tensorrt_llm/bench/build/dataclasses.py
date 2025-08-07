@@ -223,6 +223,7 @@ class NemotronHybridConfig(ModelConfig):
     mamba_head_dim: int
     d_inner: Optional[int] = Field(default=None)
     num_mamba_layers: Optional[int] = Field(default=None)
+    mamba_ssm_cache_dtype: Optional[str] = Field(default="auto")
 
     @model_validator(mode="after")
     def set_values_if_none(self):
@@ -248,3 +249,6 @@ class NemotronHybridConfig(ModelConfig):
     def cache_memory_fraction(self, cache_memory_fraction):
         # Each mamba cache entry is pretty large (~50MB for 8B model), so we are more conservative when estimating the max batch size
         return cache_memory_fraction**2
+
+    def set_mamba_ssm_cache_dtype(self, mamba_ssm_cache_dtype: str):
+        self.mamba_ssm_cache_dtype = mamba_ssm_cache_dtype
