@@ -206,7 +206,7 @@ void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
             continue;
         }
 
-#ifdef ENABLE_CUFILE
+#if ENABLE_CUFILE
         CUfileDescr_t cufileDesc = {};
         cufileDesc.type = CU_FILE_HANDLE_TYPE_OPAQUE_FD;
         cufileDesc.handle.fd = fd;
@@ -216,7 +216,7 @@ void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
         if (status.err != CU_FILE_SUCCESS)
         {
             // Fallback to POSIX
-            TLLM_LOG_WARN(
+            TLLM_LOG_WARNING(
                 "cuFileHandleRegister failed (err=%d). Falling back to POSIX for '%s'", status.err, filename.c_str());
             ::close(fd);
             if (isOffload)
@@ -271,8 +271,8 @@ void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
 }
 
 void KVCacheTransferManager::onboard(BlockPtr const& offloadBlock, BlockPtr const& block,
-    std::vector<KVCacheBlockPool> const& pools, int numTokensToCopy, executor::KvCacheTransferMode mode,
-    std::optional<std::string> directory)
+    std::vector<KVCacheBlockPool> const& pools, executor::KvCacheTransferMode mode,
+    std::optional<std::string> directory, int numTokensToCopy)
 {
     if (mode != executor::KvCacheTransferMode::DRAM
         && mPendingOffloads.find(offloadBlock->getBlockId()) == mPendingOffloads.end())
@@ -290,8 +290,8 @@ void KVCacheTransferManager::onboard(BlockPtr const& offloadBlock, BlockPtr cons
 }
 
 void KVCacheTransferManager::offload(BlockPtr const& block, BlockPtr const& offloadBlock,
-    std::vector<KVCacheBlockPool> const& pools, int numTokensToCopy, executor::KvCacheTransferMode mode,
-    std::optional<std::string> directory)
+    std::vector<KVCacheBlockPool> const& pools, executor::KvCacheTransferMode mode,
+    std::optional<std::string> directory, int numTokensToCopy)
 {
     mPendingOffloads[block->getBlockId()] = tr::CudaEvent();
     copyBlock(block, offloadBlock, pools, true, numTokensToCopy, mode, directory);

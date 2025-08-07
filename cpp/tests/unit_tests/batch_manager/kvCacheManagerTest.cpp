@@ -246,13 +246,15 @@ void runPartialCopyTest()
     auto cacheBlockIds = seq0.getCacheBlockIds(maxAttentionWindow).at(beamIdx);
     EXPECT_THAT(cacheBlockIds, ::testing::ElementsAreArray({0, 1, 2}));
 
+    KvCacheRetentionConfig retentionConfig{};
+
     // Offload all 3 blocks, fill with predictable pattern, onboard
     for (auto cacheBlockId : cacheBlockIds)
     {
         auto block = blockManager.getBlockById(cacheBlockId, maxAttentionWindow);
         EXPECT_TRUE(block->isPrimary());
         // offload so we can write to block in CPU code
-        blockManager.offloadBlock(block, maxAttentionWindow);
+        blockManager.offloadBlock(block, retentionConfig, maxAttentionWindow);
         EXPECT_FALSE(block->isPrimary());
         // need to sync so D2H transfer is done before accessing blocks
         EXPECT_EQ(cudaDeviceSynchronize(), cudaSuccess);
@@ -265,7 +267,7 @@ void runPartialCopyTest()
             rawBlockPtr[i] = i & mask;
         }
         // onboard
-        blockManager.onboardBlock(block, maxAttentionWindow);
+        blockManager.onboardBlock(block, retentionConfig, maxAttentionWindow);
         EXPECT_TRUE(block->isPrimary());
         EXPECT_EQ(cudaDeviceSynchronize(), cudaSuccess);
         EXPECT_TRUE(blockManager.verifyQueueIntegrity(maxAttentionWindow));
@@ -312,7 +314,7 @@ void runPartialCopyTest()
 
     // Verify partial copied block 2
     // Block has shape [2, numLayers, numKvHeads, tokensPerBlock, sizePerHead]
-    blockManager.offloadBlock(block2, maxAttentionWindow);
+    blockManager.offloadBlock(block2, retentionConfig, maxAttentionWindow);
     EXPECT_FALSE(block2->isPrimary());
     // need to sync so D2H transfer is done before accessing blocks
     EXPECT_EQ(cudaDeviceSynchronize(), cudaSuccess);
@@ -340,7 +342,7 @@ void runPartialCopyTest()
         }
     }
     EXPECT_EQ(numBad, 0);
-    blockManager.onboardBlock(block2, maxAttentionWindow);
+    blockManager.onboardBlock(block2, retentionConfig, maxAttentionWindow);
     EXPECT_TRUE(block2->isPrimary());
     EXPECT_EQ(cudaDeviceSynchronize(), cudaSuccess);
 
@@ -3657,12 +3659,12 @@ TEST_F(KVCacheManagerTest, KVCacheTransferManagerConcurrencyTest)
     auto primaryBlock = std::make_shared<KVCacheBlock>(0, tensorrt_llm::kernels::KVCacheIndex(0, false));
     auto secondaryBlock = std::make_shared<KVCacheBlock>(1, tensorrt_llm::kernels::KVCacheIndex(0, true));
 
-    transferManager.offload(primaryBlock, secondaryBlock, {pool});
+    transferManager.offload(primaryBlock, secondaryBlock, {pool}, KvCacheTransferMode::DRAM, std::nullopt);
     primaryBlock->swapMemoryPoolBlockOffset(secondaryBlock);
-    transferManager.onboard(primaryBlock, secondaryBlock, {pool});
+    transferManager.onboard(primaryBlock, secondaryBlock, {pool}, KvCacheTransferMode::DRAM, std::nullopt);
     transferManager.syncTransfers();
 
-    transferManager.offload(primaryBlock, secondaryBlock, {pool});
+    transferManager.offload(primaryBlock, secondaryBlock, {pool}, KvCacheTransferMode::DRAM, std::nullopt);
     bufferManager.getStream().synchronize();
 
     for (int i = 0; i < blockSize; i++)
