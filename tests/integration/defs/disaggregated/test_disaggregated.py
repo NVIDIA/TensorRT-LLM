@@ -779,6 +779,7 @@ def test_disaggregated_deepseek_v3_lite_fp8_ucx(disaggregated_test_root,
                            cwd=llm_venv.get_working_directory())
 
 
+@skip_no_hopper
 @skip_arm
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
