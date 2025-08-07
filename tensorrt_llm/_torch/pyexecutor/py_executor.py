@@ -287,24 +287,8 @@ class PyExecutor:
                     "KV Cache Connector is not supported with pipeline parallelism."
                 )
 
-            all_layers = [
-                self.kv_cache_manager.get_buffers(layer_idx)
-                for layer_idx in self.kv_cache_manager.pp_layers
-            ]
-
-            if not all(t.shape == all_layers[0].shape for t in all_layers):
-                raise NotImplementedError(
-                    "KV Cache Connector is not supported with sliding window attention."
-                )
-
-            full_kv_tensor = torch.cat(all_layers, dim=1)
-
-            if not full_kv_tensor.is_contiguous():
-                raise NotImplementedError(
-                    "KV Cache Connector is not supported with non-contiguous KV cache."
-                )
-
-            self.kv_connector_manager.worker.register_kv_caches(full_kv_tensor)
+            kv_tensor = self.kv_cache_manager.get_unique_primary_pool()
+            self.kv_connector_manager.worker.register_kv_caches(kv_tensor)
 
             # For each of our layers, we need to register the pre/post hooks.
             # These are used for methods like `wait_for_layer_load` and `save_kv_layer`.
@@ -960,7 +944,8 @@ class PyExecutor:
             self.kv_connector_manager.take_scheduled_requests_pending_load(
                 scheduled_batch)
             self.kv_connector_manager.handle_metadata()
-            self.kv_connector_manager.worker.start_load_kv()
+            self.kv_connector_manager.worker.start_load_kv(
+                torch.cuda.current_stream())
 
     def _terminate_async_save_requests(self):
         if self.kv_connector_manager:
@@ -1493,7 +1478,8 @@ class PyExecutor:
                               cache_indirection_buffer)
 
             if self.kv_connector_manager is not None:
-                self.kv_connector_manager.worker.wait_for_save()
+                self.kv_connector_manager.worker.wait_for_save(
+                    torch.cuda.current_stream())
 
             return outputs
         except Exception as e:

@@ -82,11 +82,14 @@ def test_connector_simple(model_with_connector, use_overlap_scheduler):
     # We should have a single `SchedulerOutput` per forward pass.
     for i, call in enumerate(scheduler.build_connector_meta.call_args_list):
         scheduler_output = call[0][0]
-        assert len(scheduler_output.requests) == 1
+        if i == 0:
+            assert len(scheduler_output.new_requests) == 1
+            assert len(scheduler_output.cached_requests) == 0
+        else:
+            assert len(scheduler_output.new_requests) == 0
+            assert len(scheduler_output.cached_requests) == 1
 
-        # If this is not prefill, we should always be adding a single token.
-        if i != 0:
-            assert len(scheduler_output.requests[0].new_tokens) == 1
+            assert len(scheduler_output.cached_requests[0].new_tokens) == 1
 
     # We call `start_load_kv` once at the beginning of each forward pass.
     assert worker.start_load_kv.call_count == NUM_TOKENS + int(
@@ -233,14 +236,20 @@ def test_connector_scheduler_output(model_with_connector,
     for i, call in enumerate(scheduler.build_connector_meta.call_args_list):
         sched_output = call.args[0]
 
-        assert len(sched_output.requests) == 1
-        request = sched_output.requests[0]
         if i == 0:
+            assert len(sched_output.new_requests) == 1
+            assert len(sched_output.cached_requests) == 0
+            request = sched_output.new_requests[0]
+
             assert len(request.new_tokens) == NUM_INPUT_TOKENS
             assert len(request.new_block_ids) == math.ceil(NUM_INPUT_TOKENS /
                                                            BLOCK_SIZE)
             assert request.computed_position == 0
         else:
+            assert len(sched_output.cached_requests) == 1
+            assert len(sched_output.new_requests) == 0
+            request = sched_output.cached_requests[0]
+
             assert len(request.new_tokens) == 1
 
             if (request.computed_position +
@@ -258,8 +267,8 @@ def test_connector_scheduler_output(model_with_connector,
 
     model.generate([0] * NUM_INPUT_TOKENS, sampling_params)
 
-    assert scheduler.build_connector_meta.call_args_list[0].args[0].requests[
-        0].computed_position == 8
+    assert scheduler.build_connector_meta.call_args_list[0].args[
+        0].new_requests[0].computed_position == 8
 
 
 @pytest.mark.threadleak(enabled=False)
@@ -293,9 +302,14 @@ def test_connector_scheduler_output_chunked_context(model_with_connector,
     for i, call in enumerate(scheduler.build_connector_meta.call_args_list):
         sched_output = call.args[0]
 
-        assert len(sched_output.requests) == 1
-
-        req = sched_output.requests[0]
+        if i == 0:
+            assert len(sched_output.new_requests) == 1
+            assert len(sched_output.cached_requests) == 0
+            req = sched_output.new_requests[0]
+        else:
+            assert len(sched_output.cached_requests) == 1
+            assert len(sched_output.new_requests) == 0
+            req = sched_output.cached_requests[0]
 
         if i == 0:
             # The first prefill chunk.

@@ -632,6 +632,9 @@ class KVCacheManager(BaseResourceManager):
             self.head_dim,
         )
 
+    def get_unique_primary_pool(self) -> torch.Tensor:
+        return self.impl.get_unique_primary_pool()
+
     def get_block_ids_per_seq(self, request_ids: List[int]) -> torch.Tensor:
         block_ids_per_seq = self.get_batch_cache_indices(request_ids)
         block_ids_per_seq_tensors = [

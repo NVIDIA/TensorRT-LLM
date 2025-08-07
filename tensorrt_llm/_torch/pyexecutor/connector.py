@@ -67,16 +67,17 @@ class RequestData:
 # This is used when calling `build_connector_meta` on the scheduler.
 @dataclass
 class SchedulerOutput:
-    requests: list[RequestData] = field(default_factory=list)
+    new_requests: list[RequestData] = field(default_factory=list)
+    cached_requests: list[RequestData] = field(default_factory=list)
 
     def record_first_prefill_chunk(self, req: LlmRequest, block_ids: list[int]):
         if not req.is_kv_cache_connector_async_onboard:
-            self.requests.append(
+            self.new_requests.append(
                 RequestData(req.request_id, req.get_tokens(0), block_ids,
                             req.context_current_position))
 
     def record_nth_prefill_chunk(self, req: LlmRequest):
-        self.requests.append(
+        self.cached_requests.append(
             RequestData(req.request_id, [], [], req.context_current_position))
 
     def record_generation_req(self, req: LlmRequest,
@@ -85,7 +86,7 @@ class SchedulerOutput:
         tokens = req.get_tokens(0)
         computed_position = len(tokens) - 1
 
-        self.requests.append(
+        self.cached_requests.append(
             RequestData(req.request_id, tokens[-1:], delta_block_ids,
                         computed_position))
 
@@ -116,7 +117,7 @@ class KvCacheConnectorWorker(ABC):
         """
 
     @abstractmethod
-    def start_load_kv(self):
+    def start_load_kv(self, stream: torch.cuda.Stream):
         """
         Begin loading the KV cache in preparation for the next forward pass.
         Specific blocks to transfer are indicated by the scheduler's metadata.
@@ -145,7 +146,7 @@ class KvCacheConnectorWorker(ABC):
         """
 
     @abstractmethod
-    def wait_for_save(self):
+    def wait_for_save(self, stream: torch.cuda.Stream):
         """
         Block until all synchronous saving operations are complete. Called at the end of the forward pass.
         """

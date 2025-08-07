@@ -1303,6 +1303,7 @@ public:
         LlmRequest::RequestIdType requestId, SizeType32 windowSize) const
         = 0;
 
+    [[nodiscard]] virtual runtime::ITensor::SharedPtr getUniquePrimaryPool() const = 0;
     [[nodiscard]] virtual runtime::ITensor::SharedPtr getPrimaryPool(SizeType32 layer_idx) const = 0;
     [[nodiscard]] virtual SizeType32 getPoolLayerIdx(SizeType32 layer_idx) const = 0;
 
@@ -1640,6 +1641,7 @@ public:
     std::vector<SizeType32> getNewlyAllocatedBlockIds(
         LlmRequest::RequestIdType requestId, SizeType32 windowSize) const override;
 
+    runtime::ITensor::SharedPtr getUniquePrimaryPool() const override;
     runtime::ITensor::SharedPtr getPrimaryPool(SizeType32 layer_idx) const override;
 
     SizeType32 getPoolLayerIdx(SizeType32 layer_idx) const override
