@@ -652,7 +652,7 @@ class JobManager:
                 # First, get list of active sessions on this node
                 list_cmd = [
                     "srun", "--overlap", "--oversubscribe", "-A", self.account, "-p", self.partition,
-                    "-N", "1", "-n", "1", "-t", "00:05:00", "-w", hostname,
+                    "-N", "1", "-n", "1", "-t", self.time, "-w", hostname,
                     f"--container-image={self.container_image}",
                     f"--container-mounts={self.mounts}",
                     f"--container-workdir={self.workdir}",
@@ -678,25 +678,29 @@ class JobManager:
                 
                 # Stop sessions for jobs on this hostname
                 for nsys_job in jobs:
-                    session_name = nsys_job['session_name']
-                    print(f"Stopping nsys session '{session_name}' for {nsys_job['server_type']} server (node {nsys_job['node_id']}) on {hostname}")
+                    if 'session_id' not in nsys_job:
+                        print(f"Warning: No session ID found for {nsys_job['server_type']} server (node {nsys_job['node_id']}), skipping")
+                        continue
+                        
+                    session_id = nsys_job['session_id']
+                    print(f"Stopping nsys session '{session_id}' for {nsys_job['server_type']} server (node {nsys_job['node_id']}) on {hostname}")
                     
-                    # Try to stop by session name first
+                    # Stop by session ID
                     stop_cmd = [
                         "srun", "--overlap", "--oversubscribe", "-A", self.account, "-p", self.partition,
                         "-N", "1", "-n", "1", "-t", self.time, "-w", hostname,
                         f"--container-image={self.container_image}",
                         f"--container-mounts={self.mounts}",
                         f"--container-workdir={self.workdir}",
-                        "nsys", "stop", f"--session={session_name}"
+                        "nsys", "stop", f"--session={session_id}"
                     ]
                     
                     result = subprocess.run(stop_cmd, capture_output=True, text=True, timeout=60)
                     
                     if result.returncode == 0:
-                        print(f"Successfully stopped nsys session '{session_name}' on {hostname}")
+                        print(f"Successfully stopped nsys session '{session_id}' on {hostname}")
                     else:
-                        print(f"Warning: Could not stop session '{session_name}' on {hostname}. Error: {result.stderr}")
+                        print(f"Warning: Could not stop session '{session_id}' on {hostname}. Error: {result.stderr}")
                     
                 # Give nsys some time to write the profile data
                 time.sleep(3)
@@ -705,6 +709,52 @@ class JobManager:
                 print(f"Warning: Could not stop nsys sessions on {hostname}: {e}")
                     
         print("Finished stopping nsys sessions.")
+
+    def _capture_nsys_session_id(self, nsys_info):
+        """Capture the nsys session ID after launching a job."""
+        if not nsys_info:
+            return
+            
+        hostname = nsys_info['hostnames'][0]
+        
+        try:
+            print(f"Capturing nsys session ID on {hostname}")
+            
+            # Get list of active sessions on this node
+            list_cmd = [
+                "srun", "--overlap", "--oversubscribe", "-A", self.account, "-p", self.partition,
+                "-N", "1", "-n", "1", "-t", self.time, "-w", hostname,
+                f"--container-image={self.container_image}",
+                f"--container-mounts={self.mounts}",
+                f"--container-workdir={self.workdir}",
+                "nsys", "sessions", "list", "--show-header=false"
+            ]
+            
+            result = subprocess.run(list_cmd, capture_output=True, text=True, timeout=30)
+            
+            if result.returncode != 0:
+                print(f"Warning: Could not list nsys sessions on {hostname}")
+                return
+                
+            # Parse the sessions and find the most recent one
+            # The newest session is likely the one we just started
+            sessions = []
+            for line in result.stdout.strip().split('\n'):
+                if line.strip():
+                    parts = line.strip().split()
+                    if parts:
+                        sessions.append(parts[0])  # First column is session ID
+            
+            if sessions:
+                # Take the last session as it's likely the most recently created
+                session_id = sessions[-1]
+                nsys_info['session_id'] = session_id
+                print(f"Captured nsys session ID: {session_id} on {hostname}")
+            else:
+                print(f"Warning: No active nsys sessions found on {hostname}")
+                
+        except (subprocess.TimeoutExpired, subprocess.SubprocessError) as e:
+            print(f"Warning: Could not capture nsys session ID on {hostname}: {e}")
 
     def _build_server_launch_command(self, config, hostnames, gpu_indices,
                                      node_port, config_path, log_file):
@@ -753,13 +803,10 @@ class JobManager:
             envs += " TLLM_PROFILE_RECORD_GC=1"
             envs += " TLLM_NVTX_DEBUG=1"
             nsys_file = os.path.join(self.output_folder, f"{log_file}.nsys-rep")
-            # Use a session name that includes the log file basename for easier identification
-            session_name = f"trtllm_{os.path.basename(log_file)}"
-            nsys_prefix = f"nsys profile -e \"NSYS_MPI_STORE_TEAMS_PER_RANK=1\" -o {nsys_file} -f true -t cuda,nvtx,python-gil -c cudaProfilerApi --cuda-graph-trace node --capture-range-end=stop --gpu-metrics-devices=none --session={session_name}"
+            nsys_prefix = f"nsys profile -e \"NSYS_MPI_STORE_TEAMS_PER_RANK=1\" -o {nsys_file} -f true -t cuda,nvtx,python-gil -c cudaProfilerApi --cuda-graph-trace node --capture-range-end=stop --gpu-metrics-devices=none"
             nsys_info = {
                 'enabled': True,
                 'nsys_file': nsys_file,
-                'session_name': session_name,
                 'hostnames': hostnames
             }
         log_file = os.path.join(self.output_folder, log_file)
@@ -822,6 +869,10 @@ class JobManager:
             nsys_info['server_type'] = 'context'
             nsys_info['node_id'] = node_id
             self.nsys_jobs.append(nsys_info)
+            
+            # Give the job a moment to start, then capture the session ID
+            time.sleep(5)
+            self._capture_nsys_session_id(nsys_info)
 
         # Small delay to avoid race conditions in resource allocation
         time.sleep(2)
@@ -849,6 +900,10 @@ class JobManager:
             nsys_info['server_type'] = 'generation'
             nsys_info['node_id'] = node_id
             self.nsys_jobs.append(nsys_info)
+            
+            # Give the job a moment to start, then capture the session ID
+            time.sleep(5)
+            self._capture_nsys_session_id(nsys_info)
 
         # Small delay to avoid race conditions in resource allocation
         time.sleep(2)
@@ -876,6 +931,10 @@ class JobManager:
             nsys_info['server_type'] = 'ifb'
             nsys_info['node_id'] = node_id
             self.nsys_jobs.append(nsys_info)
+            
+            # Give the job a moment to start, then capture the session ID
+            time.sleep(5)
+            self._capture_nsys_session_id(nsys_info)
 
         return launched_jobs
 
