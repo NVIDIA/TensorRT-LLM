@@ -1049,6 +1049,13 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
         module.w2_weight = tmp_w2_weight
         module.fc2_dequant = tmp_w2_weight_scale
 
+        # Bias needs to be padded as well.
+        if module.bias:
+            module.w3_w1_bias.data = _maybe_pad_weight_and_scale(
+                module.w3_w1_bias.data)
+            module.w2_bias.data = _maybe_pad_weight_and_scale(
+                module.w2_bias.data)
+
         if self.activation_dtype == torch.float8_e4m3fn:
             if max_fc31_input_scale is None or max_fc2_input_scale is None:
                 module.fc31_input_dequant = None
