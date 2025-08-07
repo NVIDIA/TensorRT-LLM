@@ -1021,11 +1021,15 @@ class KVCacheEventSerializer:
         if event_serialize_func is None:
             raise ValueError(f"Unknown KVCache event data type: {event_type}")
 
-        return {
+        json_str = {
             "event_id": event.event_id,
             "data": event_serialize_func(event.data),
-            "window_size": event.window_size
+            "window_size": event.window_size,
         }
+        if event.attention_dp_rank is not None:
+            json_str["attention_dp_rank"] = event.attention_dp_rank
+
+        return json_str
 
     @staticmethod
     def _created_to_json(data):
