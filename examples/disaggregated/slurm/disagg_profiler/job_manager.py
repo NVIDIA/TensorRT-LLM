@@ -104,8 +104,6 @@ class JobManager:
         self.generation_jobs = []
         self.ifb_jobs = []
         self.disagg_jobs = []
-        # Track jobs that have nsys enabled with their nsys file paths
-        self.nsys_jobs = []
         self.experiment_path = args.experiment_path
 
         # Clean up any previous node info files
@@ -627,144 +625,15 @@ class JobManager:
                             self.ifb_jobs + self.disagg_jobs)
         print("DEBUG JobManager: launch_jobs completed")
     
-    def stop_nsys_sessions(self):
-        """Stop nsys sessions for all tracked nsys jobs."""
-        if not self.nsys_jobs:
-            return
-        
-        print("Stopping nsys sessions...")
-        
-        # Group jobs by hostname to minimize srun calls
-        jobs_by_hostname = {}
-        for nsys_job in self.nsys_jobs:
-            if nsys_job['process'] and nsys_job['process'].poll() is None:
-                # Use the first hostname for the job
-                hostname = nsys_job['hostnames'][0]
-                if hostname not in jobs_by_hostname:
-                    jobs_by_hostname[hostname] = []
-                jobs_by_hostname[hostname].append(nsys_job)
-        
-        # Process each hostname
-        for hostname, jobs in jobs_by_hostname.items():
-            try:
-                print(f"Checking nsys sessions on node {hostname}")
-                
-                # First, get list of active sessions on this node
-                list_cmd = [
-                    "srun", "--overlap", "--oversubscribe", "-A", self.account, "-p", self.partition,
-                    "-N", "1", "-n", "1", "-t", self.time, "-w", hostname,
-                    f"--container-image={self.container_image}",
-                    f"--container-mounts={self.mounts}",
-                    f"--container-workdir={self.workdir}",
-                    "nsys", "sessions", "list", "--show-header=false"
-                ]
-                
-                result = subprocess.run(list_cmd, capture_output=True, text=True, timeout=60)
-                
-                if result.returncode != 0:
-                    print(f"Warning: Could not list nsys sessions on {hostname}")
-                    print(f"Error output: {result.stderr}")
-                    continue
-                    
-                active_sessions = []
-                for line in result.stdout.strip().split('\n'):
-                    if line.strip():
-                        # Sessions list format: typically session_id followed by other info
-                        parts = line.strip().split()
-                        if parts:
-                            active_sessions.append(parts[0])  # First column is session ID
-                
-                print(f"Found {len(active_sessions)} active nsys sessions on {hostname}")
-                
-                # Stop sessions for jobs on this hostname
-                for nsys_job in jobs:
-                    if 'session_id' not in nsys_job:
-                        print(f"Warning: No session ID found for {nsys_job['server_type']} server (node {nsys_job['node_id']}), skipping")
-                        continue
-                        
-                    session_id = nsys_job['session_id']
-                    print(f"Stopping nsys session '{session_id}' for {nsys_job['server_type']} server (node {nsys_job['node_id']}) on {hostname}")
-                    
-                    # Stop by session ID
-                    stop_cmd = [
-                        "srun", "--overlap", "--oversubscribe", "-A", self.account, "-p", self.partition,
-                        "-N", "1", "-n", "1", "-t", self.time, "-w", hostname,
-                        f"--container-image={self.container_image}",
-                        f"--container-mounts={self.mounts}",
-                        f"--container-workdir={self.workdir}",
-                        "nsys", "stop", f"--session={session_id}"
-                    ]
-                    
-                    result = subprocess.run(stop_cmd, capture_output=True, text=True, timeout=60)
-                    
-                    if result.returncode == 0:
-                        print(f"Successfully stopped nsys session '{session_id}' on {hostname}")
-                    else:
-                        print(f"Warning: Could not stop session '{session_id}' on {hostname}. Error: {result.stderr}")
-                    
-                # Give nsys some time to write the profile data
-                time.sleep(3)
-                    
-            except (subprocess.TimeoutExpired, subprocess.SubprocessError) as e:
-                print(f"Warning: Could not stop nsys sessions on {hostname}: {e}")
-                    
-        print("Finished stopping nsys sessions.")
-
-    def _capture_nsys_session_id(self, nsys_info):
-        """Capture the nsys session ID after launching a job."""
-        if not nsys_info:
-            return
-            
-        hostname = nsys_info['hostnames'][0]
-        
-        try:
-            print(f"Capturing nsys session ID on {hostname}")
-            
-            # Get list of active sessions on this node
-            list_cmd = [
-                "srun", "--overlap", "--oversubscribe", "-A", self.account, "-p", self.partition,
-                "-N", "1", "-n", "1", "-t", self.time, "-w", hostname,
-                f"--container-image={self.container_image}",
-                f"--container-mounts={self.mounts}",
-                f"--container-workdir={self.workdir}",
-                "nsys", "sessions", "list", "--show-header=false"
-            ]
-            
-            result = subprocess.run(list_cmd, capture_output=True, text=True, timeout=30)
-            
-            if result.returncode != 0:
-                print(f"Warning: Could not list nsys sessions on {hostname}")
-                return
-                
-            # Parse the sessions and find the most recent one
-            # The newest session is likely the one we just started
-            sessions = []
-            for line in result.stdout.strip().split('\n'):
-                if line.strip():
-                    parts = line.strip().split()
-                    if parts:
-                        sessions.append(parts[0])  # First column is session ID
-            
-            if sessions:
-                # Take the last session as it's likely the most recently created
-                session_id = sessions[-1]
-                nsys_info['session_id'] = session_id
-                print(f"Captured nsys session ID: {session_id} on {hostname}")
-            else:
-                print(f"Warning: No active nsys sessions found on {hostname}")
-                
-        except (subprocess.TimeoutExpired, subprocess.SubprocessError) as e:
-            print(f"Warning: Could not capture nsys session ID on {hostname}: {e}")
-
     def _build_server_launch_command(self, config, hostnames, gpu_indices,
                                      node_port, config_path, log_file):
         """Build the command to launch a server (context or generation).
         
         Returns:
-            tuple: (cmd, nsys_info) where nsys_info is a dict with nsys details or None
+        cmd: The command to launch the server
         """
         if not gpu_indices or not config_path:
-            return None, None
+            return None
 
         # Get configuration based on server type
         server_config = config
@@ -796,19 +665,15 @@ class JobManager:
                 unset_env += f" -u {key}"
         nsys = False
         nsys_prefix = ''
-        nsys_info = None
         if 'nsys' in config:
-            nsys = config['nsys']
+            nsys = True
         if nsys:
             envs += " TLLM_PROFILE_RECORD_GC=1"
             envs += " TLLM_NVTX_DEBUG=1"
+            if 'TLLM_PROFILE_START_STOP' in config['nsys']:
+                envs += f" TLLM_PROFILE_START_STOP={config['nsys']['TLLM_PROFILE_START_STOP']}"
             nsys_file = os.path.join(self.output_folder, f"{log_file}.nsys-rep")
             nsys_prefix = f"nsys profile -e \"NSYS_MPI_STORE_TEAMS_PER_RANK=1\" -o {nsys_file} -f true -t cuda,nvtx,python-gil -c cudaProfilerApi --cuda-graph-trace node --capture-range-end=stop --gpu-metrics-devices=none"
-            nsys_info = {
-                'enabled': True,
-                'nsys_file': nsys_file,
-                'hostnames': hostnames
-            }
         log_file = os.path.join(self.output_folder, log_file)
 
         # Build the command
@@ -846,14 +711,14 @@ class JobManager:
             " --pp_size " + str(pp) + " &> " + log_file
         ]
 
-        return cmd, nsys_info
+        return cmd
 
     def launch_context_server(self, node_id, hostnames, gpu_indices, node_port,
                               log_file):
         """Launch context server on a specific node."""
         launched_jobs = []
 
-        cmd, nsys_info = self._build_server_launch_command(
+        cmd = self._build_server_launch_command(
             self.config['exec']['config']['context'], hostnames, gpu_indices,
             node_port, self.context_config_path, log_file)
         if not cmd:
@@ -862,17 +727,6 @@ class JobManager:
         print(f"Running command: {' '.join(cmd)}")
         proc = subprocess.Popen(cmd)
         launched_jobs.append(proc)
-
-        # Track nsys information if enabled
-        if nsys_info:
-            nsys_info['process'] = proc
-            nsys_info['server_type'] = 'context'
-            nsys_info['node_id'] = node_id
-            self.nsys_jobs.append(nsys_info)
-            
-            # Give the job a moment to start, then capture the session ID
-            time.sleep(5)
-            self._capture_nsys_session_id(nsys_info)
 
         # Small delay to avoid race conditions in resource allocation
         time.sleep(2)
@@ -884,7 +738,7 @@ class JobManager:
         """Launch generation server on a specific node."""
         launched_jobs = []
 
-        cmd, nsys_info = self._build_server_launch_command(
+        cmd = self._build_server_launch_command(
             self.config['exec']['config']['generation'], hostnames, gpu_indices,
             node_port, self.generation_config_path, log_file)
         if not cmd:
@@ -894,20 +748,6 @@ class JobManager:
         proc = subprocess.Popen(cmd)
         launched_jobs.append(proc)
 
-        # Track nsys information if enabled
-        if nsys_info:
-            nsys_info['process'] = proc
-            nsys_info['server_type'] = 'generation'
-            nsys_info['node_id'] = node_id
-            self.nsys_jobs.append(nsys_info)
-            
-            # Give the job a moment to start, then capture the session ID
-            time.sleep(5)
-            self._capture_nsys_session_id(nsys_info)
-
-        # Small delay to avoid race conditions in resource allocation
-        time.sleep(2)
-
         return launched_jobs
 
     def launch_ifb_server(self, node_id, hostnames, gpu_indices, node_port,
@@ -915,7 +755,7 @@ class JobManager:
         """Launch IFB server on a specific node."""
         launched_jobs = []
 
-        cmd, nsys_info = self._build_server_launch_command(
+        cmd = self._build_server_launch_command(
             self.config['exec']['config']['ifb'], hostnames, gpu_indices,
             node_port, self.ifb_config_path, log_file)
         if not cmd:
@@ -924,17 +764,6 @@ class JobManager:
         print(f"Running command: {' '.join(cmd)}")
         proc = subprocess.Popen(cmd)
         launched_jobs.append(proc)
-
-        # Track nsys information if enabled
-        if nsys_info:
-            nsys_info['process'] = proc
-            nsys_info['server_type'] = 'ifb'
-            nsys_info['node_id'] = node_id
-            self.nsys_jobs.append(nsys_info)
-            
-            # Give the job a moment to start, then capture the session ID
-            time.sleep(5)
-            self._capture_nsys_session_id(nsys_info)
 
         return launched_jobs
 
@@ -1182,8 +1011,6 @@ class JobManager:
 
     def terminate_jobs(self, jobs):
         """Terminate all running jobs."""
-        # First, stop any nsys sessions for jobs that have nsys enabled
-        self.stop_nsys_sessions()
         
         # Then terminate the jobs
         for job in jobs:
