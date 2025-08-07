@@ -281,8 +281,13 @@ def buildImage(config, imageKeyToTag)
     try {
         def build_jobs = BUILD_JOBS
         // Fix the triton image pull timeout issue
+        def BASE_IMAGE = sh(script: "cd ${LLM_ROOT} && grep 'ARG BASE_IMAGE=' docker/Dockerfile.multi | grep -o '=.*' | tr -d '=\"'", returnStdout: true).trim()
         def TRITON_IMAGE = sh(script: "cd ${LLM_ROOT} && grep 'ARG TRITON_IMAGE=' docker/Dockerfile.multi | grep -o '=.*' | tr -d '=\"'", returnStdout: true).trim()
         def TRITON_BASE_TAG = sh(script: "cd ${LLM_ROOT} && grep 'ARG TRITON_BASE_TAG=' docker/Dockerfile.multi | grep -o '=.*' | tr -d '=\"'", returnStdout: true).trim()
+
+        // Replace the base image and triton image with the internal mirror
+        BASE_IMAGE = BASE_IMAGE.replace("nvcr.io/nvidia/", "urm.nvidia.com/docker/")
+        TRITON_IMAGE = TRITON_IMAGE.replace("nvcr.io/nvidia/", "urm.nvidia.com/docker/")
 
         if (dependent) {
             stage ("make ${dependent.target}_${action} (${arch})") {
@@ -292,6 +297,8 @@ def buildImage(config, imageKeyToTag)
                 retry(3) {
                     sh """
                     cd ${LLM_ROOT} && make -C docker ${dependent.target}_${action} \
+                    BASE_IMAGE=${BASE_IMAGE} \
+                    TRITON_IMAGE=${TRITON_IMAGE} \
                     TORCH_INSTALL_TYPE=${torchInstallType} \
                     IMAGE_WITH_TAG=${dependentImageWithTag} \
                     STAGE=${dependent.dockerfileStage} \
@@ -321,6 +328,8 @@ def buildImage(config, imageKeyToTag)
             retry(3) {
                 sh """
                 cd ${LLM_ROOT} && make -C docker ${target}_${action} \
+                BASE_IMAGE=${BASE_IMAGE} \
+                TRITON_IMAGE=${TRITON_IMAGE} \
                 TORCH_INSTALL_TYPE=${torchInstallType} \
                 IMAGE_WITH_TAG=${imageWithTag} \
                 STAGE=${dockerfileStage} \
@@ -336,6 +345,8 @@ def buildImage(config, imageKeyToTag)
             stage ("custom tag: ${customTag} (${arch})") {
                 sh """
                 cd ${LLM_ROOT} && make -C docker ${target}_${action} \
+                BASE_IMAGE=${BASE_IMAGE} \
+                TRITON_IMAGE=${TRITON_IMAGE} \
                 TORCH_INSTALL_TYPE=${torchInstallType} \
                 IMAGE_WITH_TAG=${customImageWithTag} \
                 STAGE=${dockerfileStage} \
