@@ -161,10 +161,11 @@ class TritonPythonModel:
                 self.video_token_id = hf_config.video_token_id
                 self.vocab_size = hf_config.vocab_size
                 self.qwen2vl_utils = Qwen2VLUtils(hf_config)
-            
+
             if self.model_type == 'pixtral':
                 from transformers import AutoConfig
-                hf_model_path = model_config['parameters'].get('hf_model_path', None)
+                hf_model_path = model_config['parameters'].get(
+                    'hf_model_path', None)
                 assert hf_model_path is not None and hf_model_path[
                     'string_value'] != "${hf_model_path}", "Need to provide hf_model_path for the Pixtral model"
                 hf_config = AutoConfig.from_pretrained(
@@ -295,13 +296,23 @@ class TritonPythonModel:
             d_min = torch.finfo(self.vision_output_dtype).min
             total_images = img_tensor.shape[0] * img_tensor.shape[1]
             num_patches = self.image_size // self.patch_size
-            input_tensors['input'].append(img_tensor.view(-1, img_tensor.shape[2], img_tensor.shape[3], img_tensor.shape[4]))
+            input_tensors['input'].append(
+                img_tensor.view(-1, img_tensor.shape[2], img_tensor.shape[3],
+                                img_tensor.shape[4]))
             attention_mask_shape = (total_images, num_patches, num_patches)
-            attention_mask = torch.full(attention_mask_shape, fill_value=d_min, dtype=self.vision_output_dtype, device="cuda")
-            image_sizes = from_dlpack(pb_utils.get_input_tensor_by_name(request, 'image_sizes').to_dlpack()).reshape(total_images, 2)
+            attention_mask = torch.full(attention_mask_shape,
+                                        fill_value=d_min,
+                                        dtype=self.vision_output_dtype,
+                                        device="cuda")
+            image_sizes = from_dlpack(
+                pb_utils.get_input_tensor_by_name(
+                    request,
+                    'image_sizes').to_dlpack()).reshape(total_images, 2)
             for image_idx in range(total_images):
-                image_h, image_w = image_sizes[image_idx][0], image_sizes[image_idx][1]
-                attention_mask[image_idx, : image_h // self.patch_size, : image_w // self.patch_size] = 0
+                image_h, image_w = image_sizes[image_idx][0], image_sizes[
+                    image_idx][1]
+                attention_mask[image_idx, :image_h //
+                               self.patch_size, :image_w // self.patch_size] = 0
             input_tensors['attention_mask'].append(attention_mask)
         else:
             input_tensors['input'].append(
@@ -532,26 +543,41 @@ class TritonPythonModel:
             visual_embed_dim = output_tensor.shape[-1]
             total_images = output_tensor.shape[0]
             output_img_size = self.image_size // self.relevant_patch_size
-            image_sizes = from_dlpack(pb_utils.get_input_tensor_by_name(requests[0], 'image_sizes').to_dlpack()).reshape(total_images, 2)
+            image_sizes = from_dlpack(
+                pb_utils.get_input_tensor_by_name(
+                    requests[0],
+                    'image_sizes').to_dlpack()).reshape(total_images, 2)
             complete_visual_features = []
             for image_idx in range(total_images):
-                image_h, image_w = image_sizes[image_idx][0], image_sizes[image_idx][1]
+                image_h, image_w = image_sizes[image_idx][0], image_sizes[
+                    image_idx][1]
                 h_patches, w_patches = image_h // self.relevant_patch_size, image_w // self.relevant_patch_size
-                relevant_visual_features = torch.zeros(1, h_patches * w_patches, visual_embed_dim)
-                visual_features = output_tensor[image_idx].reshape(output_img_size, output_img_size, visual_embed_dim)
-                flattened_features = visual_features[:h_patches, :w_patches, :].flatten(0, 1)
-                relevant_visual_features[0, : h_patches * w_patches, :] = flattened_features
+                relevant_visual_features = torch.zeros(1, h_patches * w_patches,
+                                                       visual_embed_dim)
+                visual_features = output_tensor[image_idx].reshape(
+                    output_img_size, output_img_size, visual_embed_dim)
+                flattened_features = visual_features[:h_patches, :
+                                                     w_patches, :].flatten(
+                                                         0, 1)
+                relevant_visual_features[0, :h_patches *
+                                         w_patches, :] = flattened_features
                 complete_visual_features.append(relevant_visual_features)
-            complete_visual_features = torch.cat(complete_visual_features, dim=1)
+            complete_visual_features = torch.cat(complete_visual_features,
+                                                 dim=1)
 
             prompt_embedding_table_tensor = pb_utils.Tensor.from_dlpack(
-                    'OUT_PROMPT_EMBEDDING_TABLE', to_dlpack(complete_visual_features.type(self.vision_output_dtype)))
+                'OUT_PROMPT_EMBEDDING_TABLE',
+                to_dlpack(
+                    complete_visual_features.type(self.vision_output_dtype)))
             prompt_vocab_size_tensor = pb_utils.Tensor(
-                    'OUT_PROMPT_VOCAB_SIZE',
-                    np.array([[complete_visual_features.shape[1]]], dtype=np.int32))
+                'OUT_PROMPT_VOCAB_SIZE',
+                np.array([[complete_visual_features.shape[1]]], dtype=np.int32))
 
-            output_tensors = [prompt_embedding_table_tensor, prompt_vocab_size_tensor]
-            inference_response = pb_utils.InferenceResponse(output_tensors=output_tensors)
+            output_tensors = [
+                prompt_embedding_table_tensor, prompt_vocab_size_tensor
+            ]
+            inference_response = pb_utils.InferenceResponse(
+                output_tensors=output_tensors)
             responses.append(inference_response)
         else:
             for req_idx, embeddings in enumerate(
