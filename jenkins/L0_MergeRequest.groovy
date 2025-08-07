@@ -384,7 +384,7 @@ def launchReleaseCheck(pipeline)
             -y""")
         sh "pip3 config set global.break-system-packages true"
         sh "git config --global --add safe.directory \"*\""
-        // Step 1: cloning tekit source code
+        // Step 1: Clone TRT-LLM source codes
         trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
         sh "cd ${LLM_ROOT} && git config --unset-all core.hooksPath"
 
@@ -414,10 +414,10 @@ def launchReleaseCheck(pipeline)
             }
         }
 
-        // Step 3: Run release check
+        // Step 3: Run pre-commit checks
         trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${LLM_ROOT} && python3 -u scripts/release_check.py || (git restore . && false)")
 
-        // Step 4: build tools
+        // Step 4: Run license check
         withEnv(['GONOSUMDB=*.nvidia.com']) {
             withCredentials([
                 gitUsernamePassword(
@@ -432,7 +432,6 @@ def launchReleaseCheck(pipeline)
                 sh "go install ${DEFAULT_GIT_URL}/TensorRT/Infrastructure/licensechecker/cmd/license_checker@v0.3.0"
             }
         }
-        // Step 5: Run license check
         sh "cd ${LLM_ROOT}/cpp && /go/bin/license_checker -config ../jenkins/license_cpp.json include tensorrt_llm"
     }
 
