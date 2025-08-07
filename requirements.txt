@@ -8,7 +8,7 @@ diffusers>=0.27.0
 lark
 mpi4py
 numpy<2
-onnx>=1.12.0
+onnx>=1.18.0
 onnx_graphsurgeon>=0.5.2
 openai
 polygraphy
