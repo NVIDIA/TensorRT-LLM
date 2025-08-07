@@ -5,8 +5,6 @@ from typing import List, Optional, Tuple
 
 import torch
 from transformers import AutoProcessor, Gemma3Config, PreTrainedModel
-from transformers.modeling_utils import no_init_weights
-from transformers.models.gemma3.modeling_gemma3 import Gemma3MultiModalProjector
 
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
@@ -18,6 +16,8 @@ from ...logger import logger
 from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
 from ..model_config import ModelConfig
+from ..modules.linear import Linear
+from ..modules.rms_norm import RMSNorm
 from .modeling_gemma3 import Gemma3ForCausalLM
 from .modeling_multimodal_utils import fuse_input_embeds
 from .modeling_siglip import SiglipVisionModel
@@ -81,6 +81,61 @@ class Gemma3InputProcessor(InputProcessor):
         return input_ids[0].to(torch.int32).tolist(), multimodal_data
 
 
+# Original HF implementation:
+# https://github.com/huggingface/transformers/blob/main/src/transformers/models/gemma3/modeling_gemma3.py#L684
+class Gemma3MultiModalProjector(torch.nn.Module):
+    """Gemma3MultiModalProjector using TRTLLM's Linear and RMSNorm."""
+
+    def __init__(self, model_config: ModelConfig[Gemma3Config]):
+        super().__init__()
+        config = model_config.pretrained_config
+        self.dtype = config.torch_dtype
+        self.mm_input_projection = Linear(
+            in_features=config.vision_config.hidden_size,
+            out_features=config.text_config.hidden_size,
+            bias=False,
+            dtype=self.dtype,
+            mapping=model_config.mapping)
+        self.mm_soft_emb_norm = RMSNorm(
+            hidden_size=config.vision_config.hidden_size,
+            eps=config.vision_config.layer_norm_eps,
+            dtype=self.dtype)
+        self.patches_per_image = int(config.vision_config.image_size //
+                                     config.vision_config.patch_size)
+        self.tokens_per_side = int(config.mm_tokens_per_image**0.5)
+        self.kernel_size = self.patches_per_image // self.tokens_per_side
+        self.avg_pool = torch.nn.AvgPool2d(kernel_size=self.kernel_size,
+                                           stride=self.kernel_size)
+
+    def load_weights(self, weights):
+        # Original `mm_input_projection_weight` is a matmul while we use a linear op with no bias.
+        self.mm_input_projection.weight.data.copy_(
+            weights["mm_input_projection_weight"].transpose(0, 1))
+        # Gemma3RmsNorm is a layernorm-1P and needs a +1.0.
+        self.mm_soft_emb_norm.weight.data.copy_(
+            weights["mm_soft_emb_norm.weight"] + 1.0)
+
+    @torch.inference_mode()
+    def forward(self, vision_outputs: torch.Tensor):
+        batch_size, _, seq_length = vision_outputs.shape
+        reshaped_vision_outputs = vision_outputs.transpose(1, 2)
+        reshaped_vision_outputs = reshaped_vision_outputs.reshape(
+            batch_size, seq_length, self.patches_per_image,
+            self.patches_per_image)
+        reshaped_vision_outputs = reshaped_vision_outputs.contiguous()
+        pooled_vision_outputs = self.avg_pool(reshaped_vision_outputs).to(
+            self.dtype)
+        pooled_vision_outputs = pooled_vision_outputs.flatten(2)  # [B, T, P*P].
+        pooled_vision_outputs = pooled_vision_outputs.transpose(1, 2).reshape(
+            -1, seq_length)
+        # FlashInfer's rmsnorm needs input to be contiguous.
+        normed_vision_outputs = self.mm_soft_emb_norm(
+            pooled_vision_outputs.contiguous())
+        projected_vision_outputs = self.mm_input_projection(
+            normed_vision_outputs)
+        return projected_vision_outputs.type_as(vision_outputs)
+
+
 @register_auto_model("Gemma3ForConditionalGeneration")
 @register_input_processor(Gemma3InputProcessor, model_type="gemma3")
 class Gemma3VLM(PreTrainedModel):
@@ -114,11 +169,8 @@ class Gemma3VLM(PreTrainedModel):
         self.siglip_tower = SiglipVisionModel(vision_model_config,
                                               use_post_layernorm=True)
 
-        # NOTE: Use HF implementation. We init the weights after transferring to the `device` since it can take a much
-        # longer time to initialize them on the CPU.
-        with no_init_weights():
-            self.mm_projector = Gemma3MultiModalProjector(config).eval().to(
-                self._device)
+        self.mm_projector = Gemma3MultiModalProjector(model_config).eval().to(
+            self._device)
 
         self.post_config()
         self.is_loaded = True
@@ -153,12 +205,8 @@ class Gemma3VLM(PreTrainedModel):
         vit_weights = filter_weights("vision_tower", weights)
         self.siglip_tower.load_weights(vit_weights)
 
-        _load_weights_into_hf_module(
-            model=self.mm_projector,
-            weights=weights,
-            prefix="multi_modal_projector",
-            model_name="multi modal projector",
-        )
+        mm_projector_weights = filter_weights("multi_modal_projector", weights)
+        self.mm_projector.load_weights(mm_projector_weights)
 
     def post_config(self):
         self.config = self.llm.config
@@ -191,12 +239,9 @@ class Gemma3VLM(PreTrainedModel):
         mm_embeds = []
         mm_token_mask = None
         if len(pixel_values) > 0:
-            # The shape of `image_features` is `[B, T, embed_dim]`.
             image_features = self._get_image_features(
                 pixel_values=torch.cat(pixel_values))
-            # We need to reshape it to `[B * T, embed_dim]` before passing to `fuse_input_embeds`.
-            B, T, embed_dim = image_features.shape
-            mm_embeds = [image_features.reshape(B * T, embed_dim).contiguous()]
+            mm_embeds = [image_features.contiguous()]
 
             # Get token type ids. 0 corresponds to text tokens, 1 corresponds to image tokens.
             mm_token_mask = torch.isin(input_ids, self.image_token_ids)

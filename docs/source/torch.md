@@ -2,10 +2,9 @@
 
 ```{note}
 Note:
-This feature is currently experimental, and the related API is subjected to change in future versions.
+This feature is currently in beta, and the related API is subjected to change in future versions.
 ```
-
-To enhance the usability of the system and improve developer efficiency, TensorRT-LLM launches a new experimental backend based on PyTorch.
+To enhance the usability of the system and improve developer efficiency, TensorRT-LLM launches a new backend based on PyTorch.
 
 The PyTorch backend of TensorRT-LLM is available in version 0.17 and later. You can try it via importing `tensorrt_llm._torch`.
 
