@@ -9,6 +9,9 @@ from ..pyexecutor.scheduler import ScheduledRequests
 class Drafter(ABC):
     """Abstract base class for all drafter implementations."""
 
+    def __init__(self, max_concurrency: Optional[int] = None) -> None:
+        self.max_concurrency = max_concurrency
+
     @abstractmethod
     def prepare_draft_tokens(
         self,
@@ -25,4 +28,6 @@ class Drafter(ABC):
 
     def should_use_spec_decode(self, requests: List[LlmRequest]) -> bool:
         """Check if spec decode should be used for the current iteration."""
+        if self.max_concurrency is not None:
+            return len(requests) <= self.max_concurrency
         return True

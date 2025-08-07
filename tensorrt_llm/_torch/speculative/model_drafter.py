@@ -48,6 +48,8 @@ class ModelDrafter(Drafter):
         spec_resource_manager: Optional[BaseResourceManager] = None,
         guided_decoder: Optional[GuidedDecoder] = None,
     ):
+        super().__init__(spec_config.max_concurrency)
+
         # Validate required parameters
         if draft_model_engine is None:
             raise ValueError("draft_model_engine cannot be None")
