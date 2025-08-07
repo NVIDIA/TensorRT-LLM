@@ -469,9 +469,9 @@ class SingleLayerMoeLoadBalancer:
         """
         Start to wait for the GPU stage to complete.
         """
+        assert self.func_called_count["start_wait_gpu_stage"] == 0
+        self.func_called_count["start_wait_gpu_stage"] += 1
         if self.updates_enabled:
-            assert self.func_called_count["start_wait_gpu_stage"] == 0
-            self.func_called_count["start_wait_gpu_stage"] += 1
             if is_graph_capturing():
                 self.event_dict[EventType.Main].record()
                 with torch.cuda.stream(self.aux_stream):
@@ -487,10 +487,10 @@ class SingleLayerMoeLoadBalancer:
         """
         Done waiting for the GPU stage to complete.
         """
+        assert self.func_called_count["start_wait_gpu_stage"] == 1
+        assert self.func_called_count["done_wait_gpu_stage"] == 0
+        self.func_called_count["done_wait_gpu_stage"] += 1
         if self.updates_enabled:
-            assert self.func_called_count["start_wait_gpu_stage"] == 1
-            assert self.func_called_count["done_wait_gpu_stage"] == 0
-            self.func_called_count["done_wait_gpu_stage"] += 1
             if is_graph_capturing():
                 self.event_dict[EventType.MoeBalancer].wait()
 
@@ -498,10 +498,10 @@ class SingleLayerMoeLoadBalancer:
         """
         Start to set the CPU stage.
         """
+        assert self.func_called_count["done_wait_gpu_stage"] == 1
+        assert self.func_called_count["start_set_cpu_stage"] == 0
+        self.func_called_count["start_set_cpu_stage"] += 1
         if self.updates_enabled:
-            assert self.func_called_count["done_wait_gpu_stage"] == 1
-            assert self.func_called_count["start_set_cpu_stage"] == 0
-            self.func_called_count["start_set_cpu_stage"] += 1
             if is_graph_capturing():
                 self.event_dict[EventType.Main].record()
                 with torch.cuda.stream(self.aux_stream):
@@ -517,11 +517,11 @@ class SingleLayerMoeLoadBalancer:
         """
         Done setting the CPU stage.
         """
+        assert self.func_called_count["start_set_cpu_stage"] == 1
+        for name in self.func_called_count:
+            self.func_called_count[name] = 0
+        self.statistic_flag_tensor = None
         if self.updates_enabled:
-            assert self.func_called_count["start_set_cpu_stage"] == 1
-            for name in self.func_called_count:
-                self.func_called_count[name] = 0
-            self.statistic_flag_tensor = None
             if is_graph_capturing():
                 self.event_dict[EventType.MoeBalancer].wait()
 
@@ -535,18 +535,15 @@ class SingleLayerMoeLoadBalancer:
             is_first_stage: Whether this is the first stage
             is_last_stage: Whether this is the last stage
         """
+        assert self.func_called_count["done_wait_gpu_stage"] == 1
+        assert self.func_called_count["update_statistic_with_global_ids"] == 0
+        self.func_called_count["update_local_statistic"] += 1
         if self.updates_enabled:
-            assert self.func_called_count["done_wait_gpu_stage"] == 1
-            assert self.func_called_count[
-                "update_statistic_with_global_ids"] == 0
-            self.func_called_count["update_local_statistic"] += 1
-
             if self.local_statistic_tensor is None:
                 self.local_statistic_tensor = torch.empty(
                     (self.expert_count, ),
                     dtype=torch.int32,
                     device=torch.device('cuda'))
-
             if is_graph_capturing():
                 self.event_dict[EventType.Main].record()
                 with torch.cuda.stream(self.aux_stream):
@@ -569,9 +566,9 @@ class SingleLayerMoeLoadBalancer:
         Returns:
             The local statistic tensor if using statistic else None
         """
+        assert self.func_called_count["update_local_statistic"] > 0
+        self.func_called_count["get_local_statistic_tensor"] += 1
         if self.updates_enabled:
-            assert self.func_called_count["update_local_statistic"] > 0
-            self.func_called_count["get_local_statistic_tensor"] += 1
             if is_graph_capturing():
                 with torch.cuda.stream(self.aux_stream):
                     self.event_dict[EventType.MoeBalancer].record()
@@ -587,22 +584,20 @@ class SingleLayerMoeLoadBalancer:
         Args:
             gathered_local_statistic_tensor: gathered local statistics info, should have shape (world_size, self.expert_count)
         """
+        assert self.func_called_count["get_local_statistic_tensor"] > 0
+        assert self.func_called_count["update_statistic_with_local_ids"] == 0
+        assert self.func_called_count["update_statistic_with_global_ids"] == 0
+        self.func_called_count["update_statistic_with_gathered_statistic"] += 1
+
+        def _update_statistic():
+            global_statistic_info = torch.sum(gathered_local_statistic_tensor,
+                                              dim=0,
+                                              dtype=torch.int32)
+            torch.ops.trtllm.moe_hierarchical_statistic_update(
+                global_statistic_info, self.statistic_flag_tensor,
+                self.single_layer_load_balancer_ptr)
+
         if self.updates_enabled:
-            assert self.func_called_count["get_local_statistic_tensor"] > 0
-            assert self.func_called_count[
-                "update_statistic_with_local_ids"] == 0
-            assert self.func_called_count[
-                "update_statistic_with_global_ids"] == 0
-            self.func_called_count[
-                "update_statistic_with_gathered_statistic"] += 1
-
-            def _update_statistic():
-                global_statistic_info = torch.sum(
-                    gathered_local_statistic_tensor, dim=0, dtype=torch.int32)
-                torch.ops.trtllm.moe_hierarchical_statistic_update(
-                    global_statistic_info, self.statistic_flag_tensor,
-                    self.single_layer_load_balancer_ptr)
-
             if is_graph_capturing():
                 self.event_dict[EventType.Main].record()
                 with torch.cuda.stream(self.aux_stream):
@@ -625,22 +620,20 @@ class SingleLayerMoeLoadBalancer:
             is_last_stage: Whether this is the last stage
             allreduce: The allreduce object
         """
+        assert self.func_called_count["done_wait_gpu_stage"] == 1
+        assert self.func_called_count[
+            "update_statistic_with_gathered_statistic"] == 0
+        assert self.func_called_count["update_statistic_with_global_ids"] == 0
+        self.func_called_count["update_statistic_with_local_ids"] += 1
+
+        def _update_statistic():
+            if is_last_stage:
+                global_statistic_info = allreduce(self.local_statistic_tensor)
+                torch.ops.trtllm.moe_hierarchical_statistic_update(
+                    global_statistic_info, self.statistic_flag_tensor,
+                    self.single_layer_load_balancer_ptr)
+
         if self.updates_enabled:
-            assert self.func_called_count["done_wait_gpu_stage"] == 1
-            assert self.func_called_count[
-                "update_statistic_with_gathered_statistic"] == 0
-            assert self.func_called_count[
-                "update_statistic_with_global_ids"] == 0
-            self.func_called_count["update_statistic_with_local_ids"] += 1
-
-            def _update_statistic():
-                if is_last_stage:
-                    global_statistic_info = allreduce(
-                        self.local_statistic_tensor)
-                    torch.ops.trtllm.moe_hierarchical_statistic_update(
-                        global_statistic_info, self.statistic_flag_tensor,
-                        self.single_layer_load_balancer_ptr)
-
             self.update_local_statistic(local_raw_expert_ids, is_first_stage,
                                         is_last_stage)
             if is_graph_capturing():
@@ -661,13 +654,12 @@ class SingleLayerMoeLoadBalancer:
             is_first_stage: Whether this is the first stage
             is_last_stage: Whether this is the last stage
         """
+        assert self.func_called_count["done_wait_gpu_stage"] == 1
+        assert self.func_called_count[
+            "update_statistic_with_gathered_statistic"] == 0
+        assert self.func_called_count["update_statistic_with_local_ids"] == 0
+        self.func_called_count["update_statistic_with_global_ids"] += 1
         if self.updates_enabled:
-            assert self.func_called_count["done_wait_gpu_stage"] == 1
-            assert self.func_called_count[
-                "update_statistic_with_gathered_statistic"] == 0
-            assert self.func_called_count[
-                "update_statistic_with_local_ids"] == 0
-            self.func_called_count["update_statistic_with_global_ids"] += 1
             if is_graph_capturing():
                 self.event_dict[EventType.Main].record()
                 with torch.cuda.stream(self.aux_stream):

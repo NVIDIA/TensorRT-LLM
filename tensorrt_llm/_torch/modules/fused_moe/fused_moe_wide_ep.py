@@ -136,9 +136,8 @@ class WideEPMoE(MoE):
             assert num_experts % self.ep_size == 0
             self.expert_size_per_partition = num_experts // self.ep_size
             self.num_slots = num_experts
-        self.is_dynamic_routing = self.layer_load_balancer and not self.layer_load_balancer.is_static_routing(
-        )
-        if self.is_dynamic_routing:
+        if self.layer_load_balancer and not self.layer_load_balancer.is_static_routing(
+        ):
             self.allreduce = AllReduce(mapping=model_config.mapping,
                                        strategy=AllReduceStrategy.NCCL)
         else:
@@ -386,7 +385,7 @@ class WideEPMoE(MoE):
 
         is_first_call, is_last_call = repeating_info
 
-        if self.is_dynamic_routing and is_first_call:
+        if self.layer_load_balancer and is_first_call:
             self.layer_load_balancer.start_wait_gpu_stage()
 
         use_deepseek_fp8_block_scale = False
@@ -415,7 +414,7 @@ class WideEPMoE(MoE):
             else:
                 token_final_scales = None
 
-        if self.is_dynamic_routing:
+        if self.layer_load_balancer:
             if is_first_call:
                 self.layer_load_balancer.done_wait_gpu_stage()
             if use_all_to_all and self.alltoall_method_type == AlltoallMethodType.MNNVL:
@@ -429,11 +428,10 @@ class WideEPMoE(MoE):
                     is_first_stage=is_first_call,
                     is_last_stage=is_last_call,
                     allreduce=self.allreduce)
-        if self.layer_load_balancer is None:
-            token_selected_slots = token_selected_experts
-        else:
             token_selected_slots = self.layer_load_balancer.route(
                 token_selected_experts, self.use_dp)
+        else:
+            token_selected_slots = token_selected_experts
 
         # If load balancer is disabled, the statistics are collected from expert IDs.
         # If load balancer is enabled, the statistics are collected from expert slot IDs.
@@ -664,7 +662,7 @@ class WideEPMoE(MoE):
             tuner_top_k=tuner_top_k,
         )
 
-        if self.is_dynamic_routing and is_last_call:
+        if self.layer_load_balancer and is_last_call:
             self.layer_load_balancer.start_set_cpu_stage()
 
         # Only in cutlass_min_latency_mode, the output is a list of tensors.
@@ -695,7 +693,7 @@ class WideEPMoE(MoE):
                     f"Not available alltoall method type: {self.alltoall_method_type!r}"
                 )
 
-        if self.is_dynamic_routing and is_last_call:
+        if self.layer_load_balancer and is_last_call:
             self.layer_load_balancer.done_set_cpu_stage()
 
         return final_hidden_states
