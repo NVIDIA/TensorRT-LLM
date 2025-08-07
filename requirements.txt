@@ -65,3 +65,4 @@ soundfile
 triton==3.3.1; platform_machine == "x86_64"
 tiktoken
 blobfile
+cuda-python==12.9.1
