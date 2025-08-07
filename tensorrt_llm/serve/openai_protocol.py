@@ -476,6 +476,7 @@ class ChatCompletionRequest(OpenAIBaseModel):
     tools: Optional[List[ChatCompletionToolsParam]] = None
     tool_choice: Optional[Union[Literal["none"],
                                 ChatCompletionNamedToolChoiceParam]] = "none"
+    reasoning_effort: Optional[Literal["low", "medium", "high"]] = None
     user: Optional[str] = None
 
     # doc: begin-chat-completion-sampling-params
