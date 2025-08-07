@@ -2027,7 +2027,7 @@ private:
 
         // Scatter the input tokens to other beam
         mTokens = BeamTokens(mSamplingConfig.beamWidth, inputTokens);
-        mLastTokens = VecTokens(mSamplingConfig.beamWidth);
+        mLastTokens = VecTokens(mSamplingConfig.beamWidth, inputTokens.back());
 
         // Init mUniqueTokens
         VecUniqueTokens uniqueTokens{inputTokens.size()};
@@ -2347,6 +2347,9 @@ public:
     void movePromptEmbeddingTableToGpu(runtime::BufferManager const& manager);
 
     void moveLoraWeightsToGpu(runtime::BufferManager const& manager);
+
+    // Remove LoRA weights and LoRA config tensors
+    void removeLoraTensors();
 };
 
 } // namespace tensorrt_llm::batch_manager
