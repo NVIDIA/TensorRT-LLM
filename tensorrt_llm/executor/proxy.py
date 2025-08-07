@@ -10,9 +10,9 @@ import zmq
 import zmq.asyncio
 
 from tensorrt_llm.logger import logger
-from tensorrt_llm.models.modeling_utils import KvCacheConnectorConfig
 
 from .._utils import customized_gc_thresholds, mpi_rank, nvtx_range_debug
+from ..llmapi.llm_args import KvCacheConnectorConfig
 from ..llmapi.mpi_session import (MpiCommSession, MpiPoolSession, MpiSession,
                                   RemoteMpiCommSessionClient)
 from ..llmapi.tracer import enable_llm_tracer, get_tracer, global_tracer

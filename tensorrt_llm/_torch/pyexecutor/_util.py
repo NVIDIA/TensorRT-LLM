@@ -22,8 +22,8 @@ from ..model_config import ModelConfig
 from ..speculative import get_num_extra_kv_tokens, get_spec_decoder
 from .config import PyTorchConfig
 from .config_utils import is_mla, is_nemotron_hybrid
-from .connector import KvCacheConnectorManager
 from .guided_decoder import GuidedDecoder
+from .kv_cache_connector import KvCacheConnectorManager
 from .kv_cache_transceiver import AttentionTypeCpp, create_kv_cache_transceiver
 from .llm_request import ExecutorResponse
 from .model_engine import PyTorchModelEngine

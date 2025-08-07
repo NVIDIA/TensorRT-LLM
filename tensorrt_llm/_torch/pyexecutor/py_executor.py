@@ -36,9 +36,9 @@ from ..distributed import Distributed
 from ..models.modeling_utils import DecoderModelForCausalLM
 from ..modules.decoder_layer import DecoderLayer
 from ..speculative.drafter import Drafter
-from .connector import KvCacheConnectorManager
 from .executor_request_queue import ExecutorRequestQueue, RequestQueueItem
 from .guided_decoder import GuidedDecoder
+from .kv_cache_connector import KvCacheConnectorManager
 from .kv_cache_transceiver import KvCacheTransceiver
 from .llm_request import (ExecutorRequest, LlmRequest, LlmRequestState,
                           LlmResponse)
@@ -947,6 +947,11 @@ class PyExecutor:
             for req in reqs_to_terminate:
                 self.resource_manager.free_resources(req)
 
+    def _kv_connector_wait_for_save(self):
+        if self.kv_connector_manager is not None:
+            self.kv_connector_manager.worker.wait_for_save(
+                torch.cuda.current_stream())
+
     def _executor_loop(self):
         torch.cuda.set_device(self.device_id)
         # ensure the context is created, otherwise, some MPI calls will fail.
@@ -1471,9 +1476,7 @@ class PyExecutor:
                               new_tensors_device, gather_context_logits,
                               cache_indirection_buffer)
 
-            if self.kv_connector_manager is not None:
-                self.kv_connector_manager.worker.wait_for_save(
-                    torch.cuda.current_stream())
+            self._kv_connector_wait_for_save()
 
             return outputs
         except Exception as e:

@@ -13,13 +13,12 @@ from typing import Callable, Dict, List, Optional, Tuple, Union
 import torch
 
 from tensorrt_llm.logger import logger
-from tensorrt_llm.models.modeling_utils import KvCacheConnectorConfig
 
 from .._utils import (KVCacheEventSerializer, global_mpi_rank, global_mpi_size,
                       mpi_comm, mpi_rank, nvtx_range_debug)
 from ..bindings import executor as tllm
 from ..builder import ConfigEncoder, Engine, EngineConfig
-from ..llmapi.llm_args import PybindMirror
+from ..llmapi.llm_args import KvCacheConnectorConfig, PybindMirror
 from ..llmapi.mpi_session import set_mpi_session_cpp
 from ..llmapi.tracer import VizTracer, global_tracer, set_global_tracer
 from ..llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue,
