@@ -103,7 +103,8 @@ CubinObj CompileEngine::compile() const
         // If applyRoPEInXqaKernel, no scratch is needed for storing intermediate RoPE result. Use input KV instead of
         // scratch in this case.
         /*use_input_kv=*/applyRoPEInXqaKernel,
-        /*rope_style=*/ropeStyle};
+        /*rope_style=*/ropeStyle,
+        /*is_spec_dec_tree=*/mXqaParams.is_spec_dec_tree};
     if (context.kernel_type == TLLM_XQA_JIT_MLA)
     {
         auto const& c = context;

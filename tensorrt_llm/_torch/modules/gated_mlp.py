@@ -7,22 +7,12 @@ from torch import nn
 
 from tensorrt_llm.mapping import Mapping
 
-from ..custom_ops import IS_FLASHINFER_AVAILABLE
 from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType
 from ..utils import Fp4QuantizedTensor
 from .linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
-
-
-def swiglu(x):
-    if IS_FLASHINFER_AVAILABLE:
-        # WAR for flashinfer activation since it does not support custom op properly
-        from ..custom_ops import flashinfer_silu_and_mul
-        return flashinfer_silu_and_mul(x)
-    else:
-        gate, x = x.chunk(2, dim=-1)
-        return F.silu(gate) * x
+from .swiglu import swiglu
 
 
 class GatedMLP(nn.Module):
@@ -107,8 +97,15 @@ class GatedMLP(nn.Module):
 
     def _apply_activation(self, x):
         if self.activation == F.silu:
-            return swiglu(x)
-        elif self.activation == None:
+            if self.down_proj.has_fp8_qdq:
+                return swiglu(x,
+                              quant_scale=self.down_proj.input_scale,
+                              quant_type=torch.float8_e4m3fn)
+            else:
+                return swiglu(x)
+        elif callable(self.activation):
+            return self.activation(x)
+        elif self.activation is None:
             return x
         else:
             raise NotImplementedError(

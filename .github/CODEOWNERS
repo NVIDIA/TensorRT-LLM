@@ -14,6 +14,103 @@
 /tensorrt_llm/_torch/auto_deploy @NVIDIA/trt-llm-torch-autodeploy-devs
 /tensorrt_llm/examples/auto_deploy @NVIDIA/trt-llm-torch-autodeploy-devs
 
+## TensorRT-LLM Pytorch - Speculative Decoding
+/tensorrt_llm/_torch/speculative @NVIDIA/trt-llm-torch-spec-decoding
+
+## TensorRT-LLM Pytorch - Graph Compiler
+/tensorrt_llm/_torch/compilation @NVIDIA/trt-llm-torch-graph-compiler
+/tensorrt_llm/_torch/custom_ops @NVIDIA/trt-llm-torch-graph-compiler
+/tensorrt_llm/_torch/autotuner.py @NVIDIA/trt-llm-torch-graph-compiler
+/tests/unittest/_torch/compilation @NVIDIA/trt-llm-torch-graph-compiler
+/tests/unittest/_torch/multi_gpu/test_ar_residual_norm.py @NVIDIA/trt-llm-torch-graph-compiler
+/tests/unittest/_torch/multi_gpu/test_user_buffers.py @NVIDIA/trt-llm-torch-graph-compiler
+/tests/unittest/_torch/test_custom_ops.py @NVIDIA/trt-llm-torch-graph-compiler
+/tests/unittest/_torch/test_autotuner.py @NVIDIA/trt-llm-torch-graph-compiler
+
+## TensorRT-LLM Pytorch - Attention
+/tensorrt_llm/_torch/attention_backend @NVIDIA/trt-llm-torch-attention-devs
+/tensorrt_llm/_torch/modules/attention.py @NVIDIA/trt-llm-torch-attention-devs
+
+## TensorRT-LLM Pytorch - Modules
+/tensorrt_llm/_torch/modules @NVIDIA/trt-llm-torch-modules
+
+
+## TensorRT-LLM Pytorch Models
+/tensorrt_llm/_torch/models @NVIDIA/trt-llm-torch-models-devs
+
+### TensorRT-LLM Pytorch - Models - Gemma
+/tensorrt_llm/_torch/models/modeling_gemma3.py @NVIDIA/trt-llm-torch-models-gemma-devs @NVIDIA/trt-llm-torch-models-devs
+/tensorrt_llm/_torch/models/modeling_gemma3vl.py @NVIDIA/trt-llm-torch-models-gemma-devs @NVIDIA/trt-llm-torch-models-devs
+/tests/unittest/_torch/modeling/test_modeling_gemma3.py @NVIDIA/trt-llm-torch-models-gemma-devs @NVIDIA/trt-llm-torch-models-devs
+
+### TensorRT-LLM Pytorch - Models - Mistral & Mixtral
+/tensorrt_llm/_torch/models/modeling_mistral.py @NVIDIA/trt-llm-torch-models-mistral-devs @NVIDIA/trt-llm-torch-models-devs
+/tensorrt_llm/_torch/models/modeling_pixtral.py @NVIDIA/trt-llm-torch-models-mistral-devs @NVIDIA/trt-llm-torch-models-devs
+/tests/unittest/_torch/modeling/test_modeling_mistral.py @NVIDIA/trt-llm-torch-models-mistral-devs @NVIDIA/trt-llm-torch-models-devs
+/tests/unittest/_torch/modeling/test_modeling_mixtral.py @NVIDIA/trt-llm-torch-models-mistral-devs @NVIDIA/trt-llm-torch-models-devs
+
+### TensorRT-LLM Pytorch - Models - CLIP
+/tensorrt_llm/_torch/models/modeling_clip.py @NVIDIA/trt-llm-torch-models-clip-devs @NVIDIA/trt-llm-torch-models-devs
+/tests/unittest/_torch/modeling/test_modeling_clip.py @NVIDIA/trt-llm-torch-models-clip-devs @NVIDIA/trt-llm-torch-models-devs
+
+### TensorRT-LLM Pytorch - Models - Phi
+/tensorrt_llm/_torch/models/modeling_phi3.py @NVIDIA/trt-llm-torch-models-phi-devs @NVIDIA/trt-llm-torch-models-devs
+/tensorrt_llm/_torch/models/modeling_phi4mm.py @NVIDIA/trt-llm-torch-models-phi-devs @NVIDIA/trt-llm-torch-models-devs
+/tests/unittest/_torch/modeling/test_modeling_phi3.py @NVIDIA/trt-llm-torch-models-phi-devs @NVIDIA/trt-llm-torch-models-devs
+/tests/integration/defs/examples/test_multimodal.py @NVIDIA/trt-llm-torch-models-phi-devs @NVIDIA/trt-llm-torch-models-devs
+
+### TensorRT-LLM Pytorch - Models - Deepseek
+/tensorrt_llm/_torch/models/modeling_deepseekv3.py @NVIDIA/trt-llm-torch-models-deepseek-devs @NVIDIA/trt-llm-torch-models-devs
+/tests/unittest/_torch/modeling/test_modeling_deepseek.py @NVIDIA/trt-llm-torch-models-deepseek-devs @NVIDIA/trt-llm-torch-models-devs
+
+### TensorRT-LLM Pytorch - Models - Llama
+/tensorrt_llm/_torch/models/modeling_mllama.py @NVIDIA/trt-llm-torch-models-llama-devs @NVIDIA/trt-llm-torch-models-devs
+/tensorrt_llm/_torch/models/modeling_llama.py @NVIDIA/trt-llm-torch-models-llama-devs @NVIDIA/trt-llm-torch-models-devs
+/tensorrt_llm/_torch/models/modeling_llama_min_latency.py @NVIDIA/trt-llm-torch-models-llama-devs @NVIDIA/trt-llm-torch-models-devs
+/tests/unittest/_torch/modeling/test_modeling_llama.py @NVIDIA/trt-llm-torch-models-llama-devs @NVIDIA/trt-llm-torch-models-devs
+/tests/unittest/_torch/modeling/test_modeling_llama_min_latency.py @NVIDIA/trt-llm-torch-models-llama-devs @NVIDIA/trt-llm-torch-models-devs
+
+### TensorRT-LLM Pytorch - Models - Qwen
+/tensorrt_llm/_torch/models/modeling_qwen3_moe.py @NVIDIA/trt-llm-torch-models-qwen-devs @NVIDIA/trt-llm-torch-models-devs
+/tensorrt_llm/_torch/models/modeling_qwen3.py @NVIDIA/trt-llm-torch-models-qwen-devs @NVIDIA/trt-llm-torch-models-devs
+/tensorrt_llm/_torch/models/modeling_qwen2vl.py @NVIDIA/trt-llm-torch-models-qwen-devs @NVIDIA/trt-llm-torch-models-devs
+/tensorrt_llm/_torch/models/modeling_qwen.py @NVIDIA/trt-llm-torch-models-qwen-devs @NVIDIA/trt-llm-torch-models-devs
+/tensorrt_llm/_torch/models/modeling_qwen_moe.py @NVIDIA/trt-llm-torch-models-qwen-devs @NVIDIA/trt-llm-torch-models-devs
+
+### TensorRT-LLM Pytorch - Models - VLMs
+/tensorrt_llm/_torch/models/modeling_vila.py @NVIDIA/trt-llm-torch-models-vlm-devs @NVIDIA/trt-llm-torch-models-devs
+/tests/unittest/_torch/modeling/test_modeling_vila.py @NVIDIA/trt-llm-torch-models-vlm-devs @NVIDIA/trt-llm-torch-models-devs
+/tensorrt_llm/_torch/models/modeling_pixtral.py @NVIDIA/trt-llm-torch-models-vlm-devs @NVIDIA/trt-llm-torch-models-devs
+/tests/unittest/_torch/modeling/test_modeling_pixtral.py @NVIDIA/trt-llm-torch-models-vlm-devs @NVIDIA/trt-llm-torch-models-devs
+
+### TensorRT-LLM Pytorch - Models - Nemotron
+/tensorrt_llm/_torch/models/modeling_nemotron_nas.py @NVIDIA/trt-llm-torch-models-nemotron-devs @NVIDIA/trt-llm-torch-models-devs
+/tensorrt_llm/_torch/models/modeling_nemotron_h.py @NVIDIA/trt-llm-torch-models-nemotron-devs @NVIDIA/trt-llm-torch-models-devs
+/tensorrt_llm/_torch/models/modeling_nemotron_nas.py @NVIDIA/trt-llm-torch-models-nemotron-devs @NVIDIA/trt-llm-torch-models-devs
+/tensorrt_llm/_torch/pyexecutor/resource_manager.py @NVIDIA/trt-llm-torch-models-nemotron-devs @NVIDIA/trt-llm-torch-runtime-devs @NVIDIA/trt-llm-torch-models-devs
+/tensorrt_llm/_torch/modules/mamba @NVIDIA/trt-llm-torch-models-nemotron-devs @NVIDIA/trt-llm-torch-models-devs
+/tensorrt_llm/_torch/models/checkpoints/hf/nemotron_h_weight_mapper.py @NVIDIA/trt-llm-torch-models-nemotron-devs @NVIDIA/trt-llm-torch-models-devs
+/tests/unittest/_torch/modeling/test_modeling_nemotron.py @NVIDIA/trt-llm-torch-models-nemotron-devs @NVIDIA/trt-llm-torch-models-devs
+/tests/unittest/_torch/modeling/test_modeling_nemotron_h.py @NVIDIA/trt-llm-torch-models-nemotron-devs @NVIDIA/trt-llm-torch-models-devs
+/tests/unittest/_torch/modeling/test_modeling_nemotron_nas.py @NVIDIA/trt-llm-torch-models-nemotron-devs @NVIDIA/trt-llm-torch-models-devs
+
+## TensorRT-LLM - PEFT
+/tensorrt_llm/_torch/peft @NVIDIA/trt-llm-torch-peft
+/tensorrt_llm/lora_manager.py @NVIDIA/trt-llm-torch-peft
+/cpp/tensorrt_llm/batch_manager/peftCacheManager.cpp @NVIDIA/trt-llm-torch-peft
+/cpp/include/tensorrt_llm/batch_manager/peftCacheManager.h @NVIDIA/trt-llm-torch-peft
+/cpp/tensorrt_llm/runtime/loraCache.cpp @NVIDIA/trt-llm-torch-peft
+/cpp/include/tensorrt_llm/runtime/loraCache.h @NVIDIA/trt-llm-torch-peft
+/cpp/tensorrt_llm/runtime/loraModule.cpp @NVIDIA/trt-llm-torch-peft
+/cpp/include/tensorrt_llm/runtime/loraModule.h @NVIDIA/trt-llm-torch-peft
+/cpp/tensorrt_llm/runtime/loraManager.cpp @NVIDIA/trt-llm-torch-peft
+/cpp/tensorrt_llm/runtime/loraManager.h @NVIDIA/trt-llm-torch-peft
+/cpp/tensorrt_llm/runtime/loraUtils.cpp @NVIDIA/trt-llm-torch-peft
+/cpp/tensorrt_llm/runtime/loraUtils.h @NVIDIA/trt-llm-torch-peft
+
+## TensorRT-LLM - Triton backend
+/triton_backend @NVIDIA/trt-llm-triton-backend-devs
+
 ## TensorRT-LLM trtllm-bench Reviewers
 /tensorrt_llm/bench @NVIDIA/trtllm-bench-reviewers
 /tensorrt_llm/commands/bench.py @NVIDIA/trtllm-bench-reviewers
@@ -22,6 +119,34 @@ docs/source/performance/perf-benchmarking.md @NVIDIA/trtllm-bench-reviewers
 ## TensorRT-LLM LLM API
 /tensorrt_llm/llmapi @NVIDIA/trt-llm-llmapi-devs
 /tensorrt_llm/executor @NVIDIA/trt-llm-llmapi-devs
+
+## TensorRT-LLM LLM Disaggregated
+/examples/disaggregated @NVIDIA/trt-llm-disagg-devs
+/tensorrt_llm/disaggregated_params.py @NVIDIA/trt-llm-disagg-devs
+/tensorrt_llm/_torch/pyexecutor/kv_cache_transceiver.py @NVIDIA/trt-llm-disagg-devs
+/cpp/tensorrt_llm/batch_manager/cacheFormatter.cpp @NVIDIA/trt-llm-disagg-devs
+/cpp/tensorrt_llm/batch_manager/cacheFormatter.h @NVIDIA/trt-llm-disagg-devs
+/cpp/tensorrt_llm/batch_manager/cacheTransBuffer.cpp @NVIDIA/trt-llm-disagg-devs
+/cpp/tensorrt_llm/batch_manager/cacheTransBuffer.h @NVIDIA/trt-llm-disagg-devs
+/cpp/tensorrt_llm/batch_manager/cacheTransceiver.cpp @NVIDIA/trt-llm-disagg-devs
+/cpp/tensorrt_llm/batch_manager/dataTransceiver.cpp @NVIDIA/trt-llm-disagg-devs
+/cpp/tensorrt_llm/batch_manager/dataTransceiver.h @NVIDIA/trt-llm-disagg-devs
+/cpp/tensorrt_llm/batch_manager/dataTransceiverImpl.cpp @NVIDIA/trt-llm-disagg-devs
+/cpp/tensorrt_llm/batch_manager/dataTransceiverImpl.h @NVIDIA/trt-llm-disagg-devs
+
+## TensorRT-LLM Infra
+
+### CI
+/jenkins @NVIDIA/trt-llm-ci-infra-devs @NVIDIA/trt-llm-infra-devs
+### Setup
+/docker @NVIDIA/trt-llm-setup-infra-devs @NVIDIA/trt-llm-infra-devs
+### Github workflows
+/tensorrt_llm/.github @NVIDIA/trt-llm-gh-workflows-infra-devs @NVIDIA/trt-llm-infra-devs
+/tensorrt_llm/.coderabbit.yaml @NVIDIA/trt-llm-gh-workflows-infra-devs @NVIDIA/trt-llm-infra-devs
+
+## TensorRT-LLM - Docs
+/docs @NVIDIA/trt-llm-doc-owners
+/examples @NVIDIA/trt-llm-doc-owners
 
 # The rule below requires that any PR modifying public APIs must be approved by at least one member
 # of the NVIDIA/trt-llm-committed-api-review-committee or NVIDIA/trt-llm-noncommitted-api-review-committee team.

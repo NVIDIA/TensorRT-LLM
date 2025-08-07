@@ -1859,12 +1859,13 @@ CUtensorMap makeTensorMapForQ(
 #endif // IS_MLA
 
 void launchMLA(cudaDeviceProp const& prop,
-    uint32_t inputSeqLen, // uniform for all requests and causal mask is assumed
+    uint32_t inputSeqLen,  // uniform for all requests and causal mask is assumed
     float qScale, OutputHead* output, InputHead const* q,
+    float* attentionSinks, // [headGrpSize], not supported.
 #if USE_PAGED_KV_CACHE
-    GMemCacheHead* pool, // global pool of pages
+    GMemCacheHead* pool,   // global pool of pages
     KVCachePageIndex const*
-        kvCachePageList, // device pointer. shape: KVCachePage[batchSize][beamWidth][2][maxNbPagesPerSeq]
+        kvCachePageList,   // device pointer. shape: KVCachePage[batchSize][beamWidth][2][maxNbPagesPerSeq]
 #else
     GMemKVCacheHead* kvCacheData,
 #endif

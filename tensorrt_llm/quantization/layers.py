@@ -2218,7 +2218,7 @@ class FP4Linear(Linear):
                     qkv_block_scale,
                     tllm_key.replace(
                         'weight', "weights_block_scaling_factor_interleaved"):
-                    torch.ops.trtllm.nvfp4_block_scale_interleave(
+                    torch.ops.trtllm.block_scale_interleave(
                         qkv_block_scale.view(
                             torch.uint8).cpu().contiguous()).reshape(
                                 qkv_block_scale.shape).view(
@@ -2238,7 +2238,7 @@ class FP4Linear(Linear):
             elif tllm_key.endswith("weights_block_scaling_factor"):
                 return weights
             elif tllm_key.endswith("weights_block_scaling_factor_interleaved"):
-                return torch.ops.trtllm.nvfp4_block_scale_interleave(
+                return torch.ops.trtllm.block_scale_interleave(
                     weights.view(torch.uint8).cpu().contiguous()).reshape(
                         weights.shape).view(torch.float8_e4m3fn)
             elif tllm_key.endswith("weights_global_scaling_factor"):
@@ -2379,7 +2379,7 @@ class FP4RowLinear(RowLinear):
         elif tllm_key.endswith("weights_block_scaling_factor"):
             return weights
         elif tllm_key.endswith("weights_block_scaling_factor_interleaved"):
-            return torch.ops.trtllm.nvfp4_block_scale_interleave(
+            return torch.ops.trtllm.block_scale_interleave(
                 weights.view(torch.uint8).cpu().contiguous()).reshape(
                     weights.shape).view(torch.float8_e4m3fn)
         elif tllm_key.endswith("weights_global_scaling_factor"):

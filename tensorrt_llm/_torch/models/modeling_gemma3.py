@@ -4,7 +4,6 @@ from typing import Dict, Optional, Tuple
 import torch
 from torch import nn
 from transformers import Gemma3TextConfig
-from transformers.activations import ACT2FN
 
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
@@ -15,12 +14,12 @@ from ..attention_backend import AttentionMetadata, FlashInferAttentionMetadata
 from ..attention_backend.interface import (AttentionMask, CustomAttentionMask,
                                            PositionalEmbeddingParams,
                                            PredefinedAttentionMask, RopeParams)
-from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
 from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.linear import Linear, TensorParallelMode
+from ..modules.gated_mlp import GatedMLP
+from ..modules.linear import TensorParallelMode
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
@@ -69,7 +68,7 @@ class Gemma3Attention(Attention):
             rope_params.theta = config.rope_local_base_freq
             rope_params.scale_type = RotaryScalingType.none
             rope_params.scale = 1.0
-            self.attention_window_size = config.sliding_window - 1  # Gemma3 sliding window isn't inclusive.
+            self.attention_window_size = config.sliding_window
         pos_embd_params = PositionalEmbeddingParams(
             type=PositionEmbeddingType.rope_gpt_neox,
             rope=rope_params,
@@ -105,9 +104,6 @@ class Gemma3Attention(Attention):
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         attention_mask: AttentionMask = PredefinedAttentionMask.CAUSAL,
-        mrope_config: Optional[dict] = None,
-        all_reduce_params: Optional[AllReduceParams] = None,
-        lora_params: Optional[dict] = None,
         attention_mask_data: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
@@ -121,9 +117,6 @@ class Gemma3Attention(Attention):
                                hidden_states=hidden_states,
                                attn_metadata=attn_metadata,
                                attention_mask=attention_mask,
-                               mrope_config=mrope_config,
-                               all_reduce_params=all_reduce_params,
-                               lora_params=lora_params,
                                attention_window_size=self.attention_window_size,
                                attention_mask_data=attention_mask_data,
                                **kwargs)
@@ -156,37 +149,10 @@ class Gemma3Attention(Attention):
         return super().apply_rope(q, k, v, position_ids)
 
 
-class Gemma3MLP(nn.Module):
-
-    def __init__(self, model_config: ModelConfig[Gemma3TextConfig]):
-        super().__init__()
-        self.config = model_config.pretrained_config
-        self.hidden_size = self.config.hidden_size
-        self.intermediate_size = self.config.intermediate_size
-        self.dtype = self.config.torch_dtype
-        self.quant_config = model_config.get_quant_config()
-        self.gate_proj = Linear(self.hidden_size,
-                                self.intermediate_size,
-                                bias=False,
-                                dtype=self.dtype,
-                                quant_config=self.quant_config)
-        self.up_proj = Linear(self.hidden_size,
-                              self.intermediate_size,
-                              bias=False,
-                              dtype=self.dtype,
-                              quant_config=self.quant_config)
-        self.down_proj = Linear(self.intermediate_size,
-                                self.hidden_size,
-                                bias=False,
-                                dtype=self.dtype,
-                                quant_config=self.quant_config)
-        self.act_fn = ACT2FN[self.config.hidden_activation]
-
-    @torch.inference_mode()
-    def forward(self, x):
-        down_proj = self.down_proj(
-            self.act_fn(self.gate_proj(x)) * self.up_proj(x))
-        return down_proj
+# This function is written to be compatible with TRTLLM's GatedMLP class.
+def pytorch_gelu_tanh(gate_x: torch.Tensor) -> torch.Tensor:
+    gate, x = gate_x.chunk(2, dim=-1)
+    return nn.functional.gelu(gate, approximate="tanh") * x
 
 
 class Gemma3DecoderLayer(DecoderLayer):
@@ -206,7 +172,13 @@ class Gemma3DecoderLayer(DecoderLayer):
             is_sliding=is_sliding,
         )
 
-        self.mlp = Gemma3MLP(model_config=model_config)
+        self.mlp = GatedMLP(hidden_size=config.hidden_size,
+                            intermediate_size=config.intermediate_size,
+                            bias=False,
+                            activation=pytorch_gelu_tanh,
+                            dtype=config.torch_dtype,
+                            config=model_config,
+                            layer_idx=layer_idx)
 
         self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                        eps=config.rms_norm_eps,
@@ -248,7 +220,8 @@ class Gemma3DecoderLayer(DecoderLayer):
         hidden_states = residual + hidden_states
         residual = hidden_states
         hidden_states = self.pre_feedforward_layernorm(hidden_states)
-        hidden_states = self.mlp(hidden_states)
+        hidden_states = self.mlp(hidden_states,
+                                 lora_params=kwargs.get("lora_params", None))
         hidden_states = self.post_feedforward_layernorm(hidden_states)
         hidden_states = residual + hidden_states
 
@@ -308,7 +281,9 @@ class Gemma3TextModel(DecoderModel):
                 attn_metadata=attn_metadata,
                 attention_mask_data=local_attention_mask_data
                 if decoder_layer.self_attn.is_sliding else
-                global_attention_mask_data)
+                global_attention_mask_data,
+                **kwargs,
+            )
 
         hidden_states = self.norm(hidden_states)
         return hidden_states
@@ -481,6 +456,7 @@ class Gemma3ForCausalLM(DecoderModelForCausalLM[Gemma3TextModel,
             inputs_embeds=inputs_embeds,
             local_attention_mask_data=local_attention_mask_data,
             global_attention_mask_data=global_attention_mask_data,
+            **kwargs,
         )
 
         return self.logits_processor.forward(

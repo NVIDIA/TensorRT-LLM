@@ -59,13 +59,22 @@ meta-llama/Llama-3.2-3B:
     accuracy: 60.60
 meta-llama/Llama-3.3-70B-Instruct:
   - accuracy: 81.31
+  - spec_dec_algo: Eagle
+    accuracy: 81.31
   - quant_algo: NVFP4
     kv_cache_quant_algo: FP8
     accuracy: 79.31
   - quant_algo: FP8
+    kv_cache_quant_algo: FP8
     accuracy: 81.02
+  - quant_algo: FP8
+    accuracy: 80.34
 meta-llama/Llama-4-Maverick-17B-128E-Instruct:
   - accuracy: 86.40
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    spec_dec_algo: Eagle
+    accuracy: 86.40
 meta-llama/Llama-4-Scout-17B-16E-Instruct:
   - accuracy: 80.00
   - quant_algo: NVFP4
@@ -104,7 +113,7 @@ google/gemma-3-1b-it:
   - accuracy: 39.0
   - quant_algo: FP8
     kv_cache_quant_algo: FP8
-    accuracy: 39.0
+    accuracy: 37.5
 google/gemma-3-27b-it:
   - accuracy: 77.80
 Qwen/Qwen2-0.5B-Instruct:
@@ -155,6 +164,10 @@ deepseek-ai/DeepSeek-R1:
     spec_dec_algo: MTP
     accuracy: 87.573
 Qwen3/Qwen3-8B:
+  - quant_algo: W4A8_MXFP4_FP8
+    accuracy: 72.70
+  - quant_algo: W4A8_MXFP4_MXFP8
+    accuracy: 72.70
   - quant_algo: FP8_BLOCK_SCALES
     accuracy: 76.12
   - accuracy: 76.12
@@ -169,6 +182,12 @@ Qwen3/Qwen3-30B-A3B:
   - quant_algo: NVFP4
     kv_cache_quant_algo: FP8
     accuracy: 80.65
+  - quant_algo: W4A8_MXFP4_FP8
+    accuracy: 79.78
+  - quant_algo: W4A8_MXFP4_MXFP8
+    accuracy: 79.78
+  - quant_algo: W4A16_MXFP4
+    accuracy: 79.80
 Qwen3/Qwen3-235B-A22B:
   - quant_algo: FP8
     kv_cache_quant_algo: FP8
@@ -180,6 +199,9 @@ Qwen3/Qwen3-235B-A22B:
     quant_algo: NVFP4
     kv_cache_quant_algo: FP8
     accuracy: 86
+moonshotai/Kimi-K2-Instruct:
+  - quant_algo: FP8_BLOCK_SCALES
+    accuracy: 87.65
 nvidia/Llama-3_3-Nemotron-Super-49B-v1:
   - accuracy: 79.43
   - quant_algo: FP8
@@ -232,3 +254,13 @@ microsoft/Phi-4-multimodal-instruct:
   - accuracy: 69.69
 microsoft/Phi-4-multimodal-instruct-long-rope:
   - accuracy: 65.98
+LGAI-EXAONE/EXAONE-4.0-32B:
+  - accuracy: 78.52
+GPT-OSS/BF16:
+  - accuracy: 77.50
+GPT-OSS/MXFP4:
+  - accuracy: 75.50
+  - quant_algo: W4A8_MXFP4_MXFP8
+    accuracy: 75.50
+  - quant_algo: W4A8_MXFP4_FP8
+    accuracy: 75.50

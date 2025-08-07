@@ -4,7 +4,7 @@ set -ex
 
 # Use latest stable version from https://pypi.org/project/torch/#history
 # and closest to the version specified in
-# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-25-05.html#rel-25-05
+# https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-25-06.html#rel-25-06
 TORCH_VERSION="2.7.1"
 SYSTEM_ID=$(grep -oP '(?<=^ID=).+' /etc/os-release | tr -d '"')
 

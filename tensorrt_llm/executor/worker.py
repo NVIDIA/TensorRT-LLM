@@ -260,7 +260,7 @@ class GenerationExecutorWorker(GenerationExecutor):
     def _iteration_result_task(self, it_result_queue: IterationResultQueue,
                                engine_get_result_api: Callable,
                                result_singleton: IterationResult,
-                               result_serializer: Callable):
+                               result_serializer: Callable) -> bool:
         time.sleep(0.2)
         async_queues = []
         queue = result_singleton.queue if self._is_llm_executor and result_singleton else it_result_queue.queue
@@ -372,6 +372,7 @@ class GenerationExecutorWorker(GenerationExecutor):
 
     def _enqueue_request(self, request: GenerationRequest) -> int:
         assert request.id is not None
+        py_lora_path = None
         if self._lora_manager is not None and request.lora_request is not None:
             adapter_in_cache = self._lora_manager.is_adapter_in_cpu_cache(
                 request.lora_request.adapter_id)
@@ -381,8 +382,8 @@ class GenerationExecutorWorker(GenerationExecutor):
                 task_id=request.lora_request.adapter_id,
                 weights=self._lora_manager.cpp_lora_weights[uid]
                 if not adapter_in_cache else None,
-                config=self._lora_manager.cpp_lora_config[uid]
-                if not adapter_in_cache else None)
+                config=self._lora_manager.cpp_lora_config[uid])
+            py_lora_path = request.lora_request.lora_path
         else:
             lora_config = None
 
@@ -497,6 +498,7 @@ class GenerationExecutorWorker(GenerationExecutor):
                 kv_cache_retention_config=request.kv_cache_retention_config,
                 context_phase_params=context_phase_params,
                 type=request_type)
+            executor_request.py_lora_path = py_lora_path
 
             if self._is_pytorch_backend and request.multimodal_params is not None:
                 if request.multimodal_params.multimodal_data is not None:
@@ -519,6 +521,10 @@ class GenerationExecutorWorker(GenerationExecutor):
                 lp = request.sampling_params.logits_processor
                 executor_request.py_logits_post_processors = lp if isinstance(
                     lp, list) else [lp]
+
+            executor_request.py_scheduling_params = None
+            if self._is_pytorch_backend and request.scheduling_params is not None:
+                executor_request.py_scheduling_params = request.scheduling_params
 
             if request.query_token_ids is not None:
                 # pytorch star attention workflow

@@ -331,10 +331,9 @@ class KvCacheCreator:
             ]
             kv_cache_manager = MambaHybridCacheManager(
                 # mamba cache parameters
-                config.hidden_size,
                 config.ssm_state_size,
                 config.conv_kernel,
-                config.expand,
+                config.mamba_num_heads,
                 config.n_groups,
                 config.mamba_head_dim,
                 mamba_num_layers,
@@ -503,6 +502,7 @@ def create_py_executor_instance(
         )
         peft_cache_manager = PeftCacheManager(
             peft_cache_config=executor_config.peft_cache_config,
+            lora_config=lora_config,
             model_config=model_binding_config,
             world_config=world_config,
         )

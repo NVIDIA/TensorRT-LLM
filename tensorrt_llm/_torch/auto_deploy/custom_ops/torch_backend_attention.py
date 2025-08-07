@@ -103,7 +103,7 @@ def _torch_generate_mha(
         # Apply sinks if provided (following the model file pattern)
         if sinks is not None:
             # Concatenate sinks to attention scores
-            sinks = sinks.reshape(-1, 1, 1).expand(-1, attn_scores.shape[-2], -1)
+            sinks = sinks.reshape(-1, 1, 1)
             attn_weights = torch.cat([attn_scores, sinks], dim=-1)
             attn_weights = torch.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype)
             # Use only the non-sink portion for computing output (ignore sinks)
@@ -202,9 +202,7 @@ def _torch_context_mha(
             )  # [seq_len_i, kv_seq_len]
 
             # Sliding window mask: allow attention only if 0 <= pos_diff < sliding_window_size
-            sliding_window_mask = (pos_diff < 0) | (
-                pos_diff >= sliding_window_size
-            )  # [seq_len_i, kv_seq_len]
+            sliding_window_mask = pos_diff >= sliding_window_size
 
             # Combine causal and sliding window masks
             combined_mask = causal_mask | sliding_window_mask
@@ -219,14 +217,14 @@ def _torch_context_mha(
         # Apply sinks if provided (following the model file pattern)
         if sinks is not None:
             # Concatenate sinks to attention scores
-            sinks = sinks.reshape(1, -1, 1, 1).expand(
-                attn_scores.shape[0], -1, attn_scores.shape[-2], -1
+            new_sinks = sinks.reshape(1, -1, 1, 1).expand(
+                attn_scores.shape[0], -1, attn_scores.shape[2], 1
             )
-            attn_weights = torch.cat([attn_scores, sinks], dim=-1)
+            attn_weights = torch.cat([attn_scores, new_sinks], dim=-1)
             attn_weights = torch.softmax(attn_weights, dim=-1, dtype=torch.float32).to(q.dtype)
             # Use only the non-sink portion for computing output (ignore sinks)
             attn_out = torch.matmul(
-                attn_weights[..., : -sinks.size(-1)], v_seq_t
+                attn_weights[..., : -new_sinks.size(-1)], v_seq_t
             )  # [1, n_heads, seq_len_i, v_head_dim]
         else:
             attn_weights = torch.softmax(attn_scores, dim=-1, dtype=torch.float32).to(q.dtype)

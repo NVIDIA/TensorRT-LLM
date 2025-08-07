@@ -39,6 +39,7 @@
 #include "tensorrt_llm/runtime/speculativeDecodingMode.h"
 #include "tensorrt_llm/runtime/tllmRuntime.h"
 #include "tensorrt_llm/runtime/torchView.h"
+#include "tensorrt_llm/runtime/virtualMemory.h"
 
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDAStream.h>
@@ -115,6 +116,10 @@ void initBindings(nb::module_& m)
         .def_rw("weights_out_pointer", &tr::LoraCache::TaskLayerModuleConfig::weightsOutPointer)
         .def_rw("scaling_vec_pointer", &tr::LoraCache::TaskLayerModuleConfig::scalingVecPointer)
         .def(nb::self == nb::self);
+
+    nb::class_<tr::CudaVirtualMemoryManager>(m, "CudaVirtualMemoryManager")
+        .def("release_with_tag", &tr::CudaVirtualMemoryManager::releaseWithTag, nb::arg("tag"))
+        .def("materialize_with_tag", &tr::CudaVirtualMemoryManager::materializeWithTag, nb::arg("tag"));
 
     nb::class_<tr::BufferManager>(m, "BufferManager")
         .def(nb::init<tr::BufferManager::CudaStreamPtr, bool>(), nb::arg("stream"), nb::arg("trim_pool") = false)
@@ -255,7 +260,6 @@ void initBindings(nb::module_& m)
         .def_prop_ro("next_draft_tokens_lengths", &tr::decoder::DecoderState::getNextDraftTokensLengths)
         .def_prop_ro("accepted_lengths_cum_sum", &tr::decoder::DecoderState::getAcceptedLengthsCumSum)
         .def_prop_ro("accepted_packed_paths", &tr::decoder::DecoderState::getAcceptedPackedPaths)
-        .def_prop_ro("finished_steps", &tr::decoder::DecoderState::getFinishedSteps)
         .def_prop_ro("max_beam_width", &tr::decoder::DecoderState::getMaxBeamWidth)
         .def_prop_ro("max_sequence_length", &tr::decoder::DecoderState::getMaxSequenceLength)
         .def_prop_ro("max_decoding_decoder_tokens", &tr::decoder::DecoderState::getMaxDecodingDecoderTokens)
@@ -311,6 +315,29 @@ void initBindings(nb::module_& m)
         "max_workspace_size_lowprecision",
         [](int32_t tp_size) { return tensorrt_llm::kernels::max_workspace_size_lowprecision(tp_size); },
         "Calculate the maximum workspace size needed for low precision all-reduce operations");
+
+    nb::enum_<tr::CudaVirtualMemoryAllocator::RestoreMode>(m, "CudaVirtualMemoryAllocatorRestoreMode")
+        .value("NONE", tr::CudaVirtualMemoryAllocator::RestoreMode::NONE)
+        .value("CPU", tr::CudaVirtualMemoryAllocator::RestoreMode::CPU)
+        .value("PINNED", tr::CudaVirtualMemoryAllocator::RestoreMode::PINNED)
+        .value("MEMSET", tr::CudaVirtualMemoryAllocator::RestoreMode::MEMSET);
+
+    m.def("get_virtual_memory_manager", &tr::getVirtualMemoryManager, "Get the virtual memory manager",
+        nb::rv_policy::reference);
+
+    m.def(
+        "set_virtual_memory_allocator",
+        [](std::string const& tag, tr::CudaVirtualMemoryAllocator::RestoreMode mode, uintptr_t stream)
+        {
+            static_assert(sizeof(uintptr_t) == sizeof(cudaStream_t));
+            tr::setVirtualMemoryAllocator(tag, mode,
+                std::make_shared<tr::CudaStream>(
+                    reinterpret_cast<cudaStream_t>(stream), tensorrt_llm::common::getDevice(), false));
+        },
+        "Set the virtual memory allocator and start allocating virtual memory for CUDA allocations");
+
+    m.def("clear_virtual_memory_allocator", &tr::clearVirtualMemoryAllocator,
+        "Reset the current virtual memory allocator and stop allocating virtual memory for CUDA allocations");
 
     nb::class_<tensorrt_llm::runtime::McastGPUBuffer>(m, "McastGPUBuffer")
         .def(nb::init<size_t, uint32_t, uint32_t, at::Device, bool>())

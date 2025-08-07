@@ -1,3 +1,4 @@
+from .auto_heuristic import suggest_spec_config
 from .eagle3 import Eagle3SpecMetadata
 from .interface import SpecMetadata
 from .mtp import MTPEagleWorker, MTPSpecMetadata, MTPWorker
@@ -23,4 +24,5 @@ __all__ = [
     "get_spec_resource_manager",
     "get_spec_worker",
     "update_spec_config_from_model_config",
+    "suggest_spec_config",
 ]

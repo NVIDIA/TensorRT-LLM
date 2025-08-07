@@ -19,7 +19,14 @@ import time
 import pytest
 from defs.common import (convert_weights, test_multi_lora_support,
                          venv_mpi_check_call)
+from defs.conftest import get_sm_version
 from defs.trt_test_alternative import check_call
+
+# skip trt flow cases on post-Blackwell-Ultra
+if get_sm_version() >= 103:
+    pytest.skip(
+        "TRT workflow tests are not supported on post Blackwell-Ultra architecture",
+        allow_module_level=True)
 
 
 @pytest.fixture(scope="module", autouse=True)

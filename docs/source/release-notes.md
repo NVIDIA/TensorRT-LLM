@@ -73,6 +73,7 @@ All published functionality in the Release Notes has been fully tested and verif
 ### Known Issues
 - accuracy/test_cli_flow::TestGpt2::test_beam_search_large is broken.
 - Enabling disaggregated serving, MTP, and the overlap scheduler at the same time can lead to accuracy problems.
+- In 0.21, full chunked attention support has been added to make sure LLaMA4 model can functionally run with > 8K seq length, while there is a known performance regression(only affect LLaMA4 model) on Hopper due to this functional enhancement. The root cause of the regression has been identified already and the fix will be part of the future release.
 
 ## TensorRT-LLM Release 0.20.0
 
@@ -639,7 +640,7 @@ All published functionality in the Release Notes has been fully tested and verif
 
 ### Known Issues
 
-- On Windows, installation of TensorRT-LLM may succeed, but you might hit `OSError: exception: access violation reading 0x0000000000000000` when importing the library in Python. See [Installing on Windows](https://nvidia.github.io/TensorRT-LLM/installation/windows.html) for workarounds.
+- On Windows, installation of TensorRT-LLM may succeed, but you might hit `OSError: exception: access violation reading 0x0000000000000000` when importing the library in Python.
 
 
 ## TensorRT-LLM Release 0.11.0
@@ -1045,7 +1046,7 @@ Refer to the {ref}`support-matrix-software` section for a list of supported mode
 - System prompt caching
 - Enabled split-k for weight-only cutlass kernels
 - FP8 KV cache support for XQA kernel
-- New Python builder API and `trtllm-build` command (already applied to [blip2](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/blip2) and [OPT](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/opt#3-build-tensorrt-engines))
+- Added Python builder API, `trtllm-build` command, and OPT support
 - Support `StoppingCriteria` and `LogitsProcessor` in Python generate API
 - FHMA support for chunked attention and paged KV cache
 - Performance enhancements include:

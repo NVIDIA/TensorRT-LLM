@@ -1892,6 +1892,10 @@ skip_post_blackwell = pytest.mark.skipif(
     get_sm_version() >= 100,
     reason="This test is not supported in post-Blackwell architecture")
 
+skip_post_blackwell_ultra = pytest.mark.skipif(
+    get_sm_version() >= 103,
+    reason="This test is not supported in post-Blackwell-Ultra architecture")
+
 skip_device_contain_gb200 = pytest.mark.skipif(
     check_device_contain(["GB200"]),
     reason="This test is not supported on GB200 or GB100")
@@ -2347,3 +2351,38 @@ def tritonserver_test_root(llm_root):
                                      "tests/integration/defs/triton_server")
 
     return tritonserver_root
+
+
+@pytest.fixture
+def timeout_from_marker(request):
+    """Get timeout value from pytest timeout marker."""
+    timeout_marker = request.node.get_closest_marker('timeout')
+    if timeout_marker:
+        return timeout_marker.args[0] if timeout_marker.args else None
+    return None
+
+
+@pytest.fixture
+def timeout_from_command_line(request):
+    """Get timeout value from command line --timeout parameter."""
+    # Get timeout from command line argument
+    timeout_arg = request.config.getoption("--timeout", default=None)
+    if timeout_arg is not None:
+        return float(timeout_arg)
+    return None
+
+
+@pytest.fixture
+def timeout_manager(timeout_from_command_line, timeout_from_marker):
+    """Create a TimeoutManager instance with priority: marker > cmdline > config."""
+    from defs.utils.timeout_manager import TimeoutManager
+
+    # Priority: marker > command line
+    timeout_value = None
+
+    if timeout_from_marker is not None:
+        timeout_value = timeout_from_marker
+    elif timeout_from_command_line is not None:
+        timeout_value = timeout_from_command_line
+
+    return TimeoutManager(timeout_value)

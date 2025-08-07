@@ -130,6 +130,7 @@ else
 endif
 SOURCE_DIR        ?= $(shell readlink -f ..)
 CODE_DIR          ?= /code/tensorrt_llm
+EXTRA_VOLUMES     ?=
 CCACHE_DIR        ?= $(CODE_DIR)/cpp/.ccache
 CONAN_DIR         ?= $(CODE_DIR)/cpp/.conan
 USER_CACHE_DIR    ?= $(HOME_DIR)/.cache
@@ -151,6 +152,7 @@ endif
 	docker run $(DOCKER_RUN_OPTS) $(DOCKER_RUN_ARGS) \
     		$(GPU_OPTS) \
     		--volume $(SOURCE_DIR):$(CODE_DIR) \
+    		$(EXTRA_VOLUMES) \
     		$(if $(and $(filter 1,$(LOCAL_USER)),$(shell [ -w "$(USER_CACHE_DIR)" ] && echo 1)),--volume $(USER_CACHE_DIR):/home/$(USER_NAME)/.cache:rw) \
     		--env "CCACHE_DIR=$(CCACHE_DIR)" \
     		--env "CCACHE_BASEDIR=$(CODE_DIR)" \
@@ -186,16 +188,16 @@ jenkins-rockylinux8_%: PYTHON_VERSION_TAG_ID = $(if $(findstring 3.12,${PYTHON_V
 jenkins-rockylinux8_%: IMAGE_WITH_TAG = $(shell . ../jenkins/current_image_tags.properties && echo $$LLM_ROCKYLINUX8_${PYTHON_VERSION_TAG_ID}_DOCKER_IMAGE)
 jenkins-rockylinux8_%: STAGE = tritondevel
 jenkins-rockylinux8_%: BASE_IMAGE = nvidia/cuda
-jenkins-rockylinux8_%: BASE_TAG = 12.9.0-devel-rockylinux8
+jenkins-rockylinux8_%: BASE_TAG = 12.9.1-devel-rockylinux8
 
 rockylinux8_%: STAGE = tritondevel
 rockylinux8_%: BASE_IMAGE = nvidia/cuda
-rockylinux8_%: BASE_TAG = 12.9.0-devel-rockylinux8
+rockylinux8_%: BASE_TAG = 12.9.1-devel-rockylinux8
 
 # For x86_64 and aarch64
 ubuntu22_%: STAGE = tritondevel
 ubuntu22_%: BASE_IMAGE = nvidia/cuda
-ubuntu22_%: BASE_TAG = 12.9.0-devel-ubuntu22.04
+ubuntu22_%: BASE_TAG = 12.9.1-devel-ubuntu22.04
 
 trtllm_%: STAGE = release
 trtllm_%: PUSH_TO_STAGING := 0

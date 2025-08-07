@@ -29,6 +29,7 @@ from ..llmapi.utils import (AsyncQueue, enable_llm_debug,
                             print_colored_debug)
 from ..sampling_params import (BatchedLogitsProcessor, LogprobParams,
                                SamplingParams)
+from ..scheduling_params import SchedulingParams
 from .ipc import FusedIpcQueue
 from .postproc_worker import PostprocParams, PostprocWorkerConfig
 from .request import GenerationRequest, LoRARequest, PromptAdapterRequest
@@ -120,6 +121,7 @@ class GenerationExecutor(ABC):
         disaggregated_params: Optional[DisaggregatedParams] = None,
         postproc_params: Optional[PostprocParams] = None,
         multimodal_params: Optional[MultimodalParams] = None,
+        scheduling_params: Optional[SchedulingParams] = None,
     ) -> GenerationResult:
         """Generate output for the given prompt token ids in the asynchronous mode.
         Asynchronous generation accepts single prompt only.
@@ -142,7 +144,8 @@ class GenerationExecutor(ABC):
             streaming=streaming,
             kv_cache_retention_config=kv_cache_retention_config,
             disaggregated_params=disaggregated_params,
-            multimodal_params=multimodal_params)
+            multimodal_params=multimodal_params,
+            scheduling_params=scheduling_params)
         result = self.submit(request)
         # release memory in time
         if hasattr(request, "multimodal_params"):

@@ -475,7 +475,7 @@ __device__ uint32_t cvt_warp_fp16_to_fp4_mc(PackedVec<Type>& vec, float SFScaleV
 
 // Local maximum value.
 #pragma unroll
-    for (int i = 1; i < CVT_FP4_ELTS_PER_THREAD / 2; i++)
+    for (int i = 1; i < CVT_ELTS_PER_THREAD / 2; i++)
     {
         localMax = __hmax2(localMax, __habs2(vec.elts[i]));
     }
@@ -530,10 +530,10 @@ __device__ uint32_t cvt_warp_fp16_to_fp4_mc(PackedVec<Type>& vec, float SFScaleV
     }
 
     // Convert the input to float.
-    float2 fp2Vals[CVT_FP4_ELTS_PER_THREAD / 2];
+    float2 fp2Vals[CVT_ELTS_PER_THREAD / 2];
 
 #pragma unroll
-    for (int i = 0; i < CVT_FP4_ELTS_PER_THREAD / 2; i++)
+    for (int i = 0; i < CVT_ELTS_PER_THREAD / 2; i++)
     {
         if constexpr (std::is_same_v<Type, half>)
         {
@@ -650,9 +650,9 @@ __global__ void __launch_bounds__(MAX_THREADS)
             uint8_t* sf_out = nullptr;
             if (threadIdx.x % 8 == 0)
             {
-                sf_out = cvt_quant_to_fp4_get_sf_out_offset<uint32_t, 2, SF_VEC_SIZE>(std::nullopt /* batchIdx */,
-                    token_idx, threadIdx.x + g * loop_step0, std::nullopt /* numRows */, hidden_dim,
-                    scale_out + scale_out_offset, FP4QuantizationSFLayout::SWIZZLED);
+                sf_out = cvt_quant_get_sf_out_offset<uint32_t, 2>(std::nullopt /* batchIdx */, token_idx,
+                    threadIdx.x + g * loop_step0, std::nullopt /* numRows */, hidden_dim / SF_VEC_SIZE,
+                    scale_out + scale_out_offset, QuantizationSFLayout::SWIZZLED);
             }
             uint32_t val = cvt_warp_fp16_to_fp4_mc<DType, SF_VEC_SIZE>(valout, sf, sf_out);
             MULTIMEM_ST(val, mc_ptr_out + (out_lineoffset + line + g * loop_step0));
@@ -763,9 +763,9 @@ __global__ void __launch_bounds__(MAX_THREADS)
                     (threadIdx.x + g * loop_step0) * sizeof(int4) / sizeof(DType) + j));
                 i++;
             }
-            auto sf_out = cvt_quant_to_fp4_get_sf_out_offset<uint32_t, 2, SF_VEC_SIZE>(std::nullopt /* batchIdx */,
-                token_idx, threadIdx.x + g * loop_step0, std::nullopt /* numRows */, hidden_dim,
-                scale_out + scale_out_offset, FP4QuantizationSFLayout::SWIZZLED);
+            auto sf_out = cvt_quant_get_sf_out_offset<uint32_t, 2>(std::nullopt /* batchIdx */, token_idx,
+                threadIdx.x + g * loop_step0, std::nullopt /* numRows */, hidden_dim / SF_VEC_SIZE,
+                scale_out + scale_out_offset, QuantizationSFLayout::SWIZZLED);
             mc_ptr_out[out_lineoffset + line + g * loop_step0]
                 = cvt_warp_fp16_to_fp4<DType, SF_VEC_SIZE, false>(valout, sf, sf_out);
         }
