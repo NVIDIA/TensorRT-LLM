@@ -9,6 +9,21 @@ short_hostname=$(echo "$hostname" | awk -F'.' '{print $1}')
 echo "short_hostname: ${short_hostname}"
 
 config_file=$1
+repo_dir=$2
+
+if [ ! -z "${repo_dir}" ]; then
+    pushd ${repo_dir}
+    sleep 120  # wait for the worker to finish to avoid file conflict
+    if [ $SLURM_LOCALID == 0 ];then
+        echo "Install dependencies on rank 0."
+        pip install -e .
+    else
+        echo "Sleep 120 seconds on other ranks."
+        sleep 120
+    fi
+    popd
+fi
+export PATH=${HOME}/.local/bin:${PATH}
 
 # Check and replace hostname settings in config_file
 if [ -f "$config_file" ]; then
