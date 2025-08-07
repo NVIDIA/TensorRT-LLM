@@ -3,6 +3,7 @@ import os
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
+import torch.nn as nn
 from transformers import (AutoProcessor, AutoTokenizer, PretrainedConfig,
                           PreTrainedModel, Qwen2_5_VLForConditionalGeneration,
                           Qwen2VLForConditionalGeneration)
@@ -341,22 +342,28 @@ class Qwen2VLInputProcessorBase(InputProcessor):
         }
 
 
-class Qwen2VisionModelBase:
+class Qwen2VisionModelBase(nn.Module):
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig],
                  model_class: type[PreTrainedModel]):
-        self.pretrained_config = model_config.pretrained_config
+        super().__init__()
+        pretrained_config = model_config.pretrained_config
+        self.model_config = model_config
         self.device = f"cuda:{model_config.mapping.rank}"
 
-        model_path = self.pretrained_config._name_or_path
+        model_path = pretrained_config._name_or_path
         # TODO: Change the model class to TRT-LLM's Qwen2VisionModel
         # Currently, copying vision encoder on all devices.
         # NOTE: Using attn_implementation='flash_attention_2' to avoid the issue of vision model's GPU OOM.
         model = model_class.from_pretrained(
             model_path,
-            torch_dtype=self.pretrained_config.torch_dtype,
+            torch_dtype=pretrained_config.torch_dtype,
             attn_implementation='flash_attention_2').eval()
         self.visual = model.visual.to(self.device)
+        self.post_config()
+
+    def post_config(self):
+        self.config = self.visual.config
 
     def _to_device(
         self, input_tensor: Union[torch.Tensor, List, None]
@@ -644,8 +651,8 @@ class Qwen2VLModelBase(PreTrainedModel):
         return output_prob
 
 
-@register_auto_model("Qwen2VLForConditionalGeneration")
 @register_vision_encoder(Qwen2VisionModelBase, vlm_base_model=Qwen2VLForConditionalGeneration)
+@register_auto_model("Qwen2VLForConditionalGeneration")
 @register_input_processor(Qwen2VLInputProcessorBase, model_type="qwen2_vl")
 class Qwen2VLModel(Qwen2VLModelBase):
 
@@ -656,9 +663,8 @@ class Qwen2VLModel(Qwen2VLModelBase):
                 model_config, Qwen2VLForConditionalGeneration)
         super().__init__(model_config, *args, **kwargs)
 
-
-@register_auto_model("Qwen2_5_VLForConditionalGeneration")
 @register_vision_encoder(Qwen2VisionModelBase, vlm_base_model=Qwen2_5_VLForConditionalGeneration)
+@register_auto_model("Qwen2_5_VLForConditionalGeneration")
 @register_input_processor(Qwen2VLInputProcessorBase, model_type="qwen2_5_vl")
 class Qwen2_5_VLModel(Qwen2VLModelBase):
 

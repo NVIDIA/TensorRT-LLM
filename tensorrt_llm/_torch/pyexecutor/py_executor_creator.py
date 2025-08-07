@@ -170,7 +170,11 @@ def _mangle_executor_config(executor_config: ExecutorConfig):
         executor_config.enable_chunked_context = False
 
     if executor_config.mm_encoder_only:
+        from tensorrt_llm.llmapi.llm_args import LoadFormat
         pytorch_backend_config.mm_encoder_only = True
+        pytorch_backend_config.load_format = LoadFormat.VISION_ONLY
+        # TODO: add comment and print warning here
+        pytorch_backend_config.disable_overlap_scheduler = True
 
 def _get_mapping(executor_config: ExecutorConfig) -> Mapping:
     if executor_config.mapping is None:

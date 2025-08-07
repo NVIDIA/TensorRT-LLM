@@ -99,6 +99,9 @@ class PyTorchConfig:
 
     force_dynamic_quantization: bool = False
 
+    # If true, ONLY the vision encoder part of the full model is loaded/executed.
+    mm_encoder_only: bool = False
+
     # If true, adjust PyTorch CUDA memory fraction to correspond to the
     # total GPU memory minus the statically allocated engine memory.
     # If false, set the PyTorch CUDA memory fraction to 1.0.

@@ -1940,6 +1940,8 @@ class LoadFormat(Enum):
     AUTO = 0
     # Initialize all weights randomly.
     DUMMY = 1
+    # Only load the multimodal(vision) encoder weights
+    VISION_ONLY = 2
 
 
 class TorchCompileConfig(StrictBaseModel):

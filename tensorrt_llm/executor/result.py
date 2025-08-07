@@ -3,7 +3,7 @@ import json
 import weakref
 from dataclasses import dataclass, field
 from queue import Empty, Queue
-from typing import (TYPE_CHECKING, Any, Callable, List, Literal, NamedTuple,
+from typing import (TYPE_CHECKING, Any, Callable, Dict, List, Literal, NamedTuple,
                     Optional, TypeAlias, Union)
 from weakref import WeakMethod
 
@@ -161,7 +161,7 @@ class GenerationResultBase:
             CompletionOutput(i) for i in range(self.sampling_params.best_of)
         ]
         self._context_logits: Optional[torch.Tensor] = None
-        self._mm_embeddings: Optional[torch.Tensor] = None
+        self._mm_embedding_handle: Optional[Dict[str, Any]] = None
 
         self._background_error_handler = None
         if background_error_handler is not None:
@@ -199,8 +199,8 @@ class GenerationResultBase:
         return self._context_logits
 
     @property
-    def mm_embeddings(self) -> Optional[torch.Tensor]:
-        return self._mm_embeddings
+    def mm_embedding_handle(self) -> Optional[Dict[str, Any]]:
+        return self._mm_embedding_handle
 
     def _handle_sequence(self,
                          finish_reasons,
@@ -336,8 +336,8 @@ class GenerationResultBase:
             if response_result.context_logits is not None:
                 self._context_logits = response_result.context_logits
 
-            if response_result.mm_embeddings is not None:
-                self._mm_embeddings = response_result.mm_embeddings
+            if response_result.mm_embedding_handle is not None:
+                self._mm_embedding_handle = response_result.mm_embedding_handle
 
             # Processing background errors here ASAF during generation.
             if self._background_error_handler and (

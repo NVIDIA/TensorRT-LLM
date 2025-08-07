@@ -1,12 +1,13 @@
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import List, Optional, Union
+from typing import List, Optional, Union, Dict, Any
 
 import torch
 
 import tensorrt_llm.bindings
 from tensorrt_llm.bindings import executor as tllm_executor
 from tensorrt_llm.executor.result import TokenLogprobs
+from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 
 SamplingConfig = tensorrt_llm.bindings.SamplingConfig
 '''
@@ -189,8 +190,7 @@ class PyResult:
             self._log_probs.append(log_probs, cum_log_probs)
 
     def append_mm_embeddings(self, mm_embeddings: torch.Tensor):
-        # TODO: add to_handle to use shared tensor support
-        self._mm_embeddings = mm_embeddings.to(device='cpu', non_blocking=True)
+        self._mm_embeddings = SharedTensorContainer.from_tensor(mm_embeddings).dump_to_dict()
 
     def set_log_probs(self, log_probs: list[TokenLogprobs],
                       cum_log_probs: list[float]):
@@ -229,11 +229,14 @@ class PyResult:
     def cum_log_probs(self) -> list[float] | None:
         return self._log_probs and self._log_probs.cum_log_probs
 
+    @property
+    def mm_embedding_handle(self) -> Dict[str, Any] | None:
+        return self._mm_embeddings
 
 class LlmResult:
     """LlmResult wraps `bindings.executor.Result` but detour some features to Python implementation"""
     py_result_properties = frozenset(
-        ('context_logits', 'generation_logits', 'log_probs', 'cum_log_probs'))
+        ('context_logits', 'generation_logits', 'log_probs', 'cum_log_probs', 'mm_embedding_handle'))
 
     def __init__(self,
                  result: Union[bytes, tensorrt_llm.bindings.executor.Result],

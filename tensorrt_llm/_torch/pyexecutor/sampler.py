@@ -1,7 +1,7 @@
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Literal
+from typing import Literal, List
 
 import torch
 
@@ -101,7 +101,7 @@ class EarlyStopSampler(Sampler):
 
 @dataclass(kw_only=True)
 class MultimodalResult:
-    mm_embeddings: torch.Tensor = None
+    mm_embeddings: List[torch.Tensor] = None
 
     def values(self):
         return vars(self).values()
@@ -121,18 +121,20 @@ class EarlyStopWithMMResult(EarlyStopSampler):
     def sample_async(self, scheduled_requests: ScheduledRequests,
                      model_outputs) -> SampleStateWithMMResult:
         # from model_outputs to MultimodalResult
-        data = MultimodalResult(mm_embeddings=model_outputs)
+        data = MultimodalResult(mm_embeddings=model_outputs['mm_embeddings'])
         return SampleStateWithMMResult(scheduled_requests=scheduled_requests, data=data)
 
     def update_requests(self, state: SampleStateWithMMResult) -> None:
         assert isinstance(state, SampleStateWithMMResult)
         scheduled_requests = state.scheduled_requests
         assert (not scheduled_requests.generation_requests)
+        mm_embeddings = state.data.mm_embeddings
         for idx, request in enumerate(scheduled_requests.context_requests):
             request.state = LlmRequestState.GENERATION_COMPLETE
             # NOTE: This is a hack: set finish reason manually and set the beam 0
             request.set_finished_reason(FinishReason.LENGTH, 0)
-            request.py_result.append_mm_embeddings(state.data.mm_embeddings)
+            if idx < len(mm_embeddings):
+                request.py_result.append_mm_embeddings(mm_embeddings[idx])
 
 
 def top_k_sampling_batch(logits, top_k=50):

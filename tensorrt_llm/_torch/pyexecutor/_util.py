@@ -30,7 +30,7 @@ from .py_executor import PyExecutor
 from .resource_manager import (KVCacheManager, MambaHybridCacheManager,
                                PeftCacheManager, ResourceManager,
                                ResourceManagerType)
-from .sampler import EarlyStopSampler, TorchSampler, TRTLLMSampler
+from .sampler import EarlyStopSampler, TorchSampler, TRTLLMSampler, EarlyStopWithMMResult
 from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
                         SimpleScheduler)
 from .seq_slot_manager import SeqSlotManager

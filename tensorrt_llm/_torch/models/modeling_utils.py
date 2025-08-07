@@ -595,7 +595,7 @@ def register_vision_encoder(vision_encoder_cls: Type[nn.Module],
 
     def wrapper(model_cls: Type[nn.Module]) -> Type[nn.Module]:
         for arch_name, registered_cls in MODEL_CLASS_MAPPING.items():
-            if registered_cls == model_cls:
+            if registered_cls.__name__ == model_cls.__name__:
                 MODEL_CLASS_VISION_ENCODER_MAPPING[arch_name] = (vision_encoder_cls, vlm_base_model)
                 break
 

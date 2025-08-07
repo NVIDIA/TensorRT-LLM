@@ -1074,6 +1074,10 @@ class PyTorchModelEngine(ModelEngine):
             elif load_format == LoadFormat.DUMMY:
                 initialize_dummy_weights(model)
 
+            elif load_format == LoadFormat.VISION_ONLY:
+                # Vision weights are already loaded within model
+                pass
+
             else:
                 raise NotImplementedError(
                     f"No load support for load format: {load_format}")
@@ -1099,7 +1103,11 @@ class PyTorchModelEngine(ModelEngine):
             load_method(weights)
 
     def _init_max_seq_len(self):
-        inferred_max_seq_len = self.model.infer_max_seq_len()
+        if self.pytorch_backend_config.mm_encoder_only:
+            # TODO: hardcoded for now, need to infer as: max_num_token_per_image * max_num_images (can be given as a parameter or defined same as max_seq_len)
+            inferred_max_seq_len = 32768
+        else:
+            inferred_max_seq_len = self.model.infer_max_seq_len()
         if self.max_seq_len is None:
             logger.info(
                 f"max_seq_len is not specified, using inferred value {inferred_max_seq_len}"
@@ -1618,6 +1626,7 @@ class PyTorchModelEngine(ModelEngine):
         multi_modal_data = []
         draft_lens = []
         request_ids = []
+        multimodal_params_list = []
 
         for request in scheduled_requests.context_requests:
             prompt_tokens = request.get_tokens(0)
@@ -1633,6 +1642,19 @@ class PyTorchModelEngine(ModelEngine):
             multimodal_embedding = request.multimodal_embedding
             if multimodal_embedding is not None:
                 multi_modal_data.append(multimodal_embedding)
+
+            # Multimodal
+            multimodal_params = MultimodalParams(
+                multimodal_data=request.py_multimodal_data,
+            )
+            multimodal_params.to_device("multimodal_data",
+                                        "cuda",
+                                        pin_memory=True)
+
+            if multimodal_params.has_content():
+                multimodal_params_list.append(multimodal_params)
+
+            request.py_batch_idx = request.py_seq_slot
 
         num_tokens = len(input_ids)
         assert num_tokens <= self.max_num_tokens, (
@@ -1685,7 +1707,7 @@ class PyTorchModelEngine(ModelEngine):
             'input_ids': self.input_ids_cuda[:num_tokens],
             'position_ids': self.position_ids_cuda[:num_tokens].unsqueeze(0),
             'inputs_embeds': None,
-            'multi_modal_data': multi_modal_data
+            "multimodal_params": multimodal_params_list
         }
 
         if bool(lora_params):
@@ -2127,15 +2149,15 @@ class PyTorchModelEngine(ModelEngine):
                                                      moe_enable_update)
 
         if kv_cache_manager is None:
-            # here you need to add logic for prepare_tp_inputs_no_cache and forward_step for mm encoder only
             inputs, gather_ids = self._prepare_tp_inputs_no_cache(
                 scheduled_requests, attn_metadata, spec_metadata)
 
             with MoeLoadBalancerIterContext(moe_load_balancer):
-                # need to add key ['logits']=None to the output of forward_step for mm encoder only
-                return self._forward_step(inputs, gather_ids,
-                                          gather_context_logits)
-                # lets update requst state here after this 1step finished
+                # Special handling for multimodal encoder only mode
+                if self.pytorch_backend_config.mm_encoder_only:
+                    return self._forward_step_mm_encoder_only(inputs, scheduled_requests)
+                else:
+                    return self._forward_step(inputs, gather_ids, gather_context_logits)
         with self._maybe_pad_batch(scheduled_requests, kv_cache_manager,
                                    spec_resource_manager) as scheduled_requests:
             maybe_graph = self._maybe_get_cuda_graph(scheduled_requests)
@@ -2228,6 +2250,36 @@ class PyTorchModelEngine(ModelEngine):
             return {'logits': logits[gather_ids]}
         else:
             return {'logits': logits}
+
+    @nvtx_range("_forward_step_mm_encoder_only")
+    def _forward_step_mm_encoder_only(self,
+                                      inputs: Dict[str, Any],
+                                      scheduled_requests: ScheduledRequests) -> Dict[str, Any]:
+        """Forward step for multimodal encoder only mode - returns mm_embeddings instead of logits."""
+        # Get multimodal parameters from inputs
+        multimodal_params = inputs.get("multimodal_params", [])
+        if not multimodal_params or len(multimodal_params) == 0:
+            # Return empty embeddings if no multimodal data
+            return {'mm_embeddings': []}
+        if getattr(scheduled_requests.context_requests[0], 'multimodal_lengths', None) is None:
+            multimodal_chunks = None
+        else:
+            multimodal_chunks = [
+                sum(request.multimodal_lengths)
+                for request in scheduled_requests.context_requests
+                if request.multimodal_lengths is not None
+            ]
+        # For mm_encoder_only mode, we only run the vision encoder part
+        # The model should be a vision encoder (e.g., Qwen2VisionModelBase)
+        mm_embeddings = self.model.forward(multimodal_params)
+        assert len(mm_embeddings) == 1, "mm_embeddings should be a 1-element list, mix modality (video+image) is not supported"
+
+        if multimodal_chunks is None or len(multimodal_chunks) != len(multimodal_params):
+            mm_embeddings = list(torch.chunk(mm_embeddings[0], len(scheduled_requests.context_requests), dim=0))
+        else:
+            mm_embeddings = list(torch.split(mm_embeddings[0], multimodal_chunks, dim=0))
+
+        return {'mm_embeddings': mm_embeddings, 'logits': None}
 
     def _init_userbuffers(self, hidden_size):
         if self.mapping.tp_size <= 1:
