@@ -16,6 +16,7 @@
 import os
 import re
 import subprocess
+import tempfile
 
 import pytest
 import yaml
@@ -1203,6 +1204,43 @@ def run_disaggregated_benchmark(example_dir,
         workers_proc.wait()
 
 
+def get_config_for_benchmark(model_root, backend):
+    serve_config = {
+        "model": model_root,
+        "hostname": "localhost",
+        "port": 8000,
+        "backend": "pytorch",
+        "context_servers": {
+            "num_instances": 1,
+            "max_batch_size": 2,
+            "max_num_tokens": 384,
+            "max_seq_len": 320,
+            "tensor_parallel_size": 1,
+            "pipeline_parallel_size": 1,
+            "disable_overlap_scheduler": True,
+            "cache_transceiver_config": {
+                "backend": backend,
+                "max_tokens_in_buffer": 512,
+            },
+            "urls": ["localhost:8001"]
+        },
+        "generation_servers": {
+            "num_instances": 1,
+            "tensor_parallel_size": 1,
+            "pipeline_parallel_size": 1,
+            "max_batch_size": 2,
+            "max_num_tokens": 384,
+            "max_seq_len": 320,
+            "cache_transceiver_config": {
+                "backend": backend,
+                "max_tokens_in_buffer": 512,
+            },
+            "urls": ["localhost:8002"]
+        }
+    }
+    return serve_config
+
+
 @pytest.mark.parametrize("benchmark_model_root", [
     'DeepSeek-V3-Lite-fp8', 'DeepSeek-V3-Lite-bf16', 'llama-v3-8b-hf',
     'llama-3.1-8b-instruct-hf-fp8'
@@ -1211,24 +1249,20 @@ def run_disaggregated_benchmark(example_dir,
 def test_disaggregated_benchmark_on_diff_backends(
         disaggregated_test_root, disaggregated_example_root, llm_venv,
         benchmark_model_root, benchmark_root, shared_gpt_path):
-    base_config_path = os.path.join(os.path.dirname(__file__), "test_configs",
-                                    "disagg_config_for_benchmark.yaml")
-    with open(base_config_path, 'r', encoding='utf-8') as f:
-        config = yaml.load(f, Loader=yaml.SafeLoader)
-        config["model"] = benchmark_model_root
-        with open("ucx_config.yaml", 'w', encoding='utf-8') as ucx_config:
-            yaml.dump(config, ucx_config)
-        config["context_servers"]["cache_transceiver_config"][
-            "backend"] = "nixl"
-        config["generation_servers"]["cache_transceiver_config"][
-            "backend"] = "nixl"
-        with open("nixl_config.yaml", 'w', encoding='utf-8') as nixl_config:
-            yaml.dump(config, nixl_config)
+    nixl_config = get_config_for_benchmark(benchmark_model_root, "nixl")
+    ucx_config = get_config_for_benchmark(benchmark_model_root, "ucx")
+    temp_dir = tempfile.TemporaryDirectory()
+    nixl_config_path = os.path.join(temp_dir.name, "nixl_config.yaml")
+    ucx_config_path = os.path.join(temp_dir.name, "ucx_config.yaml")
+    with open(nixl_config_path, 'w', encoding='utf-8') as f:
+        yaml.dump(nixl_config, f)
+    with open(ucx_config_path, 'w', encoding='utf-8') as f:
+        yaml.dump(ucx_config, f)
 
     env = llm_venv._new_env.copy()
     nixl_e2el, nixl_ttft = run_disaggregated_benchmark(
         disaggregated_example_root,
-        f"{os.path.dirname(__file__)}/nixl_config.yaml",
+        nixl_config_path,
         benchmark_root,
         benchmark_model_root,
         shared_gpt_path,
@@ -1236,7 +1270,7 @@ def test_disaggregated_benchmark_on_diff_backends(
         cwd=llm_venv.get_working_directory())
     ucx_e2el, ucx_ttft = run_disaggregated_benchmark(
         disaggregated_example_root,
-        f"{os.path.dirname(__file__)}/ucx_config.yaml",
+        ucx_config_path,
         benchmark_root,
         benchmark_model_root,
         shared_gpt_path,
