@@ -59,7 +59,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc5';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc6';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -71,7 +71,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.0.0rc5" />
+  <meta name="docsearch:version" content="1.0.0rc6" />
 
 
   </head>
@@ -391,7 +391,11 @@
 <li class="toctree-l1"><a class="reference internal" href="commands/trtllm-bench.html">trtllm-bench</a></li>
 
 <li class="toctree-l1"><a class="reference internal" href="commands/trtllm-build.html">trtllm-build</a></li>
-<li class="toctree-l1"><a class="reference internal" href="commands/trtllm-serve.html">trtllm-serve</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="commands/trtllm-serve/index.html">trtllm-serve</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="commands/trtllm-serve/trtllm-serve.html">trtllm-serve</a></li>
+<li class="toctree-l2"><a class="reference internal" href="commands/trtllm-serve/run-benchmark-with-trtllm-serve.html">Run benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></a></li>
+</ul>
+</details></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Architecture</span></p>
 <ul class="nav bd-sidenav">
@@ -515,8 +519,14 @@
 </ol>
 <p>The following examples can most easily be executed using the prebuilt <a class="reference external" href="https://registry.ngc.nvidia.com/orgs/nvstaging/teams/tensorrt-llm/containers/release">Docker release container available on NGC</a> (see also <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docker/release.md">release.md</a> on GitHub). Ensure to run these commands as a user with appropriate permissions, preferably <code class="docutils literal notranslate"><span class="pre">root</span></code>, to streamline the setup process.</p>
 </section>
-<section id="llm-api">
-<h2>LLM API<a class="headerlink" href="#llm-api" title="Link to this heading">#</a></h2>
+<section id="launch-docker-on-a-node-with-nvidia-gpus-deployed">
+<h2>Launch Docker on a node with NVIDIA GPUs deployed.<a class="headerlink" href="#launch-docker-on-a-node-with-nvidia-gpus-deployed" title="Link to this heading">#</a></h2>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>docker<span class="w"> </span>run<span class="w"> </span>--ipc<span class="w"> </span>host<span class="w"> </span>--gpus<span class="w"> </span>all<span class="w"> </span>-it<span class="w"> </span>nvcr.io/nvidia/tensorrt-llm/release
+</pre></div>
+</div>
+</section>
+<section id="run-offline-inference-with-llm-api">
+<h2>Run Offline inference with LLM API<a class="headerlink" href="#run-offline-inference-with-llm-api" title="Link to this heading">#</a></h2>
 <p>The LLM API is a Python API designed to facilitate setup and inference with TensorRT-LLM directly within Python. It enables model optimization by simply specifying a HuggingFace repository name or a model checkpoint. The LLM API streamlines the process by managing checkpoint conversion, engine building, engine loading, and model inference, all through a single Python object.</p>
 <p>Here is a simple example to show how to use the LLM API with TinyLlama.</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="linenos"> 1</span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm</span><span class="w"> </span><span class="kn">import</span> <span class="n">LLM</span><span class="p">,</span> <span class="n">SamplingParams</span>
@@ -557,15 +567,34 @@
 <p>You can also directly load TensorRT Model Optimizer’s <a class="reference external" href="https://huggingface.co/collections/nvidia/model-optimizer-66aa84f7966b3150262481a4">quantized checkpoints on Hugging Face</a> in the LLM constructor.
 To learn more about the LLM API, check out the <a class="reference internal" href="llm-api/index.html"><span class="doc std std-doc">LLM API Introduction</span></a> and <a class="reference internal" href="examples/llm_api_examples.html"><span class="doc std std-doc">LLM Examples</span></a>.</p>
 </section>
-<section id="deploy-with-trtllm-serve">
-<span id="id2"></span><h2>Deploy with trtllm-serve<a class="headerlink" href="#deploy-with-trtllm-serve" title="Link to this heading">#</a></h2>
+<section id="deploy-online-serving-with-trtllm-serve">
+<span id="deploy-with-trtllm-serve"></span><h2>Deploy online serving with trtllm-serve<a class="headerlink" href="#deploy-online-serving-with-trtllm-serve" title="Link to this heading">#</a></h2>
 <p>You can use the <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code> command to start an OpenAI compatible server to interact with a model.
-To start the server, you can run a command like the following example:</p>
+To start the server, you can run a command like the following example inside a Docker container:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>trtllm-serve<span class="w"> </span><span class="s2">&quot;TinyLlama/TinyLlama-1.1B-Chat-v1.0&quot;</span>
 </pre></div>
 </div>
-<p>After the server starts, you can access familiar OpenAI endpoints such as <code class="docutils literal notranslate"><span class="pre">v1/chat/completions</span></code>.
-You can run inference such as the following example from another terminal:</p>
+<blockquote>
+<div><p>[!NOTE]
+If you are running <code class="docutils literal notranslate"><span class="pre">trtllm-server</span></code> inside a Docker container, you have two options for sending API requests:</p>
+</div></blockquote>
+<blockquote>
+<div><ol class="arabic simple">
+<li><p>Expose port <code class="docutils literal notranslate"><span class="pre">8000</span></code> to access the server from outside the container.</p></li>
+</ol>
+</div></blockquote>
+<blockquote>
+<div><ol class="arabic simple" start="2">
+<li><p>Open a new terminal and use the following command to directly attach to the running container:</p></li>
+</ol>
+</div></blockquote>
+<blockquote>
+<div><div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>docker<span class="w"> </span><span class="nb">exec</span><span class="w"> </span>-it<span class="w"> </span>&lt;container_id&gt;<span class="w"> </span>bash
+</pre></div>
+</div>
+</div></blockquote>
+<p>After the server has started, you can access well-known OpenAI endpoints such as <code class="docutils literal notranslate"><span class="pre">v1/chat/completions</span></code>.
+Inference can then be performed using examples similar to the one provided below, from a separate terminal.</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>curl<span class="w"> </span>-X<span class="w"> </span>POST<span class="w"> </span>http://localhost:8000/v1/chat/completions<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>-H<span class="w"> </span><span class="s2">&quot;Content-Type: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>-H<span class="w"> </span><span class="s2">&quot;Accept: application/json&quot;</span><span class="w"> </span><span class="se">\</span>
@@ -605,7 +634,7 @@ You can run inference such as the following example from another terminal:</p>
 <span class="p">}</span>
 </pre></div>
 </div>
-<p>For detailed examples and command syntax, refer to the <a class="reference internal" href="commands/trtllm-serve.html"><span class="std std-doc">trtllm-serve</span></a> section. If you are running <code class="docutils literal notranslate"><span class="pre">trtllm-server</span></code> inside a Docker container, you have two options for sending API requests:</p>
+<p>For detailed examples and command syntax, refer to the <a class="reference internal" href="#commands/trtllm-serve.rst"><span class="xref myst">trtllm-serve</span></a> section.</p>
 <ol class="arabic simple">
 <li><p>Expose port <code class="docutils literal notranslate"><span class="pre">8000</span></code> to access the server from outside the container.</p></li>
 <li><p>Open a new terminal and use the following command to directly attach to the running container:</p></li>
@@ -614,87 +643,12 @@ You can run inference such as the following example from another terminal:</p>
 </pre></div>
 </div>
 </section>
-<section id="model-definition-api">
-<h2>Model Definition API<a class="headerlink" href="#model-definition-api" title="Link to this heading">#</a></h2>
-<section id="prerequisites">
-<h3>Prerequisites<a class="headerlink" href="#prerequisites" title="Link to this heading">#</a></h3>
-<ul>
-<li><p>This quick start uses the Meta Llama 3.1 model. This model is subject to a particular <a class="reference external" href="https://llama.meta.com/llama-downloads/">license</a>. To download the model files, agree to the terms and <a class="reference external" href="https://huggingface.co/meta-llama/Meta-Llama-3.1-8B-Instruct?clone=true">authenticate with Hugging Face</a>.</p></li>
-<li><p>Complete the <a class="reference internal" href="installation/linux.html"><span class="std std-doc">installation</span></a> steps.</p></li>
-<li><p>Pull the weights and tokenizer files for the chat-tuned variant of the Llama 3.1 8B model from the <a class="reference external" href="https://huggingface.co/meta-llama/Meta-Llama-3.1-8B-Instruct">Hugging Face Hub</a>.</p>
-<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="go">git clone https://huggingface.co/meta-llama/Meta-Llama-3.1-8B-Instruct</span>
-</pre></div>
-</div>
-</li>
-</ul>
-</section>
-<section id="compile-the-model-into-a-tensorrt-engine">
-<span id="quick-start-guide-compile"></span><h3>Compile the Model into a TensorRT Engine<a class="headerlink" href="#compile-the-model-into-a-tensorrt-engine" title="Link to this heading">#</a></h3>
-<p>Use the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/llama">Llama model definition</a> from the <code class="docutils literal notranslate"><span class="pre">examples/models/core/llama</span></code> directory of the GitHub repository.
-The model definition is a minimal example that shows some of the optimizations available in TensorRT-LLM.</p>
-<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp"># </span>From<span class="w"> </span>the<span class="w"> </span>root<span class="w"> </span>of<span class="w"> </span>the<span class="w"> </span>cloned<span class="w"> </span>repository,<span class="w"> </span>start<span class="w"> </span>the<span class="w"> </span>TensorRT-LLM<span class="w"> </span>container
-<span class="go">make -C docker ngc-release_run LOCAL_USER=1 IMAGE_TAG=x.y.z</span>
-
-<span class="gp"># </span>Log<span class="w"> </span><span class="k">in</span><span class="w"> </span>to<span class="w"> </span>huggingface-cli
-<span class="gp"># </span>You<span class="w"> </span>can<span class="w"> </span>get<span class="w"> </span>your<span class="w"> </span>token<span class="w"> </span>from<span class="w"> </span>huggingface.co/settings/token
-<span class="go">huggingface-cli login --token *****</span>
-
-<span class="gp"># </span>Convert<span class="w"> </span>the<span class="w"> </span>model<span class="w"> </span>into<span class="w"> </span>TensorRT-LLM<span class="w"> </span>checkpoint<span class="w"> </span>format
-<span class="go">cd examples/models/core/llama</span>
-<span class="go">pip install -r requirements.txt</span>
-<span class="go">pip install --upgrade transformers # Llama 3.1 requires transformer 4.43.0+ version.</span>
-<span class="go">python3 convert_checkpoint.py --model_dir Meta-Llama-3.1-8B-Instruct --output_dir llama-3.1-8b-ckpt</span>
-
-<span class="gp"># </span>Compile<span class="w"> </span>model
-<span class="go">trtllm-build --checkpoint_dir llama-3.1-8b-ckpt \</span>
-<span class="go">    --gemm_plugin float16 \</span>
-<span class="go">    --output_dir ./llama-3.1-8b-engine</span>
-</pre></div>
-</div>
-<div class="dropdown note admonition">
-<p class="admonition-title">Container image tags</p>
-<p>In the example shell commands, <code class="docutils literal notranslate"><span class="pre">x.y.z</span></code> corresponds to the TensorRT-LLM container
-version to use. If omitted, <code class="docutils literal notranslate"><span class="pre">IMAGE_TAG</span></code> will default to <code class="docutils literal notranslate"><span class="pre">tensorrt_llm.__version__</span></code>
-(e.g., this documentation was generated from the <code class="docutils literal notranslate"><span class="pre">1.0.0rc5</span></code> source tree).
-If this does not work, e.g., because a container for the version you are
-currently working with has not been released yet, you can try using a
-container published for a previous
-<a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/releases">GitHub pre-release or release</a>
-(see also <a class="reference external" href="https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release/tags">NGC Catalog</a>).</p>
-</div>
-<p>When you create a model definition with the TensorRT-LLM API, you build a graph of operations from <a class="reference external" href="https://developer.nvidia.com/tensorrt">NVIDIA TensorRT</a> primitives that form the layers of your neural network. These operations map to specific kernels; prewritten programs for the GPU.</p>
-<p>In this example, we included the <code class="docutils literal notranslate"><span class="pre">gpt_attention</span></code> plugin, which implements a FlashAttention-like fused attention kernel, and the <code class="docutils literal notranslate"><span class="pre">gemm</span></code> plugin, that performs matrix multiplication with FP32 accumulation. We also called out the desired precision for the full model as FP16, matching the default precision of the weights that you downloaded from Hugging Face. For more information about plugins and quantizations, refer to the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/llama">Llama example</a> and <a class="reference internal" href="reference/precision.html#precision"><span class="std std-ref">Numerical Precision</span></a> section.</p>
-</section>
-<section id="run-the-model">
-<h3>Run the Model<a class="headerlink" href="#run-the-model" title="Link to this heading">#</a></h3>
-<p>Now that you have the model engine, run the engine and perform inference.</p>
-<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="go">python3 ../run.py --engine_dir ./llama-3.1-8b-engine  --max_output_len 100 --tokenizer_dir Meta-Llama-3.1-8B-Instruct --input_text &quot;How do I count to nine in French?&quot;</span>
-</pre></div>
-</div>
-</section>
-<section id="deploy-with-triton-inference-server">
-<h3>Deploy with Triton Inference Server<a class="headerlink" href="#deploy-with-triton-inference-server" title="Link to this heading">#</a></h3>
-<p>To create a production-ready deployment of your LLM, use the <a class="reference external" href="https://github.com/triton-inference-server/tensorrtllm_backend">Triton Inference Server backend for TensorRT-LLM</a> to leverage the TensorRT-LLM C++ runtime for rapid inference execution and include optimizations like in-flight batching and paged KV caching. Triton Inference Server with the TensorRT-LLM backend is available as a <a class="reference external" href="https://catalog.ngc.nvidia.com/orgs/nvidia/containers/tritonserver/tags">pre-built container through NVIDIA NGC</a>.</p>
-<ol class="arabic simple">
-<li><p>Clone the TensorRT-LLM backend repository:</p></li>
-</ol>
-<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="go">cd ..</span>
-<span class="go">git clone https://github.com/triton-inference-server/tensorrtllm_backend.git</span>
-<span class="go">cd tensorrtllm_backend</span>
-</pre></div>
-</div>
-<ol class="arabic simple" start="2">
-<li><p>Refer to <a class="reference external" href="https://github.com/triton-inference-server/tensorrtllm_backend/blob/main/docs/llama.md">End to end workflow to run llama 7b</a> in the TensorRT-LLM backend repository to deploy the model with Triton Inference Server.</p></li>
-</ol>
-</section>
-</section>
 <section id="next-steps">
 <h2>Next Steps<a class="headerlink" href="#next-steps" title="Link to this heading">#</a></h2>
 <p>In this Quick Start Guide, you:</p>
 <ul class="simple">
 <li><p>Saw an example of the LLM API</p></li>
 <li><p>Learned about deploying a model with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></p></li>
-<li><p>Learned about the Model Definition API</p></li>
 </ul>
 <p>For more examples, refer to:</p>
 <ul class="simple">
@@ -760,15 +714,9 @@ container published for a previous
   <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="visible nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#installation">Installation</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#llm-api">LLM API</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#deploy-with-trtllm-serve">Deploy with trtllm-serve</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#model-definition-api">Model Definition API</a><ul class="nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#prerequisites">Prerequisites</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#compile-the-model-into-a-tensorrt-engine">Compile the Model into a TensorRT Engine</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#run-the-model">Run the Model</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#deploy-with-triton-inference-server">Deploy with Triton Inference Server</a></li>
-</ul>
-</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#launch-docker-on-a-node-with-nvidia-gpus-deployed">Launch Docker on a node with NVIDIA GPUs deployed.</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#run-offline-inference-with-llm-api">Run Offline inference with LLM API</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#deploy-online-serving-with-trtllm-serve">Deploy online serving with trtllm-serve</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#next-steps">Next Steps</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#related-information">Related Information</a></li>
 </ul>
@@ -865,9 +813,9 @@ container published for a previous
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on August 01, 2025.</p>
+  <p>Last updated on August 06, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/fbee279">fbee279</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/a16ba64">a16ba64</a>.</p>
   
 </div></div>
       

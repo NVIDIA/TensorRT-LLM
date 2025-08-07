@@ -58,7 +58,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc5';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc6';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -68,7 +68,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.0.0rc5" />
+  <meta name="docsearch:version" content="1.0.0rc6" />
 
 
   </head>
@@ -384,7 +384,11 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../commands/trtllm-bench.html">trtllm-bench</a></li>
 
 <li class="toctree-l1"><a class="reference internal" href="../../../commands/trtllm-build.html">trtllm-build</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../commands/trtllm-serve.html">trtllm-serve</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../../commands/trtllm-serve/index.html">trtllm-serve</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../../commands/trtllm-serve/trtllm-serve.html">trtllm-serve</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../../commands/trtllm-serve/run-benchmark-with-trtllm-serve.html">Run benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></a></li>
+</ul>
+</details></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Architecture</span></p>
 <ul class="nav bd-sidenav">
@@ -692,6 +696,29 @@
 
 <div class="viewcode-block" id="MoeConfig.from_dict">
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.MoeConfig.from_dict">[docs]</a>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">from_dict</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">data</span><span class="p">:</span> <span class="nb">dict</span><span class="p">):</span>
+        <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span><span class="o">**</span><span class="n">data</span><span class="p">)</span></div>
+</div>
+
+
+
+<div class="viewcode-block" id="AttentionDpConfig">
+<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.AttentionDpConfig">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">AttentionDpConfig</span><span class="p">(</span><span class="n">StrictBaseModel</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">    Configuration for attention DP.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="n">enable_balance</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+                                 <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Whether to enable balance.&quot;</span><span class="p">)</span>
+    <span class="n">timeout_iters</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="mi">50</span><span class="p">,</span> <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The number of iterations to timeout.&quot;</span><span class="p">)</span>
+    <span class="n">batching_wait_iters</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="mi">10</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The number of iterations to wait for batching.&quot;</span><span class="p">)</span>
+
+<div class="viewcode-block" id="AttentionDpConfig.from_dict">
+<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.AttentionDpConfig.from_dict">[docs]</a>
     <span class="nd">@classmethod</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">from_dict</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">data</span><span class="p">:</span> <span class="nb">dict</span><span class="p">):</span>
         <span class="k">return</span> <span class="bp">cls</span><span class="p">(</span><span class="o">**</span><span class="n">data</span><span class="p">)</span></div>
@@ -2640,6 +2667,11 @@
 <span class="s2">         Note that each CUDA graph can use up to 200 MB of extra memory.&quot;</span><span class="p">,</span>
         <span class="n">status</span><span class="o">=</span><span class="s2">&quot;beta&quot;</span><span class="p">)</span>
 
+    <span class="n">attention_dp_config</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">AttentionDpConfig</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Optimized load-balancing for the DP Attention scheduler.&quot;</span><span class="p">,</span>
+        <span class="n">status</span><span class="o">=</span><span class="s2">&quot;beta&quot;</span><span class="p">)</span>
+
     <span class="n">disable_overlap_scheduler</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Disable the overlap scheduler.&quot;</span><span class="p">,</span>
@@ -2929,6 +2961,32 @@
         <span class="k">return</span> <span class="bp">self</span></div>
 
 
+<div class="viewcode-block" id="TorchLlmArgs.validate_attention_dp_config">
+<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.validate_attention_dp_config">[docs]</a>
+    <span class="nd">@model_validator</span><span class="p">(</span><span class="n">mode</span><span class="o">=</span><span class="s1">&#39;after&#39;</span><span class="p">)</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">validate_attention_dp_config</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s1">&#39;TorchLlmArgs&#39;</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Validate attention DP configuration.</span>
+
+<span class="sd">        Ensures that:</span>
+<span class="sd">        1. If attention_dp_config.enable_balance is true, attention_dp_config.batching_wait_iters must be greater or equal to 0</span>
+<span class="sd">        2. If attention_dp_config.enable_balance is true, attention_dp_config.timeout_iters must be greater or equal to 0</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">attention_dp_config</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">return</span> <span class="bp">self</span>
+
+        <span class="n">config</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">attention_dp_config</span>
+        <span class="k">if</span> <span class="n">config</span><span class="o">.</span><span class="n">enable_balance</span><span class="p">:</span>
+            <span class="k">if</span> <span class="n">config</span><span class="o">.</span><span class="n">batching_wait_iters</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                    <span class="s2">&quot;attention_dp_config.batching_wait_iters must be greater or equal to 0 when enable_balance is true&quot;</span>
+                <span class="p">)</span>
+            <span class="k">if</span> <span class="n">config</span><span class="o">.</span><span class="n">timeout_iters</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                    <span class="s2">&quot;attention_dp_config.timeout_iters must be greater or equal to 0 when enable_balance is true&quot;</span>
+                <span class="p">)</span>
+        <span class="k">return</span> <span class="bp">self</span></div>
+
+
     <span class="c1"># TODO: Remove this after the PyTorch backend is fully migrated to TorchLlmArgs from ExecutorConfig</span>
 <div class="viewcode-block" id="TorchLlmArgs.get_pytorch_backend_config">
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.get_pytorch_backend_config">[docs]</a>
@@ -2981,7 +3039,16 @@
             <span class="n">enable_min_latency</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">enable_min_latency</span><span class="p">,</span>
             <span class="n">stream_interval</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">stream_interval</span><span class="p">,</span>
             <span class="n">force_dynamic_quantization</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">force_dynamic_quantization</span><span class="p">,</span>
-            <span class="n">allreduce_strategy</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">allreduce_strategy</span><span class="p">)</span></div>
+            <span class="n">allreduce_strategy</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">allreduce_strategy</span><span class="p">,</span>
+            <span class="n">attention_dp_enable_balance</span><span class="o">=</span><span class="nb">bool</span><span class="p">(</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">attention_dp_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+                <span class="ow">and</span> <span class="bp">self</span><span class="o">.</span><span class="n">attention_dp_config</span><span class="o">.</span><span class="n">enable_balance</span><span class="p">),</span>
+            <span class="n">attention_dp_time_out_iters</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">attention_dp_config</span><span class="o">.</span><span class="n">timeout_iters</span>
+            <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">attention_dp_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span>
+            <span class="n">AttentionDpConfig</span><span class="o">.</span><span class="n">model_fields</span><span class="p">[</span><span class="s1">&#39;timeout_iters&#39;</span><span class="p">]</span><span class="o">.</span><span class="n">default</span><span class="p">,</span>
+            <span class="n">attention_dp_batching_wait_iters</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">attention_dp_config</span><span class="o">.</span>
+            <span class="n">batching_wait_iters</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">attention_dp_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="k">else</span>
+            <span class="n">AttentionDpConfig</span><span class="o">.</span><span class="n">model_fields</span><span class="p">[</span><span class="s1">&#39;batching_wait_iters&#39;</span><span class="p">]</span><span class="o">.</span><span class="n">default</span><span class="p">)</span></div>
 </div>
 
 
@@ -3000,6 +3067,7 @@
         <span class="s2">&quot;speculative_config&quot;</span><span class="p">:</span> <span class="n">DecodingBaseConfig</span><span class="p">,</span>
         <span class="s2">&quot;lora_config&quot;</span><span class="p">:</span> <span class="n">LoraConfig</span><span class="p">,</span>
         <span class="s2">&quot;moe_config&quot;</span><span class="p">:</span> <span class="n">MoeConfig</span><span class="p">,</span>
+        <span class="s2">&quot;attention_dp_config&quot;</span><span class="p">:</span> <span class="n">AttentionDpConfig</span><span class="p">,</span>
     <span class="p">}</span>
     <span class="k">for</span> <span class="n">field_name</span><span class="p">,</span> <span class="n">field_type</span> <span class="ow">in</span> <span class="n">field_mapping</span><span class="o">.</span><span class="n">items</span><span class="p">():</span>
         <span class="k">if</span> <span class="n">field_name</span> <span class="ow">in</span> <span class="n">llm_args_dict</span><span class="p">:</span>
@@ -3175,9 +3243,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on August 01, 2025.</p>
+  <p>Last updated on August 06, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/fbee279">fbee279</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/a16ba64">a16ba64</a>.</p>
   
 </div></div>
       

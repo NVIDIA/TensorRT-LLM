@@ -59,7 +59,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc5';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc6';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -71,7 +71,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.0.0rc5" />
+  <meta name="docsearch:version" content="1.0.0rc6" />
 
 
   </head>
@@ -387,7 +387,11 @@
 <li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-bench.html">trtllm-bench</a></li>
 
 <li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-build.html">trtllm-build</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-serve.html">trtllm-serve</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../commands/trtllm-serve/index.html">trtllm-serve</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../commands/trtllm-serve/trtllm-serve.html">trtllm-serve</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../commands/trtllm-serve/run-benchmark-with-trtllm-serve.html">Run benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></a></li>
+</ul>
+</details></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Architecture</span></p>
 <ul class="nav bd-sidenav">
@@ -505,46 +509,56 @@
 <p>Refer to the <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/commands/trtllm-serve.html">trtllm-serve documentation</a> for starting a server.</p>
 <p>Source <a class="github reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/serve/openai_completion_client_json_schema.py">NVIDIA/TensorRT-LLM</a>.</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="linenos"> 1</span>
-<span class="linenos"> 2</span><span class="kn">from</span><span class="w"> </span><span class="nn">openai</span><span class="w"> </span><span class="kn">import</span> <span class="n">OpenAI</span>
-<span class="linenos"> 3</span>
-<span class="linenos"> 4</span><span class="n">client</span> <span class="o">=</span> <span class="n">OpenAI</span><span class="p">(</span>
-<span class="linenos"> 5</span>    <span class="n">base_url</span><span class="o">=</span><span class="s2">&quot;http://localhost:8000/v1&quot;</span><span class="p">,</span>
-<span class="linenos"> 6</span>    <span class="n">api_key</span><span class="o">=</span><span class="s2">&quot;tensorrt_llm&quot;</span><span class="p">,</span>
-<span class="linenos"> 7</span><span class="p">)</span>
-<span class="linenos"> 8</span>
-<span class="linenos"> 9</span><span class="n">response</span> <span class="o">=</span> <span class="n">client</span><span class="o">.</span><span class="n">chat</span><span class="o">.</span><span class="n">completions</span><span class="o">.</span><span class="n">create</span><span class="p">(</span>
-<span class="linenos">10</span>    <span class="n">model</span><span class="o">=</span><span class="s2">&quot;TinyLlama-1.1B-Chat-v1.0&quot;</span><span class="p">,</span>
-<span class="linenos">11</span>    <span class="n">messages</span><span class="o">=</span><span class="p">[{</span>
-<span class="linenos">12</span>        <span class="s2">&quot;role&quot;</span><span class="p">:</span> <span class="s2">&quot;system&quot;</span><span class="p">,</span>
-<span class="linenos">13</span>        <span class="s2">&quot;content&quot;</span><span class="p">:</span> <span class="s2">&quot;you are a helpful assistant&quot;</span>
-<span class="linenos">14</span>    <span class="p">},</span> <span class="p">{</span>
-<span class="linenos">15</span>        <span class="s2">&quot;role&quot;</span><span class="p">:</span>
-<span class="linenos">16</span>        <span class="s2">&quot;user&quot;</span><span class="p">,</span>
-<span class="linenos">17</span>        <span class="s2">&quot;content&quot;</span><span class="p">:</span>
-<span class="linenos">18</span>        <span class="sa">f</span><span class="s2">&quot;Give me the information of the biggest city of China in the JSON format.&quot;</span><span class="p">,</span>
-<span class="linenos">19</span>    <span class="p">}],</span>
-<span class="linenos">20</span>    <span class="n">max_tokens</span><span class="o">=</span><span class="mi">100</span><span class="p">,</span>
-<span class="linenos">21</span>    <span class="n">temperature</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>
-<span class="linenos">22</span>    <span class="n">response_format</span><span class="o">=</span><span class="p">{</span>
-<span class="linenos">23</span>        <span class="s2">&quot;type&quot;</span><span class="p">:</span> <span class="s2">&quot;json&quot;</span><span class="p">,</span>
-<span class="linenos">24</span>        <span class="s2">&quot;schema&quot;</span><span class="p">:</span> <span class="p">{</span>
-<span class="linenos">25</span>            <span class="s2">&quot;type&quot;</span><span class="p">:</span> <span class="s2">&quot;object&quot;</span><span class="p">,</span>
-<span class="linenos">26</span>            <span class="s2">&quot;properties&quot;</span><span class="p">:</span> <span class="p">{</span>
-<span class="linenos">27</span>                <span class="s2">&quot;name&quot;</span><span class="p">:</span> <span class="p">{</span>
-<span class="linenos">28</span>                    <span class="s2">&quot;type&quot;</span><span class="p">:</span> <span class="s2">&quot;string&quot;</span>
-<span class="linenos">29</span>                <span class="p">},</span>
-<span class="linenos">30</span>                <span class="s2">&quot;population&quot;</span><span class="p">:</span> <span class="p">{</span>
-<span class="linenos">31</span>                    <span class="s2">&quot;type&quot;</span><span class="p">:</span> <span class="s2">&quot;integer&quot;</span>
+<span class="linenos"> 2</span><span class="c1"># This example requires to specify `guided_decoding_backend` as</span>
+<span class="linenos"> 3</span><span class="c1"># `xgrammar` or `llguidance` in the extra_llm_api_options.yaml file.</span>
+<span class="linenos"> 4</span><span class="kn">import</span><span class="w"> </span><span class="nn">json</span>
+<span class="linenos"> 5</span>
+<span class="linenos"> 6</span><span class="kn">from</span><span class="w"> </span><span class="nn">openai</span><span class="w"> </span><span class="kn">import</span> <span class="n">OpenAI</span>
+<span class="linenos"> 7</span>
+<span class="linenos"> 8</span><span class="n">client</span> <span class="o">=</span> <span class="n">OpenAI</span><span class="p">(</span>
+<span class="linenos"> 9</span>    <span class="n">base_url</span><span class="o">=</span><span class="s2">&quot;http://localhost:8000/v1&quot;</span><span class="p">,</span>
+<span class="linenos">10</span>    <span class="n">api_key</span><span class="o">=</span><span class="s2">&quot;tensorrt_llm&quot;</span><span class="p">,</span>
+<span class="linenos">11</span><span class="p">)</span>
+<span class="linenos">12</span>
+<span class="linenos">13</span><span class="n">response</span> <span class="o">=</span> <span class="n">client</span><span class="o">.</span><span class="n">chat</span><span class="o">.</span><span class="n">completions</span><span class="o">.</span><span class="n">create</span><span class="p">(</span>
+<span class="linenos">14</span>    <span class="n">model</span><span class="o">=</span><span class="s2">&quot;TinyLlama-1.1B-Chat-v1.0&quot;</span><span class="p">,</span>
+<span class="linenos">15</span>    <span class="n">messages</span><span class="o">=</span><span class="p">[{</span>
+<span class="linenos">16</span>        <span class="s2">&quot;role&quot;</span><span class="p">:</span> <span class="s2">&quot;system&quot;</span><span class="p">,</span>
+<span class="linenos">17</span>        <span class="s2">&quot;content&quot;</span><span class="p">:</span> <span class="s2">&quot;you are a helpful assistant&quot;</span>
+<span class="linenos">18</span>    <span class="p">},</span> <span class="p">{</span>
+<span class="linenos">19</span>        <span class="s2">&quot;role&quot;</span><span class="p">:</span>
+<span class="linenos">20</span>        <span class="s2">&quot;user&quot;</span><span class="p">,</span>
+<span class="linenos">21</span>        <span class="s2">&quot;content&quot;</span><span class="p">:</span>
+<span class="linenos">22</span>        <span class="sa">f</span><span class="s2">&quot;Give me the information of the biggest city of China in the JSON format.&quot;</span><span class="p">,</span>
+<span class="linenos">23</span>    <span class="p">}],</span>
+<span class="linenos">24</span>    <span class="n">temperature</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>
+<span class="linenos">25</span>    <span class="n">response_format</span><span class="o">=</span><span class="p">{</span>
+<span class="linenos">26</span>        <span class="s2">&quot;type&quot;</span><span class="p">:</span> <span class="s2">&quot;json&quot;</span><span class="p">,</span>
+<span class="linenos">27</span>        <span class="s2">&quot;schema&quot;</span><span class="p">:</span> <span class="p">{</span>
+<span class="linenos">28</span>            <span class="s2">&quot;type&quot;</span><span class="p">:</span> <span class="s2">&quot;object&quot;</span><span class="p">,</span>
+<span class="linenos">29</span>            <span class="s2">&quot;properties&quot;</span><span class="p">:</span> <span class="p">{</span>
+<span class="linenos">30</span>                <span class="s2">&quot;name&quot;</span><span class="p">:</span> <span class="p">{</span>
+<span class="linenos">31</span>                    <span class="s2">&quot;type&quot;</span><span class="p">:</span> <span class="s2">&quot;string&quot;</span>
 <span class="linenos">32</span>                <span class="p">},</span>
-<span class="linenos">33</span>            <span class="p">},</span>
-<span class="linenos">34</span>            <span class="s2">&quot;required&quot;</span><span class="p">:</span> <span class="p">[</span><span class="s2">&quot;name&quot;</span><span class="p">,</span> <span class="s2">&quot;population&quot;</span><span class="p">],</span>
-<span class="linenos">35</span>            <span class="s2">&quot;chat_template_kwargs&quot;</span><span class="p">:</span> <span class="p">{</span>
-<span class="linenos">36</span>                <span class="s2">&quot;enable_thinking&quot;</span><span class="p">:</span> <span class="kc">False</span>
-<span class="linenos">37</span>            <span class="p">}</span>
-<span class="linenos">38</span>        <span class="p">}</span>
-<span class="linenos">39</span>    <span class="p">},</span>
-<span class="linenos">40</span><span class="p">)</span>
-<span class="linenos">41</span><span class="nb">print</span><span class="p">(</span><span class="n">response</span><span class="o">.</span><span class="n">choices</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">message</span><span class="o">.</span><span class="n">content</span><span class="p">)</span>
+<span class="linenos">33</span>                <span class="s2">&quot;population&quot;</span><span class="p">:</span> <span class="p">{</span>
+<span class="linenos">34</span>                    <span class="s2">&quot;type&quot;</span><span class="p">:</span> <span class="s2">&quot;integer&quot;</span>
+<span class="linenos">35</span>                <span class="p">},</span>
+<span class="linenos">36</span>            <span class="p">},</span>
+<span class="linenos">37</span>            <span class="s2">&quot;required&quot;</span><span class="p">:</span> <span class="p">[</span><span class="s2">&quot;name&quot;</span><span class="p">,</span> <span class="s2">&quot;population&quot;</span><span class="p">],</span>
+<span class="linenos">38</span>            <span class="s2">&quot;chat_template_kwargs&quot;</span><span class="p">:</span> <span class="p">{</span>
+<span class="linenos">39</span>                <span class="s2">&quot;enable_thinking&quot;</span><span class="p">:</span> <span class="kc">False</span>
+<span class="linenos">40</span>            <span class="p">}</span>
+<span class="linenos">41</span>        <span class="p">}</span>
+<span class="linenos">42</span>    <span class="p">},</span>
+<span class="linenos">43</span><span class="p">)</span>
+<span class="linenos">44</span>
+<span class="linenos">45</span><span class="n">content</span> <span class="o">=</span> <span class="n">response</span><span class="o">.</span><span class="n">choices</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">message</span><span class="o">.</span><span class="n">content</span>
+<span class="linenos">46</span><span class="k">try</span><span class="p">:</span>
+<span class="linenos">47</span>    <span class="n">response_json</span> <span class="o">=</span> <span class="n">json</span><span class="o">.</span><span class="n">loads</span><span class="p">(</span><span class="n">content</span><span class="p">)</span>
+<span class="linenos">48</span>    <span class="k">assert</span> <span class="s2">&quot;name&quot;</span> <span class="ow">in</span> <span class="n">response_json</span> <span class="ow">and</span> <span class="s2">&quot;population&quot;</span> <span class="ow">in</span> <span class="n">response_json</span>
+<span class="linenos">49</span>    <span class="nb">print</span><span class="p">(</span><span class="n">content</span><span class="p">)</span>
+<span class="linenos">50</span><span class="k">except</span> <span class="n">json</span><span class="o">.</span><span class="n">JSONDecodeError</span><span class="p">:</span>
+<span class="linenos">51</span>    <span class="nb">print</span><span class="p">(</span><span class="s2">&quot;Failed to decode JSON response&quot;</span><span class="p">)</span>
 </pre></div>
 </div>
 </section>
@@ -677,9 +691,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on August 01, 2025.</p>
+  <p>Last updated on August 06, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/fbee279">fbee279</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/a16ba64">a16ba64</a>.</p>
   
 </div></div>
       

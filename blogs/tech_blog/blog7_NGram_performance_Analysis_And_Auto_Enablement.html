@@ -1,0 +1,930 @@
+
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>N-Gram Speculative Decoding in TensorRT‑LLM &#8212; TensorRT-LLM</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../../_static/styles/theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+<link href="../../_static/styles/pydata-sphinx-theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="../../_static/styles/nvidia-sphinx-theme.css?v=df3ac72c" />
+    <link rel="stylesheet" type="text/css" href="../../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../../_static/autodoc_pydantic.css" />
+    <link rel="stylesheet" type="text/css" href="../../_static/togglebutton.css?v=13237357" />
+    <link rel="stylesheet" type="text/css" href="../../_static/custom.css?v=95073da6" />
+  
+  <!-- So that users can add custom icons -->
+  <script src="../../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf" />
+<link rel="preload" as="script" href="../../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf" />
+
+    <script src="../../_static/documentation_options.js?v=5929fcd5"></script>
+    <script src="../../_static/doctools.js?v=9a2dae69"></script>
+    <script src="../../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../../_static/copybutton.js?v=65e89d2a"></script>
+    <script>let toggleHintShow = 'Click to show';</script>
+    <script>let toggleHintHide = 'Click to hide';</script>
+    <script>let toggleOpenOnPrint = 'true';</script>
+    <script src="../../_static/togglebutton.js?v=4a39c7ea"></script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'blogs/tech_blog/blog7_NGram_performance_Analysis_And_Auto_Enablement';</script>
+    <script>
+        DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
+        DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc6';
+        DOCUMENTATION_OPTIONS.show_version_warning_banner =
+            false;
+        </script>
+    <link rel="icon" href="../../_static/favicon.png"/>
+    <link rel="index" title="Index" href="../../genindex.html" />
+    <link rel="search" title="Search" href="../../search.html" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="1.0.0rc6" />
+
+
+  </head>
+  
+  
+  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="">
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search the docs ..."
+         aria-label="Search the docs ..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-3 navbar-header-items__start">
+    
+      <div class="navbar-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
+    <img src="../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT-LLM</p>
+  
+</a></div>
+    
+  </div>
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    <div class="me-auto navbar-header-items__center">
+      
+        <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-2"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-2"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-2"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-2">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+      
+    </div>
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+        <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
+    <img src="../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT-LLM</p>
+  
+</a>
+
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+      <div class="sidebar-header-items__center">
+        
+          
+          
+            <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-3"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-3"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-3"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-3">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+          
+        
+      </div>
+    
+    
+    
+      <div class="sidebar-header-items__end">
+        
+          <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+        
+      </div>
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+
+
+<nav class="bd-docs-nav bd-links"
+     aria-label="Table of Contents">
+  <p class="bd-links__title" role="heading" aria-level="1">Table of Contents</p>
+  <div class="bd-toc-item navbar-nav"><p aria-level="2" class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../key-features.html">Key Features</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../torch.html">PyTorch Backend</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../release-notes.html">Release Notes</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Installation</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../installation/containers.html">Pre-built release container images on NGC</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../installation/linux.html">Installing on Linux via <code class="docutils literal notranslate"><span class="pre">pip</span></code></a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">LLM API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../llm-api/index.html">LLM API Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../llm-api/reference.html">API Reference</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Examples</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../examples/index.html">LLM Examples Introduction</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="simple">
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../examples/customization.html">LLM Common Customizations</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../examples/llm_api_examples.html">LLM Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_async.html">Generate text asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_async_streaming.html">Generate text in streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_trtllm_bench.html">Run trtllm-bench with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_trtllm_serve.html">Run trtllm-serve with pytorch backend on Slurm</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../examples/trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_chat_client.html">Curl Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_completion_client.html">Curl Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/deepseek_r1_reasoning_parser.html">Deepseek R1 Reasoning Parser</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/genai_perf_client.html">Genai Perf Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/genai_perf_client_for_multimodal.html">Genai Perf Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_chat_client.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client for Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client_for_lora.html">Openai Completion Client For Lora</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client_json_schema.html">OpenAI Completion Client with JSON Schema</a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Model Definition API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../python-api/tensorrt_llm.layers.html">Layers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../python-api/tensorrt_llm.functional.html">Functionals</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../python-api/tensorrt_llm.models.html">Models</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../python-api/tensorrt_llm.plugin.html">Plugin</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../python-api/tensorrt_llm.quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../python-api/tensorrt_llm.runtime.html">Runtime</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">C++ API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../_cpp_gen/executor.html">Executor</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../_cpp_gen/runtime.html">Runtime</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../commands/trtllm-bench.html">trtllm-bench</a></li>
+
+<li class="toctree-l1"><a class="reference internal" href="../../commands/trtllm-build.html">trtllm-build</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../commands/trtllm-serve/index.html">trtllm-serve</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../commands/trtllm-serve/trtllm-serve.html">trtllm-serve</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../commands/trtllm-serve/run-benchmark-with-trtllm-serve.html">Run benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Architecture</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../architecture/overview.html">TensorRT-LLM Architecture</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../architecture/core-concepts.html">Model Definition</a></li>
+
+
+
+<li class="toctree-l1"><a class="reference internal" href="../../architecture/checkpoint.html">TensorRT-LLM Checkpoint</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../architecture/workflow.html">TensorRT-LLM Build Workflow</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../architecture/add-model.html">Adding a Model</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Advanced</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/gpt-attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/gpt-runtime.html">C++ GPT Runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/executor.html">Executor API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/lora.html">Run gpt-2b + LoRA using Executor / cpp runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/kv-cache-management.html">KV Cache Management: Pools, Blocks, and Events</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/speculative-decoding.html">Speculative Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/disaggregated-service.html">Disaggregated-Service (Experimental)</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Performance</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../performance/perf-overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../performance/perf-benchmarking.html">Benchmarking</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../performance/performance-tuning-guide/index.html">Performance Tuning Guide</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../performance/performance-tuning-guide/benchmarking-default-performance.html">Benchmarking Default Performance</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../performance/performance-tuning-guide/useful-build-time-flags.html">Useful Build-Time Flags</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../performance/performance-tuning-guide/tuning-max-batch-size-and-max-num-tokens.html">Tuning Max Batch Size and Max Num Tokens</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../performance/performance-tuning-guide/deciding-model-sharding-strategy.html">Deciding Model Sharding Strategy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../performance/performance-tuning-guide/fp8-quantization.html">FP8 Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../performance/performance-tuning-guide/useful-runtime-flags.html">Useful Runtime Options</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../performance/perf-analysis.html">Performance Analysis</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../reference/troubleshooting.html">Troubleshooting</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../reference/support-matrix.html">Support Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../reference/precision.html">Numerical Precision</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../reference/memory.html">Memory Usage of TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../reference/ci-overview.html">Continuous Integration Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../reference/dev-containers.html">Using Dev Containers</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
+</ul>
+</div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item">
+
+<nav aria-label="Breadcrumb" class="d-print-none">
+  <ul class="bd-breadcrumbs">
+    
+    <li class="breadcrumb-item breadcrumb-home">
+      <a href="../../index.html" class="nav-link" aria-label="Home">
+        <i class="fa-solid fa-home"></i>
+      </a>
+    </li>
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">N-Gram Speculative Decoding in TensorRT‑LLM</span></li>
+  </ul>
+</nav>
+</div>
+      
+    </div>
+  
+  
+</div>
+</div>
+              
+              
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section id="n-gram-speculative-decoding-in-tensorrtllm">
+<h1>N-Gram Speculative Decoding in TensorRT‑LLM<a class="headerlink" href="#n-gram-speculative-decoding-in-tensorrtllm" title="Link to this heading">#</a></h1>
+<p>N-Gram speculative decoding leverages the natural repetition in many LLM workloads. It splits previously seen text into configurable (key, value) n‑gram pairs and, during generation, swiftly proposes draft tokens by matching the current key against n-gram pools in memory.</p>
+<p>In this blog, we introduce design choices in TensorRT‑LLM’s N-Gram speculative decoding algorithm, share our experimental results of performance gains, and explain N-Gram’s low barrier to adoption by deriving a simple heuristic to enable it.</p>
+<section id="highlights">
+<h2>Highlights<a class="headerlink" href="#highlights" title="Link to this heading">#</a></h2>
+<ul class="simple">
+<li><p><strong>Fast &amp; lightweight.</strong> N‑Gram algorithm runs on the host with low overhead.</p></li>
+<li><p><strong>Real speed‑ups at low concurrency.</strong> N-Gram achieves accepted length of 1.37 and more on average running on the Magpie-Align/Magpie-Llama-3.1-Pro-MT-300K-Filtered dataset (<a class="reference external" href="https://huggingface.co/datasets/Magpie-Align/Magpie-Llama-3.1-Pro-MT-300K-Filtered/viewer/default/train">link</a>) with the first round of conversation. Results in 10-60% E2E runtime speed-up.</p></li>
+<li><p><strong>Works even better with multi-turn conversations.</strong> With the cache built up during the first round of conversation, the second round achieved a higher accepted length of 1.66 and a 30–90% E2E runtime speed-up.</p></li>
+<li><p><strong>Excels on tasks with natural repetition like translation.</strong> With the translation dataset, the accepted length can exceed 4.0. New requests can benefit from cache generated by previous requests with similar tasks and reduce latency by up to 70%.</p></li>
+<li><p><strong>Heuristic “just works”.</strong> Set <code class="docutils literal notranslate"><span class="pre">spec_decode_algo=AUTO</span></code> to enable N‑Gram by default.</p>
+<ul>
+<li><p>This policy adds less than 15% overhead to iteration latency yet offers nets double‑digit end‑to‑end speed‑ups.</p></li>
+</ul>
+</li>
+</ul>
+</section>
+<hr class="docutils" />
+<section id="table-of-contents">
+<h2>Table of Contents<a class="headerlink" href="#table-of-contents" title="Link to this heading">#</a></h2>
+<ul class="simple">
+<li><p><a class="reference internal" href="#background-motivation">Background &amp; Motivation</a></p></li>
+<li><p><a class="reference internal" href="#algorithm-complexity">Algorithm &amp; Complexity</a></p></li>
+<li><p><a class="reference internal" href="#experimental-setup">Performance Study</a></p>
+<ul>
+<li><p><a class="reference internal" href="#experimental-setup">Experimental Setup</a></p></li>
+<li><p><a class="reference internal" href="#case-1-with-conversation-dataset">Case 1 with Conversation Dataset </a></p>
+<ul>
+<li><p><a class="reference internal" href="#speed-up-for-the-first-turn">Speed-up for the First Turn</a></p></li>
+<li><p><a class="reference internal" href="#effect-of-multi-turn-conversation">Effect of Multi-turn conversation</a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#case-2-with-translation-dataset">Case 2 with Translation Dataset</a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#autoenablement-with-heuristic">Auto‑Enablement with Heuristic</a></p></li>
+<li><p><a class="reference internal" href="#featuregaps"><span class="xref myst">Feature Gaps</span></a></p></li>
+</ul>
+</section>
+<hr class="docutils" />
+<section id="background-motivation">
+<h2>Background &amp; Motivation<a class="headerlink" href="#background-motivation" title="Link to this heading">#</a></h2>
+<p>Speculative decoding drafts several tokens, verifies them on the model, and keeps the accepted prefix at each iteration of the generation loop. An N‑Gram proposer can generate drafts without an extra LLM or model heads, making it a low-cost way to improve serving latency. Average accepted length (AL) is ~1.3 in generic chat (MT‑Bench, Magpie with the first round of conversation) and can exceed 4.0 on highly repetitive data like a translation task.</p>
+</section>
+<hr class="docutils" />
+<section id="algorithm-complexity">
+<h2>Algorithm &amp; Complexity<a class="headerlink" href="#algorithm-complexity" title="Link to this heading">#</a></h2>
+<p><code class="docutils literal notranslate"><span class="pre">NGramDecodingConfig</span></code> in TensorRT-LLM:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="n">spec_config</span> <span class="o">=</span> <span class="n">NGramDecodingConfig</span><span class="p">(</span>
+    <span class="n">max_draft_len</span> <span class="o">=</span> <span class="n">v</span> <span class="p">,</span>             <span class="c1"># max length of draft tokens</span>
+    <span class="n">max_matching_ngram_size</span>  <span class="o">=</span> <span class="n">k</span> <span class="p">,</span>  <span class="c1"># max length for keys</span>
+    <span class="n">is_keep_all</span>   <span class="o">=</span> <span class="kc">True</span><span class="p">,</span>           <span class="c1"># Whether to keep all candidate pattern-matches pairs, only one match is kept for each pattern if False.</span>
+    <span class="n">is_use_oldest</span> <span class="o">=</span> <span class="kc">True</span><span class="p">,</span>           <span class="c1"># Whether to provide the oldest match when pattern is hit, the newest one is provided if False.</span>
+    <span class="n">is_public_pool</span><span class="o">=</span> <span class="kc">True</span><span class="p">,</span>           <span class="c1"># Whether to use a common pool for all requests, or the pool is private for each request if False.</span>
+<span class="p">)</span>
+</pre></div>
+</div>
+<ul>
+<li><p><strong>Processing New Request</strong> ‑ scan input sequence once to create N-Gram key-value pairs for the new sequence.</p>
+<p>With <em>max_matching_ngram_size = 3, max_draft_len = 5, input_sequence_len=8</em>, Figure 1 shows the 18 new key-value pairs added to the cache pool.</p>
+<p>The number of cache pairs grows proportionally to the product of the maximum key length and the input sequence length.</p>
+</li>
+</ul>
+<div align="center">
+  <figure>
+    <img src="../media/tech_blog7_init_sequence_scan.png" width="auto" height="auto">
+  </figure>
+</div>
+<p align="center"><sub><em>Figure 1. Request initial scan</em></sub></p>
+<ul>
+<li><p><strong>Per‑token update</strong> ‑ slide window and update cache pool</p>
+<p>We now have a new token in the sequence. Figure 2 shows how the cache pool is updated accordingly. For existing key-value pairs whose value length is less than the <code class="docutils literal notranslate"><span class="pre">max_draft_len</span></code>, the new token can be appended. The new token can be the value to new keys as well, which are marked as new pairs in the graph.</p>
+<p>The number of cache update and addition is approximately the product of <code class="docutils literal notranslate"><span class="pre">max_draft_len</span></code> and <code class="docutils literal notranslate"><span class="pre">max_matching_ngram_size</span></code>, which is a constant for fixed parameters.</p>
+</li>
+</ul>
+<div align="center">
+  <figure>
+    <img src="../media/tech_blog7_per_token_update.png" width="auto" height="auto">
+  </figure>
+</div>
+<p align="center"><sub><em>Figure 2. Per-token update</em></sub></p>
+<ul>
+<li><p><strong>Lookup</strong> ‑ construct the last k tokens as the key and propose draft tokens as its value.</p>
+<p>If <code class="docutils literal notranslate"><span class="pre">is_public_pool=</span> <span class="pre">True</span></code>, a global pool is shared by all the requests. If <code class="docutils literal notranslate"><span class="pre">is_public_pool=</span> <span class="pre">False</span></code>, each request will have its own cache pool.</p>
+<p>The lookup time is amortized constant time, but extra latency can be observed once the dictionary outgrows the CPU’s fastest cache.</p>
+</li>
+<li><p><strong>Verification</strong> ‑ Verify proposed draft tokens.</p>
+<p>Run the target model with <code class="docutils literal notranslate"><span class="pre">verification_batch</span> <span class="pre">=</span>&#160; <span class="pre">original_batch</span> <span class="pre">×</span> <span class="pre">(v+1)</span></code>; There will always be at least one new token from verification even if no draft token is correct. In this case, the accepted length (AL) will be <code class="docutils literal notranslate"><span class="pre">1</span></code>. In addition, if <code class="docutils literal notranslate"><span class="pre">w</span></code> out of the <code class="docutils literal notranslate"><span class="pre">v</span></code> draft tokens are accepted, the accepted length (AL) will be <code class="docutils literal notranslate"><span class="pre">w+1</span></code>.</p>
+<p>The iteration latency grows as the verification batch becomes larger than the original batch. As we increase <code class="docutils literal notranslate"><span class="pre">max_draft_len</span> <span class="pre">(v)</span></code>, the overhead grows even more. Therefore, speculative decoding tends to work best with small batch sizes and low concurrency.</p>
+</li>
+</ul>
+</section>
+<hr class="docutils" />
+<section id="performance-study">
+<h2>Performance Study<a class="headerlink" href="#performance-study" title="Link to this heading">#</a></h2>
+<section id="experimental-setup">
+<h3>Experimental Setup<a class="headerlink" href="#experimental-setup" title="Link to this heading">#</a></h3>
+<ul class="simple">
+<li><p><strong>Hardware:</strong> 8 × B200 GPUs (Blackwell)</p></li>
+<li><p><strong>Model:</strong> Llama‑4‑Scout‑17B‑16E, FP8 weights</p></li>
+<li><p><strong>Tensor Parallel:</strong> 8</p></li>
+</ul>
+</section>
+<hr class="docutils" />
+<section id="case-1-with-conversation-dataset">
+<h3>Case 1 with Conversation Dataset<a class="headerlink" href="#case-1-with-conversation-dataset" title="Link to this heading">#</a></h3>
+<p>In this experiment, we used Magpie-Align/Magpie-Llama-3.1-Pro-MT-300K-Filtered dataset (<a class="reference external" href="https://huggingface.co/datasets/Magpie-Align/Magpie-Llama-3.1-Pro-MT-300K-Filtered/viewer/default/train">link</a>) which is a conversational dataset with two turns. The user question on the second turn is related to the previous question and answer.</p>
+<p>The first turn only data represents a general conversation with no context. The repetition comes from the conversational structure and correlation between the question and answers.</p>
+<p>On the second turn, the global cache already has the knowledge of the previous conversation. The additional repetitions come from the correlation between the second answer and previous conversation.</p>
+<section id="speed-up-for-the-first-turn">
+<h4>Speed-up for the First Turn<a class="headerlink" href="#speed-up-for-the-first-turn" title="Link to this heading">#</a></h4>
+<p>For batch size of 1, 4 and 32, we configure the max_batch_size of the model accordingly. We will run <code class="docutils literal notranslate"><span class="pre">20</span> <span class="pre">*</span> <span class="pre">batch_size</span></code> number of requests with the model and compare the E2E runtime with and without N-Gram speculative decoding.</p>
+<div align="center">
+  <figure>
+    <img src="../media/tech_blog7_speed_up_first_turn.png" width="80%" height="auto">
+  </figure>
+</div>
+<p align="center"><sub><em>Figure 3. First Turn Speed-up</em></sub></p>
+<p>We can see that N-Gram can provide speed-ups for batch sizes up to 32 and works best with a single batch. The main overhead with larger batch sizes is the verification cost. With batch size being 1 and 4, <code class="docutils literal notranslate"><span class="pre">k</span> <span class="pre">=</span> <span class="pre">3,</span> <span class="pre">v</span> <span class="pre">=</span> <span class="pre">5</span></code> is the best N-Gram configuration. With batch size = 32, <code class="docutils literal notranslate"><span class="pre">k</span> <span class="pre">=</span> <span class="pre">5,</span> <span class="pre">v</span> <span class="pre">=</span> <span class="pre">3</span></code> is the best configuration since the verification batch size is smaller and the overhead is less.</p>
+</section>
+<section id="effect-of-multi-turn-conversation">
+<h4>Effect of Multi-turn conversation<a class="headerlink" href="#effect-of-multi-turn-conversation" title="Link to this heading">#</a></h4>
+<p>The table below shows the accepted length (AL) derived from 3000 sampled conversations using different N-Gram configurations.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>k</p></th>
+<th class="head"><p>v</p></th>
+<th class="head"><p>AL Turn1</p></th>
+<th class="head"><p>AL Turn2</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>3</p></td>
+<td><p>5</p></td>
+<td><p>1.37</p></td>
+<td><p>1.66</p></td>
+</tr>
+<tr class="row-odd"><td><p>5</p></td>
+<td><p>5</p></td>
+<td><p>1.40</p></td>
+<td><p>1.77</p></td>
+</tr>
+<tr class="row-even"><td><p>5</p></td>
+<td><p>3</p></td>
+<td><p>1.37</p></td>
+<td><p>1.66</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Figure 4 shows the distribution of accepted length (AL) with <code class="docutils literal notranslate"><span class="pre">k=3,</span> <span class="pre">v=5</span></code>. When <code class="docutils literal notranslate"><span class="pre">AL=1</span></code>, it means none of the draft tokens are accepted. AL=6 means all the drafts are accepted.</p>
+<div align="center">
+  <figure>
+    <img src="../media/tech_blog7_magpie_accepted_length_distribution.png" width="90%" height="auto">
+  </figure>
+</div>
+<p align="center"><sub><em>Figure 4. Accepted draft token length distribution</em></sub></p>
+<p>In Figure 5, for each iteration, we plot the average of accepted length (AL) for each request. Transparency is calculated according to the number of requests scheduled on that iteration and normalized by the max capacity among all iterations. If fewer requests are scheduled, the dot is more transparent.</p>
+<div align="center">
+  <figure>
+    <img src="../media/tech_blog7_al_over_iteration_magpie.png" width="auto" height="auto">
+  </figure>
+</div>
+<p align="center"><sub><em>Figure 5. AL over iteration</em></sub></p>
+<p>Figure 6 shows the speed-up with N-Gram speculative decoding for the second turn of conversation only.
+N-Gram with <code class="docutils literal notranslate"><span class="pre">k</span> <span class="pre">=</span> <span class="pre">3,</span> <span class="pre">v</span> <span class="pre">=</span> <span class="pre">5</span></code> delivers 96.13% of speed-up with single batch and 63.99% of speed-up with batch size 4. With batch size 32 and N-Gram <code class="docutils literal notranslate"><span class="pre">k</span> <span class="pre">=</span> <span class="pre">5,</span> <span class="pre">v</span> <span class="pre">=</span> <span class="pre">3</span></code>, the speed up is 33.06%.</p>
+<div align="center">
+  <figure>
+    <img src="../media/tech_blog7_speed_up_second_turn.png" width="80%" height="auto">
+  </figure>
+</div>
+<p align="center"><sub><em>Figure 6. Second Turn Speed-up</em></sub></p>
+<p>We can draw the conclusion that:</p>
+<p><strong>N-Gram speculative decoding improves the runtime of conversational workloads, especially when the conversation has multiple rounds.</strong></p>
+</section>
+</section>
+<hr class="docutils" />
+<section id="case-2-with-translation-dataset">
+<h3>Case 2 with Translation Dataset<a class="headerlink" href="#case-2-with-translation-dataset" title="Link to this heading">#</a></h3>
+<p>From the conversational dataset, we learned that N-Gram takes advantage of structural repetition. In the second case study, we unleash the potential of N-Gram by testing it with a translation dataset that exhibits natural repetition in both context and language. The dataset has a single turn, with prompts in English asking for translations into other languages.</p>
+<p>The table below shows the accepted length (AL) measured with 4000 requests. AL grows with increasing <code class="docutils literal notranslate"><span class="pre">max_draft_len</span> <span class="pre">(v)</span></code> and the trend extends beyond <code class="docutils literal notranslate"><span class="pre">max_draft_len</span> <span class="pre">(v)</span> <span class="pre">=</span> <span class="pre">23</span></code> in our measurements.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p></p></th>
+<th class="head"><p>1</p></th>
+<th class="head"><p>2</p></th>
+<th class="head"><p>3</p></th>
+<th class="head"><p>4</p></th>
+<th class="head"><p>5</p></th>
+<th class="head"><p>6</p></th>
+<th class="head"><p>7</p></th>
+<th class="head"><p>8</p></th>
+<th class="head"><p>9</p></th>
+<th class="head"><p>10</p></th>
+<th class="head"><p>11</p></th>
+<th class="head"><p>12</p></th>
+<th class="head"><p>13</p></th>
+<th class="head"><p>14</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>k</p></td>
+<td><p>3</p></td>
+<td><p>5</p></td>
+<td><p>3</p></td>
+<td><p>5</p></td>
+<td><p>3</p></td>
+<td><p>5</p></td>
+<td><p>3</p></td>
+<td><p>5</p></td>
+<td><p>3</p></td>
+<td><p>5</p></td>
+<td><p>5</p></td>
+<td><p>5</p></td>
+<td><p>5</p></td>
+<td><p>5</p></td>
+</tr>
+<tr class="row-odd"><td><p>v</p></td>
+<td><p>7</p></td>
+<td><p>7</p></td>
+<td><p>9</p></td>
+<td><p>9</p></td>
+<td><p>11</p></td>
+<td><p>11</p></td>
+<td><p>13</p></td>
+<td><p>13</p></td>
+<td><p>15</p></td>
+<td><p>15</p></td>
+<td><p>17</p></td>
+<td><p>19</p></td>
+<td><p>21</p></td>
+<td><p>23</p></td>
+</tr>
+<tr class="row-even"><td><p>AL</p></td>
+<td><p>3.44</p></td>
+<td><p>3.62</p></td>
+<td><p>3.708</p></td>
+<td><p>3.925</p></td>
+<td><p>3.878</p></td>
+<td><p>4.092</p></td>
+<td><p>4.079</p></td>
+<td><p>4.214</p></td>
+<td><p>4.198</p></td>
+<td><p>4.36</p></td>
+<td><p>4.43</p></td>
+<td><p>4.55</p></td>
+<td><p>4.59</p></td>
+<td><p>4.73</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>Figure 7 shows properties of accepted length with N-Gram configured with k = 5, v = 7.</p>
+<p>From the pie chart on the left, among the seven draft tokens proposed by N-Gram, roughly one-third of the cases accept none of the drafts, which correspond to <code class="docutils literal notranslate"><span class="pre">AL=1</span></code>, while another one-third accept all of them, which correspond to <code class="docutils literal notranslate"><span class="pre">AL=8</span></code>. Compared with the similar pie chart in Case 1 Figure 4, the ratio is very high. The graph on the right plots the accepted length at each iteration with five random requests.</p>
+<div align="center">
+  <figure>
+    <img src="../media/tech_blog7_accepted_length_case2.png" width="auto" height="auto">
+  </figure>
+</div>
+<p align="center"><sub><em>Figure 7. Accepted Tokens from Drafts</em></sub></p>
+</section>
+</section>
+<section id="autoenablement-with-heuristic">
+<h2>Auto‑Enablement with Heuristic<a class="headerlink" href="#autoenablement-with-heuristic" title="Link to this heading">#</a></h2>
+<p>A big part of N-Gram’s appeal is the simplicity of deployment. It does not need a carefully selected draft model or additional training of model heads to benefit from speculative decoding. It can be enabled by the serving software to take advantage of the strong performance of the N-Gram speculative decoding algorithm.</p>
+<p>From our experiments, we propose a simple batch-aware policy that keeps iteration overhead under control and yields ~15 % end-to-end speed-up at low to mid concurrency. Give it a try by setting <code class="docutils literal notranslate"><span class="pre">spec_decode_algo=AUTO</span></code>!</p>
+</section>
+</section>
+
+
+                </article>
+              
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+</div>
+                </footer>
+              
+            </div>
+            
+            
+
+
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+<div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> On this page
+  </div>
+  <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#highlights">Highlights</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#table-of-contents">Table of Contents</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#background-motivation">Background &amp; Motivation</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#algorithm-complexity">Algorithm &amp; Complexity</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#performance-study">Performance Study</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#experimental-setup">Experimental Setup</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#case-1-with-conversation-dataset">Case 1 with Conversation Dataset</a><ul class="nav section-nav flex-column">
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#speed-up-for-the-first-turn">Speed-up for the First Turn</a></li>
+<li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#effect-of-multi-turn-conversation">Effect of Multi-turn conversation</a></li>
+</ul>
+</li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#case-2-with-translation-dataset">Case 2 with Translation Dataset</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#autoenablement-with-heuristic">Auto‑Enablement with Heuristic</a></li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+
+          </div>
+          <footer class="bd-footer-content">
+            
+          </footer>
+        
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf"></script>
+<script defer src="../../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf"></script>
+
+  <footer class="bd-footer">
+<div class="bd-footer__inner bd-page-width">
+  
+    <div class="footer-items__start">
+      
+        <div class="footer-item">
+<a class="footer-brand logo" href="https://www.nvidia.com">
+  <img src="../../_static/nvidia-logo-horiz-rgb-1c-blk-for-screen.svg" class="logo__image only-light" alt="NVIDIA"/>
+  <img src="../../_static/nvidia-logo-horiz-rgb-1c-wht-for-screen.svg" class="logo__image only-dark" alt="NVIDIA"/>
+</a></div>
+      
+        <div class="footer-item">
+
+<div class="footer-links">
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/">Privacy Policy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/">Manage My Privacy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/preferences/start/">Do Not Sell or Share My Data</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/">Terms of Service</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/">Accessibility</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/">Corporate Policies</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/product-security/">Product Security</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/contact/">Contact</a>
+  
+  
+  
+</div>
+</div>
+      
+        <div class="footer-item">
+
+
+
+
+  <p class="copyright">
+    
+      Copyright © 2025, NVidia.
+      <br/>
+    
+  </p>
+</div>
+      
+        <div class="footer-item">
+<div class="extra_footer">
+  
+  <p>Last updated on August 06, 2025.</p>
+  
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/a16ba64">a16ba64</a>.</p>
+  
+</div></div>
+      
+    </div>
+  
+  
+  
+</div>
+
+  </footer>
+  </body>
+</html>

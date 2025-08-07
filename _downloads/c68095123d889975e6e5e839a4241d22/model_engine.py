@@ -316,6 +316,10 @@ class PyTorchModelEngine(ModelEngine):
         self._init_model_capacity()
 
         self._torch_compile_backend = None
+        self._torch_compile_enabled = pytorch_backend_config.torch_compile_enabled
+        self._torch_compile_piecewise_cuda_graph = (
+            pytorch_backend_config.torch_compile_piecewise_cuda_graph
+            and not self.enable_attention_dp)
 
         try:
             if pytorch_backend_config.torch_compile_enabled:
@@ -325,8 +329,8 @@ class PyTorchModelEngine(ModelEngine):
                 self._torch_compile_backend = Backend(
                     pytorch_backend_config.torch_compile_inductor_enabled,
                     enable_userbuffers=use_ub,
-                    enable_piecewise_cuda_graph=pytorch_backend_config.
-                    torch_compile_piecewise_cuda_graph,
+                    enable_piecewise_cuda_graph=self.
+                    _torch_compile_piecewise_cuda_graph,
                     cuda_graph_batch_sizes=pytorch_backend_config.
                     cuda_graph_batch_sizes,
                     max_num_streams=pytorch_backend_config.
@@ -350,8 +354,6 @@ class PyTorchModelEngine(ModelEngine):
             import traceback
             traceback.print_exception(Exception, e, e.__traceback__)
             raise e
-        self._torch_compile_enabled = pytorch_backend_config.torch_compile_enabled
-        self._torch_compile_piecewise_cuda_graph = pytorch_backend_config.torch_compile_piecewise_cuda_graph
 
         self.attn_backend = get_attention_backend(attn_backend)
 
@@ -658,7 +660,6 @@ class PyTorchModelEngine(ModelEngine):
                                self._torch_compile_backend)
 
                 self._torch_compile_backend.enable_optimization()
-                set_enable_piecewise_cuda_graph_capture_flag(True)
 
                 # Disable cuda graph capture here so that we can properly capture it later
                 with self.no_cuda_graph():
@@ -746,26 +747,28 @@ class PyTorchModelEngine(ModelEngine):
                                      resource_manager=resource_manager)
                         torch.cuda.synchronize()
 
-                    if self._torch_compile_piecewise_cuda_graph and self._torch_compile_enabled:
-                        with self.no_cuda_graph():
-                            with release_batch(
-                                    get_torch_compile_warmup_request(
-                                        1, bs)) as batch:
-                                logger.info(
-                                    f"Run piecewise CUDA graph warmup for batch size={bs}"
-                                )
-
-                                for _ in range(3):
-                                    self.forward(
-                                        batch,
-                                        new_tensors_device=None,
-                                        resource_manager=resource_manager)
+            if self._torch_compile_piecewise_cuda_graph and self._torch_compile_enabled:
+                for seq_lens in cuda_graph_batch_sizes:
+                    set_enable_piecewise_cuda_graph_capture_flag(True)
+                    with self.no_cuda_graph():
+                        with release_batch(
+                                get_torch_compile_warmup_request(
+                                    1, seq_lens)) as batch:
+                            logger.info(
+                                f"Run piecewise CUDA graph warmup for seq_lens={seq_lens}"
+                            )
+                            # self.model.mtp_worker.stored_input_ids = []
+                            for _ in range(3):
                                 self.forward(batch,
                                              new_tensors_device=None,
                                              resource_manager=resource_manager)
-                                torch.cuda.synchronize()
-                                gc.collect()
-                                torch.cuda.empty_cache()
+                            self.forward(batch,
+                                         new_tensors_device=None,
+                                         resource_manager=resource_manager)
+                            torch.cuda.synchronize()
+                            gc.collect()
+                            torch.cuda.empty_cache()
+                    set_enable_piecewise_cuda_graph_capture_flag(False)
 
         # Set the value back to the original value
         self.enable_spec_decode = self.is_spec_decode
@@ -993,8 +996,7 @@ class PyTorchModelEngine(ModelEngine):
                     moe_max_num_tokens: Optional[int] = None,
                     moe_load_balancer: Optional[MoeLoadBalancerConfig] = None,
                     lora_config: Optional[LoraConfig] = None,
-                    **kwargs):
-
+                    **kwargs) -> DecoderModelForCausalLM:
         config = checkpoint_loader.load_config(
             checkpoint_dir,
             trust_remote_code=True,

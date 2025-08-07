@@ -5,6 +5,6 @@ Refer to the `trtllm-serve documentation <https://nvidia.github.io/TensorRT-LLM/
 Source https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/serve/openai_completion_client_json_schema.py.
 
 .. literalinclude:: ../../../examples/serve/openai_completion_client_json_schema.py
-    :lines: 2-42
+    :lines: 2-52
     :language: python
     :linenos:

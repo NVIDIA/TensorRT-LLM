@@ -59,7 +59,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc5';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc6';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -71,7 +71,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.0.0rc5" />
+  <meta name="docsearch:version" content="1.0.0rc6" />
 
 
   </head>
@@ -391,7 +391,11 @@
 <li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-bench.html">trtllm-bench</a></li>
 
 <li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-build.html">trtllm-build</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../commands/trtllm-serve.html">trtllm-serve</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../commands/trtllm-serve/index.html">trtllm-serve</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../commands/trtllm-serve/trtllm-serve.html">trtllm-serve</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../commands/trtllm-serve/run-benchmark-with-trtllm-serve.html">Run benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></a></li>
+</ul>
+</details></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Architecture</span></p>
 <ul class="nav bd-sidenav">
@@ -509,16 +513,29 @@ It should <em>not</em> be considered as the peak performance that can be deliver
 <p>We attempted to keep commands as simple as possible to ease reproducibility and left many options at their default settings.
 Tuning batch sizes, parallelism configurations, and other options may lead to improved performance depending on your situaiton.</p>
 <p>For DeepSeek R1 performance, please check out our <a class="reference internal" href="../blogs/Best_perf_practice_on_DeepSeek-R1_in_TensorRT-LLM.html"><span class="std std-doc">performance guide</span></a></p>
+<p>For more information on benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code> see this NVIDIA <a class="reference external" href="https://developer.nvidia.com/blog/llm-inference-benchmarking-performance-tuning-with-tensorrt-llm/">blog post</a>.</p>
 <section id="throughput-measurements">
 <h2>Throughput Measurements<a class="headerlink" href="#throughput-measurements" title="Link to this heading">#</a></h2>
 <p>The below table shows performance data where a local inference client is fed requests at an infinite rate (no delay between messages),
 and shows the throughput scenario under maximum load. The reported metric is <code class="docutils literal notranslate"><span class="pre">Total</span> <span class="pre">Output</span> <span class="pre">Throughput</span> <span class="pre">(tokens/sec)</span></code>.</p>
 <p>The performance numbers below were collected using the steps described in this document.</p>
 <p>Testing was performed on models with weights quantized using <a class="reference external" href="https://nvidia.github.io/TensorRT-Model-Optimizer/#">ModelOpt</a> and published by NVIDIA on the <a class="reference external" href="https://huggingface.co/collections/nvidia/model-optimizer-66aa84f7966b3150262481a4">Model Optimizer HuggingFace Collection</a>.</p>
+<section id="hardware">
+<h3>Hardware<a class="headerlink" href="#hardware" title="Link to this heading">#</a></h3>
+<p>The following GPU variants were used for testing:</p>
+<ul class="simple">
+<li><p>H100 SXM 80GB (DGX H100)</p></li>
+<li><p>H200 SXM 141GB (DGX H200)</p></li>
+<li><p>GH200 96GB HBM3 (480GB LPDDR5X)</p></li>
+<li><p>B200 180GB (DGX B200)</p></li>
+<li><p>GB200 192GB (GB200 NVL72)</p></li>
+</ul>
+<p>Other hardware variants may have different TDP, memory bandwidth, core count, or other features leading to performance differences on these workloads.</p>
+</section>
 <section id="fp4-models">
-<h3>FP4 Models:<a class="headerlink" href="#fp4-models" title="Link to this heading">#</a></h3>
-<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">nvidia</span><span class="o">/</span><span class="n">Llama</span><span class="o">-</span><span class="mf">3.3</span><span class="o">-</span><span class="mi">70</span><span class="n">B</span><span class="o">-</span><span class="n">Instruct</span><span class="o">-</span><span class="n">FP4</span>
-<span class="n">nvidia</span><span class="o">/</span><span class="n">Llama</span><span class="o">-</span><span class="mf">3.1</span><span class="o">-</span><span class="mi">405</span><span class="n">B</span><span class="o">-</span><span class="n">Instruct</span><span class="o">-</span><span class="n">FP4</span>
+<h3>FP4 Models<a class="headerlink" href="#fp4-models" title="Link to this heading">#</a></h3>
+<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>nvidia/Llama-3.3-70B-Instruct-FP4
+nvidia/Llama-3.1-405B-Instruct-FP4
 </pre></div>
 </div>
 <section id="llama-3-3-70b-fp4">
@@ -526,24 +543,18 @@ and shows the throughput scenario under maximum load. The reported metric is <co
 <div class="pst-scrollable-table-container"><table class="table">
 <thead>
 <tr class="row-odd"><th class="head text-left"><p></p></th>
-<th class="head text-left"><p>GPU</p></th>
+<th class="head text-left"><p>GPU:</p></th>
 <th class="head text-left"><p>B200</p></th>
-<th class="head text-left"><p></p></th>
-<th class="head text-left"><p></p></th>
-<th class="head text-left"><p></p></th>
+<th class="head text-left"><p>GB200</p></th>
 </tr>
 </thead>
 <tbody>
 <tr class="row-even"><td class="text-left"><p></p></td>
 <td class="text-left"><p>TP Size</p></td>
 <td class="text-left"><p>1</p></td>
-<td class="text-left"><p>2</p></td>
-<td class="text-left"><p>4</p></td>
-<td class="text-left"><p>8</p></td>
+<td class="text-left"><p>1</p></td>
 </tr>
 <tr class="row-odd"><td class="text-left"><p>ISL, OSL</p></td>
-<td class="text-left"><p></p></td>
-<td class="text-left"><p></p></td>
 <td class="text-left"><p></p></td>
 <td class="text-left"><p></p></td>
 <td class="text-left"><p></p></td>
@@ -552,78 +563,61 @@ and shows the throughput scenario under maximum load. The reported metric is <co
 <td class="text-left"><p></p></td>
 <td class="text-left"><p></p></td>
 <td class="text-left"><p></p></td>
-<td class="text-left"><p></p></td>
-<td class="text-left"><p></p></td>
 </tr>
 <tr class="row-odd"><td class="text-left"><p>128, 128</p></td>
 <td class="text-left"><p></p></td>
-<td class="text-left"><p>10,994.48</p></td>
-<td class="text-left"><p>17,542.11</p></td>
-<td class="text-left"><p>24,667.31</p></td>
-<td class="text-left"><p>27,272.27</p></td>
+<td class="text-left"><p>10,613.84</p></td>
+<td class="text-left"><p>11,100.97</p></td>
 </tr>
 <tr class="row-even"><td class="text-left"><p>128, 2048</p></td>
 <td class="text-left"><p></p></td>
-<td class="text-left"><p>9,580.46</p></td>
-<td class="text-left"><p>15,432.35</p></td>
-<td class="text-left"><p>23,568.12</p></td>
-<td class="text-left"><p>31,174.31</p></td>
+<td class="text-left"><p>9,445.51</p></td>
+<td class="text-left"><p>10,276.05</p></td>
 </tr>
 <tr class="row-odd"><td class="text-left"><p>128, 4096</p></td>
 <td class="text-left"><p></p></td>
-<td class="text-left"><p>6,418.39</p></td>
-<td class="text-left"><p>9,841.53</p></td>
-<td class="text-left"><p>17,808.76</p></td>
-<td class="text-left"><p>25,229.25</p></td>
+<td class="text-left"><p>6,276.85</p></td>
+<td class="text-left"><p>7,351.12</p></td>
 </tr>
 <tr class="row-even"><td class="text-left"><p>500, 2000</p></td>
 <td class="text-left"><p></p></td>
-<td class="text-left"><p>7,343.32</p></td>
-<td class="text-left"><p>11,850.57</p></td>
-<td class="text-left"><p>20,709.67</p></td>
-<td class="text-left"><p>28,038.78</p></td>
+<td class="text-left"><p>6,983.27</p></td>
+<td class="text-left"><p>8,194.30</p></td>
 </tr>
 <tr class="row-odd"><td class="text-left"><p>1000, 1000</p></td>
 <td class="text-left"><p></p></td>
-<td class="text-left"><p>6,752.53</p></td>
-<td class="text-left"><p>10,815.88</p></td>
-<td class="text-left"><p>16,413.04</p></td>
-<td class="text-left"><p>20,060.66</p></td>
+<td class="text-left"><p>6,434.29</p></td>
+<td class="text-left"><p>7,401.80</p></td>
 </tr>
 <tr class="row-even"><td class="text-left"><p>1000, 2000</p></td>
 <td class="text-left"><p></p></td>
-<td class="text-left"><p>6,670.07</p></td>
-<td class="text-left"><p>9,830.73</p></td>
-<td class="text-left"><p>15,597.49</p></td>
-<td class="text-left"><p>20,672.37</p></td>
+<td class="text-left"><p>6,725.03</p></td>
+<td class="text-left"><p>6,478.72</p></td>
 </tr>
 <tr class="row-odd"><td class="text-left"><p>1024, 2048</p></td>
 <td class="text-left"><p></p></td>
-<td class="text-left"><p>6,636.75</p></td>
-<td class="text-left"><p>9,807.13</p></td>
-<td class="text-left"><p>15,519.23</p></td>
-<td class="text-left"><p>20,617.28</p></td>
+<td class="text-left"><p>6,546.61</p></td>
+<td class="text-left"><p>7,922.88</p></td>
 </tr>
 <tr class="row-even"><td class="text-left"><p>2048, 128</p></td>
 <td class="text-left"><p></p></td>
-<td class="text-left"><p>1,342.17</p></td>
-<td class="text-left"><p>1,989.41</p></td>
-<td class="text-left"><p>3,033.14</p></td>
-<td class="text-left"><p>4,035.64</p></td>
+<td class="text-left"><p>1,330.35</p></td>
+<td class="text-left"><p>1,418.47</p></td>
 </tr>
-<tr class="row-odd"><td class="text-left"><p>5000, 500</p></td>
+<tr class="row-odd"><td class="text-left"><p>2048, 2048</p></td>
 <td class="text-left"><p></p></td>
-<td class="text-left"><p>1,429.67</p></td>
-<td class="text-left"><p>2,419.67</p></td>
-<td class="text-left"><p>3,686.84</p></td>
-<td class="text-left"><p>5,182.96</p></td>
+<td class="text-left"><p>4,528.48</p></td>
+<td class="text-left"><p>5,326.77</p></td>
 </tr>
-<tr class="row-even"><td class="text-left"><p>20000, 2000</p></td>
+<tr class="row-even"><td class="text-left"><p>5000, 500</p></td>
 <td class="text-left"><p></p></td>
-<td class="text-left"><p>629.77</p></td>
-<td class="text-left"><p>1,177.01</p></td>
-<td class="text-left"><p>2,120.66</p></td>
-<td class="text-left"><p>3,429.03</p></td>
+<td class="text-left"><p>1,427.44</p></td>
+<td class="text-left"><p>1,502.44</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>20000, 2000</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>636.36</p></td>
+<td class="text-left"><p>732.43</p></td>
 </tr>
 </tbody>
 </table>
@@ -634,16 +628,16 @@ and shows the throughput scenario under maximum load. The reported metric is <co
 <div class="pst-scrollable-table-container"><table class="table">
 <thead>
 <tr class="row-odd"><th class="head text-left"><p></p></th>
-<th class="head text-left"><p>GPU</p></th>
+<th class="head text-left"><p>GPU:</p></th>
 <th class="head text-left"><p>B200</p></th>
-<th class="head text-left"><p></p></th>
+<th class="head text-left"><p>GB200</p></th>
 </tr>
 </thead>
 <tbody>
 <tr class="row-even"><td class="text-left"><p></p></td>
 <td class="text-left"><p>TP Size</p></td>
 <td class="text-left"><p>4</p></td>
-<td class="text-left"><p>8</p></td>
+<td class="text-left"><p>4</p></td>
 </tr>
 <tr class="row-odd"><td class="text-left"><p>ISL, OSL</p></td>
 <td class="text-left"><p></p></td>
@@ -657,53 +651,58 @@ and shows the throughput scenario under maximum load. The reported metric is <co
 </tr>
 <tr class="row-odd"><td class="text-left"><p>128, 128</p></td>
 <td class="text-left"><p></p></td>
-<td class="text-left"><p>6,163.81</p></td>
-<td class="text-left"><p>9,002.90</p></td>
+<td class="text-left"><p>6,218.89</p></td>
+<td class="text-left"><p>6,598.97</p></td>
 </tr>
 <tr class="row-even"><td class="text-left"><p>128, 2048</p></td>
 <td class="text-left"><p></p></td>
-<td class="text-left"><p>7,081.21</p></td>
-<td class="text-left"><p>10,288.28</p></td>
+<td class="text-left"><p>7,178.10</p></td>
+<td class="text-left"><p>7,497.40</p></td>
 </tr>
 <tr class="row-odd"><td class="text-left"><p>128, 4096</p></td>
 <td class="text-left"><p></p></td>
-<td class="text-left"><p>6,028.37</p></td>
-<td class="text-left"><p>8,713.77</p></td>
+<td class="text-left"><p>5,890.89</p></td>
+<td class="text-left"><p>5,898.19</p></td>
 </tr>
 <tr class="row-even"><td class="text-left"><p>500, 2000</p></td>
 <td class="text-left"><p></p></td>
-<td class="text-left"><p>5,858.75</p></td>
-<td class="text-left"><p>9,125.86</p></td>
+<td class="text-left"><p>5,844.37</p></td>
+<td class="text-left"><p>6,198.33</p></td>
 </tr>
 <tr class="row-odd"><td class="text-left"><p>1000, 1000</p></td>
 <td class="text-left"><p></p></td>
-<td class="text-left"><p>4,848.00</p></td>
-<td class="text-left"><p>7,582.97</p></td>
+<td class="text-left"><p>4,958.53</p></td>
+<td class="text-left"><p>5,243.35</p></td>
 </tr>
 <tr class="row-even"><td class="text-left"><p>1000, 2000</p></td>
 <td class="text-left"><p></p></td>
-<td class="text-left"><p>5,375.25</p></td>
-<td class="text-left"><p>7,626.28</p></td>
+<td class="text-left"><p>4,874.16</p></td>
+<td class="text-left"><p>4,905.51</p></td>
 </tr>
 <tr class="row-odd"><td class="text-left"><p>1024, 2048</p></td>
 <td class="text-left"><p></p></td>
-<td class="text-left"><p>5,345.70</p></td>
-<td class="text-left"><p>7,464.03</p></td>
+<td class="text-left"><p>4,833.19</p></td>
+<td class="text-left"><p>4,686.38</p></td>
 </tr>
 <tr class="row-even"><td class="text-left"><p>2048, 128</p></td>
 <td class="text-left"><p></p></td>
-<td class="text-left"><p>693.55</p></td>
-<td class="text-left"><p>1,086.56</p></td>
+<td class="text-left"><p>737.95</p></td>
+<td class="text-left"><p>761.58</p></td>
 </tr>
-<tr class="row-odd"><td class="text-left"><p>5000, 500</p></td>
+<tr class="row-odd"><td class="text-left"><p>2048, 2048</p></td>
 <td class="text-left"><p></p></td>
-<td class="text-left"><p>947.49</p></td>
-<td class="text-left"><p>1,532.45</p></td>
+<td class="text-left"><p>4,024.02</p></td>
+<td class="text-left"><p>4,326.56</p></td>
 </tr>
-<tr class="row-even"><td class="text-left"><p>20000, 2000</p></td>
+<tr class="row-even"><td class="text-left"><p>5000, 500</p></td>
 <td class="text-left"><p></p></td>
-<td class="text-left"><p>641.11</p></td>
-<td class="text-left"><p>1,097.84</p></td>
+<td class="text-left"><p>1,032.40</p></td>
+<td class="text-left"><p>1,078.87</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>20000, 2000</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>667.39</p></td>
+<td class="text-left"><p>649.95</p></td>
 </tr>
 </tbody>
 </table>
@@ -711,11 +710,11 @@ and shows the throughput scenario under maximum load. The reported metric is <co
 </section>
 </section>
 <section id="fp8-models">
-<h3>FP8 Models:<a class="headerlink" href="#fp8-models" title="Link to this heading">#</a></h3>
-<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">nvidia</span><span class="o">/</span><span class="n">Llama</span><span class="o">-</span><span class="mf">3.1</span><span class="o">-</span><span class="mi">8</span><span class="n">B</span><span class="o">-</span><span class="n">Instruct</span><span class="o">-</span><span class="n">FP8</span>
-<span class="n">nvidia</span><span class="o">/</span><span class="n">Llama</span><span class="o">-</span><span class="mf">3.3</span><span class="o">-</span><span class="mi">70</span><span class="n">B</span><span class="o">-</span><span class="n">Instruct</span><span class="o">-</span><span class="n">FP8</span>
-<span class="n">nvidia</span><span class="o">/</span><span class="n">Llama</span><span class="o">-</span><span class="mf">3.1</span><span class="o">-</span><span class="mi">405</span><span class="n">B</span><span class="o">-</span><span class="n">Instruct</span><span class="o">-</span><span class="n">FP8</span>
-<span class="n">nvidia</span><span class="o">/</span><span class="n">Llama</span><span class="o">-</span><span class="mi">4</span><span class="o">-</span><span class="n">Maverick</span><span class="o">-</span><span class="mi">17</span><span class="n">B</span><span class="o">-</span><span class="mi">128</span><span class="n">E</span><span class="o">-</span><span class="n">Instruct</span><span class="o">-</span><span class="n">FP8</span>
+<h3>FP8 Models<a class="headerlink" href="#fp8-models" title="Link to this heading">#</a></h3>
+<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>nvidia/Llama-3.1-8B-Instruct-FP8
+nvidia/Llama-3.3-70B-Instruct-FP8
+nvidia/Llama-3.1-405B-Instruct-FP8
+nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8
 </pre></div>
 </div>
 <section id="llama-3-1-8b-fp8">
@@ -723,9 +722,10 @@ and shows the throughput scenario under maximum load. The reported metric is <co
 <div class="pst-scrollable-table-container"><table class="table">
 <thead>
 <tr class="row-odd"><th class="head text-left"><p></p></th>
-<th class="head text-left"><p>GPU</p></th>
-<th class="head text-left"><p>H200 141GB HBM3</p></th>
-<th class="head text-left"><p>H100 80GB HBM3</p></th>
+<th class="head text-left"><p>GPU:</p></th>
+<th class="head text-left"><p>GH200</p></th>
+<th class="head text-left"><p>H100</p></th>
+<th class="head text-left"><p>H200</p></th>
 </tr>
 </thead>
 <tbody>
@@ -733,8 +733,10 @@ and shows the throughput scenario under maximum load. The reported metric is <co
 <td class="text-left"><p>TP Size</p></td>
 <td class="text-left"><p>1</p></td>
 <td class="text-left"><p>1</p></td>
+<td class="text-left"><p>1</p></td>
 </tr>
 <tr class="row-odd"><td class="text-left"><p>ISL, OSL</p></td>
+<td class="text-left"><p></p></td>
 <td class="text-left"><p></p></td>
 <td class="text-left"><p></p></td>
 <td class="text-left"><p></p></td>
@@ -743,56 +745,73 @@ and shows the throughput scenario under maximum load. The reported metric is <co
 <td class="text-left"><p></p></td>
 <td class="text-left"><p></p></td>
 <td class="text-left"><p></p></td>
+<td class="text-left"><p></p></td>
 </tr>
 <tr class="row-odd"><td class="text-left"><p>128, 128</p></td>
 <td class="text-left"><p></p></td>
-<td class="text-left"><p>27,970.14</p></td>
-<td class="text-left"><p>27,688.36</p></td>
+<td class="text-left"><p>27,304.25</p></td>
+<td class="text-left"><p>26,401.48</p></td>
+<td class="text-left"><p>27,027.80</p></td>
 </tr>
 <tr class="row-even"><td class="text-left"><p>128, 2048</p></td>
 <td class="text-left"><p></p></td>
-<td class="text-left"><p>23,326.38</p></td>
-<td class="text-left"><p>21,841.15</p></td>
+<td class="text-left"><p>24,045.60</p></td>
+<td class="text-left"><p>21,413.21</p></td>
+<td class="text-left"><p>23,102.25</p></td>
 </tr>
 <tr class="row-odd"><td class="text-left"><p>128, 4096</p></td>
 <td class="text-left"><p></p></td>
-<td class="text-left"><p>17,508.51</p></td>
-<td class="text-left"><p>13,730.89</p></td>
+<td class="text-left"><p>15,409.85</p></td>
+<td class="text-left"><p>13,541.54</p></td>
+<td class="text-left"><p>17,396.83</p></td>
 </tr>
 <tr class="row-even"><td class="text-left"><p>500, 2000</p></td>
 <td class="text-left"><p></p></td>
-<td class="text-left"><p>21,390.41</p></td>
-<td class="text-left"><p>17,833.34</p></td>
+<td class="text-left"><p>20,123.88</p></td>
+<td class="text-left"><p>17,571.01</p></td>
+<td class="text-left"><p>19,759.16</p></td>
 </tr>
 <tr class="row-odd"><td class="text-left"><p>1000, 1000</p></td>
 <td class="text-left"><p></p></td>
-<td class="text-left"><p>17,366.89</p></td>
-<td class="text-left"><p>15,270.62</p></td>
+<td class="text-left"><p>16,352.99</p></td>
+<td class="text-left"><p>14,991.62</p></td>
+<td class="text-left"><p>17,162.49</p></td>
 </tr>
 <tr class="row-even"><td class="text-left"><p>1000, 2000</p></td>
 <td class="text-left"><p></p></td>
-<td class="text-left"><p>16,831.31</p></td>
-<td class="text-left"><p>13,798.08</p></td>
+<td class="text-left"><p>15,705.82</p></td>
+<td class="text-left"><p>13,505.23</p></td>
+<td class="text-left"><p>16,227.11</p></td>
 </tr>
 <tr class="row-odd"><td class="text-left"><p>1024, 2048</p></td>
 <td class="text-left"><p></p></td>
-<td class="text-left"><p>16,737.03</p></td>
-<td class="text-left"><p>13,385.50</p></td>
+<td class="text-left"><p>16,102.52</p></td>
+<td class="text-left"><p>13,165.91</p></td>
+<td class="text-left"><p>16,057.66</p></td>
 </tr>
 <tr class="row-even"><td class="text-left"><p>2048, 128</p></td>
 <td class="text-left"><p></p></td>
-<td class="text-left"><p>3,488.03</p></td>
-<td class="text-left"><p>3,414.67</p></td>
+<td class="text-left"><p>3,573.85</p></td>
+<td class="text-left"><p>3,275.55</p></td>
+<td class="text-left"><p>3,390.69</p></td>
 </tr>
-<tr class="row-odd"><td class="text-left"><p>5000, 500</p></td>
+<tr class="row-odd"><td class="text-left"><p>2048, 2048</p></td>
 <td class="text-left"><p></p></td>
-<td class="text-left"><p>3,813.69</p></td>
-<td class="text-left"><p>3,394.54</p></td>
+<td class="text-left"><p>10,767.05</p></td>
+<td class="text-left"><p>9,462.43</p></td>
+<td class="text-left"><p>11,822.14</p></td>
 </tr>
-<tr class="row-even"><td class="text-left"><p>20000, 2000</p></td>
+<tr class="row-even"><td class="text-left"><p>5000, 500</p></td>
 <td class="text-left"><p></p></td>
-<td class="text-left"><p>1,696.66</p></td>
-<td class="text-left"><p>1,345.42</p></td>
+<td class="text-left"><p>3,584.74</p></td>
+<td class="text-left"><p>3,276.47</p></td>
+<td class="text-left"><p>3,758.08</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>20000, 2000</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>1,393.31</p></td>
+<td class="text-left"><p>1,340.69</p></td>
+<td class="text-left"><p>1,705.68</p></td>
 </tr>
 </tbody>
 </table>
@@ -803,171 +822,81 @@ and shows the throughput scenario under maximum load. The reported metric is <co
 <div class="pst-scrollable-table-container"><table class="table">
 <thead>
 <tr class="row-odd"><th class="head text-left"><p></p></th>
-<th class="head text-left"><p>GPU</p></th>
-<th class="head text-left"><p>H200 141GB HBM3</p></th>
-<th class="head text-left"><p></p></th>
-<th class="head text-left"><p></p></th>
-<th class="head text-left"><p></p></th>
-<th class="head text-left"><p>H100 80GB HBM3</p></th>
-<th class="head text-left"><p></p></th>
-<th class="head text-left"><p></p></th>
-<th class="head text-left"><p></p></th>
+<th class="head text-left"><p>GPU:</p></th>
+<th class="head text-left"><p>H100</p></th>
+<th class="head text-left"><p>H200</p></th>
 </tr>
 </thead>
 <tbody>
 <tr class="row-even"><td class="text-left"><p></p></td>
 <td class="text-left"><p>TP Size</p></td>
-<td class="text-left"><p>1</p></td>
 <td class="text-left"><p>2</p></td>
-<td class="text-left"><p>4</p></td>
-<td class="text-left"><p>8</p></td>
-<td class="text-left"><p>1</p></td>
 <td class="text-left"><p>2</p></td>
-<td class="text-left"><p>4</p></td>
-<td class="text-left"><p>8</p></td>
 </tr>
 <tr class="row-odd"><td class="text-left"><p>ISL, OSL</p></td>
 <td class="text-left"><p></p></td>
 <td class="text-left"><p></p></td>
 <td class="text-left"><p></p></td>
-<td class="text-left"><p></p></td>
-<td class="text-left"><p></p></td>
-<td class="text-left"><p></p></td>
-<td class="text-left"><p></p></td>
-<td class="text-left"><p></p></td>
-<td class="text-left"><p></p></td>
 </tr>
 <tr class="row-even"><td class="text-left"><p></p></td>
-<td class="text-left"><p></p></td>
-<td class="text-left"><p></p></td>
-<td class="text-left"><p></p></td>
-<td class="text-left"><p></p></td>
-<td class="text-left"><p></p></td>
-<td class="text-left"><p></p></td>
 <td class="text-left"><p></p></td>
 <td class="text-left"><p></p></td>
 <td class="text-left"><p></p></td>
 </tr>
 <tr class="row-odd"><td class="text-left"><p>128, 128</p></td>
 <td class="text-left"><p></p></td>
-<td class="text-left"><p>3,605.47</p></td>
-<td class="text-left"><p>6,427.69</p></td>
-<td class="text-left"><p>10,407.42</p></td>
-<td class="text-left"><p>15,434.37</p></td>
-<td class="text-left"><p>3,128.33</p></td>
-<td class="text-left"><p>6,216.91</p></td>
-<td class="text-left"><p></p></td>
-<td class="text-left"><p></p></td>
+<td class="text-left"><p>6,092.28</p></td>
+<td class="text-left"><p>6,327.98</p></td>
 </tr>
 <tr class="row-even"><td class="text-left"><p>128, 2048</p></td>
 <td class="text-left"><p></p></td>
-<td class="text-left"><p>4,315.80</p></td>
-<td class="text-left"><p>8,464.03</p></td>
-<td class="text-left"><p>13,508.59</p></td>
-<td class="text-left"><p>20,759.72</p></td>
-<td class="text-left"><p>756.42</p></td>
-<td class="text-left"><p>5,782.57</p></td>
-<td class="text-left"><p>11,464.94</p></td>
-<td class="text-left"><p>17,424.32</p></td>
+<td class="text-left"><p>5,892.94</p></td>
+<td class="text-left"><p>7,467.36</p></td>
 </tr>
 <tr class="row-odd"><td class="text-left"><p>128, 4096</p></td>
 <td class="text-left"><p></p></td>
-<td class="text-left"><p>2,701.17</p></td>
-<td class="text-left"><p>5,573.55</p></td>
-<td class="text-left"><p>11,458.56</p></td>
-<td class="text-left"><p>16,668.75</p></td>
-<td class="text-left"><p></p></td>
-<td class="text-left"><p>3,868.37</p></td>
-<td class="text-left"><p>8,206.39</p></td>
-<td class="text-left"><p>12,624.61</p></td>
+<td class="text-left"><p>3,828.46</p></td>
+<td class="text-left"><p>5,526.42</p></td>
 </tr>
 <tr class="row-even"><td class="text-left"><p>500, 2000</p></td>
 <td class="text-left"><p></p></td>
-<td class="text-left"><p>3,478.76</p></td>
-<td class="text-left"><p>6,740.06</p></td>
-<td class="text-left"><p>12,200.18</p></td>
-<td class="text-left"><p></p></td>
-<td class="text-left"><p></p></td>
-<td class="text-left"><p>4,684.06</p></td>
-<td class="text-left"><p>9,903.53</p></td>
-<td class="text-left"><p>14,553.93</p></td>
+<td class="text-left"><p>4,654.74</p></td>
+<td class="text-left"><p>6,639.15</p></td>
 </tr>
 <tr class="row-odd"><td class="text-left"><p>1000, 1000</p></td>
 <td class="text-left"><p></p></td>
-<td class="text-left"><p>2,744.32</p></td>
-<td class="text-left"><p>5,119.72</p></td>
-<td class="text-left"><p>8,685.44</p></td>
-<td class="text-left"><p>12,744.51</p></td>
-<td class="text-left"><p>742.14</p></td>
-<td class="text-left"><p>4,247.19</p></td>
-<td class="text-left"><p>7,435.65</p></td>
-<td class="text-left"><p>11,018.81</p></td>
+<td class="text-left"><p>4,181.06</p></td>
+<td class="text-left"><p>4,773.33</p></td>
 </tr>
 <tr class="row-even"><td class="text-left"><p>1000, 2000</p></td>
 <td class="text-left"><p></p></td>
-<td class="text-left"><p>2,896.44</p></td>
-<td class="text-left"><p>5,847.26</p></td>
-<td class="text-left"><p>9,031.21</p></td>
-<td class="text-left"><p>13,141.17</p></td>
-<td class="text-left"><p>533.74</p></td>
-<td class="text-left"><p>3,866.53</p></td>
-<td class="text-left"><p>7,611.12</p></td>
-<td class="text-left"><p>11,139.22</p></td>
+<td class="text-left"><p>3,708.93</p></td>
+<td class="text-left"><p>5,790.36</p></td>
 </tr>
 <tr class="row-odd"><td class="text-left"><p>1024, 2048</p></td>
 <td class="text-left"><p></p></td>
-<td class="text-left"><p>2,874.18</p></td>
-<td class="text-left"><p>5,568.61</p></td>
-<td class="text-left"><p>8,946.71</p></td>
-<td class="text-left"><p>13,082.62</p></td>
-<td class="text-left"><p>530.16</p></td>
-<td class="text-left"><p>3,796.68</p></td>
-<td class="text-left"><p>7,575.24</p></td>
-<td class="text-left"><p>11,004.31</p></td>
+<td class="text-left"><p>3,785.04</p></td>
+<td class="text-left"><p>5,480.44</p></td>
 </tr>
 <tr class="row-even"><td class="text-left"><p>2048, 128</p></td>
 <td class="text-left"><p></p></td>
-<td class="text-left"><p>435.90</p></td>
-<td class="text-left"><p>772.67</p></td>
-<td class="text-left"><p>1,264.76</p></td>
-<td class="text-left"><p></p></td>
-<td class="text-left"><p></p></td>
-<td class="text-left"><p>736.89</p></td>
-<td class="text-left"><p>1,213.33</p></td>
-<td class="text-left"><p>1,839.22</p></td>
+<td class="text-left"><p>723.40</p></td>
+<td class="text-left"><p>747.55</p></td>
 </tr>
 <tr class="row-odd"><td class="text-left"><p>2048, 2048</p></td>
 <td class="text-left"><p></p></td>
-<td class="text-left"><p></p></td>
-<td class="text-left"><p></p></td>
-<td class="text-left"><p></p></td>
-<td class="text-left"><p>10,412.85</p></td>
-<td class="text-left"><p></p></td>
-<td class="text-left"><p></p></td>
-<td class="text-left"><p></p></td>
-<td class="text-left"><p></p></td>
+<td class="text-left"><p>2,785.53</p></td>
+<td class="text-left"><p>3,775.80</p></td>
 </tr>
 <tr class="row-even"><td class="text-left"><p>5000, 500</p></td>
 <td class="text-left"><p></p></td>
-<td class="text-left"><p>545.96</p></td>
-<td class="text-left"><p>997.15</p></td>
-<td class="text-left"><p>1,698.22</p></td>
-<td class="text-left"><p>2,655.28</p></td>
-<td class="text-left"><p>204.94</p></td>
-<td class="text-left"><p>862.91</p></td>
-<td class="text-left"><p>1,552.68</p></td>
-<td class="text-left"><p>2,369.84</p></td>
+<td class="text-left"><p>865.55</p></td>
+<td class="text-left"><p>978.28</p></td>
 </tr>
 <tr class="row-odd"><td class="text-left"><p>20000, 2000</p></td>
 <td class="text-left"><p></p></td>
-<td class="text-left"><p>276.66</p></td>
-<td class="text-left"><p>620.33</p></td>
-<td class="text-left"><p>1,161.29</p></td>
-<td class="text-left"><p>1,985.85</p></td>
-<td class="text-left"><p></p></td>
-<td class="text-left"><p>416.13</p></td>
-<td class="text-left"><p>903.66</p></td>
-<td class="text-left"><p>1,554.10</p></td>
+<td class="text-left"><p>411.85</p></td>
+<td class="text-left"><p>609.42</p></td>
 </tr>
 </tbody>
 </table>
@@ -978,9 +907,9 @@ and shows the throughput scenario under maximum load. The reported metric is <co
 <div class="pst-scrollable-table-container"><table class="table">
 <thead>
 <tr class="row-odd"><th class="head text-left"><p></p></th>
-<th class="head text-left"><p>GPU</p></th>
-<th class="head text-left"><p>H200 141GB HBM3</p></th>
-<th class="head text-left"><p>H100 80GB HBM3</p></th>
+<th class="head text-left"><p>GPU:</p></th>
+<th class="head text-left"><p>H100</p></th>
+<th class="head text-left"><p>H200</p></th>
 </tr>
 </thead>
 <tbody>
@@ -989,7 +918,7 @@ and shows the throughput scenario under maximum load. The reported metric is <co
 <td class="text-left"><p>8</p></td>
 <td class="text-left"><p>8</p></td>
 </tr>
-<tr class="row-odd"><td class="text-left"><p>ISL, OSL</p></td>
+<tr class="row-odd"><td class="text-left"><p>Runtime Input/Output Lengths</p></td>
 <td class="text-left"><p></p></td>
 <td class="text-left"><p></p></td>
 <td class="text-left"><p></p></td>
@@ -999,50 +928,60 @@ and shows the throughput scenario under maximum load. The reported metric is <co
 <td class="text-left"><p></p></td>
 <td class="text-left"><p></p></td>
 </tr>
-<tr class="row-odd"><td class="text-left"><p>128, 2048</p></td>
+<tr class="row-odd"><td class="text-left"><p>128, 128</p></td>
 <td class="text-left"><p></p></td>
-<td class="text-left"><p>5,567.87</p></td>
 <td class="text-left"><p></p></td>
+<td class="text-left"><p>3,705.18</p></td>
 </tr>
-<tr class="row-even"><td class="text-left"><p>128, 4096</p></td>
+<tr class="row-even"><td class="text-left"><p>128, 2048</p></td>
 <td class="text-left"><p></p></td>
-<td class="text-left"><p>5,136.85</p></td>
-<td class="text-left"><p></p></td>
+<td class="text-left"><p>4,517.39</p></td>
+<td class="text-left"><p>4,715.13</p></td>
 </tr>
-<tr class="row-odd"><td class="text-left"><p>500, 2000</p></td>
+<tr class="row-odd"><td class="text-left"><p>128, 4096</p></td>
 <td class="text-left"><p></p></td>
-<td class="text-left"><p>4,787.61</p></td>
-<td class="text-left"><p>3,673.91</p></td>
+<td class="text-left"><p>2,910.31</p></td>
+<td class="text-left"><p>4,475.91</p></td>
 </tr>
-<tr class="row-even"><td class="text-left"><p>1000, 1000</p></td>
+<tr class="row-even"><td class="text-left"><p>500, 2000</p></td>
 <td class="text-left"><p></p></td>
-<td class="text-left"><p>3,286.30</p></td>
-<td class="text-left"><p>3,012.22</p></td>
+<td class="text-left"><p>3,664.62</p></td>
+<td class="text-left"><p>4,804.10</p></td>
 </tr>
-<tr class="row-odd"><td class="text-left"><p>1000, 2000</p></td>
+<tr class="row-odd"><td class="text-left"><p>1000, 1000</p></td>
 <td class="text-left"><p></p></td>
-<td class="text-left"><p>3,636.76</p></td>
-<td class="text-left"><p>3,262.20</p></td>
+<td class="text-left"><p>2,955.50</p></td>
+<td class="text-left"><p>3,208.25</p></td>
 </tr>
-<tr class="row-even"><td class="text-left"><p>1024, 2048</p></td>
+<tr class="row-even"><td class="text-left"><p>1000, 2000</p></td>
 <td class="text-left"><p></p></td>
-<td class="text-left"><p>3,618.66</p></td>
-<td class="text-left"><p>3,109.70</p></td>
+<td class="text-left"><p>2,884.69</p></td>
+<td class="text-left"><p>3,630.29</p></td>
 </tr>
-<tr class="row-odd"><td class="text-left"><p>2048, 128</p></td>
+<tr class="row-odd"><td class="text-left"><p>1024, 2048</p></td>
 <td class="text-left"><p></p></td>
-<td class="text-left"><p>443.10</p></td>
-<td class="text-left"><p>449.02</p></td>
+<td class="text-left"><p>3,237.41</p></td>
+<td class="text-left"><p>3,609.50</p></td>
+</tr>
+<tr class="row-even"><td class="text-left"><p>2048, 128</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>433.47</p></td>
+<td class="text-left"><p>441.35</p></td>
+</tr>
+<tr class="row-odd"><td class="text-left"><p>2048, 2048</p></td>
+<td class="text-left"><p></p></td>
+<td class="text-left"><p>2,216.55</p></td>
+<td class="text-left"><p>2,840.86</p></td>
 </tr>
 <tr class="row-even"><td class="text-left"><p>5000, 500</p></td>
 <td class="text-left"><p></p></td>
-<td class="text-left"><p>645.46</p></td>
-<td class="text-left"><p></p></td>
+<td class="text-left"><p>579.05</p></td>
+<td class="text-left"><p>645.26</p></td>
 </tr>
 <tr class="row-odd"><td class="text-left"><p>20000, 2000</p></td>
 <td class="text-left"><p></p></td>
-<td class="text-left"><p></p></td>
-<td class="text-left"><p>372.12</p></td>
+<td class="text-left"><p>363.27</p></td>
+<td class="text-left"><p>509.87</p></td>
 </tr>
 </tbody>
 </table>
@@ -1050,12 +989,13 @@ and shows the throughput scenario under maximum load. The reported metric is <co
 </section>
 <section id="llama-4-maverick-fp8">
 <h4>Llama 4 Maverick FP8<a class="headerlink" href="#llama-4-maverick-fp8" title="Link to this heading">#</a></h4>
+<p>Note: Performance for Llama 4 on sequence lengths less than 8,192 tokens is affected by an issue introduced in v0.21. To reproduce the Llama 4 performance noted here, please use v0.20</p>
 <div class="pst-scrollable-table-container"><table class="table">
 <thead>
 <tr class="row-odd"><th class="head text-left"><p></p></th>
 <th class="head text-left"><p>GPU</p></th>
-<th class="head text-left"><p>H200 141GB HBM3</p></th>
-<th class="head text-left"><p>H100 80GB HBM3</p></th>
+<th class="head text-left"><p>H200</p></th>
+<th class="head text-left"><p>H100</p></th>
 </tr>
 </thead>
 <tbody>
@@ -1113,11 +1053,6 @@ and shows the throughput scenario under maximum load. The reported metric is <co
 <td class="text-left"><p></p></td>
 <td class="text-left"><p>5,128.60</p></td>
 <td class="text-left"><p></p></td>
-</tr>
-<tr class="row-odd"><td class="text-left"><p>20000, 2000</p></td>
-<td class="text-left"><p></p></td>
-<td class="text-left"><p>1,764.27</p></td>
-<td class="text-left"><p>1,400.79</p></td>
 </tr>
 </tbody>
 </table>
@@ -1281,7 +1216,7 @@ a model name (HuggingFace reference or path to a local model), a <a class="refer
 <div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>trtllm-bench<span class="w"> </span>--model<span class="w"> </span><span class="nv">$model_name</span><span class="w"> </span>throughput<span class="w"> </span>--dataset<span class="w"> </span><span class="nv">$dataset_file</span><span class="w"> </span>--backend<span class="w"> </span>pytorch<span class="w"> </span>--extra_llm_api_options<span class="w"> </span><span class="nv">$llm_options</span>
 </pre></div>
 </div>
-<p>The data collected for the v0.20 benchmarks was run with the following file:</p>
+<p>The data collected for the v0.21 benchmarks was run with the following file:</p>
 <p><code class="docutils literal notranslate"><span class="pre">llm_options.yml</span></code></p>
 <div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">cuda_graph_config</span><span class="p">:</span>
 <span class="w">  </span><span class="nt">enable_padding</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
@@ -1303,7 +1238,7 @@ a model name (HuggingFace reference or path to a local model), a <a class="refer
 <span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">8192</span>
 </pre></div>
 </div>
-<p>In a majority of cases, we also use a higher KV cache percentage by setting <code class="docutils literal notranslate"><span class="pre">--kv_cache_free_gpu_mem_fraction</span> <span class="pre">0.95</span></code> in the benchmark command. This allows us to obtain better performance than the default setting of <code class="docutils literal notranslate"><span class="pre">0.90</span></code>. We fall back to <code class="docutils literal notranslate"><span class="pre">0.90</span></code> if we hit an out of memory issue.</p>
+<p>In many cases, we also use a higher KV cache percentage by setting <code class="docutils literal notranslate"><span class="pre">--kv_cache_free_gpu_mem_fraction</span> <span class="pre">0.95</span></code> in the benchmark command. This allows us to obtain better performance than the default setting of <code class="docutils literal notranslate"><span class="pre">0.90</span></code>. We fall back to <code class="docutils literal notranslate"><span class="pre">0.90</span></code> or lower if out-of-memory errors are encountered.</p>
 <p>The results will be printed to the terminal upon benchmark completion. For example,</p>
 <div class="highlight-shell notranslate"><div class="highlight"><pre><span></span><span class="o">===========================================================</span>
 <span class="o">=</span><span class="w"> </span>PERFORMANCE<span class="w"> </span><span class="nv">OVERVIEW</span>
@@ -1409,12 +1344,13 @@ using the <code class="docutils literal notranslate"><span class="pre">--kv_cach
   <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="visible nav section-nav flex-column">
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#throughput-measurements">Throughput Measurements</a><ul class="nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#fp4-models">FP4 Models:</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#hardware">Hardware</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#fp4-models">FP4 Models</a><ul class="nav section-nav flex-column">
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#llama-3-3-70b-fp4">Llama 3.3 70B FP4</a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#llama-3-1-405b-fp4">Llama 3.1 405B FP4</a></li>
 </ul>
 </li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#fp8-models">FP8 Models:</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#fp8-models">FP8 Models</a><ul class="nav section-nav flex-column">
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#llama-3-1-8b-fp8">Llama 3.1 8B FP8</a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#llama-3-3-70b-fp8">Llama 3.3 70B FP8</a></li>
 <li class="toc-h4 nav-item toc-entry"><a class="reference internal nav-link" href="#llama-3-1-405b-fp8">Llama 3.1 405B FP8</a></li>
@@ -1524,9 +1460,9 @@ using the <code class="docutils literal notranslate"><span class="pre">--kv_cach
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on August 01, 2025.</p>
+  <p>Last updated on August 06, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/fbee279">fbee279</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/a16ba64">a16ba64</a>.</p>
   
 </div></div>
       
