@@ -79,6 +79,7 @@ add_library(
   noAuxTcOp.cpp
   ncclCommunicatorOp.cpp
   parallelDecodeKVCacheUpdateOp.cpp
+  prefetchOp.cpp
   redrafterCurandOp.cpp
   reducescatterOp.cpp
   relativeAttentionBiasOp.cpp
