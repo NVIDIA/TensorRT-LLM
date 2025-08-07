@@ -19,8 +19,8 @@ from pydantic import PrivateAttr, field_validator, model_validator
 from strenum import StrEnum
 from transformers import PreTrainedTokenizerBase
 
-from tensorrt_llm.lora_manager import (LoraConfig,
-                                       get_default_trtllm_modules_to_hf_modules)
+from tensorrt_llm.lora_helper import (LoraConfig,
+                                      get_default_trtllm_modules_to_hf_modules)
 
 from .._utils import mpi_rank
 from ..auto_parallel import AutoParallelConfig, infer_cluster_config

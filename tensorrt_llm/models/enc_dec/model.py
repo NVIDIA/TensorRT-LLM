@@ -35,9 +35,9 @@ from tensorrt_llm.layers import (MLP, Attention, AttentionMaskParams,
                                  LanguageAdapterConfig, LayerNorm, LoraParams,
                                  PromptTuningEmbedding, RmsNorm)
 # yapf: enable
-from tensorrt_llm.lora_manager import (LoraConfig,
-                                       get_default_trtllm_modules_to_hf_modules,
-                                       use_lora)
+from tensorrt_llm.lora_helper import (LoraConfig,
+                                      get_default_trtllm_modules_to_hf_modules,
+                                      use_lora)
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import PretrainedConfig, PretrainedModel
 from tensorrt_llm.module import Module, ModuleList
