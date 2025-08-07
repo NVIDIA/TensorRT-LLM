@@ -1654,9 +1654,15 @@ class TestDeepSeekR1(LlmapiAccuracyTestHarness):
                             attention_dp, cuda_graph, overlap_scheduler,
                             max_batch_size):
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
+        if get_sm_version() == 100:
+            moe_config = MoeConfig(backend="DEEPGEMM")
+        else:
+            moe_config = MoeConfig()
+
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
+            moe_config=moe_config,
         )
 
         if fp8kv:
