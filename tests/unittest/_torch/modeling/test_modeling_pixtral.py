@@ -28,8 +28,7 @@ mpi4py.MPI.pickle.__init__(
 pytestmark = pytest.mark.threadleak(enabled=False)
 
 
-@pytest.fixture
-def pixtral_vision_config():
+def make_pixtral_vision_config():
     # Values taken from:
     # https://huggingface.co/mistralai/Mistral-Small-3.1-24B-Instruct-2503/blob/main/config.json
     return model_config_lib.ModelConfig(
@@ -71,9 +70,10 @@ def init_hf_model(cls, config, dtype, device):
 
 @torch.no_grad()
 @pytest.mark.usefixtures("set_seed")
-def test_pixtral_vision_model_vs_hf(pixtral_vision_config):
+def test_pixtral_vision_model_vs_hf():
     dtype = torch.bfloat16
     device = torch.device("cuda")
+    pixtral_vision_config = make_pixtral_vision_config()
     pretrained_config = pixtral_vision_config.pretrained_config
 
     pixtral_model = (
@@ -111,13 +111,14 @@ def test_pixtral_vision_model_vs_hf(pixtral_vision_config):
 
 @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
 @torch.no_grad()
-def test_tensor_parallelism(pixtral_vision_config, mpi_pool_executor, tmp_path):
+def test_tensor_parallelism(mpi_pool_executor, tmp_path):
     mapping = mapping_lib.Mapping(world_size=2, tp_size=2)
     if (num_available_devices := torch.cuda.device_count()) < mapping.world_size:
         pytest.skip(f"{num_available_devices=} is less than the requested {mapping.world_size}.")
 
     dtype = torch.bfloat16
     device = torch.device("cuda")
+    pixtral_vision_config = make_pixtral_vision_config()
     pretrained_config = pixtral_vision_config.pretrained_config
 
     hf_pixtral_model = init_hf_model(
@@ -157,20 +158,22 @@ def test_tensor_parallelism(pixtral_vision_config, mpi_pool_executor, tmp_path):
     gc.collect()
     torch.cuda.empty_cache()
 
+    # NOTE: we cannot send `pixtral_vision_config` across the process barrier, as it contains
+    # `weakref` objects, which cannot be pickled. Instead, each worker will recreate it by
+    # calling the `make_pixtral_vision_config` function.
     world_size = mapping.world_size
-    pixtral_vision_config.mapping = mapping
     results = mpi_pool_executor.starmap(
         _run_pixtral_and_compare_against_ref,
         [
             (
-                pixtral_vision_config,
+                mapping_lib.Mapping(tp_size=world_size, world_size=world_size, rank=rank),
                 hf_weights_path,
                 pixel_values,
                 image_sizes,
                 ref_out,
                 num_params,
             )
-            for _ in range(world_size)
+            for rank in range(world_size)
         ],
     )
 
@@ -179,7 +182,7 @@ def test_tensor_parallelism(pixtral_vision_config, mpi_pool_executor, tmp_path):
 
 
 def _run_pixtral_and_compare_against_ref(
-    pixtral_vision_config: model_config_lib.ModelConfig[transformers.PixtralVisionConfig],
+    mapping: mapping_lib.Mapping,
     hf_weights_path: pathlib.Path,
     pixel_values: torch.Tensor,
     image_sizes: torch.Tensor,
@@ -197,7 +200,8 @@ def _run_pixtral_and_compare_against_ref(
     image_sizes = image_sizes.to("cuda")
     expected_output = expected_output.to("cuda")
 
-    pixtral_vision_config.mapping.rank = rank
+    pixtral_vision_config = make_pixtral_vision_config()
+    pixtral_vision_config.mapping = mapping
     pixtral_model = (
         modeling_pixtral.PixtralVisionModel(model_config=pixtral_vision_config).eval().to("cuda")
     )

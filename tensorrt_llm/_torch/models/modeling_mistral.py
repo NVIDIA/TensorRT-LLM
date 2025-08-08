@@ -475,6 +475,7 @@ class Mistral3PatchMerger(torch.nn.Module):
             out_features=hidden_size,
             bias=False,
             dtype=config.torch_dtype,
+            mapping=model_config.mapping,
         )
 
     @torch.inference_mode()
@@ -539,6 +540,7 @@ class Mistral3MultiModalProjector(torch.nn.Module):
             out_features=config.text_config.hidden_size,
             bias=config.multimodal_projector_bias,
             dtype=dtype,
+            mapping=model_config.mapping,
         )
         self.act = ACT2FN[config.projector_hidden_act]
         self.linear_2 = Linear(
@@ -546,6 +548,7 @@ class Mistral3MultiModalProjector(torch.nn.Module):
             out_features=config.text_config.hidden_size,
             bias=config.multimodal_projector_bias,
             dtype=dtype,
+            mapping=model_config.mapping,
         )
 
     @torch.inference_mode()
