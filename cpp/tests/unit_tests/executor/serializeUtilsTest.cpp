@@ -474,7 +474,7 @@ TEST(SerializeUtilsTest, VectorResponses)
 TEST(SerializeUtilsTest, KvCacheConfig)
 {
     texec::KvCacheConfig kvCacheConfig(
-        true, 10, std::vector(1, 100), 2, 0.1, 10000, false, 0.5, 50, 1024, false, false, true);
+        true, 10, std::vector(1, 100), 2, 0.1, 10000, false, 0.5, 50, 1024, false, false, true, 77);
     auto kvCacheConfig2 = serializeDeserialize(kvCacheConfig);
 
     EXPECT_EQ(kvCacheConfig.getEnableBlockReuse(), kvCacheConfig2.getEnableBlockReuse());
@@ -490,6 +490,7 @@ TEST(SerializeUtilsTest, KvCacheConfig)
     EXPECT_EQ(kvCacheConfig.getSecondaryOffloadMinPriority(), kvCacheConfig2.getSecondaryOffloadMinPriority());
     EXPECT_EQ(kvCacheConfig.getEventBufferMaxSize(), kvCacheConfig2.getEventBufferMaxSize());
     EXPECT_EQ(kvCacheConfig.getUseUvm(), kvCacheConfig2.getUseUvm());
+    EXPECT_EQ(kvCacheConfig.getAttentionDpEventsGatherPeriodMs(), kvCacheConfig2.getAttentionDpEventsGatherPeriodMs());
 }
 
 TEST(SerializeUtilsTest, SchedulerConfig)
@@ -844,6 +845,168 @@ TEST(SerializeUtilsTest, RequestStatsPerIteration)
     texec::RequestStatsPerIteration requestStatsPerIteration{0, {requestStats1, requestStats2}};
     auto requestStatsPerIteration2 = serializeDeserialize(requestStatsPerIteration);
     compareRequestStatsPerIteration(requestStatsPerIteration, requestStatsPerIteration2);
+}
+
+void compareKvCacheEvents(texec::KVCacheEvent const& kvCacheEvent, texec::KVCacheEvent const& kvCacheEvent2)
+{
+    EXPECT_EQ(kvCacheEvent.eventId, kvCacheEvent2.eventId);
+    EXPECT_EQ(kvCacheEvent.windowSize, kvCacheEvent2.windowSize);
+    EXPECT_EQ(kvCacheEvent.attentionDpRank, kvCacheEvent2.attentionDpRank);
+
+    if (std::holds_alternative<texec::KVCacheCreatedData>(kvCacheEvent.data))
+    {
+        EXPECT_TRUE(std::holds_alternative<texec::KVCacheCreatedData>(kvCacheEvent2.data));
+        auto data = std::get<texec::KVCacheCreatedData>(kvCacheEvent.data);
+        auto data2 = std::get<texec::KVCacheCreatedData>(kvCacheEvent2.data);
+        EXPECT_EQ(data.numBlocksPerCacheLevel, data2.numBlocksPerCacheLevel);
+    }
+    else if (std::holds_alternative<texec::KVCacheRemovedData>(kvCacheEvent.data))
+    {
+        EXPECT_TRUE(std::holds_alternative<texec::KVCacheRemovedData>(kvCacheEvent2.data));
+        auto data = std::get<texec::KVCacheRemovedData>(kvCacheEvent.data);
+        auto data2 = std::get<texec::KVCacheRemovedData>(kvCacheEvent2.data);
+        EXPECT_EQ(data.blockHashes, data2.blockHashes);
+    }
+    else if (std::holds_alternative<texec::KVCacheStoredData>(kvCacheEvent.data))
+    {
+        EXPECT_TRUE(std::holds_alternative<texec::KVCacheStoredData>(kvCacheEvent2.data));
+        auto data = std::get<texec::KVCacheStoredData>(kvCacheEvent.data);
+        auto data2 = std::get<texec::KVCacheStoredData>(kvCacheEvent2.data);
+        EXPECT_EQ(data.parentHash, data2.parentHash);
+        EXPECT_EQ(data.blocks.size(), data2.blocks.size());
+        for (size_t i = 0; i < data.blocks.size(); ++i)
+        {
+            auto blockData = data.blocks[i];
+            auto blockData2 = data2.blocks[i];
+            EXPECT_EQ(blockData.blockHash, blockData2.blockHash);
+            EXPECT_EQ(blockData.loraId, blockData2.loraId);
+            EXPECT_EQ(blockData.cacheLevel, blockData2.cacheLevel);
+            EXPECT_EQ(blockData.priority, blockData2.priority);
+            EXPECT_EQ(blockData.tokens.size(), blockData2.tokens.size());
+            for (size_t j = 0; j < blockData.tokens.size(); ++j)
+            {
+                EXPECT_EQ(blockData.tokens[j].tokenId, blockData2.tokens[j].tokenId);
+                EXPECT_EQ(blockData.tokens[j].tokenExtraId, blockData2.tokens[j].tokenExtraId);
+            }
+        }
+    }
+    else if (std::holds_alternative<texec::KVCacheUpdatedData>(kvCacheEvent.data))
+    {
+        EXPECT_TRUE(std::holds_alternative<texec::KVCacheUpdatedData>(kvCacheEvent2.data));
+        auto data = std::get<texec::KVCacheUpdatedData>(kvCacheEvent.data);
+        auto data2 = std::get<texec::KVCacheUpdatedData>(kvCacheEvent2.data);
+        EXPECT_EQ(data.blockHash, data2.blockHash);
+        if (data.cacheLevel)
+        {
+            EXPECT_TRUE(data2.cacheLevel);
+            EXPECT_EQ(data.cacheLevel.value().oldValue, data2.cacheLevel.value().oldValue);
+            EXPECT_EQ(data.cacheLevel.value().newValue, data2.cacheLevel.value().newValue);
+        }
+        if (data.priority)
+        {
+            EXPECT_TRUE(data2.priority);
+            EXPECT_EQ(data.priority.value().oldValue, data2.priority.value().oldValue);
+            EXPECT_EQ(data.priority.value().newValue, data2.priority.value().newValue);
+        }
+    }
+    else
+    {
+        FAIL() << "Unknown KVCacheEvent data type";
+    }
+}
+
+TEST(SerializeUtilsTest, KvCacheEventsDeque)
+{
+    // Created event
+    texec::KVCacheCreatedData kvCacheCreatedData{{1, 2}};
+    texec::KVCacheEvent kvCacheCreatedEvent(1, kvCacheCreatedData, 32);
+
+    // Removed event
+    texec::KVCacheEvent kvCacheRemovedEvent(1, texec::KVCacheRemovedData{{3, 4}}, 32);
+
+    // Stored event
+    auto storedBlockData1 = texec::KVCacheStoredBlockData(77, {{1, 2}, {3, 4}, {5, 6}}, 88, 0, 99);
+    auto storedBlockData2 = texec::KVCacheStoredBlockData(99, {{11, 12}, {3, 4}, {15, 6}}, 77, 1, 101);
+    texec::KVCacheStoredData kvCacheStoredData{177, {storedBlockData1, storedBlockData2}};
+    texec::KVCacheEvent kvCacheStoredEvent(1, kvCacheStoredData, 32);
+
+    // Updated event
+    texec::KVCacheEventDiff<texec::SizeType32> diff{0, 1};
+    texec::KVCacheEventDiff<texec::SizeType32> diff2{90, 99};
+    texec::KVCacheUpdatedData kvCacheUpdatedData(999, diff, diff2);
+    texec::KVCacheEvent kvCacheEvent(1, kvCacheUpdatedData, 32);
+
+    std::deque<texec::KVCacheEvent> kvCacheEvents{
+        kvCacheCreatedEvent, kvCacheRemovedEvent, kvCacheStoredEvent, kvCacheEvent};
+
+    auto serializedEvents = texec::Serialization::serialize(kvCacheEvents);
+    auto kvCacheEvents2 = texec::Serialization::deserializeKVCacheEvents(serializedEvents);
+
+    EXPECT_EQ(kvCacheEvents.size(), kvCacheEvents2.size());
+    for (size_t i = 0; i < kvCacheEvents.size(); ++i)
+    {
+        compareKvCacheEvents(kvCacheEvents[i], kvCacheEvents2[i]);
+    }
+}
+
+// Test for KVCacheEvent with KVCacheCreatedData
+TEST(SerializeUtilsTest, KVCacheCreatedEvent)
+{
+    texec::KVCacheCreatedData kvCacheCreatedData{{1, 2}};
+    texec::KVCacheEvent kvCacheEvent(1, kvCacheCreatedData, 32);
+    auto kvCacheEvent2 = serializeDeserialize(kvCacheEvent);
+    compareKvCacheEvents(kvCacheEvent, kvCacheEvent2);
+}
+
+// Test for KVCacheEvent with KVCacheRemovedData
+TEST(SerializeUtilsTest, KVCacheRemovedEvents)
+{
+    texec::KVCacheEvent kvCacheEvent(1, texec::KVCacheRemovedData{{3, 4}}, 32);
+    auto kvCacheEvent2 = serializeDeserialize(kvCacheEvent);
+    compareKvCacheEvents(kvCacheEvent, kvCacheEvent2);
+}
+
+// Test for KVCacheEvent with KVCacheStoredData
+TEST(SerializeUtilsTest, KVCacheStoredEvent)
+{
+    auto storedBlockData1 = texec::KVCacheStoredBlockData(77, {{1, 2}, {3, 4}, {5, 6}}, 88, 0, 99);
+    auto storedBlockData2 = texec::KVCacheStoredBlockData(99, {{11, 12}, {3, 4}, {15, 6}}, 77, 1, 101);
+
+    texec::KVCacheStoredData kvCacheStoredData{177, {storedBlockData1, storedBlockData2}};
+    texec::KVCacheEvent kvCacheEvent(1, kvCacheStoredData, 32);
+    auto kvCacheEvent2 = serializeDeserialize(kvCacheEvent);
+    compareKvCacheEvents(kvCacheEvent, kvCacheEvent2);
+}
+
+// Test for KVCacheEvent with KVCacheUpdatedData
+TEST(SerializeUtilsTest, KVCacheUpdatedEvent)
+{
+    texec::KVCacheEventDiff<texec::SizeType32> diff{0, 1};
+    texec::KVCacheEventDiff<texec::SizeType32> diff2{90, 99};
+    texec::KVCacheUpdatedData kvCacheUpdatedData(999, diff, diff2);
+    texec::KVCacheEvent kvCacheEvent(1, kvCacheUpdatedData, 32);
+    auto kvCacheEvent2 = serializeDeserialize(kvCacheEvent);
+    compareKvCacheEvents(kvCacheEvent, kvCacheEvent2);
+}
+
+TEST(SerializeUtilsTest, UniqueToken)
+{
+    tensorrt_llm::runtime::UniqueToken token{1, 2};
+    auto token2 = serializeDeserialize(token);
+    EXPECT_EQ(token.tokenId, token2.tokenId);
+    EXPECT_EQ(token.tokenExtraId, token2.tokenExtraId);
+}
+
+TEST(SerializeUtilsTest, UniqueTokenVector)
+{
+    std::vector<tensorrt_llm::runtime::UniqueToken> tokens{{1, 2}, {3, 4}, {5, 6}};
+    auto tokens2 = serializeDeserialize(tokens);
+    EXPECT_EQ(tokens.size(), tokens2.size());
+    for (size_t i = 0; i < tokens.size(); ++i)
+    {
+        EXPECT_EQ(tokens[i].tokenId, tokens2[i].tokenId);
+        EXPECT_EQ(tokens[i].tokenExtraId, tokens2[i].tokenExtraId);
+    }
 }
 
 TEST(SerializeUtilsTest, MethodReturnType)
