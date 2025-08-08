@@ -1,6 +1,6 @@
 import copy
 import os
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Dict
 
 import numpy as np
 import torch
@@ -118,6 +118,128 @@ class LlavaNextInputProcessor(InputProcessor):
         )
         return unpadded_feature_size + newline_feature_size + base_feature_size
 
+    def _postprocess(self, input_ids, mm_features):
+        # Define model specific variables here before shared logic
+        mm_tokens = torch.tensor([self.model_config.image_token_index
+                                  ]).to(input_ids.device)
+        model_hidden_size = self.model_config.text_config.hidden_size
+        vocab_size = self.model_config.text_config.vocab_size
+        start_len = end_len = 0  # for llava, need not append start/end token around each image token
+        # End model specific variables
+
+        ## find mm token positions in input_ids
+        mm_token_positions = torch.where(torch.isin(input_ids, mm_tokens))[0]
+        num_medias = num_mm_tokens = len(mm_token_positions)
+        if num_medias > 1 and isinstance(mm_features, torch.Tensor):
+            mm_features = list(
+                mm_features.split(mm_features.shape[0] // num_medias))
+
+        if isinstance(mm_features, torch.Tensor):
+            # 1 prompt + 1 media
+            # "split" means what a single mm_token in the input_ids should represent
+            # image: one split --> one frame
+            # video: one split --> N frames
+            num_frames, mm_feature_length, mm_hidden_dim = mm_features.shape
+            mm_lengths_per_split = [mm_feature_length * num_frames]
+            mm_lengths_per_frame = [mm_feature_length]
+        elif isinstance(mm_features, list):
+            # 1 prompt + N media
+            num_frames = len(mm_features) if mm_features[0].dim() == 2 else sum(
+                [f.shape[0] for f in mm_features])
+            mm_lengths_per_split = [
+                f.shape[0] if f.dim() == 2 else f.shape[0] * f.shape[1]
+                for f in mm_features
+            ]
+            mm_lengths_per_frame = [
+                f.shape[0] if f.dim() == 2 else f.shape[1] for f in mm_features
+            ]
+            mm_hidden_dim = mm_features[0].shape[-1]
+            mm_features = torch.cat(mm_features, dim=0)
+        else:
+            raise ValueError(
+                f"Invalid multimodal features type: {type(mm_features)}")
+        mm_total_length = sum(mm_lengths_per_split)
+        assert mm_hidden_dim == model_hidden_size, "Multimodal embedding_dim must match model hidden_size"
+
+        ## split input_ids into segments by isolating mm tokens
+        mm_split_positions = torch.cat(
+            [mm_token_positions, mm_token_positions + 1]).unique()
+        input_ids_splits = list(input_ids.tensor_split(mm_split_positions.cpu(
+        )))  # len(input_ids_splits) = num_segments after mm tokens are isolated
+        mm_ids_splits = list(
+            torch.arange(vocab_size,
+                         vocab_size + mm_total_length,
+                         device=input_ids.device).split(mm_lengths_per_split)
+        )  # len(mm_ids_splits) = num_mm_segments
+
+        for i, mm_ids in enumerate(mm_ids_splits):
+            mm_ids = mm_ids.reshape(-1, mm_lengths_per_frame[i])
+            mm_ids_splits[i] = mm_ids.flatten()
+
+        ## replace mm token ids with the expanded out-of-vocab ids
+        mm_split_idx = 0
+        for i, split in enumerate(input_ids_splits):
+            if torch.isin(split, mm_tokens).any().item():
+                input_ids_splits[i] = mm_ids_splits[mm_split_idx]
+                mm_split_idx += 1
+        assert mm_split_idx == len(
+            mm_ids_splits), "All mm_ids_splits should be consumed"
+
+        ## concat text & mm input_ids, wrap mm feature in prompt tuning config
+        fused_input_ids = torch.cat(input_ids_splits).to(
+            device=input_ids.device)
+        fused_length = len(input_ids) + mm_total_length + num_frames * (
+            start_len + end_len) - num_medias
+        assert len(
+            fused_input_ids
+        ) == fused_length, f"Fused input_ids length {len(fused_input_ids)} should match the sum of text and multimodal embedding lengths {fused_length}"
+
+        # [num_frames, feature_length, hidden_dim] -> [num_frames * feature_length, hidden_dim]
+        mm_features = mm_features.view(-1, mm_features.shape[-1])
+        return fused_input_ids, mm_features
+
+
+    def attach_multimodal_embeddings(
+        self, inputs: TextPrompt,
+        multimodal_embedding: Dict[str, List[torch.Tensor]],
+        sampling_params: SamplingParams
+    ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
+        """
+        Attach pre-processed multimodal embeddings into text token stream for LlavaNext model.
+        This method skips vision processing and works with externally provided embeddings.
+        It replaces/expands image placeholders in the text with appropriate tokens and prepares
+        the embeddings for model forward pass.
+        Args:
+            inputs: Text prompt containing image placeholders
+            multimodal_embedding: Dictionary containing pre-processed image embedding data
+        Returns:
+            Tuple of (token_ids, extra_processed_inputs) where:
+            - token_ids: List of processed token IDs with image placeholders
+            - extra_processed_inputs: Optional dictionary containing multimodal embeddings
+        """
+        text_prompt = inputs.get("prompt")
+        if not text_prompt:
+            raise ValueError("Text prompt is required but not provided")
+
+
+
+        if not isinstance(multimodal_embedding, dict):
+            raise ValueError("multimodal_embedding must be a dictionary")
+
+        if 'image' not in multimodal_embedding:
+            raise ValueError(
+                "Only image modality is supported for external multimodal embedding"
+            )
+
+        input_ids = self.tokenizer(
+            text_prompt, return_tensors="pt").input_ids[0]
+        mm_features = torch.stack(multimodal_embedding['image'])
+        fused_input_ids, mm_features = self._postprocess(input_ids, mm_features)
+        multimodal_data = {}
+        multimodal_data["multimodal_embedding"] = mm_features
+        return fused_input_ids.to(torch.int32).tolist(), {
+            "multimodal_data": multimodal_data
+        }
 
     @torch.inference_mode()
     def __call__(
@@ -158,9 +280,9 @@ class LlavaNextVisionModel(nn.Module):
                  **kwargs) -> None:
         super().__init__()
         self.model_config = model_config
-        pretrained_config = model_config.pretrained_config
+        self.pretrained_config = model_config.pretrained_config
         self.device = f"cuda:{model_config.mapping.rank}"
-        model_path = pretrained_config._name_or_path
+        model_path = self.pretrained_config._name_or_path
 
         # Determine the actual local path for model files
         if os.path.isdir(model_path):
@@ -200,7 +322,7 @@ class LlavaNextVisionModel(nn.Module):
             self.vision_tower = hf_vision_tower.to(self.device)
         else:
             vision_model_config = ModelConfig(
-                pretrained_config=model_config.pretrained_config.vision_config,
+                pretrained_config=self.pretrained_config.vision_config,
                 attn_backend="TRTLLM")
             self.vision_tower = CLIPVisionModel(vision_model_config).to(
                 self.device).to(self.dtype)
@@ -210,13 +332,13 @@ class LlavaNextVisionModel(nn.Module):
         self.mm_projector = hf_mm_projector
         self.image_newline = hf_image_newline
         self.vision_feature_select_strategy = getattr(
-            model_config.pretrained_config, "vision_feature_select_strategy",
+            self.pretrained_config, "vision_feature_select_strategy",
             "default")
 
         self.post_config()
 
     def post_config(self):
-        self.config = self.model_config.pretrained_config.vision_config
+        self.config = self.pretrained_config.vision_config
 
     # Copied from https://github.com/huggingface/transformers/blob/main/src/transformers/models/llava_next/modeling_llava_next.py#L284
     def pack_image_features(self,
@@ -234,7 +356,7 @@ class LlavaNextVisionModel(nn.Module):
 
                 num_patch_height, num_patch_width = get_anyres_image_grid_shape(
                     image_sizes[image_idx],
-                    self.model_config.pretrained_config.image_grid_pinpoints,
+                    self.pretrained_config.image_grid_pinpoints,
                     self.config.image_size,
                 )
 
@@ -296,7 +418,7 @@ class LlavaNextVisionModel(nn.Module):
         image_num_patches = [
             image_size_to_num_patches(
                 image_size=imsize,
-                grid_pinpoints=self.model_config.pretrained_config.image_grid_pinpoints,
+                grid_pinpoints=self.pretrained_config.image_grid_pinpoints,
                 patch_size=self.config.image_size,
             ) for imsize in image_sizes
         ]
@@ -396,7 +518,13 @@ class LlavaNextModel(PreTrainedModel):
         mm_embeds = []
         if len(multimodal_params) > 0:
             if not DISAGG:
-                mm_embeds = self.mm_encoder.forward(multimodal_params)
+                if  multimodal_params[0].multimodal_data.get("multimodal_embedding", None) is not None:
+                    mm_embeds = [
+                        multimodal_param.multimodal_data["multimodal_embedding"]
+                        for multimodal_param in multimodal_params
+                    ]
+                else:
+                    mm_embeds = self.mm_encoder.forward(multimodal_params)
             else:
                 mm_embeds = [
                     multimodal_param.multimodal_data["multimodal_embedding"]

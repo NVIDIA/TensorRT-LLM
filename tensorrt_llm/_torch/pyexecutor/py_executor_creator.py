@@ -175,6 +175,8 @@ def _mangle_executor_config(executor_config: ExecutorConfig):
         pytorch_backend_config.load_format = LoadFormat.VISION_ONLY
         # TODO: add comment and print warning here
         pytorch_backend_config.disable_overlap_scheduler = True
+        # TODO: add comment here to infer it by max_num_images and image_token_sizen
+        executor_config.max_num_tokens = 16384
 
 def _get_mapping(executor_config: ExecutorConfig) -> Mapping:
     if executor_config.mapping is None:
