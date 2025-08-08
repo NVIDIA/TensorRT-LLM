@@ -16,6 +16,7 @@
 
 #include "prefetch.h"
 
+#include "tensorrt_llm/common/cudaUtils.h"
 #include <cute/tensor.hpp>
 
 namespace tensorrt_llm
@@ -31,6 +32,7 @@ __global__ void cute_tma_prefetch_kernel(
 {
     using namespace cute;
 
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     // if the kernel allocates tmem (min 32 columns), the compiler will mark the binary
     // as using tmem, then the kernel launch will acquire all vrc so that we have 1 cta/SM
     // then we relinquish which clears the vrc, and we deallocate the tmem
@@ -59,12 +61,20 @@ __global__ void cute_tma_prefetch_kernel(
                 ;
         }
     }
+#else
+    if (blockIdx.x == 0 && threadIdx.x == 0)
+    {
+        printf("Error: TMA prefetch is only supported on compute_90 and above\n");
+    }
+    __trap();
+#endif
 }
 
 template <typename T, int CTA_M, int CTA_K>
-void cute_host_prefetch(T const* data, int M, int K, int strideM, int throttle_time, cudaStream_t stream)
+void cute_host_prefetch(T const* data, int M, int K, int strideM, int throttle_time, bool pdl, cudaStream_t stream)
 {
     using namespace cute;
+    using tensorrt_llm::common::check;
 
     // create the GMEM tensor, row major
     auto gmem_layout = make_layout(make_shape(M, K), make_stride(strideM, 1));
@@ -81,20 +91,28 @@ void cute_host_prefetch(T const* data, int M, int K, int strideM, int throttle_t
     // invoke the kernel
     // each CTA responsible for a range of M, and all kblock associated with it
     cudaLaunchConfig_t config{};
+    cudaLaunchAttribute attrs[1];
     config.gridDim = dim3{(uint32_t) (M / CTA_M), 1, 1};
     config.blockDim = 32;
     config.stream = stream;
+    if (pdl)
+    {
+        attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attrs[0].val.programmaticStreamSerializationAllowed = 1;
+        config.attrs = attrs;
+        config.numAttrs = 1;
+    }
 
     auto* kernel_instance = &cute_tma_prefetch_kernel<T, CTA_M, CTA_K, decltype(tma_load), decltype(gmem_tensor)>;
     // default carveout is 32KB, which mismatches with gemm, so will trigger smem reconfiguration, which requires
     // draining SM, i.e. no overlapping
-    cudaFuncSetAttribute(kernel_instance, cudaFuncAttributePreferredSharedMemoryCarveout, 100);
+    check_cuda_error(cudaFuncSetAttribute(kernel_instance, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
 
-    cudaLaunchKernelEx(&config, kernel_instance, tma_load, gmem_tensor, K, throttle_time);
+    check_cuda_error(cudaLaunchKernelEx(&config, kernel_instance, tma_load, gmem_tensor, K, throttle_time));
 }
 
 #define INSTANTIATE_CUTE_HOST_PREFETCH(T, CTA_M, CTA_K)                                                                \
-    template void cute_host_prefetch<T, CTA_M, CTA_K>(T const*, int, int, int, int, cudaStream_t);
+    template void cute_host_prefetch<T, CTA_M, CTA_K>(T const*, int, int, int, int, bool, cudaStream_t);
 
 // In the same order as in 3rdparty/cutlass/include/cute/arch/copy_sm90_desc.hpp
 INSTANTIATE_CUTE_HOST_PREFETCH(uint8_t, 64, 128);
