@@ -45,7 +45,9 @@ else
 fi
 
 # Default for prompt embedding table dtype; allow override via env var
-if [ -z "${PROMPT_EMBEDDING_TABLE_DTYPE}" ]; then
+if [ "$MODEL" = "mistral_small_3_1" ]; then
+    PROMPT_EMBEDDING_TABLE_DTYPE="TYPE_BF16"
+else
     PROMPT_EMBEDDING_TABLE_DTYPE="TYPE_FP16"
 fi
 
@@ -187,7 +189,7 @@ fill_triton_repo () {
 
     echo "Filling triton repository at ${TRITON_REPO}/tensorrt_llm with engine ${DECODER_ENGINE_PATH}"
     python3 tools/fill_template.py -i ${TRITON_REPO}/tensorrt_llm/config.pbtxt triton_backend:${BACKEND},engine_dir:${DECODER_ENGINE_PATH},decoupled_mode:${DECOUPLED_MODE},max_tokens_in_paged_kv_cache:${MAX_TOKENS_IN_KV_CACHE},max_attention_window_size:${MAX_ATTENTION_WINDOW_SIZE},batch_scheduler_policy:${BATCH_SCHEDULER_POLICY},batching_strategy:${BATCHING_STRATEGY},kv_cache_free_gpu_mem_fraction:${KV_CACHE_FREE_GPU_MEM_FRACTION},exclude_input_in_output:${EXCLUDE_INPUT_IN_OUTPUT},triton_max_batch_size:${TRITON_MAX_BATCH_SIZE},max_queue_delay_microseconds:${MAX_QUEUE_DELAY_MICROSECONDS},max_beam_width:${MAX_BEAM_WIDTH},enable_kv_cache_reuse:${ENABLE_KV_CACHE_REUSE},normalize_log_probs:${NORMALIZE_LOG_PROBS},enable_chunked_context:${ENABLE_CHUNKED_CONTEXT},gpu_device_ids:${GPU_DEVICE_IDS},decoding_mode:${DECODING_MODE},max_queue_size:${MAX_QUEUE_SIZE},enable_context_fmha_fp32_acc:${ENABLE_CONTEXT_FMHA_FP32_ACC},encoder_input_features_data_type:${ENCODER_INPUT_FEATURES_DTYPE},prompt_embedding_table_data_type:${PROMPT_EMBEDDING_TABLE_DTYPE},logits_datatype:TYPE_FP32,lookahead_window_size:${LOOKAHEAD_WINDOW_SIZE},lookahead_ngram_size:${LOOKAHEAD_NGRAM_SIZE},lookahead_verification_set_size:${LOOKAHEAD_VERIFICATION_SET_SIZE}
-    python3 tools/fill_template.py -i ${TRITON_REPO}/preprocessing/config.pbtxt tokenizer_dir:${TOKENIZER_PATH},triton_max_batch_size:${TRITON_MAX_BATCH_SIZE},preprocessing_instance_count:${PREPROCESSING_INSTANCE_COUNT}
+    python3 tools/fill_template.py -i ${TRITON_REPO}/preprocessing/config.pbtxt tokenizer_dir:${TOKENIZER_PATH},hf_model_path:${TOKENIZER_PATH},triton_max_batch_size:${TRITON_MAX_BATCH_SIZE},preprocessing_instance_count:${PREPROCESSING_INSTANCE_COUNT}
     python3 tools/fill_template.py -i ${TRITON_REPO}/postprocessing/config.pbtxt tokenizer_dir:${TOKENIZER_PATH},triton_max_batch_size:${TRITON_MAX_BATCH_SIZE},postprocessing_instance_count:${POSTPROCESSING_INSTANCE_COUNT}
     python3 tools/fill_template.py -i ${TRITON_REPO}/ensemble/config.pbtxt triton_max_batch_size:${TRITON_MAX_BATCH_SIZE},logits_datatype:TYPE_FP32
 
@@ -1606,6 +1608,32 @@ if [ "$MODEL" = "qwen2_vl" ]; then
     launch_triton_server
     python3 tools/multimodal/client.py --model_type qwen2_vl --streaming --end-id 151645 --pad-id 151643 | tee multimodal_output
     grep -oi "Singapore" multimodal_output
+    kill_triton_server
+
+fi
+
+# Mistral Small 3.1 (pixtral) multimodal tests
+if [ "$MODEL" = "mistral_small_3_1" ]; then
+
+    BACKEND=python
+    MAX_TOKENS_IN_KV_CACHE="${MAX_TOKENS_IN_KV_CACHES[0]}"
+    BATCH_SCHEDULER_POLICY="${BATCH_SCHEDULER_POLICIES[0]}"
+    KV_CACHE_FREE_GPU_MEM_FRACTION="${KV_CACHE_FREE_GPU_MEM_FRACTIONS[0]}"
+
+    # Non-streaming
+    DECOUPLED_MODE="False"
+    BATCHING_STRATEGY="inflight_fused_batching"
+    launch_triton_server
+    python3 tools/multimodal/client.py --text '[IMG] Question: which city is this? Answer:' --model_type pixtral --end-id 2 | tee multimodal_output
+    grep -oi "singapore" multimodal_output
+    kill_triton_server
+
+    # Streaming
+    DECOUPLED_MODE="True"
+    BATCHING_STRATEGY="inflight_fused_batching"
+    launch_triton_server
+    python3 tools/multimodal/client.py --text '[IMG] Question: which city is this? Answer:' --model_type pixtral --streaming --end-id 2 | tee multimodal_output
+    grep -oi "singapore" multimodal_output
     kill_triton_server
 
 fi
