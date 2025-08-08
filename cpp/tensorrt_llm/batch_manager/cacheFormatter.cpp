@@ -847,16 +847,23 @@ void CacheFormatter::unformat(TransferSession& session)
     }
     int selfNumLayers = selfConfig.getModelConfig().mNbKvHeadsPerLayer.size();
     int selfPPSize = selfConfig.getParallelConfig().mPipelineParallelism;
+    int destPPSize = destConfig.getParallelConfig().mPipelineParallelism;
+    int destNumLayers = destConfig.getModelConfig().mNbKvHeadsPerLayer.size();
+
+    if (selfPPSize == destPPSize)
+    {
+        return true;
+    }
     if (selfNumLayers % selfPPSize != 0)
     {
-        TLLM_LOG_WARNING("CacheFormatter::inquireSupport: layers must be divisible by pipeline parallelism");
+        TLLM_LOG_WARNING("CacheFormatter::inquireSupport: layers %d must be divisible by pipeline parallelism :%d",
+            selfNumLayers, selfPPSize);
         return false;
     }
-    int destNumLayers = destConfig.getModelConfig().mNbKvHeadsPerLayer.size();
-    int destPPSize = destConfig.getParallelConfig().mPipelineParallelism;
     if (destNumLayers % destPPSize != 0)
     {
-        TLLM_LOG_WARNING("CacheFormatter::inquireSupport: layers must be divisible by pipeline parallelism");
+        TLLM_LOG_WARNING("CacheFormatter::inquireSupport: layers %d must be divisible by pipeline parallelism :%d ",
+            destNumLayers, selfPPSize);
         return false;
     }
     return true;
