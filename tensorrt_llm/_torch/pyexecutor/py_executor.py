@@ -749,6 +749,9 @@ class PyExecutor:
                             if self._need_return_logits(scheduled_batch):
                                 logits_host = batch_outputs["logits"].to(
                                     "cpu", non_blocking=True)
+                            if self.kv_cache_transceiver and self.guided_decoder:
+                                self.guided_decoder.init_disagg_gen_requests(
+                                    scheduled_batch)
                             self._execute_guided_decoder(
                                 scheduled_batch, batch_outputs['logits'])
 
@@ -939,6 +942,10 @@ class PyExecutor:
                         self._handle_first_token_response(scheduled_batch)
 
                     self.resource_manager.prepare_resources(scheduled_batch)
+
+                    if self.kv_cache_transceiver and self.guided_decoder:
+                        self.guided_decoder.init_disagg_gen_requests(
+                            scheduled_batch)
                     if self.drafter is not None and self.use_spec_decode:
                         if self.guided_decoder is not None:
                             self.guided_decoder.rollback_rejected_tokens(
@@ -1063,6 +1070,9 @@ class PyExecutor:
                     if self.previous_batch is not None:
                         self._update_requests(self.previous_batch.sample_state)
 
+                    if self.kv_cache_transceiver and self.guided_decoder:
+                        self.guided_decoder.init_disagg_gen_requests(
+                            scheduled_batch)
                     self._execute_guided_decoder(scheduled_batch,
                                                  batch_outputs['logits'])
 
