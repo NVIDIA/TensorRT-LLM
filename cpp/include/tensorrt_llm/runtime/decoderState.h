@@ -51,13 +51,13 @@ public:
     DecoderState();
 
     //! @brief Setup buffers for the decoder excluding speculative decoding.
-    void setup(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, SizeType32 maxAttentionWindow,
+    void setup(SizeType32 maxNumSequences, SizeType32 maxBeamWidth, SizeType32 maxAttentionWindow,
         SizeType32 sinkTokenLength, SizeType32 maxSequenceLength, nvinfer1::DataType dtype,
         ModelConfig const& modelConfig, WorldConfig const& worldConfig, BufferManager const& bufferManager);
 
     //! @brief Setup buffers for the cache indirection.
     //! @details This is used for beam search on pipeline parallel ranks without a decoder.
-    void setupCacheIndirection(SizeType32 maxBatchSize, SizeType32 maxBeamWidth, SizeType32 maxAttentionWindow,
+    void setupCacheIndirection(SizeType32 maxNumSequences, SizeType32 maxBeamWidth, SizeType32 maxAttentionWindow,
         BufferManager const& bufferManager);
 
     //! @brief Setup buffers for speculative decoding.
@@ -134,7 +134,7 @@ public:
     //! @returns [batchSize, maxAcceptedDraftTokensPerStep], accepted paths packed into continuous tensor, on gpu
     [[nodiscard]] TensorPtr getAcceptedPackedPaths() const;
 
-    [[nodiscard]] SizeType32 getMaxBatchSize() const;
+    [[nodiscard]] SizeType32 getMaxNumSequences() const;
 
     [[nodiscard]] SizeType32 getMaxBeamWidth() const;
 
@@ -187,10 +187,10 @@ public:
     //! @param generationSteps The generation steps for all requests in the batch.
     void setGenerationSteps(std::vector<SizeType32> const& generationSteps);
 
-    //! @brief Stateful inputs for the decoder. Allocated for maxBatchSize slots.
+    //! @brief Stateful inputs for the decoder. Allocated for maxNumSequences slots.
     [[nodiscard]] DecodingInput& getJointDecodingInput() const;
 
-    //! @brief Stateful outputs for the decoder. Allocated for maxBatchSize slots.
+    //! @brief Stateful outputs for the decoder. Allocated for maxNumSequences slots.
     [[nodiscard]] DecodingOutput& getJointDecodingOutput() const;
 
 private:
@@ -209,13 +209,13 @@ private:
         SizeType32 maxTokensPerEngineStep, ModelConfig const& modelConfig, WorldConfig const& worldConfig,
         BufferManager const& bufferManager);
 
-    SizeType32 mMaxBatchSize{};
+    SizeType32 mMaxNumSequences{};
     SizeType32 mMaxBeamWidth{};
     SizeType32 mMaxSequenceLength{};
 
-    //! @brief Stateful inputs for the decoder. Allocated for maxBatchSize slots.
+    //! @brief Stateful inputs for the decoder. Allocated for maxNumSequences slots.
     DecodingInputPtr mJointDecodingInput;
-    //! @brief Stateful outputs for the decoder. Allocated for maxBatchSize slots.
+    //! @brief Stateful outputs for the decoder. Allocated for maxNumSequences slots.
     DecodingOutputPtr mJointDecodingOutput;
 
     //! @brief Workspace for beam search in streaming mode.

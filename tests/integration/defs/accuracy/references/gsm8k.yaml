@@ -17,6 +17,8 @@ meta-llama/Llama-3.3-70B-Instruct:
   - quant_algo: FP8
     kv_cache_quant_algo: FP8
     accuracy: 84.08
+  - quant_algo: FP8
+    accuracy: 84.08
 meta-llama/Llama-4-Maverick-17B-128E-Instruct:
   - accuracy: 92.20
 meta-llama/Llama-4-Scout-17B-16E-Instruct:
@@ -156,5 +158,13 @@ microsoft/Phi-4-multimodal-instruct-long-rope:
   - accuracy: 75.85
 microsoft/Phi-4-mini-instruct:
   - accuracy: 82.30
+GPT-OSS/BF16:
+  - accuracy: 88.5
+GPT-OSS/MXFP4:
+  - accuracy: 88.5
+  - quant_algo: W4A8_MXFP4_MXFP8
+    accuracy: 88.5
+  - quant_algo: W4A8_MXFP4_FP8
+    accuracy: 88.5
 LGAI-EXAONE/EXAONE-4.0-32B:
   - accuracy: 88.36

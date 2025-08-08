@@ -376,7 +376,7 @@ class WideEPMoE(MoE):
             self.layer_load_balancer.wait_for_gpu_stage()
 
         use_deepseek_fp8_block_scale = False
-        use_w4a8_group_scaling = False
+        use_w4_group_scaling = False
         weight_dtype = self.w3_w1_weight.dtype
 
         token_selected_experts, token_final_scales = self.routing_method.apply(
@@ -539,7 +539,7 @@ class WideEPMoE(MoE):
             elif self.has_deepseek_fp8_block_scales:
                 use_deepseek_fp8_block_scale = True
             elif self.has_w4afp8:
-                use_w4a8_group_scaling = True
+                use_w4_group_scaling = True
                 weight_dtype = torch.quint4x2
             else:
                 raise ValueError(
@@ -670,7 +670,7 @@ class WideEPMoE(MoE):
             cluster_rank=cluster_rank,
             enable_alltoall=use_all_to_all,
             use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
-            use_w4a8_group_scaling=use_w4a8_group_scaling,
+            use_w4_group_scaling=use_w4_group_scaling,
             min_latency_mode=False,
             tune_max_num_tokens=self.tune_max_num_tokens,
             tuner_num_tokens=tuner_num_tokens,

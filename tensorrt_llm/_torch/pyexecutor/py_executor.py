@@ -11,7 +11,11 @@ from contextlib import contextmanager
 from typing import Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
-from cuda import cudart
+
+try:
+    from cuda.bindings import runtime as cudart
+except ImportError:
+    from cuda import cudart
 
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
@@ -790,7 +794,7 @@ class PyExecutor:
                     # Second last rank does not need to since last rank has original decoded tokens
                     if not self.dist.is_second_last_pp_rank:
                         if self.send_handles[prev_microbatch_id] is not None:
-                            self.send_handles[prev_microbatch_id].Wait()
+                            self.send_handles[prev_microbatch_id].wait()
                         needs_logits = (
                             self._need_return_logits(scheduled_batch)
                             or (self._need_return_log_probs(scheduled_batch)
@@ -861,6 +865,10 @@ class PyExecutor:
             self.use_spec_decode = self.drafter.should_use_spec_decode(
                 self.active_requests)
             self.model_engine.enable_spec_decode = self.use_spec_decode
+            # If speculation is off, this function sets py_draft_tokens to None
+            # for all active requests. If it's on, we initialize py_draft_tokens
+            # with dummy draft tokens to make the scheduler aware of the fact
+            # that speculation is about to happen.
             self._prepare_draft_requests()
 
         scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
@@ -883,7 +891,8 @@ class PyExecutor:
             f'{len(scheduled_batch.generation_requests)} generation requests')
         return scheduled_batch, iter_stats
 
-    def _execute_guided_decoder(self, scheduled_batch, logits):
+    def _execute_guided_decoder(self, scheduled_batch: ScheduledRequests,
+                                logits: torch.Tensor):
         if self.guided_decoder is not None:
             self.guided_decoder.build(scheduled_batch)
             self.guided_decoder.execute(scheduled_batch, logits)
@@ -921,6 +930,9 @@ class PyExecutor:
 
                     self.resource_manager.prepare_resources(scheduled_batch)
                     if self.drafter is not None and self.use_spec_decode:
+                        if self.guided_decoder is not None:
+                            self.guided_decoder.rollback_rejected_tokens(
+                                scheduled_batch)
                         self.drafter.prepare_draft_tokens(
                             scheduled_batch, self.resource_manager)
 
@@ -1297,7 +1309,9 @@ class PyExecutor:
             if req.is_disagg_generation_transmission_complete:
                 cache_trans_complete_requests.append(req)
         if len(cache_trans_complete_requests) > 0:
-            self._setup_sampler_step(cache_trans_complete_requests)
+            requests = ScheduledRequests()
+            requests.context_requests = cache_trans_complete_requests
+            self._setup_sampler_step(requests)
 
         for req in scheduled_batch.generation_requests:
             if req.is_disagg_generation_transmission_complete:
@@ -1451,7 +1465,7 @@ class PyExecutor:
             self._handle_errors(error_msg)
 
     @nvtx_range("_setup_sampler_step")
-    def _setup_sampler_step(self, requests):
+    def _setup_sampler_step(self, requests: ScheduledRequests):
         try:
             return self.sampler.setup_sampler_step(requests)
         except Exception as e:
