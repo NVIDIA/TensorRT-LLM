@@ -97,7 +97,9 @@ class EarlyStopSampler(Sampler):
                 request.py_result.append_context_logits(logits)
 
 
-def top_k_sampling_batch(logits, top_k=50, generator: torch.Generator = None):
+def top_k_sampling_batch(logits,
+                         top_k=50,
+                         generator: Optional[torch.Generator] = None):
     logits_dim = logits.dim()
     if logits_dim == 1:
         logits = logits.unsqueeze(0)
@@ -124,7 +126,7 @@ def top_k_sampling_batch(logits, top_k=50, generator: torch.Generator = None):
 def top_p_sampling_batch(logits: torch.Tensor,
                          top_p: float = 0.9,
                          temperature: float = 1.0,
-                         generator: torch.Generator = None):
+                         generator: Optional[torch.Generator] = None):
     logits_dim = logits.dim()
     if logits_dim == 1:
         logits = logits.unsqueeze(0)
@@ -139,6 +141,51 @@ def top_p_sampling_batch(logits: torch.Tensor,
     # compute  cumulative probability distribution of each sample
     cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1),
                                     dim=-1)
+    # get the location of top_p
+    sorted_indices_to_remove = cumulative_probs > top_p
+    sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
+    sorted_indices_to_remove[:, 0] = 0
+
+    # set the logits to -inf whose is outside top_p
+    indices_to_remove = sorted_indices_to_remove.scatter(
+        1, sorted_indices, sorted_indices_to_remove)
+    logits = logits.masked_fill(indices_to_remove, float('-inf'))
+
+    # compute probability distribution
+    softmax = torch.softmax(logits, dim=-1)
+
+    # sample from the distribution and generate result of [batch_size, 1]
+    next_tokens = torch.multinomial(softmax, num_samples=1,
+                                    generator=generator).squeeze(-1)
+    return next_tokens, softmax
+
+
+def top_k_top_p_sampling_batch(logits: torch.Tensor,
+                               top_k: int,
+                               top_p: float,
+                               temperature: float = 1.0,
+                               generator: Optional[torch.Generator] = None):
+    logits_dim = logits.dim()
+    if logits_dim == 1:
+        logits = logits.unsqueeze(0)
+    assert logits_dim == 2, "logits should be 2D: [batch_size, vocab_size]"
+    if temperature != 0:
+        logits = logits / max(temperature, 1e-5)
+    batch_size, vocab_size = logits.size()
+    # get first top_k logits of each sample and their indices
+    values, indices = torch.topk(logits, top_k, dim=-1)
+    min_values = values[:, -1].unsqueeze(-1).expand(batch_size, vocab_size)
+
+    # set the logits who is less than first top_k logits to -inf
+    logits = torch.where(logits < min_values,
+                         torch.full_like(logits, float('-inf')), logits)
+
+    sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+
+    # compute  cumulative probability distribution of each sample
+    cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1),
+                                    dim=-1)
+
     # get the location of top_p
     sorted_indices_to_remove = cumulative_probs > top_p
     sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
@@ -194,12 +241,20 @@ def sample_rejected(draft_probs: torch.Tensor, target_probs: torch.Tensor,
 
 TopK = tuple[Literal["top_k"], int]
 TopP = tuple[Literal["top_p"], float, float]
+TopKTopP = tuple[Literal["top_k_top_p"], int, float, float]
 Greedy = tuple[Literal["greedy"], None]
 GREEDY: Greedy = ("greedy", None)
 Strategy = TopK | TopP | Greedy
 
 
 def request_strategy(request: LlmRequest) -> Strategy:
+    if request.sampling_config.top_k is not None and len(
+            request.sampling_config.top_k
+    ) > 0 and request.sampling_config.top_p is not None and len(
+            request.sampling_config.top_p) > 0:
+        return ("top_k_top_p", request.sampling_config.top_k[0],
+                request.sampling_config.top_p[0],
+                request.sampling_config.temperature[0])
     if request.sampling_config.top_p is not None and len(
             request.sampling_config.top_p) > 0:
         return ("top_p", request.sampling_config.top_p[0],
@@ -217,12 +272,15 @@ def sampling_strategies(requests: Iterable[LlmRequest]) -> list[Strategy]:
 
 def sample(strategy: Strategy,
            logits: torch.Tensor,
-           generator: torch.Generator = None):
+           generator: Optional[torch.Generator] = None):
     match strategy:
         case ("top_k", top_k):
             return top_k_sampling_batch(logits, top_k, generator)
         case ("top_p", top_p, temperature):
             return top_p_sampling_batch(logits, top_p, temperature, generator)
+        case ("top_k_top_p", top_k, top_p, temperature):
+            return top_k_top_p_sampling_batch(logits, top_k, top_p, temperature,
+                                              generator)
         case ("greedy", None):
             return greedy_search_sampling_batch(logits)
 
@@ -358,69 +416,77 @@ class TorchSampler(Sampler):
             assert beam == 0, "The following call relies on beam_width to be 1 - hence the list with a single element"
             request.py_result.append_log_probs([token_log_probs])
 
+    def _process_draft_tokens_greedy(self, request: LlmRequest,
+                                     new_tokens: torch.Tensor) -> int:
+        new_token = add_token(request, new_tokens, beam=self.BEAM)
+        stop = self._handle_stop_criteria(request, new_token)
+        if stop or len(request.py_draft_tokens) == 0:
+            return 0
+        num_accepted = 0
+
+        for draft_token in request.py_draft_tokens:
+            if draft_token != new_token:
+                # Reject.
+                break
+
+            num_accepted += 1
+            new_token = add_token(request,
+                                  new_tokens,
+                                  beam=self.BEAM,
+                                  step=num_accepted)
+            if self._handle_stop_criteria(request, new_token):
+                break
+        return num_accepted
+
+    def _process_draft_tokens_rejection_sampling(
+            self, request: LlmRequest, new_tokens: torch.Tensor) -> int:
+        sampling_strategy = request_strategy(request)
+        generator = self.get_generator(request.py_draft_logits.device)
+        _, draft_probs = sample(sampling_strategy,
+                                request.py_draft_logits[0],
+                                generator=generator)
+        target_probs = request.py_target_probs
+        rejected_indices = get_rejected_indices(draft_probs, target_probs,
+                                                generator,
+                                                request.py_draft_tokens)
+        sample_last = True
+        stop = False
+        if rejected_indices.numel() == 0:
+            num_initially_accepted = len(request.py_draft_tokens)
+            sample_last = False
+        else:
+            num_initially_accepted = rejected_indices[0].item()
+        num_accepted = num_initially_accepted
+        for i in range(num_accepted):
+            new_token = request.py_draft_tokens[i]
+            new_tokens[i, request.seq_slot, self.BEAM] = new_token
+            request.add_new_token(new_token, self.BEAM)
+            stop = self._handle_stop_criteria(request, new_token)
+            if stop:
+                num_accepted = i + 1
+                return num_accepted
+        if sample_last:
+            new_token = sample_rejected(draft_probs, target_probs, generator,
+                                        num_accepted)
+            new_tokens[num_accepted, request.seq_slot, self.BEAM] = new_token
+            request.add_new_token(new_token, self.BEAM)
+            stop = self._handle_stop_criteria(request, new_token)
+        else:
+            new_token = add_token(request,
+                                  new_tokens,
+                                  beam=self.BEAM,
+                                  step=num_accepted)
+            stop = self._handle_stop_criteria(request, new_token)
+
+        return num_accepted
+
     def process_draft_tokens(self, request: LlmRequest,
                              new_tokens: torch.Tensor) -> int:
         if request.py_draft_logits is None:
-            new_token = add_token(request, new_tokens, beam=self.BEAM)
-            stop = self._handle_stop_criteria(request, new_token)
-            if stop or get_draft_token_length(request) == 0:
-                return 0
-            num_accepted = 0
-
-            for draft_token in request.py_draft_tokens:
-                if draft_token != new_token:
-                    # Reject.
-                    break
-
-                num_accepted += 1
-                new_token = add_token(request,
-                                      new_tokens,
-                                      beam=self.BEAM,
-                                      step=num_accepted)
-                if self._handle_stop_criteria(request, new_token):
-                    break
-            return num_accepted
+            return self._process_draft_tokens_greedy(request, new_tokens)
         else:
-            sampling_strategy = request_strategy(request)
-            generator = self.get_generator(request.py_draft_logits.device)
-            _, draft_probs = sample(sampling_strategy,
-                                    request.py_draft_logits[0],
-                                    generator=generator)
-            target_probs = request.py_target_probs
-            rejected_indices = get_rejected_indices(draft_probs, target_probs,
-                                                    generator,
-                                                    request.py_draft_tokens)
-            sample_last = True
-            stop = False
-            if rejected_indices.numel() == 0:
-                num_initially_accepted = get_draft_token_length(request)
-                sample_last = False
-            else:
-                num_initially_accepted = rejected_indices[0].item()
-            num_accepted = num_initially_accepted
-            for i in range(num_accepted):
-                new_token = request.py_draft_tokens[i]
-                new_tokens[i, request.seq_slot, self.BEAM] = new_token
-                request.add_new_token(new_token, self.BEAM)
-                stop = self._handle_stop_criteria(request, new_token)
-                if stop:
-                    num_accepted = i + 1
-                    break
-            if not stop and sample_last:
-                new_token = sample_rejected(draft_probs, target_probs,
-                                            generator, num_accepted)
-                new_tokens[num_accepted, request.seq_slot,
-                           self.BEAM] = new_token
-                request.add_new_token(new_token, self.BEAM)
-                stop = self._handle_stop_criteria(request, new_token)
-            elif not stop and not sample_last:
-                new_token = add_token(request,
-                                      new_tokens,
-                                      beam=self.BEAM,
-                                      step=num_accepted)
-                stop = self._handle_stop_criteria(request, new_token)
-
-            return num_accepted
+            return self._process_draft_tokens_rejection_sampling(
+                request, new_tokens)
 
     def update_requests(self, state: SampleState) -> None:
         assert isinstance(state, SampleState)
