@@ -1275,8 +1275,8 @@ void standalone_stable_radix_topk_(void* buf, size_t& buf_size, T const* in, Idx
             sort_in = static_cast<decltype(sort_in)>(aligned_pointers[9]);
             sort_in_idx = static_cast<decltype(sort_in_idx)>(aligned_pointers[10]);
         }
-        cudaMemsetAsync(
-            buf, 0, static_cast<char*>(aligned_pointers[2]) - static_cast<char*>(aligned_pointers[0]), stream);
+        cudaMemsetAsync(aligned_pointers[0], 0,
+            static_cast<char*>(aligned_pointers[2]) - static_cast<char*>(aligned_pointers[0]), stream);
     }
 
     T const* in_buf = nullptr;
