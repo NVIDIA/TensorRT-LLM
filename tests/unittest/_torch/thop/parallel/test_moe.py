@@ -875,7 +875,7 @@ class TestMoeFP8:
                               use_topk_as_input=False)
 
     @pytest.mark.parametrize("num_tokens", [16])
-    @pytest.mark.parametrize("expert_info", [(32, 8, 4, 8)])
+    @pytest.mark.parametrize("expert_info", [(32, 8, 4, 8), (384, 1, 1, 8)])
     @pytest.mark.parametrize("hidden_size", [512])
     @pytest.mark.parametrize("intermediate_size", [512])
     @pytest.mark.parametrize("use_topk_as_input", [False, True],
@@ -1106,6 +1106,18 @@ class TestMoeFp4:
                     "routing_method_type": RoutingMethodType.Renormalize
                 },
                 id="RoutingRenormalize_topk_4"),
+            pytest.param(
+                {
+                    "num_experts": 512,
+                    "top_k": 10,
+                    "padding": 8,
+                    "n_groups": None,
+                    "top_k_groups": None,
+                    "routed_scaling": None,
+                    "has_routing_bias": False,
+                    "routing_method_type": RoutingMethodType.Renormalize
+                },
+                id="RoutingRenormalize_qwen_next"),
         ],
     )
     @pytest.mark.parametrize("use_topk_as_input", [False, True],
@@ -1153,7 +1165,7 @@ class TestMoeFp4:
             pytest.skip("Routing kernel requires that padding be less than 256")
 
         assert top_k <= num_experts
-        assert top_k <= 8
+        assert top_k <= 10
         assert num_experts % 4 == 0
 
         if use_topk_as_input:
@@ -1406,7 +1418,7 @@ class TestMoeFp4:
             pytest.skip("Routing kernel requires that padding be less than 256")
 
         assert top_k <= num_experts
-        assert top_k <= 8
+        assert top_k <= 10
         assert num_experts % 4 == 0
 
         if are_groups_valid(top_k_groups, n_groups):
