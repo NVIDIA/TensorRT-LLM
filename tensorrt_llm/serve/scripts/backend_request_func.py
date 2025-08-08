@@ -44,6 +44,7 @@ class RequestFuncOutput:
     tpot: float = 0.0  # avg next-token latencies
     prompt_len: int = 0
     error: str = ""
+    avg_decoded_tokens_per_iter: float = 0.0  # Average tokens decoded per iteration
 
 
 async def async_request_trt_llm(
@@ -104,7 +105,13 @@ async def async_request_trt_llm(
 
                         most_recent_timestamp = timestamp
 
+                        # Extract avg_decoded_tokens_per_iter from TensorRT-LLM response
+                        if "avg_decoded_tokens_per_iter" in data:
+                            output.avg_decoded_tokens_per_iter = data[
+                                "avg_decoded_tokens_per_iter"]
+
                     output.latency = most_recent_timestamp - st
+
                 else:
                     content = await response.content.read()
                     data = json.loads(content.decode())
@@ -112,6 +119,11 @@ async def async_request_trt_llm(
                     output.itl = []
                     output.generated_text = data["text_output"]
                     output.latency = time.perf_counter() - st
+
+                    # Extract avg_decoded_tokens_per_iter from non-streaming TensorRT-LLM response
+                    if "avg_decoded_tokens_per_iter" in data:
+                        output.avg_decoded_tokens_per_iter = data[
+                            "avg_decoded_tokens_per_iter"]
 
             else:
                 output.error = response.reason or ""
@@ -126,6 +138,7 @@ async def async_request_trt_llm(
 
     if pbar:
         pbar.update(1)
+
     return output
 
 
@@ -208,6 +221,11 @@ async def async_request_openai_completions(
 
                                 most_recent_timestamp = timestamp
                                 generated_text += text or ""
+
+                                # Extract avg_decoded_tokens_per_iter from streaming response
+                                if "avg_decoded_tokens_per_iter" in choices[0]:
+                                    output.avg_decoded_tokens_per_iter = choices[
+                                        0]["avg_decoded_tokens_per_iter"]
                             elif usage := data.get("usage"):
                                 output.output_tokens = usage.get(
                                     "completion_tokens")
@@ -230,6 +248,11 @@ async def async_request_openai_completions(
                     output.ttft = -1
                     output.itl = []
                     output.output_tokens = data["usage"]["completion_tokens"]
+                    # Extract avg_decoded_tokens_per_iter if available
+                    choice = data["choices"][0]
+                    if "avg_decoded_tokens_per_iter" in choice:
+                        output.avg_decoded_tokens_per_iter = choice[
+                            "avg_decoded_tokens_per_iter"]
             else:
                 output.error = response.reason or ""
                 output.success = False
@@ -243,6 +266,7 @@ async def async_request_openai_completions(
 
     if pbar:
         pbar.update(1)
+
     return output
 
 
@@ -337,6 +361,11 @@ async def async_request_openai_chat_completions(
                                                       most_recent_timestamp)
 
                                 generated_text += content or ""
+
+                                # Extract avg_decoded_tokens_per_iter from streaming chat response
+                                if "avg_decoded_tokens_per_iter" in choices[0]:
+                                    output.avg_decoded_tokens_per_iter = choices[
+                                        0]["avg_decoded_tokens_per_iter"]
                             elif usage := data.get("usage"):
                                 output.output_tokens = usage.get(
                                     "completion_tokens")
@@ -355,6 +384,12 @@ async def async_request_openai_chat_completions(
                     output.latency = time.perf_counter() - st
                     output.ttft = -1
 
+                    # Extract avg_decoded_tokens_per_iter if available
+                    choice = data["choices"][0]
+                    if "avg_decoded_tokens_per_iter" in choice:
+                        output.avg_decoded_tokens_per_iter = choice[
+                            "avg_decoded_tokens_per_iter"]
+
             else:
                 output.error = response.reason or ""
                 output.success = False
@@ -368,6 +403,7 @@ async def async_request_openai_chat_completions(
 
     if pbar:
         pbar.update(1)
+
     return output
 
 
