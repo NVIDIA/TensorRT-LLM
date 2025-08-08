@@ -75,11 +75,12 @@ void initBindings(pybind11::module_& m)
                 update_kv_cache, predicted_tokens_per_seq, layer_idx, num_heads, num_kv_heads, head_size,
                 tokens_per_block, max_num_requests, max_context_length, attention_window_size, sink_token_length,
                 beam_width, mask_type, quant_mode, q_scaling, position_embedding_type, rotary_embedding_dim,
-                rotary_embedding_base, rotary_embedding_scale_type, rotary_embedding_scales,
-                rotary_embedding_max_position_info, use_paged_context_fmha, attention_input_type, is_mla_enable,
-                q_lora_rank, kv_lora_rank, qk_nope_head_dim, qk_rope_head_dim, v_head_dim, mrope_rotary_cos_sin,
-                mrope_position_deltas, mla_context_paged_kv, mla_context_kv_cache_block_offsets, attention_chunk_size,
-                softmax_stats_tensor, cpp_spec_decoding_bool_list, spec_decoding_tensor_params);
+                rotary_embedding_base, rotary_embedding_scale_type, c10::ArrayRef<double>(rotary_embedding_scales),
+                c10::ArrayRef<int64_t>(rotary_embedding_max_position_info), use_paged_context_fmha,
+                attention_input_type, is_mla_enable, q_lora_rank, kv_lora_rank, qk_nope_head_dim, qk_rope_head_dim,
+                v_head_dim, mrope_rotary_cos_sin, mrope_position_deltas, mla_context_paged_kv,
+                mla_context_kv_cache_block_offsets, attention_chunk_size, softmax_stats_tensor,
+                cpp_spec_decoding_bool_list, c10::ArrayRef<std::optional<torch::Tensor>>(spec_decoding_tensor_params));
         },
         // Parameters with default values using std::nullopt for optional arguments
         py::arg("q"), py::arg("k") = torch::nullopt, py::arg("v") = torch::nullopt, py::arg("output"),
