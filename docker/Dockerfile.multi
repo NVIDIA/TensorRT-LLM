@@ -71,7 +71,7 @@ RUN bash ./install_pytorch.sh $TORCH_INSTALL_TYPE && rm install_pytorch.sh
 ENV PYTORCH_CUDA_ALLOC_CONF="garbage_collection_threshold:0.99999"
 
 # Install OpenCV with FFMPEG support
-RUN pip3 uninstall -y opencv &&  \
+RUN pip3 uninstall -y opencv && \
     rm -rf /usr/local/lib/python3*/dist-packages/cv2/ && \
     pip3 install opencv-python-headless --force-reinstall --no-deps --no-cache-dir
 
@@ -79,10 +79,6 @@ RUN pip3 uninstall -y opencv &&  \
 # * https://github.com/advisories/GHSA-8qvm-5x2c-j2w7
 RUN pip3 install --upgrade --no-cache-dir \
     "protobuf>=4.25.8"
-
-# WAR: build containers only contain stub version of libnvidia-ml.so and not the real version.
-# Need to create symbolic link to prevent errors for stub generation.
-RUN ln -s libnvidia-ml.so $(find /usr -name *libnvidia-ml.so).1
 
 FROM ${TRITON_IMAGE}:${TRITON_BASE_TAG} AS triton
 
