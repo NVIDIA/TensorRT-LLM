@@ -934,6 +934,8 @@ class PyTorchModelEngine(ModelEngine):
             if new is None:
                 return
             for key, v in new.items():
+                if v is None:
+                    continue
                 if key not in old:
                     old[key] = [v]
                 else:

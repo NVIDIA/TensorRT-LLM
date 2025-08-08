@@ -732,7 +732,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
         def get_cache_maybe_with_buffer(like, buffers, cache_name):
             target = None
-            if cache_name in buffers:
+            if buffers is not None and isinstance(
+                    buffers, dict) and cache_name in buffers:
                 cache_buffers = buffers[cache_name]
                 for cache in cache_buffers:
                     if like.dim() == 1:
