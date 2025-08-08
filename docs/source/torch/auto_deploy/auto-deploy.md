@@ -1,22 +1,21 @@
 # AutoDeploy
 
 ```{note}
-Note:
-This project is in active development and is currently in a prototype stage. The code is experimental, subject to change, and may include backward-incompatible updates. While we strive for correctness, we provide no guarantees regarding functionality, stability, or reliability.
+This project is under active development and is currently in a prototype stage. The code is experimental, subject to change, and may include backward-incompatible updates. While we strive for correctness, there are no guarantees regarding functionality, stability, or reliability.
 ```
 
-<h4> Seamless Model Deployment from PyTorch to TRT-LLM</h4>
+### Seamless Model Deployment from PyTorch to TensorRT-LLM
 
-AutoDeploy is a prototype designed to simplify and accelerate the deployment of PyTorch models, including off-the-shelf models like those from HuggingFace transformers library, to TensorRT-LLM.
+AutoDeploy is a prototype designed to simplify and accelerate the deployment of PyTorch models, including off-the-shelf models such as those from the Hugging Face Transformers library, to TensorRT-LLM.
 
 ![AutoDeploy overview](../../media/ad_overview.png)
 <sub><em>AutoDeploy overview and relation with TensorRT-LLM's LLM API</em></sub>
 
-AutoDeploy provides an alternative path for deploying models using the LLM API that does not require users to rewrite the source model (e.g., HuggingFace Transformers models) or manually implement various inference optimizations such as KV-caches, multi-GPU parallelism, quantization, etc. Instead, AutoDeploy extracts a computation graph from the source model and applies inference optimizations through a series of automated graph transformations. AutoDeploy generates an inference-optimized graph that can be directly executed in the TensorRT-LLM PyTorch runtime and leverages various runtime optimizations including in-flight batching, paging, and overlap scheduling.
+AutoDeploy provides an alternative method for deploying models using the LLM API without requiring code changes to the source model (for example, Hugging Face Transformers models) or manual implementation of inference optimizations, such as KV-caches, multi-GPU parallelism, or quantization. Instead, AutoDeploy extracts a computation graph from the source model and applies inference optimizations through a series of automated graph transformations. AutoDeploy generates an inference-optimized graph that can be directly executed in the TensorRT-LLM PyTorch runtime and leverages various runtime optimizations including in-flight batching, paging, and overlap scheduling.
 
-### **Key Features:**
+### Key Feature:
 
-- **Seamless Model Translation:** Automatically converts PyTorch/Hugging Face models to TRT-LLM without manual rewrites.
+- **Seamless Model Translation:** Automatically converts PyTorch/Hugging Face models to TensorRT-LLM without manual rewrites.
 - **Unified Model Definition:** Maintain a single source of truth with your original PyTorch/Hugging Face model.
 - **Optimized Inference:** Built-in transformations for sharding, quantization, KV-cache integration, MHA fusion, and CudaGraph optimization.
 - **Immediate Deployment:** Day-0 support for models with continuous performance enhancements.
@@ -26,7 +25,7 @@ AutoDeploy provides an alternative path for deploying models using the LLM API t
 
 1. **Install AutoDeploy:**
 
-AutoDeploy is accessible through TRT-LLM installation.
+AutoDeploy is included with the TRT-LLM installation.
 
 ```bash
 sudo apt-get -y install libopenmpi-dev && pip3 install --upgrade pip setuptools && pip3 install tensorrt_llm
@@ -36,9 +35,9 @@ You can refer to [TRT-LLM installation guide](../../installation/linux.md) for m
 
 2. **Run Llama Example:**
 
-You are ready to run an in-framework LLama Demo now.
+You are now ready to run an in-framework LLama Demo.
 
-The general entrypoint to run the auto-deploy demo is the `build_and_run_ad.py` script, Checkpoints are loaded directly from Huggingface (HF) or a local HF-like directory:
+The general entry point for running the AutoDeploy demo is the `build_and_run_ad.py` script, Checkpoints are loaded directly from Huggingface (HF) or a local HF-like directory:
 
 ```bash
 cd examples/auto_deploy
@@ -51,7 +50,7 @@ AutoDeploy streamlines the model deployment process through an automated workflo
 
 The exported graph then undergoes a series of automated transformations, including graph sharding, KV-cache insertion, and GEMM fusion, to optimize model performance. After these transformations, the graph is compiled using one of the supported compile backends (like `torch-opt`), followed by deploying it via the TensorRT-LLM runtime.
 
-- [Supported Matrix](support_matrix.md)
+- [Support Matrix](support_matrix.md)
 
 ## Advanced Usage
 
@@ -59,7 +58,7 @@ The exported graph then undergoes a series of automated transformations, includi
 - [Logging Level](./advanced/logging.md)
 - [Incorporating AutoDeploy into Your Own Workflow](./advanced/workflow.md)
 - [Expert Configurations](./advanced/expert_configurations.md)
-- [Performance benchmarking](./advanced/benchmarking_with_trtllm_bench.md)
+- [Performance Benchmarking](./advanced/benchmarking_with_trtllm_bench.md)
 
 ## Roadmap
 

@@ -1,19 +1,19 @@
 # Example Run Script
 
-To build and run AutoDeploy example, use `examples/auto_deploy/build_and_run_ad.py` script:
+To build and run AutoDeploy example, use the `examples/auto_deploy/build_and_run_ad.py` script:
 
 ```bash
 cd examples/auto_deploy
 python build_and_run_ad.py --model "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 ```
 
-You can arbitrarily configure your experiment. Use the `-h/--help` flag to see available options:
+You can configure your experiment with various options. Use the `-h/--help` flag to see available options:
 
 ```bash
 python build_and_run_ad.py --help
 ```
 
-Below is a non-exhaustive list of common config options:
+The following is a non-exhaustive list of common configuration options:
 
 | Configuration Key | Description |
 |-------------------|-------------|
@@ -35,7 +35,7 @@ Below is a non-exhaustive list of common config options:
 
 For default values and additional configuration options, refer to the `ExperimentConfig` class in `examples/auto_deploy/build_and_run_ad.py` file.
 
-Here is a more complete example of using the script:
+The following is a more complete example of using the script:
 
 ```bash
 cd examples/auto_deploy

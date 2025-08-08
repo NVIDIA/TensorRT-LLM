@@ -1,15 +1,15 @@
 ## Support Matrix
 
-AutoDeploy streamlines the model deployment process through an automated workflow designed for efficiency and performance. The workflow begins with a PyTorch model, which is exported using `torch.export` to generate a standard Torch graph. This graph contains core PyTorch ATen operations alongside custom attention operations, determined by the attention backend specified in the configuration.
+AutoDeploy streamlines model deployment with an automated workflow designed for efficiency and performance. The workflow begins with a PyTorch model, which is exported using `torch.export` to generate a standard Torch graph. This graph contains core PyTorch ATen operations alongside custom attention operations, determined by the attention backend specified in the configuration.
 
 The exported graph then undergoes a series of automated transformations, including graph sharding, KV-cache insertion, and GEMM fusion, to optimize model performance. After these transformations, the graph is compiled using one of the supported compile backends (like `torch-opt`), followed by deploying it via the TRT-LLM runtime.
 
-### Supported Models
+### Support Models
 
 **Bring Your Own Model**: AutoDeploy leverages `torch.export` and dynamic graph pattern matching, enabling seamless integration for a wide variety of models without relying on hard-coded architectures.
 
-We support Hugging Face models that are compatible with `AutoModelForCausalLM` and `AutoModelForImageTextToText`.
-In addition, we have officially validated the following models using the default configuration: runtime=trtllm, compile_backend=torch-compile, and attn_backend=flashinfer
+AutoDeploy supports Hugging Face models compatible with `AutoModelForCausalLM` and `AutoModelForImageTextToText`.
+In addition, the following models have been officially validated using the default configuration: `runtime=trtllm`, `compile_backend=torch-compile`, and `attn_backend=flashinfer`
 
 <details>
 <summary>Click to expand supported models list</summary>
@@ -89,7 +89,7 @@ In addition, we have officially validated the following models using the default
 
 ### Runtime Integrations
 
-AutoDeploy runs natively with the entire `TRT-LLM` stack via the `LLM` API. In addition, we provide a light-weight wrapper of the `LLM` API for onboarding and debugging new models:
+AutoDeploy runs natively with the complete `TRT-LLM` stack via the `LLM` API. In addition, we provide a light-weight wrapper of the `LLM` API for onboarding and debugging new models:
 
 | `"runtime"` | Description |
 |-------------|-------------|
@@ -109,12 +109,12 @@ AutoDeploy supports multiple backends for compiling the exported Torch graph:
 
 ### Attention backends
 
-Optimize attention operations using different attention kernel implementations:
+Optimize attention operations with different attention kernel implementations:
 
 | `"attn_backend"` | Description |
 |----------------------|-------------|
 | `triton` | Custom fused multi-head attention (MHA) with KV Cache kernels for efficient attention processing. |
-| `flashinfer`         | Uses off-the-shelf optimized attention kernels with KV Cache from the [`flashinfer`](https://github.com/flashinfer-ai/flashinfer.git) library. |
+| `flashinfer`         | Uses optimized attention kernels with KV Cache from the [`flashinfer`](https://github.com/flashinfer-ai/flashinfer.git) library. |
 
 ### Precision Support
 

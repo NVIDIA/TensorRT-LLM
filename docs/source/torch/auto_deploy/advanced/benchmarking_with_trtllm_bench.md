@@ -4,11 +4,11 @@ AutoDeploy is integrated with the `trtllm-bench` performance benchmarking utilit
 
 ## Getting Started
 
-Before benchmarking with AutoDeploy, familiarize yourself with the general `trtllm-bench` workflow and best practices by reviewing the [TensorRT-LLM benchmarking guide](../../performance/perf-benchmarking.md#running-with-the-pytorch-workflow).
+Before benchmarking with AutoDeploy, review the [TensorRT-LLM benchmarking guide](../../performance/perf-benchmarking.md#running-with-the-pytorch-workflow) to familiarize yourself with the standard trtllm-bench workflow and best practices.
 
 ## Basic Usage
 
-The AutoDeploy backend can be invoked by specifying `--backend _autodeploy` in your `trtllm-bench` command:
+Invoke the AutoDeploy backend by specifying `--backend _autodeploy` in your `trtllm-bench` command:
 
 ```bash
 trtllm-bench \
@@ -19,12 +19,12 @@ trtllm-bench \
 ```
 
 ```{note}
-Similar to the PyTorch workflow, AutoDeploy does not require a separate `trtllm-bench build` step. The model is automatically optimized during the benchmark initialization phase.
+As in the PyTorch workflow, AutoDeploy does not require a separate `trtllm-bench build` step. The model is automatically optimized during benchmark initialization.
 ```
 
 ## Advanced Configuration
 
-For fine-tuned control over AutoDeploy's behavior during benchmarking, use the `--extra_llm_api_options` flag with a YAML configuration file:
+For more granular control over AutoDeploy's behavior during benchmarking, use the `--extra_llm_api_options` flag with a YAML configuration file:
 
 ```bash
 trtllm-bench \
@@ -62,7 +62,7 @@ attn_backend: flashinfer
 max_batch_size: 256
 ```
 
-Multi-gpu execution can be enabled by specifying `--tp n`, where `n` is the number of GPUs
+Enable multi-GPU execution by specifying `--tp n`, where `n` is the number of GPUs
 
 ## Configuration Options Reference
 
@@ -82,7 +82,7 @@ Multi-gpu execution can be enabled by specifying `--tp n`, where `n` is the numb
 | `cuda_graph_batch_sizes` | `null` | List of batch sizes for CUDA graph creation |
 
 ```{tip}
-For optimal performance with CUDA graphs, specify batch sizes that match your expected workload patterns. For example: `[1, 2, 4, 8, 16, 32, 64, 128]`
+For optimal CUDA graph performance, specify batch sizes that match your expected workload patterns. For example: `[1, 2, 4, 8, 16, 32, 64, 128]`
 ```
 
 ## Performance Optimization Tips
@@ -90,4 +90,4 @@ For optimal performance with CUDA graphs, specify batch sizes that match your ex
 1. **Memory Management**: Set `free_mem_ratio` to 0.8-0.9 for optimal KV cache utilization
 1. **Compilation Backend**: Use `torch-opt` for production workloads
 1. **Attention Backend**: `flashinfer` generally provides the best performance for most models
-1. **CUDA Graphs**: Enable for batch sizes matching your production traffic patterns
+1. **CUDA Graphs**: Enable CUDA graphs for batch sizes that match your production traffic patterns.

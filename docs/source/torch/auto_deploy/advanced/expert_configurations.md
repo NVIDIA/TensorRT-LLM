@@ -1,28 +1,25 @@
 # Expert Configuration of LLM API
 
-For expert TensorRT-LLM users, we also expose the full set of `tensorrt_llm._torch.auto_deploy.llm_args.LlmArgs`
-*at your own risk* (the argument list diverges from TRT-LLM's argument list):
+For advanced TensorRT-LLM users, the full set of `tensorrt_llm._torch.auto_deploy.llm_args.LlmArgs` is exposed. Use at your own risk. The argument list may diverge from the standard TRT-LLM argument list.
 
-- All config fields that are used by the AutoDeploy core pipeline (i.e. the `InferenceOptimizer`) are
-  _exclusively_ exposed in the `AutoDeployConfig` in `tensorrt_llm._torch.auto_deploy.llm_args`.
+- All configuration fields used by the AutoDeploy core pipeline, `InferenceOptimizer`, are exposed exclusively in `AutoDeployConfi`g in `tensorrt_llm._torch.auto_deploy.llm_args`.
   Please make sure to refer to those first.
-- For expert users we expose the full set of `LlmArgs` in `tensorrt_llm._torch.auto_deploy.llm_args`
-  that can be used to configure the AutoDeploy `LLM` API including runtime options.
+- For advanced users, the full set of `LlmArgs` in `tensorrt_llm._torch.auto_deploy.llm_args` can be used to configure the AutoDeploy `LLM` API, including runtime options.
 - Note that some fields in the full `LlmArgs`
   object are overlapping, duplicated, and/or _ignored_ in AutoDeploy, particularly arguments
   pertaining to configuring the model itself since AutoDeploy's model ingestion+optimize pipeline
   significantly differs from the default manual workflow in TensorRT-LLM.
 - However, with the proper care the full `LlmArgs`
   objects can be used to configure advanced runtime options in TensorRT-LLM.
-- Note that any valid field can be simply provided as keyword argument ("`**kwargs`") to the AutoDeploy `LLM` API.
+- Any valid field can be simply provided as keyword argument ("`**kwargs`") to the AutoDeploy `LLM` API.
 
 # Expert Configuration of `build_and_run_ad.py`
 
-For expert users, `build_and_run_ad.py` provides advanced configuration capabilities through a flexible argument parser powered by PyDantic Settings and OmegaConf. You can use dot notation for CLI arguments, provide multiple YAML configuration files, and leverage sophisticated configuration precedence rules to create complex deployment configurations.
+For advanced users, `build_and_run_ad.py` provides advanced configuration capabilities using a flexible argument parser powered by PyDantic Settings and OmegaConf. You can use dot notation for CLI arguments, provide multiple YAML configuration files, and utilize sophisticated configuration precedence rules to create complex deployment configurations.
 
 ## CLI Arguments with Dot Notation
 
-The script supports flexible CLI argument parsing using dot notation to modify nested configurations dynamically. You can target any field in both the `ExperimentConfig` in `examples/auto_deploy/build_and_run_ad.py` and nested `AutoDeployConfig`/`LlmArgs` objects in `tensorrt_llm._torch.auto_deploy.llm_args`:
+The script supports flexible CLI argument parsing using dot notation to modify nested configurations dynamically. You can target any field in both the `ExperimentConfig` in `examples/auto_deploy/build_and_run_ad.py` and nested `AutoDeployConfig` or `LlmArgs` objects in `tensorrt_llm._torch.auto_deploy.llm_args`:
 
 ```bash
 # Configure model parameters
@@ -35,7 +32,7 @@ python build_and_run_ad.py \
   --args.model-kwargs.hidden-size=2048 \
   --args.tokenizer-kwargs.padding-side=left
 
-# Configure runtime and backend settings
+# Configure runtime and backend options
 python build_and_run_ad.py \
   --model "TinyLlama/TinyLlama-1.1B-Chat-v1.0" \
   --args.world-size=2 \
@@ -55,7 +52,7 @@ python build_and_run_ad.py \
 
 ## YAML Configuration Files
 
-Both `ExperimentConfig` and `AutoDeployConfig`/`LlmArgs` inherit from `DynamicYamlMixInForSettings`, enabling you to provide multiple YAML configuration files that are automatically deep-merged at runtime.
+Both `ExperimentConfig` and `AutoDeployConfig`/`LlmArgs` inherit from `DynamicYamlMixInForSettings`, which enables you to provide multiple YAML configuration files that are automatically deep-merged at runtime.
 
 Create a YAML configuration file (e.g., `my_config.yaml`):
 
@@ -126,13 +123,13 @@ python build_and_run_ad.py \
 
 ## Configuration Precedence and Deep Merging
 
-The configuration system follows a strict precedence order where higher priority sources override lower priority ones:
+The configuration system follows a precedence order in which higher priority sources override lower priority ones:
 
 1. **CLI Arguments** (highest priority) - Direct command line arguments
 1. **YAML Configs** - Files specified via `--yaml-configs` and `--args.yaml-configs`
 1. **Default Settings** (lowest priority) - Built-in defaults from the config classes
 
-**Deep Merging**: Unlike simple overwriting, deep merging intelligently combines nested dictionaries recursively. For example:
+**Deep Merging**: Unlike simple overwriting, deep merging recursively combines nested dictionaries. For example:
 
 ```yaml
 # Base config
@@ -152,7 +149,7 @@ args:
   world_size: 4  # This gets added
 ```
 
-**Nested Config Behavior**: When using nested configurations, outer YAML configs become init settings for inner objects, giving them higher precedence:
+**Nested Config Behavior**: When using nested configurations, outer YAML configuration files become initialization settings for inner objects, giving them higher precedence:
 
 ```bash
 # The outer yaml-configs affects the entire ExperimentConfig
@@ -166,7 +163,7 @@ python build_and_run_ad.py \
 
 ## Built-in Default Configuration
 
-Both `AutoDeployConfig` and `LlmArgs` classes automatically load a built-in `default.yaml` configuration file that provides sensible defaults for the AutoDeploy inference optimizer pipeline. This file is specified in the `_get_config_dict()` function in `tensorrt_llm._torch.auto_deploy.llm_args` and defines default transform configurations for graph optimization stages.
+Both `AutoDeployConfig` and `LlmArgs` classes automatically load a built-in `default.yaml` configuration file that provides defaults for the AutoDeploy inference optimizer pipeline. This file is specified in the `_get_config_dict()` function in `tensorrt_llm._torch.auto_deploy.llm_args` and defines default transform configurations for graph optimization stages.
 
 The built-in defaults are automatically merged with your configurations at the lowest priority level, ensuring that your custom settings always override the defaults. You can inspect the current default configuration to understand the baseline transform pipeline:
 

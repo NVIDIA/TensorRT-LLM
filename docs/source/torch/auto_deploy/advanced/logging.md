@@ -1,6 +1,6 @@
 # Logging Level
 
-Use the following env variable to specify the logging level of our built-in logger ordered by
+Use the following env variable to specify the logging level of our built-in logger, ordered by
 decreasing verbosity;
 
 ```bash
@@ -11,4 +11,4 @@ AUTO_DEPLOY_LOG_LEVEL=ERROR
 AUTO_DEPLOY_LOG_LEVEL=INTERNAL_ERROR
 ```
 
-The default level is `INFO`.
+The default log level is `INFO`.

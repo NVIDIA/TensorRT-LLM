@@ -1,8 +1,8 @@
 ### Incorporating `auto_deploy` into your own workflow
 
-AutoDeploy can be seamlessly integrated into your existing workflows using TRT-LLM's LLM high-level API. This section provides a blueprint for configuring and invoking AutoDeploy within your custom applications.
+AutoDeploy can be seamlessly integrated into existing workflows using TRT-LLM's LLM high-level API. This section provides an example for configuring and invoking AutoDeploy in custom applications.
 
-Here is an example of how you can build an LLM object with AutoDeploy integration:
+The following example demonstrates how to build an LLM object with AutoDeploy integration:
 
 ```
 from tensorrt_llm._torch.auto_deploy import LLM
@@ -27,6 +27,4 @@ llm = LLM(
 
 ```
 
-Please consult the AutoDeploy `LLM` API in `tensorrt_llm._torch.auto_deploy.llm` and the
-`AutoDeployConfig` class in `tensorrt_llm._torch.auto_deploy.llm_args`
-for more detail on how AutoDeploy is configured via the `**kwargs` of the `LLM` API.
+For more information about configuring AutoDeploy via the `LLM` API using `**kwargs`, see the AutoDeploy LLM API in `tensorrt_llm._torch.auto_deploy.llm` and the `AutoDeployConfig` class in `tensorrt_llm._torch.auto_deploy.llm_args`.
