@@ -17,11 +17,12 @@
 
 ## TensorRT-LLM - Docs
 /docs @NVIDIA/trt-llm-doc-owners
+
+## Examples
 /examples @NVIDIA/trt-llm-doc-owners
 
 ## TensorRT-LLM - Triton backend
 /triton_backend @NVIDIA/trt-llm-triton-backend-devs
-
 
 # TensorRT-LLM Pytorch backend
 /tensorrt_llm/_torch @NVIDIA/trt-llm-torch-devs
@@ -31,11 +32,13 @@
 
 ## TensorRT-LLM Pytorch Models
 /tensorrt_llm/_torch/models @NVIDIA/trt-llm-torch-models-devs
+/examples/models @NVIDIA/trt-llm-torch-models-devs @NVIDIA/trt-llm-doc-owners
+
 ## TensorRT-LLM Pytorch backend - runtime
 /tensorrt_llm/_torch/pyexecutor @NVIDIA/trt-llm-torch-runtime-devs
 ## TensorRT-LLM Pytorch backend - AutoDeploy flow
 /tensorrt_llm/_torch/auto_deploy @NVIDIA/trt-llm-torch-autodeploy-devs
-/tensorrt_llm/examples/auto_deploy @NVIDIA/trt-llm-torch-autodeploy-devs
+/examples/auto_deploy @NVIDIA/trt-llm-torch-autodeploy-devs @NVIDIA/trt-llm-doc-owners
 
 ## TensorRT-LLM Pytorch - Speculative Decoding
 /tensorrt_llm/_torch/speculative @NVIDIA/trt-llm-torch-spec-decoding
@@ -136,7 +139,7 @@ docs/source/performance/perf-benchmarking.md @NVIDIA/trtllm-bench-reviewers
 /tensorrt_llm/executor @NVIDIA/trt-llm-llmapi-devs
 
 ## TensorRT-LLM LLM Disaggregated
-/examples/disaggregated @NVIDIA/trt-llm-disagg-devs
+/examples/disaggregated @NVIDIA/trt-llm-disagg-devs @NVIDIA/trt-llm-doc-owners
 /tensorrt_llm/disaggregated_params.py @NVIDIA/trt-llm-disagg-devs
 /tensorrt_llm/_torch/pyexecutor/kv_cache_transceiver.py @NVIDIA/trt-llm-disagg-devs
 /cpp/tensorrt_llm/batch_manager/cacheFormatter.cpp @NVIDIA/trt-llm-disagg-devs
