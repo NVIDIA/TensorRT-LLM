@@ -122,15 +122,21 @@ class BaseLLM:
         self._executor_cls = kwargs.pop("executor_cls", GenerationExecutor)
         self._llm_id = None
 
+        log_level = logger.level
+        logger.set_level("info")  # force display the backend
+
         try:
             backend = kwargs.get('backend', None)
-            if backend == 'pytorch':
+            if backend == "pytorch":
+                logger.info("Using LLM with PyTorch backend")
                 llm_args_cls = TorchLlmArgs
             elif backend == '_autodeploy':
+                logger.info("Using LLM with AutoDeploy backend")
                 from .._torch.auto_deploy.llm_args import \
                     LlmArgs as AutoDeployLlmArgs
                 llm_args_cls = AutoDeployLlmArgs
             else:
+                logger.info("Using LLM with TensorRT backend")
                 llm_args_cls = TrtLlmArgs
 
             # check the kwargs and raise ValueError directly
@@ -159,6 +165,9 @@ class BaseLLM:
             logger.error(
                 f"Failed to parse the arguments for the LLM constructor: {e}")
             raise e
+
+        finally:
+            logger.set_level(log_level)  # restore the log level
 
         print_colored_debug(f"LLM.args.mpi_session: {self.args.mpi_session}\n",
                             "yellow")
