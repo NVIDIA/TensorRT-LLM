@@ -80,6 +80,7 @@ Qwen3/Qwen3-8B:
     kv_cache_quant_algo: FP8
     accuracy: 87.1114
 Qwen3/Qwen3-30B-A3B:
+  - accuracy: 83.43
   - quant_algo: FP8_BLOCK_SCALES
     accuracy: 84.36
   - quant_algo: FP8
