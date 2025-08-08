@@ -300,8 +300,10 @@ class Mistral3VLM(PreTrainedModel):
         self.llm = MistralForCausalLM(llm_model_config)
 
         self._device = "cuda"
-        vision_model_config = self._get_sub_model_config(
-            model_config, "vision_config")
+        # NOTE: current `modelopt` does not support quantizing the vision portion.
+        vision_model_config = self._get_sub_model_config(model_config,
+                                                         "vision_config",
+                                                         quant_config=None)
         self._vision_tower = modeling_pixtral.PixtralVisionModel(
             vision_model_config)
         self._multi_modal_projector = Mistral3MultiModalProjector(model_config)
@@ -397,12 +399,14 @@ class Mistral3VLM(PreTrainedModel):
     def _get_sub_model_config(
         model_config: ModelConfig[MistralConfig],
         name: str,
+        **changes,
     ) -> ModelConfig:
         # Extract the subconfig from the `transformers` config and shove it into our own
         # `ModelConfig` class.
         sub_model_config: ModelConfig[MistralConfig] = dataclasses.replace(
             model_config,
             pretrained_config=getattr(model_config.pretrained_config, name),
+            **changes,
         )
         # Make sure some fields that are not explicitly included in the sub config, but present
         # in the top-level config, are replicated.
