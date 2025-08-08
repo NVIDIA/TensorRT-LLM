@@ -12,6 +12,7 @@ context_servers:
     backend: "default"
   urls:
     - "localhost:8001"
+  use_torch_sampler: True
 generation_servers:
   num_instances: 1
   tensor_parallel_size: 1

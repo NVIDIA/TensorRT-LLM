@@ -34,6 +34,7 @@ struct XQAParams
     void* output_sf = nullptr;
     void const* qkv = nullptr;
     int32_t const* cache_indir = nullptr;
+    float const* attention_sinks = nullptr;
     float const* kv_scale_orig_quant = nullptr;
     float const* kv_scale_quant_orig = nullptr;
     int32_t const* host_past_key_value_lengths = nullptr;

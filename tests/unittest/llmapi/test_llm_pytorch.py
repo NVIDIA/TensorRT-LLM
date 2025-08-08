@@ -238,7 +238,7 @@ def test_embedding_bias_with_torch_sampler_strategies(enable_mixed_sampler,
         ["Z Z Z Z Z Z"],
         sampling_params=sampling_params,
         backend="pytorch",
-        enable_trtllm_sampler=False,  # Use TorchSampler to test all 3 paths
+        use_torch_sampler=True,  # Use TorchSampler to test all 3 paths
         enable_mixed_sampler=enable_mixed_sampler)
 
 
