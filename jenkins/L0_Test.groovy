@@ -674,6 +674,10 @@ def globalVars = [
     (IMAGE_KEY_TO_TAG): [:],
 ]
 
+class GlobalState {
+    static def uploadResultStageNames = []
+}
+
 String getShortenedJobName(String path)
 {
     static final nameMapping = [
@@ -745,6 +749,14 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
             sh "STAGE_NAME=${stageName} && env | sort > ${stageName}/debug_env.txt"
             echo "Upload test results."
             sh "tar -czvf results-${stageName}.tar.gz ${stageName}/"
+            if(!GlobalState.uploadResultStageNames.contains(stageName)) {
+                GlobalState.uploadResultStageNames.add(stageName)
+                echo "uploadResultStageNames: ${GlobalState.uploadResultStageNames}"
+            } else {
+                catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                    error "Upload test results for ${stageName} failed because it has already been uploaded."
+                }
+            }
             trtllm_utils.uploadArtifacts(
                 "results-${stageName}.tar.gz",
                 "${UPLOAD_PATH}/test-results/"
