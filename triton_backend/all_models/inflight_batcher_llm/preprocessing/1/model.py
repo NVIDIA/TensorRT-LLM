@@ -1083,10 +1083,19 @@ class VisionPreProcessor:
         visual_tokens = []
         for batch_id in range(batch_size):
             # Preprocess images and query
+            query = queries[batch_id]
+            if not isinstance(query, (str, bytes)):
+                query = query[0]
+            if isinstance(query, bytes):
+                query = query.decode("utf-8")
+            if "[IMG]" not in query:
+                query = "[IMG]" * len(images[batch_id]) + query
+            assert query.count("[IMG]") == len(
+                images[batch_id]
+            ), "Number of [IMG] tags must match number of images"
+
             processed_vision_data = self.vision_model_processor(
-                images=images[batch_id],
-                text=queries[batch_id],
-                return_tensors="pt")
+                images=images[batch_id], text=query, return_tensors="pt")
             visual_tokens.append(processed_vision_data['input_ids'].shape[1])
             # Pad to self.image_size x self.image_size
             processed_vision_data['pixel_values'] = torch.nn.functional.pad(
