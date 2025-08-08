@@ -109,16 +109,9 @@ void initBindings(pybind11::module_& m)
         py::arg("spec_decoding_bool_params"), py::arg("spec_decoding_tensor_params"),
         "In-place multi-head attention operation");
 
-    m.def(
-        "attention_supports_nvfp4_output",
-        [](int64_t num_heads, int64_t num_kv_heads, int64_t head_size, std::optional<int64_t> tokens_per_block,
-            int64_t mask_type, int64_t quant_mode, bool use_paged_context_fmha, bool is_mla_enable)
-        {
-            return torch_ext::attention_supports_nvfp4_output(num_heads, num_kv_heads, head_size, tokens_per_block,
-                mask_type, quant_mode, use_paged_context_fmha, is_mla_enable);
-        },
-        py::arg("num_heads"), py::arg("num_kv_heads"), py::arg("head_size"), py::arg("tokens_per_block") = std::nullopt,
-        py::arg("mask_type"), py::arg("quant_mode"), py::arg("use_paged_context_fmha"), py::arg("is_mla_enable"),
+    m.def("attention_supports_nvfp4_output", &torch_ext::attention_supports_nvfp4_output, py::arg("num_heads"),
+        py::arg("num_kv_heads"), py::arg("head_size"), py::arg("tokens_per_block") = std::nullopt, py::arg("mask_type"),
+        py::arg("quant_mode"), py::arg("use_paged_context_fmha"), py::arg("is_mla_enable"),
         "Check if attention operation supports NVFP4 output format");
 }
 } // namespace tensorrt_llm::pybind::thop::attentionOp
