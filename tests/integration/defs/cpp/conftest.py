@@ -19,8 +19,15 @@ from defs.conftest import llm_models_root
 
 
 @pytest.fixture(scope="session")
-def build_dir():
-    return _cpp.find_build_dir()
+def build_type():
+    # For debugging purposes, we can use the RelWithDebInfo build type.
+    # return "RelWithDebInfo"
+    return "Release"
+
+
+@pytest.fixture(scope="session")
+def build_dir(build_type):
+    return _cpp.find_build_dir(build_type)
 
 
 @pytest.fixture(scope="session")
@@ -148,44 +155,35 @@ def install_additional_requirements(python_exe, root_dir):
 
 
 @pytest.fixture(scope="session")
-def build_google_tests(request, build_dir):
+def build_google_tests(request, build_type):
 
     cuda_arch = f"{request.param}-real"
 
-    print(f"Using CUDA arch: {cuda_arch}")
+    _logger.info(f"Using CUDA arch: {cuda_arch}")
 
-    build_trt_llm(cuda_architectures=cuda_arch,
-                  job_count=12,
-                  use_ccache=True,
-                  clean=True,
-                  generator="Ninja",
-                  trt_root="/usr/local/tensorrt",
-                  nixl_root="/opt/nvidia/nvda_nixl",
-                  skip_building_wheel=True)
-
-    make_google_tests = [
-        "cmake",
-        "--build",
-        ".",
-        "--config",
-        "Release",
-        "-j",
-        "--target",
-        "google-tests",
-    ]
-
-    _cpp.run_command(make_google_tests, cwd=build_dir, timeout=300)
+    build_trt_llm(
+        build_type=build_type,
+        cuda_architectures=cuda_arch,
+        job_count=12,
+        use_ccache=True,
+        clean=True,
+        generator="Ninja",
+        trt_root="/usr/local/tensorrt",
+        nixl_root="/opt/nvidia/nvda_nixl",
+        skip_building_wheel=True,
+        extra_make_targets=["google-tests"],
+    )
 
 
 @pytest.fixture(scope="session")
-def build_benchmarks(build_google_tests, build_dir):
+def build_benchmarks(build_google_tests, build_dir, build_type):
 
     make_benchmarks = [
         "cmake",
         "--build",
         ".",
         "--config",
-        "Release",
+        build_type,
         "-j",
         "--target",
         "benchmarks",
@@ -224,9 +222,9 @@ def prepare_model(
 
 
 @pytest.fixture(scope="function", autouse=True)
-def keep_log_files(llm_root):
+def keep_log_files(llm_root, build_dir):
     "Backup previous cpp test results when run multiple ctest"
-    results_dir = f"{llm_root}/cpp/build"
+    results_dir = build_dir
 
     yield
 

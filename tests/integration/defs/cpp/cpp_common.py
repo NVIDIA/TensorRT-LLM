@@ -82,9 +82,9 @@ def find_root_dir(start_dir: Optional[_pl.Path] = None) -> _pl.Path:
     return find_dir_containing(("scripts", "examples", "cpp"), start_dir)
 
 
-def find_build_dir():
+def find_build_dir(build_type):
     root_dir = find_root_dir()
-    dir = get_trt_llm_build_dir(None, "Release")
+    dir = get_trt_llm_build_dir(None, build_type)
 
     return dir if dir.is_absolute() else root_dir / dir
 
