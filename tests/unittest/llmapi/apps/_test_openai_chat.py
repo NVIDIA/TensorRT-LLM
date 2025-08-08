@@ -22,7 +22,7 @@ def model_name():
     return "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
 
 
-@pytest.fixture(scope="module", params=["trt", "pytorch"])
+@pytest.fixture(scope="module", params=["tensorrt", "pytorch"])
 def backend(request):
     return request.param
 
@@ -68,7 +68,7 @@ def server(model_name: str, backend: str, extra_llm_api_options: bool,
            temp_extra_llm_api_options_file: str, num_postprocess_workers: int):
     model_path = get_model_path(model_name)
     args = ["--backend", f"{backend}"]
-    if backend == "trt":
+    if backend == "tensorrt":
         args.extend(["--max_beam_width", "4"])
     if extra_llm_api_options:
         args.extend(

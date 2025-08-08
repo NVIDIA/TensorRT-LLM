@@ -25,6 +25,7 @@ from tensorrt_llm.llmapi.disagg_utils import (CtxGenServerConfig,
 from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_dict
 from tensorrt_llm.llmapi.mpi_session import find_free_port
 from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
+from tensorrt_llm.llmapi.utils import BackendType
 from tensorrt_llm.logger import logger, severity_map
 from tensorrt_llm.serve import OpenAIDisaggServer, OpenAIServer
 
@@ -71,7 +72,7 @@ def _signal_handler_cleanup_child(signum, frame):
 
 def get_llm_args(model: str,
                  tokenizer: Optional[str] = None,
-                 backend: str = "pytorch",
+                 backend: BackendType = BackendType.PYTORCH,
                  max_beam_width: int = BuildConfig.max_beam_width,
                  max_batch_size: int = BuildConfig.max_batch_size,
                  max_num_tokens: int = BuildConfig.max_num_tokens,
@@ -137,7 +138,7 @@ def get_llm_args(model: str,
         "kv_cache_config":
         kv_cache_config,
         "backend":
-        backend if backend == "pytorch" else None,
+        backend if backend == BackendType.PYTORCH else None,
         "num_postprocess_workers":
         num_postprocess_workers,
         "postprocess_tokenizer_dir":
@@ -157,10 +158,15 @@ def launch_server(host: str,
                   metadata_server_cfg: Optional[MetadataServerConfig] = None,
                   server_role: Optional[ServerRole] = None):
 
-    backend = llm_args["backend"]
+    if backend := llm_args.get("backend", None):
+        if isinstance(backend, BackendType):
+            llm_args["backend"] = backend.canonical_value
+    else:
+        backend = BackendType.get_default_backend_with_warning(backend)
+
     model = llm_args["model"]
 
-    if backend == 'pytorch':
+    if backend == BackendType.PYTORCH:
         llm = PyTorchLLM(**llm_args)
     else:
         llm = LLM(**llm_args)
@@ -185,10 +191,12 @@ def launch_server(host: str,
               default="localhost",
               help="Hostname of the server.")
 @click.option("--port", type=int, default=8000, help="Port of the server.")
-@click.option("--backend",
-              type=click.Choice(["pytorch", "trt"]),
-              default="pytorch",
-              help="Set to 'pytorch' for pytorch path. Default is cpp path.")
+@click.option(
+    "--backend",
+    type=click.Choice(BackendType.canonical_values()),
+    default=None,
+    help=
+    "Set to 'tensorrt' for TensorRT engine path. Default is the pytorch path.")
 @click.option('--log_level',
               type=click.Choice(severity_map.keys()),
               default='info',
@@ -277,21 +285,25 @@ def launch_server(host: str,
     help=
     "Exit with runtime error when attention window is too large to fit even a single sequence in the KV cache."
 )
-def serve(
-        model: str, tokenizer: Optional[str], host: str, port: int,
-        log_level: str, backend: str, max_beam_width: int, max_batch_size: int,
-        max_num_tokens: int, max_seq_len: int, tp_size: int, pp_size: int,
-        ep_size: Optional[int], cluster_size: Optional[int],
-        gpus_per_node: Optional[int], kv_cache_free_gpu_memory_fraction: float,
-        num_postprocess_workers: int, trust_remote_code: bool,
-        extra_llm_api_options: Optional[str], reasoning_parser: Optional[str],
-        metadata_server_config_file: Optional[str], server_role: Optional[str],
-        fail_fast_on_attention_window_too_large: bool):
+def serve(model: str, tokenizer: Optional[str], host: str, port: int,
+          log_level: str, backend: Optional[str], max_beam_width: int,
+          max_batch_size: int, max_num_tokens: int, max_seq_len: int,
+          tp_size: int, pp_size: int, ep_size: Optional[int],
+          cluster_size: Optional[int], gpus_per_node: Optional[int],
+          kv_cache_free_gpu_memory_fraction: float,
+          num_postprocess_workers: int, trust_remote_code: bool,
+          extra_llm_api_options: Optional[str], reasoning_parser: Optional[str],
+          metadata_server_config_file: Optional[str],
+          server_role: Optional[str],
+          fail_fast_on_attention_window_too_large: bool):
     """Running an OpenAI API compatible server
 
     MODEL: model name | HF checkpoint path | TensorRT engine path
     """
     logger.set_level(log_level)
+
+    backend: BackendType = BackendType.get_default_backend_with_warning(backend)
+    BackendType.print_backend_info(backend)
 
     llm_args, _ = get_llm_args(
         model=model,

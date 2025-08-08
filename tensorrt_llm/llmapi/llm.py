@@ -124,7 +124,7 @@ class BaseLLM:
 
         try:
             backend = kwargs.get('backend', None)
-            if backend == 'pytorch':
+            if backend in ('pytorch', None):
                 llm_args_cls = TorchLlmArgs
             elif backend == '_autodeploy':
                 from .._torch.auto_deploy.llm_args import \

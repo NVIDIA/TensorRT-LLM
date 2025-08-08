@@ -322,7 +322,7 @@ def check_server_health(server_url: str,
 
 @pytest.mark.parametrize("test_mode", ["stress-test", "stress-stage-alone"],
                          ids=lambda x: x)
-@pytest.mark.parametrize("backend", ["trt", "pytorch"], ids=lambda x: x)
+@pytest.mark.parametrize("backend", ["tensorrt", "pytorch"], ids=lambda x: x)
 @pytest.mark.parametrize("capacity_scheduler_policy",
                          ["GUARANTEED_NO_EVICT", "MAX_UTILIZATION"],
                          ids=lambda x: x)
@@ -358,12 +358,12 @@ def test_run_stress_test(config, stress_time_timeout, backend,
     Args:
         config: Model configuration for the test (injected by pytest.mark.parametrize)
         stress_time_timeout: Tuple of (stress_time, stress_timeout) in seconds
-        backend: Backend to use ("trt" or "pytorch")
+        backend: Backend to use ("tensorrt" or "pytorch")
         capacity_scheduler_policy: Scheduler policy ("GUARANTEED_NO_EVICT", "MAX_UTILIZATION")
         test_mode: Test mode ("stress-test" or "stress-stage-alone")
     """
     # Create a new ModelConfig with the backend parameter
-    # Convert 'trt' to None as expected by the ModelConfig
+    # Convert 'tensorrt' to None as expected by the ModelConfig
 
     new_config = ModelConfig(model_dir=config.model_dir,
                              tp_size=config.tp_size,

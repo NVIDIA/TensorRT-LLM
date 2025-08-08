@@ -17,7 +17,7 @@ def model_name():
     return "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
 
 
-@pytest.fixture(scope="module", params=["trt", "pytorch"])
+@pytest.fixture(scope="module", params=["tensorrt", "pytorch"])
 def backend(request):
     return request.param
 
@@ -33,7 +33,7 @@ def num_postprocess_workers(request):
 def server(model_name: str, backend: str, num_postprocess_workers: int):
     model_path = get_model_path(model_name)
     args = ["--backend", f"{backend}"]
-    if backend == "trt":
+    if backend == "tensorrt":
         args.extend(["--max_beam_width", "4"])
     args.extend(["--num_postprocess_workers", f"{num_postprocess_workers}"])
     with RemoteOpenAIServer(model_path, args) as remote_server:

@@ -20,6 +20,7 @@ import filelock
 import huggingface_hub
 import psutil
 import torch
+from aenum import MultiValueEnum
 from huggingface_hub import snapshot_download
 from pydantic import BaseModel
 from tqdm.auto import tqdm
@@ -634,3 +635,54 @@ class ApiStatusRegistry:
 
 set_api_status = ApiStatusRegistry().set_api_status
 get_api_status = ApiStatusRegistry().get_api_status
+
+
+class BackendType(MultiValueEnum):
+    """ The backend type. """
+    # display_name, canonical_value, other aliases ...
+    PYTORCH = "PyTorch", "pytorch", "PyT"
+    TENSORRT = "TensorRT", "tensorrt", "trt"
+    _AUTODEPLOY = "AutoDeploy", "_autodeploy"
+
+    def __str__(self):
+        return self.values[0]
+
+    @property
+    def canonical_value(self):
+        return self.values[1]
+
+    @staticmethod
+    def default_value() -> str:
+        """ Default value for the backend. """
+        return BackendType.PYTORCH.canonical_value
+
+    @staticmethod
+    def canonical_values() -> list[str]:
+        """ Canonical values for the backend. """
+        return [v.canonical_value for v in BackendType]
+
+    # Several utils for unified behavior across trtllm-serve and trtllm-bench
+    @staticmethod
+    def print_backend_info(backend: "BackendType"):
+        """ Print the backend info. """
+        logger.info(f"Running with {backend} backend.")
+
+    # TODO[Superjom]: Remove this method after v1.0.0 is released.
+    @staticmethod
+    def get_default_backend_with_warning(
+            backend: Optional[str]) -> "BackendType":
+        """ Warn the user if the backend is not set, as we changed the default
+        backend to from tensorrt topytorch from v1.0 """
+        if backend is None:
+            logger.warning(
+                f"The default backend becomes 'pytorch' from v1.0, for TensorRT "
+                "engine, please use `--backend tensorrt` instead.")
+            backend = BackendType.default_value()
+
+        # check the backend should be in the canonical values
+        if backend not in BackendType.canonical_values():
+            raise ValueError(
+                f"Invalid backend: {backend}. Please use one of the following: "
+                f"{BackendType.canonical_values()}")
+
+        return BackendType(backend)

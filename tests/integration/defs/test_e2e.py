@@ -1441,7 +1441,7 @@ def test_trtllm_serve_lora_example(llm_root, llm_venv):
          str(test_root / "_test_trtllm_serve_lora.py")])
 
 
-@pytest.mark.parametrize("backend", ["pytorch", "trt"])
+@pytest.mark.parametrize("backend", ["pytorch", "tensorrt"])
 def test_openai_misc_example(llm_root, llm_venv, backend: str):
     test_root = unittest_path() / "llmapi" / "apps"
     llm_venv.run_cmd([
@@ -1450,7 +1450,7 @@ def test_openai_misc_example(llm_root, llm_venv, backend: str):
     ])
 
 
-@pytest.mark.parametrize("backend", ["pytorch", "trt"])
+@pytest.mark.parametrize("backend", ["pytorch", "tensorrt"])
 def test_openai_completions_example(llm_root, llm_venv, backend: str):
     test_root = unittest_path() / "llmapi" / "apps"
     filter_expr = f"{backend} and not sampler"
@@ -1460,7 +1460,7 @@ def test_openai_completions_example(llm_root, llm_venv, backend: str):
     ])
 
 
-@pytest.mark.parametrize("backend", ["pytorch", "trt"])
+@pytest.mark.parametrize("backend", ["pytorch", "tensorrt"])
 def test_openai_chat_example(llm_root, llm_venv, backend: str):
     test_root = unittest_path() / "llmapi" / "apps"
     filter_expr = f"{backend} and not sampler"
@@ -1470,7 +1470,7 @@ def test_openai_chat_example(llm_root, llm_venv, backend: str):
     ])
 
 
-@pytest.mark.parametrize("backend", ["pytorch", "trt"])
+@pytest.mark.parametrize("backend", ["pytorch", "tensorrt"])
 def test_openai_reasoning(llm_root, llm_venv, backend: str):
     test_root = unittest_path() / "llmapi" / "apps"
     llm_venv.run_cmd([

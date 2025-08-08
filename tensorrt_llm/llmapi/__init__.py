@@ -17,6 +17,7 @@ from .llm_args import (AttentionDpConfig, AutoDecodingConfig, BatchingType,
 from .llm_utils import (BuildConfig, KvCacheRetentionConfig, QuantAlgo,
                         QuantConfig)
 from .mpi_session import MpiCommSession
+from .utils import BackendType
 
 __all__ = [
     'LLM',
@@ -56,4 +57,5 @@ __all__ = [
     'TrtLlmArgs',
     'AutoDecodingConfig',
     'AttentionDpConfig',
+    'BackendType',
 ]

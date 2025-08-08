@@ -83,10 +83,10 @@ l0_a10:
   - llmapi/test_llm_e2e.py::test_llmapi_exit
   - llmapi/test_llm_examples.py::test_llmapi_server_example
   - test_e2e.py::test_trtllm_serve_example
-  - test_e2e.py::test_openai_misc_example[trt]
-  - test_e2e.py::test_openai_completions_example[trt]
-  - test_e2e.py::test_openai_chat_example[trt]
-  - test_e2e.py::test_openai_reasoning[trt]
+  - test_e2e.py::test_openai_misc_example[tensorrt]
+  - test_e2e.py::test_openai_completions_example[tensorrt]
+  - test_e2e.py::test_openai_chat_example[tensorrt]
+  - test_e2e.py::test_openai_reasoning[tensorrt]
   - test_e2e.py::test_trtllm_bench_sanity[--non-streaming-FP16-meta-llama/Llama-3.1-8B-llama-3.1-model/Meta-Llama-3.1-8B]
   - test_e2e.py::test_trtllm_bench_latency_sanity[FP16-meta-llama/Llama-3.1-8B-llama-3.1-model/Meta-Llama-3.1-8B]
   - unittest/trt/quantization
@@ -181,8 +181,8 @@ l0_a10:
   - accuracy/test_cli_flow.py::TestVicuna7B::test_eagle[cuda_graph=True-chunked_context=False-typical_acceptance=True] # 5 mins
   - accuracy/test_llm_api.py::TestEagleVicuna_7B_v1_3::test_auto_dtype
   - accuracy/test_llm_api.py::TestEagle2Vicuna_7B_v1_3::test_auto_dtype
-  - stress_test/stress_test.py::test_run_stress_test[llama-v3-8b-instruct-hf_tp1-stress_time_300s_timeout_450s-MAX_UTILIZATION-trt-stress-test]
-  - stress_test/stress_test.py::test_run_stress_test[llama-v3-8b-instruct-hf_tp1-stress_time_300s_timeout_450s-GUARANTEED_NO_EVICT-trt-stress-test]
+  - stress_test/stress_test.py::test_run_stress_test[llama-v3-8b-instruct-hf_tp1-stress_time_300s_timeout_450s-MAX_UTILIZATION-tensorrt-stress-test]
+  - stress_test/stress_test.py::test_run_stress_test[llama-v3-8b-instruct-hf_tp1-stress_time_300s_timeout_450s-GUARANTEED_NO_EVICT-tensorrt-stress-test]
 - condition:
     ranges:
       system_gpu_count:
