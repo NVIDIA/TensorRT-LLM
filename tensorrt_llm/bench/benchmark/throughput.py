@@ -109,6 +109,10 @@ from tensorrt_llm.sampling_params import SamplingParams
     required=False,
     help="Pass in a dataset file for parsing instead of stdin.",
 )
+# For text models, tokenizer initialization is not needed when loading the model since the dataset is already tokenized.
+# For this reason, we skip tokenizer initialization by default.
+# However, for VLM models, tokenizer initialization is needed inside the model since the dataset contains texts and
+# raw media data. We cannot skip tokenizer initialization in this case.
 @optgroup.option(
     "--no_skip_tokenizer_init",
     is_flag=True,

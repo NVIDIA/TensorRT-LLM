@@ -84,7 +84,7 @@ def add_multimodal_args(parser):
         "--model_type",
         type=str,
         choices=MULTIMODAL_PLACEHOLDER_REGISTRY.get_registered_model_types(),
-        help="Model type.")
+        help="Model type as specified in the HuggingFace model config.")
     parser.add_argument("--modality",
                         type=str,
                         choices=[
@@ -92,7 +92,7 @@ def add_multimodal_args(parser):
                             "multiple_image", "mixture_text_image"
                         ],
                         default="image",
-                        help="Media type.")
+                        help="Media type being used for inference.")
     parser.add_argument("--media",
                         type=str,
                         nargs="+",

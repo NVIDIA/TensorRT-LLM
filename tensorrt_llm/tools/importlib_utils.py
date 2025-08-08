@@ -15,10 +15,12 @@
 
 import importlib.util
 from pathlib import Path
-from typing import Union
+from types import ModuleType
+from typing import Optional, Union
 
 
-def import_custom_module_from_file(custom_module_path: Union[str, Path]):
+def import_custom_module_from_file(
+        custom_module_path: Union[str, Path]) -> Optional[ModuleType]:
     """Import a custom module from a single file.
 
     Args:
@@ -54,7 +56,8 @@ def import_custom_module_from_file(custom_module_path: Union[str, Path]):
     return module
 
 
-def import_custom_module_from_dir(custom_module_path: Union[str, Path]):
+def import_custom_module_from_dir(
+        custom_module_path: Union[str, Path]) -> Optional[ModuleType]:
     """Import a custom module from a directory.
 
     Args:
@@ -78,10 +81,8 @@ def import_custom_module_from_dir(custom_module_path: Union[str, Path]):
     # Add the parent directory to sys.path so we can import the package
     import sys
     parent_dir = str(custom_module_path.parent)
-    path_added = False
     if parent_dir not in sys.path:
         sys.path.insert(0, parent_dir)
-        path_added = True
 
     # Import the package
     module = None
@@ -95,14 +96,11 @@ def import_custom_module_from_dir(custom_module_path: Union[str, Path]):
         raise ImportError(
             f"Failed to import package {package_name} from {custom_module_path}: {e}"
         )
-    finally:
-        # Clean up sys.path if we added to it
-        if path_added and parent_dir in sys.path:
-            sys.path.remove(parent_dir)
     return module
 
 
-def import_custom_module(custom_module_path: Union[str, Path]):
+def import_custom_module(
+        custom_module_path: Union[str, Path]) -> Optional[ModuleType]:
     """Import a custom module from a file or directory.
 
     Args:
