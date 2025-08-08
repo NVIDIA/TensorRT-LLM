@@ -74,6 +74,39 @@ void printElement(std::ostream& os, std::tuple<Args...> const& t)
     printTupleImpl(os, t, std::index_sequence_for<Args...>{});
 }
 
+// Using RAII to automatically manage the allocation and release of va_list
+class va_list_wrapper
+{
+public:
+    explicit va_list_wrapper(char const* format)
+    {
+        va_start(args_, format);
+    }
+
+    // Constructor for copying existing va_list
+    explicit va_list_wrapper(va_list args)
+    {
+        va_copy(args_, args);
+    }
+
+    ~va_list_wrapper()
+    {
+        va_end(args_);
+    }
+
+    // Non-copyable - avoid double-free issues
+    va_list_wrapper(va_list_wrapper const&) = delete;
+    va_list_wrapper& operator=(va_list_wrapper const&) = delete;
+
+    va_list& get()
+    {
+        return args_;
+    }
+
+private:
+    va_list args_;
+};
+
 } // namespace
 
 // Override operator<< for any tuple
@@ -103,7 +136,7 @@ inline std::string fmtstr(std::string&& s)
 }
 
 typedef char* (*fmtstr_allocator)(void* target, size_t count);
-void fmtstr_(char const* format, fmtstr_allocator alloc, void* target, va_list args);
+void fmtstr_(char const* format, fmtstr_allocator alloc, void* target, va_list_wrapper& args_wrapper);
 
 #if defined(_MSC_VER)
 inline std::string fmtstr(char const* format, ...);
@@ -115,8 +148,7 @@ inline std::string fmtstr(char const* format, ...)
 {
     std::string result;
 
-    va_list args;
-    va_start(args, format);
+    va_list_wrapper args_wrapper(format);
     fmtstr_(
         format,
         [](void* target, size_t count) -> char*
@@ -130,8 +162,7 @@ inline std::string fmtstr(char const* format, ...)
             str->resize(count);
             return str->data();
         },
-        &result, args);
-    va_end(args);
+        &result, args_wrapper);
 
     return result;
 }

@@ -26,14 +26,14 @@
 namespace tensorrt_llm::common
 {
 
-void fmtstr_(char const* format, fmtstr_allocator alloc, void* target, va_list args)
+void fmtstr_(char const* format, fmtstr_allocator alloc, void* target, va_list_wrapper& args_wrapper)
 {
-    va_list args0;
-    va_copy(args0, args);
+    va_list_wrapper args0_wrapper(args_wrapper.get());
 
     size_t constexpr init_size = 2048;
     char fixed_buffer[init_size];
-    auto const size = std::vsnprintf(fixed_buffer, init_size, format, args0);
+    auto const size = std::vsnprintf(fixed_buffer, init_size, format, args0_wrapper.get());
+
     TLLM_CHECK_WITH_INFO(size >= 0, std::string(std::strerror(errno)));
     if (size == 0)
     {
@@ -48,7 +48,7 @@ void fmtstr_(char const* format, fmtstr_allocator alloc, void* target, va_list a
     }
     else
     {
-        auto const size2 = std::vsnprintf(memory, size + 1, format, args);
+        auto const size2 = std::vsnprintf(memory, size + 1, format, args_wrapper.get());
         TLLM_CHECK_WITH_INFO(size2 == size, std::string(std::strerror(errno)));
     }
 }
