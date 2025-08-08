@@ -14,6 +14,7 @@ def run_single_gpu_tests(build_dir: _pl.Path,
                          timeout=3600):
 
     cpp_env = {**_os.environ}
+    tests_dir = build_dir / "tests" / "e2e_tests"
 
     included_tests = list(_cpp.generate_included_model_tests(test_list))
 
@@ -38,7 +39,7 @@ def run_single_gpu_tests(build_dir: _pl.Path,
             parallel = int(parallel_override)
 
         _cpp.parallel_run_ctest(ctest,
-                                cwd=build_dir,
+                                cwd=tests_dir,
                                 env=cpp_env,
                                 timeout=timeout,
                                 parallel=parallel)
@@ -50,12 +51,12 @@ def run_single_gpu_tests(build_dir: _pl.Path,
             global_commands=["mpirun", "--allow-run-as-root"],
             nranks=2,
             local_commands=[
-                "tests/executor/disaggExecutorTest",
+                "executor/disaggExecutorTest",
                 "--gtest_filter=*GptSingleDeviceDisaggSymmetricExecutorTest*"
             ],
             leader_commands=[f"--gtest_output=xml:{xml_output_file}"])
         _cpp.run_command(trt_model_test,
-                         cwd=build_dir,
+                         cwd=tests_dir,
                          env=new_env,
                          timeout=timeout)
 
@@ -192,7 +193,7 @@ def run_benchmarks(
 def run_spec_dec_tests(build_dir: _pl.Path):
     xml_output_file = build_dir / "results-spec-dec-fast-logits.xml"
     cpp_env = {**_os.environ}
-    tests_dir = build_dir / "tests"
+    tests_dir = build_dir / "tests" / "e2e_tests"
     trt_model_test = _cpp.produce_mpirun_command(
         global_commands=["mpirun", "--allow-run-as-root"],
         nranks=3,

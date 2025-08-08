@@ -69,14 +69,6 @@ function(add_gtest test_name test_src)
   add_dependencies(google-tests ${test_name})
 endfunction()
 
-add_subdirectory(unit_tests)
-
 add_subdirectory(utils)
-
-if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/batch_manager)
-  add_subdirectory(batch_manager)
-endif()
-
-if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/executor)
-  add_subdirectory(executor)
-endif()
+add_subdirectory(unit_tests)
+add_subdirectory(e2e_tests)
