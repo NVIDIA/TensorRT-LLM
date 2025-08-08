@@ -367,7 +367,13 @@ class GenerationResultBase:
 
     def record_stats(self,
                      output: CompletionOutput,
-                     stats: Optional[dict[str, float]] = None):
+                     stats: Optional[dict[str, float]] = None) -> None:
+        """Record the stats of the generation result.
+
+        Args:
+            output (CompletionOutput): The output of the generation result.
+            stats (Optional[dict[str, float]]): The stats of the generation result. Defaults to None.
+        """
         if not stats:
             return
         metrics_stats = {}
