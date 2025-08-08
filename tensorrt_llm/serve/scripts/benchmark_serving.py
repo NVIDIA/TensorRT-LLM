@@ -12,7 +12,7 @@ On the client side, run:
         --model <your_model> \
         --dataset-name sharegpt \
         --dataset-path <path to dataset> \
-        --request-rate <request_rate> \ # By default <request_rate> is inf
+        --request-rate <request_rate> # By default <request_rate> is inf
         --num-prompts <num_prompts> # By default <num_prompts> is 1000
 
 """
@@ -79,6 +79,7 @@ class BenchmarkMetrics:
     std_e2el_ms: float
     percentiles_e2el_ms: list[tuple[float, float]]
     tput_user: list[float]
+    avg_decoded_tokens_per_iter: float
 
 
 async def get_request(
@@ -142,6 +143,7 @@ def calculate_metrics(
     ttfts: list[float] = []
     e2els: list[float] = []
     tput_user: list[float] = []
+    latest_avg_decoded_tokens_per_iter: float = 0.0
     for i in range(len(outputs)):
         if outputs[i].success:
             output_len = outputs[i].output_tokens
@@ -168,6 +170,12 @@ def calculate_metrics(
             e2els.append(outputs[i].latency)
             tput_user.append(output_len / (outputs[i].latency))
             completed += 1
+
+            # Track the latest avg_decoded_tokens_per_iter if available
+            if hasattr(outputs[i], 'avg_decoded_tokens_per_iter'
+                       ) and outputs[i].avg_decoded_tokens_per_iter is not None:
+                latest_avg_decoded_tokens_per_iter = outputs[
+                    i].avg_decoded_tokens_per_iter
         else:
             actual_output_lens.append(0)
 
@@ -228,6 +236,7 @@ def calculate_metrics(
         percentiles_e2el_ms=[(p, np.percentile(e2els or 0, p) * 1000)
                              for p in selected_percentiles],
         tput_user=np.mean(tput_user or 0),
+        avg_decoded_tokens_per_iter=latest_avg_decoded_tokens_per_iter,
     )
     return metrics, actual_output_lens
 
@@ -442,6 +451,11 @@ async def benchmark(
     print("{:<40} {:<10.2f}".format("User throughput (tok/s):",
                                     metrics.tput_user))
 
+    # Print last avg_decoded_tokens_per_iter value if available
+    if metrics.avg_decoded_tokens_per_iter > 0.0:
+        print("{:<40} {:<10.2f}".format("Avg Decoded Tokens per Iter:",
+                                        metrics.avg_decoded_tokens_per_iter))
+
     result = {
         "duration": benchmark_duration,
         "completed": metrics.completed,
@@ -453,6 +467,7 @@ async def benchmark(
         "output_throughput": metrics.output_throughput,
         "total_token_throughput": metrics.total_token_throughput,
         "user_throughput": metrics.tput_user,
+        "avg_decoded_tokens_per_iter": metrics.avg_decoded_tokens_per_iter,
         "input_lens": [output.prompt_len for output in outputs],
         "output_lens": actual_output_lens,
         "ttfts": [output.ttft for output in outputs],
