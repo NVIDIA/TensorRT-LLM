@@ -24,7 +24,7 @@ from ..model_config import ModelConfig
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_clip import CLIPVisionModel
 from .modeling_multimodal_utils import fuse_input_embeds
-from .modeling_utils import ModelConfig, filter_weights, register_auto_model
+from .modeling_utils import ModelConfig, filter_weights, register_auto_model, register_vision_encoder
 
 DISAGG = os.getenv('TLLM_MULTIMODAL_DISAGGREGATED', '0') == '1'
 
@@ -51,6 +51,73 @@ class LlavaNextInputProcessor(InputProcessor):
 
         self.image_token_index = model_config.image_token_index
         self.vocab_size = model_config.vocab_size
+        self.vision_feature_select_strategy = getattr(
+            model_config, "vision_feature_select_strategy",
+            "default")
+        self.config = model_config.vision_config
+
+    def _get_num_unpadded_features(
+        self,
+        *,
+        original_height: int,
+        original_width: int,
+        npatches: int,
+        num_patch_height: int,
+        num_patch_width: int,
+    ) -> tuple[int, int]:
+        current_height = npatches * num_patch_height
+        current_width = npatches * num_patch_width
+
+        aspect_ratio = original_width / original_height
+        current_aspect_ratio = current_width / current_height
+
+        if aspect_ratio > current_aspect_ratio:
+            new_height = int(
+                round(original_height * (current_width / original_width), 7))
+            padding = (current_height - new_height) // 2
+            current_height = current_height - (2 * padding)
+        else:
+            new_width = int(
+                round(original_width * (current_height / original_height), 7))
+            padding = (current_width - new_width) // 2
+            current_width = current_width - (2 * padding)
+
+        unpadded_features = current_height * current_width
+        newline_features = current_height
+
+        return (unpadded_features, newline_features)
+
+    # Based on: https://github.com/huggingface/text-generation-inference/blob/v3.0.1/server/text_generation_server/models/vlm_causal_lm.py#L113
+    def get_num_tokens_per_image(
+        self,
+        *,
+        image_width: int,
+        image_height: int,
+    ) -> int:
+        patch_grid_length = self.config.image_size // self.config.patch_size
+        base_feature_size = patch_grid_length**2 + 1
+
+        if self.vision_feature_select_strategy == "default":
+            base_feature_size = base_feature_size - 1
+
+        num_patch_height, num_patch_width = get_anyres_image_grid_shape(
+            image_size=(image_width, image_height),
+            grid_pinpoints=self.model_config.image_grid_pinpoints,
+            patch_size=self.config.image_size,
+        )
+
+        (
+            unpadded_feature_size,
+            newline_feature_size,
+        ) = self._get_num_unpadded_features(
+            original_height=image_height,
+            original_width=image_width,
+            npatches=patch_grid_length,
+            num_patch_height=num_patch_height,
+            num_patch_width=num_patch_width,
+        )
+        return unpadded_feature_size + newline_feature_size + base_feature_size
+
 
     @torch.inference_mode()
     def __call__(
@@ -90,9 +157,10 @@ class LlavaNextVisionModel(nn.Module):
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args,
                  **kwargs) -> None:
         super().__init__()
-        self.pretrained_config = model_config.pretrained_config
+        self.model_config = model_config
+        pretrained_config = model_config.pretrained_config
         self.device = f"cuda:{model_config.mapping.rank}"
-        model_path = self.pretrained_config._name_or_path
+        model_path = pretrained_config._name_or_path
 
         # Determine the actual local path for model files
         if os.path.isdir(model_path):
@@ -145,6 +213,11 @@ class LlavaNextVisionModel(nn.Module):
             model_config.pretrained_config, "vision_feature_select_strategy",
             "default")
 
+        self.post_config()
+
+    def post_config(self):
+        self.config = self.model_config.pretrained_config.vision_config
+
     # Copied from https://github.com/huggingface/transformers/blob/main/src/transformers/models/llava_next/modeling_llava_next.py#L284
     def pack_image_features(self,
                             image_features,
@@ -157,12 +230,12 @@ class LlavaNextVisionModel(nn.Module):
             if image_feature.shape[0] > 1:
                 base_image_feature = image_feature[0]
                 image_feature = image_feature[1:]
-                height = width = self.pretrained_config.vision_config.image_size // self.pretrained_config.vision_config.patch_size
+                height = width = self.config.image_size // self.config.patch_size
 
                 num_patch_height, num_patch_width = get_anyres_image_grid_shape(
                     image_sizes[image_idx],
-                    self.pretrained_config.image_grid_pinpoints,
-                    self.pretrained_config.vision_config.image_size,
+                    self.model_config.pretrained_config.image_grid_pinpoints,
+                    self.config.image_size,
                 )
 
                 if (np.prod(image_feature.shape) %
@@ -223,8 +296,8 @@ class LlavaNextVisionModel(nn.Module):
         image_num_patches = [
             image_size_to_num_patches(
                 image_size=imsize,
-                grid_pinpoints=self.pretrained_config.image_grid_pinpoints,
-                patch_size=self.pretrained_config.vision_config.image_size,
+                grid_pinpoints=self.model_config.pretrained_config.image_grid_pinpoints,
+                patch_size=self.config.image_size,
             ) for imsize in image_sizes
         ]
 
@@ -261,7 +334,7 @@ class LlavaNextVisionModel(nn.Module):
         image_features = torch.cat(image_features, dim=0)
         return [image_features]
 
-
+@register_vision_encoder(LlavaNextVisionModel)
 @register_auto_model("LlavaNextForConditionalGeneration")
 @register_input_processor(LlavaNextInputProcessor, model_type="llava_next")
 class LlavaNextModel(PreTrainedModel):

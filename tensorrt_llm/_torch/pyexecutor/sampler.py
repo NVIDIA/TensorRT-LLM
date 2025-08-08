@@ -134,6 +134,9 @@ class EarlyStopWithMMResult(EarlyStopSampler):
             # NOTE: This is a hack: set finish reason manually and set the beam 0
             request.set_finished_reason(FinishReason.LENGTH, 0)
             if idx < len(mm_embeddings):
+                if len(mm_embeddings[idx]) != sum(request.multimodal_lengths):
+                    raise ValueError(f"mm_embedding shape mismatch: {len(mm_embeddings[idx])} != {sum(request.multimodal_lengths)}")
+
                 request.py_result.append_mm_embeddings(mm_embeddings[idx])
 
 

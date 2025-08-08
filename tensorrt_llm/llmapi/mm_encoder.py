@@ -157,8 +157,7 @@ class MultimodalEncoder(_TorchLLM):
         Returns:
             Future that resolves to tensorrt_llm.llmapi.RequestOutput containing mm_embeddings
         """
-        # TODO: possible preprocess the input
         result = super().generate_async(inputs, sampling_params)
-        # TODO: possible postprocess the result
+        # TODO: possible postprocess the result for disaggregated serving
         return result
 
