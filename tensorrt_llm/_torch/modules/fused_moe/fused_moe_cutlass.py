@@ -87,7 +87,7 @@ class CutlassFusedMoE(MoE):
         )
 
         # Store original hidden size before any potential padding
-        self.original_hidden_size = self.hidden_size
+        self.unpadded_hidden_size = self.hidden_size
 
         if model_config.quant_config and model_config.quant_config.layer_quant_mode.has_w4a16_mxfp4(
         ):
@@ -422,7 +422,7 @@ class CutlassFusedMoE(MoE):
             tune_max_num_tokens=self.tune_max_num_tokens,
             tuner_num_tokens=tuner_num_tokens,
             tuner_top_k=tuner_top_k,
-            original_hidden_size=self.original_hidden_size,
+            unpadded_hidden_size=self.unpadded_hidden_size,
         )
         # Custom op requires all inputs are in the same type.
         # Only in cutlass_min_latency_mode, the output is a list of tensors.

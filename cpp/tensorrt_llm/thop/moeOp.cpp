@@ -240,7 +240,7 @@ public:
         torch::optional<torch::Tensor> const& swiglu_limit, int64_t const tp_size, int64_t const tp_rank,
         int64_t const ep_size, int64_t const ep_rank, int64_t const cluster_size, int64_t const cluster_rank,
         bool const enable_alltoall, bool min_latency_mode, torch::optional<c10::ArrayRef<int64_t>> const& profile_ids,
-        torch::optional<int64_t> const& original_hidden_size)
+        torch::optional<int64_t> const& unpadded_hidden_size)
     {
         std::lock_guard<std::mutex> lock(mMutex);
         // Free the profile workspace to save memory
@@ -313,7 +313,7 @@ public:
         int experts_per_token = token_selected_experts.sizes()[1];
         int64_t num_rows = input.sizes()[0];
         int64_t hidden_size = fc2_expert_weights.sizes()[1];
-        int64_t orig_hidden_size = original_hidden_size.has_value() ? original_hidden_size.value() : hidden_size;
+        int64_t orig_hidden_size = unpadded_hidden_size.has_value() ? unpadded_hidden_size.value() : hidden_size;
         int64_t inter_size = fc2_expert_weights.sizes()[2] * mInnerDimMultiplier;
 
         if (isWMxfp4AMxfp8Quant() || isWMxfp4AFp8Quant())
@@ -420,7 +420,8 @@ public:
         torch::optional<torch::Tensor> const& swiglu_alpha, torch::optional<torch::Tensor> const& swiglu_beta,
         torch::optional<torch::Tensor> const& swiglu_limit, int64_t const tp_size, int64_t const tp_rank,
         int64_t const ep_size, int64_t const ep_rank, int64_t const cluster_size, int64_t const cluster_rank,
-        bool const enable_alltoall, bool min_latency_mode, torch::optional<c10::ArrayRef<int64_t>> const& profile_ids, torch::optional<int64_t> const& original_hidden_size)
+        bool const enable_alltoall, bool min_latency_mode, torch::optional<c10::ArrayRef<int64_t>> const& profile_ids,
+        torch::optional<int64_t> const& unpadded_hidden_size)
     {
         std::lock_guard<std::mutex> lock(mMutex);
 
@@ -479,7 +480,7 @@ public:
         int experts_per_token = token_selected_experts.sizes()[1];
         int64_t num_rows = input.sizes()[0];
         int64_t hidden_size = fc2_expert_weights.sizes()[1];
-        int64_t orig_hidden_size = original_hidden_size.has_value() ? original_hidden_size.value() : hidden_size;
+        int64_t orig_hidden_size = unpadded_hidden_size.has_value() ? unpadded_hidden_size.value() : hidden_size;
         int64_t inter_size = fc2_expert_weights.sizes()[2] * mInnerDimMultiplier;
         int const num_experts_on_rank = fc2_expert_weights.sizes()[0];
         auto const num_experts_total = static_cast<int>(num_experts_on_rank * ep_size);
