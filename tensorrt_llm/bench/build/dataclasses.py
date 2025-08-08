@@ -1,5 +1,5 @@
 from transformers import AutoConfig
-from typing import Optional, Literal
+from typing import Optional, Literal, List
 from pydantic import AliasPath, BaseModel, Field, AliasChoices, model_validator
 import huggingface_hub
 from huggingface_hub.constants import (
@@ -152,6 +152,8 @@ class ModelConfig(BaseModel):
                                          "attention_head_dim",
                                          AliasPath("text_config", "head_dim"),
                                      ))
+    sliding_window: Optional[int] = Field(default=None)
+    sliding_window_pattern: Optional[int | str] = Field(default=None)
     max_position_embeddings: Optional[int] = Field(
         default=None,
         validation_alias=AliasChoices(
@@ -176,6 +178,28 @@ class ModelConfig(BaseModel):
         if self.num_attention_layers is None:
             self.num_attention_layers = self.num_hidden_layers
         return self
+
+    @property
+    def max_attention_window_sizes(self) -> List[int] | None:
+        if self.sliding_window is None:
+            # Non-sliding window attention.
+            return None
+        elif self.sliding_window_pattern is None:
+            # SWA model
+            return [self.sliding_window]
+
+        # VSWA model
+        if isinstance(self.sliding_window_pattern, int):
+            window_sizes = [self.sliding_window] * self.sliding_window_pattern
+            window_sizes[-1] = self.max_position_embeddings
+        else:
+            assert isinstance(self.sliding_window_pattern, str)
+            window_sizes = [
+                self.sliding_window
+                if p == 'L' else self.max_position_embeddings
+                for p in self.sliding_window_pattern
+            ]
+        return window_sizes
 
     @classmethod
     def get_param_count(cls, model_hf_name, hf_model_path):
