@@ -128,6 +128,10 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
     int const num_experts_per_node = num_experts_on_rank;
     auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
     int64_t num_moe_inputs = static_cast<int64_t>(experts_per_token * num_rows);
+    TORCH_CHECK(num_moe_inputs <= std::numeric_limits<int32_t>::max(),
+        "num_moe_inputs exceeds int32 range (because we use int32 for expert_first_token_offset_tensor output). "
+        "num_moe_inputs = ",
+        num_moe_inputs);
 
     auto permuted_row_to_unpermuted_row_tensor
         = torch::empty({num_moe_inputs}, torch::dtype(torch::kInt32).device(torch::kCUDA).requires_grad(false));
@@ -224,6 +228,8 @@ std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Te
             "Invalid dtype, only supports input tensor with float32, float16 and bfloat16 dtype");
         break;
     }
+    expert_first_token_offset_tensor = expert_first_token_offset_tensor.to(torch::kInt32);
+
     return std::make_tuple(permuted_row_to_unpermuted_row_tensor, permuted_token_selected_experts_tensor,
         permuted_data_tensor, expert_first_token_offset_tensor, permuted_token_final_scales_tensor,
         unpermuted_row_to_permuted_row_tensor);

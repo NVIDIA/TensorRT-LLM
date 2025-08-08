@@ -12,7 +12,6 @@ from torch import nn
 from torch.nn.parameter import Parameter
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
-import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
 from tensorrt_llm._torch.peft.lora.layer import LoraLayer
 from tensorrt_llm.functional import (AllReduceFusionOp, AllReduceParams,
                                      AllReduceStrategy)
@@ -584,10 +583,9 @@ class FP8BlockScalesLinearMethod(LinearMethodBase):
 
         if get_sm_version() == 100:
             if module.use_cute_dsl_blockscaling_mm:
-                # TODO (@lmin): replace with cute_dsl gemm
                 act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
                     input)
-                output = torch.ops.trtllm.fp8_block_scaling_gemm(
+                output = torch.ops.trtllm.cute_dsl_fp8_gemm_blackwell(
                     act_input_fp8, module.weight, act_input_sf,
                     module.weight_scale)
             else:
@@ -1543,7 +1541,11 @@ class Linear(nn.Module):
         self._weights_created = False
         self.reduce_output = reduce_output
         self.use_custom_cublas_mm = use_custom_cublas_mm
+        self.use_cute_dsl_blockscaling_mm = use_cute_dsl_blockscaling_mm
         self.lora = lora
+        print(
+            f"limin: Linear, use_cute_dsl_blockscaling_mm: {self.use_cute_dsl_blockscaling_mm}"
+        )
 
         self.enable_cuda_core = False
         if torch.cuda.is_available():

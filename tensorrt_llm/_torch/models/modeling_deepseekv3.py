@@ -190,6 +190,11 @@ class DeepseekV3Linear(Linear):
         use_custom_cublas_mm: bool = False,
         lora: Optional[LoraLayer] = None,
     ):
+        self.use_cute_dsl_blockscaling_mm = os.getenv(
+            "USE_CUTE_DSL_BLOCKSCALING_MM", "0") == "1"
+        print(
+            f"limin: DeepseekV3Linear, use_cute_dsl_blockscaling_mm: {self.use_cute_dsl_blockscaling_mm}"
+        )
         super().__init__(
             in_features,
             out_features,
@@ -204,7 +209,7 @@ class DeepseekV3Linear(Linear):
             skip_create_weights_in_init,
             use_custom_cublas_mm,
             lora,
-        )
+            use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm)
 
     def apply_linear(self,
                      input,
@@ -260,7 +265,8 @@ class DeepseekV3Attention(MLA):
             quant_config=model_config.get_quant_config(),
             skip_create_weights_in_init=model_config.
             skip_create_weights_in_init,
-            use_custom_cublas_mm=True)
+            use_custom_cublas_mm=True,
+        )
 
 
 class Deepseekv3RoutingImpl():
@@ -429,6 +435,13 @@ class Deepseekv3MoE(nn.Module):
         from ..distributed import AllReduce
 
         super().__init__()
+
+        self.use_cute_dsl_blockscaling_mm = os.getenv(
+            "USE_CUTE_DSL_BLOCKSCALING_MM", "0") == "1"
+        print(
+            f"limin: Deepseekv3MoE, use_cute_dsl_blockscaling_mm: {self.use_cute_dsl_blockscaling_mm}"
+        )
+
         config = model_config.pretrained_config
         self.top_k = top_k
         self.use_dp = model_config.mapping.enable_attention_dp
@@ -473,7 +486,8 @@ class Deepseekv3MoE(nn.Module):
             dtype=dtype,
             config=model_config,
             overridden_tp_size=shared_tp_size,
-            reduce_output=False)
+            reduce_output=False,
+            use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm)
 
         self.allreduce = AllReduce(mapping=model_config.mapping,
                                    strategy=model_config.allreduce_strategy)
@@ -628,6 +642,12 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             model_config, layer_idx)
         self.is_nvfp4 = quant_config.layer_quant_mode.has_nvfp4()
 
+        self.use_cute_dsl_blockscaling_mm = os.getenv(
+            "USE_CUTE_DSL_BLOCKSCALING_MM", "0") == "1"
+        print(
+            f"limin: DeepseekV3DecoderLayer, use_cute_dsl_blockscaling_mm: {self.use_cute_dsl_blockscaling_mm}"
+        )
+
         has_tp = mapping.has_tp()
 
         if (config.n_routed_experts is not None
@@ -660,13 +680,15 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             self.fusion_config.PRE_MLP_FUSION = self.enable_fusion and has_mlp_tp and self.is_nvfp4
             self.fusion_config.POST_MLP_FUSION = self.enable_fusion and has_mlp_tp
 
-            self.mlp = GatedMLP(hidden_size=config.hidden_size,
-                                intermediate_size=config.intermediate_size,
-                                bias=False,
-                                dtype=config.torch_dtype,
-                                config=model_config,
-                                overridden_tp_size=self.mlp_tp_size,
-                                reduce_output=True)
+            self.mlp = GatedMLP(
+                hidden_size=config.hidden_size,
+                intermediate_size=config.intermediate_size,
+                bias=False,
+                dtype=config.torch_dtype,
+                config=model_config,
+                overridden_tp_size=self.mlp_tp_size,
+                reduce_output=True,
+                use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm)
 
         self.input_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                        eps=config.rms_norm_eps,
@@ -922,6 +944,12 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
             for key in [EventType.Main, EventType.MoeShared]
         }
 
+        self.use_cute_dsl_blockscaling_mm = os.getenv(
+            "USE_CUTE_DSL_BLOCKSCALING_MM", "0") == "1"
+        print(
+            f"limin: DeepseekV3MTP, use_cute_dsl_blockscaling_mm: {self.use_cute_dsl_blockscaling_mm}"
+        )
+
         self.enorm = RMSNorm(hidden_size=config.hidden_size,
                              eps=config.rms_norm_eps,
                              dtype=config.torch_dtype)
@@ -937,7 +965,7 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
                 dtype=config.torch_dtype,
                 skip_create_weights_in_init=model_config.
                 skip_create_weights_in_init,
-            )
+                use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm)
         else:
             self.eh_proj = Linear(
                 config.hidden_size * 2,
@@ -949,7 +977,7 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
                 reduce_output=True,
                 skip_create_weights_in_init=model_config.
                 skip_create_weights_in_init,
-            )
+                use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm)
 
         self.shared_head = DeepseekV3MTPHead(model_config)
 
@@ -1117,6 +1145,10 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
             model_config._frozen = False
             model_config.quant_config_dict = quant_config_dict
             model_config._frozen = True
+        self.use_cute_dsl_blockscaling_mm = os.getenv(
+            "USE_CUTE_DSL_BLOCKSCALING_MM", "0") == "1"
+        self.use_cute_dsl_blockscaling_bmm = os.getenv(
+            "USE_CUTE_DSL_BLOCKSCALING_BMM", "0") == "1"
         super().__init__(DeepseekV3Model(model_config),
                          config=model_config,
                          hidden_size=model_config.pretrained_config.hidden_size,
@@ -1259,7 +1291,8 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
             weight_divisor = 1 if self.model_config.mapping.enable_attention_dp else tp_size
             local_num_heads = num_heads // weight_divisor
 
-            k_nope_weight_trans = k_nope_weight.transpose(2, 1).contiguous()
+            # k_nope_weight_trans = k_nope_weight.transpose(2, 1).contiguous()
+            k_nope_weight_trans = k_nope_weight.transpose(2, 1)
 
             kv_b_proj = torch.concat([
                 k_nope_weight.reshape(local_num_heads * local_qk_nope_head_dim,
@@ -1300,7 +1333,8 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
             weight_divisor = 1 if self.model_config.mapping.enable_attention_dp else tp_size
             local_num_heads = num_heads // weight_divisor
 
-            k_nope_weight_trans = k_nope_weight.transpose(2, 1).contiguous()
+            # k_nope_weight_trans = k_nope_weight.transpose(2, 1).contiguous()
+            k_nope_weight_trans = k_nope_weight.transpose(2, 1)
 
             kv_b_proj = torch.concat([
                 k_nope_weight.reshape(local_num_heads * local_qk_nope_head_dim,
@@ -1342,6 +1376,11 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
 
         params_map = {'gate_up_proj': ['gate_proj', 'up_proj']}
         all_named_modules = dict(self.named_modules())
+
+        moe_backend = self.model_config.moe_backend.upper()
+        print(
+            f"limin: DeepseekV3ForCausalLM load_weights, moe_backend: {moe_backend}"
+        )
 
         for name, module in tqdm(all_named_modules.items(),
                                  desc="Loading weights"):
@@ -1394,6 +1433,7 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
                         attn_module.v_b_proj_scale = nn.Parameter(
                             v_b_proj_scale, requires_grad=False)
 
+                        # limin-todo: check if we could keep it for cute dsl ops.
                         if attn_module.k_b_proj_trans_dequant is not None:
                             attn_module.k_b_proj_trans_dequant.data.copy_(
                                 weight_dequant(
@@ -1461,9 +1501,11 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
                         for n, p in module.named_parameters():
                             p.data.copy_(module_weights[n][:])
 
-                if self.model_config.quant_config.layer_quant_mode.has_fp8_block_scales(
+                # limin-todo: how to set for cute dsl ops?
+                if moe_backend == "DEEPGEMM" and self.model_config.quant_config.layer_quant_mode.has_fp8_block_scales(
                 ) and get_sm_version() == 100 and hasattr(
                         module, "weight_scale"):
+                    #
                     weight, weight_scale = resmooth_to_fp8_e8m0(
                         module.weight, module.weight_scale)
                     transfromed_scale = transform_sf_into_required_layout(
