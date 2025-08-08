@@ -43,7 +43,6 @@ def llm(fixed_params, input_prompts):
             input_prompts
         ),  # use small batch size to prevent large buffers from possibly hiding wrong data accesses.
         max_seq_len=32,
-        enable_trtllm_sampler=True,
         max_beam_width=fixed_params["max_beam_width"],
         disable_overlap_scheduler=True,
         cuda_graph_config=None,
@@ -60,10 +59,10 @@ def llm_cuda_graph(fixed_params, input_prompts):
             input_prompts
         ),  # use small batch size to prevent large buffers from possibly hiding wrong data accesses.
         max_seq_len=32,
-        enable_trtllm_sampler=True,
         max_beam_width=fixed_params["max_beam_width"],
         disable_overlap_scheduler=False,
-        cuda_graph_config=CudaGraphConfig(),
+        cuda_graph_config=CudaGraphConfig(batch_sizes=[1, 2, 4, 8],
+                                          enable_padding=True),
     )
 
 
@@ -128,7 +127,7 @@ def test_beam_search_output_shapes(gather_context_logits: bool,
 @pytest.mark.parametrize("gather_generation_logits", [True, False])
 @pytest.mark.parametrize("gather_context_logits", [True, False])
 @pytest.mark.parametrize("num_output_beams", [1, 2])
-@pytest.mark.parametrize("num_prompts", [1, 2])
+@pytest.mark.parametrize("num_prompts", [1, 2, 3])
 @pytest.mark.threadleak(enabled=False)
 def test_beam_search_output_shapes_cuda_graph_and_overlap(
         gather_context_logits: bool, gather_generation_logits: bool,
@@ -147,6 +146,10 @@ def test_beam_search_output_shapes_cuda_graph_and_overlap(
         return_generation_logits=gather_generation_logits,
         logprobs=return_log_probs,
     )
+    # test padding of cuda graph with 3 prompts
+    # replicate the prompts to have more than 2 prompts available
+    if (num_prompts == 3 and len(input_prompts) == 2):
+        input_prompts = [input_prompts[0]] * 3
     outputs = llm_cuda_graph.generate(input_prompts[:num_prompts],
                                       sampling_params=sampling_params)
     assert len(outputs) == num_prompts

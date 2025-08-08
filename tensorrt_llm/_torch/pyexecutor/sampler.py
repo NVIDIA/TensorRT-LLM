@@ -241,9 +241,9 @@ class TorchSampler(Sampler):
         self.enable_mixed_sampler = args.enable_mixed_sampler
         self.max_tokens = args.max_draft_len + 1
         assert args.max_beam_width == self.MAX_BEAM_WIDTH, "TorchSampler only supports beam_width = 1"
-        self.num_seq_slots = args.max_num_sequences
+        self.max_num_sequences = args.max_num_sequences
 
-        self.NEW_TOKENS_SHAPE = (self.max_tokens, self.num_seq_slots,
+        self.NEW_TOKENS_SHAPE = (self.max_tokens, self.max_num_sequences,
                                  self.MAX_BEAM_WIDTH)
         # AutoDeploy build creates the sampler in inference mode,
         # which would disallow in-place mutating of new_tokens.
@@ -440,14 +440,14 @@ class TorchSampler(Sampler):
         """Shape: In lockstep with TRTLLMSampler: https://github.com/NVIDIA/TensorRT-LLM/blob/cea5dd1e3883b18bf50901a7f196f50a9544c28c/cpp/include/tensorrt_llm/runtime/decoderState.h#L103"""
         if any(req.py_return_log_probs for req in requests):
             return torch.empty(
-                (self.num_seq_slots, self.MAX_BEAM_WIDTH, self.max_tokens),
+                (self.max_num_sequences, self.MAX_BEAM_WIDTH, self.max_tokens),
                 device="cpu",
                 pin_memory=True)
         return None
 
     def gen_logits_host(self, requests: Iterable[LlmRequest], vocab_size: int):
         if any(req.py_return_generation_logits for req in requests):
-            return torch.empty((self.max_tokens, self.num_seq_slots,
+            return torch.empty((self.max_tokens, self.max_num_sequences,
                                 self.MAX_BEAM_WIDTH, vocab_size),
                                device="cpu",
                                pin_memory=True)
@@ -548,8 +548,8 @@ class TorchSampler(Sampler):
         no_draft_tokens = len(requests) == sum_steps
         fast_path = not self.enable_mixed_sampler and no_draft_tokens and gen_logits_host is None and log_probs_host is None
 
-        seq_slots = torch.as_tensor([r.py_seq_slot for r in requests])
-        seq_slots = seq_slots.to(device="cuda", non_blocking=True)
+        seq_slots_host = torch.as_tensor([r.py_seq_slot for r in requests])
+        seq_slots = seq_slots_host.to(device="cuda", non_blocking=True)
 
         if fast_path:
             logits = raw_logits[:len(requests)]
@@ -585,7 +585,7 @@ class TorchSampler(Sampler):
 
         offset = 0
         for i, (strategy, slot, steps, request) in enumerate(
-                zip(strategies, seq_slots, num_steps, requests)):
+                zip(strategies, seq_slots_host, num_steps, requests)):
             input_slice = slice(offset, offset + steps)
             logits = raw_logits[input_slice]
 
@@ -636,7 +636,8 @@ class SampleStateTensorsHostTRTLLM(SampleStateTensors):
 
 @dataclass(kw_only=True)
 class SampleStateTRTLLM(SampleState):
-    finalize_events: dict[str, CudaEvent]
+    finalize_events: dict[str, CudaEvent] | None = None
+    """`Optional` to accommodate `_forward_step_inter_pp` which creates a `SampleState` without `finalize_events`"""
     host: SampleStateTensorsHostTRTLLM
 
 
@@ -666,7 +667,9 @@ class TRTLLMSampler(Sampler):
         self.decoding_config = self.executor_config.decoding_config if self.executor_config.decoding_config else DecodingConfig(
             decoding_mode)
         max_attn_window = self.executor_config.kv_cache_config.max_attention_window
-        self.max_attention_window = max_attn_window if max_attn_window is not None else executor_config.max_seq_len
+        self.max_attention_window = max(
+            max_attn_window
+        ) if max_attn_window is not None else executor_config.max_seq_len
         self.max_num_sequences = mapping.pp_size * self.executor_config.max_batch_size
         self.max_seq_idle_microseconds = 180 * 1000 * 1000
         self.is_trt_overlap = not disable_overlap_scheduler
@@ -700,13 +703,19 @@ class TRTLLMSampler(Sampler):
                                     self.MAX_DECODING_TOKENS, buffer_manager)
                 for _ in range(self.num_micro_batches)
             ],
+            "sequence_lengths_host":
+            torch.empty((
+                self.max_num_sequences,
+                self.executor_config.max_beam_width,
+            ),
+                        dtype=torch.int),
             "decoder_state":
             DecoderState(),
             "decoding_input": [None] * self.num_micro_batches,
         }
 
         self.store["decoder_state"].setup(
-            max_batch_size=self.executor_config.max_batch_size,
+            max_num_sequences=self.max_num_sequences,
             max_beam_width=self.executor_config.max_beam_width,
             max_attention_window=self.max_attention_window,
             sink_token_length=0,
@@ -722,7 +731,7 @@ class TRTLLMSampler(Sampler):
         self.algs.decoder = GptDecoderBatched(stream=self.store["torch_stream"])
         self.algs.decoder.setup(
             mode=self.decoding_mode,
-            max_batch_size=self.executor_config.max_batch_size,
+            max_num_sequences=self.max_num_sequences,
             max_beam_width=self.executor_config.max_beam_width,
             dtype=self.logits_datatype,
             model_config=self.model_config,
@@ -740,11 +749,12 @@ class TRTLLMSampler(Sampler):
     def setup_sampler_step(self, requests):
         batch_slots, sampling_configs, lookahead_prompt, lookahead_algo_configs = self.algs.create_new_decoder_requests(
             self.model_config, self.world_config, self.decoding_config,
-            requests, self.store["buffer_manager"], self.logits_datatype,
+            requests.context_requests, self.store["buffer_manager"],
+            self.logits_datatype,
             self.store["decoder_input_buffers"][self.micro_batch_idx],
             self.store["decoder_state"], self.store["cuda_stream"],
             self.algs.decoder.decoder_stream, self.executor_config.max_seq_len,
-            self.beam_width(requests))
+            self.beam_width(requests.context_requests))
 
         local_batch_size = len(batch_slots)
         if local_batch_size > 0:
@@ -754,6 +764,16 @@ class TRTLLMSampler(Sampler):
                 self.store["decoder_state"].joint_decoding_output,
                 self.model_config.data_type, lookahead_prompt,
                 lookahead_algo_configs)
+
+        adp = [
+            r for r in requests.generation_requests if r.is_attention_dp_dummy
+        ]
+        batch_size = len(adp)
+        if batch_size == 0:
+            return
+        config = make_sampling_config([r.sampling_config for r in adp])
+        slots = torch.tensor([r.py_seq_slot for r in adp], dtype=torch.int32)
+        self.algs.decoder.underlying_decoder().setup(config, batch_size, slots)
 
     @staticmethod
     @torch.inference_mode()
@@ -789,7 +809,7 @@ class TRTLLMSampler(Sampler):
                 "Beam search is not supported for multiple prompts and logprobs"
             )
 
-        self.setup_sampler_step(scheduled_requests.context_requests)
+        self.setup_sampler_step(scheduled_requests)
 
         num_context_logits_prefix_sum = [0]
         prefix_sum = 0
@@ -1040,7 +1060,7 @@ class TRTLLMSampler(Sampler):
             if finished_sum_host[seq_slot] == beam_width:
                 request.state = LlmRequestState.GENERATION_COMPLETE
         for request in reqs:
-            if request.request_id in finalize_events:
+            if finalize_events is not None and request.request_id in finalize_events:
                 self._post_process_request(request, state)
 
     def _finalize_request(self, request: LlmRequest, streaming: bool):

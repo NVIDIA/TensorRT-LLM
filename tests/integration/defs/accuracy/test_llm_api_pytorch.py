@@ -196,8 +196,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     @skip_pre_hopper
     def test_fp8_llm_sampler(self):
         model_path = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct-FP8"
-        with LLM(model_path, enable_trtllm_sampler=True,
-                 max_batch_size=256) as llm:
+        with LLM(model_path, use_torch_sampler=True, max_batch_size=256) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
 
             sampling_params = SamplingParams(
@@ -230,7 +229,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                   max_beam_width=max_beam_width,
                   max_batch_size=16,
                   max_seq_len=1024,
-                  enable_trtllm_sampler=True,
+                  use_torch_sampler=False,
                   build_config=None)
 
         with llm:
@@ -2014,14 +2013,16 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
                               cuda_graph, overlap_scheduler):
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
-            cuda_graph_config=CudaGraphConfig() if cuda_graph else None)
+            cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
+            use_torch_sampler=True)
 
         with LLM(f"{llm_models_root()}/Qwen3/Qwen3-8B-FP8",
                  tensor_parallel_size=tp_size,
                  pipeline_parallel_size=pp_size,
                  moe_expert_parallel_size=ep_size,
                  **pytorch_config,
-                 enable_attention_dp=attention_dp) as llm:
+                 enable_attention_dp=attention_dp,
+                 max_batch_size=64) as llm:
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)
@@ -2035,7 +2036,8 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
                   overlap_scheduler):
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
-            cuda_graph_config=CudaGraphConfig() if cuda_graph else None)
+            cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
+            use_torch_sampler=True)
 
         with LLM(f"{llm_models_root()}/Qwen3/Qwen3-8B",
                  tensor_parallel_size=tp_size,
@@ -2048,7 +2050,6 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
-    @pytest.mark.skip_less_device_memory(140000)  ## OOM on 80G H100
     @parametrize_with_ids("eagle3_one_model", [True, False])
     @parametrize_with_ids("enable_chunked_prefill", [False, True])
     def test_eagle3(self, enable_chunked_prefill, eagle3_one_model):
@@ -2056,7 +2057,10 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             disable_overlap_scheduler=True,
             cuda_graph_config=CudaGraphConfig(batch_sizes=[1]),
         )
-        kv_cache_config = KvCacheConfig(enable_block_reuse=False)
+        kv_cache_config = KvCacheConfig(
+            enable_block_reuse=False,
+            free_gpu_memory_fraction=0.6,
+        )
 
         eagle_model_dir = f"{llm_models_root()}/Qwen3/qwen3_8b_eagle3"
         target_model_dir = f"{llm_models_root()}/Qwen3/Qwen3-8B"

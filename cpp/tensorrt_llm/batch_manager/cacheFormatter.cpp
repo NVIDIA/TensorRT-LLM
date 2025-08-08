@@ -75,6 +75,7 @@ BlockRange getBlockRangeForReceiving(BaseKVCacheManager* cacheManager, LlmReques
 bool CacheFormatter::needSendCache(
     CacheState const& selfConfig, CacheState const& destConfig, runtime::SizeType32 selfIdx)
 {
+    // int selfTpRank = selfIdx % selfConfig.getParallelConfig().mTensorParallelism;
     auto targetInfo = executor::kv_cache::targetIRanks(destConfig, selfConfig, selfIdx);
     if (targetInfo.mDupHeadFactor <= 1)
     {
@@ -89,9 +90,8 @@ bool CacheFormatter::needSendCache(
             = selfConfig.getParallelConfig().mTensorParallelism / selfConfig.getParallelConfig().mDPsize;
         selfTpRankInDpGroup = selfTpRank % selfTPNumInDPGroup;
     }
-    int destDPRank = destConfig.getParallelConfig().mEnableAttentionDP ? destConfig.getParallelConfig().mDPrank : 0;
 
-    return (destDPRank % targetInfo.mDupHeadFactor) == (selfTpRankInDpGroup % targetInfo.mDupHeadFactor);
+    return selfTpRankInDpGroup % targetInfo.mDupHeadFactor == 0;
 }
 
 void checkAlternateWindow(BaseKVCacheManager* cacheManager, BaseCacheFormatter::CacheState const& selfConfig,
@@ -128,12 +128,11 @@ std::vector<size_t> CacheFormatter::pickRecvConnections(
         return ret;
     }
     TLLM_CHECK(numConnections == targetInfo.mIRanks.size());
-    int selfDPRank = selfConfig.getParallelConfig().mEnableAttentionDP ? selfConfig.getParallelConfig().mDPrank : 0;
 
     std::vector<size_t> ret;
     for (int i = 0; i < targetInfo.mDomainTPSize; i++)
     {
-        if ((i % targetInfo.mPeerDupHeadFactor) == (selfDPRank % targetInfo.mPeerDupHeadFactor))
+        if (i % targetInfo.mPeerDupHeadFactor == 0)
         {
             for (int j = 0; j < targetInfo.mDomainPPSize; j++)
             {
@@ -361,7 +360,7 @@ void CacheFormatter::format(TransferSession& session)
             }
             double cacheTransferTime
                 = std::max(0.0, std::chrono::duration<double, std::milli>(endTime - startTime).count());
-            kvCacheMeasureHelper.appendKVCacheTransfer(llmRequest.mRequestId, delay, cacheTransferTime, size);
+            session.appendMeasure(delay, cacheTransferTime, size);
         };
 
         if (connections.size() > 1)
@@ -713,7 +712,7 @@ void CacheFormatter::unformat(TransferSession& session)
                 }
                 double cacheTransferTime
                     = std::max(0.0, std::chrono::duration<double, std::milli>(endTime - startTime).count());
-                kvCacheMeasureHelper.appendKVCacheTransfer(ctxReqId, delay, cacheTransferTime, size);
+                session.appendMeasure(delay, cacheTransferTime, size);
             };
             if (pickUpConnections.size() > 1)
             {

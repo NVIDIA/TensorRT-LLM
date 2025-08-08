@@ -34,6 +34,7 @@ class DecodingCUDAGraphRunner:
         attn_metadata: AttentionMetadata,
         spec_metadata: Optional[SpecMetadata] = None,
         use_mrope: bool = False,
+        max_beam_width: int = 1,
     ) -> None:
         """
         Stores a CUDA graph and its associated input buffers.
@@ -49,19 +50,21 @@ class DecodingCUDAGraphRunner:
         e.g. FlashInfer cause graph breaks).
         """
         self.batch_size = batch_size
-
+        self.max_beam_width = max_beam_width
         # [CUDA graph spec decode padding]
         # We pad input IDs/position IDs to the maximum draft length (token per request).
         # We're forced to do this because we cannot reallocate inputs over many graph runs.
         token_per_request = spec_metadata.max_draft_len + 1 if spec_metadata is not None else 1
 
         # Using ones instead of zeros prevents NaNs in e.g. Deepseek
-        self.input_ids = torch.ones((batch_size * token_per_request, ),
-                                    device=device,
-                                    dtype=torch.int32)
-        self.position_ids = torch.zeros((1, batch_size * token_per_request),
-                                        device=device,
-                                        dtype=torch.int32)
+        self.input_ids = torch.ones(
+            (batch_size * max_beam_width * token_per_request, ),
+            device=device,
+            dtype=torch.int32)
+        self.position_ids = torch.zeros(
+            (1, batch_size * max_beam_width * token_per_request),
+            device=device,
+            dtype=torch.int32)
         self.mrope_position_deltas = torch.zeros(
             (batch_size,
              1), device=device, dtype=torch.int32) if use_mrope else None
