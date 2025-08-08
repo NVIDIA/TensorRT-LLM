@@ -152,7 +152,7 @@ Welcome to TensorRT-LLM's Documentation!
 
 .. toctree::
    :maxdepth: 2
-   :caption: LLM with TensorRT Engine
+   :caption: Use TensorRT Engine
    :hidden:
 
    legacy/tensorrt_quickstart.md
