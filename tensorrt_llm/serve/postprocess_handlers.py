@@ -156,10 +156,20 @@ def chat_stream_post_processor(rsp: GenerationResultBase, args: ChatPostprocArgs
         if finish_reason_sent[i]:
             continue
 
-        delta_text = output.text_diff
-
-        in_reasoning, delta_text, reasoning_delta_text = apply_reasoning_parser(
-            args, i, delta_text, True)
+        if args.use_harmony:
+            parser = args.harmony_parsers[i]
+            for token in output.token_ids_diff:
+                parser.process(token)
+            is_final = parser.current_channel == "final"
+            delta = parser.last_content_delta or ""
+            if is_final:
+                in_reasoning, reasoning_delta_text, delta_text = False, None, delta
+            else:
+                in_reasoning, reasoning_delta_text, delta_text = True, delta, None
+        else:
+            delta_text = output.text_diff
+            in_reasoning, delta_text, reasoning_delta_text = apply_reasoning_parser(
+                args, i, delta_text, True)
 
         if args.tool_choice and type(
                 args.tool_choice) is ChatCompletionNamedToolChoiceParam:
@@ -170,10 +180,10 @@ def chat_stream_post_processor(rsp: GenerationResultBase, args: ChatPostprocArgs
         else:
             if in_reasoning:
                 delta_message = DeltaMessage(
-                    reasoning_text=reasoning_delta_text)
+                    reasoning_content=reasoning_delta_text)
             else:
                 delta_message = DeltaMessage(
-                    content=delta_text, reasoning_text=reasoning_delta_text)
+                    content=delta_text, reasoning_content=reasoning_delta_text)
 
         choice = ChatCompletionResponseStreamChoice(index=i,
                                                     delta=delta_message,
