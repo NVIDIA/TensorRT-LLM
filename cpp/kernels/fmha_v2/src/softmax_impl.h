@@ -151,8 +151,8 @@ static inline __device__ float apply_exp_(float x, float max)
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <int N>
-static inline __device__ void reduce(
-    float (&data_fp32)[N][1], const int8_t (&mask)[N][1], int warps_n, float& sum_fp32, float& max_fp32, float const attention_sink)
+static inline __device__ void reduce(float (&data_fp32)[N][1], int8_t const (&mask)[N][1], int warps_n, float& sum_fp32,
+    float& max_fp32, float const attention_sink)
 {
 
 // Apply the masks.
@@ -247,8 +247,8 @@ static inline __device__ void reduce(
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <int N>
-static inline __device__ void reduce(
-    float (&data_fp32)[N][2], const int8_t (&mask)[N][2], int warps_n, float& sum_fp32, float& max_fp32, float const attention_sink)
+static inline __device__ void reduce(float (&data_fp32)[N][2], int8_t const (&mask)[N][2], int warps_n, float& sum_fp32,
+    float& max_fp32, float const attention_sink)
 {
 // Apply the masks.
 #pragma unroll
@@ -416,8 +416,8 @@ static inline __device__ void reduce(
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 template <int N>
-static inline __device__ void reduce(
-    float (&data_fp32)[N][4], const int8_t (&mask)[N][4], int warps_n, float& sum_fp32, float& max_fp32, float const attention_sink)
+static inline __device__ void reduce(float (&data_fp32)[N][4], int8_t const (&mask)[N][4], int warps_n, float& sum_fp32,
+    float& max_fp32, float const attention_sink)
 {
 
 // Apply the masks.
