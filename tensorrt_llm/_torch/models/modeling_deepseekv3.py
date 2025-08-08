@@ -26,29 +26,49 @@
 # --------------------------------------------------
 
 import copy
-from typing import Dict, Optional
+import math
+import os
+import warnings
+from typing import Dict, List, Optional, Tuple
 
 import torch
+import torch.nn.functional as F
 import triton
 import triton.language as tl
 from torch import nn
 from tqdm import tqdm
 from transformers import PretrainedConfig
 
+from tensorrt_llm._ipc_utils import can_access_peer
 from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.functional import PositionEmbeddingType
+from tensorrt_llm.llmapi.utils import enable_llm_debug
+from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.utils.fp8_utils import (
     resmooth_to_fp8_e8m0, transform_sf_into_required_layout)
 
 from ..attention_backend import AttentionMetadata
+from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
+from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
+                           MoEAllReduce, MoEAllReduceParams, allgather)
 from ..model_config import ModelConfig
+from ..modules.attention import MLA
+from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import moe_load_balancer_set_repeated_for_next_layer
+from ..modules.fused_moe import (DeepSeekV3MoeRoutingMethod, TRTLLMGenFusedMoE,
+                                 create_moe,
+                                 moe_load_balancer_set_repeated_for_next_layer)
+from ..modules.gated_mlp import GatedMLP
+from ..modules.linear import Linear, TensorParallelMode, WeightsLoadingConfig
+from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
+from ..peft.lora.layer import LoraLayer
 from ..speculative import MTPSpecMetadata, SpecMetadata
-from ..utils import AuxStreamType
-from .modeling_speculative import (DeepseekV3DecoderLayer,
-                                   SpecDecOneEngineForCausalLM)
-from .modeling_utils import DecoderModel, filter_weights, register_auto_model
+from ..utils import AuxStreamType, EventType, Fp4QuantizedTensor
+from .modeling_speculative import SpecDecOneEngineForCausalLM
+from .modeling_utils import (DecoderModel, EagerFusionConfig, filter_weights,
+                             register_auto_model)
 
 
 @triton.jit
@@ -106,6 +126,7 @@ def weight_dequant(x: torch.Tensor,
                          triton.cdiv(N, meta['BLOCK_SIZE']))
     weight_dequant_kernel[grid](x, s, y, M, N, BLOCK_SIZE=block_size)
     return y
+
 
 class DeepseekV3MTPHead(nn.Module):
 
@@ -512,7 +533,8 @@ class Deepseekv3MoE(nn.Module):
         router_logits = self.gate(hidden_states)
 
         routed_output = self.experts(
-            hidden_states_fp4 or hidden_states,
+            hidden_states_fp4
+            if hidden_states_fp4 is not None else hidden_states,
             router_logits,
             do_finalize=do_finalize,
             output_dtype=hidden_states.dtype,
@@ -536,8 +558,9 @@ class Deepseekv3MoE(nn.Module):
             assert not self.use_dp
 
         def _compute_shared_output():
-            shared_output = self.shared_experts(hidden_states_fp4
-                                                or hidden_states)
+            shared_output = self.shared_experts(
+                hidden_states_fp4
+                if hidden_states_fp4 is not None else hidden_states)
             if self.shared_output_scale is not None:
                 shared_output *= self.shared_output_scale
             return shared_output
@@ -721,7 +744,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         attn_metadata: AttentionMetadata,
         residual: torch.Tensor,
         **kwargs,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -753,7 +776,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         residual: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
 
         def _run_MoE(hidden_states, hidden_states_fp4, do_finalize):
             return self.mlp(
@@ -837,7 +860,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         self,
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
 
         if self.fusion_config.PRE_MLP_FUSION:
             act_fp4, act_sf, residual = self.allreduce(
@@ -941,7 +964,7 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
         all_rank_num_tokens: Optional[List[int]] = None,
         all_rank_max_num_tokens: Optional[int] = None,
         **kwargs,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
 
         def norm_embeds():
             return self.enorm(embed_tokens(input_ids))  #emdedding
