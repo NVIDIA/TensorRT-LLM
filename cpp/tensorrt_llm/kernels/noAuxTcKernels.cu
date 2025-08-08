@@ -15,11 +15,13 @@
  * limitations under the License.
  */
 
+#include "moeTopKFuncs.cuh"
 #include "tensorrt_llm/common/cudaTypeUtils.cuh"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/kernels/noAuxTcKernels.h"
 #include <cooperative_groups.h>
 #include <cooperative_groups/reduce.h>
+
 namespace cg = cooperative_groups;
 using namespace tensorrt_llm::common;
 
@@ -29,6 +31,7 @@ constexpr unsigned FULL_WARP_MASK = 0xffffffff;
 constexpr int32_t WARP_SIZE = 32;
 constexpr int32_t BLOCK_SIZE = 512;
 constexpr int32_t NUM_WARPS_PER_BLOCK = BLOCK_SIZE / WARP_SIZE;
+constexpr int32_t DS_NUM_EXPERTS = 256; // for DeepSeekV3
 
 namespace warp_topk
 {
@@ -669,42 +672,209 @@ __global__ void group_idx_and_topk_idx_kernel(T* scores, T const* group_scores, 
 #endif
 }
 
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+static constexpr int NumThreads = 256;
+static constexpr int NumWarps = NumThreads / WARP_SIZE;
+static constexpr int NumTopGroupScores = 2;
+static constexpr int MaxNumTopExperts = 8;
+static constexpr int MaxNumTopGroups = 4;
+
+static __device__ inline float sigmoid_accurate(float x)
+{
+    return 0.5f * tanhf(0.5f * x) + 0.5f;
+}
+
+template <typename InputT, typename OutputT, typename IdxT>
+__global__ void deepseek_v3_topk_kernel(InputT* scores, OutputT* topkValues, IdxT* topkIndices, OutputT* scoresWithBias,
+    int64_t const numTokens, int64_t const numGroup, int64_t const topkGroup, int64_t const topk,
+    int64_t const numExperts, int64_t const numExpertsPerGroup, double const routedScalingFactor)
+{
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    asm volatile("griddepcontrol.wait;");
+#endif
+
+    // declare shared memory structure
+    // number of experts is bounded by number of threads
+    __shared__ float __attribute((aligned(128))) smemScoreSigmoid[NumThreads];
+    __shared__ float __attribute((aligned(128))) smemScoreBias[NumThreads];
+    // number of expert groups is bounded by number of warps
+    __shared__ float __attribute((aligned(128))) smemGroupScores[NumWarps];
+
+    // needed for warp reduce
+    auto block = cg::this_thread_block();
+    auto warp = cg::tiled_partition<WARP_SIZE>(block);
+
+    // for the final reduction of weight norm, only some lanes need to participate
+    int32_t laneIdx = threadIdx.x % WARP_SIZE;
+    int32_t warpIdx = __shfl_sync(0xffffffff, threadIdx.x / WARP_SIZE, 0);
+
+    if (warpIdx >= numGroup)
+    {
+        return;
+    }
+
+    // note that for invalid scores, we simply use a negative value:
+    // they work well even with the compacted format used in topK, and
+    // sigmoid / bias activated scores cannot be negative
+    static constexpr float invalidScoreFloat = -1.F;
+    const OutputT invalidScore = OutputT{invalidScoreFloat};
+
+    // load bias already; each warp represents one expert group
+    auto threadExpert = warpIdx * numExpertsPerGroup + laneIdx;
+    bool expertSelected = laneIdx < numExpertsPerGroup;
+
+    auto scoreIdx = int64_t{blockIdx.x} * int64_t{numExperts} + threadExpert;
+    topkValues += blockIdx.x * topk;
+    topkIndices += blockIdx.x * topk;
+
+    // get our assigned thread score; each warp represents one expert group
+    // float score = expertSelected ? static_cast<float>(scores[scoreIdx]) : invalidScoreFloat;
+    float scoreSigmoid = expertSelected ? static_cast<float>(scores[scoreIdx]) : invalidScoreFloat;
+
+    // write the sigmoid score to shared for later use
+    if (expertSelected)
+    {
+        smemScoreSigmoid[threadExpert] = scoreSigmoid;
+    }
+
+    // get the score with bias
+    // note that with invalid values, because sigmoid is < 1 and bias is -1,
+    // we must get a negative value, which is smaller than any valid value
+    auto scoreBias = expertSelected ? static_cast<float>(scoresWithBias[scoreIdx]) : invalidScoreFloat;
+
+    if (expertSelected)
+    {
+        smemScoreBias[threadExpert] = scoreBias;
+    }
+
+    // registers for top group score reduction
+    float topExpGroupScores[NumTopGroupScores];
+    [[maybe_unused]] int32_t topExpGroupIdx[NumTopGroupScores];
+    float topGroups[MaxNumTopGroups]; // bound of numGroup
+    int32_t topGroupIdx[MaxNumTopGroups];
+    float expertScoreGroup[MaxNumTopGroups];
+    int32_t expertIdxGroup[MaxNumTopGroups];
+    float topScores[MaxNumTopExperts]; // bound of topk
+    int32_t topExperts[MaxNumTopExperts];
+
+    reduce_topk::reduceTopK(warp, topExpGroupScores, topExpGroupIdx, scoreBias, threadExpert,
+        /* minValue */ invalidScoreFloat);
+
+    // get the final group score and write it to shared
+    if (laneIdx == 0)
+    {
+        auto groupScore = topExpGroupScores[0] + topExpGroupScores[1];
+        smemGroupScores[warpIdx] = groupScore;
+    }
+
+    // make group scores available to all warps
+    __syncthreads();
+
+    if (warpIdx == 0)
+    {
+        // a single warp performs the selection of top groups, and goes on to select the final experts
+        float groupScore = laneIdx < numGroup ? smemGroupScores[laneIdx] : invalidScoreFloat;
+
+        reduce_topk::reduceTopK(warp, topGroups, topGroupIdx, groupScore, laneIdx,
+            /* minValue */ invalidScoreFloat);
+
+        // final expert selection: get relevant indexes and scores from shared
+
+#pragma unroll
+        for (int ii = 0; ii < MaxNumTopGroups; ++ii)
+        { // bound of numGroup
+            auto groupIdx = topGroupIdx[ii];
+            expertIdxGroup[ii] = groupIdx * numExpertsPerGroup + laneIdx;
+
+            expertScoreGroup[ii]
+                = groupIdx < numGroup && expertSelected ? smemScoreBias[expertIdxGroup[ii]] : invalidScoreFloat;
+        }
+
+        tensorrt_llm::kernels::reduce_topk::reduceTopK(warp, topScores, topExperts, expertScoreGroup, expertIdxGroup,
+            /* minValue */ invalidScoreFloat, topk);
+
+        // determine our lane's expert index and write to output
+        int32_t expertIdx = 0;
+#pragma unroll
+        for (int ii = 0; ii < topk; ++ii)
+        { // bound of topk
+            expertIdx = laneIdx == ii ? topExperts[ii] : expertIdx;
+        }
+        // norm the value
+        float scoreNorm = laneIdx < topk ? smemScoreSigmoid[expertIdx] : 0.F;
+        auto redNorm = cg::reduce(warp, scoreNorm, cg::plus<float>{});
+        auto finalScore = OutputT{scoreNorm * routedScalingFactor / (redNorm + 1e-20)};
+        // store the topk scores and experts to output
+        if (laneIdx < topk)
+        {
+            topkValues[laneIdx] = finalScore;
+            topkIndices[laneIdx] = expertIdx;
+        }
+    }
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    asm volatile("griddepcontrol.launch_dependents;");
+#endif
+}
+
 template <typename T, typename IdxT>
 void invokeNoAuxTc(T* scores, T* group_scores, T* topk_values, IdxT* topk_indices, T* scores_with_bias,
     int64_t const num_tokens, int64_t const num_experts, int64_t const n_group, int64_t const topk_group,
     int64_t const topk, double const routed_scaling_factor, cudaStream_t const stream)
 {
-    int64_t num_cases = num_tokens * n_group;
-    int64_t topk_with_k2_num_blocks = (num_cases - 1) / NUM_WARPS_PER_BLOCK + 1;
-    auto* kernel_instance1 = &topk_with_k2_kernel<T>;
-    cudaLaunchConfig_t config;
-    config.gridDim = topk_with_k2_num_blocks;
-    config.blockDim = BLOCK_SIZE;
-    config.dynamicSmemBytes = 0;
-    config.stream = stream;
-    cudaLaunchAttribute attrs[1];
-    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
-    config.numAttrs = 1;
-    config.attrs = attrs;
-    cudaLaunchKernelEx(&config, kernel_instance1, group_scores, scores_with_bias, num_tokens, num_cases, n_group,
-        num_experts / n_group);
-    sync_check_cuda_error(stream);
+    if (topk_group <= MaxNumTopGroups && num_experts <= NumThreads && topk <= MaxNumTopExperts && n_group != 1)
+    {
+        cudaLaunchConfig_t config;
+        auto* kernel_instance2 = &deepseek_v3_topk_kernel<T, T, IdxT>;
+        config.gridDim = num_tokens;
+        config.blockDim = NumThreads;
+        config.dynamicSmemBytes = 0;
+        config.stream = stream;
+        cudaLaunchAttribute attrs[1];
+        attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+        config.numAttrs = 1;
+        config.attrs = attrs;
 
-    int64_t topk_with_k_group_num_blocks = (num_tokens - 1) / NUM_WARPS_PER_BLOCK + 1;
-    size_t dynamic_smem_in_bytes = warp_topk::calc_smem_size_for_block_wide<T, int32_t>(NUM_WARPS_PER_BLOCK, topk);
-    auto* kernel_instance2 = &group_idx_and_topk_idx_kernel<T, IdxT>;
-    config.gridDim = topk_with_k_group_num_blocks;
-    config.blockDim = BLOCK_SIZE;
-    config.dynamicSmemBytes = dynamic_smem_in_bytes;
-    config.stream = stream;
-    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
-    config.numAttrs = 1;
-    config.attrs = attrs;
-    cudaLaunchKernelEx(&config, kernel_instance2, scores, group_scores, topk_values, topk_indices, scores_with_bias,
-        num_tokens, n_group, topk_group, topk, num_experts, num_experts / n_group, routed_scaling_factor);
-    sync_check_cuda_error(stream);
+        cudaLaunchKernelEx(&config, kernel_instance2, scores, topk_values, topk_indices, scores_with_bias, num_tokens,
+            n_group, topk_group, topk, num_experts, num_experts / n_group, routed_scaling_factor);
+        sync_check_cuda_error(stream);
+    }
+    else
+    {
+        int64_t num_cases = num_tokens * n_group;
+        int64_t topk_with_k2_num_blocks = (num_cases - 1) / NUM_WARPS_PER_BLOCK + 1;
+        auto* kernel_instance1 = &topk_with_k2_kernel<T>;
+        cudaLaunchConfig_t config;
+        config.gridDim = topk_with_k2_num_blocks;
+        config.blockDim = BLOCK_SIZE;
+        config.dynamicSmemBytes = 0;
+        config.stream = stream;
+        cudaLaunchAttribute attrs[1];
+        attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+        config.numAttrs = 1;
+        config.attrs = attrs;
+        cudaLaunchKernelEx(&config, kernel_instance1, group_scores, scores_with_bias, num_tokens, num_cases, n_group,
+            num_experts / n_group);
+        sync_check_cuda_error(stream);
+
+        int64_t topk_with_k_group_num_blocks = (num_tokens - 1) / NUM_WARPS_PER_BLOCK + 1;
+        size_t dynamic_smem_in_bytes = warp_topk::calc_smem_size_for_block_wide<T, int32_t>(NUM_WARPS_PER_BLOCK, topk);
+        auto* kernel_instance2 = &group_idx_and_topk_idx_kernel<T, IdxT>;
+        config.gridDim = topk_with_k_group_num_blocks;
+        config.blockDim = BLOCK_SIZE;
+        config.dynamicSmemBytes = dynamic_smem_in_bytes;
+        config.stream = stream;
+        attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
+        config.numAttrs = 1;
+        config.attrs = attrs;
+        cudaLaunchKernelEx(&config, kernel_instance2, scores, group_scores, topk_values, topk_indices, scores_with_bias,
+            num_tokens, n_group, topk_group, topk, num_experts, num_experts / n_group, routed_scaling_factor);
+        sync_check_cuda_error(stream);
+    }
 }
 
 #define INSTANTIATE_NOAUX_TC(T, IdxT)                                                                                  \

@@ -835,7 +835,7 @@ class TestMoeFP8:
                               use_autotune=True)
 
     @pytest.mark.parametrize("num_tokens", [16])
-    @pytest.mark.parametrize("expert_info", [(32, 8, 4, 8)])
+    @pytest.mark.parametrize("expert_info", [(32, 8, 4, 8), (384, 1, 1, 8)])
     @pytest.mark.parametrize("hidden_size", [512])
     @pytest.mark.parametrize("intermediate_size", [512])
     def test_no_autotune(self, num_tokens: int, expert_info: Tuple[int, int,

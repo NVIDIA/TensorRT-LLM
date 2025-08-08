@@ -162,9 +162,28 @@ struct Sort<4, RedType>
     }
 };
 
+template <int K, typename Type>
+__forceinline__ __device__ void reduceTopK(cg::thread_block_tile<kWARP_SIZE> const& warp, Type (&out)[K],
+    int32_t (&outIdx)[K], Type value, int32_t idx, Type const minValue, int actualK = K)
+{
+    static_assert(K > 0, "Top K must have K > 0");
+    static_assert(K < kWARP_SIZE, "Top K must have K < kWARP_SIZE");
+    using RedType = TopKRedType<Type>;
+    RedType topK{value, idx};
+    typename RedType::TypeCmp packedMax{};
+#pragma unroll
+    for (int kk = 0; kk < actualK; ++kk) //@todo: check if actualK is correct
+    {
+        topK = kk > 0 && packedMax == topK.compValIdx ? RedType{minValue, idx} : topK;
+        // get the next largest value
+        packedMax = topK.reduce(warp);
+        RedType::unpack(out[kk], outIdx[kk], packedMax);
+    }
+};
+
 template <int K, typename Type, int N, bool IsSorted = false>
 __device__ void reduceTopK(cg::thread_block_tile<kWARP_SIZE> const& warp, Type (&out)[K], int32_t (&outIdx)[K],
-    Type (&value)[N], int32_t (&idx)[N], Type minValue)
+    Type (&value)[N], int32_t (&idx)[N], Type minValue, int actualK = K)
 {
     static_assert(K > 0, "Top K must have K > 0");
     static_assert(K < kWARP_SIZE, "Top K must have K < kWARP_SIZE");
@@ -184,7 +203,7 @@ __device__ void reduceTopK(cg::thread_block_tile<kWARP_SIZE> const& warp, Type (
     }
     typename RedType::TypeCmp packedMax{};
 #pragma unroll
-    for (int kk = 0; kk < K; ++kk)
+    for (int kk = 0; kk < actualK; ++kk)
     {
         bool update = kk > 0 && packedMax == topK[0].compValIdx;
 #pragma unroll
