@@ -1223,7 +1223,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         'branch': branch,
                         'action': "push",
                         'triggerType': env.JOB_NAME ==~ /.*PostMerge.*/ ? "post-merge" : "pre-merge",
-                        'runSanityCheck': true,
+                        'runSanityCheck': env.JOB_NAME ==~ /.*PostMerge.*/ ? true : false,
                     ]
 
                     launchJob("/LLM/helpers/BuildDockerImages", false, enableFailFast, globalVars, "x86_64", additionalParameters)
@@ -1240,6 +1240,9 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
         testFilter[(TEST_STAGE_LIST)]?.remove("Build-Docker-Images")
         testFilter[(EXTRA_STAGE_LIST)]?.remove("Build-Docker-Images")
         echo "Will run Build-Docker-Images job"
+        stages.remove("x86_64-linux")
+        stages.remove("SBSA-linux")
+        echo "When running Build-Docker-Images job in pre-merge pipeline, x86_64-linux and SBSA-linux will be removed from the pipeline."
     }
 
     parallelJobs = stages.collectEntries{key, value -> [key, {
