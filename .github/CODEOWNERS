@@ -6,13 +6,39 @@
 # Without approval from a member of this team, PRs cannot be merged to release branches.
 # * @NVIDIA/trt-llm-release-branch-approval
 
+## TensorRT-LLM Infra
+### CI
+/jenkins @NVIDIA/trt-llm-ci-infra-devs @NVIDIA/trt-llm-infra-devs
+### Setup
+/docker @NVIDIA/trt-llm-setup-infra-devs @NVIDIA/trt-llm-infra-devs
+### Github workflows
+/.github @NVIDIA/trt-llm-gh-workflows-infra-devs @NVIDIA/trt-llm-infra-devs
+/.coderabbit.yaml @NVIDIA/trt-llm-gh-workflows-infra-devs @NVIDIA/trt-llm-infra-devs
+
+## TensorRT-LLM - Docs
+/docs @NVIDIA/trt-llm-doc-owners
+
+## Examples
+/examples @NVIDIA/trt-llm-doc-owners
+
+## TensorRT-LLM - Triton backend
+/triton_backend @NVIDIA/trt-llm-triton-backend-devs
+
 # TensorRT-LLM Pytorch backend
 /tensorrt_llm/_torch @NVIDIA/trt-llm-torch-devs
+
+## TensorRT-LLM Pytorch - Modules
+/tensorrt_llm/_torch/modules @NVIDIA/trt-llm-torch-modules
+
+## TensorRT-LLM Pytorch Models
+/tensorrt_llm/_torch/models @NVIDIA/trt-llm-torch-models-devs
+/examples/models @NVIDIA/trt-llm-torch-models-devs @NVIDIA/trt-llm-doc-owners
+
 ## TensorRT-LLM Pytorch backend - runtime
 /tensorrt_llm/_torch/pyexecutor @NVIDIA/trt-llm-torch-runtime-devs
 ## TensorRT-LLM Pytorch backend - AutoDeploy flow
 /tensorrt_llm/_torch/auto_deploy @NVIDIA/trt-llm-torch-autodeploy-devs
-/tensorrt_llm/examples/auto_deploy @NVIDIA/trt-llm-torch-autodeploy-devs
+/examples/auto_deploy @NVIDIA/trt-llm-torch-autodeploy-devs @NVIDIA/trt-llm-doc-owners
 
 ## TensorRT-LLM Pytorch - Speculative Decoding
 /tensorrt_llm/_torch/speculative @NVIDIA/trt-llm-torch-spec-decoding
@@ -31,12 +57,6 @@
 /tensorrt_llm/_torch/attention_backend @NVIDIA/trt-llm-torch-attention-devs
 /tensorrt_llm/_torch/modules/attention.py @NVIDIA/trt-llm-torch-attention-devs
 
-## TensorRT-LLM Pytorch - Modules
-/tensorrt_llm/_torch/modules @NVIDIA/trt-llm-torch-modules
-
-
-## TensorRT-LLM Pytorch Models
-/tensorrt_llm/_torch/models @NVIDIA/trt-llm-torch-models-devs
 
 ### TensorRT-LLM Pytorch - Models - Gemma
 /tensorrt_llm/_torch/models/modeling_gemma3.py @NVIDIA/trt-llm-torch-models-gemma-devs @NVIDIA/trt-llm-torch-models-devs
@@ -108,8 +128,6 @@
 /cpp/tensorrt_llm/runtime/loraUtils.cpp @NVIDIA/trt-llm-torch-peft
 /cpp/tensorrt_llm/runtime/loraUtils.h @NVIDIA/trt-llm-torch-peft
 
-## TensorRT-LLM - Triton backend
-/triton_backend @NVIDIA/trt-llm-triton-backend-devs
 
 ## TensorRT-LLM trtllm-bench Reviewers
 /tensorrt_llm/bench @NVIDIA/trtllm-bench-reviewers
@@ -121,7 +139,7 @@ docs/source/performance/perf-benchmarking.md @NVIDIA/trtllm-bench-reviewers
 /tensorrt_llm/executor @NVIDIA/trt-llm-llmapi-devs
 
 ## TensorRT-LLM LLM Disaggregated
-/examples/disaggregated @NVIDIA/trt-llm-disagg-devs
+/examples/disaggregated @NVIDIA/trt-llm-disagg-devs @NVIDIA/trt-llm-doc-owners
 /tensorrt_llm/disaggregated_params.py @NVIDIA/trt-llm-disagg-devs
 /tensorrt_llm/_torch/pyexecutor/kv_cache_transceiver.py @NVIDIA/trt-llm-disagg-devs
 /cpp/tensorrt_llm/batch_manager/cacheFormatter.cpp @NVIDIA/trt-llm-disagg-devs
@@ -134,19 +152,6 @@ docs/source/performance/perf-benchmarking.md @NVIDIA/trtllm-bench-reviewers
 /cpp/tensorrt_llm/batch_manager/dataTransceiverImpl.cpp @NVIDIA/trt-llm-disagg-devs
 /cpp/tensorrt_llm/batch_manager/dataTransceiverImpl.h @NVIDIA/trt-llm-disagg-devs
 
-## TensorRT-LLM Infra
-
-### CI
-/jenkins @NVIDIA/trt-llm-ci-infra-devs @NVIDIA/trt-llm-infra-devs
-### Setup
-/docker @NVIDIA/trt-llm-setup-infra-devs @NVIDIA/trt-llm-infra-devs
-### Github workflows
-/tensorrt_llm/.github @NVIDIA/trt-llm-gh-workflows-infra-devs @NVIDIA/trt-llm-infra-devs
-/tensorrt_llm/.coderabbit.yaml @NVIDIA/trt-llm-gh-workflows-infra-devs @NVIDIA/trt-llm-infra-devs
-
-## TensorRT-LLM - Docs
-/docs @NVIDIA/trt-llm-doc-owners
-/examples @NVIDIA/trt-llm-doc-owners
 
 # The rule below requires that any PR modifying public APIs must be approved by at least one member
 # of the NVIDIA/trt-llm-committed-api-review-committee or NVIDIA/trt-llm-noncommitted-api-review-committee team.
