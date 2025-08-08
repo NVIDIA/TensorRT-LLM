@@ -18,6 +18,7 @@ CUBLAS_VER="12.9.0.13-1"
 # Align with the pre-installed CUDA / NVCC / NVRTC versions from
 # https://docs.nvidia.com/cuda/cuda-toolkit-release-notes/index.html
 NVRTC_VER="12.9.86-1"
+NVCC_VER=$NVRTC_VER
 CUDA_RUNTIME="12.9.79-1"
 CUDA_DRIVER_VERSION="575.57.08-1.el8"
 
@@ -81,6 +82,7 @@ install_ubuntu_requirements() {
 
 install_rockylinux_requirements() {
     CUBLAS_CUDA_VERSION=$(echo $CUDA_VER | sed 's/\./-/g')
+    NVRTC_CUDA_VERSION=$(echo $CUDA_VER | sed 's/\./-/g')
 
     ARCH=$(uname -m)
     if [ "$ARCH" = "x86_64" ];then ARCH1="x86_64" && ARCH2="x64" && ARCH3=$ARCH1;fi
@@ -94,13 +96,11 @@ install_rockylinux_requirements() {
         "cuda-toolkit-${CUBLAS_CUDA_VERSION}-config-common-${CUDA_RUNTIME}.noarch" \
         "cuda-toolkit-12-config-common-${CUDA_RUNTIME}.noarch" \
         "cuda-toolkit-config-common-${CUDA_RUNTIME}.noarch" \
+        "cuda-nvrtc-devel-${NVRTC_CUDA_VERSION}-${NVRTC_VER}.${ARCH1}" \
         "libcublas-${CUBLAS_CUDA_VERSION}-${CUBLAS_VER}.${ARCH1}" \
         "libcublas-devel-${CUBLAS_CUDA_VERSION}-${CUBLAS_VER}.${ARCH1}"; do
         wget -q --timeout=180 --tries=3 "https://developer.download.nvidia.cn/compute/cuda/repos/rhel8/${ARCH3}/${pkg}.rpm"
     done
-
-    # Remove old packages
-    dnf remove -y "libnccl*" "cuda-compat*" "cuda-toolkit*" "libcublas*"
 
     # Install new packages
     dnf -y install \
@@ -110,6 +110,7 @@ install_rockylinux_requirements() {
         cuda-toolkit-${CUBLAS_CUDA_VERSION}-config-common-${CUDA_RUNTIME}.noarch.rpm \
         cuda-toolkit-12-config-common-${CUDA_RUNTIME}.noarch.rpm \
         cuda-toolkit-config-common-${CUDA_RUNTIME}.noarch.rpm \
+        cuda-nvrtc-devel-${NVRTC_CUDA_VERSION}-${NVRTC_VER}.${ARCH1}.rpm \
         libcublas-${CUBLAS_CUDA_VERSION}-${CUBLAS_VER}.${ARCH1}.rpm \
         libcublas-devel-${CUBLAS_CUDA_VERSION}-${CUBLAS_VER}.${ARCH1}.rpm
 
