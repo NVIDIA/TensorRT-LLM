@@ -13,7 +13,9 @@ from tensorrt_llm.llmapi import KvCacheConfig as TRT_KvCacheConfig
 # A test case of mmlu_llama from lm_eval
 @pytest.fixture(scope="module")
 def test_case():
-    with open(Path(__file__).parent / "test_overlap_scheduler_input.json") as f:
+    with open(
+            Path(__file__).parent.parent / "executor" /
+            "test_overlap_scheduler_input.json") as f:
         return json.load(f)
 
 

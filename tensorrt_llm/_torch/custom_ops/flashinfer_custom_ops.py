@@ -1,35 +1,11 @@
-import os
-import platform
-import traceback
-
 import torch
 
-from ...logger import logger
-
-IS_FLASHINFER_AVAILABLE = False
-
-
-def get_env_enable_pdl():
-    return os.environ.get("TRTLLM_ENABLE_PDL", "0") == "1"
-
-
-ENABLE_PDL = get_env_enable_pdl()
-if ENABLE_PDL:
-    logger.info("PDL is enabled")
-
-if platform.system() != "Windows":
-    try:
-        import flashinfer
-        IS_FLASHINFER_AVAILABLE = True
-    except ImportError:
-        traceback.print_exc()
-        print(
-            "flashinfer is not installed properly, please try pip install or building from source codes"
-        )
+from ..flashinfer_utils import ENABLE_PDL, IS_FLASHINFER_AVAILABLE
 
 if IS_FLASHINFER_AVAILABLE:
     from flashinfer.activation import silu_and_mul
     from flashinfer.norm import fused_add_rmsnorm, rmsnorm
+    from flashinfer.rope import apply_rope_with_cos_sin_cache_inplace
 
     # Warp this into custom op since flashinfer didn't warp it properly and we want to avoid graph break between mlp layer for user buffer optimization
     @torch.library.custom_op("trtllm::flashinfer_silu_and_mul", mutates_args=())
@@ -69,7 +45,7 @@ if IS_FLASHINFER_AVAILABLE:
         cos_sin_cache: torch.Tensor,
         is_neox: bool = True,
     ) -> None:
-        flashinfer.apply_rope_with_cos_sin_cache_inplace(
+        apply_rope_with_cos_sin_cache_inplace(
             positions,
             query,
             key,
