@@ -29,8 +29,7 @@ def example_cuda_graph_config():
         cuda_graph_config=cuda_graph_config,  # Enable CUDA graphs
         max_batch_size=4,
         max_seq_len=512,
-        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.8,
-                                      enable_block_reuse=True))
+        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.5))
 
     prompts = [
         "Hello, my name is",
@@ -56,7 +55,7 @@ def example_kv_cache_config():
                        max_batch_size=8,
                        max_seq_len=1024,
                        kv_cache_config=KvCacheConfig(
-                           free_gpu_memory_fraction=0.85,
+                           free_gpu_memory_fraction=0.5,
                            enable_block_reuse=True))
 
     prompts = [

@@ -161,3 +161,8 @@ def test_llmapi_sampling(llm_root, engine_dir, llm_venv):
 
 def test_llmapi_runtime(llm_root, engine_dir, llm_venv):
     _run_llmapi_example(llm_root, engine_dir, llm_venv, "llm_runtime.py")
+
+
+def test_llmapi_tensorrt_engine(llm_root, engine_dir, llm_venv):
+    _run_llmapi_example(llm_root, engine_dir, llm_venv,
+                        "_tensorrt_engine/quickstart_example.py")
