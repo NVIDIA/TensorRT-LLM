@@ -71,24 +71,6 @@ endfunction()
 
 add_subdirectory(unit_tests)
 
-add_gtest(mpiUtilsTest runtime/mpiUtilsTest.cpp)
-
-add_gtest(gptDecoderTest runtime/gptDecoderTest.cpp)
-add_gtest(gptDecoderBatchedTest runtime/gptDecoderBatchedTest.cpp)
-add_gtest(medusaModuleTest runtime/medusaModuleTest.cpp)
-
-add_gtest(moeLoadBalancerTest runtime/moeLoadBalancerTest.cpp)
-
-add_gtest(sanitizerTest runtime/sanitizerTest.cpp)
-
-add_gtest(eaglePackDataTest kernels/eaglePackDataTest.cpp)
-
-add_gtest(medusaDecodeLayerTest layers/medusaDecodeLayerTest.cpp)
-
-add_gtest(moeLoadBalanceKernelTest kernels/moeLoadBalanceKernelTest.cpp)
-
-add_gtest(eagleLayerTest layers/eagleLayerTest.cpp)
-
 add_subdirectory(utils)
 
 if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/batch_manager)

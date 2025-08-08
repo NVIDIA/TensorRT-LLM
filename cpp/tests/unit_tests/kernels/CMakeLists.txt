@@ -88,11 +88,13 @@ set(SAMPLING_KERNEL_TEST_SRC
     sampling/samplingTest.cpp sampling/samplingTopKTest.cpp
     sampling/samplingTopPTest.cpp sampling/samplingAirTopPTest.cpp
     sampling/samplingPenaltyTest.cpp sampling/samplingUtilsTest.cu)
-
 add_gtest(samplingKernelsTest "${SAMPLING_KERNEL_TEST_SRC}")
 
 set(ROUTING_KERNEL_TEST_SRC
     routing/routingTest.cpp routing/routingLlama4Test.cpp
     routing/routingRenormalizeTest.cpp routing/routingDeepSeekTest.cpp)
-
 add_gtest(routingKernelsTest "${ROUTING_KERNEL_TEST_SRC}")
+
+add_gtest(moeLoadBalanceKernelTest moeLoadBalanceKernelTest.cpp)
+
+add_gtest(eaglePackDataTest eaglePackDataTest.cpp)

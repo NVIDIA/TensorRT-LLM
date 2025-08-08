@@ -9,6 +9,9 @@
 # license agreement from NVIDIA CORPORATION or its affiliates is strictly
 # prohibited.
 
+add_gtest(blockKeyTest blockKeyTest.cpp)
+add_gtest(cacheTransBufferTest cacheTransBufferTest.cpp)
+add_gtest(cacheTransceiverTest cacheTransceiverTest.cpp)
 add_gtest(capacitySchedulerTest capacitySchedulerTest.cpp)
 add_gtest(contextProgressTest contextProgressTest.cu)
 add_gtest(evictionPolicyTest evictionPolicyTest.cpp)
@@ -16,5 +19,5 @@ add_gtest(kvCacheManagerTest kvCacheManagerTest.cpp)
 add_gtest(kvCacheUtilsTest kvCacheUtilsTest.cpp)
 add_gtest(llmRequestTest llmRequestTest.cpp)
 add_gtest(microBatchSchedulerTest microBatchSchedulerTest.cpp)
+add_gtest(peftCacheManagerTest peftCacheManagerTest.cpp)
 add_gtest(staticThreadPoolTest staticThreadPoolTest.cpp)
-add_gtest(cacheTransBufferTest cacheTransBufferTest.cpp)
