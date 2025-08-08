@@ -1,5 +1,5 @@
 # Adapted from https://github.com/vllm-project/vllm/tree/main/.github/ISSUE_TEMPLATE/300-usage.yml
-name: 💻 Usage
+name: 💻 Questions
 description: Raise an issue here if you don't know how to use TensorRT-LLM.
 title: "[Usage]: "
 labels: ["question"]
