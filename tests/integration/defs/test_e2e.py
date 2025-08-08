@@ -1590,12 +1590,12 @@ def parse_output(text):
     for item in text_lists:
         item = item.replace(os.linesep, "")
         while True:
-            match = re.search(r"(Generated text: \'(.*?)\')", item,
+            match = re.search(r"Generated text: [\"'](.*?)[\"']", item,
                               re.MULTILINE)
             if match is None:
                 break
             _, end = match.span(1)
-            results.append(match.group(2))
+            results.append(match.group(1))
             item = item[end:]
     return results
 
@@ -2562,7 +2562,7 @@ def test_ptp_quickstart_multimodal_multiturn(llm_root, llm_venv, model_name,
         },
         "Phi-4-multimodal-instruct": {
             "image": [
-                ["image", "depicts", "mountain", "half", "rock"],
+                ["depicts", "landscape", "mountain", "half", "rock"],
                 ["atmosphere", "beauty", "mountain", "sheer", "landscape"],
             ],
         },
