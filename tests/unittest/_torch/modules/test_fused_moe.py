@@ -13,7 +13,8 @@ from _torch.helpers import (per_block_cast_to_fp8, per_block_cast_to_fp8_e8m0,
                             per_token_cast_to_fp8_e8m0)
 from mpi4py import MPI
 from mpi4py.futures import MPIPoolExecutor
-from utils.util import (check_accuracy, skip_neither_ada_nor_hopper_unittest,
+from utils.util import (check_accuracy, skip_blackwell_geforce,
+                        skip_neither_ada_nor_hopper_unittest,
                         skip_non_hopper_unittest, skip_pre_blackwell,
                         skip_pre_hopper)
 
@@ -965,13 +966,16 @@ def test_fused_moe_fp8_blockwise_cute_dsl_multi_gpu(ep_size, routing_method,
 @pytest.mark.parametrize("moe_backend", ["TRTLLM", "CUTLASS"])
 def test_fused_moe_nvfp4(dtype, moe_backend):
 
-    if dtype == torch.float16 and moe_backend == "TRTLLM":
-        pytest.skip("TRTLLM NVFP4 MoE backend does not support float16 yet")
+    if moe_backend == "TRTLLM":
+        skip_blackwell_geforce()
+    if moe_backend == "TRTLLM" and dtype == torch.float16:
+        pytest.skip(
+            reason="TRTLLM NVFP4 MoE backend does not support float16 yet", )
 
     mapping = Mapping()
     mapping.rank = mpi_rank()
 
-    with torch.device(f'cuda:{mapping.rank}'):
+    with torch.device(f"cuda:{mapping.rank}"):
         SCALING_VECTOR_SIZE = 16
 
         SEQ_LEN = 4
@@ -1234,6 +1238,10 @@ def test_fused_moe_w4afp8(dtype):
 @pytest.mark.parametrize("moe_backend", ["TRTLLM", "CUTLASS"])
 @pytest.mark.parametrize("bias", [True, False])
 def test_fused_moe_mxfp4_mxfp8(moe_backend, bias):
+
+    if moe_backend == "TRTLLM":
+        skip_blackwell_geforce()
+
     SCALING_VECTOR_SIZE = 32
     dtype = torch.bfloat16
     SEQ_LEN = 128
