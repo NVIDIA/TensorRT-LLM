@@ -161,7 +161,6 @@ def main():
     args = parse_arguments()
 
     lora_config = None
-    model_class = None  # Initialize model_class to None
     if args.load_lora:
         assert args.auto_model_name is not None, "Please provide the auto model name to load LoRA config."
         import importlib
