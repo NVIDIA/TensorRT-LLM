@@ -48,7 +48,8 @@ TrtllmGenGemmRunner::TrtllmGenGemmRunner(TrtllmGenGemmRunnerOptions const& optio
         // When we include low-latency kernels we can set transposeMmaOutput via constructor
         if (options.mDtypeA == mOptions.eltType && options.mDtypeC == mOptions.outputType
             && options.mUseDeepSeekFp8 == mOptions.deepSeekFp8
-            && options.mTransposeMmaOutput == mOptions.transposeMmaOutput)
+            && options.mTransposeMmaOutput == mOptions.transposeMmaOutput
+            && (mOptions.dtypeMmaA == gemm::trtllm::gen::Dtype::Void || options.mDtypeMmaA == mOptions.dtypeMmaA))
         {
             mPassingConfigIndices.push_back(i);
         }
@@ -113,8 +114,8 @@ void TrtllmGenGemmRunner::run(int32_t m, int32_t n, int32_t k, void const* a, fl
     // FIXME once we start using all-reduce in the epilogue of the gemm this can be moved elsewhere
     gemm.runInitBeforeWorldSync(config, gemmData, static_cast<void*>(stream));
 
-    auto const err = gemm.run(
-        config, workspace, gemmData, static_cast<void*>(stream), multiProcessorCount, globalTrtllmGenGemmModuleCache);
+    auto const err = gemm.run(config, workspace, gemmData, static_cast<void*>(stream), multiProcessorCount, true,
+        globalTrtllmGenGemmModuleCache);
 
     TLLM_CHECK_WITH_INFO(err == 0, "Error occurred when running GEMM!");
 }

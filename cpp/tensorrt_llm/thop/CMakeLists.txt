@@ -78,6 +78,7 @@ add_library(
   fp4BlockScaleMoe.cpp
   noAuxTcOp.cpp
   ncclCommunicatorOp.cpp
+  nvfp4xFp8GemmTrtllmGen.cpp
   parallelDecodeKVCacheUpdateOp.cpp
   redrafterCurandOp.cpp
   reducescatterOp.cpp
