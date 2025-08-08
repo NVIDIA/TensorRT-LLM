@@ -23,6 +23,8 @@
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/executor/cache_transmission/cacheSplitConcat.h"
 
+#include <fstream>
+
 namespace tensorrt_llm::batch_manager
 {
 struct TransceiverTag
@@ -67,6 +69,7 @@ private:
     std::unique_ptr<BaseCacheFormatter> mFormatter;
     std::mutex mMtxForMap;
     runtime::BufferManager mBufferManager;
+    std::ofstream mMeasuresFile;
 };
 
 class DataReceiverImpl : public DataReceiver, public TransceiverTag
@@ -103,6 +106,8 @@ private:
     std::unique_ptr<BaseCacheFormatter> mFormatter;
     std::unordered_map<std::string, std::unique_ptr<ReceiveCacheResource>> mProcessToResources;
     std::mutex mProcessIoResouceMutex;
+    std::ofstream mMeasuresFile;
+    std::mutex mMeasuresFileMutex;
 };
 
 } // namespace tensorrt_llm::batch_manager
