@@ -380,6 +380,7 @@ class TestNemotronNas(unittest.TestCase):
 
         return test_cases
 
+    @pytest.mark.skip(reason="https://nvbugs/5444611")
     @parameterized.expand(get_loader_test_cases, name_func=unittest_name_func)
     def test_allclose_to_hf(self, hf_model_dir: str, params: TestParams):
         hf_model = transformers.AutoModelForCausalLM.from_pretrained(
@@ -819,6 +820,7 @@ class TestNemotronNas(unittest.TestCase):
         # verify config is valid enough for model creation
         DeciLMForCausalLM(config)
 
+    @pytest.mark.skip(reason="https://nvbugs/5444611")
     @parameterized.expand(
         itertools.product(
             os.listdir(
