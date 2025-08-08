@@ -62,7 +62,8 @@ def model_path(test_name):
         "llava_onevision": "llava-onevision-qwen2-7b-ov-hf",
         "qwen2_vl": "Qwen2-VL-7B-Instruct",
         "llava": "llava-1.5-7b-hf",
-        "llava_fp8": "llava-1.5-7b-hf"
+        "llava_fp8": "llava-1.5-7b-hf",
+        "mistral_small_3_1": "Mistral-Small-3.1-24B-Instruct-2503",
     }
     model_cache_root = os.environ.get("LLM_MODELS_ROOT",
                                       "/scratch.trt_llm_data/llm-models")
@@ -73,38 +74,58 @@ def model_path(test_name):
 def engine_dir(test_name, llm_root):
     """Returns the appropriate engine directory based on the test name."""
     engine_mapping = {
-        "gpt": "models/core/gpt/trt_engine/gpt2/fp16/1-gpu/",
-        "opt": "models/contrib/opt/trt_engine/opt-125m/fp16/1-gpu/",
-        "llama": "models/core/llama/llama_outputs",
-        "mistral": "models/core/llama/mistral_7b_outputs",
-        "mistral-ib": "models/core/llama/ib_mistral_7b_outputs",
-        "mistral-ib-streaming": "models/core/llama/ib_mistral_7b_outputs",
-        "mistral-ib-mm": "models/core/llama/ib_mistral_7b_outputs",
-        "gptj": "models/contrib/gptj/gptj_outputs",
-        "gpt-ib": "models/core/gpt/trt_engine/gpt2-ib/fp16/1-gpu/",
-        "gpt-ib-streaming": "models/core/gpt/trt_engine/gpt2-ib/fp16/1-gpu/",
+        "gpt":
+        "models/core/gpt/trt_engine/gpt2/fp16/1-gpu/",
+        "opt":
+        "models/contrib/opt/trt_engine/opt-125m/fp16/1-gpu/",
+        "llama":
+        "models/core/llama/llama_outputs",
+        "mistral":
+        "models/core/llama/mistral_7b_outputs",
+        "mistral-ib":
+        "models/core/llama/ib_mistral_7b_outputs",
+        "mistral-ib-streaming":
+        "models/core/llama/ib_mistral_7b_outputs",
+        "mistral-ib-mm":
+        "models/core/llama/ib_mistral_7b_outputs",
+        "gptj":
+        "models/contrib/gptj/gptj_outputs",
+        "gpt-ib":
+        "models/core/gpt/trt_engine/gpt2-ib/fp16/1-gpu/",
+        "gpt-ib-streaming":
+        "models/core/gpt/trt_engine/gpt2-ib/fp16/1-gpu/",
         "gpt-ib-ptuning":
         "models/core/gpt/trt_engine/email_composition/fp16/1-gpu/",
-        "gpt-ib-lad": "models/core/gpt/trt_engine/gpt2-ib-lad/fp16/1-gpu/",
+        "gpt-ib-lad":
+        "models/core/gpt/trt_engine/gpt2-ib-lad/fp16/1-gpu/",
         "gpt-2b-ib-lora":
         "models/core/gpt/trt_engine/gpt-2b-lora-ib/fp16/1-gpu/",
-        "medusa": "medusa/tmp/medusa/7B/trt_engines/fp16/1-gpu/",
-        "eagle": "eagle/tmp/eagle/7B/trt_engines/fp16/1-gpu/",
-        "bart-ib": "models/core/enc_dec/trt_engine/bart-ib/fp16/1-gpu/",
-        "t5-ib": "models/core/enc_dec/trt_engine/t5-ib/fp16/1-gpu/",
-        "blip2-opt": "models/core/multimodal/trt_engines/opt-2.7b/fp16/1-gpu",
+        "medusa":
+        "medusa/tmp/medusa/7B/trt_engines/fp16/1-gpu/",
+        "eagle":
+        "eagle/tmp/eagle/7B/trt_engines/fp16/1-gpu/",
+        "bart-ib":
+        "models/core/enc_dec/trt_engine/bart-ib/fp16/1-gpu/",
+        "t5-ib":
+        "models/core/enc_dec/trt_engine/t5-ib/fp16/1-gpu/",
+        "blip2-opt":
+        "models/core/multimodal/trt_engines/opt-2.7b/fp16/1-gpu",
         "mllama":
         "models/core/multimodal/trt_engines/Llama-3.2-11B-Vision-Instruct/bf16/1-gpu",
-        "whisper": "models/core/whisper/trt_engine/whisper",
+        "whisper":
+        "models/core/whisper/trt_engine/whisper",
         "gpt-disaggregated-serving-bls":
         "models/core/gpt/trt_engine/gpt2/fp16/1-gpu/",
         "llava_onevision":
         "models/core/multimodal/trt_engines/llava-onevision-7b/fp16/1-gpu",
-        "qwen2_vl": "models/core/multimodal/trt_engines/qwen2-vl-7b/fp16/1-gpu",
+        "qwen2_vl":
+        "models/core/multimodal/trt_engines/qwen2-vl-7b/fp16/1-gpu",
         "llava":
         "models/core/multimodal/trt_engines/llava-1.5-7b-hf/fp16/1-gpu",
         "llava_fp8":
-        "models/core/multimodal/trt_engines/llava-1.5-7b-hf/fp8/1-gpu"
+        "models/core/multimodal/trt_engines/llava-1.5-7b-hf/fp8/1-gpu",
+        "mistral_small_3_1":
+        "models/core/multimodal/trt_engines/Mistral-Small-3.1-24B-Instruct-2503/bf16/1-gpu",
     }
     return os.path.join(llm_root, "examples/",
                         engine_mapping.get(test_name, ""))
@@ -441,6 +462,18 @@ def test_qwen2_vl(tritonserver_test_root, test_name, llm_root, model_path,
     build_model(test_name, llm_root, tritonserver_test_root)
     tokenizer_type = "auto"
     visual_encoder_path = f"{llm_root}/examples/models/core/multimodal/tmp/trt_engines/Qwen2-VL-7B-Instruct/multimodal_encoder/"
+    run_shell_command(
+        f"cd {tritonserver_test_root} && ./test.sh {test_name} {engine_dir} {model_path} {tokenizer_type} skip skip skip {visual_encoder_path}",
+        llm_root)
+
+
+@pytest.mark.parametrize("test_name", ["mistral_small_3_1"], indirect=True)
+def test_mistral_small_3_1(tritonserver_test_root, test_name, llm_root,
+                           model_path, engine_dir):
+    build_model(test_name, llm_root, tritonserver_test_root)
+    tokenizer_type = "auto"
+    # Visual encoder path follows the multimodal tmp engine pattern similar to others
+    visual_encoder_path = f"{llm_root}/examples/models/core/multimodal/tmp/trt_engines/{os.path.basename(model_path)}/multimodal_encoder/"
     run_shell_command(
         f"cd {tritonserver_test_root} && ./test.sh {test_name} {engine_dir} {model_path} {tokenizer_type} skip skip skip {visual_encoder_path}",
         llm_root)
