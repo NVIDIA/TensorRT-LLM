@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
 Script to run benchmarks from YAML configuration file
-Usage: python run_benchmark_serve.py --output_folder <output_folder> --commit <commit> --config_file <config_file> [--skip <skip_pattern>] [--select <select_pattern>]
+Usage: python run_benchmark_serve.py --output_folder <output_folder> --config_file <config_file> [--skip <skip_pattern>] [--select <select_pattern>]
 Skip pattern format: "2,4-1" means skip test case 2 and test case 4's 1st concurrency
 Select pattern format: "1,3,5" means only run test cases 1, 3, and 5
+Select pattern format: "1-1,2-3" means only run test case 1's 1st concurrency and test case 2's 3rd concurrency
 If select_pattern is empty, all test cases are selected
 If skip_pattern is empty, no test cases are skipped
 """
@@ -22,21 +23,27 @@ from typing import Dict, List, Tuple, Any, Set
 
 
 class BenchmarkRunner:
-    def __init__(self, output_folder: str, commit: str, config_file: str, skip_pattern: str = None, select_pattern: str = None):
+    def __init__(self, output_folder: str, config_file: str, skip_pattern: str = None, select_pattern: str = None):
         self.output_folder = Path(output_folder)
-        self.commit = commit
         self.config_file = Path(config_file)
-        self.skip_pattern = skip_pattern
-        self.select_pattern = select_pattern
+        
+        # Treat empty or "default" values as None (default behavior)
+        self.skip_pattern = None if not skip_pattern or skip_pattern.lower() == "default" else skip_pattern
+        self.select_pattern = None if not select_pattern or select_pattern.lower() == "default" else select_pattern
+        
         self.skip_test_cases: Set[int] = set()
         self.skip_concurrencies: Dict[int, Set[int]] = {}
         self.select_test_cases: Set[int] = set()
+        self.select_concurrencies: Dict[int, Set[int]] = {}
         
-        if skip_pattern:
-            self.parse_skip_pattern(skip_pattern)
+        if self.skip_pattern:
+            self.parse_skip_pattern(self.skip_pattern)
         
-        if select_pattern:
-            self.parse_select_pattern(select_pattern)
+        if self.select_pattern:
+            self.parse_select_pattern(self.select_pattern)
+        
+        # Execution plan: {test_case_id: [concurrency_indices]}
+        self.execution_plan: Dict[int, List[int]] = {}
         
         # Model path mapping
         self.model_paths = {
@@ -63,50 +70,163 @@ class BenchmarkRunner:
         parts = skip_pattern.split(',')
         for part in parts:
             part = part.strip()
+            if not part:  # Skip empty parts
+                continue
+                
             if '-' in part:
                 # Format: "test_case-concurrency_index" (1-based)
-                test_case_str, concurrency_str = part.split('-')
-                test_case_id = int(test_case_str)
-                concurrency_index = int(concurrency_str) - 1  # Convert to 0-based
-                
-                if test_case_id not in self.skip_concurrencies:
-                    self.skip_concurrencies[test_case_id] = set()
-                self.skip_concurrencies[test_case_id].add(concurrency_index)
+                try:
+                    test_case_str, concurrency_str = part.split('-')
+                    test_case_id = int(test_case_str)
+                    concurrency_index = int(concurrency_str) - 1  # Convert to 0-based
+                    
+                    if test_case_id not in self.skip_concurrencies:
+                        self.skip_concurrencies[test_case_id] = set()
+                    self.skip_concurrencies[test_case_id].add(concurrency_index)
+                except ValueError:
+                    raise ValueError(f"Invalid skip pattern '{part}'. Expected format: 'test_case-concurrency_index' (e.g., '2-1')")
             else:
                 # Format: "test_case" - skip entire test case
-                test_case_id = int(part)
-                self.skip_test_cases.add(test_case_id)
+                try:
+                    test_case_id = int(part)
+                    self.skip_test_cases.add(test_case_id)
+                except ValueError:
+                    raise ValueError(f"Invalid test case ID '{part}' in skip pattern. Must be a valid integer.")
         
         print(f"Skipping test cases: {sorted(self.skip_test_cases)}")
         print(f"Skipping concurrencies: {self.skip_concurrencies}")
     
     def parse_select_pattern(self, select_pattern: str) -> None:
-        """Parse select pattern like '1,3,5' to determine which test cases to run"""
+        """Parse select pattern like '1,3,5' or '1-1,2-3' to determine which test cases/concurrencies to run"""
         if not select_pattern:
             return
             
+        self.select_concurrencies: Dict[int, Set[int]] = {}
+        
         parts = select_pattern.split(',')
         for part in parts:
             part = part.strip()
-            if part:  # Skip empty parts
-                test_case_id = int(part)
-                self.select_test_cases.add(test_case_id)
+            if not part:  # Skip empty parts
+                continue
+                
+            if '-' in part:
+                # Format: "test_case-concurrency_index" (1-based)
+                try:
+                    test_case_str, concurrency_str = part.split('-')
+                    test_case_id = int(test_case_str)
+                    concurrency_index = int(concurrency_str) - 1  # Convert to 0-based
+                    
+                    if test_case_id not in self.select_concurrencies:
+                        self.select_concurrencies[test_case_id] = set()
+                    self.select_concurrencies[test_case_id].add(concurrency_index)
+                except ValueError:
+                    raise ValueError(f"Invalid select pattern '{part}'. Expected format: 'test_case-concurrency_index' (e.g., '2-1')")
+            else:
+                # Format: "test_case" - select entire test case
+                try:
+                    test_case_id = int(part)
+                    self.select_test_cases.add(test_case_id)
+                except ValueError:
+                    raise ValueError(f"Invalid test case ID '{part}' in select pattern. Must be a valid integer.")
         
         print(f"Selected test cases: {sorted(self.select_test_cases)}")
+        print(f"Selected concurrencies: {self.select_concurrencies}")
     
-    def should_skip_test_case(self, test_case_id: int) -> bool:
-        """Check if a test case should be skipped"""
-        # First check if test case is in selected set (if select_pattern is specified)
-        if self.select_test_cases and test_case_id not in self.select_test_cases:
-            return True
+    def build_execution_plan(self, test_cases: List[Dict[str, Any]]) -> None:
+        """Build execution plan by analyzing config file, skip_pattern, and select_pattern"""
+        self.execution_plan.clear()
         
-        # Then check if test case is in skip set
-        return test_case_id in self.skip_test_cases
+        # Step 1: Initialize execution plan based on select_pattern
+        if not self.select_pattern:
+            # If select_pattern is empty or default, include all test cases with all concurrencies
+            for test_case in test_cases:
+                test_case_id = test_case['id']
+                all_concurrencies = list(range(len(test_case['concurrency_iterations'])))
+                self.execution_plan[test_case_id] = all_concurrencies
+        else:
+            # If select_pattern is specified, only include selected test cases and concurrencies
+            for test_case in test_cases:
+                test_case_id = test_case['id']
+                
+                # Check if this test case is selected
+                if test_case_id in self.select_test_cases:
+                    # Test case is selected - include all concurrencies
+                    all_concurrencies = list(range(len(test_case['concurrency_iterations'])))
+                    self.execution_plan[test_case_id] = all_concurrencies
+                elif test_case_id in self.select_concurrencies:
+                    # Specific concurrencies are selected for this test case
+                    selected_concurrencies = list(self.select_concurrencies[test_case_id])
+                    # Validate that selected concurrencies exist in config
+                    max_concurrency_index = len(test_case['concurrency_iterations']) - 1
+                    valid_concurrencies = [c for c in selected_concurrencies if 0 <= c <= max_concurrency_index]
+                    if valid_concurrencies:
+                        self.execution_plan[test_case_id] = valid_concurrencies
+        
+        # Step 2: Apply skip_pattern to remove test cases and concurrencies
+        # Remove entire test cases that are in skip_test_cases
+        for test_case_id in self.skip_test_cases:
+            if test_case_id in self.execution_plan:
+                del self.execution_plan[test_case_id]
+        
+        # Remove specific concurrencies that are in skip_concurrencies
+        for test_case_id, skip_concurrency_indices in self.skip_concurrencies.items():
+            if test_case_id in self.execution_plan:
+                # Remove skipped concurrencies from the list
+                remaining_concurrencies = [c for c in self.execution_plan[test_case_id] 
+                                         if c not in skip_concurrency_indices]
+                if remaining_concurrencies:
+                    self.execution_plan[test_case_id] = remaining_concurrencies
+                else:
+                    # If no concurrencies remain, remove the entire test case
+                    del self.execution_plan[test_case_id]
+        
+        # Step 3: Clean up - remove test cases with empty concurrency lists
+        # (This should not happen with the above logic, but just to be safe)
+        test_cases_to_remove = []
+        for test_case_id, concurrencies in self.execution_plan.items():
+            if not concurrencies:
+                test_cases_to_remove.append(test_case_id)
+        
+        for test_case_id in test_cases_to_remove:
+            del self.execution_plan[test_case_id]
     
-    def should_skip_concurrency(self, test_case_id: int, concurrency_index: int) -> bool:
-        """Check if a specific concurrency should be skipped"""
-        return (test_case_id in self.skip_concurrencies and 
-                concurrency_index in self.skip_concurrencies[test_case_id])
+
+    def print_execution_plan(self, test_cases: List[Dict[str, Any]]) -> None:
+        """Print which test cases and concurrencies will be executed"""
+        print("\n" + "=" * 80)
+        print("EXECUTION PLAN")
+        print("=" * 80)
+        
+        total_test_cases = 0
+        total_concurrencies = 0
+        
+        for test_case in test_cases:
+            test_case_id = test_case['id']
+            model_label = test_case['model']
+            
+            # Check if this test case is in execution plan
+            if test_case_id not in self.execution_plan:
+                print(f"Test Case {test_case_id}: {model_label} - SKIPPED")
+                continue
+            
+            total_test_cases += 1
+            print(f"\nTest Case {test_case_id}: {model_label}")
+            print(f"  Config: GPUs={test_case['gpus']}, TP={test_case['tp']}, EP={test_case['ep']}, attn_backend={test_case['attn_backend']}, moe_backend={test_case['moe_backend']}")
+            
+            # Get concurrencies from execution plan
+            concurrencies_to_run = []
+            for concurrency_index in self.execution_plan[test_case_id]:
+                concurrency, iteration = test_case['concurrency_iterations'][concurrency_index]
+                concurrencies_to_run.append((concurrency_index + 1, concurrency, iteration))  # +1 for 1-based display
+                total_concurrencies += 1
+            
+            print(f"  Concurrencies to run ({len(concurrencies_to_run)}/{len(test_case['concurrency_iterations'])}):")
+            for concurrency_num, concurrency, iteration in concurrencies_to_run:
+                print(f"    {concurrency_num}. Concurrency={concurrency}, Iteration={iteration}")
+        
+        print("\n" + "=" * 80)
+        print(f"SUMMARY: {total_test_cases} test cases, {total_concurrencies} concurrencies will be executed")
+        print("=" * 80 + "\n")
         
     def generate_extra_llm_api_config(self, test_case: Dict[str, Any]) -> str:
         """Generate extra-llm-api-config.yml content"""
@@ -299,14 +419,100 @@ class BenchmarkRunner:
             print(f"Benchmark completed for {model_label}")
             print()
     
+    def run_test_case_with_plan(self, test_case: Dict[str, Any]) -> None:
+        """Run a test case using the execution plan"""
+        model_label = test_case['model']
+        test_case_id = test_case['id']
+        
+        # Get model path
+        model_path = self.model_paths.get(model_label)
+        if not model_path:
+            print(f"Error: No model path found for {model_label}")
+            return
+        
+        # Use local path if it exists, otherwise use model name
+        if os.path.exists(model_path):
+            MODEL = model_path
+        else:
+            MODEL = model_label
+        
+        # Generate extra-llm-api-config.yml
+        config_content = self.generate_extra_llm_api_config(test_case)
+        config_path = "/tmp/extra-llm-api-config.yml"
+        
+        with open(config_path, 'w') as f:
+            f.write(config_content)
+        
+        print("extra-llm-api-config.yml:")
+        print(config_content)
+        
+        # Build trtllm-serve command
+        serve_cmd = [
+            "trtllm-serve", MODEL,
+            "--backend", "pytorch",
+            "--tp_size", str(test_case['tp']),
+            "--ep_size", str(test_case['ep']),
+            "--max_batch_size", str(test_case['max_batch_size']),
+            "--max_num_tokens", str(test_case['max_num_tokens']),
+            "--kv_cache_free_gpu_memory_fraction", str(test_case['free_gpu_mem_fraction']),
+            "--extra_llm_api_options", config_path
+        ]
+        
+        print("Starting trtllm-serve with command:")
+        print(' '.join(serve_cmd))
+        print()
+        
+        # Start server
+        server_log_filename = f"trtllm-serve.{model_label}.tp{test_case['tp']}.ep{test_case['ep']}.attn{test_case['attn_backend']}.moe{test_case['moe_backend']}.gpu{test_case['free_gpu_mem_fraction']}.batch{test_case['max_batch_size']}.isl{test_case['isl']}.osl{test_case['osl']}.tokens{test_case['max_num_tokens']}.moetokens{test_case['moe_max_num_tokens']}.log"
+        
+        try:
+            with open(server_log_filename, 'w') as log_file:
+                server_process = subprocess.Popen(
+                    serve_cmd,
+                    stdout=log_file,
+                    stderr=subprocess.STDOUT
+                )
+            
+            # Wait for server to be ready
+            if not self.wait_for_server(server_process.pid):
+                print("Failed to start server, killing process and skipping this test case")
+                try:
+                    subprocess.run(f"kill -9 {server_process.pid}", shell=True, check=False)
+                    subprocess.run(f"wait {server_process.pid} 2>/dev/null || true", shell=True, check=False)
+                except Exception as e:
+                    print(f"Warning: Error during server cleanup: {e}")
+                return
+            
+            # Run benchmarks based on execution plan
+            for concurrency_index in self.execution_plan[test_case_id]:
+                concurrency, iteration = test_case['concurrency_iterations'][concurrency_index]
+                self.run_benchmark(test_case, concurrency, iteration, MODEL)
+            
+        finally:
+            # Cleanup: Kill server process using shell commands like in the original bash script
+            print(f"Stopping server for {model_label}")
+            try:
+                # Use shell commands for more reliable process killing
+                subprocess.run(f"kill -9 {server_process.pid}", shell=True, check=False)
+                subprocess.run(f"wait {server_process.pid} 2>/dev/null || true", shell=True, check=False)
+            except Exception as e:
+                print(f"Warning: Error during server cleanup: {e}")
+            
+            time.sleep(5)  # Give it time to clean up resources
+            print(f"Benchmark completed for {model_label}")
+            print()
+    
     def run_benchmarks(self) -> None:
         """Main function to run all benchmarks from config file"""
-        print(f"TRT-LLM GIT COMMIT: {self.commit}")
         print(f"Using config file: {self.config_file}")
         if self.select_pattern:
             print(f"Select pattern: {self.select_pattern}")
+        else:
+            print("Select pattern: default (all test cases)")
         if self.skip_pattern:
             print(f"Skip pattern: {self.skip_pattern}")
+        else:
+            print("Skip pattern: default (no skipping)")
         
         # Load configuration
         with open(self.config_file, 'r') as f:
@@ -314,17 +520,17 @@ class BenchmarkRunner:
         
         test_cases = config['test_cases']
         
-        # Run nvidia-smi to show GPU status
-        try:
-            subprocess.run(["nvidia-smi"], check=True)
-        except subprocess.CalledProcessError:
-            print("Warning: nvidia-smi failed")
+        # Build execution plan
+        self.build_execution_plan(test_cases)
         
-        # Run each test case
+        # Print execution plan before starting benchmarks
+        self.print_execution_plan(test_cases)
+        
+        # Run each test case based on execution plan
         for i, test_case in enumerate(test_cases, 1):
             test_case_id = test_case['id']
             
-            if self.should_skip_test_case(test_case_id):
+            if test_case_id not in self.execution_plan:
                 print("=" * 57)
                 print(f"Test case {i}/{len(test_cases)} (ID: {test_case_id}): {test_case['model']} - SKIPPED")
                 print("=" * 57)
@@ -335,7 +541,7 @@ class BenchmarkRunner:
             print(f"Config: GPUs={test_case['gpus']}, TP={test_case['tp']}, EP={test_case['ep']}, attn_backend={test_case['attn_backend']}, moe_backend={test_case['moe_backend']}")
             print("=" * 57)
             
-            self.run_test_case(test_case)
+            self.run_test_case_with_plan(test_case)
         
         print("All benchmarks completed!")
 
@@ -343,12 +549,16 @@ class BenchmarkRunner:
 def main():
     parser = argparse.ArgumentParser(description='Run benchmarks from YAML configuration file')
     parser.add_argument('--output_folder', required=True, help='Output folder for benchmark results')
-    parser.add_argument('--commit', required=True, help='Git commit ID')
     parser.add_argument('--config_file', required=True, help='Path to YAML configuration file')
     parser.add_argument('--skip', help='Skip pattern: "2,4-1" means skip test case 2 and test case 4\'s 1st concurrency')
-    parser.add_argument('--select', help='Select pattern: "1,3,5" means only run test cases 1, 3, and 5')
+    parser.add_argument('--select', help='Select pattern: "1,3,5" means only run test cases 1, 3, and 5; "1-1,2-3" means only run test case 1\'s 1st concurrency and test case 2\'s 3rd concurrency')
     
     args = parser.parse_args()
+
+    try:
+        subprocess.run(f'echo "TRT-LLM GIT COMMIT": $TRT_LLM_GIT_COMMIT', shell=True, check=True)
+    except subprocess.CalledProcessError:
+        print("Warning: Could not echo TRT-LLM GIT COMMIT")
     
     if not os.path.exists(args.config_file):
         print(f"Error: Config file '{args.config_file}' does not exist")
@@ -359,7 +569,7 @@ def main():
         sys.exit(1)
     
     try:
-        runner = BenchmarkRunner(args.output_folder, args.commit, args.config_file, args.skip, args.select)
+        runner = BenchmarkRunner(args.output_folder, args.config_file, args.skip, args.select)
         runner.run_benchmarks()
     except Exception as e:
         print(f"Error: {e}")

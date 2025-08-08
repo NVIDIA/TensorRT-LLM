@@ -2,7 +2,9 @@
 
 """
 Script to parse benchmark metrics from a specified folder and generate CSV table
-Usage: python parse_benchmark_results.py <folder_name>
+Usage: python parse_benchmark_results.py <folder_name> [output_csv]
+  folder_name: Folder containing benchmark log files
+  output_csv: Output CSV filename (optional, default: folder_name.csv)
 """
 
 import os
@@ -90,10 +92,20 @@ def extract_config_from_log_content(log_file):
     return None
 
 
-
-
-
-
+def get_default_config():
+    """
+    Return default configuration values when log content parsing fails
+    """
+    return {
+        'attn_backend': 'TRTLLM',
+        'moe_backend': '',
+        'enable_attention_dp': False,
+        'free_gpu_mem_fraction': 0.9,
+        'max_num_tokens': 16384,
+        'moe_max_num_tokens': '',
+        'gpus': 1,
+        'max_batch_size': 512
+    }
 
 
 def extract_metrics_from_log(log_file):
@@ -144,18 +156,14 @@ def parse_benchmark_results(folder_path):
     # Extract configuration and metrics for each log file
     results = []
     for log_file in log_files:
-        # Extract configuration from log content
+        # Try to extract configuration from log content first
         log_config = extract_config_from_log_content(log_file)
         
         if log_config and log_config['found_in_log']:
             # Use configuration from log content
             config = log_config
             print(f"Using configuration from log content for {os.path.basename(log_file)}")
-        else:
-            # Skip files without configuration in log content
-            print(f"Skipping {os.path.basename(log_file)} - no configuration found in log content")
-            continue
-        
+
         total_throughput, user_throughput = extract_metrics_from_log(log_file)
         
         results.append({
@@ -206,12 +214,22 @@ def parse_benchmark_results(folder_path):
     # Remove filename and config_source columns for Excel output
     df_excel = df.drop(['filename', 'config_source'], axis=1)
     
-    # Generate CSV filename using folder name
-    folder_name = folder_path.name
-    csv_filename = f"{folder_name}.csv"
+    # Generate CSV filename
+    if len(sys.argv) > 2:
+        # Use provided output CSV filename
+        csv_filename = sys.argv[2]
+        # If it's a relative path, make it relative to the output folder's parent
+        if not os.path.isabs(csv_filename):
+            csv_path = folder_path.parent / csv_filename
+        else:
+            csv_path = Path(csv_filename)
+    else:
+        # Use default filename based on folder name
+        folder_name = folder_path.name
+        csv_filename = f"{folder_name}.csv"
+        csv_path = folder_path.parent / csv_filename
     
-    # Save to CSV in the same directory as the output folder
-    csv_path = folder_path.parent / csv_filename
+    # Save to CSV
     df_excel.to_csv(csv_path, index=False)
     
     # Print results to console as well
@@ -245,9 +263,9 @@ def parse_benchmark_results(folder_path):
 
 
 def main():
-    if len(sys.argv) != 2:
+    if len(sys.argv) < 2 or len(sys.argv) > 3:
         print("Error: Please provide a folder name as argument")
-        print(f"Usage: {sys.argv[0]} <folder_name>")
+        print(f"Usage: {sys.argv[0]} <folder_name> [output_csv]")
         sys.exit(1)
     
     folder_name = sys.argv[1]
