@@ -3896,6 +3896,13 @@ def test_tiny_llama_ifb_token_counts(
 
 
 @pytest.mark.skip_less_device_memory(80000)
+@pytest.mark.parametrize("TEXT,IMAGE", [
+    ("[IMG]\nDescribe the image in one sentence.",
+     "https://storage.googleapis.com/sfr-vision-language-research/LAVIS/assets/merlion.png"),
+    ("Image A: [IMG]\nImage B: [IMG]\nSummarize the differences between the two images.",
+     "https://images.pexels.com/photos/32285228/pexels-photo-32285228.jpeg?cs=srgb&dl=pexels-franco-monsalvo-252430633-32285228.jpg&fm=jpg&w=1280&h=720," \
+        "https://images.pexels.com/photos/8975010/pexels-photo-8975010.jpeg?cs=srgb&dl=pexels-ron-lach-8975010.jpg&fm=jpg&w=640&h=960"),
+])
 @pytest.mark.parametrize("E2E_MODEL_NAME", ["ensemble"])  # BLS optional later
 @pytest.mark.parametrize("ACCUMULATE_TOKEN", ["False"])
 @pytest.mark.parametrize("BLS_INSTANCE_COUNT", ["1"])
@@ -3926,6 +3933,8 @@ def test_tiny_llama_ifb_token_counts(
 @pytest.mark.parametrize("ENCODER_INPUT_FEATURES_DTYPE",
                          ["TYPE_FP16"])  # pixtral uses fp16 vision by default
 def test_mistral_small_3_1_24b_pixtral(
+    TEXT,
+    IMAGE,
     E2E_MODEL_NAME,
     MAX_TOKENS_IN_KV_CACHE,
     MAX_ATTENTION_WINDOW_SIZE,
@@ -4018,14 +4027,13 @@ def test_mistral_small_3_1_24b_pixtral(
     check_server_ready()
 
     # Run Test: use multimodal client; set model_type to pixtral
-    text_prompt = "[IMG]\nDescribe the image in one sentence."
     run_cmd = [
         f"{llm_backend_multimodal_example_root}/client.py",
         "--model_type=pixtral",
         f"--hf_model_dir={mistral_small_3_1_24b_model_root}",
-        f"--text={text_prompt}",
+        f"--text={TEXT}",
         # Use a simple image URL (same as mllama test) to validate end-to-end
-        "--image=https://storage.googleapis.com/sfr-vision-language-research/LAVIS/assets/merlion.png",
+        f"--image={IMAGE}",
     ]
     if DECOUPLED_MODE == "True":
         run_cmd += ["--streaming"]
