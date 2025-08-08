@@ -228,13 +228,13 @@ def main():
                 # Store generated output
                 generated_outputs.append({
                     "turn": i + 1,
-                    "user_input": args.prompt[i],
+                    "user_input": cur_prompt,
                     "assistant_response": response,
                     "media": args.media
                 })
 
                 # Add to cur_prompt
-                cur_prompt = cur_prompt + f"assistant: {response}"
+                cur_prompt = cur_prompt + response
 
             except Exception as e:
                 print(f"Error in turn {i+1}: {e}")
