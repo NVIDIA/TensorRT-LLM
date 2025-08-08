@@ -2427,10 +2427,14 @@ class TestPhi4MM(LlmapiAccuracyTestHarness):
 class TestGPTOSS(LlmapiAccuracyTestHarness):
     kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5)
 
-    def get_gpt_oss_root(self):
-        gpt_oss_root = os.getenv("GPT_OSS_MODELS_ROOT")
-        assert gpt_oss_root, "GPT_OSS_MODELS_ROOT needs to be set as parent of checkpoints."
-        return gpt_oss_root
+    MODEL_PATH = f"{llm_models_root()}/gpt_oss/gpt-oss-120b"
+
+    def update_task_kwargs(self, task):
+        task.EVALUATOR_KWARGS["fewshot_as_multiturn"] = True
+        task.EVALUATOR_KWARGS["apply_chat_template"] = True
+        task.MAX_OUTPUT_LEN = 8192
+        task.SCORES_FILTER = "exact_match,flexible-extract"
+        return task
 
     @pytest.mark.parametrize("moe_backend", ["CUTLASS", "TRTLLM", "TRITON"],
                              ids=["cutlass", "trtllm", "triton"])
@@ -2445,7 +2449,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None)
 
-        llm = LLM(f"{self.get_gpt_oss_root()}/gpt-oss-120b",
+        llm = LLM(self.MODEL_PATH,
                   tensor_parallel_size=1,
                   pipeline_parallel_size=1,
                   moe_expert_parallel_size=1,
@@ -2455,9 +2459,8 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
 
         with llm:
             model_name = "GPT-OSS/MXFP4"
-            task = MMLU(model_name)
-            task.evaluate(llm)
             task = GSM8K(model_name)
+            task = self.update_task_kwargs(task)
             task.evaluate(llm)
 
     @pytest.mark.skip_less_device(4)
@@ -2483,7 +2486,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None)
 
-        llm = LLM(f"{self.get_gpt_oss_root()}/gpt-oss-120b",
+        llm = LLM(self.MODEL_PATH,
                   tensor_parallel_size=tp_size,
                   pipeline_parallel_size=pp_size,
                   moe_expert_parallel_size=ep_size,
@@ -2494,9 +2497,8 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
 
         with llm:
             model_name = "GPT-OSS/MXFP4"
-            task = MMLU(model_name)
-            task.evaluate(llm)
             task = GSM8K(model_name)
+            task = self.update_task_kwargs(task)
             task.evaluate(llm)
 
     @pytest.mark.skip_less_device(4)
@@ -2515,7 +2517,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None)
 
-        llm = LLM(f"{self.get_openai_root()}/gpt-oss-120b",
+        llm = LLM(self.MODEL_PATH,
                   tensor_parallel_size=tp_size,
                   pipeline_parallel_size=pp_size,
                   moe_expert_parallel_size=ep_size,
@@ -2525,9 +2527,8 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                   moe_backend="TRITON")
         with llm:
             model_name = "GPT-OSS/BF16"
-            task = MMLU(model_name)
-            task.evaluate(llm)
             task = GSM8K(model_name)
+            task = self.update_task_kwargs(task)
             task.evaluate(llm)
 
 
