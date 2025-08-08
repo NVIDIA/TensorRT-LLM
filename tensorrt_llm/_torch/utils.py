@@ -260,3 +260,11 @@ def set_piecewise_cuda_graph_flag(enable: bool):
 def get_piecewise_cuda_graph_flag() -> bool:
     global _enable_piecewise_cuda_graph
     return _enable_piecewise_cuda_graph
+
+
+def set_per_request_piecewise_cuda_graph_flag(enable: bool):
+    _global_attrs.per_request_piecewise_cuda_graph_flag = enable
+
+
+def get_per_request_piecewise_cuda_graph_flag() -> bool:
+    return getattr(_global_attrs, 'per_request_piecewise_cuda_graph_flag', True)

@@ -436,6 +436,12 @@ class MTPWorker(nn.Module):
                     - new generated draft tokens: UVQ
         '''
 
+        if attn_metadata.padded_num_tokens is not None:
+            input_ids = input_ids[:attn_metadata.num_tokens]
+            position_ids = position_ids[:attn_metadata.num_tokens]
+            hidden_states = hidden_states[:attn_metadata.num_tokens]
+            logits = logits[:attn_metadata.num_tokens]
+
         batch_size = attn_metadata.num_seqs
 
         # Sample and verify draft tokens
@@ -1136,6 +1142,12 @@ class MTPEagleWorker(MTPWorker):
         batch_size = attn_metadata.num_seqs
         num_contexts = attn_metadata.num_contexts
         num_gens = batch_size - num_contexts
+
+        if attn_metadata.padded_num_tokens is not None:
+            input_ids = input_ids[:attn_metadata.num_tokens]
+            position_ids = position_ids[:attn_metadata.num_tokens]
+            hidden_states = hidden_states[:attn_metadata.num_tokens]
+            logits = logits[:attn_metadata.num_tokens]
 
         # Sample and verify draft tokens
         raw_logits = logits
