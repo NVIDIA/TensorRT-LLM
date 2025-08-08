@@ -72,6 +72,7 @@ class InferenceOptimizer:
         ############################################################################################
 
         # Match MoE pattern
+        # TODO:remove quantized linear handling inside this transformation
         match_moe_pattern(egm)
 
         ############################################################################################

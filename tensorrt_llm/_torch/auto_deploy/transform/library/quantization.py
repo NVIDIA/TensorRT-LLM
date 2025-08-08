@@ -1,6 +1,5 @@
-from collections import defaultdict
 from functools import partial
-from typing import Dict, Tuple
+from typing import Tuple
 
 import torch.nn as nn
 from torch.fx import GraphModule, Node
@@ -166,67 +165,87 @@ def _insert_quantized_bmm(
     node.args = (*node.args, *scale_values)
 
 
-@TransformRegistry.register("quantize")
-class Quantization(BaseTransform):
-    """Quantize the GraphModule and replace linear/BMM with quantized linear/BMM."""
+@TransformRegistry.register("quantize_from_config")
+class QuantizationFromConfig(BaseTransform):
+    """
+    Quantize linear and BMM ops using a quantization config.
+
+    Replaces eligible ops with quantized equivalents based on the quantization algorithm
+    and exclude patterns defined in the config.
+    """
 
     def _apply(
         self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory
     ) -> Tuple[GraphModule, TransformInfo]:
-        # extract info from quant_config
         quant_config = factory.get_quant_config()
-        if not quant_config:
+        quant_algo = quant_config.get("quant_algo")
+        excluded_patterns = quant_config.get("exclude_modules", [])
+
+        if not quant_config or not quant_algo:
             return gm, TransformInfo(
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )
 
+        num_matches = 0
+
+        for n in gm.graph.nodes:
+            if should_skip_quantization(n, excluded_patterns):
+                continue
+
+            if is_linear_op(n, include_quantization=False):
+                impl = QuantizationImpl.create(quant_algo, is_bmm=False)
+                _insert_quantized_linear(gm, n, impl, False)
+                num_matches += 1
+
+            elif is_bmm_op(n):
+                impl = QuantizationImpl.create(quant_algo, is_bmm=True)
+                _insert_quantized_bmm(gm, n, impl, False)
+                num_matches += 1
+
+        info = TransformInfo(
+            skipped=False, num_matches=num_matches, is_clean=False, has_valid_shapes=True
+        )
+
+        return gm, info
+
+
+@TransformRegistry.register("quantize_from_graph")
+class QuantizationFromGraph(BaseTransform):
+    """
+    Fuse ModelOpt-quantized linear ops into fused quantized implementations.
+
+    Detects quantized nodes from ModelOpt checkpoints's graph and replaces them with
+    fused linear ops based on the quantization type.
+    """
+
+    def _apply(
+        self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory
+    ) -> Tuple[GraphModule, TransformInfo]:
         is_quant_graph = is_quantized_graph(gm)
-        quant_algo = quant_config.get("quant_algo")
-        excluded_patterns = quant_config.get("exclude_modules", [])
-        if not quant_algo:
+
+        # no quantization to do
+        if not is_quant_graph:
             return gm, TransformInfo(
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )
 
         # tracking quantized operations in the graph
-        quantized_nodes: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+        num_matches = 0
         for n in gm.graph.nodes:
-            if should_skip_quantization(n, excluded_patterns):
-                continue
-
             # Process linear operations
             if is_linear_op(n, include_quantization=False):
                 # get per-layer quantization format from the node
-                quant_algo_n: str = (
-                    get_quantization_from_linear_node(n) if is_quant_graph else quant_algo
-                )
+                quant_algo_n: str = get_quantization_from_linear_node(n)
                 if not quant_algo_n:
                     continue
 
                 # insert quantized linear node
-                _insert_quantized_linear(
-                    gm, n, QuantizationImpl.create(quant_algo_n), is_quant_graph
-                )
-                quantized_nodes[quant_algo_n]["linear"] += 1
+                _insert_quantized_linear(gm, n, QuantizationImpl.create(quant_algo_n), True)
+                num_matches += 1
 
-            # Process BMM operations
-            elif is_bmm_op(n):
-                if not quant_algo:
-                    continue
+            # To check: quant BMM does not have graph based pass?
 
-                # insert quantized bmm node
-                _insert_quantized_bmm(
-                    gm, n, QuantizationImpl.create(quant_algo, is_bmm=True), is_quant_graph
-                )
-                quantized_nodes[quant_algo]["bmm"] += 1
-
-        if is_quant_graph:
-            remove_output_quantizers(gm)
-
-        num_matches = 0
-        for quant_algo in quantized_nodes:
-            for op_type, count in quantized_nodes[quant_algo].items():
-                num_matches += count
+        remove_output_quantizers(gm)
 
         info = TransformInfo(
             skipped=False, num_matches=num_matches, is_clean=False, has_valid_shapes=True

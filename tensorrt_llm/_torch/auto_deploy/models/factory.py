@@ -2,11 +2,12 @@
 
 import copy
 from abc import ABC, abstractmethod
-from typing import Any, Callable, Dict, Optional, Type
+from typing import Any, Callable, Dict, List, Optional, Type
 
 import torch
 import torch.nn as nn
 from torch._prims_common import DeviceLikeType
+from torch.fx import GraphModule
 
 from ..custom_ops.attention_interface import CacheConfig
 from ..utils.logger import ad_logger
@@ -95,6 +96,10 @@ class ModelFactory(ABC):
     def get_quant_config(self) -> Dict:
         """Returns the quantization config for this model or None if not quantized."""
         return {}
+
+    def get_quantization_targets(self, gm: GraphModule) -> List[Any]:
+        """Delegates to the quant_config_reader to collect quantization targets."""
+        return []
 
     def get_cache_config(self) -> CacheConfig:
         """Return the cache configuration for the model.
