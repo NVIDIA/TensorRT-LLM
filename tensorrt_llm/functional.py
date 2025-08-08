@@ -3882,6 +3882,7 @@ class AllReduceStrategy(IntEnum):
     TWOSHOT = 5
     LOWPRECISION = 6
     MNNVL = 7
+    NCCL_SYMMETRIC = 8
 
 
 class AllReduceFusionOp(IntEnum):

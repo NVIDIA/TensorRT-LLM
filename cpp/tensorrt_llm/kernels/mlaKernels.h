@@ -87,6 +87,8 @@ struct MlaParams
     void* context_paged_kv_ptr = nullptr;
     void* context_kv_cache_block_offsets_ptr = nullptr;
     int32_t context_paged_kv_max_blocks_per_seq = 0;
+    // for FP8 context qkv quantization
+    float const* quant_scale_qkv = nullptr;
 };
 
 template <typename T, typename KVCacheBuffer>
@@ -110,6 +112,10 @@ void invokeMLARopeAppendPagedKVAssignQ(KVBlockArray& kv_cache, T* q_ptr, T* late
     int64_t const* cu_ctx_cached_kv_lens, int64_t const* cu_seq_lens, int const max_input_uncached_seq_len,
     float2 const* cos_sin_cache, size_t head_num, int nope_size, int rope_size, int lora_size,
     float const* kv_scale_orig_quant_ptr, cudaStream_t stream);
+
+template <typename T_IN>
+__global__ void QuantizeCopyInputToFp8Kernel(
+    T_IN const* input_buffer, __nv_fp8_e4m3* output_fp8_buffer, int num_total_elements, float const* device_scale_ptr);
 
 } // namespace kernels
 } // namespace tensorrt_llm

@@ -456,7 +456,8 @@ void initBindings(pybind11::module_& m)
         .value("AUTO", tensorrt_llm::kernels::AllReduceStrategyType::AUTO)
         .value("UB", tensorrt_llm::kernels::AllReduceStrategyType::UB)
         .value("ONESHOT", tensorrt_llm::kernels::AllReduceStrategyType::ONESHOT)
-        .value("TWOSHOT", tensorrt_llm::kernels::AllReduceStrategyType::TWOSHOT);
+        .value("TWOSHOT", tensorrt_llm::kernels::AllReduceStrategyType::TWOSHOT)
+        .value("NCCL_SYMMETRIC", tensorrt_llm::kernels::AllReduceStrategyType::NCCL_SYMMETRIC);
 
     // Initialize MoeLoadBalancer bindings
     initMoeBindings(m);

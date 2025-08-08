@@ -2027,7 +2027,7 @@ private:
 
         // Scatter the input tokens to other beam
         mTokens = BeamTokens(mSamplingConfig.beamWidth, inputTokens);
-        mLastTokens = VecTokens(mSamplingConfig.beamWidth);
+        mLastTokens = VecTokens(mSamplingConfig.beamWidth, inputTokens.back());
 
         // Init mUniqueTokens
         VecUniqueTokens uniqueTokens{inputTokens.size()};

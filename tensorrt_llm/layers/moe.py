@@ -40,7 +40,8 @@ from ..module import Module, ModuleList
 from ..parameter import Parameter
 from ..plugin import TRT_LLM_PLUGIN_NAMESPACE
 from ..quantization import GroupwiseQuantAlgo, QuantMode
-from ..quantization.functional import (postprocess_weight_only,
+from ..quantization.functional import (get_weight_scale_interleave_factor,
+                                       postprocess_weight_only,
                                        preprocess_weights_for_mixed_gemm,
                                        quantize)
 from .linear import RowLinear
@@ -489,11 +490,18 @@ class MOEWeightWrapper(Module):
             self.alpha = Parameter(shape=(experts_per_node, ),
                                    dtype=trt.float32)
         elif quant_mode.has_per_group_scaling():
-            self.weight = Parameter(shape=(experts_per_node, in_features,
-                                           out_features // 4),
-                                    dtype=dtype)
-            scale_shape = (experts_per_node, in_features // group_size,
-                           out_features)
+            self.weight = Parameter(
+                shape=(experts_per_node, in_features,
+                       out_features // 4),  # int4 <--> fp16/bf16
+                dtype=dtype)
+            if groupwise_quant_algo & GroupwiseQuantAlgo.W4A8_ALPHA:
+                scale_interleave_factor = get_weight_scale_interleave_factor(
+                    in_features, group_size)
+            else:
+                scale_interleave_factor = 1
+            scale_shape = (experts_per_node,
+                           in_features // group_size // scale_interleave_factor,
+                           out_features * scale_interleave_factor)
             self.weights_scaling_factor = Parameter(shape=scale_shape,
                                                     dtype=dtype)
             if groupwise_quant_algo & GroupwiseQuantAlgo.ZERO:

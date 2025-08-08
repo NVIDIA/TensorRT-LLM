@@ -197,6 +197,7 @@ class KVCacheManager(BaseResourceManager):
         from ..speculative import get_num_extra_kv_tokens
         self.num_extra_kv_tokens = get_num_extra_kv_tokens(spec_config)
         self.event_buffer_max_size = kv_cache_config.event_buffer_max_size
+        self.attention_dp_events_gather_period_ms = kv_cache_config.attention_dp_events_gather_period_ms
         self.max_num_tokens = max_num_tokens
 
         # Determine max_attention_window_vec
@@ -300,8 +301,17 @@ class KVCacheManager(BaseResourceManager):
             'copy_on_partial_reuse': kv_cache_config.copy_on_partial_reuse,
         }
         if self.event_buffer_max_size > 0:
-            kwargs['event_manager'] = KVCacheEventManagerCpp(
-                max_kv_event_entries=self.event_buffer_max_size)
+            if mapping.enable_attention_dp:
+                kwargs['event_manager'] = KVCacheEventManagerCpp(
+                    max_kv_event_entries=self.event_buffer_max_size,
+                    attention_dp_rank=mapping.rank,
+                    attention_dp_size=mapping.world_size,
+                    attention_dp_events_gather_period_ms=self.
+                    attention_dp_events_gather_period_ms,
+                )
+            else:
+                kwargs['event_manager'] = KVCacheEventManagerCpp(
+                    max_kv_event_entries=self.event_buffer_max_size)
 
         self.impl = KVCacheManagerCpp(**kwargs)
 
