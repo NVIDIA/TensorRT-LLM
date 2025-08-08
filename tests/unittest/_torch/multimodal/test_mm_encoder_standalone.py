@@ -34,17 +34,16 @@ def multimodal_model_config():
     "llava-v1.6-mistral-7b-hf",
 ])
 def test_single_image_chat(model_key, multimodal_model_config):
-    """Test processing single image using disaggregated encoder + LLM API.
+    """Test processing single image using encoder (pass mm_embeddings) + LLM API.
     
-    This test verifies that disaggregated multimodal generation produces identical
-    results to standard multimodal generation by comparing outputs.
+    This test verifies that encoder (pass mm_embeddings) + LLM API produces identical
+    results to standard llm generation (pass raw image) by comparing outputs.
     """
     # Get model configuration
     if model_key != "llava-v1.6-mistral-7b-hf":
         pytest.skip(f"Skipping test for {model_key} - only testing llava-v1.6-mistral-7b-hf for now")
     
     # Extract model information from config
-    model_name = multimodal_model_config['model_name']
     encoder_model_dir = multimodal_model_config['hf_model_dir']
     
     # Test configuration
@@ -80,7 +79,7 @@ def test_single_image_chat(model_key, multimodal_model_config):
         free_gpu_memory_fraction=free_gpu_memory_fraction,
     )
     
-    # Step 1: Process multimodal data using disaggregated encoder
+    # Step 1: Process multimodal data using encoder (pass mm_embeddings)
     encoder = None
     llm = None
     
@@ -126,7 +125,7 @@ def test_single_image_chat(model_key, multimodal_model_config):
         for i, output in enumerate(outputs_ref):
             assert len(output.outputs) > 0, f"Reference generation has no output text for input {i}"
         
-        # Step 4: Prepare inputs for disaggregated multimodal generation
+        # Step 4: Prepare inputs for llm (pass mm_embeddings)
         encoder_outputs = encoder.generate(inputs)
         inputs = default_multimodal_input_loader(
             tokenizer=llm.tokenizer,
@@ -138,14 +137,14 @@ def test_single_image_chat(model_key, multimodal_model_config):
             image_data_format="pt"
         )
 
-        # Step 5: Generate output using disaggregated multimodal parameters
+        # Step 5: Generate output using llm (pass mm_embeddings)
         # Note: For batch processing, we need to match mm_params with inputs
         outputs = llm.generate(inputs, sampling_params=sampling_params)
         
-        # Validate disaggregated outputs
-        assert len(outputs) == len(prompts), f"Expected {len(prompts)} disaggregated outputs, got {len(outputs)}"
+        # Validate outputs
+        assert len(outputs) == len(prompts), f"Expected {len(prompts)} outputs, got {len(outputs)}"
         for i, output in enumerate(outputs):
-            assert len(output.outputs) > 0, f"Disaggregated generation has no output text for input {i}"
+            assert len(output.outputs) > 0, f"generation has no output text for input {i}"
         
         # Step 6: Compare outputs - they should match exactly
         assert len(outputs_ref) == len(outputs), f"Number of outputs don't match: {len(outputs_ref)} vs {len(outputs)}"

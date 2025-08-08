@@ -44,26 +44,3 @@ class AutoModelForCausalLM(Generic[TModel, TConfig]):
             model = cls(config)
         model.extra_attrs = extra_attrs
         return model
-
-class AutoModelForMultimodalEncoder(Generic[TModel, TConfig]):
-
-    @staticmethod
-    def from_config(
-        config: ModelConfig[TConfig],
-    ):
-        model_arch = config.pretrained_config.architectures[0]
-
-        # Direct lookup using architecture name
-        vision_encoder_info = MODEL_CLASS_VISION_ENCODER_MAPPING.get(model_arch)
-        if vision_encoder_info is None:
-            raise ValueError(
-                f"Unknown architecture for AutoModelForMultimodalEncoder: {model_arch}"
-            )
-
-        vision_encoder_cls, vlm_base_model = vision_encoder_info
-        if vlm_base_model is None:
-            model = vision_encoder_cls(config)
-        else:
-            model = vision_encoder_cls(config, vlm_base_model)
-
-        return model

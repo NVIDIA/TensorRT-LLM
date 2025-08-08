@@ -87,8 +87,6 @@ class EarlyStopSampler(Sampler):
             request.state = LlmRequestState.GENERATION_COMPLETE
             # NOTE: This is a hack: set finish reason manually and set the beam 0
             request.set_finished_reason(FinishReason.LENGTH, 0)
-            if request.py_return_mm_embeddings:
-                request.py_result.append_mm_embeddings(state.host.mm_embeddings[idx])
             if request.py_return_context_logits:
                 logits = state.host.logits[idx]
                 if logits.ndim == 1:
