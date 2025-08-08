@@ -124,8 +124,7 @@ def create_moe(
             dtype=dtype,
             reduce_results=reduce_results,
             model_config=model_config,
-            aux_stream=None if aux_stream_dict is None else
-            aux_stream_dict[AuxStreamType.MoeChunkingOverlap],
+            aux_stream_dict=aux_stream_dict,
             weight_loading_mode=weight_loading_mode,
             bias=bias,
             apply_router_weight_on_input=apply_router_weight_on_input,
@@ -171,8 +170,7 @@ def create_moe(
             dtype=dtype,
             reduce_results=reduce_results,
             model_config=model_config,
-            aux_stream=None if aux_stream_dict is None else
-            aux_stream_dict[AuxStreamType.MoeChunkingOverlap],
+            aux_stream_dict=aux_stream_dict,
             weight_loading_mode=weight_loading_mode,
             apply_router_weight_on_input=apply_router_weight_on_input,
             layer_idx=layer_idx,
@@ -186,8 +184,7 @@ def create_moe(
             dtype=dtype,
             reduce_results=reduce_results,
             model_config=model_config,
-            aux_stream=None if aux_stream_dict is None else
-            aux_stream_dict[AuxStreamType.MoeChunkingOverlap],
+            aux_stream_dict=aux_stream_dict,
             weight_loading_mode=weight_loading_mode,
             apply_router_weight_on_input=apply_router_weight_on_input,
             layer_idx=layer_idx,
@@ -203,7 +200,6 @@ def create_moe(
             dtype=dtype,
             reduce_results=reduce_results,
             model_config=model_config,
-            aux_stream=aux_stream,
             weight_loading_mode=weight_loading_mode,
             bias=bias,
             layer_idx=layer_idx,
