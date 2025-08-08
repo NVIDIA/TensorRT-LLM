@@ -322,10 +322,14 @@ class PyTorchModelEngine(ModelEngine):
             and not self.enable_attention_dp)
 
         try:
+            use_ub_for_nccl = (
+                pytorch_backend_config.allreduce_strategy == "NCCL_SYMMETRIC"
+                and self._init_userbuffers(self.model.config.hidden_size))
             if pytorch_backend_config.torch_compile_enabled:
                 set_torch_compiling(True)
-                use_ub = pytorch_backend_config.torch_compile_enable_userbuffers and self._init_userbuffers(
-                    self.model.config.hidden_size)
+                use_ub = not use_ub_for_nccl and (
+                    pytorch_backend_config.torch_compile_enable_userbuffers
+                    and self._init_userbuffers(self.model.config.hidden_size))
                 self._torch_compile_backend = Backend(
                     pytorch_backend_config.torch_compile_inductor_enabled,
                     enable_userbuffers=use_ub,
@@ -2232,12 +2236,12 @@ class PyTorchModelEngine(ModelEngine):
         # Disable UB for unsupported platforms
         if not ub.ub_supported():
             return False
-        ub.initialize_userbuffers_manager(self.mapping.tp_size,
-                                          self.mapping.pp_size,
-                                          self.mapping.cp_size,
-                                          self.mapping.rank,
-                                          self.mapping.gpus_per_node,
-                                          hidden_size * self.max_num_tokens * 2)
+        use_nccl_symmetric = self.pytorch_backend_config.allreduce_strategy == "NCCL_SYMMETRIC"
+        ub.initialize_userbuffers_manager(
+            self.mapping.tp_size, self.mapping.pp_size, self.mapping.cp_size,
+            self.mapping.rank, self.mapping.gpus_per_node,
+            hidden_size * self.max_num_tokens * 2, use_nccl_symmetric)
+
         return True
 
     def load_weights_from_target_model(self,

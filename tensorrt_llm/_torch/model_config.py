@@ -130,7 +130,8 @@ class ModelConfig(Generic[TConfig]):
                 "ONESHOT": AllReduceStrategy.ONESHOT,
                 "TWOSHOT": AllReduceStrategy.TWOSHOT,
                 "LOWPRECISION": AllReduceStrategy.LOWPRECISION,
-                "MNNVL": AllReduceStrategy.MNNVL
+                "MNNVL": AllReduceStrategy.MNNVL,
+                "NCCL_SYMMETRIC": AllReduceStrategy.NCCL_SYMMETRIC
             }
             key = strategy.upper()
             return maps[key] if key in maps else AllReduceStrategy.AUTO
