@@ -437,6 +437,10 @@ class PyTorchModelEngine(ModelEngine):
         else:
             self.cache_indirection_attention = None
 
+    @property
+    def runtime_draft_len(self):
+        return self.max_draft_len if self.enable_spec_decode else 0
+
     def set_lora_model_config(self, lora_target_modules: list[str],
                               trtllm_modules_to_hf_modules: dict[str, str]):
         self.lora_model_config = LoraModelConfig(
@@ -557,7 +561,7 @@ class PyTorchModelEngine(ModelEngine):
                     list(range(batch_size)), [num_tokens_per_request] *
                     batch_size if not is_gen else None,
                     is_gen=is_gen,
-                    max_num_draft_tokens=self.max_draft_len)
+                    max_num_draft_tokens=self.runtime_draft_len)
 
                 if spec_resource_manager is not None:
                     spec_resource_manager.add_dummy_requests(
@@ -576,7 +580,7 @@ class PyTorchModelEngine(ModelEngine):
 
         def get_autotune_warmup_request():
             available_tokens = kv_cache_manager.get_num_available_tokens(
-                self.max_draft_len)
+                self.runtime_draft_len)
             num_tokens_per_request = min(
                 min(available_tokens, self.max_seq_len - 1),
                 self.max_num_tokens)
@@ -610,14 +614,14 @@ class PyTorchModelEngine(ModelEngine):
                 request_ids=list(range(full_len_request_num)),
                 token_nums=[num_tokens_per_request] * full_len_request_num,
                 is_gen=False,
-                max_num_draft_tokens=self.max_draft_len)
+                max_num_draft_tokens=self.runtime_draft_len)
 
             if remaining_tokens > 0:
                 final_request = kv_cache_manager.add_dummy_requests(
                     request_ids=[full_len_request_num],
                     token_nums=[remaining_tokens],
                     is_gen=False,
-                    max_num_draft_tokens=self.max_draft_len)
+                    max_num_draft_tokens=self.runtime_draft_len)
 
                 requests += final_request
 
@@ -664,7 +668,7 @@ class PyTorchModelEngine(ModelEngine):
                 # Disable cuda graph capture here so that we can properly capture it later
                 with self.no_cuda_graph():
                     available_tokens = kv_cache_manager.get_num_available_tokens(
-                        self.max_draft_len)
+                        self.runtime_draft_len)
                     warmup_batch_size = [1, self.batch_size // 2]
                     if self.batch_size < 2:
                         warmup_batch_size = [1]
@@ -875,12 +879,11 @@ class PyTorchModelEngine(ModelEngine):
             if available_blocks < 1:
                 return 0
 
-            max_draft_len = self.max_draft_len if self.enable_spec_decode else 0
             cuda_graph_dummy_request_ids = [MAX_UINT64 - 1]
             self.cuda_graph_dummy_request = kv_cache_manager.add_dummy_requests(
                 cuda_graph_dummy_request_ids,
                 is_gen=True,
-                max_num_draft_tokens=max_draft_len,
+                max_num_draft_tokens=self.runtime_draft_len,
                 use_mrope=self.use_mrope,
                 max_beam_width=self.max_beam_width)[0]
             self.cuda_graph_dummy_request.is_cuda_graph_dummy = True
@@ -1307,7 +1310,7 @@ class PyTorchModelEngine(ModelEngine):
                 gather_ids.extend(
                     list(
                         range(len(position_ids),
-                              len(position_ids) + 1 + self.max_draft_len)))
+                              len(position_ids) + 1 + self.runtime_draft_len)))
                 position_ids.extend(
                     list(
                         range(past_seen_token_num,
@@ -1323,23 +1326,23 @@ class PyTorchModelEngine(ModelEngine):
                 # inputs
                 # overlap scheduler can only support the speculative decoding
                 # methods with a fixed number of draft tokens
-                sequence_lengths.append(1 + self.max_draft_len)
+                sequence_lengths.append(1 + self.runtime_draft_len)
                 past_seen_token_num = request.max_beam_num_tokens - 1
-                draft_lens.append(self.max_draft_len)
+                draft_lens.append(self.runtime_draft_len)
                 gather_ids.extend(
                     list(
                         range(len(position_ids),
-                              len(position_ids) + 1 + self.max_draft_len)))
+                              len(position_ids) + 1 + self.runtime_draft_len)))
                 position_ids.extend(
                     list(
-                        range(past_seen_token_num,
-                              past_seen_token_num + 1 + self.max_draft_len)))
+                        range(past_seen_token_num, past_seen_token_num + 1 +
+                              self.runtime_draft_len)))
                 # previous tensor
                 previous_batch_indices.append(previous_batch_idx)
                 previous_pos_indices.extend([previous_batch_idx] *
-                                            (1 + self.max_draft_len))
+                                            (1 + self.runtime_draft_len))
                 num_cached_tokens_per_seq.append(past_seen_token_num +
-                                                 self.max_draft_len + 1)
+                                                 self.runtime_draft_len + 1)
                 prompt_lengths.append(request.py_prompt_len)
                 request_ids.append(request.py_request_id)
 
@@ -1413,21 +1416,21 @@ class PyTorchModelEngine(ModelEngine):
                 previous_slots = previous_seq_slots_device()
                 # previous input ids
                 previous_batch_tokens = previous_batch_len * (
-                    1 + self.max_draft_len)
+                    1 + self.runtime_draft_len)
                 new_tokens = new_tokens_device.transpose(
                     0, 1)[previous_slots, :].flatten()
                 self.input_ids_cuda[num_tokens:num_tokens +
                                     previous_batch_tokens].copy_(
                                         new_tokens, non_blocking=True)
                 # previous draft tokens
-                previous_batch_draft_tokens = previous_batch_len * self.max_draft_len
+                previous_batch_draft_tokens = previous_batch_len * self.runtime_draft_len
                 self.draft_tokens_cuda[num_draft_tokens:num_draft_tokens +
                                        previous_batch_draft_tokens].copy_(
                                            next_draft_tokens_device[
                                                previous_slots, :].flatten(),
                                            non_blocking=True)
                 # prepare data for the preprocess inputs
-                kv_len_offsets_device = new_tokens_lens_device - self.max_draft_len - 1
+                kv_len_offsets_device = new_tokens_lens_device - self.runtime_draft_len - 1
                 previous_pos_indices_host = torch.tensor(previous_pos_indices,
                                                          dtype=torch.int,
                                                          pin_memory=True)
@@ -1452,8 +1455,8 @@ class PyTorchModelEngine(ModelEngine):
                     extend_dummy_requests)
                 self.previous_pos_id_offsets_cuda[
                     (num_extend_reqeust_wo_dummy - previous_batch_len) *
-                    (1 + self.max_draft_len):num_extend_reqeust_wo_dummy *
-                    (1 + self.max_draft_len)].copy_(
+                    (1 + self.runtime_draft_len):num_extend_reqeust_wo_dummy *
+                    (1 + self.runtime_draft_len)].copy_(
                         new_tokens_lens_device[self.previous_pos_indices_cuda[
                             0:previous_batch_tokens]],
                         non_blocking=True)
