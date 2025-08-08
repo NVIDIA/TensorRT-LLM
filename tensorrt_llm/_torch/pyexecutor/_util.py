@@ -314,6 +314,7 @@ class KvCacheCreator:
                 dtype=kv_cache_dtype,
                 spec_config=spec_config,
                 max_beam_width=executor_config.max_beam_width,
+                is_draft=model_engine.is_draft_model,
             )
         elif is_nemotron_hybrid(config):
             if executor_config.max_beam_width > 1:
@@ -376,6 +377,7 @@ class KvCacheCreator:
                 max_num_tokens=executor_config.max_num_tokens,
                 model_config=binding_model_config,
                 max_beam_width=executor_config.max_beam_width,
+                is_draft=model_engine.is_draft_model,
             )
         # KVCacheManager (Non-draft) modifies the max_seq_len field, update it to executor_config
         if model_engine.kv_cache_manager_key == ResourceManagerType.KV_CACHE_MANAGER:

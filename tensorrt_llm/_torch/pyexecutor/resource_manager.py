@@ -110,6 +110,33 @@ def get_pp_layers(
     return pp_layers, total_num_layers
 
 
+def request_context(is_draft: bool, scheduled_requests: ScheduledRequests):
+
+    class RequestContext:
+
+        def __init__(self, is_draft: bool,
+                     scheduled_requests: ScheduledRequests):
+            self.is_draft = is_draft
+            self.scheduled_requests = scheduled_requests
+
+        def __enter__(self):
+            if not self.is_draft:
+                return
+
+            for req in self.scheduled_requests.all_requests():
+                req.use_draft_model = True
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            if not self.is_draft:
+                return
+
+            # Clean up the state
+            for req in self.scheduled_requests.all_requests():
+                req.use_draft_model = False
+
+    return RequestContext(is_draft, scheduled_requests)
+
+
 class KVCacheManager(BaseResourceManager):
 
     def __init__(
@@ -132,6 +159,7 @@ class KVCacheManager(BaseResourceManager):
         max_num_tokens: int = 8192,
         model_config: Optional[ModelConfig] = None,
         max_beam_width: int = 1,
+        is_draft: bool = False,
     ) -> None:
         self.mapping = mapping
         self.dtype = dtype
@@ -142,6 +170,7 @@ class KVCacheManager(BaseResourceManager):
             spec_config=spec_config,
             layer_mask=layer_mask,
         )
+        self.is_draft = is_draft
         self.num_local_layers = len(self.pp_layers)
         self.layer_offsets = {
             idx: offset
@@ -366,34 +395,36 @@ class KVCacheManager(BaseResourceManager):
         return need_blocks
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
-        context_batch = scheduled_batch.context_requests
-        generation_batch = scheduled_batch.generation_requests
-        # allocate KV Cache
-        for req in context_batch:
-            req_beam_width = req.sampling_config.beam_width
-            if 'cp_type' in self.mapping.cp_config and 'star_attention' == self.mapping.cp_config[
-                    'cp_type']:
-                if req.ctx_iters == 0:
-                    seq_len = sum(
-                        len(ctx_block) for ctx_block in req.ctx_blocks)
-                    self.impl.add_sequence(
-                        req.py_request_id,
-                        seq_len + (len(req.query_id) if self.mapping.cp_rank
-                                   == self.mapping.cp_size - 1 else 0),
-                        req_beam_width, req)
-            else:
-                if req.is_first_context_chunk:
-                    self.impl.add_sequence(req.py_request_id, req.prompt_len,
-                                           req_beam_width, req)
-                    for _ in range(self.num_extra_kv_tokens):
-                        self.impl.add_token(req.py_request_id)
-                    for _ in range(get_draft_token_length(req)):
-                        self.impl.add_token(req.py_request_id)
+        with request_context(self.is_draft, scheduled_batch):
+            context_batch = scheduled_batch.context_requests
+            generation_batch = scheduled_batch.generation_requests
+            # allocate KV Cache
+            for req in context_batch:
+                req_beam_width = req.sampling_config.beam_width
+                if 'cp_type' in self.mapping.cp_config and 'star_attention' == self.mapping.cp_config[
+                        'cp_type']:
+                    if req.ctx_iters == 0:
+                        seq_len = sum(
+                            len(ctx_block) for ctx_block in req.ctx_blocks)
+                        self.impl.add_sequence(
+                            req.py_request_id,
+                            seq_len + (len(req.query_id) if self.mapping.cp_rank
+                                       == self.mapping.cp_size - 1 else 0),
+                            req_beam_width, req)
+                else:
+                    if req.is_first_context_chunk:
+                        self.impl.add_sequence(req.py_request_id,
+                                               req.prompt_len, req_beam_width,
+                                               req)
+                        for _ in range(self.num_extra_kv_tokens):
+                            self.impl.add_token(req.py_request_id)
+                        for _ in range(get_draft_token_length(req)):
+                            self.impl.add_token(req.py_request_id)
 
-        for req in generation_batch:
-            self.impl.add_token(req.py_request_id)
-            for _ in range(get_draft_token_length(req)):
+            for req in generation_batch:
                 self.impl.add_token(req.py_request_id)
+                for _ in range(get_draft_token_length(req)):
+                    self.impl.add_token(req.py_request_id)
 
     def add_dummy_requests(
         self,
@@ -1156,11 +1187,7 @@ class ResourceManager:
 
     @nvtx_range("prepare_resources")
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
-        for resource_mgr_type, resource_manager in self.resource_managers.items(
-        ):
-            # Delay the preparation of draft kv cache manager to ModelDrafter.prepare_draft_tokens.
-            if resource_mgr_type == ResourceManagerType.DRAFT_KV_CACHE_MANAGER:
-                continue
+        for _, resource_manager in self.resource_managers.items():
             if hasattr(resource_manager, "prepare_resources"):
                 resource_manager.prepare_resources(scheduled_batch)
 
