@@ -12,6 +12,7 @@ from strenum import StrEnum
 from torch.cuda import device_count
 
 from tensorrt_llm import LLM as PyTorchLLM
+from tensorrt_llm import MultimodalEncoder
 from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm._utils import mpi_rank
 from tensorrt_llm.executor.utils import LlmLauncherEnvs
@@ -172,6 +173,19 @@ def launch_server(host: str,
 
     asyncio.run(server(host, port))
 
+def launch_mm_encoder_server(host: str,
+                  port: int,
+                  encoder_args: dict,
+                  metadata_server_cfg: Optional[MetadataServerConfig] = None,
+                  ):
+    model = encoder_args["model"]
+    mm_encoder = MultimodalEncoder(**encoder_args)
+
+    server = OpenAIServer(llm=mm_encoder,
+                          model=model,
+                          server_role=ServerRole.MM_ENCODER,
+                          metadata_server_cfg=metadata_server_cfg)
+    asyncio.run(server(host, port))
 
 @click.command("serve")
 @click.argument("model", type=str)
@@ -330,6 +344,80 @@ def serve(
             raise ValueError(f"Invalid server role: {server_role}. " \
                              f"Must be one of: {', '.join([role.name for role in ServerRole])}")
     launch_server(host, port, llm_args, metadata_server_cfg, server_role)
+
+
+@click.command("mmemb_serve")
+@click.argument("model", type=str)
+@click.option("--host",
+              type=str,
+              default="localhost",
+              help="Hostname of the server.")
+@click.option("--port", type=int, default=8000, help="Port of the server.")
+@click.option('--log_level',
+              type=click.Choice(severity_map.keys()),
+              default='info',
+              help="The logging level.")
+@click.option("--max_batch_size",
+              type=int,
+              default=BuildConfig.max_batch_size,
+              help="Maximum number of requests that the engine can schedule.")
+@click.option("--gpus_per_node",
+              type=int,
+              default=None,
+              help="Number of GPUs per node. Default to None, and it will be "
+              "detected automatically.")
+@click.option("--trust_remote_code",
+              is_flag=True,
+              default=False,
+              help="Flag for HF transformers.")
+@click.option(
+    "--extra_encoder_options",
+    type=str,
+    default=None,
+    help=
+    "Path to a YAML file that overwrites the parameters specified by trtllm-serve."
+)
+@click.option("--metadata_server_config_file",
+              type=str,
+              default=None,
+              help="Path to metadata server config file")
+def serve_encoder(model: str, host: str, port: int,
+          log_level: str, max_batch_size: int,
+          gpus_per_node: Optional[int],
+          trust_remote_code: bool,
+          extra_encoder_options: Optional[str],
+          metadata_server_config_file: Optional[str]):
+    """Running an OpenAI API compatible server
+
+    MODEL: model name | HF checkpoint path | TensorRT engine path
+    """
+    logger.set_level(log_level)
+
+    # TODO: expose more argument progressivly
+    llm_args, _ = get_llm_args(
+        model=model,
+        max_batch_size=max_batch_size,
+        gpus_per_node=gpus_per_node,
+        trust_remote_code=trust_remote_code)
+
+    encoder_args_extra_dict = {}
+    if extra_encoder_options is not None:
+        with open(extra_encoder_options, 'r') as f:
+            encoder_args_extra_dict = yaml.safe_load(f)
+    encoder_args = update_llm_args_with_extra_dict(llm_args, encoder_args_extra_dict)
+
+    metadata_server_cfg = parse_metadata_server_config_file(
+        metadata_server_config_file)
+
+    if metadata_server_cfg is not None:
+        assert server_role is not None, "server_role is required when metadata_server_cfg is provided"
+        try:
+            server_role = ServerRole[server_role.upper()]
+            assert server_role == ServerRole.MM_ENCODER, "server_role must be MM_ENCODER for multimodal encoder"
+        except ValueError:
+            raise ValueError(f"Invalid server role: {server_role}. " \
+                             f"Must be one of: {', '.join([role.name for role in ServerRole])}")
+    launch_mm_encoder_server(host, port, encoder_args, metadata_server_cfg)
 
 
 def get_ctx_gen_server_urls(
@@ -637,7 +725,8 @@ main = DefaultGroup(
     commands={
         "serve": serve,
         "disaggregated": disaggregated,
-        "disaggregated_mpi_worker": disaggregated_mpi_worker
+        "disaggregated_mpi_worker": disaggregated_mpi_worker,
+        "mmemb_serve": serve_encoder
     })
 
 if __name__ == "__main__":

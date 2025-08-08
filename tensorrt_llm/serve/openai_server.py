@@ -7,7 +7,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from http import HTTPStatus
 from pathlib import Path
-from typing import Any, AsyncGenerator, AsyncIterator, List, Optional
+from typing import Any, AsyncGenerator, AsyncIterator, List, Optional, Union
 
 import uvicorn
 from fastapi import FastAPI, Request
@@ -16,6 +16,7 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from transformers import AutoConfig, AutoProcessor
 
 from tensorrt_llm._tensorrt_engine import LLM
+from tensorrt_llm.llmapi import MultimodalEncoder
 # yapf: disable
 from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.executor.postproc_worker import PostprocParams
@@ -41,7 +42,7 @@ from tensorrt_llm.serve.postprocess_handlers import (
     chat_stream_post_processor, completion_response_post_processor,
     completion_stream_post_processor)
 from tensorrt_llm.version import __version__ as VERSION
-
+from tensorrt_llm.serve.openai_protocol import ChatMessage, ChatCompletionResponseChoice, UsageInfo
 from .._utils import nvtx_mark
 
 # yapf: enale
@@ -51,7 +52,7 @@ TIMEOUT_KEEP_ALIVE = 5  # seconds.
 class OpenAIServer:
 
     def __init__(self,
-                 llm: LLM,
+                 llm: Union[LLM, MultimodalEncoder],
                  model: str,
                  server_role: Optional[ServerRole],
                  metadata_server_cfg: MetadataServerConfig):
@@ -108,7 +109,11 @@ class OpenAIServer:
         async def validation_exception_handler(_, exc):
             return self.create_error_response(message=str(exc))
 
-        self.register_routes()
+        if self.server_role is not ServerRole.MM_ENCODER:
+            self.register_routes()
+        else:
+            assert isinstance(self.llm, MultimodalEncoder), "llm must be a MultimodalEncoder for multimodal encoder"
+            self.register_mm_encoder_routes()
 
     async def await_disconnected(self, raw_request: Request, promise):
         if raw_request is None:
@@ -150,6 +155,17 @@ class OpenAIServer:
                                methods=["POST"])
         self.app.add_api_route("/v1/chat/completions",
                                self.openai_chat,
+                               methods=["POST"])
+
+    def register_mm_encoder_routes(self):
+        self.app.add_api_route("/health", self.health, methods=["GET"])
+        self.app.add_api_route("/health_generate", self.health_generate, methods=["GET"])
+        self.app.add_api_route("/version", self.version, methods=["GET"])
+        self.app.add_api_route("/v1/models", self.get_model, methods=["GET"])
+        # TODO: the metrics endpoint only reports iteration stats, not the runtime stats for now
+        self.app.add_api_route("/metrics", self.get_iteration_stats, methods=["GET"])
+        self.app.add_api_route("/v1/chat/completions",
+                               self.openai_mm_encoder,
                                methods=["POST"])
 
     async def health(self) -> Response:
@@ -316,6 +332,68 @@ class OpenAIServer:
             else:
                 response = await create_chat_response(promise, postproc_params, disaggregated_params)
                 return JSONResponse(content=response.model_dump())
+        except CppExecutorError:
+            logger.error(traceback.format_exc())
+            # If internal executor error is raised, shutdown the server
+            signal.raise_signal(signal.SIGINT)
+        except Exception as e:
+            logger.error(traceback.format_exc())
+            return self.create_error_response(str(e))
+
+    async def openai_mm_encoder(self, request: ChatCompletionRequest, raw_request: Request) -> Response:
+
+        async def create_mm_embedding_response(
+                promise: RequestOutput):
+            await promise.aresult()
+            mm_embedding_handle = promise.mm_embedding_handle
+            num_tokens = mm_embedding_handle["tensor_size"][0]
+            # TODO: need to add more info like input_ids, specific_token_ids, mrope, mm_hashes, etc
+            return ChatCompletionResponse(
+                id=str(promise.request_id),
+                model=self.model,
+                choices=[ChatCompletionResponseChoice(index=0, message=ChatMessage(role="assistant", content="dummy"), mm_embedding_handle=mm_embedding_handle, finish_reason="length")],
+                usage=UsageInfo(prompt_tokens=num_tokens, completion_tokens=1, total_tokens=num_tokens+1))
+
+        try:
+            check_multiple_response(request.n, self.llm.args.backend)
+            conversation: List[ConversationMessage] = []
+            tool_dicts = None if request.tools is None else [
+                tool.model_dump() for tool in request.tools
+            ]
+            # TODO: placeholder for multimodal disagg e2e
+            disaggregated_params = to_llm_disaggregated_params(request.disaggregated_params)
+
+            conversation, mm_coroutines, mm_placeholder_counts = parse_chat_messages_coroutines(request.messages, self.model_config)
+
+            if request.prompt_token_ids is not None:
+                prompt = request.prompt_token_ids
+            else:
+                prompt: str = apply_chat_template(
+                    model_type=self.model_config.model_type,
+                    tokenizer=self.tokenizer,
+                    processor=self.processor,
+                    conversation=conversation,
+                    add_generation_prompt=request.add_generation_prompt,
+                    mm_placeholder_counts=mm_placeholder_counts,
+                    tools=tool_dicts,
+                    documents=request.documents,
+                    chat_template=request.chat_template,
+                    chat_template_kwargs=request.chat_template_kwargs or {},
+                )
+            prompt = prompt_inputs(prompt)
+
+            mm_data = await mm_coroutines
+            if mm_data is not None:
+                prompt["multi_modal_data"] = mm_data
+
+            promise = self.llm.generate_async(
+                inputs=prompt,
+            )
+            asyncio.create_task(self.await_disconnected(raw_request, promise))
+
+            response = await create_mm_embedding_response(promise)
+            return JSONResponse(content=response.model_dump())
+
         except CppExecutorError:
             logger.error(traceback.format_exc())
             # If internal executor error is raised, shutdown the server

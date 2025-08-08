@@ -2,22 +2,19 @@ from pathlib import Path
 from typing import Any, Optional, Union
 
 from tensorrt_llm.inputs.data import PromptInputs
-from tensorrt_llm.llmapi.llm import BaseLLM, _TorchLLM, RequestOutput
+from .llm import BaseLLM, _TorchLLM, RequestOutput
 from tensorrt_llm.sampling_params import SamplingParams
-from .._utils import nvtx_range_debug
+from tensorrt_llm._utils import nvtx_range_debug
 from typing import List, Sequence
 from tensorrt_llm.inputs import prompt_inputs
 from tqdm import tqdm
 from tensorrt_llm.inputs import create_input_processor
-from tensorrt_llm.llmapi.llm_args import PybindMirror
-from tensorrt_llm.llmapi.mpi_session import external_mpi_comm_available
+from .llm_args import PybindMirror
+from .mpi_session import external_mpi_comm_available
 from tensorrt_llm.bindings import executor as tllm
-from tensorrt_llm._torch.pyexecutor.config import update_executor_config
 
 class MultimodalEncoder(_TorchLLM):
     """MultimodalEncoder class is the main class for running a multimodal encoder model using PyTorch backend.
-
-    Parameters:
 """
 
     def __init__(self,
@@ -66,7 +63,7 @@ class MultimodalEncoder(_TorchLLM):
             max_batch_size=max_batch_size,
             max_num_tokens=max_num_tokens,
             **kwargs)
-
+        from tensorrt_llm._torch.pyexecutor.config import update_executor_config
         max_batch_size = self._executor_config.max_batch_size
         update_executor_config(
             self._executor_config,
@@ -164,5 +161,4 @@ class MultimodalEncoder(_TorchLLM):
         result = super().generate_async(inputs, sampling_params)
         # TODO: possible postprocess the result
         return result
-
 

@@ -564,7 +564,7 @@ class GenerationResult(GenerationResultBase):
     def _repr_fields(self):
         return [
             'request_id', 'prompt_token_ids', 'outputs', 'finished',
-            "context_logits", "mm_embeddings"
+            "context_logits", "mm_embedding_handle"
         ]
 
     def __repr__(self) -> str:
