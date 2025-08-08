@@ -381,7 +381,17 @@ public:
         : mTileTokensDim(tileTokensDim)
     {
         mRunner = std::make_unique<RunnerType>(mDtypeAct, mDtypeWeights, mUseDeepSeekFp8, mTileTokensDim,
-            static_cast<tensorrt_llm::kernels::ActType>(actType));
+            static_cast<tensorrt_llm::kernels::ActType>(actType), true /* useTmaOobOpt */);
+    }
+
+    [[nodiscard]] int64_t getNumPrependTokensFc1OutputBuffer() const
+    {
+        return mRunner->getNumPrependTokensFc1OutputBuffer();
+    }
+
+    [[nodiscard]] int64_t getNumPrependTokensFc2OutputBuffer() const
+    {
+        return mRunner->getNumPrependTokensFc2OutputBuffer();
     }
 
     [[nodiscard]] std::vector<int64_t> getValidConfigs(
@@ -434,12 +444,22 @@ class MxE4m3MxE2m1BlockScaleMoeRunner : public torch::CustomClassHolder
 {
 
 public:
-    explicit MxE4m3MxE2m1BlockScaleMoeRunner(int64_t tileTokensDim, int64_t actType, bool isMxFp8)
-        : mDtypeAct(isMxFp8 ? btg::Dtype::MxE4m3 : btg::Dtype::E4m3)
+    explicit MxE4m3MxE2m1BlockScaleMoeRunner(int64_t tileTokensDim, int64_t actType, bool isMxFp4)
+        : mDtypeAct(isMxFp4 ? btg::Dtype::MxE4m3 : btg::Dtype::E4m3)
         , mTileTokensDim(tileTokensDim)
     {
         mRunner = std::make_unique<RunnerType>(mDtypeAct, mDtypeWeights, mUseDeepSeekFp8, mTileTokensDim,
-            static_cast<tensorrt_llm::kernels::ActType>(actType));
+            static_cast<tensorrt_llm::kernels::ActType>(actType), true /* useTmaOobOpt */);
+    }
+
+    [[nodiscard]] int64_t getNumPrependTokensFc1OutputBuffer() const
+    {
+        return mRunner->getNumPrependTokensFc1OutputBuffer();
+    }
+
+    [[nodiscard]] int64_t getNumPrependTokensFc2OutputBuffer() const
+    {
+        return mRunner->getNumPrependTokensFc2OutputBuffer();
     }
 
     [[nodiscard]] std::vector<int64_t> getValidConfigs(
@@ -498,11 +518,19 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.class_<torch_ext::Bf16MxE2m1BlockScaleMoeRunner>("Bf16MxE2m1BlockScaleMoERunner")
         .def(torch::init<int64_t, int64_t>())
+        .def("get_num_prepend_tokens_fc1_output_buffer",
+            &torch_ext::Bf16MxE2m1BlockScaleMoeRunner::getNumPrependTokensFc1OutputBuffer)
+        .def("get_num_prepend_tokens_fc2_output_buffer",
+            &torch_ext::Bf16MxE2m1BlockScaleMoeRunner::getNumPrependTokensFc2OutputBuffer)
         .def("get_valid_configs", &torch_ext::Bf16MxE2m1BlockScaleMoeRunner::getValidConfigs)
         .def("run_moe", &torch_ext::Bf16MxE2m1BlockScaleMoeRunner::run);
 
     m.class_<torch_ext::MxE4m3MxE2m1BlockScaleMoeRunner>("MxE4m3MxE2m1BlockScaleMoERunner")
         .def(torch::init<int64_t, int64_t, bool>())
+        .def("get_num_prepend_tokens_fc1_output_buffer",
+            &torch_ext::MxE4m3MxE2m1BlockScaleMoeRunner::getNumPrependTokensFc1OutputBuffer)
+        .def("get_num_prepend_tokens_fc2_output_buffer",
+            &torch_ext::MxE4m3MxE2m1BlockScaleMoeRunner::getNumPrependTokensFc2OutputBuffer)
         .def("get_valid_configs", &torch_ext::MxE4m3MxE2m1BlockScaleMoeRunner::getValidConfigs)
         .def("run_moe", &torch_ext::MxE4m3MxE2m1BlockScaleMoeRunner::run);
 }

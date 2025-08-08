@@ -294,7 +294,23 @@ public:
     explicit FP4BlockScaleMoeRunner(int64_t tileTokensDim)
         : mTileTokensDim(tileTokensDim)
     {
-        mRunner = std::make_unique<RunnerType>(mDtypeElt, mUseDeepSeekFp8, mTileTokensDim);
+        mRunner = std::make_unique<RunnerType>(mDtypeElt, mUseDeepSeekFp8, mTileTokensDim, true /* useTmaOobOpt */);
+    }
+
+    [[nodiscard]] int64_t getNumPrependTokensFc1OutputBuffer() const
+    {
+        return mRunner->getNumPrependTokensFc1OutputBuffer();
+    }
+
+    [[nodiscard]] int64_t getNumPrependTokensFc2OutputBuffer() const
+    {
+        return mRunner->getNumPrependTokensFc2OutputBuffer();
+    }
+
+    [[nodiscard]] std::vector<int64_t> getValidConfigs(
+        int64_t topK, int64_t hiddenSize, int64_t intermediateSize, int64_t numLocalExperts, int64_t numTokens) const
+    {
+        return mRunner->getValidConfigIndices(topK, hiddenSize, intermediateSize, numLocalExperts, numTokens);
     }
 
     [[nodiscard]] std::vector<torch::Tensor> run(torch::Tensor const& routing_logits,
@@ -328,12 +344,6 @@ public:
             routing_method_type, do_finalize, *mRunner, moeConfigIndex);
     }
 
-    [[nodiscard]] std::vector<int64_t> getValidConfigs(
-        int64_t topK, int64_t hiddenSize, int64_t intermediateSize, int64_t numLocalExperts, int64_t numTokens) const
-    {
-        return mRunner->getValidConfigIndices(topK, hiddenSize, intermediateSize, numLocalExperts, numTokens);
-    }
-
 private:
     using RunnerType = tensorrt_llm::kernels::trtllmGenFp8BlockScaleMoe::MoE::Runner;
 
@@ -354,6 +364,10 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.class_<torch_ext::FP4BlockScaleMoeRunner>("FP4BlockScaleMoERunner")
         .def(torch::init<int64_t>())
+        .def("get_num_prepend_tokens_fc1_output_buffer",
+            &torch_ext::FP4BlockScaleMoeRunner::getNumPrependTokensFc1OutputBuffer)
+        .def("get_num_prepend_tokens_fc2_output_buffer",
+            &torch_ext::FP4BlockScaleMoeRunner::getNumPrependTokensFc2OutputBuffer)
         .def("get_valid_configs", &torch_ext::FP4BlockScaleMoeRunner::getValidConfigs)
         .def("run_moe", &torch_ext::FP4BlockScaleMoeRunner::run);
 }

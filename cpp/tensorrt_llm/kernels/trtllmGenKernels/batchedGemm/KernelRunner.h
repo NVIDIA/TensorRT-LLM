@@ -54,6 +54,12 @@ struct TrtllmGenBatchedGemmRunnerOptions
     bool routeAct{false};
     bool staticBatch{false};
     bool transposeMmaOutput{false};
+    // Whether runner selects kernels with TMA OOB optimization. It requires the TMA descriptor and the
+    // underlying buffer be constructed differently:
+    // - Requires valid buffer at (p - mTileTokensDim * hiddenSize) - needs prepending `mTileTokensDim` tokens.
+    // - TMA outermost dimension must be extended by `mTileTokensDim` or loads will OOB in the rightmost side.
+    bool useTmaOobOpt{true};
+    // The assumed tile size in the token dimension.
     int32_t tileSize{8};
     int32_t epilogueTileM{128};
 };
@@ -76,11 +82,12 @@ public:
         int32_t const* ctaIdxXyToBatchIdx, int32_t const* ctaIdxXyToMnLimit, int32_t const* numNonExitingCtas,
         void* workspace, CUstream stream, int device, int32_t configIndex);
 
-    // NVFP4 per-block scaling GEMM
+    // Block-scaling GEMM
     void run(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens, void const* a, void const* sfA,
         void const* b, void const* sfB, void* c, void* outSfC, void* workspace, CUstream stream, int device,
         int32_t configIndex);
 
+    // Block-scaling GEMM with SwiGLU activation
     void run(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens, void const* a, void const* sfA,
         void const* b, void const* sfB, float const* bias, float const* swiGluAlpha, float const* swiGluBeta,
         float const* clampLimit, void* c, void* outSfC, void* workspace, CUstream stream, int device,
@@ -111,6 +118,11 @@ public:
     [[nodiscard]] bool isValidConfigIndex(int32_t configIndex, int32_t m, int32_t n, int32_t k,
         std::vector<int32_t> const& batchedTokens, int32_t numTokens, int32_t numBatches,
         int32_t maxNumCtasInBatchDim) const;
+
+    [[nodiscard]] TrtllmGenBatchedGemmRunnerOptions const getOptions() const
+    {
+        return mOptions;
+    };
 
 private:
     void selectGemmConfig(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens, int32_t numTokens,

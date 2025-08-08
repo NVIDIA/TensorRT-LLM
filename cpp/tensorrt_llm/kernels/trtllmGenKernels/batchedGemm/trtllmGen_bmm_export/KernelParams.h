@@ -18,6 +18,7 @@
 
 #include "trtllm/gen/CommonUtils.h"
 #include "trtllm/gen/SfLayoutDecl.h"
+#include <stdexcept>
 
 #include "BatchedGemmEnums.h"
 #include "Enums.h"
@@ -51,17 +52,45 @@ namespace tg = trtllm::gen;
 namespace KernelParamsSetup
 {
 #ifdef TLLM_ENABLE_CUDA
-//////////////////////////////////////////////////////////////////////////////////////////////////
-//
-// Member functions.
-//
-//////////////////////////////////////////////////////////////////////////////////////////////////
+
 enum class MatrixType
 {
     MatrixA = 0,
     MatrixB,
     MatrixC
 };
+
+//////////////////////////////////////////////////////////////////////////////////////////////////
+//
+// Utility functions.
+//
+//////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <typename BatchedGemmOptions>
+bool useTmaOobOptA(BatchedGemmOptions const& options)
+{
+    return options.mBatchMode == BatchedGemmOptions::BatchMode::BatchM && doesRouteImplUseNoRoute(options.mRouteImpl)
+        && options.mUseTmaOobOpt;
+}
+
+//////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <typename BatchedGemmOptions>
+bool useTmaOobOptB(BatchedGemmOptions const& options)
+{
+    return options.mBatchMode == BatchedGemmOptions::BatchMode::BatchN && doesRouteImplUseNoRoute(options.mRouteImpl)
+        && options.mUseTmaOobOpt;
+}
+
+//////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <typename BatchedGemmOptions>
+bool useTmaOobOptC(BatchedGemmOptions const& options)
+{
+    return options.mUseTmaStore && options.mUseTmaOobOpt;
+}
+
+//////////////////////////////////////////////////////////////////////////////////////////////////
 
 // Create the TMA shape/stride for A/B/C.
 template <class GemmOptions>
@@ -73,60 +102,83 @@ static auto makeTmaShapeStrideAbc(
     bool const isWeights = (matrixType == MatrixType::MatrixA && options.mTransposeMmaOutput)
         || (matrixType == MatrixType::MatrixB && !options.mTransposeMmaOutput);
 
+    // Whether to use TMA OOB trick to block out padded dummy tokens and saving BW whenever no routing
+    // is involved. It applies to batchM and matrixA, or batchN and matrixB, or any case for matrixC.
+    bool const useTmaOobOpt = matrixType == MatrixType::MatrixA ? useTmaOobOptA(options)
+        : matrixType == MatrixType::MatrixB                     ? useTmaOobOptB(options)
+        : matrixType == MatrixType::MatrixC                     ? useTmaOobOptC(options)
+                                                                : false;
+
     // The outer dimension.
     auto numTokens = (matrixType == MatrixType::MatrixA || matrixType == MatrixType::MatrixC) ? mM : mN;
     // The outer dimension tile size.
-    auto tileNumTokens = (matrixType == MatrixType::MatrixC) ? options.mEpilogueTileM
-        : (matrixType == MatrixType::MatrixA)                ? tileM
-                                                             : tileN;
+    auto ctaTileNumTokens = (matrixType == MatrixType::MatrixA || matrixType == MatrixType::MatrixC) ? tileM : tileN;
+    // The outer dimension of TMA box shape.
+    auto tileNumTokens = (matrixType == MatrixType::MatrixC) ? options.mEpilogueTileM : ctaTileNumTokens;
+
     // The inner dimension.
     auto hiddenSize = (matrixType == MatrixType::MatrixC) ? mN : mK;
     // The inner dimension tile size.
-    auto tileHiddenSize = (matrixType == MatrixType::MatrixC) ? options.mEpilogueTileN : tileK;
+    auto ctaTileHiddenSize = (matrixType == MatrixType::MatrixC) ? tileN : tileK;
+    // The inner dimension of TMA box shape.
+    auto tileHiddenSize = (matrixType == MatrixType::MatrixC) ? options.mEpilogueTileN : ctaTileHiddenSize;
 
-    // Swap matrix C sizes if output is transpose
+    // Swap matrix C sizes if output is transposed.
     if (matrixType == MatrixType::MatrixC && options.mTransposeMmaOutput)
     {
-        numTokens = mN;
-        hiddenSize = mM;
-        tileNumTokens = options.mEpilogueTileN;
-        tileHiddenSize = options.mEpilogueTileM;
+        std::swap(numTokens, hiddenSize);
+        std::swap(ctaTileNumTokens, ctaTileHiddenSize);
+        std::swap(tileNumTokens, tileHiddenSize);
     }
 
     // For a fused activation kernel, the hidden size of output is halved. TODO: That's true for
     // gated activations but not regular activations.
-    if (options.mFusedAct)
+    if (options.mFusedAct && matrixType == MatrixType::MatrixC)
     {
-        if (matrixType == MatrixType::MatrixC)
-        {
-            hiddenSize /= 2;
-            tileHiddenSize /= 2;
-        }
+        hiddenSize /= 2;
+        tileHiddenSize /= 2;
+        ctaTileHiddenSize /= 2;
     }
 
     // The cute tensor shape for A/B: (numTokens, hiddenSize).
     // Note that TMA descriptor expects the first dimension's stride to be
     // 1, so swap the first two dimension so that the hiddenSize dimension comes first.
-    auto shape = std::vector<uint64_t>{static_cast<uint64_t>(hiddenSize), static_cast<uint64_t>(numTokens)};
-    // If the matrix is a weights matrix, we use 3D logical shape for it (B, M, K) or (B, N, K).
-    // Ativations matrix is 2D (sum(divUpMul(M[bi], tileM) for bi in B), K).
-    if (isWeights)
+
+    // Activations matrix is 2D (sum(divUpMul(M[bi], tileM) for bi in B), K).
+    std::vector<uint64_t> shape = {static_cast<uint64_t>(hiddenSize), static_cast<uint64_t>(numTokens)};
+    if (useTmaOobOpt /* also implies input/output activation */)
     {
-        shape.push_back(static_cast<uint64_t>(options.mNumBatches));
+        // If TMA OOB optimization is used, we use 3D logical shape (M, tileM, K) or (N, tileN, K).
+        // The outer dimension is extended to make room for the possible counterbalance positive
+        // offset from the middle "bound" dimension. The counterbalance should be no more than
+        // ctaTileNumTokens.
+        shape = {static_cast<uint64_t>(hiddenSize), static_cast<uint64_t>(ctaTileNumTokens),
+            static_cast<uint64_t>(numTokens + ctaTileNumTokens)};
+    }
+    else if (isWeights)
+    {
+        // If the matrix is a weights matrix, we use 3D logical shape (B, M, K) or (B, N, K).
+        shape = {static_cast<uint64_t>(hiddenSize), static_cast<uint64_t>(numTokens),
+            static_cast<uint64_t>(options.mNumBatches)};
     }
 
     // Assemble the stride (strideTokens, 1).
     // Swap the first two dimension as mentioned before.
-    auto stride = std::vector<uint64_t>{1, static_cast<uint64_t>(hiddenSize)};
-    if (isWeights)
+    std::vector<uint64_t> stride = {1, static_cast<uint64_t>(hiddenSize)};
+    if (useTmaOobOpt)
     {
-        stride.push_back(static_cast<uint64_t>(hiddenSize * numTokens));
+        stride = {1, static_cast<uint64_t>(hiddenSize), static_cast<uint64_t>(hiddenSize)};
+    }
+    else if (isWeights)
+    {
+        stride = {
+            1, static_cast<uint64_t>(hiddenSize), static_cast<uint64_t>(hiddenSize) * static_cast<uint64_t>(numTokens)};
     }
 
     // Assemble the box shape
     std::vector<int32_t> tileShape = {tileHiddenSize, tileNumTokens};
 
-    // Alternate layouts do not apply to matrixC
+    // Alternate layouts (MajorMn and BlockMajorK) do not apply to matrixC
     if (matrixType != MatrixType::MatrixC)
     {
         gemm::MatrixLayout layout = (matrixType == MatrixType::MatrixA) ? options.mLayoutA : options.mLayoutB;
@@ -296,8 +348,8 @@ static KernelParams setKernelParams(GemmOptions_ const& options, bool const batc
         for (int b = 0; b < options.mNumBatches; b++)
         {
 
-            int mM = batchM ? options.mBatchedM[b] : options.mN;
-            int mN = batchM ? options.mM : options.mBatchedN[b];
+            int mM = batchM ? options.mBatchedM[b] : options.mM;
+            int mN = batchM ? options.mN : options.mBatchedN[b];
 
             // Skip Tma descriptor creation if expert isn't used
             if (mM == 0 || mN == 0)
