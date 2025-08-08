@@ -2466,8 +2466,8 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
     def update_task_kwargs(self, task):
         task.EVALUATOR_KWARGS["fewshot_as_multiturn"] = True
         task.EVALUATOR_KWARGS["apply_chat_template"] = True
+        task.EVALUATE_KWARGS["scores_filter"] = "exact_match,flexible-extract"
         task.MAX_OUTPUT_LEN = 8192
-        task.SCORES_FILTER = "exact_match,flexible-extract"
         return task
 
     @pytest.mark.parametrize("moe_backend", ["CUTLASS", "TRTLLM", "TRITON"],

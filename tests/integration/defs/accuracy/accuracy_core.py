@@ -192,11 +192,11 @@ class AccuracyTask:
             evaluator_kwargs.update(extra_evaluator_kwargs)
         evaluator = self.EVALUATOR_CLS(num_samples=num_samples,
                                        **evaluator_kwargs)
-        scores_filter = self.SCORES_FILTER if self.SCORES_FILTER is not None else None
-        accuracy = evaluator.evaluate(llm,
-                                      sampling_params,
-                                      streaming,
-                                      scores_filter=scores_filter)
+        evaluate_kwargs = {}
+        if hasattr(self, 'EVALUATE_KWARGS'):
+            evaluate_kwargs.update(self.EVALUATE_KWARGS)
+        accuracy = evaluator.evaluate(llm, sampling_params, streaming,
+                                      **evaluate_kwargs)
         if self.HIGHER_IS_BETTER:
             assert accuracy >= threshold, f"Expected accuracy >= {threshold}, but got {accuracy}."
         else:
@@ -298,10 +298,11 @@ class GSM8K(AccuracyTask):
 
     MAX_INPUT_LEN = 4096
     MAX_OUTPUT_LEN = 256
-    SCORES_FILTER = None
 
     EVALUATOR_CLS = tensorrt_llm.evaluate.GSM8K
     EVALUATOR_KWARGS = dict(dataset_path=DATASET_DIR, random_seed=0)
+
+    EVALUATE_KWARGS = dict(scores_filter=None)
 
 
 class GPQADiamond(AccuracyTask):
