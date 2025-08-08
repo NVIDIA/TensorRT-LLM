@@ -471,7 +471,7 @@ class LLaMAForCausalLM(DecoderModelForCausalLM):
         if os.environ.get("TRTLLM_DISABLE_UNIFIED_CONVERTER") is None:
             custom_dict = {}
             model_name = hf_model.config.model_type if use_preloading else hf_model_or_dir
-            if "llava" in model_name:
+            if "llava" in model_name or config.orig_model_type == "Llama_Nemotron_Nano_VL":
                 custom_dict = {
                     "transformer": "language_model.model",
                     "lm_head": "language_model.lm_head"

@@ -36,12 +36,25 @@ def add_multimodal_arguments(parser):
                         type=str,
                         default=None,
                         choices=[
-                            'blip2', 'llava', 'llava_next', 'llava_onevision',
-                            'llava_onevision_lmms', 'vila', 'nougat', 'cogvlm',
-                            'fuyu', 'pix2struct', 'neva', 'kosmos-2',
-                            'video-neva', 'phi-3-vision', 'phi-4-multimodal',
-                            'mllama', 'internvl', 'qwen2_vl',
-                            'internlm-xcomposer2', 'qwen2_audio', 'pixtral'
+                            'blip2',
+                            'llava',
+                            'llava_next',
+                            'llava_onevision',
+                            'llava_onevision_lmms',
+                            'vila',
+                            'nougat',
+                            'cogvlm',
+                            'fuyu',
+                            'pix2struct',
+                            'neva',
+                            'kosmos-2',
+                            'video-neva',
+                            'phi-3-vision',
+                            'phi-4-multimodal',
+                            'mllama',
+                            'internvl',
+                            'qwen2_vl',
+                            'llama_nemotron_nano_vl',
                         ],
                         help="Model type")
     parser.add_argument(
@@ -144,6 +157,8 @@ class MultimodalEngineBuilder:
             build_qwen2_audio_engine(args)
         elif args.model_type == "pixtral":
             build_pixtral_engine(args)
+        elif args.model_type == "llama_nemotron_nano_vl":
+            build_llama_nemotron_nano_vl_engine(args)
         else:
             raise RuntimeError(f"Invalid model type {args.model_type}")
 
@@ -1739,3 +1754,65 @@ def build_pixtral_engine(args):
         max_batch_size=args.max_batch_size,
         engine_name=f"model.engine",
         dtype=torch.bfloat16)
+
+
+def build_llama_nemotron_nano_vl_engine(args):
+    model = AutoModel.from_pretrained(args.model_path)
+
+    class RadioWithNeck(torch.nn.Module):
+
+        def __init__(self, model):
+            super().__init__()
+            self.downsample_ratio = model.downsample_ratio
+            self.ps_version = model.ps_version
+            self.vision_model = model.vision_model
+            self.mlp1 = model.mlp1
+
+        def pixel_shuffle(self, x, scale_factor=0.5):
+            n, w, h, c = x.size()
+            # n, w, h, c --> n, w, h * scale, c // scale
+            x = x.view(n, w, int(h * scale_factor), int(c / scale_factor))
+            # n, w, h * scale, c // scale --> n, h * scale, w, c // scale
+            x = x.permute(0, 2, 1, 3).contiguous()
+            # n, h * scale, w, c // scale --> n, h * scale, w * scale, c // (scale ** 2)
+            x = x.view(n, int(h * scale_factor), int(w * scale_factor),
+                       int(c / (scale_factor * scale_factor)))
+            if self.ps_version == 'v1':
+                logger.warning(
+                    "in ps_version 'v1', the height and width have not been swapped back, "
+                    'which results in a transposed image.')
+            else:
+                x = x.permute(0, 2, 1, 3).contiguous()
+            return x
+
+        def extract_feature(self, pixel_values):
+            vit_embeds = self.vision_model(pixel_values).features
+            vit_embeds = vit_embeds.to(dtype=torch.bfloat16)
+            h = w = int(vit_embeds.shape[1]**0.5)
+            vit_embeds = vit_embeds.reshape(vit_embeds.shape[0], h, w, -1)
+            vit_embeds = self.pixel_shuffle(vit_embeds,
+                                            scale_factor=self.downsample_ratio)
+            vit_embeds = vit_embeds.reshape(vit_embeds.shape[0], -1,
+                                            vit_embeds.shape[-1])
+            vit_embeds = self.mlp1(vit_embeds)
+            return vit_embeds
+
+        @torch.no_grad
+        def forward(self, pixel_values):
+            return self.extract_feature(pixel_values)
+
+    wrapper = RadioWithNeck(model).to(args.device)
+    # temporary fix due to TRT onnx export bug
+    for block in wrapper.vision_model.model.blocks:
+        block.attn.fused_attn = False
+    image = torch.randn((1, 3, 512, 512), device=args.device, dtype=model.dtype)
+    export_onnx(wrapper, image, f'{args.output_dir}/onnx')
+    build_trt_engine(
+        args.model_type,
+        [image.shape[1], image.shape[2], image.shape[3]],  # [3, H, W]
+        f'{args.output_dir}/onnx',
+        args.output_dir,
+        args.max_batch_size,
+        dtype=model.dtype,
+        engine_name='model.engine',
+    )

@@ -1,3 +1,4 @@
+import itertools
 import json
 import os
 import sys
@@ -23,8 +24,8 @@ from huggingface_hub import hf_hub_download
 from PIL import Image, UnidentifiedImageError
 from safetensors import safe_open
 from torch import nn
-from transformers import (AutoConfig, AutoModelForCausalLM, AutoProcessor,
-                          AutoTokenizer)
+from transformers import (AutoConfig, AutoImageProcessor, AutoModelForCausalLM,
+                          AutoProcessor, AutoTokenizer)
 
 from .. import profiler
 from .._utils import (mpi_rank, str_dtype_to_torch, str_dtype_to_trt,
@@ -485,8 +486,8 @@ class MultimodalModelRunner:
 
             if (not (self.model_type in
                      ('llava', 'vila', 'blip2-opt', 'kosmos-2', 'fuyu',
-                      'cogvlm', 'neva', "internvl") or 'internlm'
-                     in self.model_type)) and args.session == 'cpp':
+                      'cogvlm', 'neva', "internvl", "llama_nemotron_nano_vl") or
+                     'internlm' in self.model_type)) and args.session == 'cpp':
                 logger.warning(
                     f'C++ end-to-end mode does not support {self.model_type}. Visual engine fallbacks to Python session. See support matrix in README.'
                 )
@@ -584,6 +585,14 @@ class MultimodalModelRunner:
                 self.args.hf_model_dir + "/llm",
                 use_fast=False,
                 use_legacy=False)
+        elif self.model_type == 'llama_nemotron_nano_vl':
+            logger.info(
+                f'Initializing Llama-Nemotron-Nano-VL tokenizer from {self.args.hf_model_dir}'
+            )
+            self.tokenizer = AutoTokenizer.from_pretrained(
+                self.args.hf_model_dir, trust_remote_code=True)
+            logger.info(
+                f'Llama-Nemotron-Nano-VL tokenizer initialized successfully')
         else:
             use_fast = self.model_type in [
                 "phi-3-vision", "phi-4-multimodal", "internvl"
@@ -628,6 +637,15 @@ class MultimodalModelRunner:
         ]:
             self.processor = AutoProcessor.from_pretrained(
                 self.args.hf_model_dir, trust_remote_code=True, num_crops=16)
+        elif self.model_type == 'llama_nemotron_nano_vl':
+            logger.info(
+                f'Initializing Llama-Nemotron-Nano-VL image processor from {self.args.hf_model_dir}'
+            )
+            self.processor = AutoImageProcessor.from_pretrained(
+                self.args.hf_model_dir, trust_remote_code=True)
+            logger.info(
+                f'Llama-Nemotron-Nano-VL image processor initialized successfully'
+            )
 
         elif 'pixtral' in self.model_type:
             self.processor = AutoProcessor.from_pretrained(
@@ -1234,6 +1252,38 @@ class MultimodalModelRunner:
                                             padding=True).input_ids
             length = pre_input_ids.shape[1] + visual_features.shape[
                 1] + post_input_ids.shape[1]
+
+        elif self.model_type == 'llama_nemotron_nano_vl':
+            logger.info(f'Processing Llama-Nemotron-Nano-VL preprocessing')
+
+            # Flatten visual features to match vision_processor.py approach
+            original_shape = visual_features.shape
+            visual_features = visual_features.view(-1,
+                                                   visual_features.shape[-1])
+            logger.info(
+                f'Flattened visual features from {original_shape} to {visual_features.shape}'
+            )
+
+            # Tokenize the properly formatted query using baseline approach
+            model_inputs = self.tokenizer(post_prompt,
+                                          return_tensors='pt',
+                                          add_special_tokens=False)
+            input_ids = model_inputs['input_ids']
+            input_ids = input_ids.expand(self.args.batch_size,
+                                         *input_ids.shape[1:])
+
+            # Apply prompt tuning setup to replace <image> tokens with fake prompt IDs
+            input_ids = self.ptuning_setup_llama_nemotron_nano_vl(
+                visual_features, input_ids)
+
+            length = input_ids.shape[1]
+            logger.info(f'Llama-Nemotron-Nano-VL preprocessing completed')
+            logger.info(f'Input IDs shape: {input_ids.shape}')
+            logger.info(f'Image context token ID: {self.img_context_token_id}')
+            logger.info(
+                f'Number of image tokens to replace: {(input_ids == self.img_context_token_id).sum().item()}'
+            )
+
         else:
             pre_input_ids = self.tokenizer(pre_prompt,
                                            return_tensors="pt",
@@ -1287,7 +1337,8 @@ class MultimodalModelRunner:
                 torch.int32)
 
         if self.model_type in [
-                'fuyu', 'kosmos-2', 'phi-3-vision', 'llava_next', 'pixtral'
+                'fuyu', 'kosmos-2', 'phi-3-vision', 'llava_next', 'pixtral',
+                'llama_nemotron_nano_vl'
         ]:
             return input_ids, input_lengths, [
                 visual_features
@@ -2120,6 +2171,56 @@ class MultimodalModelRunner:
                 idx += cnt
         return input_ids
 
+    def ptuning_setup_llama_nemotron_nano_vl(self, visual_features, input_ids):
+        original_shape = input_ids.shape
+        token_ids = input_ids.flatten()
+
+        indices = torch.where(token_ids == self.img_context_token_id)[0]
+        if not indices.numel():
+            logger.warning("No <image> tokens found in input_ids")
+            return input_ids
+
+        split_points_before, split_points_after = indices, indices + 1
+        split_points = torch.stack([split_points_before, split_points_after],
+                                   dim=1).flatten()
+        chunks = torch.tensor_split(
+            token_ids,
+            split_points)[::2]  # Take every other chunk (text chunks)
+
+        vocab_size = self.model_config.vocab_size
+        arange = torch.arange(vocab_size, vocab_size + visual_features.shape[0])
+        split_arange = torch.split(arange,
+                                   (self.num_patches *
+                                    (visual_features.shape[0] //
+                                     self.num_patches.sum().item())).tolist())
+
+        img_start_token_id = 128257
+        img_end_token_id = 128258
+
+        img_start = torch.full((len(self.num_patches), 1),
+                               img_start_token_id,
+                               dtype=token_ids.dtype,
+                               device=token_ids.device)
+        img_end = torch.full((len(self.num_patches), 1),
+                             img_end_token_id,
+                             dtype=token_ids.dtype,
+                             device=token_ids.device)
+
+        interleaved_chunks = list(
+            itertools.chain(*zip(chunks[:-1], img_start, split_arange, img_end),
+                            [chunks[-1]]))
+        new_token_ids = torch.cat(interleaved_chunks)
+
+        if len(new_token_ids) > self.model_config.max_seq_len:
+            raise ValueError(
+                f"The number of input tokens must not be greater than {self.model_config.max_seq_len}."
+                f" Number of prompt tokens: {len(token_ids)}"
+                f" Number of image tokens: {len(new_token_ids) - len(token_ids)}"
+                f" Total input tokens: {len(new_token_ids)}. See NIM Documentation for details."
+            )
+
+        return new_token_ids.unsqueeze(0).expand(original_shape[0], -1)
+
     def ptuning_setup(self, prompt_table, input_ids, input_lengths):
         hidden_size = self.model_config.hidden_size * self.runtime_mapping.tp_size
         if prompt_table is not None:
@@ -2667,6 +2768,38 @@ class MultimodalModelRunner:
                                        text=prompt,
                                        return_tensors="pt")
 
+        elif self.model_type == 'llama_nemotron_nano_vl':
+            logger.info(f'Processing Llama-Nemotron-Nano-VL inputs')
+            # Simple chat interface with <image> tokens
+            if input_text is None:
+                input_text = "Describe this image."
+
+            # Add <image> token if not present
+            if '<image>' not in input_text:
+                input_text = '<image>\n' + input_text
+
+            # Set up image context token (following baseline pattern)
+            IMG_CONTEXT_TOKEN = '<image>'  # nosec B105
+            img_context_token_id = self.tokenizer.convert_tokens_to_ids(
+                IMG_CONTEXT_TOKEN)
+
+            # Store for later use in preprocessing
+            self.img_context_token_id = img_context_token_id
+
+            # Apply chat template formatting like baseline
+            messages = [{"role": "user", "content": input_text}]
+            query = self.tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True)
+
+            pre_prompt = ""
+            post_prompt = query
+
+            # Process image using the image processor and extract pixel_values + num_patches
+            image_dict = self.processor(raw_image, return_tensors="pt")
+            image = image_dict['pixel_values']
+
+            self.num_patches = torch.as_tensor(image_dict['num_patches'])
+
         # Repeat inputs to match batch size
         pre_prompt = [pre_prompt] * self.args.batch_size
         if not isinstance(input_text, list):
@@ -2674,7 +2807,7 @@ class MultimodalModelRunner:
         if self.model_type not in [
                 'fuyu', 'pix2struct', 'kosmos-2', 'vila', 'phi-3-vision',
                 'phi-4-multimodal', 'llava_next', 'internvl', 'llava_onevision',
-                'pixtral'
+                'pixtral', 'llama_nemotron_nano_vl'
         ]:
             if image is not None:
                 if image.dim() == 5:
