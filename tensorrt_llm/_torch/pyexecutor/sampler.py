@@ -548,8 +548,8 @@ class TorchSampler(Sampler):
         no_draft_tokens = len(requests) == sum_steps
         fast_path = not self.enable_mixed_sampler and no_draft_tokens and gen_logits_host is None and log_probs_host is None
 
-        seq_slots = torch.as_tensor([r.py_seq_slot for r in requests])
-        seq_slots = seq_slots.to(device="cuda", non_blocking=True)
+        seq_slots_host = torch.as_tensor([r.py_seq_slot for r in requests])
+        seq_slots = seq_slots_host.to(device="cuda", non_blocking=True)
 
         if fast_path:
             logits = raw_logits[:len(requests)]
@@ -585,7 +585,7 @@ class TorchSampler(Sampler):
 
         offset = 0
         for i, (strategy, slot, steps, request) in enumerate(
-                zip(strategies, seq_slots, num_steps, requests)):
+                zip(strategies, seq_slots_host, num_steps, requests)):
             input_slice = slice(offset, offset + steps)
             logits = raw_logits[input_slice]
 
