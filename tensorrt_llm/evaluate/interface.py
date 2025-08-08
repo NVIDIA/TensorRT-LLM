@@ -110,10 +110,9 @@ class Evaluator(ABC):
         score = self.compute_score(results, references, *zip(*auxiliaries))
 
         from dataclasses import asdict
-        from itertools import repeat
         num_repeats = 100
         with open("bench_requests.jsonl", "w") as f:
-            for i, output in enumerate(repeat(outputs, num_repeats)):
+            for i, output in enumerate(outputs * num_repeats):
                 bench_request = {
                     "task_id": i,
                     "prompt": output.prompt,
