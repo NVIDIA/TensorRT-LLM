@@ -1246,6 +1246,9 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
         testFilter[(TEST_STAGE_LIST)]?.remove("Build-Docker-Images")
         testFilter[(EXTRA_STAGE_LIST)]?.remove("Build-Docker-Images")
         echo "Will run Build-Docker-Images job"
+        stages.remove("x86_64-linux")
+        stages.remove("SBSA-linux")
+        echo "When running Build-Docker-Images job in pre-merge pipeline, x86_64-linux and SBSA-linux will be removed from the pipeline."
     }
 
     parallelJobs = stages.collectEntries{key, value -> [key, {
