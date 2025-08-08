@@ -2,7 +2,7 @@
 name: ⚡ Discussion on the performance of TensorRT-LLM
 description: Submit a proposal/discussion about the performance of TensorRT-LLM
 title: "[Performance]: "
-labels: ["performance"]
+labels: ["Performance"]
 assignees: ["byshiue", "kaiyux"]
 
 body:

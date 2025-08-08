@@ -2,7 +2,7 @@
 name: 💻 Usage
 description: Raise an issue here if you don't know how to use TensorRT-LLM.
 title: "[Usage]: "
-labels: ["usage"]
+labels: ["question"]
 
 body:
 - type: markdown

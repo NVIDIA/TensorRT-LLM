@@ -2,7 +2,7 @@
 name: 📚 Documentation
 description: Report an issue related to https://nvidia.github.io/TensorRT-LLM/
 title: "[Doc]: "
-labels: ["documentation"]
+labels: ["Documentation"]
 assignees: ["nv-guomingz"]
 
 body:

@@ -2,7 +2,7 @@
 name: 🚀 Feature request
 description: Submit a proposal/request for a new TensorRT-LLM feature
 title: "[Feature]: "
-labels: ["feature"]
+labels: ["feature request"]
 assignees: ["laikhtewari"]
 
 body:
