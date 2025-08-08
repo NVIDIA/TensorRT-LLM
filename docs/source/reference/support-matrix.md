@@ -158,6 +158,7 @@ The following table shows the supported software for TensorRT-LLM.
   - [10.11](https://docs.nvidia.com/deeplearning/tensorrt/release-notes/index.html)
 * - Precision
   -
+    - Blackwell (SM100/SM120) - FP32, FP16, BF16, FP8, FP4, INT8, INT4
     - Hopper (SM90) - FP32, FP16, BF16, FP8, INT8, INT4
     - Ada Lovelace (SM89) - FP32, FP16, BF16, FP8, INT8, INT4
     - Ampere (SM80, SM86) - FP32, FP16, BF16, INT8, INT4[^smgte89]
