@@ -9,10 +9,8 @@ This project is in active development and is currently in a prototype stage. The
 
 AutoDeploy is a prototype designed to simplify and accelerate the deployment of PyTorch models, including off-the-shelf models like those from HuggingFace transformers library, to TensorRT-LLM.
 
-<div align="center">
-  <img src="../../media/ad_overview.png" alt="AutoDeploy integration with LLM API" width="70%">
-  <p><em>AutoDeploy overview and relation with TensorRT-LLM's LLM api</em></p>
-</div>
+![AutoDeploy overview](../../media/ad_overview.png)
+<sub><em>AutoDeploy overview and relation with TensorRT-LLM's LLM API</em></sub>
 
 AutoDeploy provides an alternative path for deploying models using the LLM API that does not require users to rewrite the source model (e.g., HuggingFace Transformers models) or manually implement various inference optimizations such as KV-caches, multi-GPU parallelism, quantization, etc. Instead, AutoDeploy extracts a computation graph from the source model and applies inference optimizations through a series of automated graph transformations. AutoDeploy generates an inference-optimized graph that can be directly executed in the TensorRT-LLM PyTorch runtime and leverages various runtime optimizations including in-flight batching, paging, and overlap scheduling.
 
