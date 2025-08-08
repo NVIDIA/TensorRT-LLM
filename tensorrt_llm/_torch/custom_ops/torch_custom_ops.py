@@ -55,7 +55,7 @@ class MoERunner(TunableRunner):
         cluster_size: int,
         cluster_rank: int,
         use_deepseek_fp8_block_scale: bool,
-        use_w4a8_group_scaling: bool,
+        use_w4_group_scaling: bool,
         use_mxfp8_act_scaling: bool,
         min_latency_mode: bool,
     ):
@@ -72,18 +72,18 @@ class MoERunner(TunableRunner):
         # The best tactic is estimated as if alltoall is disabled
         self.enable_alltoall = False
         self.use_deepseek_fp8_block_scale = use_deepseek_fp8_block_scale
-        self.use_w4a8_group_scaling = use_w4a8_group_scaling
+        self.use_w4_group_scaling = use_w4_group_scaling
         self.use_mxfp8_act_scaling = use_mxfp8_act_scaling
         self.min_latency_mode = min_latency_mode
         instance_key = (x_dtype, weight_dtype, output_dtype,
-                        use_deepseek_fp8_block_scale, use_w4a8_group_scaling,
+                        use_deepseek_fp8_block_scale, use_w4_group_scaling,
                         use_mxfp8_act_scaling)
 
         if instance_key not in MoERunner.runner_dict:
             MoERunner.runner_dict[
                 instance_key] = torch.classes.trtllm.FusedMoeRunner(
                     x_dtype, weight_dtype, output_dtype,
-                    use_deepseek_fp8_block_scale, use_w4a8_group_scaling,
+                    use_deepseek_fp8_block_scale, use_w4_group_scaling,
                     use_mxfp8_act_scaling)
         self.fused_moe_runner = MoERunner.runner_dict[instance_key]
 
@@ -144,6 +144,9 @@ def fused_moe(
     output_dtype: torch.dtype,
     quant_scales: List[torch.Tensor],
     input_sf: Optional[torch.Tensor] = None,
+    swiglu_alpha: Optional[torch.Tensor] = None,
+    swiglu_beta: Optional[torch.Tensor] = None,
+    swiglu_limit: Optional[torch.Tensor] = None,
     tp_size: int = 1,
     tp_rank: int = 0,
     ep_size: int = 1,
@@ -152,7 +155,7 @@ def fused_moe(
     cluster_rank: int = 0,
     enable_alltoall: bool = False,
     use_deepseek_fp8_block_scale: bool = False,
-    use_w4a8_group_scaling: bool = False,
+    use_w4_group_scaling: bool = False,
     use_mxfp8_act_scaling: bool = False,
     min_latency_mode: bool = False,
     tune_max_num_tokens: int = 8192,
@@ -188,7 +191,7 @@ def fused_moe(
         cluster_size=cluster_size,
         cluster_rank=cluster_rank,
         use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
-        use_w4a8_group_scaling=use_w4a8_group_scaling,
+        use_w4_group_scaling=use_w4_group_scaling,
         use_mxfp8_act_scaling=use_mxfp8_act_scaling,
         min_latency_mode=min_latency_mode,
     )
@@ -226,6 +229,9 @@ def fused_moe(
         fc2_expert_biases,
         quant_scales,
         input_sf,
+        swiglu_alpha,
+        swiglu_beta,
+        swiglu_limit,
         tp_size,
         tp_rank,
         ep_size,
@@ -252,6 +258,9 @@ def _(
     output_dtype: torch.dtype,
     quant_scales: List[torch.Tensor],
     input_sf: Optional[torch.Tensor] = None,
+    swiglu_alpha: Optional[torch.Tensor] = None,
+    swiglu_beta: Optional[torch.Tensor] = None,
+    swiglu_limit: Optional[torch.Tensor] = None,
     tp_size: int = 1,
     tp_rank: int = 0,
     ep_size: int = 1,
@@ -260,7 +269,7 @@ def _(
     cluster_rank: int = 0,
     enable_alltoall: bool = False,
     use_deepseek_fp8_block_scale: bool = False,
-    use_w4a8_group_scaling: bool = False,
+    use_w4_group_scaling: bool = False,
     use_mxfp8_act_scaling: bool = False,
     min_latency_mode: bool = False,
     tune_max_num_tokens: int = 8192,

@@ -193,6 +193,8 @@ class Attention(nn.Module):
             gpus_per_node=config.mapping.gpus_per_node,
             enable_attention_dp=config.mapping.enable_attention_dp,
         )
+        self.tp_size = tp_size
+        self.tp_rank = mapping.tp_rank
         assert self.num_heads % tp_size == 0
         self.num_heads = self.num_heads // tp_size
         self.num_key_value_heads = (self.num_key_value_heads + tp_size -
@@ -343,6 +345,7 @@ class Attention(nn.Module):
         enable_attn_nvfp4_output: bool = True,
         output: Optional[torch.Tensor] = None,
         output_sf: Optional[torch.Tensor] = None,
+        attention_sinks: Optional[torch.Tensor] = None,
     ):
 
         out_scale = None
@@ -376,7 +379,8 @@ class Attention(nn.Module):
             attention_mask_data=attention_mask_data,
             enable_attn_nvfp4_output=enable_attn_nvfp4_output,
             output=output,
-            output_sf=output_sf)
+            output_sf=output_sf,
+            attention_sinks=attention_sinks)
         if isinstance(attn_output, tuple):
             assert len(
                 attn_output
@@ -395,6 +399,7 @@ class Attention(nn.Module):
         lora_params: Optional[dict] = None,
         attention_window_size: Optional[int] = None,
         attention_mask_data: Optional[torch.Tensor] = None,
+        attention_sinks: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         """
@@ -446,6 +451,11 @@ class Attention(nn.Module):
                                  and (self.attn_backend == "TRTLLM"
                                       or self.attn_backend == "FLASHINFER")
                                  and is_torch_compiling())
+
+        if attention_sinks is not None:
+            assert self.attn_backend == "TRTLLM", "Attention sinks are only supported for TRTLLM backend."
+            assert not use_custom_inplace_op, "Attention sinks are not supported when using custom inplace op."
+
         if use_custom_inplace_op:
             output = self.create_output(q)
             attn_custom_op_inplace(
@@ -461,17 +471,16 @@ class Attention(nn.Module):
                 output=output,
             )
         else:
-            output, output_sf = self._attn_impl(
-                q,
-                k,
-                v,
-                attn_metadata,
-                attention_mask,
-                mrope_rotary_cos_sin,
-                mrope_position_deltas,
-                attention_window_size,
-                attention_mask_data,
-            )
+            output, output_sf = self._attn_impl(q,
+                                                k,
+                                                v,
+                                                attn_metadata,
+                                                attention_mask,
+                                                mrope_rotary_cos_sin,
+                                                mrope_position_deltas,
+                                                attention_window_size,
+                                                attention_mask_data,
+                                                attention_sinks=attention_sinks)
             if output_sf is not None:
                 output = Fp4QuantizedTensor(output, output_sf)
 
@@ -496,9 +505,9 @@ class Attention(nn.Module):
         Returns:
             tuple: A tuple of (q, k, v).
         """
-        q, k, v = self.split_qkv(q, k, v)
         # If RoPE is fused into the attention OP, do not apply RoPE here.
         if not self.rope_fusion and position_ids is not None:
+            q, k, v = self.split_qkv(q, k, v)
             q, k = self.rotary_emb(position_ids, [q, k])
         return q, k, v
 
