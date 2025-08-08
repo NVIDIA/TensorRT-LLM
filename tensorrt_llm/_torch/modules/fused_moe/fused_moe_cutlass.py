@@ -429,11 +429,6 @@ class CutlassFusedMoE(MoE):
         # Otherwise, the output should be unpacked as a single tensor.
         final_hidden_states = final_hidden_states[0]
 
-        if self.has_w4a16_mxfp4:
-            final_hidden_states = final_hidden_states[:, :self.
-                                                      original_hidden_size].contiguous(
-                                                      )
-
         # Combine results if using alltoall
         if self.enable_alltoall and alltoall_info is not None:
             top_k = self.routing_method.experts_per_token
