@@ -516,7 +516,7 @@ class TrtllmAttentionWrapper:
         else:
             raise ValueError("Unexpected attention mask type")
 
-        return torch.ops.trtllm.attention_supports_nvfp4_output(
+        return trtllm_thop.attention_supports_nvfp4_output(
             self.num_heads,
             self.num_kv_heads,
             self.head_size,
