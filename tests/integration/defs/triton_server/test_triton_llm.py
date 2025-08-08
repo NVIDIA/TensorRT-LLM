@@ -3893,3 +3893,144 @@ def test_tiny_llama_ifb_token_counts(
     print_info(
         f"Successfully tested token count functionality for {TOKEN_COUNT_TEST} mode"
     )
+
+
+@pytest.mark.skip_less_device_memory(80000)
+@pytest.mark.parametrize("E2E_MODEL_NAME", ["ensemble"])  # BLS optional later
+@pytest.mark.parametrize("ACCUMULATE_TOKEN", ["False"])
+@pytest.mark.parametrize("BLS_INSTANCE_COUNT", ["1"])
+@pytest.mark.parametrize("PREPROCESSING_INSTANCE_COUNT", ["1"])
+@pytest.mark.parametrize("POSTPROCESSING_INSTANCE_COUNT", ["1"])
+@pytest.mark.parametrize("MAX_TOKENS_IN_KV_CACHE", [""])
+@pytest.mark.parametrize("MAX_ATTENTION_WINDOW_SIZE", [""])
+@pytest.mark.parametrize("BATCH_SCHEDULER_POLICY",
+                         ["max_utilization", "guaranteed_no_evict"])
+@pytest.mark.parametrize("KV_CACHE_FREE_GPU_MEM_FRACTION", ["0.7"])
+@pytest.mark.parametrize("CROSS_KV_CACHE_FRACTION", [""])
+@pytest.mark.parametrize("ENABLE_TRT_OVERLAP", ["False"],
+                         ids=["disableTrtOverlap"])
+@pytest.mark.parametrize("BATCHING_STRATEGY", ["inflight_fused_batching"])
+@pytest.mark.parametrize("DECOUPLED_MODE", ["True", "False"],
+                         ids=["enableDecoupleMode", "disableDecoupleMode"])
+@pytest.mark.parametrize("TRITON_MAX_BATCH_SIZE", ["1"])
+@pytest.mark.parametrize("MAX_QUEUE_DELAY_MICROSECONDS", ["0"])
+@pytest.mark.parametrize("ENABLE_KV_CACHE_REUSE", ["False"])
+@pytest.mark.parametrize("NORMALIZE_LOG_PROBS", ["True"])
+@pytest.mark.parametrize("ENABLE_CHUNKED_CONTEXT", ["False"])
+@pytest.mark.parametrize("GPU_DEVICE_IDS", [""])
+@pytest.mark.parametrize("DECODING_MODE", [""])
+@pytest.mark.parametrize("MAX_BEAM_WIDTH", ["1"])
+@pytest.mark.parametrize("EXCLUDE_INPUT_IN_OUTPUT", ["False"])
+@pytest.mark.parametrize("PROMPT_EMBEDDING_TABLE_DTYPE",
+                         ["TYPE_BF16"])  # allow override later
+@pytest.mark.parametrize("ENCODER_INPUT_FEATURES_DTYPE",
+                         ["TYPE_FP16"])  # pixtral uses fp16 vision by default
+def test_mistral_small_3_1_24b_pixtral(
+    E2E_MODEL_NAME,
+    MAX_TOKENS_IN_KV_CACHE,
+    MAX_ATTENTION_WINDOW_SIZE,
+    BATCH_SCHEDULER_POLICY,
+    KV_CACHE_FREE_GPU_MEM_FRACTION,
+    CROSS_KV_CACHE_FRACTION,
+    ENABLE_TRT_OVERLAP,
+    BATCHING_STRATEGY,
+    DECOUPLED_MODE,
+    TRITON_MAX_BATCH_SIZE,
+    MAX_QUEUE_DELAY_MICROSECONDS,
+    MAX_BEAM_WIDTH,
+    ENABLE_KV_CACHE_REUSE,
+    NORMALIZE_LOG_PROBS,
+    ENABLE_CHUNKED_CONTEXT,
+    GPU_DEVICE_IDS,
+    DECODING_MODE,
+    PREPROCESSING_INSTANCE_COUNT,
+    POSTPROCESSING_INSTANCE_COUNT,
+    ACCUMULATE_TOKEN,
+    BLS_INSTANCE_COUNT,
+    EXCLUDE_INPUT_IN_OUTPUT,
+    PROMPT_EMBEDDING_TABLE_DTYPE,
+    ENCODER_INPUT_FEATURES_DTYPE,
+    tensorrt_llm_multimodal_example_root,
+    tensorrt_llm_llama_example_root,
+    mistral_small_3_1_24b_model_root,
+    llm_backend_multimodal_example_root,
+    llm_backend_venv,
+):
+    if BATCHING_STRATEGY == "V1" and BATCH_SCHEDULER_POLICY == "max_utilization":
+        pytest.skip("Skipping. V1 doesn't support max_utilization.")
+
+    llm_backend_repo_root = os.environ["LLM_BACKEND_ROOT"]
+
+    # Build Engines (LLM + vision)
+    ENGINE_PATH, MULTIMODAL_ENGINE_DIR = prepare_mistral3_pixtral_engine(
+        tensorrt_llm_multimodal_example_root, tensorrt_llm_llama_example_root,
+        mistral_small_3_1_24b_model_root)
+
+    # Prepare model repo
+    new_model_repo = os.path.join(llm_backend_repo_root, "triton_repo")
+    prepare_ib_model_repo(llm_backend_repo_root, new_model_repo)
+
+    # Prepare multimodal specific repo
+    prepare_multimodal_model_repo(llm_backend_repo_root, new_model_repo,
+                                  "ensemble")
+    prepare_multimodal_model_repo(llm_backend_repo_root, new_model_repo,
+                                  "multimodal_encoders")
+
+    # Modify config.pbtxt
+    TOKENIZER_PATH = mistral_small_3_1_24b_model_root
+    modify_ib_config_pbtxt(
+        new_model_repo,
+        ENGINE_PATH,
+        TOKENIZER_PATH,
+        llm_backend_repo_root,
+        DECOUPLED_MODE,
+        MAX_TOKENS_IN_KV_CACHE,
+        MAX_ATTENTION_WINDOW_SIZE,
+        BATCH_SCHEDULER_POLICY,
+        BATCHING_STRATEGY,
+        KV_CACHE_FREE_GPU_MEM_FRACTION,
+        EXCLUDE_INPUT_IN_OUTPUT,
+        ENABLE_TRT_OVERLAP,
+        TRITON_MAX_BATCH_SIZE,
+        MAX_QUEUE_DELAY_MICROSECONDS,
+        MAX_BEAM_WIDTH,
+        ENABLE_KV_CACHE_REUSE,
+        NORMALIZE_LOG_PROBS,
+        ENABLE_CHUNKED_CONTEXT,
+        GPU_DEVICE_IDS,
+        DECODING_MODE,
+        PREPROCESSING_INSTANCE_COUNT,
+        POSTPROCESSING_INSTANCE_COUNT,
+        ACCUMULATE_TOKEN,
+        BLS_INSTANCE_COUNT,
+        MULTIMODAL_ENGINE_PATH=MULTIMODAL_ENGINE_DIR,
+        ENCODER_INPUT_FEATURES_DTYPE=ENCODER_INPUT_FEATURES_DTYPE,
+        PROMPT_EMBEDDING_TABLE_DTYPE=PROMPT_EMBEDDING_TABLE_DTYPE,
+        BACKEND="python",  # Only python supported for Mistral Small 3.1
+    )
+
+    # Launch Triton Server
+    launch_server_py = os.path.join(llm_backend_repo_root, "scripts",
+                                    "launch_triton_server.py")
+    check_call(
+        f"PMIX_MCA_gds=hash python3 {launch_server_py} --world_size=1 --model_repo={new_model_repo}",
+        shell=True)
+    check_server_ready()
+
+    # Run Test: use multimodal client; set model_type to pixtral
+    text_prompt = "[IMG]\nDescribe the image in one sentence."
+    run_cmd = [
+        f"{llm_backend_multimodal_example_root}/client.py",
+        "--model_type=pixtral",
+        f"--hf_model_dir={mistral_small_3_1_24b_model_root}",
+        f"--text={text_prompt}",
+        # Use a simple image URL (same as mllama test) to validate end-to-end
+        "--image=https://storage.googleapis.com/sfr-vision-language-research/LAVIS/assets/merlion.png",
+    ]
+    if DECOUPLED_MODE == "True":
+        run_cmd += ["--streaming"]
+
+        if E2E_MODEL_NAME == "tensorrt_llm_bls":
+            run_cmd += ["--use_bls"]
+
+    venv_check_call(llm_backend_venv, run_cmd)

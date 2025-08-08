@@ -338,7 +338,7 @@ def modify_ib_config_pbtxt(REPO_PATH,
             shell=True)
 
     check_call(
-        f"python3 {fill_template_py} -i {preprocessing_config} tokenizer_dir:{TOKENIZER_PATH}," \
+        f"python3 {fill_template_py} -i {preprocessing_config} tokenizer_dir:{TOKENIZER_PATH},hf_model_path:{TOKENIZER_PATH}," \
         f"triton_max_batch_size:{TRITON_MAX_BATCH_SIZE},preprocessing_instance_count:{PREPROCESSING_INSTANCE_COUNT}," \
         f"multimodal_model_path:{MULTIMODAL_ENGINE_PATH},engine_dir:{DECODER_ENGINE_PATH}",
         shell=True)
