@@ -1449,6 +1449,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         temp_attn: torch.Tensor,
         softmax_stats: torch.Tensor,
         temp_softmax_stats: torch.Tensor,
+        bmm1_scale: float,
         merge_op: torch.Tensor,
         metadata: TrtllmAttentionMetadata,
     ) -> None:

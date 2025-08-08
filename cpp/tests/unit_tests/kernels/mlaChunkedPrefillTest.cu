@@ -750,6 +750,7 @@ protected:
         auto* d_cu_q_seq_lens_ptr = bufferCast<int64_t>(*(this->d_cu_q_seq_lens));
 
         int const loop_count = (this->mMaxSeqLen + this->mChunkSize - 1) / this->mChunkSize;
+        float bmm1_scale = 1.F / std::sqrt(static_cast<double>(this->mNopeSize + this->mRopeSize));
         // do not apply mask
         for (int _ = 0; _ < loop_count - 1; _++)
         {
