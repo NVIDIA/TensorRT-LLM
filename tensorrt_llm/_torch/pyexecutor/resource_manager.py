@@ -463,7 +463,7 @@ class KVCacheManager(BaseResourceManager):
 
         # For context requests, we store the blocks for reuse.
         for request in scheduled_batch.context_requests:
-            self.impl.store_new_block(request)
+            self.impl.store_context_blocks(request)
 
     def free_resources(self, request: LlmRequest):
         self.impl.remove_sequence(request.py_request_id, request)
