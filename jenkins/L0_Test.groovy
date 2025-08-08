@@ -2106,18 +2106,6 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.7.1 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128")
                         }
 
-                        // Workaround for https://nvbugs/5433581 where deep_gemm installation fails on SBSA platform
-                        if (cpu_arch == AARCH64_TRIPLE) {
-                              echo "###### Workaround for https://nvbugs/5433581 Start ######"
-                              def deepGemmLine = readFile("${LLM_ROOT}/requirements.txt").readLines().find { it.trim().startsWith('deep_gemm') }
-                              if (deepGemmLine) {
-                                  trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install '${deepGemmLine.trim()}' --extra-index-url https://download.pytorch.org/whl/cu128")
-                              }
-                              else {
-                                echo "deep_gemm package not found in requirements.txt"
-                              }
-                        }
-
                         def libEnv = []
                         if (env.alternativeTRT) {
                             stage("Replace TensorRT") {

@@ -126,8 +126,6 @@ def get_masked_input_and_mask(
     return input_, ~vocab_mask.unsqueeze(-1)
 
 
-# We use torch.compile() to fuse the tiny pointwise ops before all_reduce/all_gather for Embedding module.
-@torch.compile(options={"max-autotune": True})
 def pre_comm_embedding_ops(
     input_: torch.Tensor,
     weight: torch.Tensor,
@@ -184,6 +182,7 @@ class Embedding(LMHead):
         mapping: Optional[Mapping] = None,
         tensor_parallel_mode: Optional[TensorParallelMode] = None,
         gather_output: bool = False,
+        enable_torch_compile_for_embedding: Optional[bool] = False,
     ):
         super().__init__(
             embedding_dim=embedding_dim,
@@ -193,6 +192,9 @@ class Embedding(LMHead):
             tensor_parallel_mode=tensor_parallel_mode,
             gather_output=gather_output,
         )
+
+        self.enable_torch_compile_for_embedding = enable_torch_compile_for_embedding
+
         if self.tp_size > 1:
             slice_width = math.ceil(num_embeddings / self.tp_size)
             self.vocab_start_index = self.tp_rank * slice_width
@@ -204,11 +206,16 @@ class Embedding(LMHead):
 
     def forward(self, input):
         # Run the ops before all_reduce/all_gather.
-        output = pre_comm_embedding_ops(input, self.weight, self.tp_size,
-                                        self.tp_rank, self.tp_mode,
-                                        self.vocab_start_index,
-                                        self.vocab_end_index,
-                                        self.gather_output, self.padding_size)
+        # We use torch.compile() to fuse the tiny pointwise ops before all_reduce/all_gather for Embedding module.
+        embedding_ops_func = torch.compile(
+            pre_comm_embedding_ops,
+            options={"max-autotune": True},
+            disable=not self.enable_torch_compile_for_embedding)
+        output = embedding_ops_func(input, self.weight, self.tp_size,
+                                    self.tp_rank, self.tp_mode,
+                                    self.vocab_start_index,
+                                    self.vocab_end_index, self.gather_output,
+                                    self.padding_size)
 
         # Run the all_reduce/all_gather.
         if self.tp_size > 1:
