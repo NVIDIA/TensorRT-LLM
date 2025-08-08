@@ -51,6 +51,7 @@ class LlmManager:
         # Set up sampling params with inference request
         self.request_seen.set()
         sampling_params.max_tokens = request.output_tokens
+        sampling_params.guided_decoding = request.guided_decoding_params
 
         async with semaphore_guard(self._concurrency_semaphore):
             request_start_timestamp = time.perf_counter_ns()

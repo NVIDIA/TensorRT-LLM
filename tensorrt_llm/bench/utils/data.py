@@ -9,6 +9,7 @@ from tensorrt_llm.bench.dataclasses.general import (DatasetMetadata,
 from tensorrt_llm.bench.dataclasses.statistics import PercentileStats
 from tensorrt_llm.executor.request import LoRARequest
 from tensorrt_llm.inputs import default_multimodal_input_loader
+from tensorrt_llm.sampling_params import GuidedDecodingParams
 
 
 def initialize_tokenizer(model_name: str) -> PreTrainedTokenizer:
@@ -86,6 +87,7 @@ def create_dataset_from_stream(
     all_logits = []
     task_ids = []
     lora_requests = []
+    all_guided_decoding_params = []
     while (line := stream.readline()) and len(task_ids) < max_requests:
         # We expect the data to come in as a JSON string.
         # For example:
@@ -121,6 +123,14 @@ def create_dataset_from_stream(
         else:
             lora_requests.append(None)
 
+        # Parse guided decoding params if present
+        if (guided_decoding_params :=
+                data.get("guided_decoding_params")) is not None:
+            all_guided_decoding_params.append(
+                GuidedDecodingParams(**guided_decoding_params))
+        else:
+            all_guided_decoding_params.append(None)
+
     if modality is not None:
         # Multimodal data need extra preprocessing
         assert modality in [
@@ -138,8 +148,9 @@ def create_dataset_from_stream(
 
     all_isl = []
     all_seq_len = []
-    for prompt, logits, osl, task_id, lora_request in zip(
-            prompts, all_logits, all_osl, task_ids, lora_requests):
+    for prompt, logits, osl, task_id, lora_request, guided_decoding_params in zip(
+            prompts, all_logits, all_osl, task_ids, lora_requests,
+            all_guided_decoding_params):
         if modality is not None:
             # NOTE: we cannot tokenize multi-modal data, handled by preprocessor
             #       so the actual sequence length is unknown until the model is run
@@ -159,6 +170,7 @@ def create_dataset_from_stream(
             output_tokens=output_limiter(osl),
             input_ids=logits,
             lora_request=lora_request,
+            guided_decoding_params=guided_decoding_params,
         )
         dataset.append(request)
 
