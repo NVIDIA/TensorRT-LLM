@@ -13,6 +13,14 @@ from .trt_test_alternative import (SessionDataWriter, check_call, check_output,
                                    print_info)
 
 
+def find_repo_root():
+    """Find the repository root by going up 4 directories from the current file location."""
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    for _ in range(4):
+        current_dir = os.path.dirname(current_dir)
+    return current_dir
+
+
 def llm_models_root() -> str:
     '''return LLM_MODELS_ROOT path if it is set in env, assert when it's set but not a valid path
     '''
@@ -68,7 +76,8 @@ def output_dir(request):
 
 @pytest.fixture(scope="session")
 def llm_backend_root():
-    return os.path.join(os.environ["LLM_ROOT"], "triton_backend")
+    llm_root = os.environ.get("LLM_ROOT", find_repo_root())
+    return os.path.join(llm_root, "triton_backend")
 
 
 @pytest.fixture(scope="session")
