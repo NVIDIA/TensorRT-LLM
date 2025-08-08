@@ -741,7 +741,8 @@ class Deepseekv3MoE(nn.Module):
         router_logits = self.gate(hidden_states)
 
         routed_output = self.experts(
-            hidden_states_fp4 or hidden_states,
+            hidden_states_fp4
+            if hidden_states_fp4 is not None else hidden_states,
             router_logits,
             do_finalize=do_finalize,
             output_dtype=hidden_states.dtype,
@@ -765,8 +766,9 @@ class Deepseekv3MoE(nn.Module):
             assert not self.use_dp
 
         def _compute_shared_output():
-            shared_output = self.shared_experts(hidden_states_fp4
-                                                or hidden_states)
+            shared_output = self.shared_experts(
+                hidden_states_fp4
+                if hidden_states_fp4 is not None else hidden_states)
             if self.shared_output_scale is not None:
                 shared_output *= self.shared_output_scale
             return shared_output
@@ -1170,7 +1172,7 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
         all_rank_num_tokens: Optional[List[int]] = None,
         all_rank_max_num_tokens: Optional[int] = None,
         **kwargs,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
 
         def norm_embeds():
             return self.enorm(embed_tokens(input_ids))  #emdedding
@@ -1269,6 +1271,7 @@ class MTPForCausalLM(nn.Module):
                           model.aux_stream_dict)
             for layer_idx in range(mtp_num_layers)
         ])
+        self.lm_head = model.lm_head
 
 
 def get_draft_model(model, model_config, draft_config):
@@ -1281,7 +1284,7 @@ def get_draft_model(model, model_config, draft_config):
         return MTPForCausalLM(model, model_config,
                               model_config.pretrained_config.num_hidden_layers)
     else:
-        raise NotImplemented(
+        raise NotImplementedError(
             f"get_draft_model does not support speculative decoding mode {spec_dec_mode}."
         )
 
@@ -1349,7 +1352,6 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                                     position_ids=position_ids,
                                     hidden_states=hidden_states,
                                     logits=logits,
-                                    lm_head=self.lm_head,
                                     attn_metadata=attn_metadata,
                                     spec_metadata=spec_metadata,
                                     draft_model=self.draft_model)
