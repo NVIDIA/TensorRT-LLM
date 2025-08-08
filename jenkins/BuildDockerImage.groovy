@@ -563,53 +563,55 @@ pipeline {
             }
             steps {
                 script {
-                    container("python3") {
-                        // Install wget
-                        trtllm_utils.llmExecStepWithRetry(this, script: "apt-get update && apt-get -y install wget")
+                    catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                        container("python3") {
+                            // Install wget
+                            trtllm_utils.llmExecStepWithRetry(this, script: "apt-get update && apt-get -y install wget")
 
-                        // Poll for build artifacts
-                        def artifactBaseUrl = "https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/"
-                        def requiredFiles = [
-                            "TensorRT-LLM-GH200.tar.gz",
-                            "TensorRT-LLM.tar.gz"
-                        ]
-                        def maxWaitMinutes = 60
-                        def pollIntervalSeconds = 60
+                            // Poll for build artifacts
+                            def artifactBaseUrl = "https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/"
+                            def requiredFiles = [
+                                "TensorRT-LLM-GH200.tar.gz",
+                                "TensorRT-LLM.tar.gz"
+                            ]
+                            def maxWaitMinutes = 60
+                            def pollIntervalSeconds = 60
 
-                        echo "Waiting for build artifacts..."
-                        echo "Required files: ${requiredFiles}"
+                            echo "Waiting for build artifacts..."
+                            echo "Required files: ${requiredFiles}"
 
-                        def startTime = System.currentTimeMillis()
-                        def maxWaitMs = maxWaitMinutes * 60 * 1000
+                            def startTime = System.currentTimeMillis()
+                            def maxWaitMs = maxWaitMinutes * 60 * 1000
 
-                        while ((System.currentTimeMillis() - startTime) < maxWaitMs) {
-                            def missingFiles = []
+                            while ((System.currentTimeMillis() - startTime) < maxWaitMs) {
+                                def missingFiles = []
 
-                            for (file in requiredFiles) {
-                                def fileUrl = "${artifactBaseUrl}${file}"
-                                def exitCode = sh(
-                                    script: "wget --spider --quiet --timeout=30 --tries=1 '${fileUrl}'",
-                                    returnStatus: true
-                                )
+                                for (file in requiredFiles) {
+                                    def fileUrl = "${artifactBaseUrl}${file}"
+                                    def exitCode = sh(
+                                        script: "wget --spider --quiet --timeout=30 --tries=1 '${fileUrl}'",
+                                        returnStatus: true
+                                    )
 
-                                if (exitCode != 0) {
-                                    missingFiles.add(file)
+                                    if (exitCode != 0) {
+                                        missingFiles.add(file)
+                                    }
                                 }
-                            }
 
-                            if (missingFiles.isEmpty()) {
-                                echo "All build artifacts are ready!"
-                                return
+                                if (missingFiles.isEmpty()) {
+                                    echo "All build artifacts are ready!"
+                                    return
+                                }
+
+                                def elapsedMinutes = (System.currentTimeMillis() - startTime) / (60 * 1000)
+                                echo "Waiting... (${elapsedMinutes.intValue()} minutes elapsed)"
+                                echo "Missing files: ${missingFiles}"
+                                sleep(pollIntervalSeconds)
                             }
 
                             def elapsedMinutes = (System.currentTimeMillis() - startTime) / (60 * 1000)
-                            echo "Waiting... (${elapsedMinutes.intValue()} minutes elapsed)"
-                            echo "Missing files: ${missingFiles}"
-                            sleep(pollIntervalSeconds)
+                            error "Timeout waiting for build artifacts (${elapsedMinutes.intValue()} minutes)"
                         }
-
-                        def elapsedMinutes = (System.currentTimeMillis() - startTime) / (60 * 1000)
-                        error "Timeout waiting for build artifacts (${elapsedMinutes.intValue()} minutes)"
                     }
                 }
             }
@@ -622,28 +624,28 @@ pipeline {
             }
             steps {
                 script {
-                    globalVars[IMAGE_KEY_TO_TAG] = imageKeyToTag
-                    String globalVarsJson = writeJSON returnText: true, json: globalVars
-                    def parameters = getCommonParameters()
-                    parameters += [
-                        'enableFailFast': false,
-                        'globalVars': globalVarsJson,
-                    ]
+                    catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                        globalVars[IMAGE_KEY_TO_TAG] = imageKeyToTag
+                        String globalVarsJson = writeJSON returnText: true, json: globalVars
+                        def parameters = getCommonParameters()
+                        parameters += [
+                            'enableFailFast': false,
+                            'globalVars': globalVarsJson,
+                        ]
 
-                    echo "Trigger BuildDockerImageSanityTest job, params: ${parameters}"
+                        echo "Trigger BuildDockerImageSanityTest job, params: ${parameters}"
 
-                    def status = ""
-                    def jobName = "/LLM/helpers/BuildDockerImageSanityTest"
-                    def handle = build(
-                        job: jobName,
-                        parameters: trtllm_utils.toBuildParameters(parameters),
-                        propagate: false,
-                    )
-                    echo "Triggered job: ${handle.absoluteUrl}"
-                    status = handle.result
+                        def status = ""
+                        def jobName = "/LLM/helpers/BuildDockerImageSanityTest"
+                        def handle = build(
+                            job: jobName,
+                            parameters: trtllm_utils.toBuildParameters(parameters),
+                            propagate: false,
+                        )
+                        echo "Triggered job: ${handle.absoluteUrl}"
+                        status = handle.result
 
-                    if (status != "SUCCESS") {
-                        catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                        if (status != "SUCCESS") {
                             error "Downstream job did not succeed"
                         }
                     }
