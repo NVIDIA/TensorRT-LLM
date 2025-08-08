@@ -1511,7 +1511,6 @@ def get_model(args):
                 def __init__(self):
                     super().__init__()
 
-                    torch.hub._validate_not_a_forked_repo = lambda a, b, c: True  # avoid HTTP 403 error
                     self.model_encoder = torch.hub.load("NVlabs/RADIO",
                                                         "radio_model",
                                                         version="radio_v2.5-h")
@@ -1662,7 +1661,8 @@ def convert_checkpoint(args):
         'nmt': parse_nmt_config,
         'bart': parse_bart_config,
     }
-    encoder_config, decoder_config = parse_config_mapper[model_type](args, model)
+    encoder_config, decoder_config = parse_config_mapper[model_type](args,
+                                                                     model)
 
     additional_settings = ["gated_act"]
     if model_type == 'language_adapter':
