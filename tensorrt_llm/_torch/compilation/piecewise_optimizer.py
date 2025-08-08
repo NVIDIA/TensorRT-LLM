@@ -25,7 +25,7 @@ class PiecewiseInterpreter(Interpreter):
         module: GraphModule,
         enable_inductor: bool,
         compile_time_num_tokens: Union[int | torch.SymInt],
-        cuda_graph_batch_sizes: list[int],
+        capture_num_tokens: list[int],
         exclude_modules_id: list[int],
         graph_pool_handle: tuple[int, int],
         garbage_collect_values: bool = True,
@@ -37,7 +37,7 @@ class PiecewiseInterpreter(Interpreter):
         self.fake_mode = detect_fake_mode()
 
         self.compile_time_num_tokens = compile_time_num_tokens
-        self.cuda_graph_batch_sizes = cuda_graph_batch_sizes
+        self.capture_num_tokens = capture_num_tokens
         self.exclude_modules = [f"submod_{i}" for i in exclude_modules_id]
         self.graph_pool_handle = graph_pool_handle
         self.enable_inductor = enable_inductor
@@ -86,7 +86,7 @@ class PiecewiseInterpreter(Interpreter):
                 target,
                 self.compile_time_num_tokens,
                 runtime_num_tokens_idx,
-                self.cuda_graph_batch_sizes,
+                self.capture_num_tokens,
                 self.graph_pool_handle,
                 compile_fx(submod, args) if self.enable_inductor else submod,
                 self.enable_inductor,
@@ -120,7 +120,7 @@ class PiecewiseRunner(object):
         name: str,
         compile_time_num_tokens: Union[int | torch.SymInt],
         runtime_num_tokens_idx: tuple[int],
-        cuda_graph_batch_sizes: List[int],
+        capture_num_tokens: List[int],
         graph_pool_handle,
         default_callable: Callable,
         enable_inductor: bool,
@@ -139,9 +139,9 @@ class PiecewiseRunner(object):
 
         self.entries: dict[int, Entry] = {}
 
-        for bs in cuda_graph_batch_sizes:
-            self.entries[bs] = Entry(
-                bs,
+        for num_tokens in capture_num_tokens:
+            self.entries[num_tokens] = Entry(
+                num_tokens,
                 enable_inductor=self.enable_inductor,
                 callable=default_callable,
             )
@@ -228,7 +228,7 @@ def piecewise_optimizer(
     example_inputs: List[torch.Tensor],
     enable_inductor: bool,
     input_num_tokens: Union[int | torch.SymInt],
-    cuda_graph_batch_sizes: Sequence[int],
+    capture_num_tokens: Sequence[int],
     graph_pool_handle: tuple[int, int],
     max_num_streams: int = 1,
 ) -> tuple[GraphModule, int]:
@@ -269,7 +269,7 @@ def piecewise_optimizer(
         gm,
         enable_inductor,
         input_num_tokens,
-        cuda_graph_batch_sizes,
+        capture_num_tokens,
         exclude_modules_id,
         graph_pool_handle,
         max_num_streams=max_num_streams,

@@ -9,9 +9,10 @@ from mpi4py import MPI
 
 import tensorrt_llm
 import tensorrt_llm.bindings.internal.runtime as _tbr
-from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import is_graph_capturing
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
+
+from ..multi_stream_utils import do_multi_stream
 
 
 def _tensor_to_weight(t: torch.Tensor) -> _tbr.MoeWeight:
@@ -451,7 +452,7 @@ class SingleLayerMoeLoadBalancer:
         if self.updates_enabled:
             assert self.statistic_flag_tensor is None, \
                 "Already has statistic_flag_tensor, should not wait."
-            if is_graph_capturing():
+            if do_multi_stream():
                 self.cudagraph_event = torch.cuda.Event()
                 self.cudagraph_stream = torch.cuda.Stream()
                 current_stream_event = torch.cuda.Event()
@@ -470,7 +471,7 @@ class SingleLayerMoeLoadBalancer:
 
     def maybe_cudagraph_done_wait(self):
         if self.updates_enabled:
-            if is_graph_capturing():
+            if do_multi_stream():
                 assert self.cudagraph_event is not None, "should have cudagraph_event when capturing"
                 assert self.cudagraph_stream is not None, "should have cudagraph_stream when capturing"
                 self.cudagraph_event.wait()
@@ -483,7 +484,7 @@ class SingleLayerMoeLoadBalancer:
             assert self.statistic_flag_tensor is not None, \
                 "Doesn't have statistic_flag_tensor, should not set_cpu_stage."
             self.statistic_flag_tensor = None
-            if is_graph_capturing():
+            if do_multi_stream():
                 assert self.cudagraph_stream is not None, "Doesn't have cudagraph_stream, should not set_cpu_stage."
                 assert self.statistic_event is not None
                 assert self.statistic_stream is not None
@@ -504,7 +505,7 @@ class SingleLayerMoeLoadBalancer:
 
     def maybe_cudagraph_done_set_cpu_stage(self):
         if self.updates_enabled:
-            if is_graph_capturing():
+            if do_multi_stream():
                 assert self.cudagraph_event is not None, "should have cudagraph_event when capturing"
                 assert self.cudagraph_stream is not None, "should have cudagraph_stream when capturing"
                 self.cudagraph_event.wait()
@@ -523,7 +524,7 @@ class SingleLayerMoeLoadBalancer:
         """
         if self.updates_enabled:
             assert isinstance(self.statistic_flag_tensor, torch.Tensor)
-            if is_graph_capturing():
+            if do_multi_stream():
                 if is_first_stage:
                     self.statistic_event = torch.cuda.Event()
                     self.statistic_stream = torch.cuda.Stream()
@@ -560,7 +561,7 @@ class SingleLayerMoeLoadBalancer:
                     (self.expert_count, ),
                     dtype=torch.int32,
                     device=torch.device('cuda'))
-            if is_graph_capturing():
+            if do_multi_stream():
                 if is_first_stage:
                     self.statistic_event = torch.cuda.Event()
                     self.statistic_stream = torch.cuda.Stream()
@@ -589,7 +590,7 @@ class SingleLayerMoeLoadBalancer:
         """
         if self.updates_enabled:
             assert self.local_statistic_tensor is not None
-            if is_graph_capturing():
+            if do_multi_stream():
                 assert self.statistic_event is not None
                 assert self.statistic_stream is not None
                 self.statistic_event.wait()
@@ -613,7 +614,7 @@ class SingleLayerMoeLoadBalancer:
                     global_statistic_info, self.statistic_flag_tensor,
                     self.single_layer_load_balancer_ptr)
 
-            if is_graph_capturing():
+            if do_multi_stream():
                 current_stream_event = torch.cuda.Event()
                 current_stream_event.record(torch.cuda.current_stream())
                 with torch.cuda.stream(self.statistic_stream):
@@ -792,8 +793,8 @@ class MoeLoadBalancer:
         """
         self.load_balancer_impl.set_warm_up_iter_count(iter_count)
 
-    def set_next_iter_info(self, enable_statistic: Optional[bool],
-                           enable_update_weights: Optional[bool]):
+    def set_iter_info(self, enable_statistic: Optional[bool],
+                      enable_update_weights: Optional[bool]):
         if enable_statistic is not None:
             self.enable_statistic = enable_statistic
         if enable_update_weights is not None:
@@ -939,8 +940,8 @@ class MoeLoadBalancerIterContext:
         """
         if self.moe_load_balancer is not None and not self.moe_load_balancer.is_static_routing(
         ):
-            self.moe_load_balancer.set_next_iter_info(self.enable_statistic,
-                                                      self.enable_updates)
+            self.moe_load_balancer.set_iter_info(self.enable_statistic,
+                                                 self.enable_updates)
             self.moe_load_balancer.start_iter()
         return self
 
