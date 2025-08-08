@@ -11,7 +11,7 @@ context_servers:
   max_seq_len: 4096
   tensor_parallel_size: 1
   pipeline_parallel_size: 1
-  enable_trtllm_sampler: True
+  use_torch_sampler: True
   kv_cache_config:
     free_gpu_memory_fraction: 0.2
     enable_partial_reuse: False
@@ -27,7 +27,7 @@ generation_servers:
   max_batch_size: 256
   max_num_tokens: 4096
   max_seq_len: 4096
-  enable_trtllm_sampler: True
+  use_torch_sampler: True
   kv_cache_config:
     free_gpu_memory_fraction: 0.2
     enable_partial_reuse: False
