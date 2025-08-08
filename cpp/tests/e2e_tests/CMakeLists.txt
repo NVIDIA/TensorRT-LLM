@@ -11,9 +11,3 @@
 
 add_subdirectory(batch_manager)
 add_subdirectory(executor)
-add_subdirectory(common)
-add_subdirectory(kernels)
-add_subdirectory(layers)
-add_subdirectory(runtime)
-add_subdirectory(thop)
-add_subdirectory(utils)
