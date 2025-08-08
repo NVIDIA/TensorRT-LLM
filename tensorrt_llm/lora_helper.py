@@ -24,7 +24,7 @@ def get_missing_qkv_modules_from_lora_modules(
     """Get missing QKV modules from LoRA target modules.
 
     In current design, q_lora_params, k_lora_params and v_lora_params should be all enabled or
-    all disabled at the same time. However, some lora checkpoint (e.g. BART) only contain two of them,
+    all disabled at the same time. However, some lora checkpoints (e.g. BART) only contain two of them,
     so we use zero tensor to fill the missing ones.
     """
     missing_qkv_modules = []
