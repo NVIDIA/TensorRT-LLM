@@ -46,8 +46,9 @@ public:
     //! @param gpus_per_node The number of GPUs per node.
     //! @param buffer_size The size of the buffer to allocate. All buffers allocated by this manager will have this
     //! size.
-    void initialize(
-        int64_t tp_size, int64_t pp_size, int64_t cp_size, int64_t rank, int64_t gpus_per_node, int64_t buffer_size);
+    //! @param use_nccl_symmetric Whether to use NCCL symmetric communication.
+    void initialize(int64_t tp_size, int64_t pp_size, int64_t cp_size, int64_t rank, int64_t gpus_per_node,
+        int64_t buffer_size, bool use_nccl_symmetric);
 
     //! @brief Create a UB tensor from the given shape, strides and data type. The function will choose available UB
     //! buffer or create a new one if no available buffer is found.
@@ -75,7 +76,7 @@ private:
     int64_t buffer_size_;
 };
 
-void initialize_userbuffers_manager(
-    int64_t tp_size, int64_t pp_size, int64_t cp_size, int64_t rank, int64_t gpus_per_node, int64_t buffer_size);
+void initialize_userbuffers_manager(int64_t tp_size, int64_t pp_size, int64_t cp_size, int64_t rank,
+    int64_t gpus_per_node, int64_t buffer_size, bool use_nccl_symmetric);
 
 } // namespace tensorrt_llm::runtime::ub
