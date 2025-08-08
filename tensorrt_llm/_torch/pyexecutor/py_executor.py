@@ -937,11 +937,30 @@ class PyExecutor:
                         self.guided_decoder.init_disagg_gen_requests(
                             scheduled_batch)
                     if self.drafter is not None and self.use_spec_decode:
-                        if self.guided_decoder is not None:
-                            self.guided_decoder.rollback_rejected_tokens(
-                                scheduled_batch)
-                        self.drafter.prepare_draft_tokens(
-                            scheduled_batch, self.resource_manager)
+                        # When running with an external drafter, only TP rank 0 sends request to drafter
+                        if self.dist.tp_size > 1 and getattr(
+                                self.drafter, 'single_draft_call',
+                                lambda: False)():
+                            if self.dist.rank == 0:
+                                self.drafter.prepare_draft_tokens(
+                                    scheduled_batch, self.resource_manager)
+                                draft_data = {}
+                                for req in scheduled_batch.generation_requests:
+                                    draft_data[
+                                        req.py_request_id] = req.py_draft_tokens
+                                self.dist.tp_broadcast(draft_data, root=0)
+                            else:
+                                draft_data = self.dist.tp_broadcast(None,
+                                                                    root=0)
+                                for req in scheduled_batch.generation_requests:
+                                    req.py_draft_tokens = draft_data[
+                                        req.py_request_id]
+                        else:
+                            if self.guided_decoder is not None:
+                                self.guided_decoder.rollback_rejected_tokens(
+                                    scheduled_batch)
+                            self.drafter.prepare_draft_tokens(
+                                scheduled_batch, self.resource_manager)
 
                     batch_outputs = self._forward_step(scheduled_batch)
                     self._execute_guided_decoder(scheduled_batch,
