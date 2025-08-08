@@ -235,11 +235,11 @@ public:
         torch::optional<torch::Tensor> const& fc1_expert_biases, torch::Tensor const& fc2_expert_weights,
         torch::optional<torch::Tensor> const& fc2_expert_biases,
         torch::optional<c10::ArrayRef<torch::Tensor>> const& quant_scales,
-        torch::optional<torch::Tensor> const& input_sf, torch::optional<torch::Tensor> const& swiglu_alpha,
-        torch::optional<torch::Tensor> const& swiglu_beta, torch::optional<torch::Tensor> const& swiglu_limit,
-        int64_t const tp_size, int64_t const tp_rank, int64_t const ep_size, int64_t const ep_rank,
-        int64_t const cluster_size, int64_t const cluster_rank, bool const enable_alltoall, bool min_latency_mode,
-        torch::optional<c10::ArrayRef<int64_t>> const& profile_ids)
+        torch::optional<torch::Tensor> const& input_sf, bool const swizzled_input_sf,
+        torch::optional<torch::Tensor> const& swiglu_alpha, torch::optional<torch::Tensor> const& swiglu_beta,
+        torch::optional<torch::Tensor> const& swiglu_limit, int64_t const tp_size, int64_t const tp_rank,
+        int64_t const ep_size, int64_t const ep_rank, int64_t const cluster_size, int64_t const cluster_rank,
+        bool const enable_alltoall, bool min_latency_mode, torch::optional<c10::ArrayRef<int64_t>> const& profile_ids)
     {
         std::lock_guard<std::mutex> lock(mMutex);
         // Free the profile workspace to save memory
@@ -378,7 +378,7 @@ public:
         ::tensorrt_llm::kernels::LoraParams lora_params{};
 #ifdef USING_OSS_CUTLASS_MOE_GEMM
         mKernelRunner->runMoe(input.const_data_ptr(),
-            input_sf.has_value() ? input_sf.value().const_data_ptr() : nullptr,
+            input_sf.has_value() ? input_sf.value().const_data_ptr() : nullptr, swizzled_input_sf,
             reinterpret_cast<int const*>(token_selected_experts.const_data_ptr()),
             token_final_scales.has_value() ? reinterpret_cast<float const*>(token_final_scales.value().const_data_ptr())
                                            : nullptr,
@@ -392,7 +392,7 @@ public:
             mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params, stream);
 #else
         mKernelRunner->runMoe(input.const_data_ptr(),
-            input_sf.has_value() ? input_sf.value().const_data_ptr() : nullptr,
+            input_sf.has_value() ? input_sf.value().const_data_ptr() : nullptr, swizzled_input_sf,
             reinterpret_cast<int const*>(token_selected_experts.const_data_ptr()),
             token_final_scales.has_value() ? reinterpret_cast<float const*>(token_final_scales.value().const_data_ptr())
                                            : nullptr,
@@ -414,11 +414,11 @@ public:
         torch::Tensor const& fc1_expert_weights, torch::optional<torch::Tensor> const& fc1_expert_biases,
         torch::Tensor const& fc2_expert_weights, torch::optional<torch::Tensor> const& fc2_expert_biases,
         torch::optional<c10::ArrayRef<torch::Tensor>> const& quant_scales,
-        torch::optional<torch::Tensor> const& input_sf, torch::optional<torch::Tensor> const& swiglu_alpha,
-        torch::optional<torch::Tensor> const& swiglu_beta, torch::optional<torch::Tensor> const& swiglu_limit,
-        int64_t const tp_size, int64_t const tp_rank, int64_t const ep_size, int64_t const ep_rank,
-        int64_t const cluster_size, int64_t const cluster_rank, bool const enable_alltoall, bool min_latency_mode,
-        torch::optional<c10::ArrayRef<int64_t>> const& profile_ids)
+        torch::optional<torch::Tensor> const& input_sf, bool const swizzled_input_sf,
+        torch::optional<torch::Tensor> const& swiglu_alpha, torch::optional<torch::Tensor> const& swiglu_beta,
+        torch::optional<torch::Tensor> const& swiglu_limit, int64_t const tp_size, int64_t const tp_rank,
+        int64_t const ep_size, int64_t const ep_rank, int64_t const cluster_size, int64_t const cluster_rank,
+        bool const enable_alltoall, bool min_latency_mode, torch::optional<c10::ArrayRef<int64_t>> const& profile_ids)
     {
         std::lock_guard<std::mutex> lock(mMutex);
 
@@ -535,7 +535,7 @@ public:
         ::tensorrt_llm::kernels::LoraParams lora_params{};
 #ifdef USING_OSS_CUTLASS_MOE_GEMM
         mKernelRunner->runMoe(input.const_data_ptr(),
-            input_sf.has_value() ? input_sf.value().const_data_ptr() : nullptr,
+            input_sf.has_value() ? input_sf.value().const_data_ptr() : nullptr, swizzled_input_sf,
             reinterpret_cast<int const*>(token_selected_experts.const_data_ptr()),
             token_final_scales.has_value() ? reinterpret_cast<float const*>(token_final_scales.value().const_data_ptr())
                                            : nullptr,
@@ -549,7 +549,7 @@ public:
             mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params, stream);
 #else
         mKernelRunner->runMoe(input.const_data_ptr(),
-            input_sf.has_value() ? input_sf.value().const_data_ptr() : nullptr,
+            input_sf.has_value() ? input_sf.value().const_data_ptr() : nullptr, swizzled_input_sf,
             reinterpret_cast<int const*>(token_selected_experts.const_data_ptr()),
             token_final_scales.has_value() ? reinterpret_cast<float const*>(token_final_scales.value().const_data_ptr())
                                            : nullptr,

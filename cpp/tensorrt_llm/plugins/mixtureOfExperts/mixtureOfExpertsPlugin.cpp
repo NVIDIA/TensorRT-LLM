@@ -957,7 +957,7 @@ int MixtureOfExpertsPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     MoeMinLatencyParams min_latency_params{};
     mMOERunner->setTactic(gemm1, gemm2);
 #ifdef USING_OSS_CUTLASS_MOE_GEMM
-    mMOERunner->runMoe(inputs[getInputTensorIndex()], nullptr,
+    mMOERunner->runMoe(inputs[getInputTensorIndex()], nullptr, true,
         static_cast<int const*>(inputs[getTokenSelectedExpertsIndex()]),
         hasFinalScales() ? static_cast<float const*>(inputs[getTokenFinalScalesIndex()]) : nullptr,
         inputs[getExpertWeights1Index()], hasBias() ? inputs[getExpertBias1Index()] : nullptr,
@@ -969,7 +969,7 @@ int MixtureOfExpertsPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
         /*enable_alltoall=*/false, hasLora(), lora_params, /*use_deepseek_fp8_block_scale=*/false,
         /*min_latency_mode=*/false, min_latency_params, stream);
 #else
-    mMOERunner->runMoe(inputs[getInputTensorIndex()], nullptr,
+    mMOERunner->runMoe(inputs[getInputTensorIndex()], nullptr, true,
         static_cast<int const*>(inputs[getTokenSelectedExpertsIndex()]),
         hasFinalScales() ? static_cast<float const*>(inputs[getTokenFinalScalesIndex()]) : nullptr,
         inputs[getExpertWeights1Index()], hasBias() ? inputs[getExpertBias1Index()] : nullptr,
