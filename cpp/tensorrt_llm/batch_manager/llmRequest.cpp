@@ -365,4 +365,10 @@ void LlmRequest::moveLoraWeightsToGpu(runtime::BufferManager const& manager)
     mLoraWeights = gpuLoraWeights;
 }
 
+void LlmRequest::removeLoraTensors()
+{
+    mLoraWeights.reset();
+    mLoraConfig.reset();
+}
+
 } // namespace tensorrt_llm::batch_manager

@@ -357,6 +357,7 @@ class RopeParams:
     short_factor: Optional[Tuple[float]] = None
     long_factor: Optional[Tuple[float]] = None
     max_seq_len: Optional[int] = None
+    duplicate_data: bool = True
 
     @staticmethod
     def from_config(config) -> "RopeParams":
@@ -440,6 +441,7 @@ class RopeParams:
                 self.beta_slow,
                 self.mscale,
                 self.mscale_all_dim,
+                self.duplicate_data,
             )
         elif self.scale_type == RotaryScalingType.longrope:
             rope_inv_freq, rope_cos_sin = RopeEmbeddingUtils.create_sinusoidal_positions_long_rope(

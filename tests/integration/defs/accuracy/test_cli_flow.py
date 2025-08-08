@@ -958,6 +958,7 @@ class TestLlama3_2_1B(CliFlowAccuracyTestHarness):
 
 
 # TODO: Remove the CLI tests once NIMs use PyTorch backend
+@pytest.mark.skip_less_device_memory(80000)
 class TestLlama3_3_70BInstruct(CliFlowAccuracyTestHarness):
     MODEL_NAME = "meta-llama/Llama-3.3-70B-Instruct"
     MODEL_PATH = f"{llm_models_root()}/llama-3.3-models/Llama-3.3-70B-Instruct"
