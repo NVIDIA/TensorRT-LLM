@@ -1014,6 +1014,14 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             attention_dp_events_gather_period_ms,
             max_gpu_total_bytes=self.max_gpu_total_bytes)
 
+    @field_validator('max_gpu_total_bytes')
+    @classmethod
+    def validate_max_gpu_total_bytes(cls, v: int):
+        if v < 0:
+            raise ValueError(
+                "kv_cache_config.max_gpu_total_bytes must be non-negative")
+        return v
+
 
 @PybindMirror.mirror_pybind_fields(_ExtendedRuntimePerfKnobConfig)
 class ExtendedRuntimePerfKnobConfig(StrictBaseModel, PybindMirror):
