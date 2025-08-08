@@ -1,0 +1,48 @@
+name: PR Checklist
+on:
+  pull_request:
+    types: [opened, reopened]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  post-checklist:
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.draft == false
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Post PR Checklist
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+
+            // Read checklist from file
+            const checklistPath = path.join(process.env.GITHUB_WORKSPACE, '.github', 'pr-checklist.md');
+            const checklistContent = fs.readFileSync(checklistPath, 'utf8');
+
+            // Check if we already posted a checklist comment
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number
+            });
+
+            const checklistExists = comments.some(comment =>
+              comment.user.login === 'github-actions[bot]' &&
+              comment.body.includes('PR Checklist')
+            );
+
+            if (!checklistExists) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body: checklistContent
+              });
+            }
