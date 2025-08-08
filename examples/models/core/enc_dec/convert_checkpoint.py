@@ -55,7 +55,7 @@ def parse_t5_config(args, hf_model):
         return scaling
 
     config["decoder"] = {}
-    for key, val in hf_model.model.decoder.config.to_dict().items():
+    for key, val in hf_model.decoder.config.to_dict().items():
         config["decoder"][key] = f"{val}"
 
     config["structure"] = dict()
@@ -1654,8 +1654,15 @@ def convert_checkpoint(args):
     quant_algo = None
 
     model_type = args.model_type if args.model_type != "blip2" else "t5"
-    encoder_config, decoder_config = globals()[f'parse_{model_type}_config'](
-        args, model)
+    parse_config_mapper = {
+        't5': parse_t5_config,
+        'pix2struct': parse_pix2struct_config,
+        'blip2': parse_t5_config,  # blip2 uses t5 config parser
+        'language_adapter': parse_language_adapter_config,
+        'nmt': parse_nmt_config,
+        'bart': parse_bart_config,
+    }
+    encoder_config, decoder_config = parse_config_mapper[model_type](args, model)
 
     additional_settings = ["gated_act"]
     if model_type == 'language_adapter':
