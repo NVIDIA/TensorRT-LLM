@@ -1,6 +1,9 @@
 from dataclasses import dataclass, field
 from typing import List, Literal, Optional, Tuple, Union
 
+from openai_harmony import (HarmonyEncodingName, Role, StreamableParser,
+                            load_harmony_encoding)
+
 from .._utils import nvtx_range_debug
 from ..executor import (DetokenizedGenerationResultBase, GenerationResult,
                         GenerationResultBase)
@@ -41,6 +44,8 @@ class ChatPostprocArgs(PostprocArgs):
     reasoning_parser: Optional[str] = None
     reasoning_parser_dict: dict[int, BaseReasoningParser] = field(
         default_factory=dict)
+    use_harmony: bool = False
+    harmony_parsers: list[StreamableParser] = field(default_factory=list)
 
     @classmethod
     def from_request(cls, request: ChatCompletionRequest):
@@ -54,6 +59,7 @@ class ChatPostprocArgs(PostprocArgs):
             tool_choice=request.tool_choice,
             stream_options=request.stream_options,
             return_logprobs=request.logprobs,
+            use_harmony=request.use_harmony,
         )
 
 
@@ -89,11 +95,19 @@ def apply_reasoning_parser(args: ChatPostprocArgs, output_index: int, text: str,
             result = reasoning_parser.parse(text)
         else:
             result = reasoning_parser.parse_delta(text)
-        in_reasoning, content, reasoning_content = result.in_reasoning, result.content, result.reasoning_content
+        in_reasoning, content, reasoning_text = result.in_reasoning, result.content, result.reasoning_text
     else:
-        in_reasoning, content, reasoning_content = False, text, None
+        in_reasoning, content, reasoning_text = False, text, None
 
-    return in_reasoning, content, reasoning_content
+    return in_reasoning, content, reasoning_text
+
+
+def init_harmony_parsers(args: ChatPostprocArgs):
+    encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
+    args.harmony_parsers = [
+        StreamableParser(encoding, Role.ASSISTANT)
+        for _ in range(args.num_choices)
+    ]
 
 
 @nvtx_range_debug("chat_stream_post_processor")
@@ -133,6 +147,9 @@ def chat_stream_post_processor(rsp: GenerationResultBase, args: ChatPostprocArgs
                 res.append(f"data: {yield_first_chat(prompt_tokens, i, content=args.last_message_content)} \n\n")
         args.first_iteration = False
 
+    if args.use_harmony and not args.harmony_parsers:
+        init_harmony_parsers(args)
+
     for output in rsp.outputs:
         i = output.index
 
@@ -153,10 +170,10 @@ def chat_stream_post_processor(rsp: GenerationResultBase, args: ChatPostprocArgs
         else:
             if in_reasoning:
                 delta_message = DeltaMessage(
-                    reasoning_content=reasoning_delta_text)
+                    reasoning_text=reasoning_delta_text)
             else:
                 delta_message = DeltaMessage(
-                    content=delta_text, reasoning_content=reasoning_delta_text)
+                    content=delta_text, reasoning_text=reasoning_delta_text)
 
         choice = ChatCompletionResponseStreamChoice(index=i,
                                                     delta=delta_message,
@@ -197,9 +214,34 @@ def chat_stream_post_processor(rsp: GenerationResultBase, args: ChatPostprocArgs
 def chat_response_post_processor(rsp: GenerationResultBase, args: ChatPostprocArgs) -> ChatCompletionResponse:
     choices: List[ChatCompletionResponseChoice] = []
     role = args.role
+    if args.use_harmony and not args.harmony_parsers:
+        init_harmony_parsers(args)
+
     for output in rsp.outputs:
-        _, text, reasoning_text = apply_reasoning_parser(
-            args, output.index, output.text, False)
+        if args.use_harmony:
+            parser = args.harmony_parsers[output.index]
+            for token in output.token_ids:
+                parser.process(token)
+            msg = parser.messages
+            if len(msg) == 0:
+                # The generation has stopped during reasoning.
+                reasoning_text = parser.current_content
+                text = None
+            elif len(msg) == 1:
+                # The generation has stopped during final message.
+                reasoning_text = msg[0].content[0].text
+                text = parser.current_content
+            else:
+                if len(msg) != 2:
+                    raise ValueError(
+                        "Expected 2 output messages (reasoning and final), "
+                        f"but got {len(msg)}.")
+                reasoning_msg, final_msg = msg
+                reasoning_text = reasoning_msg.content[0].text
+                text = final_msg.content[0].text
+        else:
+            _, text, reasoning_text = apply_reasoning_parser(
+                args, output.index, output.text, False)
 
         if args.tool_choice and isinstance(
                 args.tool_choice,

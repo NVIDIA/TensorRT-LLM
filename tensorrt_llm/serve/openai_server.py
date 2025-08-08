@@ -15,6 +15,7 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.routing import Mount
+from openai_harmony import HarmonyEncodingName, load_harmony_encoding
 from transformers import AutoConfig, AutoProcessor
 
 from tensorrt_llm._tensorrt_engine import LLM
@@ -300,6 +301,13 @@ class OpenAIServer:
             # TODO: better way to enable metrics
             if len(os.getenv("TRTLLM_KVCACHE_TIME_OUTPUT_PATH", "")) > 0:
                 sampling_params.return_perf_metrics = True
+            if request.use_harmony:
+                encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
+                harmony_stop_token_ids = encoding.stop_tokens_for_assistant_actions()
+                if stop_token_ids := sampling_params.stop_token_ids:
+                    stop_token_ids += harmony_stop_token_ids
+                else:
+                    stop_token_ids = harmony_stop_token_ids
             postproc_args = ChatPostprocArgs.from_request(request)
             disaggregated_params = to_llm_disaggregated_params(request.disaggregated_params)
 
