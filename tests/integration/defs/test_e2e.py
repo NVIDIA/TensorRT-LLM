@@ -1584,18 +1584,20 @@ def test_build_time_benchmark_sanity(llm_root, llm_venv):
 
 
 ### PyTorch examples
+
+
 def parse_output(text):
     results = []
     text_lists = re.split(r"\[\d+\] Prompt:", text)
     for item in text_lists:
         item = item.replace(os.linesep, "")
         while True:
-            match = re.search(r"Generated text: [\"'](.*?)[\"']", item,
+            match = re.search(r"(Generated text: \'(.*?)\')", item,
                               re.MULTILINE)
             if match is None:
                 break
             _, end = match.span(1)
-            results.append(match.group(1))
+            results.append(match.group(2))
             item = item[end:]
     return results
 
@@ -2537,8 +2539,8 @@ def test_ptp_quickstart_multimodal_multiturn(llm_root, llm_venv, model_name,
     accuracy_inputs = {
         "image": {
             "prompt": [
-                "user: Describe what you see in this image.",
-                "user: How would you describe the atmosphere of this scene?",
+                "Describe what you see in this image.",
+                "How would you describe the atmosphere of this scene?",
             ],
             "media": [
                 str(test_data_root / "inpaint.png"),
