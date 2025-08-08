@@ -640,6 +640,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 dtype=torch.int32,
                 device='cuda',
             )
+
             self.host_kv_cache_block_offsets = torch.empty_like(
                 self.kv_cache_block_offsets,
                 device='cpu',
@@ -697,6 +698,180 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     device='cpu',
                     pin_memory=True,
                 )
+
+    def get_runtime_buffers(self):
+        buffers = {
+            "prompt_lens_cuda": self.prompt_lens_cuda,
+            "kv_lens_cuda": self.kv_lens_cuda,
+            "kv_lens": self.kv_lens,
+            "workspace": self.workspace
+        }
+
+        if self.kv_cache_manager is not None:
+            buffers["kv_cache_block_offsets"] = self.kv_cache_block_offsets
+
+            if self.enable_flash_mla:
+                buffers["block_ids_per_seq"] = self.block_ids_per_seq
+                buffers["kv_block_ids_per_seq"] = self.kv_block_ids_per_seq
+
+            if self.enable_paged_context_mla:
+                buffers[
+                    "ctx_cached_token_indptr"] = self.ctx_cached_token_indptr
+                buffers[
+                    "ctx_uncached_token_indptr"] = self.ctx_uncached_token_indptr
+                buffers["ctx_kv_indptr"] = self.ctx_kv_indptr
+
+        return buffers
+
+    def __post_init_with_buffers__(self, buffers) -> None:
+        super().__post_init__()
+
+        # Set a default value, as max_num_sequences is not always set.
+        if self.max_num_sequences is None:
+            self.max_num_sequences = self.max_num_requests
+
+        def get_cache_maybe_with_buffer(like, buffers, cache_name):
+            target = None
+            if buffers is not None and isinstance(
+                    buffers, dict) and cache_name in buffers:
+                cache_buffers = buffers[cache_name]
+                for cache in cache_buffers:
+                    if like.dim() == 1:
+                        if cache.numel() >= like.numel():
+                            target = cache
+                            break
+                    else:
+                        quotient, remainder = divmod(cache.numel(),
+                                                     like.numel())
+                        if quotient >= 1 and remainder == 0:
+                            target = cache
+                            break
+
+            if target == None:
+                target = torch.empty_like(
+                    like,
+                    device='cuda',
+                )
+            return target
+
+        self.prompt_lens_cpu = torch.empty(
+            (self.max_num_sequences, ),
+            device='cpu',
+            dtype=torch.int,
+            pin_memory=True,
+        )
+
+        self.prompt_lens_cuda = get_cache_maybe_with_buffer(
+            self.prompt_lens_cpu, buffers, "prompt_lens_cuda")
+
+        self.kv_lens = torch.empty_like(self.prompt_lens_cuda,
+                                        device='cpu',
+                                        pin_memory=True)
+
+        self.kv_lens_cuda = get_cache_maybe_with_buffer(self.kv_lens, buffers,
+                                                        "kv_lens_cuda")
+
+        self.host_request_types = torch.empty_like(self.prompt_lens_cpu)
+
+        if self.workspace is None:
+            if "workspace" in buffers:
+                self.workspace = buffers['workspace'][0]
+            else:
+                self.workspace = torch.empty(
+                    (0, ),
+                    device='cuda',
+                    dtype=torch.int8,
+                )
+
+        if self.kv_cache_manager is not None:
+            self.host_kv_cache_block_offsets = torch.empty(
+                [
+                    self.kv_cache_manager.num_pools, self.max_num_sequences, 2,
+                    self.kv_cache_manager.max_blocks_per_seq
+                ],
+                device='cpu',
+                dtype=torch.int32,
+                pin_memory=True,
+            )
+
+            self.kv_cache_block_offsets = get_cache_maybe_with_buffer(
+                self.host_kv_cache_block_offsets, buffers,
+                "kv_cache_block_offsets")
+
+            self.block_ids_per_seq = None
+            self.kv_block_ids_per_seq = None
+            if self.enable_flash_mla:
+
+                if "block_ids_per_seq" in buffers:
+                    id_caches = buffers["block_ids_per_seq"]
+                    target_size = self.kv_cache_manager.max_batch_size * self.kv_cache_manager.max_blocks_per_seq
+                    for cache in id_caches:
+                        quotient, remainder = divmod(cache.numel(), target_size)
+                        if quotient >= 1 and remainder == 0:
+                            self.block_ids_per_seq = cache
+                            break
+
+                if self.block_ids_per_seq == None:
+                    self.block_ids_per_seq = torch.empty(
+                        [
+                            self.kv_cache_manager.max_batch_size,
+                            self.kv_cache_manager.max_blocks_per_seq
+                        ],
+                        dtype=torch.int32,
+                        device='cuda',
+                    )
+
+                if "kv_block_ids_per_seq" in buffers:
+                    ids_per_seq_caches = buffers["kv_block_ids_per_seq"]
+                    target_size = self.kv_cache_manager.max_batch_size * self.kv_cache_manager.max_blocks_per_seq
+                    for cache in ids_per_seq_caches:
+                        quotient, remainder = divmod(cache.numel(), target_size)
+                        if quotient >= 1 and remainder == 0:
+                            self.kv_block_ids_per_seq = cache
+
+                if self.kv_block_ids_per_seq == None:
+                    self.kv_block_ids_per_seq = torch.zeros(
+                        [
+                            self.kv_cache_manager.max_batch_size,
+                            self.kv_cache_manager.max_blocks_per_seq
+                        ],
+                        dtype=torch.int32,
+                        device='cuda',
+                    )
+
+            if self.enable_paged_context_mla:
+                # for kv cache reuse/chunked context in MLA
+                self.host_ctx_cached_token_indptr = torch.zeros(
+                    (self.max_num_requests + 1, ),
+                    device='cpu',
+                    dtype=torch.int64,
+                    pin_memory=True,
+                )
+
+                self.ctx_cached_token_indptr = get_cache_maybe_with_buffer(
+                    self.host_ctx_cached_token_indptr, buffers,
+                    "ctx_cached_token_indptr")
+
+                self.host_ctx_uncached_token_indptr = torch.zeros(
+                    (self.max_num_requests + 1, ),
+                    device='cpu',
+                    dtype=torch.int64,
+                    pin_memory=True,
+                )
+
+                self.ctx_uncached_token_indptr = get_cache_maybe_with_buffer(
+                    self.host_ctx_uncached_token_indptr, buffers,
+                    "ctx_uncached_token_indptr")
+
+                self.host_ctx_kv_indptr = torch.zeros(
+                    (self.max_num_requests + 1, ),
+                    device='cpu',
+                    dtype=torch.int64,
+                    pin_memory=True,
+                )
+
+                self.ctx_kv_indptr = get_cache_maybe_with_buffer(
+                    self.host_ctx_kv_indptr, buffers, "ctx_kv_indptr")
 
     def prepare(self) -> None:
         extra_attrs = get_model_extra_attrs()
@@ -764,6 +939,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 self.host_kv_cache_block_offsets,
                 self.request_ids[self.num_contexts:], self.beam_width,
                 self.num_contexts)
+            host_kv_shape = self.host_kv_cache_block_offsets.shape
+            self.kv_cache_block_offsets.view(host_kv_shape[0], -1,
+                                             host_kv_shape[2], host_kv_shape[3])
             self.kv_cache_block_offsets[:, :self.num_seqs].copy_(
                 self.host_kv_cache_block_offsets[:, :self.num_seqs],
                 non_blocking=True)
