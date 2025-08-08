@@ -1,0 +1,98 @@
+# See https://confluence.nvidia.com/display/PRODSEC/AllowList for usage patterns.
+
+version = "1.0.0"
+
+[[pulse-trufflehog.files]]
+file = "jenkins/L0_Test.groovy"
+
+  [[pulse-trufflehog.files.secrets]]
+  type = "sshpass"
+  values = ["ssh********************sswd"]
+
+  [[pulse-trufflehog.files.secrets]]
+  type = "sshpass"
+  values = ["ssh**************WORD"]
+
+[[pulse-trufflehog.files]]
+file = "jenkins/L0_MergeRequest.groovy"
+
+  [[pulse-trufflehog.files.secrets]]
+  type = "Password"
+  values = ["pas**********************ASS\""]
+
+[[pulse-trufflehog.files]]
+file = "jenkins/L0_PostMerge.groovy"
+
+  [[pulse-trufflehog.files.secrets]]
+  type = "Password"
+  values = ["pas**********************ASS\""]
+
+[[pulse-trufflehog.files]]
+file = "jenkins/L0_MergeRequest_WindowsTest.groovy"
+
+  [[pulse-trufflehog.files.secrets]]
+  type = "Password"
+  values = ["pas**********************ASS\""]
+
+[[pulse-trufflehog.files]]
+file = "jenkins/L0_MergeRequest_WindowsBuildBuild.groovy"
+
+  [[pulse-trufflehog.files.secrets]]
+  type = "Password"
+  values = ["pas**********************ASS\""]
+
+[[pulse-trufflehog.files]]
+file = "jenkins/L0_MergeRequest_WindowsBuild.groovy"
+
+  [[pulse-trufflehog.files.secrets]]
+  type = "Password"
+  values = ["pas**********************ASS\""]
+
+[[pulse-trufflehog.files]]
+file = "jenkins/Parameterized.groovy"
+
+  [[pulse-trufflehog.files.secrets]]
+  type = "Password"
+  values = ["pas**********************ASS\""]
+
+[[pulse-trufflehog.files]]
+file = "jenkins/L0_Parameterized.groovy"
+
+  [[pulse-trufflehog.files.secrets]]
+  type = "Password"
+  values = ["pas**********************ASS\""]
+
+[[pulse-trufflehog.files]]
+file = "jenkins/L0_L1_Nighty_WindowsTest.groovy"
+
+  [[pulse-trufflehog.files.secrets]]
+  type = "Password"
+  values = ["pas**********************ASS\""]
+
+[[pulse-trufflehog.files]]
+file = "jenkins/L1_Nightly.groovy"
+
+  [[pulse-trufflehog.files.secrets]]
+  type = "Password"
+  values = ["pas**********************ASS\""]
+
+[[pulse-trufflehog.files]]
+file = "jenkins/TRT_Dependency.groovy"
+
+  [[pulse-trufflehog.files.secrets]]
+  type = "Password"
+  values = ["pas**********************ASS\""]
+
+[[pulse-trufflehog.files]]
+file = "jenkins/GH200Builder.groovy"
+
+  [[pulse-trufflehog.files.secrets]]
+  type = "Password"
+  values = ["pas**********************ASS\""]
+
+[[pulse-trufflehog.files]]
+file = "jenkins/L1_Nightly_GH200RemoteJob.groovy"
+
+  [[pulse-trufflehog.files.secrets]]
+  type = "Password"
+  values = ["pas**********************ASS\""]
