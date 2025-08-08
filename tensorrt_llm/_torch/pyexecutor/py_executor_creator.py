@@ -33,6 +33,7 @@ from .py_executor import PyExecutor
 class _ExecutorCreationStage(enum.Enum):
     SAMPLER = "Sampler"
     DRAFTER = "Drafter"
+    GUIDED_DECODER = "Guided decoder"
     INIT_KV_CACHE = "Initial KV cache (temporary for KV cache size estimation)"
     INIT_EXTRA_RESOURCES = "Additional executor resources (temporary for KV cache size estimation)"
     MODEL_EXTRA = "Model resources created during usage"
@@ -168,6 +169,14 @@ def _mangle_executor_config(executor_config: ExecutorConfig):
             f"Disabling chunked context for {pytorch_backend_config.attn_backend} backend"
         )
         executor_config.enable_chunked_context = False
+
+    spec_config = executor_config.speculative_config
+    if not executor_config.pytorch_backend_config.disable_overlap_scheduler and spec_config is not None:
+        if not spec_config.spec_dec_mode.support_overlap_scheduler():
+            logger.warning(
+                f"Disable overlap scheduler for speculation mode {spec_config.spec_dec_mode.name}"
+            )
+            executor_config.pytorch_backend_config.disable_overlap_scheduler = True
 
 
 def _get_mapping(executor_config: ExecutorConfig) -> Mapping:
@@ -326,20 +335,27 @@ def create_py_executor(
     else:
         ctx_chunk_config = None
 
+    with mem_monitor.observe_creation_stage(
+            _ExecutorCreationStage.GUIDED_DECODER):
+        guided_decoder: Optional[GuidedDecoder] = None
+        if executor_config.guided_decoding_config is not None:
+            if spec_config is not None and not has_spec_drafter:
+                raise ValueError(
+                    "Guided decoding is only supported with speculative decoding that has a dedicated drafter (two-model engine)."
+                )
+            if mapping.is_last_pp_rank():
+                max_num_draft_tokens = 0
+                if spec_config is not None:
+                    max_num_draft_tokens = spec_config.max_draft_len
+                guided_decoder = GuidedDecoder(
+                    executor_config.guided_decoding_config,
+                    executor_config.max_batch_size,
+                    model_engine.model.vocab_size_padded,
+                    max_num_draft_tokens=max_num_draft_tokens)
+
     with mem_monitor.observe_creation_stage(_ExecutorCreationStage.SAMPLER):
         sampler = instantiate_sampler(model_engine, executor_config,
                                       pytorch_backend_config, mapping)
-
-    guided_decoder: Optional[GuidedDecoder] = None
-    if executor_config.guided_decoding_config is not None:
-        if spec_config is not None:
-            raise ValueError(
-                "Guided decoding is not supported with speculative decoding.")
-        if mapping.is_last_pp_rank():
-            guided_decoder = GuidedDecoder(
-                executor_config.guided_decoding_config,
-                executor_config.max_batch_size,
-                model_engine.model.vocab_size_padded)
 
     resources = {}
     estimating_kv_cache = False
@@ -368,8 +384,11 @@ def create_py_executor(
 
     # Drafter for speculative decoding
     with mem_monitor.observe_creation_stage(_ExecutorCreationStage.DRAFTER):
-        drafter = get_spec_drafter(model_engine, draft_model_engine, sampler,
-                                   spec_resource_manager)
+        drafter = get_spec_drafter(model_engine,
+                                   draft_model_engine,
+                                   sampler,
+                                   spec_resource_manager=spec_resource_manager,
+                                   guided_decoder=guided_decoder)
 
     with mem_monitor.observe_creation_stage(
             _ExecutorCreationStage.INIT_EXTRA_RESOURCES

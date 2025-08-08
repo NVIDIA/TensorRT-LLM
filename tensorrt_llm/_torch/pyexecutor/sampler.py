@@ -97,7 +97,7 @@ class EarlyStopSampler(Sampler):
                 request.py_result.append_context_logits(logits)
 
 
-def top_k_sampling_batch(logits, top_k=50):
+def top_k_sampling_batch(logits, top_k=50, generator: torch.Generator = None):
     logits_dim = logits.dim()
     if logits_dim == 1:
         logits = logits.unsqueeze(0)
@@ -116,15 +116,22 @@ def top_k_sampling_batch(logits, top_k=50):
     softmax = torch.softmax(logits, dim=-1)
 
     # sample from the distribution and generate result of [batch_size, 1]
-    next_tokens = torch.multinomial(softmax, num_samples=1).squeeze(-1)
+    next_tokens = torch.multinomial(softmax, num_samples=1,
+                                    generator=generator).squeeze(-1)
     return next_tokens, softmax
 
 
-def top_p_sampling_batch(logits: torch.Tensor, top_p: float = 0.9):
+def top_p_sampling_batch(logits: torch.Tensor,
+                         top_p: float = 0.9,
+                         temperature: float = 1.0,
+                         generator: torch.Generator = None):
     logits_dim = logits.dim()
     if logits_dim == 1:
         logits = logits.unsqueeze(0)
     assert logits_dim == 2, "logits should be 2D: [batch_size, vocab_size]"
+
+    if temperature != 0:
+        logits = logits / max(temperature, 1e-5)
 
     # sort the logits of each sample in descending order
     sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
@@ -147,7 +154,8 @@ def top_p_sampling_batch(logits: torch.Tensor, top_p: float = 0.9):
     softmax = torch.softmax(logits, dim=-1)
 
     # sample from the distribution and generate result of [batch_size, 1]
-    next_tokens = torch.multinomial(softmax, num_samples=1).squeeze(-1)
+    next_tokens = torch.multinomial(softmax, num_samples=1,
+                                    generator=generator).squeeze(-1)
     return next_tokens, softmax
 
 
@@ -158,7 +166,7 @@ def greedy_search_sampling_batch(logits):
 
 
 TopK = tuple[Literal["top_k"], int]
-TopP = tuple[Literal["top_p"], float]
+TopP = tuple[Literal["top_p"], float, float]
 Greedy = tuple[Literal["greedy"], None]
 GREEDY: Greedy = ("greedy", None)
 Strategy = TopK | TopP | Greedy
@@ -167,7 +175,8 @@ Strategy = TopK | TopP | Greedy
 def request_strategy(request: LlmRequest) -> Strategy:
     if request.sampling_config.top_p is not None and len(
             request.sampling_config.top_p) > 0:
-        return ("top_p", request.sampling_config.top_p[0])
+        return ("top_p", request.sampling_config.top_p[0],
+                request.sampling_config.temperature[0])
     elif request.sampling_config.top_k is not None and len(
             request.sampling_config.top_k) > 0:
         return ("top_k", request.sampling_config.top_k[0])
@@ -179,12 +188,14 @@ def sampling_strategies(requests: Iterable[LlmRequest]) -> list[Strategy]:
     return [request_strategy(req) for req in requests]
 
 
-def sample(strategy: Strategy, logits: torch.Tensor):
+def sample(strategy: Strategy,
+           logits: torch.Tensor,
+           generator: torch.Generator = None):
     match strategy:
         case ("top_k", top_k):
-            return top_k_sampling_batch(logits, top_k)
-        case ("top_p", top_p):
-            return top_p_sampling_batch(logits, top_p)
+            return top_k_sampling_batch(logits, top_k, generator)
+        case ("top_p", top_p, temperature):
+            return top_p_sampling_batch(logits, top_p, temperature, generator)
         case ("greedy", None):
             return greedy_search_sampling_batch(logits)
 
@@ -239,6 +250,25 @@ class TorchSampler(Sampler):
         # So, we temporarily exit inference mode.
         with torch.inference_mode(False):
             self.store = self.create_store()
+
+        # Initialize seed for multi-GPU consistency
+        self._global_seed = 42
+        self._generator = None
+
+    def get_generator(self, device: torch.device) -> torch.Generator:
+        """Get a deterministic generator for the specified device.
+
+        Args:
+            device: The device to create the generator on
+
+        Returns:
+            A torch.Generator with the global seed set
+        """
+        if self._generator is None:
+            # Fallback to a default seed if not set
+            self._generator = torch.Generator(device=device)
+            self._generator.manual_seed(self._global_seed)
+        return self._generator
 
     def _meet_max_token_stop_criteria(self, request: LlmRequest):
         num_tokens = request.get_num_tokens(self.BEAM)
@@ -302,20 +332,83 @@ class TorchSampler(Sampler):
             request.py_result.append_log_probs([token_log_probs])
 
     def process_draft_tokens(self, request: LlmRequest,
-                             new_tokens: torch.Tensor, new_token: int) -> int:
-        num_accepted = 0
-        for draft_token in request.py_draft_tokens:
-            if draft_token != new_token:
-                # Reject.
-                break
-            num_accepted += 1
-            new_token = add_token(request,
-                                  new_tokens,
-                                  beam=self.BEAM,
-                                  step=num_accepted)
-            if self._handle_stop_criteria(request, new_token):
-                break
-        return num_accepted
+                             new_tokens: torch.Tensor) -> int:
+        if request.py_draft_logits is None:
+            new_token = add_token(request, new_tokens, beam=self.BEAM)
+            stop = self._handle_stop_criteria(request, new_token)
+            if stop or len(request.py_draft_tokens) == 0:
+                return 0
+            num_accepted = 0
+
+            for draft_token in request.py_draft_tokens:
+                if draft_token != new_token:
+                    # Reject.
+                    break
+
+                num_accepted += 1
+                new_token = add_token(request,
+                                      new_tokens,
+                                      beam=self.BEAM,
+                                      step=num_accepted)
+                if self._handle_stop_criteria(request, new_token):
+                    break
+            return num_accepted
+        else:
+            sampling_strategy = request_strategy(request)
+            generator = self.get_generator(request.py_draft_logits.device)
+            _, draft_probs = sample(sampling_strategy,
+                                    request.py_draft_logits[0],
+                                    generator=generator)
+            target_probs = request.py_target_probs
+            p = draft_probs[torch.arange(len(request.py_draft_tokens)),
+                            request.py_draft_tokens]
+            q = target_probs[:-1]
+            q = q[torch.arange(len(request.py_draft_tokens)),
+                  request.py_draft_tokens]
+            accept_probs = torch.minimum(torch.ones(()), q / p)
+            # Use deterministic random generation for multi-GPU consistency
+            rejected_indices = (torch.rand(accept_probs.shape,
+                                           generator=generator,
+                                           device=accept_probs.device)
+                                > accept_probs).nonzero()
+            sample_last = True
+            stop = False
+            if rejected_indices.numel() == 0:
+                num_initially_accepted = len(request.py_draft_tokens)
+                sample_last = False
+            else:
+                num_initially_accepted = rejected_indices[0].item()
+            num_accepted = num_initially_accepted
+            for i in range(num_accepted):
+                new_token = request.py_draft_tokens[i]
+                new_tokens[i, request.seq_slot, self.BEAM] = new_token
+                request.add_new_token(new_token, self.BEAM)
+                stop = self._handle_stop_criteria(request, new_token)
+                if stop:
+                    num_accepted = i + 1
+                    break
+            if not stop and sample_last:
+                last_draft = draft_probs[num_accepted]
+                last_target = target_probs[num_accepted]
+                new = last_target - last_draft
+                new = torch.where(new > 0, new, 0.0)
+
+                new_token = torch.multinomial(new,
+                                              num_samples=1,
+                                              generator=generator).squeeze(-1)
+
+                new_tokens[num_accepted, request.seq_slot,
+                           self.BEAM] = new_token
+                request.add_new_token(new_token, self.BEAM)
+                stop = self._handle_stop_criteria(request, new_token)
+            elif not stop and not sample_last:
+                new_token = add_token(request,
+                                      new_tokens,
+                                      beam=self.BEAM,
+                                      step=num_accepted)
+                stop = self._handle_stop_criteria(request, new_token)
+
+            return num_accepted
 
     def update_requests(self, state: SampleState) -> None:
         assert isinstance(state, SampleState)
@@ -334,15 +427,12 @@ class TorchSampler(Sampler):
         for req in state.scheduled_requests.generation_requests:
             if req.state == LlmRequestState.GENERATION_COMPLETE:
                 continue
-            new_token = add_token(req, new_tokens, beam=self.BEAM)
-            stop = self._handle_stop_criteria(req, new_token)
             processed = 1
-            if not stop and get_draft_token_length(req) > 0:
-                num_accepted = self.process_draft_tokens(
-                    req, new_tokens, new_token)
+            num_accepted = self.process_draft_tokens(req, new_tokens)
+            if get_draft_token_length(req) > 0:
                 req.py_num_accepted_draft_tokens = num_accepted
                 req.py_rewind_len = req.py_draft_pages_allocated - num_accepted
-                processed += num_accepted
+            processed += num_accepted
             self.handle_logits(req, state, beam=self.BEAM, count=processed)
             req.py_decoding_iter += 1
 
@@ -480,7 +570,7 @@ class TorchSampler(Sampler):
                 batched_strategy = strategies[0]
             else:
                 batched_strategy = None
-
+        generator = self.get_generator(raw_logits.device)
         if batched_strategy is not None:
             logits = raw_logits[:sum_steps]
             # Collect steps per request for batched strategy
@@ -490,12 +580,12 @@ class TorchSampler(Sampler):
             logits = self._apply_embedding_bias(logits, requests,
                                                 steps_per_request)
             batched_next_tokens, batched_softmax = sample(
-                batched_strategy, logits)
+                batched_strategy, logits, generator)
             self.append_eagle3(batched_next_tokens, model_outputs)
 
         offset = 0
-        for i, (strategy, slot,
-                steps) in enumerate(zip(strategies, seq_slots, num_steps)):
+        for i, (strategy, slot, steps, request) in enumerate(
+                zip(strategies, seq_slots, num_steps, requests)):
             input_slice = slice(offset, offset + steps)
             logits = raw_logits[input_slice]
 
@@ -503,13 +593,16 @@ class TorchSampler(Sampler):
 
             if batched_next_tokens is None:
                 logits = self._apply_embedding_bias(logits, [req])
-                next_tokens, softmax = sample(strategy, logits)
+                next_tokens, softmax = sample(strategy, logits, generator)
             else:
                 # Batched processing already applied bias, just use the results
                 next_tokens = batched_next_tokens[input_slice]
                 softmax = batched_softmax[input_slice]
             current_slice = slice(0, steps), slot, beam
             new_tokens[current_slice] = next_tokens
+            if request.py_draft_logits is not None:
+                # Could be cleaner
+                request.py_target_probs = softmax.clone()
             if gen_logits_host is not None:
                 gen_logits_host[current_slice].copy_(logits, non_blocking=True)
             if log_probs_host is not None:

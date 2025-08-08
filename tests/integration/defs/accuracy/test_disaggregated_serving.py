@@ -146,7 +146,8 @@ def launch_disaggregated_llm(disaggregated_server_config: Dict[str, Any],
               disaggregated_serving_config_path, "--server_start_timeout",
               "3600"
           ]) as disaggregated_server):
-        while True:
+        start_time = time.time()
+        while time.time() - start_time < 3600:
             time.sleep(1)
             try:
                 print("Checking health endpoint")
@@ -501,6 +502,10 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
 
     @pytest.mark.parametrize("overlap_scheduler", [False, True])
     def test_auto_dtype(self, overlap_scheduler):
+        pytest.skip(
+            "Currently we require full kvcache for variable sliding window. "
+            "This test only transfers the kvcache inside the sliding window.")
+
         ctx_server_config = {
             "disable_overlap_scheduler": True,
             "cuda_graph_config": None,
@@ -583,4 +588,6 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
                                       ctx_server_config, gen_server_config,
                                       self.MODEL_PATH) as llm:
             task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)

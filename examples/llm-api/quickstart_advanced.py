@@ -53,7 +53,7 @@ def add_llm_args(parser):
                         default='CUTLASS',
                         choices=[
                             'CUTLASS', 'TRTLLM', 'VANILLA', 'WIDEEP',
-                            'DEEPGEMM', 'CUTEDSL'
+                            'DEEPGEMM', 'CUTEDSL', 'TRITON'
                         ])
     parser.add_argument('--enable_attention_dp',
                         default=False,
@@ -243,8 +243,7 @@ def setup_llm(args, **kwargs):
         trust_remote_code=args.trust_remote_code,
         gather_generation_logits=args.return_generation_logits,
         max_beam_width=args.max_beam_width,
-        **kwargs,
-    )
+        **kwargs)
 
     use_beam_search = args.max_beam_width > 1
     best_of = args.best_of or args.n

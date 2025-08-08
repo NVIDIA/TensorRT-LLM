@@ -149,7 +149,7 @@ class CudaGraphConfig(StrictBaseModel):
 
         # Add powers of 2 up to max_batch_size
         batch_sizes += [
-            2**i for i in range(8, math.floor(math.log(max_batch_size, 2)))
+            2**i for i in range(8, math.ceil(math.log(max_batch_size, 2)))
         ]
 
         # Filter and sort batch sizes
@@ -168,8 +168,9 @@ class MoeConfig(StrictBaseModel):
     Configuration for MoE.
     """
     backend: Literal["CUTLASS", "CUTEDSL", "WIDEEP", "TRTLLM", "DEEPGEMM",
-                     "VANILLA"] = Field(default='CUTLASS',
-                                        description="MoE backend to use.")
+                     "VANILLA",
+                     "TRITON"] = Field(default='CUTLASS',
+                                       description="MoE backend to use.")
 
     max_num_tokens: Optional[int] = Field(
         default=None,
@@ -341,6 +342,11 @@ class DecodingBaseConfig(StrictBaseModel):
     max_draft_len: Optional[int] = None
     speculative_model_dir: Optional[Union[str, Path]] = None
 
+    # PyTorch only.
+    # When specified, speculation will be disabled at batch sizes above
+    # this value. Otherwise, speculation will always be on.
+    max_concurrency: Optional[int] = None
+
     @classmethod
     def from_dict(cls, data: dict):
         # dispatch to the correct decoding config
@@ -468,9 +474,6 @@ class NGramDecodingConfig(DecodingBaseConfig):
     is_keep_all: bool = True
     is_use_oldest: bool = True
     is_public_pool: bool = True
-    # Flag to indicate the NGramDecodingConfig is instantiated by auto heuristic.
-    # User should not set this flag. Use AutoDecodingConfig instead.
-    is_auto_heuristic: bool = False
 
     @classmethod
     def from_dict(cls, data: dict):
@@ -534,13 +537,10 @@ class AutoDecodingConfig(DecodingBaseConfig):
     """
     Configuration for auto speculative decoding.
 
-    This config is used to automatically select the best speculative decoding algorithm.
+    This config will automatically select a good, draft-model free
+    speculation algorithm with some heuristic.
 
-    According to benchmark results, the best algorithm in general is NGRAM with low concurrency <= 32.
-    Default heuristic:
-        With concurrency <= 4, max_draft_len = 5, max_matching_ngram_size = 3
-        With concurrency <= 32, max_draft_len = 3, max_matching_ngram_size = 5
-        With concurrency > 32, speculative decoding is disabled.
+    Attributes that are inherited from the base class are ignored.
     """
 
     @classmethod
@@ -969,6 +969,11 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         description=
         "Maximum size of the event buffer. If set to 0, the event buffer will not be used."
     )
+    attention_dp_events_gather_period_ms: int = Field(
+        default=5,
+        description=
+        "The period in milliseconds to gather attention DP events across ranks."
+    )
     enable_partial_reuse: bool = Field(
         default=True,
         description=
@@ -999,7 +1004,10 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             event_buffer_max_size=self.event_buffer_max_size,
             enable_partial_reuse=self.enable_partial_reuse,
             copy_on_partial_reuse=self.copy_on_partial_reuse,
-            use_uvm=self.use_uvm)
+            use_uvm=self.use_uvm,
+            attention_dp_events_gather_period_ms=self.
+            attention_dp_events_gather_period_ms,
+        )
 
 
 @PybindMirror.mirror_pybind_fields(_ExtendedRuntimePerfKnobConfig)
@@ -2090,14 +2098,12 @@ class TorchLlmArgs(BaseLlmArgs):
         status="prototype",
     )
 
-    allreduce_strategy: Optional[
-        Literal['AUTO', 'NCCL', 'UB', 'MINLATENCY', 'ONESHOT', 'TWOSHOT',
-                'LOWPRECISION', 'MNNVL']] = Field(
-                    default='AUTO',
-                    description="Allreduce strategy to use.",
-                    status="beta",
-                )
-
+    allreduce_strategy: Optional[Literal[
+        'AUTO', 'NCCL', 'UB', 'MINLATENCY', 'ONESHOT', 'TWOSHOT',
+        'LOWPRECISION', 'MNNVL',
+        'NCCL_SYMMETRIC']] = Field(default='AUTO',
+                                   description="Allreduce strategy to use.",
+                                   status="beta")
     checkpoint_loader: Optional[object] = Field(
         default=None,
         description="The checkpoint loader to use for this LLM instance.",
