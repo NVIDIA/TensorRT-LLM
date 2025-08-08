@@ -322,10 +322,14 @@ class PyTorchModelEngine(ModelEngine):
             and not self.enable_attention_dp)
 
         try:
+            use_ub_for_nccl = (
+                pytorch_backend_config.allreduce_strategy == "NCCL_SYMMETRIC"
+                and self._init_userbuffers(self.model.config.hidden_size))
             if pytorch_backend_config.torch_compile_enabled:
                 set_torch_compiling(True)
-                use_ub = pytorch_backend_config.torch_compile_enable_userbuffers and self._init_userbuffers(
-                    self.model.config.hidden_size)
+                use_ub = not use_ub_for_nccl and (
+                    pytorch_backend_config.torch_compile_enable_userbuffers
+                    and self._init_userbuffers(self.model.config.hidden_size))
                 self._torch_compile_backend = Backend(
                     pytorch_backend_config.torch_compile_inductor_enabled,
                     enable_userbuffers=use_ub,
@@ -453,7 +457,7 @@ class PyTorchModelEngine(ModelEngine):
                 'type'] == 'mrope'
         except Exception:
             pass
-        logger.info(f"Detected use_mrope: {use_mrope}")
+        logger.debug(f"Detected use_mrope: {use_mrope}")
         return use_mrope
 
     @property
@@ -842,8 +846,8 @@ class PyTorchModelEngine(ModelEngine):
             spec_resource_manager: Optional[BaseResourceManager] = None) -> int:
         can_run_cuda_graph = scheduled_requests.can_run_cuda_graph
         batch_size = scheduled_requests.batch_size
-        # The number of sequences in the batch is the number of prompts times the beam width.
-        new_batch_size = batch_size * self.max_beam_width
+        new_batch_size = batch_size
+
         if self._run_cuda_graphs and self.enable_attention_dp and self.mapping.tp_size > 1:
             graph_batch_size = self.dist.tp_allgather(
                 [can_run_cuda_graph, batch_size])
@@ -977,8 +981,8 @@ class PyTorchModelEngine(ModelEngine):
             self._cuda_graphs[batch_size] = {}
 
         self._cuda_graphs[batch_size][draft_len] = DecodingCUDAGraphRunner(
-            num_sequences_in_batch, "cuda", attn_metadata, spec_metadata,
-            self.use_mrope)
+            batch_size, "cuda", attn_metadata, spec_metadata, self.use_mrope,
+            self.max_beam_width)
         return self._cuda_graphs[batch_size][draft_len]
 
     def __del__(self) -> None:
@@ -1372,8 +1376,11 @@ class PyTorchModelEngine(ModelEngine):
                 gather_ids.append(len(position_ids) - 1)
 
             request_ids.append(request.py_request_id)
-            gen_request_seq_slots.append(request.py_seq_slot)
             request.py_batch_idx = request.py_seq_slot
+            # Do not add a gen_request_seq_slot for CUDA graph dummy requests
+            # to prevent access errors due to None values
+            if not request.is_cuda_graph_dummy:
+                gen_request_seq_slots.append(request.py_seq_slot)
 
         previous_batch_len = len(previous_batch_indices)
 
@@ -1502,7 +1509,7 @@ class PyTorchModelEngine(ModelEngine):
                 pin_memory=True,
             )
 
-        num_generation_requests = len(scheduled_requests.generation_requests)
+        num_generation_requests = len(gen_request_seq_slots)
         # Cache indirection is only used for beam search on generation requests
         if self.use_beam_search and num_generation_requests > 0:
             # CUDA Graph needs to set beam width during warmup (where the graph is captured), to ensure that cache indirection buffer is correctly picked up by the CUDA graph
@@ -2232,12 +2239,12 @@ class PyTorchModelEngine(ModelEngine):
         # Disable UB for unsupported platforms
         if not ub.ub_supported():
             return False
-        ub.initialize_userbuffers_manager(self.mapping.tp_size,
-                                          self.mapping.pp_size,
-                                          self.mapping.cp_size,
-                                          self.mapping.rank,
-                                          self.mapping.gpus_per_node,
-                                          hidden_size * self.max_num_tokens * 2)
+        use_nccl_symmetric = self.pytorch_backend_config.allreduce_strategy == "NCCL_SYMMETRIC"
+        ub.initialize_userbuffers_manager(
+            self.mapping.tp_size, self.mapping.pp_size, self.mapping.cp_size,
+            self.mapping.rank, self.mapping.gpus_per_node,
+            hidden_size * self.max_num_tokens * 2, use_nccl_symmetric)
+
         return True
 
     def load_weights_from_target_model(self,

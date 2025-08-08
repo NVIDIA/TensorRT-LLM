@@ -360,7 +360,7 @@ void CacheFormatter::format(TransferSession& session)
             }
             double cacheTransferTime
                 = std::max(0.0, std::chrono::duration<double, std::milli>(endTime - startTime).count());
-            kvCacheMeasureHelper.appendKVCacheTransfer(llmRequest.mRequestId, delay, cacheTransferTime, size);
+            session.appendMeasure(delay, cacheTransferTime, size);
         };
 
         if (connections.size() > 1)
@@ -712,7 +712,7 @@ void CacheFormatter::unformat(TransferSession& session)
                 }
                 double cacheTransferTime
                     = std::max(0.0, std::chrono::duration<double, std::milli>(endTime - startTime).count());
-                kvCacheMeasureHelper.appendKVCacheTransfer(ctxReqId, delay, cacheTransferTime, size);
+                session.appendMeasure(delay, cacheTransferTime, size);
             };
             if (pickUpConnections.size() > 1)
             {

@@ -127,6 +127,7 @@ MODEL_PATH_DICT = {
     "phi_4_multimodal_instruct_audio": "multimodals/Phi-4-multimodal-instruct",
     "bielik_11b_v2.2_instruct": "Bielik-11B-v2.2-Instruct",
     "bielik_11b_v2.2_instruct_fp8": "Bielik-11B-v2.2-Instruct-FP8",
+    "mistral_small_v3.1_24b": "Mistral-Small-3.1-24B-Instruct-2503",
 }
 # Model PATH of HuggingFace
 HF_MODEL_PATH = {
