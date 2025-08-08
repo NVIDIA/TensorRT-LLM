@@ -291,10 +291,10 @@ std::vector<torch::Tensor> run_fp4_block_scale_moe_runner(torch::Tensor const& r
 class FP4BlockScaleMoeRunner : public torch::CustomClassHolder
 {
 public:
-    explicit FP4BlockScaleMoeRunner(int64_t tileTokensDim, bool useTmaOobOpt)
+    explicit FP4BlockScaleMoeRunner(int64_t tileTokensDim)
         : mTileTokensDim(tileTokensDim)
     {
-        mRunner = std::make_unique<RunnerType>(mDtypeElt, mUseDeepSeekFp8, mTileTokensDim, useTmaOobOpt);
+        mRunner = std::make_unique<RunnerType>(mDtypeElt, mUseDeepSeekFp8, mTileTokensDim, true /* useTmaOobOpt */);
     }
 
     [[nodiscard]] int64_t getNumPrependTokensFc1OutputBuffer() const
@@ -363,7 +363,7 @@ torch::Tensor shuffleMatrix(torch::Tensor matrix, torch::Tensor permuteIndices)
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.class_<torch_ext::FP4BlockScaleMoeRunner>("FP4BlockScaleMoERunner")
-        .def(torch::init<int64_t, bool>())
+        .def(torch::init<int64_t>())
         .def("get_num_prepend_tokens_fc1_output_buffer",
             &torch_ext::FP4BlockScaleMoeRunner::getNumPrependTokensFc1OutputBuffer)
         .def("get_num_prepend_tokens_fc2_output_buffer",

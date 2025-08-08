@@ -58,8 +58,7 @@ class FP4BlockScaleMoERunner(TunableRunner):
                  topk_group: Optional[int], intermediate_size: int,
                  local_expert_offset: int, local_num_experts: int,
                  routed_scaling_factor: Optional[float], tile_tokens_dim: int,
-                 routing_method_type: int, do_finalize: bool,
-                 use_tma_oob_opt: bool):
+                 routing_method_type: int, do_finalize: bool):
 
         self.num_experts = num_experts
         self.top_k = top_k
@@ -72,7 +71,6 @@ class FP4BlockScaleMoERunner(TunableRunner):
         self.tile_tokens_dim = tile_tokens_dim
         self.routing_method_type = routing_method_type
         self.do_finalize = do_finalize
-        self.use_tma_oob_opt = use_tma_oob_opt
 
         FP4BlockScaleMoERunner.tuning_config = FP4BlockScaleMoERunner.get_tuning_config(
         )
@@ -82,13 +80,12 @@ class FP4BlockScaleMoERunner(TunableRunner):
             self.intermediate_size,
             self.local_num_experts,
             self.tile_tokens_dim,
-            self.use_tma_oob_opt,
         )
 
         if instance_key not in FP4BlockScaleMoERunner.runner_dict:
             FP4BlockScaleMoERunner.runner_dict[
                 instance_key] = torch.classes.trtllm.FP4BlockScaleMoERunner(
-                    tile_tokens_dim, use_tma_oob_opt)
+                    tile_tokens_dim)
 
         self.kernel_runner = FP4BlockScaleMoERunner.runner_dict[instance_key]
 
@@ -101,7 +98,6 @@ class FP4BlockScaleMoERunner(TunableRunner):
             self.intermediate_size,
             self.local_num_experts,
             self.tile_tokens_dim,
-            self.use_tma_oob_opt,
         ))
 
     # __eq__ and __hash__ must agree
@@ -112,8 +108,7 @@ class FP4BlockScaleMoERunner(TunableRunner):
         return (self.top_k == other.top_k
                 and self.intermediate_size == other.intermediate_size
                 and self.local_num_experts == other.local_num_experts
-                and self.tile_tokens_dim == other.tile_tokens_dim
-                and self.use_tma_oob_opt == other.use_tma_oob_opt)
+                and self.tile_tokens_dim == other.tile_tokens_dim)
 
     def forward(
         self,
@@ -267,7 +262,6 @@ def fp4_block_scale_moe_runner(routing_logits: torch.Tensor,
         tile_tokens_dim,
         routing_method_type,
         do_finalize,
-        True  # use_tma_oob_opt,
     )
 
     inputs = [
@@ -363,7 +357,7 @@ class FP8BlockScaleMoERunner(TunableRunner):
                  topk_group: int, intermediate_size: int,
                  local_expert_offset: int, local_num_experts: int,
                  routed_scaling_factor: float, tile_tokens_dim: int,
-                 routing_method_type: int, use_tma_oob_opt: bool):
+                 routing_method_type: int):
 
         self.num_experts = num_experts
         self.top_k = top_k
@@ -375,7 +369,6 @@ class FP8BlockScaleMoERunner(TunableRunner):
         self.routed_scaling_factor = routed_scaling_factor
         self.tile_tokens_dim = tile_tokens_dim
         self.routing_method_type = routing_method_type
-        self.use_tma_oob_opt = use_tma_oob_opt
 
         FP8BlockScaleMoERunner.tuning_config = FP8BlockScaleMoERunner.get_tuning_config(
         )
@@ -385,13 +378,12 @@ class FP8BlockScaleMoERunner(TunableRunner):
             self.intermediate_size,
             self.local_num_experts,
             self.tile_tokens_dim,
-            self.use_tma_oob_opt,
         )
 
         if instance_key not in FP8BlockScaleMoERunner.runner_dict:
             FP8BlockScaleMoERunner.runner_dict[
                 instance_key] = torch.classes.trtllm.FP8BlockScaleMoERunner(
-                    tile_tokens_dim, use_tma_oob_opt)
+                    tile_tokens_dim)
 
         self.kernel_runner = FP8BlockScaleMoERunner.runner_dict[instance_key]
 
@@ -404,7 +396,6 @@ class FP8BlockScaleMoERunner(TunableRunner):
             self.intermediate_size,
             self.local_num_experts,
             self.tile_tokens_dim,
-            self.use_tma_oob_opt,
         ))
 
     # __eq__ and __hash__ must agree
@@ -415,8 +406,7 @@ class FP8BlockScaleMoERunner(TunableRunner):
         return (self.top_k == other.top_k
                 and self.intermediate_size == other.intermediate_size
                 and self.local_num_experts == other.local_num_experts
-                and self.tile_tokens_dim == other.tile_tokens_dim
-                and self.use_tma_oob_opt == other.use_tma_oob_opt)
+                and self.tile_tokens_dim == other.tile_tokens_dim)
 
     def forward(
         self,
@@ -547,7 +537,6 @@ def fp8_block_scale_moe_runner(
         routed_scaling_factor,
         tile_tokens_dim,
         routing_method_type,
-        True,  # use_tma_oob_opt
     )
 
     inputs = [
@@ -624,9 +613,7 @@ class MxE4m3MxE2m1BlockScaleMoERunner(TunableRunner):
                  topk_group: Optional[int], intermediate_size: int,
                  hidden_size_output: int, local_expert_offset: int,
                  local_num_experts: int, routed_scaling_factor: Optional[float],
-                 tile_tokens_dim: int,
-                 routing_method_type: int, act_type: int,
-                 use_tma_oob_opt: bool):
+                 tile_tokens_dim: int, routing_method_type: int, act_type: int):
 
         self.num_experts = num_experts
         self.top_k = top_k
@@ -640,7 +627,6 @@ class MxE4m3MxE2m1BlockScaleMoERunner(TunableRunner):
         self.tile_tokens_dim = tile_tokens_dim
         self.routing_method_type = routing_method_type
         self.act_type = act_type
-        self.use_tma_oob_opt = use_tma_oob_opt
 
         MxE4m3MxE2m1BlockScaleMoERunner.tuning_config = MxE4m3MxE2m1BlockScaleMoERunner.get_tuning_config(
         )
@@ -652,14 +638,15 @@ class MxE4m3MxE2m1BlockScaleMoERunner(TunableRunner):
             self.local_num_experts,
             self.tile_tokens_dim,
             self.act_type,
-            self.use_tma_oob_opt,
         )
 
         if instance_key not in MxE4m3MxE2m1BlockScaleMoERunner.runner_dict:
             MxE4m3MxE2m1BlockScaleMoERunner.runner_dict[
                 instance_key] = torch.classes.trtllm.MxE4m3MxE2m1BlockScaleMoERunner(
-                    self.tile_tokens_dim, self.act_type, True,
-                    self.use_tma_oob_opt)
+                    self.tile_tokens_dim,
+                    self.act_type,
+                    True,  # isMxFp4
+                )
 
         self.kernel_runner = MxE4m3MxE2m1BlockScaleMoERunner.runner_dict[
             instance_key]
@@ -675,7 +662,6 @@ class MxE4m3MxE2m1BlockScaleMoERunner(TunableRunner):
             self.local_num_experts,
             self.tile_tokens_dim,
             self.act_type,
-            self.use_tma_oob_opt,
         ))
 
     # __eq__ and __hash__ must agree
@@ -688,8 +674,7 @@ class MxE4m3MxE2m1BlockScaleMoERunner(TunableRunner):
                 and self.hidden_size_output == other.hidden_size_output
                 and self.local_num_experts == other.local_num_experts
                 and self.tile_tokens_dim == other.tile_tokens_dim
-                and self.act_type == other.act_type
-                and self.use_tma_oob_opt == other.use_tma_oob_opt)
+                and self.act_type == other.act_type)
 
     def forward(
         self,
@@ -841,7 +826,6 @@ def mxe4m3_mxe2m1_block_scale_moe_runner(
         tile_tokens_dim,
         routing_method_type,
         act_type,
-        True  # use_tma_oob_opt,
     )
 
     input_tensors = [
@@ -898,8 +882,7 @@ class E4m3MxE2m1BlockScaleMoERunner(TunableRunner):
                  topk_group: Optional[int], intermediate_size: int,
                  local_expert_offset: int, local_num_experts: int,
                  routed_scaling_factor: Optional[float], tile_tokens_dim: int,
-                 routing_method_type: int, act_type: int,
-                 use_tma_oob_opt: bool):
+                 routing_method_type: int, act_type: int):
 
         self.num_experts = num_experts
         self.top_k = top_k
@@ -912,7 +895,6 @@ class E4m3MxE2m1BlockScaleMoERunner(TunableRunner):
         self.tile_tokens_dim = tile_tokens_dim
         self.routing_method_type = routing_method_type
         self.act_type = act_type
-        self.use_tma_oob_opt = use_tma_oob_opt
 
         E4m3MxE2m1BlockScaleMoERunner.tuning_config = E4m3MxE2m1BlockScaleMoERunner.get_tuning_config(
         )
@@ -928,8 +910,10 @@ class E4m3MxE2m1BlockScaleMoERunner(TunableRunner):
         if instance_key not in E4m3MxE2m1BlockScaleMoERunner.runner_dict:
             E4m3MxE2m1BlockScaleMoERunner.runner_dict[
                 instance_key] = torch.classes.trtllm.MxE4m3MxE2m1BlockScaleMoERunner(
-                    self.tile_tokens_dim, self.act_type, False,
-                    self.use_tma_oob_opt)
+                    self.tile_tokens_dim,
+                    self.act_type,
+                    False,  # isMxFp4
+                )
 
         self.kernel_runner = E4m3MxE2m1BlockScaleMoERunner.runner_dict[
             instance_key]
@@ -944,7 +928,6 @@ class E4m3MxE2m1BlockScaleMoERunner(TunableRunner):
             self.local_num_experts,
             self.tile_tokens_dim,
             self.act_type,
-            self.use_tma_oob_opt,
         ))
 
     # __eq__ and __hash__ must agree
@@ -956,8 +939,7 @@ class E4m3MxE2m1BlockScaleMoERunner(TunableRunner):
                 and self.intermediate_size == other.intermediate_size
                 and self.local_num_experts == other.local_num_experts
                 and self.tile_tokens_dim == other.tile_tokens_dim
-                and self.act_type == other.act_type
-                and self.use_tma_oob_opt == other.use_tma_oob_opt)
+                and self.act_type == other.act_type)
 
     def forward(
         self,
@@ -1076,7 +1058,6 @@ def e4m3_mxe2m1_block_scale_moe_runner(
         tile_tokens_dim,
         routing_method_type,
         act_type,
-        True  # use_tma_oob_opt,
     )
 
     input_tensors = [
@@ -1132,8 +1113,7 @@ class Bf16MxE2m1BlockScaleMoERunner(TunableRunner):
                  topk_group: Optional[int], intermediate_size: int,
                  local_expert_offset: int, local_num_experts: int,
                  routed_scaling_factor: Optional[float], tile_tokens_dim: int,
-                 routing_method_type: int, act_type: int,
-                 use_tma_oob_opt: bool):
+                 routing_method_type: int, act_type: int):
 
         self.num_experts = num_experts
         self.top_k = top_k
@@ -1146,7 +1126,6 @@ class Bf16MxE2m1BlockScaleMoERunner(TunableRunner):
         self.tile_tokens_dim = tile_tokens_dim
         self.routing_method_type = routing_method_type
         self.act_type = act_type
-        self.use_tma_oob_opt = use_tma_oob_opt
 
         Bf16MxE2m1BlockScaleMoERunner.tuning_config = Bf16MxE2m1BlockScaleMoERunner.get_tuning_config(
         )
@@ -1157,7 +1136,6 @@ class Bf16MxE2m1BlockScaleMoERunner(TunableRunner):
             self.local_num_experts,
             self.tile_tokens_dim,
             self.act_type,
-            self.use_tma_oob_opt,
         )
 
         if instance_key not in Bf16MxE2m1BlockScaleMoERunner.runner_dict:
@@ -1165,7 +1143,6 @@ class Bf16MxE2m1BlockScaleMoERunner(TunableRunner):
                 torch.classes.trtllm.Bf16MxE2m1BlockScaleMoERunner(
                     self.tile_tokens_dim,
                     self.act_type,
-                    self.use_tma_oob_opt,
                 ))
 
         self.kernel_runner = Bf16MxE2m1BlockScaleMoERunner.runner_dict[
@@ -1181,7 +1158,6 @@ class Bf16MxE2m1BlockScaleMoERunner(TunableRunner):
             self.local_num_experts,
             self.tile_tokens_dim,
             self.act_type,
-            self.use_tma_oob_opt,
         ))
 
     # __eq__ and __hash__ must agree
@@ -1193,8 +1169,7 @@ class Bf16MxE2m1BlockScaleMoERunner(TunableRunner):
                 and self.intermediate_size == other.intermediate_size
                 and self.local_num_experts == other.local_num_experts
                 and self.tile_tokens_dim == other.tile_tokens_dim
-                and self.act_type == other.act_type
-                and self.use_tma_oob_opt == other.use_tma_oob_opt)
+                and self.act_type == other.act_type)
 
     def forward(
         self,
@@ -1310,7 +1285,6 @@ def bf16_mxe2m1_block_scale_moe_runner(
         tile_tokens_dim,
         routing_method_type,
         act_type,
-        True  # use_tma_oob_opt,
     )
 
     input_tensors = [
