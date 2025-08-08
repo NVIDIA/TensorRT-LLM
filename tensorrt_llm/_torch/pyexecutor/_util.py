@@ -512,6 +512,10 @@ def create_py_executor_instance(
             lora_config.trtllm_modules_to_hf_modules)
 
     max_num_sequences = executor_config.max_batch_size * mapping.pp_size
+    # When max_num_sequences == 1, attention dp dummy request will prevent the scheduling of DISAGG_GENERATION_INIT.
+    # Enlarge slot and scheduler capacity to avoid DISAGG_GENERATION_INIT stuck in the scheduler.
+    if max_num_sequences == 1 and kv_cache_manager:
+        max_num_sequences += 1
 
     resources[ResourceManagerType.SEQ_SLOT_MANAGER] = SeqSlotManager(
         max_num_sequences)
@@ -564,6 +568,10 @@ def create_py_executor_instance(
 def create_torch_sampler_args(executor_config: ExecutorConfig, mapping: Mapping,
                               *, max_seq_len: int, enable_mixed_sampler: bool):
     max_num_sequences = executor_config.max_batch_size * mapping.pp_size
+    # When max_num_sequences == 1, attention dp dummy request will prevent the scheduling of DISAGG_GENERATION_INIT.
+    # Enlarge sampler size to align with slot and scheduler capacity.
+    if max_num_sequences == 1 and executor_config.kv_cache_config:
+        max_num_sequences += 1
     max_draft_len = (0 if executor_config.speculative_config is None else
                      executor_config.speculative_config.max_draft_len)
     return TorchSampler.Args(
