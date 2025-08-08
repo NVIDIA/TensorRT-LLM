@@ -1820,11 +1820,8 @@ __global__ void finalizeMoeRoutingKernel(GemmOutputType const* expanded_permuted
 #endif
 
 #pragma unroll
-    for (int elem_index = start_offset; elem_index < num_elems_in_padded_col; elem_index += stride)
+    for (int elem_index = start_offset; elem_index < num_elems_in_orig_col; elem_index += stride)
     {
-        if (elem_index >= num_elems_in_orig_col)
-            continue; // Skip writing beyond original columns
-
         ComputeElem thread_output;
         thread_output.fill(0);
         for (int k_idx = 0; k_idx < experts_per_token; ++k_idx)
@@ -3540,11 +3537,12 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
     void const* input_activations_void, void const* input_sf_void, bool const swizzled_input_sf,
     int const* token_selected_experts, float const* token_final_scales, void const* fc1_expert_weights_void,
     void const* fc1_expert_biases_void, ActivationParams fc1_activation_type, void const* fc2_expert_weights_void,
-    void const* fc2_expert_biases_void, QuantParams quant_params, int64_t const num_rows, int64_t const hidden_size, int64_t const orig_hidden_size,
-    int64_t const inter_size, int const full_num_experts, int const experts_per_token, char* workspace_ptr,
-    void* final_output_void, int* unpermuted_row_to_permuted_row, MOEParallelismConfig parallelism_config,
-    bool const enable_alltoall, bool use_lora, LoraParams& lora_params, bool use_deepseek_fp8_block_scale,
-    bool min_latency_mode, MoeMinLatencyParams& min_latency_params, cudaStream_t stream)
+    void const* fc2_expert_biases_void, QuantParams quant_params, int64_t const num_rows, int64_t const hidden_size,
+    int64_t const orig_hidden_size, int64_t const inter_size, int const full_num_experts, int const experts_per_token,
+    char* workspace_ptr, void* final_output_void, int* unpermuted_row_to_permuted_row,
+    MOEParallelismConfig parallelism_config, bool const enable_alltoall, bool use_lora, LoraParams& lora_params,
+    bool use_deepseek_fp8_block_scale, bool min_latency_mode, MoeMinLatencyParams& min_latency_params,
+    cudaStream_t stream)
 {
     static constexpr bool int_scales_required
         = std::is_same<WeightType, uint8_t>::value || std::is_same<WeightType, cutlass::uint4b_t>::value || use_wfp4a16;
