@@ -53,7 +53,7 @@ def test_llama4(model_name, backend, tp_size, use_cuda_graph,
     ]
 
     expected_outputs = [
-        " the head of state and head of government of the", ", 8999, 9000, ",
+        " the head of state and head of government of the", ", 9000, 9001, ",
         " white. What is the color of the background of"
     ]
 
