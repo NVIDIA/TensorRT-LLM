@@ -28,9 +28,9 @@ namespace kernels
 // == 2, we only copy curr_attn and curr_softmax_sum to merged_attn and merged_softmax_sum
 template <typename T>
 void invokeMergeAttnWithSoftmax(T* merged_attn, float* merged_softmax_stats, T const* pre_attn,
-    float const* pre_softmax_stats, T const* curr_attn, float const* curr_softmax_stats, float bmm1_scale,
-    int const batch_size, int64_t const* cu_q_seq_len, int max_q_seq_len, int64_t const* merge_op, int const num_heads,
-    int const head_size, cudaStream_t stream);
+    float const* pre_softmax_stats, T const* curr_attn, float const* curr_softmax_stats, int const batch_size,
+    int64_t const* cu_q_seq_len, int max_q_seq_len, int64_t const* merge_op, int const num_heads, int const head_size,
+    cudaStream_t stream);
 
 // load single chunk kv from kv_cache for each request
 template <typename T, typename TCache>

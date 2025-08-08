@@ -1201,10 +1201,6 @@ class MLA(nn.Module):
         origin_kv_lens_cuda_runtime = attn_metadata.kv_lens_cuda_runtime
         origin_kv_lens_runtime = attn_metadata.kv_lens_runtime
 
-        bmm1_scale = 1.0 / math.sqrt(
-            float(self.qk_nope_head_dim +
-                  self.qk_rope_head_dim)) if get_sm_version() == 100 else 1.0
-
         for loop_idx in range(chunked_loop_num):
             # {b, chunked_unit_size, h, kv_lora_rank + qk_rope_head_dim} zero padded
             # fetch `loop_idx` chunk from kv cache
@@ -1267,8 +1263,7 @@ class MLA(nn.Module):
             temp_merge_op = attn_metadata.merge_op_tensor[loop_idx]
             trtllm_attention.merge_attention_for_mla(
                 attn_output, temp_attn_output, self.softmax_stats_tensor,
-                self.temp_softmax_stats_tensor, bmm1_scale, temp_merge_op,
-                attn_metadata)
+                self.temp_softmax_stats_tensor, temp_merge_op, attn_metadata)
 
         # deal with the uncached kv
         kv = self.kv_b_proj(compressed_kv)
@@ -1317,8 +1312,7 @@ class MLA(nn.Module):
         trtllm_attention.merge_attention_for_mla(attn_output, temp_attn_output,
                                                  self.softmax_stats_tensor,
                                                  self.temp_softmax_stats_tensor,
-                                                 bmm1_scale, temp_merge_op,
-                                                 attn_metadata)
+                                                 temp_merge_op, attn_metadata)
         # copy back kv_lens_runtime and kv_lens_cuda_runtime
         attn_metadata.kv_lens_runtime = origin_kv_lens_runtime
         attn_metadata.kv_lens_cuda_runtime = origin_kv_lens_cuda_runtime
