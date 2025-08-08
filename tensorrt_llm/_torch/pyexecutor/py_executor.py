@@ -605,6 +605,42 @@ class PyExecutor:
                            stats: IterationStats,
                            req_stats: Optional[List[RequestStats]] = None):
 
+        # Calculate and log KV cache transfer metrics for disaggregated serving
+        if self.kv_cache_transceiver is not None and req_stats is not None:
+            # Collect KV cache transfer metrics from request stats
+            kv_transfer_times_ms = []
+            kv_transfer_sizes_bytes = []
+
+            for req_stat in req_stats:
+                if (req_stat.dis_serving_stats is not None and
+                        req_stat.dis_serving_stats.kv_cache_transfer_ms > 0):
+                    kv_transfer_times_ms.append(
+                        req_stat.dis_serving_stats.kv_cache_transfer_ms)
+                    kv_transfer_sizes_bytes.append(
+                        req_stat.dis_serving_stats.kv_cache_size)
+
+            # Log KV cache transfer metrics if any transfers occurred
+            if kv_transfer_times_ms:
+                num_transfers = len(kv_transfer_times_ms)
+                total_transfer_size_bytes = sum(kv_transfer_sizes_bytes)
+                avg_transfer_latency_ms = sum(
+                    kv_transfer_times_ms) / num_transfers
+
+                # Calculate total bandwidth (this naturally accounts for parallel transfers)
+                # When transfers happen in parallel, total bandwidth is higher - which is correct
+                total_transfer_time_s = sum(kv_transfer_times_ms) / 1000.0
+                total_bandwidth_gbps = (
+                    total_transfer_size_bytes * 8
+                ) / total_transfer_time_s / 1e9 if total_transfer_time_s > 0 else 0.0
+
+                total_transfer_size_gb = total_transfer_size_bytes / (1024**3)
+
+                logger.info(f"[KV Cache Transfer] Iteration {stats.iter}: "
+                            f"Transfers={num_transfers}, "
+                            f"Avg Latency={avg_transfer_latency_ms:.2f}ms, "
+                            f"Total Size={total_transfer_size_gb:.3f}GB, "
+                            f"Total Bandwidth={total_bandwidth_gbps:.2f}Gbps")
+
         try:
             self.stats_lock.acquire()
             self.stats.append((stats, req_stats))
