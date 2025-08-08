@@ -1405,12 +1405,14 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
 
                         _, v_b_proj_scale = split_kv_b_proj(kv_b_proj_scale,
                                                             is_scale=True)
-                        kv_b_proj_scale = transform_sf_into_required_layout(
-                            kv_b_proj_scale,
-                            mn=kv_b_proj.shape[0],
-                            k=kv_b_proj.shape[1],
-                            recipe=(1, 128, 128),
-                            is_sfa=False)
+                        if self.model_config.quant_config.layer_quant_mode.has_fp8_block_scales(
+                        ) and get_sm_version() == 100:
+                            kv_b_proj_scale = transform_sf_into_required_layout(
+                                kv_b_proj_scale,
+                                mn=kv_b_proj.shape[0],
+                                k=kv_b_proj.shape[1],
+                                recipe=(1, 128, 128),
+                                is_sfa=False)
                         module.weight_scale.copy_(
                             kv_b_proj_scale.reshape(module.weight_scale.shape))
                         attn_module.v_b_proj_scale = nn.Parameter(
@@ -1453,12 +1455,14 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
                             fused_a_scale = torch.cat(
                                 [q_a_proj_scale, fused_a_scale], dim=0)
 
-                        fused_a_scale = transform_sf_into_required_layout(
-                            fused_a_scale,
-                            mn=fused_a.shape[0],
-                            k=fused_a.shape[1],
-                            recipe=(1, 128, 128),
-                            is_sfa=False)
+                        if self.model_config.quant_config.layer_quant_mode.has_fp8_block_scales(
+                        ) and get_sm_version() == 100:
+                            fused_a_scale = transform_sf_into_required_layout(
+                                fused_a_scale,
+                                mn=fused_a.shape[0],
+                                k=fused_a.shape[1],
+                                recipe=(1, 128, 128),
+                                is_sfa=False)
                         module.weight_scale.data.copy_(fused_a_scale)
 
                     module.weight.data.copy_(fused_a)
