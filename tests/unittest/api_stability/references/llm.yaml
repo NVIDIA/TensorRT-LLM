@@ -107,10 +107,10 @@ methods:
         annotation: bool
         default: False
         status: beta
-      enable_trtllm_sampler:
+      use_torch_sampler:
         annotation: bool
         default: False
-        status: prototype
+        status: beta
       enable_iter_perf_stats:
         annotation: bool
         default: False

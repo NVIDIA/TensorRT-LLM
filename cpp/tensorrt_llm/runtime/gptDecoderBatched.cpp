@@ -72,11 +72,11 @@ void GptDecoderBatched::disableLookahead(RequestVector const& genRequests, Tenso
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void GptDecoderBatched::setup(executor::DecodingMode const& mode, SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
+void GptDecoderBatched::setup(executor::DecodingMode const& mode, SizeType32 maxNumSequences, SizeType32 maxBeamWidth,
     nvinfer1::DataType dtype, ModelConfig const& modelConfig, WorldConfig const& worldConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    TLLM_CHECK(maxBatchSize > 0);
+    TLLM_CHECK(maxNumSequences > 0);
     TLLM_CHECK(maxBeamWidth > 0);
 
     std::shared_ptr<SpeculativeDecodingModule const> speculativeDecodingModulePtr = nullptr;
@@ -92,8 +92,8 @@ void GptDecoderBatched::setup(executor::DecodingMode const& mode, SizeType32 max
     auto const vocabSize = modelConfig.getVocabSize();
     auto const vocabSizePadded = modelConfig.getVocabSizePadded(worldConfig.getSize());
 
-    mDecoder = IGptDecoder::create(mode, dtype, maxBatchSize, maxBeamWidth, vocabSize, vocabSizePadded, mDecoderStream,
-        speculativeDecodingModulePtr);
+    mDecoder = IGptDecoder::create(mode, dtype, maxNumSequences, maxBeamWidth, vocabSize, vocabSizePadded,
+        mDecoderStream, speculativeDecodingModulePtr);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }

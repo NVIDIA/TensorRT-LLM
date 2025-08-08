@@ -1319,7 +1319,9 @@ class PyExecutor:
             if req.is_disagg_generation_transmission_complete:
                 cache_trans_complete_requests.append(req)
         if len(cache_trans_complete_requests) > 0:
-            self._setup_sampler_step(cache_trans_complete_requests)
+            requests = ScheduledRequests()
+            requests.context_requests = cache_trans_complete_requests
+            self._setup_sampler_step(requests)
 
         for req in scheduled_batch.generation_requests:
             if req.is_disagg_generation_transmission_complete:
@@ -1473,7 +1475,7 @@ class PyExecutor:
             self._handle_errors(error_msg)
 
     @nvtx_range("_setup_sampler_step")
-    def _setup_sampler_step(self, requests):
+    def _setup_sampler_step(self, requests: ScheduledRequests):
         try:
             return self.sampler.setup_sampler_step(requests)
         except Exception as e:
