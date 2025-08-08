@@ -56,8 +56,6 @@ def generate_result_file_name(test_list: List[str],
 
 def generate_excluded_test_list(test_list):
     if "gpt" in test_list:
-        if "gpt_session" not in test_list:
-            yield "GptSession"
         if "gpt_executor" not in test_list:
             yield "GptExecutor"
         if "gpt_tests" not in test_list:
