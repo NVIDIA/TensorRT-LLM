@@ -175,6 +175,7 @@ def check_events(llm,
     else:
         while events:
             event = events.pop(0)
+            assert "attention_dp_rank" in event
             if event and event["attention_dp_rank"] == attention_dp_rank:
                 assert event["event_id"] in [0, 1]
                 assert event["data"]["type"] in ["created", "stored"]
@@ -192,8 +193,9 @@ def check_events(llm,
 
     while events2:
         event = events2.pop(0)
-        if event and (event["attention_dp_rank"] == attention_dp_rank
-                      or attention_dp_rank is None):
+        event_adp_rank = event.get("attention_dp_rank", None)
+        if event and (attention_dp_rank is None
+                      or event_adp_rank == attention_dp_rank):
             if event["event_id"] == 2:
                 # 2 removed events needed
                 # should be a removed event to make space for context block
@@ -215,8 +217,9 @@ def check_events(llm,
 
     while events3:
         event = events3.pop(0)
-        if event and (event["attention_dp_rank"] == attention_dp_rank
-                      or attention_dp_rank is None):
+        event_adp_rank = event.get("attention_dp_rank", None)
+        if event and (attention_dp_rank is None
+                      or event_adp_rank == attention_dp_rank):
             if event["event_id"] == 5:
                 assert event["data"]["type"] == "removed"
                 assert event["data"]["block_hashes"]
