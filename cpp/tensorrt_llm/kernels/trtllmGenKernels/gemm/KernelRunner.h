@@ -32,6 +32,7 @@ struct TrtllmGenGemmRunnerOptions
     gemm::trtllm::gen::Dtype outputType;
     bool deepSeekFp8{false};
     bool transposeMmaOutput{false};
+    gemm::trtllm::gen::Dtype dtypeMmaA{gemm::trtllm::gen::Dtype::Void};
 };
 
 class TrtllmGenGemmRunner
