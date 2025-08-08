@@ -1145,7 +1145,6 @@ def test_fused_moe_mxfp4_mxfp8(moe_backend, bias):
         model_config=ModelConfig(quant_config=quant_config,
                                  moe_backend=moe_backend),
         bias=bias,
-        tllmgen_use_tma_oob_opt=True if moe_backend == "TRTLLM" else False,
     )
     fused_moe.cuda()
     fused_moe.load_weights([weights])
