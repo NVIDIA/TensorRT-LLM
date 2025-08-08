@@ -58,10 +58,18 @@ First, launch a server using trtllm-serve:
 ```bash
 cat > ./extra_llm_api_options.yaml <<EOF
 # define your extra parameters here
+cuda_graph_config:
+  batch_sizes:
+    - 1
+    - 4
+enable_attention_dp: False
 EOF
 
-trtllm-serve <model> \
+trtllm-serve  \
+    --model /path_to_model/Kimi-K2-Instruct/ \
     --backend pytorch \
+    --tp_size 8 \
+    --ep_size 8 \
     --extra_llm_api_options extra_llm_api_options.yaml
 ```
 
