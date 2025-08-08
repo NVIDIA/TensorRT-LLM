@@ -13,7 +13,8 @@ from ...distributed import allgather
 from ...model_config import ModelConfig
 from ...utils import Fp4QuantizedTensor
 from .fused_moe_cutlass import CutlassFusedMoE
-from .quantization import MoEWeightLoadingMode
+from .quantization import (DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm,
+                           MoEWeightLoadingMode, UnquantizedFusedMoEMethod)
 from .routing import BaseMoeRoutingMethod
 
 
@@ -339,6 +340,18 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
             apply_router_weight_on_input=apply_router_weight_on_input,
             layer_idx=layer_idx,
         )
+
+    def _get_quant_method(self):
+        if self.quant_config is not None and self.quant_config.layer_quant_mode.has_any_quant(
+                exclude_kv_cache=True):
+            if self.quant_config.layer_quant_mode.has_fp8_block_scales():
+                return DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm()
+            else:
+                raise ValueError(
+                    f"Unsupported quantization mode: {self.quant_config.quant_mode}"
+                )
+        else:
+            return UnquantizedFusedMoEMethod()
 
     @nvtx_range("[DG] forward")
     def forward_chunk(

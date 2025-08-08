@@ -58,10 +58,9 @@ class PyTorchConfig:
     If true, will iterate over sampling_params of each request and use the
     corresponding sampling strategy, e.g. top-k, top-p, etc.
     """
-    enable_trtllm_sampler: bool = False
+    use_torch_sampler: bool = False
     """
-    If true, will use the TRTLLM sampler instead of the PyTorch sampler.
-    The TRTLLM sampler has a wide coverage of sampling strategies.
+    If true, will use the Torch sampler instead of the TRTLLM sampler.
     """
 
     kv_cache_dtype: str = "auto"

@@ -448,14 +448,14 @@ public:
         = 0;
     virtual std::vector<cutlass_extensions::CutlassGemmConfig> getTactics() = 0;
 
-    virtual void runMoe(void const* input_activations, void const* input_sf, int const* token_selected_experts,
-        float const* token_final_scales, void const* fc1_expert_weights, void const* fc1_expert_biases,
-        ActivationParams fc1_activation_type, void const* fc2_expert_weights, void const* fc2_expert_biases,
-        QuantParams quant_params, int64_t const num_rows, int64_t const hidden_size, int64_t const inter_size,
-        int const num_experts, int const experts_per_token, char* workspace_ptr, void* final_output,
-        int* unpermuted_row_to_permuted_row, MOEParallelismConfig parallelism_config, bool const enable_alltoall,
-        bool use_lora, LoraParams& lora_params, bool use_deepseek_fp8_block_scale, bool min_latency_mode,
-        MoeMinLatencyParams& min_latency_params, cudaStream_t stream)
+    virtual void runMoe(void const* input_activations, void const* input_sf, bool const swizzled_input_sf,
+        int const* token_selected_experts, float const* token_final_scales, void const* fc1_expert_weights,
+        void const* fc1_expert_biases, ActivationParams fc1_activation_type, void const* fc2_expert_weights,
+        void const* fc2_expert_biases, QuantParams quant_params, int64_t const num_rows, int64_t const hidden_size,
+        int64_t const inter_size, int const num_experts, int const experts_per_token, char* workspace_ptr,
+        void* final_output, int* unpermuted_row_to_permuted_row, MOEParallelismConfig parallelism_config,
+        bool const enable_alltoall, bool use_lora, LoraParams& lora_params, bool use_deepseek_fp8_block_scale,
+        bool min_latency_mode, MoeMinLatencyParams& min_latency_params, cudaStream_t stream)
         = 0;
 
     // Aliases for profiling the gemms
@@ -603,14 +603,14 @@ public:
         return RunnerType::getConfigs(sm);
     }
 
-    void runMoe(void const* input_activations, void const* input_sf, int const* token_selected_experts,
-        float const* token_final_scales, void const* fc1_expert_weights, void const* fc1_expert_biases,
-        ActivationParams fc1_activation_type, void const* fc2_expert_weights, void const* fc2_expert_biases,
-        QuantParams quant_params, int64_t const num_rows, int64_t const hidden_size, int64_t const inter_size,
-        int const num_experts, int const experts_per_token, char* workspace_ptr, void* final_output,
-        int* unpermuted_row_to_permuted_row, MOEParallelismConfig parallelism_config, bool const enable_alltoall,
-        bool use_lora, LoraParams& lora_params, bool use_deepseek_fp8_block_scale, bool min_latency_mode,
-        MoeMinLatencyParams& min_latency_params, cudaStream_t stream) override;
+    void runMoe(void const* input_activations, void const* input_sf, bool const swizzled_input_sf,
+        int const* token_selected_experts, float const* token_final_scales, void const* fc1_expert_weights,
+        void const* fc1_expert_biases, ActivationParams fc1_activation_type, void const* fc2_expert_weights,
+        void const* fc2_expert_biases, QuantParams quant_params, int64_t const num_rows, int64_t const hidden_size,
+        int64_t const inter_size, int const num_experts, int const experts_per_token, char* workspace_ptr,
+        void* final_output, int* unpermuted_row_to_permuted_row, MOEParallelismConfig parallelism_config,
+        bool const enable_alltoall, bool use_lora, LoraParams& lora_params, bool use_deepseek_fp8_block_scale,
+        bool min_latency_mode, MoeMinLatencyParams& min_latency_params, cudaStream_t stream) override;
 
     // We make these GEMM1 & GEMM2 static because they need to be stateless for the profiler to work
     static void gemm1(MoeGemmRunner<T, WeightType, OutputType, ScaleBiasType>& gemm_runner,

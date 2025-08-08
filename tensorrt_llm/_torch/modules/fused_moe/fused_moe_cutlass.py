@@ -402,6 +402,7 @@ class CutlassFusedMoE(MoE):
             output_dtype,
             quant_scales=self.quant_scales,
             input_sf=x_sf,
+            swizzled_input_sf=True,
             swiglu_alpha=self.swiglu_alpha,
             swiglu_beta=self.swiglu_beta,
             swiglu_limit=self.swiglu_limit,
