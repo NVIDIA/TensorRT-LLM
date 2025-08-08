@@ -1381,21 +1381,6 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
         print(
             f"limin: DeepseekV3ForCausalLM load_weights, moe_backend: {moe_backend}"
         )
-        # limin-todo: how to set for cute dsl ops?
-        if moe_backend == "DEEPGEMM" and self.model_config.quant_config.layer_quant_mode.has_fp8_block_scales(
-        ) and get_sm_version() == 100:
-            for name in list(weights.keys()):
-                # Use ".experts." to exclude shared_experts.
-                if name.endswith(
-                        "weight_scale_inv") and ".experts." not in name:
-                    weight_name = name.replace("weight_scale_inv", "weight")
-                    logger.debug(f"Resmoothing {weight_name}")
-                    weight = weights[weight_name][:]
-                    scale = weights[name][:]
-                    weights[weight_name], weights[name] = resmooth_to_fp8_e8m0(
-                        weight, scale)
-                    weights[weight_name] = weights[weight_name].cpu()
-                    weights[name] = weights[name].cpu()
 
         for name, module in tqdm(all_named_modules.items(),
                                  desc="Loading weights"):
@@ -1516,9 +1501,11 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
                         for n, p in module.named_parameters():
                             p.data.copy_(module_weights[n][:])
 
+                # limin-todo: how to set for cute dsl ops?
                 if moe_backend == "DEEPGEMM" and self.model_config.quant_config.layer_quant_mode.has_fp8_block_scales(
                 ) and get_sm_version() == 100 and hasattr(
                         module, "weight_scale"):
+                    #
                     weight, weight_scale = resmooth_to_fp8_e8m0(
                         module.weight, module.weight_scale)
                     transfromed_scale = transform_sf_into_required_layout(

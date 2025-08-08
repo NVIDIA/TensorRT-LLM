@@ -4,6 +4,8 @@ from typing import List, Optional, Union
 import torch
 import torch.nn.functional as F
 
+from tensorrt_llm._torch.custom_ops.torch_custom_ops import \
+    cute_dsl_fp8_group_gemm_blackwell as cute_dsl_fp8_group_blockwise_gemm
 from tensorrt_llm._utils import get_sm_version
 
 from ...model_config import ModelConfig
@@ -215,21 +217,21 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         # print("limin: act_input_sf.shape = ", act_input_sf.shape)
         # print("limin: w3_w1_weight.shape = ", self.w3_w1_weight.shape)
         # print("limin: quant_scales[0].shape = ", self.quant_scales[0].shape)
-        h1 = cute_dsl_fp8_group_blockwise_gemm_ref(
-            a=act_input_fp8,
-            b=self.w3_w1_weight.view(weight_dtype),
-            a_sf=act_input_sf,
-            b_sf=self.quant_scales[0],
-            offset_array=expert_first_token_offset_tensor,
+        h1 = cute_dsl_fp8_group_blockwise_gemm(
+            act_input_fp8,
+            self.w3_w1_weight.view(weight_dtype),
+            act_input_sf,
+            self.quant_scales[0],
+            expert_first_token_offset_tensor,
         )
         h2 = swiglu_fused_moe(h1)
         act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(h2)
-        h3 = cute_dsl_fp8_group_blockwise_gemm_ref(
-            a=act_input_fp8,
-            b=self.w2_weight.view(weight_dtype),
-            a_sf=act_input_sf,
-            b_sf=self.quant_scales[1],
-            offset_array=expert_first_token_offset_tensor,
+        h3 = cute_dsl_fp8_group_blockwise_gemm(
+            act_input_fp8,
+            self.w2_weight.view(weight_dtype),
+            act_input_sf,
+            self.quant_scales[1],
+            expert_first_token_offset_tensor,
         )
         final_hidden_states = torch.ops.trtllm.moe_finalize_scale_op(
             h3,
