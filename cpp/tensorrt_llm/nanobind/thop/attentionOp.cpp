@@ -17,7 +17,7 @@
 #inlucde "attentionOp.h"
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/optional.h>
-#include <nanobind/stl/string.h>
+#include <nanobind/stl/vector.h>
 #include <tensorrt_llm/thop/attentionOp.h>
 #include <torch/extension.h>
 
