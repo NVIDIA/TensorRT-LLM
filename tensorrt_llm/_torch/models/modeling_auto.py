@@ -2,8 +2,9 @@ from typing import Generic
 
 from ..model_config import ModelConfig
 from ..utils import model_extra_attrs
-from .modeling_utils import (MODEL_CLASS_MAPPING, DecoderModelForCausalLM,
-                             MODEL_CLASS_VISION_ENCODER_MAPPING, TConfig, TModel)
+from .modeling_utils import (MODEL_CLASS_MAPPING,
+                             MODEL_CLASS_VISION_ENCODER_MAPPING,
+                             DecoderModelForCausalLM, TConfig, TModel)
 
 
 class AutoModelForCausalLM(Generic[TModel, TConfig]):
@@ -14,7 +15,8 @@ class AutoModelForCausalLM(Generic[TModel, TConfig]):
     ) -> DecoderModelForCausalLM[TModel, TConfig]:
         model_arch = config.pretrained_config.architectures[0]
         if config.mm_encoder_only:
-            vision_encoder_info = MODEL_CLASS_VISION_ENCODER_MAPPING.get(model_arch)
+            vision_encoder_info = MODEL_CLASS_VISION_ENCODER_MAPPING.get(
+                model_arch)
             if vision_encoder_info is None:
                 raise ValueError(
                     f"Unknown architecture for AutoModelForMultimodalEncoder: {model_arch}"

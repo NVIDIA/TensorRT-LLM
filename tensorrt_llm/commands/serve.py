@@ -173,11 +173,13 @@ def launch_server(host: str,
 
     asyncio.run(server(host, port))
 
-def launch_mm_encoder_server(host: str,
-                  port: int,
-                  encoder_args: dict,
-                  metadata_server_cfg: Optional[MetadataServerConfig] = None,
-                  ):
+
+def launch_mm_encoder_server(
+    host: str,
+    port: int,
+    encoder_args: dict,
+    metadata_server_cfg: Optional[MetadataServerConfig] = None,
+):
     model = encoder_args["model"]
     mm_encoder = MultimodalEncoder(**encoder_args)
 
@@ -186,6 +188,7 @@ def launch_mm_encoder_server(host: str,
                           server_role=ServerRole.MM_ENCODER,
                           metadata_server_cfg=metadata_server_cfg)
     asyncio.run(server(host, port))
+
 
 @click.command("serve")
 @click.argument("model", type=str)
@@ -381,12 +384,10 @@ def serve(
               type=str,
               default=None,
               help="Path to metadata server config file")
-def serve_encoder(model: str, host: str, port: int,
-          log_level: str, max_batch_size: int,
-          gpus_per_node: Optional[int],
-          trust_remote_code: bool,
-          extra_encoder_options: Optional[str],
-          metadata_server_config_file: Optional[str]):
+def serve_encoder(model: str, host: str, port: int, log_level: str,
+                  max_batch_size: int, gpus_per_node: Optional[int],
+                  trust_remote_code: bool, extra_encoder_options: Optional[str],
+                  metadata_server_config_file: Optional[str]):
     """Running an OpenAI API compatible server
 
     MODEL: model name | HF checkpoint path | TensorRT engine path
@@ -394,17 +395,17 @@ def serve_encoder(model: str, host: str, port: int,
     logger.set_level(log_level)
 
     # TODO: expose more argument progressivly
-    llm_args, _ = get_llm_args(
-        model=model,
-        max_batch_size=max_batch_size,
-        gpus_per_node=gpus_per_node,
-        trust_remote_code=trust_remote_code)
+    llm_args, _ = get_llm_args(model=model,
+                               max_batch_size=max_batch_size,
+                               gpus_per_node=gpus_per_node,
+                               trust_remote_code=trust_remote_code)
 
     encoder_args_extra_dict = {}
     if extra_encoder_options is not None:
         with open(extra_encoder_options, 'r') as f:
             encoder_args_extra_dict = yaml.safe_load(f)
-    encoder_args = update_llm_args_with_extra_dict(llm_args, encoder_args_extra_dict)
+    encoder_args = update_llm_args_with_extra_dict(llm_args,
+                                                   encoder_args_extra_dict)
 
     metadata_server_cfg = parse_metadata_server_config_file(
         metadata_server_config_file)
@@ -726,7 +727,7 @@ main = DefaultGroup(
         "serve": serve,
         "disaggregated": disaggregated,
         "disaggregated_mpi_worker": disaggregated_mpi_worker,
-        "mmemb_serve": serve_encoder
+        "mm_embedding_serve": serve_encoder
     })
 
 if __name__ == "__main__":

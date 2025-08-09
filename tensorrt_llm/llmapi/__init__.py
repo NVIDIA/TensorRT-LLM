@@ -3,7 +3,6 @@ from ..executor import CompletionOutput, RequestError
 from ..sampling_params import GuidedDecodingParams, SamplingParams
 from .build_cache import BuildCacheConfig
 from .llm import LLM, RequestOutput
-from .mm_encoder import MultimodalEncoder
 # yapf: disable
 from .llm_args import (AttentionDpConfig, AutoDecodingConfig, BatchingType,
                        CacheTransceiverConfig, CalibConfig,
@@ -17,6 +16,7 @@ from .llm_args import (AttentionDpConfig, AutoDecodingConfig, BatchingType,
                        UserProvidedDecodingConfig)
 from .llm_utils import (BuildConfig, KvCacheRetentionConfig, QuantAlgo,
                         QuantConfig)
+from .mm_encoder import MultimodalEncoder
 from .mpi_session import MpiCommSession
 
 __all__ = [

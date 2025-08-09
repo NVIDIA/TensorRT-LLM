@@ -82,7 +82,8 @@ class RequestOutput(DetokenizedGenerationResultBase, GenerationResult):
 
     def _repr_fields(self):
         return [
-            "request_id", "prompt", "prompt_token_ids", "outputs", "finished", "mm_embedding_handle"
+            "request_id", "prompt", "prompt_token_ids", "outputs", "finished",
+            "mm_embedding_handle"
         ]
 
 

@@ -1,6 +1,6 @@
 import copy
 import os
-from typing import List, Optional, Tuple, Dict
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -24,7 +24,8 @@ from ..model_config import ModelConfig
 from .modeling_auto import AutoModelForCausalLM
 from .modeling_clip import CLIPVisionModel
 from .modeling_multimodal_utils import fuse_input_embeds
-from .modeling_utils import ModelConfig, filter_weights, register_auto_model, register_vision_encoder
+from .modeling_utils import (filter_weights, register_auto_model,
+                             register_vision_encoder)
 
 DISAGG = os.getenv('TLLM_MULTIMODAL_DISAGGREGATED', '0') == '1'
 
@@ -52,71 +53,19 @@ class LlavaNextInputProcessor(InputProcessor):
         self.image_token_index = model_config.image_token_index
         self.vocab_size = model_config.vocab_size
         self.vision_feature_select_strategy = getattr(
-            model_config, "vision_feature_select_strategy",
-            "default")
+            model_config, "vision_feature_select_strategy", "default")
         self.config = model_config.vision_config
 
-    def _get_num_unpadded_features(
-        self,
-        *,
-        original_height: int,
-        original_width: int,
-        npatches: int,
-        num_patch_height: int,
-        num_patch_width: int,
-    ) -> tuple[int, int]:
-        current_height = npatches * num_patch_height
-        current_width = npatches * num_patch_width
-
-        aspect_ratio = original_width / original_height
-        current_aspect_ratio = current_width / current_height
-
-        if aspect_ratio > current_aspect_ratio:
-            new_height = int(
-                round(original_height * (current_width / original_width), 7))
-            padding = (current_height - new_height) // 2
-            current_height = current_height - (2 * padding)
-        else:
-            new_width = int(
-                round(original_width * (current_height / original_height), 7))
-            padding = (current_width - new_width) // 2
-            current_width = current_width - (2 * padding)
-
-        unpadded_features = current_height * current_width
-        newline_features = current_height
-
-        return (unpadded_features, newline_features)
-
-    # Based on: https://github.com/huggingface/text-generation-inference/blob/v3.0.1/server/text_generation_server/models/vlm_causal_lm.py#L113
     def get_num_tokens_per_image(
         self,
         *,
         image_width: int,
         image_height: int,
     ) -> int:
-        patch_grid_length = self.config.image_size // self.config.patch_size
-        base_feature_size = patch_grid_length**2 + 1
-
-        if self.vision_feature_select_strategy == "default":
-            base_feature_size = base_feature_size - 1
-
-        num_patch_height, num_patch_width = get_anyres_image_grid_shape(
-            image_size=(image_width, image_height),
-            grid_pinpoints=self.model_config.image_grid_pinpoints,
-            patch_size=self.config.image_size,
-        )
-
-        (
-            unpadded_feature_size,
-            newline_feature_size,
-        ) = self._get_num_unpadded_features(
-            original_height=image_height,
-            original_width=image_width,
-            npatches=patch_grid_length,
-            num_patch_height=num_patch_height,
-            num_patch_width=num_patch_width,
-        )
-        return unpadded_feature_size + newline_feature_size + base_feature_size
+        image_size = (image_height, image_width)
+        num_image_tokens = self.processor._get_num_multimodal_tokens(
+            [image_size])["num_image_tokens"][0]
+        return num_image_tokens
 
     def _postprocess(self, input_ids, mm_features):
         # Define model specific variables here before shared logic
@@ -198,7 +147,6 @@ class LlavaNextInputProcessor(InputProcessor):
         mm_features = mm_features.view(-1, mm_features.shape[-1])
         return fused_input_ids, mm_features
 
-
     def attach_multimodal_embeddings(
         self, inputs: TextPrompt,
         multimodal_embedding: Dict[str, List[torch.Tensor]],
@@ -221,8 +169,6 @@ class LlavaNextInputProcessor(InputProcessor):
         if not text_prompt:
             raise ValueError("Text prompt is required but not provided")
 
-
-
         if not isinstance(multimodal_embedding, dict):
             raise ValueError("multimodal_embedding must be a dictionary")
 
@@ -231,9 +177,9 @@ class LlavaNextInputProcessor(InputProcessor):
                 "Only image modality is supported for external multimodal embedding"
             )
 
-        input_ids = self.tokenizer(
-            text_prompt, return_tensors="pt").input_ids[0]
-        mm_features = torch.stack(multimodal_embedding['image'])
+        input_ids = self.tokenizer(text_prompt,
+                                   return_tensors="pt").input_ids[0]
+        mm_features = multimodal_embedding['image']
         fused_input_ids, mm_features = self._postprocess(input_ids, mm_features)
         multimodal_data = {}
         multimodal_data["multimodal_embedding"] = mm_features
@@ -332,8 +278,7 @@ class LlavaNextVisionModel(nn.Module):
         self.mm_projector = hf_mm_projector
         self.image_newline = hf_image_newline
         self.vision_feature_select_strategy = getattr(
-            self.pretrained_config, "vision_feature_select_strategy",
-            "default")
+            self.pretrained_config, "vision_feature_select_strategy", "default")
 
         self.post_config()
 
@@ -456,6 +401,7 @@ class LlavaNextVisionModel(nn.Module):
         image_features = torch.cat(image_features, dim=0)
         return [image_features]
 
+
 @register_vision_encoder(LlavaNextVisionModel)
 @register_auto_model("LlavaNextForConditionalGeneration")
 @register_input_processor(LlavaNextInputProcessor, model_type="llava_next")
@@ -518,7 +464,8 @@ class LlavaNextModel(PreTrainedModel):
         mm_embeds = []
         if len(multimodal_params) > 0:
             if not DISAGG:
-                if  multimodal_params[0].multimodal_data.get("multimodal_embedding", None) is not None:
+                if multimodal_params[0].multimodal_data.get(
+                        "multimodal_embedding", None) is not None:
                     mm_embeds = [
                         multimodal_param.multimodal_data["multimodal_embedding"]
                         for multimodal_param in multimodal_params

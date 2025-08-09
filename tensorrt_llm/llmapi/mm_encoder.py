@@ -1,17 +1,18 @@
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import Any, List, Literal, Optional, Sequence, Union
 
-from tensorrt_llm.inputs.data import PromptInputs
-from .llm import BaseLLM, _TorchLLM, RequestOutput
-from tensorrt_llm.sampling_params import SamplingParams
-from tensorrt_llm._utils import nvtx_range_debug
-from typing import List, Sequence
-from tensorrt_llm.inputs import prompt_inputs
 from tqdm import tqdm
-from tensorrt_llm.inputs import create_input_processor
+
+from tensorrt_llm._utils import nvtx_range_debug
+from tensorrt_llm.bindings import executor as tllm
+from tensorrt_llm.inputs import create_input_processor, prompt_inputs
+from tensorrt_llm.inputs.data import PromptInputs
+from tensorrt_llm.sampling_params import SamplingParams
+
+from .llm import BaseLLM, RequestOutput, _TorchLLM
 from .llm_args import PybindMirror
 from .mpi_session import external_mpi_comm_available
-from tensorrt_llm.bindings import executor as tllm
+
 
 class MultimodalEncoder(_TorchLLM):
     """MultimodalEncoder class is the main class for running a multimodal encoder model using PyTorch backend.
@@ -21,16 +22,23 @@ class MultimodalEncoder(_TorchLLM):
                  model: Union[str, Path],
                  trust_remote_code: bool = False,
                  tensor_parallel_size: int = 1,
-                 dtype: str = "auto",
+                 dtype: Literal["auto", "float16", "float32",
+                                "bfloat16"] = "auto",
                  **kwargs: Any) -> None:
 
         # Validate that users don't pass LLM-specific or TRT-specific arguments
         self._validate_mm_args_for_torch_backend(kwargs)
 
+        # Set higher default max_num_tokens for multimodal encoder (16384 vs 8192 default)
+        # Vision encoders can handle more tokens than text-only models
+        # TODO: Make this adaptive based on model-specific max_mm_token_length (see _test_llm_multimodal_general)
+        if 'max_num_tokens' not in kwargs or kwargs['max_num_tokens'] is None:
+            kwargs['max_num_tokens'] = 16384
+
         super().__init__(model,
                          trust_remote_code=trust_remote_code,
                          tensor_parallel_size=tensor_parallel_size,
-                         dtype = dtype,
+                         dtype=dtype,
                          **kwargs)
 
     def _build_model(self):
@@ -87,7 +95,7 @@ class MultimodalEncoder(_TorchLLM):
             mpi_session=self.mpi_session,
             reuse_mpi_comm=external_mpi_comm_available(
                 self.args.parallel_config.world_size),
-            is_llm_executor=True, # TODO: check if this is correct or needed
+            is_llm_executor=True,  # TODO: check if this is correct or needed
             garbage_collection_gen0_threshold=self.args.
             garbage_collection_gen0_threshold)
 
@@ -95,7 +103,6 @@ class MultimodalEncoder(_TorchLLM):
         """Validate that users don't pass LLM-specific arguments when using MultimodalEncoder (PyTorch).
         Placeholder for now.
         """
-        pass
 
     def generate(
         self,
@@ -129,9 +136,7 @@ class MultimodalEncoder(_TorchLLM):
 
         futures = []
         for i, request_inputs in enumerate(inputs):
-            future = self.generate_async(
-                request_inputs
-            )
+            future = self.generate_async(request_inputs)
             futures.append(future)
 
         for future in tqdm(futures,
@@ -145,12 +150,14 @@ class MultimodalEncoder(_TorchLLM):
 
         return futures
 
-    @nvtx_range_debug("MM_encoder.generate_async", color="green", category="VisionEncoder")
+    @nvtx_range_debug("MM_encoder.generate_async",
+                      color="green",
+                      category="VisionEncoder")
     def generate_async(
         self,
         inputs: PromptInputs,
         sampling_params: Optional[SamplingParams] = None,
-    ):
+    ) -> RequestOutput:
         """Generate output for the given multimodal request in the asynchronous mode.
         Asynchronous generation accepts single multimodal request only.
 
@@ -160,4 +167,3 @@ class MultimodalEncoder(_TorchLLM):
         result = super().generate_async(inputs, sampling_params)
         # TODO: possible postprocess the result for disaggregated serving
         return result
-

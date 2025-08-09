@@ -1,7 +1,7 @@
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Literal, List
+from typing import List, Literal
 
 import torch
 
@@ -104,6 +104,7 @@ class MultimodalResult:
     def values(self):
         return vars(self).values()
 
+
 @dataclass(kw_only=True)
 class SampleStateWithMMResult:
     scheduled_requests: ScheduledRequests
@@ -111,7 +112,7 @@ class SampleStateWithMMResult:
     data: MultimodalResult = None
 
 
-class EarlyStopWithMMResult(EarlyStopSampler):
+class EarlyStopWithMMResult(Sampler):
     """
     Use for skipping decoding step for non generation model, and return the batch_output (such as mm_embeddings)
     """
@@ -120,22 +121,25 @@ class EarlyStopWithMMResult(EarlyStopSampler):
                      model_outputs) -> SampleStateWithMMResult:
         # from model_outputs to MultimodalResult
         data = MultimodalResult(mm_embeddings=model_outputs['mm_embeddings'])
-        return SampleStateWithMMResult(scheduled_requests=scheduled_requests, data=data)
+        return SampleStateWithMMResult(scheduled_requests=scheduled_requests,
+                                       data=data)
 
     def update_requests(self, state: SampleStateWithMMResult) -> None:
         assert isinstance(state, SampleStateWithMMResult)
         scheduled_requests = state.scheduled_requests
         assert (not scheduled_requests.generation_requests)
         mm_embeddings = state.data.mm_embeddings
-        for idx, request in enumerate(scheduled_requests.context_requests):
+        for request, mm_embedding in zip(scheduled_requests.context_requests,
+                                         mm_embeddings):
             request.state = LlmRequestState.GENERATION_COMPLETE
             # NOTE: This is a hack: set finish reason manually and set the beam 0
             request.set_finished_reason(FinishReason.LENGTH, 0)
-            if idx < len(mm_embeddings):
-                if len(mm_embeddings[idx]) != sum(request.multimodal_lengths):
-                    raise ValueError(f"mm_embedding shape mismatch: {len(mm_embeddings[idx])} != {sum(request.multimodal_lengths)}")
+            if len(mm_embedding) != sum(request.multimodal_lengths):
+                raise ValueError(
+                    f"mm_embedding shape mismatch: {len(mm_embedding)} != {sum(request.multimodal_lengths)}"
+                )
 
-                request.py_result.append_mm_embeddings(mm_embeddings[idx])
+            request.py_result.append_mm_embeddings(mm_embedding)
 
 
 def top_k_sampling_batch(logits, top_k=50):

@@ -3,8 +3,8 @@ import json
 import weakref
 from dataclasses import dataclass, field
 from queue import Empty, Queue
-from typing import (TYPE_CHECKING, Any, Callable, Dict, List, Literal, NamedTuple,
-                    Optional, TypeAlias, Union)
+from typing import (TYPE_CHECKING, Any, Callable, Dict, List, Literal,
+                    NamedTuple, Optional, TypeAlias, Union)
 from weakref import WeakMethod
 
 import torch

@@ -588,20 +588,38 @@ def register_auto_model(name: str):
 
     return decorator
 
-# Need to register the model class before the vision encoder class
-# to ensure that the key (the architecture name) is available here
-def register_vision_encoder(vision_encoder_cls: Type[nn.Module],
-                            vlm_base_model: Optional[Type[nn.Module]] = None):
+
+def register_vision_encoder(
+    vision_encoder_cls: Type[nn.Module],
+    vlm_base_model: Optional[Type[nn.Module]] = None,
+):
+    """Decorator to register a vision encoder implementation for a pre-registered model architecture.
+
+    Usage:
+        @register_vision_encoder(MyVisionEncoder, MyVLMBaseModel)
+        @register_auto_model("SomeVLModel")
+        class SomeVLModel(...):
+            ...
+    The register_auto_model decorator must be applied (executed) before this one (i.e., placed lower)
+    so that the architecture name is present in MODEL_CLASS_MAPPING.
+    """
 
     def wrapper(model_cls: Type[nn.Module]) -> Type[nn.Module]:
         for arch_name, registered_cls in MODEL_CLASS_MAPPING.items():
             if registered_cls.__name__ == model_cls.__name__:
-                MODEL_CLASS_VISION_ENCODER_MAPPING[arch_name] = (vision_encoder_cls, vlm_base_model)
+                MODEL_CLASS_VISION_ENCODER_MAPPING[arch_name] = (
+                    vision_encoder_cls, vlm_base_model)
                 break
+        else:
+            raise ValueError(
+                f"register_vision_encoder: model class {model_cls.__name__} is not registered "
+                f"via register_auto_model; decorator order must ensure registration occurs first."
+            )
 
         return model_cls
 
     return wrapper
+
 
 def register_mapper(format: str, name: Optional[str] = None):
 

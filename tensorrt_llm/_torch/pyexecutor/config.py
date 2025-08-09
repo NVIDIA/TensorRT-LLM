@@ -131,7 +131,7 @@ def update_executor_config(
         max_seq_len: Optional[int] = None,
         checkpoint_format: Optional[str] = None,
         checkpoint_loader: Optional[BaseCheckpointLoader] = None,
-        mm_encoder_only: Optional[bool] = False):
+        mm_encoder_only: bool = False):
     if backend is None:
         return
 

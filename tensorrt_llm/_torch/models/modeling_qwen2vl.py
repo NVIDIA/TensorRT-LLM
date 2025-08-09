@@ -651,7 +651,8 @@ class Qwen2VLModelBase(PreTrainedModel):
         return output_prob
 
 
-@register_vision_encoder(Qwen2VisionModelBase, vlm_base_model=Qwen2VLForConditionalGeneration)
+@register_vision_encoder(Qwen2VisionModelBase,
+                         vlm_base_model=Qwen2VLForConditionalGeneration)
 @register_auto_model("Qwen2VLForConditionalGeneration")
 @register_input_processor(Qwen2VLInputProcessorBase, model_type="qwen2_vl")
 class Qwen2VLModel(Qwen2VLModelBase):
@@ -663,7 +664,9 @@ class Qwen2VLModel(Qwen2VLModelBase):
                 model_config, Qwen2VLForConditionalGeneration)
         super().__init__(model_config, *args, **kwargs)
 
-@register_vision_encoder(Qwen2VisionModelBase, vlm_base_model=Qwen2_5_VLForConditionalGeneration)
+
+@register_vision_encoder(Qwen2VisionModelBase,
+                         vlm_base_model=Qwen2_5_VLForConditionalGeneration)
 @register_auto_model("Qwen2_5_VLForConditionalGeneration")
 @register_input_processor(Qwen2VLInputProcessorBase, model_type="qwen2_5_vl")
 class Qwen2_5_VLModel(Qwen2VLModelBase):

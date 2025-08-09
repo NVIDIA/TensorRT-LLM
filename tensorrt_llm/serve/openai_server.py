@@ -16,13 +16,13 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from transformers import AutoConfig, AutoProcessor
 
 from tensorrt_llm._tensorrt_engine import LLM
-from tensorrt_llm.llmapi import MultimodalEncoder
 # yapf: disable
 from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.executor.postproc_worker import PostprocParams
 from tensorrt_llm.inputs import prompt_inputs
 from tensorrt_llm.inputs.utils import ConversationMessage, apply_chat_template
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
+from tensorrt_llm.llmapi import MultimodalEncoder
 from tensorrt_llm.llmapi.disagg_utils import MetadataServerConfig, ServerRole
 from tensorrt_llm.llmapi.llm import RequestOutput
 from tensorrt_llm.logger import logger
@@ -31,7 +31,8 @@ from tensorrt_llm.serve.chat_utils import (check_multiple_response,
 from tensorrt_llm.serve.metadata_server import create_metadata_server
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 ChatCompletionResponse,
-                                                CompletionRequest,
+                                                ChatCompletionResponseChoice,
+                                                ChatMessage, CompletionRequest,
                                                 CompletionResponse,
                                                 CompletionResponseChoice,
                                                 ErrorResponse, ModelCard,
@@ -42,7 +43,7 @@ from tensorrt_llm.serve.postprocess_handlers import (
     chat_stream_post_processor, completion_response_post_processor,
     completion_stream_post_processor)
 from tensorrt_llm.version import __version__ as VERSION
-from tensorrt_llm.serve.openai_protocol import ChatMessage, ChatCompletionResponseChoice, UsageInfo
+
 from .._utils import nvtx_mark
 
 # yapf: enale
@@ -361,7 +362,7 @@ class OpenAIServer:
                 tool.model_dump() for tool in request.tools
             ]
             # TODO: placeholder for multimodal disagg e2e
-            disaggregated_params = to_llm_disaggregated_params(request.disaggregated_params)
+            to_llm_disaggregated_params(request.disaggregated_params)
 
             conversation, mm_coroutines, mm_placeholder_counts = parse_chat_messages_coroutines(request.messages, self.model_config)
 
