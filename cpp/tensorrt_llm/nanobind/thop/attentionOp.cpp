@@ -14,8 +14,10 @@
  * limitations under the License.
  */
 
+#inlucde "attentionOp.h"
 #include <nanobind/nanobind.h>
-#include <nanobind/stl.h>
+#include <nanobind/stl/optional.h>
+#include <nanobind/stl/string.h>
 #include <tensorrt_llm/thop/attentionOp.h>
 #include <torch/extension.h>
 
