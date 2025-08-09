@@ -250,6 +250,12 @@ class LlmResult:
         self._result = tensorrt_llm.bindings.executor.deserialize_result(
             self._result)
 
+    def get_result(self):
+        if tmp_res := tensorrt_llm.bindings.executor.deserialize_result(
+                self._result):
+            return tmp_res
+        return None
+
 
 @dataclass
 class LlmResponse:

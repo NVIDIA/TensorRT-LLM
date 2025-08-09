@@ -548,7 +548,7 @@ class BaseLLM:
         if sampling_params._stream_interval is None:
             sampling_params._stream_interval = getattr(self.args,
                                                        "stream_interval", 1)
-
+        sampling_params.return_perf_metrics = sampling_params.return_perf_metrics or self.args.return_perf_metrics
         return sampling_params
 
     def _check_arguments(self, prompt_len: int, query_len: int,
