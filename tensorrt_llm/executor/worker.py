@@ -25,6 +25,7 @@ from ..llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue,
                             clear_sched_affinity, print_colored_debug,
                             print_traceback_on_error)
 from ..lora_manager import LoraConfig, LoraManager
+from ..metrics import RequestEventTiming
 from ..prompt_adapter_manager import PromptAdapterManager
 from ..runtime import ModelConfig
 from ..runtime.model_runner import _engine_config_to_model_config
@@ -899,10 +900,8 @@ class AwaitResponseHelper:
             assert response is not None
             queue = self.worker.return_queue(response.client_id)
 
-            logprobs_result = _get_logprobs(self.worker, response,
+            response = _maybe_wrap_response(self.worker, response,
                                             self.worker._is_pytorch_backend)
-            if logprobs_result:
-                response = ResponseWrapper(response, logprobs_result)
 
             # For AsyncQueue.sync_q, we will batch the events to avoid too many
             # event notifications, thus put without wait here.
@@ -940,10 +939,8 @@ class AwaitResponseHelper:
                 response = ErrorResponse(response.client_id, response.error_msg,
                                          response.request_id)
             else:
-                logprobs_result = _get_logprobs(self.worker, response,
+                response = _maybe_wrap_response(self.worker, response,
                                                 self.worker._is_pytorch_backend)
-                if logprobs_result:
-                    response = ResponseWrapper(response, logprobs_result)
 
             _send_rsp(self.worker,
                       response,
@@ -1051,3 +1048,41 @@ def _send_rsp(
         worker._pop_result(response.client_id)
     else:
         raise ValueError(f"Unknown response type: {response}")
+
+
+def _get_metrics_dict(
+        response: tllm.Response) -> dict[RequestEventTiming, float]:
+    req_perf_metrics, metrics_dict = None, {}
+    res = response.result
+    if res:
+        if hasattr(res, '_result'):
+            if result := res.get_result():
+                req_perf_metrics = result.request_perf_metrics
+        else:
+            req_perf_metrics = res.request_perf_metrics
+        if req_perf_metrics and req_perf_metrics.timing_metrics:
+            metrics_dict = {
+                RequestEventTiming.ARRIVAL_TIME:
+                req_perf_metrics.timing_metrics.arrival_time.total_seconds(),
+                RequestEventTiming.FIRST_TOKEN_TIME:
+                req_perf_metrics.timing_metrics.first_token_time.total_seconds(
+                ),
+                RequestEventTiming.FIRST_SCHEDULED_TIME:
+                req_perf_metrics.timing_metrics.first_scheduled_time.
+                total_seconds(),
+                RequestEventTiming.LAST_TOKEN_TIME:
+                req_perf_metrics.timing_metrics.last_token_time.total_seconds()
+            }
+    return metrics_dict
+
+
+def _maybe_wrap_response(
+        worker,
+        response: tllm.Response,
+        is_pytorch_backend=False) -> Union[tllm.Response, ResponseWrapper]:
+
+    logprobs_result = _get_logprobs(worker, response, is_pytorch_backend)
+    req_perf_metrics = _get_metrics_dict(response)
+    if logprobs_result or req_perf_metrics:
+        response = ResponseWrapper(response, logprobs_result, req_perf_metrics)
+    return response

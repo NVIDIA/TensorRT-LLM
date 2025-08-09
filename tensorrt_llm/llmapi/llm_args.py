@@ -1311,6 +1311,10 @@ class BaseLlmArgs(StrictBaseModel):
         status="deprecated",
     )
 
+    return_perf_metrics: bool = Field(default=False,
+                                      description="Return perf metrics.",
+                                      status="prototype")
+
     _parallel_config: Optional[object] = PrivateAttr(default=None)
     _model_format: Optional[_ModelFormatKind] = PrivateAttr(default=None)
     _speculative_model: Optional[str] = PrivateAttr(default=None)
