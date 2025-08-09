@@ -450,7 +450,6 @@ def throughput_command(
         elif runtime_config.backend == "_autodeploy":
             ignore_trt_only_args(kwargs)
             kwargs["world_size"] = kwargs.pop("tensor_parallel_size", None)
-
             llm = AutoDeployLLM(**kwargs)
         else:
             llm = LLM(**kwargs)
