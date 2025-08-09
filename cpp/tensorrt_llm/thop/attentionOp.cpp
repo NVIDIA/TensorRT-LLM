@@ -21,6 +21,7 @@
 #include "tensorrt_llm/kernels/mlaKernels.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/runtime/utils/debugUtils.h"
+#include "tensorrt_llm/thop/attentionOp.h"
 #include "tensorrt_llm/thop/thUtils.h"
 #include <cstdint>
 #include <functional>
@@ -748,81 +749,3 @@ bool attention_supports_nvfp4_output(int64_t const num_heads, int64_t const num_
 }
 
 } // namespace torch_ext
-
-TORCH_LIBRARY_FRAGMENT(trtllm, m)
-{
-    m.def(
-        "attention_inplace("
-        "Tensor q"
-        ", Tensor? k"
-        ", Tensor? v"
-        ", Tensor(a!) output"
-        ", Tensor(b!)? output_sf"
-        ", ScalarType? out_dtype"
-        ", Tensor? workspace"
-        ", Tensor sequence_length"
-        ", Tensor host_past_key_value_lengths"
-        ", Tensor context_lengths"
-        ", Tensor host_context_lengths"
-        ", Tensor host_request_types"
-        ", Tensor? kv_cache_block_offsets"
-        ", Tensor? host_kv_cache_block_offsets"
-        ", Tensor? host_kv_cache_pool_pointers"
-        ", Tensor? host_kv_cache_pool_mapping"
-        ", Tensor? cache_indirection"
-        ", Tensor? kv_scale_orig_quant"
-        ", Tensor? kv_scale_quant_orig"
-        ", Tensor? out_scale"
-        ", Tensor? rotary_inv_freq"
-        ", Tensor? rotary_cos_sin"
-        ", Tensor? latent_cache"
-        ", Tensor? q_pe"
-        ", Tensor? block_ids_per_seq"
-        ", Tensor? attention_sinks"
-        ", bool is_fused_qkv"
-        ", bool update_kv_cache"
-        ", int predicted_tokens_per_seq"
-        ", int layer_idx"
-        ", int num_heads"
-        ", int num_kv_heads"
-        ", int head_size"
-        ", SymInt? tokens_per_block"
-        ", SymInt max_num_requests"
-        ", SymInt max_context_length"
-        ", SymInt attention_window_size"
-        ", int sink_token_length"
-        ", int beam_width"
-        ", int mask_type"
-        ", int quant_mode"
-        ", float q_scaling"
-        ", int position_embedding_type"
-        ", int rotary_embedding_dim"
-        ", float rotary_embedding_base"
-        ", int rotary_embedding_scale_type"
-        ", float[] rotary_embedding_scales"
-        ", int[] rotary_embedding_max_position_info"
-        ", bool use_paged_context_fmha"
-        ", int? attention_input_type"
-        ", bool is_mla_enable"
-        ", int? q_lora_rank"
-        ", int? kv_lora_rank"
-        ", int? qk_nope_head_dim"
-        ", int? qk_rope_head_dim"
-        ", int? v_head_dim"
-        ", Tensor? mrope_rotary_cos_sin"
-        ", Tensor? mrope_position_deltas"
-        ", Tensor? mla_context_paged_kv"
-        ", Tensor? mla_context_kv_cache_block_offsets"
-        ", int? attention_chunk_size"
-        ", Tensor? softmax_stats_tensor"
-        ", bool[] spec_decoding_bool_params"
-        ", Tensor?[] spec_decoding_tensor_params"
-        ") -> ()");
-
-    m.def("attention_supports_nvfp4_output", &torch_ext::attention_supports_nvfp4_output);
-}
-
-TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
-{
-    m.impl("attention_inplace", &torch_ext::attention_inplace);
-}
