@@ -1397,3 +1397,491 @@ TEST_F(FusedMoeCommLocalSendRecvTest, LocalSendRecvStressTestManyWarps)
     std::vector<int> mapping = {1, 0, 3, 2};                                // Simple reordering
     runLocalSendRecvTest(2, false, true, 1, {4}, {64}, mapping, 256, 4, 2); // Many warps per block
 }
+
+// Test class for launchLocalFifoSendRecv function (FIFO-based local send/recv test)
+class FusedMoeCommLocalFifoSendRecvTest : public FusedMoeCommTestBase
+{
+protected:
+    void runLocalFifoSendRecvTest(int topK, bool hasScales, bool hasBasicFields, int fieldCount,
+        std::vector<size_t> const& elementSizes, std::vector<uint16_t> const& vectorSizes,
+        std::vector<int> const& recvIndexMappingVec, int tokenCount = 4, int warpsPerBlock = 2,
+        int blockChannelCount = 1, bool useSimpleProto = false)
+    {
+        // Setup expert parallel info
+        MoeExpertParallelInfo expertParallelInfo;
+        expertParallelInfo.topK = topK;
+        expertParallelInfo.expertCount = 8;
+
+        // Setup field info for send and receive sides
+        FusedMoeFieldInfo sendFieldInfo = {};
+        sendFieldInfo.isBasicInterleaved = false;
+        sendFieldInfo.fieldCount = fieldCount;
+
+        FusedMoeFieldInfo recvFieldInfo = {};
+        recvFieldInfo.isBasicInterleaved = false;
+        recvFieldInfo.fieldCount = fieldCount;
+
+        // Allocate token selected slots and expert scales if needed
+        int* hostSendTokenSlots = nullptr;
+        int* deviceSendTokenSlots = nullptr;
+        float* hostSendScales = nullptr;
+        float* deviceSendScales = nullptr;
+        int* hostRecvTokenSlots = nullptr;
+        int* deviceRecvTokenSlots = nullptr;
+        float* hostRecvScales = nullptr;
+        float* deviceRecvScales = nullptr;
+
+        if (hasBasicFields)
+        {
+            // Send side basic fields
+            allocateAndInitializeData<int>(&hostSendTokenSlots, &deviceSendTokenSlots, tokenCount * topK,
+                [](size_t i) { return static_cast<int>(i % 8); });
+            sendFieldInfo.tokenSelectedSlots = deviceSendTokenSlots;
+
+            // Recv side basic fields (initialized to zero, will be filled by communication)
+            allocateAndInitializeData<int>(
+                &hostRecvTokenSlots, &deviceRecvTokenSlots, tokenCount * topK, [](size_t) { return 0; });
+            recvFieldInfo.tokenSelectedSlots = deviceRecvTokenSlots;
+
+            if (hasScales)
+            {
+                allocateAndInitializeData<float>(&hostSendScales, &deviceSendScales, tokenCount * topK,
+                    [](size_t i) -> float { return 1.0f + static_cast<float>(i) * 0.1f; });
+                sendFieldInfo.expertScales = deviceSendScales;
+
+                allocateAndInitializeData<float>(
+                    &hostRecvScales, &deviceRecvScales, tokenCount * topK, [](size_t) { return 0.0f; });
+                recvFieldInfo.expertScales = deviceRecvScales;
+            }
+        }
+
+        // Setup field info for additional fields
+        std::vector<void*> hostSendFieldPtrs(fieldCount);
+        std::vector<void*> deviceSendFieldPtrs(fieldCount);
+        std::vector<void*> hostRecvFieldPtrs(fieldCount);
+        std::vector<void*> deviceRecvFieldPtrs(fieldCount);
+
+        for (int i = 0; i < fieldCount; i++)
+        {
+            size_t elementSize = elementSizes[i % elementSizes.size()];
+            uint16_t vectorSize = vectorSizes[i % vectorSizes.size()];
+            size_t fieldSize = elementSize * vectorSize * tokenCount;
+
+            // Allocate send field data with specific pattern
+            uint8_t* hostSendField;
+            uint8_t* deviceSendField;
+            allocateAndInitializeData<uint8_t>(&hostSendField, &deviceSendField, fieldSize,
+                [i](size_t idx) { return static_cast<uint8_t>((i * 100 + idx + 1) % 128); });
+
+            // Allocate recv field data (initially zero, will be filled by communication)
+            uint8_t* hostRecvField;
+            uint8_t* deviceRecvField;
+            allocateAndInitializeData<uint8_t>(
+                &hostRecvField, &deviceRecvField, fieldSize, [](size_t) { return static_cast<uint8_t>(0); });
+
+            hostSendFieldPtrs[i] = hostSendField;
+            deviceSendFieldPtrs[i] = deviceSendField;
+            hostRecvFieldPtrs[i] = hostRecvField;
+            deviceRecvFieldPtrs[i] = deviceRecvField;
+
+            // Fill field info
+            sendFieldInfo.fieldsInfo[i].fillFieldInfo(deviceSendField, elementSize, vectorSize, vectorSize);
+            recvFieldInfo.fieldsInfo[i].fillFieldInfo(deviceRecvField, elementSize, vectorSize, vectorSize);
+        }
+
+        // Fill field placement info
+        sendFieldInfo.fillFieldPlacementInfo(topK, hasBasicFields);
+        recvFieldInfo.fillFieldPlacementInfo(topK, hasBasicFields);
+
+        // Setup recvIndexMapping - ensure one-to-one mapping
+        std::vector<int> fullMapping = generateOneToOneMapping(recvIndexMappingVec, tokenCount);
+        int* hostRecvIndexMapping;
+        int* deviceRecvIndexMapping;
+        allocateAndInitializeData<int>(&hostRecvIndexMapping, &deviceRecvIndexMapping, tokenCount,
+            [&fullMapping](size_t i) { return fullMapping[i]; });
+
+        // Setup workspace for FIFO communication
+        FusedMoeWorkspace fusedMoeWorkspace;
+        size_t workspaceSizePerRank
+            = FusedMoeWorkspace::computeWorkspaceSizePreRank(1, blockChannelCount * warpsPerBlock);
+        size_t totalWorkspaceSize = workspaceSizePerRank;
+        fusedMoeWorkspace.rankStrideInU64 = workspaceSizePerRank / sizeof(uint64_t);
+
+        TLLM_CUDA_CHECK(cudaMalloc(&fusedMoeWorkspace.workspacePtr, totalWorkspaceSize));
+
+        // Initialize workspace
+        FusedMoeWorldInfo worldInfo;
+        worldInfo.epInfo.epRank = 0;
+        worldInfo.epInfo.epSize = 1;
+        fusedMoeWorkspace.initializeLocalWorkspace(worldInfo, blockChannelCount * warpsPerBlock);
+
+        // Launch FIFO send/recv kernel
+        fused_moe_comm_tests::launchLocalFifoSendRecv(sendFieldInfo, recvFieldInfo, expertParallelInfo,
+            deviceRecvIndexMapping, fusedMoeWorkspace, tokenCount, warpsPerBlock, blockChannelCount, hasBasicFields,
+            useSimpleProto, stream);
+
+        TLLM_CUDA_CHECK(cudaStreamSynchronize(stream));
+
+        // Copy back results and verify
+        verifyLocalFifoSendRecvResults(hostSendTokenSlots, hostSendScales, hostSendFieldPtrs, hostRecvFieldPtrs,
+            deviceRecvTokenSlots, deviceRecvScales, deviceRecvFieldPtrs, fullMapping, topK, hasScales, hasBasicFields,
+            fieldCount, elementSizes, vectorSizes, tokenCount);
+
+        // Cleanup
+        if (hasBasicFields)
+        {
+            cleanup(hostSendTokenSlots, deviceSendTokenSlots);
+            cleanup(hostRecvTokenSlots, deviceRecvTokenSlots);
+            if (hasScales)
+            {
+                cleanup(hostSendScales, deviceSendScales);
+                cleanup(hostRecvScales, deviceRecvScales);
+            }
+        }
+        for (int i = 0; i < fieldCount; i++)
+        {
+            cleanup(hostSendFieldPtrs[i], deviceSendFieldPtrs[i]);
+            cleanup(hostRecvFieldPtrs[i], deviceRecvFieldPtrs[i]);
+        }
+        cleanup(hostRecvIndexMapping, deviceRecvIndexMapping);
+        TLLM_CUDA_CHECK(cudaFree(fusedMoeWorkspace.workspacePtr));
+    }
+
+private:
+    void verifyLocalFifoSendRecvResults(int const* expectedSendTokenSlots, float const* expectedSendScales,
+        std::vector<void*> const& expectedSendFields, std::vector<void*> const& hostRecvFields,
+        int* deviceRecvTokenSlots, float* deviceRecvScales, std::vector<void*> const& deviceRecvFields,
+        std::vector<int> const& fullMapping, int topK, bool hasScales, bool hasBasicFields, int fieldCount,
+        std::vector<size_t> const& elementSizes, std::vector<uint16_t> const& vectorSizes, int tokenCount)
+    {
+        // Copy back device results for verification
+        int* resultRecvTokenSlots = nullptr;
+        float* resultRecvScales = nullptr;
+
+        if (hasBasicFields)
+        {
+            resultRecvTokenSlots = new int[tokenCount * topK];
+            TLLM_CUDA_CHECK(cudaMemcpy(
+                resultRecvTokenSlots, deviceRecvTokenSlots, tokenCount * topK * sizeof(int), cudaMemcpyDeviceToHost));
+
+            if (hasScales)
+            {
+                resultRecvScales = new float[tokenCount * topK];
+                TLLM_CUDA_CHECK(cudaMemcpy(
+                    resultRecvScales, deviceRecvScales, tokenCount * topK * sizeof(float), cudaMemcpyDeviceToHost));
+            }
+        }
+
+        // Copy back field data
+        std::vector<uint8_t*> resultRecvFields(fieldCount);
+        for (int i = 0; i < fieldCount; i++)
+        {
+            size_t elementSize = elementSizes[i % elementSizes.size()];
+            uint16_t vectorSize = vectorSizes[i % vectorSizes.size()];
+            size_t fieldSize = elementSize * vectorSize * tokenCount;
+
+            resultRecvFields[i] = new uint8_t[fieldSize];
+            TLLM_CUDA_CHECK(cudaMemcpy(resultRecvFields[i], deviceRecvFields[i], fieldSize, cudaMemcpyDeviceToHost));
+        }
+
+        // Verify the FIFO send/recv: recv[fullMapping[sendIndex]] should equal send[sendIndex]
+        int tokenSlotErrorCount = 0;
+        int scaleErrorCount = 0;
+        std::vector<int> fieldErrorCounts(fieldCount, 0);
+
+        for (int sendIndex = 0; sendIndex < tokenCount; sendIndex++)
+        {
+            int recvIndex = fullMapping[sendIndex];
+            if (recvIndex < 0 || recvIndex >= tokenCount)
+                continue;
+
+            // Verify token selected slots
+            if (hasBasicFields)
+            {
+                for (int k = 0; k < topK; k++)
+                {
+                    int expectedSlot = expectedSendTokenSlots[sendIndex * topK + k];
+                    int actualSlot = resultRecvTokenSlots[recvIndex * topK + k];
+                    if (expectedSlot != actualSlot)
+                    {
+                        tokenSlotErrorCount++;
+                        if (tokenSlotErrorCount <= 16)
+                        {
+                            EXPECT_EQ(expectedSlot, actualSlot) << "Token slot mismatch at sendIndex=" << sendIndex
+                                                                << ", recvIndex=" << recvIndex << ", k=" << k;
+                        }
+                    }
+                }
+
+                // Verify expert scales
+                if (hasScales)
+                {
+                    for (int k = 0; k < topK; k++)
+                    {
+                        float expectedScale = expectedSendScales[sendIndex * topK + k];
+                        float actualScale = resultRecvScales[recvIndex * topK + k];
+                        if (std::abs(expectedScale - actualScale) > 1e-6f)
+                        {
+                            scaleErrorCount++;
+                            if (scaleErrorCount <= 16)
+                            {
+                                EXPECT_NEAR(expectedScale, actualScale, 1e-6f)
+                                    << "Scale mismatch at sendIndex=" << sendIndex << ", recvIndex=" << recvIndex
+                                    << ", k=" << k;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Verify additional fields
+            for (int fieldIdx = 0; fieldIdx < fieldCount; fieldIdx++)
+            {
+                size_t elementSize = elementSizes[fieldIdx % elementSizes.size()];
+                uint16_t vectorSize = vectorSizes[fieldIdx % vectorSizes.size()];
+                size_t fieldSizePerToken = elementSize * vectorSize;
+
+                uint8_t const* expectedFieldData = static_cast<uint8_t const*>(expectedSendFields[fieldIdx]);
+                uint8_t const* actualFieldData = resultRecvFields[fieldIdx];
+
+                for (size_t byteIdx = 0; byteIdx < fieldSizePerToken; byteIdx++)
+                {
+                    uint8_t expected = expectedFieldData[sendIndex * fieldSizePerToken + byteIdx];
+                    uint8_t actual = actualFieldData[recvIndex * fieldSizePerToken + byteIdx];
+                    if (expected != actual)
+                    {
+                        fieldErrorCounts[fieldIdx]++;
+                        if (fieldErrorCounts[fieldIdx] <= 16)
+                        {
+                            EXPECT_EQ(static_cast<int>(expected), static_cast<int>(actual))
+                                << "Field[" << fieldIdx << "] mismatch at sendIndex=" << sendIndex
+                                << ", recvIndex=" << recvIndex << ", byteIdx=" << byteIdx;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Print error summary for counts exceeding 16
+        if (tokenSlotErrorCount > 16)
+        {
+            ADD_FAILURE() << "Token slot errors: Showed first 16 of " << tokenSlotErrorCount << " total mismatches.";
+        }
+        if (scaleErrorCount > 16)
+        {
+            ADD_FAILURE() << "Scale errors: Showed first 16 of " << scaleErrorCount << " total mismatches.";
+        }
+        for (int fieldIdx = 0; fieldIdx < fieldCount; fieldIdx++)
+        {
+            if (fieldErrorCounts[fieldIdx] > 16)
+            {
+                ADD_FAILURE() << "Field[" << fieldIdx << "] errors: Showed first 16 of " << fieldErrorCounts[fieldIdx]
+                              << " total mismatches.";
+            }
+        }
+
+        // Cleanup temporary arrays
+        if (resultRecvTokenSlots)
+            delete[] resultRecvTokenSlots;
+        if (resultRecvScales)
+            delete[] resultRecvScales;
+        for (int i = 0; i < fieldCount; i++)
+        {
+            if (resultRecvFields[i])
+                delete[] resultRecvFields[i];
+        }
+    }
+};
+
+// Tests for Local FIFO Send/Recv functionality with Simple Protocol
+TEST_F(FusedMoeCommLocalFifoSendRecvTest, BasicFifoSendRecvSimpleProtocol)
+{
+    std::vector<int> mapping = {0, 1, 2, 3};                                        // Identity mapping
+    runLocalFifoSendRecvTest(2, false, true, 1, {4}, {64}, mapping, 4, 1, 1, true); // Simple protocol
+}
+
+TEST_F(FusedMoeCommLocalFifoSendRecvTest, BasicFifoSendRecvWithScalesSimpleProtocol)
+{
+    std::vector<int> mapping = {0, 1, 2, 3};                                       // Identity mapping
+    runLocalFifoSendRecvTest(4, true, true, 1, {4}, {32}, mapping, 4, 2, 1, true); // With scales, simple protocol
+}
+
+TEST_F(FusedMoeCommLocalFifoSendRecvTest, FifoSendRecvWithReorderingSimpleProtocol)
+{
+    std::vector<int> mapping = {3, 0, 2, 1}; // Reorder mapping
+    runLocalFifoSendRecvTest(2, true, true, 2, {4, 8}, {32, 64}, mapping, 256, 2, 2, true);
+}
+
+TEST_F(FusedMoeCommLocalFifoSendRecvTest, FifoSendRecvMultipleFieldsSimpleProtocol)
+{
+    std::vector<int> mapping = {1, 3, 0, 2}; // Complex reordering
+    runLocalFifoSendRecvTest(2, true, true, 3, {1, 2, 4}, {16, 32, 64}, mapping, 256, 2, 2, true);
+}
+
+TEST_F(FusedMoeCommLocalFifoSendRecvTest, FifoSendRecvLargeTopKSimpleProtocol)
+{
+    std::vector<int> mapping = {2, 0, 3, 1}; // Reorder mapping
+    runLocalFifoSendRecvTest(8, true, true, 2, {4, 8}, {128, 256}, mapping, 512, 3, 2, true);
+}
+
+// Tests for Local FIFO Send/Recv functionality with Lamport Protocol
+TEST_F(FusedMoeCommLocalFifoSendRecvTest, BasicFifoSendRecvLamportProtocol)
+{
+    std::vector<int> mapping = {0, 1, 2, 3};                                         // Identity mapping
+    runLocalFifoSendRecvTest(2, false, true, 1, {4}, {64}, mapping, 4, 1, 1, false); // Lamport protocol
+}
+
+TEST_F(FusedMoeCommLocalFifoSendRecvTest, BasicFifoSendRecvWithScalesLamportProtocol)
+{
+    std::vector<int> mapping = {0, 1, 2, 3};                                        // Identity mapping
+    runLocalFifoSendRecvTest(4, true, true, 1, {4}, {32}, mapping, 4, 2, 1, false); // With scales, Lamport protocol
+}
+
+TEST_F(FusedMoeCommLocalFifoSendRecvTest, FifoSendRecvWithReorderingLamportProtocol)
+{
+    std::vector<int> mapping = {3, 0, 2, 1}; // Reorder mapping
+    runLocalFifoSendRecvTest(2, true, true, 2, {4, 8}, {32, 64}, mapping, 256, 2, 2, false);
+}
+
+TEST_F(FusedMoeCommLocalFifoSendRecvTest, FifoSendRecvMultipleFieldsLamportProtocol)
+{
+    std::vector<int> mapping = {1, 3, 0, 2}; // Complex reordering
+    runLocalFifoSendRecvTest(2, true, true, 3, {1, 2, 4}, {16, 32, 64}, mapping, 256, 2, 2, false);
+}
+
+TEST_F(FusedMoeCommLocalFifoSendRecvTest, FifoSendRecvLargeTopKLamportProtocol)
+{
+    std::vector<int> mapping = {2, 0, 3, 1}; // Reorder mapping
+    runLocalFifoSendRecvTest(8, true, true, 2, {4, 8}, {128, 256}, mapping, 512, 3, 2, false);
+}
+
+// Tests without basic fields
+TEST_F(FusedMoeCommLocalFifoSendRecvTest, FifoSendRecvWithoutBasicFieldsSimpleProtocol)
+{
+    std::vector<int> mapping = {1, 3, 0, 2};                             // Reorder mapping
+    runLocalFifoSendRecvTest(
+        0, false, false, 2, {4, 8}, {32, 64}, mapping, 256, 2, 2, true); // No basic fields, simple protocol
+}
+
+TEST_F(FusedMoeCommLocalFifoSendRecvTest, FifoSendRecvWithoutBasicFieldsLamportProtocol)
+{
+    std::vector<int> mapping = {1, 3, 0, 2};                              // Reorder mapping
+    runLocalFifoSendRecvTest(
+        0, false, false, 2, {4, 8}, {32, 64}, mapping, 256, 2, 2, false); // No basic fields, Lamport protocol
+}
+
+// Mixed alignment tests
+TEST_F(FusedMoeCommLocalFifoSendRecvTest, FifoSendRecvMixedAlignmentsSimpleProtocol)
+{
+    std::vector<int> mapping = {1, 0, 3, 2}; // Pair swap
+    runLocalFifoSendRecvTest(3, true, true, 4, {1, 2, 4, 8}, {8, 16, 32, 64}, mapping, 512, 2, 2, true);
+}
+
+TEST_F(FusedMoeCommLocalFifoSendRecvTest, FifoSendRecvMixedAlignmentsLamportProtocol)
+{
+    std::vector<int> mapping = {1, 0, 3, 2}; // Pair swap
+    runLocalFifoSendRecvTest(3, true, true, 4, {1, 2, 4, 8}, {8, 16, 32, 64}, mapping, 512, 2, 2, false);
+}
+
+// Edge cases
+TEST_F(FusedMoeCommLocalFifoSendRecvTest, FifoSendRecvEdgeCaseTopKOneSimpleProtocol)
+{
+    std::vector<int> mapping = {1, 0, 3, 2}; // Simple reordering
+    runLocalFifoSendRecvTest(1, false, true, 1, {4}, {16}, mapping, 128, 2, 1, true);
+}
+
+TEST_F(FusedMoeCommLocalFifoSendRecvTest, FifoSendRecvEdgeCaseTopKOneLamportProtocol)
+{
+    std::vector<int> mapping = {1, 0, 3, 2}; // Simple reordering
+    runLocalFifoSendRecvTest(1, false, true, 1, {4}, {16}, mapping, 128, 2, 1, false);
+}
+
+TEST_F(FusedMoeCommLocalFifoSendRecvTest, FifoSendRecvEdgeCaseNoExtraFieldsSimpleProtocol)
+{
+    std::vector<int> mapping = {3, 1, 0, 2};                                      // Random reordering
+    runLocalFifoSendRecvTest(2, true, true, 0, {}, {}, mapping, 256, 2, 2, true); // Only basic fields
+}
+
+TEST_F(FusedMoeCommLocalFifoSendRecvTest, FifoSendRecvEdgeCaseNoExtraFieldsLamportProtocol)
+{
+    std::vector<int> mapping = {3, 1, 0, 2};                                       // Random reordering
+    runLocalFifoSendRecvTest(2, true, true, 0, {}, {}, mapping, 256, 2, 2, false); // Only basic fields
+}
+
+// Large scale tests
+TEST_F(FusedMoeCommLocalFifoSendRecvTest, FifoSendRecvLargeTokenCountSimpleProtocol)
+{
+    std::vector<int> mapping = {7, 0, 5, 2, 3, 6, 1, 4, 15, 8, 11, 10, 9, 14, 13, 12}; // Complex 16-element mapping
+    runLocalFifoSendRecvTest(4, true, true, 2, {4, 8}, {64, 128}, mapping, 1024, 3, 3, true); // Large scale test
+}
+
+TEST_F(FusedMoeCommLocalFifoSendRecvTest, FifoSendRecvLargeTokenCountLamportProtocol)
+{
+    std::vector<int> mapping = {7, 0, 5, 2, 3, 6, 1, 4, 15, 8, 11, 10, 9, 14, 13, 12}; // Complex 16-element mapping
+    runLocalFifoSendRecvTest(4, true, true, 2, {4, 8}, {64, 128}, mapping, 1024, 3, 3, false); // Large scale test
+}
+
+// Perfect alignment tests
+TEST_F(FusedMoeCommLocalFifoSendRecvTest, FifoSendRecvPerfectAlignmentSimpleProtocol)
+{
+    std::vector<int> mapping = {0, 2, 1, 3}; // Partial reordering
+    runLocalFifoSendRecvTest(4, false, true, 2, {16}, {32}, mapping, 256, 2, 3, true);
+}
+
+TEST_F(FusedMoeCommLocalFifoSendRecvTest, FifoSendRecvPerfectAlignmentLamportProtocol)
+{
+    std::vector<int> mapping = {0, 2, 1, 3}; // Partial reordering
+    runLocalFifoSendRecvTest(4, false, true, 2, {16}, {32}, mapping, 256, 2, 3, false);
+}
+
+// Single byte alignment tests
+TEST_F(FusedMoeCommLocalFifoSendRecvTest, FifoSendRecvSingleByteAlignmentSimpleProtocol)
+{
+    std::vector<int> mapping = {2, 3, 0, 1}; // Cyclic shift
+    runLocalFifoSendRecvTest(2, false, true, 2, {1}, {128}, mapping, 256, 3, 1, true);
+}
+
+TEST_F(FusedMoeCommLocalFifoSendRecvTest, FifoSendRecvSingleByteAlignmentLamportProtocol)
+{
+    std::vector<int> mapping = {2, 3, 0, 1}; // Cyclic shift
+    runLocalFifoSendRecvTest(2, false, true, 2, {1}, {128}, mapping, 256, 3, 1, false);
+}
+
+// Stress tests
+TEST_F(FusedMoeCommLocalFifoSendRecvTest, FifoSendRecvStressTestManyChannelsSimpleProtocol)
+{
+    std::vector<int> mapping = {7, 2, 5, 0, 3, 6, 1, 4};                                       // Complex mapping
+    runLocalFifoSendRecvTest(4, true, true, 2, {8, 16}, {128, 256}, mapping, 512, 3, 4, true); // Many channels
+}
+
+TEST_F(FusedMoeCommLocalFifoSendRecvTest, FifoSendRecvStressTestManyChannelsLamportProtocol)
+{
+    std::vector<int> mapping = {7, 2, 5, 0, 3, 6, 1, 4};                                        // Complex mapping
+    runLocalFifoSendRecvTest(4, true, true, 2, {8, 16}, {128, 256}, mapping, 512, 3, 4, false); // Many channels
+}
+
+TEST_F(FusedMoeCommLocalFifoSendRecvTest, FifoSendRecvStressTest2ManyChannelsSimpleProtocol)
+{
+    std::vector<int> mapping = {7, 2, 5, 0, 3, 6, 1, 4};                               // Complex mapping
+    runLocalFifoSendRecvTest(
+        4, true, true, 2, {2, 4, 8, 16}, {7, 15, 31, 255}, mapping, 4096, 1, 2, true); // Many channels
+}
+
+TEST_F(FusedMoeCommLocalFifoSendRecvTest, FifoSendRecvStressTest2ManyChannelsLamportProtocol)
+{
+    std::vector<int> mapping = {7, 2, 5, 0, 3, 6, 1, 4};                                // Complex mapping
+    runLocalFifoSendRecvTest(
+        4, true, true, 2, {2, 4, 8, 16}, {7, 15, 31, 255}, mapping, 4096, 1, 2, false); // Many channels
+}
+
+TEST_F(FusedMoeCommLocalFifoSendRecvTest, FifoSendRecvStressTestManyWarpsSimpleProtocol)
+{
+    std::vector<int> mapping = {1, 0, 3, 2};                                          // Simple reordering
+    runLocalFifoSendRecvTest(2, false, true, 1, {4}, {64}, mapping, 256, 4, 2, true); // Many warps per block
+}
+
+TEST_F(FusedMoeCommLocalFifoSendRecvTest, FifoSendRecvStressTestManyWarpsLamportProtocol)
+{
+    std::vector<int> mapping = {1, 0, 3, 2};                                           // Simple reordering
+    runLocalFifoSendRecvTest(2, false, true, 1, {4}, {64}, mapping, 256, 4, 2, false); // Many warps per block
+}

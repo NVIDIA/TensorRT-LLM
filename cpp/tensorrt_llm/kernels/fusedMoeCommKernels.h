@@ -32,7 +32,7 @@ struct ALIGN_256 SenderSideFifoInfo
 
 struct ALIGN_256 ReceiverSideFifoInfo
 {
-    // volatile uint64_t head; // write position not used
+    volatile uint64_t head; // write position do we use this?
     volatile uint64_t tail; // read position
 };
 
@@ -192,6 +192,7 @@ struct FusedMoePairInfo
     int senderRank;
     int receiverRank;
     int channel;
+    int runChannelCount;
     int channelCount;
 };
 
@@ -296,6 +297,7 @@ class FusedMoeCommunicator
 public:
     static constexpr int FIFO_DEPTH = 4;
     static constexpr int FIFO_ENTRY_BYTES = 256 * 1024;
+    static constexpr int FIFO_ENTRY_128_BYTE_COUNT = FIFO_ENTRY_BYTES / 128;
     static constexpr int FIFO_TOTAL_BYTES = FIFO_ENTRY_BYTES * FIFO_DEPTH;
     static constexpr int FIFO_TOTAL_U64 = FIFO_TOTAL_BYTES / sizeof(uint64_t);
     static constexpr int GROUP_COUNT_PER_BLOCK = 8;
@@ -427,6 +429,11 @@ void launchLoopback(FusedMoeFieldInfo const& sendFieldInfo, FusedMoeFieldInfo co
 void launchLocalSendRecv(FusedMoeFieldInfo const& sendFieldInfo, FusedMoeFieldInfo const& recvFieldInfo,
     MoeExpertParallelInfo const& expertParallelInfo, int* recvIndexMapping, FusedMoeWorkspace fusedMoeWorkspace,
     int tokenCount, int warpsPerBlock, int blockChannelCount, bool hasBasicFields, cudaStream_t stream);
+
+void launchLocalFifoSendRecv(FusedMoeFieldInfo const& sendFieldInfo, FusedMoeFieldInfo const& recvFieldInfo,
+    MoeExpertParallelInfo const& expertParallelInfo, int* recvIndexMapping, FusedMoeWorkspace fusedMoeWorkspace,
+    int tokenCount, int warpsPerBlock, int blockChannelCount, bool hasBasicFields, bool useSimpleProto,
+    cudaStream_t stream);
 
 } // namespace fused_moe_comm_tests
 

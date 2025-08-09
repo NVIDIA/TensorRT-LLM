@@ -36,6 +36,11 @@ static __device__ __forceinline__ uint64_t __as_ptr_gmem(void const* __ptr)
     return static_cast<uint64_t>(__cvta_generic_to_global(__ptr));
 }
 
+__device__ __forceinline__ void fence_release_sys()
+{
+    asm volatile("fence.release.sys;" : : : "memory");
+}
+
 __device__ __forceinline__ void mbarrier_init(uint64_t* addr, uint32_t const& count)
 {
 #if defined(__CUDACC__) || __CUDA_ARCH__ >= 800
@@ -645,6 +650,373 @@ __device__ __forceinline__ void s2gAllFields(FusedMoeFieldInfo const& recvFieldI
     cp_async_bulk_commit_group();
 }
 
+template <bool HAS_BASIC_FIELD = true, bool USE_SIMPLE_PROTO = false>
+class SingleChannelCommunicator
+{
+public:
+    __device__ __forceinline__ SingleChannelCommunicator(FusedMoeFieldInfo const& fieldInfo,
+        MoeExpertParallelInfo const& expertParallelInfo, MoeSingleCommMeta const& commMeta,
+        FusedMoeWorkspace const& workspace, FusedMoeWorldInfo const& worldInfo, FusedMoePairInfo const& pairInfo,
+        uint64_t* smemBar, uint8_t* shmemBase)
+        : mFieldInfo(fieldInfo)
+        , mExpertParallelInfo(expertParallelInfo)
+        , mCommMeta(commMeta)
+        , mWorkspace(workspace)
+        , mWorldInfo(worldInfo)
+        , mPairInfo(pairInfo)
+        , mSmemBar(smemBar)
+        , mShmemBase(shmemBase)
+    {
+        mWarpId = threadIdx.x / WARP_SIZE;
+        mLaneId = threadIdx.x % WARP_SIZE;
+
+        mFifoBasePtr = mWorkspace.getFifoBasePtr(mWorldInfo, mPairInfo);
+        mSenderSideFifoInfo = mWorkspace.getSenderSideFifoInfo(mWorldInfo, mPairInfo);
+        mReceiverSideFifoInfo = mWorkspace.getReceiverSideFifoInfo(mWorldInfo, mPairInfo);
+
+        mSingleTransfer128ByteCount = mCommMeta.getPacked128ByteCount();
+        // initialize as need new Entry first
+        mFifoEntry128ByteIndexBase = kFifoEntry128ByteCount;
+        mFifoEntryIndex = -1;
+
+        tensorrt_llm::kernels::fused_moe_impl::initSmemBar(mSmemBar, mLaneId);
+    }
+
+    __device__ __forceinline__ uint64_t* getFifoEntryPtr() const
+    {
+        return mFifoBasePtr + mFifoEntryIndex * kFifoEntrySizeInU64;
+    }
+
+    __device__ __forceinline__ bool needNewEntry() const
+    {
+        return mFifoEntry128ByteIndexBase + mSingleTransfer128ByteCount > kFifoEntry128ByteCount;
+    }
+
+    __device__ __forceinline__ void nextToken()
+    {
+        mFifoEntry128ByteIndexBase += mSingleTransfer128ByteCount;
+    }
+
+    __device__ __forceinline__ void senderInitFifo()
+    {
+        mHead = mSenderSideFifoInfo->head;
+        mTail = mSenderSideFifoInfo->tail;
+    }
+
+    __device__ __forceinline__ void receiverInitFifo()
+    {
+        mHead = mReceiverSideFifoInfo->head;
+        mTail = mReceiverSideFifoInfo->tail;
+    }
+
+    /*
+     * Head     | 0 | 1 | 2 | 3 | 4 | 4 | 4 | 4 | 4 | 5 |
+     * Tail     | 0 | 0 | 0 | 0 | 0 | 1 | 2 | 3 | 4 | 4 |
+     * Writable | Y | Y | Y | Y | N | Y | Y | Y | Y | Y |
+     * Readable | N | Y | Y | Y | Y | Y | Y | Y | N | Y |
+     */
+
+    __device__ __forceinline__ void waitEntryWritable()
+    {
+        while (mTail + kFifoDepth <= mHead)
+        {
+            mTail = mSenderSideFifoInfo->tail;
+        }
+    }
+
+    __device__ __forceinline__ void updateWriteEntry()
+    {
+        __syncwarp();
+        mSenderSideFifoInfo->head = mHead;
+        if (USE_SIMPLE_PROTO)
+        {
+            fence_release_sys();
+            mReceiverSideFifoInfo->head = mHead;
+        }
+    }
+
+    __device__ __forceinline__ void waitEntryReadable()
+    {
+        if (USE_SIMPLE_PROTO)
+        {
+            // only used in Simple Proto
+            while (mTail >= mHead)
+            {
+                mHead = mReceiverSideFifoInfo->head;
+            }
+        }
+    }
+
+    __device__ __forceinline__ void updateReadEntry()
+    {
+        // need this fence to be sure lamport flags are updated.
+        fence_release_sys();
+        mReceiverSideFifoInfo->tail = mTail;
+        mSenderSideFifoInfo->tail = mTail;
+    }
+
+    __device__ __forceinline__ void newSendEntry()
+    {
+        mFifoEntryIndex = mHead % kFifoDepth;
+        mFifoEntry128ByteIndexBase = 0;
+        waitEntryWritable();
+        __syncwarp();
+    }
+
+    __device__ __forceinline__ void newReceiveEntry()
+    {
+        mFifoEntryIndex = mTail % kFifoDepth;
+        mFifoEntry128ByteIndexBase = 0;
+        waitEntryReadable();
+        __syncwarp();
+    }
+
+    __device__ __forceinline__ void doSend(int tokenCount)
+    {
+        senderInitFifo();
+
+        int sendIndex = mPairInfo.channel;
+        uint32_t phaseParity = 0;
+#ifdef DEBUG_PRINT
+        if (mLaneId == 0)
+        {
+            printf("[Send] warpId=%d, blockIdx=(%d, %d, %d), in doSend head=%lu, tail=%lu\n", mWarpId, blockIdx.x,
+                blockIdx.y, blockIdx.z, mHead, mTail);
+        }
+        __syncwarp();
+#endif
+        for (; sendIndex < tokenCount; sendIndex += mPairInfo.runChannelCount)
+        {
+            int tokenIndex = sendIndex;
+#ifdef DEBUG_PRINT
+            if (mLaneId == 0)
+            {
+                printf("[Send] warpId=%d, blockIdx=(%d, %d, %d), tokenIndex=%d, head=%lu, tail=%lu, starting G2S\n",
+                    mWarpId, blockIdx.x, blockIdx.y, blockIdx.z, tokenIndex, mHead, mTail);
+            }
+            __syncwarp();
+#endif
+            tensorrt_llm::kernels::fused_moe_impl::g2sAllFields<HAS_BASIC_FIELD>(
+                mFieldInfo, mExpertParallelInfo, tokenIndex, mShmemBase, mWarpId, mLaneId, mSmemBar);
+            if (needNewEntry())
+            {
+                if (mFifoEntryIndex >= 0)
+                {
+                    // not first entry, update FIFO info from last entry.
+                    mHead++;
+                    updateWriteEntry();
+                }
+                newSendEntry();
+            }
+            tensorrt_llm::kernels::fused_moe_impl::waitG2SAllFields<HAS_BASIC_FIELD>(mSmemBar, &phaseParity);
+#ifdef DEBUG_PRINT
+            if (mLaneId == 0)
+            {
+                printf("[Send] warpId=%d, blockIdx=(%d, %d, %d), tokenIndex=%d, head=%lu, tail=%lu, done G2S\n",
+                    mWarpId, blockIdx.x, blockIdx.y, blockIdx.z, tokenIndex, mHead, mTail);
+            }
+            __syncwarp();
+#endif
+            tensorrt_llm::kernels::fused_moe_impl::packAllFields(mFieldInfo, tokenIndex, mShmemBase, mLaneId);
+
+            tensorrt_llm::kernels::fused_moe_impl::fixInvalidData(
+                reinterpret_cast<int*>(mShmemBase), mSingleTransfer128ByteCount, mFifoEntry128ByteIndexBase, mLaneId);
+
+            tensorrt_llm::kernels::fused_moe_impl::startWorkspaceS2G(getFifoEntryPtr(), mShmemBase,
+                mSingleTransfer128ByteCount, mFifoEntry128ByteIndexBase, mWarpId, mLaneId);
+
+#ifdef DEBUG_PRINT
+            if (mLaneId == 0)
+            {
+                printf(
+                    "[Send] warpId=%d, blockIdx=(%d, %d, %d), tokenIndex=%d, head=%lu, tail=%lu, started S2G, "
+                    "mFifoEntry128ByteIndexBase=%d \n",
+                    mWarpId, blockIdx.x, blockIdx.y, blockIdx.z, tokenIndex, mHead, mTail, mFifoEntry128ByteIndexBase);
+            }
+            __syncwarp();
+#endif
+            tensorrt_llm::kernels::fused_moe_impl::waitS2GBulkRead();
+
+#ifdef DEBUG_PRINT
+            if (mLaneId == 0)
+            {
+                printf(
+                    "[Send] warpId=%d, blockIdx=(%d, %d, %d), tokenIndex=%d, head=%lu, tail=%lu, done S2G read, "
+                    "mFifoEntry128ByteIndexBase=%d \n",
+                    mWarpId, blockIdx.x, blockIdx.y, blockIdx.z, tokenIndex, mHead, mTail, mFifoEntry128ByteIndexBase);
+            }
+            __syncwarp();
+#endif
+            nextToken();
+        }
+        if (mFifoEntry128ByteIndexBase > 0)
+        {
+            mHead++;
+            updateWriteEntry();
+        }
+    }
+
+    __device__ __forceinline__ void rearmLamportBuffer()
+    {
+        constexpr int kUint32CountPer128Byte = 128 / sizeof(uint32_t);
+        uint32_t* fifoPtr = reinterpret_cast<uint32_t*>(getFifoEntryPtr());
+        fifoPtr += mFifoEntry128ByteIndexBase * kUint32CountPer128Byte;
+        for (int i = mLaneId; i < mSingleTransfer128ByteCount; i += WARP_SIZE)
+        {
+            int checkValue0Position = (mFifoEntry128ByteIndexBase + i) % kUint32CountPer128Byte;
+            fifoPtr[i * kUint32CountPer128Byte + checkValue0Position] = FusedMoeCommunicator::INVALID_VALUE;
+        }
+        __syncwarp();
+    }
+
+    __device__ __forceinline__ void doReceive(int tokenCount, int* recvIndexMapping)
+    {
+        receiverInitFifo();
+#ifdef DEBUG_PRINT
+        if (mLaneId == 0)
+        {
+            printf("[Receive] warpId=%d, blockIdx=(%d, %d, %d), in doReceive head=%lu, tail=%lu\n", mWarpId, blockIdx.x,
+                blockIdx.y, blockIdx.z, mHead, mTail);
+        }
+        __syncwarp();
+#endif
+        int recvIndex = mPairInfo.channel;
+        uint32_t phaseParity = 0;
+        bool needRelease = false;
+        for (; recvIndex < tokenCount; recvIndex += mPairInfo.runChannelCount)
+        {
+            int tokenIndex = recvIndexMapping[recvIndex];
+            int loaded128ByteCount = 0;
+#ifdef DEBUG_PRINT
+            if (mLaneId == 0)
+            {
+                printf(
+                    "[Receive] warpId=%d, blockIdx=(%d, %d, %d), recvIndex=%d, tokenIndex=%d, head=%lu, tail=%lu, "
+                    "start G2S\n",
+                    mWarpId, blockIdx.x, blockIdx.y, blockIdx.z, recvIndex, tokenIndex, mHead, mTail);
+            }
+            __syncwarp();
+#endif
+            while (loaded128ByteCount < mSingleTransfer128ByteCount)
+            {
+                if (needNewEntry())
+                {
+                    if (mFifoEntryIndex >= 0)
+                    {
+                        // not first entry, update FIFO info from last entry.
+                        mTail++;
+                        needRelease = true;
+                    }
+                    newReceiveEntry();
+#ifdef DEBUG_PRINT
+                    if (mLaneId == 0)
+                    {
+                        printf(
+                            "[Receive] warpId=%d, blockIdx=(%d, %d, %d), recvIndex=%d, tokenIndex=%d, head=%lu, "
+                            "tail=%lu, new receive entry done\n",
+                            mWarpId, blockIdx.x, blockIdx.y, blockIdx.z, recvIndex, tokenIndex, mHead, mTail);
+                    }
+                    __syncwarp();
+#endif
+                }
+                tensorrt_llm::kernels::fused_moe_impl::startWorkspaceG2S(mShmemBase, getFifoEntryPtr(),
+                    mSingleTransfer128ByteCount, mFifoEntry128ByteIndexBase, loaded128ByteCount, mSmemBar, mWarpId,
+                    mLaneId);
+                if (needRelease)
+                {
+                    updateReadEntry();
+                    needRelease = false;
+                }
+                tensorrt_llm::kernels::fused_moe_impl::smemBarWait(mSmemBar, &phaseParity);
+                if (USE_SIMPLE_PROTO)
+                {
+                    loaded128ByteCount = mSingleTransfer128ByteCount;
+                }
+                else
+                {
+                    // Lamport case
+                    loaded128ByteCount += tensorrt_llm::kernels::fused_moe_impl::dataReceivedInShm<false>(mShmemBase,
+                        mSingleTransfer128ByteCount, mFifoEntry128ByteIndexBase, loaded128ByteCount, mWarpId, mLaneId);
+                }
+            }
+
+#ifdef DEBUG_PRINT
+            if (mLaneId == 0)
+            {
+                printf(
+                    "[Receive] warpId=%d, blockIdx=(%d, %d, %d), recvIndex=%d, tokenIndex=%d, head=%lu, tail=%lu, G2S "
+                    "done\n",
+                    mWarpId, blockIdx.x, blockIdx.y, blockIdx.z, recvIndex, tokenIndex, mHead, mTail);
+            }
+            __syncwarp();
+#endif
+
+            tensorrt_llm::kernels::fused_moe_impl::unpackAllFields(mFieldInfo, tokenIndex, mShmemBase, mLaneId);
+            tensorrt_llm::kernels::fused_moe_impl::s2gAllFields<HAS_BASIC_FIELD>(
+                mFieldInfo, mExpertParallelInfo, tokenIndex, mShmemBase, mWarpId, mLaneId);
+            tensorrt_llm::kernels::fused_moe_impl::waitS2GBulkRead();
+
+#ifdef DEBUG_PRINT
+            if (mLaneId == 0)
+            {
+                printf(
+                    "[Receive] warpId=%d, blockIdx=(%d, %d, %d), recvIndex=%d, tokenIndex=%d, head=%lu, tail=%lu, "
+                    "after S2G read\n",
+                    mWarpId, blockIdx.x, blockIdx.y, blockIdx.z, recvIndex, tokenIndex, mHead, mTail);
+            }
+            __syncwarp();
+#endif
+            // we need to rearm even for simple proto since next time may use lamport
+            rearmLamportBuffer();
+
+#ifdef DEBUG_PRINT
+            if (mLaneId == 0)
+            {
+                printf(
+                    "[Receive] warpId=%d, blockIdx=(%d, %d, %d), recvIndex=%d, tokenIndex=%d, head=%lu, tail=%lu, "
+                    "after rearmLamportBuffer\n",
+                    mWarpId, blockIdx.x, blockIdx.y, blockIdx.z, recvIndex, tokenIndex, mHead, mTail);
+            }
+            __syncwarp();
+#endif
+            nextToken();
+        }
+        if (mFifoEntry128ByteIndexBase > 0)
+        {
+            mTail++;
+            updateReadEntry();
+        }
+    }
+
+private:
+    static constexpr int kFifoEntrySizeInU64 = FusedMoeCommunicator::FIFO_ENTRY_BYTES / sizeof(uint64_t);
+    static constexpr int kFifoEntry128ByteCount = FusedMoeCommunicator::FIFO_ENTRY_128_BYTE_COUNT;
+    static constexpr int kFifoDepth = FusedMoeCommunicator::FIFO_DEPTH;
+
+    FusedMoeFieldInfo mFieldInfo;
+    MoeExpertParallelInfo mExpertParallelInfo;
+    MoeSingleCommMeta mCommMeta;
+    FusedMoeWorkspace mWorkspace;
+    FusedMoeWorldInfo mWorldInfo;
+    FusedMoePairInfo mPairInfo;
+    uint64_t* mSmemBar;
+    uint8_t* mShmemBase;
+
+    int mLaneId;
+    int mWarpId;
+
+    uint64_t* mFifoBasePtr;
+    SenderSideFifoInfo* mSenderSideFifoInfo;
+    ReceiverSideFifoInfo* mReceiverSideFifoInfo;
+
+    int64_t mHead;
+    int64_t mTail;
+
+    int mSingleTransfer128ByteCount;
+    int mFifoEntry128ByteIndexBase;
+    int mFifoEntryIndex;
+};
+
 } // namespace fused_moe_impl
 
 namespace fused_moe_comm_tests
@@ -1147,6 +1519,95 @@ void launchLocalSendRecv(FusedMoeFieldInfo const& sendFieldInfo, FusedMoeFieldIn
     localSendRecvKernel<<<gridDim, blockDim, warpShmSize * warpsPerBlock, stream>>>(sendFieldInfo, recvFieldInfo,
         expertParallelInfo, sendCommMeta, recvCommMeta, fusedMoeWorkspace, recvIndexMapping, tokenCount,
         hasBasicFields);
+    TLLM_CUDA_CHECK(cudaGetLastError());
+}
+
+template <bool HAS_BASIC_FIELD = true, bool USE_SIMPLE_PROTO = false>
+__global__ void localFifoSendRecvKernel(FusedMoeFieldInfo sendFieldInfo, FusedMoeFieldInfo recvFieldInfo,
+    MoeExpertParallelInfo expertParallelInfo, MoeSingleCommMeta sendCommMeta, MoeSingleCommMeta recvCommMeta,
+    FusedMoeWorkspace fusedMoeWorkspace, int* recvIndexMapping, int tokenCount)
+{
+    __shared__ uint64_t allWarpSmemBar[32];
+    extern __shared__ int4 allWarpShm[];
+
+    FusedMoeWorldInfo worldInfo;
+    worldInfo.epInfo.epRank = 0;
+    worldInfo.epInfo.epSize = 1;
+
+    int warpId = threadIdx.x / WARP_SIZE;
+    int warpCount = blockDim.x / WARP_SIZE;
+
+    FusedMoePairInfo pairInfo;
+    pairInfo.senderRank = 0;
+    pairInfo.receiverRank = 0;
+    pairInfo.channel = blockIdx.z * warpCount + warpId;
+    pairInfo.runChannelCount = gridDim.z * warpCount;
+    pairInfo.channelCount = gridDim.z * warpCount;
+
+    if (blockIdx.y == 0)
+    {
+        tensorrt_llm::kernels::fused_moe_impl::SingleChannelCommunicator<HAS_BASIC_FIELD, USE_SIMPLE_PROTO> senderComm(
+            sendFieldInfo, expertParallelInfo, sendCommMeta, fusedMoeWorkspace, worldInfo, pairInfo,
+            &allWarpSmemBar[warpId],
+            reinterpret_cast<uint8_t*>(&allWarpShm[0]) + warpId * sendCommMeta.singleUnpackedAlignedSize);
+        senderComm.doSend(tokenCount);
+    }
+    else
+    {
+        tensorrt_llm::kernels::fused_moe_impl::SingleChannelCommunicator<HAS_BASIC_FIELD, USE_SIMPLE_PROTO> recverComm(
+            recvFieldInfo, expertParallelInfo, recvCommMeta, fusedMoeWorkspace, worldInfo, pairInfo,
+            &allWarpSmemBar[warpId],
+            reinterpret_cast<uint8_t*>(&allWarpShm[0]) + warpId * recvCommMeta.singleUnpackedAlignedSize);
+        recverComm.doReceive(tokenCount, recvIndexMapping);
+    }
+}
+
+void launchLocalFifoSendRecv(FusedMoeFieldInfo const& sendFieldInfo, FusedMoeFieldInfo const& recvFieldInfo,
+    MoeExpertParallelInfo const& expertParallelInfo, int* recvIndexMapping, FusedMoeWorkspace fusedMoeWorkspace,
+    int tokenCount, int warpsPerBlock, int blockChannelCount, bool hasBasicFields, bool useSimpleProto,
+    cudaStream_t stream)
+{
+    int warpSendShmSize = sendFieldInfo.computeSingleWarpShmSize(
+        expertParallelInfo.topK, sendFieldInfo.expertScales != nullptr, hasBasicFields);
+    int warpRecvShmSize = recvFieldInfo.computeSingleWarpShmSize(
+        expertParallelInfo.topK, recvFieldInfo.expertScales != nullptr, hasBasicFields);
+    int warpShmSize = warpSendShmSize;
+    TLLM_CHECK_WITH_INFO(warpSendShmSize == warpRecvShmSize, "warpSendShmSize(%d) not same as warpRecvShmSize(%d)",
+        warpSendShmSize, warpRecvShmSize);
+    dim3 blockDim(WARP_SIZE * warpsPerBlock, 1, 1);
+    dim3 gridDim(1, 2, blockChannelCount);
+    MoeSingleCommMeta sendCommMeta, recvCommMeta;
+    sendFieldInfo.fillMetaInfo(
+        &sendCommMeta, expertParallelInfo.topK, sendFieldInfo.expertScales != nullptr, hasBasicFields);
+    recvFieldInfo.fillMetaInfo(
+        &recvCommMeta, expertParallelInfo.topK, recvFieldInfo.expertScales != nullptr, hasBasicFields);
+    auto* kernelFn = localFifoSendRecvKernel<>;
+    if (hasBasicFields)
+    {
+        if (useSimpleProto)
+        {
+            kernelFn = localFifoSendRecvKernel<true, true>;
+        }
+        else
+        {
+            kernelFn = localFifoSendRecvKernel<true, false>;
+        }
+    }
+    else
+    {
+        if (useSimpleProto)
+        {
+            kernelFn = localFifoSendRecvKernel<false, true>;
+        }
+        else
+        {
+            kernelFn = localFifoSendRecvKernel<false, false>;
+        }
+    }
+    TLLM_CUDA_CHECK(
+        cudaFuncSetAttribute(kernelFn, cudaFuncAttributeMaxDynamicSharedMemorySize, warpShmSize * warpsPerBlock));
+    kernelFn<<<gridDim, blockDim, warpShmSize * warpsPerBlock, stream>>>(sendFieldInfo, recvFieldInfo,
+        expertParallelInfo, sendCommMeta, recvCommMeta, fusedMoeWorkspace, recvIndexMapping, tokenCount);
     TLLM_CUDA_CHECK(cudaGetLastError());
 }
 
