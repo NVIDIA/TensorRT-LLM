@@ -1161,6 +1161,13 @@ class PyExecutor:
             if not _respond_if_invalid(request)
         ]
 
+        if self.kv_cache_transceiver is None:
+            assert all(
+                req.request is None
+                or req.request.request_type != "REQUEST_TYPE_CONTEXT_ONLY"
+                for req in validated_requests
+            ), "Context-only requests are not allowed when disaggregation is disabled."
+
         self.active_requests.extend(validated_requests)
         return validated_requests
 

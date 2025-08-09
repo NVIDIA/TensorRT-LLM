@@ -52,7 +52,7 @@ Refer to the [ep_load_balancer](./ep_load_balancer/) directory for more details 
 
 ### 2. Execute Wide-EP on SLURM Clusters
 
-Refer to the [slurm_scripts](./slurm_scripts/) directory, which reuses [disaggregated slurm scripts](../disaggregated/slurm/) to automatically generate configuration files and submit jobs to SLURM clusters.
+Refer to the [slurm_scripts](./slurm_scripts/) directory, which reuses [disaggregated slurm scripts](../disaggregated/benchmark/slurm/) to automatically generate configuration files and submit jobs to SLURM clusters.
 
 ## Trouble shooting
 
