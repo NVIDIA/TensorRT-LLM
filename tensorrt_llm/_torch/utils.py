@@ -12,7 +12,12 @@ from tensorrt_llm.quantization.utils import fp4_utils
 
 is_torch_compiling_flag = False
 
-aux_stream_name_list = ['Attention', 'MoeShared', 'MoeChunkingOverlap']
+aux_stream_name_list = [
+    'Attention',
+    'MoeShared',
+    'MoeChunkingOverlap',
+    'MoeBalancer',
+]
 AuxStreamType = Enum(
     'AuxStreamType',
     aux_stream_name_list,
