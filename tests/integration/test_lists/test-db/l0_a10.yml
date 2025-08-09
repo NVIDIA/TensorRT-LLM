@@ -21,9 +21,11 @@ l0_a10:
   - disaggregated/test_disaggregated.py::test_disaggregated_cuda_graph[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_mixed[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_overlap[TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated.py::test_disaggregated_diff_max_tokens[TinyLlama-1.1B-Chat-v1.0]
   - test_e2e.py::test_openai_chat_structural_tag_example
   - test_e2e.py::test_openai_chat_json_example
   - test_e2e.py::test_openai_chat_multimodal_example
+  - test_e2e.py::test_openai_prometheus
   - test_e2e.py::test_openai_lora
   - test_e2e.py::test_trtllm_serve_multimodal_example
   - test_e2e.py::test_trtllm_serve_lora_example
@@ -32,6 +34,7 @@ l0_a10:
   - test_e2e.py::test_openai_completions_example[pytorch]
   - test_e2e.py::test_openai_chat_example[pytorch] TIMEOUT (90)
   - test_e2e.py::test_trtllm_bench_request_rate_and_concurrency[enable_concurrency-]
+  - test_e2e.py::test_trtllm_bench_invalid_token_pytorch[TinyLlama-1.1B-Chat-v1.0-TinyLlama-1.1B-Chat-v1.0]
 - condition:
     ranges:
       system_gpu_count:
@@ -97,6 +100,11 @@ l0_a10:
   - unittest/test_model_runner_cpp.py
   - unittest/llmapi/test_build_cache.py
   - unittest/llmapi/test_llm_utils.py
+  - unittest/llmapi/test_gc_utils.py
+  - unittest/llmapi/test_reasoning_parser.py
+  - unittest/llmapi/test_serialization.py
+  - unittest/llmapi/test_utils.py
+  - unittest/llmapi/test_llm_args.py
   - accuracy/test_cli_flow.py::TestGpt2::test_auto_dtype # 1 min
   - accuracy/test_cli_flow.py::TestGpt2::test_beam_search # 1 min
   - accuracy/test_cli_flow.py::TestGpt2::test_beam_search_large # 6 mins

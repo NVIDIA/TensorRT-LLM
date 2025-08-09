@@ -475,6 +475,7 @@ async def benchmark(
         "user_throughput": metrics.tput_user,
         "mean_request_ar": metrics.mean_request_ar,
         "median_request_ar": metrics.median_request_ar,
+        "std_request_ar": metrics.std_request_ar,
         "input_lens": [output.prompt_len for output in outputs],
         "output_lens": actual_output_lens,
         "ttfts": [output.ttft for output in outputs],

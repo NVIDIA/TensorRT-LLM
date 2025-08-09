@@ -38,7 +38,7 @@ class Mamba2Mixer(nn.Module):
         d_model: int,
         d_state: int,
         d_conv: int,
-        expand: int,
+        nheads: int,
         n_groups: int,
         head_dim: int,
         chunk_size: int,
@@ -60,8 +60,7 @@ class Mamba2Mixer(nn.Module):
         tp_rank = config.mapping.tp_rank
         tp_size = config.mapping.tp_size
 
-        d_inner = d_model * expand
-        nheads = d_inner // head_dim
+        d_inner = head_dim * nheads
         d_in_proj = 2 * d_inner + 2 * n_groups * d_state + nheads
         conv_dim = d_inner + 2 * n_groups * d_state
 

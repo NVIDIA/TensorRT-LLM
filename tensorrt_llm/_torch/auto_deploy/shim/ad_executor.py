@@ -132,6 +132,9 @@ class ADEngine(ModelEngine):
         self.pytorch_backend_config.enable_iter_perf_stats = False
         self.pytorch_backend_config.enable_iter_req_stats = False
         self.pytorch_backend_config.stream_interval = 1
+        self.pytorch_backend_config.attention_dp_enable_balance = False
+        self.pytorch_backend_config.attention_dp_time_out_iters = 50
+        self.pytorch_backend_config.attention_dp_batching_wait_iters = 10
         self.iter_counter = 0
 
         # NOTE (lucaslie): not a declared base member in the base class; required by PyExecutor...

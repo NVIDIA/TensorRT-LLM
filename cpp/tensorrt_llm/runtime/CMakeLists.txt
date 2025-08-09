@@ -55,7 +55,8 @@ set(SRCS
     tllmStreamReaders.cpp
     tllmLogger.cpp
     workerPool.cpp
-    worldConfig.cpp)
+    worldConfig.cpp
+    virtualMemory.cpp)
 
 include_directories(${API_INCLUDE_DIR}/tensorrt_llm/runtime)
 

@@ -315,17 +315,25 @@ class PyTorchModelEngine(ModelEngine):
         self._init_model_capacity()
 
         self._torch_compile_backend = None
+        self._torch_compile_enabled = pytorch_backend_config.torch_compile_enabled
+        self._torch_compile_piecewise_cuda_graph = (
+            pytorch_backend_config.torch_compile_piecewise_cuda_graph
+            and not self.enable_attention_dp)
 
         try:
+            use_ub_for_nccl = (
+                pytorch_backend_config.allreduce_strategy == "NCCL_SYMMETRIC"
+                and self._init_userbuffers(self.model.config.hidden_size))
             if pytorch_backend_config.torch_compile_enabled:
                 set_torch_compiling(True)
-                use_ub = pytorch_backend_config.torch_compile_enable_userbuffers and self._init_userbuffers(
-                    self.model.config.hidden_size)
+                use_ub = not use_ub_for_nccl and (
+                    pytorch_backend_config.torch_compile_enable_userbuffers
+                    and self._init_userbuffers(self.model.config.hidden_size))
                 self._torch_compile_backend = Backend(
                     pytorch_backend_config.torch_compile_inductor_enabled,
                     enable_userbuffers=use_ub,
-                    enable_piecewise_cuda_graph=pytorch_backend_config.
-                    torch_compile_piecewise_cuda_graph,
+                    enable_piecewise_cuda_graph=self.
+                    _torch_compile_piecewise_cuda_graph,
                     cuda_graph_batch_sizes=pytorch_backend_config.
                     cuda_graph_batch_sizes,
                     max_num_streams=pytorch_backend_config.
@@ -349,8 +357,6 @@ class PyTorchModelEngine(ModelEngine):
             import traceback
             traceback.print_exception(Exception, e, e.__traceback__)
             raise e
-        self._torch_compile_enabled = pytorch_backend_config.torch_compile_enabled
-        self._torch_compile_piecewise_cuda_graph = pytorch_backend_config.torch_compile_piecewise_cuda_graph
 
         self.attn_backend = get_attention_backend(attn_backend)
 
@@ -453,7 +459,7 @@ class PyTorchModelEngine(ModelEngine):
                 'type'] == 'mrope'
         except Exception:
             pass
-        logger.info(f"Detected use_mrope: {use_mrope}")
+        logger.debug(f"Detected use_mrope: {use_mrope}")
         return use_mrope
 
     @property
@@ -660,7 +666,6 @@ class PyTorchModelEngine(ModelEngine):
                                self._torch_compile_backend)
 
                 self._torch_compile_backend.enable_optimization()
-                set_enable_piecewise_cuda_graph_capture_flag(True)
 
                 # Disable cuda graph capture here so that we can properly capture it later
                 with self.no_cuda_graph():
@@ -723,8 +728,11 @@ class PyTorchModelEngine(ModelEngine):
             # For non-draft model, we also capture the CUDA graph instance for draft length 0,
             # so that when we disable spec decode at runtime, we can still run the captured graph.
             # Note that for one engine mode, we are not able to turn off spec decode at runtime.
-            if not self.is_draft_model and self.max_draft_len > 0 and not self.spec_config.spec_dec_mode.use_one_engine(
-            ):
+            if (not self.is_draft_model and self.max_draft_len > 0
+                    and not self.spec_config.spec_dec_mode.use_one_engine()
+                    # Assume that speculation is always on if the user didn't give us a max_concurrency
+                    # value. This will save on memory.
+                    and self.spec_config.max_concurrency is not None):
                 draft_lengths.append(0)
 
             for bs in cuda_graph_batch_sizes:
@@ -760,26 +768,28 @@ class PyTorchModelEngine(ModelEngine):
                                      resource_manager=resource_manager)
                         torch.cuda.synchronize()
 
-                    if self._torch_compile_piecewise_cuda_graph and self._torch_compile_enabled:
-                        with self.no_cuda_graph():
-                            with release_batch(
-                                    get_torch_compile_warmup_request(
-                                        1, bs)) as batch:
-                                logger.info(
-                                    f"Run piecewise CUDA graph warmup for batch size={bs}"
-                                )
-
-                                for _ in range(3):
-                                    self.forward(
-                                        batch,
-                                        new_tensors_device=None,
-                                        resource_manager=resource_manager)
+            if self._torch_compile_piecewise_cuda_graph and self._torch_compile_enabled:
+                for seq_lens in cuda_graph_batch_sizes:
+                    set_enable_piecewise_cuda_graph_capture_flag(True)
+                    with self.no_cuda_graph():
+                        with release_batch(
+                                get_torch_compile_warmup_request(
+                                    1, seq_lens)) as batch:
+                            logger.info(
+                                f"Run piecewise CUDA graph warmup for seq_lens={seq_lens}"
+                            )
+                            # self.model.mtp_worker.stored_input_ids = []
+                            for _ in range(3):
                                 self.forward(batch,
                                              new_tensors_device=None,
                                              resource_manager=resource_manager)
-                                torch.cuda.synchronize()
-                                gc.collect()
-                                torch.cuda.empty_cache()
+                            self.forward(batch,
+                                         new_tensors_device=None,
+                                         resource_manager=resource_manager)
+                            torch.cuda.synchronize()
+                            gc.collect()
+                            torch.cuda.empty_cache()
+                    set_enable_piecewise_cuda_graph_capture_flag(False)
 
         # Set the value back to the original value
         self.enable_spec_decode = self.is_spec_decode
@@ -861,8 +871,7 @@ class PyTorchModelEngine(ModelEngine):
                     moe_max_num_tokens: Optional[int] = None,
                     moe_load_balancer: Optional[MoeLoadBalancerConfig] = None,
                     lora_config: Optional[LoraConfig] = None,
-                    **kwargs):
-
+                    **kwargs) -> DecoderModelForCausalLM:
         config = checkpoint_loader.load_config(
             checkpoint_dir,
             trust_remote_code=True,
@@ -1232,8 +1241,11 @@ class PyTorchModelEngine(ModelEngine):
                 gather_ids.append(len(position_ids) - 1)
 
             request_ids.append(request.py_request_id)
-            gen_request_seq_slots.append(request.py_seq_slot)
             request.py_batch_idx = request.py_seq_slot
+            # Do not add a gen_request_seq_slot for CUDA graph dummy requests
+            # to prevent access errors due to None values
+            if not request.is_cuda_graph_dummy:
+                gen_request_seq_slots.append(request.py_seq_slot)
 
         previous_batch_len = len(previous_batch_indices)
 
@@ -1362,7 +1374,7 @@ class PyTorchModelEngine(ModelEngine):
                 pin_memory=True,
             )
 
-        num_generation_requests = len(scheduled_requests.generation_requests)
+        num_generation_requests = len(gen_request_seq_slots)
         # Cache indirection is only used for beam search on generation requests
         if self.use_beam_search and num_generation_requests > 0:
             # CUDA Graph needs to set beam width during warmup (where the graph is captured), to ensure that cache indirection buffer is correctly picked up by the CUDA graph
@@ -2069,12 +2081,12 @@ class PyTorchModelEngine(ModelEngine):
         # Disable UB for unsupported platforms
         if not ub.ub_supported():
             return False
-        ub.initialize_userbuffers_manager(self.mapping.tp_size,
-                                          self.mapping.pp_size,
-                                          self.mapping.cp_size,
-                                          self.mapping.rank,
-                                          self.mapping.gpus_per_node,
-                                          hidden_size * self.max_num_tokens * 2)
+        use_nccl_symmetric = self.pytorch_backend_config.allreduce_strategy == "NCCL_SYMMETRIC"
+        ub.initialize_userbuffers_manager(
+            self.mapping.tp_size, self.mapping.pp_size, self.mapping.cp_size,
+            self.mapping.rank, self.mapping.gpus_per_node,
+            hidden_size * self.max_num_tokens * 2, use_nccl_symmetric)
+
         return True
 
     def load_weights_from_target_model(self,

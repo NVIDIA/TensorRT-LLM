@@ -159,7 +159,8 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
     {
         std::lock_guard<std::mutex> lock(mDllMutex);
         mWrapperLibHandle = dllOpen(UCX_WRAPPER_LIB_NAME);
-        TLLM_CHECK_WITH_INFO(mWrapperLibHandle != nullptr, "UCX wrapper library is not open correctly.");
+        TLLM_CHECK_WITH_INFO(
+            mWrapperLibHandle != nullptr, "UCX wrapper library is not open correctly. error : %s", dlerror());
         auto load_sym = [](void* handle, char const* name)
         {
             void* ret = dllGetSym(handle, name);

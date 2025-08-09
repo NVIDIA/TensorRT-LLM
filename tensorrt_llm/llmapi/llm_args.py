@@ -149,7 +149,7 @@ class CudaGraphConfig(StrictBaseModel):
 
         # Add powers of 2 up to max_batch_size
         batch_sizes += [
-            2**i for i in range(8, math.floor(math.log(max_batch_size, 2)))
+            2**i for i in range(8, math.ceil(math.log(max_batch_size, 2)))
         ]
 
         # Filter and sort batch sizes
@@ -168,8 +168,9 @@ class MoeConfig(StrictBaseModel):
     Configuration for MoE.
     """
     backend: Literal["CUTLASS", "CUTEDSL", "WIDEEP", "TRTLLM", "DEEPGEMM",
-                     "VANILLA"] = Field(default='CUTLASS',
-                                        description="MoE backend to use.")
+                     "VANILLA",
+                     "TRITON"] = Field(default='CUTLASS',
+                                       description="MoE backend to use.")
 
     max_num_tokens: Optional[int] = Field(
         default=None,
@@ -181,6 +182,23 @@ class MoeConfig(StrictBaseModel):
         default=None,
         description="Configuration for MoE load balancing.",
         json_schema_extra={"type": "Union[MoeLoadBalancerConfig, str]"})
+
+    @classmethod
+    def from_dict(cls, data: dict):
+        return cls(**data)
+
+
+class AttentionDpConfig(StrictBaseModel):
+    """
+    Configuration for attention DP.
+    """
+    enable_balance: bool = Field(default=False,
+                                 description="Whether to enable balance.")
+    timeout_iters: int = Field(
+        default=50, description="The number of iterations to timeout.")
+    batching_wait_iters: int = Field(
+        default=10,
+        description="The number of iterations to wait for batching.")
 
     @classmethod
     def from_dict(cls, data: dict):
@@ -324,6 +342,11 @@ class DecodingBaseConfig(StrictBaseModel):
     max_draft_len: Optional[int] = None
     speculative_model_dir: Optional[Union[str, Path]] = None
 
+    # PyTorch only.
+    # When specified, speculation will be disabled at batch sizes above
+    # this value. Otherwise, speculation will always be on.
+    max_concurrency: Optional[int] = None
+
     @classmethod
     def from_dict(cls, data: dict):
         # dispatch to the correct decoding config
@@ -451,9 +474,6 @@ class NGramDecodingConfig(DecodingBaseConfig):
     is_keep_all: bool = True
     is_use_oldest: bool = True
     is_public_pool: bool = True
-    # Flag to indicate the NGramDecodingConfig is instantiated by auto heuristic.
-    # User should not set this flag. Use AutoDecodingConfig instead.
-    is_auto_heuristic: bool = False
 
     @classmethod
     def from_dict(cls, data: dict):
@@ -517,13 +537,10 @@ class AutoDecodingConfig(DecodingBaseConfig):
     """
     Configuration for auto speculative decoding.
 
-    This config is used to automatically select the best speculative decoding algorithm.
+    This config will automatically select a good, draft-model free
+    speculation algorithm with some heuristic.
 
-    According to benchmark results, the best algorithm in general is NGRAM with low concurrency <= 32.
-    Default heuristic:
-        With concurrency <= 4, max_draft_len = 5, max_matching_ngram_size = 3
-        With concurrency <= 32, max_draft_len = 3, max_matching_ngram_size = 5
-        With concurrency > 32, speculative decoding is disabled.
+    Attributes that are inherited from the base class are ignored.
     """
 
     @classmethod
@@ -952,6 +969,11 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         description=
         "Maximum size of the event buffer. If set to 0, the event buffer will not be used."
     )
+    attention_dp_events_gather_period_ms: int = Field(
+        default=5,
+        description=
+        "The period in milliseconds to gather attention DP events across ranks."
+    )
     enable_partial_reuse: bool = Field(
         default=True,
         description=
@@ -982,7 +1004,10 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             event_buffer_max_size=self.event_buffer_max_size,
             enable_partial_reuse=self.enable_partial_reuse,
             copy_on_partial_reuse=self.copy_on_partial_reuse,
-            use_uvm=self.use_uvm)
+            use_uvm=self.use_uvm,
+            attention_dp_events_gather_period_ms=self.
+            attention_dp_events_gather_period_ms,
+        )
 
 
 @PybindMirror.mirror_pybind_fields(_ExtendedRuntimePerfKnobConfig)
@@ -1285,6 +1310,10 @@ class BaseLlmArgs(StrictBaseModel):
         validate_default=True,
         status="deprecated",
     )
+
+    return_perf_metrics: bool = Field(default=False,
+                                      description="Return perf metrics.",
+                                      status="prototype")
 
     _parallel_config: Optional[object] = PrivateAttr(default=None)
     _model_format: Optional[_ModelFormatKind] = PrivateAttr(default=None)
@@ -1988,6 +2017,11 @@ class TorchLlmArgs(BaseLlmArgs):
          Note that each CUDA graph can use up to 200 MB of extra memory.",
         status="beta")
 
+    attention_dp_config: Optional[AttentionDpConfig] = Field(
+        default=None,
+        description="Optimized load-balancing for the DP Attention scheduler.",
+        status="beta")
+
     disable_overlap_scheduler: bool = Field(
         default=False,
         description="Disable the overlap scheduler.",
@@ -2007,11 +2041,11 @@ class TorchLlmArgs(BaseLlmArgs):
         "If true, will iterate over sampling_params of each request and use the corresponding sampling strategy, e.g. top-k, top-p, etc.",
         status="beta")
 
-    enable_trtllm_sampler: bool = Field(
+    use_torch_sampler: bool = Field(
         default=False,
         description=
-        "If true, will use the TRTLLM sampler instead of the PyTorch sampler. The TRTLLM sampler has a wide coverage of sampling strategies.",
-        status="prototype")
+        "If true, will use the Torch sampler instead of the TRTLLM sampler.",
+        status="beta")
 
     enable_iter_perf_stats: bool = Field(
         default=False,
@@ -2068,14 +2102,12 @@ class TorchLlmArgs(BaseLlmArgs):
         status="prototype",
     )
 
-    allreduce_strategy: Optional[
-        Literal['AUTO', 'NCCL', 'UB', 'MINLATENCY', 'ONESHOT', 'TWOSHOT',
-                'LOWPRECISION', 'MNNVL']] = Field(
-                    default='AUTO',
-                    description="Allreduce strategy to use.",
-                    status="beta",
-                )
-
+    allreduce_strategy: Optional[Literal[
+        'AUTO', 'NCCL', 'UB', 'MINLATENCY', 'ONESHOT', 'TWOSHOT',
+        'LOWPRECISION', 'MNNVL',
+        'NCCL_SYMMETRIC']] = Field(default='AUTO',
+                                   description="Allreduce strategy to use.",
+                                   status="beta")
     checkpoint_loader: Optional[object] = Field(
         default=None,
         description="The checkpoint loader to use for this LLM instance.",
@@ -2253,6 +2285,29 @@ class TorchLlmArgs(BaseLlmArgs):
 
         return self
 
+    @model_validator(mode='after')
+    def validate_attention_dp_config(self) -> 'TorchLlmArgs':
+        """Validate attention DP configuration.
+
+        Ensures that:
+        1. If attention_dp_config.enable_balance is true, attention_dp_config.batching_wait_iters must be greater or equal to 0
+        2. If attention_dp_config.enable_balance is true, attention_dp_config.timeout_iters must be greater or equal to 0
+        """
+        if self.attention_dp_config is None:
+            return self
+
+        config = self.attention_dp_config
+        if config.enable_balance:
+            if config.batching_wait_iters < 0:
+                raise ValueError(
+                    "attention_dp_config.batching_wait_iters must be greater or equal to 0 when enable_balance is true"
+                )
+            if config.timeout_iters < 0:
+                raise ValueError(
+                    "attention_dp_config.timeout_iters must be greater or equal to 0 when enable_balance is true"
+                )
+        return self
+
     # TODO: Remove this after the PyTorch backend is fully migrated to TorchLlmArgs from ExecutorConfig
     def get_pytorch_backend_config(self) -> "PyTorchConfig":
         from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
@@ -2275,7 +2330,7 @@ class TorchLlmArgs(BaseLlmArgs):
             attn_backend=self.attn_backend,
             moe_backend=self.moe_config.backend,
             enable_mixed_sampler=self.enable_mixed_sampler,
-            enable_trtllm_sampler=self.enable_trtllm_sampler,
+            use_torch_sampler=self.use_torch_sampler,
             kv_cache_dtype=self.kv_cache_config.dtype,
             enable_iter_perf_stats=self.enable_iter_perf_stats,
             enable_iter_req_stats=self.enable_iter_req_stats,
@@ -2303,7 +2358,16 @@ class TorchLlmArgs(BaseLlmArgs):
             enable_min_latency=self.enable_min_latency,
             stream_interval=self.stream_interval,
             force_dynamic_quantization=self.force_dynamic_quantization,
-            allreduce_strategy=self.allreduce_strategy)
+            allreduce_strategy=self.allreduce_strategy,
+            attention_dp_enable_balance=bool(
+                self.attention_dp_config is not None
+                and self.attention_dp_config.enable_balance),
+            attention_dp_time_out_iters=self.attention_dp_config.timeout_iters
+            if self.attention_dp_config is not None else
+            AttentionDpConfig.model_fields['timeout_iters'].default,
+            attention_dp_batching_wait_iters=self.attention_dp_config.
+            batching_wait_iters if self.attention_dp_config is not None else
+            AttentionDpConfig.model_fields['batching_wait_iters'].default)
 
 
 def update_llm_args_with_extra_dict(
@@ -2320,6 +2384,7 @@ def update_llm_args_with_extra_dict(
         "speculative_config": DecodingBaseConfig,
         "lora_config": LoraConfig,
         "moe_config": MoeConfig,
+        "attention_dp_config": AttentionDpConfig,
     }
     for field_name, field_type in field_mapping.items():
         if field_name in llm_args_dict:
