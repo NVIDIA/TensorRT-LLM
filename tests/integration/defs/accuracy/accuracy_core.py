@@ -155,6 +155,8 @@ class AccuracyTask:
             spec_dec_algo = None
         elif isinstance(llm.args.speculative_config, DecodingBaseConfig):
             spec_dec_algo = llm.args.speculative_config.decoding_type
+            if spec_dec_algo == 'AUTO':
+                spec_dec_algo = 'NGram'
         else:
             raise ValueError(
                 f"Not recognized speculative_config: {llm.args.speculative_config}."
