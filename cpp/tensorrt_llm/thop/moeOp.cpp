@@ -95,7 +95,8 @@ public:
     };
 
     FusedMoeRunner(c10::ScalarType activation_dtype, c10::ScalarType weight_dtype, c10::ScalarType output_dtype,
-        bool use_deepseek_fp8_block_scale, bool use_w4_group_scaling, bool use_mxfp8_act_scaling)
+        bool use_deepseek_fp8_block_scale, bool use_w4_group_scaling, bool use_mxfp8_act_scaling,
+        bool use_fused_finalize)
     {
         mActivationDtype = activation_dtype;
         mWeightDtype = weight_dtype;
@@ -103,6 +104,7 @@ public:
         mUseDeepSeekFP8BlockScaling = use_deepseek_fp8_block_scale;
         mUseW4GroupScaling = use_w4_group_scaling;
         mUseMxfp8ActScaling = use_mxfp8_act_scaling;
+        mUseFusedFinalize = use_fused_finalize;
         mInnerDimMultiplier = 1;
 
         // keep consistent with cpp/tensorrt_llm/plugins/mixtureOfExperts/mixtureOfExpertsPlugin.cpp
@@ -212,6 +214,8 @@ public:
                     << torch::toString(mActivationDtype) << ", Weight: " << torch::toString(mWeightDtype)
                     << ", Output: " << torch::toString(mOutputDtype));
         }
+
+        mKernelRunner->use_fused_finalize_ = mUseFusedFinalize;
 
         mProfiler = std::make_shared<kernels::GemmProfilerBackend>();
         mAllProfiles = mKernelRunner->getTactics();
@@ -674,6 +678,7 @@ private:
     bool mUseDeepSeekFP8BlockScaling = false;
     bool mUseW4GroupScaling = false;
     bool mUseMxfp8ActScaling = false;
+    bool mUseFusedFinalize = true;
 
     using Profile = tensorrt_llm::cutlass_extensions::CutlassGemmConfig;
     std::vector<Profile> mAllProfiles;
@@ -1045,7 +1050,7 @@ private:
 TORCH_LIBRARY(trtllm, m)
 {
     m.class_<torch_ext::FusedMoeRunner>("FusedMoeRunner")
-        .def(torch::init<c10::ScalarType, c10::ScalarType, c10::ScalarType, bool, bool, bool>())
+        .def(torch::init<c10::ScalarType, c10::ScalarType, c10::ScalarType, bool, bool, bool, bool>())
         .def("run_gemm_profile", &torch_ext::FusedMoeRunner::runGemmProfile)
         .def("get_tactic_num", &torch_ext::FusedMoeRunner::getTacticNum)
         .def("run_moe", &torch_ext::FusedMoeRunner::runMoe)
