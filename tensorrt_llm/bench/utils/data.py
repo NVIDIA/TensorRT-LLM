@@ -41,6 +41,8 @@ def create_dataset_from_stream(
     model_dir: str = None,
     model_type: str = None,
     modality: str = None,
+    image_data_format: str = "pt",
+    data_device: str = "cpu",
     max_input_seq_len_for_multimodal: int = 4096,
 ) -> Tuple[DatasetMetadata, List[InferenceRequest]]:
     """Generate metadata and a list of requests to drive benchmarking.
@@ -130,7 +132,9 @@ def create_dataset_from_stream(
             model_type=model_type,
             modality=modality,
             prompts=prompts,
-            media=media_paths)  # list of dicts
+            media=media_paths,  # list of dicts
+            image_data_format=image_data_format,
+            device=data_device)
 
     all_isl = []
     all_seq_len = []
