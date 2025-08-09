@@ -13,12 +13,13 @@ from ...utils import EventType, Fp4QuantizedTensor, ceil_div, swizzle_sf
 from .interface import MoE
 
 # isort: off
-from .quantization import (
-    DeepSeekFP8BlockScalesFusedMoEMethod, FP8QDQFusedMoEMethod,
-    MoEWeightLoadingMode, NVFP4CutlassFusedMoEMethod, UnquantizedFusedMoEMethod, WeightOnlyFusedMoEMethod,
-                          
-    W4A8MXFP4FP8CutlassFusedMoEMethod, W4A8MXFP4MXFP8CutlassFusedMoEMethod,
-    WFP4A16FusedMoEMethod, WInt4AFP8FusedMoEMethod)
+from .quantization import (DeepSeekFP8BlockScalesFusedMoEMethod,
+                           FP8QDQFusedMoEMethod, MoEWeightLoadingMode,
+                           NVFP4CutlassFusedMoEMethod,
+                           UnquantizedFusedMoEMethod, WeightOnlyFusedMoEMethod,
+                           W4A8MXFP4FP8CutlassFusedMoEMethod,
+                           W4A8MXFP4MXFP8CutlassFusedMoEMethod,
+                           WFP4A16FusedMoEMethod, WInt4AFP8FusedMoEMethod)
 # isort: on
 from .routing import BaseMoeRoutingMethod
 
@@ -185,11 +186,6 @@ class CutlassFusedMoE(MoE):
         return self.quant_config.layer_quant_mode.is_weight_only(
         ) and not self.quant_config.layer_quant_mode.has_per_group_scaling()
 
-    @property
-    def has_woq_per_group_scaling(self):
-        return self.quant_config.layer_quant_mode.is_weight_only(
-        ) and self.quant_config.layer_quant_mode.has_per_group_scaling()
-
     @cached_property
     def enable_alltoall(self):
         return (self.mapping.moe_ep_size > self.routing_method.experts_per_token
@@ -270,7 +266,6 @@ class CutlassFusedMoE(MoE):
         use_deepseek_fp8_block_scale = False
         use_w4_group_scaling = False
         use_woq_per_channel = False
-        use_woq_group_scaling = False
         use_mxfp8_act_scaling = False
         weight_dtype = self.w3_w1_weight.dtype
         x_sf = None
@@ -284,19 +279,15 @@ class CutlassFusedMoE(MoE):
                 use_deepseek_fp8_block_scale = True
             elif self.has_w4afp8:
                 use_w4_group_scaling = True
-                use_woq_group_scaling = True
                 weight_dtype = torch.quint4x2
-            elif self.has_woq_per_channel:
-                use_woq_per_channel = True
-            elif self.has_woq_per_group_scaling:
-                use_woq_group_scaling = True
             elif self.has_w4a16_mxfp4:
                 pad_size = self.hidden_size - x.shape[1]
                 original_hidden_size = x.shape[1]
                 x = torch.nn.functional.pad(x, (0, pad_size))
-
                 use_w4_group_scaling = True
                 weight_dtype = torch.uint8
+            elif self.has_woq_per_channel:
+                use_woq_per_channel = True
             elif self.has_nvfp4:
                 if run_post_quant_allgather or self.enable_alltoall:
                     if isinstance(x, Fp4QuantizedTensor):
@@ -437,7 +428,6 @@ class CutlassFusedMoE(MoE):
             use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
             use_w4_group_scaling=use_w4_group_scaling,
             use_woq_per_channel=use_woq_per_channel,
-            use_woq_group_scaling=use_woq_group_scaling,
             use_mxfp8_act_scaling=use_mxfp8_act_scaling,
             min_latency_mode=False,
             tune_max_num_tokens=self.tune_max_num_tokens,

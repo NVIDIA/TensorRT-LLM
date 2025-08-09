@@ -1646,9 +1646,9 @@ def test_fused_moe_weight_only(dtype, weight_dtype):
         weights[f"{expert_id}.w1.weight"] = w1_weight
         weights[f"{expert_id}.w2.weight"] = w2_weight
         weights[f"{expert_id}.w3.weight"] = w3_weight
-        weights[f"{expert_id}.w1.weight_scale_inv"] = w1_scale
-        weights[f"{expert_id}.w2.weight_scale_inv"] = w2_scale
-        weights[f"{expert_id}.w3.weight_scale_inv"] = w3_scale
+        weights[f"{expert_id}.w1.weight_scale"] = w1_scale
+        weights[f"{expert_id}.w2.weight_scale"] = w2_scale
+        weights[f"{expert_id}.w3.weight_scale"] = w3_scale
 
     fused_moe = CutlassFusedMoE(
         num_experts=NUM_EXPERTS,
@@ -1678,9 +1678,9 @@ def test_fused_moe_weight_only(dtype, weight_dtype):
             w3 = weights[f"{e_idx}.w3.weight"].T.contiguous().cuda()
             w3_w1 = torch.cat([w3, w1], dim=-1)
             # scales
-            s1 = weights[f"{e_idx}.w1.weight_scale_inv"].cuda()
-            s2 = weights[f"{e_idx}.w2.weight_scale_inv"].cuda()
-            s3 = weights[f"{e_idx}.w3.weight_scale_inv"].cuda()
+            s1 = weights[f"{e_idx}.w1.weight_scale"].cuda()
+            s2 = weights[f"{e_idx}.w2.weight_scale"].cuda()
+            s3 = weights[f"{e_idx}.w3.weight_scale"].cuda()
             s3_s1 = torch.cat([s3, s1], dim=-1)
             # calculation
             w3_w1 = (w3_w1.float() * s3_s1).to(dtype)
