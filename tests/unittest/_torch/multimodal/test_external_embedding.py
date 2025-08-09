@@ -1,24 +1,29 @@
 from unittest.mock import Mock, patch
+
 import pytest
 
+from tensorrt_llm._torch.models.modeling_llava_next import \
+    LlavaNextInputProcessor
 from tensorrt_llm.inputs.data import TextPrompt
 from tensorrt_llm.sampling_params import SamplingParams
-from tensorrt_llm._torch.models.modeling_llava_next import LlavaNextInputProcessor
-
 
 # Model configurations for different processors
 MODEL_CONFIGS = {
     "LlavaNextInputProcessor": {
-        "processor_class": LlavaNextInputProcessor,
-        "module_path": "tensorrt_llm._torch.models.modeling_llava_next",
-        "config_setup": lambda mock_config: setattr_multiple(mock_config, {
-            "image_token_index": 32001,
-            "vocab_size": 32001,
-            "text_config.hidden_size": 4096,
-            "text_config.vocab_size": 32000,
-            "vision_config": Mock(),
-            "vision_feature_select_strategy": "default"
-        })
+        "processor_class":
+        LlavaNextInputProcessor,
+        "module_path":
+        "tensorrt_llm._torch.models.modeling_llava_next",
+        "config_setup":
+        lambda mock_config: setattr_multiple(
+            mock_config, {
+                "image_token_index": 32001,
+                "vocab_size": 32001,
+                "text_config.hidden_size": 4096,
+                "text_config.vocab_size": 32000,
+                "vision_config": Mock(),
+                "vision_feature_select_strategy": "default"
+            })
     },
     # TODO: Add test for more VLM models
     # Future model configurations can be added here
@@ -31,6 +36,7 @@ MODEL_CONFIGS = {
     #     "module_path": "tensorrt_llm._torch.models.modeling_qwen2vl",
     # },
 }
+
 
 def setattr_multiple(obj, attr_dict):
     """Helper function to set multiple nested attributes."""
@@ -69,12 +75,10 @@ def processor_setup(request):
         mock_auto_tokenizer.from_pretrained.return_value = mock_tokenizer
         mock_auto_processor.from_pretrained.return_value = mock_processor
 
-        processor = config["processor_class"](
-            model_path="dummy_path",
-            model_config=mock_config,
-            tokenizer=mock_tokenizer,
-            trust_remote_code=True
-        )
+        processor = config["processor_class"](model_path="dummy_path",
+                                              model_config=mock_config,
+                                              tokenizer=mock_tokenizer,
+                                              trust_remote_code=True)
 
         # Return processor along with mocks for test usage
         return {
@@ -93,45 +97,51 @@ class TestExternalEmbedding:
         import torch
 
         # Prepare test inputs
-        text_prompt: TextPrompt = {
-            "prompt": "What is in this image? <image>"
-        }
+        text_prompt: TextPrompt = {"prompt": "What is in this image? <image>"}
 
         # Create mock embedding tensors (batch_size=1, seq_len=144, hidden_dim=768)
         image_embeddings = [
-            torch.randn(144, 4096),  # Single image embedding so num_frames=1 always
+            torch.randn(144,
+                        4096),  # Single image embedding so num_frames=1 always
         ]
 
-        multimodal_embedding = {
-            "image": image_embeddings
-        }
+        multimodal_embedding = {"image": image_embeddings}
 
         sampling_params = SamplingParams()
 
         # Mock tokenizer output - simulate tokenizing the text with image token
-        mock_token_ids = torch.tensor([1, 2, 3, 32001, 4, 5])  # image token at index 3
-        processor_setup["mock_tokenizer"].return_value.input_ids = [mock_token_ids]
+        mock_token_ids = torch.tensor([1, 2, 3, 32001, 4,
+                                       5])  # image token at index 3
+        processor_setup["mock_tokenizer"].return_value.input_ids = [
+            mock_token_ids
+        ]
 
-        result_token_ids, extra_processed_inputs = processor_setup["processor"].attach_multimodal_embeddings(
-            text_prompt, multimodal_embedding, sampling_params
-        )
+        result_token_ids, extra_processed_inputs = processor_setup[
+            "processor"].attach_multimodal_embeddings(text_prompt,
+                                                      multimodal_embedding,
+                                                      sampling_params)
 
         # Verify outputs
         assert isinstance(result_token_ids, list)
-        assert len(result_token_ids) == len(mock_token_ids) + len(image_embeddings[0]) - 1
+        assert len(result_token_ids) == len(mock_token_ids) + len(
+            image_embeddings[0]) - 1
         assert isinstance(extra_processed_inputs, dict)
         assert "multimodal_data" in extra_processed_inputs
-        assert "multimodal_embedding" in extra_processed_inputs["multimodal_data"]
+        assert "multimodal_embedding" in extra_processed_inputs[
+            "multimodal_data"]
 
         # Check that multimodal embedding is properly formatted
-        mm_embedding = extra_processed_inputs["multimodal_data"]["multimodal_embedding"]
+        mm_embedding = extra_processed_inputs["multimodal_data"][
+            "multimodal_embedding"]
         assert mm_embedding.shape[-1] == 4096  # Hidden dimension should match
         assert mm_embedding.shape[0] == 144
 
         # Verify tokenizer was called with correct prompt
-        processor_setup["mock_tokenizer"].assert_called_once_with(text_prompt["prompt"], return_tensors="pt")
+        processor_setup["mock_tokenizer"].assert_called_once_with(
+            text_prompt["prompt"], return_tensors="pt")
 
-    def test_attach_multimodal_embeddings_multiple_images(self, processor_setup):
+    def test_attach_multimodal_embeddings_multiple_images(
+            self, processor_setup):
         """Test with multiple image embeddings."""
         import torch
 
@@ -146,35 +156,40 @@ class TestExternalEmbedding:
         ]
 
         # multiple images are concatenated along the first dimension
-        multimodal_embedding = {
-            "image": image_embeddings
-        }
+        multimodal_embedding = {"image": image_embeddings}
 
         sampling_params = SamplingParams()
 
         # Mock tokenizer output with two image tokens
         mock_token_ids = torch.tensor([1, 2, 32001, 3, 4, 32001, 5])
-        processor_setup["mock_tokenizer"].return_value.input_ids = [mock_token_ids]
+        processor_setup["mock_tokenizer"].return_value.input_ids = [
+            mock_token_ids
+        ]
 
         # Call the function
-        result_token_ids, extra_processed_inputs = processor_setup["processor"].attach_multimodal_embeddings(
-            text_prompt, multimodal_embedding, sampling_params
-        )
+        result_token_ids, extra_processed_inputs = processor_setup[
+            "processor"].attach_multimodal_embeddings(text_prompt,
+                                                      multimodal_embedding,
+                                                      sampling_params)
 
         # Verify outputs
         assert isinstance(result_token_ids, list)
-        assert len(result_token_ids) == len(mock_token_ids) + torch.cat(image_embeddings, dim=0).shape[0] - 2
+        assert len(result_token_ids) == len(mock_token_ids) + torch.cat(
+            image_embeddings, dim=0).shape[0] - 2
         assert isinstance(extra_processed_inputs, dict)
         assert "multimodal_data" in extra_processed_inputs
-        assert "multimodal_embedding" in extra_processed_inputs["multimodal_data"]
+        assert "multimodal_embedding" in extra_processed_inputs[
+            "multimodal_data"]
 
         # Check that multimodal embedding is properly formatted
-        mm_embedding = extra_processed_inputs["multimodal_data"]["multimodal_embedding"]
+        mm_embedding = extra_processed_inputs["multimodal_data"][
+            "multimodal_embedding"]
         assert mm_embedding.shape[-1] == 4096  # Hidden dimension should match
         assert mm_embedding.shape[0] == 144 + 288
 
         # Verify tokenizer was called with correct prompt
-        processor_setup["mock_tokenizer"].assert_called_once_with(text_prompt["prompt"], return_tensors="pt")
+        processor_setup["mock_tokenizer"].assert_called_once_with(
+            text_prompt["prompt"], return_tensors="pt")
 
 
 if __name__ == "__main__":

@@ -52,8 +52,6 @@ class LlavaNextInputProcessor(InputProcessor):
 
         self.image_token_index = model_config.image_token_index
         self.vocab_size = model_config.vocab_size
-        self.vision_feature_select_strategy = getattr(
-            model_config, "vision_feature_select_strategy", "default")
         self.config = model_config.vision_config
 
     def get_num_tokens_per_image(
@@ -75,7 +73,6 @@ class LlavaNextInputProcessor(InputProcessor):
         mm_tokens = torch.tensor([self.model_config.image_token_index
                                   ]).to(input_ids.device)
         model_hidden_size = self.model_config.text_config.hidden_size
-        vocab_size = self.model_config.text_config.vocab_size
         start_len = end_len = 0  # for llava, need not append start/end token around each image token
         # End model specific variables
 
@@ -119,8 +116,8 @@ class LlavaNextInputProcessor(InputProcessor):
         input_ids_splits = list(input_ids.tensor_split(mm_split_positions.cpu(
         )))  # len(input_ids_splits) = num_segments after mm tokens are isolated
         mm_ids_splits = list(
-            torch.arange(vocab_size,
-                         vocab_size + mm_total_length,
+            torch.arange(self.vocab_size,
+                         self.vocab_size + mm_total_length,
                          device=input_ids.device).split(mm_lengths_per_split)
         )  # len(mm_ids_splits) = num_mm_segments
 
@@ -431,7 +428,6 @@ class LlavaNextModel(PreTrainedModel):
         self.llm = AutoModelForCausalLM.from_config(llm_model_config)
 
         self.model_config = model_config
-        self.vocab_size = config.vocab_size
         self.model_dtype = getattr(config.text_config, "torch_dtype",
                                    torch.float16)
         logger.info(f"{self.dtype=} {self.model_dtype=}")

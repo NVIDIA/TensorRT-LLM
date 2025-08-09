@@ -160,7 +160,6 @@ class OpenAIServer:
 
     def register_mm_encoder_routes(self):
         self.app.add_api_route("/health", self.health, methods=["GET"])
-        self.app.add_api_route("/health_generate", self.health_generate, methods=["GET"])
         self.app.add_api_route("/version", self.version, methods=["GET"])
         self.app.add_api_route("/v1/models", self.get_model, methods=["GET"])
         # TODO: the metrics endpoint only reports iteration stats, not the runtime stats for now

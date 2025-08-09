@@ -1,19 +1,17 @@
-import json
-import os
-from typing import Dict, Any
-
-import pytest
-import torch
-from PIL import Image
-import requests
 import io
 
+import pytest
+import requests
+from PIL import Image
+from transformers import AutoConfig, AutoTokenizer
+
 from tensorrt_llm import MultimodalEncoder
+from tensorrt_llm._torch.models.modeling_llava_next import \
+    LlavaNextInputProcessor
+from tensorrt_llm._torch.models.modeling_qwen2vl import \
+    Qwen2VLInputProcessorBase
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm.inputs import default_multimodal_input_loader
-from transformers import AutoTokenizer, AutoConfig, AutoProcessor
-from tensorrt_llm._torch.models.modeling_llava_next import LlavaNextInputProcessor
-from tensorrt_llm._torch.models.modeling_qwen2vl import Qwen2VLInputProcessorBase
 
 example_images = [
     "https://huggingface.co/datasets/YiYiXu/testing-images/resolve/main/seashore.png",
@@ -74,8 +72,10 @@ def test_get_num_tokens_per_image(model_key, multimodal_model_configs):
                                     max_batch_size=max_batch_size)
 
         # Load model configuration and create input processor once
-        model_config_dict = AutoConfig.from_pretrained(encoder_model_dir, trust_remote_code=True)
-        tokenizer = AutoTokenizer.from_pretrained(encoder_model_dir, trust_remote_code=True)
+        model_config_dict = AutoConfig.from_pretrained(encoder_model_dir,
+                                                       trust_remote_code=True)
+        tokenizer = AutoTokenizer.from_pretrained(encoder_model_dir,
+                                                  trust_remote_code=True)
 
         # Create input processor once
         if model_type == 'llava_next':
@@ -83,15 +83,13 @@ def test_get_num_tokens_per_image(model_key, multimodal_model_configs):
                 model_path=encoder_model_dir,
                 model_config=model_config_dict,
                 tokenizer=tokenizer,
-                trust_remote_code=True
-            )
+                trust_remote_code=True)
         elif model_type == 'qwen2_5_vl':
             input_processor = Qwen2VLInputProcessorBase(
                 model_path=encoder_model_dir,
                 model_config=model_config_dict,
                 tokenizer=tokenizer,
-                trust_remote_code=True
-            )
+                trust_remote_code=True)
         else:
             pytest.fail(f"Unsupported model type: {model_type}")
 
@@ -100,19 +98,19 @@ def test_get_num_tokens_per_image(model_key, multimodal_model_configs):
         media = example_images  # All image URLs
 
         # Prepare inputs and get actual embeddings for all images
-        inputs = default_multimodal_input_loader(
-            tokenizer=tokenizer,
-            model_dir=encoder_model_dir,
-            model_type=model_type,
-            modality="image",
-            prompts=prompts,
-            media=media,
-            image_data_format="pt"
-        )
+        inputs = default_multimodal_input_loader(tokenizer=tokenizer,
+                                                 model_dir=encoder_model_dir,
+                                                 model_type=model_type,
+                                                 modality="image",
+                                                 prompts=prompts,
+                                                 media=media,
+                                                 image_data_format="pt")
 
         # Get actual embeddings from encoder (batch processing)
         encoder_outputs = encoder.generate(inputs)
-        assert len(encoder_outputs) == len(example_images), f"Expected {len(example_images)} encoder outputs, got {len(encoder_outputs)}"
+        assert len(encoder_outputs) == len(
+            example_images
+        ), f"Expected {len(example_images)} encoder outputs, got {len(encoder_outputs)}"
 
         for image_idx, test_image_url in enumerate(example_images):
 
@@ -122,8 +120,8 @@ def test_get_num_tokens_per_image(model_key, multimodal_model_configs):
 
             # Get actual embedding tensor for this image
             actual_embedding = SharedTensorContainer.from_dict(
-                encoder_outputs[image_idx].mm_embedding_handle
-            ).get_local_view()
+                encoder_outputs[image_idx].mm_embedding_handle).get_local_view(
+                )
 
             # The first dimension should be the number of image tokens
             actual_num_tokens = actual_embedding.shape[0]
@@ -131,16 +129,13 @@ def test_get_num_tokens_per_image(model_key, multimodal_model_configs):
             # Get predicted number of tokens using get_num_tokens_per_image
             if model_type == 'llava_next':
                 predicted_num_tokens = input_processor.get_num_tokens_per_image(
-                    image_width=image_width,
-                    image_height=image_height
-                )
+                    image_width=image_width, image_height=image_height)
             elif model_type == 'qwen2_5_vl':
                 predicted_num_tokens = input_processor.get_num_tokens_per_image(
                     image_width=image_width,
                     image_height=image_height,
                     num_frames=1,
-                    do_resize=True
-                )
+                    do_resize=True)
 
             # The key assertion: predicted should match actual
             assert predicted_num_tokens == actual_num_tokens, \
@@ -155,5 +150,3 @@ def test_get_num_tokens_per_image(model_key, multimodal_model_configs):
         # Cleanup resources
         if encoder is not None:
             del encoder
-
-
