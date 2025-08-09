@@ -20,7 +20,8 @@ import tensorrt as trt
 import torch
 
 from tensorrt_llm._common import default_net
-from tensorrt_llm._utils import numpy_to_torch, str_dtype_to_torch
+from tensorrt_llm._utils import (numpy_to_torch, pad_vocab_size,
+                                 str_dtype_to_torch)
 from tensorrt_llm.functional import (LayerNormPositionType, LayerNormType,
                                      MLPType, PositionEmbeddingType, Tensor,
                                      assertion, cast, gather_last_token_logits,
@@ -1156,9 +1157,11 @@ class DecoderModel(PretrainedModel):
         self.transformer.assign_module(decoder_layers, "layers")
 
         if self.mapping.is_last_pp_rank():
+            vocab_size_padded = pad_vocab_size(self.config.vocab_size,
+                                               self.config.mapping.tp_size)
             self.lm_head = ColumnLinear(
                 self.config.hidden_size,
-                self.config.vocab_size,
+                vocab_size_padded,
                 bias=False if not hasattr(self.config, "has_lm_head_bias") else
                 self.config.has_lm_head_bias,
                 dtype=self.config.dtype,
@@ -1208,7 +1211,6 @@ class DecoderModel(PretrainedModel):
         config.set_if_not_exist('num_buckets', None)
         config.set_if_not_exist('max_distance', None)
         config.set_if_not_exist('relative_attention', False)
-        config.set_if_not_exist('residual_scaling', 1.0)
 
     def forward(self,
                 decoder_input_ids: Tensor,
