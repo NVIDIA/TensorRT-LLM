@@ -111,7 +111,10 @@ def copy_weight(dst: Parameter, src: torch.Tensor):
     dst.data.copy_(src)
 
 
-def load_weights_vanilla_helper(module: Linear, weights: List[Dict]):
+def load_weights_vanilla_helper(module: Linear,
+                                weights: List[Dict],
+                                weight_transform=lambda x: x,
+                                bias_transform=lambda x: x):
     assert len(weights) == 1
     device = torch.device('cuda')
 
@@ -127,17 +130,20 @@ def load_weights_vanilla_helper(module: Linear, weights: List[Dict]):
             weight.T.to(torch.int8).contiguous().cpu(), weight_dtype,
             activation_dtype).cuda().contiguous()
 
-    copy_weight(module.weight, weight)
+    copy_weight(module.weight, weight_transform(weight))
 
     if module.bias is not None:
         bias = load_weight_shard(weights[0]['bias'], module.tp_size,
                                  module.tp_rank, module.tp_mode, device)
-        copy_weight(module.bias, bias)
+        copy_weight(module.bias, bias_transform(bias))
 
 
 def load_weights_fused_qkv_helper(
-        module: Linear,
-        weights: List[Dict]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    module: Linear,
+    weights: List[Dict],
+    weight_transform=lambda x: x,
+    bias_transform=lambda x: x
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     assert len(weights) == 3
     device = torch.device('cuda')
 
@@ -155,14 +161,17 @@ def load_weights_fused_qkv_helper(
                                    module.tp_rank, module.tp_mode, device)
         v_bias = load_weight_shard(weights[2]['bias'], module.tp_size,
                                    module.tp_rank, module.tp_mode, device)
-        copy_weight(module.bias, torch.cat((q_bias, k_bias, v_bias)))
+        copy_weight(module.bias,
+                    bias_transform(torch.cat((q_bias, k_bias, v_bias))))
 
-    return (q_weight, k_weight, v_weight)
+    return tuple(map(weight_transform, (q_weight, k_weight, v_weight)))
 
 
 def load_weights_fused_gate_up_helper(
         module: Linear,
-        weights: List[Dict]) -> tuple[torch.Tensor, torch.Tensor]:
+        weights: List[Dict],
+        weight_transform=lambda x: x,
+        bias_transform=lambda x: x) -> tuple[torch.Tensor, torch.Tensor]:
     assert len(weights) == 2
     device = torch.device('cuda')
 
@@ -175,8 +184,9 @@ def load_weights_fused_gate_up_helper(
                                       module.tp_rank, module.tp_mode, device)
         up_bias = load_weight_shard(weights[1]['bias'], module.tp_size,
                                     module.tp_rank, module.tp_mode, device)
-        copy_weight(module.bias, torch.cat((up_bias, gate_bias)))
-    return (gate_weight, up_weight)
+        copy_weight(module.bias, bias_transform(torch.cat(
+            (gate_bias, up_bias))))
+    return tuple(map(weight_transform, (gate_weight, up_weight)))
 
 
 def get_weight_dtype_and_id(module: Linear) -> tuple[torch.dtype, int]:
@@ -342,7 +352,7 @@ class FP8QDQLinearMethod(LinearMethodBase):
             qinput = input
 
         # This op does not support bias now.
-        if qinput.shape[0] <= 8 and module.enable_cuda_core:
+        if module.enable_cuda_core and qinput.shape[0] <= 8:
             # use cuda core for small m dimension
             output = torch.ops.trtllm.cuda_scaled_mm(
                 qinput,
@@ -573,21 +583,29 @@ class FP8BlockScalesLinearMethod(LinearMethodBase):
         assert input.dtype == torch.bfloat16
 
         if get_sm_version() == 100:
-            import deep_gemm
-            a, a_sf = fp8_utils.per_token_quant_and_transform(input)
-            output = torch.empty((input.shape[0], module.weight.shape[0]),
-                                 device=input.device,
-                                 dtype=torch.bfloat16)
-            deep_gemm.fp8_gemm_nt((a, a_sf),
-                                  (module.weight, module.weight_scale),
-                                  output,
-                                  disable_ue8m0_cast=True)
+            if module.use_cute_dsl_blockscaling_mm:
+                # TODO (@lmin): replace with cute_dsl gemm
+                act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
+                    input)
+                output = torch.ops.trtllm.fp8_block_scaling_gemm(
+                    act_input_fp8, module.weight, act_input_sf,
+                    module.weight_scale)
+            else:
+                from tensorrt_llm import deep_gemm
+                a, a_sf = fp8_utils.per_token_quant_and_transform(input)
+                output = torch.empty((input.shape[0], module.weight.shape[0]),
+                                     device=input.device,
+                                     dtype=torch.bfloat16)
+                deep_gemm.fp8_gemm_nt((a, a_sf),
+                                      (module.weight, module.weight_scale),
+                                      output,
+                                      disable_ue8m0_cast=True)
         else:
             act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
                 input)
-
             output = torch.ops.trtllm.fp8_block_scaling_gemm(
                 act_input_fp8, module.weight, act_input_sf, module.weight_scale)
+
         if bias is not None:
             output = output + bias
         return output
@@ -687,6 +705,8 @@ class NVFP4LinearMethod(LinearMethodBase):
               bias: Optional[torch.Tensor]):
         if isinstance(input, Fp4QuantizedTensor):
             act_fp4, act_sf = input.fp4_tensor, input.scaling_factor
+        elif isinstance(input, tuple):
+            act_fp4, act_sf = input
         else:
             act_fp4, act_sf = torch.ops.trtllm.fp4_quantize(
                 input, module.input_scale, module.scaling_vector_size, False)
@@ -752,8 +772,7 @@ class NVFP4LinearMethod(LinearMethodBase):
         assert len(weights) == 1
         weight_scale = weight_scale[0]
         # Swizzle weight scale
-        weight_scale = torch.ops.trtllm.nvfp4_block_scale_interleave(
-            weight_scale)
+        weight_scale = torch.ops.trtllm.block_scale_interleave(weight_scale)
 
         copy_weight(module.input_scale, input_scale)
         copy_weight(module.weight_scale, weight_scale)
@@ -773,8 +792,7 @@ class NVFP4LinearMethod(LinearMethodBase):
             tp_mode=module.tp_mode)
         # Swizzle weight scales after concatenation
         weight_scale = torch.cat(weight_scales, 0)
-        weight_scale = torch.ops.trtllm.nvfp4_block_scale_interleave(
-            weight_scale)
+        weight_scale = torch.ops.trtllm.block_scale_interleave(weight_scale)
         copy_weight(module.input_scale, input_scale)
         copy_weight(module.weight_scale, weight_scale)
         copy_weight(module.alpha, alpha)
@@ -796,8 +814,7 @@ class NVFP4LinearMethod(LinearMethodBase):
             tp_mode=module.tp_mode)
         # Swizzle weight scales after concatenation
         weight_scale = torch.cat(weight_scales, 0)
-        weight_scale = torch.ops.trtllm.nvfp4_block_scale_interleave(
-            weight_scale)
+        weight_scale = torch.ops.trtllm.block_scale_interleave(weight_scale)
         copy_weight(module.input_scale, input_scale)
         copy_weight(module.weight_scale, weight_scale)
         copy_weight(module.alpha, alpha)
@@ -880,8 +897,7 @@ class W4A8MXFP4FP8LinearMethod(LinearMethodBase):
         assert len(weights) == 1
         weight_scale = weight_scale[0]
         # Swizzle weight scale
-        weight_scale = torch.ops.trtllm.nvfp4_block_scale_interleave(
-            weight_scale)
+        weight_scale = torch.ops.trtllm.block_scale_interleave(weight_scale)
         copy_weight(module.weight_scale, weight_scale)
 
     def load_weights_fused_qkv_linear(self, module: Linear,
@@ -896,8 +912,7 @@ class W4A8MXFP4FP8LinearMethod(LinearMethodBase):
                                                tp_rank=module.tp_rank,
                                                tp_mode=module.tp_mode)
         weight_scale = torch.cat(weight_scale, 0)
-        weight_scale = torch.ops.trtllm.nvfp4_block_scale_interleave(
-            weight_scale)
+        weight_scale = torch.ops.trtllm.block_scale_interleave(weight_scale)
         copy_weight(module.weight_scale, weight_scale)
 
     def load_weights_fused_gate_up_linear(self, module: Linear,
@@ -913,8 +928,7 @@ class W4A8MXFP4FP8LinearMethod(LinearMethodBase):
                                                tp_mode=module.tp_mode)
         # Swizzle weight scales after concatenation
         weight_scale = torch.cat(weight_scale, 0)
-        weight_scale = torch.ops.trtllm.nvfp4_block_scale_interleave(
-            weight_scale)
+        weight_scale = torch.ops.trtllm.block_scale_interleave(weight_scale)
         copy_weight(module.weight_scale, weight_scale)
 
 
@@ -1416,6 +1430,27 @@ class W4A8_AWQ_LinearMethod(LinearMethodBase):
             copy_weight(module.pre_quant_scale, pre_quant_scale)
 
 
+class W4A8MXFP4MXFP8LinearMethod(W4A8MXFP4FP8LinearMethod):
+
+    def create_weights(self, module: Linear, in_features: int,
+                       out_features: int, bias: bool, dtype: torch.dtype):
+        super().create_weights(module, in_features, out_features, bias, dtype)
+        module.scale_one = torch.tensor([1.0], dtype=torch.float32).cuda()
+
+    def apply(self, module: Linear, input: torch.Tensor,
+              bias: Optional[torch.Tensor]):
+        # requires the swizzled block scales.
+        fp8_input, input_scales = torch.ops.trtllm.mxfp8_quantize(input, True)
+        output = torch.ops.trtllm.w4a8_mxfp4_fp8_gemm(fp8_input, module.weight,
+                                                      input_scales,
+                                                      module.weight_scale,
+                                                      module.scale_one,
+                                                      module.dtype)
+        if bias is not None:
+            output = output + bias
+        return output
+
+
 def get_quant_method(quant_config: Optional[QuantConfig] = None):
     if quant_config is None or not quant_config.layer_quant_mode.has_any_quant(
             exclude_kv_cache=True):
@@ -1439,6 +1474,8 @@ def get_quant_method(quant_config: Optional[QuantConfig] = None):
     if quant_config.layer_quant_mode.is_int4_weight_only_per_group(
     ) and quant_config.quant_algo == QuantAlgo.W4A8_AWQ:
         return W4A8_AWQ_LinearMethod()
+    if quant_config.layer_quant_mode.has_w4a8_mxfp4_mxfp8():
+        return W4A8MXFP4MXFP8LinearMethod()
     raise ValueError(f'unsupported quant mode: {quant_config.quant_mode}')
 
 
@@ -1461,6 +1498,7 @@ class Linear(nn.Module):
         lora: Optional[LoraLayer] = None,
         allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO,
         force_dynamic_quantization: bool = False,
+        use_cute_dsl_blockscaling_mm: bool = False,
     ):
         from ..distributed import AllReduce
 
@@ -1477,6 +1515,7 @@ class Linear(nn.Module):
         self.tp_mode = tensor_parallel_mode
         self.gather_output = gather_output
         self.force_dynamic_quantization = force_dynamic_quantization
+        self.use_cute_dsl_blockscaling_mm = use_cute_dsl_blockscaling_mm
 
         local_in_features = in_features
         local_out_features = out_features
@@ -1498,9 +1537,9 @@ class Linear(nn.Module):
         self.in_features = local_in_features
         self.out_features = local_out_features
 
-        self.all_reduce = AllReduce(
-            mapping=self.mapping,
-            strategy=allreduce_strategy) if reduce_output else None
+        self.all_reduce = AllReduce(mapping=self.mapping,
+                                    strategy=allreduce_strategy,
+                                    dtype=self.dtype) if reduce_output else None
         self._weights_created = False
         self.reduce_output = reduce_output
         self.use_custom_cublas_mm = use_custom_cublas_mm
@@ -1516,11 +1555,14 @@ class Linear(nn.Module):
         if not skip_create_weights_in_init:
             self.create_weights()
 
+    def get_quant_method(self, quant_config: Optional[QuantConfig] = None):
+        return get_quant_method(quant_config)
+
     def create_weights(self):
         if self._weights_created:
             return
 
-        self.quant_method = get_quant_method(self.quant_config)
+        self.quant_method = self.get_quant_method(self.quant_config)
         self.quant_method.create_weights(self, self.in_features,
                                          self.out_features, self.has_bias,
                                          self.dtype)
@@ -1574,6 +1616,12 @@ class Linear(nn.Module):
         assert self._weights_created
         return self.quant_config is not None and self.quant_config.layer_quant_mode.is_int4_weight_only_per_group(
         ) and self.quant_config.quant_algo == QuantAlgo.W4A8_AWQ
+
+    @property
+    def has_w4a8_mxfp4_fp8(self):
+        assert self._weights_created
+        return self.quant_config is not None and self.quant_config.layer_quant_mode.has_w4a8_mxfp4_fp8(
+        )
 
     def apply_linear(self,
                      input,

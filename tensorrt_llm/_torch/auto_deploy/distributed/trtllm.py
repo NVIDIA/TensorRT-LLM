@@ -17,7 +17,8 @@ try:
         rank, world_size = get_rank_world_size()
         assert op == ReduceOp.SUM, "TRT-LLM all reduce only supports SUM op."
         p_config = Mapping(world_size=world_size, tp_size=world_size, rank=rank)
-        torch_op = AllReduce(mapping=p_config, strategy=AllReduceStrategy.AUTO)
+        # Use Strategy.NCCL until https://nvbugspro.nvidia.com/bug/5331013 is fixed, then change to Strategy.AUTO
+        torch_op = AllReduce(mapping=p_config, strategy=AllReduceStrategy.NCCL)
         return torch_op(tensor, all_reduce_params=all_reduce_params)
 
     @torch.library.custom_op(

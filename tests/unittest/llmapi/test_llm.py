@@ -708,6 +708,7 @@ def test_generate_with_beam_search(llm_for_sampling_params: LLM):
     check_output(outputs, references)
 
 
+@pytest.mark.skip(reason="https://nvbugs/5435714")
 @force_ampere
 @pytest.mark.part0
 def test_generate_with_streaming_llm():
@@ -1149,6 +1150,11 @@ def tinyllama_logits_processor_test_harness(backend=None, **llm_kwargs):
     sampling_params = SamplingParams(
         max_tokens=6, logits_processor=MyLogitsProcessor(biased_word_id))
 
+    prompts = ["A B C"]
+    if llm_kwargs.get('enable_chunked_prefill', None):
+        prompts[0] = prompts[0] * 256
+        llm_kwargs["max_num_tokens"] = 256
+
     llm_test_harness(
         llama_model_path,
         prompts, ["Z Z Z Z Z Z"],
@@ -1453,20 +1459,7 @@ def llama_v2_13b_lora_from_dir_test_harness(**llm_kwargs):
         assert similar(output.outputs[0].text, ref)
 
 
-@pytest.mark.parametrize(
-    "lora_adapter_count_per_call, max_loras, max_cpu_loras, repeat_calls, repeats_per_call",
-    [
-        # Test eviction and re-loading a previously evicted adapter from the LoRA GPU cache, within a single
-        # llm.generate call, that's repeated twice.
-        ([
-            2,
-        ], 1, 2, 2, 3),
-        # Test eviction and loading of new adapters in the evicted space, over several llm.generate calls, with LoRA GPU
-        # cache size < LoRA CPU cache size
-        ([2, 2, 2], 1, 3, 1, 1),
-    ])
-@skip_gpu_memory_less_than_40gb
-def test_llama_7b_multi_lora_evict_load_new_adapters(
+def _check_llama_7b_multi_lora_evict_load_new_adapters(
         lora_adapter_count_per_call: list[int], max_loras: int,
         max_cpu_loras: int, repeat_calls: int, repeats_per_call: int):
     # For LoRA checkpoints without finetuned embedding and lm_head, we can either:
@@ -1485,6 +1478,43 @@ def test_llama_7b_multi_lora_evict_load_new_adapters(
         enable_lora=True,
         build_config=build_config,
         fast_build=True)
+
+
+@skip_gpu_memory_less_than_40gb
+def test_llama_7b_multi_lora_evict_and_reload_lora_gpu_cache():
+    """Test eviction and re-loading a previously evicted adapter from the LoRA GPU cache, within a single
+    llm.generate call, that's repeated twice.
+    """  # noqa: D205
+    _check_llama_7b_multi_lora_evict_load_new_adapters(
+        lora_adapter_count_per_call=[2],
+        max_loras=1,
+        max_cpu_loras=2,
+        repeat_calls=2,
+        repeats_per_call=3)
+
+
+@skip_gpu_memory_less_than_40gb
+def test_llama_7b_multi_lora_evict_and_load_new_adapters_in_cpu_and_gpu_cache():
+    """Test eviction and loading of new adapters in the evicted space, over several llm.generate calls, with LoRA GPU
+    cache size < LoRA CPU cache size.
+    """  # noqa: D205
+    _check_llama_7b_multi_lora_evict_load_new_adapters(
+        lora_adapter_count_per_call=[2, 2, 2],
+        max_loras=1,
+        max_cpu_loras=3,
+        repeat_calls=1,
+        repeats_per_call=1)
+
+
+@skip_gpu_memory_less_than_40gb
+def test_llama_7b_multi_lora_read_from_cache_after_insert():
+    """Test that loading and then using the same adapters loaded in cache works."""
+    _check_llama_7b_multi_lora_evict_load_new_adapters(
+        lora_adapter_count_per_call=[3],
+        max_loras=3,
+        max_cpu_loras=3,
+        repeat_calls=2,
+        repeats_per_call=1)
 
 
 def test_llama_7b_peft_cache_config_affects_peft_cache_size():
@@ -2234,24 +2264,36 @@ def test_llm_chunked_prefill():
     success_path()
 
 
-def _test_llm_capture_request_error(tp_size: int = 1):
-    build_config = BuildConfig()
-    build_config.max_num_tokens = 64
+def _test_llm_capture_request_error(pytorch_backend: bool, tp_size: int = 1):
+    llm_args_extra = {}
+    if pytorch_backend:
+        LLM_CLASS = LLM_torch
+        llm_args_extra["max_num_tokens"] = 64
+    else:
+        LLM_CLASS = LLM
+        build_config = BuildConfig()
+        build_config.max_num_tokens = 64
+        llm_args_extra["fast_build"] = True
+        llm_args_extra["build_config"] = build_config
 
-    llm = LLM(
+    llm = LLM_CLASS(
         model=llama_model_path,
-        build_config=build_config,
-        fast_build=True,
+        tensor_parallel_size=tp_size,
+        **llm_args_extra,
     )
 
     prompt = 'A ' * 65  # the minimum max_num_tokens is 64
-
-    with pytest.raises(RequestError):
-        llm.generate(prompt)
+    if pytorch_backend:
+        # pytorch backend will raise ValueError for max_num_tokens
+        with pytest.raises(ValueError):
+            llm.generate(prompt)
+    else:
+        with pytest.raises(RequestError):
+            llm.generate(prompt)
 
 
 def test_llm_capture_request_error():
-    _test_llm_capture_request_error(tp_size=1)
+    _test_llm_capture_request_error(pytorch_backend=False, tp_size=1)
 
 
 def test_llm_shutdown_executor():

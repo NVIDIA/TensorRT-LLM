@@ -14,6 +14,9 @@
 # limitations under the License.
 # # Force resource release after test
 
+import traceback
+from typing import Any
+
 import pytest
 import torch
 import tqdm
@@ -51,6 +54,19 @@ def pytest_runtest_protocol(item, nextitem):
 
                 torch.cuda.empty_cache()
             break
+
+
+# Logging exceptions to stdout to prevent them from being masked by
+# pytest-threadleak complaints.
+@pytest.hookimpl(wrapper=True)
+def pytest_pyfunc_call(pyfuncitem) -> Any:
+    try:
+        return (yield)
+    # NB: _pytest.outcomes.OutcomeException subclasses BaseException
+    except BaseException as e:
+        print(f"TEST RAISED ERROR: {e}")
+        traceback.print_exception(e)
+        raise
 
 
 def pytest_addoption(parser):

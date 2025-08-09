@@ -11,6 +11,8 @@ import yaml
 
 from ..test_llm import get_model_path
 from .openai_server import RemoteOpenAIServer
+from .utils import (invalid_logit_bias_helper, logit_bias_effect_helper,
+                    make_server_with_custom_sampler_fixture)
 
 pytestmark = pytest.mark.threadleak(enabled=False)
 
@@ -523,39 +525,31 @@ def test_stop_reason(client: openai.OpenAI, model_name: str, backend: str):
     assert resp.choices[0].stop_reason == "two"
 
 
-@pytest.mark.asyncio
-async def test_chat_completion_with_logit_bias(async_client: openai.AsyncOpenAI,
-                                               model_name: str):
-    """Test logit_bias in chat completions"""
-    logit_bias = {
-        "1000": 2.0,
-        "2000": -2.0,
-    }
-
-    chat_completion = await async_client.chat.completions.create(
-        model=model_name,
-        messages=[{
-            "role": "user",
-            "content": "Tell me a fact about Paris"
-        }],
-        max_tokens=20,
-        logit_bias=logit_bias,
-        temperature=0.0,
-    )
-    assert chat_completion.choices[0].message.content
+server_with_custom_sampler = make_server_with_custom_sampler_fixture('chat')
 
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope='function')
+@pytest.mark.parametrize(
+    'server_with_custom_sampler',
+    [
+        {
+            'use_torch_sampler': True
+        },  # torch_sampler
+        {
+            'use_torch_sampler': False
+        },  # trtllm_sampler
+    ],
+    indirect=True,
+    ids=['torch_sampler', 'trtllm_sampler'])
+async def test_chat_completion_with_logit_bias_effect(
+        server_with_custom_sampler, model_name: str) -> None:
+    '''Test that logit bias affects output as expected for both samplers (chat endpoint).'''
+    client = server_with_custom_sampler.get_async_client()
+    await logit_bias_effect_helper(client, model_name, 'chat')
+
+
+@pytest.mark.asyncio(loop_scope="module")
 async def test_chat_completion_with_invalid_logit_bias(
         async_client: openai.AsyncOpenAI, model_name: str):
-    """Test with invalid token IDs (non-integer keys)"""
-    with pytest.raises(openai.BadRequestError):
-        await async_client.chat.completions.create(
-            model=model_name,
-            messages=[{
-                "role": "user",
-                "content": "Tell me a fact about Paris"
-            }],
-            logit_bias={"invalid_token": 1.0},  # Non-integer key
-            max_tokens=5,
-        )
+    """Test with invalid token IDs (non-integer keys) for chat completions"""
+    await invalid_logit_bias_helper(async_client, model_name, 'chat')

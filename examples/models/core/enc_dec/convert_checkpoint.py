@@ -13,11 +13,13 @@ from pathlib import Path
 import safetensors
 from helper import (convert_weight_to_dtype, fairseq_sin_pos_embedding,
                     fuse_qkv_one_layer, reshape, split)
-from transformers import (AutoModelForSeq2SeqLM, AutoModelForCausalLM, Blip2ForConditionalGeneration,
-                          MBartForConditionalGeneration,
+
+from transformers import (AutoModelForSeq2SeqLM, Blip2ForConditionalGeneration,
+                          MBartForConditionalGeneration, NougatProcessor,
                           Pix2StructForConditionalGeneration,
                           T5ForConditionalGeneration, VisionEncoderDecoderModel)
 
+from tensorrt_llm._utils import pad_vocab_size
 from tensorrt_llm.functional import (LayerNormPositionType, LayerNormType,
                                      MLPType)
 from tensorrt_llm.layers import LanguageAdapterConfig
@@ -29,6 +31,9 @@ LOGGER = logging.getLogger(__name__)
 layernorm_type_map = {i.name: i.value for i in LayerNormType}
 layernorm_position_map = {i.name: i.value for i in LayerNormPositionType}
 mlp_type_map = {i.name: i.value for i in MLPType}
+
+# Constants for specific model configurations
+ECLAIR_RADIO_MAX_POSITION_EMBEDDINGS = 20000
 
 
 def copy_args_to_component_config(component_config, args):
@@ -619,14 +624,19 @@ def parse_bart_config(args, hf_model):
     config = configparser.ConfigParser()
 
     config['decoder'] = dict()
-    for key, val in hf_model.model.decoder.config.to_dict().items():
-        config["decoder"][key] = f"{val}"
+    if args.eclair_radio:
+        for key, val in hf_model.config.to_dict().items():
+            config["decoder"][key] = f"{val}"
+    else:
+        for key, val in hf_model.model.decoder.config.to_dict().items():
+            config["decoder"][key] = f"{val}"
     config["decoder"]["q_scaling"] = '1'
     config["decoder"]["rescale_before_lm_head"] = str(False)
     config['decoder']['has_model_final_layernorm'] = str(
-        args.nougat or isinstance(hf_model, MBartForConditionalGeneration))
+        args.nougat or args.eclair_radio
+        or isinstance(hf_model, MBartForConditionalGeneration))
 
-    if args.nougat:
+    if args.nougat or args.eclair_radio:
         # These flags are true for mbart decoders, but missing in HF config
         config['decoder']['normalize_before'] = str(True)
         config['decoder']['normalize_embeddings'] = str(True)
@@ -763,9 +773,13 @@ def parse_bart_config(args, hf_model):
         return component_config
 
     encoder_config = None
-    if not args.nougat:
+    if not (args.nougat or args.eclair_radio):
         encoder_config = parse_bart_config_by_component(config, "encoder", args)
     decoder_config = parse_bart_config_by_component(config, "decoder", args)
+
+    # Override n_positions for eclair_radio model
+    if args.eclair_radio:
+        decoder_config.n_positions = ECLAIR_RADIO_MAX_POSITION_EMBEDDINGS
 
     return encoder_config, decoder_config
 
@@ -952,11 +966,22 @@ def convert_bart_weights_to_tllm_safetensors(config, component, params):
                     (hidden_size * 3 // mapping.tp_size)))
 
     if component == 'decoder':
+        import torch
+        lm_head_weights = params['lm_head.weight'].clone().detach()
+        vocab_size = config.vocab_size
+        if params['lm_head.weight'].shape[0] % mapping.tp_size != 0:
+            vocab_size_padded = pad_vocab_size(config.vocab_size,
+                                               mapping.tp_size)
+            pad_width = vocab_size_padded - config.vocab_size
+
+            lm_head_weights = torch.nn.functional.pad(lm_head_weights,
+                                                      (0, 0, 0, pad_width),
+                                                      'constant',
+                                                      value=0)
+            vocab_size = vocab_size_padded
         weights['lm_head.weight'] = reshape(
-            split(params['lm_head.weight'],
-                  mapping.tp_size,
-                  mapping.tp_rank,
-                  dim=0), (config.vocab_size // mapping.tp_size, hidden_size))
+            split(lm_head_weights, mapping.tp_size, mapping.tp_rank, dim=0),
+            (vocab_size // mapping.tp_size, hidden_size))
 
     if config.has_model_final_layernorm:
         weights['transformer.ln_f.weight'] = params[
@@ -1481,6 +1506,113 @@ def get_model(args):
         if args.nougat:
             model = VisionEncoderDecoderModel.from_pretrained(args.model_dir)
             model = model.get_decoder()
+        elif args.eclair_radio:
+            import torch
+
+            class RadioWithNeck(torch.nn.Module):
+
+                def __init__(self):
+                    super().__init__()
+
+                    self.model_encoder = torch.hub.load("NVlabs/RADIO",
+                                                        "radio_model",
+                                                        version="radio_v2.5-h")
+                    self.model_encoder.summary_idxs = torch.tensor(4)
+
+                    self.conv1 = torch.nn.Conv1d(1280, 1024, 1)
+                    self.layer_norm1 = torch.nn.LayerNorm(
+                        1024, eps=1e-6, elementwise_affine=True)
+                    self.conv2 = torch.nn.Conv2d(1024,
+                                                 1024,
+                                                 kernel_size=(1, 4),
+                                                 stride=(1, 4),
+                                                 padding=0,
+                                                 bias=False)
+                    self.layer_norm2 = torch.nn.LayerNorm(
+                        1024, eps=1e-6, elementwise_affine=True)
+
+                def forward(self, pixel_values):
+                    _, feature = self.model_encoder(pixel_values)
+                    output = self.conv1(feature.permute(0, 2,
+                                                        1)).permute(0, 2, 1)
+                    output = self.layer_norm1(output).permute(0, 2, 1)
+
+                    b, d, _ = output.shape
+                    h = pixel_values.shape[-2] // 16
+                    w = pixel_values.shape[-1] // 16
+                    output = self.conv2(output.reshape(b, d, h, w))
+                    output = output.flatten(-2, -1).permute(0, 2, 1)
+                    output = self.layer_norm2(output)
+                    return output
+
+            def get_processor():
+                processor = NougatProcessor.from_pretrained(
+                    "facebook/nougat-base")
+
+                special_tokens = {
+                    "output_plain_index": "<output_plain>",
+                    "output_markdown_index": "<output_markdown>",
+                    "output_no_text_index": "<output_no_text>",
+                    "output_ocr_index": "<output_ocr>",
+                    "predict_bbox_index": "<predict_bbox>",
+                    "no_bbox_index": "<no_bbox>",
+                    "bbox_start_index": "<bbox>",  # not used but can keep
+                    # "bbox_end_index": "</bbox>",  # not used but can keep
+                    "no_class_index": "<no_classes>",
+                    "predict_classes_index": "<predict_classes>",
+                }
+                for key, special_t in special_tokens.items():
+                    processor.tokenizer.add_special_tokens(
+                        {"additional_special_tokens": [special_t]})
+                    setattr(processor.tokenizer, key,
+                            processor.tokenizer.encode(special_t)[1])
+
+                # Add regular tokens for boxes
+                processor.tokenizer.add_tokens(
+                    [f"<x_{x_i}>" for x_i in range(1024)])
+                processor.tokenizer.add_tokens(
+                    [f"<y_{y_i}>" for y_i in range(1280)])
+                # Add regular tokens for classes
+                #"<class_{class_i}>"
+                possible_classes = [
+                    "Text", "Title", "Section-header", "List-item", "TOC",
+                    "Bibliography", "Footnote", "Page-header", "Page-footer",
+                    "Picture", "Formula", "Page-number", "Table", "Caption"
+                ]
+                processor.tokenizer.add_tokens(
+                    [f"<class_{cls}>" for cls in possible_classes])
+                return processor
+
+            processor = get_processor()
+            model = VisionEncoderDecoderModel.from_pretrained(
+                "facebook/nougat-base")
+            model.encoder = RadioWithNeck()
+            model.decoder.resize_token_embeddings(len(processor.tokenizer),
+                                                  pad_to_multiple_of=64)
+            model.config.decoder_start_token_id = processor.tokenizer.eos_token_id  # 2
+            model.config.pad_token_id = processor.tokenizer.pad_token_id  # 1
+            from transformers.models.mbart.modeling_mbart import \
+                MBartLearnedPositionalEmbedding
+            _, d_model = model.device, model.config.decoder.d_model
+
+            with torch.inference_mode():
+                # Inspect checkpoint shapes
+                safetensors.torch.load_model(model,
+                                             os.path.join(
+                                                 args.model_dir,
+                                                 "model.safetensors"),
+                                             strict=False)
+            model.decoder.model.decoder.embed_positions = MBartLearnedPositionalEmbedding(
+                ECLAIR_RADIO_MAX_POSITION_EMBEDDINGS, d_model)
+            model.decoder.model.decoder.embed_positions.weight.data.zero_()
+            model.decoder.model.decoder.embed_positions.weight.requires_grad_(
+                True)
+            model.decoder.lm_head.weight = model.decoder.get_input_embeddings(
+            ).weight
+
+            model.eval()
+            model = model.get_decoder()
+
         else:
             model = AutoModelForSeq2SeqLM.from_pretrained(args.model_dir)
     elif args.model_type == "pix2struct":
@@ -1529,15 +1661,24 @@ def convert_checkpoint(args):
     quant_algo = None
 
     model_type = args.model_type if args.model_type != "blip2" else "t5"
-    model_type = model_type if model_type != "florence2" else "bart"
-    encoder_config, decoder_config = globals()[f'parse_{model_type}_config'](
-        args, model)
+
+    parse_config_mapper = {
+        't5': parse_t5_config,
+        'pix2struct': parse_pix2struct_config,
+        'blip2': parse_t5_config,  # blip2 uses t5 config parser
+        'language_adapter': parse_language_adapter_config,
+        'nmt': parse_nmt_config,
+        'bart': parse_bart_config,
+    }
+    encoder_config, decoder_config = parse_config_mapper[model_type](args,
+                                                                     model)
 
     additional_settings = ["gated_act"]
     if model_type == 'language_adapter':
         additional_settings += ["residual_scaling", "language_adapter_config"]
 
-    if not args.nougat and args.model_type != "pix2struct":
+    if not (args.nougat
+            or args.eclair_radio) and args.model_type != "pix2struct":
         tllm_encoder_config = {
             'architecture': "EncoderModel",
             'dtype': args.dtype,
@@ -1672,7 +1813,8 @@ def convert_checkpoint(args):
         decoder_convert_args["sin_pos_embedding"] = sin_pos_embedding
 
     if args.workers == 1:
-        if not args.nougat and args.model_type != "pix2struct":
+        if not (args.nougat
+                or args.eclair_radio) and args.model_type != "pix2struct":
             convert(0, world_size, args, tllm_encoder_config,
                     encoder_convert_args, encoder_saved_dir)
         convert(0, world_size, args, tllm_decoder_config, decoder_convert_args,
@@ -1682,7 +1824,8 @@ def convert_checkpoint(args):
             args.workers = world_size
         LOGGER.info(f'Convert checkpoint using {args.workers} workers.')
         import torch.multiprocessing as mp
-        if not args.nougat and args.model_type != "pix2struct":
+        if not (args.nougat
+                or args.eclair_radio) and args.model_type != "pix2struct":
             mp.spawn(convert,
                      nprocs=args.workers,
                      args=(world_size, args, tllm_encoder_config,
@@ -1742,6 +1885,9 @@ if __name__ == "__main__":
         help="How many workers to spawn for conversion (default: 4)",
         default=4)
     parser.add_argument("--nougat",
+                        action="store_true",
+                        help="Model which uses vision encoder + mbart decoder")
+    parser.add_argument("--eclair_radio",
                         action="store_true",
                         help="Model which uses vision encoder + mbart decoder")
     parser.add_argument("--verbose",

@@ -1,19 +1,20 @@
 from typing import List, Optional, Union
 
-import deep_gemm
 import torch
 import torch.nn.functional as F
 import triton
 import triton.language as tl
 
 import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
+from tensorrt_llm import deep_gemm
 from tensorrt_llm._utils import nvtx_range
 
 from ...distributed import allgather
 from ...model_config import ModelConfig
 from ...utils import Fp4QuantizedTensor
 from .fused_moe_cutlass import CutlassFusedMoE
-from .quantization import MoEWeightLoadingMode
+from .quantization import (DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm,
+                           MoEWeightLoadingMode, UnquantizedFusedMoEMethod)
 from .routing import BaseMoeRoutingMethod
 
 
@@ -339,6 +340,18 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
             apply_router_weight_on_input=apply_router_weight_on_input,
             layer_idx=layer_idx,
         )
+
+    def _get_quant_method(self):
+        if self.quant_config is not None and self.quant_config.layer_quant_mode.has_any_quant(
+                exclude_kv_cache=True):
+            if self.quant_config.layer_quant_mode.has_fp8_block_scales():
+                return DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm()
+            else:
+                raise ValueError(
+                    f"Unsupported quantization mode: {self.quant_config.quant_mode}"
+                )
+        else:
+            return UnquantizedFusedMoEMethod()
 
     @nvtx_range("[DG] forward")
     def forward_chunk(

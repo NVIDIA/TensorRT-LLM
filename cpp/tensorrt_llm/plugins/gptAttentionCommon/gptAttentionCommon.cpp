@@ -72,8 +72,7 @@ GPTAttentionPluginCommon::GPTAttentionPluginCommon(int layer_idx, int num_heads,
     mMaskType = mask_type;
     mBlockSparseParams = block_sparse_params;
     mType = type;
-    mMultiBlockMode
-        = is_spec_decoding_enabled ? false : true; // set to true in build time to account for enough workspace size
+    mMultiBlockMode = true;
     mEnableXQA = true;
     mKVCacheQuantMode = tc::QuantMode(kv_cache_quant_mode);
     mRemovePadding = remove_input_padding;

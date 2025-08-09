@@ -101,14 +101,17 @@ struct GemmGatedActOptions : public gemm::GemmOptions
 {
     GemmGatedActOptions() = default;
 
-    GemmGatedActOptions(gemm::GemmOptions options, ActType actType)
+    GemmGatedActOptions(gemm::GemmOptions options, ActType actType, bool clampBeforeAct)
         : gemm::GemmOptions(options)
         , mActType(actType)
+        , mClampBeforeAct(clampBeforeAct)
     {
     }
 
     // Type of the gated activation.
     ActType mActType{ActType::SwiGlu};
+    // Clamp the dequantized values to the range [-limit, limit].
+    bool mClampBeforeAct{false};
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -175,7 +178,8 @@ inline std::string dumpOptions(GemmGatedActOptions const& options)
     std::stringstream ss;
     ss << gemm::dumpOptions(options) << ", ";
     ss << "mActType="
-       << "gemmGatedAct::ActType(" << static_cast<int32_t>(options.mActType) << ")" << std::endl;
+       << "gemmGatedAct::ActType(" << static_cast<int32_t>(options.mActType) << ")," << std::endl;
+    ss << "mClampLimit=" << options.mClampBeforeAct << "," << std::endl;
     return ss.str();
 }
 
@@ -196,6 +200,7 @@ struct GemmGatedActConfig
     uint32_t const mSharedMemSize{0};
     char const* mFunctionName{nullptr};
     uint32_t const mNumThreadsPerCTA{0};
+    char const* mHash{nullptr};
 #else
     trtllm::gen::CudaRunner* mCudaRunner{nullptr};
 #endif

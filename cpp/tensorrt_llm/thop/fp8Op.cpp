@@ -15,6 +15,7 @@
  */
 
 #include "tensorrt_llm/thop/fp8Op.h"
+#include "cutlass/numeric_types.h"
 #include "tensorrt_llm/common/cudaBf16Wrapper.h"
 #include "tensorrt_llm/common/cudaFp8Utils.h"
 #include "tensorrt_llm/thop/thUtils.h"
@@ -206,6 +207,122 @@ Tensor e4m3_dequantize_helper(Tensor input, Tensor scales, QuantizeMode quantize
     return dequantized_input;
 }
 
+inline uint8_t float_to_ue8m0(float value)
+{
+    if (value == 0.0f)
+    {
+        return 0x00;
+    }
+    constexpr uint32_t FP32_MANTISSA_BITS = 23;
+    uint32_t val_u32 = *reinterpret_cast<uint32_t*>(&value);
+    uint8_t exponent = (val_u32 >> FP32_MANTISSA_BITS);
+    uint32_t mantissa = val_u32 & 0x7FFFFF;
+    // Round up exponent and deal with satfinite.
+    if ((mantissa > 0 && exponent != 0xFE) && !(exponent == 0 && mantissa <= 0x400000))
+    {
+        ++exponent;
+    }
+    return exponent;
+}
+
+// Used in tests to quantize mxe4m3 tensors on host.
+std::tuple<Tensor, Tensor> quantize_mxe4m3_host(Tensor x_fp32, bool is_sf_swizzled_layout = true)
+{
+    int32_t const sf_vec_size = 32;
+    CHECK_CPU_INPUT(x_fp32, torch::kFloat32);
+    auto data_shape = x_fp32.sizes();
+    TORCH_CHECK(data_shape.size() == 2, "x_fp32 should be 2D tensor.");
+    int num_tokens = data_shape[0];
+    int hidden_dim = data_shape[1];
+    int groups_per_hidden_dim = hidden_dim / sf_vec_size;
+
+    Tensor fp8_tensor = at::detail::empty_cpu(
+        {num_tokens, hidden_dim}, at::ScalarType::Byte, /* pinned */ true, at::MemoryFormat::Contiguous);
+    int64_t sf_size = is_sf_swizzled_layout
+        ? tensorrt_llm::computeSwizzledLayoutSFSize(num_tokens, hidden_dim / sf_vec_size)
+        : tensorrt_llm::computeLinearLayoutSFSize(num_tokens, hidden_dim / sf_vec_size);
+    Tensor scale_tensor = at::detail::empty_cpu({sf_size}, SF_DTYPE, /* pinned */ true, at::MemoryFormat::Contiguous);
+
+    tensorrt_llm::QuantizationSFLayout layout = is_sf_swizzled_layout ? tensorrt_llm::QuantizationSFLayout::SWIZZLED
+                                                                      : tensorrt_llm::QuantizationSFLayout::LINEAR;
+
+    for (size_t ti = 0; ti < static_cast<size_t>(data_shape[0]); ++ti)
+    {
+        for (int group = 0; group < groups_per_hidden_dim; ++group)
+        {
+            float* fp32_ptr = x_fp32.data_ptr<float>() + ti * hidden_dim + group * sf_vec_size;
+            uint8_t* fp8_ptr = fp8_tensor.data_ptr<uint8_t>() + ti * hidden_dim + group * sf_vec_size;
+
+            uint8_t* scale_ue8m08sf_ptr = scale_tensor.data_ptr<uint8_t>();
+
+            float local_amax = 0.0f;
+            for (int ki = 0; ki < sf_vec_size; ++ki)
+            {
+                local_amax = std::max(std::abs(fp32_ptr[ki]), local_amax);
+            }
+
+            local_amax *= (1.f / 448.0f);
+
+            uint8_t scale_ue8m0 = float_to_ue8m0(local_amax);
+            auto const inv_scale = (scale_ue8m0 == 0) ? 1 : exp2f(127 - static_cast<float>(scale_ue8m0));
+
+            scale_ue8m08sf_ptr[computeSFIndex(ti, group, data_shape[0], groups_per_hidden_dim, layout)] = scale_ue8m0;
+
+            for (int ki = 0; ki < sf_vec_size; ++ki)
+            {
+                float const scaled_fp32_value = fp32_ptr[ki] * inv_scale;
+                auto fp8_value = cutlass::float_e4m3_t{scaled_fp32_value};
+                fp8_ptr[ki] = *reinterpret_cast<uint8_t*>(&fp8_value);
+            }
+        }
+    }
+    return std::make_tuple(fp8_tensor, scale_tensor);
+}
+
+// Used in tests to dequantize mxe4m3 tensors on host.
+Tensor dequantize_mxe4m3_host(Tensor value_e4m3, Tensor scale_ue8m08sf, bool is_sf_swizzled_layout = true)
+{
+    int32_t const sf_vec_size = 32;
+    CHECK_CPU_INPUT(value_e4m3, at::ScalarType::Byte);
+    CHECK_CPU_INPUT(scale_ue8m08sf, SF_DTYPE);
+    auto data_shape = value_e4m3.sizes();
+    auto scale_shape = scale_ue8m08sf.sizes();
+    TORCH_CHECK(data_shape.size() == 2, "value_e4m3 should be 2D tensor.");
+    TORCH_CHECK(scale_shape.size() == 1, "scale_ue8m08sf should be 1D tensor.");
+    Tensor float_tensor = at::detail::empty_cpu(
+        {data_shape[0], data_shape[1]}, at::ScalarType::Float, /* pinned */ true, at::MemoryFormat::Contiguous);
+
+    int hidden_dim = data_shape[1];
+    int groups_per_hidden_dim = hidden_dim / sf_vec_size;
+
+    tensorrt_llm::QuantizationSFLayout layout = is_sf_swizzled_layout ? tensorrt_llm::QuantizationSFLayout::SWIZZLED
+                                                                      : tensorrt_llm::QuantizationSFLayout::LINEAR;
+    for (size_t ti = 0; ti < static_cast<size_t>(data_shape[0]); ++ti)
+    {
+        for (int group = 0; group < groups_per_hidden_dim; ++group)
+        {
+            float* float_ptr = float_tensor.data_ptr<float>() + ti * hidden_dim + group * sf_vec_size;
+            uint8_t* fp8_ptr = value_e4m3.data_ptr<uint8_t>() + ti * hidden_dim + group * sf_vec_size;
+            uint8_t* scale_ue8m08sf_ptr = scale_ue8m08sf.data_ptr<uint8_t>();
+            uint8_t fp8_scale
+                = scale_ue8m08sf_ptr[computeSFIndex(ti, group, data_shape[0], groups_per_hidden_dim, layout)];
+
+            float scale_float;
+            uint32_t scale_float_u32 = uint32_t(fp8_scale) << 23;
+            memcpy(&scale_float, &scale_float_u32, sizeof(scale_float));
+
+            for (int ki = 0; ki < sf_vec_size; ++ki)
+            {
+                uint8_t fp8_u8_repr = fp8_ptr[ki];
+                auto fp32 = static_cast<float>(*reinterpret_cast<cutlass::float_e4m3_t*>(&fp8_u8_repr));
+                float value = fp32 * scale_float;
+                float_ptr[ki] = value;
+            }
+        }
+    }
+    return float_tensor;
+}
+
 std::tuple<Tensor, Tensor> symmetric_quantize_weight(Tensor weight)
 {
     return e4m3_quantize_helper(weight, at::nullopt, QuantizeMode::PER_CHANNEL);
@@ -279,3 +396,9 @@ TORCH_LIBRARY_IMPL(tensorrt_llm, CUDA, m)
     m.impl("dequantize_e4m3_activation", &torch_ext::symmetric_dequantize_activation);
     m.impl("dequantize_e4m3_per_tensor", &torch_ext::symmetric_dequantize_per_tensor);
 }
+
+static auto dequantize_mxe4m3_host
+    = torch::RegisterOperators("tensorrt_llm::dequantize_mxe4m3_host", &torch_ext::dequantize_mxe4m3_host);
+
+static auto quantize_mxe4m3_host
+    = torch::RegisterOperators("tensorrt_llm::quantize_mxe4m3_host", &torch_ext::quantize_mxe4m3_host);
