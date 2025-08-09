@@ -25,7 +25,7 @@ from ...functional import (AllReduceFusionOp, AllReduceParams, Tensor,
 from ...layers import (MOE, Attention, AttentionMaskType, ColumnLinear,
                        Embedding, FusedGatedMLP, GatedMLP,
                        PositionEmbeddingType, RmsNorm)
-from ...lora_manager import LoraConfig, use_lora
+from ...lora_helper import LoraConfig, use_lora
 from ...mapping import Mapping
 from ...module import Module
 from ...quantization.functional import fused_layernorm

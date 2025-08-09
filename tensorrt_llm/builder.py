@@ -36,7 +36,7 @@ from .bindings import KVCacheType
 from .functional import PositionEmbeddingType
 from .graph_rewriting import optimize
 from .logger import logger
-from .lora_manager import LoraConfig
+from .lora_helper import LoraConfig
 from .models import PretrainedConfig, PretrainedModel
 from .models.modeling_utils import SpeculativeDecodingMode, optimize_model
 from .network import Network, net_guard
