@@ -34,6 +34,9 @@ void fmtstr_(char const* format, fmtstr_allocator alloc, void* target, va_list a
     size_t constexpr init_size = 2048;
     char fixed_buffer[init_size];
     auto const size = std::vsnprintf(fixed_buffer, init_size, format, args0);
+    // Clean up the copied va_list to prevent potential resource leak
+    va_end(args0);
+
     TLLM_CHECK_WITH_INFO(size >= 0, std::string(std::strerror(errno)));
     if (size == 0)
     {
