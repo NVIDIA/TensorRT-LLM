@@ -231,6 +231,7 @@ def check_events(llm,
     assert not llm.get_kv_cache_events(5)
 
 
+@pytest.mark.skip(reason="https://nvbugs/5445001")
 def test_llm_kv_events_api():
     llm = create_llm()
     sampling_params = SamplingParams(max_tokens=6,

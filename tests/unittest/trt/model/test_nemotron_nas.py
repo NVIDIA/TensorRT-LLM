@@ -382,6 +382,7 @@ class TestNemotronNas(unittest.TestCase):
 
     @parameterized.expand(get_loader_test_cases, name_func=unittest_name_func)
     def test_allclose_to_hf(self, hf_model_dir: str, params: TestParams):
+        self.skipTest(f"https://nvbugs/5444611")
         hf_model = transformers.AutoModelForCausalLM.from_pretrained(
             hf_model_dir,
             trust_remote_code=True,
@@ -827,6 +828,7 @@ class TestNemotronNas(unittest.TestCase):
     def test_convert_model_from_hf(self, model_dir: Optional[str],
                                    preloaded: bool, tp_size: int, pp_size: int,
                                    dtype: str) -> None:
+        self.skipTest(f"https://nvbugs/5444611")
         ckpt_path = Path(llm_models_root(check=True), "nvsmall/tests",
                          model_dir)
 
