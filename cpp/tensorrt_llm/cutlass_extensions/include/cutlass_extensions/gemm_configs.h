@@ -19,6 +19,7 @@
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <tuple>
 
 #include "cute/tensor.hpp"
 
@@ -80,7 +81,21 @@ enum class SplitKStyle
     // SPLIT_K_PARALLEL // Not supported yet
 };
 
-enum class CutlassTileConfigSM90
+constexpr static int shape_tuple_to_enum(int m, int n, int k)
+{
+    return m * 1000000 + n * 1000 + k;
+}
+
+template <typename TEnum>
+constexpr static std::tuple<int, int, int> enum_to_shape_tuple(TEnum shape_id_enum)
+{
+    static_assert(std::is_enum_v<TEnum> && std::is_same_v<std::underlying_type_t<TEnum>, int>,
+        "TEnum must be an enum with underlying type int");
+    auto shape_id = static_cast<int>(shape_id_enum);
+    return std::make_tuple(shape_id / 1000000, (shape_id % 1000000) / 1000, shape_id % 1000);
+}
+
+enum class CutlassTileConfigSM90 : int
 {
     // Signals that we should run heuristics do choose a config
     Undefined,
@@ -89,25 +104,25 @@ enum class CutlassTileConfigSM90
     ChooseWithHeuristic,
 
     // CTA configs for M=64
-    CtaShape64x16x128B,
-    CtaShape64x32x128B,
-    CtaShape64x64x128B,
-    CtaShape64x128x128B,
-    CtaShape64x256x128B,
+    CtaShape64x16x128B = shape_tuple_to_enum(64, 16, 128),
+    CtaShape64x32x128B = shape_tuple_to_enum(64, 32, 128),
+    CtaShape64x64x128B = shape_tuple_to_enum(64, 64, 128),
+    CtaShape64x128x128B = shape_tuple_to_enum(64, 128, 128),
+    CtaShape64x256x128B = shape_tuple_to_enum(64, 256, 128),
 
     // CTA configs for M=128
-    CtaShape128x16x128B,
-    CtaShape128x32x128B,
-    CtaShape128x64x128B,
-    CtaShape128x128x128B,
-    CtaShape128x256x128B,
+    CtaShape128x16x128B = shape_tuple_to_enum(128, 16, 128),
+    CtaShape128x32x128B = shape_tuple_to_enum(128, 32, 128),
+    CtaShape128x64x128B = shape_tuple_to_enum(128, 64, 128),
+    CtaShape128x128x128B = shape_tuple_to_enum(128, 128, 128),
+    CtaShape128x256x128B = shape_tuple_to_enum(128, 256, 128),
 
     // CTA configs for M=256
-    CtaShape256x128x128B,
-    CtaShape256x256x128B,
+    CtaShape256x128x128B = shape_tuple_to_enum(256, 128, 128),
+    CtaShape256x256x128B = shape_tuple_to_enum(256, 256, 128),
 };
 
-enum class CutlassTileConfigSM100
+enum class CutlassTileConfigSM100 : int
 {
     // Signals that we should run heuristics do choose a config
     Undefined,
@@ -119,28 +134,28 @@ enum class CutlassTileConfigSM100
      * Grouped GEMM
      */
     // M=64
-    CtaShape64x32x128B,
-    CtaShape64x64x128B,
-    CtaShape64x128x128B,
-    CtaShape64x256x128B,
+    CtaShape64x32x128B = shape_tuple_to_enum(64, 32, 128),
+    CtaShape64x64x128B = shape_tuple_to_enum(64, 64, 128),
+    CtaShape64x128x128B = shape_tuple_to_enum(64, 128, 128),
+    CtaShape64x256x128B = shape_tuple_to_enum(64, 256, 128),
 
     // M=128
-    CtaShape128x8x256B,
-    CtaShape128x16x128B,
-    CtaShape128x32x128B,
-    CtaShape128x64x128B,
-    CtaShape128x128x128B,
-    CtaShape128x256x128B,
-    CtaShape128x128x256B,
-    CtaShape128x256x256B,
+    CtaShape128x8x256B = shape_tuple_to_enum(128, 8, 256),
+    CtaShape128x16x128B = shape_tuple_to_enum(128, 16, 128),
+    CtaShape128x32x128B = shape_tuple_to_enum(128, 32, 128),
+    CtaShape128x64x128B = shape_tuple_to_enum(128, 64, 128),
+    CtaShape128x128x128B = shape_tuple_to_enum(128, 128, 128),
+    CtaShape128x256x128B = shape_tuple_to_enum(128, 256, 128),
+    CtaShape128x128x256B = shape_tuple_to_enum(128, 128, 256),
+    CtaShape128x256x256B = shape_tuple_to_enum(128, 256, 256),
 
     // M=256
-    CtaShape256x64x128B,
-    CtaShape256x128x128B,
-    CtaShape256x256x128B,
+    CtaShape256x64x128B = shape_tuple_to_enum(256, 64, 128),
+    CtaShape256x128x128B = shape_tuple_to_enum(256, 128, 128),
+    CtaShape256x256x128B = shape_tuple_to_enum(256, 256, 128),
 };
 
-enum class CutlassTileConfigSM120
+enum class CutlassTileConfigSM120 : int
 {
     // Signals that we should run heuristics do choose a config
     Undefined,
@@ -148,12 +163,12 @@ enum class CutlassTileConfigSM120
     // Signals that we should run heuristics do choose a config
     ChooseWithHeuristic,
 
-    CtaShape128x128x128B,
-    CtaShape128x128x64B,
-    CtaShape256x128x64B,
-    CtaShape128x256x64B,
-    CtaShape128x128x256B,
-    CtaShape256x128x128B,
+    CtaShape128x128x128B = shape_tuple_to_enum(128, 128, 128),
+    CtaShape128x128x64B = shape_tuple_to_enum(128, 128, 64),
+    CtaShape256x128x64B = shape_tuple_to_enum(256, 128, 64),
+    CtaShape128x256x64B = shape_tuple_to_enum(128, 256, 64),
+    CtaShape128x128x256B = shape_tuple_to_enum(128, 128, 256),
+    CtaShape256x128x128B = shape_tuple_to_enum(256, 128, 128),
 };
 
 enum class MainloopScheduleType
@@ -191,23 +206,25 @@ enum class EpilogueScheduleType
     AUTO, // Automatically chooses an epilogue schedule compatible with the selected main loop schedule for Hopper. For
           // architectures older than hopper, the epilogue is always performed by the same thread block as the main
           // loop.
+    NO_SMEM,
+    TMA
 };
 
-enum class TileShape
+enum class TileShape : int
 {
-    TileShape_64x16x128,
-    TileShape_64x32x128,
-    TileShape_64x64x128,
-    TileShape_64x128x128,
-    TileShape_64x256x128,
-    TileShape_64x512x128,
-    TileShape_128x16x128,
-    TileShape_128x32x128,
-    TileShape_128x64x128,
-    TileShape_128x128x128,
-    TileShape_128x256x128,
-    TileShape_256x128x128,
-    TileShape_256x256x128
+    TileShape_64x16x128 = shape_tuple_to_enum(64, 16, 128),
+    TileShape_64x32x128 = shape_tuple_to_enum(64, 32, 128),
+    TileShape_64x64x128 = shape_tuple_to_enum(64, 64, 128),
+    TileShape_64x128x128 = shape_tuple_to_enum(64, 128, 128),
+    TileShape_64x256x128 = shape_tuple_to_enum(64, 256, 128),
+    TileShape_64x512x128 = shape_tuple_to_enum(64, 512, 128),
+    TileShape_128x16x128 = shape_tuple_to_enum(128, 16, 128),
+    TileShape_128x32x128 = shape_tuple_to_enum(128, 32, 128),
+    TileShape_128x64x128 = shape_tuple_to_enum(128, 64, 128),
+    TileShape_128x128x128 = shape_tuple_to_enum(128, 128, 128),
+    TileShape_128x256x128 = shape_tuple_to_enum(128, 256, 128),
+    TileShape_256x128x128 = shape_tuple_to_enum(256, 128, 128),
+    TileShape_256x256x128 = shape_tuple_to_enum(256, 256, 128)
 };
 
 template <TileShape Shape_MNK>
@@ -325,19 +342,20 @@ static auto get_tile_shape_name(TileShape Shape_MNK)
     return "Unknown shape";
 }
 
-enum class ClusterShape
+enum class ClusterShape : int
 {
-    ClusterShape_1x1x1,
-    ClusterShape_2x1x1,
-    ClusterShape_1x2x1,
-    ClusterShape_2x2x1,
-    ClusterShape_1x4x1,
-    ClusterShape_4x1x1,
-    ClusterShape_4x2x1,
-    ClusterShape_2x4x1,
-    ClusterShape_4x4x1,
-    ClusterShape_1x8x1,
-    ClusterShape_8x1x1
+    Undefined,
+    ClusterShape_1x1x1 = shape_tuple_to_enum(1, 1, 1),
+    ClusterShape_2x1x1 = shape_tuple_to_enum(2, 1, 1),
+    ClusterShape_1x2x1 = shape_tuple_to_enum(1, 2, 1),
+    ClusterShape_2x2x1 = shape_tuple_to_enum(2, 2, 1),
+    ClusterShape_1x4x1 = shape_tuple_to_enum(1, 4, 1),
+    ClusterShape_4x1x1 = shape_tuple_to_enum(4, 1, 1),
+    ClusterShape_4x2x1 = shape_tuple_to_enum(4, 2, 1),
+    ClusterShape_2x4x1 = shape_tuple_to_enum(2, 4, 1),
+    ClusterShape_4x4x1 = shape_tuple_to_enum(4, 4, 1),
+    ClusterShape_1x8x1 = shape_tuple_to_enum(1, 8, 1),
+    ClusterShape_8x1x1 = shape_tuple_to_enum(8, 1, 1)
 };
 
 static auto get_cluster_shape_name(ClusterShape Shape_MNK)
@@ -434,6 +452,8 @@ struct CutlassGemmConfig
     MainloopScheduleType mainloop_schedule = MainloopScheduleType::AUTO;
     EpilogueScheduleType epilogue_schedule = EpilogueScheduleType::AUTO;
     ClusterShape cluster_shape = ClusterShape::ClusterShape_1x1x1;
+    ClusterShape dynamic_cluster_shape = ClusterShape::Undefined;
+    ClusterShape fallback_cluster_shape = ClusterShape::Undefined;
     bool enableCudaKernel = false;
     int sm_version = 80; // Use 80 as a catch all for <90
     bool is_tma_warp_specialized = false;
@@ -460,12 +480,18 @@ struct CutlassGemmConfig
     {
     }
 
+    // If dynamic_cluster_shape is provided, dynamic CGA will be enabled and cluster_shape will be interpreted as
+    // whether to use 1 or 2 SM mode, otherwise static cluster shape is used.
     CutlassGemmConfig(CutlassTileConfigSM100 tile_config_sm100, MainloopScheduleType mainloop_schedule,
-        EpilogueScheduleType epilogue_schedule, ClusterShape cluster_shape)
+        EpilogueScheduleType epilogue_schedule, ClusterShape cluster_shape,
+        ClusterShape dynamic_cluster_shape = ClusterShape::Undefined,
+        ClusterShape fallback_cluster_shape = ClusterShape::Undefined)
         : tile_config_sm100(tile_config_sm100)
         , mainloop_schedule(mainloop_schedule)
         , epilogue_schedule(epilogue_schedule)
         , cluster_shape(cluster_shape)
+        , dynamic_cluster_shape(dynamic_cluster_shape)
+        , fallback_cluster_shape(fallback_cluster_shape)
         , sm_version(100)
         , is_tma_warp_specialized(true)
     {
@@ -506,6 +532,8 @@ struct CutlassGemmConfig
             tactic << "\n\tstyle=TMA Warp Specialized"
                    << "\n\tsm: " << sm_version << "\n\ttile shape ID: " << getTileConfigAsInt()
                    << "\n\tcluster shape ID: " << (int) cluster_shape
+                   << "\n\tdynamic cluster shape ID: " << (int) dynamic_cluster_shape
+                   << "\n\tfallback cluster shape ID: " << (int) fallback_cluster_shape
                    << "\n\tmainloop sched: " << (int) mainloop_schedule << "\n\tepi sched: " << (int) epilogue_schedule
                    << "\n\tenable cuda kernel: " << (enableCudaKernel ? "true" : "false");
         }
@@ -539,6 +567,8 @@ inline std::ostream& operator<<(std::ostream& out, CutlassGemmConfig const& conf
             << ", mainloop_schedule_enum: " << int(config.mainloop_schedule)
             << ", epilogue_schedule_enum: " << int(config.epilogue_schedule)
             << ", cluster_shape_enum: " << int(config.cluster_shape)
+            << ", dynamic_cluster_shape_enum: " << int(config.dynamic_cluster_shape)
+            << ", fallback_cluster_shape_enum: " << int(config.fallback_cluster_shape)
             << ", enable_cuda_kernel: " << (config.enableCudaKernel ? "true" : "false");
     }
     else

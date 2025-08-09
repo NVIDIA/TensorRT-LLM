@@ -367,82 +367,101 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm90(CutlassGemmConfig::Can
     return candidate_configs;
 }
 
+std::vector<CutlassGemmConfig> get_candidate_configs_sm100_dynamic_cluster_shape(
+    CutlassGemmConfig::CandidateConfigTypeParam const config, EpilogueScheduleType schedule,
+    ClusterShape const dynamic_cluster_shape, ClusterShape const fallback_cluster_shape)
+{
+    auto cluster1sm = ClusterShape::ClusterShape_1x1x1;
+    auto cluster2sm = ClusterShape::ClusterShape_2x1x1;
+    bool supports_2sm = dynamic_cluster_shape == ClusterShape::Undefined
+        || std::get<0>(enum_to_shape_tuple(dynamic_cluster_shape)) % 2 == 0;
+
+    std::vector<CutlassGemmConfig> candidate_configs;
+    if ((config & CutlassGemmConfig::FP4_ONLY) != 0)
+    {
+        candidate_configs.push_back(CutlassGemmConfig{CutlassTileConfigSM100::CtaShape128x128x128B,
+            MainloopScheduleType::AUTO, schedule, cluster1sm, dynamic_cluster_shape, fallback_cluster_shape});
+        candidate_configs.push_back(CutlassGemmConfig{CutlassTileConfigSM100::CtaShape128x256x128B,
+            MainloopScheduleType::AUTO, schedule, cluster1sm, dynamic_cluster_shape, fallback_cluster_shape});
+        candidate_configs.push_back(CutlassGemmConfig{CutlassTileConfigSM100::CtaShape128x64x128B,
+            MainloopScheduleType::AUTO, schedule, cluster1sm, dynamic_cluster_shape, fallback_cluster_shape});
+        if (supports_2sm)
+        {
+            candidate_configs.push_back(CutlassGemmConfig{CutlassTileConfigSM100::CtaShape256x128x128B,
+                MainloopScheduleType::AUTO, schedule, cluster2sm, dynamic_cluster_shape, fallback_cluster_shape});
+            candidate_configs.push_back(CutlassGemmConfig{CutlassTileConfigSM100::CtaShape256x256x128B,
+                MainloopScheduleType::AUTO, schedule, cluster2sm, dynamic_cluster_shape, fallback_cluster_shape});
+            candidate_configs.push_back(CutlassGemmConfig{CutlassTileConfigSM100::CtaShape256x64x128B,
+                MainloopScheduleType::AUTO, schedule, cluster2sm, dynamic_cluster_shape, fallback_cluster_shape});
+        }
+        return candidate_configs;
+    }
+
+    std::vector<std::pair<CutlassTileConfigSM100, ClusterShape>> tile_configs{
+        {CutlassTileConfigSM100::CtaShape128x128x128B, cluster1sm},
+        {CutlassTileConfigSM100::CtaShape128x256x128B, cluster1sm},
+        {CutlassTileConfigSM100::CtaShape128x32x128B, cluster1sm},
+        {CutlassTileConfigSM100::CtaShape64x64x128B, cluster1sm},
+        {CutlassTileConfigSM100::CtaShape64x32x128B, cluster1sm},
+        {CutlassTileConfigSM100::CtaShape64x128x128B, cluster1sm},
+        {CutlassTileConfigSM100::CtaShape64x256x128B, cluster1sm},
+        {CutlassTileConfigSM100::CtaShape128x64x128B, cluster1sm},
+    };
+
+    if (supports_2sm)
+    {
+        tile_configs.push_back({CutlassTileConfigSM100::CtaShape64x128x128B, cluster2sm});
+        tile_configs.push_back({CutlassTileConfigSM100::CtaShape64x256x128B, cluster2sm});
+        tile_configs.push_back({CutlassTileConfigSM100::CtaShape64x64x128B, cluster2sm});
+        tile_configs.push_back({CutlassTileConfigSM100::CtaShape128x64x128B, cluster2sm});
+        tile_configs.push_back({CutlassTileConfigSM100::CtaShape128x128x128B, cluster2sm});
+        tile_configs.push_back({CutlassTileConfigSM100::CtaShape128x256x128B, cluster2sm});
+    }
+    else
+
+        if (config & CutlassGemmConfig::FP8_ONLY)
+    {
+        tile_configs.push_back({CutlassTileConfigSM100::CtaShape128x16x128B, cluster1sm});
+        // TODO: re-enable when handled by the MoE GEMM dispatch
+        // tile_configs.push_back({ CutlassTileConfigSM100::CtaShape128x8x256B, ClusterShape::ClusterShape_1x1x1 });
+    }
+
+    for (auto [tile, cluster] : tile_configs)
+    {
+        CutlassGemmConfig config{
+            tile, MainloopScheduleType::AUTO, schedule, cluster, dynamic_cluster_shape, fallback_cluster_shape};
+        candidate_configs.push_back(config);
+    }
+    return candidate_configs;
+}
+
 std::vector<CutlassGemmConfig> get_candidate_configs_sm100(CutlassGemmConfig::CandidateConfigTypeParam const config)
 {
 #ifdef FAST_BUILD
     // Fast build disables all configs except this one for SM100
     return {CutlassGemmConfig{CutlassTileConfigSM100::CtaShape128x128x128B, MainloopScheduleType::AUTO,
-        EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1}};
+        EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1, ClusterShape::ClusterShape_1x1x1,
+        ClusterShape::ClusterShape_1x1x1}};
 #else
     if (config & CutlassGemmConfig::GROUPED_GEMM)
     {
         std::vector<CutlassGemmConfig> candidate_configs;
-        if ((config & CutlassGemmConfig::FP4_ONLY) != 0)
+        for (auto schedule : {EpilogueScheduleType::TMA, EpilogueScheduleType::NO_SMEM})
         {
-            candidate_configs.push_back(CutlassGemmConfig{CutlassTileConfigSM100::CtaShape128x128x128B,
-                MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1});
-            candidate_configs.push_back(CutlassGemmConfig{CutlassTileConfigSM100::CtaShape256x128x128B,
-                MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_2x1x1});
-            candidate_configs.push_back(CutlassGemmConfig{CutlassTileConfigSM100::CtaShape128x256x128B,
-                MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1});
-            candidate_configs.push_back(CutlassGemmConfig{CutlassTileConfigSM100::CtaShape256x256x128B,
-                MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_2x1x1});
-            candidate_configs.push_back(CutlassGemmConfig{CutlassTileConfigSM100::CtaShape128x256x128B,
-                MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x2x1});
-            candidate_configs.push_back(CutlassGemmConfig{CutlassTileConfigSM100::CtaShape256x64x128B,
-                MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_2x1x1});
-            candidate_configs.push_back(CutlassGemmConfig{CutlassTileConfigSM100::CtaShape128x64x128B,
-                MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1});
-            return candidate_configs;
-        }
-
-        for (int cluster_m = 1; cluster_m <= 2; cluster_m++)
-        {
-            bool Is2SM = cluster_m == 2;
-            for (int cluster_n = 1; cluster_n <= 2; cluster_n++)
+            for (auto cluster_shape : {ClusterShape::ClusterShape_1x1x1, ClusterShape::ClusterShape_4x1x1,
+                     ClusterShape::ClusterShape_4x2x1, ClusterShape::ClusterShape_4x4x1})
             {
-                std::vector base = {// M=128
-                    CutlassTileConfigSM100::CtaShape128x128x128B, CutlassTileConfigSM100::CtaShape128x256x128B};
-
-                if (Is2SM)
-                {
-                    if (cluster_n == 1)
-                    {
-                        base.push_back(CutlassTileConfigSM100::CtaShape128x64x128B);
-                        base.push_back(CutlassTileConfigSM100::CtaShape256x64x128B);
-                    }
-
-                    std::vector twosm = {// M=256
-                        CutlassTileConfigSM100::CtaShape256x128x128B, CutlassTileConfigSM100::CtaShape256x256x128B};
-                    std::copy(twosm.begin(), twosm.end(), std::back_inserter(base));
-                }
-                else
-                {
-                    if (cluster_n == 1)
-                    {
-                        base.push_back(CutlassTileConfigSM100::CtaShape128x32x128B);
-                        if ((config & CutlassGemmConfig::FP8_ONLY) != 0)
-                        {
-                            base.push_back(CutlassTileConfigSM100::CtaShape128x16x128B);
-                        }
-                    }
-
-                    std::vector onesm{CutlassTileConfigSM100::CtaShape64x64x128B,
-                        CutlassTileConfigSM100::CtaShape64x128x128B, CutlassTileConfigSM100::CtaShape64x256x128B,
-                        CutlassTileConfigSM100::CtaShape128x64x128B};
-                    std::copy(onesm.begin(), onesm.end(), std::back_inserter(base));
-                }
-
-                constexpr std::array cluster_shapes
-                    = {std::array{ClusterShape::ClusterShape_1x1x1, ClusterShape::ClusterShape_1x2x1},
-                        std::array{ClusterShape::ClusterShape_2x1x1, ClusterShape::ClusterShape_2x2x1}};
-                auto cluster = cluster_shapes[cluster_m - 1][cluster_n - 1];
-                for (auto tile : base)
-                {
-                    CutlassGemmConfig config{tile, MainloopScheduleType::AUTO, EpilogueScheduleType::AUTO, cluster};
-                    candidate_configs.push_back(config);
-                }
+                auto fallback_cluster_shape = cluster_shape == ClusterShape::ClusterShape_1x1x1
+                    ? ClusterShape::ClusterShape_1x1x1
+                    : ClusterShape::ClusterShape_2x1x1;
+                auto configs
+                    = get_candidate_configs_sm100_dynamic_cluster_shape(config, schedule, cluster_shape, cluster_shape);
+                candidate_configs.insert(candidate_configs.end(), configs.begin(), configs.end());
             }
+
+            auto configs = get_candidate_configs_sm100_dynamic_cluster_shape(
+                config, schedule, ClusterShape::Undefined, ClusterShape::Undefined);
+            candidate_configs.insert(candidate_configs.end(), configs.begin(), configs.end());
         }
         return candidate_configs;
     }
