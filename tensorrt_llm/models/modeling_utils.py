@@ -98,6 +98,7 @@ class SpeculativeDecodingMode(IntFlag):
     EAGLE = auto()
     NGRAM = auto()
     USER_PROVIDED = auto()
+    EXTERNAL_API = auto()
     AUTO = auto()
 
     @staticmethod
@@ -118,6 +119,8 @@ class SpeculativeDecodingMode(IntFlag):
             return SpeculativeDecodingMode.NGRAM
         elif args.speculative_decoding_mode == "user_provided":
             return SpeculativeDecodingMode.USER_PROVIDED
+        elif args.speculative_decoding_mode == "external_api":
+            return SpeculativeDecodingMode.EXTERNAL_API
         elif args.speculative_decoding_mode == "auto":
             return SpeculativeDecodingMode.AUTO
         else:
