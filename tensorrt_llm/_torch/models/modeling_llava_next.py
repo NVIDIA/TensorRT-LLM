@@ -1,6 +1,6 @@
 import copy
 import os
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -67,7 +67,10 @@ class LlavaNextInputProcessor(InputProcessor):
             [image_size])["num_image_tokens"][0]
         return num_image_tokens
 
-    def _postprocess(self, input_ids, mm_features):
+    def _postprocess(
+        self, input_ids: torch.Tensor, mm_features: Union[torch.Tensor,
+                                                          List[torch.Tensor]]
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Define model specific variables here before shared logic
         mm_tokens = torch.tensor([self.model_config.image_token_index
                                   ]).to(input_ids.device)
