@@ -795,7 +795,7 @@ void initRequestBindings(pybind11::module_& m)
 
     auto resultSetstate = [](py::tuple const& state)
     {
-        if (state.size() != 13)
+        if (state.size() != 14)
         {
             throw std::runtime_error("Invalid Request state!");
         }
@@ -811,8 +811,9 @@ void initRequestBindings(pybind11::module_& m)
         result.sequenceIndex = state[8].cast<SizeType32>();
         result.isSequenceFinal = state[9].cast<bool>();
         result.decodingIter = state[10].cast<SizeType32>();
-        result.contextPhaseParams = state[11].cast<std::optional<tle::ContextPhaseParams>>();
-        result.requestPerfMetrics = state[12].cast<std::optional<tle::RequestPerfMetrics>>();
+        result.avgDecodedTokensPerIter = state[11].cast<float>();
+        result.contextPhaseParams = state[12].cast<std::optional<tle::ContextPhaseParams>>();
+        result.requestPerfMetrics = state[13].cast<std::optional<tle::RequestPerfMetrics>>();
         return std::make_unique<tle::Result>(result);
     };
 
@@ -820,7 +821,7 @@ void initRequestBindings(pybind11::module_& m)
     {
         return py::make_tuple(self.isFinal, self.outputTokenIds, self.cumLogProbs, self.logProbs, self.contextLogits,
             self.generationLogits, self.encoderOutput, self.finishReasons, self.sequenceIndex, self.isSequenceFinal,
-            self.decodingIter, self.contextPhaseParams, self.requestPerfMetrics);
+            self.decodingIter, self.avgDecodedTokensPerIter, self.contextPhaseParams, self.requestPerfMetrics);
     };
 
     py::class_<tle::Result>(m, "Result")
@@ -837,6 +838,7 @@ void initRequestBindings(pybind11::module_& m)
         .def_readwrite("sequence_index", &tle::Result::sequenceIndex)
         .def_readwrite("is_sequence_final", &tle::Result::isSequenceFinal)
         .def_readwrite("decoding_iter", &tle::Result::decodingIter)
+        .def_readwrite("avg_decoded_tokens_per_iter", &tle::Result::avgDecodedTokensPerIter)
         .def_readwrite("context_phase_params", &tle::Result::contextPhaseParams)
         .def_readwrite("request_perf_metrics", &tle::Result::requestPerfMetrics)
         .def_readwrite("additional_outputs", &tle::Result::additionalOutputs)

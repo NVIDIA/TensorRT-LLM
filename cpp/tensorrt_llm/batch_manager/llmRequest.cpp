@@ -200,6 +200,7 @@ std::optional<executor::Result> LlmRequest::createResult(bool useFastLogits, int
 
     result.finishReasons = sliceBeams(mFinishReasons);
     result.decodingIter = mDecodingIter;
+    result.avgDecodedTokensPerIter = getAvgDecodedTokensPerIter();
 
     if (hasAdditionalOutputs())
     {
