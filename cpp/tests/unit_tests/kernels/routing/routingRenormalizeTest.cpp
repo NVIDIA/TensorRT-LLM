@@ -178,6 +178,28 @@ private:
 
 TYPED_TEST_SUITE(RoutingRenormalizeKernelTest, FloatAndBf16Types);
 
+TYPED_TEST(RoutingRenormalizeKernelTest, BlockLevelParallelization)
+{
+    RoutingKernelTestParam param(RoutingMethodType::Renormalize, /*numTokens=*/4,
+        /*numExperts=*/128, /*topK=*/8,
+        /*expertParallelization=*/1, /*expertParallelizationId=*/0,
+        /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
+        /*usePdl=*/true, /*getExpWeights=*/true,
+        /*nGroup*/ 0, /*topkGroup*/ 0, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 9);
+    this->runTest(param);
+};
+
+TYPED_TEST(RoutingRenormalizeKernelTest, BlockLevelParallelizationWithExpertParallelization)
+{
+    RoutingKernelTestParam param(RoutingMethodType::Renormalize, /*numTokens=*/14,
+        /*numExperts=*/128, /*topK=*/8,
+        /*expertParallelization=*/2, /*expertParallelizationId=*/1,
+        /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
+        /*usePdl=*/true, /*getExpWeights=*/true,
+        /*nGroup*/ 0, /*topkGroup*/ 0, /*routedScalingFactor*/ 1.0f, /*requiredComputeCapability*/ 9);
+    this->runTest(param);
+};
+
 TYPED_TEST(RoutingRenormalizeKernelTest, ClusterLevelParallelization)
 {
     RoutingKernelTestParam param(RoutingMethodType::Renormalize, /*numTokens=*/10,
