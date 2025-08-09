@@ -25,6 +25,7 @@ import tensorrt_llm.profiler as profiler
 
 try:
     from lm_eval.api.model import TemplateLM
+    from lm_eval.tasks import TaskManager
 except ImportError:
     TemplateLM = object
 
@@ -150,7 +151,7 @@ class LmEvalEvaluator(Evaluator):
         self.dataset_path = dataset_path
         self.num_samples = num_samples
 
-        task_manager = lm_eval.tasks.TaskManager(
+        task_manager = TaskManager(
             include_path=f"{os.path.dirname(__file__)}/lm_eval_tasks")
         with self._patch_lm_eval():
             self.task_dict = lm_eval.tasks.get_task_dict(

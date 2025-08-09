@@ -6,6 +6,7 @@ from tensorrt_llm import LLM
 from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.llmapi.llm_args import PeftCacheConfig
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
+from tensorrt_llm.metrics import MetricNames
 from tensorrt_llm.sampling_params import SamplingParams
 
 # isort: off
@@ -193,6 +194,27 @@ def test_llm_perf_metrics():
     assert perf_metrics.first_iter is not None
     assert perf_metrics.iter - perf_metrics.first_iter == sampling_params.max_tokens - 1
     assert perf_metrics.last_iter == perf_metrics.iter
+
+
+def test_llm_prometheus():
+    test_prompts = [
+        "Hello, my name is",
+        "The president of the United States is",
+        "The capital of France is",
+        "The future of AI is",
+    ]
+    sampling_params = SamplingParams(max_tokens=10, temperature=0.8, top_p=0.95)
+    llm = LLM(model=llama_model_path,
+              return_perf_metrics=True,
+              kv_cache_config=global_kvcache_config)
+    for test_prompt in test_prompts:
+        request_output = llm.generate(test_prompt, sampling_params)
+        assert request_output.metrics_dict is not None
+        assert MetricNames.REQUEST_QUEUE_TIME in request_output.metrics_dict
+        assert MetricNames.TPOT in request_output.metrics_dict
+        assert MetricNames.TTFT in request_output.metrics_dict
+        assert MetricNames.E2E in request_output.metrics_dict
+        assert request_output.outputs is not None
 
 
 @pytest.mark.parametrize("streaming", [True, False])

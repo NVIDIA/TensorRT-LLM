@@ -39,7 +39,6 @@ from torch import nn
 from tqdm import tqdm
 from transformers import PretrainedConfig
 
-from tensorrt_llm import logger
 from tensorrt_llm._ipc_utils import can_access_peer
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import PositionEmbeddingType
@@ -1344,21 +1343,6 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
         params_map = {'gate_up_proj': ['gate_proj', 'up_proj']}
         all_named_modules = dict(self.named_modules())
 
-        if self.model_config.quant_config.layer_quant_mode.has_fp8_block_scales(
-        ) and get_sm_version() == 100:
-            for name in list(weights.keys()):
-                # Use ".experts." to exclude shared_experts.
-                if name.endswith(
-                        "weight_scale_inv") and ".experts." not in name:
-                    weight_name = name.replace("weight_scale_inv", "weight")
-                    logger.debug(f"Resmoothing {weight_name}")
-                    weight = weights[weight_name][:]
-                    scale = weights[name][:]
-                    weights[weight_name], weights[name] = resmooth_to_fp8_e8m0(
-                        weight, scale)
-                    weights[weight_name] = weights[weight_name].cpu()
-                    weights[name] = weights[name].cpu()
-
         for name, module in tqdm(all_named_modules.items(),
                                  desc="Loading weights"):
             if len(module._parameters) > 0:
@@ -1480,12 +1464,15 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
                 if self.model_config.quant_config.layer_quant_mode.has_fp8_block_scales(
                 ) and get_sm_version() == 100 and hasattr(
                         module, "weight_scale"):
+                    weight, weight_scale = resmooth_to_fp8_e8m0(
+                        module.weight, module.weight_scale)
                     transfromed_scale = transform_sf_into_required_layout(
-                        module.weight_scale,
-                        mn=module.weight.shape[0],
-                        k=module.weight.shape[1],
+                        weight_scale,
+                        mn=weight.shape[0],
+                        k=weight.shape[1],
                         recipe=(1, 128, 128),
                         is_sfa=False)
+                    module.weight = nn.Parameter(weight, requires_grad=False)
                     module.weight_scale = nn.Parameter(transfromed_scale,
                                                        requires_grad=False)
 
