@@ -352,15 +352,13 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
         TLLM_CHECK_WITH_INFO(
             !blockManager.isVariableWindow(), "Rewinding KV cache blocks for variable SWA models isn't supported");
         auto const maxBlocksPerSeq = blockManager.getMaxBlockPerSeqWhenSingleWindowSize();
-        auto const isUseOneMoreBlock = kv_cache_manager::BlockManager::isUseOneMoreBlock(
-            getMaxAttentionWindow(), getMaxSequenceLen(), getMaxBeamWidth());
 
         // TODO(oargov): VGQA is not supported, assume all layers have the same num_kv_heads
         TLLM_CHECK_WITH_INFO(
             !blockManager.isVariableGQA(), "Rewinding KV cache blocks for variable GQA models isn't supported");
         auto const numKvHeads = mModelConfig.getNbKvHeads(0);
 
-        mRewindInputs = RewindInputs{maxBlocksPerSeq, isUseOneMoreBlock, numKvHeads};
+        mRewindInputs = RewindInputs{maxBlocksPerSeq, /*isUseOneMoreBlock*/ false, numKvHeads};
     }
 
     if (mWorldConfig.isPipelineParallel())
@@ -648,19 +646,6 @@ std::unique_ptr<kv_cache_manager::KVCacheManager> TrtGptModelInflightBatching::c
     auto const tokensPerBlock = mModelConfig.getTokensPerBlock();
     auto const kvDtype = mModelConfig.getKvDataType();
 
-    bool enableCyclicKvCache = false;
-    for (SizeType32 maxAttenWin : getMaxAttentionWindowVec())
-    {
-        if (maxAttenWin != getMaxSequenceLen())
-        {
-            enableCyclicKvCache = true;
-            break;
-        }
-    }
-    // Below assertion should be removed once SWA/VSWA is no longer cyclic.
-    TLLM_CHECK_WITH_INFO(
-        getMaxBeamWidth() == 1 || !enableCyclicKvCache, "Can't support cyclic kv cache with beam search.");
-
     // init KV cache block manager
     auto [numKvHeadsPerLayerBegin, numKvHeadsPerLayerEnd] = mModelConfig.getNumKvHeadsPerLayerLocalRange(
         mWorldConfig.getPipelineParallelism(), mWorldConfig.getPipelineParallelRank(), isCrossAttention);
@@ -702,7 +687,8 @@ std::unique_ptr<kv_cache_manager::KVCacheManager> TrtGptModelInflightBatching::c
 
     auto kvCacheManager = std::make_unique<KVCacheManager>(numKvHeadsPerLayer, sizePerHead, tokensPerBlock,
         blocksPerWindow, getMaxNumSequences(), getMaxBeamWidth(), maxAttentionWindowVec, tempAttentionWindowInputs,
-        kvDtype, getSinkTokenLen(), mRuntime->getStreamPtr(), std::nullopt, enableBlockReuse,
+        kvDtype, getSinkTokenLen(), mRuntime->getStreamPtr(),
+        kvCacheType == KvCacheType::kCROSS ? mModelConfig.getMaxEncoderLen() : getMaxSequenceLen(), enableBlockReuse,
         kvCacheConfig.getOnboardBlocks(), kvCacheType, kvCacheConfig.getSecondaryOffloadMinPriority(),
         kvCacheConfig.getEventBufferMaxSize() > 0
             ? std::make_unique<kv_cache_manager::KVCacheEventManager>(kvCacheConfig.getEventBufferMaxSize())
