@@ -22,6 +22,6 @@
 namespace tensorrt_llm::nanobind::thop::attentionOp
 {
 
-void initBindings(nanobind::module_& m);
+void initBindings(nb::module_& m);
 
 } // namespace tensorrt_llm::nanobind::thop::attentionOp

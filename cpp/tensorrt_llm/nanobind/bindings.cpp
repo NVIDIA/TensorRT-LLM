@@ -129,7 +129,7 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
 
     tensorrt_llm::nanobind::executor::initBindings(mExecutor);
     tensorrt_llm::nanobind::runtime::initBindingsEarly(mInternalRuntime);
-    tensorrt_llm::pybind::thop::attentionOp::initBindings(mInternalThop);
+    tensorrt_llm::nanobind::thop::attentionOp::initBindings(mInternalThop);
 
     auto buildInfo = m.def_submodule("BuildInfo");
     buildInfo.attr("ENABLE_MULTI_DEVICE") = nb::int_(ENABLE_MULTI_DEVICE);
