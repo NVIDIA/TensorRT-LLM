@@ -99,3 +99,17 @@ l0_a100:
   - triton_server/test_triton.py::test_eagle[eagle]
   - triton_server/test_triton.py::test_llava_onevision[llava_onevision]
   - triton_server/test_triton.py::test_qwen2_vl[qwen2_vl]
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 1
+        lte: 1
+    wildcards:
+      gpu:
+      - '*a100*'
+      linux_distribution_name: ubuntu*
+    terms:
+      stage: post_merge
+      backend: fmha
+  tests:
+  - test_fmha.py::test_fmha
