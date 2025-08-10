@@ -1,5 +1,3 @@
-# Adapted from
-# https://github.com/vllm-project/vllm/blob/aae6927be06dedbda39c6b0c30f6aa3242b84388/tests/entrypoints/openai/test_chat.py
 import os
 import tempfile
 from typing import List

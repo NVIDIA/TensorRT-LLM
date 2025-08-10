@@ -1112,11 +1112,7 @@ class PyTorchModelEngine(ModelEngine):
             load_method(weights)
 
     def _init_max_seq_len(self):
-        if self.pytorch_backend_config.mm_encoder_only:
-            # TODO: hardcoded for now, need to infer as: max_num_token_per_image * max_num_images (can be given as a parameter or defined same as max_seq_len)
-            inferred_max_seq_len = 32768
-        else:
-            inferred_max_seq_len = self.model.infer_max_seq_len()
+        inferred_max_seq_len = self.model.infer_max_seq_len()
         if self.max_seq_len is None:
             logger.info(
                 f"max_seq_len is not specified, using inferred value {inferred_max_seq_len}"

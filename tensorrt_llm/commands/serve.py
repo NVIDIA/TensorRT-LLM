@@ -349,7 +349,7 @@ def serve(
     launch_server(host, port, llm_args, metadata_server_cfg, server_role)
 
 
-@click.command("mmemb_serve")
+@click.command("mm_embedding_serve")
 @click.argument("model", type=str)
 @click.option("--host",
               type=str,
@@ -410,14 +410,6 @@ def serve_encoder(model: str, host: str, port: int, log_level: str,
     metadata_server_cfg = parse_metadata_server_config_file(
         metadata_server_config_file)
 
-    if metadata_server_cfg is not None:
-        assert server_role is not None, "server_role is required when metadata_server_cfg is provided"
-        try:
-            server_role = ServerRole[server_role.upper()]
-            assert server_role == ServerRole.MM_ENCODER, "server_role must be MM_ENCODER for multimodal encoder"
-        except ValueError:
-            raise ValueError(f"Invalid server role: {server_role}. " \
-                             f"Must be one of: {', '.join([role.name for role in ServerRole])}")
     launch_mm_encoder_server(host, port, encoder_args, metadata_server_cfg)
 
 

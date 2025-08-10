@@ -563,8 +563,14 @@ class DecoderModelForCausalLM(nn.Module,
 
         # Step 1: Find the upper bound of max_seq_len
         inferred_max_seq_len = 2048
-        if getattr(self.config, 'max_position_embeddings', None) is not None:
-            inferred_max_seq_len = self.config.max_position_embeddings
+        max_position_embeddings = getattr(self.config,
+                                          'max_position_embeddings', None)
+        if max_position_embeddings is None and hasattr(self.config,
+                                                       'text_config'):
+            max_position_embeddings = getattr(self.config.text_config,
+                                              'max_position_embeddings', None)
+        if max_position_embeddings is not None:
+            inferred_max_seq_len = max_position_embeddings
 
         # Step 2: Scale max_seq_len with rotary scaling
         if rope_factor != 1:
