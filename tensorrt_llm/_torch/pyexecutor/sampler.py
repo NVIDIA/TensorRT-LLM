@@ -671,6 +671,9 @@ class TRTLLMSampler(Sampler):
             max_attn_window
         ) if max_attn_window is not None else executor_config.max_seq_len
         self.max_num_sequences = mapping.pp_size * self.executor_config.max_batch_size
+        # When max_num_sequences == 1, enlarge sampler max_num_sequences size to align with slot and scheduler capacity.
+        if self.max_num_sequences == 1 and mapping.enable_attention_dp and executor_config.kv_cache_config:
+            self.max_num_sequences += 1
         self.max_seq_idle_microseconds = 180 * 1000 * 1000
         self.is_trt_overlap = not disable_overlap_scheduler
         self.num_micro_batches = mapping.pp_size if mapping.pp_size > 1 else (
