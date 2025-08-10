@@ -256,7 +256,9 @@ class MatchRopeLayout(BaseTransform):
     ) -> Tuple[GraphModule, TransformInfo]:
         supported = {"bsnd", "bnsd"}
         if self.config.expected_layout.lower() not in supported:
-            return
+            return gm, TransformInfo(
+                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+            )
 
         graph = gm.graph
         rope_ops = {
