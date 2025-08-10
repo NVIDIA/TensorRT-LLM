@@ -1,6 +1,6 @@
 # Checkpoint Loading
 
-The PyTorch backend provides a flexible and extensible infrastructure for loading model checkpoints from different formats, such as HuggingFace (HF). This system allows you to load models from various sources (e.g., HuggingFace or custom formats) by implementing the required components, such as the checkpoint’s weight loader, mapper, and configuration parser.
+The PyTorch backend provides a flexible and extensible infrastructure for loading model checkpoints from different sources and formats, such as HuggingFace (HF) or custom formats, by implementing required components like the checkpoint's weight loader, mapper, and configuration parser.
 
 ## Table of Contents
 1. [Overview](#overview)
@@ -13,31 +13,31 @@ The PyTorch backend provides a flexible and extensible infrastructure for loadin
 
 The checkpoint loading design is built around a plugin-like architecture that is separated into four distinct components:
 
-- **Checkpoint Loaders**: Orchestrate the loading process for specific formats
-- **Config Loaders**: Handle model configuration parsing and validation
-- **Weight Loaders**: Manage the actual loading of model weights from storage into memory
-- **Weight Mappers**: Map and transform loaded weights to TRTLLM model's definition
+- **Checkpoint Loaders**: Orchestrates the loading process for specific formats.
+- **Config Loaders**: Handles model configuration parsing and validation.
+- **Weight Loaders**: Manages the actual loading of model weights from storage into memory.
+- **Weight Mappers**: Maps and transforms loaded weights to the TRTLLM model's definition.
 
-This modular design allows for easy extension to support new checkpoint formats while maintaining backward compatibility and performance optimizations. By separating the checkpoint loading components into four different subcomponents, any user can employ any relevant previous work while also introducing their own custom checkpoint-specific components.
+This modular design allows for easy extension to support new checkpoint formats while maintaining backward compatibility and performance optimizations. By separating checkpoint loading into four subcomponents, users can leverage existing implementations and introduce custom, checkpoint-specific components.
 
-If one wishes to support a new checkpoint format, they must implement all four components.
-Likewise, if the format shares some components with an already supported framework (e.g., HF), only the custom-specific components need to be implemented.
+To support a new checkpoint format, you must implement all four components.
+If the format shares components with an existing framework (such as HF), you only need to implement the components that differ.
 
 ## Core Components
 
 ### BaseCheckpointLoader
 
-The `BaseCheckpointLoader` is the central base interface for all checkpoint loading required operators. It provides a unified API regardless of the underlying checkpoint format. This interface is responsible for holding and exposing all objects required for the loading and parsing process.
+The `BaseCheckpointLoader` is the central interface for all checkpoint loading operations. It provides a unified API regardless of the underlying checkpoint format. This interface is responsible for holding and exposing all objects required for the loading and parsing process.
 
 **Key Methods:**
 - `load_config(checkpoint_dir, **kwargs)`: Loads and returns a `ModelConfig` object
 - `load_weights(checkpoint_dir, **kwargs)`: Loads and returns a dictionary of weights
-- `get_initialized_weight_mapper(model, config)`: Returns a runtime initialized weight mapper for the model
+- `get_initialized_weight_mapper(model, config)`: Returns a weight mapper initialized at runtime for the model
 - `cleanup()`: Releases resources and cleans up internal state
 
 ### BaseConfigLoader
 
-Responsible for loading model configurations from checkpoint directories and parsing them into TRTLLM `ModelConfig`:
+Loads model configurations from checkpoint directories and parses them into a TRTLLM `ModelConfig`:
 
 ```python
 from tensorrt_llm._torch.models.checkpoints.base_config_loader import BaseConfigLoader
@@ -71,25 +71,25 @@ class CustomWeightLoader(BaseWeightLoader):
 
 ### BaseWeightMapper
 
-Transforms weights between different naming conventions and applies model-specific transformations into TRTLLM model's object.
+Transforms weights between different naming conventions and applies model-specific transformations to the TRTLLM model object.
 
 ## Built-in Checkpoint Formats
 
 ### HuggingFace Format
 
-Currently, HF checkpoint loader is the primary built-in format, supporting:
+Currently, the HF checkpoint loader is the primary built-in format and supports:
 
-- **Weights loading** (`.safetensors/.bin/.pth`) - Loading HF compatible weights from disk
-- **Configuration parser** - Parsing HF stored configuration information to TRTLLM `ModelConfig` object
-- **Weights Mapping** - Converting HF weights into TRTLLM compatible representation
+- **Weights loading** (`.safetensors, .bin, .pth`): Load HF-compatible weights from disk
+- **Configuration parser** - Parse configuration information stored by HF into a TRTLLM `ModelConfig` object
+- **Weights Mapping** - Convert HF weights into a TRTLLM-compatible representation
 
 ## Using Checkpoint Loaders
 
 ### Basic Usage
 
-There are two main approaches to trigger the use of checkpoint loading objects.
+There are two main approaches for using checkpoint loading objects
 
-The first approach, through llm-api, as shown in the following example:
+The first approach is through the llm-api, as shown in the following example:
 
 ```python
 from tensorrt_llm import LLM
@@ -99,9 +99,9 @@ hf_model_dir = "llama-models-v2/llama-v2-13b-hf"
 llm = LLM(model=hf_model_dir)
 ```
 
-In this example, `HfCheckpointLoader` will be selected by default.
+In this example, the `HfCheckpointLoader` is selected by default.
 
-To explicitly set the checkpoint loader, you need to call the required checkpoint-specific loader
+To explicitly set the checkpoint loader, specify the required checkpoint-specific loader:
 
 ```python
 from tensorrt_llm import LLM
@@ -113,7 +113,7 @@ llm = LLM(model=hf_model_dir,
           checkpoint_loader=HfCheckpointLoader())
 ```
 
-Similarly, if one wants to use a basic implemented checkpoint loader, but with a specific subcomponent, they can provide any specific subcomponent upon need
+Similarly, to use a basic checkpoint loader with a specific subcomponent, provide the desired subcomponent as needed:
 
 ```python
 from tensorrt_llm import LLM
@@ -125,7 +125,7 @@ llm = LLM(model=hf_model_dir,
           checkpoint_loader=HfCheckpointLoader(weight_loader=MyCustomWeightLoader()))
 ```
 
-In the second approach, one can directly use the components of the checkpoint loading.
+In the second approach, you can directly use the individual checkpoint loading components:
 
 ```python
 from tensorrt_llm._torch.models.checkpoints.hf.gemma3_weight_mapper import \
@@ -139,14 +139,14 @@ gemma3.load_weights(hf_gemma3.state_dict(), weight_mapper)
 ```
 ## Creating Custom Checkpoint Loaders
 
-To support a new checkpoint format, you need to implement all four components. This section provides minimal templates for each component.
+To support a new checkpoint format, implement all four components. This section provides minimal templates for each.
 
 ### When to Create Custom Components
 
-- **Complete New Format**: Implement all four components when supporting a completely new checkpoint format
-- **Custom Weight Storage**: Only implement a custom weight loader if you have a unique weight storage format (e.g., custom binary format, database storage, etc.)
-- **Custom Configuration**: Only implement a custom config loader if your configuration format cannot be parsed by existing parsers.
-- **Custom Weight Mapping**: Only implement a custom weight mapper if your model has unique weight naming or transformation requirements that are checkpoint-specific.
+- **Complete New Format**: Implement all four components to support a new checkpoint format
+- **Custom Weight Storage**: Implement only a custom weight loader if you have a unique weight storage format (such as a custom binary format or database storage)
+- **Custom Configuration**: Implement only a custom config loader if your configuration format cannot be parsed by existing loaders
+- **Custom Weight Mapping**: Implement only a custom weight mapper if your model has unique weight naming or transformation requirements that are checkpoint-specific
 
 ### Step 1: Create the Checkpoint Loader
 
@@ -168,7 +168,7 @@ class CustomCheckpointLoader(BaseCheckpointLoader):
         self._weight_loader = weight_loader or self.get_default_weight_loader()
         self._config_loader = config_loader or self.get_default_config_loader()
         self._weight_mapper = weight_mapper
-        self._checkpoint_format = "CUSTOM_FORMAT"
+        self._checkpoint_format = "CUSTOM_FORMAT" # Set the checkpoint format name
 
     def get_default_weight_loader(self) -> BaseWeightLoader:
         return CustomWeightLoader()
@@ -197,9 +197,8 @@ class CustomWeightLoader(BaseWeightLoader):
         Returns:
             Dictionary mapping parameter names to tensors
         """
-        weights = {}
+        weights = {} # Implement your custom weight loading logic here
 
-        # Implement your custom weight loading logic here
         # Examples:
         # - Load from custom binary files
         # - Load from databases
@@ -229,7 +228,7 @@ class CustomConfigLoader(BaseConfigLoader):
         Returns:
             ModelConfig object containing parsed configuration
         """
-        # Load your custom configuration format
+        # Load your custom configuration format here
         # Examples:
         # - Parse YAML/TOML files
         # - Convert from proprietary formats
@@ -243,6 +242,7 @@ class CustomConfigLoader(BaseConfigLoader):
 
     def _load_pretrained_config(self, checkpoint_dir: str, **kwargs):
         """Load the raw configuration from your custom format."""
+        # Implement as needed
         pass
 ```
 
@@ -270,7 +270,7 @@ class CustomWeightMapper(BaseWeightMapper):
         self.mapping.update({
             # Map source names to target names
             # 'target_module_name': ['source_param1', 'source_param2'],
-            # Example: 'qkv_proj': ['q_proj', 'k_proj', 'v_proj']
+            # For example: 'qkv_proj': ['q_proj', 'k_proj', 'v_proj']
         })
 
     def apply_callbacks(self, module: nn.Module, module_name: str,
@@ -315,7 +315,7 @@ class CustomWeightMapper(BaseWeightMapper):
         return super().should_skip_module(module_name)
 ```
 
-Note: when creating a custom mapper, you can either define a checkpoint-format-specific mapper. For example:
+Note: When creating a custom mapper, you can define either a checkpoint-format-specific mapper. For example:
 
 ```python
 @register_mapper("CUSTOM_FORMAT")
@@ -329,4 +329,4 @@ Alternatively, you can define a checkpoint-model-specific mapper. For example:
 class CustomWeightMapper(BaseWeightMapper)
 ```
 
-By setting the model name, the registered mapper will be asscoiated with the specific model.
+By setting the model name, the registered mapper will be associated with the specific model.
