@@ -57,7 +57,13 @@ from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils.node_utils import extract_op_args, extract_output_tuple, is_op
 from ...utils.pattern_matcher import ADPatternMatcherPass, Match, register_ad_pattern
-from ..interface import BaseTransform, TransformConfig, TransformInfo, TransformRegistry
+from ..interface import (
+    BaseTransform,
+    SharedConfig,
+    TransformConfig,
+    TransformInfo,
+    TransformRegistry,
+)
 
 
 def _rotate_half(x):
@@ -124,7 +130,11 @@ def _explicit_not_interleaved(match: Match) -> bool:
 @TransformRegistry.register("match_rope_pattern")
 class MatchRopePattern(BaseTransform):
     def _apply(
-        self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory
+        self,
+        gm: GraphModule,
+        cm: CachedSequenceInterface,
+        factory: ModelFactory,
+        shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
         graph = gm.graph
         patterns = ADPatternMatcherPass()
@@ -238,7 +248,11 @@ class MatchRopeLayout(BaseTransform):
         return MatchRopeLayoutConfig
 
     def _apply(
-        self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory
+        self,
+        gm: GraphModule,
+        cm: CachedSequenceInterface,
+        factory: ModelFactory,
+        shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
         supported = {"bsnd", "bnsd"}
         if self.config.expected_layout.lower() not in supported:
@@ -350,7 +364,11 @@ class OptimizeRope(BaseTransform):
     """
 
     def _apply(
-        self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory
+        self,
+        gm: GraphModule,
+        cm: CachedSequenceInterface,
+        factory: ModelFactory,
+        shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
         graph = gm.graph
         rope_flash_cache: DefaultDict[Any, Optional[Node]] = defaultdict(lambda: None)

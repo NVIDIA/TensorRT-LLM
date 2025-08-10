@@ -14,7 +14,7 @@ from torch.fx import GraphModule, Node
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils.node_utils import is_op
-from ..interface import BaseTransform, TransformInfo, TransformRegistry
+from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
 
 
 def _is_transpose_op(node: Node) -> bool:
@@ -50,7 +50,11 @@ class EliminateRedundantTransposes(BaseTransform):
     """
 
     def _apply(
-        self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory
+        self,
+        gm: GraphModule,
+        cm: CachedSequenceInterface,
+        factory: ModelFactory,
+        shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
         graph = gm.graph
 

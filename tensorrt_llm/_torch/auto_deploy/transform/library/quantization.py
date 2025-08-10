@@ -20,7 +20,7 @@ from ...utils.quantization_utils import (
     remove_output_quantizers,
     should_skip_quantization,
 )
-from ..interface import BaseTransform, TransformInfo, TransformRegistry
+from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
 
 
 def _insert_quantized_linear(
@@ -175,7 +175,11 @@ class QuantizationFromConfig(BaseTransform):
     """
 
     def _apply(
-        self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory
+        self,
+        gm: GraphModule,
+        cm: CachedSequenceInterface,
+        factory: ModelFactory,
+        shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
         quant_config = factory.get_quant_config()
         if not quant_config:
@@ -223,7 +227,11 @@ class QuantizationFromGraph(BaseTransform):
     """
 
     def _apply(
-        self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory
+        self,
+        gm: GraphModule,
+        cm: CachedSequenceInterface,
+        factory: ModelFactory,
+        shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
         is_quant_graph = is_quantized_graph(gm)
 
