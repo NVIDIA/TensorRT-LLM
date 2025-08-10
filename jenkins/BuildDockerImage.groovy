@@ -286,8 +286,8 @@ def buildImage(config, imageKeyToTag)
         def TRITON_BASE_TAG = sh(script: "cd ${LLM_ROOT} && grep 'ARG TRITON_BASE_TAG=' docker/Dockerfile.multi | grep -o '=.*' | tr -d '=\"'", returnStdout: true).trim()
 
         // Replace the base image and triton image with the internal mirror
-        BASE_IMAGE = BASE_IMAGE.replace("nvcr.io/nvidia/", "urm.nvidia.com/docker/")
-        TRITON_IMAGE = TRITON_IMAGE.replace("nvcr.io/nvidia/", "urm.nvidia.com/docker/")
+        BASE_IMAGE = BASE_IMAGE.replace("nvcr.io/", "urm.nvidia.com/docker/")
+        TRITON_IMAGE = TRITON_IMAGE.replace("nvcr.io/", "urm.nvidia.com/docker/")
 
         if (dependent) {
             stage ("make ${dependent.target}_${action} (${arch})") {
