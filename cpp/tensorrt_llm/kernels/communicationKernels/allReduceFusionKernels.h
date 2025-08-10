@@ -132,7 +132,7 @@ struct AllReduceFusionParams
     float rms_eps;
     float* scale_factor;
     bool use_oneshot;
-    FP4QuantizationSFLayout layout = FP4QuantizationSFLayout::SWIZZLED;
+    QuantizationSFLayout layout = QuantizationSFLayout::SWIZZLED;
     cudaStream_t stream;
     AllReduceFusionPattern pattern;
     bool trigger_completion_at_end = true;

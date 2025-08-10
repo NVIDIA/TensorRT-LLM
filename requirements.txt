@@ -3,7 +3,7 @@
 accelerate>=0.25.0
 build
 colored
-cuda-python # Do not override the custom version of cuda-python installed in the NGC PyTorch image.
+cuda-python>=12,<13
 diffusers>=0.27.0
 lark
 mpi4py
@@ -28,7 +28,9 @@ torchvision
 nvidia-modelopt[torch]~=0.33.0
 nvidia-nccl-cu12
 nvidia-cuda-nvrtc-cu12
-transformers==4.53.1
+transformers==4.55.0
+prometheus_client
+prometheus_fastapi_instrumentator
 pydantic>=2.9.1
 pydantic-settings[yaml]
 omegaconf
@@ -52,6 +54,8 @@ einops
 flashinfer-python==0.2.5
 opencv-python-headless
 xgrammar==0.1.21
+llguidance==0.7.29
+jsonschema
 backoff
 nvtx
 matplotlib # FIXME: this is added to make nvtx happy
@@ -59,7 +63,6 @@ meson
 ninja
 etcd3
 blake3
-llguidance==0.7.29
 soundfile
 triton==3.3.1; platform_machine == "x86_64"
 tiktoken

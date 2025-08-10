@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 import asyncio
 import os
+import re
 import signal
 import traceback
 from contextlib import asynccontextmanager
@@ -13,6 +14,7 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from starlette.routing import Mount
 from transformers import AutoConfig, AutoProcessor
 
 from tensorrt_llm._tensorrt_engine import LLM
@@ -26,6 +28,7 @@ from tensorrt_llm.llmapi import MultimodalEncoder
 from tensorrt_llm.llmapi.disagg_utils import MetadataServerConfig, ServerRole
 from tensorrt_llm.llmapi.llm import RequestOutput
 from tensorrt_llm.logger import logger
+from tensorrt_llm.metrics.collector import MetricsCollector
 from tensorrt_llm.serve.chat_utils import (check_multiple_response,
                                            parse_chat_messages_coroutines)
 from tensorrt_llm.serve.metadata_server import create_metadata_server
@@ -44,7 +47,7 @@ from tensorrt_llm.serve.postprocess_handlers import (
     completion_stream_post_processor)
 from tensorrt_llm.version import __version__ as VERSION
 
-from .._utils import nvtx_mark
+from .._utils import nvtx_mark, set_prometheus_multiproc_dir
 
 # yapf: enale
 TIMEOUT_KEEP_ALIVE = 5  # seconds.
@@ -80,6 +83,13 @@ class OpenAIServer:
             self.model = model_dir.name
         else:
             self.model = model
+        self.metrics_collector = None
+        if self.llm.args.return_perf_metrics:
+            set_prometheus_multiproc_dir()
+            self.metrics_collector = MetricsCollector({
+                "model_name": "undefined",
+                "engine_type": "undefined"
+            })
 
         @asynccontextmanager
         async def lifespan(app: FastAPI):
@@ -157,6 +167,32 @@ class OpenAIServer:
         self.app.add_api_route("/v1/chat/completions",
                                self.openai_chat,
                                methods=["POST"])
+        if self.llm.args.return_perf_metrics:
+            # register /prometheus/metrics
+            self.mount_metrics()
+
+    def mount_metrics(self):
+        # Lazy import for prometheus multiprocessing.
+        # We need to set PROMETHEUS_MULTIPROC_DIR environment variable
+        # before prometheus_client is imported.
+        # See https://prometheus.github.io/client_python/multiprocess/
+        from prometheus_client import (CollectorRegistry, make_asgi_app,
+                                       multiprocess)
+        from prometheus_fastapi_instrumentator import Instrumentator
+        registry = CollectorRegistry()
+        multiprocess.MultiProcessCollector(registry)
+        Instrumentator(
+            should_group_status_codes=False,
+            should_respect_env_var=True,
+            excluded_handlers=[
+                ".*"
+            ],
+            registry=registry,
+        ).add().instrument(self.app).expose(self.app)
+        metrics_app = make_asgi_app(registry=registry)
+        metrics_route = Mount("/prometheus/metrics", metrics_app)
+        metrics_route.path_regex = re.compile("^/prometheus/metrics(?P<path>.*)$")
+        self.app.routes.append(metrics_route)
 
     def register_mm_encoder_routes(self):
         self.app.add_api_route("/health", self.health, methods=["GET"])
@@ -244,6 +280,8 @@ class OpenAIServer:
                 post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
             async for res in promise:
                 pp_results = res.outputs[0]._postprocess_result if self.postproc_worker_enabled else post_processor(res, args)
+                if res.finished and self.metrics_collector:
+                    self.metrics_collector.log_metrics_dict(res.metrics_dict)
                 for pp_res in pp_results:
                     yield pp_res
             yield "data: [DONE]\n\n"
@@ -261,6 +299,8 @@ class OpenAIServer:
             # Add prompt_tokens_ids to the response
             if disaggregated_params and disaggregated_params.request_type and disaggregated_params.request_type == "context_only":
                 chat_response.prompt_token_ids = promise.prompt_token_ids
+            if promise.finished and self.metrics_collector:
+                self.metrics_collector.log_metrics_dict(promise.metrics_dict)
             return chat_response
 
         try:
@@ -415,6 +455,8 @@ class OpenAIServer:
             if disaggregated_params and disaggregated_params.request_type and disaggregated_params.request_type == "context_only":
                 # Include prompt token ids for context-only requests
                 pp_result.prompt_token_ids = response.prompt_token_ids
+            if response.finished and self.metrics_collector:
+                self.metrics_collector.log_metrics_dict(response.metrics_dict)
             return pp_result
 
         def merge_completion_responses(responses: List[CompletionResponse]) -> CompletionResponse:
@@ -450,6 +492,8 @@ class OpenAIServer:
                     pp_result = post_processor(output, args)
                 else:
                     pp_result = output.outputs[0]._postprocess_result
+                if output.finished and self.metrics_collector:
+                    self.metrics_collector.log_metrics_dict(output.metrics_dict)
                 for pp_res in pp_result:
                     yield pp_res
 

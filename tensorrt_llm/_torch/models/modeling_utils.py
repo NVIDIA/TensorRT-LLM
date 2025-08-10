@@ -421,8 +421,7 @@ class DecoderModelForCausalLM(nn.Module,
 
         self.model.__pp_init__()
 
-    def __post_init__(self):
-        # 1. mixed precision
+    def apply_layerwise_quant_config(self):
         quant_config_dict = self.model_config.quant_config_dict
         if quant_config_dict is not None:
             for name, module in self.named_modules():
@@ -466,11 +465,14 @@ class DecoderModelForCausalLM(nn.Module,
                             module.quant_config = q
                             break
 
-        # 2. skip quant for modules in QuantConfig.exclude_modules.
-        # kv_cache_quant_algo takes precedence over exclude_modules.
-        # kv_cache_quant_algo, if not None, is set for non-Attention
-        # modules too, which is the same practice as when there's no
-        # exclude_modules.
+    def apply_quant_config_exclude_modules(self):
+        """
+        Skip quant for modules in QuantConfig.exclude_modules.
+        kv_cache_quant_algo takes precedence over exclude_modules.
+        kv_cache_quant_algo, if not None, is set for non-Attention
+        modules too, which is the same practice as when there's no
+        exclude_modules.
+        """
         quant_config = self.model_config.quant_config
         kv_cache_quant_algo = None
         if quant_config:
@@ -485,6 +487,10 @@ class DecoderModelForCausalLM(nn.Module,
                     if is_excluded and getattr(module, "quant_config",
                                                None) is not None:
                         module.quant_config = new_config
+
+    def __post_init__(self):
+        self.apply_layerwise_quant_config()
+        self.apply_quant_config_exclude_modules()
 
         for _, module in self.named_modules():
             if callable(getattr(module, "create_weights", None)):
