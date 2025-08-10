@@ -177,7 +177,7 @@ def _mangle_executor_config(executor_config: ExecutorConfig):
                 f"Disable overlap scheduler for speculation mode {spec_config.spec_dec_mode.name}"
             )
             executor_config.pytorch_backend_config.disable_overlap_scheduler = True
-    
+
     if executor_config.mm_encoder_only:
         from tensorrt_llm.llmapi.llm_args import LoadFormat
         pytorch_backend_config.mm_encoder_only = True
