@@ -338,15 +338,13 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
         TLLM_CHECK_WITH_INFO(
             !blockManager.isVariableWindow(), "Rewinding KV cache blocks for variable SWA models isn't supported");
         auto const maxBlocksPerSeq = blockManager.getMaxBlockPerSeqWhenSingleWindowSize();
-        auto const isUseOneMoreBlock = kv_cache_manager::BlockManager::isUseOneMoreBlock(
-            getMaxAttentionWindow(), getMaxSequenceLen(), getMaxBeamWidth());
 
         // TODO(oargov): VGQA is not supported, assume all layers have the same num_kv_heads
         TLLM_CHECK_WITH_INFO(
             !blockManager.isVariableGQA(), "Rewinding KV cache blocks for variable GQA models isn't supported");
         auto const numKvHeads = mModelConfig.getNbKvHeads(0);
 
-        mRewindInputs = RewindInputs{maxBlocksPerSeq, isUseOneMoreBlock, numKvHeads};
+        mRewindInputs = RewindInputs{maxBlocksPerSeq, /*isUseOneMoreBlock*/ false, numKvHeads};
     }
 
     if (mWorldConfig.isPipelineParallel())
