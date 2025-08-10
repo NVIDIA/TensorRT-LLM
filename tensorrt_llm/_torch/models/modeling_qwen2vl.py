@@ -660,10 +660,10 @@ class Qwen2VLModel(Qwen2VLModelBase):
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args,
                  **kwargs):
+        super().__init__(model_config, *args, **kwargs)
         if not DISAGG:
             self.mm_encoder = Qwen2VisionModelBase(
                 model_config, Qwen2VLForConditionalGeneration)
-        super().__init__(model_config, *args, **kwargs)
 
 
 @register_vision_encoder(Qwen2VisionModelBase,
@@ -674,7 +674,7 @@ class Qwen2_5_VLModel(Qwen2VLModelBase):
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args,
                  **kwargs):
+        super().__init__(model_config, *args, **kwargs)
         if not DISAGG:
             self.mm_encoder = Qwen2VisionModelBase(
                 model_config, Qwen2_5_VLForConditionalGeneration)
-        super().__init__(model_config, *args, **kwargs)
