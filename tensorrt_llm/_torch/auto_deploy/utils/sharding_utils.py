@@ -210,12 +210,16 @@ class ShardingTransformInfo(BaseModel, ABC):
         """
         pass
 
-    def check_and_apply(self, gm: GraphModule, node: Node) -> None:
-        """Check if the transformation is valid and apply it if it is."""
+    def check_and_apply(self, gm: GraphModule, node: Node) -> bool:
+        """
+        Check if the transformation is valid and apply it if it is.
+        Return True if the transformation is applied, False otherwise.
+        """
         if not self.validate(gm, node):
             ad_logger.warning(f"Skipping invalid transformation {self}.")
-            return
+            return False
         self.apply(gm, node)
+        return True
 
 
 class TPShardingInfo(ShardingTransformInfo):

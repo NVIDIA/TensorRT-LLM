@@ -64,25 +64,26 @@ class ShardingTransformExecutor(BaseTransform):
         # create a node dict for faster lookup
         node_dict = {n.name: n for n in gm.graph.nodes}
 
-        def check_and_apply(transform: ShardingTransformInfo) -> None:
+        def check_and_apply(transform: ShardingTransformInfo) -> bool:
+            """Return True if the transformation is applied, False otherwise."""
             if transform.target_node is None or transform.target_node not in node_dict:
                 ad_logger.warning(
                     f"Skipping transformation {transform} because target node "
                     + f"{transform.target_node} not found in graph"
                 )
-                return
-            transform.check_and_apply(gm, node_dict[transform.target_node])
+                return False
+            return transform.check_and_apply(gm, node_dict[transform.target_node])
 
         num_matches = 0
         for tp_transform in shared_config.sharding_config.tp_transforms:
-            check_and_apply(tp_transform)
-            num_matches += 1
+            if check_and_apply(tp_transform):
+                num_matches += 1
         for bmm_transform in shared_config.sharding_config.bmm_transforms:
-            check_and_apply(bmm_transform)
-            num_matches += 1
+            if check_and_apply(bmm_transform):
+                num_matches += 1
         for ep_transform in shared_config.sharding_config.ep_transforms:
-            check_and_apply(ep_transform)
-            num_matches += 1
+            if check_and_apply(ep_transform):
+                num_matches += 1
 
         info = TransformInfo(
             skipped=False, num_matches=num_matches, is_clean=False, has_valid_shapes=False
