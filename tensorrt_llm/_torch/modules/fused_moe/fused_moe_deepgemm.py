@@ -11,7 +11,7 @@ from tensorrt_llm._utils import nvtx_range
 
 from ...distributed import allgather
 from ...model_config import ModelConfig
-from ...utils import AuxStreamType, Fp4QuantizedTensor
+from ...utils import AuxStreamType, EventType, Fp4QuantizedTensor
 from .fused_moe_cutlass import CutlassFusedMoE
 from .quantization import (DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm,
                            MoEWeightLoadingMode, UnquantizedFusedMoEMethod)
@@ -88,6 +88,7 @@ def _masked_index_copy_group_quant_fp8(
 
 def masked_index_copy_group_quant_fp8(
     output: torch.Tensor,
+    output_s: torch.Tensor,
     input: torch.Tensor,
     start_offsets: torch.Tensor,
     row_indices: torch.Tensor,
@@ -107,15 +108,11 @@ def masked_index_copy_group_quant_fp8(
     row_size = output.shape[0]
     col_size = output.shape[1]
     dim_size = output.shape[2]
-
-    # create padded output_s
+    
     alignment = 4
     scale_dim = (dim_size + group_size - 1) // group_size
     padded_dim_size = (scale_dim + alignment - 1) // alignment * alignment
     padded_col_size = (col_size + alignment - 1) // alignment * alignment
-    output_s = torch.zeros((row_size, padded_dim_size // 4, padded_col_size),
-                           dtype=torch.int32,
-                           device='cuda')
 
     # get block/grid/stage/warp
     num_groups = (dim_size + group_size - 1) // group_size
@@ -247,6 +244,7 @@ def preprocess_after_permute(expert_first_token_offset_tensor,
 
 @nvtx_range("[DG]")
 def deepgemm_fp8_group_blockwise_gemm(
+    d: torch.Tensor,
     a: torch.Tensor,
     b: torch.Tensor,
     sfa: torch.Tensor,
@@ -254,10 +252,6 @@ def deepgemm_fp8_group_blockwise_gemm(
     masked_m: torch.Tensor,
     expected_m: int,
 ) -> torch.Tensor:
-    d = torch.empty((a.shape[0], a.shape[1], b.shape[1]),
-                    device=b.device,
-                    dtype=torch.bfloat16)
-
     # NOTES: shape must be `[G, M, K] @ [G, N, K].mT`
     assert a.stride(-1) == 1
     assert b.stride(-1) == 1
@@ -287,7 +281,7 @@ def deepgemm_fp8_group_blockwise_gemm(
                                            masked_m,
                                            expected_m,
                                            disable_ue8m0_cast=True)
-    return d
+    return
 
 
 class DeepGemmFusedMoE(CutlassFusedMoE):
@@ -341,6 +335,38 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
             apply_router_weight_on_input=apply_router_weight_on_input,
             layer_idx=layer_idx,
         )
+    
+    def get_workspace(self, m_max: int, group_size: int):
+        hidden_size_0 = max(self.hidden_size, self.w3_w1_weight.shape[1] // 2)
+        workspace_0 = torch.empty(
+            (self.expert_size_per_partition * m_max * hidden_size_0),
+            dtype=torch.float8_e4m3fn,
+            device='cuda')
+        
+        hidden_size_1 = max(self.w3_w1_weight.shape[1], self.w2_weight.shape[1])
+        workspace_1 = torch.empty(
+            (self.expert_size_per_partition * m_max * self.hidden_size),
+            dtype=torch.bfloat16,
+            device='cuda')
+        
+        alignment = 4
+        scale_dim = (self.hidden_size + group_size - 1) // group_size
+        padded_dim_size = (scale_dim + alignment - 1) // alignment * alignment
+        padded_col_size = (m_max + alignment - 1) // alignment * alignment
+        scale_k = (self.w3_w1_weight.shape[1] // 2 + group_size - 1) // group_size
+        scale_k_padded = (scale_k + alignment - 1) // alignment * alignment
+        row_size = max(padded_dim_size // 4, scale_k_padded // 4)
+        workspace_sf = torch.empty(
+            (self.expert_size_per_partition * row_size * padded_col_size),
+            dtype=torch.int32,
+            device='cuda')
+        
+        workspace = {
+            "workspace_0": workspace_0,
+            "workspace_1": workspace_1,
+            "workspace_sf": workspace_sf,
+        }
+        return workspace
 
     def _get_quant_method(self):
         if self.quant_config is not None and self.quant_config.layer_quant_mode.has_any_quant(
@@ -362,6 +388,7 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
         output_dtype: Optional[torch.dtype] = None,
         all_rank_num_tokens: Optional[List[int]] = None,
         use_dp_padding: Optional[bool] = None,
+        workspace: Optional[dict] = None,
     ) -> torch.Tensor:
         if isinstance(x, Fp4QuantizedTensor):
             assert output_dtype is not None
@@ -437,22 +464,44 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
         masked_m, token_to_expert_map = preprocess_after_permute(
             expert_first_token_offset_tensor, permuted_data_tensor)
 
-        m_max = (x.shape[0] + 127) // 128 * 128
         expected_m = (token_selected_experts.numel() +
                       self.expert_size_per_partition -
                       1) // self.expert_size_per_partition
-        act_input_fp8 = torch.empty(
-            (self.expert_size_per_partition, m_max, self.hidden_size),
-            dtype=torch.float8_e4m3fn,
-            device='cuda')
+        # prepare workspace
+        m_max = (x.shape[0] + 127) // 128 * 128
+        act_input_fp8 = workspace["workspace_0"][0: self.expert_size_per_partition * m_max * self.hidden_size]
+        # act_input_fp8.view(self.expert_size_per_partition, m_max, self.hidden_size)
+        act_input_fp8 = act_input_fp8.as_strided(
+            size=(self.expert_size_per_partition, m_max, self.hidden_size),
+            stride=(m_max * self.hidden_size, self.hidden_size, 1),
+        )
+        alignment = 4
+        scale_dim = (self.hidden_size + 128 - 1) // 128
+        padded_dim_size = (scale_dim + alignment - 1) // alignment * alignment
+        padded_col_size = (m_max + alignment - 1) // alignment * alignment
+        act_input_sf = workspace["workspace_sf"][0: self.expert_size_per_partition * padded_dim_size // 4 * padded_col_size]
+        # act_input_sf.view(self.expert_size_per_partition, padded_dim_size // 4, padded_col_size)
+        act_input_sf = act_input_sf.as_strided(
+            size=(self.expert_size_per_partition, padded_dim_size // 4, padded_col_size),
+            stride=(padded_dim_size // 4 * padded_col_size, padded_col_size, 1),
+        )
         act_input_sf = masked_index_copy_group_quant_fp8(
             act_input_fp8,
+            act_input_sf,
             permuted_data_tensor,
             expert_first_token_offset_tensor,
             token_to_expert_map,
             group_size=128)
-
-        h1 = deepgemm_fp8_group_blockwise_gemm(
+        
+        # prepare workspace
+        h1 = workspace["workspace_1"][0: self.expert_size_per_partition * m_max * self.w3_w1_weight.shape[1]]
+        # h1.view(self.expert_size_per_partition, m_max, self.w3_w1_weight.shape[1])
+        h1 = h1.as_strided(
+            size=(self.expert_size_per_partition, m_max, self.w3_w1_weight.shape[1]),
+            stride=(m_max * self.w3_w1_weight.shape[1], self.w3_w1_weight.shape[1], 1),
+        )
+        deepgemm_fp8_group_blockwise_gemm(
+            d=h1,
             a=act_input_fp8,
             b=self.w3_w1_weight,
             sfa=act_input_sf,
@@ -460,10 +509,36 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
             masked_m=masked_m,
             expected_m=expected_m,
         )
-        act_input_fp8, act_input_sf = fp8_utils.silu_and_mul_masked_post_quant_fwd(
+        
+        # prepare workspace
+        h2 = workspace["workspace_0"][0: self.expert_size_per_partition * m_max * self.w3_w1_weight.shape[1] // 2]
+        # h2.view(self.expert_size_per_partition, m_max, self.w3_w1_weight.shape[1] // 2)
+        h2 = h2.as_strided(
+            size=(self.expert_size_per_partition, m_max, self.w3_w1_weight.shape[1] // 2),
+            stride=(m_max * self.w3_w1_weight.shape[1] // 2, self.w3_w1_weight.shape[1] // 2, 1),
+        )
+        scale_k = (self.w3_w1_weight.shape[1] // 2 + 128 - 1) // 128
+        scale_k_padded = (scale_k + alignment - 1) // alignment * alignment
+        h2_sf = workspace["workspace_sf"][0: self.expert_size_per_partition * scale_k_padded // 4 * padded_col_size]
+        # h2_sf.view(self.expert_size_per_partition, scale_k_padded // 4, padded_col_size)
+        h2_sf = h2_sf.as_strided(
+            size=(self.expert_size_per_partition, scale_k_padded // 4, padded_col_size),
+            stride=(scale_k_padded // 4 * padded_col_size, padded_col_size, 1),
+        )
+        act_input_sf = fp8_utils.silu_and_mul_masked_post_quant_fwd(
+            output=h2, output_scale=h2_sf,
             input=h1, quant_group_size=128, masked_m=masked_m, scale_ue8m0=True)
-        h3 = deepgemm_fp8_group_blockwise_gemm(
-            a=act_input_fp8,
+        
+        # prepare workspace
+        h3 = workspace["workspace_1"][0: self.expert_size_per_partition * m_max * self.w2_weight.shape[1]]
+        # h3.view(self.expert_size_per_partition, m_max, self.w2_weight.shape[1])
+        h3 = h3.as_strided(
+            size=(self.expert_size_per_partition, m_max, self.w2_weight.shape[1]),
+            stride=(m_max * self.w2_weight.shape[1], self.w2_weight.shape[1], 1),
+        )
+        deepgemm_fp8_group_blockwise_gemm(
+            d=h3,
+            a=h2,
             b=self.w2_weight,
             sfa=act_input_sf,
             sfb=self.quant_scales[1],
@@ -495,3 +570,141 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
         )
 
         return final_hidden_states
+
+    def forward(
+        self,
+        x: Union[torch.Tensor, Fp4QuantizedTensor],
+        router_logits: torch.Tensor,
+        do_finalize: bool = True,  # used by other MoE backends
+        output_dtype: Optional[torch.dtype] = None,
+        all_rank_num_tokens: Optional[List[int]] = None,
+        all_rank_max_num_tokens: Optional[int] = None,
+        use_dp_padding: Optional[bool] = None,
+    ) -> torch.Tensor:
+        assert do_finalize, "CutlassFusedMoE does not support do_finalize=False"
+        if self.use_dp and self.parallel_size > 1:
+            assert all_rank_num_tokens is not None
+            assert use_dp_padding is not None
+            num_rows = sum(all_rank_num_tokens)
+        else:
+            num_rows = x.shape[0]
+
+        # in case of num_rows is larger than max_chunk_size, we need to split the input into multiple chunks
+        num_chunks = (num_rows + self.moe_max_num_tokens -
+                      1) // self.moe_max_num_tokens
+
+        if use_dp_padding:
+            all_rank_num_tokens_padded = [all_rank_max_num_tokens
+                                          ] * len(all_rank_num_tokens)
+        else:
+            all_rank_num_tokens_padded = all_rank_num_tokens
+
+        if num_chunks == 1:
+            # create workspace
+            num_rows = x.shape[0]
+            if self.use_dp:
+                num_rows = sum(all_rank_num_tokens_padded)
+            m_max = (num_rows + 127) // 128 * 128
+            workspace = self.get_workspace(m_max, 128)
+            outputs = self.forward_chunk(
+                x,
+                router_logits,
+                output_dtype,
+                all_rank_num_tokens=all_rank_num_tokens_padded,
+                use_dp_padding=use_dp_padding,
+                workspace=workspace)
+            outputs = self.reducescatter_or_allreduce(
+                outputs,
+                all_rank_num_tokens=all_rank_num_tokens_padded,
+                use_dp_padding=use_dp_padding)
+        else:
+            if self.use_dp:
+                all_rank_chunk_size_list = [
+                    self.split_chunk(val, num_chunks)
+                    for val in all_rank_num_tokens_padded
+                ]
+                all_rank_num_tokens_list = [[
+                    val[idx_chunk] for val in all_rank_chunk_size_list
+                ] for idx_chunk in range(num_chunks)]
+                chunk_size_list = all_rank_chunk_size_list[self.rank]
+            else:
+                all_rank_num_tokens_list = [None] * num_chunks
+                chunk_size_list = self.split_chunk(x.shape[0], num_chunks)
+                
+            # create workspace
+            chunk_size_0 = sum(all_rank_num_tokens_list[0]) if self.use_dp else chunk_size_list[0]
+            workspace_0 = self.get_workspace((chunk_size_0 + 127) // 128 * 128, 128)
+            chunk_size_1 = sum(all_rank_num_tokens_list[1]) if self.use_dp else chunk_size_list[1]
+            workspace_1 = self.get_workspace((chunk_size_1 + 127) // 128 * 128, 128)
+
+            x_list = x.split(chunk_size_list)
+            router_logits_list = router_logits.split(chunk_size_list)
+
+            self.event_dict[EventType.Main].record()
+            with torch.cuda.stream(self.aux_stream):
+                self.event_dict[EventType.Main].wait()
+
+            def _forward_chunk(x_, router_logits_, idx, workspace):
+                # num_rows = x_.shape[0]
+                # if self.use_dp:
+                #     num_rows = sum(all_rank_num_tokens_list[idx])
+                # m_max = (num_rows + 127) // 128 * 128
+                # workspace = self.get_workspace(m_max, 128)
+                return self.forward_chunk(
+                    x_,
+                    router_logits_,
+                    all_rank_num_tokens=all_rank_num_tokens_list[idx]
+                    if self.use_dp else None,
+                    use_dp_padding=use_dp_padding,
+                    workspace=workspace)
+
+            def _reducescatter_or_allreduce(x_, idx):
+                return self.reducescatter_or_allreduce(
+                    x_,
+                    all_rank_num_tokens=all_rank_num_tokens_list[idx],
+                    use_dp_padding=use_dp_padding)
+
+            outputs_list = []
+            # Postpone reduce-scatter/all-reduce to the next iteration to achieve better overlap
+            for idx_chunk, (x, router_logits) in enumerate(
+                    zip(x_list, router_logits_list)):
+
+                if idx_chunk % 2 == 0:
+                    with torch.cuda.stream(self.aux_stream):
+                        chunk_size = sum(all_rank_num_tokens_list[idx_chunk]) if self.use_dp else chunk_size_list[idx_chunk]
+                        if chunk_size != chunk_size_0:
+                            workspace_0 = self.get_workspace((chunk_size + 127) // 128 * 128, 128)
+                            chunk_size_0 = chunk_size
+                        outputs = _forward_chunk(x, router_logits, idx_chunk, workspace_0)
+                    if idx_chunk > 0:
+                        outputs_list[-1] = _reducescatter_or_allreduce(
+                            outputs_list[-1], idx_chunk - 1)
+                else:
+                    chunk_size = sum(all_rank_num_tokens_list[idx_chunk]) if self.use_dp else chunk_size_list[idx_chunk]
+                    if chunk_size != chunk_size_1:
+                        workspace_1 = self.get_workspace((chunk_size + 127) // 128 * 128, 128)
+                        chunk_size_1 = chunk_size
+                    outputs = _forward_chunk(x, router_logits, idx_chunk, workspace_1)
+                    with torch.cuda.stream(self.aux_stream):
+                        outputs_list[-1] = _reducescatter_or_allreduce(
+                            outputs_list[-1], idx_chunk - 1)
+
+                outputs_list.append(outputs)
+
+            if num_chunks % 2 == 0:
+                outputs_list[-1] = _reducescatter_or_allreduce(
+                    outputs_list[-1], -1)
+            else:
+                with torch.cuda.stream(self.aux_stream):
+                    outputs_list[-1] = _reducescatter_or_allreduce(
+                        outputs_list[-1], -1)
+            with torch.cuda.stream(self.aux_stream):
+                self.event_dict[EventType.MoeChunkingOverlap].record()
+            self.event_dict[EventType.MoeChunkingOverlap].wait()
+
+            outputs = torch.cat(outputs_list)
+
+        if self.use_dp and self.parallel_size > 1:
+            rank = self.mapping.tp_rank
+            outputs = outputs[:all_rank_num_tokens[rank]]
+        return outputs

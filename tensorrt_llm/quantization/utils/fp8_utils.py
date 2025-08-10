@@ -302,6 +302,8 @@ def _silu_and_mul_post_quant_kernel(
 
 
 def silu_and_mul_masked_post_quant_fwd(
+    output: torch.Tensor,
+    output_scale: torch.Tensor,
     input: torch.Tensor,
     quant_group_size: int,
     masked_m: torch.Tensor,
@@ -327,18 +329,6 @@ def silu_and_mul_masked_post_quant_fwd(
 
     g, m, k = input.shape
     k = k // 2
-
-    # Create output
-    output = torch.empty((g, m, k), dtype=torch.float8_e4m3fn, device="cuda")
-
-    # Create output scale
-    alignment = 4
-    scale_k = ceil_div(k, quant_group_size)
-    m_padded = align(m, alignment)
-    scale_k_padded = align(scale_k, alignment)
-    output_scale = torch.zeros((g, scale_k_padded // 4, m_padded),
-                               dtype=torch.int32,
-                               device='cuda')
 
     # Get block/grid/stage/warp
     expert_num = len(masked_m)
@@ -382,7 +372,7 @@ def silu_and_mul_masked_post_quant_fwd(
         g,
         tma_stride_check=True,
     )
-    return output, output_scale
+    return output_scale
 
 
 @triton.jit
