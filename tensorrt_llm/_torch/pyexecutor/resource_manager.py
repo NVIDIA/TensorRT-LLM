@@ -10,9 +10,10 @@ import torch
 import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
+from tensorrt_llm.lora_manager import LoraConfig, LoraManager, LoraModelConfig
 from tensorrt_llm.sampling_params import SamplingParams
 
-from ..._utils import binding_dtype_size, nvtx_range
+from ..._utils import binding_dtype_size, binding_to_str_dtype, nvtx_range
 from ...logger import logger
 from ...mapping import Mapping
 from .llm_request import (LlmRequest, LlmRequestState, SamplingConfig,
@@ -109,6 +110,33 @@ def get_pp_layers(
     return pp_layers, total_num_layers
 
 
+def request_context(is_draft: bool, scheduled_requests: ScheduledRequests):
+
+    class RequestContext:
+
+        def __init__(self, is_draft: bool,
+                     scheduled_requests: ScheduledRequests):
+            self.is_draft = is_draft
+            self.scheduled_requests = scheduled_requests
+
+        def __enter__(self):
+            if not self.is_draft:
+                return
+
+            for req in self.scheduled_requests.all_requests():
+                req.use_draft_model = True
+
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            if not self.is_draft:
+                return
+
+            # Clean up the state
+            for req in self.scheduled_requests.all_requests():
+                req.use_draft_model = False
+
+    return RequestContext(is_draft, scheduled_requests)
+
+
 class KVCacheManager(BaseResourceManager):
 
     def __init__(
@@ -131,6 +159,7 @@ class KVCacheManager(BaseResourceManager):
         max_num_tokens: int = 8192,
         model_config: Optional[ModelConfig] = None,
         max_beam_width: int = 1,
+        is_draft: bool = False,
     ) -> None:
         self.mapping = mapping
         self.dtype = dtype
@@ -141,6 +170,7 @@ class KVCacheManager(BaseResourceManager):
             spec_config=spec_config,
             layer_mask=layer_mask,
         )
+        self.is_draft = is_draft
         self.num_local_layers = len(self.pp_layers)
         self.layer_offsets = {
             idx: offset
@@ -196,6 +226,7 @@ class KVCacheManager(BaseResourceManager):
         from ..speculative import get_num_extra_kv_tokens
         self.num_extra_kv_tokens = get_num_extra_kv_tokens(spec_config)
         self.event_buffer_max_size = kv_cache_config.event_buffer_max_size
+        self.attention_dp_events_gather_period_ms = kv_cache_config.attention_dp_events_gather_period_ms
         self.max_num_tokens = max_num_tokens
 
         # Determine max_attention_window_vec
@@ -299,8 +330,17 @@ class KVCacheManager(BaseResourceManager):
             'copy_on_partial_reuse': kv_cache_config.copy_on_partial_reuse,
         }
         if self.event_buffer_max_size > 0:
-            kwargs['event_manager'] = KVCacheEventManagerCpp(
-                max_kv_event_entries=self.event_buffer_max_size)
+            if mapping.enable_attention_dp:
+                kwargs['event_manager'] = KVCacheEventManagerCpp(
+                    max_kv_event_entries=self.event_buffer_max_size,
+                    attention_dp_rank=mapping.rank,
+                    attention_dp_size=mapping.world_size,
+                    attention_dp_events_gather_period_ms=self.
+                    attention_dp_events_gather_period_ms,
+                )
+            else:
+                kwargs['event_manager'] = KVCacheEventManagerCpp(
+                    max_kv_event_entries=self.event_buffer_max_size)
 
         self.impl = KVCacheManagerCpp(**kwargs)
 
@@ -355,34 +395,36 @@ class KVCacheManager(BaseResourceManager):
         return need_blocks
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
-        context_batch = scheduled_batch.context_requests
-        generation_batch = scheduled_batch.generation_requests
-        # allocate KV Cache
-        for req in context_batch:
-            req_beam_width = req.sampling_config.beam_width
-            if 'cp_type' in self.mapping.cp_config and 'star_attention' == self.mapping.cp_config[
-                    'cp_type']:
-                if req.ctx_iters == 0:
-                    seq_len = sum(
-                        len(ctx_block) for ctx_block in req.ctx_blocks)
-                    self.impl.add_sequence(
-                        req.py_request_id,
-                        seq_len + (len(req.query_id) if self.mapping.cp_rank
-                                   == self.mapping.cp_size - 1 else 0),
-                        req_beam_width, req)
-            else:
-                if req.is_first_context_chunk:
-                    self.impl.add_sequence(req.py_request_id, req.prompt_len,
-                                           req_beam_width, req)
-                    for _ in range(self.num_extra_kv_tokens):
-                        self.impl.add_token(req.py_request_id)
-                    for _ in range(get_draft_token_length(req)):
-                        self.impl.add_token(req.py_request_id)
+        with request_context(self.is_draft, scheduled_batch):
+            context_batch = scheduled_batch.context_requests
+            generation_batch = scheduled_batch.generation_requests
+            # allocate KV Cache
+            for req in context_batch:
+                req_beam_width = req.sampling_config.beam_width
+                if 'cp_type' in self.mapping.cp_config and 'star_attention' == self.mapping.cp_config[
+                        'cp_type']:
+                    if req.ctx_iters == 0:
+                        seq_len = sum(
+                            len(ctx_block) for ctx_block in req.ctx_blocks)
+                        self.impl.add_sequence(
+                            req.py_request_id,
+                            seq_len + (len(req.query_id) if self.mapping.cp_rank
+                                       == self.mapping.cp_size - 1 else 0),
+                            req_beam_width, req)
+                else:
+                    if req.is_first_context_chunk:
+                        self.impl.add_sequence(req.py_request_id,
+                                               req.prompt_len, req_beam_width,
+                                               req)
+                        for _ in range(self.num_extra_kv_tokens):
+                            self.impl.add_token(req.py_request_id)
+                        for _ in range(get_draft_token_length(req)):
+                            self.impl.add_token(req.py_request_id)
 
-        for req in generation_batch:
-            self.impl.add_token(req.py_request_id)
-            for _ in range(get_draft_token_length(req)):
+            for req in generation_batch:
                 self.impl.add_token(req.py_request_id)
+                for _ in range(get_draft_token_length(req)):
+                    self.impl.add_token(req.py_request_id)
 
     def add_dummy_requests(
         self,
@@ -888,10 +930,9 @@ class MambaCacheManager(BaseResourceManager):
 
     def __init__(
         self,
-        d_model: int,
         d_state: int,
         d_conv: int,
-        expand: int,
+        num_heads: int,
         n_groups: int,
         head_dim: int,
         num_layers: int,
@@ -905,9 +946,9 @@ class MambaCacheManager(BaseResourceManager):
         tp_size = mapping.tp_size
 
         # derive mamba parameters for conv and ssm states
-        d_inner = d_model * expand
+        d_inner = head_dim * num_heads
         conv_dim = d_inner + 2 * n_groups * d_state
-        nheads = d_inner // head_dim
+        nheads = num_heads
 
         # check that can be partitioned
         assert nheads % tp_size == 0, "nheads must be divisible by tp_size"
@@ -1023,10 +1064,9 @@ class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
     def __init__(
         self,
         # mamba cache parameters
-        mamba_d_model: int,
         mamba_d_state: int,
         mamba_d_conv: int,
-        mamba_expand: int,
+        mamba_num_heads: int,
         mamba_n_groups: int,
         mamba_head_dim: int,
         mamba_num_layers: int,
@@ -1056,10 +1096,9 @@ class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
         # initialize mamba cache manager
         MambaCacheManager.__init__(
             self,
-            mamba_d_model,
             mamba_d_state,
             mamba_d_conv,
-            mamba_expand,
+            mamba_num_heads,
             mamba_n_groups,
             mamba_head_dim,
             mamba_num_layers,
@@ -1173,6 +1212,7 @@ class PeftCacheManager(BaseResourceManager):
 
     def __init__(self,
                  peft_cache_config: PeftCacheConfig,
+                 lora_config: LoraConfig,
                  model_config: ModelConfig,
                  world_config: WorldConfig | None = None):
         import tensorrt_llm.bindings as _tb
@@ -1203,8 +1243,36 @@ class PeftCacheManager(BaseResourceManager):
                                         model_config=model_config,
                                         world_config=world_config,
                                         buffer_manager=buffer_manager)
+        self._lora_config = lora_config
+        self._lora_model_config = LoraModelConfig(
+            lora_config.lora_target_modules,
+            lora_config.trtllm_modules_to_hf_modules, model_config.hidden_size,
+            binding_to_str_dtype(model_config.data_type))
+        self._lora_manager = LoraManager()
 
     def add_request_peft(self, request: LlmRequest):
+        if request.lora_task_id is not None:
+            is_task_cached = self.impl.is_task_cached(request.lora_task_id)
+            if is_task_cached:
+                # PeftCacheManager::addRequestPeft in CPP doesn't allow having only one of [config tensor, weights
+                # tensor] without the other. Since there's no need for any of them when the LoRA adapter is already
+                # cached, we can safely remove both from the request.
+                request.remove_lora_tensors()
+            elif request.lora_weights is None and request.py_lora_path:
+                self._lora_manager.load_from_ckpt(
+                    [request.py_lora_path],
+                    model_config=self._lora_model_config,
+                    runtime_mapping=None,
+                    uids=[request.lora_task_id],
+                    ckpt_source=self._lora_config.lora_ckpt_source)
+                request.lora_weights = self._lora_manager.cpp_lora_weights[
+                    request.lora_task_id]
+
+            # PeftCacheManager CPP implementation expects an extra dim at index 0
+            if request.lora_weights is not None:
+                request.lora_weights = request.lora_weights.unsqueeze(0)
+            if request.lora_config is not None:
+                request.lora_config = request.lora_config.unsqueeze(0)
         self.impl.add_request_peft(request, True)
 
     def ensure_batch(self,
@@ -1224,12 +1292,7 @@ class PeftCacheManager(BaseResourceManager):
         context_batch = scheduled_batch.context_requests
         generation_batch = scheduled_batch.generation_requests
         for req in context_batch:
-            if req.lora_weights is not None and req.lora_config is not None:
-                req.lora_weights = req.lora_weights.reshape(
-                    [1] + list(req.lora_weights.shape))
-                req.lora_config = req.lora_config.reshape(
-                    [1] + list(req.lora_config.shape))
-            self.impl.add_request_peft(req, True)
+            self.add_request_peft(req)
 
         py_lora_task_layer_module_configs = self.impl.ensure_batch(
             context_batch, generation_batch, False)

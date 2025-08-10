@@ -91,6 +91,10 @@ def test_register_fake(custom_ops):
         "trtllm::set_chunked_kv_cache_for_mla",
         "trtllm::mla_rope_append_paged_kv_assign_q",
         "trtllm::fused_qk_norm_rope",
+        "trtllm::bf16_mxe2m1_block_scale_moe_runner",
+        "trtllm::e4m3_mxe2m1_block_scale_moe_runner",
+        "trtllm::mxe4m3_mxe2m1_block_scale_moe_runner",
+        "trtllm::mxfp8_quantize",
     }
 
     ops_missing_fake_impl = []

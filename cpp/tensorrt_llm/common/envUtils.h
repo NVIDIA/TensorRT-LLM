@@ -76,7 +76,7 @@ bool getEnvDisableKVCacheTransferOverlap();
 
 bool getEnvEnableReceiveKVCacheParallel();
 
-std::string getEnvKVCacheTransferOutputPath();
+std::string const& getEnvKVCacheTransferOutputPath();
 
 bool getEnvTryZCopyForKVCacheTransfer();
 

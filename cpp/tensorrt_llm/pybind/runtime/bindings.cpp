@@ -38,6 +38,7 @@
 #include "tensorrt_llm/runtime/speculativeDecodingMode.h"
 #include "tensorrt_llm/runtime/tllmRuntime.h"
 #include "tensorrt_llm/runtime/torchView.h"
+#include "tensorrt_llm/runtime/virtualMemory.h"
 
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDAStream.h>
@@ -213,6 +214,10 @@ void initBindings(pybind11::module_& m)
         .def_readwrite("scaling_vec_pointer", &tr::LoraCache::TaskLayerModuleConfig::scalingVecPointer)
         .def(py::self == py::self);
 
+    py::class_<tr::CudaVirtualMemoryManager>(m, "CudaVirtualMemoryManager")
+        .def("release_with_tag", &tr::CudaVirtualMemoryManager::releaseWithTag, py::arg("tag"))
+        .def("materialize_with_tag", &tr::CudaVirtualMemoryManager::materializeWithTag, py::arg("tag"));
+
     py::classh<tr::BufferManager>(m, "BufferManager")
         .def(py::init<tr::BufferManager::CudaStreamPtr, bool>(), py::arg("stream"), py::arg("trim_pool") = false)
         .def_property_readonly("stream", &tr::BufferManager::getStream);
@@ -307,10 +312,10 @@ void initBindings(pybind11::module_& m)
 
     py::class_<tr::decoder::DecoderState>(m, "DecoderState")
         .def(py::init<>())
-        .def("setup", &tr::decoder::DecoderState::setup, py::arg("max_batch_size"), py::arg("max_beam_width"),
+        .def("setup", &tr::decoder::DecoderState::setup, py::arg("max_num_sequences"), py::arg("max_beam_width"),
             py::arg("max_attention_window"), py::arg("sink_token_length"), py::arg("max_sequence_length"),
             py::arg("dtype"), py::arg("model_config"), py::arg("world_config"), py::arg("buffer_manager"))
-        .def("setup_cache_indirection", &tr::decoder::DecoderState::setupCacheIndirection, py::arg("max_batch_size"),
+        .def("setup_cache_indirection", &tr::decoder::DecoderState::setupCacheIndirection, py::arg("max_num_sequences"),
             py::arg("max_beam_width"), py::arg("max_attention_window"), py::arg("buffer_manager"))
         .def("setup_speculative_decoding", &tr::decoder::DecoderState::setupSpeculativeDecoding,
             py::arg("speculative_decoding_mode"), py::arg("max_tokens_per_engine_step"), py::arg("dtype"),
@@ -366,7 +371,7 @@ void initBindings(pybind11::module_& m)
 
     py::class_<tr::GptDecoderBatched>(m, "GptDecoderBatched")
         .def(py::init<tr::GptDecoderBatched::CudaStreamPtr>(), py::arg("stream"))
-        .def("setup", &tr::GptDecoderBatched::setup, py::arg("mode"), py::arg("max_batch_size"),
+        .def("setup", &tr::GptDecoderBatched::setup, py::arg("mode"), py::arg("max_num_sequences"),
             py::arg("max_beam_width"), py::arg("dtype"), py::arg("model_config"), py::arg("world_config"))
         .def("forward_async", &tr::GptDecoderBatched::forwardAsync, py::arg("decoder_state"), py::arg("input"))
         .def("underlying_decoder", &tr::GptDecoderBatched::getUnderlyingDecoder, py::return_value_policy::reference)
@@ -405,6 +410,29 @@ void initBindings(pybind11::module_& m)
         [](int32_t tp_size) { return tensorrt_llm::kernels::max_workspace_size_lowprecision(tp_size); },
         "Calculate the maximum workspace size needed for low precision all-reduce operations");
 
+    py::enum_<tr::CudaVirtualMemoryAllocator::RestoreMode>(m, "CudaVirtualMemoryAllocatorRestoreMode")
+        .value("NONE", tr::CudaVirtualMemoryAllocator::RestoreMode::NONE)
+        .value("CPU", tr::CudaVirtualMemoryAllocator::RestoreMode::CPU)
+        .value("PINNED", tr::CudaVirtualMemoryAllocator::RestoreMode::PINNED)
+        .value("MEMSET", tr::CudaVirtualMemoryAllocator::RestoreMode::MEMSET);
+
+    m.def("get_virtual_memory_manager", &tr::getVirtualMemoryManager, "Get the virtual memory manager",
+        py::return_value_policy::reference);
+
+    m.def(
+        "set_virtual_memory_allocator",
+        [](std::string const& tag, tr::CudaVirtualMemoryAllocator::RestoreMode mode, uintptr_t stream)
+        {
+            static_assert(sizeof(uintptr_t) == sizeof(cudaStream_t));
+            tr::setVirtualMemoryAllocator(tag, mode,
+                std::make_shared<tr::CudaStream>(
+                    reinterpret_cast<cudaStream_t>(stream), tensorrt_llm::common::getDevice(), false));
+        },
+        "Set the virtual memory allocator and start allocating virtual memory for CUDA allocations");
+
+    m.def("clear_virtual_memory_allocator", &tr::clearVirtualMemoryAllocator,
+        "Reset the current virtual memory allocator and stop allocating virtual memory for CUDA allocations");
+
     py::class_<tensorrt_llm::runtime::McastGPUBuffer>(m, "McastGPUBuffer")
         .def(py::init<size_t, uint32_t, uint32_t, at::Device, bool>())
         .def("get_uc_buffer", &tensorrt_llm::runtime::McastGPUBuffer::getUCBuffer)
@@ -428,7 +456,8 @@ void initBindings(pybind11::module_& m)
         .value("AUTO", tensorrt_llm::kernels::AllReduceStrategyType::AUTO)
         .value("UB", tensorrt_llm::kernels::AllReduceStrategyType::UB)
         .value("ONESHOT", tensorrt_llm::kernels::AllReduceStrategyType::ONESHOT)
-        .value("TWOSHOT", tensorrt_llm::kernels::AllReduceStrategyType::TWOSHOT);
+        .value("TWOSHOT", tensorrt_llm::kernels::AllReduceStrategyType::TWOSHOT)
+        .value("NCCL_SYMMETRIC", tensorrt_llm::kernels::AllReduceStrategyType::NCCL_SYMMETRIC);
 
     // Initialize MoeLoadBalancer bindings
     initMoeBindings(m);

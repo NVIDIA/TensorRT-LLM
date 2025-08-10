@@ -463,7 +463,7 @@ def test_llm_get_stats_async_tp2(pytorch_backend):
 
 
 def test_llm_capture_request_error():
-    _test_llm_capture_request_error(tp_size=2)
+    _test_llm_capture_request_error(pytorch_backend=False, tp_size=2)
 
 
 def test_llm_with_postprocess_parallel_tp2():

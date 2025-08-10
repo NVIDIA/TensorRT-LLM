@@ -95,6 +95,8 @@ MODEL_PATH_DICT = {
     "gemma_3_1b_it": "gemma/gemma-3-1b-it",
     "deepseek_r1_fp8": "DeepSeek-R1/DeepSeek-R1",
     "deepseek_r1_nvfp4": "DeepSeek-R1/DeepSeek-R1-FP4",
+    "deepseek_r1_0528_fp8": "DeepSeek-R1/DeepSeek-R1-0528/",
+    "deepseek_r1_0528_fp4": "DeepSeek-R1/DeepSeek-R1-0528-FP4/",
     "deepseek_v3_lite_fp8": "DeepSeek-V3-Lite/fp8",
     "deepseek_v3_lite_nvfp4": "DeepSeek-V3-Lite/nvfp4_moe_only",
     "qwen2_7b_instruct": "Qwen2-7B-Instruct",
@@ -125,6 +127,7 @@ MODEL_PATH_DICT = {
     "phi_4_multimodal_instruct_audio": "multimodals/Phi-4-multimodal-instruct",
     "bielik_11b_v2.2_instruct": "Bielik-11B-v2.2-Instruct",
     "bielik_11b_v2.2_instruct_fp8": "Bielik-11B-v2.2-Instruct-FP8",
+    "mistral_small_v3.1_24b": "Mistral-Small-3.1-24B-Instruct-2503",
 }
 # Model PATH of HuggingFace
 HF_MODEL_PATH = {
@@ -374,12 +377,12 @@ class PerfTestConfig:
         num_reqs: int = 512,
         concurrency: int = -1,
         quantization: str = "",
+        kv_cache_free_gpu_mem_fraction: float = 0.9,
         kv_cache_dtype: str = "auto",
         ep_size: int = None,
         tp_size: int = 1,
         pp_size: int = 1,
         num_gpus: int = 1,
-        kv_cache_free_gpu_mem_fraction: float = 0.9,
     ):
         # The model name.
         self.model_name = model_name
@@ -419,6 +422,8 @@ class PerfTestConfig:
         self.concurrency = concurrency
         # Quantization type.
         self.quantization = quantization
+        # KV cache free gpu mem fraction
+        self.kv_cache_free_gpu_mem_fraction = kv_cache_free_gpu_mem_fraction
         # KV Cache dtype
         self.kv_cache_dtype = kv_cache_dtype
         # Multiple Profiles
@@ -433,8 +438,6 @@ class PerfTestConfig:
         self.num_gpus = num_gpus
         # Just build engines
         self.build_only = False
-        # kv cache free gpu mem fraction
-        self.kv_cache_free_gpu_mem_fraction = kv_cache_free_gpu_mem_fraction
 
     def to_string(self,
                   custom_bs: int = None,
@@ -477,6 +480,10 @@ class PerfTestConfig:
 
         # Add Max number of tokens.
         entries.append(f"maxnt:{self.max_num_tokens}")
+
+        # Add kv cache free gpu mem fraction.
+        if self.kv_cache_free_gpu_mem_fraction != 0.9:
+            entries.append(f"kv_frac:{self.kv_cache_free_gpu_mem_fraction}")
 
         if self.build_only:
             entries.append(f"build_only")
@@ -548,10 +555,6 @@ class PerfTestConfig:
         if self.num_gpus > 1:
             entries.append(f"gpus:{self.num_gpus}")
 
-        # Add kv cache free gpu mem fraction.
-        if self.kv_cache_free_gpu_mem_fraction != 0.9:
-            entries.append(f"kv_frac:{self.kv_cache_free_gpu_mem_fraction}")
-
         # Concatenate labels with "-".
         return "-".join(entries)
 
@@ -590,6 +593,10 @@ class PerfTestConfig:
 
         if labels[0].startswith("maxnt"):
             self.max_num_tokens = int(labels.pop(0).replace("maxnt:", ""))
+
+        if labels[0].startswith("kv_frac"):
+            self.kv_cache_free_gpu_mem_fraction = float(
+                labels.pop(0).replace("kv_frac:", ""))
 
         if labels[0] == "build_only":
             self.build_only = True
@@ -658,11 +665,6 @@ class PerfTestConfig:
         if len(labels) > 0:
             self.num_gpus = 1 if not labels[0].startswith("gpus:") else int(
                 labels.pop(0).replace("gpus:", ""))
-
-        if len(labels) > 0:
-            self.kv_cache_free_gpu_mem_fraction = 0.9 if not labels[
-                0].startswith("kv_frac:") else float(
-                    labels.pop(0).replace("kv_frac:", ""))
 
         assert len(
             labels
