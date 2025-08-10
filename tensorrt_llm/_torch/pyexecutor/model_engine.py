@@ -1079,7 +1079,7 @@ class PyTorchModelEngine(ModelEngine):
                 else:
                     weights = checkpoint_loader.load_weights(checkpoint_dir)
 
-                weight_mapper = checkpoint_loader.get_initilized_weight_mapper(
+                weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
                     model, config)
                 self._call_load_weights(model.load_weights, weights,
                                         weight_mapper)
