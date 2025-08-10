@@ -939,8 +939,11 @@ class MambaCacheManager(BaseResourceManager):
         max_batch_size: int,
         mapping: Mapping,
         dtype: torch.dtype,
+        ssm_cache_dtype: torch.dtype,
         layer_mask: Optional[List[bool]] = None,
     ) -> None:
+
+        self.mamba_ssm_cache_dtype = ssm_cache_dtype
 
         # get tp size
         tp_size = mapping.tp_size
@@ -993,7 +996,7 @@ class MambaCacheManager(BaseResourceManager):
                 head_dim,
                 d_state,
             ],
-            dtype=dtype,
+            dtype=self.mamba_ssm_cache_dtype,
             device=device,
         )
 
@@ -1051,6 +1054,9 @@ class MambaCacheManager(BaseResourceManager):
         layer_offset = self.mamba_layer_offsets[layer_idx]
         return self.ssm_states[layer_offset]
 
+    def get_mamba_ssm_cache_dtype(self) -> torch.dtype:
+        return self.mamba_ssm_cache_dtype
+
     def shutdown(self):
         # release tensor memory, keeping python references as tensors
         self.conv_states = torch.tensor([])
@@ -1072,6 +1078,8 @@ class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
         mamba_num_layers: int,
         mamba_layer_mask: List[bool],
         mamba_cache_dtype: torch.dtype,
+        mamba_ssm_cache_dtype: torch.dtype,
+
         # kv cache parameters
         kv_cache_config: KvCacheConfigCpp,
         kv_cache_type: CacheTypeCpp,
@@ -1105,6 +1113,7 @@ class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
             max_batch_size,
             mapping,
             mamba_cache_dtype,
+            mamba_ssm_cache_dtype,
             mamba_layer_mask,
         )
 

@@ -22,7 +22,8 @@ from tensorrt_llm._torch.speculative import (
     get_num_extra_kv_tokens, update_spec_config_from_model_config)
 from tensorrt_llm._torch.speculative.mtp import SampleStateTensorsMTP
 from tensorrt_llm._utils import (is_trace_enabled, nvtx_range, release_gc,
-                                 torch_dtype_to_str, trace_func)
+                                 str_dtype_to_torch, torch_dtype_to_str,
+                                 trace_func)
 from tensorrt_llm.inputs.multimodal import (MultimodalParams,
                                             MultimodalRuntimeData)
 from tensorrt_llm.logger import logger
@@ -96,6 +97,16 @@ _KV_CACHE_MAP = {
     "auto": "auto"
 }
 _VALID_KV_CACHE_DTYPES = ("fp8", "auto")
+
+
+def validate_and_set_mamba_ssm_cache_dtype(config: ModelConfig,
+                                           mamba_ssm_cache_dtype: str) -> None:
+    if mamba_ssm_cache_dtype == "auto":
+        mamba_ssm_cache_dtype = config.pretrained_config.torch_dtype
+    else:
+        mamba_ssm_cache_dtype = str_dtype_to_torch(mamba_ssm_cache_dtype)
+
+    config.quant_config.mamba_ssm_cache_dtype = mamba_ssm_cache_dtype
 
 
 def validate_and_set_kv_cache_quant(model_config: ModelConfig,
@@ -1022,6 +1033,9 @@ class PyTorchModelEngine(ModelEngine):
 
         validate_and_set_kv_cache_quant(
             config, self.pytorch_backend_config.kv_cache_dtype)
+        validate_and_set_mamba_ssm_cache_dtype(
+            config, self.pytorch_backend_config.mamba_ssm_cache_dtype)
+
         num_layers = int(os.environ.get("TLLM_OVERRIDE_LAYER_NUM", "0"))
         if num_layers > 0:
             config.pretrained_config.num_hidden_layers = num_layers

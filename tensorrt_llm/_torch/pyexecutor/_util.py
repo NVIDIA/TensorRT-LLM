@@ -330,6 +330,7 @@ class KvCacheCreator:
             mamba_layer_mask = [
                 char == "M" for char in config.hybrid_override_pattern
             ]
+
             kv_cache_manager = MambaHybridCacheManager(
                 # mamba cache parameters
                 config.ssm_state_size,
@@ -340,6 +341,8 @@ class KvCacheCreator:
                 mamba_num_layers,
                 mamba_layer_mask,
                 config.torch_dtype,
+                model_engine.model.model_config.quant_config.
+                mamba_ssm_cache_dtype,
                 # kv cache parameters
                 executor_config.kv_cache_config,
                 tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
