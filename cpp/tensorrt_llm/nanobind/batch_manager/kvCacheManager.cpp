@@ -483,13 +483,12 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
         .value("SELFKONLY", tbk::CacheType::kSELFKONLY);
 
     nb::class_<tbk::KVCacheManager, tbk::BaseKVCacheManager>(m, "KVCacheManager")
-        .def(
-            nb::init<std::vector<SizeType32> const&, SizeType32, SizeType32,
-                std::map<SizeType32, std::tuple<SizeType32, SizeType32>> const&, SizeType32, SizeType32,
-                std::vector<SizeType32> const&, std::optional<tbk::TempAttentionWindowInputs> const&,
-                nvinfer1::DataType, SizeType32, int64_t, std::optional<runtime::SizeType32>, bool, bool, tbk::CacheType,
-                std::optional<tensorrt_llm::executor::RetentionPriority>, std::shared_ptr<tbk::KVCacheEventManager>,
-                bool, bool, std::shared_ptr<tbc::KvCacheConnectorManager>>(),
+        .def(nb::init<std::vector<SizeType32> const&, SizeType32, SizeType32,
+                 std::map<SizeType32, std::tuple<SizeType32, SizeType32>> const&, SizeType32, SizeType32,
+                 std::vector<SizeType32> const&, std::optional<tbk::TempAttentionWindowInputs> const&,
+                 nvinfer1::DataType, SizeType32, int64_t, runtime::SizeType32, bool, bool, tbk::CacheType,
+                 std::optional<tensorrt_llm::executor::RetentionPriority>, std::shared_ptr<tbk::KVCacheEventManager>,
+                 bool, bool, std::shared_ptr<tbc::KvCacheConnectorManager>>(),
             nb::arg("num_kv_heads_per_layer"), nb::arg("size_per_head"), nb::arg("tokens_per_block"),
             nb::arg("blocks_per_window"), nb::arg("max_num_sequences"), nb::arg("max_beam_width"),
             nb::arg("max_attention_window_vec"), nb::arg("temp_attention_window_inputs").none(), nb::arg("dtype"),
