@@ -54,7 +54,7 @@ class MultimodalEncoder(_TorchLLM):
         # 2. May need to modify model weights for MM (e.g., resize vocab embedding). We must do such operation via input processor's __init__
         self.input_processor = create_input_processor(self._hf_model_dir,
                                                       self.tokenizer)
-        self.tokenizer = self.input_processor.tokenizer
+        self._tokenizer = self.input_processor.tokenizer
 
         max_batch_size = self.args.max_batch_size
         max_num_tokens = self.args.max_num_tokens

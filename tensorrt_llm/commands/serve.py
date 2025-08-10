@@ -364,6 +364,13 @@ def serve(
               type=int,
               default=BuildConfig.max_batch_size,
               help="Maximum number of requests that the engine can schedule.")
+@click.option(
+    "--max_num_tokens",
+    type=int,
+    default=16384,  # set higher default max_num_tokens for multimodal encoder
+    help=
+    "Maximum number of batched input tokens after padding is removed in each batch."
+)
 @click.option("--gpus_per_node",
               type=int,
               default=None,
@@ -385,8 +392,9 @@ def serve(
               default=None,
               help="Path to metadata server config file")
 def serve_encoder(model: str, host: str, port: int, log_level: str,
-                  max_batch_size: int, gpus_per_node: Optional[int],
-                  trust_remote_code: bool, extra_encoder_options: Optional[str],
+                  max_batch_size: int, max_num_tokens: int,
+                  gpus_per_node: Optional[int], trust_remote_code: bool,
+                  extra_encoder_options: Optional[str],
                   metadata_server_config_file: Optional[str]):
     """Running an OpenAI API compatible server
 
@@ -397,6 +405,7 @@ def serve_encoder(model: str, host: str, port: int, log_level: str,
     # TODO: expose more argument progressivly
     llm_args, _ = get_llm_args(model=model,
                                max_batch_size=max_batch_size,
+                               max_num_tokens=max_num_tokens,
                                gpus_per_node=gpus_per_node,
                                trust_remote_code=trust_remote_code)
 

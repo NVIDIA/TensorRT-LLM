@@ -382,17 +382,33 @@ class OpenAIServer:
 
     async def openai_mm_encoder(self, request: ChatCompletionRequest, raw_request: Request) -> Response:
 
-        async def create_mm_embedding_response(
-                promise: RequestOutput):
+        async def create_mm_embedding_response(promise: RequestOutput):
             await promise.aresult()
-            mm_embedding_handle = promise.mm_embedding_handle
-            num_tokens = mm_embedding_handle["tensor_size"][0]
-            # TODO: need to add more info like input_ids, specific_token_ids, mrope, mm_hashes, etc
+            # TODO: Replace mm_embedding_handle with a dedicated OpenAIBaseModel(JSON-safe), when enable multimodal disagg E2E
+            mm_embedding_handle = getattr(promise, "mm_embedding_handle", None)
+            if not mm_embedding_handle or "tensor_size" not in mm_embedding_handle:
+                return self.create_error_response(
+                    message="Multimodal embedding handle missing in response",
+                    err_type="InternalServerError",
+                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR)
+            num_tokens = int(mm_embedding_handle["tensor_size"][0])
             return ChatCompletionResponse(
                 id=str(promise.request_id),
                 model=self.model,
-                choices=[ChatCompletionResponseChoice(index=0, message=ChatMessage(role="assistant", content="dummy"), mm_embedding_handle=mm_embedding_handle, finish_reason="length")],
-                usage=UsageInfo(prompt_tokens=num_tokens, completion_tokens=1, total_tokens=num_tokens+1))
+                choices=[
+                    ChatCompletionResponseChoice(
+                        index=0,
+                        message=ChatMessage(role="assistant", content="dummy"),
+                        mm_embedding_handle=mm_embedding_handle,
+                        finish_reason="length",
+                    )
+                ],
+                usage=UsageInfo(
+                    prompt_tokens=num_tokens,
+                    completion_tokens=1,
+                    total_tokens=num_tokens + 1,
+                ),
+            )
 
         try:
             check_multiple_response(request.n, self.llm.args.backend)
@@ -400,8 +416,6 @@ class OpenAIServer:
             tool_dicts = None if request.tools is None else [
                 tool.model_dump() for tool in request.tools
             ]
-            # TODO: placeholder for multimodal disagg e2e
-            to_llm_disaggregated_params(request.disaggregated_params)
 
             conversation, mm_coroutines, mm_placeholder_counts = parse_chat_messages_coroutines(request.messages, self.model_config)
 

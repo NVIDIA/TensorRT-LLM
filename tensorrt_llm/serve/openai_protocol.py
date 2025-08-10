@@ -391,7 +391,7 @@ class ChatCompletionResponseChoice(OpenAIBaseModel):
     finish_reason: Optional[str] = None
     stop_reason: Optional[Union[int, str]] = None
     # TODO: progressivly add more info like input_ids, specific_token_ids, mrope, mm_hashes, etc
-    # TODO: refer to ChatCompletionLogProbs
+    # TODO: and use a JSON-safe handle to refer to the server-side output
     mm_embedding_handle: Optional[Dict[str, Any]] = None
 
     disaggregated_params: Optional[DisaggregatedParams] = Field(default=None)

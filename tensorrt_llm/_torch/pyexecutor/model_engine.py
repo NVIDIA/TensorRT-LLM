@@ -1112,7 +1112,12 @@ class PyTorchModelEngine(ModelEngine):
             load_method(weights)
 
     def _init_max_seq_len(self):
-        inferred_max_seq_len = self.model.infer_max_seq_len()
+        # For mm_encoder_only mode, infer_max_seq_len() is for LLM decoder models
+        if hasattr(self.model, 'infer_max_seq_len'):
+            inferred_max_seq_len = self.model.infer_max_seq_len()
+        else:
+            inferred_max_seq_len = self._infer_max_seq_len_from_config()
+
         if self.max_seq_len is None:
             logger.info(
                 f"max_seq_len is not specified, using inferred value {inferred_max_seq_len}"
@@ -1127,6 +1132,46 @@ class PyTorchModelEngine(ModelEngine):
                 f"({inferred_max_seq_len}). Setting max_seq_len to {inferred_max_seq_len}. "
             )
             self.max_seq_len = inferred_max_seq_len
+
+    def _infer_max_seq_len_from_config(self) -> int:
+
+        if hasattr(self.model, 'model_config') and self.model.model_config:
+            model_config = self.model.model_config.pretrained_config
+            rope_scaling = getattr(model_config, 'rope_scaling', None)
+            rope_factor = 1
+            if rope_scaling is not None:
+                rope_type = rope_scaling.get('type',
+                                             rope_scaling.get('rope_type'))
+                if rope_type not in ("su", "longrope", "llama3", "yarn"):
+                    rope_factor = rope_scaling.get('factor', 1.0)
+
+            # Step 1: Find the upper bound of max_seq_len
+            inferred_max_seq_len = 2048
+            max_position_embeddings = getattr(model_config,
+                                              'max_position_embeddings', None)
+            if max_position_embeddings is None and hasattr(
+                    model_config, 'text_config'):
+                max_position_embeddings = getattr(model_config.text_config,
+                                                  'max_position_embeddings',
+                                                  None)
+            if max_position_embeddings is not None:
+                inferred_max_seq_len = max_position_embeddings
+
+            # Step 2: Scale max_seq_len with rotary scaling
+            if rope_factor != 1:
+                inferred_max_seq_len = int(
+                    math.ceil(inferred_max_seq_len * rope_factor))
+                logger.warning(
+                    f'max_seq_len is scaled to {inferred_max_seq_len} by rope scaling {rope_factor}'
+                )
+
+            return inferred_max_seq_len
+
+        default_max_seq_len = 8192
+        logger.warning(
+            f"Could not infer max_seq_len from model config, using default value: {default_max_seq_len}"
+        )
+        return default_max_seq_len
 
     def _init_max_num_tokens(self):
         # Modified from tensorrt_llm/_common.py check_max_num_tokens

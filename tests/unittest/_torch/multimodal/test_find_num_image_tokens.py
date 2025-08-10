@@ -22,9 +22,10 @@ example_images = [
 
 def download_image(url: str) -> Image.Image:
     """Download image from URL and return as PIL Image."""
-    response = requests.get(url)
+    response = requests.get(url, timeout=30)
     response.raise_for_status()
-    return Image.open(io.BytesIO(response.content))
+    img = Image.open(io.BytesIO(response.content))
+    return img.convert("RGB")
 
 
 @pytest.fixture(scope="function")

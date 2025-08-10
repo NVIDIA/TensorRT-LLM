@@ -359,7 +359,8 @@ class GenerationResultBase:
             if response_result.context_logits is not None:
                 self._context_logits = response_result.context_logits
 
-            if response_result.mm_embedding_handle is not None:
+            if hasattr(response_result, 'mm_embedding_handle'
+                       ) and response_result.mm_embedding_handle is not None:
                 self._mm_embedding_handle = response_result.mm_embedding_handle
 
             # Processing background errors here ASAF during generation.
