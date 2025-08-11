@@ -5,6 +5,7 @@ import re
 import signal
 import traceback
 from collections import deque
+from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from datetime import datetime
 from http import HTTPStatus
@@ -15,6 +16,7 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from starlette.datastructures import Headers
 from starlette.routing import Mount
 from transformers import AutoConfig, AutoProcessor
 
@@ -28,6 +30,10 @@ from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.llmapi import MultimodalEncoder
 from tensorrt_llm.llmapi.disagg_utils import MetadataServerConfig, ServerRole
 from tensorrt_llm.llmapi.llm import RequestOutput
+from tensorrt_llm.llmapi.otel_tracing import (contains_trace_headers,
+                                              extract_trace_headers,
+                                              is_tracing_enabled,
+                                              log_tracing_disabled_warning)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.metrics.collector import MetricsCollector
 from tensorrt_llm.serve.chat_utils import (check_multiple_response,
@@ -460,6 +466,8 @@ class OpenAIServer:
                 postproc_args=postproc_args,
             )
 
+            trace_headers = (None if raw_request is None else await self._get_trace_headers(raw_request.headers))
+
             promise = self.llm.generate_async(
                 inputs=prompt,
                 sampling_params=sampling_params,
@@ -468,6 +476,7 @@ class OpenAIServer:
                 lora_request=request.lora_request,
                 disaggregated_params=disaggregated_params,
                 cache_salt=request.cache_salt,
+                trace_headers=trace_headers,
             )
             asyncio.create_task(self.await_disconnected(raw_request, promise))
             if not self.postproc_worker_enabled:
@@ -669,13 +678,15 @@ class OpenAIServer:
                     if request.stream else completion_response_post_processor,
                     postproc_args=postproc_args,
                 )
+                trace_headers = (None if raw_request is None else await self._get_trace_headers(raw_request.headers))
                 promise = self.llm.generate_async(
                     inputs=prompt,
                     sampling_params=sampling_params,
                     _postproc_params=postproc_params,
                     streaming=request.stream,
                     lora_request=request.lora_request,
-                    disaggregated_params=disaggregated_params
+                    disaggregated_params=disaggregated_params,
+                    trace_headers=trace_headers
                 )
                 asyncio.create_task(self.await_disconnected(raw_request, promise))
                 if not self.postproc_worker_enabled:
@@ -892,3 +903,13 @@ class OpenAIServer:
                                 log_level="info",
                                 timeout_keep_alive=TIMEOUT_KEEP_ALIVE)
         await uvicorn.Server(config).serve()
+
+    async def _get_trace_headers(
+        self,
+        headers: Headers,
+    ) -> Optional[Mapping[str, str]]:
+        if is_tracing_enabled():
+            return extract_trace_headers(headers)
+        if contains_trace_headers(headers):
+            log_tracing_disabled_warning()
+        return None

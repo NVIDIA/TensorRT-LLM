@@ -5,6 +5,7 @@ import platform
 import signal
 import traceback
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from pathlib import Path
 from queue import Queue
 from typing import (TYPE_CHECKING, AsyncIterable, Generator, List, Optional,
@@ -121,6 +122,7 @@ class GenerationExecutor(ABC):
         streaming: bool = False,
         kv_cache_retention_config: Optional[KvCacheRetentionConfig] = None,
         disaggregated_params: Optional[DisaggregatedParams] = None,
+        trace_headers: Optional[Mapping[str, str]] = None,
         postproc_params: Optional[PostprocParams] = None,
         multimodal_params: Optional[MultimodalParams] = None,
         scheduling_params: Optional[SchedulingParams] = None,
@@ -147,6 +149,7 @@ class GenerationExecutor(ABC):
             streaming=streaming,
             kv_cache_retention_config=kv_cache_retention_config,
             disaggregated_params=disaggregated_params,
+            trace_headers=trace_headers,
             multimodal_params=multimodal_params,
             scheduling_params=scheduling_params,
             cache_salt_id=cache_salt_id)

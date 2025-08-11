@@ -6,6 +6,7 @@ import socket
 import tempfile
 import time
 import weakref
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any, List, Literal, Optional, Sequence, Union
 
@@ -15,6 +16,7 @@ from transformers import PreTrainedTokenizerBase
 from tensorrt_llm.inputs.data import TextPrompt
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.inputs.registry import DefaultInputProcessor
+from tensorrt_llm.llmapi.otel_tracing import init_tracer
 
 from .._utils import nvtx_range_debug
 from ..bindings import executor as tllm
@@ -220,6 +222,15 @@ class BaseLLM:
                 self.mpi_session.shutdown()
             raise
 
+        try:
+            if self.args.otlp_traces_endpoint:
+                init_tracer("trt.llm", self.args.otlp_traces_endpoint)
+                logger.info(
+                    f"Initialized OTLP tracer successfully, endpoint: {self.args.otlp_traces_endpoint}"
+                )
+        except Exception as e:
+            logger.error(f"Failed to initialize OTLP tracer: {e}")
+
         exception_handler.register(self, 'shutdown')
         atexit.register(LLM._shutdown_wrapper, weakref.ref(self))
 
@@ -324,6 +335,7 @@ class BaseLLM:
         streaming: bool = False,
         kv_cache_retention_config: Optional[KvCacheRetentionConfig] = None,
         disaggregated_params: Optional[DisaggregatedParams] = None,
+        trace_headers: Optional[Mapping[str, str]] = None,
         _postproc_params: Optional[PostprocParams] = None,
         scheduling_params: Optional[SchedulingParams] = None,
         cache_salt: Optional[str] = None,
@@ -444,6 +456,7 @@ class BaseLLM:
             streaming=streaming,
             kv_cache_retention_config=kv_cache_retention_config,
             disaggregated_params=disaggregated_params,
+            trace_headers=trace_headers,
             postproc_params=_postproc_params,
             multimodal_params=multimodal_params,
             scheduling_params=scheduling_params,
