@@ -1,4 +1,3 @@
-import glob
 import logging as _logger
 import os as _os
 import pathlib as _pl
@@ -20,13 +19,14 @@ from defs.conftest import llm_models_root
 
 @pytest.fixture(scope="session")
 def build_type():
+    """CMake build type for C++ builds."""
     # For debugging purposes, we can use the RelWithDebInfo build type.
-    # return "RelWithDebInfo"
-    return "Release"
+    return _os.environ.get("TLLM_BUILD_TYPE", "Release")
 
 
 @pytest.fixture(scope="session")
 def build_dir(build_type):
+    """Resolved build directory for the current build_type."""
     return _cpp.find_build_dir(build_type)
 
 
@@ -223,15 +223,15 @@ def prepare_model(
 
 @pytest.fixture(scope="function", autouse=True)
 def keep_log_files(llm_root, build_dir):
-    "Backup previous cpp test results when run multiple ctest"
+    """Backup previous cpp test results when run multiple ctest invocations."""
     results_dir = build_dir
 
     yield
 
-    backup_dir = f"{llm_root}/cpp/build_backup"
-    _os.makedirs(backup_dir, exist_ok=True)
-    # Copy XML files to backup directory
-    xml_files = glob.glob(f"{results_dir}/*.xml")
+    backup_dir = _pl.Path(llm_root) / "cpp" / "build_backup"
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    # Copy XML files from all subdirectories to backup directory
+    xml_files = list(results_dir.rglob("*.xml"))
     if xml_files:
         for xml_file in xml_files:
             try:
