@@ -487,7 +487,7 @@ class GenerationExecutorWorker(GenerationExecutor):
                 lora_config=lora_config,
                 prompt_tuning_config=prompt_tuning_config,
                 multimodal_input=multimodal_input,
-                #NOTE: `multimodal_embedding` and `mrope_config` will be in MultimodalParams.multimodal_data. And this will be handled below by `py_multimodal_data`.
+                # NOTE: `multimodal_embedding` and `mrope_config` will be in MultimodalParams.multimodal_data. And this will be handled below by `py_multimodal_data`.
                 multimodal_embedding=None,
                 mrope_config=None,
                 logits_post_processor_name=(
@@ -503,17 +503,8 @@ class GenerationExecutorWorker(GenerationExecutor):
 
             if self._is_pytorch_backend and request.multimodal_params is not None:
                 if request.multimodal_params.multimodal_data is not None:
-                    # Convert back to tensor, as opposite to `to_handle` in `llm.generate_async`
-                    # for values with non-selected keys, it's no-op
-                    request.multimodal_params.to_tensor(
-                        "multimodal_data", key="multimodal_embedding")
-                    embedding = request.multimodal_params.multimodal_data.get(
-                        "multimodal_embedding")
-                    if embedding is not None and embedding.is_cuda:
-                        # make sure the embedding resides on the local device
-                        request.multimodal_params.multimodal_data[
-                            "multimodal_embedding"] = embedding.to("cuda")
-
+                    # NOTE: Deserialize SharedTensor handle to actual tensor
+                    request.multimodal_params.to_tensor("multimodal_data")
                     executor_request.py_multimodal_data = request.multimodal_params.multimodal_data
 
             if self._is_pytorch_backend and request.sampling_params.logits_processor:

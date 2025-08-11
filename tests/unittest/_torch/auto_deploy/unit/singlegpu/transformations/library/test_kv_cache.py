@@ -187,7 +187,7 @@ def test_sdpa_with_kv_cache(dtype, attn_descriptor, gqa_config):
     # Helper function to call the model with proper sequence nesting
     def _call_and_unnest(x):
         # Use nest_sequences to properly set input_ids and automatically update position_ids
-        cm.info.nest_sequences(x)
+        cm.info.nest_sequences(x, allow_realloc=True)
 
         # Use the cm.args as is - it already contains the correct position_ids
         y = gm(*cm.args)
