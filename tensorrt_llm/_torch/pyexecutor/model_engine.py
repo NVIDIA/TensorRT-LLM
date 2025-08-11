@@ -502,11 +502,23 @@ class PyTorchModelEngine(ModelEngine):
             else:
                 self._torch_compile_backend.bypass_optimization()
 
+        self.moe_load_balancer_iter_info = (not value, not value)
+
+    @property
+    def moe_load_balancer_iter_info(self):
         moe_load_balancer: MoeLoadBalancer = getattr(self, 'moe_load_balancer',
                                                      None)
         if moe_load_balancer is not None:
-            moe_load_balancer.set_iter_info(enable_statistic=not value,
-                                            enable_update_weights=not value)
+            return moe_load_balancer.enable_statistic, moe_load_balancer.enable_update_weights
+        return False, False
+
+    @moe_load_balancer_iter_info.setter
+    def moe_load_balancer_iter_info(self, value: Tuple[bool, bool]):
+        moe_load_balancer: MoeLoadBalancer = getattr(self, 'moe_load_balancer',
+                                                     None)
+        if moe_load_balancer is not None:
+            moe_load_balancer.set_iter_info(enable_statistic=value[0],
+                                            enable_update_weights=value[1])
 
     @property
     def use_beam_search(self):
