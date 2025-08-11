@@ -77,7 +77,10 @@ def output_dir(request):
 @pytest.fixture(scope="session")
 def llm_backend_root():
     llm_root = os.environ.get("LLM_ROOT", find_repo_root())
-    return os.path.join(llm_root, "triton_backend")
+    backend_root = os.path.join(llm_root, "triton_backend")
+    assert os.path.isabs(backend_root), "LLM backend path must be absolute"
+    assert os.path.exists(backend_root), f"{backend_root} does not exist"
+    return backend_root
 
 
 @pytest.fixture(scope="session")
