@@ -726,3 +726,9 @@ disaggregated/test_workers.py::test_workers_kv_cache_aware_router_eviction[TinyL
 # These tests will impact triton. They should be at the end of all tests (https://nvbugs/4904271)
 # examples/test_openai.py::test_llm_openai_triton_1gpu
 # examples/test_openai.py::test_llm_openai_triton_plugingen_1gpu
+
+# llm-api promote pytorch to default
+llmapi/test_llm_api_qa.py::TestLlmDefaultBackend::test_llm_args_logging
+llmapi/test_llm_api_qa.py::TestLlmDefaultBackend::test_llm_args_type_tensorrt
+llmapi/test_llm_api_qa.py::TestLlmDefaultBackend::test_llm_args_type_default
+llmapi/test_llm_api_qa.py::TestLlmDefaultBackend::test_llm_args_logging
