@@ -1270,7 +1270,7 @@ class PyExecutor:
 
     def _check_kv_transfer_timeout(self):
         current_time = time.time()
-        timeout_ms = self.kv_cache_transceiver.cache_transceiver_config.kv_transfer_timeout_ms
+        timeout_ms = self.kv_cache_transceiver.kv_transfer_timeout_ms
         if timeout_ms is None:
             return
 
@@ -1279,6 +1279,9 @@ class PyExecutor:
                 continue
             if (current_time -
                     req.py_kv_transfer_start_time) * 1000 > timeout_ms:
+                logger.debug(
+                    f"Terminating context request {req.py_request_id} due to KV cache transfer timeout"
+                )
                 self._terminate_request(req)
 
         for req in self.active_requests[:]:
@@ -1385,7 +1388,7 @@ class PyExecutor:
             for req in new_gen_reqs:
                 self.kv_cache_transceiver.request_and_receive_async(req)
 
-        if self.kv_cache_transceiver.cache_transceiver_config.kv_transfer_timeout_ms is not None:
+        if self.kv_cache_transceiver.kv_transfer_timeout_ms is not None:
             for req in new_gen_reqs:
                 if req.state == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS:
                     req.py_kv_transfer_start_time = time.time()
@@ -1423,7 +1426,7 @@ class PyExecutor:
             if req.state == LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
         ]
 
-        if self.kv_cache_transceiver.cache_transceiver_config.kv_transfer_timeout_ms is not None:
+        if self.kv_cache_transceiver.kv_transfer_timeout_ms is not None:
             for req in ctx_transmission_reqs:
                 if req.state == LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS:
                     req.py_kv_transfer_start_time = time.time()
