@@ -368,30 +368,14 @@ std::vector<int64_t> TrtllmGenBatchedGemmRunner::getValidConfigIndices(int32_t m
     };
     // Tier 2+: When previous comparators are the same, and when number of estimated CTAs is on the larger side, prefer
     // persistent tile scheduler. The threshold is hardcoded as >148 CTAs at the moment.
-    auto cmpTier3 = [this, maxNumCtasInBatchDim, numBatches, &configs, &gemmData](int64_t idx0, int64_t idx1)
+    auto cmpTier3 = [maxNumCtasInBatchDim, bmm, &configs, &gemmData](int64_t idx0, int64_t idx1)
     {
         auto const& optionsA = configs[idx0].mOptions;
         auto const& optionsB = configs[idx1].mOptions;
         if (optionsA.mTileK == optionsB.mTileK && optionsA.mUseUnrollLoop2xForMma == optionsB.mUseUnrollLoop2xForMma
             && optionsA.mTileM == optionsB.mTileM)
         {
-            int64_t numWorks{0};
-            if (mOptions.staticBatch)
-            {
-                int64_t numTilesM = divUp(gemmData.mProblemDimensions.mM, optionsA.mTileM);
-                int64_t numTilesN = divUp(gemmData.mProblemDimensions.mN, optionsA.mTileN);
-                numWorks = numTilesM * numTilesN * numBatches;
-            }
-            else
-            {
-                int64_t sizeOutDim
-                    = mOptions.transposeMmaOutput ? gemmData.mProblemDimensions.mM : gemmData.mProblemDimensions.mN;
-                int64_t tileOutDim = mOptions.transposeMmaOutput ? optionsA.mTileM : optionsA.mTileN;
-                int64_t numTilesTokens = maxNumCtasInBatchDim;
-                int64_t numTilesOutDim = divUp(sizeOutDim, tileOutDim);
-                numWorks = numTilesTokens * numTilesOutDim;
-            }
-            if (numWorks > 148)
+            if (bmm.getNumCtas(configs[idx0].mOptions, maxNumCtasInBatchDim) > 148)
             {
                 return optionsA.mTileScheduler == batchedGemm::gemm::TileScheduler::Persistent;
             }
