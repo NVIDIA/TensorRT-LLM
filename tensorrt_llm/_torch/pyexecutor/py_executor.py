@@ -841,6 +841,7 @@ class PyExecutor:
 
                 if self.kv_cache_transceiver and self.ctx_in_transmission_requests:
                     self._terminate_ctx_finished_requests()
+                    self._check_kv_transfer_timeout()
 
                 # march forward in microbatch slots
                 microbatch_id = (microbatch_id + 1) % self.num_micro_batches
@@ -857,6 +858,7 @@ class PyExecutor:
 
         if self.kv_cache_transceiver:
             self._check_disagg_gen_transfer_status()
+            self._check_kv_transfer_timeout()
 
         iter_stats = None
         if self.enable_iter_perf_stats:
@@ -974,6 +976,7 @@ class PyExecutor:
 
                 if self.kv_cache_transceiver and self.ctx_in_transmission_requests:
                     self._terminate_ctx_finished_requests()
+                    self._check_kv_transfer_timeout()
 
                 if self.enable_iter_perf_stats:
                     iter_stats.inflight_batching_stats.num_ctx_tokens = self.model_engine.iter_states[
@@ -1098,6 +1101,8 @@ class PyExecutor:
 
                 if self.kv_cache_transceiver and self.ctx_in_transmission_requests:
                     self._terminate_ctx_finished_requests()
+                    # Not sure about this one...
+                    # self._check_kv_transfer_timeout()
 
     def _process_previous_batch(self):
         if self.kv_cache_transceiver and self.previous_batch.ctx_transmission_reqs:
@@ -1263,6 +1268,25 @@ class PyExecutor:
 
         return
 
+    def _check_kv_transfer_timeout(self):
+        current_time = time.time()
+        timeout_ms = self.kv_cache_transceiver.cache_transceiver_config.kv_transfer_timeout_ms
+
+        for req in self.ctx_in_transmission_requests[:]:
+            if req.py_kv_transfer_start_time is None:
+                continue
+            if (current_time -
+                    req.py_kv_transfer_start_time) * 1000 > timeout_ms:
+                self._terminate_request(req)
+
+        for req in self.active_requests[:]:
+            if req.is_disagg_generation_transmission_complete and req.py_kv_transfer_start_time is not None:
+                if (current_time -
+                        req.py_kv_transfer_start_time) * 1000 > timeout_ms:
+                    self._terminate_request(req)
+
+        return
+
     @nvtx_range("_pad_attention_dp_dummy_request")
     def _pad_attention_dp_dummy_request(self):
         """
@@ -1335,6 +1359,7 @@ class PyExecutor:
                 req.context_current_position = req.prompt_len
                 req.decoding_iter = 1
                 req.py_decoding_iter = 1
+                req.py_kv_transfer_start_time = None
                 first_gen_tokens = req.context_phase_params.first_gen_tokens
                 ctx_draft_tokens = req.context_phase_params.draft_tokens
                 req.py_draft_tokens = [] if ctx_draft_tokens is None else ctx_draft_tokens
@@ -1357,6 +1382,11 @@ class PyExecutor:
         else:
             for req in new_gen_reqs:
                 self.kv_cache_transceiver.request_and_receive_async(req)
+
+        if self.kv_cache_transceiver.cache_transceiver_config.kv_transfer_timeout_ms is not None:
+            for req in new_gen_reqs:
+                if req.state == LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS:
+                    req.py_kv_transfer_start_time = time.time()
 
         block_transfer = all([
             req.is_disagg_generation_transmission_in_progress
@@ -1390,6 +1420,11 @@ class PyExecutor:
             req for req in scheduled_ctx_requests
             if req.state == LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
         ]
+
+        if self.kv_cache_transceiver.cache_transceiver_config.kv_transfer_timeout_ms is not None:
+            for req in ctx_transmission_reqs:
+                if req.state == LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS:
+                    req.py_kv_transfer_start_time = time.time()
 
         return ctx_transmission_reqs
 
@@ -1650,6 +1685,7 @@ class PyExecutor:
     def _terminate_ctx_finished_requests(self):
         for request in self.ctx_in_transmission_requests[:]:
             if request.is_disagg_context_complete_state:
+                request.py_kv_transfer_start_time = None
                 self._terminate_request(request)
                 self.ctx_in_transmission_requests.remove(request)
 

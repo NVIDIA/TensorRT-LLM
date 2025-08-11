@@ -412,15 +412,26 @@ void initConfigBindings(pybind11::module_& m)
         .def(py::pickle(guidedDecodingConfigGetstate, guidedDecodingConfigSetstate));
 
     auto cacheTransceiverConfigGetstate = [](tle::CacheTransceiverConfig const& self)
-    { return py::make_tuple(self.getBackendType(), self.getMaxTokensInBuffer()); };
+    {
+        auto timeout = self.getKvTransferTimeoutMs();
+        std::optional<int64_t> timeoutMs = timeout ? std::optional<int64_t>(timeout->count()) : std::nullopt;
+        return py::make_tuple(self.getBackendType(), self.getMaxTokensInBuffer(), timeoutMs);
+    };
     auto cacheTransceiverConfigSetstate = [](py::tuple const& state)
     {
-        if (state.size() != 2)
+        if (state.size() != 3)
         {
             throw std::runtime_error("Invalid CacheTransceiverConfig state!");
         }
-        return tle::CacheTransceiverConfig(
-            state[0].cast<tle::CacheTransceiverConfig::BackendType>(), state[1].cast<std::optional<size_t>>());
+        auto config
+            = tle::CacheTransceiverConfig(state[0].cast<std::optional<tle::CacheTransceiverConfig::BackendType>>(),
+                state[1].cast<std::optional<size_t>>());
+        auto timeoutMs = state[2].cast<std::optional<int64_t>>();
+        if (timeoutMs)
+        {
+            config.setKvTransferTimeoutMs(std::chrono::milliseconds(*timeoutMs));
+        }
+        return config;
     };
 
     py::enum_<tle::CacheTransceiverConfig::BackendType>(m, "CacheTransceiverBackendType")
@@ -443,12 +454,44 @@ void initConfigBindings(pybind11::module_& m)
             });
 
     py::class_<tle::CacheTransceiverConfig>(m, "CacheTransceiverConfig")
-        .def(py::init<std::optional<tle::CacheTransceiverConfig::BackendType>, std::optional<size_t>>(),
-            py::arg("backend") = std::nullopt, py::arg("max_tokens_in_buffer") = std::nullopt)
+        .def(py::init(
+                 [](std::optional<tle::CacheTransceiverConfig::BackendType> backend, std::optional<size_t> maxTokens,
+                     std::optional<int64_t> timeoutMs)
+                 {
+                     std::optional<std::chrono::milliseconds> timeout = std::nullopt;
+                     if (timeoutMs)
+                     {
+                         timeout = std::chrono::milliseconds(*timeoutMs);
+                     }
+                     return tle::CacheTransceiverConfig(backend, maxTokens, timeout);
+                 }),
+            py::arg("backend") = std::nullopt, py::arg("max_tokens_in_buffer") = std::nullopt,
+            py::arg("kv_transfer_timeout_ms") = std::nullopt)
         .def_property(
             "backend", &tle::CacheTransceiverConfig::getBackendType, &tle::CacheTransceiverConfig::setBackendType)
         .def_property("max_tokens_in_buffer", &tle::CacheTransceiverConfig::getMaxTokensInBuffer,
             &tle::CacheTransceiverConfig::setMaxTokensInBuffer)
+        .def_property(
+            "kv_transfer_timeout_ms",
+            [](tle::CacheTransceiverConfig const& self) -> std::optional<int64_t>
+            {
+                auto timeout = self.getKvTransferTimeoutMs();
+                return timeout ? std::optional<int64_t>(timeout->count()) : std::nullopt;
+            },
+            [](tle::CacheTransceiverConfig& self, std::optional<int64_t> timeoutMs)
+            {
+                if (timeoutMs)
+                {
+                    self.setKvTransferTimeoutMs(std::chrono::milliseconds(*timeoutMs));
+                }
+                else
+                {
+                    self.setKvTransferTimeoutMs(std::nullopt);
+                }
+            })
+        .def("setKvTransferTimeoutMs",
+            [](tle::CacheTransceiverConfig& self, int64_t timeoutMs)
+            { self.setKvTransferTimeoutMs(std::chrono::milliseconds(timeoutMs)); })
         .def(py::pickle(cacheTransceiverConfigGetstate, cacheTransceiverConfigSetstate));
 
     auto executorConfigGetState = [](py::object const& self)

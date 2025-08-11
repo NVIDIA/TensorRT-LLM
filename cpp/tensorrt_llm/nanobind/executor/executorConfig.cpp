@@ -429,15 +429,25 @@ void initConfigBindings(nb::module_& m)
         .def("__setstate__", guidedDecodingConfigSetstate);
 
     auto cacheTransceiverConfigGetstate = [](tle::CacheTransceiverConfig const& self)
-    { return nb::make_tuple(self.getBackendType(), self.getMaxTokensInBuffer()); };
+    {
+        auto timeout = self.getKvTransferTimeoutMs();
+        std::optional<int64_t> timeoutMs = timeout ? std::optional<int64_t>(timeout->count()) : std::nullopt;
+        return nb::make_tuple(self.getBackendType(), self.getMaxTokensInBuffer(), timeoutMs);
+    };
     auto cacheTransceiverConfigSetstate = [](tle::CacheTransceiverConfig& self, nb::tuple const& state)
     {
-        if (state.size() != 2)
+        if (state.size() != 3)
         {
             throw std::runtime_error("Invalid CacheTransceiverConfig state!");
         }
-        new (&self) tle::CacheTransceiverConfig(
-            nb::cast<tle::CacheTransceiverConfig::BackendType>(state[0]), nb::cast<std::optional<size_t>>(state[1]));
+        new (&self)
+            tle::CacheTransceiverConfig(nb::cast<std::optional<tle::CacheTransceiverConfig::BackendType>>(state[0]),
+                nb::cast<std::optional<size_t>>(state[1]));
+        auto timeoutMs = nb::cast<std::optional<int64_t>>(state[2]);
+        if (timeoutMs)
+        {
+            self.setKvTransferTimeoutMs(std::chrono::milliseconds(*timeoutMs));
+        }
     };
 
     nb::enum_<tle::CacheTransceiverConfig::BackendType>(m, "CacheTransceiverBackendType")
@@ -460,12 +470,44 @@ void initConfigBindings(nb::module_& m)
             });
 
     nb::class_<tle::CacheTransceiverConfig>(m, "CacheTransceiverConfig")
-        .def(nb::init<std::optional<tle::CacheTransceiverConfig::BackendType>, std::optional<size_t>>(),
-            nb::arg("backend") = std::nullopt, nb::arg("max_tokens_in_buffer") = std::nullopt)
+        .def(nb::init(
+                 [](std::optional<tle::CacheTransceiverConfig::BackendType> backend, std::optional<size_t> maxTokens,
+                     std::optional<int64_t> timeoutMs)
+                 {
+                     std::optional<std::chrono::milliseconds> timeout = std::nullopt;
+                     if (timeoutMs)
+                     {
+                         timeout = std::chrono::milliseconds(*timeoutMs);
+                     }
+                     return tle::CacheTransceiverConfig(backend, maxTokens, timeout);
+                 }),
+            nb::arg("backend") = std::nullopt, nb::arg("max_tokens_in_buffer") = std::nullopt,
+            nb::arg("kv_transfer_timeout_ms") = std::nullopt)
         .def_prop_rw(
             "backend", &tle::CacheTransceiverConfig::getBackendType, &tle::CacheTransceiverConfig::setBackendType)
         .def_prop_rw("max_tokens_in_buffer", &tle::CacheTransceiverConfig::getMaxTokensInBuffer,
             &tle::CacheTransceiverConfig::setMaxTokensInBuffer)
+        .def_prop_rw(
+            "kv_transfer_timeout_ms",
+            [](tle::CacheTransceiverConfig const& self) -> std::optional<int64_t>
+            {
+                auto timeout = self.getKvTransferTimeoutMs();
+                return timeout ? std::optional<int64_t>(timeout->count()) : std::nullopt;
+            },
+            [](tle::CacheTransceiverConfig& self, std::optional<int64_t> timeoutMs)
+            {
+                if (timeoutMs)
+                {
+                    self.setKvTransferTimeoutMs(std::chrono::milliseconds(*timeoutMs));
+                }
+                else
+                {
+                    self.setKvTransferTimeoutMs(std::nullopt);
+                }
+            })
+        .def("setKvTransferTimeoutMs",
+            [](tle::CacheTransceiverConfig& self, int64_t timeoutMs)
+            { self.setKvTransferTimeoutMs(std::chrono::milliseconds(timeoutMs)); })
         .def("__getstate__", cacheTransceiverConfigGetstate)
         .def("__setstate__", cacheTransceiverConfigSetstate);
 

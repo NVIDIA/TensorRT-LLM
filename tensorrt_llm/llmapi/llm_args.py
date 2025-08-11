@@ -1070,10 +1070,16 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
         default=None,
         description="The max number of tokens the transfer buffer can fit.")
 
+    kv_transfer_timeout_ms: Optional[int] = Field(
+        default=None,
+        description="Timeout in milliseconds for KV cache transfer operations. "
+        "Requests exceeding this timeout will be terminated.")
+
     def _to_pybind(self):
         return _CacheTransceiverConfig(
             backend=_CacheTransceiverBackendType.from_string(self.backend),
-            max_tokens_in_buffer=self.max_tokens_in_buffer)
+            max_tokens_in_buffer=self.max_tokens_in_buffer,
+            kv_transfer_timeout_ms=self.kv_transfer_timeout_ms)
 
 
 @dataclass
