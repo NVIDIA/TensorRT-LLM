@@ -3989,7 +3989,9 @@ class FlashInferAllReduceParams(AllReduceParams):
                  fusion_op: Optional[
                      flashinfer_comm.AllReduceFusionOp] = flashinfer_comm.
                  AllReduceFusionOp.NONE,
-                 config_mode: Optional[flashinfer_comm.AllReduceConfigMode] = 0,
+                 config_mode: Optional[
+                     flashinfer_comm.AllReduceConfigMode] = flashinfer_comm.
+                 AllReduceStrategyConfig.USE_MEMCPY,
                  bias: Optional[Tensor] = None,
                  residual: Optional[Tensor] = None,
                  norm_weight: Optional[Tensor] = None,

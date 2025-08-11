@@ -1826,8 +1826,6 @@ class Linear(nn.Module):
     ):
         import flashinfer.comm as flashinfer_comm
 
-        from ..distributed import AllReduce
-
         super().__init__()
         self.has_bias = bias
         self.dtype = dtype
@@ -1865,14 +1863,16 @@ class Linear(nn.Module):
         self.in_features = local_in_features
         self.out_features = local_out_features
 
-        self.all_reduce = AllReduce(mapping=self.mapping,
-                                    strategy=allreduce_strategy,
-                                    dtype=self.dtype) if reduce_output else None
+        # self.all_reduce = AllReduce(mapping=self.mapping,
+        #                             strategy=allreduce_strategy,
+        #                             dtype=self.dtype) if reduce_output else None
+
         self.flash_infer_all_reduce = FlashInferAllReduce(
             mapping=self.mapping,
             hidden_dim=self.out_features,
             strategy=flashinfer_comm.AllReduceStrategyType.TWOSHOT,
             dtype=self.dtype) if reduce_output else None
+
         self._weights_created = False
         self.reduce_output = reduce_output
         self.use_custom_cublas_mm = use_custom_cublas_mm

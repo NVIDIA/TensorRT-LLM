@@ -743,6 +743,12 @@ class FlashInferAllReduce(nn.Module):
             group=None,
         )
         self._flag_value = 1
+        self._enable_debug = os.environ.get("_FLASHINFER_DEBUG", "0") == "1"
+
+        if self._enable_debug:
+            print(
+                f"FlashInferAllReduce.forward: {self.mapping.rank} {self.mapping.tp_size} {self.max_num_tokens} {self.hidden_dim}"
+            )
 
     def forward(
         self,
@@ -756,12 +762,16 @@ class FlashInferAllReduce(nn.Module):
         hidden_dim = input.size(1)
 
         output_buffer = torch.empty(num_token * hidden_dim)
+        if self._enable_debug:
+            print(
+                f"FlashInferAllReduce.forward: {num_token} {hidden_dim} {all_reduce_params}"
+            )
 
         if all_reduce_params is None:
             all_reduce_params = FlashInferAllReduceParams(
                 strategy=self.strategy,
-                fusion_op=AllReduceFusionOp.NONE,
-                config_mode=0,
+                fusion_op=flashinfer_comm.AllReduceFusionOp.NONE,
+                config_mode=flashinfer_comm.AllReduceStrategyConfig.USE_MEMCPY,
             )
 
         flashinfer_comm.trtllm_custom_all_reduce(
