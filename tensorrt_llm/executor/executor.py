@@ -15,7 +15,7 @@ import torch
 
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.logger import logger, set_level
-from tensorrt_llm.lora_manager import LoraConfig
+from tensorrt_llm.lora_helper import LoraConfig
 
 from .._utils import mpi_world_size
 from ..bindings import executor as tllm
