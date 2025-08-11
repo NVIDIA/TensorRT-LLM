@@ -863,7 +863,7 @@ void CacheFormatter::unformat(TransferSession& session)
     if (destNumLayers % destPPSize != 0)
     {
         TLLM_LOG_WARNING("CacheFormatter::inquireSupport: layers %d must be divisible by pipeline parallelism :%d ",
-            destNumLayers, selfPPSize);
+            destNumLayers, destPPSize);
         return false;
     }
     return true;
