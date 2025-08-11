@@ -11,8 +11,6 @@ import os
 from abc import ABC, abstractmethod
 from typing import Any, Callable, Dict, Optional, Tuple, Type
 
-import torch
-
 
 class QuantConfigReader(ABC):
     """Base class for reading and parsing quantization config."""
@@ -30,16 +28,18 @@ class QuantConfigReader(ABC):
         Parse and normalize a quantization config dictionary.
 
         Args:
-            config: The raw "quantization" field from the JSON file.
+            config: The raw parsed JSON object.
 
         Returns:
-            A processed and normalized config dictionary.
+            A dictionary of extra model kwargs derived from the quantization config.
+            Implementations must also populate self._quant_config with the normalized
+            quantization config.
         """
         pass
 
     @classmethod
     @abstractmethod
-    def from_file(cls, file_path: str) -> Optional["QuantConfigReader"]:
+    def from_file(cls, file_path: str) -> Optional[Tuple["QuantConfigReader", Dict[str, Any]]]:
         """
         Load and parse a quantization config file from disk.
 
@@ -49,7 +49,7 @@ class QuantConfigReader(ABC):
             file_path: Path to the quant config JSON file.
 
         Returns:
-            An initialized QuantConfigReader instance, or None if the file doesn't exist.
+            A (reader, extra_model_kwargs) tuple, or None if the file doesn't exist.
         """
         pass
 
@@ -109,7 +109,7 @@ class ModelOPTQuantConfigReader(QuantConfigReader):
     @classmethod
     def from_file(
         cls, ckpt_dir: str
-    ) -> Optional[Tuple["ModelOPTQuantConfigReader", Optional[torch.dtype]]]:
+    ) -> Optional[Tuple["ModelOPTQuantConfigReader", Dict[str, Any]]]:
         """
         Load and parse a modelopt-style quantization config from a checkpoint directory.
 
