@@ -185,7 +185,7 @@ class CUDAGraphModelEngine:
         self.graphs[batch_size].replay()
         output_ref = self.graph_outputs[batch_size]
 
-        return output_ref()
+        return output_ref
 
     def _can_run_graph(self, batch: ScheduledRequests) -> bool:
         """Checks if the current batch is eligible for CUDA graph execution."""
