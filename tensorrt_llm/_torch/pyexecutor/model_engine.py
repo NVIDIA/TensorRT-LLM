@@ -439,9 +439,7 @@ class PyTorchModelEngine(ModelEngine):
         self.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
         self.lora_model_config: Optional[LoraModelConfig] = None
         self.cuda_graph_dummy_request = None
-        self.cuda_graph_model_engine = CUDAGraphModelEngine(
-            self
-        ) if self._run_cuda_graphs or self._torch_compile_piecewise_cuda_graph else None
+        self.cuda_graph_model_engine = CUDAGraphModelEngine(self)
 
         # Setup the local cache indirection buffer only once and reuse it.
         # This way it can also be used for CUDA graphs.
