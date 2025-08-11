@@ -1,5 +1,6 @@
 import bisect
 import contextlib
+import copy
 import functools
 import gc
 import inspect
@@ -1033,9 +1034,12 @@ class PyTorchModelEngine(ModelEngine):
 
         with timing("Model init total"), maybe_create_moe_load_balancer(
                 config, self.mapping) as moe_load_balancer:
+
             try:
+                # config will be modified in-place for some models, like Qwen2
+                config_copy = copy.deepcopy(config)
                 with MetaInitMode():
-                    model = AutoModelForCausalLM.from_config(config)
+                    model = AutoModelForCausalLM.from_config(config_copy)
 
                 memo = dict()
 
@@ -1047,6 +1051,7 @@ class PyTorchModelEngine(ModelEngine):
                     return memo[t]
 
                 model._apply(init_meta_tensor)
+                config = config_copy
 
             except Exception:
                 logger.info(
