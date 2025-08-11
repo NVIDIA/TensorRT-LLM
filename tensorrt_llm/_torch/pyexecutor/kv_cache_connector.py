@@ -301,6 +301,7 @@ class KvCacheConnectorSchedulerOutputManager:
 
     def __init__(self):
         self.requests = defaultdict(KvCacheConnectorSchedulerOutputRequest)
+        self.external_loads = dict()
 
     def build_scheduler_output(self, scheduled_batch: ScheduledRequests,
                                new_async_requests: AsyncRequests,
@@ -316,6 +317,11 @@ class KvCacheConnectorSchedulerOutputManager:
             request_data = self.requests[req.request_id].update_and_build_data(
                 req, kv_cache_manager)
 
+            # Don't include the connector matched tokens in the initial scheduler output.
+            if req.request_id in self.external_loads:
+                request_data.computed_position -= self.external_loads[
+                    req.request_id]
+
             if is_new:
                 scheduler_output.new_requests.append(request_data)
             else:
@@ -327,7 +333,13 @@ class KvCacheConnectorSchedulerOutputManager:
 
             scheduler_output.cached_requests.append(request_data)
 
+        self.external_loads = dict()
+
         return scheduler_output
+
+    def record_new_matched_tokens(self, request: LlmRequest,
+                                  num_new_matched_tokens: int):
+        self.external_loads[request.request_id] = num_new_matched_tokens
 
 
 class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
@@ -394,7 +406,9 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         # Because of this, we need to remove it from our list of scheduled requests (see `take_scheduled_requests_pending_load`).
         if load_kv_async:
             self.new_async_requests.loading[request.request_id] = request
-            request.is_kv_cache_connector_async_onboard = True
+
+        self.scheduler_output_manager.record_new_matched_tokens(
+            request, num_tokens)
 
         return num_tokens
 
@@ -426,6 +440,8 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             # we also need to update it's state.
             if req.request_id in self.new_async_requests.loading.keys():
                 req.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+
+                # Replace the request with the canonical request.
                 self.new_async_requests.loading[req.request_id] = req
             else:
                 allowed_context_requests.append(req)

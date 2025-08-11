@@ -281,8 +281,9 @@ def test_connector_scheduler_output(enforce_single_worker, model_with_connector,
 
     model.generate([0] * NUM_INPUT_TOKENS, sampling_params)
 
+    # The initial computed position should be 0, since we haven't yet onboarded any blocks.
     assert scheduler.build_connector_meta.call_args_list[0].args[
-        0].new_requests[0].computed_position == 8
+        0].new_requests[0].computed_position == 0
 
 
 @pytest.mark.threadleak(enabled=False)

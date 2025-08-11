@@ -113,7 +113,6 @@ def test_connector_manager_num_matched_tokens(mpi_pool_executor):
         req.request_id = 42
 
         assert manager.get_num_new_matched_tokens(req, 32) == 16
-        assert req.is_kv_cache_connector_async_onboard
 
         if mpi_rank() == 0:
             assert scheduler.get_num_new_matched_tokens.call_count == 1

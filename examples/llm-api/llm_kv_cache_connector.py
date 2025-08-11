@@ -103,12 +103,8 @@ class PersistentKvCacheConnectorLeader(KvCacheConnectorScheduler):
 
             pending_load = self.pending_loads[req.request_id]
 
-            # TODO: The `computed_position` field in the scheduler output counts both the device cache hits and onboarded device blocks.
-            # This is inconsistent with vLLM.
             for file_path, block_pos in zip(
-                    pending_load,
-                    range(num_computed_blocks - len(pending_load),
-                          len(block_ids))):
+                    pending_load, range(num_computed_blocks, len(block_ids))):
                 metadata.load.append((file_path, block_ids[block_pos]))
 
             # Break up the remainder of the token sequence into chunks.
