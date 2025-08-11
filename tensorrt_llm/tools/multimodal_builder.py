@@ -1392,6 +1392,7 @@ def build_qwen2_vl_engine(args):
     class VisionAttentionOpt(VisionAttention):
 
         def __init__(self, config: Qwen2VLVisionConfig):
+            # Fallback for compatibility with older transformers versions (for certain nvbugs/tests)
             if transformers.__version__ >= '4.53.0':
                 super().__init__(config)
                 self.head_dim = config.embed_dim // config.num_heads
