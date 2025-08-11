@@ -10,10 +10,20 @@ from torch import nn
 from tensorrt_llm._utils import mpi_comm, mpi_disabled
 from tensorrt_llm.bindings.internal.runtime import McastGPUBuffer
 from tensorrt_llm.functional import (AllReduceFusionOp, AllReduceParams,
-                                     AllReduceStrategy, MoEAllReduceParams)
+                                     AllReduceStrategy,
+                                     FlashInferAllReduceParams,
+                                     MoEAllReduceParams)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.plugin.plugin import CustomAllReduceHelper
+
+try:
+    import flashinfer.comm as flashinfer_comm
+except ImportError:
+    print(
+        "FlashInfer comm module not found. Follow readme to install Flashinfer >=2.8.0."
+    )
+    exit(1)
 
 _thread_local = threading.local()
 
@@ -706,3 +716,90 @@ class MoEAllReduce(nn.Module):
                 nranks=self.mapping.tp_size,
                 eps=all_reduce_params.eps,
             )
+
+
+class FlashInferAllReduce(nn.Module):
+
+    def __init__(self, mapping: Mapping,
+                 strategy: flashinfer_comm.AllReduceStrategyType,
+                 hidden_dim: int, dtype: torch.dtype):
+        super().__init__()
+        self.mapping = mapping
+        self.max_message_size = 70 * 1024 * 1024  # 70MB
+        self.dtype = dtype
+        self.hidden_dim = hidden_dim
+        self.strategy = strategy
+
+        # flashinfer all reduce is better for message sizes < ~70MB
+        # num tokens * hidden dim * 2 < 70 *1024*1024
+        # TODO: 2 is for bf16,fp16. need to add fp8, fp4
+        self.max_num_tokens = self.max_message_size // (self.hidden_dim * 2)
+
+        self.workspace = flashinfer_comm.trtllm_create_ipc_workspace_for_all_reduce(
+            rank=self.mapping.rank,
+            tp_size=self.mapping.tp_size,
+            max_token_num=self.max_num_tokens,
+            hidden_dim=self.hidden_dim,
+            group=None,
+        )
+        self._flag_value = 1
+
+    def forward(
+        self,
+        input: torch.Tensor,
+        *,
+        all_reduce_params: Optional[FlashInferAllReduceParams] = None,
+    ) -> torch.Tensor:
+
+        input = input.contiguous()
+        num_token = input.size(0)
+        hidden_dim = input.size(1)
+
+        output_buffer = torch.empty(num_token * hidden_dim)
+
+        if all_reduce_params is None:
+            all_reduce_params = FlashInferAllReduceParams(
+                strategy=self.strategy,
+                fusion_op=AllReduceFusionOp.NONE,
+                config_mode=0,
+            )
+
+        flashinfer_comm.trtllm_custom_all_reduce(
+            inp=input.ravel(),
+            out=output_buffer,
+            tp_size=self.mapping.tp_size,
+            tp_rank=self.mapping.rank,
+            token_num=num_token,
+            fusion_op_code=all_reduce_params.fusion_op,
+            strategy_code=all_reduce_params.strategy,
+            config_code=all_reduce_params.config_mode,
+            launch_with_pdl=False,
+            flag_value=self._flag_value,
+            peer_comm_buffer_ptrs=torch.tensor(self.workspace[0],
+                                               dtype=torch.int64),
+            peer_barrier_ptrs_in=torch.tensor(self.workspace[2],
+                                              dtype=torch.int64),
+            peer_barrier_ptrs_out=torch.tensor(self.workspace[3],
+                                               dtype=torch.int64),
+            bias=None,
+            residual=None,
+            weight=None,
+            weight_pre_residual_norm=None,
+            eps=None,
+            intermediate_buffer=None,
+            lamport_peer_comm_buffer_ptrs_0=None,
+            lamport_peer_comm_buffer_ptrs_1=None,
+            lamport_peer_comm_buffer_ptrs_2=None,
+            # lamport_peer_comm_buffer_ptrs_0=torch.tensor(
+            #     self.workspace[4], dtype=torch.int64
+            # ),
+            # lamport_peer_comm_buffer_ptrs_1=torch.tensor(
+            #     self.workspace[5], dtype=torch.int64
+            # ),
+            # lamport_peer_comm_buffer_ptrs_2=torch.tensor(
+            #     self.workspace[6], dtype=torch.int64
+            # ),
+        )
+        self._flag_value += 1
+
+        return output_buffer.reshape(num_token, hidden_dim)
