@@ -34,6 +34,7 @@
 #include "tensorrt_llm/nanobind/batch_manager/algorithms.h"
 #include "tensorrt_llm/nanobind/batch_manager/bindings.h"
 #include "tensorrt_llm/nanobind/batch_manager/cacheTransceiver.h"
+#include "tensorrt_llm/nanobind/batch_manager/kvCacheConnector.h"
 #include "tensorrt_llm/nanobind/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/nanobind/batch_manager/llmRequest.h"
 #include "tensorrt_llm/nanobind/executor/bindings.h"
@@ -477,6 +478,8 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
     tensorrt_llm::nanobind::runtime::initBindings(mInternalRuntime);
     tensorrt_llm::nanobind::testing::initBindings(mInternalTesting);
     tpb::initBindings(mInternalBatchManager);
+
+    tb::kv_cache_manager::KVCacheManagerConnectorBindings::initBindings(mInternalBatchManager);
     tb::kv_cache_manager::KVCacheManagerBindings::initBindings(mInternalBatchManager);
     tb::BasePeftCacheManagerBindings::initBindings(mInternalBatchManager);
     tb::CacheTransceiverBindings::initBindings(mInternalBatchManager);

@@ -16,7 +16,7 @@ from tensorrt_llm.sampling_params import SamplingParams
 from ..._utils import binding_dtype_size, binding_to_str_dtype, nvtx_range
 from ...logger import logger
 from ...mapping import Mapping
-from .kv_cache_connector import KvCacheConnectorManager, SchedulerOutput
+from .kv_cache_connector import KvCacheConnectorManager
 from .llm_request import (LlmRequest, LlmRequestState, SamplingConfig,
                           get_draft_token_length)
 from .scheduler import ScheduledRequests
@@ -373,10 +373,6 @@ class KVCacheManager(BaseResourceManager):
         context_batch = scheduled_batch.context_requests
         generation_batch = scheduled_batch.generation_requests
 
-        # Build the scheduler output for the connector.
-        scheduler_output = SchedulerOutput(
-        ) if self.kv_connector_manager is not None else None
-
         # allocate KV Cache
         for req in context_batch:
             req_beam_width = req.sampling_config.beam_width
@@ -398,7 +394,8 @@ class KVCacheManager(BaseResourceManager):
                 # When that happens, the request will go through this same code path, but with is_kv_cache_connector_async_onboard set to True.
                 # Because of this, we need to filter this case out to avoid adding the same sequence twice.
                 # NOTE(jthomson04): Surely there's a better way to do this.
-                if req.is_first_context_chunk and not req.is_kv_cache_connector_async_onboard:
+                if req.is_first_context_chunk and self._kv_connector_should_add_sequence(
+                        req):
                     self.impl.add_sequence(req.py_request_id, req.prompt_len,
                                            req_beam_width, req,
                                            self.kv_connector_manager)
@@ -407,39 +404,20 @@ class KVCacheManager(BaseResourceManager):
                     for _ in range(get_draft_token_length(req)):
                         self.impl.add_token(req.py_request_id)
 
-                    if self.kv_connector_manager is not None:
-                        scheduler_output.record_first_prefill_chunk(
-                            req, self.get_cache_indices(req))
-                elif self.kv_connector_manager is not None:
-                    # When using the connector, this code path will be hit after the async load is complete.
-                    # Alternatively, with no connector, this is hit after the first chunk of prefill.
-
-                    # If this is the first prefill chunk, we can add all of our new tokens and blocks.
-                    if req.is_first_context_chunk or req.is_kv_cache_connector_async_onboard:
-                        req.is_kv_cache_connector_async_onboard = False
-                        scheduler_output.record_first_prefill_chunk(
-                            req, self.get_cache_indices(req))
-                    else:
-                        scheduler_output.record_nth_prefill_chunk(req)
-
         for req in generation_batch:
-            if self.kv_connector_manager is not None:
-                old_block_ids = self.get_cache_indices(req)
 
             self.impl.add_token(req.py_request_id)
 
             for _ in range(get_draft_token_length(req)):
                 self.impl.add_token(req.py_request_id)
 
-            if self.kv_connector_manager is not None:
-                new_block_ids = self.get_cache_indices(req)
-
-                delta_block_ids = new_block_ids[len(old_block_ids):]
-
-                scheduler_output.record_generation_req(req, delta_block_ids)
-
         if self.kv_connector_manager is not None:
-            self.kv_connector_manager.set_scheduler_output(scheduler_output)
+            self.kv_connector_manager.build_scheduler_output(
+                scheduled_batch, self)
+
+    def _kv_connector_should_add_sequence(self, request: LlmRequest) -> bool:
+        return self.kv_connector_manager is None or self.kv_connector_manager.should_add_sequence(
+            request)
 
     def add_dummy_requests(
         self,

@@ -35,8 +35,9 @@ To implement a custom KV connector, you need to implement both the scheduler and
 """
 
 from abc import ABC, abstractmethod
+from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Any, Callable, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, List, Optional
 
 import torch
 
@@ -48,6 +49,9 @@ from tensorrt_llm.bindings.internal.batch_manager import \
 from tensorrt_llm.bindings.internal.batch_manager import LlmRequest
 
 from .scheduler import ScheduledRequests
+
+if TYPE_CHECKING:
+    from .resource_manager import KVCacheManager
 
 
 # Used to store data for a single inflight request.
@@ -72,26 +76,6 @@ class SchedulerOutput:
 
     # Requests being scheduled, that have already shown up in `new_requests`.
     cached_requests: List[RequestData] = field(default_factory=list)
-
-    def record_first_prefill_chunk(self, req: LlmRequest, block_ids: List[int]):
-        if not req.is_kv_cache_connector_async_onboard:
-            self.new_requests.append(
-                RequestData(req.request_id, req.get_tokens(0), block_ids,
-                            req.context_current_position))
-
-    def record_nth_prefill_chunk(self, req: LlmRequest):
-        self.cached_requests.append(
-            RequestData(req.request_id, [], [], req.context_current_position))
-
-    def record_generation_req(self, req: LlmRequest,
-                              delta_block_ids: List[int]):
-
-        tokens = req.get_tokens(0)
-        computed_position = len(tokens) - 1
-
-        self.cached_requests.append(
-            RequestData(req.request_id, tokens[-1:], delta_block_ids,
-                        computed_position))
 
 
 class KvCacheConnectorWorker(ABC):
@@ -275,6 +259,64 @@ class AsyncRequests:
         return set(self.loading.keys())
 
 
+class KvCacheConnectorSchedulerOutputRequest:
+
+    def __init__(self):
+        self.block_ids = []
+        self.tokens = []
+
+    def update_and_build_data(self, req: LlmRequest,
+                              kv_cache_manager: "KVCacheManager"):
+        block_ids = kv_cache_manager.get_cache_indices(req)
+        tokens = req.get_tokens(0)
+
+        new_block_ids = block_ids[len(self.block_ids):]
+        new_tokens = tokens[len(self.tokens):]
+
+        self.block_ids.extend(new_block_ids)
+        self.tokens.extend(new_tokens)
+
+        computed_position = len(
+            tokens
+        ) - 1 if req.state != LlmRequestState.CONTEXT_INIT else req.context_current_position
+
+        return RequestData(req.request_id, new_tokens, new_block_ids,
+                           computed_position)
+
+
+class KvCacheConnectorSchedulerOutputManager:
+
+    def __init__(self):
+        self.requests = defaultdict(KvCacheConnectorSchedulerOutputRequest)
+
+    def build_scheduler_output(self, scheduled_batch: ScheduledRequests,
+                               new_async_requests: AsyncRequests,
+                               kv_cache_manager: "KVCacheManager"):
+        scheduler_output = SchedulerOutput()
+
+        for req in scheduled_batch.context_requests:
+            if req.request_id in new_async_requests.loading_ids:
+                continue
+
+            is_new = req.request_id not in self.requests
+
+            request_data = self.requests[req.request_id].update_and_build_data(
+                req, kv_cache_manager)
+
+            if is_new:
+                scheduler_output.new_requests.append(request_data)
+            else:
+                scheduler_output.cached_requests.append(request_data)
+
+        for req in scheduled_batch.generation_requests:
+            request_data = self.requests[req.request_id].update_and_build_data(
+                req, kv_cache_manager)
+
+            scheduler_output.cached_requests.append(request_data)
+
+        return scheduler_output
+
+
 class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
     """
     The KvCacheConnectorManager is used to manager connector-related state.
@@ -306,7 +348,11 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         # Requests that have been returned from get_finished locally, but haven't yet been returned by all workers.
         self.local_finished_async_requests = AsyncRequests(dict(), dict())
 
+        # Requests that have finished loading asynchronously.
+        self.finished_async_loading_requests = dict()
+
         self._scheduler_output = None
+        self.scheduler_output_manager = KvCacheConnectorSchedulerOutputManager()
 
     def _run_on_leader(self, f: Callable[[], Any]) -> Any:
         """
@@ -339,6 +385,15 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
 
         return num_tokens
 
+    def should_add_sequence(self, request: LlmRequest) -> bool:
+        req_id = request.request_id
+        return req_id not in self.finished_async_loading_requests
+
+    def build_scheduler_output(self, scheduled_batch: ScheduledRequests,
+                               kv_cache_manager: "KVCacheManager"):
+        self._scheduler_output = self.scheduler_output_manager.build_scheduler_output(
+            scheduled_batch, self.new_async_requests, kv_cache_manager)
+
     def take_scheduled_requests_pending_load(
             self, scheduled_requests: ScheduledRequests):
         """
@@ -358,6 +413,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             # we also need to update it's state.
             if req.request_id in self.new_async_requests.loading.keys():
                 req.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+                self.new_async_requests.loading[req.request_id] = req
             else:
                 allowed_context_requests.append(req)
 
@@ -383,6 +439,9 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         Returns:
             Whether the request is performing asynchronous saving operations. If true, we do not immediately call free_resources on the request.
         """
+
+        if req.request_id in self.finished_async_loading_requests:
+            del self.finished_async_loading_requests[req.request_id]
 
         saving_async = self._run_on_leader(
             lambda: self.scheduler.request_finished(req, cache_block_ids))
@@ -438,8 +497,9 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             intersect_finished_saving, intersect_finished_loading)
 
         # For requests that have finished loading, move them back to the context state.
-        for req in all_finished.loading.values():
+        for id, req in all_finished.loading.items():
             req.state = LlmRequestState.CONTEXT_INIT
+            self.finished_async_loading_requests[id] = req
 
         # Return the requests that have finished saving.
         # The execution loop will call _terminate_request on these requests.

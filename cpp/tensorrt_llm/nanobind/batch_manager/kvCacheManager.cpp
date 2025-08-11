@@ -110,9 +110,11 @@ public:
     }
 
     void addSequence(tb::LlmRequest::RequestIdType requestId, SizeType32 inputLength, SizeType32 beamWidth,
-        tensorrt_llm::common::OptionalRef<tb::LlmRequest> llmRequest = std::nullopt) override
+        tensorrt_llm::common::OptionalRef<tb::LlmRequest> llmRequest = std::nullopt,
+        tensorrt_llm::common::OptionalRef<tb::kv_connector::KvCacheConnectorManager> kvCacheConnectorManager
+        = std::nullopt) override
     {
-        NB_OVERRIDE_PURE(addSequence, requestId, inputLength, beamWidth, llmRequest);
+        NB_OVERRIDE_PURE(addSequence, requestId, inputLength, beamWidth, llmRequest, kvCacheConnectorManager);
     }
 
     void removeSequence(tb::LlmRequest::RequestIdType requestId,
@@ -346,7 +348,9 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
         .def("get_needed_blocks_one_step", &BaseKVCacheManager::getNeededBlocksOneStep)
         .def("get_remaining_blocks_to_completion", &BaseKVCacheManager::getRemainingBlocksToCompletion)
         .def("add_token", &BaseKVCacheManager::addToken)
-        .def("add_sequence", &BaseKVCacheManager::addSequence)
+        .def("add_sequence", &BaseKVCacheManager::addSequence, nb::arg("request_id"), nb::arg("input_length"),
+            nb::arg("beam_width"), nb::arg("llm_request") = std::nullopt,
+            nb::arg("kv_cache_connector_manager") = std::nullopt)
         .def("remove_sequence", &BaseKVCacheManager::removeSequence)
         .def("scheduling_remove_sequence", &BaseKVCacheManager::schedulingRemoveSequence)
         .def("get_block_pool_pointers",
@@ -380,6 +384,7 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
                 auto pool_layer_idx = self.getPoolLayerIdx(layer_idx);
                 return pool.index({torch::indexing::Slice(), pool_layer_idx});
             })
+        .def("get_unique_primary_pool", [](tbk::BaseKVCacheManager& self) { return self.getUniquePrimaryPool(); })
         .def("get_block_offsets_of_batch",
             [](tbk::BaseKVCacheManager& self, at::Tensor output, SizeType32 firstBatchSlotIdx, SizeType32 batchSize,
                 SizeType32 beamWidth)
