@@ -2027,7 +2027,7 @@ class PyTorchModelEngine(ModelEngine):
             self.iter_counter += 1
 
             # 3. Ask the manager to execute the graph
-            graph_output = self.cuda_graph_manager.execute(
+            graph_output = self.cuda_graph_model_engine.execute(
                 batch=padded_requests,
                 inputs=inputs,
                 forward_fn=self._forward_step)
