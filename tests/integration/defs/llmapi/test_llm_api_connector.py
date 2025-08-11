@@ -14,7 +14,6 @@
 # limitations under the License.
 
 import math
-import os
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -54,14 +53,17 @@ def model_with_connector():
         yield model_fn, mock_scheduler, mock_worker
 
 
-# Needed because MagicMocks don't work across processes.
-# TODO(jthomson04): This limits us to testing only TP1 for now.
-os.environ["TLLM_WORKER_USE_SINGLE_PROCESS"] = "1"
+@pytest.fixture(scope="function")
+def enforce_single_worker(monkeypatch):
+    monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
+
+    yield
 
 
 @pytest.mark.threadleak(enabled=False)
 @pytest.mark.parametrize("use_overlap_scheduler", [True, False])
-def test_connector_simple(model_with_connector, use_overlap_scheduler):
+def test_connector_simple(enforce_single_worker, model_with_connector,
+                          use_overlap_scheduler):
     NUM_TOKENS = 8
 
     model_fn, scheduler, worker = model_with_connector
@@ -134,7 +136,8 @@ def test_connector_simple(model_with_connector, use_overlap_scheduler):
 
 @pytest.mark.threadleak(enabled=False)
 @pytest.mark.parametrize("use_overlap_scheduler", [True, False])
-def test_connector_async_onboard(model_with_connector, use_overlap_scheduler):
+def test_connector_async_onboard(enforce_single_worker, model_with_connector,
+                                 use_overlap_scheduler):
     NUM_TOKENS = 8
 
     model_fn, scheduler, worker = model_with_connector
@@ -162,7 +165,8 @@ def test_connector_async_onboard(model_with_connector, use_overlap_scheduler):
 
 @pytest.mark.threadleak(enabled=False)
 @pytest.mark.parametrize("use_overlap_scheduler", [True, False])
-def test_connector_async_save(model_with_connector, use_overlap_scheduler):
+def test_connector_async_save(enforce_single_worker, model_with_connector,
+                              use_overlap_scheduler):
     NUM_TOKENS = 8
 
     model_fn, scheduler, worker = model_with_connector
@@ -202,7 +206,7 @@ def test_connector_async_save(model_with_connector, use_overlap_scheduler):
 
 @pytest.mark.threadleak(enabled=False)
 @pytest.mark.parametrize("use_overlap_scheduler", [True, False])
-def test_connector_scheduler_output(model_with_connector,
+def test_connector_scheduler_output(enforce_single_worker, model_with_connector,
                                     use_overlap_scheduler):
     NUM_INPUT_TOKENS = 48
     NUM_TOKENS = 32
@@ -271,7 +275,8 @@ def test_connector_scheduler_output(model_with_connector,
 
 @pytest.mark.threadleak(enabled=False)
 @pytest.mark.parametrize("use_overlap_scheduler", [True, False])
-def test_connector_scheduler_output_chunked_context(model_with_connector,
+def test_connector_scheduler_output_chunked_context(enforce_single_worker,
+                                                    model_with_connector,
                                                     use_overlap_scheduler):
     model_fn, scheduler, worker = model_with_connector
 

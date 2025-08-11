@@ -417,7 +417,7 @@ class KVCacheManager(BaseResourceManager):
                             req_beam_width, req, None)
                 else:
                     if req.is_first_context_chunk and self._kv_connector_should_add_sequence(
-                        req):
+                            req):
                         self.impl.add_sequence(req.py_request_id,
                                                req.prompt_len, req_beam_width,
                                                req, self.kv_connector_manager)

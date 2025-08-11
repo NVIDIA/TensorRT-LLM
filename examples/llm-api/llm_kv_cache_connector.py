@@ -7,9 +7,8 @@ from tempfile import TemporaryDirectory
 import torch
 
 from tensorrt_llm import LLM, SamplingParams, logger
-from tensorrt_llm._torch.pyexecutor.connector import (KvCacheConnectorScheduler,
-                                                      KvCacheConnectorWorker,
-                                                      SchedulerOutput)
+from tensorrt_llm._torch.pyexecutor.kv_cache_connector import (
+    KvCacheConnectorScheduler, KvCacheConnectorWorker, SchedulerOutput)
 from tensorrt_llm.bindings.executor import ExecutorConfig
 from tensorrt_llm.bindings.internal.batch_manager import LlmRequest
 from tensorrt_llm.llmapi.llm_args import KvCacheConnectorConfig
@@ -204,7 +203,8 @@ if __name__ == "__main__":
     model = LLM(model="Qwen/Qwen2-0.5B",
                 backend="pytorch",
                 cuda_graph_config=None,
-                connector_config=connector_config)
+                connector_config=connector_config,
+                use_torch_sampler=True)
 
     test_text = (
         "Nvidia Corporation is an American technology company headquartered in Santa Clara, California."
@@ -215,8 +215,9 @@ if __name__ == "__main__":
     sampling_params = SamplingParams(max_tokens=32)
 
     output = model.generate([test_text], sampling_params)
+    text0 = output[0].outputs[0].text
 
-    print("First output: ", output[0].outputs[0].text)
+    print("First output: ", text0)
     print("Loading new LLM instance...")
 
     del model
@@ -224,9 +225,14 @@ if __name__ == "__main__":
     model = LLM(model="Qwen/Qwen2-0.5B",
                 backend="pytorch",
                 cuda_graph_config=None,
-                connector_config=connector_config)
+                connector_config=connector_config,
+                use_torch_sampler=True)
 
     output = model.generate([test_text], sampling_params)
-    print("Second output (using connector cache): ", output[0].outputs[0].text)
+    text1 = output[0].outputs[0].text
+
+    print("Second output (using connector cache): ", text1)
+
+    assert text0 == text1
 
     connector_cache_dir.cleanup()

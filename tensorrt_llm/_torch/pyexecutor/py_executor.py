@@ -288,6 +288,10 @@ class PyExecutor:
                     "KV Cache Connector is not supported with pipeline parallelism."
                 )
 
+            if self.kv_cache_manager is None:
+                raise ValueError(
+                    "KV Cache Connector requires a KV Cache Manager.")
+
             kv_tensor = self.kv_cache_manager.get_unique_primary_pool()
             self.kv_connector_manager.worker.register_kv_caches(kv_tensor)
 

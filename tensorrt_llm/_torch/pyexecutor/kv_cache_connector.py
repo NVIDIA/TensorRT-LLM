@@ -37,7 +37,7 @@ To implement a custom KV connector, you need to implement both the scheduler and
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Callable, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple
 
 import torch
 
@@ -82,6 +82,7 @@ class KvCacheConnectorWorker(ABC):
 
     def __init__(self, config: ExecutorConfig):
         self._config = config
+        self._metadata = None
         super().__init__()
 
     def bind_connector_meta(self, metadata: object):
@@ -141,7 +142,7 @@ class KvCacheConnectorWorker(ABC):
     @abstractmethod
     def get_finished(
             self, finished_gen_req_ids: List[int],
-            started_loading_req_ids: List[int]) -> tuple[List[int], List[int]]:
+            started_loading_req_ids: List[int]) -> Tuple[List[int], List[int]]:
         """
         Get the requests that have finished loading and saving.
 
@@ -179,7 +180,7 @@ class KvCacheConnectorScheduler(ABC):
     @abstractmethod
     def get_num_new_matched_tokens(
             self, request: LlmRequest,
-            num_computed_tokens: int) -> tuple[int, bool]:
+            num_computed_tokens: int) -> Tuple[int, bool]:
         """
         Get the number of tokens that can be loaded from remote KV cache.
         This does not include the tokens already matched on device (indicated by `num_computed_tokens`).
