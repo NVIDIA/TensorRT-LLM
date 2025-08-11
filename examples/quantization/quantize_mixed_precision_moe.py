@@ -45,10 +45,16 @@ def load_and_preprocess_state_dict(modelopt_state_root, world_size=8):
     state_dict_list = []
     # load amax from state dict
     for rank in range(world_size):
-        state_dict_list.append(
-            torch.load(
-                f"{modelopt_state_root}/amax_dict_rank{rank}-mp{world_size}.pt",
-                map_location="cuda:0"))
+        amax_file = f"{modelopt_state_root}/amax_dict_rank{rank}-mp{world_size}.pt"
+        if os.path.exists(amax_file):
+            state_dict_list.append(torch.load(amax_file, map_location="cuda:0"))
+        else:
+            print(f"WARNING: amax file not found: {amax_file}")
+
+    if not state_dict_list:
+        print("ERROR: No amax files loaded!")
+        return {}
+
     # calculate the max across all TP ranks
     merged_state_dict = state_dict_list[0]
     for rank in range(world_size):
@@ -237,9 +243,10 @@ def main(args):
             # Extract activation scales
             renamed_state_dict = load_and_preprocess_state_dict(
                 modelopt_state_root=args.act_scales, world_size=8)
-            get_scales_from_amax(start_layer=start_layer,
-                                 end_layer=end_layer,
-                                 renamed_state_dict=renamed_state_dict)
+            scales = get_scales_from_amax(start_layer=start_layer,
+                                          end_layer=end_layer,
+                                          renamed_state_dict=renamed_state_dict)
+            new_safetensors.update(scales)
         else:
             input_scales = safe_open(args.act_scales, "pt")
             for k in input_scales.keys():
@@ -259,7 +266,10 @@ def main(args):
         ]
         for name in names:
             shutil.copy(os.path.join(model_dir, name), output_dir)
-        shutil.copy(args.act_scales, output_dir)
+        if os.path.isdir(args.act_scales):
+            shutil.copytree(args.act_scales, output_dir, dirs_exist_ok=True)
+        else:
+            shutil.copy(args.act_scales, output_dir)
 
         # config.json
         del config['quantization_config']
@@ -302,6 +312,15 @@ def main(args):
                   'w') as file:
             json.dump(hf_quant_config, file, indent=4)
     else:
+        if os.path.isdir(args.act_scales):
+            # Extract activation scales
+            renamed_state_dict = load_and_preprocess_state_dict(
+                modelopt_state_root=args.act_scales, world_size=8)
+            scales = get_scales_from_amax(start_layer=start_layer,
+                                          end_layer=end_layer,
+                                          renamed_state_dict=renamed_state_dict)
+            new_safetensors.update(scales)
+
         file_name = get_file_name(start_layer)
         print(f'saving to {file_name}...')
         save_file(new_safetensors, os.path.join(output_dir, file_name))
