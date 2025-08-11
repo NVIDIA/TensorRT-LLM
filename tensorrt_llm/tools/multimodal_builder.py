@@ -25,25 +25,25 @@ from transformers import (AutoConfig, AutoModel, AutoModelForCausalLM,
 import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
-from safetensors.torch import save_file
+from safetensors.torch import load_model, save_file
 from transformers import CLIPImageProcessor
 
 from ..runtime.session import Session
 
 
 def add_multimodal_arguments(parser):
-    parser.add_argument('--model_type',
-                        type=str,
-                        default=None,
-                        choices=[
-                            'blip2', 'llava', 'llava_next', 'llava_onevision',
-                            'llava_onevision_lmms', 'vila', 'nougat', 'cogvlm',
-                            'fuyu', 'pix2struct', 'neva', 'kosmos-2',
-                            'video-neva', 'phi-3-vision', 'phi-4-multimodal',
-                            'mllama', 'internvl', 'qwen2_vl',
-                            'internlm-xcomposer2', 'qwen2_audio', 'pixtral'
-                        ],
-                        help="Model type")
+    parser.add_argument(
+        '--model_type',
+        type=str,
+        default=None,
+        choices=[
+            'blip2', 'llava', 'llava_next', 'llava_onevision',
+            'llava_onevision_lmms', 'vila', 'nougat', 'cogvlm', 'fuyu',
+            'pix2struct', 'neva', 'kosmos-2', 'video-neva', 'phi-3-vision',
+            'phi-4-multimodal', 'mllama', 'internvl', 'qwen2_vl',
+            'internlm-xcomposer2', 'qwen2_audio', 'pixtral', 'eclair'
+        ],
+        help="Model type")
     parser.add_argument(
         '--model_path',
         type=str,
@@ -144,6 +144,8 @@ class MultimodalEngineBuilder:
             build_qwen2_audio_engine(args)
         elif args.model_type == "pixtral":
             build_pixtral_engine(args)
+        elif args.model_type == "eclair":
+            build_eclair_engine(args)
         else:
             raise RuntimeError(f"Invalid model type {args.model_type}")
 
@@ -1739,3 +1741,78 @@ def build_pixtral_engine(args):
         max_batch_size=args.max_batch_size,
         engine_name=f"model.engine",
         dtype=torch.bfloat16)
+
+
+def build_eclair_engine(args):
+
+    class RadioWithNeck(torch.nn.Module):
+
+        def __init__(self):
+            super().__init__()
+
+            try:
+                self.model_encoder = torch.hub.load("NVlabs/RADIO",
+                                                    "radio_model",
+                                                    version="radio_v2.5-h")
+            except Exception as e:
+                raise RuntimeError(
+                    f"Failed to load RADIO model from torch.hub: {e}")
+            self.model_encoder.summary_idxs = torch.tensor(4)
+
+            self.conv1 = torch.nn.Conv1d(1280, 1024, 1)
+            self.layer_norm1 = torch.nn.LayerNorm(1024,
+                                                  eps=1e-6,
+                                                  elementwise_affine=True)
+            self.conv2 = torch.nn.Conv2d(1024,
+                                         1024,
+                                         kernel_size=(1, 4),
+                                         stride=(1, 4),
+                                         padding=0,
+                                         bias=False)
+            self.layer_norm2 = torch.nn.LayerNorm(1024,
+                                                  eps=1e-6,
+                                                  elementwise_affine=True)
+
+        @torch.no_grad
+        def forward(self, pixel_values):
+            _, feature = self.model_encoder(pixel_values)
+            output = self.conv1(feature.permute(0, 2, 1)).permute(0, 2, 1)
+            output = self.layer_norm1(output).permute(0, 2, 1)
+
+            b, d, _ = output.shape
+            h = pixel_values.shape[-2] // 16
+            w = pixel_values.shape[-1] // 16
+            output = self.conv2(output.reshape(b, d, h, w))
+            output = output.flatten(-2, -1).permute(0, 2, 1)
+            output = self.layer_norm2(output)
+            return output
+
+    processor = NougatProcessor.from_pretrained(args.model_path)
+    model = VisionEncoderDecoderModel.from_pretrained("facebook/nougat-base")
+    model.encoder = RadioWithNeck()
+    model.decoder.resize_token_embeddings(len(processor.tokenizer))
+    model.config.decoder_start_token_id = processor.tokenizer.eos_token_id  # 2
+    model.config.pad_token_id = processor.tokenizer.pad_token_id  # 1
+    checkpoint_path = os.path.join(args.model_path, "model.safetensors")
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(
+            f"Model checkpoint not found at {checkpoint_path}")
+    load_model(model, checkpoint_path)
+
+    wrapper = model.encoder.to(args.device)
+    # temporary fix due to TRT onnx export bug
+    for block in wrapper.model_encoder.model.blocks:
+        block.attn.fused_attn = False
+
+    image = torch.randn((1, 3, 2048, 1648),
+                        device=args.device,
+                        dtype=torch.bfloat16)
+    export_onnx(wrapper, image, f'{args.output_dir}/onnx')
+    build_trt_engine(
+        args.model_type,
+        [image.shape[1], image.shape[2], image.shape[3]],  # [3, H, W]
+        f'{args.output_dir}/onnx',
+        args.output_dir,
+        args.max_batch_size,
+        dtype=torch.bfloat16,
+        engine_name='visual_encoder.engine')

@@ -319,6 +319,7 @@ class KvCacheCreator:
                 dtype=kv_cache_dtype,
                 spec_config=spec_config,
                 max_beam_width=executor_config.max_beam_width,
+                is_draft=model_engine.is_draft_model,
                 kv_connector_manager=self._kv_connector_manager
                 if not estimating_kv_cache else None,
             )
@@ -342,6 +343,7 @@ class KvCacheCreator:
             mamba_layer_mask = [
                 char == "M" for char in config.hybrid_override_pattern
             ]
+
             kv_cache_manager = MambaHybridCacheManager(
                 # mamba cache parameters
                 config.ssm_state_size,
@@ -352,6 +354,8 @@ class KvCacheCreator:
                 mamba_num_layers,
                 mamba_layer_mask,
                 config.torch_dtype,
+                model_engine.model.model_config.quant_config.
+                mamba_ssm_cache_dtype,
                 # kv cache parameters
                 executor_config.kv_cache_config,
                 tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
@@ -389,6 +393,7 @@ class KvCacheCreator:
                 max_num_tokens=executor_config.max_num_tokens,
                 model_config=binding_model_config,
                 max_beam_width=executor_config.max_beam_width,
+                is_draft=model_engine.is_draft_model,
                 kv_connector_manager=self._kv_connector_manager
                 if not estimating_kv_cache else None,
             )

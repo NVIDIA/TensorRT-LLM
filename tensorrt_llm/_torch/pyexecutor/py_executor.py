@@ -17,7 +17,8 @@ try:
 except ImportError:
     from cuda import cudart
 
-from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
+from tensorrt_llm._torch.pyexecutor.resource_manager import (
+    ResourceManagerType, request_context)
 from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
 from tensorrt_llm._utils import (customized_gc_thresholds, global_mpi_rank,
                                  is_trace_enabled, nvtx_range, trace_func)
@@ -994,11 +995,14 @@ class PyExecutor:
                         self.enable_attention_dp and self.dist.tp_size > 1):
 
                     if self.drafter is not None and self.use_spec_decode:
-                        if self.guided_decoder is not None:
-                            self.guided_decoder.rollback_rejected_tokens(
-                                scheduled_batch)
-                        self.drafter.prepare_draft_tokens(
-                            scheduled_batch, self.resource_manager)
+                        with request_context(
+                                is_draft=True,
+                                scheduled_requests=scheduled_batch):
+                            if self.guided_decoder is not None:
+                                self.guided_decoder.rollback_rejected_tokens(
+                                    scheduled_batch)
+                            self.drafter.prepare_draft_tokens(
+                                scheduled_batch, self.resource_manager)
 
                     batch_outputs = self._forward_step(scheduled_batch)
                     self._execute_guided_decoder(scheduled_batch,

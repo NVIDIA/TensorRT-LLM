@@ -1005,6 +1005,14 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
     dtype: str = Field(default="auto",
                        description="The data type to use for the KV cache.")
 
+    # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
+    mamba_ssm_cache_dtype: Literal[
+        "auto", "float16", "bfloat16", "float32"] = Field(
+            default="auto",
+            description=
+            "The data type to use for the Mamba SSM cache. If set to 'auto', the data type will be inferred from the model config."
+        )
+
     def _to_pybind(self):
         return _KvCacheConfig(
             enable_block_reuse=self.enable_block_reuse,
@@ -1325,6 +1333,10 @@ class BaseLlmArgs(StrictBaseModel):
         validate_default=True,
         status="deprecated",
     )
+
+    return_perf_metrics: bool = Field(default=False,
+                                      description="Return perf metrics.",
+                                      status="prototype")
 
     _parallel_config: Optional[object] = PrivateAttr(default=None)
     _model_format: Optional[_ModelFormatKind] = PrivateAttr(default=None)
@@ -2348,6 +2360,7 @@ class TorchLlmArgs(BaseLlmArgs):
             enable_mixed_sampler=self.enable_mixed_sampler,
             use_torch_sampler=self.use_torch_sampler,
             kv_cache_dtype=self.kv_cache_config.dtype,
+            mamba_ssm_cache_dtype=self.kv_cache_config.mamba_ssm_cache_dtype,
             enable_iter_perf_stats=self.enable_iter_perf_stats,
             enable_iter_req_stats=self.enable_iter_req_stats,
             print_iter_log=self.print_iter_log,
