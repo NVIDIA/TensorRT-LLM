@@ -9,7 +9,7 @@ context_servers:
   tensor_parallel_size: 1
   pipeline_parallel_size: 1
   cache_transceiver_config:
-    backend: "default"
+    backend: "DEFAULT"
   urls:
     - "localhost:8001"
 generation_servers:
@@ -17,7 +17,7 @@ generation_servers:
   tensor_parallel_size: 1
   pipeline_parallel_size: 1
   cache_transceiver_config:
-    backend: "default"
+    backend: "DEFAULT"
   urls:
     - "localhost:8002"
   speculative_config:

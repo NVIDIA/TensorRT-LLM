@@ -12,24 +12,39 @@ cache_transceiver_config:
   max_tokens_in_buffer: <int>
 ```
 
-`backend` specifies the communication backend for transferring the kvCache, valid options include `DEFAULT`,`UCX`, `NIXL`, and `MPI`, the default backend is UCX.
+`backend` specifies the communication backend for transferring the KV cache, valid options include `DEFAULT`, `UCX`, `NIXL`, and `MPI`, the default backend is `UCX`.
 
-`max_tokens_in_buffer` defines the buffer size for kvCache transfers, it is recommended to set this value greater than or equal to the maximum ISL (Input Sequence Length) of all requests for optimal performance.
+`max_tokens_in_buffer` defines the buffer size for KV cache transfers, it is recommended to set this value greater than or equal to the maximum ISL (Input Sequence Length) of all requests for optimal performance.
 
-You can use multiple `trtllm-serve` commands to launch the context and generation servers that will be used
-for disaggregated serving. For example, you could launch two context servers and one generation servers as follows:
+You can use multiple `trtllm-serve` commands to launch the context and generation servers required for disaggregated serving. For instance, you might start two context servers and one generation server as shown below.
+
+Begin by creating `ctx_extra-llm-api-config.yml` and `gen_extra-llm-api-config.yml` following the specified format.
+
+```yaml
+# ctx_extra-llm-api-config.yml
+
+# The overlap scheduler for context servers is currently disabled, as it is
+# not yet supported in disaggregated context server architectures.
+disable_overlap_scheduler: True
+cache_transceiver_config:
+  backend: UCX
+  max_tokens_in_buffer: 2048
+```
+
+```yaml
+# gen_extra-llm-api-config.yml
+
+cache_transceiver_config:
+  backend: UCX
+  max_tokens_in_buffer: 2048
+```
+
+Then, start the context and generation servers separately.
 
 ```bash
-# Generate context_extra-llm-api-config.yml
-# Overlap scheduler for context servers are disabled because it's not supported for disaggregated context servers yet
-echo -e "disable_overlap_scheduler: True\ncache_transceiver_config:\n  backend: UCX\n  max_tokens_in_buffer: 2048" > context_extra-llm-api-config.yml
-
 # Start context servers
-CUDA_VISIBLE_DEVICES=0 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8001  --extra_llm_api_options ./context_extra-llm-api-config.yml &> log_ctx_0 &
-CUDA_VISIBLE_DEVICES=1 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8002  --extra_llm_api_options ./context_extra-llm-api-config.yml &> log_ctx_1 &
-
-# Generate gen_extra-llm-api-config.yml
-echo -e "cache_transceiver_config:\n  backend: UCX\n  max_tokens_in_buffer: 2048" > gen_extra-llm-api-config.yml
+CUDA_VISIBLE_DEVICES=0 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8001  --extra_llm_api_options ./ctx_extra-llm-api-config.yml &> log_ctx_0 &
+CUDA_VISIBLE_DEVICES=1 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8002  --extra_llm_api_options ./ctx_extra-llm-api-config.yml &> log_ctx_1 &
 
 # Start generation servers
 CUDA_VISIBLE_DEVICES=2 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8003  --extra_llm_api_options ./gen_extra-llm-api-config.yml &> log_gen_0 &
@@ -95,8 +110,8 @@ After this, you can enable the dynamic scaling feature for the use case above as
 export TRTLLM_USE_UCX_KVCACHE=1
 
 # Context servers
-CUDA_VISIBLE_DEVICES=0 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8001  --server_role CONTEXT --extra_llm_api_options ./context_extra-llm-api-config.yml --metadata_server_config_file ./metadata_config.yml &> log_ctx_0 &
-CUDA_VISIBLE_DEVICES=1 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8002  --server_role CONTEXT --extra_llm_api_options ./context_extra-llm-api-config.yml --metadata_server_config_file ./metadata_config.yml &> log_ctx_1 &
+CUDA_VISIBLE_DEVICES=0 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8001  --server_role CONTEXT --extra_llm_api_options ./ctx_extra-llm-api-config.yml --metadata_server_config_file ./metadata_config.yml &> log_ctx_0 &
+CUDA_VISIBLE_DEVICES=1 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8002  --server_role CONTEXT --extra_llm_api_options ./ctx_extra-llm-api-config.yml --metadata_server_config_file ./metadata_config.yml &> log_ctx_1 &
 
 # Generation servers
 CUDA_VISIBLE_DEVICES=2 trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8003  --server_role GENERATION --extra_llm_api_options ./gen_extra-llm-api-config.yml --metadata_server_config_file ./metadata_config.yml &> log_gen_0 &
@@ -180,4 +195,4 @@ trtllm-serve disaggregated -c disagg_config.yaml
 
 ## Know Issues
 
-The MPI communication backend for kvCache transfer has been deprecated and may not be supported in the future. When using the MPI backend, the environment variable `TRTLLM_USE_MPI_KVCACHE=1` should be set to avoid conflicts between mpi4py and kvCache transfer.
+The MPI communication backend for KV cache transfer has been deprecated and may not be supported in the future. When using the MPI backend, the environment variable `TRTLLM_USE_MPI_KVCACHE=1` should be set to avoid conflicts between mpi4py and KV cache transfer.
