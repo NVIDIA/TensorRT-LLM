@@ -671,6 +671,7 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     @pytest.mark.parametrize("overlap_scheduler", [False, True])
+    @skip_pre_hopper
     def test_auto_dtype(self, overlap_scheduler):
         ctx_server_config = {
             "disable_overlap_scheduler": True,
