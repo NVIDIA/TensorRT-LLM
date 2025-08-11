@@ -7,8 +7,8 @@ from difflib import SequenceMatcher
 import torch
 
 from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import CpType
-from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
 
 def dump_jsonl(data, fname):
@@ -56,9 +56,7 @@ def similarity_score(a, b):
 
 # Generate the outputs using either TRT or PyTorch (based on the use_pytorch argument). It’s the same function for both workflows.
 def generate_llm_outputs(args, data, fp8=False, fp8_kv_cache=False):
-    quant_config = QuantConfig(quant_algo=QuantAlgo.FP8,
-                               kv_cache_quant_algo=QuantAlgo.FP8 if fp8_kv_cache
-                               else None) if fp8 else QuantConfig()
+    kv_cache_config = KvCacheConfig(dtype="fp8" if fp8_kv_cache else "auto")
     cp_config = {
         "cp_type": CpType.STAR,
         "cp_anchor_size": args.sa_anchor_size,
@@ -70,7 +68,7 @@ def generate_llm_outputs(args, data, fp8=False, fp8_kv_cache=False):
               max_input_len=args.max_input_len,
               max_seq_len=args.max_seq_len,
               max_num_tokens=args.max_num_tokens,
-              quant_config=quant_config,
+              kv_cache_config=kv_cache_config,
               tensor_parallel_size=1,
               context_parallel_size=args.num_procs,
               cp_config=cp_config,
