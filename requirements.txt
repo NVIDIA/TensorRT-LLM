@@ -29,6 +29,8 @@ nvidia-modelopt[torch]~=0.33.0
 nvidia-nccl-cu12
 nvidia-cuda-nvrtc-cu12
 transformers==4.55.0
+prometheus_client
+prometheus_fastapi_instrumentator
 pydantic>=2.9.1
 pydantic-settings[yaml]
 omegaconf

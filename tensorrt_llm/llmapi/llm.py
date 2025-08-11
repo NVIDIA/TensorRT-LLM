@@ -405,13 +405,12 @@ class BaseLLM:
                         'multimodal_input'),
                     multimodal_data=extra_processed_inputs.get(
                         'multimodal_data'))
-                # Convert to shared tensor handle to reduce IPC overhead
-                # for values with non-selected keys, it's no-op
-                multimodal_params.to_handle("multimodal_data",
-                                            key="multimodal_embedding")
                 # Only pass it if it has content
                 if not multimodal_params.has_content():
                     multimodal_params = None
+                else:
+                    # Convert to shared tensor handle to reduce IPC overhead
+                    multimodal_params.to_handle("multimodal_data")
         else:
             raise TypeError(
                 f"The inputs must be type str or list of int, but got {type(inputs)}"
@@ -550,7 +549,7 @@ class BaseLLM:
         if sampling_params._stream_interval is None:
             sampling_params._stream_interval = getattr(self.args,
                                                        "stream_interval", 1)
-
+        sampling_params.return_perf_metrics = sampling_params.return_perf_metrics or self.args.return_perf_metrics
         return sampling_params
 
     def _check_arguments(self, prompt_len: int, query_len: int,

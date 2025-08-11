@@ -22,7 +22,8 @@ from tensorrt_llm._torch.speculative import (
     get_num_extra_kv_tokens, update_spec_config_from_model_config)
 from tensorrt_llm._torch.speculative.mtp import SampleStateTensorsMTP
 from tensorrt_llm._utils import (is_trace_enabled, nvtx_range, release_gc,
-                                 torch_dtype_to_str, trace_func)
+                                 str_dtype_to_torch, torch_dtype_to_str,
+                                 trace_func)
 from tensorrt_llm.inputs.multimodal import (MultimodalParams,
                                             MultimodalRuntimeData)
 from tensorrt_llm.logger import logger
@@ -96,6 +97,16 @@ _KV_CACHE_MAP = {
     "auto": "auto"
 }
 _VALID_KV_CACHE_DTYPES = ("fp8", "auto")
+
+
+def validate_and_set_mamba_ssm_cache_dtype(config: ModelConfig,
+                                           mamba_ssm_cache_dtype: str) -> None:
+    if mamba_ssm_cache_dtype == "auto":
+        mamba_ssm_cache_dtype = config.pretrained_config.torch_dtype
+    else:
+        mamba_ssm_cache_dtype = str_dtype_to_torch(mamba_ssm_cache_dtype)
+
+    config.quant_config.mamba_ssm_cache_dtype = mamba_ssm_cache_dtype
 
 
 def validate_and_set_kv_cache_quant(model_config: ModelConfig,
@@ -726,8 +737,11 @@ class PyTorchModelEngine(ModelEngine):
             # For non-draft model, we also capture the CUDA graph instance for draft length 0,
             # so that when we disable spec decode at runtime, we can still run the captured graph.
             # Note that for one engine mode, we are not able to turn off spec decode at runtime.
-            if not self.is_draft_model and self.max_draft_len > 0 and not self.spec_config.spec_dec_mode.use_one_engine(
-            ):
+            if (not self.is_draft_model and self.max_draft_len > 0
+                    and not self.spec_config.spec_dec_mode.use_one_engine()
+                    # Assume that speculation is always on if the user didn't give us a max_concurrency
+                    # value. This will save on memory.
+                    and self.spec_config.max_concurrency is not None):
                 draft_lengths.append(0)
 
             for bs in cuda_graph_batch_sizes:
@@ -1019,6 +1033,9 @@ class PyTorchModelEngine(ModelEngine):
 
         validate_and_set_kv_cache_quant(
             config, self.pytorch_backend_config.kv_cache_dtype)
+        validate_and_set_mamba_ssm_cache_dtype(
+            config, self.pytorch_backend_config.mamba_ssm_cache_dtype)
+
         num_layers = int(os.environ.get("TLLM_OVERRIDE_LAYER_NUM", "0"))
         if num_layers > 0:
             config.pretrained_config.num_hidden_layers = num_layers
@@ -1062,7 +1079,7 @@ class PyTorchModelEngine(ModelEngine):
                 else:
                     weights = checkpoint_loader.load_weights(checkpoint_dir)
 
-                weight_mapper = checkpoint_loader.get_initilized_weight_mapper(
+                weight_mapper = checkpoint_loader.get_initialized_weight_mapper(
                     model, config)
                 self._call_load_weights(model.load_weights, weights,
                                         weight_mapper)
@@ -1227,11 +1244,13 @@ class PyTorchModelEngine(ModelEngine):
             multimodal_params = MultimodalParams(
                 multimodal_data=request.py_multimodal_data,
                 multimodal_runtime=py_multimodal_runtime)
-            multimodal_params.to_device("multimodal_data",
-                                        "cuda",
-                                        pin_memory=True)
 
             if multimodal_params.has_content():
+                multimodal_params.to_device("multimodal_data",
+                                            "cuda",
+                                            pin_memory=True)
+                #re-assign the multimodal_data to the request after to_device for generation requests
+                request.py_multimodal_data = multimodal_params.multimodal_data
                 multimodal_params_list.append(multimodal_params)
 
             request.py_batch_idx = request.py_seq_slot
@@ -1265,10 +1284,12 @@ class PyTorchModelEngine(ModelEngine):
             multimodal_params = MultimodalParams(
                 multimodal_data=request.py_multimodal_data)
             multimodal_params.strip_for_generation()
-            multimodal_params.to_device("multimodal_data",
-                                        "cuda",
-                                        pin_memory=True)
             if multimodal_params.has_content():
+                multimodal_params.to_device("multimodal_data",
+                                            "cuda",
+                                            pin_memory=True)
+                # re-assign the multimodal_data to the request after strip_for_generation for another generation request,
+                request.py_multimodal_data = multimodal_params.multimodal_data
                 multimodal_params_list.append(multimodal_params)
         extend_requests += extend_dummy_requests
 
