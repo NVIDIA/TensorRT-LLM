@@ -431,9 +431,9 @@ void launchLocalSendRecv(FusedMoeFieldInfo const& sendFieldInfo, FusedMoeFieldIn
     int tokenCount, int warpsPerBlock, int blockChannelCount, bool hasBasicFields, cudaStream_t stream);
 
 void launchLocalFifoSendRecv(FusedMoeFieldInfo const& sendFieldInfo, FusedMoeFieldInfo const& recvFieldInfo,
-    MoeExpertParallelInfo const& expertParallelInfo, int* recvIndexMapping, FusedMoeWorkspace fusedMoeWorkspace,
-    int tokenCount, int warpsPerBlock, int blockChannelCount, bool hasBasicFields, bool useSimpleProto,
-    cudaStream_t stream);
+    MoeExpertParallelInfo const& expertParallelInfo, int* sendIndexMapping, int* recvIndexMapping,
+    FusedMoeWorkspace fusedMoeWorkspace, int tokenCount, int warpsPerBlock, int blockChannelCount, bool hasBasicFields,
+    bool useSimpleProto, cudaStream_t stream);
 
 } // namespace fused_moe_comm_tests
 

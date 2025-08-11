@@ -771,7 +771,7 @@ public:
         __syncwarp();
     }
 
-    __device__ __forceinline__ void doSend(int tokenCount)
+    __device__ __forceinline__ void doSend(int tokenCount, int* sendIndexMapping)
     {
         senderInitFifo();
 
@@ -787,7 +787,7 @@ public:
 #endif
         for (; sendIndex < tokenCount; sendIndex += mPairInfo.runChannelCount)
         {
-            int tokenIndex = sendIndex;
+            int tokenIndex = sendIndexMapping == nullptr ? sendIndex : sendIndexMapping[sendIndex];
 #ifdef DEBUG_PRINT
             if (mLaneId == 0)
             {
@@ -885,7 +885,7 @@ public:
         bool needRelease = false;
         for (; recvIndex < tokenCount; recvIndex += mPairInfo.runChannelCount)
         {
-            int tokenIndex = recvIndexMapping[recvIndex];
+            int tokenIndex = recvIndexMapping == nullptr ? recvIndex : recvIndexMapping[recvIndex];
             int loaded128ByteCount = 0;
 #ifdef DEBUG_PRINT
             if (mLaneId == 0)
@@ -1525,7 +1525,7 @@ void launchLocalSendRecv(FusedMoeFieldInfo const& sendFieldInfo, FusedMoeFieldIn
 template <bool HAS_BASIC_FIELD = true, bool USE_SIMPLE_PROTO = false>
 __global__ void localFifoSendRecvKernel(FusedMoeFieldInfo sendFieldInfo, FusedMoeFieldInfo recvFieldInfo,
     MoeExpertParallelInfo expertParallelInfo, MoeSingleCommMeta sendCommMeta, MoeSingleCommMeta recvCommMeta,
-    FusedMoeWorkspace fusedMoeWorkspace, int* recvIndexMapping, int tokenCount)
+    FusedMoeWorkspace fusedMoeWorkspace, int* sendIndexMapping, int* recvIndexMapping, int tokenCount)
 {
     __shared__ uint64_t allWarpSmemBar[32];
     extern __shared__ int4 allWarpShm[];
@@ -1550,7 +1550,7 @@ __global__ void localFifoSendRecvKernel(FusedMoeFieldInfo sendFieldInfo, FusedMo
             sendFieldInfo, expertParallelInfo, sendCommMeta, fusedMoeWorkspace, worldInfo, pairInfo,
             &allWarpSmemBar[warpId],
             reinterpret_cast<uint8_t*>(&allWarpShm[0]) + warpId * sendCommMeta.singleUnpackedAlignedSize);
-        senderComm.doSend(tokenCount);
+        senderComm.doSend(tokenCount, sendIndexMapping);
     }
     else
     {
@@ -1563,9 +1563,9 @@ __global__ void localFifoSendRecvKernel(FusedMoeFieldInfo sendFieldInfo, FusedMo
 }
 
 void launchLocalFifoSendRecv(FusedMoeFieldInfo const& sendFieldInfo, FusedMoeFieldInfo const& recvFieldInfo,
-    MoeExpertParallelInfo const& expertParallelInfo, int* recvIndexMapping, FusedMoeWorkspace fusedMoeWorkspace,
-    int tokenCount, int warpsPerBlock, int blockChannelCount, bool hasBasicFields, bool useSimpleProto,
-    cudaStream_t stream)
+    MoeExpertParallelInfo const& expertParallelInfo, int* sendIndexMapping, int* recvIndexMapping,
+    FusedMoeWorkspace fusedMoeWorkspace, int tokenCount, int warpsPerBlock, int blockChannelCount, bool hasBasicFields,
+    bool useSimpleProto, cudaStream_t stream)
 {
     int warpSendShmSize = sendFieldInfo.computeSingleWarpShmSize(
         expertParallelInfo.topK, sendFieldInfo.expertScales != nullptr, hasBasicFields);
@@ -1607,7 +1607,8 @@ void launchLocalFifoSendRecv(FusedMoeFieldInfo const& sendFieldInfo, FusedMoeFie
     TLLM_CUDA_CHECK(
         cudaFuncSetAttribute(kernelFn, cudaFuncAttributeMaxDynamicSharedMemorySize, warpShmSize * warpsPerBlock));
     kernelFn<<<gridDim, blockDim, warpShmSize * warpsPerBlock, stream>>>(sendFieldInfo, recvFieldInfo,
-        expertParallelInfo, sendCommMeta, recvCommMeta, fusedMoeWorkspace, recvIndexMapping, tokenCount);
+        expertParallelInfo, sendCommMeta, recvCommMeta, fusedMoeWorkspace, sendIndexMapping, recvIndexMapping,
+        tokenCount);
     TLLM_CUDA_CHECK(cudaGetLastError());
 }
 
