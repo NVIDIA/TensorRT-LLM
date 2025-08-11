@@ -11,7 +11,9 @@ import torch
 import tensorrt_llm
 from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
 from tensorrt_llm._utils import get_sm_version
-from tensorrt_llm.bindings.executor import ContextChunkingPolicy, ExecutorConfig
+from tensorrt_llm.bindings.executor import (CapacitySchedulerPolicy,
+                                            ContextChunkingPolicy,
+                                            ExecutorConfig)
 from tensorrt_llm.bindings.internal.batch_manager import ContextChunkingConfig
 from tensorrt_llm.llmapi.llm_args import KvCacheConnectorConfig
 from tensorrt_llm.logger import logger
@@ -370,6 +372,12 @@ def create_py_executor(
         if pytorch_backend_config.use_cuda_graph:
             raise NotImplementedError(
                 "CUDA graphs are not supported with KV connector hooks.")
+
+        if executor_config.scheduler_config.capacity_scheduler_policy != CapacitySchedulerPolicy.GUARANTEED_NO_EVICT:
+            raise NotImplementedError(
+                "KV connector is only supported with guaranteed no evict scheduler policy."
+            )
+
         try:
             module = importlib.import_module(
                 kv_connector_config.connector_module)

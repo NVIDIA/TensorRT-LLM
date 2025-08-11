@@ -37,7 +37,8 @@ To implement a custom KV connector, you need to implement both the scheduler and
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple
+from typing import (TYPE_CHECKING, Any, Callable, Dict, List, Optional, Set,
+                    Tuple)
 
 import torch
 
@@ -212,8 +213,8 @@ class KvCacheConnectorScheduler(ABC):
 # An internal dataclass to handle async saving/loading requests.
 @dataclass
 class AsyncRequests:
-    saving: dict[int, LlmRequest]
-    loading: dict[int, LlmRequest]
+    saving: Dict[int, LlmRequest]
+    loading: Dict[int, LlmRequest]
 
     def add_from(self, other: 'AsyncRequests'):
         """
@@ -246,14 +247,14 @@ class AsyncRequests:
         return new_async_requests
 
     @property
-    def saving_ids(self) -> set[int]:
+    def saving_ids(self) -> Set[int]:
         """
         Get the IDs of the requests that are being saved asynchronously.
         """
         return set(self.saving.keys())
 
     @property
-    def loading_ids(self) -> set[int]:
+    def loading_ids(self) -> Set[int]:
         """
         Get the IDs of the requests that are being loaded asynchronously.
         """

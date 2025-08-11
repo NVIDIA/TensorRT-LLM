@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+import click
 import torch
 
 from tensorrt_llm import LLM, SamplingParams, logger
@@ -17,6 +18,8 @@ from tensorrt_llm.llmapi.llm_args import KvCacheConnectorConfig
 # It persists KV cache contents into a folder, and can load them back on subsequent runs.
 # See tensorrt_llm/_torch/pyexecutor/connector.py for details about the KV cache connector interface.
 # NOTE: This example connector implementation is NOT suitable for production use.
+
+CONNECTOR_CACHE_FOLDER_KEY = "CONNECTOR_CACHE_FOLDER"
 
 
 @dataclass
@@ -80,7 +83,7 @@ class PersistentKvCacheConnectorLeader(KvCacheConnectorScheduler):
         self.block_size = self._config.tokens_per_block
         self.pending_loads = {}
 
-        self.cache_folder = os.environ.get("CONNECTOR_CACHE_FOLDER",
+        self.cache_folder = os.environ.get(CONNECTOR_CACHE_FOLDER_KEY,
                                            "./connector_cache")
 
         os.makedirs(self.cache_folder, exist_ok=True)
@@ -182,8 +185,9 @@ class PersistentKvCacheConnectorLeader(KvCacheConnectorScheduler):
         return False
 
 
-if __name__ == "__main__":
-
+@click.command()
+@click.argument("model", type=str)
+def main(model: str):
     sys.path.append(os.path.join(
         os.path.dirname(__file__),
         "..",
@@ -198,13 +202,13 @@ if __name__ == "__main__":
     )
 
     connector_cache_dir = TemporaryDirectory()
-    os.environ["CONNECTOR_CACHE_FOLDER"] = connector_cache_dir.name
+    os.environ[CONNECTOR_CACHE_FOLDER_KEY] = connector_cache_dir.name
 
-    model = LLM(model="Qwen/Qwen2-0.5B",
-                backend="pytorch",
-                cuda_graph_config=None,
-                connector_config=connector_config,
-                use_torch_sampler=True)
+    llm = LLM(model=model,
+              backend="pytorch",
+              cuda_graph_config=None,
+              connector_config=connector_config,
+              use_torch_sampler=True)
 
     test_text = (
         "Nvidia Corporation is an American technology company headquartered in Santa Clara, California."
@@ -214,21 +218,21 @@ if __name__ == "__main__":
 
     sampling_params = SamplingParams(max_tokens=32)
 
-    output = model.generate([test_text], sampling_params)
+    output = llm.generate([test_text], sampling_params)
     text0 = output[0].outputs[0].text
 
     print("First output: ", text0)
     print("Loading new LLM instance...")
 
-    del model
+    del llm
 
-    model = LLM(model="Qwen/Qwen2-0.5B",
-                backend="pytorch",
-                cuda_graph_config=None,
-                connector_config=connector_config,
-                use_torch_sampler=True)
+    llm = LLM(model=model,
+              backend="pytorch",
+              cuda_graph_config=None,
+              connector_config=connector_config,
+              use_torch_sampler=True)
 
-    output = model.generate([test_text], sampling_params)
+    output = llm.generate([test_text], sampling_params)
     text1 = output[0].outputs[0].text
 
     print("Second output (using connector cache): ", text1)
@@ -236,3 +240,7 @@ if __name__ == "__main__":
     assert text0 == text1
 
     connector_cache_dir.cleanup()
+
+
+if __name__ == "__main__":
+    main()
