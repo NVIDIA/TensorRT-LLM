@@ -261,13 +261,6 @@ parameters: {
   }
 }
 
-parameters: {
-  key: "hf_model_path"
-  value: {
-    string_value: "${hf_model_path}"
-  }
-}
-
 instance_group [
     {
         count: ${preprocessing_instance_count}

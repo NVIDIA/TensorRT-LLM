@@ -154,14 +154,9 @@ class TritonPythonModel:
             if self.model_type in [
                     'mllama', 'llava_onevision', 'qwen2_vl', 'pixtral'
             ]:
-                # Read the correct path from the config
-                hf_model_path = model_config['parameters']['hf_model_path'][
-                    'string_value']
-
-                # Load the full processor from the hf_model_path, not the tokenizer_dir
                 full_processor = AutoProcessor.from_pretrained(
-                    hf_model_path, trust_remote_code=True)
-                self.hf_config = AutoConfig.from_pretrained(hf_model_path)
+                    tokenizer_dir, trust_remote_code=True)
+                self.hf_config = AutoConfig.from_pretrained(tokenizer_dir)
                 self.vision_preprocessor = VisionPreProcessor(
                     self.model_type,
                     full_processor,
