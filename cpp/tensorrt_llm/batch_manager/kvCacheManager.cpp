@@ -1196,25 +1196,26 @@ void WindowBlockManager::addSequence(
 // There are two versions of BlockManager::addSequence function.
 // This is called when block reuse is disabled.
 void BlockManager::addSequence(
-    GenerationRequest& sequence, SizeType32 numBlocks, SizeType32 unsharedBlockIdx, SizeType32 windowSize)
+    GenerationRequest& sequence, SizeType32 numContextBlocks, SizeType32 windowSize, bool isShareLastContextBlock)
 {
-    mWindowBlockManagers.at(windowSize).addSequence(sequence, numBlocks, unsharedBlockIdx);
+    mWindowBlockManagers.at(windowSize).addSequence(sequence, numContextBlocks, isShareLastContextBlock);
 }
 
 // There are two versions of WindowBlockManager::addSequence function.
 // This is called when block reuse is disabled.
-void WindowBlockManager::addSequence(GenerationRequest& sequence, SizeType32 numBlocks, SizeType32 unsharedBlockIdx)
+void WindowBlockManager::addSequence(
+    GenerationRequest& sequence, SizeType32 numContextBlocks, bool isShareLastContextBlock)
 {
     auto const requestId = sequence.getRequestId();
     auto const [seqIt, emplaceDone] = mAllocatedBlocksPerSeq.emplace(requestId, std::vector<BlockPtr>{});
     TLLM_CHECK(emplaceDone);
 
-    // Allocate blocks
-    for (SizeType32 bi = 0; bi < numBlocks; ++bi)
+    TLLM_CHECK_WITH_INFO(numContextBlocks > 0, "numContextBlocks must be greater than 0");
+    for (SizeType32 bi = 0; bi < numContextBlocks - 1; ++bi)
     {
-        bool shareAmongBeams = bi != unsharedBlockIdx;
-        allocateBlock(sequence, shareAmongBeams);
+        allocateBlock(sequence, /*shareAmongBeams=*/true);
     }
+    allocateBlock(sequence, /*shareAmongBeams=*/isShareLastContextBlock);
 }
 
 void WindowBlockManager::addBlockToBeam(BlockPtr& block, GenerationRequest& sequence, SizeType32 beamIdx)
@@ -1761,7 +1762,6 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(
     {
         auto const maxTokensToAddToKVCache = req.mMaxNewTokens;
         auto const maxDraftTokensToAdd = std::min(req.getNumDraftTokens(), maxTokensToAddToKVCache);
-        // Assumes shared among beam = True
         auto const promptCacheLen
             = std::min((isCrossKv() ? req.getEncoderOutputLen() : req.mPromptLen) + maxDraftTokensToAdd, windowSize)
             + mSinkBubbleLength;
@@ -1936,9 +1936,7 @@ std::optional<BlockKey> KVCacheManager::findNewContextBlock(
 void KVCacheManager::addSequence(
     RequestIdType requestId, SizeType32 inputLength, SizeType32 beamWidth, OptionalRef<LlmRequest> llmRequest)
 {
-    // Need to add the bubble after the sink tokens to use even block size
-    inputLength += mSinkBubbleLength;
-
+    // TODO: add streamLLM support
     auto kvCacheRetentionConfig = llmRequest
         ? llmRequest->getKvCacheRetentionConfig().value_or(executor::KvCacheRetentionConfig())
         : executor::KvCacheRetentionConfig();
@@ -1963,20 +1961,6 @@ void KVCacheManager::addSequence(
         auto const maxTokenNum = metadata.maxTokenNum;
         auto const temporaryAttentionWindow = metadata.temporaryAttentionWindow;
 
-        // Get the final token index in kv cache
-        SizeType32 const finalTokenKVIdx = mSinkBlockTokenLength
-            + ((inputLength - 1 - mSinkBlockTokenLength) % (maxTokenNum - mSinkBlockTokenLength));
-
-        // Get block index that with shareAmongBeams=False.
-        // For cross kv cache in encoder-decoder models, always shareAmongBeams=True.
-        SizeType32 unsharedBlockIdx = -1;
-        if ((!sequence.isCyclic() || beamWidth > 1 || finalTokenKVIdx % getTokensPerBlock() > 0) && !isCrossKv())
-        {
-            unsharedBlockIdx = ((finalTokenKVIdx + 1) % getTokensPerBlock() == 0)
-                ? finalTokenKVIdx / getTokensPerBlock() + 1
-                : finalTokenKVIdx / getTokensPerBlock();
-        }
-
         // Consider the temporaryAttentionWindow when allocating blocks.
         auto const effectiveInputLength = std::min(inputLength, maxTokenNum + temporaryAttentionWindow);
         auto const numContextBlocks = tc::ceilDiv(effectiveInputLength, getTokensPerBlock());
@@ -1995,7 +1979,9 @@ void KVCacheManager::addSequence(
                     "have no effect.",
                     llmRequest->mRequestId);
             }
-            mBlockManager.addSequence(sequence, numContextBlocks, unsharedBlockIdx, windowSize);
+            bool isShareLastContextBlock = isCrossKv() || (sequence.isCyclic() && beamWidth == 1)
+                || effectiveInputLength % getTokensPerBlock() == 0;
+            mBlockManager.addSequence(sequence, numContextBlocks, windowSize, isShareLastContextBlock);
         }
         mBlockManager.updateSequenceCacheBlockOffsets(sequence, windowSize);
     }
