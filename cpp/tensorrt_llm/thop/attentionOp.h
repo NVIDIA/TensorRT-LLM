@@ -60,18 +60,4 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     std::optional<int64_t> attention_chunk_size, std::optional<torch::Tensor> softmax_stats_tensor,
     std::vector<bool> spec_decoding_bool_params, std::vector<std::optional<torch::Tensor>> spec_decoding_tensor_params);
 
-/**
- * @brief Check if attention operation supports NVFP4 output format
- *
- * This function checks whether the current hardware and configuration support
- * NVFP4 (4-bit floating point) output format for attention operations.
- * NVFP4 is only supported on certain GPU architectures (Blackwell and later,
- * excluding SM 120) and specific configurations.
- *
- * @return true if NVFP4 output is supported, false otherwise
- */
-bool attention_supports_nvfp4_output(int64_t const num_heads, int64_t const num_kv_heads, int64_t const head_size,
-    std::optional<int64_t> const tokens_per_block, int64_t const mask_type, int64_t const quant_mode,
-    bool const use_paged_context_fmha, bool is_mla_enable);
-
 } // namespace torch_ext
