@@ -1271,6 +1271,8 @@ class PyExecutor:
     def _check_kv_transfer_timeout(self):
         current_time = time.time()
         timeout_ms = self.kv_cache_transceiver.cache_transceiver_config.kv_transfer_timeout_ms
+        if timeout_ms is None:
+            return
 
         for req in self.ctx_in_transmission_requests[:]:
             if req.py_kv_transfer_start_time is None:
@@ -1280,7 +1282,7 @@ class PyExecutor:
                 self._terminate_request(req)
 
         for req in self.active_requests[:]:
-            if req.is_disagg_generation_transmission_complete and req.py_kv_transfer_start_time is not None:
+            if req.is_disagg_generation_transmission_in_progress and req.py_kv_transfer_start_time is not None:
                 if (current_time -
                         req.py_kv_transfer_start_time) * 1000 > timeout_ms:
                     self._terminate_request(req)
