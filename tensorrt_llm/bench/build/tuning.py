@@ -1,5 +1,8 @@
 from typing import Tuple
 
+import torch
+
+from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.llmapi.llm_utils import QuantConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -77,8 +80,16 @@ def calc_engine_setting(
     target_seq_len = target_input_len + target_output_len
     cache_memory = available_memory * model_config.cache_memory_fraction(
         kv_cache_gpu_mem_fraction)
+
+    bytes_per_elem = BYTES_PER_ELEM.get(QuantAlgo.NO_QUANT)
+    if isinstance(model_config, NemotronHybridConfig):
+        mamba_ssm_cache_dtype = model_config.mamba_ssm_cache_dtype
+        if mamba_ssm_cache_dtype != "auto":
+            if str_dtype_to_torch(mamba_ssm_cache_dtype) == torch.float32:
+                bytes_per_elem = 4.0
+
     gb_per_extra_cache = model_config.extra_model_cache_in_gb(
-        BYTES_PER_ELEM.get(QuantAlgo.NO_QUANT), target_seq_len)
+        bytes_per_elem, target_seq_len)
     kv_cache_max_requests = cache_memory / (gb_per_token * target_seq_len +
                                             gb_per_extra_cache)
     extra_cache_memory = gb_per_extra_cache * kv_cache_max_requests

@@ -1,10 +1,11 @@
 import argparse
 
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm.llmapi import (AutoDecodingConfig, CudaGraphConfig,
-                                 DraftTargetDecodingConfig, EagleDecodingConfig,
-                                 KvCacheConfig, MoeConfig, MTPDecodingConfig,
-                                 NGramDecodingConfig, TorchCompileConfig)
+from tensorrt_llm.llmapi import (AttentionDpConfig, AutoDecodingConfig,
+                                 CudaGraphConfig, DraftTargetDecodingConfig,
+                                 EagleDecodingConfig, KvCacheConfig, MoeConfig,
+                                 MTPDecodingConfig, NGramDecodingConfig,
+                                 TorchCompileConfig)
 
 example_prompts = [
     "Hello, my name is",
@@ -52,12 +53,19 @@ def add_llm_args(parser):
                         default='CUTLASS',
                         choices=[
                             'CUTLASS', 'TRTLLM', 'VANILLA', 'WIDEEP',
-                            'DEEPGEMM', 'CUTEDSL'
+                            'DEEPGEMM', 'CUTEDSL', 'TRITON'
                         ])
     parser.add_argument('--enable_attention_dp',
                         default=False,
                         action='store_true')
-    parser.add_argument('--enable_trtllm_sampler',
+    parser.add_argument('--attention_dp_enable_balance',
+                        default=False,
+                        action='store_true')
+    parser.add_argument('--attention_dp_time_out_iters', type=int, default=0)
+    parser.add_argument('--attention_dp_batching_wait_iters',
+                        type=int,
+                        default=0)
+    parser.add_argument('--use_torch_sampler',
                         default=False,
                         action='store_true')
     parser.add_argument('--tp_size', type=int, default=1)
@@ -196,6 +204,12 @@ def setup_llm(args, **kwargs):
         enable_padding=args.cuda_graph_padding_enabled,
     ) if args.use_cuda_graph else None
 
+    attention_dp_config = AttentionDpConfig(
+        enable_balance=args.attention_dp_enable_balance,
+        timeout_iters=args.attention_dp_time_out_iters,
+        batching_wait_iters=args.attention_dp_batching_wait_iters,
+    )
+
     llm = LLM(
         model=args.model_dir,
         backend='pytorch',
@@ -213,11 +227,12 @@ def setup_llm(args, **kwargs):
                 args.use_piecewise_cuda_graph)
         if args.use_torch_compile else None,
         moe_config=MoeConfig(backend=args.moe_backend),
-        enable_trtllm_sampler=args.enable_trtllm_sampler,
+        use_torch_sampler=args.use_torch_sampler,
         max_seq_len=args.max_seq_len,
         max_batch_size=args.max_batch_size,
         max_num_tokens=args.max_num_tokens,
         enable_attention_dp=args.enable_attention_dp,
+        attention_dp_config=attention_dp_config,
         tensor_parallel_size=args.tp_size,
         pipeline_parallel_size=args.pp_size,
         moe_expert_parallel_size=args.moe_ep_size,
@@ -228,8 +243,7 @@ def setup_llm(args, **kwargs):
         trust_remote_code=args.trust_remote_code,
         gather_generation_logits=args.return_generation_logits,
         max_beam_width=args.max_beam_width,
-        **kwargs,
-    )
+        **kwargs)
 
     use_beam_search = args.max_beam_width > 1
     best_of = args.best_of or args.n

@@ -27,6 +27,10 @@ methods:
         annotation: Optional[int]
         default: null
         status: prototype
+      return_perf_metrics:
+        annotation: bool
+        default: False
+        status: prototype
       # Bindings and mirrored configs
       peft_cache_config:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.PeftCacheConfig]
@@ -79,6 +83,10 @@ methods:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.CudaGraphConfig]
         default: null
         status: beta
+      attention_dp_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.AttentionDpConfig]
+        default: null
+        status: beta
       checkpoint_loader:
         annotation: Optional[tensorrt_llm._torch.models.checkpoints.BaseCheckpointLoader]
         default: null
@@ -103,10 +111,10 @@ methods:
         annotation: bool
         default: False
         status: beta
-      enable_trtllm_sampler:
+      use_torch_sampler:
         annotation: bool
         default: False
-        status: prototype
+        status: beta
       enable_iter_perf_stats:
         annotation: bool
         default: False
@@ -140,7 +148,7 @@ methods:
         default: False
         status: prototype
       allreduce_strategy:
-        annotation: Optional[Literal['AUTO', 'NCCL', 'UB', 'MINLATENCY', 'ONESHOT', 'TWOSHOT', 'LOWPRECISION', 'MNNVL']]
+        annotation: Optional[Literal['AUTO', 'NCCL', 'UB', 'MINLATENCY', 'ONESHOT', 'TWOSHOT', 'LOWPRECISION', 'MNNVL', 'NCCL_SYMMETRIC']]
         default: AUTO
         status: beta
       decoding_config:

@@ -27,10 +27,28 @@ namespace tensorrt_llm
 namespace kernels
 {
 
+// Keep this in sync with the ActType in
+// cpp/tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/trtllmGen_bmm_export/GemmGatedActOptions.h
+enum class ActType
+{
+    // For ActType == SwiGlu, ideally we would like to have something like
+    //    gatedAct = scaleC * (x0 * scaleAb + beta) * ((x1 * scaleGate) * sigmoid(alpha * x1 *
+    //    scaleGate)).
+    // But for now, we use the simplified version
+    //    gatedAct = scaleC' * (x0 + beta') * ((x1 * scaleGate) * sigmoid(alpha * x1 * scaleGate)),
+    // where x0 and x1 are the raw numbers from Gemm, while scaleC and scaleGate are input scales,
+    // beta' = beta / scaleAb, scaleC' = scaleC * scaleAb.
+    //
+    // GatedSilu is a special case of SwiGlu where the alpha is 1.0 and the beta is 0.0.
+    SwiGlu
+};
+
 struct TrtllmGenBatchedGemmRunnerOptions
 {
-    batchedGemm::trtllm::gen::Dtype eltType;
-    batchedGemm::trtllm::gen::Dtype outputType;
+    batchedGemm::trtllm::gen::Dtype dtypeA;
+    batchedGemm::trtllm::gen::Dtype dtypeB;
+    batchedGemm::trtllm::gen::Dtype dtypeC;
+    ActType actType{ActType::SwiGlu};
     bool deepSeekFp8{false};
     bool fusedAct{false};
     bool routeAct{false};
@@ -53,13 +71,19 @@ public:
     void run(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens, int32_t numTokens,
         int32_t numBatches, int32_t maxNumCtasInBatchDim, void const* a, void const* sfA, void const* b,
         void const* sfB, void const* perTokensSfA, void const* perTokensSfB, float const* scaleC,
-        float const* scaleGateC, void* c, void* outSfC, int32_t const* routeMap, int32_t const* totalNumPaddedTokens,
+        float const* scaleGateC, float const* bias, float const* swiGluAlpha, float const* swiGluBeta,
+        float const* clampLimit, void* c, void* outSfC, int32_t const* routeMap, int32_t const* totalNumPaddedTokens,
         int32_t const* ctaIdxXyToBatchIdx, int32_t const* ctaIdxXyToMnLimit, int32_t const* numNonExitingCtas,
         void* workspace, CUstream stream, int device, int32_t configIndex);
 
     // NVFP4 per-block scaling GEMM
     void run(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens, void const* a, void const* sfA,
         void const* b, void const* sfB, void* c, void* outSfC, void* workspace, CUstream stream, int device,
+        int32_t configIndex);
+
+    void run(int32_t m, int32_t n, int32_t k, std::vector<int32_t> const& batchedTokens, void const* a, void const* sfA,
+        void const* b, void const* sfB, float const* bias, float const* swiGluAlpha, float const* swiGluBeta,
+        float const* clampLimit, void* c, void* outSfC, void* workspace, CUstream stream, int device,
         int32_t configIndex);
 
     // FP8 per-tensor scaling GEMM

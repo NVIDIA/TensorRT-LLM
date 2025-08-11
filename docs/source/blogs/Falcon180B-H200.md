@@ -33,7 +33,7 @@ Often quantization can have adverse impacts on the accuracy of the model,
 however, TensorRT-LLM's AWQ decreases memory footprint of the model by **4x**
 while maintaining high accuracy.
 
-<img src="https://github.com/NVIDIA/TensorRT-LLM/blob/rel/docs/source/blogs/media/Falcon180B-H200_acc.png?raw=true" alt="Falcon-180B accuracy comparison" width="600" height="auto">
+<img src="https://github.com/NVIDIA/TensorRT-LLM/blob/5aec7af45fc0abd876fa68a9ae8c8cae084f3af3/docs/source/blogs/media/Falcon180B-H200_acc.png?raw=true" alt="Falcon-180B accuracy comparison" width="600" height="auto">
 
 
 <sup>Preliminary measured accuracy, subject to change. </sup>

@@ -11,9 +11,14 @@ from contextlib import contextmanager
 from typing import Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
-from cuda import cudart
 
-from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
+try:
+    from cuda.bindings import runtime as cudart
+except ImportError:
+    from cuda import cudart
+
+from tensorrt_llm._torch.pyexecutor.resource_manager import (
+    ResourceManagerType, request_context)
 from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
 from tensorrt_llm._utils import (customized_gc_thresholds, global_mpi_rank,
                                  is_trace_enabled, nvtx_range, trace_func)
@@ -178,6 +183,9 @@ class PyExecutor:
         self.enable_iter_perf_stats = model_engine.pytorch_backend_config.enable_iter_perf_stats
         self.enable_iter_req_stats = model_engine.pytorch_backend_config.enable_iter_req_stats
         self.stream_interval = model_engine.pytorch_backend_config.stream_interval
+        self.attention_dp_enable_balance = model_engine.pytorch_backend_config.attention_dp_enable_balance
+        self.attention_dp_time_out_iters = model_engine.pytorch_backend_config.attention_dp_time_out_iters
+        self.attention_dp_batching_wait_iters = model_engine.pytorch_backend_config.attention_dp_batching_wait_iters
         self.num_fetch_requests_cur_rank = 0
         self.num_fetch_requests = 0
         self.shutdown_event = threading.Event()
@@ -216,6 +224,9 @@ class PyExecutor:
             self.draft_model_engine.warmup(self.resource_manager)
 
         self.is_shutdown = False
+        self.max_batch_size = max_batch_size
+        self.adp_ctx_waiting_iters_count = 0
+        self.adp_ctx_batching_wait_iters_count = 0
 
         # request fetcher initialization
         self.executor_request_queue = ExecutorRequestQueue(
@@ -269,15 +280,12 @@ class PyExecutor:
             self._executor_loop_cleanup()
 
     def start_worker(self):
-        self.worker_lock.acquire()
-        try:
+        with self.worker_lock:
             if self.worker_started == False:
                 self.worker_thread = threading.Thread(
                     target=self._event_loop_wrapper, daemon=True)
                 self.worker_thread.start()
                 self.worker_started = True
-        finally:
-            self.worker_lock.release()
 
     def __enter__(self):
         return self
@@ -354,13 +362,9 @@ class PyExecutor:
             return []
 
         latest_stats = (IterationStats(), None)
-        try:
-            self.stats_lock.acquire()
+        with self.stats_lock:
             latest_stats = self.stats
             self.stats = []
-        finally:
-            self.stats_lock.release()
-
         return latest_stats
 
     def get_latest_kv_cache_events(self):
@@ -595,11 +599,8 @@ class PyExecutor:
                            stats: IterationStats,
                            req_stats: Optional[List[RequestStats]] = None):
 
-        try:
-            self.stats_lock.acquire()
+        with self.stats_lock:
             self.stats.append((stats, req_stats))
-        finally:
-            self.stats_lock.release()
 
     def _process_iter_stats(self, finished_requests: list[LlmRequest],
                             active_requests: List[LlmRequest],
@@ -739,6 +740,9 @@ class PyExecutor:
                             if self._need_return_logits(scheduled_batch):
                                 logits_host = batch_outputs["logits"].to(
                                     "cpu", non_blocking=True)
+                            if self.kv_cache_transceiver and self.guided_decoder:
+                                self.guided_decoder.init_disagg_gen_requests(
+                                    scheduled_batch)
                             self._execute_guided_decoder(
                                 scheduled_batch, batch_outputs['logits'])
 
@@ -794,7 +798,7 @@ class PyExecutor:
                     # Second last rank does not need to since last rank has original decoded tokens
                     if not self.dist.is_second_last_pp_rank:
                         if self.send_handles[prev_microbatch_id] is not None:
-                            self.send_handles[prev_microbatch_id].Wait()
+                            self.send_handles[prev_microbatch_id].wait()
                         needs_logits = (
                             self._need_return_logits(scheduled_batch)
                             or (self._need_return_log_probs(scheduled_batch)
@@ -865,6 +869,10 @@ class PyExecutor:
             self.use_spec_decode = self.drafter.should_use_spec_decode(
                 self.active_requests)
             self.model_engine.enable_spec_decode = self.use_spec_decode
+            # If speculation is off, this function sets py_draft_tokens to None
+            # for all active requests. If it's on, we initialize py_draft_tokens
+            # with dummy draft tokens to make the scheduler aware of the fact
+            # that speculation is about to happen.
             self._prepare_draft_requests()
 
         scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
@@ -887,7 +895,8 @@ class PyExecutor:
             f'{len(scheduled_batch.generation_requests)} generation requests')
         return scheduled_batch, iter_stats
 
-    def _execute_guided_decoder(self, scheduled_batch, logits):
+    def _execute_guided_decoder(self, scheduled_batch: ScheduledRequests,
+                                logits: torch.Tensor):
         if self.guided_decoder is not None:
             self.guided_decoder.build(scheduled_batch)
             self.guided_decoder.execute(scheduled_batch, logits)
@@ -924,9 +933,19 @@ class PyExecutor:
                         self._handle_first_token_response(scheduled_batch)
 
                     self.resource_manager.prepare_resources(scheduled_batch)
+
+                    if self.kv_cache_transceiver and self.guided_decoder:
+                        self.guided_decoder.init_disagg_gen_requests(
+                            scheduled_batch)
                     if self.drafter is not None and self.use_spec_decode:
-                        self.drafter.prepare_draft_tokens(
-                            scheduled_batch, self.resource_manager)
+                        with request_context(
+                                is_draft=True,
+                                scheduled_requests=scheduled_batch):
+                            if self.guided_decoder is not None:
+                                self.guided_decoder.rollback_rejected_tokens(
+                                    scheduled_batch)
+                            self.drafter.prepare_draft_tokens(
+                                scheduled_batch, self.resource_manager)
 
                     batch_outputs = self._forward_step(scheduled_batch)
                     self._execute_guided_decoder(scheduled_batch,
@@ -1045,6 +1064,9 @@ class PyExecutor:
                     if self.previous_batch is not None:
                         self._update_requests(self.previous_batch.sample_state)
 
+                    if self.kv_cache_transceiver and self.guided_decoder:
+                        self.guided_decoder.init_disagg_gen_requests(
+                            scheduled_batch)
                     self._execute_guided_decoder(scheduled_batch,
                                                  batch_outputs['logits'])
 
@@ -1155,13 +1177,68 @@ class PyExecutor:
         # to be transferred to main thread when user needs them.
         kv_cache_manager.flush_iteration_events()
 
+    def _balance_adp_requests(self, context_requests: list[LlmRequest],
+                              generation_requests: list[LlmRequest]):
+        balanced_context_requests = context_requests
+        num_scheduled_context_requests = len(context_requests)
+        num_scheduled_generation_requests = len(generation_requests)
+        num_scheduled_tokens = sum(
+            [len(req.get_tokens(0))
+             for req in context_requests]) + num_scheduled_generation_requests
+        responses_list = self.dist.tp_allgather([
+            num_scheduled_context_requests, num_scheduled_generation_requests,
+            num_scheduled_tokens
+        ])
+        all_ranks_num_scheduled_context_requests = [
+            response[0] for response in responses_list
+        ]
+        all_ranks_num_scheduled_generation_requests = [
+            response[1] for response in responses_list
+        ]
+        all_ranks_have_free_ctx_slots = all([
+            num_gen < self.max_batch_size
+            for num_gen in all_ranks_num_scheduled_generation_requests
+        ])
+        all_ranks_have_ctx_requests = all([
+            num_ctx > 0 for num_ctx in all_ranks_num_scheduled_context_requests
+        ])
+        all_ranks_have_gen_requests = all([
+            num_gen > 0
+            for num_gen in all_ranks_num_scheduled_generation_requests
+        ])
+
+        if self.attention_dp_enable_balance:
+            # wait for all ranks have context requests
+            if all_ranks_have_free_ctx_slots and all_ranks_have_ctx_requests:
+                self.adp_ctx_waiting_iters_count = 0
+                # balance number of context requests across ranks
+                if all_ranks_have_gen_requests:
+                    if self.adp_ctx_batching_wait_iters_count < self.attention_dp_batching_wait_iters:
+                        self.adp_ctx_batching_wait_iters_count += 1
+                        balanced_context_requests = []
+                    else:
+                        self.adp_ctx_batching_wait_iters_count = 0
+            else:
+                self.adp_ctx_waiting_iters_count += 1
+                balanced_context_requests = []
+                timeout_reached = self.adp_ctx_waiting_iters_count >= self.attention_dp_time_out_iters
+                if timeout_reached or not all_ranks_have_gen_requests:
+                    self.adp_ctx_waiting_iters_count = 0
+                    balanced_context_requests = context_requests
+        return balanced_context_requests
+
     @nvtx_range("_schedule")
     def _schedule(self):
         scheduler_output = self.scheduler.schedule_request(
             self.active_requests, self.inflight_req_ids)
-        scheduled_requests = ScheduledRequests()
+        scheduled_context_requests = scheduler_output.context_requests
+        if self.enable_attention_dp and self.attention_dp_enable_balance:
+            scheduled_context_requests = self._balance_adp_requests(
+                scheduler_output.context_requests,
+                scheduler_output.generation_requests)
 
-        scheduled_requests.context_requests = scheduler_output.context_requests
+        scheduled_requests = ScheduledRequests()
+        scheduled_requests.context_requests = scheduled_context_requests
         scheduled_requests.generation_requests = scheduler_output.generation_requests
         scheduled_requests.paused_requests = scheduler_output.paused_requests
         return scheduled_requests, scheduler_output.fitting_disagg_gen_init_requests, scheduler_output.num_fitting_requests
@@ -1246,7 +1323,9 @@ class PyExecutor:
             if req.is_disagg_generation_transmission_complete:
                 cache_trans_complete_requests.append(req)
         if len(cache_trans_complete_requests) > 0:
-            self._setup_sampler_step(cache_trans_complete_requests)
+            requests = ScheduledRequests()
+            requests.context_requests = cache_trans_complete_requests
+            self._setup_sampler_step(requests)
 
         for req in scheduled_batch.generation_requests:
             if req.is_disagg_generation_transmission_complete:
@@ -1400,7 +1479,7 @@ class PyExecutor:
             self._handle_errors(error_msg)
 
     @nvtx_range("_setup_sampler_step")
-    def _setup_sampler_step(self, requests):
+    def _setup_sampler_step(self, requests: ScheduledRequests):
         try:
             return self.sampler.setup_sampler_step(requests)
         except Exception as e:

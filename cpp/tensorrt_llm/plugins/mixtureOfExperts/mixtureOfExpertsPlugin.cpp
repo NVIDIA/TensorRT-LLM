@@ -957,23 +957,25 @@ int MixtureOfExpertsPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     MoeMinLatencyParams min_latency_params{};
     mMOERunner->setTactic(gemm1, gemm2);
 #ifdef USING_OSS_CUTLASS_MOE_GEMM
-    mMOERunner->runMoe(inputs[getInputTensorIndex()], nullptr,
+    mMOERunner->runMoe(inputs[getInputTensorIndex()], nullptr, true,
         static_cast<int const*>(inputs[getTokenSelectedExpertsIndex()]),
         hasFinalScales() ? static_cast<float const*>(inputs[getTokenFinalScalesIndex()]) : nullptr,
-        inputs[getExpertWeights1Index()], hasBias() ? inputs[getExpertBias1Index()] : nullptr, mActivationType,
-        inputs[getExpertWeights2Index()], hasBias() ? inputs[getExpertBias2Index()] : nullptr, quant_params, num_tokens,
-        mExpertHiddenSize, mExpertInterSize, mNumExperts, mExpertsPerToken, static_cast<char*>(workspace.workspace),
+        inputs[getExpertWeights1Index()], hasBias() ? inputs[getExpertBias1Index()] : nullptr,
+        ActivationParams(mActivationType), inputs[getExpertWeights2Index()],
+        hasBias() ? inputs[getExpertBias2Index()] : nullptr, quant_params, num_tokens, mExpertHiddenSize,
+        mExpertInterSize, mNumExperts, mExpertsPerToken, static_cast<char*>(workspace.workspace),
         // Outputs
         outputs[getOutputTensorIndex()], static_cast<int*>(workspace.src_to_dest_map), mParallelismConfig,
         /*enable_alltoall=*/false, hasLora(), lora_params, /*use_deepseek_fp8_block_scale=*/false,
         /*min_latency_mode=*/false, min_latency_params, stream);
 #else
-    mMOERunner->runMoe(inputs[getInputTensorIndex()], nullptr,
+    mMOERunner->runMoe(inputs[getInputTensorIndex()], nullptr, true,
         static_cast<int const*>(inputs[getTokenSelectedExpertsIndex()]),
         hasFinalScales() ? static_cast<float const*>(inputs[getTokenFinalScalesIndex()]) : nullptr,
-        inputs[getExpertWeights1Index()], hasBias() ? inputs[getExpertBias1Index()] : nullptr, mActivationType,
-        inputs[getExpertWeights2Index()], hasBias() ? inputs[getExpertBias2Index()] : nullptr, quant_params, num_tokens,
-        mExpertHiddenSize, mExpertInterSize, mNumExperts, mExpertsPerToken, static_cast<char*>(workspace.workspace),
+        inputs[getExpertWeights1Index()], hasBias() ? inputs[getExpertBias1Index()] : nullptr,
+        ActivationParams(mActivationType), inputs[getExpertWeights2Index()],
+        hasBias() ? inputs[getExpertBias2Index()] : nullptr, quant_params, num_tokens, mExpertHiddenSize,
+        mExpertInterSize, mNumExperts, mExpertsPerToken, static_cast<char*>(workspace.workspace),
         // Outputs
         outputs[getOutputTensorIndex()], static_cast<int*>(workspace.src_to_dest_map), mParallelismConfig, hasLora(),
         lora_params, /*use_deepseek_fp8_block_scale=*/false,

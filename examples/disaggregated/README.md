@@ -83,7 +83,7 @@ Or using the provided client parsing the prompts from a file and sending request
 python3 ./clients/disagg_client.py -c disagg_config.yaml -p ./clients/prompts.json -e chat
 ```
 
-## Dynamic scaling (Experimental)
+## Dynamic scaling (Prototype)
 
 Currently, trtllm supports dynamic addition and removal of servers by leveraging ETCD. To enable this feature, you should start the context and generation servers with an additional flag ```--metadata_server_config_file``` and ```--server_role```.
 Before launching the context and generation servers, you should first start the ETCD server. By default, the ETCD server listens for client requests at ```localhost:2379```.

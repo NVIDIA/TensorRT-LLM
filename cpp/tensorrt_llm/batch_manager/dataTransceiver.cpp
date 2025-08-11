@@ -91,6 +91,43 @@ std::size_t RequestInfo::serializedSize(RequestInfo const& requestInfo)
     return totalSize;
 }
 
+void TransferSession::appendMeasure(double delay, double duration, size_t size)
+{
+    if (!mRecordMeasure)
+    {
+        return;
+    }
+    auto bandwidth = size * 8 / (duration / 1000) / 1e9; // byte, ms => Gbps
+    mMeasures.emplace_back(Measure{delay, duration, bandwidth});
+}
+
+void TransferSession::exportMeasure(std::ofstream& outFile, bool isContext) const
+{
+    if (mMeasures.empty())
+    {
+        return;
+    }
+    // write header if not exist
+    if (outFile.tellp() == 0)
+    {
+        outFile << "RequestID";
+        for (size_t i = 0; i < mMeasures.size(); i++)
+        {
+            outFile << ",Delay(ms),Duration(ms),Bandwidth(Gbps)";
+        }
+        outFile << '\n';
+    }
+    // write measures
+    TLLM_CHECK(isContext || mRequest->getContextPhaseParams().has_value());
+    auto reqId = isContext ? mRequest->mRequestId : mRequest->getContextPhaseParams().value().getReqId();
+    outFile << reqId;
+    for (auto const& measure : mMeasures)
+    {
+        outFile << "," << measure.delay << "," << measure.duration << "," << measure.bandwidth;
+    }
+    outFile << '\n' << std::flush;
+}
+
 class DataResponder::Impl
 {
 public:

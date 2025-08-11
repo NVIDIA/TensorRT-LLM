@@ -357,6 +357,7 @@ class TestNemotronNAS(unittest.TestCase):
     ], lambda testcase_func, param_num, param:
                           f"{testcase_func.__name__}[{param.args[0]}]")
     @torch.no_grad()
+    @unittest.skip("https://nvbugspro.nvidia.com/bug/5439817")
     def test_nemotron_nas_allclose_to_hf(self, scenario: Scenario) -> None:
         """
         Compare output to HF

@@ -147,6 +147,8 @@ class Mamba2Mixer(nn.Module):
                                quant_config=config.get_quant_config(),
                                allreduce_strategy=config.allreduce_strategy)
 
+        self._mamba_ssm_cache_dtype = config.quant_config.mamba_ssm_cache_dtype
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -230,6 +232,7 @@ class Mamba2Mixer(nn.Module):
                 seq_idx=seq_idx,
                 return_varlen_states=True,
                 return_final_states=False,
+                mamba_ssm_cache_dtype=self._mamba_ssm_cache_dtype,
             )
             out.append(rearrange(y, "b l h p -> (b l) (h p)"))
 

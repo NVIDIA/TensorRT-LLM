@@ -339,7 +339,9 @@ def mergeWaiveList(pipeline, globalVars)
     LLM_TOT_ROOT = "llm-tot"
     targetBranch = env.gitlabTargetBranch ? env.gitlabTargetBranch : globalVars[TARGET_BRANCH]
     echo "Target branch: ${targetBranch}"
-    trtllm_utils.checkoutSource(LLM_REPO, targetBranch, LLM_TOT_ROOT, true, true)
+    withCredentials([string(credentialsId: 'default-sync-llm-repo', variable: 'DEFAULT_SYNC_LLM_REPO')]) {
+        trtllm_utils.checkoutSource(DEFAULT_SYNC_LLM_REPO, targetBranch, LLM_TOT_ROOT, false, false)
+    }
     targetBranchTOTCommit = sh (script: "cd ${LLM_TOT_ROOT} && git rev-parse HEAD", returnStdout: true).trim()
     echo "Target branch TOT commit: ${targetBranchTOTCommit}"
     sh "cp ${LLM_TOT_ROOT}/tests/integration/test_lists/waives.txt ./waives_TOT_${targetBranchTOTCommit}.txt"
@@ -384,30 +386,11 @@ def launchReleaseCheck(pipeline)
             -y""")
         sh "pip3 config set global.break-system-packages true"
         sh "git config --global --add safe.directory \"*\""
-        // Step 1: cloning tekit source code
+        // Step 1: Clone TRT-LLM source codes
         trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
         sh "cd ${LLM_ROOT} && git config --unset-all core.hooksPath"
-        trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${LLM_ROOT} && python3 -u scripts/release_check.py || (git restore . && false)")
 
-        // Step 2: build tools
-        withEnv(['GONOSUMDB=*.nvidia.com']) {
-            withCredentials([
-                gitUsernamePassword(
-                    credentialsId: 'svc_tensorrt_gitlab_read_api_token',
-                    gitToolName: 'git-tool'
-                ),
-                string(
-                    credentialsId: 'default-git-url',
-                    variable: 'DEFAULT_GIT_URL'
-                )
-            ]) {
-                sh "go install ${DEFAULT_GIT_URL}/TensorRT/Infrastructure/licensechecker/cmd/license_checker@v0.3.0"
-            }
-        }
-        // Step 3: Run license check
-        sh "cd ${LLM_ROOT}/cpp && /go/bin/license_checker -config ../jenkins/license_cpp.json include tensorrt_llm"
-
-        // Step 4: Run guardwords scan
+        // Step 2: Run guardwords scan
         def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
         if (env.alternativeTRT || isOfficialPostMergeJob) {
             trtllm_utils.checkoutSource(SCAN_REPO, SCAN_COMMIT, SCAN_ROOT, true, true)
@@ -432,6 +415,26 @@ def launchReleaseCheck(pipeline)
                 echo "Guardwords Scan Results: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/guardwords-scan-results/scan.log"
             }
         }
+
+        // Step 3: Run pre-commit checks
+        trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${LLM_ROOT} && python3 -u scripts/release_check.py || (git restore . && false)")
+
+        // Step 4: Run license check
+        withEnv(['GONOSUMDB=*.nvidia.com']) {
+            withCredentials([
+                gitUsernamePassword(
+                    credentialsId: 'svc_tensorrt_gitlab_read_api_token',
+                    gitToolName: 'git-tool'
+                ),
+                string(
+                    credentialsId: 'default-git-url',
+                    variable: 'DEFAULT_GIT_URL'
+                )
+            ]) {
+                sh "go install ${DEFAULT_GIT_URL}/TensorRT/Infrastructure/licensechecker/cmd/license_checker@v0.3.0"
+            }
+        }
+        sh "cd ${LLM_ROOT}/cpp && /go/bin/license_checker -config ../jenkins/license_cpp.json include tensorrt_llm"
     }
 
     def image = "urm.nvidia.com/docker/golang:1.22"
@@ -588,6 +591,12 @@ def getMergeRequestChangedFileList(pipeline, globalVars) {
 }
 
 def getMergeRequestOneFileChanges(pipeline, globalVars, filePath) {
+    def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
+    if (env.alternativeTRT || isOfficialPostMergeJob) {
+        pipeline.echo("Force set changed file diff to empty string.")
+        return ""
+    }
+
     def githubPrApiUrl = globalVars[GITHUB_PR_API_URL]
     def diff = ""
 

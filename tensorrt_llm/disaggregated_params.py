@@ -1,6 +1,11 @@
 from dataclasses import dataclass
 from typing import List, Optional
 
+# isort: off
+# needed before trying to import bindings to load tensorrt_libs
+import tensorrt as trt  # noqa
+# isort: on
+
 from tensorrt_llm.bindings import executor as tllme
 
 

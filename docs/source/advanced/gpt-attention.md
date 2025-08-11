@@ -112,8 +112,6 @@ printed.
 #### XQA Optimization
 
 Another optimization for MQA/GQA in generation phase called XQA optimization.
-It is still experimental feature and support limited configurations. LLAMA2 70B
-is one model that it supports.
 
 Support matrix of the XQA optimization:
  - FP16 / BF16 compute data type.

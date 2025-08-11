@@ -12,9 +12,10 @@
 
 #include "softmax_impl.h"
 
-void run_softmax_fp16(void* dst, void const* src, void const* mask, void* softmax_sum_d, void* cu_q_seqlens_d,
-    int s_inner, int s_outer, int b, int h, float softcapping_scale_bmm1, int warps_n, bool has_alibi)
+void run_softmax_fp16(void* dst, void const* src, void const* mask, void const* attention_sinks, void* softmax_sum_d,
+    void* cu_q_seqlens_d, int s_inner, int s_outer, int b, int h, float softcapping_scale_bmm1, int warps_n,
+    bool has_alibi)
 {
-    run_softmax<uint16_t, uint16_t>(dst, src, mask, softmax_sum_d, cu_q_seqlens_d, s_inner, s_outer, b, h, 0.f, 0.f,
-        softcapping_scale_bmm1, warps_n, has_alibi);
+    run_softmax<uint16_t, uint16_t>(dst, src, mask, attention_sinks, softmax_sum_d, cu_q_seqlens_d, s_inner, s_outer, b,
+        h, 0.f, 0.f, softcapping_scale_bmm1, warps_n, has_alibi);
 }

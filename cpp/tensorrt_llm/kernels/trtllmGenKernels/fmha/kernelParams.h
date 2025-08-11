@@ -64,6 +64,8 @@ struct KernelParams
     // The output SF pointer (used for FP4 output).
     void* ptrSfO;
 
+    // The attention sinks pointer (additional value per head in the denominator of the softmax).
+    float const* ptrAttentionSinks;
     // The cumulative sequence lengths for Q.
     int32_t const* ptrCumSeqLensQ;
     // The cumulative sequence lengths for K/V.
@@ -717,6 +719,7 @@ struct KernelParams
             options, kernelMeta.mDataTypeQ, shapeO, strideO, tileShapeO, const_cast<void*>(options.oPtr));
 
         // Set the other kernel parameters.
+        params.ptrAttentionSinks = options.attentionSinksPtr;
         params.ptrCumSeqLensQ = options.cumSeqLensQPtr;
         params.ptrCumSeqLensKv = options.cumSeqLensKvPtr;
 

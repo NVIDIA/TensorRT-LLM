@@ -5,7 +5,7 @@ import re
 import tarfile
 import warnings
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Union
@@ -16,8 +16,13 @@ import yaml
 
 from tensorrt_llm.bindings import internal as tb_internal
 
-from ._utils import DictConversion, pad_vocab_size, release_gc, str_dtype_to_torch, torch_to_numpy
+from ._utils import pad_vocab_size, release_gc, str_dtype_to_torch, torch_to_numpy
 from .layers.linear import ColumnLinear
+from .lora_helper import (
+    LoraConfig,
+    get_default_trtllm_modules_to_hf_modules,
+    get_missing_qkv_modules_from_lora_modules,
+)
 from .mapping import Mapping
 from .models.convert_utils import get_model_path, load_state_dict, split_matrix_tp
 
@@ -233,26 +238,6 @@ def norm_dora_magnitude(
 
 
 @dataclass
-class LoraConfig(DictConversion):
-    lora_dir: List[str] = field(default_factory=list)
-    lora_ckpt_source: str = "hf"
-    max_lora_rank: int = 64
-    lora_target_modules: List[str] = field(default_factory=list)
-    trtllm_modules_to_hf_modules: Dict[str, str] = field(default_factory=dict)
-    max_loras: int | None = None
-    max_cpu_loras: int | None = None
-
-    def __post_init__(self):
-        assert self.lora_ckpt_source in ["hf", "nemo"], (
-            f"lora_ckpt_source must be one of 'hf' or 'nemo', got {self.lora_ckpt_source}"
-        )
-
-    @property
-    def missing_qkv_modules(self) -> List[str]:
-        return LoraManager.get_missing_qkv_modules(self.lora_target_modules)
-
-
-@dataclass
 class LoraModelConfig:
     lora_target_modules: list[str]
     trtllm_modules_to_hf_modules: dict[str, str]
@@ -428,23 +413,6 @@ def load_nemo_lora(model, lora_config: LoraConfig):
 
     if len(lora_config.lora_target_modules) == 0:
         lora_config.lora_target_modules = lora_loader.lora_target_modules
-
-
-def get_default_trtllm_modules_to_hf_modules():
-    return {
-        "attn_q": "q_proj",
-        "attn_k": "k_proj",
-        "attn_v": "v_proj",
-        "attn_dense": "o_proj",
-        "mlp_h_to_4h": "gate_proj",
-        "mlp_4h_to_h": "down_proj",
-        "mlp_gate": "up_proj",
-        "mlp_gate_up": "gate_up_proj",
-        "moe_h_to_4h": "w1",
-        "moe_4h_to_h": "w2",
-        "moe_gate": "w3",
-        "moe_router": "gate",
-    }
 
 
 def load_torch_hf_lora(lora_config: LoraConfig):
@@ -628,19 +596,6 @@ def load_hf_lora(
             ).to(torch_dtype)
 
 
-def use_lora(
-    model,
-    lora_config: LoraConfig,
-    trtllm_modules_to_hf_modules: Optional[Dict[str, str]] = None,
-):
-    if lora_config.lora_ckpt_source == "nemo":
-        load_nemo_lora(model, lora_config)
-    elif lora_config.lora_ckpt_source == "hf":
-        load_hf_lora(model, lora_config, trtllm_modules_to_hf_modules)
-    else:
-        raise ValueError(f"Unsupported lora_ckpt_source: {lora_config.lora_ckpt_source}")
-
-
 def unpack_nemo_weights(nemo_archive_path: str) -> Tuple[Dict, Dict[str, torch.Tensor]]:
     """Unpack model config and weights from a NeMo .nemo archive file.
 
@@ -762,21 +717,8 @@ class LoraManager(object):
         )
 
     @staticmethod
-    def get_missing_qkv_modules(lora_target_modules):
-        # In current design, q_lora_params, k_lora_params and v_lora_params should be all enabled or
-        # all disabled at the same time.
-        # However, some lora checkpoint (e.g. BART) only contain two of them, so we use zero tensor
-        # to fill the missing ones.
-        missing_qkv_modules = []
-        if any(x in lora_target_modules for x in ["attn_q", "attn_k", "attn_v"]):
-            for lora_module in ["attn_q", "attn_k", "attn_v"]:
-                if lora_module not in lora_target_modules:
-                    missing_qkv_modules.append(lora_module)
-        if any(x in lora_target_modules for x in ["cross_attn_q", "cross_attn_k", "cross_attn_v"]):
-            for lora_module in ["cross_attn_q", "cross_attn_k", "cross_attn_v"]:
-                if lora_module not in lora_target_modules:
-                    missing_qkv_modules.append(lora_module)
-        return missing_qkv_modules
+    def get_missing_qkv_modules(lora_target_modules: List[str]) -> List[str]:
+        return get_missing_qkv_modules_from_lora_modules(lora_target_modules)
 
     @property
     def missing_qkv_modules(self) -> List[str]:
