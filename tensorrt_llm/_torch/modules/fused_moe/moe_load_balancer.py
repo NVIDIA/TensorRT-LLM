@@ -598,7 +598,7 @@ class SingleLayerMoeLoadBalancer:
                 self.single_layer_load_balancer_ptr)
 
         if self.updates_enabled:
-            if is_graph_capturing():
+            if do_multi_stream():
                 self.event_dict[EventType.Main].record()
                 with torch.cuda.stream(self.aux_stream):
                     self.event_dict[EventType.Main].wait()
@@ -660,7 +660,7 @@ class SingleLayerMoeLoadBalancer:
         assert self.func_called_count["update_statistic_with_local_ids"] == 0
         self.func_called_count["update_statistic_with_global_ids"] += 1
         if self.updates_enabled:
-            if is_graph_capturing():
+            if do_multi_stream():
                 self.event_dict[EventType.Main].record()
                 with torch.cuda.stream(self.aux_stream):
                     self.event_dict[EventType.Main].wait()
