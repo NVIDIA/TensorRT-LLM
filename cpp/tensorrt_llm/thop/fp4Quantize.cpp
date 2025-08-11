@@ -72,13 +72,16 @@ std::tuple<at::Tensor, at::Tensor> fp4_quantize(at::Tensor const& self, std::opt
     auto const k = inputShape[rank - 1];
     TORCH_CHECK(k % sfVecSize == 0);
 
+    bool isPerTokenGlobalScale = false;
     // Check globalScale shape - support both [1] and [m] shapes
-    auto const& numGlobalScales = globalScale.numel();
-    TORCH_CHECK(numGlobalScales == 1 || numGlobalScales == m,
-        "Number of global scales must be 1 (shared) or match number of rows in input tensor (", m, "), but got ",
-        numGlobalScales);
-
-    bool isPerTokenGlobalScale = numGlobalScales == m;
+    if (globalScale.has_value())
+    {
+        auto const& numGlobalScales = globalScale.value().numel();
+        TORCH_CHECK(numGlobalScales == 1 || numGlobalScales == m,
+            "Number of global scales must be 1 (shared) or match number of rows in input tensor (", m, "), but got ",
+            numGlobalScales);
+        isPerTokenGlobalScale = numGlobalScales == m;
+    }
 
     std::vector<int64_t> outputShape(inputShape.begin(), inputShape.end());
     outputShape[rank - 1] = k / 2;
@@ -228,8 +231,8 @@ at::Tensor fp4_dequantize(at::Tensor const& fp4Tensor, at::Tensor const& scaleFa
 
     const thread_local int mMultiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
 
-    auto const layout = isSfSwizzledLayout ? tensorrt_llm::FP4QuantizationSFLayout::SWIZZLED
-                                           : tensorrt_llm::FP4QuantizationSFLayout::LINEAR;
+    auto const layout = isSfSwizzledLayout ? tensorrt_llm::QuantizationSFLayout::SWIZZLED
+                                           : tensorrt_llm::QuantizationSFLayout::LINEAR;
 
 #define LAUNCH_FP4_DEQUANTIZE_KERNEL(T)                                                                                \
     tensorrt_llm::kernels::invokeFP4Dequantization(m, k, reinterpret_cast<int64_t const*>(fp4Tensor.data_ptr()),       \

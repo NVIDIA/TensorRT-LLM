@@ -536,7 +536,7 @@ class WideEPMoE(MoE):
                             self.fc31_input_scale,
                             self.scaling_vector_size,
                             sfUseUE8M0=False,
-                            swizzedLayout=False)
+                            isSfSwizzledLayout=False)
                     x_sf = x_sf.view((x_row, -1))
 
             elif self.has_deepseek_fp8_block_scales:

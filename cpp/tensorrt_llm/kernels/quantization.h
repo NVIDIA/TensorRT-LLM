@@ -85,7 +85,7 @@ void invokeMxFP8Quantization(int b, int m, int n, int padded_n, T const* input, 
 
 template <typename T, int SF_VEC_SIZE = 16>
 void invokeFP4Dequantization(int m, int n, int64_t const* input, int32_t const* SFInput, float const* globalScale,
-    T* output, bool useUE8M0, FP4QuantizationSFLayout layout, int multiProcessorCount, bool perTokenGlobalScale,
+    T* output, bool useUE8M0, QuantizationSFLayout layout, int multiProcessorCount, bool perTokenGlobalScale,
     cudaStream_t stream = 0);
 
 void invokeBlockScaleInterleave(int b, int m, int m_padded, int n, int n_padded, uint8_t const* SFIn, uint8_t* SFOutput,
