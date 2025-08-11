@@ -297,6 +297,10 @@ void argGenLoadFile(benchmark::internal::Benchmark* benchmark)
      */
 
     std::ifstream file{workloadFile};
+    if (!file.is_open())
+    {
+        throw std::invalid_argument("Failed to open benchmark file: " + workloadFile);
+    }
     std::stringstream buffer;
     buffer << file.rdbuf();
     auto file_contents = buffer.str();

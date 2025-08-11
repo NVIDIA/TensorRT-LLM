@@ -362,6 +362,9 @@ def is_gemm_op_valid_sm100(op):
         #     return False
         if tile_n not in [64, 128, 256] or tile_m != 128:
             return False
+        # TODO Revert this once cutlass adds support for blockscaled + no smem
+        if op.epi_schedule == EpilogueScheduleType.PtrArrayNoSmemWarpSpecialized1Sm:
+            return False
 
     # Shapes for fp8 small N shapes
     if (op.act_type == DataType.e4m3) and (tile_n == 16
