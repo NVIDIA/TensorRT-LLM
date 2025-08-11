@@ -912,6 +912,9 @@ class VisionPreProcessor:
                 mode='constant')
             for image in preprocessor_outputs['PIXEL_VALUES']
         ]
+        # Add a dimension image_sizes to match the dimensions defined in config.pbtxt
+        for elem in preprocessor_outputs['IMAGE_SIZES']:
+            elem.unsqueeze_(1)
         for key, tensor_list in preprocessor_outputs.items():
             val = self.convert_tensor_list_to_tensor(tensor_list)
             if key in self.output_str_dtypes:
