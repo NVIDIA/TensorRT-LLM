@@ -53,7 +53,6 @@ def similarity_score(a, b):
     return SequenceMatcher(None, a, b).ratio()
 
 
-# Generate the outputs using either TRT or PyTorch (based on the use_pytorch argument). It’s the same function for both workflows.
 def generate_llm_outputs(args, data, fp8=False, fp8_kv_cache=False):
     kv_cache_config = KvCacheConfig(dtype="fp8" if fp8_kv_cache else "auto")
     cp_config = {
