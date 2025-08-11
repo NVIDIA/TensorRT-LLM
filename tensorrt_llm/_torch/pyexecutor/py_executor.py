@@ -34,7 +34,7 @@ from .llm_request import (ExecutorRequest, ExecutorResponse, LlmRequest,
                           LlmRequestState, executor_request_to_llm_request)
 from .model_engine import ModelEngine, PyTorchModelEngine
 from .sampler import BlockPredictionSampler, SampleStateBlockPrediction, Sampler, SampleState, SampleStateTensors, TorchSampler
-from .scheduler import ScheduledRequests
+from .scheduler import ScheduledRequests, SimpleScheduler
 
 # Environment variable to specify iteration ranges for profiling start/stop.
 # Format: "start1-stop1,start2-stop2,..." or single iterations "iter1,iter2,..."
@@ -185,7 +185,7 @@ class PyExecutor:
 
         # related modules
         self.resource_manager = resource_manager
-        self.scheduler = scheduler
+        self.scheduler: SimpleScheduler = scheduler
         self.model_engine = model_engine
         self.enable_attention_dp = model_engine.enable_attention_dp
         self.sampler = sampler
@@ -890,8 +890,7 @@ class PyExecutor:
                 if self.draft_model_engine is not None or is_ngram:
                     self._prepare_draft_requests()
 
-                scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
-                )
+                scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule()
 
                 if self.kv_cache_transceiver:
                     # For requests that are fitting disagg gen init, also prepare resources for KV cache manager
@@ -951,7 +950,7 @@ class PyExecutor:
                     batch_outputs = self._forward_step(scheduled_batch)  # Run a forward pass through the model to get logits
 
                     sample_state = self._sample_async(scheduled_batch,
-                                                      batch_outputs)  # Sample these logits to get the next token
+                                                      batch_outputs)  # Sample these logits to get the next tokens
 
                     self._update_request_states(scheduled_batch)  # Only for context phase
                     self._update_requests(sample_state)  # 
@@ -983,10 +982,53 @@ class PyExecutor:
                             scheduled_requests=scheduled_batch),
                                    iter_stats=iter_stats,
                                    iter_start_time=iter_start_time))
+
     def _executor_loop_block(self):
         """Executor loop for block prediction with iterative unmasking."""
         torch.cuda.set_device(self.device_id)
         # print("[BLOCK_PREDICTION] Starting block prediction executor loop")
+
+        with self._profiler() as profile_step:
+            while not self.is_shutdown or len(self.active_requests) > 0:
+                profile_step()
+                _new_requests = self._fetch_new_requests()
+                if self.is_shutdown and len(self.active_requests) == 0:
+                    break
+
+                scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule()
+
+                self.num_scheduled_requests = scheduled_batch.batch_size
+                logger.debug(
+                    f'has {len(self.active_requests)} active_request, '
+                    f'scheduled {len(scheduled_batch.context_requests)} context requests and '
+                    f'{len(scheduled_batch.generation_requests)} generation requests'
+                )
+
+                self._pause_requests(scheduled_batch.paused_requests)
+
+                finished_requests = []
+
+                if scheduled_batch.batch_size > 0:
+                    self.resource_manager.prepare_resources(scheduled_batch)
+
+                    # Even though this computes the entire prefix cache in the first iteration, it only outputs
+                    # logits for the current block undergoing generation.
+                    # We need to make sure the last block's logits are NOT cached
+                    batch_outputs = self._forward_step(scheduled_batch)
+
+                    # TODO(marcelroed): Use sample async block
+                    sample_state = self._sample_async_block(scheduled_batch, batch_outputs)
+
+                    # TODO(marcelroed)
+                    self._update_request_states(scheduled_batch)
+                    # TODO(marcelroed)
+                    self._update_requests(sample_state)
+
+                    self._handle_cancelled_requests()
+                    finished_requests = self._handle_responses()
+                    self.resource_manager.update_resources(scheduled_batch)
+        return
+        
         
         with self._profiler() as profile_step:
             iter_start_time = time.time()
@@ -1091,39 +1133,40 @@ class PyExecutor:
     def _process_block_prediction_batch(self, scheduled_batch):
         """Process a batch with iterative block prediction."""
         # print(f"[BLOCK_PREDICTION] Processing batch with {len(scheduled_batch.generation_requests)} generation requests")
-        
-        # Forward step to get initial logits
-        batch_outputs = self._forward_step_block(scheduled_batch)
-        
-        # Iterative block prediction loop
-        max_iterations = getattr(self.block_prediction_sampler, 'max_iterations', 10)
+
+        max_iterations: int = getattr(self.block_prediction_sampler, 'max_iterations', 10)
         iteration = 0
-        
-        # if iteration < max_iterations:
-        iteration += 1
-        # print(f"[BLOCK_PREDICTION] Block prediction iteration {iteration}")
-        
-        # Sample tokens using block prediction
-        sample_state = self._sample_async_block(scheduled_batch, batch_outputs)
-        
-        if sample_state is not None:
-            # print("[BLOCK_PREDICTION] Sample state is None, breaking")
-        
-            # Check if block prediction is complete
-            if hasattr(sample_state, 'device') and sample_state.device is not None:
-                # Block is complete - update requests and break
-                print("[BLOCK_PREDICTION] Block prediction complete, updating requests (TODO(marcelroed): check why/when this happens)")
-                self._update_requests(sample_state)
-            else:
-                # Block is not complete - continue iteration
-                print(f"[BLOCK_PREDICTION] Block not complete, continuing iteration {iteration}")
-                
-                # Update the requests with the current masked chunks for the next forward pass
-                self._update_requests_for_next_iteration(sample_state)
-                self._update_requests(sample_state)
-                
-                # Run another forward step with the updated masked chunks
-                # batch_outputs = self._forward_step_block(scheduled_batch)
+        while iteration < max_iterations:
+            # Forward step to get initial logits
+            batch_outputs = self._forward_step_block(scheduled_batch)
+            
+            # Iterative block prediction loop
+            # if iteration < max_iterations:
+            iteration += 1
+            # print(f"[BLOCK_PREDICTION] Block prediction iteration {iteration}")
+            
+            # Sample tokens using block prediction
+            sample_state = self._sample_async_block(scheduled_batch, batch_outputs)
+            
+            if sample_state is not None:
+                # print("[BLOCK_PREDICTION] Sample state is None, breaking")
+            
+                # Check if block prediction is complete
+                if hasattr(sample_state, 'device') and sample_state.device is not None:
+                    # Block is complete - update requests and break
+                    print("[BLOCK_PREDICTION] Block prediction complete, updating requests (TODO(marcelroed): check why/when this happens)")
+                    self._update_requests(sample_state)
+                    break
+                else:
+                    # Block is not complete - continue iteration
+                    print(f"[BLOCK_PREDICTION] Block not complete, continuing iteration {iteration}")
+                    
+                    # Update the requests with the current masked chunks for the next forward pass
+                    self._update_requests_for_next_iteration(sample_state)
+                    # self._update_requests(sample_state)
+                    
+                    # Run another forward step with the updated masked chunks
+                    # batch_outputs = self._forward_step_block(scheduled_batch)
         
         if iteration >= max_iterations:
             # print(f"[BLOCK_PREDICTION] Reached max iterations ({max_iterations}), forcing completion")
@@ -1861,6 +1904,7 @@ class PyExecutor:
         )
         def forward(scheduled_requests, resource_manager, new_tensors_device,
                     gather_context_logits):
+            assert isinstance(self.model_engine, PyTorchModelEngine)
             return self.model_engine.forward(
                 scheduled_requests,
                 resource_manager,
@@ -1868,11 +1912,13 @@ class PyExecutor:
                 gather_context_logits=gather_context_logits)
 
         try:
-            # For block prediction we need logits for every position in the newly allocated block, not
-            # just for the last token.  Force `gather_context_logits` to True when the block-prediction
-            # sampler is active so the model forward pass returns the full per-token logits tensor.
+            # When doing block prediction, we need logits for every position in the block in progress,
+            # but we don't need to return the entire context. Internally, the model should know to return
+            # only the block_size last logits.
+            # We also need to make sure the KV-cache doesn't add the last block's logits
             if hasattr(self, 'block_prediction_sampler') and self.block_prediction_sampler is not None:
-                gather_context_logits = True
+                assert self.block_prediction_sampler.block_size > 0
+                gather_context_logits = self.block_prediction_sampler.block_size
             else:
                 gather_context_logits = any(
                     a.py_return_context_logits
@@ -1914,6 +1960,7 @@ class PyExecutor:
                 gather_context_logits = any(
                     a.py_return_context_logits
                     for a in scheduled_requests.context_requests)
+            # Contains logits (should be just for the last block tokens)
             outputs = forward(scheduled_requests, self.resource_manager,
                               new_tensors_device, gather_context_logits)
             return outputs
@@ -1970,6 +2017,7 @@ class PyExecutor:
                       batch_outputs) -> SampleState | None:
         try:
             if batch_outputs is not None:
+                assert isinstance(self.sampler, TorchSampler)
                 return self.sampler.sample_async(scheduled_batch, batch_outputs)
         except Exception as e:
             traceback.print_exc()
@@ -1980,7 +2028,7 @@ class PyExecutor:
 
     @nvtx_range("_sample_async_block")
     def _sample_async_block(self, scheduled_batch,
-                      batch_outputs) -> SampleState | None:
+                      batch_outputs) -> SampleStateBlockPrediction | None:
         try:
             if batch_outputs is not None:
                 # For block prediction, we need to use a special sampler
@@ -1991,14 +2039,14 @@ class PyExecutor:
                     return self.sampler.sample_async(scheduled_batch, batch_outputs)
             else:
                 # Return a dummy sample state if no batch outputs
-                return SampleState(scheduled_requests=scheduled_batch)
+                return SampleStateBlockPrediction(scheduled_requests=scheduled_batch)
         except Exception as e:
             traceback.print_exc()
             error_msg = str(e)
             logger.error(f"Encountered an error in sampling: {error_msg}")
             self._handle_errors(error_msg)
             # Return a dummy sample state to prevent None errors
-            return SampleState(scheduled_requests=scheduled_batch)
+            return SampleStateBlockPrediction(scheduled_requests=scheduled_batch)
 
 
     @nvtx_range("_setup_sampler_step")
@@ -2012,9 +2060,11 @@ class PyExecutor:
             self._handle_errors(error_msg)
 
     @nvtx_range("_update_requests")
-    def _update_requests(self, sample_state: SampleState):
+    def _update_requests(self, sample_state: SampleState | SampleStateBlockPrediction):
         try:
             if self.block_prediction_sampler is not None:
+                assert isinstance(sample_state, SampleStateBlockPrediction), \
+                    "SampleState must be of type SampleStateBlockPrediction when using block prediction sampler"
                 self.block_prediction_sampler.update_requests(sample_state)
             # elif isinstance(self.sampler, BlockPredictionSampler):  # Split like this to enable go-to-definition
             #     self.sampler.update_requests(sample_state)

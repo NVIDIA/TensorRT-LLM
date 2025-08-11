@@ -178,8 +178,8 @@ class KvCacheCreator:
         return estimating_kv_cache
 
     def estimate_max_tokens(self, py_executor: PyExecutor) -> None:
-        """Perform KV cache capacity estimation.
-
+        """
+        Perform KV cache capacity estimation.
         This updates `kv_cache_config`.
         """
         executor_config = self._executor_config

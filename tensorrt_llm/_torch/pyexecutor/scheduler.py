@@ -173,7 +173,7 @@ class BindMicroBatchScheduler(MicroBatchScheduler):
     def __init__(
         self,
         max_batch_size: int,
-        max_num_tokens: int = None,
+        max_num_tokens: int | None = None,
         ctx_chunk_config: Optional[
             tb_internal.batch_manager.ContextChunkingConfig] = None,
     ) -> None:
@@ -194,7 +194,6 @@ class BindMicroBatchScheduler(MicroBatchScheduler):
 
 
 class SimpleScheduler(RequestScheduler):
-
     def __init__(self, capacity_scheduler: CapacityScheduler,
                  micro_batch_scheduler: MicroBatchScheduler):
         super(SimpleScheduler, self).__init__()

@@ -503,7 +503,7 @@ def forward_pattern(
     q = q.view(-1, num_heads, head_dim)
 
     # Key and Value
-    kv_cache = metadata.kv_cache_manager.get_buffers(layer_idx)
+    kv_cache: torch.Tensor = metadata.kv_cache_manager.get_buffers(layer_idx)
 
     if k is not None and v is not None:
         k = k.view(-1, num_kv_heads, head_dim)
@@ -530,20 +530,20 @@ def forward_pattern(
     num_generations = metadata.num_generations
     num_ctx_tokens = metadata.num_ctx_tokens
 
-    def prefill_forward(plan_params: PlanParams):
+    def prefill_forward(plan_params: PlanParams) -> torch.Tensor:
         wrapper = metadata.get_prefill_wrapper(plan_params)
         output = wrapper.run(q[:num_ctx_tokens], kv_cache)
         output = output.view(num_ctx_tokens, -1)
         return output
 
-    def decode_forward(plan_params: PlanParams):
+    def decode_forward(plan_params: PlanParams) -> torch.Tensor:
         wrapper = metadata.get_decode_wrapper(plan_params)
         output = wrapper.run(q[num_ctx_tokens:], kv_cache)
         output = output.view(num_generations, -1)
         return output
 
     # this will do nothing if the last forward pass had the same parameters
-    plan_params = metadata.plan(num_heads,
+    plan_params: PlanParams = metadata.plan(num_heads,
                                 num_kv_heads,
                                 head_dim,
                                 q_dtype=q.dtype,

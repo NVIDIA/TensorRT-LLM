@@ -2164,8 +2164,7 @@ class PyTorchModelEngine(ModelEngine):
             # guided_decoder.build should be called immediately after the launch of the single step;
             # while guided_decoder.execute should be called right before the samplings.
             # We can insert other CPU computation between them in the future.
-            if self.mapping.is_last_pp_rank(
-            ) and self.guided_decoder is not None:
+            if self.mapping.is_last_pp_rank() and self.guided_decoder is not None:
                 seq_slot_manager = resource_manager.get_resource_manager(
                     "seq_slot_manager")
                 self.guided_decoder.build(scheduled_requests, seq_slot_manager)

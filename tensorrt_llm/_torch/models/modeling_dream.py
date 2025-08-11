@@ -824,6 +824,7 @@ class DreamAttention(Attention):
         model_config: ModelConfig[DreamConfig],
         layer_idx: Optional[int] = None,
     ):
+        assert model_config.pretrained_config is not None, "Model config must have a pretrained_config attribute."
         config = model_config.pretrained_config
         super().__init__(
             hidden_size=config.hidden_size,
@@ -1310,7 +1311,7 @@ class DreamForCausalLM(DecoderModelForCausalLM[DreamModel, DreamConfig]):
         input_ids: torch.IntTensor | None = None,
         position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
-        return_context_logits: bool = False,
+        return_context_logits: bool | int = False,
         spec_metadata: Optional[SpecMetadata] = None,
         lora_params: Optional[dict] = None,
         **kwargs,
@@ -1350,6 +1351,17 @@ class DreamForCausalLM(DecoderModelForCausalLM[DreamModel, DreamConfig]):
             else:
                 # Fallback: return only the last token
                 hidden_states = hidden_states[:, -1]
+        if isinstance(return_context_logits, int) and not isinstance(return_context_logits, bool):
+            last_tokens = torch.cumsum(
+                attn_metadata.seq_lens_cuda,
+                dim=0,
+                dtype=torch.long,
+            )
+            d_model = hidden_states.size(-1)
+            offsets = torch.arange(-return_context_logits, 0, device=hidden_states.device)
+            gather_indices = last_tokens[:, None] + offsets[None, :]
+
+            hidden_states = torch.gather(hidden_states, 0, gather_indices.flatten()[:, None].repeat(1, d_model))
 
         # Ensure hidden_states are in the correct dtype
         if hasattr(self.model, 'config') and hasattr(self.model.config, 'torch_dtype'):
