@@ -88,7 +88,6 @@ class CUDAGraphModelEngine:
         return engine
 
     def execute(self, batch: ScheduledRequests, inputs: Dict[str, Any],
-                gather_ids: torch.Tensor, gather_context_logits: bool,
                 forward_fn: Callable) -> Optional[torch.Tensor]:
         """
         Runs the model via a CUDA graph or captures it if needed.
@@ -102,19 +101,14 @@ class CUDAGraphModelEngine:
 
         if batch_size not in self.graphs:
             if batch_size in self.supported_batch_sizes:
-                self._capture_graph(batch_size, forward_fn, inputs, gather_ids,
-                                    gather_context_logits)
+                self._capture_graph(batch_size, forward_fn, inputs)
             else:
                 return None
 
         return self._run_graph(batch_size, inputs)
 
-    def _capture_graph(self,
-                       batch_size: int,
-                       forward_fn: Callable,
-                       initial_inputs: Dict[str, Any],
-                       gather_ids: torch.Tensor,
-                       gather_context_logits: bool = False):
+    def _capture_graph(self, batch_size: int, forward_fn: Callable,
+                       initial_inputs: Dict[str, Any]):
         """Captures the forward pass for a given batch size."""
         engine = self._get_engine()
 
@@ -151,11 +145,10 @@ class CUDAGraphModelEngine:
         graph = torch.cuda.CUDAGraph()
         with capturing_cuda_graph_context():
             for _ in range(self.WARMUP_STEPS):
-                forward_fn(capture_inputs, gather_ids, gather_context_logits)
+                forward_fn(capture_inputs)
 
             with torch.cuda.graph(graph, pool=self.memory_pool):
-                output = forward_fn(capture_inputs, gather_ids,
-                                    gather_context_logits)
+                output = forward_fn(capture_inputs)
 
         self.graphs[batch_size] = graph
         self.graph_outputs[batch_size] = make_weak_ref(output)

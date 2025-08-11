@@ -2012,13 +2012,18 @@ class PyTorchModelEngine(ModelEngine):
 
             self.iter_counter += 1
 
+            def capture_forward_fn(inputs: Dict[str, Any]):
+                with MoeLoadBalancerIterContext(moe_load_balancer):
+                    return self._forward_step(
+                        inputs,
+                        gather_ids=gather_ids,
+                        gather_context_logits=gather_context_logits)
+
             # 3. Ask the manager to execute the graph
             graph_output = self.cuda_graph_model_engine.execute(
                 batch=padded_requests,
                 inputs=inputs,
-                gather_ids=gather_ids,
-                gather_context_logits=gather_context_logits,
-                forward_fn=self._forward_step)
+                forward_fn=capture_forward_fn)
 
             if graph_output is not None:
                 # Graph was successfully run
