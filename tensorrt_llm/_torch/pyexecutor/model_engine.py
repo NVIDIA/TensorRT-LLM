@@ -750,18 +750,6 @@ class PyTorchModelEngine(ModelEngine):
                 if bs > self.batch_size:
                     # skip batch size larger than self.batch_size
                     continue
-                with release_batch(get_cuda_graph_warmup_request(bs)) as batch:
-                    if batch is None:
-                        # No KV cache space!
-                        return
-                    logger.info(
-                        f"Run generation only CUDA graph warmup for batch size={bs}"
-                    )
-                    self.cuda_graph_model_engine.execute(
-                        batch,
-                        new_tensors_device=None,
-                        resource_manager=resource_manager)
-                    torch.cuda.synchronize()
 
                 for draft_len in draft_lengths:
                     with release_batch(
