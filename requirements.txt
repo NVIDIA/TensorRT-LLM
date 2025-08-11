@@ -63,6 +63,11 @@ meson
 ninja
 etcd3
 blake3
+# observation.tracing
+opentelemetry-sdk
+opentelemetry-api
+opentelemetry-exporter-otlp
+opentelemetry-semantic-conventions-ai
 soundfile
 triton==3.3.1; platform_machine == "x86_64"
 tiktoken
