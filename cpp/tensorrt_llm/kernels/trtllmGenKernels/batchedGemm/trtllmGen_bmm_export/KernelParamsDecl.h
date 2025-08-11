@@ -29,7 +29,7 @@ struct KernelParams
     //
     //////////////////////////////////////////////////////////////////////////////////////////////////
 
-    // Maximum number of CTAs
+    // Maximum number of CTAs in the batch-token dimension.
     static constexpr int MaxNumCtas = 2048;
 
     // NOTE: TMA out-of-bounds optimization for MoE padded tokens:

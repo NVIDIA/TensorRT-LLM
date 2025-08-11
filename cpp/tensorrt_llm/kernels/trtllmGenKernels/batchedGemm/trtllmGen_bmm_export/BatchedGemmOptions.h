@@ -230,22 +230,6 @@ bool checkAndUpdateBatchedGemmOptions(BatchedGemmOptions& options, bool isBlackw
         TLLM_CHECK_ERROR(options.mTransposeMmaOutput, "When batchN the MMA output has to be in column-major.");
     }
 
-    for (int b = 0; b < options.mNumBatches && options.mIsStaticBatch; b++)
-    {
-        if (batchM)
-        {
-            TLLM_CHECK_ERROR(options.mBatchedM[b] > 0 && options.mK > 0, "N and K must be larger than 0");
-            TLLM_CHECK_ERROR(options.mBatchedM[b] >= options.mTileM, "M must be equal or larger than TileM.");
-            TLLM_CHECK_ERROR(options.mBatchedM[b] % options.mTileM == 0, "M must be divisible by TileM.");
-        }
-        else
-        {
-            TLLM_CHECK_ERROR(options.mBatchedN[b] > 0 && options.mK > 0, "N and K must be larger than 0");
-            TLLM_CHECK_ERROR(options.mBatchedN[b] >= options.mTileN, "N must be equal or larger than TileN.");
-            TLLM_CHECK_ERROR(options.mBatchedN[b] % options.mTileN == 0, "N must be divisible by TileN.");
-        }
-    }
-
     if (options.mUseDeepSeekFp8)
     {
         if (batchM)

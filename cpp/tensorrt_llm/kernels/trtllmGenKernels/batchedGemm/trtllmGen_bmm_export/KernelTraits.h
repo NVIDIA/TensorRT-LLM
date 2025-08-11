@@ -109,6 +109,17 @@ public:
         return getOffsetBeforeChunk(static_cast<int32_t>(mNumBytesAndAlignmentPerSmemChunk.size()));
     }
 
+    // Print the contents of this object.
+    void print() const
+    {
+        for (size_t ii = 0; ii < mNumBytesAndAlignmentPerSmemChunk.size(); ++ii)
+        {
+            printf("Chunk %zd %s: %d bytes, %d alignment, reuse %s, offset %d\n", ii, mSmemChunkNames[ii].c_str(),
+                mNumBytesAndAlignmentPerSmemChunk[ii].first, mNumBytesAndAlignmentPerSmemChunk[ii].second,
+                mFirstChunkReuse[ii] ? "true" : "false", getChunkOffset(ii));
+        }
+    }
+
 private:
     int32_t getChunkOffset(int32_t ii) const
     {
@@ -130,18 +141,6 @@ private:
         return mFirstChunkReuse[ii];
     }
 
-    // Print the contents of this object.
-    void print() const
-    {
-        for (size_t ii = 0; ii < mNumBytesAndAlignmentPerSmemChunk.size(); ++ii)
-        {
-            printf("Chunk %zd %s: %d bytes, %d alignment, reuse %s, offset %d\n", ii, mSmemChunkNames[ii].c_str(),
-                mNumBytesAndAlignmentPerSmemChunk[ii].first, mNumBytesAndAlignmentPerSmemChunk[ii].second,
-                mFirstChunkReuse[ii] ? "true" : "false", getChunkOffset(ii));
-        }
-    }
-
-private:
     // Helper function to calculate padded size
     int32_t getSizePaddedToAlignment(int32_t size, int32_t alignment) const
     {

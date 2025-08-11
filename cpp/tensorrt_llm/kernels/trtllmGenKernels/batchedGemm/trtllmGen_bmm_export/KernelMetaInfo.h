@@ -28,7 +28,7 @@ namespace kernels
 {
 // clang-format off
 
-#define TLLM_GEN_COMMIT "3aa0f53d"
+#define TLLM_GEN_COMMIT "106ccd8a"
 #define TLLM_GEN_EXPORT_VERSION "7.0.3.0.3.0"
 
 static constexpr size_t tllmGenBatchedGemmListLen = 288;
