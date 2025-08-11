@@ -88,6 +88,7 @@ class CUDAGraphModelEngine:
         return engine
 
     def execute(self, batch: ScheduledRequests, inputs: Dict[str, Any],
+                gather_ids: torch.Tensor, gather_context_logits: bool,
                 forward_fn: Callable) -> Optional[torch.Tensor]:
         """
         Runs the model via a CUDA graph or captures it if needed.
@@ -101,7 +102,8 @@ class CUDAGraphModelEngine:
 
         if batch_size not in self.graphs:
             if batch_size in self.supported_batch_sizes:
-                self._capture_graph(batch_size, forward_fn, inputs)
+                self._capture_graph(batch_size, forward_fn, inputs, gather_ids,
+                                    gather_context_logits)
             else:
                 return None
 
