@@ -5,7 +5,6 @@ from huggingface_hub import snapshot_download
 
 from tensorrt_llm import LLM
 from tensorrt_llm.executor import LoRARequest
-from tensorrt_llm.llmapi import BuildConfig
 from tensorrt_llm.lora_manager import LoraConfig
 
 
@@ -19,12 +18,12 @@ def main():
 
     # Currently, we need to pass at least one lora_dir to LLM constructor via build_config.lora_config.
     # This is necessary because it requires some configuration in the lora_dir to build the engine with LoRA support.
-    build_config = BuildConfig()
-    build_config.lora_config = LoraConfig(lora_dir=[lora_dir1])
+    lora_config = LoraConfig(lora_dir=[lora_dir1],
+                             max_lora_rank=64,
+                             max_loras=3,
+                             max_cpu_loras=3)
     llm = LLM(model="TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-              enable_lora=True,
-              max_lora_rank=64,
-              build_config=build_config)
+              lora_config=lora_config)
 
     # Sample prompts
     prompts = [

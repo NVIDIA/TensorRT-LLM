@@ -76,6 +76,12 @@ class AutoModelForCausalLMFactory(ModelFactory):
         "max_position_embeddings": 1024,
     }
 
+    def _get_max_position_embeddings_config(self) -> Dict[str, Any]:
+        """Get the max position embeddings config for the model."""
+        return {
+            "max_position_embeddings": self.max_seq_len,
+        }
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
 
@@ -83,7 +89,11 @@ class AutoModelForCausalLMFactory(ModelFactory):
 
         # Ingest defaults for tokenizer and model kwargs
         self.tokenizer_kwargs = deep_merge_dicts(self._tokenizer_defaults, self.tokenizer_kwargs)
-        self.model_kwargs = deep_merge_dicts(self._model_defaults, self.model_kwargs)
+        self.model_kwargs = deep_merge_dicts(
+            self._model_defaults,
+            self.model_kwargs,
+            self._get_max_position_embeddings_config(),
+        )
 
         # special handling for torch_dtype in model_kwargs since HF does not correctly update
         # torch_dtype string to an actual torch.dtype object (only with default)
@@ -295,7 +305,7 @@ class AutoModelForCausalLMFactory(ModelFactory):
         # at this point it should be a directory (either the original one or the download dir)
         assert os.path.isdir(fetched_dir), f"Checkpoint path {fetched_dir} is not a directory."
 
-        self._load_quantization_config()
+        self._load_quantization_config(fetched_dir)
 
         return fetched_dir
 
@@ -313,13 +323,13 @@ class AutoModelForCausalLMFactory(ModelFactory):
             # model-transformed weights,leading to unexpected key mismatches or format issues.
             load_checkpoint_in_model(model, checkpoint=ckpt_file, full_state_dict=False)
 
-    def _load_quantization_config(self):
+    def _load_quantization_config(self, fetched_dir: str):
         """Load the quantization config from the model directory if not done already."""
         if self._quant_config is not None:
             return
 
         assert self.model
-        hf_quant_config_file = os.path.join(self.model, "hf_quant_config.json")
+        hf_quant_config_file = os.path.join(fetched_dir, "hf_quant_config.json")
         if os.path.exists(hf_quant_config_file):
             with open(hf_quant_config_file, "r") as file:
                 quantization_config = json.load(file)
@@ -343,6 +353,15 @@ class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
             "use_cache": False,
         },
     }
+
+    def _get_max_position_embeddings_config(self) -> Dict[str, Any]:
+        """Get the max position embeddings config for the model."""
+        return {
+            "max_position_embeddings": self.max_seq_len,
+            "text_config": {
+                "max_position_embeddings": self.max_seq_len,
+            },
+        }
 
     @property
     def automodel_from_config(self):

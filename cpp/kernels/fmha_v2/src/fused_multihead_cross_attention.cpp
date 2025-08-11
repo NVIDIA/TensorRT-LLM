@@ -23,25 +23,27 @@ using Launch_params = bert::Fused_multihead_attention_launch_params;
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-void run_softmax_fp32(void* dst, void const* src, void const* mask, void* softmax_sum_d, void* cu_seqlens_q_d,
-    int s_inner, int s_outer, int b, int h, float softcapping_scale_bmm1, int warps_n, bool has_alibi);
-
-////////////////////////////////////////////////////////////////////////////////////////////////////
-
-void run_softmax_e4m3(void* dst, void const* src, void const* mask, void* softmax_sum_d, void* cu_seqlens_q_d,
-    int s_inner, int s_outer, int b, int h, float scale_softmax, float softcapping_scale_bmm1, int warps_n,
+void run_softmax_fp32(void* dst, void const* src, void const* mask, void const* attention_sinks, void* softmax_sum_d,
+    void* cu_seqlens_q_d, int s_inner, int s_outer, int b, int h, float softcapping_scale_bmm1, int warps_n,
     bool has_alibi);
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-void run_softmax_fp16(void* dst, void const* src, void const* mask, void* softmax_sum_d, void* cu_seqlens_q_d,
-    int s_inner, int s_outer, int b, int h, float softcapping_scale_bmm1, int warps_n, bool has_alibi);
+void run_softmax_e4m3(void* dst, void const* src, void const* mask, void const* attention_sinks, void* softmax_sum_d,
+    void* cu_seqlens_q_d, int s_inner, int s_outer, int b, int h, float scale_softmax, float softcapping_scale_bmm1,
+    int warps_n, bool has_alibi);
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-void run_softmax_int8(void* dst, void const* src, void const* mask, void* softmax_sum_d, void* cu_seqlens_q_d,
-    int s_inner, int s_outer, int b, int h, float scale_i2f, float scale_f2i, float softcapping_scale_bmm1, int warps_n,
+void run_softmax_fp16(void* dst, void const* src, void const* mask, void const* attention_sinks, void* softmax_sum_d,
+    void* cu_seqlens_q_d, int s_inner, int s_outer, int b, int h, float softcapping_scale_bmm1, int warps_n,
     bool has_alibi);
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+void run_softmax_int8(void* dst, void const* src, void const* mask, void const* attention_sinks, void* softmax_sum_d,
+    void* cu_seqlens_q_d, int s_inner, int s_outer, int b, int h, float scale_i2f, float scale_f2i,
+    float softcapping_scale_bmm1, int warps_n, bool has_alibi);
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -57,10 +59,10 @@ void run_conversion_fp32_to_e4m3(void* dst, void const* src, int s, int b, int h
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-void ground_truth(RefBMM& bmm1, RefBMM& bmm2, Data_type const data_type, Data_type const acc_type,
+void ground_truth(RefBMM& bmm1, RefBMM& bmm2, const Data_type data_type, const Data_type acc_type,
     float const scale_bmm1, float const scale_softmax, float const scale_bmm2, void* q_d, void* kv_d, void* vt_d,
     void* mask_d, void* p_d, void* s_d, void* tmp_d, void* o_d, void* softmax_sum_d, void* cu_seqlens_q_d,
-    size_t const b, size_t const s_q, size_t const s_kv, size_t const h, size_t const d, int const runs,
+    const size_t b, const size_t s_q, const size_t s_kv, const size_t h, const size_t d, int const runs,
     int const warps_m, int const warps_n, bool has_alibi)
 {
 
@@ -84,20 +86,22 @@ void ground_truth(RefBMM& bmm1, RefBMM& bmm2, Data_type const data_type, Data_ty
         // Softmax.
         if (data_type == DATA_TYPE_FP16 && acc_type == DATA_TYPE_FP16)
         {
-            run_softmax_fp16(s_d, p_d, mask_d, softmax_sum_d, cu_seqlens_q_d, s_kv, s_q, b, h, 0.f, warps_n, has_alibi);
+            run_softmax_fp16(
+                s_d, p_d, mask_d, nullptr, softmax_sum_d, cu_seqlens_q_d, s_kv, s_q, b, h, 0.f, warps_n, has_alibi);
         }
         else if (data_type == DATA_TYPE_FP16 && acc_type == DATA_TYPE_FP32)
         {
-            run_softmax_fp32(s_d, p_d, mask_d, softmax_sum_d, cu_seqlens_q_d, s_kv, s_q, b, h, 0.f, warps_n, has_alibi);
+            run_softmax_fp32(
+                s_d, p_d, mask_d, nullptr, softmax_sum_d, cu_seqlens_q_d, s_kv, s_q, b, h, 0.f, warps_n, has_alibi);
         }
         else if (data_type == DATA_TYPE_E4M3 && acc_type == DATA_TYPE_FP32)
         {
-            run_softmax_e4m3(s_d, p_d, mask_d, softmax_sum_d, cu_seqlens_q_d, s_kv, s_q, b, h, scale_softmax, 0.f,
-                warps_n, has_alibi);
+            run_softmax_e4m3(s_d, p_d, mask_d, nullptr, softmax_sum_d, cu_seqlens_q_d, s_kv, s_q, b, h, scale_softmax,
+                0.f, warps_n, has_alibi);
         }
         else if (data_type == DATA_TYPE_INT8 && acc_type == DATA_TYPE_INT32)
         {
-            run_softmax_int8(s_d, p_d, mask_d, softmax_sum_d, cu_seqlens_q_d, s_kv, s_q, b, h, scale_bmm1,
+            run_softmax_int8(s_d, p_d, mask_d, nullptr, softmax_sum_d, cu_seqlens_q_d, s_kv, s_q, b, h, scale_bmm1,
                 scale_softmax, 0.f, warps_n, has_alibi);
         }
         else
@@ -148,8 +152,8 @@ static inline void set_params(bert::Fused_multihead_attention_params_mhca& param
     // types
     Data_type data_type, Data_type acc_type,
     // sizes
-    size_t const b, size_t const s_q, size_t const s_kv, size_t const h, size_t const d, size_t const d_padded,
-    size_t const total,
+    const size_t b, const size_t s_q, const size_t s_kv, const size_t h, const size_t d, const size_t d_padded,
+    const size_t total,
     // device pointers
     void* q_packed_d, void* kv_packed_d, void* cu_seqlens_q_d, void* cu_seqlens_kv_d, void* o_packed_d, void* p_d,
     void* s_d,
@@ -515,17 +519,17 @@ int main(int argc, char** argv)
     launch_params.use_tma = use_tma;
 
     // The Q matrix of size S_Q x B x H x D.
-    size_t const q_size = s_q * b * h * d;
+    const size_t q_size = s_q * b * h * d;
     // The K and V matrices are packed into one big matrix of size S_KV x B x H x 2 x D.
-    size_t const kv_size = s_kv_padded * b * h * 2 * d;
+    const size_t kv_size = s_kv_padded * b * h * 2 * d;
     // Allocate on the host.
     float* q_h = (float*) malloc(q_size * sizeof(float));
     // Allocate on the host.
     float* kv_h = (float*) malloc(kv_size * sizeof(float));
     // The size in bytes.
-    size_t const q_size_in_bytes = get_size_in_bytes(q_size, data_type);
+    const size_t q_size_in_bytes = get_size_in_bytes(q_size, data_type);
     // The size in bytes.
-    size_t const kv_size_in_bytes = get_size_in_bytes(kv_size, data_type);
+    const size_t kv_size_in_bytes = get_size_in_bytes(kv_size, data_type);
     // Allocate on the device.
     void* q_d = nullptr;
     FMHA_CHECK_CUDA(cudaMalloc(&q_d, q_size_in_bytes));
@@ -534,11 +538,11 @@ int main(int argc, char** argv)
     FMHA_CHECK_CUDA(cudaMalloc(&kv_d, kv_size_in_bytes));
 
     // The mask for dropout.
-    size_t const mask_size = s_q * b * s_kv_padded;
+    const size_t mask_size = s_q * b * s_kv_padded;
     // Allocate on the host.
     float* mask_h = (float*) malloc(mask_size * sizeof(float));
     // The size in bytes.
-    size_t const mask_size_in_bytes = get_size_in_bytes(mask_size, DATA_TYPE_INT8);
+    const size_t mask_size_in_bytes = get_size_in_bytes(mask_size, DATA_TYPE_INT8);
     // Allocate on the device.
     void* mask_d = nullptr;
     FMHA_CHECK_CUDA(cudaMalloc(&mask_d, mask_size_in_bytes));
@@ -554,28 +558,28 @@ int main(int argc, char** argv)
         v1 ? 1 : 2);
 
     // The number of threads per CTA.
-    size_t const threads_per_cta = warps_m * warps_n * warps_k * 32;
+    const size_t threads_per_cta = warps_m * warps_n * warps_k * 32;
     // The number of mmas in the M dimension. We use one uint32_t per MMA in the M dimension.
-    size_t const mmas_m = (s_q + 16 * warps_m - 1) / (16 * warps_m);
+    const size_t mmas_m = (s_q + 16 * warps_m - 1) / (16 * warps_m);
     // The number of mmas in the N dimension.
-    size_t const mmas_n = (s_kv_padded + 16 * warps_n - 1) / (16 * warps_n);
+    const size_t mmas_n = (s_kv_padded + 16 * warps_n - 1) / (16 * warps_n);
     // We do not support more than 4 MMAS in the N dimension (as each MMA needs 8 bits in the mask).
     assert(!v1 || mmas_n <= 4);
     // The packed mask for dropout (in the fused kernel). Layout is B * MMAS_M * THREADS_PER_CTA.
-    size_t const packed_mask_size = b * mmas_m * threads_per_cta;
+    const size_t packed_mask_size = b * mmas_m * threads_per_cta;
     // The size in bytes.
-    size_t const packed_mask_size_in_bytes = packed_mask_size * sizeof(uint32_t);
+    const size_t packed_mask_size_in_bytes = packed_mask_size * sizeof(uint32_t);
     // Allocate on the host.
     uint32_t* packed_mask_h = (uint32_t*) malloc(packed_mask_size_in_bytes);
     // Allocate on the device.
     void* packed_mask_d = nullptr;
 
     // The O matrix is packed as S_Q * B * H * D.
-    size_t const o_size = s_q * b * h * d;
+    const size_t o_size = s_q * b * h * d;
     // Allocate on the host.
     float* o_h = (float*) malloc(o_size * sizeof(float));
     // The size in bytes.
-    size_t const o_size_in_bytes = get_size_in_bytes(o_size, data_type);
+    const size_t o_size_in_bytes = get_size_in_bytes(o_size, data_type);
     // Allocate on the device.
     void* o_d = nullptr;
     FMHA_CHECK_CUDA(cudaMalloc(&o_d, o_size_in_bytes));
@@ -587,7 +591,7 @@ int main(int argc, char** argv)
     FMHA_CHECK_CUDA(cudaMemset(softmax_max_d, 0x00, sizeof(float) * b * s_q * h));
 
     // The size in bytes.
-    size_t const tmp_size_in_bytes = get_size_in_bytes(o_size, acc_type);
+    const size_t tmp_size_in_bytes = get_size_in_bytes(o_size, acc_type);
     // Allocate on the device.
     void* tmp_d = nullptr;
     if (data_type != acc_type)
@@ -599,9 +603,9 @@ int main(int argc, char** argv)
     float* o_ref_h = (float*) malloc(o_size * sizeof(float));
 
     // The P matrix is stored as one big matrix of size S_Q x B x H x S_KV.
-    size_t const p_size = s_q * b * h * s_kv_padded;
+    const size_t p_size = s_q * b * h * s_kv_padded;
     // The size in bytes.
-    size_t const p_size_in_bytes = get_size_in_bytes(p_size, acc_type);
+    const size_t p_size_in_bytes = get_size_in_bytes(p_size, acc_type);
     // Allocate on the device.
     void* p_d = nullptr;
     FMHA_CHECK_CUDA(cudaMalloc(&p_d, p_size_in_bytes));
@@ -614,7 +618,7 @@ int main(int argc, char** argv)
 #endif // defined(STORE_P)
 
     // The size in bytes of the S matrix (the data type may be different from P for int8).
-    size_t const s_size_in_bytes = get_size_in_bytes(p_size, data_type);
+    const size_t s_size_in_bytes = get_size_in_bytes(p_size, data_type);
     // Allocate on the device.
     void* s_d = nullptr;
     FMHA_CHECK_CUDA(cudaMalloc(&s_d, s_size_in_bytes));
@@ -634,9 +638,9 @@ int main(int argc, char** argv)
 
     //   WAR fOR MISSING CUBLAS FP8 NN SUPPORT.
     //   Transpose V, so that we can do a TN BMM2, i.e. O = S x V'  instead of O = S x V.
-    size_t const v_size = s_kv_padded * b * h * d;
+    const size_t v_size = s_kv_padded * b * h * d;
     // The size in bytes.
-    size_t const v_size_in_bytes = get_size_in_bytes(v_size, data_type);
+    const size_t v_size_in_bytes = get_size_in_bytes(v_size, data_type);
     float* vt_h = (float*) malloc(v_size * sizeof(float));
     void* vt_d = nullptr;
     FMHA_CHECK_CUDA(cudaMalloc(&vt_d, v_size_in_bytes));
@@ -676,7 +680,7 @@ int main(int argc, char** argv)
         = [min_s, fix_s, b](int s, std::vector<uint32_t>& seqlens, std::vector<int>& cu_seqlens, void** cu_seqlens_d)
     {
         std::transform(seqlens.begin(), seqlens.end(), seqlens.begin(),
-            [=](uint32_t const)
+            [=](const uint32_t)
             {
                 if (fix_s)
                 {
@@ -728,7 +732,7 @@ int main(int argc, char** argv)
     void* kv_packed_d = nullptr;
     FMHA_CHECK_CUDA(cudaMalloc(&kv_packed_d, kv_packed_size_in_bytes));
 
-    size_t const o_packed_size = cu_seqlens_q.back() * h * d;
+    const size_t o_packed_size = cu_seqlens_q.back() * h * d;
     // Allocate on the host.
     float* o_packed_h = (float*) malloc(o_packed_size * sizeof(float));
     float* o_ref_packed_h = (float*) malloc(o_packed_size * sizeof(float));

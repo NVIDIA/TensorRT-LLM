@@ -6,7 +6,6 @@ set(TRTLLM_PYBIND_MODULE
 set(SRCS
     batch_manager/algorithms.cpp
     batch_manager/bindings.cpp
-    batch_manager/buffers.cpp
     batch_manager/cacheTransceiver.cpp
     batch_manager/kvCacheManager.cpp
     batch_manager/llmRequest.cpp
@@ -54,6 +53,6 @@ if(NOT WIN32)
     ${TRTLLM_PYBIND_MODULE}
     PROPERTIES
       LINK_FLAGS
-      "-Wl,-rpath,'$ORIGIN/libs' -Wl,-rpath,'$ORIGIN/../nvidia/nccl/lib' -Wl,-rpath,'${CUDA_TOOLKIT_ROOT_DIR}/targets/x86_64-linux/lib/stubs' ${AS_NEEDED_FLAG} ${UNDEFINED_FLAG}"
+      "-Wl,-rpath,'$ORIGIN/libs' -Wl,-rpath,'$ORIGIN/../nvidia/nccl/lib' ${AS_NEEDED_FLAG} ${UNDEFINED_FLAG}"
   )
 endif()

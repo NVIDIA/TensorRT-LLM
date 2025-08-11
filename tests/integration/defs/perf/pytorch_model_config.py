@@ -56,8 +56,8 @@ def get_model_yaml_config(model_label: str,
         # DeepSeek R1 models with MTP speculative decoding
         {
             'patterns': [
-                'deepseek_r1-bench-pytorch-float16-maxbs:1-maxnt:8192-input_output_len:1000,2000-quant:fp8-reqs:10-ep:4-gpus:8',
-                'deepseek_r1_nvfp4-bench-pytorch-float16-maxbs:1-maxnt:8192-input_output_len:1000,2000-quant:nvfp4-reqs:10-ep:4-tp:8-gpus:8'
+                'deepseek_r1-bench-pytorch-float16-maxbs:1-maxnt:8192-input_output_len:1000,2000-reqs:10-ep:4-gpus:8',
+                'deepseek_r1_nvfp4-bench-pytorch-float16-maxbs:1-maxnt:8192-input_output_len:1000,2000-reqs:10-ep:4-tp:8-gpus:8'
             ],
             'config': {
                 'enable_attention_dp': True,
@@ -71,8 +71,8 @@ def get_model_yaml_config(model_label: str,
         # DeepSeek R1 models with large batch sizes and cuda graph padding
         {
             'patterns': [
-                'deepseek_r1-bench-pytorch-float16-maxbs:384-maxnt:1536-input_output_len:1000,2000-quant:nvfp4-reqs:49152-con:3072-ep:8-gpus:8',
-                'deepseek_r1_nvfp4-bench-pytorch-float16-maxbs:384-maxnt:1536-input_output_len:1000,2000-quant:nvfp4-reqs:49152-con:3072-ep:8-gpus:8'
+                'deepseek_r1_fp8-bench-pytorch-float16-maxbs:384-maxnt:1536-input_output_len:1000,2000-reqs:49152-con:3072-ep:8-gpus:8',
+                'deepseek_r1_nvfp4-bench-pytorch-float16-maxbs:384-maxnt:1536-input_output_len:1000,2000-reqs:49152-con:3072-ep:8-gpus:8'
             ],
             'config': {
                 'enable_attention_dp': True,
@@ -85,7 +85,7 @@ def get_model_yaml_config(model_label: str,
         # DeepSeek R1 model with specific batch size 128
         {
             'patterns':
-            'deepseek_r1-bench-pytorch-float16-maxbs:128-maxnt:1127-input_output_len:1000,2000-quant:fp8-reqs:5120-con:1024-ep:8-gpus:8',
+            'deepseek_r1_fp8-bench-pytorch-float16-maxbs:128-maxnt:1127-input_output_len:1000,2000-reqs:5120-con:1024-ep:8-gpus:8',
             'config': {
                 'enable_attention_dp': True,
                 'cuda_graph_config': {
@@ -154,6 +154,9 @@ def get_model_yaml_config(model_label: str,
                 'llama_v3.3_70b_instruct_fp8-bench-pytorch-float8-maxbs:512-maxnt:2048-input_output_len:2000,500-gpus:4',
                 'llama_v3.3_70b_instruct_fp8-bench-pytorch-float8-maxbs:512-maxnt:2048-input_output_len:128,128-gpus:4',
                 'llama_v3.3_70b_instruct_fp8-bench-pytorch-bfloat16-maxbs:512-maxnt:2048-input_output_len:512,32-gpus:4',
+                'llama_v3.1_405b_instruct_fp4',
+                'llama_v4_scout_17b_16e_instruct_fp4',
+                'llama_v4_maverick_17b_128e_instruct_fp8'
             ],
             'config': {
                 'use_cuda_graph':
@@ -196,7 +199,7 @@ def get_model_yaml_config(model_label: str,
                 "mlp_h_to_4h": "gate_up_proj",
                 "mlp_4h_to_h": "down_proj"
             }
-            lora_config['lora_config']['max_lora_rank'] = 64
+            lora_config['lora_config']['max_lora_rank'] = 320
         base_config.update(lora_config)
 
     kv_cache_config = base_config.get('kv_cache_config', KvCacheConfig())

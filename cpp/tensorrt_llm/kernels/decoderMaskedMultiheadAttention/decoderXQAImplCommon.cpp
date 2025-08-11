@@ -52,9 +52,11 @@ XQAKernelRuntimeHashKey getRuntimeHashKeyFromXQAParams(XQAParams const& xqaParam
     unsigned int kernel_m_tilesize
         = getKernelMTileSize(num_q_heads_over_kv, xqaParams.multi_query_tokens, qSeqLen, isXqaJit);
 
+    // precompiled XQA does not use is_fp8_output as hashing key
     return {xqaParams.kv_cache_data_type, head_size, beam_width, kernel_num_q_heads_over_kv, kernel_m_tilesize,
         xqaParams.paged_kv_cache ? static_cast<unsigned int>(xqaParams.tokens_per_block) : 0, xqaParams.paged_kv_cache,
-        xqaParams.multi_query_tokens, xqaParams.is_fp8_output};
+        xqaParams.multi_query_tokens, isXqaJit ? xqaParams.is_fp8_output : false,
+        isXqaJit ? std::optional(xqaParams.position_embedding_type) : std::nullopt};
 }
 
 } // namespace tensorrt_llm::kernels

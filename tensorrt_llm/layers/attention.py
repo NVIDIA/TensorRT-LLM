@@ -631,7 +631,7 @@ class Attention(Module):
                 embed_positions, long_rope_embed_positions, \
                 (rotary_inv_freq, embed_positions_for_gpt_attention), \
                 (long_rope_rotary_inv_freq, long_rope_embed_positions_for_gpt_attention), mscale \
-                    = RopeEmbeddingUtils.create_sinusoidal_positions_long_rope(
+                    = RopeEmbeddingUtils.create_sinusoidal_positions_long_rope_for_attention_plugin(
                     max_position_embeddings,
                     original_max_position_embeddings, rotary_embedding_dim,
                     rotary_embedding_base, rope_scaling_short_factors,

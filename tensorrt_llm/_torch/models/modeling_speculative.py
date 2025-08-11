@@ -359,6 +359,7 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
 
             self.draft_model = get_draft_model(model_config, draft_config)
             self.spec_worker = get_spec_worker(model_config.spec_config,
+                                               model_config,
                                                model_config.mapping)
 
     def forward(

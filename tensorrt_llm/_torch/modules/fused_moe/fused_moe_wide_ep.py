@@ -11,7 +11,7 @@ from tensorrt_llm.mapping import Mapping
 from ...distributed import allgather, reducescatter
 from ...expert_statistic import ExpertStatistic
 from ...model_config import ModelConfig
-from ...utils import EventType, Fp4QuantizedTensor, swizzle_sf
+from ...utils import EventType, Fp4QuantizedTensor
 from .deep_ep_utils import buffer_pool, deep_ep_installed
 from .interface import MoE
 from .moe_load_balancer import get_moe_load_balancer
@@ -376,7 +376,7 @@ class WideEPMoE(MoE):
             self.layer_load_balancer.wait_for_gpu_stage()
 
         use_deepseek_fp8_block_scale = False
-        use_w4a8_group_scaling = False
+        use_w4_group_scaling = False
         weight_dtype = self.w3_w1_weight.dtype
 
         token_selected_experts, token_final_scales = self.routing_method.apply(
@@ -437,6 +437,19 @@ class WideEPMoE(MoE):
 
         # If alltoall is disabled, we need also disable use_postquant_alltoall
         use_postquant_alltoall = self.use_postquant_alltoall and use_all_to_all
+
+        # Prepare additional information for profiling in case padding is applied when using alltoall.
+        # Only the non-alltoall case is considered for profiling in the warmup phase.
+        # Therefore, to get the correct tactics during the actual inference, the inputs to the tuner should be the same as when not using alltoall.
+        if use_all_to_all:
+            if all_rank_num_tokens is not None:
+                tuner_num_tokens = sum(all_rank_num_tokens)
+            else:
+                tuner_num_tokens = x.shape[0] * self.mapping.tp_size
+            tuner_top_k = token_selected_slots.shape[1]
+        else:
+            tuner_num_tokens = None
+            tuner_top_k = None
         if use_all_to_all:
             if self.alltoall_method_type == AlltoallMethodType.MNNVL:
                 if self.enable_dummy_allreduce:
@@ -457,6 +470,10 @@ class WideEPMoE(MoE):
                         self.expert_size_per_partition * self.mapping.moe_ep_rank)
                     padded, x, _, token_selected_slots, token_final_scales = self.pad_empty_recv_tensors(
                         x, None, recv_topk_idx, token_final_scales)
+                if is_last_call and self.layer_load_balancer and not self.layer_load_balancer.is_static_routing(
+                ):
+                    gathered_loadbalancer_local_statistic_info = allgather(
+                        loadbalancer_local_statistic_info, self.mapping, dim=0)
             elif self.alltoall_method_type == AlltoallMethodType.DeepEPLowLatency:
                 if not use_postquant_alltoall:
                     deep_ep_topk_idx = token_selected_slots
@@ -486,6 +503,10 @@ class WideEPMoE(MoE):
                         x.shape[0], 1)
                     token_final_scales = torch.ones_like(
                         token_selected_slots, dtype=token_final_scales.dtype)
+                if is_last_call and self.layer_load_balancer and not self.layer_load_balancer.is_static_routing(
+                ):
+                    gathered_loadbalancer_local_statistic_info = allgather(
+                        loadbalancer_local_statistic_info, self.mapping, dim=0)
 
         x_sf = None
         x_row = x.shape[0]
@@ -518,7 +539,7 @@ class WideEPMoE(MoE):
             elif self.has_deepseek_fp8_block_scales:
                 use_deepseek_fp8_block_scale = True
             elif self.has_w4afp8:
-                use_w4a8_group_scaling = True
+                use_w4_group_scaling = True
                 weight_dtype = torch.quint4x2
             else:
                 raise ValueError(
@@ -541,9 +562,6 @@ class WideEPMoE(MoE):
                 dim=0,
                 sizes=None if use_dp_padding else all_rank_num_tokens)
             x_row = x.shape[0]
-            # Fp4 gemm has extra scaling factor
-            if x_sf is not None:
-                x_sf = swizzle_sf(x_sf, x_row, x_col, self.scaling_vector_size)
 
         if self.layer_load_balancer and not self.layer_load_balancer.is_static_routing(
         ):
@@ -584,47 +602,27 @@ class WideEPMoE(MoE):
                     x, x_sf, recv_topk_idx, token_final_scales)
                 if x_sf is not None:
                     x_sf = x_sf.view(x_sf_dtype)
-                    if self.has_nvfp4:
-                        x_sf = swizzle_sf(x_sf, x.shape[0], x.shape[1] * 2,
-                                          self.scaling_vector_size)
             elif self.alltoall_method_type == AlltoallMethodType.DeepEPLowLatency:
-                assert x_sf is not None and self.has_nvfp4
                 token_num = x_row
                 hidden_size = x_col
+                assert x_sf is not None and self.has_nvfp4
                 assert hidden_size % 32 == 0
-                x_sf_dtype = x_sf.dtype
-                x_dtype = x.dtype
-                assert x_sf_dtype == torch.uint8 and x_dtype == torch.uint8
-                x_sf = x_sf.view(torch.bfloat16)
+                assert x.dtype == torch.uint8 and x_sf.dtype == torch.uint8
                 assert x_sf.shape[0] == token_num and x_sf.shape[
-                    1] == hidden_size // 16 // 2
-                x = x.view(torch.bfloat16)
-                assert x.shape[0] == token_num and x.shape[1] == hidden_size // 4
-                # DeepEP LL dispatch only supports bf16 tensors with a hidden size of 2560, 4096, 5120, or 7168 as input. A hidden size of 2560 is sufficient to accommodate packed FP4 data.
-                packed_hidden_size = 2560
-                assert x.shape[1] + x_sf.shape[1] <= packed_hidden_size
-                fp4_packed_tensor = torch.empty((token_num, packed_hidden_size),
-                                                dtype=torch.bfloat16,
-                                                device=x.device)
-                fp4_packed_tensor[:, :x.shape[1]] = x
-                fp4_packed_tensor[:,
-                                  x.shape[1]:x.shape[1] + x_sf.shape[1]] = x_sf
+                    1] == hidden_size // 16
+                assert x.shape[0] == token_num and x.shape[1] == hidden_size // 2
 
                 deep_ep_topk_idx = token_selected_slots
                 deep_ep_topk_weights = token_final_scales
 
                 assert all_rank_max_num_tokens <= self.deep_ep_max_num_tokens
-                fp4_packed_tensor, recv_expert_count, deep_ep_handle = \
-                    self.deep_ep_buffer.low_latency_dispatch(fp4_packed_tensor, deep_ep_topk_idx, all_rank_max_num_tokens, self.num_slots)
-                deep_ep_handle = list(deep_ep_handle)
-                deep_ep_handle[3] = hidden_size
-                deep_ep_handle = tuple(deep_ep_handle)
+                x, x_sf, recv_expert_count, deep_ep_handle = \
+                    self.deep_ep_buffer.low_latency_dispatch_fp4(x, x_sf, deep_ep_topk_idx, all_rank_max_num_tokens, self.num_slots)
+                assert x.dtype == torch.uint8 and x_sf.dtype == torch.uint8
+                assert x.dim() == 3 and x_sf.dim() == 3
+                assert x.shape[2] == hidden_size // 2 and x_sf.shape[
+                    2] == hidden_size // 16
 
-                assert fp4_packed_tensor.ndim == 3 and fp4_packed_tensor.shape[
-                    2] == packed_hidden_size
-                x_sf = fp4_packed_tensor[:, :, x.shape[1]:x.shape[1] +
-                                         x_sf.shape[1]].contiguous()
-                x = fp4_packed_tensor[:, :, :x.shape[1]].contiguous()
                 mask = torch.arange(
                     x.shape[1], dtype=torch.int32, device=x.device).expand(
                         x.shape[0], x.shape[1]) < recv_expert_count.unsqueeze(1)
@@ -634,11 +632,9 @@ class WideEPMoE(MoE):
                                  x.shape[0] * (self.mapping.moe_ep_rank + 1),
                                  dtype=torch.int32,
                                  device=x.device).unsqueeze(1), self.num_slots)
-                x = x.reshape(x.shape[0] * x.shape[1], x.shape[2]).view(x_dtype)
+                x = x.reshape(x.shape[0] * x.shape[1], x.shape[2])
                 x_sf = x_sf.reshape(x_sf.shape[0] * x_sf.shape[1],
-                                    x_sf.shape[2]).view(x_sf_dtype)
-                x_sf = swizzle_sf(x_sf, x.shape[0], x.shape[1] * 2,
-                                  self.scaling_vector_size)
+                                    x_sf.shape[2])
                 token_selected_slots = token_selected_slots.view(x.shape[0], 1)
                 token_final_scales = torch.ones_like(
                     token_selected_slots, dtype=token_final_scales.dtype)
@@ -658,6 +654,7 @@ class WideEPMoE(MoE):
             output_dtype,
             quant_scales=quant_scales,
             input_sf=x_sf,
+            swizzled_input_sf=False,
             tp_size=self.tp_size,
             tp_rank=self.tp_rank,
             ep_size=ep_size,
@@ -666,9 +663,11 @@ class WideEPMoE(MoE):
             cluster_rank=cluster_rank,
             enable_alltoall=use_all_to_all,
             use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
-            use_w4a8_group_scaling=use_w4a8_group_scaling,
+            use_w4_group_scaling=use_w4_group_scaling,
             min_latency_mode=False,
             tune_max_num_tokens=self.tune_max_num_tokens,
+            tuner_num_tokens=tuner_num_tokens,
+            tuner_top_k=tuner_top_k,
         )
 
         if self.layer_load_balancer and not self.layer_load_balancer.is_static_routing(
@@ -932,10 +931,6 @@ class WideEPMoE(MoE):
             x_sf = MnnvlMoe.mnnvl_moe_alltoallv(x_sf, alltoall_info,
                                                 self.alltoall_workspace,
                                                 self.ep_rank, self.ep_size)
-
-            if self.has_nvfp4:
-                x_sf = swizzle_sf(x_sf, x.shape[0], x.shape[1] * 2,
-                                  self.scaling_vector_size)
 
         return x, x_sf
 

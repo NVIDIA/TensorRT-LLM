@@ -30,7 +30,7 @@ def is_call_function(node: Node, target: Union[List[Callable], Callable]):
         return node.op == "call_function" and node.target == target
 
 
-_enable_piecewise_cuda_graph_capture = True
+_enable_piecewise_cuda_graph_capture = False
 
 
 def set_enable_piecewise_cuda_graph_capture_flag(enable: bool):
@@ -49,12 +49,14 @@ def inplace_info():
             1: "input",
             2: "residual"
         },
-        torch.ops.trtllm.attention_inplace.default: {
+        torch.ops.trtllm.attn_custom_op_inplace.default: {
             1: "output",
-            2: "output_sf"
         },
         torch.ops.trtllm.mla_custom_op_inplace.default: {
             1: "output"
+        },
+        torch.ops.trtllm.fused_qk_norm_rope.default: {
+            1: "qkv"
         }
     }
     return inplace_map

@@ -12,6 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import time
 from pathlib import Path
 
 import pytest
@@ -429,7 +430,9 @@ def test_hf_gemma_fp8_base_bf16_multi_lora(gemma_model_root,
                                            batch_size=8):
     "Run Gemma models with multiple dummy LoRAs."
 
+    start_time = time.time()
     print("Convert checkpoint by modelopt...")
+    convert_start = time.time()
     kv_cache_dtype = 'fp8' if qformat == 'fp8' else 'int8'
     convert_cmd = [
         f"{gemma_example_root}/../../../quantization/quantize.py",
@@ -441,7 +444,13 @@ def test_hf_gemma_fp8_base_bf16_multi_lora(gemma_model_root,
         f"--output_dir={cmodel_dir}",
     ]
     venv_check_call(llm_venv, convert_cmd)
+    convert_end = time.time()
+    print(
+        f"Convert checkpoint completed in {(convert_end - convert_start):.2f} seconds."
+    )
 
+    test_multi_lora_start = time.time()
+    print("Calling test_multi_lora_support...")
     test_multi_lora_support(
         hf_model_dir=gemma_model_root,
         tllm_ckpt_dir=cmodel_dir,
@@ -454,3 +463,10 @@ def test_hf_gemma_fp8_base_bf16_multi_lora(gemma_model_root,
         target_trtllm_modules=["attn_q", "attn_k", "attn_v"],
         zero_lora_weights=True,
     )
+    test_multi_lora_end = time.time()
+    print(
+        f"test_multi_lora_support completed in {(test_multi_lora_end - test_multi_lora_start):.2f} seconds"
+    )
+
+    total_time = time.time() - start_time
+    print(f"Total function execution time: {total_time:.2f} seconds")

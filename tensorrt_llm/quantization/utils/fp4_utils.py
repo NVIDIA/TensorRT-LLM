@@ -49,8 +49,7 @@ def get_reorder_rows_for_gated_act_gemm_row_indices(x) -> torch.Tensor:
     to
     [r0, rN/2, r1, rN/2+1, ..., r(N/2-1), r(N-1)]
     """
-    assert x.dim() == 2, f"x should be a 2D tensor, not {x.dim()}"
-    M, K = x.shape
+    M = x.shape[0]
     assert M % 2 == 0, f"x.shape[0] must be even, not {M}"
 
     row_indices = torch.arange(M, dtype=torch.long)
@@ -120,11 +119,8 @@ def get_shuffle_matrix_a_row_indices(input_tensor: torch.Tensor,
     - We do NOT try to handle custom e2m1 memory usage (i.e. no 'K/2' bytes).
     - Instead, we purely reorder rows in a standard PyTorch shape [M, K].
     """
-    assert input_tensor.dim(
-    ) == 2, f"input_tensor should be a 2D tensor, not {input_tensor.dim()}"
-
-    # M, K from the input
-    M, K = input_tensor.shape
+    # M from the input
+    M = input_tensor.shape[0]
 
     # Choose block size 16 or 32
     shuffle_block_size = get_shuffle_block_size(epilogue_tile_m)
@@ -168,7 +164,7 @@ def get_shuffle_matrix_sf_a_row_indices(
         num_elts_per_sf: int = 16) -> torch.Tensor:
 
     assert input_tensor.dtype == float4_sf_dtype
-    assert num_elts_per_sf == 16
+    assert num_elts_per_sf == 16 or num_elts_per_sf == 32
 
     assert input_tensor.dim(
     ) == 2, f"input_tensor should be a 2D tensor, not {input_tensor.dim()}"
@@ -207,4 +203,4 @@ def shuffle_matrix_sf_a(
         input_tensor, row_indices.to(input_tensor.device))
 
     # 128x4
-    return torch.ops.trtllm.nvfp4_block_scale_interleave(w_shuffled)
+    return torch.ops.trtllm.block_scale_interleave(w_shuffled)

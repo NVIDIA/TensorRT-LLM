@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 from pathlib import Path
 
 import click
@@ -82,6 +83,12 @@ from tensorrt_llm.sampling_params import SamplingParams
     type=float,
     default=.90,
     help="The percentage of memory to use for KV Cache after model load.",
+)
+@optgroup.option(
+    "--mamba_ssm_cache_dtype",
+    type=click.Choice(["auto", "float16", "bfloat16", "float32"]),
+    default="auto",
+    help="Data type for Mamba SSM cache. If 'auto', inferred from model config.",
 )
 @optgroup.group(
     "Engine Input Configuration",
@@ -233,10 +240,10 @@ from tensorrt_llm.sampling_params import SamplingParams
     help="Path where per request information is written to.",
 )
 @optgroup.option(
-    "--enable_chunked_context",
-    is_flag=True,
-    default=False,
-    help="Enable chunking in prefill stage for enhanced throughput benchmark.",
+    "--enable_chunked_context/--disable_chunked_context",
+    default=True,
+    help=
+    "Enable/disable chunking in prefill stage for enhanced throughput benchmark. "
 )
 @optgroup.option(
     "--scheduler_policy",
@@ -255,25 +262,25 @@ def throughput_command(
     logger.info("Preparing to run throughput benchmark...")
     # Parameters from CLI
     # Model, experiment, and engine params
-    dataset_path: Path = params.pop("dataset")
-    eos_id: int = params.pop("eos_id")
+    dataset_path: Path = params.get("dataset")
+    eos_id: int = params.get("eos_id")
     warmup: int = params.get("warmup")
-    num_requests: int = params.pop("num_requests")
-    max_seq_len: int = params.pop("max_seq_len")
+    num_requests: int = params.get("num_requests")
+    max_seq_len: int = params.get("max_seq_len")
     model: str = bench_env.model
     checkpoint_path: Path = bench_env.checkpoint_path or bench_env.model
-    engine_dir: Path = params.pop("engine_dir")
-    concurrency: int = params.pop("concurrency")
+    engine_dir: Path = params.get("engine_dir")
+    concurrency: int = params.get("concurrency")
     backend: str = params.get("backend")
-    modality: str = params.pop("modality")
-    max_input_len: int = params.pop("max_input_len")
+    modality: str = params.get("modality")
+    max_input_len: int = params.get("max_input_len")
     model_type = get_model_config(model, checkpoint_path).model_type
 
     # Reporting options
-    report_json: Path = params.pop("report_json")
-    output_json: Path = params.pop("output_json")
-    request_json: Path = params.pop("request_json")
-    iteration_log: Path = params.pop("iteration_log")
+    report_json: Path = params.get("report_json")
+    output_json: Path = params.get("output_json")
+    request_json: Path = params.get("request_json")
+    iteration_log: Path = params.get("iteration_log")
     iteration_writer = IterationWriter(iteration_log)
 
     # Runtime kwargs and option tracking.
@@ -340,15 +347,15 @@ def throughput_command(
     engine_tokens = exec_settings["settings_config"]["max_num_tokens"]
 
     # Runtime Options
-    runtime_max_bs = params.pop("max_batch_size")
-    runtime_max_tokens = params.pop("max_num_tokens")
+    runtime_max_bs = params.get("max_batch_size")
+    runtime_max_tokens = params.get("max_num_tokens")
     runtime_max_bs = runtime_max_bs or engine_bs
     runtime_max_tokens = runtime_max_tokens or engine_tokens
-    kv_cache_percent = params.pop("kv_cache_free_gpu_mem_fraction")
-    beam_width = params.pop("beam_width")
-    streaming: bool = params.pop("streaming")
-    enable_chunked_context: bool = params.pop("enable_chunked_context")
-    scheduler_policy: str = params.pop("scheduler_policy")
+    kv_cache_percent = params.get("kv_cache_free_gpu_mem_fraction")
+    beam_width = params.get("beam_width")
+    streaming: bool = params.get("streaming")
+    enable_chunked_context: bool = params.get("enable_chunked_context")
+    scheduler_policy: str = params.get("scheduler_policy")
 
     # Update configuration with runtime options
     exec_settings["settings_config"]["kv_cache_percent"] = kv_cache_percent
@@ -369,6 +376,18 @@ def throughput_command(
     # Construct the runtime configuration dataclass.
     runtime_config = RuntimeConfig(**exec_settings)
     llm = None
+
+    def ignore_trt_only_args(kwargs: dict):
+        trt_only_args = [
+            "batching_type",
+            "normalize_log_probs",
+            "extended_runtime_perf_knob_config",
+        ]
+        for arg in trt_only_args:
+            if kwargs.pop(arg, None):
+                logger.warning(
+                    f"Ignore {arg} for {runtime_config.backend} backend.")
+
     try:
         logger.info("Setting up throughput benchmark.")
         kwargs = kwargs | runtime_config.get_llm_args()
@@ -378,18 +397,11 @@ def throughput_command(
             kwargs["enable_iter_perf_stats"] = True
 
         if runtime_config.backend == 'pytorch':
-            if kwargs.pop("extended_runtime_perf_knob_config", None):
-                logger.warning(
-                    "Ignore extended_runtime_perf_knob_config for pytorch backend."
-                )
+            ignore_trt_only_args(kwargs)
             llm = PyTorchLLM(**kwargs)
         elif runtime_config.backend == "_autodeploy":
-            if kwargs.pop("extended_runtime_perf_knob_config", None):
-                logger.warning(
-                    "Ignore extended_runtime_perf_knob_config for _autodeploy backend."
-                )
+            ignore_trt_only_args(kwargs)
             kwargs["world_size"] = kwargs.pop("tensor_parallel_size", None)
-            kwargs.pop("pipeline_parallel_size", None)
 
             llm = AutoDeployLLM(**kwargs)
         else:
@@ -455,6 +467,10 @@ def throughput_command(
         report_utility.report_statistics()
     except KeyboardInterrupt:
         logger.info("Keyboard interrupt, exiting benchmark...")
+        sys.exit(130)
+    except Exception as e:
+        logger.error(f"Error during benchmarking: {e}")
+        sys.exit(-1)
     finally:
         if llm is not None:
             llm.shutdown()

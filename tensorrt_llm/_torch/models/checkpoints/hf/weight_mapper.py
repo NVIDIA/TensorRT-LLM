@@ -59,17 +59,15 @@ class HfWeightMapper(BaseWeightMapper):
     def _duplicate_kv_weights(self, module: nn.Module, new_name: str,
                               weights: dict):
         if new_name in ['k_proj', 'v_proj']:
-            num_kv_heads_list = [self._num_kv_heads
-                                 ] * len(weights) if isinstance(
-                                     self._num_kv_heads,
-                                     int) else self._num_kv_heads
+            # k_proj and v_proj shape is [num_kv_heads*head_dim, hidden_dim]
+            num_kv_heads = weights['weight'].shape[0] // self._head_dim
             processed_weights = {
                 k:
                 self._duplicate_kv(weight=v[:],
-                                   num_kv_heads=num_kv_heads_list[i],
+                                   num_kv_heads=num_kv_heads,
                                    tensor_parallel_size=self._tp_size)
                 if k in ["weight", "bias"] else v
-                for i, (k, v) in enumerate(weights.items())
+                for k, v in weights.items()
             }
             return processed_weights
 

@@ -50,7 +50,6 @@
 
 namespace nb = nanobind;
 namespace tb = tensorrt_llm::batch_manager;
-namespace tbk = tensorrt_llm::batch_manager::kv_cache_manager;
 namespace tpb = tensorrt_llm::nanobind::batch_manager;
 namespace tc = tensorrt_llm::common;
 namespace tr = tensorrt_llm::runtime;
@@ -246,12 +245,17 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
         .def_prop_ro("has_fp8_qdq", &tc::QuantMode::hasFp8Qdq)
         .def_prop_ro("has_nvfp4", &tc::QuantMode::hasNvfp4)
         .def_prop_ro("has_w4a8_mxfp4_fp8", &tc::QuantMode::hasW4a8Mxfp4Fp8)
+
+        .def_prop_ro("has_w4a8_mxfp4_mxfp8", &tc::QuantMode::hasW4a8Mxfp4Mxfp8)
+        .def_prop_ro("has_w4a16_mxfp4", &tc::QuantMode::hasW4a16Mxfp4)
+
         .def_prop_ro("has_kv_cache_quant", &tc::QuantMode::hasKvCacheQuant)
         .def_static("from_description", &tc::QuantMode::fromDescription, nb::arg("quantize_weights"),
             nb::arg("quantize_activations"), nb::arg("per_token"), nb::arg("per_channel"), nb::arg("per_group"),
             nb::arg("use_int4_weights"), nb::arg("use_int8_kv_cache"), nb::arg("use_fp8_kv_kache"),
             nb::arg("use_fp8_qdq"), nb::arg("use_fp8_rowwise"), nb::arg("use_w4a8_qserve"), nb::arg("use_nvfp4"),
-            nb::arg("use_fp8_block_scales"), nb::arg("use_w4a8_mxfp4_fp8"))
+            nb::arg("use_fp8_block_scales"), nb::arg("use_w4a8_mxfp4_fp8"), nb::arg("use_w4a8_mxfp4_mxfp8"),
+            nb::arg("use_w4a16_mxfp4"))
         .def_static("use_smooth_quant", &tc::QuantMode::useSmoothQuant, nb::arg("per_token") = false,
             nb::arg("per_channel") = false)
         .def_static("use_weight_only", &tc::QuantMode::useWeightOnly, nb::arg("use_int4_weights") = false,

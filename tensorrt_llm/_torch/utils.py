@@ -120,7 +120,7 @@ def swizzle_sf(sf: torch.Tensor,
     """
     sf_cols = ceil_div(cols, scaling_vector_size)
     sf = sf.view(-1, rows, sf_cols)
-    return torch.ops.trtllm.nvfp4_block_scale_interleave(sf)
+    return torch.ops.trtllm.block_scale_interleave(sf)
 
 
 def unswizzle_sf(sf: torch.Tensor,
@@ -138,8 +138,7 @@ def unswizzle_sf(sf: torch.Tensor,
     """
     sf_cols = ceil_div(cols, scaling_vector_size)
     sf = sf.view(-1, rows, sf_cols)
-    return torch.ops.trtllm.nvfp4_block_scale_interleave_reverse(sf).view(
-        -1, sf_cols)
+    return torch.ops.trtllm.block_scale_interleave_reverse(sf).view(-1, sf_cols)
 
 
 @torch.library.custom_op("trtllm::reswizzle_sf", mutates_args=())
@@ -229,7 +228,7 @@ def get_power_of_2_num_tokens_buckets(max_num_tokens) -> List[int]:
         num_token_buckets.append(m)
         m //= 2
 
-    return tuple(num_token_buckets)
+    return tuple(num_token_buckets[::-1])
 
 
 def get_last_power_of_2_num_tokens_buckets(max_num_tokens) -> List[int]:
@@ -239,7 +238,7 @@ def get_last_power_of_2_num_tokens_buckets(max_num_tokens) -> List[int]:
     while m >= 1:
         num_token_buckets.append(m)
         m //= 2
-    return tuple(num_token_buckets)
+    return tuple(num_token_buckets[::-1])
 
 
 def fp4_scale_infer_shape(input_shapes: List[List[int]]):

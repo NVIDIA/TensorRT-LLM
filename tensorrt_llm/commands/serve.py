@@ -81,9 +81,11 @@ def get_llm_args(model: str,
                  moe_expert_parallel_size: Optional[int] = None,
                  gpus_per_node: Optional[int] = None,
                  free_gpu_memory_fraction: Optional[float] = None,
+                 mamba_ssm_cache_dtype: str = "auto",
                  num_postprocess_workers: int = 0,
                  trust_remote_code: bool = False,
                  reasoning_parser: Optional[str] = None,
+                 fail_fast_on_attention_window_too_large: bool = False,
                  **llm_args_extra_dict: Any):
 
     if gpus_per_node is None:
@@ -95,7 +97,8 @@ def get_llm_args(model: str,
                                max_beam_width=max_beam_width,
                                max_seq_len=max_seq_len)
     kv_cache_config = KvCacheConfig(
-        free_gpu_memory_fraction=free_gpu_memory_fraction)
+        free_gpu_memory_fraction=free_gpu_memory_fraction,
+        mamba_ssm_cache_dtype=mamba_ssm_cache_dtype)
 
     dynamic_batch_config = DynamicBatchConfig(
         enable_batch_size_tuning=True,
@@ -107,24 +110,44 @@ def get_llm_args(model: str,
     )
 
     llm_args = {
-        "model": model,
-        "scheduler_config": scheduler_config,
-        "tokenizer": tokenizer,
-        "tensor_parallel_size": tensor_parallel_size,
-        "pipeline_parallel_size": pipeline_parallel_size,
-        "moe_expert_parallel_size": moe_expert_parallel_size,
-        "gpus_per_node": gpus_per_node,
-        "trust_remote_code": trust_remote_code,
-        "build_config": build_config,
-        "max_batch_size": max_batch_size,
-        "max_num_tokens": max_num_tokens,
-        "max_beam_width": max_beam_width,
-        "max_seq_len": max_seq_len,
-        "kv_cache_config": kv_cache_config,
-        "backend": backend if backend == "pytorch" else None,
-        "num_postprocess_workers": num_postprocess_workers,
-        "postprocess_tokenizer_dir": tokenizer or model,
-        "reasoning_parser": reasoning_parser,
+        "model":
+        model,
+        "scheduler_config":
+        scheduler_config,
+        "tokenizer":
+        tokenizer,
+        "tensor_parallel_size":
+        tensor_parallel_size,
+        "pipeline_parallel_size":
+        pipeline_parallel_size,
+        "moe_expert_parallel_size":
+        moe_expert_parallel_size,
+        "gpus_per_node":
+        gpus_per_node,
+        "trust_remote_code":
+        trust_remote_code,
+        "build_config":
+        build_config,
+        "max_batch_size":
+        max_batch_size,
+        "max_num_tokens":
+        max_num_tokens,
+        "max_beam_width":
+        max_beam_width,
+        "max_seq_len":
+        max_seq_len,
+        "kv_cache_config":
+        kv_cache_config,
+        "backend":
+        backend if backend == "pytorch" else None,
+        "num_postprocess_workers":
+        num_postprocess_workers,
+        "postprocess_tokenizer_dir":
+        tokenizer or model,
+        "reasoning_parser":
+        reasoning_parser,
+        "fail_fast_on_attention_window_too_large":
+        fail_fast_on_attention_window_too_large,
     }
 
     return llm_args, llm_args_extra_dict
@@ -217,6 +240,12 @@ def launch_server(host: str,
               help="Free GPU memory fraction reserved for KV Cache, "
               "after allocating model weights and buffers.")
 @click.option(
+    "--mamba_ssm_cache_dtype",
+    type=click.Choice(["auto", "float16", "bfloat16", "float32"]),
+    default="auto",
+    help="Data type for Mamba SSM cache. If 'auto', inferred from model config."
+)
+@click.option(
     "--num_postprocess_workers",
     type=int,
     default=0,
@@ -249,16 +278,24 @@ def launch_server(host: str,
     default=None,
     help="Server role. Specify this value only if running in disaggregated mode."
 )
+@click.option(
+    "--fail_fast_on_attention_window_too_large",
+    is_flag=True,
+    default=False,
+    help=
+    "Exit with runtime error when attention window is too large to fit even a single sequence in the KV cache."
+)
 def serve(model: str, tokenizer: Optional[str], host: str, port: int,
           log_level: str, backend: str, max_beam_width: int,
           max_batch_size: int, max_num_tokens: int, max_seq_len: int,
           tp_size: int, pp_size: int, ep_size: Optional[int],
           cluster_size: Optional[int], gpus_per_node: Optional[int],
-          kv_cache_free_gpu_memory_fraction: float,
+          kv_cache_free_gpu_memory_fraction: float, mamba_ssm_cache_dtype: str,
           num_postprocess_workers: int, trust_remote_code: bool,
           extra_llm_api_options: Optional[str], reasoning_parser: Optional[str],
           metadata_server_config_file: Optional[str],
-          server_role: Optional[str]):
+          server_role: Optional[str],
+          fail_fast_on_attention_window_too_large: bool):
     """Running an OpenAI API compatible server
 
     MODEL: model name | HF checkpoint path | TensorRT engine path
@@ -279,9 +316,12 @@ def serve(model: str, tokenizer: Optional[str], host: str, port: int,
         moe_cluster_parallel_size=cluster_size,
         gpus_per_node=gpus_per_node,
         free_gpu_memory_fraction=kv_cache_free_gpu_memory_fraction,
+        mamba_ssm_cache_dtype=mamba_ssm_cache_dtype,
         num_postprocess_workers=num_postprocess_workers,
         trust_remote_code=trust_remote_code,
-        reasoning_parser=reasoning_parser)
+        reasoning_parser=reasoning_parser,
+        fail_fast_on_attention_window_too_large=
+        fail_fast_on_attention_window_too_large)
 
     llm_args_extra_dict = {}
     if extra_llm_api_options is not None:

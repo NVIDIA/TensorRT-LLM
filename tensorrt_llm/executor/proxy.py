@@ -247,6 +247,12 @@ class GenerationExecutorProxy(GenerationExecutor):
         return True  # success
 
     def dispatch_stats_task(self) -> bool:
+        if not self._iter_stats_result:
+            # This can happen temporarily because the WAR in tensorrt_llm/bench/benchmark/throughput.py
+            # is not synchronized with self.dispatch_stats_thread.
+            logger.debug(
+                f"Skipping stats dispatch while self._iter_stats_result=None")
+            return True  # Intended behavior, not an error
         return self._iteration_result_task(self.mp_stats_queue,
                                            self._iter_stats_result)
 
