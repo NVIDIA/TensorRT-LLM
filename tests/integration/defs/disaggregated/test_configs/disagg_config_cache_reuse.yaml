@@ -15,7 +15,7 @@ context_servers:
     enable_partial_reuse: True
     event_buffer_max_size: 1024
   cache_transceiver_config:
-    backend: default
+    backend: DEFAULT
   urls:
       - "localhost:8001"
 generation_servers:
@@ -30,6 +30,6 @@ generation_servers:
     event_buffer_max_size: 1024
     free_gpu_memory_fraction: 0.05
   cache_transceiver_config:
-    backend: default
+    backend: DEFAULT
   urls:
       - "localhost:8002"
