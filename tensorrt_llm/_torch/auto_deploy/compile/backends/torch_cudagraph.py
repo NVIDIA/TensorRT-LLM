@@ -162,7 +162,7 @@ class CapturedGraph(nn.Module):
 
         # copy inputs to input buffers
         for i, input_tensor in enumerate(args_batched):
-            self._input_buffers[i][: input_tensor.shape[0]] = input_tensor
+            self._input_buffers[i][: input_tensor.shape[0]].copy_(input_tensor, non_blocking=True)
 
         # run forward pass via graph
         self.graphs[combined_shape].replay()

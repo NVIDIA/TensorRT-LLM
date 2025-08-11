@@ -25,6 +25,7 @@ l0_a10:
   - test_e2e.py::test_openai_chat_structural_tag_example
   - test_e2e.py::test_openai_chat_json_example
   - test_e2e.py::test_openai_chat_multimodal_example
+  - test_e2e.py::test_openai_prometheus
   - test_e2e.py::test_openai_lora
   - test_e2e.py::test_trtllm_serve_multimodal_example
   - test_e2e.py::test_trtllm_serve_lora_example

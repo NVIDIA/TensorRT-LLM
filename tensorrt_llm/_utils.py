@@ -20,6 +20,7 @@ import linecache
 import math
 import os
 import struct
+import tempfile
 import trace
 import weakref
 from contextlib import contextmanager
@@ -1112,3 +1113,17 @@ def is_multi_device_enable():
     the number of devices
     """
     return local_mpi_size() > 1
+
+
+def set_prometheus_multiproc_dir() -> object:
+    # Adapted from: https://github.com/sgl-project/sglang/blob/v0.4.10/python/sglang/srt/utils.py#L1266
+    global prometheus_multiproc_dir
+    if "PROMETHEUS_MULTIPROC_DIR" in os.environ:
+        logger.info("User set PROMETHEUS_MULTIPROC_DIR detected.")
+        prometheus_multiproc_dir = tempfile.TemporaryDirectory(
+            dir=os.environ["PROMETHEUS_MULTIPROC_DIR"])
+    else:
+        prometheus_multiproc_dir = tempfile.TemporaryDirectory()
+        os.environ["PROMETHEUS_MULTIPROC_DIR"] = prometheus_multiproc_dir.name
+    logger.info(
+        f"PROMETHEUS_MULTIPROC_DIR: {os.environ['PROMETHEUS_MULTIPROC_DIR']}")

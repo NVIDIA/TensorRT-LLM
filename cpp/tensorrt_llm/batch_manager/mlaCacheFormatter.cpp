@@ -583,6 +583,28 @@ void MLACacheFormatter::unformat(TransferSession& session)
         return false;
     }
 
+    int selfNumLayers = selfConfig.getModelConfig().mNbKvHeadsPerLayer.size();
+    int selfPPSize = selfConfig.getParallelConfig().mPipelineParallelism;
+    int destPPSize = destConfig.getParallelConfig().mPipelineParallelism;
+    int destNumLayers = destConfig.getModelConfig().mNbKvHeadsPerLayer.size();
+
+    if (selfPPSize == destPPSize)
+    {
+        return true;
+    }
+    if (selfNumLayers % selfPPSize != 0)
+    {
+        TLLM_LOG_WARNING("CacheFormatter::inquireSupport: layers %d must be divisible by pipeline parallelism :%d",
+            selfNumLayers, selfPPSize);
+        return false;
+    }
+    if (destNumLayers % destPPSize != 0)
+    {
+        TLLM_LOG_WARNING("CacheFormatter::inquireSupport: layers %d must be divisible by pipeline parallelism :%d ",
+            destNumLayers, destPPSize);
+        return false;
+    }
+
     return true;
 }
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager

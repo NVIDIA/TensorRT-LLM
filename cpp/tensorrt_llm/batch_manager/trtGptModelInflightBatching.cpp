@@ -693,7 +693,7 @@ std::unique_ptr<kv_cache_manager::KVCacheManager> TrtGptModelInflightBatching::c
         kvCacheConfig.getEventBufferMaxSize() > 0
             ? std::make_unique<kv_cache_manager::KVCacheEventManager>(kvCacheConfig.getEventBufferMaxSize())
             : nullptr,
-        false, kvCacheConfig.getEnablePartialReuse(), kvCacheConfig.getCopyOnPartialReuse());
+        kvCacheConfig.getEnablePartialReuse(), kvCacheConfig.getCopyOnPartialReuse());
 
     reshapeKvTensors(kvCacheManager->getOffsetTableDimensions());
 

@@ -64,6 +64,8 @@ class PyTorchConfig:
     """
 
     kv_cache_dtype: str = "auto"
+    mamba_ssm_cache_dtype: str = "auto"
+
     enable_iter_perf_stats: bool = False
     # If true, enables per request stats per iteration
     # Must also set enable_iter_perf_stats to true to get request stats
