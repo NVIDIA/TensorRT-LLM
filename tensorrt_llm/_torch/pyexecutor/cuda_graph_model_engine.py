@@ -66,7 +66,8 @@ class CUDAGraphModelEngine:
         self.padding_enabled = config.cuda_graph_padding_enabled
         self.supported_batch_sizes = engine._cuda_graph_batch_sizes
         self.max_supported_batch_size = engine._max_cuda_graph_batch_size
-        self.max_num_tokens = engine.max_num_tokens
+        self.batch_size = engine.batch_size
+        self.max_beam_width = engine.max_beam_width
 
         # Low-level state, storing resources per batch size
         self.graphs: Dict[int, torch.cuda.CUDAGraph] = {}
@@ -116,15 +117,22 @@ class CUDAGraphModelEngine:
         if engine.is_spec_decode:
             max_tokens_per_req += engine.spec_config.max_draft_len
 
+        spec_metadata = initial_inputs.get("spec_metadata", None)
+        # [CUDA graph spec decode padding]
+        # We pad input IDs/position IDs to the maximum draft length (token per request).
+        # We're forced to do this because we cannot reallocate inputs over many graph runs.
+        token_per_request = spec_metadata.max_draft_len + 1 if spec_metadata is not None else 1
+
         static_tensors = {
             "input_ids":
-            torch.ones((self.max_num_tokens, ),
-                       device="cuda",
-                       dtype=torch.int32),
+            torch.ones(
+                (self.batch_size * self.max_beam_width * token_per_request, ),
+                device="cuda",
+                dtype=torch.int32),
             "position_ids":
             torch.zeros((
                 1,
-                self.max_num_tokens,
+                self.batch_size * self.max_beam_width * token_per_request,
             ),
                         device="cuda",
                         dtype=torch.int32),
@@ -139,7 +147,7 @@ class CUDAGraphModelEngine:
 
         self.graph_metadata[batch_size] = {
             "attn_metadata": initial_inputs["attn_metadata"],
-            "spec_metadata": initial_inputs.get("spec_metadata"),
+            "spec_metadata": spec_metadata,
         }
 
         graph = torch.cuda.CUDAGraph()
