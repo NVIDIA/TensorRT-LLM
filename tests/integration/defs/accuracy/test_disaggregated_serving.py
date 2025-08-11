@@ -719,8 +719,6 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
                 "backend": "nixl"
             }
         }
-        ctx_server_config["cache_transceiver_config"]
-        ctx_server_config["cache_transceiver_config"]
         disaggregated_server_config = {
             "hostname": "localhost",
             "port": 8000,

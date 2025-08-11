@@ -1211,7 +1211,7 @@ def get_config_for_benchmark(model_root, backend):
             "num_instances": 1,
             "max_batch_size": 2,
             "max_num_tokens": 384,
-            "max_seq_len": 320,
+            "max_seq_len": 384,
             "tensor_parallel_size": 1,
             "pipeline_parallel_size": 1,
             "disable_overlap_scheduler": True,
@@ -1227,7 +1227,7 @@ def get_config_for_benchmark(model_root, backend):
             "pipeline_parallel_size": 1,
             "max_batch_size": 2,
             "max_num_tokens": 384,
-            "max_seq_len": 320,
+            "max_seq_len": 384,
             "cache_transceiver_config": {
                 "backend": backend,
                 "max_tokens_in_buffer": 512,
