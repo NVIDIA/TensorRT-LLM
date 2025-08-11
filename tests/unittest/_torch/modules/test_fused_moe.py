@@ -318,7 +318,7 @@ def test_fused_moe_alltoall_fp4(alltoall_method_type):
             x = torch.randn((m, HIDDEN_SIZE), dtype=dtype, device="cuda")
             x_list.append(x.cuda(i))
             m //= 2
-        
+
         x_abs_max = torch.cat([x.flatten() for x in x_list]).abs().max().float()
         x_sf_global = (448 * 6) / x_abs_max
 
@@ -368,20 +368,28 @@ def test_fused_moe_alltoall_fp4(alltoall_method_type):
             weights[f"{expert_id}.w1.weight"] = w1_weight_nvfp4.cuda(i)
             weights[f"{expert_id}.w2.weight"] = w2_weight_nvfp4.cuda(i)
             weights[f"{expert_id}.w3.weight"] = w3_weight_nvfp4.cuda(i)
-            weights[f"{expert_id}.w1.weight_scale"] = w1_sf_block_unswizzled.cuda(i)
-            weights[f"{expert_id}.w2.weight_scale"] = w2_sf_block_unswizzled.cuda(i)
-            weights[f"{expert_id}.w3.weight_scale"] = w3_sf_block_unswizzled.cuda(i)
+            weights[
+                f"{expert_id}.w1.weight_scale"] = w1_sf_block_unswizzled.cuda(i)
+            weights[
+                f"{expert_id}.w2.weight_scale"] = w2_sf_block_unswizzled.cuda(i)
+            weights[
+                f"{expert_id}.w3.weight_scale"] = w3_sf_block_unswizzled.cuda(i)
 
-            weights[f"{expert_id}.w1.input_scale"] = 1.0 / w1_input_scale.cuda(i)
-            weights[f"{expert_id}.w2.input_scale"] = 1.0 / w2_input_scale.cuda(i)
-            weights[f"{expert_id}.w3.input_scale"] = 1.0 / w3_input_scale.cuda(i)
-            weights[f"{expert_id}.w1.weight_scale_2"] = 1.0 / w3_w1_global.cuda(i)
-            weights[f"{expert_id}.w2.weight_scale_2"] = 1.0 / w2_sf_global.cuda(i)
-            weights[f"{expert_id}.w3.weight_scale_2"] = 1.0 / w3_w1_global.cuda(i)
+            weights[f"{expert_id}.w1.input_scale"] = 1.0 / w1_input_scale.cuda(
+                i)
+            weights[f"{expert_id}.w2.input_scale"] = 1.0 / w2_input_scale.cuda(
+                i)
+            weights[f"{expert_id}.w3.input_scale"] = 1.0 / w3_input_scale.cuda(
+                i)
+            weights[f"{expert_id}.w1.weight_scale_2"] = 1.0 / w3_w1_global.cuda(
+                i)
+            weights[f"{expert_id}.w2.weight_scale_2"] = 1.0 / w2_sf_global.cuda(
+                i)
+            weights[f"{expert_id}.w3.weight_scale_2"] = 1.0 / w3_w1_global.cuda(
+                i)
 
         x_list_world.append(x_list)
         weights_world.append(weights)
-
 
     def per_rank_test_fused_moe_alltoall(job_id):
         routing_method = DefaultMoeRoutingMethod(top_k=TOP_K)
@@ -1900,7 +1908,3 @@ class RefGatedMLPFusedMoE(nn.Module):
 
             self.experts[expert].gate_up_proj.load_weights(gate_up_proj_weights)
             self.experts[expert].down_proj.load_weights(down_proj_weights)
-
-# pytest -s test_fused_moe.py::test_fused_moe_alltoall_fp4[DeepEP]
-if __name__ == '__main__':
-    test_fused_moe_alltoall()
