@@ -216,8 +216,7 @@ However, for the PyTorch backend, you must explicitly enable iteration statistic
 .. code-block:: yaml
 
    # extra-llm-api-config.yml
-   pytorch_backend_config:
-    enable_iter_perf_stats: true
+   enable_iter_perf_stats: true
 
 Then start the server and specify the ``--extra_llm_api_options`` argument with the path to the YAML file as shown in the following example:
 
