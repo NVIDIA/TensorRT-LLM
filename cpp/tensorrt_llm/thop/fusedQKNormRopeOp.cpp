@@ -39,9 +39,9 @@ void fused_qk_norm_rope(
     bool is_neox,                // Whether RoPE is applied in Neox style
     torch::Tensor& position_ids, // Position IDs for RoPE [num_tokens]
     // parameters for yarn
-    double factor,          // factor in rope_scaling in config.json. When it is not 1.0, it means the model is using yarn.
-    double low,             // threshold for high frequency
-    double high,            // threshold for low frequency
+    double factor, // factor in rope_scaling in config.json. When it is not 1.0, it means the model is using yarn.
+    double low,    // threshold for high frequency
+    double high,   // threshold for low frequency
     double attention_factor // attention_factor applied on cos and sin
 )
 {
@@ -73,12 +73,8 @@ void fused_qk_norm_rope(
         reinterpret_cast<__nv_bfloat16*>(q_weight.data_ptr()), reinterpret_cast<__nv_bfloat16*>(k_weight.data_ptr()),
         static_cast<float>(base),
         !is_neox, // interleave
-        reinterpret_cast<int const*>(position_ids.data_ptr()), 
-        static_cast<float>(factor),
-        static_cast<float>(low),
-        static_cast<float>(high),
-        static_cast<float>(attention_factor),
-        stream);
+        reinterpret_cast<int const*>(position_ids.data_ptr()), static_cast<float>(factor), static_cast<float>(low),
+        static_cast<float>(high), static_cast<float>(attention_factor), stream);
 }
 
 // Register the PyTorch operators
@@ -86,7 +82,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
         "fused_qk_norm_rope(Tensor(a!) qkv, int num_heads_q, int num_heads_k, int num_heads_v, int head_dim, float "
-        "eps, Tensor q_weight, Tensor k_weight, float base, bool is_neox, Tensor position_ids, float factor, float low, float high, float attention_factor) -> ()");
+        "eps, Tensor q_weight, Tensor k_weight, float base, bool is_neox, Tensor position_ids, float factor, float "
+        "low, float high, float attention_factor) -> ()");
 }
 
 // Register the CUDA implementation

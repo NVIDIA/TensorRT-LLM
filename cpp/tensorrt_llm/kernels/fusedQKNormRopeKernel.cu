@@ -67,10 +67,10 @@ __global__ void fusedQKNormRopeKernel(
     int const* position_ids,       // Position IDs for RoPE
     int const num_tokens,          // Number of tokens
     // parameters for yarn
-    float factor,                  // factor in rope_scaling in config.json. When it is not 1.0, it means the model is using yarn.
-    float low,                     // threshold for high frequency
-    float high,                    // threshold for low frequency
-    float attention_factor         // attention_factor applied on cos and sin
+    float factor, // factor in rope_scaling in config.json. When it is not 1.0, it means the model is using yarn.
+    float low,    // threshold for high frequency
+    float high,   // threshold for low frequency
+    float attention_factor // attention_factor applied on cos and sin
 )
 {
     int const warpsPerBlock = blockDim.x / 32;
@@ -180,16 +180,18 @@ __global__ void fusedQKNormRopeKernel(
             {
                 float inv_freq_extrapolation = freq;
                 float inv_freq_interpolation = freq / factor;
-    
+
                 // linear_ramp_factor
-                if (low == high) {
+                if (low == high)
+                {
                     high += 0.001; // Prevent singularity
                 }
                 float linear_func = (static_cast<float>(half_dim) - low) / (high - low);
                 // clamp linear_func to [0.0f, 1.0f]
-                float ramp_func = min(max(linear_func, 0.0f), 1.0f); 
+                float ramp_func = min(max(linear_func, 0.0f), 1.0f);
                 float inv_freq_extrapolation_factor = 1 - ramp_func;
-                freq = inv_freq_interpolation * (1.f - inv_freq_extrapolation_factor) + inv_freq_extrapolation * inv_freq_extrapolation_factor;
+                freq = inv_freq_interpolation * (1.f - inv_freq_extrapolation_factor)
+                    + inv_freq_extrapolation * inv_freq_extrapolation_factor;
             }
 
             float theta = pos_id * freq;
@@ -218,18 +220,20 @@ __global__ void fusedQKNormRopeKernel(
             {
                 float inv_freq_extrapolation = freq;
                 float inv_freq_interpolation = freq / factor;
-    
+
                 // linear_ramp_factor
-                if (low == high) {
+                if (low == high)
+                {
                     high += 0.001; // Prevent singularity
                 }
                 float linear_func = (static_cast<float>(half_dim) - low) / (high - low);
                 // clamp linear_func to [0.0f, 1.0f]
                 float ramp_func = min(max(linear_func, 0.0f), 1.0f);
                 float inv_freq_extrapolation_factor = 1 - ramp_func;
-                freq = inv_freq_interpolation * (1.f - inv_freq_extrapolation_factor) + inv_freq_extrapolation * inv_freq_extrapolation_factor;
+                freq = inv_freq_interpolation * (1.f - inv_freq_extrapolation_factor)
+                    + inv_freq_extrapolation * inv_freq_extrapolation_factor;
             }
-            
+
             float theta = pos_id * freq;
             __sincosf(theta, &sin_vals[i], &cos_vals[i]);
         }
@@ -271,9 +275,11 @@ __global__ void fusedQKNormRopeKernel(
 
 void launchFusedQKNormRope(void* qkv, int const num_tokens, int const num_heads_q, int const num_heads_k,
     int const num_heads_v, int const head_dim, float const eps, void const* q_weight, void const* k_weight,
-    float const base, bool const interleave, int const* position_ids, float factor, float low, float high, float attention_factor, cudaStream_t stream)
+    float const base, bool const interleave, int const* position_ids, float factor, float low, float high,
+    float attention_factor, cudaStream_t stream)
 {
-    if (factor == 1.0f) {
+    if (factor == 1.0f)
+    {
         TLLM_CHECK(attention_factor == 1.0f);
     }
     constexpr int blockSize = 256;
@@ -292,18 +298,18 @@ void launchFusedQKNormRope(void* qkv, int const num_tokens, int const num_heads_
     {
     case 64:
         DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
-            fusedQKNormRopeKernel<64, INTERLEAVE>
-                <<<gridDim, blockDim, 0, stream>>>(reinterpret_cast<__nv_bfloat16*>(qkv), num_heads_q, num_heads_k,
-                    num_heads_v, eps, reinterpret_cast<__nv_bfloat16 const*>(q_weight),
-                    reinterpret_cast<__nv_bfloat16 const*>(k_weight), base, position_ids, num_tokens, factor, low, high, attention_factor);
+            fusedQKNormRopeKernel<64, INTERLEAVE><<<gridDim, blockDim, 0, stream>>>(
+                reinterpret_cast<__nv_bfloat16*>(qkv), num_heads_q, num_heads_k, num_heads_v, eps,
+                reinterpret_cast<__nv_bfloat16 const*>(q_weight), reinterpret_cast<__nv_bfloat16 const*>(k_weight),
+                base, position_ids, num_tokens, factor, low, high, attention_factor);
         });
         break;
     case 128:
         DISPATCH_INTERLEAVE(interleave, INTERLEAVE, {
-            fusedQKNormRopeKernel<128, INTERLEAVE>
-                <<<gridDim, blockDim, 0, stream>>>(reinterpret_cast<__nv_bfloat16*>(qkv), num_heads_q, num_heads_k,
-                    num_heads_v, eps, reinterpret_cast<__nv_bfloat16 const*>(q_weight),
-                    reinterpret_cast<__nv_bfloat16 const*>(k_weight), base, position_ids, num_tokens, factor, low, high, attention_factor);
+            fusedQKNormRopeKernel<128, INTERLEAVE><<<gridDim, blockDim, 0, stream>>>(
+                reinterpret_cast<__nv_bfloat16*>(qkv), num_heads_q, num_heads_k, num_heads_v, eps,
+                reinterpret_cast<__nv_bfloat16 const*>(q_weight), reinterpret_cast<__nv_bfloat16 const*>(k_weight),
+                base, position_ids, num_tokens, factor, low, high, attention_factor);
         });
         break;
     default: TLLM_THROW("Unsupported head dimension for fusedQKNormRope: %d", head_dim);

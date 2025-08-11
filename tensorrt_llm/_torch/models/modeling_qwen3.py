@@ -1,8 +1,9 @@
-from typing import Optional, Tuple
 import math
+from typing import Optional, Tuple
+
 import torch
 from torch import nn
-from transformers import Qwen3Config, PretrainedConfig
+from transformers import PretrainedConfig, Qwen3Config
 
 from tensorrt_llm.functional import PositionEmbeddingType
 
@@ -20,10 +21,10 @@ from ..speculative import SpecMetadata
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, register_auto_model
 
+
 # Move out from this class
 def compute_yarn_parameters(
-    config: PretrainedConfig,
-) -> tuple[float, float, float, float]:
+    config: PretrainedConfig, ) -> tuple[float, float, float, float]:
     """
     Refer to https://github.com/huggingface/transformers/blob/main/src/transformers/modeling_rope_utils.py#L197C1-L288C1
     Computes the inverse frequencies with NTK scaling. Please refer to the
@@ -44,8 +45,10 @@ def compute_yarn_parameters(
         return 1.0, 0, 0, 1.0
 
     base = config.rope_theta
-    partial_rotary_factor = config.partial_rotary_factor if hasattr(config, "partial_rotary_factor") else 1.0
-    head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+    partial_rotary_factor = config.partial_rotary_factor if hasattr(
+        config, "partial_rotary_factor") else 1.0
+    head_dim = getattr(config, "head_dim",
+                       config.hidden_size // config.num_attention_heads)
     dim = int(head_dim * partial_rotary_factor)
     factor = getattr(rope_scaling, "factor", 1.0)
     attention_factor = rope_scaling.get("attention_factor")
@@ -53,7 +56,8 @@ def compute_yarn_parameters(
     mscale_all_dim = rope_scaling.get("mscale_all_dim")
 
     if "original_max_position_embeddings" in rope_scaling:
-        original_max_position_embeddings = rope_scaling["original_max_position_embeddings"]
+        original_max_position_embeddings = rope_scaling[
+            "original_max_position_embeddings"]
         factor = config.max_position_embeddings / original_max_position_embeddings
     else:
         original_max_position_embeddings = config.max_position_embeddings
@@ -66,7 +70,8 @@ def compute_yarn_parameters(
     # Sets the attention factor as suggested in the paper
     if attention_factor is None:
         if mscale and mscale_all_dim:
-            attention_factor = float(get_mscale(factor, mscale) / get_mscale(factor, mscale_all_dim))
+            attention_factor = float(
+                get_mscale(factor, mscale) / get_mscale(factor, mscale_all_dim))
         else:
             attention_factor = get_mscale(factor)
 
@@ -78,9 +83,12 @@ def compute_yarn_parameters(
     # Compute the inverse frequencies
     def find_correction_dim(num_rotations, dim, base, max_position_embeddings):
         """Inverse dimension formula to find the dimension based on the number of rotations"""
-        return (dim * math.log(max_position_embeddings / (num_rotations * 2 * math.pi))) / (2 * math.log(base))
+        return (dim *
+                math.log(max_position_embeddings /
+                         (num_rotations * 2 * math.pi))) / (2 * math.log(base))
 
-    def find_correction_range(low_rot, high_rot, dim, base, max_position_embeddings, truncate):
+    def find_correction_range(low_rot, high_rot, dim, base,
+                              max_position_embeddings, truncate):
         """Find dimension range bounds based on rotations"""
         low = find_correction_dim(low_rot, dim, base, max_position_embeddings)
         high = find_correction_dim(high_rot, dim, base, max_position_embeddings)
@@ -89,9 +97,10 @@ def compute_yarn_parameters(
             high = math.ceil(high)
         return max(low, 0), min(high, dim - 1)
 
-
     truncate = rope_scaling.get("truncate", True)
-    low, high = find_correction_range(beta_fast, beta_slow, dim, base, original_max_position_embeddings, truncate)
+    low, high = find_correction_range(beta_fast, beta_slow, dim, base,
+                                      original_max_position_embeddings,
+                                      truncate)
 
     # These parts are implemented in the fusedQKNormRopeKernel.cu
     # # def linear_ramp_factor(min, max, dim):
@@ -116,7 +125,8 @@ def compute_yarn_parameters(
     # # )
     # # return inv_freq, attention_factor
     return factor, low, high, attention_factor
-    
+
+
 class Qwen3Attention(Attention):
 
     def __init__(
@@ -189,14 +199,15 @@ class Qwen3Attention(Attention):
         return q, k
 
     def apply_qk_norm_rope(self, qkv, position_ids):
-        factor, low, high, attention_factor = compute_yarn_parameters(self.config)
+        factor, low, high, attention_factor = compute_yarn_parameters(
+            self.config)
         torch.ops.trtllm.fused_qk_norm_rope(
             qkv, self.num_heads, self.num_key_value_heads,
             self.num_key_value_heads, self.head_dim,
             self.q_norm.variance_epsilon, self.q_norm.weight,
-            self.k_norm.weight, self.pos_embd_params.rope.theta,
-            self.pos_embd_params.is_neox, position_ids.view(-1),
-            factor, low, high, attention_factor)
+            self.k_norm.weight,
+            self.pos_embd_params.rope.theta, self.pos_embd_params.is_neox,
+            position_ids.view(-1), factor, low, high, attention_factor)
         return qkv, None, None
 
     def apply_rope(self, q: torch.Tensor, k: Optional[torch.Tensor],

@@ -38,11 +38,11 @@ void launchFusedQKNormRope(
     float const base,        // Base for RoPE computation
     bool const interleave,   // Whether RoPE is applied in interleave mode (non-Neox style)
     int const* position_ids, // Position IDs for RoPE [num_tokens]
-    float factor,            // factor in rope_scaling in config.json. When it is not 1.0, it means the model is using yarn.
-    float low,               // threshold for high frequency
-    float high,              // threshold for low frequency
-    float attention_factor,  // attention_factor applied on cos and sin
-    cudaStream_t stream);    // CUDA stream
+    float factor, // factor in rope_scaling in config.json. When it is not 1.0, it means the model is using yarn.
+    float low,    // threshold for high frequency
+    float high,   // threshold for low frequency
+    float attention_factor, // attention_factor applied on cos and sin
+    cudaStream_t stream);   // CUDA stream
 
 } // namespace kernels
 } // namespace tensorrt_llm
