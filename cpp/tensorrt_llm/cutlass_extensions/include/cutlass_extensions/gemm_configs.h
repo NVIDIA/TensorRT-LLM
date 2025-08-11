@@ -207,6 +207,7 @@ enum class EpilogueScheduleType
 
 enum class TileShape : int
 {
+    Undefined,
     TileShape_64x16x128 = shape_tuple_to_enum(64, 16, 128),
     TileShape_64x32x128 = shape_tuple_to_enum(64, 32, 128),
     TileShape_64x64x128 = shape_tuple_to_enum(64, 64, 128),
@@ -278,63 +279,26 @@ constexpr auto get_tile_shape()
     {
         return cute::Shape<_256, _256, _128>{};
     }
+    else
+    {
+        return cute::Shape<_0, _0, _0>{};
+    }
 }
 
-static auto get_tile_shape_name(TileShape Shape_MNK)
+template <class TEnum>
+static std::string get_tile_shape_name(TEnum Shape_MNK)
 {
-    if (Shape_MNK == TileShape::TileShape_64x16x128)
+    static_assert(std::is_enum_v<TEnum> && std::is_same_v<std::underlying_type_t<TEnum>, int>,
+        "TEnum must be an enum with underlying type int");
+    if ((int) Shape_MNK == 0)
     {
-        return "64x16x128";
+        return "undefined";
     }
-    else if (Shape_MNK == TileShape::TileShape_64x32x128)
+    else
     {
-        return "64x32x128";
+        auto [m, n, k] = enum_to_shape_tuple(Shape_MNK);
+        return std::to_string(m) + "x" + std::to_string(n) + "x" + std::to_string(k);
     }
-    else if (Shape_MNK == TileShape::TileShape_64x64x128)
-    {
-        return "64x64x128";
-    }
-    else if (Shape_MNK == TileShape::TileShape_64x128x128)
-    {
-        return "64x128x128";
-    }
-    else if (Shape_MNK == TileShape::TileShape_64x256x128)
-    {
-        return "64x256x128";
-    }
-    else if (Shape_MNK == TileShape::TileShape_64x512x128)
-    {
-        return "64x512x128";
-    }
-    else if (Shape_MNK == TileShape::TileShape_128x16x128)
-    {
-        return "128x16x128";
-    }
-    else if (Shape_MNK == TileShape::TileShape_128x32x128)
-    {
-        return "128x32x128";
-    }
-    else if (Shape_MNK == TileShape::TileShape_128x64x128)
-    {
-        return "128x64x128";
-    }
-    else if (Shape_MNK == TileShape::TileShape_128x128x128)
-    {
-        return "128x128x128";
-    }
-    else if (Shape_MNK == TileShape::TileShape_128x256x128)
-    {
-        return "128x256x128";
-    }
-    else if (Shape_MNK == TileShape::TileShape_256x128x128)
-    {
-        return "256x128x128";
-    }
-    else if (Shape_MNK == TileShape::TileShape_256x256x128)
-    {
-        return "256x256x128";
-    }
-    return "Unknown shape";
 }
 
 enum class ClusterShape : int
@@ -353,37 +317,17 @@ enum class ClusterShape : int
     ClusterShape_8x1x1 = shape_tuple_to_enum(8, 1, 1)
 };
 
-static auto get_cluster_shape_name(ClusterShape Shape_MNK)
+static std::string get_cluster_shape_name(ClusterShape Shape_MNK)
 {
-    if (Shape_MNK == ClusterShape::ClusterShape_1x1x1)
+    if (Shape_MNK == ClusterShape::Undefined)
     {
-        return "1x1x1";
+        return "undefined";
     }
-    else if (Shape_MNK == ClusterShape::ClusterShape_2x1x1)
+    else
     {
-        return "2x1x1";
+        auto [m, n, k] = enum_to_shape_tuple(Shape_MNK);
+        return std::to_string(m) + "x" + std::to_string(n) + "x" + std::to_string(k);
     }
-    else if (Shape_MNK == ClusterShape::ClusterShape_1x2x1)
-    {
-        return "1x2x1";
-    }
-    else if (Shape_MNK == ClusterShape::ClusterShape_2x2x1)
-    {
-        return "2x2x1";
-    }
-    else if (Shape_MNK == ClusterShape::ClusterShape_4x1x1)
-    {
-        return "4x1x1";
-    }
-    else if (Shape_MNK == ClusterShape::ClusterShape_1x8x1)
-    {
-        return "1x8x1";
-    }
-    else if (Shape_MNK == ClusterShape::ClusterShape_8x1x1)
-    {
-        return "8x1x1";
-    }
-    return "Unknown shape";
 }
 
 template <ClusterShape Shape_MNK>
@@ -417,6 +361,26 @@ constexpr auto get_cluster_shape()
     else if constexpr (Shape_MNK == ClusterShape::ClusterShape_8x1x1)
     {
         return cute::Shape<_8, _1, _1>{};
+    }
+    else if constexpr (Shape_MNK == ClusterShape::ClusterShape_1x4x1)
+    {
+        return cute::Shape<_1, _4, _1>{};
+    }
+    else if constexpr (Shape_MNK == ClusterShape::ClusterShape_4x2x1)
+    {
+        return cute::Shape<_4, _2, _1>{};
+    }
+    else if constexpr (Shape_MNK == ClusterShape::ClusterShape_2x4x1)
+    {
+        return cute::Shape<_2, _4, _1>{};
+    }
+    else if constexpr (Shape_MNK == ClusterShape::ClusterShape_4x4x1)
+    {
+        return cute::Shape<_4, _4, _1>{};
+    }
+    else
+    {
+        return cute::Shape<_0, _0, _0>{};
     }
 }
 
@@ -517,6 +481,20 @@ struct CutlassGemmConfig
         return -1;
     }
 
+    std::string getTileConfigAsName() const
+    {
+        if (sm_version == 120 || sm_version == 121)
+            return get_tile_shape_name(tile_config_sm120);
+        if (sm_version >= 100 && sm_version < 120)
+            return get_tile_shape_name(tile_config_sm100);
+        if (sm_version == 90)
+            return get_tile_shape_name(tile_config_sm90);
+        if (sm_version < 90)
+            return std::to_string((int) tile_config_sm80);
+        assert(false && "Invalid SM version");
+        return "invalid";
+    }
+
     std::string toString() const
     {
         std::stringstream tactic;
@@ -525,10 +503,10 @@ struct CutlassGemmConfig
         {
             assert(sm_version >= 90 && "Invalid cutlass GEMM config");
             tactic << "\n\tstyle=TMA Warp Specialized"
-                   << "\n\tsm: " << sm_version << "\n\ttile shape ID: " << getTileConfigAsInt()
-                   << "\n\tcluster shape ID: " << (int) cluster_shape
-                   << "\n\tdynamic cluster shape ID: " << (int) dynamic_cluster_shape
-                   << "\n\tfallback cluster shape ID: " << (int) fallback_cluster_shape
+                   << "\n\tsm: " << sm_version << "\n\ttile shape ID: " << getTileConfigAsName()
+                   << "\n\tcluster shape ID: " << get_cluster_shape_name(cluster_shape)
+                   << "\n\tdynamic cluster shape ID: " << get_cluster_shape_name(dynamic_cluster_shape)
+                   << "\n\tfallback cluster shape ID: " << get_cluster_shape_name(fallback_cluster_shape)
                    << "\n\tmainloop sched: " << (int) mainloop_schedule << "\n\tepi sched: " << (int) epilogue_schedule
                    << "\n\tenable cuda kernel: " << (enableCudaKernel ? "true" : "false");
         }
