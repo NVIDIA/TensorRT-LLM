@@ -50,6 +50,8 @@ l0_dgx_h100:
   - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_ctx_pp_gen_tp_asymmetric[GSM8K-gen_tp=2-ctx_pp=2]
   - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_ctx_pp_gen_tp_asymmetric[MMLU-gen_tp=1-ctx_pp=2]
   - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_ctx_pp_gen_tp_asymmetric[MMLU-gen_tp=2-ctx_pp=2]
+  - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_multi_instance[GSM8K]
+  - accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_multi_instance[MMLU]
   - accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_nixl_backend
   - accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_nixl_backend
   - test_e2e.py::test_ptp_quickstart_advanced_bs1
