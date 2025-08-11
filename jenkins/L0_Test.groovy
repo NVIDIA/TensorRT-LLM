@@ -1015,6 +1015,8 @@ def getMakoArgsFromStageName(stageName, parseSysinfo=false) {
     }
     if (stageName.contains("-DeepSeek-")) {
         makoArgs += ["auto_trigger=deepseek"]
+    } else if (stageName.contains("-GptOss-")) {
+        makoArgs += ["auto_trigger=gpt_oss"]
     } else {
         makoArgs += ["auto_trigger=others"]
     }
