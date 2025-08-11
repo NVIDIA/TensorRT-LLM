@@ -18,11 +18,11 @@ class QuantConfigReader(ABC):
     """Base class for reading and parsing quantization config."""
 
     def __init__(self):
-        self._quant_config: Optional[Dict] = None
+        self._quant_config: Optional[Dict] = {}
 
     def get_config(self) -> Dict:
         """Return the parsed quantization config."""
-        return self._quant_config or {}
+        return self._quant_config
 
     @abstractmethod
     def read_config(self, config: Dict) -> Dict:
@@ -79,22 +79,32 @@ class QuantConfigReaderRegistry:
 @QuantConfigReaderRegistry.register("modelopt")
 class ModelOPTQuantConfigReader(QuantConfigReader):
     def read_config(self, config: Dict) -> Dict:
-        # Inject default exclusion
-        config.setdefault("exclude_modules", ["lm_head"])
+        producer = config.get("producer", {}).get("name")
+        # sanity check
+        if producer != "modelopt":
+            raise ValueError(f"Expected producer 'modelopt', got '{producer}'")
 
+        quant_config = config.get("quantization", {})
+        # Inject default exclusion, add "model.embed_tokens" for "tie_word_embedding:true" case
+        quant_config.setdefault("exclude_modules", ["lm_head", "model.embed_tokens"])
         # Update dtype
-        if config.get("quant_algo") == "NVFP4":
-            config["torch_dtype"] = "float16"
+        if quant_config.get("quant_algo") == "NVFP4":
+            quant_config["torch_dtype"] = "float16"
 
         # Handle kv cache
-        kv_algo = config.get("kv_cache_quant_algo")
+        kv_algo = quant_config.get("kv_cache_quant_algo")
         if kv_algo:
             if kv_algo != "FP8":
                 raise ValueError(f"KV cache quantization format {kv_algo} not supported.")
-            config["kv_cache_dtype"] = "float8_e4m3fn"
+            quant_config["kv_cache_dtype"] = "float8_e4m3fn"
 
-        self._quant_config = config
-        return self._quant_config
+        self._quant_config = quant_config
+
+        extra_model_kwargs: Dict[str, Any] = {}
+        if quant_config.get("quant_algo", None) == "NVFP4":
+            extra_model_kwargs["torch_dtype"] = "float16"
+
+        return extra_model_kwargs
 
     @classmethod
     def from_file(
@@ -115,16 +125,6 @@ class ModelOPTQuantConfigReader(QuantConfigReader):
 
         with open(quant_file, "r") as f:
             raw = json.load(f)
-
-        producer = raw.get("producer", {}).get("name")
-        # sanity check
-        if producer != "modelopt":
-            raise ValueError(f"Expected producer 'modelopt', got '{producer}'")
-
-        quant_config = raw.get("quantization", {})
         reader = cls()
-        reader.read_config(quant_config)
-        extra_model_kwargs: Dict[str, Any] = {}
-        if quant_config and quant_config.get("quant_algo", None) == "NVFP4":
-            extra_model_kwargs["torch_dtype"] = "float16"
+        extra_model_kwargs = reader.read_config(raw)
         return reader, extra_model_kwargs

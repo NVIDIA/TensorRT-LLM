@@ -144,12 +144,12 @@ def _extract_linear_parameters(linear_node: Node) -> tuple[Node, torch.Tensor, O
         weight = linear_node.args[1]
         return input_node, weight, None, ""
     elif {
-        is_op(linear_node, torch.ops.auto_deploy.torch_quant_fp4_linear),
-        is_op(linear_node, torch.ops.auto_deploy.torch_quant_fp8_linear),
+        is_op(linear_node, torch.ops.auto_deploy.torch_quant_fp4_linear)
+        or is_op(linear_node, torch.ops.auto_deploy.torch_quant_fp8_linear),
     }:
         weight = linear_node.args[1]
         scales, quant_type = get_scales_and_type_from_node(linear_node)
-        return input_node, weight, scales, quant_type
+        return input_node, weight, scales or {}, quant_type
 
 
 def _match_expert_compute_pattern(start_boundary: Node, end_boundary: Node):

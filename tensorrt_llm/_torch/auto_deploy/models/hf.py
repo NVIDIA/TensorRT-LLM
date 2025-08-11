@@ -84,7 +84,7 @@ class AutoModelForCausalLMFactory(ModelFactory):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self._quant_config_reader: Optional[QuantConfigReader] = None
+        self._quant_config_reader: QuantConfigReader | None = None
         # Ingest defaults for tokenizer and model kwargs
         self.tokenizer_kwargs = deep_merge_dicts(self._tokenizer_defaults, self.tokenizer_kwargs)
         self.model_kwargs = deep_merge_dicts(
@@ -177,7 +177,7 @@ class AutoModelForCausalLMFactory(ModelFactory):
         return model
 
     def get_quant_config(self) -> Dict:
-        """Returns the quantization config for this model or None if not quantized."""
+        """Returns the quantization config for this model or an empty dict if not quantized."""
         if self._quant_config_reader is not None:
             return self._quant_config_reader.get_config()
         return {}
@@ -188,7 +188,10 @@ class AutoModelForCausalLMFactory(ModelFactory):
             return CacheConfig(dtype=None)
 
         kv_cache_dtype = self._quant_config_reader.get_config().get("kv_cache_dtype")
-        torch_dtype = {"float8_e4m3fn": torch.float8_e4m3fn}.get(kv_cache_dtype, None)
+        torch_dtype = torch.float8_e4m3fn if kv_cache_dtype == "float8_e4m3fn" else None
+        assert torch_dtype in (torch.float8_e4m3fn, None), (
+            f"Unsupported dtype: {torch_dtype}. Only torch.float8_e4m3fn is supported."
+        )
 
         return CacheConfig(dtype=torch_dtype)
 
