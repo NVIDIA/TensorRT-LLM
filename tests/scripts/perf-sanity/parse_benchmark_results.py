@@ -1,19 +1,4 @@
 #!/usr/bin/env python3
-"""
-Script to parse benchmark metrics from a specified folder and generate CSV table
-Usage: python parse_benchmark_results.py <input_folder> <output_csv> <config_file>
-  input_folder: Folder containing benchmark log files
-  output_csv: Output CSV filename for the results table
-  config_file: Path to benchmark_config.yaml file
-
-The script will:
-1. Load all test cases from benchmark_config.yaml
-2. Initialize a table with all test cases and empty performance data
-3. Parse serve.*.log files and match them to test cases
-4. Fill in performance data for matched test cases
-5. Generate a CSV table with all test cases and empty rows between different test configurations
-"""
-
 import argparse
 import re
 import sys

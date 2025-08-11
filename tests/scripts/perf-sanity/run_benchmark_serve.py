@@ -1,14 +1,4 @@
 #!/usr/bin/env python3
-"""
-Script to run benchmarks from YAML configuration file
-Usage: python run_benchmark_serve.py --output_folder <output_folder> --config_file <config_file> [--skip <skip_pattern>] [--select <select_pattern>]
-Skip pattern format: "2,4-1" means skip test case 2 and test case 4's 1st concurrency
-Select pattern format: "1,3,5" means only run test cases 1, 3, and 5
-Select pattern format: "1-1,2-3" means only run test case 1's 1st concurrency and test case 2's 3rd concurrency
-If select_pattern is empty, all test cases are selected
-If skip_pattern is empty, no test cases are skipped
-"""
-
 import argparse
 import os
 import subprocess
@@ -391,7 +381,13 @@ class BenchmarkRunner:
         print()
 
         # Prepare log filename
-        benchmark_log_filename = f"serve.{test_case['model']}.tp{test_case['tp']}.ep{test_case['ep']}.attn{test_case['attn_backend']}.moe{test_case['moe_backend']}.gpu{test_case['free_gpu_mem_fraction']}.batch{test_case['max_batch_size']}.isl{test_case['isl']}.osl{test_case['osl']}.tokens{test_case['max_num_tokens']}.moetokens{test_case['moe_max_num_tokens']}.concurrency{concurrency}.iter{iteration}.log"
+        benchmark_log_filename = (
+            f"serve.{test_case['model']}.tp{test_case['tp']}.ep{test_case['ep']}."
+            f"attn{test_case['attn_backend']}.moe{test_case['moe_backend']}."
+            f"gpu{test_case['free_gpu_mem_fraction']}.batch{test_case['max_batch_size']}."
+            f"isl{test_case['isl']}.osl{test_case['osl']}."
+            f"tokens{test_case['max_num_tokens']}.moetokens{test_case['moe_max_num_tokens']}."
+            f"concurrency{concurrency}.iter{iteration}.log")
 
         try:
             # Start benchmark as subprocess
@@ -472,9 +468,19 @@ class BenchmarkRunner:
             )
 
             # Add configuration summary to log file
-            config_summary = f"Completed benchmark with Configuration: model_label={test_case['model']}, GPUs={test_case['gpus']}, TP={test_case['tp']}, EP={test_case['ep']}, attn_backend={test_case['attn_backend']}, moe_backend={test_case['moe_backend']}, enable_attention_dp={test_case['enable_attention_dp']}, free_gpu_mem_fraction={test_case['free_gpu_mem_fraction']}, max_batch_size={test_case['max_batch_size']}, ISL={test_case['isl']}, OSL={test_case['osl']}, max_num_tokens={test_case['max_num_tokens']}, moe_max_num_tokens={test_case['moe_max_num_tokens']}, Concurrency={concurrency}"
-            print(config_summary)
-
+            config_summary = (
+                f"Completed benchmark with Configuration: "
+                f"model_label={test_case['model']}, GPUs={test_case['gpus']}, "
+                f"TP={test_case['tp']}, EP={test_case['ep']}, "
+                f"attn_backend={test_case['attn_backend']}, "
+                f"moe_backend={test_case['moe_backend']}, "
+                f"enable_attention_dp={test_case['enable_attention_dp']}, "
+                f"free_gpu_mem_fraction={test_case['free_gpu_mem_fraction']}, "
+                f"max_batch_size={test_case['max_batch_size']}, "
+                f"ISL={test_case['isl']}, OSL={test_case['osl']}, "
+                f"max_num_tokens={test_case['max_num_tokens']}, "
+                f"moe_max_num_tokens={test_case['moe_max_num_tokens']}, "
+                f"Concurrency={concurrency}")
             with open(benchmark_log_filename, 'a') as f:
                 f.write(f"\n{config_summary}\n")
 
@@ -534,7 +540,13 @@ class BenchmarkRunner:
         print()
 
         # Start server
-        server_log_filename = f"trtllm-serve.{model_label}.tp{test_case['tp']}.ep{test_case['ep']}.attn{test_case['attn_backend']}.moe{test_case['moe_backend']}.gpu{test_case['free_gpu_mem_fraction']}.batch{test_case['max_batch_size']}.isl{test_case['isl']}.osl{test_case['osl']}.tokens{test_case['max_num_tokens']}.moetokens{test_case['moe_max_num_tokens']}.log"
+        server_log_filename = (
+            f"trtllm-serve.{model_label}.tp{test_case['tp']}.ep{test_case['ep']}."
+            f"attn{test_case['attn_backend']}.moe{test_case['moe_backend']}."
+            f"gpu{test_case['free_gpu_mem_fraction']}.batch{test_case['max_batch_size']}."
+            f"isl{test_case['isl']}.osl{test_case['osl']}."
+            f"tokens{test_case['max_num_tokens']}.moetokens{test_case['moe_max_num_tokens']}.log"
+        )
 
         try:
             with open(server_log_filename, 'w') as log_file:
