@@ -1,9 +1,12 @@
+from contextlib import contextmanager, nullcontext
+
 import pytest
 
 from tensorrt_llm import LLM
 from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.llmapi.llm_args import PeftCacheConfig
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
+from tensorrt_llm.metrics import MetricNames
 from tensorrt_llm.sampling_params import SamplingParams
 
 # isort: off
@@ -14,17 +17,15 @@ from .lora_test_utils import (
 from .test_llm import (_test_llm_capture_request_error, get_model_path,
                        global_kvcache_config, llama_model_path,
                        llm_get_stats_async_test_harness,
-                       llm_get_stats_test_harness, prompts,
+                       llm_get_stats_test_harness, llm_test_harness, prompts,
                        run_llm_abort_request,
                        run_llm_with_postprocess_parallel_and_result_handler,
                        tinyllama_logits_processor_test_harness)
-from utils.util import (EnvVarsContextManager, force_ampere,
-                        run_function_in_sub_process, similar,
-                        skip_gpu_memory_less_than_40gb,
+from utils.util import (force_ampere, similar, skip_gpu_memory_less_than_40gb,
                         skip_gpu_memory_less_than_80gb,
                         skip_gpu_memory_less_than_138gb)
 from utils.llm_data import llm_models_root
-from tensorrt_llm.lora_manager import LoraConfig
+from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.executor.request import LoRARequest
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -33,7 +34,7 @@ import tempfile
 import torch
 from peft import LoraConfig as PeftLoraConfig
 from peft import get_peft_model
-from transformers import AutoModelForCausalLM
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
 # isort: on
 
@@ -93,6 +94,63 @@ def test_llm_abort_request(sampling_params):
     run_llm_abort_request(llm=llm, sampling_params=sampling_params)
 
 
+@contextmanager
+def _validate_invalid_token_error_scope():
+    with pytest.raises(RuntimeError) as exc_info:
+        yield
+    assert "Token ID out of range" in str(exc_info.value)
+
+
+@force_ampere
+def test_llm_invalid_input_token():
+    llm = LLM(model=llama_model_path, kv_cache_config=global_kvcache_config)
+    prompts = [
+        [-1],
+    ]
+    # NB: exc_info in _validate_invalid_token_error_scope creates a reference
+    #     to a traceback which outlives the scope of 'exc_info' and prevents
+    #     deletion of 'llm'. However, using the context manager protocol is
+    #     anyways more robust than delegating cleanup to __del__.
+    with llm:
+        with _validate_invalid_token_error_scope():
+            llm.generate(
+                prompts,
+                sampling_params=SamplingParams(max_tokens=5),
+            )
+
+
+@force_ampere
+def test_llm_invalid_input_token_async():
+    llm = LLM(model=llama_model_path, kv_cache_config=global_kvcache_config)
+    # NB: exc_info in _validate_invalid_token_error_scope creates a reference
+    #     to a traceback which outlives the scope of 'exc_info' and prevents
+    #     deletion of 'llm'. However, using the context manager protocol is
+    #     anyways more robust than delegating cleanup to __del__.
+    with llm:
+        prompts = [
+            [-1],
+            [42],
+        ]
+        fail_idx = [0]
+        for submit_order in [[0, 1], [1, 0]]:
+            for collect_order in [[0, 1], [1, 0]]:
+                print(f"submitting {submit_order}")
+                futures = [
+                    llm.generate_async(
+                        prompts[submit_idx],
+                        sampling_params=SamplingParams(max_tokens=5),
+                    ) for submit_idx in submit_order
+                ]
+                for collect_idx in collect_order:
+                    with _validate_invalid_token_error_scope(
+                    ) if submit_order[collect_idx] in fail_idx else nullcontext(
+                    ):
+                        print(
+                            f"collect order {collect_order}, collecting {collect_idx}"
+                        )
+                        futures[collect_idx].result()
+
+
 def test_llm_reward_model():
     rm_model_path = get_model_path("Qwen2.5-Math-PRM-7B")
     tokenizer = TransformersTokenizer.from_pretrained(rm_model_path)
@@ -138,11 +196,72 @@ def test_llm_perf_metrics():
     assert perf_metrics.last_iter == perf_metrics.iter
 
 
+def test_llm_prometheus():
+    test_prompts = [
+        "Hello, my name is",
+        "The president of the United States is",
+        "The capital of France is",
+        "The future of AI is",
+    ]
+    sampling_params = SamplingParams(max_tokens=10, temperature=0.8, top_p=0.95)
+    llm = LLM(model=llama_model_path,
+              return_perf_metrics=True,
+              kv_cache_config=global_kvcache_config)
+    for test_prompt in test_prompts:
+        request_output = llm.generate(test_prompt, sampling_params)
+        assert request_output.metrics_dict is not None
+        assert MetricNames.REQUEST_QUEUE_TIME in request_output.metrics_dict
+        assert MetricNames.TPOT in request_output.metrics_dict
+        assert MetricNames.TTFT in request_output.metrics_dict
+        assert MetricNames.E2E in request_output.metrics_dict
+        assert request_output.outputs is not None
+
+
 @pytest.mark.parametrize("streaming", [True, False])
 def test_llm_with_postprocess_parallel_and_result_handler(streaming):
     run_llm_with_postprocess_parallel_and_result_handler(streaming,
                                                          "pytorch",
                                                          tp_size=1)
+
+
+@pytest.mark.parametrize(
+    "enable_mixed_sampler,enable_logprobs",
+    [
+        (False, False),  # Fast path: no mixed sampler, no logits, greedy
+        (True,
+         False),  # Batched strategy path: mixed sampler enabled, same strategy
+        (False,
+         True),  # Per-request path: mixed sampler disabled, logprobs enabled
+    ])
+@pytest.mark.part0
+def test_embedding_bias_with_torch_sampler_strategies(enable_mixed_sampler,
+                                                      enable_logprobs):
+    """Test embedding bias application in all 3 TorchSampler paths: fast, batched strategy, and per-request"""
+    tokenizer = AutoTokenizer.from_pretrained(llama_model_path)
+    biased_word_id = tokenizer.encode("Z", add_special_tokens=False)[-1]
+    vocab_size_padded = 32000
+    embedding_bias = torch.zeros(vocab_size_padded)
+    embedding_bias[biased_word_id] = torch.finfo(torch.float32).max
+
+    sampling_kwargs = {
+        "max_tokens": 6,
+        "embedding_bias": embedding_bias,
+    }
+
+    if enable_logprobs:
+        sampling_kwargs["logprobs"] = 1
+    # All test cases use greedy sampling for simplicity
+
+    sampling_params = SamplingParams(**sampling_kwargs)
+
+    llm_test_harness(
+        llama_model_path,
+        prompts,
+        ["Z Z Z Z Z Z"],
+        sampling_params=sampling_params,
+        backend="pytorch",
+        use_torch_sampler=True,  # Use TorchSampler to test all 3 paths
+        enable_mixed_sampler=enable_mixed_sampler)
 
 
 def llama_7b_lora_from_dir_test_harness(**llm_kwargs) -> None:
@@ -214,20 +333,7 @@ def test_llama_7b_lora_default_modules() -> None:
         llm.shutdown()
 
 
-@pytest.mark.parametrize(
-    "lora_adapter_count_per_call, max_loras, max_cpu_loras, repeat_calls, repeats_per_call",
-    [
-        # Test eviction and re-loading a previously evicted adapter from the LoRA GPU cache, within a single
-        # llm.generate call, that's repeated twice.
-        ([
-            2,
-        ], 1, 2, 2, 3),
-        # Test eviction and loading of new adapters in the evicted space, over several llm.generate calls, with LoRA GPU
-        # cache size < LoRA CPU cache size
-        ([2, 2, 2], 1, 3, 1, 1),
-    ])
-@skip_gpu_memory_less_than_40gb
-def test_llama_7b_multi_lora_evict_load_new_adapters(
+def _check_llama_7b_multi_lora_evict_load_new_adapters(
         lora_adapter_count_per_call: list[int], max_loras: int,
         max_cpu_loras: int, repeat_calls: int, repeats_per_call: int):
     # For LoRA checkpoints without finetuned embedding and lm_head, we can either:
@@ -248,60 +354,66 @@ def test_llama_7b_multi_lora_evict_load_new_adapters(
         cuda_graph_config=None)
 
 
-@pytest.mark.parametrize(
-    "lora_adapter_count_per_call, max_loras, max_cpu_loras, repeat_calls, repeats_per_call",
-    [
-        # Test eviction, reloading new adapters and reloading previously evicted adapters from the LoRA CPU cache & GPU
-        # cache over multiple llm.generate call repeated twice (two calls with the same requests):
-        # At the end of the 1st llm.generate call:
-        #   The LoRA caches should contain adapters 1, 2 and shouldn't contain adapter 0 (it should have been evicted).
-        # So in the 2nd call, the worker should:
-        # - Send req0 with adapter 0 weights (because it was previously evicted)
-        # - Send the other two requests without their adapter weights as they're already in LoRA CPU cache
-        # Then, handling of req0 that has weights but not in the cache should evict one of the other two adapters from
-        # the cache, causing that evicted adapter's request to fail because its weights aren't with the request and
-        # aren't in LoRA cache.
-        ([
-            3,
-        ], 2, 2, 2, 1),
-    ])
 @skip_gpu_memory_less_than_40gb
-def test_llama_7b_multi_lora_load_previously_cpu_cache_evicted_adapter_fails(
-        lora_adapter_count_per_call: list[int], max_loras: int,
-        max_cpu_loras: int, repeat_calls: int, repeats_per_call: int):
-    """Tests that trying to load a LoRA adapter after it was evicted from CPU cache fails with the expected
-    message, as this feature is currently not supported in favor of the performance improvement of not
-    sending the LoRA weights with every request after the first time.
-    NOTE: This test assumes the requests are handled in the order they're sent, if that's not true, then this test
-          may not get any error at all, which would cause it to fail.
+def test_llama_7b_multi_lora_evict_and_reload_lora_gpu_cache():
+    """Test eviction and re-loading a previously evicted adapter from the LoRA GPU cache, within a single
+    llm.generate call, that's repeated twice.
     """  # noqa: D205
-
-    def _check_contains_expected_message(stdout: str, stderr: str):
-        note_in_message = "Note that currently a request with LoRA task that was already loaded is sent" \
-                          " without its LoRA weights to save its serialization, copy and deserialization, so if this" \
-                          " LoRA task was evicted from LoRA CPU cache, then its reuse is currently not supported."
-        return note_in_message in stderr
-
-    lora_config = LoraConfig(lora_target_modules=['attn_q', 'attn_k', 'attn_v'],
-                             max_lora_rank=8,
-                             max_loras=max_loras,
-                             max_cpu_loras=max_cpu_loras)
-    with EnvVarsContextManager({"TLLM_WORKER_USE_SINGLE_PROCESS": "1"}):
-        child_stdout, child_stderr = run_function_in_sub_process(
-            target=check_llama_7b_multi_unique_lora_adapters_from_request,
-            args=(lora_adapter_count_per_call, repeat_calls, repeats_per_call,
-                  LLM),
-            kwargs={
-                "lora_config": lora_config,
-                # Disable CUDA graph
-                # TODO: remove this once we have a proper fix for CUDA graph in LoRA
-                "cuda_graph_config": None
-            },
-            stop_waiting_criteria=_check_contains_expected_message)
-
-    assert _check_contains_expected_message(child_stdout, child_stderr)
+    _check_llama_7b_multi_lora_evict_load_new_adapters(
+        lora_adapter_count_per_call=[2],
+        max_loras=1,
+        max_cpu_loras=2,
+        repeat_calls=2,
+        repeats_per_call=3)
 
 
+@skip_gpu_memory_less_than_40gb
+def test_llama_7b_multi_lora_evict_and_load_new_adapters_in_cpu_and_gpu_cache():
+    """Test eviction and loading of new adapters in the evicted space, over several llm.generate calls, with LoRA GPU
+    cache size < LoRA CPU cache size.
+    """  # noqa: D205
+    _check_llama_7b_multi_lora_evict_load_new_adapters(
+        lora_adapter_count_per_call=[2, 2, 2],
+        max_loras=1,
+        max_cpu_loras=3,
+        repeat_calls=1,
+        repeats_per_call=1)
+
+
+@skip_gpu_memory_less_than_40gb
+def test_llama_7b_multi_lora_read_from_cache_after_insert():
+    """Test that loading and then using the same adapters loaded in cache works."""
+    _check_llama_7b_multi_lora_evict_load_new_adapters(
+        lora_adapter_count_per_call=[3],
+        max_loras=3,
+        max_cpu_loras=3,
+        repeat_calls=2,
+        repeats_per_call=1)
+
+
+@skip_gpu_memory_less_than_40gb
+def test_llama_7b_multi_lora_evict_and_reload_evicted_adapters_in_cpu_and_gpu_cache(
+):
+    """Test eviction, reloading new adapters and reloading previously evicted adapters from the LoRA CPU cache & GPU
+    cache over multiple llm.generate call repeated twice (two calls with the same requests):
+    At the end of the 1st llm.generate call:
+      The LoRA caches should contain adapters 1, 2 and shouldn't contain adapter 0 (it should have been evicted).
+    So in the 2nd call, the worker should:
+    - Send req0 with adapter 0 weights (because it was previously evicted)
+    - Send the other two requests without their adapter weights as they're already in LoRA CPU cache
+    Then, handling of req0 that has weights but not in the cache should evict one of the other two adapters from
+    the cache, causing that evicted adapter's request to again load its weights from the file system, as they
+    aren't with the request and aren't in LoRA cache.
+    """  # noqa: D205
+    _check_llama_7b_multi_lora_evict_load_new_adapters(
+        lora_adapter_count_per_call=[3],
+        max_loras=2,
+        max_cpu_loras=2,
+        repeat_calls=2,
+        repeats_per_call=1)
+
+
+@skip_gpu_memory_less_than_40gb
 def test_llama_7b_peft_cache_config_affects_peft_cache_size():
     """Tests that LLM arg of peft_cache_config affects the peft cache sizes.
 
@@ -337,6 +449,7 @@ def test_llama_7b_peft_cache_config_affects_peft_cache_size():
             cuda_graph_config=None)
 
 
+@skip_gpu_memory_less_than_40gb
 def test_llama_7b_lora_config_overrides_peft_cache_config():
     """Tests that cache size args in lora_config LLM arg override the cache size
     parameters in peft_cache_config LLM arg.
@@ -358,6 +471,7 @@ def test_llama_7b_lora_config_overrides_peft_cache_config():
 
 # TODO smor: currently Nemotron-Super-49B-v1 with LoRA memory consumption is overly high
 # https://jirasw.nvidia.com/browse/TRTLLM-5045
+@pytest.mark.skip(reason="https://nvbugs/5448464")
 @skip_gpu_memory_less_than_138gb
 def test_nemotron_nas_lora() -> None:
     lora_config = LoraConfig(lora_dir=[

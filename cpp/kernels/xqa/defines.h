@@ -97,6 +97,15 @@ static_assert(SPEC_DEC, "SPEC_Q_SEQ_LEN should only be used when SPEC_DEC is ena
 #define USE_PAGED_KV_CACHE (TOKENS_PER_PAGE > 0)
 #endif
 
+// Paged KV Cache Format
+// 0 - XQA Original
+// 1 - separate K and V cache pools, each with layout (batch, seq_len, head, head_elem) for VLLM/SGLang
+#ifdef USE_PAGED_KV_CACHE
+#ifndef PAGED_KV_CACHE_LAYOUT
+#define PAGED_KV_CACHE_LAYOUT 0
+#endif
+#endif
+
 // don't modify
 #define USE_BEAM_SEARCH (BEAM_WIDTH > 1)
 
@@ -160,6 +169,10 @@ static_assert(CACHE_ELEM_ENUM != 0);
 
 #ifndef OPTIMIZE_FOR_LATENCY
 #define OPTIMIZE_FOR_LATENCY 1
+#endif
+
+#ifndef IS_SPEC_DEC_TREE
+#define IS_SPEC_DEC_TREE 1 // by default SPEC_DEC expect tree-based draft token structure
 #endif
 
 #define DBG_BATCH_SIZE 2

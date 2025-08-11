@@ -13,9 +13,9 @@ from tensorrt_llm._utils import str_dtype_to_binding, torch_dtype_to_str
 from tensorrt_llm.bindings.executor import DecodingMode, ExecutorConfig
 from tensorrt_llm.llmapi.llm_args import PeftCacheConfig
 from tensorrt_llm.logger import logger
-from tensorrt_llm.lora_manager import (LoraConfig,
-                                       get_default_trtllm_modules_to_hf_modules,
-                                       load_torch_lora)
+from tensorrt_llm.lora_helper import (LoraConfig,
+                                      get_default_trtllm_modules_to_hf_modules)
+from tensorrt_llm.lora_manager import load_torch_lora
 from tensorrt_llm.mapping import Mapping
 
 from ..model_config import ModelConfig
@@ -314,6 +314,7 @@ class KvCacheCreator:
                 dtype=kv_cache_dtype,
                 spec_config=spec_config,
                 max_beam_width=executor_config.max_beam_width,
+                is_draft=model_engine.is_draft_model,
             )
         elif is_nemotron_hybrid(config):
             if executor_config.max_beam_width > 1:
@@ -329,17 +330,19 @@ class KvCacheCreator:
             mamba_layer_mask = [
                 char == "M" for char in config.hybrid_override_pattern
             ]
+
             kv_cache_manager = MambaHybridCacheManager(
                 # mamba cache parameters
-                config.hidden_size,
                 config.ssm_state_size,
                 config.conv_kernel,
-                config.expand,
+                config.mamba_num_heads,
                 config.n_groups,
                 config.mamba_head_dim,
                 mamba_num_layers,
                 mamba_layer_mask,
                 config.torch_dtype,
+                model_engine.model.model_config.quant_config.
+                mamba_ssm_cache_dtype,
                 # kv cache parameters
                 executor_config.kv_cache_config,
                 tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
@@ -377,6 +380,7 @@ class KvCacheCreator:
                 max_num_tokens=executor_config.max_num_tokens,
                 model_config=binding_model_config,
                 max_beam_width=executor_config.max_beam_width,
+                is_draft=model_engine.is_draft_model,
             )
         # KVCacheManager (Non-draft) modifies the max_seq_len field, update it to executor_config
         if model_engine.kv_cache_manager_key == ResourceManagerType.KV_CACHE_MANAGER:
@@ -503,6 +507,7 @@ def create_py_executor_instance(
         )
         peft_cache_manager = PeftCacheManager(
             peft_cache_config=executor_config.peft_cache_config,
+            lora_config=lora_config,
             model_config=model_binding_config,
             world_config=world_config,
         )
@@ -590,15 +595,14 @@ def instantiate_sampler(engine: PyTorchModelEngine,
     if engine.spec_config is not None and engine.spec_config.spec_dec_mode.has_spec_decoder(
     ):
         return get_spec_decoder(sampler_args, engine.spec_config)
-    if pytorch_backend_config.enable_trtllm_sampler:
-        decoding_mode = get_decoding_mode(executor_config)
-        return TRTLLMSampler(executor_config, engine.model, engine.dtype,
-                             mapping, decoding_mode,
-                             pytorch_backend_config.disable_overlap_scheduler)
+    if pytorch_backend_config.use_torch_sampler or pytorch_backend_config.enable_mixed_sampler or engine.spec_config is not None:
+        return TorchSampler(sampler_args)
     if not engine.model.model_config.is_generation:
         # NOTE: choose sampler based on model type
         return EarlyStopSampler()
-    return TorchSampler(sampler_args)
+    return TRTLLMSampler(executor_config, engine.model, engine.dtype, mapping,
+                         get_decoding_mode(executor_config),
+                         pytorch_backend_config.disable_overlap_scheduler)
 
 
 def get_decoding_mode(executor_config: ExecutorConfig) -> DecodingMode:
@@ -620,17 +624,16 @@ def get_decoding_mode(executor_config: ExecutorConfig) -> DecodingMode:
         decoding_mode = DecodingMode.TopKTopP()
 
     # Override decoding mode when Medusa is used
-    if executor_config.speculative_config and executor_config.speculative_config.is_medusa and not decoding_mode.isMedusa(
-    ):
+    if getattr(executor_config.speculative_config, "is_medusa",
+               False) and not decoding_mode.isMedusa():
         logger.warning(
             "Model is Medusa, but decoding mode is not Medusa. Overwriting decoding mode to Medusa."
         )
         decoding_mode = DecodingMode.Medusa()
 
     # Override decoding mode when Medusa is not used
-    if (not executor_config.speculative_config
-            or not executor_config.speculative_config.is_medusa
-        ) and decoding_mode.isMedusa():
+    if (not getattr(executor_config.speculative_config, "is_medusa",
+                    False)) and decoding_mode.isMedusa():
         logger.warning(
             "Model is not Medusa, but decoding mode is Medusa. Overwriting decoding mode."
         )
@@ -640,17 +643,16 @@ def get_decoding_mode(executor_config: ExecutorConfig) -> DecodingMode:
             decoding_mode = DecodingMode.BeamSearch()
 
     # Override decoding mode when lookahead decoding is used
-    if executor_config.speculative_config and executor_config.speculative_config.is_lookahead and not decoding_mode.isLookahead(
-    ):
+    if getattr(executor_config.speculative_config, "is_lookahead",
+               False) and not decoding_mode.isLookahead():
         logger.warning(
             "Model is Lookahead, but decoding mode is not Lookahead. Overwriting decoding mode to Lookahead."
         )
         decoding_mode = DecodingMode.Lookahead()
 
     # Override decoding mode when lookahead decoding is not used
-    if (not executor_config.speculative_config
-            or not executor_config.speculative_config.is_lookahead
-        ) and decoding_mode.isLookahead():
+    if (not getattr(executor_config.speculative_config, "is_lookahead",
+                    False)) and decoding_mode.isLookahead():
         logger.warning(
             "Model is not built with Lookahead decoding, but decoding mode is Lookahead. Overwriting decoding mode."
         )
@@ -660,17 +662,17 @@ def get_decoding_mode(executor_config: ExecutorConfig) -> DecodingMode:
             decoding_mode = DecodingMode.BeamSearch()
 
     # Override decoding mode when 'explicit draft tokens' is used
-    if executor_config.speculative_config and executor_config.speculative_config.is_explicit_draft_tokens and not decoding_mode.isExplicitDraftTokens(
-    ):
+    if getattr(executor_config.speculative_config, "is_explicit_draft_tokens",
+               False) and not decoding_mode.isExplicitDraftTokens():
         logger.warning(
             "Model is built with 'explicit draft tokens' decoding, but decoding mode is something else. Overwriting decoding mode."
         )
         decoding_mode = DecodingMode.ExplicitDraftTokens()
 
     # Override decoding mode when 'explicit draft tokens' is not used
-    if (not executor_config.speculative_config
-            or not executor_config.speculative_config.is_explicit_draft_tokens
-        ) and decoding_mode.isExplicitDraftTokens():
+    if (not getattr(executor_config.speculative_config,
+                    "is_explicit_draft_tokens",
+                    False)) and decoding_mode.isExplicitDraftTokens():
         logger.warning(
             "Model is not built with 'explicit draft tokens' decoding, but decoding mode is set to it. Overwriting decoding mode to default."
         )
@@ -680,17 +682,16 @@ def get_decoding_mode(executor_config: ExecutorConfig) -> DecodingMode:
             decoding_mode = DecodingMode.BeamSearch()
 
     # Override decoding mode when EAGLE is used
-    if executor_config.speculative_config and executor_config.speculative_config.is_eagle and not decoding_mode.isEagle(
-    ):
+    if getattr(executor_config.speculative_config, "is_eagle",
+               False) and not decoding_mode.isEagle():
         logger.warning(
             "Model is Eagle, but decoding mode is not Eagle. Overwriting decoding mode to Eagle."
         )
         decoding_mode = DecodingMode.Eagle()
 
     # Override decoding mode when Eagle is not used
-    if (not executor_config.speculative_config
-            or not executor_config.speculative_config.is_eagle
-        ) and decoding_mode.isEagle():
+    if (not getattr(executor_config.speculative_config, "is_eagle",
+                    False)) and decoding_mode.isEagle():
         logger.warning(
             "Model is not Eagle, but decoding mode is Eagle. Overwriting decoding mode."
         )
@@ -700,7 +701,8 @@ def get_decoding_mode(executor_config: ExecutorConfig) -> DecodingMode:
             decoding_mode = DecodingMode.BeamSearch()
 
     # Override decoding mode when draft tokens are external
-    if executor_config.speculative_config and executor_config.speculative_config.is_draft_tokens_external:
+    if getattr(executor_config.speculative_config, "is_draft_tokens_external",
+               False):
         logger.warning("Overwriting decoding mode to external draft token")
         decoding_mode = DecodingMode.ExternalDraftTokens()
 

@@ -394,7 +394,9 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
     else
     {
         appendParam(&launchParams.num_k_heads);
-        bool const allowSlidingWindow = !isSpecDec;
+        bool const allowSlidingWindow
+            = !(isSpecDec && xqaParams.is_spec_dec_tree); // sliding windows does not support spec dec with tree-based
+                                                          // token, only chained tokens
         if (allowSlidingWindow)
         {
             appendParam(&launchParams.slidingWindowSize);
@@ -410,6 +412,7 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
         {
             appendParam(&launchParams.ropeCosSin);
         }
+        appendParam(&xqaParams.attention_sinks);
         appendParam(&launchParams.kvCacheParams);
         if (xqaParams.beam_width > 1)
         {

@@ -385,6 +385,7 @@ void XqaDispatcher::runImpl(XQAParams params, KVCacheBuffer const& kv_cache_buff
         tllmRunnerParams.multiCtasKvCounterPtr = launchParams.semaphores;
         tllmRunnerParams.multiCtasKvScratchPtr = launchParams.scratch;
 
+        tllmRunnerParams.attentionSinksPtr = params.attention_sinks;
         tllmRunnerParams.cumSeqLensQPtr = cu_seqlens;
         tllmRunnerParams.cumSeqLensKvPtr = reinterpret_cast<int const*>(launchParams.cu_kv_seq_lens);
         tllmRunnerParams.outputScalePtr = reinterpret_cast<float const*>(launchParams.bmm2_scale_ptr);

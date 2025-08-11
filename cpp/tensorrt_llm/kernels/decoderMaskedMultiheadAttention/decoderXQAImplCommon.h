@@ -88,21 +88,21 @@ struct XQAKernelRuntimeHasher
     size_t operator()(XQAKernelRuntimeHashKey const& s) const
     {
         size_t key = s.kv_data_type;
-        key <<= 16;
+        key <<= 16; // 16
         key ^= s.head_size;
-        key <<= 8;
+        key <<= 8;  // 24
         key ^= s.num_q_heads_per_kv;
-        key <<= 8;
+        key <<= 8;  // 32
         key ^= s.beam_size;
-        key <<= 6;
+        key <<= 6;  // 38
         key ^= s.m_tilesize;
-        key <<= 10;
+        key <<= 10; // 48
         key ^= s.tokens_per_page;
-        key <<= 1;
+        key <<= 1;  // 49
         key ^= s.paged_kv_cache;
-        key <<= 1;
+        key <<= 1;  // 50
         key ^= s.multi_query_tokens;
-        key <<= 1;
+        key <<= 1;  // 51
         key ^= s.is_fp8_output;
         key <<= 8;
         key ^= static_cast<int8_t>(s.position_embedding_type.value_or(static_cast<PositionEmbeddingType>(-1)));
