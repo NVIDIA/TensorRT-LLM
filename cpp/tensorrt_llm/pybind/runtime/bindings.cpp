@@ -38,6 +38,7 @@
 #include "tensorrt_llm/runtime/speculativeDecodingMode.h"
 #include "tensorrt_llm/runtime/tllmRuntime.h"
 #include "tensorrt_llm/runtime/torchView.h"
+#include "tensorrt_llm/runtime/virtualMemory.h"
 
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDAStream.h>
@@ -212,6 +213,10 @@ void initBindings(pybind11::module_& m)
         .def_readwrite("weights_out_pointer", &tr::LoraCache::TaskLayerModuleConfig::weightsOutPointer)
         .def_readwrite("scaling_vec_pointer", &tr::LoraCache::TaskLayerModuleConfig::scalingVecPointer)
         .def(py::self == py::self);
+
+    py::class_<tr::CudaVirtualMemoryManager>(m, "CudaVirtualMemoryManager")
+        .def("release_with_tag", &tr::CudaVirtualMemoryManager::releaseWithTag, py::arg("tag"))
+        .def("materialize_with_tag", &tr::CudaVirtualMemoryManager::materializeWithTag, py::arg("tag"));
 
     py::classh<tr::BufferManager>(m, "BufferManager")
         .def(py::init<tr::BufferManager::CudaStreamPtr, bool>(), py::arg("stream"), py::arg("trim_pool") = false)
@@ -404,6 +409,29 @@ void initBindings(pybind11::module_& m)
         "max_workspace_size_lowprecision",
         [](int32_t tp_size) { return tensorrt_llm::kernels::max_workspace_size_lowprecision(tp_size); },
         "Calculate the maximum workspace size needed for low precision all-reduce operations");
+
+    py::enum_<tr::CudaVirtualMemoryAllocator::RestoreMode>(m, "CudaVirtualMemoryAllocatorRestoreMode")
+        .value("NONE", tr::CudaVirtualMemoryAllocator::RestoreMode::NONE)
+        .value("CPU", tr::CudaVirtualMemoryAllocator::RestoreMode::CPU)
+        .value("PINNED", tr::CudaVirtualMemoryAllocator::RestoreMode::PINNED)
+        .value("MEMSET", tr::CudaVirtualMemoryAllocator::RestoreMode::MEMSET);
+
+    m.def("get_virtual_memory_manager", &tr::getVirtualMemoryManager, "Get the virtual memory manager",
+        py::return_value_policy::reference);
+
+    m.def(
+        "set_virtual_memory_allocator",
+        [](std::string const& tag, tr::CudaVirtualMemoryAllocator::RestoreMode mode, uintptr_t stream)
+        {
+            static_assert(sizeof(uintptr_t) == sizeof(cudaStream_t));
+            tr::setVirtualMemoryAllocator(tag, mode,
+                std::make_shared<tr::CudaStream>(
+                    reinterpret_cast<cudaStream_t>(stream), tensorrt_llm::common::getDevice(), false));
+        },
+        "Set the virtual memory allocator and start allocating virtual memory for CUDA allocations");
+
+    m.def("clear_virtual_memory_allocator", &tr::clearVirtualMemoryAllocator,
+        "Reset the current virtual memory allocator and stop allocating virtual memory for CUDA allocations");
 
     py::class_<tensorrt_llm::runtime::McastGPUBuffer>(m, "McastGPUBuffer")
         .def(py::init<size_t, uint32_t, uint32_t, at::Device, bool>())

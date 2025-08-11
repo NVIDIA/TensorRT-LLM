@@ -103,8 +103,7 @@ Python function, for details.
 
 This release includes examples of applying GPTQ to [GPT-NeoX](source:examples/models/core/gpt)
 and [LLaMA-v2](source:examples/models/core/llama), as well as an example of using AWQ with
-[GPT-J](source:examples/models/contrib/gpt). Those examples are experimental implementations and
-are likely to evolve in a future release.
+[GPT-J](source:examples/models/contrib/gptj).
 
 ## FP8 (Hopper)
 

@@ -39,6 +39,10 @@ BufferManager::BufferManager(CudaStreamPtr stream, bool trimPool)
 
 BufferManager::IBufferPtr BufferManager::gpu(std::size_t size, nvinfer1::DataType type) const
 {
+    if (auto vmAllocator = getVirtualMemoryAllocator())
+    {
+        return std::make_unique<VirtualAddressDeviceBuffer>(size, type, std::move(vmAllocator));
+    }
     if (static_cast<bool>(mPool))
     {
         return std::make_unique<DeviceBuffer>(size, type, CudaAllocatorAsync{mStream, mPool});
@@ -49,6 +53,10 @@ BufferManager::IBufferPtr BufferManager::gpu(std::size_t size, nvinfer1::DataTyp
 
 BufferManager::ITensorPtr BufferManager::gpu(nvinfer1::Dims dims, nvinfer1::DataType type) const
 {
+    if (auto vmAllocator = getVirtualMemoryAllocator())
+    {
+        return std::make_unique<VirtualAddressDeviceTensor>(dims, type, std::move(vmAllocator));
+    }
     if (static_cast<bool>(mPool))
     {
         return std::make_unique<DeviceTensor>(dims, type, CudaAllocatorAsync{mStream, mPool});
@@ -59,11 +67,19 @@ BufferManager::ITensorPtr BufferManager::gpu(nvinfer1::Dims dims, nvinfer1::Data
 
 BufferManager::IBufferPtr BufferManager::gpuSync(std::size_t size, nvinfer1::DataType type)
 {
+    if (auto vmAllocator = getVirtualMemoryAllocator())
+    {
+        return std::make_unique<VirtualAddressDeviceBuffer>(size, type, std::move(vmAllocator));
+    }
     return std::make_unique<StaticDeviceBuffer>(size, type, CudaAllocator{});
 }
 
 BufferManager::ITensorPtr BufferManager::gpuSync(nvinfer1::Dims dims, nvinfer1::DataType type)
 {
+    if (auto vmAllocator = getVirtualMemoryAllocator())
+    {
+        return std::make_unique<VirtualAddressDeviceTensor>(dims, type, std::move(vmAllocator));
+    }
     return std::make_unique<StaticDeviceTensor>(dims, type, CudaAllocator{});
 }
 

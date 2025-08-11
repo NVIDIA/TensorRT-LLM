@@ -30,7 +30,7 @@ def is_call_function(node: Node, target: Union[List[Callable], Callable]):
         return node.op == "call_function" and node.target == target
 
 
-_enable_piecewise_cuda_graph_capture = True
+_enable_piecewise_cuda_graph_capture = False
 
 
 def set_enable_piecewise_cuda_graph_capture_flag(enable: bool):

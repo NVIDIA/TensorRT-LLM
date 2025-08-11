@@ -349,8 +349,8 @@ def build_model(
         model_config.logits_dtype = logits_dtype
 
     architecture = model_config.architecture
-    assert not build_config.plugin_config.streamingllm or architecture == "LlamaForCausalLM", \
-        "StreamingLLM is only supported in the llama model."
+    assert not build_config.plugin_config.streamingllm, \
+        "StreamingLLM is no longer supported because attention sink cannot work with the non-cyclic kv cache kernel & runtime changes."
     assert not build_config.plugin_config.pp_reduce_scatter or architecture == "MixtralForCausalLM", \
         "PP reduce scatter is only supported in the mixtral model."
 

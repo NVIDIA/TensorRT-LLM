@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 from pathlib import Path
 
 import click
@@ -233,10 +234,10 @@ from tensorrt_llm.sampling_params import SamplingParams
     help="Path where per request information is written to.",
 )
 @optgroup.option(
-    "--enable_chunked_context",
-    is_flag=True,
-    default=False,
-    help="Enable chunking in prefill stage for enhanced throughput benchmark.",
+    "--enable_chunked_context/--disable_chunked_context",
+    default=True,
+    help=
+    "Enable/disable chunking in prefill stage for enhanced throughput benchmark. "
 )
 @optgroup.option(
     "--scheduler_policy",
@@ -460,6 +461,10 @@ def throughput_command(
         report_utility.report_statistics()
     except KeyboardInterrupt:
         logger.info("Keyboard interrupt, exiting benchmark...")
+        sys.exit(130)
+    except Exception as e:
+        logger.error(f"Error during benchmarking: {e}")
+        sys.exit(-1)
     finally:
         if llm is not None:
             llm.shutdown()

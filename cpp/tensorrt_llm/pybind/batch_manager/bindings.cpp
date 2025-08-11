@@ -192,6 +192,8 @@ void initBindings(pybind11::module_& m)
         .def_property_readonly("missed_blocks", &GenLlmReq::getMissedBlocksPerRequest)
         .def_property_readonly("kv_cache_hit_rate", &GenLlmReq::getKVCacheHitRatePerRequest)
         .def_property_readonly("llm_request_type", &GenLlmReq::getLlmRequestType)
+        .def_property_readonly("parent_request_id", &GenLlmReq::getParentRequestId)
+        .def_property_readonly("is_child", &GenLlmReq::isChild)
         .def_property_readonly("multimodal_hashes",
             [](GenLlmReq& self)
             {
@@ -254,7 +256,7 @@ void initBindings(pybind11::module_& m)
         .def_property_readonly("return_perf_metrics", &GenLlmReq::getReturnPerfMetrics);
 
     py::classh<tb::LlmRequest, GenLlmReq>(m, "LlmRequest", pybind11::dynamic_attr())
-        .def(py::init(
+        .def(py::init<>(
                  [](tb::LlmRequest::RequestIdType request_id, tb::LlmRequest::SizeType32 max_new_tokens,
                      std::vector<tb::LlmRequest::TokenIdType> input_tokens, runtime::SamplingConfig sampling_config,
                      bool is_streaming, std::optional<tb::LlmRequest::SizeType32> end_id,
@@ -357,11 +359,14 @@ void initBindings(pybind11::module_& m)
             py::arg("return_perf_metrics") = false, py::arg("guided_decoding_params") = std::nullopt,
             py::arg("language_adapter_uid") = std::nullopt, py::arg("allotted_time_ms") = std::nullopt,
             py::arg("context_phase_params") = std::nullopt)
+        .def("check_token_id_range", &tb::LlmRequest::checkTokenIdRange, py::arg("vocab_size"))
+        .def(py::init<tb::LlmRequest const&>())
         .def("validate", &tb::LlmRequest::validate, py::arg("max_input_len"), py::arg("max_seq_len"),
             py::arg("max_draft_len"), py::arg("vocab_size_padded"), py::arg("max_endocer_input_len") = std::nullopt,
             py::arg("enable_kv_cache_reuse") = false)
         .def("create_response", &tb::LlmRequest::createResponse, py::arg("use_fast_logits") = false,
             py::arg("mpi_world_rank") = 0)
+        .def("create_child_request", &tb::LlmRequest::createChildRequest, py::arg("child_id"))
         .def("create_result", &tb::LlmRequest::createResult, py::arg("use_fast_logits") = false,
             py::arg("mpi_world_rank") = 0)
         .def("create_serialized_result",

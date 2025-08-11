@@ -75,7 +75,8 @@ def test_enqueue_requests(executor_queue):
     """Test enqueuing multiple requests."""
     mock_requests = [Mock(), Mock(), Mock()]
 
-    with patch('time.time', return_value=1234.5):
+    with (patch('time.time', return_value=1234.5),
+          patch.object(executor_queue, '_generate_child_request_ids')):
         req_ids = executor_queue.enqueue_requests(mock_requests)  # type: ignore
 
     assert len(req_ids) == 3
@@ -92,7 +93,8 @@ def test_enqueue_request_single(executor_queue):
     """Test enqueuing a single request."""
     mock_request = Mock()
 
-    with patch('time.time', return_value=1234.5):
+    with (patch('time.time', return_value=1234.5),
+          patch.object(executor_queue, '_generate_child_request_ids')):
         req_id = executor_queue.enqueue_request(mock_request)
 
     assert req_id == 8
@@ -104,8 +106,8 @@ def test_enqueue_request_with_query(executor_queue):
     """Test enqueuing a request with query data."""
     mock_request = Mock()
     query_data = [1, 2, 3, 4]
-
-    req_id = executor_queue.enqueue_request(mock_request, query=query_data)
+    with patch.object(executor_queue, '_generate_child_request_ids'):
+        req_id = executor_queue.enqueue_request(mock_request, query=query_data)
 
     assert req_id == 8
 
@@ -113,6 +115,31 @@ def test_enqueue_request_with_query(executor_queue):
     item = executor_queue.request_queue.get_nowait()
     assert item.id == req_id
     assert item.request == mock_request
+
+
+@pytest.mark.parametrize("n_children", [0, 1, 2])
+def test_enqueue_request_with_child_ids(executor_queue, n_children):
+    """Test enqueuing a request with query data."""
+    mock_request = Mock()
+    query_data = [1, 2, 3, 4]
+    with patch.object(executor_queue,
+                      '_get_num_child_requests') as mock_children:
+        mock_children.return_value = n_children
+        req_id = executor_queue.enqueue_request(mock_request, query=query_data)
+
+    assert req_id == 8
+
+    # Verify the item was enqueued with child ids
+    item = executor_queue.request_queue.get_nowait()
+    assert item.id == req_id
+    assert item.request == mock_request
+    if n_children == 0:
+        assert item.child_req_ids is None
+    else:
+        assert item.child_req_ids is not None
+        assert len(item.child_req_ids) == n_children
+        assert item.child_req_ids == list(
+            range(1 + req_id, 1 + req_id + n_children))
 
 
 def test_enqueue_cancel_request(executor_queue):
@@ -253,11 +280,10 @@ def test_validate_and_filter_requests(executor_queue):
 )
 def test_merge_requests_default(mock_convert, executor_queue):
     """Test merging requests with default configuration."""
-    mock_llm_request = Mock()
+    mock_llm_request = Mock(child_requests=[])
     mock_convert.return_value = mock_llm_request
 
     requests = [RequestQueueItem(1, Mock()), RequestQueueItem(2, Mock())]
-
     result = executor_queue._merge_requests(requests)
 
     assert len(result) == 2

@@ -122,15 +122,21 @@ class BaseLLM:
         self._executor_cls = kwargs.pop("executor_cls", GenerationExecutor)
         self._llm_id = None
 
+        log_level = logger.level
+        logger.set_level("info")  # force display the backend
+
         try:
             backend = kwargs.get('backend', None)
-            if backend == 'pytorch':
+            if backend == "pytorch":
+                logger.info("Using LLM with PyTorch backend")
                 llm_args_cls = TorchLlmArgs
             elif backend == '_autodeploy':
+                logger.info("Using LLM with AutoDeploy backend")
                 from .._torch.auto_deploy.llm_args import \
                     LlmArgs as AutoDeployLlmArgs
                 llm_args_cls = AutoDeployLlmArgs
             else:
+                logger.info("Using LLM with TensorRT backend")
                 llm_args_cls = TrtLlmArgs
 
             # check the kwargs and raise ValueError directly
@@ -159,6 +165,9 @@ class BaseLLM:
             logger.error(
                 f"Failed to parse the arguments for the LLM constructor: {e}")
             raise e
+
+        finally:
+            logger.set_level(log_level)  # restore the log level
 
         print_colored_debug(f"LLM.args.mpi_session: {self.args.mpi_session}\n",
                             "yellow")
@@ -566,6 +575,14 @@ class BaseLLM:
                 raise ValueError(
                     f"PyTorch backend currently only supports `logprobs=1`. Received `logprobs={sampling_params.logprobs}` (Top{sampling_params.logprobs} logprobs). Please set `logprobs=1` in `sampling_params` instead."
                 )
+            # Check prompt length and query length against max_num_tokens to filter illegal requests.
+            # Skip check for gen-only requests
+            if self.args.backend == "pytorch" and not self.args.enable_chunked_prefill and not is_gen_only:
+                max_num_tokens = self.args.max_num_tokens
+                if max_num_tokens and prompt_len / self.args.parallel_config.cp_size + query_len > max_num_tokens:
+                    raise ValueError(
+                        f"The sum of prompt length ({prompt_len/self.args.parallel_config.cp_size}), query length ({query_len}) should not exceed "
+                        f"max_num_tokens ({max_num_tokens})")
             return
 
         build_config = self.args.build_config
@@ -582,7 +599,7 @@ class BaseLLM:
             (sampling_params.max_tokens or 0) > max_seq_len):
             raise ValueError(
                 f"The sum of prompt length ({prompt_len/self.args.parallel_config.cp_size}) and query length ({query_len}) max_tokens ({sampling_params.max_tokens}) should not exceed "
-                f"max_seq_len ({build_config.max_seq_len})")
+                f"max_seq_len ({max_seq_len})")
 
         if sampling_params.use_beam_search and sampling_params.best_of > build_config.max_beam_width:
             if sampling_params.n == sampling_params.best_of:

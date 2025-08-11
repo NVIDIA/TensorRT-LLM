@@ -94,22 +94,27 @@ def test_llm_commandr_plus_4gpus_summary(commandr_example_root,
                                          llm_commandr_plus_model_root,
                                          llm_datasets_root, llm_rouge_root,
                                          llm_venv, cmodel_dir, engine_dir,
-                                         use_weight_only):
+                                         use_weight_only, timeout_manager):
     "Build & run Command-R+ with smoothquant on 4 gpus."
     dtype = 'float16'
     tp_size = 4
     model_name = os.path.basename(llm_commandr_plus_model_root)
-    print("Converting checkpoint...")
-    ckpt_dir = convert_weights(llm_venv=llm_venv,
-                               example_root=commandr_example_root,
-                               cmodel_dir=cmodel_dir,
-                               model=model_name,
-                               model_path=llm_commandr_plus_model_root,
-                               data_type=dtype,
-                               tp_size=tp_size,
-                               gpus=tp_size,
-                               use_weight_only=use_weight_only)
 
+    # Convert checkpoint with timeout management
+    print("Converting checkpoint...")
+    with timeout_manager.timed_operation("convert"):
+        ckpt_dir = convert_weights(llm_venv=llm_venv,
+                                   example_root=commandr_example_root,
+                                   cmodel_dir=cmodel_dir,
+                                   model=model_name,
+                                   model_path=llm_commandr_plus_model_root,
+                                   data_type=dtype,
+                                   tp_size=tp_size,
+                                   gpus=tp_size,
+                                   use_weight_only=use_weight_only,
+                                   timeout=timeout_manager.remaining_timeout)
+
+    # Build engines with timeout management
     print("Building engines...")
     build_cmd = [
         "trtllm-build",
@@ -130,12 +135,23 @@ def test_llm_commandr_plus_4gpus_summary(commandr_example_root,
         f"--engine_dir={engine_dir}",
     ]
 
-    check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
+    with timeout_manager.timed_operation("build"):
+        check_call(" ".join(build_cmd),
+                   shell=True,
+                   env=llm_venv._new_env,
+                   timeout=timeout_manager.remaining_timeout)
 
-    venv_mpi_check_call(
-        llm_venv,
-        ["mpirun", "-n", str(tp_size), "--allow-run-as-root"], run_cmd)
+    # Run engines with timeout management
+    print("Running engines...")
+    with timeout_manager.timed_operation("run"):
+        venv_mpi_check_call(
+            llm_venv, ["mpirun", "-n",
+                       str(tp_size), "--allow-run-as-root"],
+            run_cmd,
+            timeout=timeout_manager.remaining_timeout)
 
+    # Run summary with timeout management
+    print("Running summary...")
     summary_cmd = generate_summary_cmd(
         commandr_example_root,
         hf_model_dir=llm_commandr_plus_model_root,
@@ -144,6 +160,9 @@ def test_llm_commandr_plus_4gpus_summary(commandr_example_root,
         dataset_dir=llm_datasets_root,
         rouge_dir=llm_rouge_root)
 
-    venv_mpi_check_call(
-        llm_venv,
-        ["mpirun", "-n", str(tp_size), "--allow-run-as-root"], summary_cmd)
+    with timeout_manager.timed_operation("summary"):
+        venv_mpi_check_call(
+            llm_venv, ["mpirun", "-n",
+                       str(tp_size), "--allow-run-as-root"],
+            summary_cmd,
+            timeout=timeout_manager.remaining_timeout)

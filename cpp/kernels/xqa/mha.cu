@@ -1592,7 +1592,6 @@ CUBIN_EXPORT __global__
 #endif
 
     uint32_t const cacheSeqLen = getCacheSeqLen<usePagedKVCache>(cacheList, idxReq);
-    static_assert(!(allowSlidingWindow && useSpecDec), "Sliding window is not yet supported in spec-dec mode");
 #if SLIDING_WINDOW
     bool const rtIsReallySliding = (cacheSeqLen > slidingWinSize);
     uint32_t const nbTotalSkipTokens = rtIsReallySliding ? cacheSeqLen - slidingWinSize : 0;
@@ -1672,17 +1671,33 @@ CUBIN_EXPORT __global__
             uint32_t const dstHeadOffset = 0;
             uint32_t const seqOffset = ctaTile.x * seqIter + warpTile.x * warpIdx.x;
 #if USE_PAGED_KV_CACHE
+#if PAGED_KV_CACHE_LAYOUT == 1
+            uint32_t const idxHeadBeg = (seqOffset % tokensPerPage) * nbKHeads + idxHeadGrp;
+
+#else
             uint32_t const idxHeadBeg = tokensPerPage * idxHeadGrp + seqOffset % tokensPerPage;
+#endif
 #if BEAM_WIDTH == 1
+#if PAGED_KV_CACHE_LAYOUT == 1
+            HeadPtr<GMemCacheHead const, tokensPerPage, nbPagesPerWarpTile> const src{
+                cacheList.kCacheVLLM, pageIdx, nbKHeads, idxHeadBeg};
+#else
             HeadPtr<GMemCacheHead const, tokensPerPage, nbPagesPerWarpTile> const src{
                 cacheList.pool, pageIdx, nbKHeads, idxHeadBeg};
+#endif
 #else
-            IndexedHeadPtr<GMemCacheHead const, tokensPerPage, nbPagesPerWarpTile> const src{
+            IndexedHeadPtr<GMemCacheHead const, tokensPerPage, nbPagesPerWarpTile> const src
+            {
                 /*indices=*/smem.gemm0CacheIndir[warpIdx.x].data,
-                /*pool=*/cacheList.pool,
-                /*pageIndices=*/smem.kCachePages[warpIdx.x].data,
-                /*nbKHeads=*/nbKHeads,
-                /*offset=*/idxHeadBeg};
+#if PAGED_KV_CACHE_LAYOUT == 1
+                    /*pool=*/cacheList.kCacheVLLM,
+#else
+                    /*pool=*/cacheList.pool,
+#endif
+                    /*pageIndices=*/smem.kCachePages[warpIdx.x].data,
+                    /*nbKHeads=*/nbKHeads,
+                    /*offset=*/idxHeadBeg
+            };
 #endif
 #else
             uint32_t const idxHeadBeg = cacheKSeqBaseOffset + seqOffset;
@@ -1991,17 +2006,33 @@ CUBIN_EXPORT __global__
                   uint32_t const seqOffset = ctaTile.x * seqIter + warpTile.x * nbXTilesPerXIter * xIter
                       + cacheVTileSeqStride * vIter + cacheVTileSeqLen * warpGrpIdx;
 #if USE_PAGED_KV_CACHE
+#if PAGED_KV_CACHE_LAYOUT == 1
+                  uint32_t const idxHeadBeg = (seqOffset % tokensPerPage) * nbKHeads + idxHeadGrp;
+
+#else
                   uint32_t const idxHeadBeg = tokensPerPage * idxHeadGrp + seqOffset % tokensPerPage;
+#endif
 #if BEAM_WIDTH == 1
+#if PAGED_KV_CACHE_LAYOUT == 1
+                  HeadPtr<GMemCacheHead const, tokensPerPage, nbPagesPerVTile> const src{
+                      cacheList.vCacheVLLM, pageIdx, nbKHeads, idxHeadBeg};
+#else
                   HeadPtr<GMemCacheHead const, tokensPerPage, nbPagesPerVTile> const src{
                       cacheList.pool, pageIdx, nbKHeads, idxHeadBeg};
+#endif
 #else
-                  IndexedHeadPtr<GMemCacheHead const, tokensPerPage, nbPagesPerVTile> const src{
+                  IndexedHeadPtr<GMemCacheHead const, tokensPerPage, nbPagesPerVTile> const src
+                  {
                       /*indices=*/smem.gemm1CacheIndir[grpLoadV ? warpGrpIdx : warpIdx.x].data,
-                      /*pool=*/cacheList.pool,
-                      /*pageIndices=*/smem.vCachePages[grpLoadV ? warpGrpIdx : warpIdx.x].data,
-                      /*nbKHeads=*/nbKHeads,
-                      /*offset=*/idxHeadBeg};
+#if PAGED_KV_CACHE_LAYOUT == 1
+                          /*pool=*/cacheList.vCacheVLLM,
+#else
+                          /*pool=*/cacheList.pool,
+#endif
+                          /*pageIndices=*/smem.vCachePages[grpLoadV ? warpGrpIdx : warpIdx.x].data,
+                          /*nbKHeads=*/nbKHeads,
+                          /*offset=*/idxHeadBeg
+                  };
 #endif
 #else
                   uint32_t const idxHeadBeg = cacheVSeqBaseOffset + seqOffset;
@@ -2637,7 +2668,11 @@ void launchMHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
     InputHead const* q,
 #endif
 #if USE_PAGED_KV_CACHE
+#if PAGED_KV_CACHE_LAYOUT == 1
+    GMemCacheHead* kCacheVLLM, GMemCacheHead* vCacheVLLM,
+#else
     GMemCacheHead* pool, // global pool of pages
+#endif
     KVCachePageIndex const*
         kvCachePageList, // device pointer. shape: KVCachePageIndex[batchSize][beamWidth][2][maxNbPagesPerSeq].
 #else
@@ -2703,7 +2738,11 @@ void launchMHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
     auto const launchCfg = makeLaunchConfig(dimGrid, dimCta, hostSmemSize, stream, ENABLE_PDL != 0);
 #if USE_PAGED_KV_CACHE
     uint32_t const maxNbPagesPerSeq = exactDiv(maxSeqLen, tokensPerPage);
+#if PAGED_KV_CACHE_LAYOUT == 1
+    KVCacheList<true> const cacheList{kCacheVLLM, vCacheVLLM, kvCachePageList, seqLen, maxNbPagesPerSeq};
+#else
     KVCacheList<true> const cacheList{pool, kvCachePageList, seqLen, maxNbPagesPerSeq};
+#endif
     cudaLaunchKernelEx(&launchCfg, kernel_mha,
 #if SPEC_DEC
         qSeqLen, nbKHeads, headGrpSize, qCuSeqLens,

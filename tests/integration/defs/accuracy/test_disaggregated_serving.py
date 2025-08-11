@@ -259,7 +259,6 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     MODEL_PATH = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct"
 
     @pytest.mark.skip_less_device_memory(32000)
-    @pytest.mark.skip_device_not_contain(["H100", "H200"])
     @pytest.mark.parametrize("disable_overlap_scheduler", [False, True])
     def test_auto_dtype(self, disable_overlap_scheduler):
         ctx_server_config = {"disable_overlap_scheduler": True}
@@ -394,6 +393,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @pytest.mark.skip_less_device(2)
     @pytest.mark.parametrize("tp,pp", [(1, 2), (2, 1), (2, 2)],
                              ids=["tp1pp2", "tp2pp1", "tp2pp2"])
     @pytest.mark.parametrize("testset", ["GSM8K", "MMLU"])
@@ -452,6 +452,40 @@ class TestLlama4ScoutInstruct(LlmapiAccuracyTestHarness):
 class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     MODEL_NAME = "deepseek-ai/DeepSeek-V3-Lite"
     MODEL_PATH = f"{llm_models_root()}/DeepSeek-V3-Lite/bf16"
+
+    def test_nixl_backend(self):
+        ctx_server_config = {
+            "disable_overlap_scheduler": True,
+            "cache_transceiver_config": {
+                "backend": "nixl"
+            }
+        }
+        gen_server_config = {
+            "disable_overlap_scheduler": True,
+            "cache_transceiver_config": {
+                "backend": "nixl"
+            }
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "port": 8000,
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1,
+                "urls": ["localhost:8001"]
+            },
+            "generation_servers": {
+                "num_instances": 1,
+                "urls": ["localhost:8002"]
+            }
+        }
+        with launch_disaggregated_llm(disaggregated_server_config,
+                                      ctx_server_config, gen_server_config,
+                                      self.MODEL_PATH) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
 
     @parametrize_with_ids("overlap_scheduler", [True, False])
     @parametrize_with_ids("mtp_nextn",
@@ -516,12 +550,12 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             }
         }
         ctx_server_config["kv_cache_config"] = {
-            "max_attention_window": [512, 512, 512, 512, 512, 32768],
-            "enable_block_reuse": False
+            # "max_attention_window": [512, 512, 512, 512, 512, 32768],
+            "enable_block_reuse": True
         }
         gen_server_config["kv_cache_config"] = {
-            "max_attention_window": [512, 512, 512, 512, 512, 32768],
-            "enable_block_reuse": False
+            # "max_attention_window": [512, 512, 512, 512, 512, 32768],
+            "enable_block_reuse": True
         }
         disaggregated_server_config = {
             "hostname": "localhost",
@@ -541,12 +575,50 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
                                       self.MODEL_PATH) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
 
 
 @pytest.mark.timeout(3600)
 class TestQwen3_8B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "Qwen3/Qwen3-8B"
     MODEL_PATH = f"{llm_models_root()}/Qwen3/Qwen3-8B-FP8"
+
+    def test_nixl_backend(self):
+        ctx_server_config = {
+            "disable_overlap_scheduler": True,
+            "cache_transceiver_config": {
+                "backend": "nixl"
+            }
+        }
+        gen_server_config = {
+            "disable_overlap_scheduler": True,
+            "cache_transceiver_config": {
+                "backend": "nixl"
+            }
+        }
+        ctx_server_config["cache_transceiver_config"]
+        ctx_server_config["cache_transceiver_config"]
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "port": 8000,
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1,
+                "urls": ["localhost:8001"]
+            },
+            "generation_servers": {
+                "num_instances": 1,
+                "urls": ["localhost:8002"]
+            }
+        }
+        with launch_disaggregated_llm(disaggregated_server_config,
+                                      ctx_server_config, gen_server_config,
+                                      self.MODEL_PATH) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
 
     @pytest.mark.parametrize("overlap_scheduler", [False, True])
     def test_auto_dtype(self, overlap_scheduler):

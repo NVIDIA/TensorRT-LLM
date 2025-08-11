@@ -50,7 +50,11 @@ struct CacheSeq<true, false>
     GMemCacheHead const& operator[](uint32_t i) const
     {
         uint32_t const pageIdx = pageIndices[i / tokensPerPage];
+#if PAGED_KV_CACHE_LAYOUT == 1 && USE_PAGED_KV_CACHE
+        return pool[nbHeads * tokensPerPage * pageIdx + (i % tokensPerPage) * nbHeads + idxHead];
+#else
         return pool[tokensPerPage * nbHeads * pageIdx + tokensPerPage * idxHead + i % tokensPerPage];
+#endif
     }
 
     GMemCacheHead const* pool;

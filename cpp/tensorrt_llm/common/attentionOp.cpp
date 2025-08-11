@@ -197,6 +197,7 @@ bool AttentionOp::convertMMHAParamsToXQAParams(tensorrt_llm::kernels::XQAParams&
     xqaParams.multi_block_mode = common::getEnvForceDeterministicAttention() ? false : mMultiBlockMode;
     // Medusa mode will have multiple query tokens.
     xqaParams.multi_query_tokens = mIsSpecDecodingEnabled && mUseSpecDecoding;
+    xqaParams.is_spec_dec_tree = mIsSpecDecTree;
 
     if (mKVCacheQuantMode.hasInt8KvCache())
     {
@@ -1722,10 +1723,6 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
 
         // Run the fmha kernel.
         mFmhaDispatcher->run(fmhaParams);
-        sync_check_cuda_error(stream);
-        // The kv cache might need to be updated after FMHA (only when sliding window attention + chunked context is
-        // used together). Reuse the preprocessingParams.
-        invokeKvCachePostprocessing(preprocessingParams, stream);
         sync_check_cuda_error(stream);
 
         if (mCpSize > 1 && mAttnTpSize > 1 && mAttnCpSize == 1)

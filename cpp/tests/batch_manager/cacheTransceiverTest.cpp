@@ -1457,12 +1457,15 @@ TEST(targetTest, CacheStateNODP)
 
     verifyContext(
         /*contextRank*/ 0, /*expectRanks*/ {0}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 1, /*expectNeedSend*/ true);
+
     verifyContext(
         /*contextRank*/ 1, /*expectRanks*/ {0}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 1, /*expectNeedSend*/ false);
+
     verifyContext(
         /*contextRank*/ 2, /*expectRanks*/ {1}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 1, /*expectNeedSend*/ true);
     verifyContext(
         /*contextRank*/ 3, /*expectRanks*/ {1}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 1, /*expectNeedSend*/ false);
+
     verifyContext(
         /*contextRank*/ 4, /*expectRanks*/ {2}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 1, /*expectNeedSend*/ true);
     verifyContext(
@@ -1474,7 +1477,6 @@ TEST(targetTest, CacheStateNODP)
 
     contextTP = 2;
     genTP = 4;
-
     verifyContext(
         /*contextRank*/ 0, /*expectRanks*/ {0, 1}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 2, /*expectNeedSend*/ true);
     verifyContext(/*contextRank*/ 1, /*expectRanks*/ {2, 3}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 2,
@@ -1564,13 +1566,13 @@ TEST(targetTest, CacheStateContextDP)
         /*expectNeedSend*/ true);
     verifyContext(
         /*contextRank*/ 0, /*generationRank*/ 1, /*expectRanks*/ {1}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 1,
-        /*expectNeedSend*/ true);
+        /*expectNeedSend*/ false);
     verifyContext(
         /*contextRank*/ 1, /*generationRank*/ 0, /*expectRanks*/ {0}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 1,
         /*expectNeedSend*/ false);
     verifyContext(
         /*contextRank*/ 1, /*generationRank*/ 1, /*expectRanks*/ {1}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 1,
-        /*expectNeedSend*/ false);
+        /*expectNeedSend*/ true);
     verifyContext(
         /*contextRank*/ 2, /*generationRank*/ 0, /*expectRanks*/ {0}, /*expectPPDomain*/ 1, /*expectTPDomain*/ 1,
         /*expectNeedSend*/ false);

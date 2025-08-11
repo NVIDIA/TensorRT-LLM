@@ -582,6 +582,11 @@ class FlashInferAttention(AttentionBackend[FlashInferAttentionMetadata]):
         if output is None:
             output = torch.empty_like(q)
 
+        # FlashInfer's sliding window attention is inclusive, while the attention window size defined in TRTLLM is exclusive.
+        # So we need to subtract 1 from the attention window size for a consistent behavior.
+        if attention_window_size is not None:
+            attention_window_size = attention_window_size - 1
+
         self.forward_impl(q=q,
                           k=k,
                           v=v,

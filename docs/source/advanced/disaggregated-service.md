@@ -1,10 +1,10 @@
 (disaggregated-service)=
 
-# Disaggregated-Service (Experimental)
+# Disaggregated-Service (Prototype)
 
 ```{note}
 Note:
-This feature is currently experimental, and the related API is subjected to change in future versions.
+This feature is currently in prototype, and the related API is subjected to change in future versions.
 ```
 Currently TRT-LLM supports `disaggregated-service`, where the context and generation phases of a request can run on different executors. TRT-LLM's disaggregated service relies on the executor API, please make sure to read the [executor page](executor.md) before reading the document.
 
