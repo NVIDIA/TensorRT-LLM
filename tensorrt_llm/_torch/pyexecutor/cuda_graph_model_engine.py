@@ -66,6 +66,7 @@ class CUDAGraphModelEngine:
         self.padding_enabled = config.cuda_graph_padding_enabled
         self.supported_batch_sizes = engine._cuda_graph_batch_sizes
         self.max_supported_batch_size = engine._max_cuda_graph_batch_size
+        self.max_num_tokens = engine.max_num_tokens
 
         # Low-level state, storing resources per batch size
         self.graphs: Dict[int, torch.cuda.CUDAGraph] = {}
@@ -106,8 +107,12 @@ class CUDAGraphModelEngine:
 
         return self._run_graph(batch_size, inputs)
 
-    def _capture_graph(self, batch_size: int, forward_fn: Callable,
-                       initial_inputs: Dict[str, Any]):
+    def _capture_graph(self,
+                       batch_size: int,
+                       forward_fn: Callable,
+                       initial_inputs: Dict[str, Any],
+                       gather_ids: torch.Tensor,
+                       gather_context_logits: bool = False):
         """Captures the forward pass for a given batch size."""
         engine = self._get_engine()
 
@@ -117,13 +122,13 @@ class CUDAGraphModelEngine:
 
         static_tensors = {
             "input_ids":
-            torch.ones((batch_size * max_tokens_per_req, ),
+            torch.ones((self.max_num_tokens, ),
                        device="cuda",
                        dtype=torch.int32),
             "position_ids":
             torch.zeros((
                 1,
-                batch_size * max_tokens_per_req,
+                self.max_num_tokens,
             ),
                         device="cuda",
                         dtype=torch.int32),
@@ -144,10 +149,11 @@ class CUDAGraphModelEngine:
         graph = torch.cuda.CUDAGraph()
         with capturing_cuda_graph_context():
             for _ in range(self.WARMUP_STEPS):
-                forward_fn(capture_inputs)
+                forward_fn(capture_inputs, gather_ids, gather_context_logits)
 
             with torch.cuda.graph(graph, pool=self.memory_pool):
-                output = forward_fn(capture_inputs)
+                output = forward_fn(capture_inputs, gather_ids,
+                                    gather_context_logits)
 
         self.graphs[batch_size] = graph
         self.graph_outputs[batch_size] = make_weak_ref(output)

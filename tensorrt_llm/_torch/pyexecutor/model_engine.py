@@ -2018,6 +2018,8 @@ class PyTorchModelEngine(ModelEngine):
             graph_output = self.cuda_graph_model_engine.execute(
                 batch=padded_requests,
                 inputs=inputs,
+                gather_ids=gather_ids,
+                gather_context_logits=gather_context_logits,
                 forward_fn=self._forward_step)
 
             if graph_output is not None:
