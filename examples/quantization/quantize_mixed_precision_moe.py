@@ -238,16 +238,18 @@ def main(args):
                 continue
             new_safetensors.update({key: get_tensor(key)})
 
+    # Process activation scales for all ranks
+    if os.path.isdir(args.act_scales):
+        # Extract activation scales
+        renamed_state_dict = load_and_preprocess_state_dict(
+            modelopt_state_root=args.act_scales, world_size=8)
+        scales = get_scales_from_amax(start_layer=start_layer,
+                                      end_layer=end_layer,
+                                      renamed_state_dict=renamed_state_dict)
+        new_safetensors.update(scales)
+
     if args.rank == 0:
-        if os.path.isdir(args.act_scales):
-            # Extract activation scales
-            renamed_state_dict = load_and_preprocess_state_dict(
-                modelopt_state_root=args.act_scales, world_size=8)
-            scales = get_scales_from_amax(start_layer=start_layer,
-                                          end_layer=end_layer,
-                                          renamed_state_dict=renamed_state_dict)
-            new_safetensors.update(scales)
-        else:
+        if not os.path.isdir(args.act_scales):
             input_scales = safe_open(args.act_scales, "pt")
             for k in input_scales.keys():
                 new_safetensors.update({k: input_scales.get_tensor(k)})
@@ -312,15 +314,6 @@ def main(args):
                   'w') as file:
             json.dump(hf_quant_config, file, indent=4)
     else:
-        if os.path.isdir(args.act_scales):
-            # Extract activation scales
-            renamed_state_dict = load_and_preprocess_state_dict(
-                modelopt_state_root=args.act_scales, world_size=8)
-            scales = get_scales_from_amax(start_layer=start_layer,
-                                          end_layer=end_layer,
-                                          renamed_state_dict=renamed_state_dict)
-            new_safetensors.update(scales)
-
         file_name = get_file_name(start_layer)
         print(f'saving to {file_name}...')
         save_file(new_safetensors, os.path.join(output_dir, file_name))
