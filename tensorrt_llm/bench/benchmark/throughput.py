@@ -517,8 +517,9 @@ def throughput_command(
         logger.info("Keyboard interrupt, exiting benchmark...")
         sys.exit(130)
     except Exception as e:
-        logger.error(f"Error during benchmarking: {e}")
-        sys.exit(-1)
+        import traceback
+        logger.error(traceback.format_exc())
+        raise e
     finally:
         if llm is not None:
             llm.shutdown()
