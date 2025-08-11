@@ -184,6 +184,10 @@ class PersistentKvCacheConnectorLeader(KvCacheConnectorScheduler):
         # We don't do any asynchronous saving, so always return False
         return False
 
+    def update_state_after_alloc(self, request: LlmRequest,
+                                 block_ids: list[int]):
+        pass
+
 
 @click.command()
 @click.argument("model", type=str)

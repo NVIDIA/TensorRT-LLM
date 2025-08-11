@@ -209,6 +209,17 @@ class KvCacheConnectorScheduler(ABC):
             If true, this indicates that the kv cache manager should wait to deallocate the blocks until the saving has completed (determined by `get_finished` on the workers).
         """
 
+    @abstractmethod
+    def update_state_after_alloc(self, request: LlmRequest,
+                                 block_ids: List[int]):
+        """
+        Called after get_num_new_matched_tokens is called to provide the block ids to the scheduler.
+
+        Args:
+            request: The request that was allocated resources.
+            block_ids: The KV cacheblock IDs that were allocated.
+        """
+
 
 # An internal dataclass to handle async saving/loading requests.
 @dataclass
@@ -506,6 +517,10 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         # Return the requests that have finished saving.
         # The execution loop will call _terminate_request on these requests.
         return list(all_finished.saving.values())
+
+    def update_state_after_alloc(self, req: LlmRequest, block_ids: List[int]):
+        if self.scheduler is not None:
+            self.scheduler.update_state_after_alloc(req, block_ids)
 
     def set_scheduler_output(self, scheduler_output: SchedulerOutput):
         self._scheduler_output = scheduler_output

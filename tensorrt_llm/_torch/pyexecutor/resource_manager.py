@@ -426,6 +426,11 @@ class KVCacheManager(BaseResourceManager):
                         for _ in range(get_draft_token_length(req)):
                             self.impl.add_token(req.py_request_id)
 
+                        if self.kv_connector_manager is not None:
+                            block_ids = self.get_cache_indices(req)
+                            self.kv_connector_manager.update_state_after_alloc(
+                                req, block_ids)
+
             for req in generation_batch:
                 self.impl.add_token(req.py_request_id)
                 for _ in range(get_draft_token_length(req)):

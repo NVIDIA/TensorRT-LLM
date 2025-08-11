@@ -20,7 +20,8 @@ import pytest
 
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig, KvCacheConnectorConfig
-from tests.integration.defs.conftest import llm_models_root
+
+from ..conftest import llm_models_root
 
 
 @pytest.fixture(scope="function")
@@ -80,6 +81,11 @@ def test_connector_simple(enforce_single_worker, model_with_connector,
     sampling_params = SamplingParams(max_tokens=NUM_TOKENS, ignore_eos=True)
 
     model.generate(["Hello, world"], sampling_params)
+
+    assert scheduler.update_state_after_alloc.call_count == 1
+
+    # Allocate 1 block.
+    assert len(scheduler.update_state_after_alloc.call_args.args[1]) == 1
 
     # With the overlap scheduler, we generate one extra token.
     assert scheduler.build_connector_meta.call_count == NUM_TOKENS + int(
@@ -227,6 +233,11 @@ def test_connector_scheduler_output(enforce_single_worker, model_with_connector,
 
     model.generate([0] * NUM_INPUT_TOKENS, sampling_params)
 
+    assert scheduler.update_state_after_alloc.call_count == 1
+    assert len(
+        scheduler.update_state_after_alloc.call_args.args[1]) == math.ceil(
+            NUM_INPUT_TOKENS / BLOCK_SIZE)
+
     # Additional token when using the overlap scheduler.
     assert scheduler.build_connector_meta.call_count == NUM_TOKENS + int(
         use_overlap_scheduler)
@@ -297,6 +308,12 @@ def test_connector_scheduler_output_chunked_context(enforce_single_worker,
     sampling_params = SamplingParams(max_tokens=BLOCK_SIZE, ignore_eos=True)
 
     model.generate([0] * (CHUNK_SIZE * 2), sampling_params)
+
+    assert scheduler.update_state_after_alloc.call_count == 1
+
+    assert len(
+        scheduler.update_state_after_alloc.call_args.args[1]) == math.ceil(
+            CHUNK_SIZE * 2 / BLOCK_SIZE)
 
     for i, call in enumerate(scheduler.build_connector_meta.call_args_list):
         sched_output = call.args[0]
