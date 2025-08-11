@@ -182,15 +182,15 @@ __global__ void fusedQKNormRopeKernel(
                 float inv_freq_interpolation = freq / factor;
 
                 // linear_ramp_factor
-                if (low == high)
+                if (fabsf(low - high) <= 1e-6f)
                 {
                     high += 0.001; // Prevent singularity
                 }
                 float linear_func = (static_cast<float>(half_dim) - low) / (high - low);
                 // clamp linear_func to [0.0f, 1.0f]
-                float ramp_func = min(max(linear_func, 0.0f), 1.0f);
-                float inv_freq_extrapolation_factor = 1 - ramp_func;
-                freq = inv_freq_interpolation * (1.f - inv_freq_extrapolation_factor)
+                float ramp_func = fmin(fmax(linear_func, 0.0f), 1.0f);
+                float inv_freq_extrapolation_factor = 1.0f - ramp_func;
+                freq = inv_freq_interpolation * (1.0f - inv_freq_extrapolation_factor)
                     + inv_freq_extrapolation * inv_freq_extrapolation_factor;
             }
 
@@ -222,15 +222,15 @@ __global__ void fusedQKNormRopeKernel(
                 float inv_freq_interpolation = freq / factor;
 
                 // linear_ramp_factor
-                if (low == high)
+                if (fabsf(low - high) <= 1e-6f)
                 {
                     high += 0.001; // Prevent singularity
                 }
                 float linear_func = (static_cast<float>(half_dim) - low) / (high - low);
                 // clamp linear_func to [0.0f, 1.0f]
-                float ramp_func = min(max(linear_func, 0.0f), 1.0f);
-                float inv_freq_extrapolation_factor = 1 - ramp_func;
-                freq = inv_freq_interpolation * (1.f - inv_freq_extrapolation_factor)
+                float ramp_func = fmin(fmax(linear_func, 0.0f), 1.0f);
+                float inv_freq_extrapolation_factor = 1.0f - ramp_func;
+                freq = inv_freq_interpolation * (1.0f - inv_freq_extrapolation_factor)
                     + inv_freq_extrapolation * inv_freq_extrapolation_factor;
             }
 

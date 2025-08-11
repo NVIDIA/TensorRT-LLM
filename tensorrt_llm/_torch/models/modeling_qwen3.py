@@ -93,7 +93,7 @@ def compute_yarn_parameters(
         low = find_correction_dim(low_rot, dim, base, max_position_embeddings)
         high = find_correction_dim(high_rot, dim, base, max_position_embeddings)
         if truncate:
-            low = low = math.floor(low)
+            low = math.floor(low)
             high = math.ceil(high)
         return max(low, 0), min(high, dim - 1)
 
@@ -136,7 +136,7 @@ class Qwen3Attention(Attention):
         fuse_qk_norm_rope: bool = True,
     ):
         config = model_config.pretrained_config
-        self.config = config
+        self.pretrained_config = config
 
         if getattr(config, "rope_scaling", None) is not None:
             pos_embd_params = PositionalEmbeddingParams(
@@ -200,7 +200,7 @@ class Qwen3Attention(Attention):
 
     def apply_qk_norm_rope(self, qkv, position_ids):
         factor, low, high, attention_factor = compute_yarn_parameters(
-            self.config)
+            self.pretrained_config)
         torch.ops.trtllm.fused_qk_norm_rope(
             qkv, self.num_heads, self.num_key_value_heads,
             self.num_key_value_heads, self.head_dim,
