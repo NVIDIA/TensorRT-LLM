@@ -9,7 +9,7 @@ context_servers:
   tensor_parallel_size: 2
   pipeline_parallel_size: 1
   cache_transceiver_config:
-    backend: "mpi"
+    backend: "MPI"
   urls:
       - "localhost:8001"
 generation_servers:
@@ -17,6 +17,6 @@ generation_servers:
   tensor_parallel_size: 2
   pipeline_parallel_size: 1
   cache_transceiver_config:
-    backend: "mpi"
+    backend: "MPI"
   urls:
       - "localhost:8002"
