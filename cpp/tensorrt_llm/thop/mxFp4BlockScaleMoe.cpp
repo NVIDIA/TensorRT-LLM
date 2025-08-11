@@ -518,19 +518,11 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.class_<torch_ext::Bf16MxE2m1BlockScaleMoeRunner>("Bf16MxE2m1BlockScaleMoERunner")
         .def(torch::init<int64_t, int64_t>())
-        .def("get_num_prepend_tokens_fc1_output_buffer",
-            &torch_ext::Bf16MxE2m1BlockScaleMoeRunner::getNumPrependTokensFc1OutputBuffer)
-        .def("get_num_prepend_tokens_fc2_output_buffer",
-            &torch_ext::Bf16MxE2m1BlockScaleMoeRunner::getNumPrependTokensFc2OutputBuffer)
         .def("get_valid_configs", &torch_ext::Bf16MxE2m1BlockScaleMoeRunner::getValidConfigs)
         .def("run_moe", &torch_ext::Bf16MxE2m1BlockScaleMoeRunner::run);
 
     m.class_<torch_ext::MxE4m3MxE2m1BlockScaleMoeRunner>("MxE4m3MxE2m1BlockScaleMoERunner")
         .def(torch::init<int64_t, int64_t, bool>())
-        .def("get_num_prepend_tokens_fc1_output_buffer",
-            &torch_ext::MxE4m3MxE2m1BlockScaleMoeRunner::getNumPrependTokensFc1OutputBuffer)
-        .def("get_num_prepend_tokens_fc2_output_buffer",
-            &torch_ext::MxE4m3MxE2m1BlockScaleMoeRunner::getNumPrependTokensFc2OutputBuffer)
         .def("get_valid_configs", &torch_ext::MxE4m3MxE2m1BlockScaleMoeRunner::getValidConfigs)
         .def("run_moe", &torch_ext::MxE4m3MxE2m1BlockScaleMoeRunner::run);
 }

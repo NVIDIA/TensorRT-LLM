@@ -87,6 +87,10 @@ int32_t getMaxNumCtasInBatchDim(int32_t numTokens, int32_t topK, int32_t numExpe
     // E.g., at this point tokens over 4 experts are [1, 1, 1, 1], and we have 4 tokens left.
     // If each CTA handles 4 tokens/expert, the greedy strategy is to pour all remaining tokens
     // to any one expert to get to the 5th CTA tile. Otherwise, we can only get 4 tiles in total.
+    //
+    // Another way to reason about this is to pour the remaining tokens into buckets of some fixed
+    // capacity. These buckets, if full, can then be attributed to any expert; it does not have to
+    // belong to the same expert every time.
     if (numRemainingTokens > 0)
     {
         // For every tileTokenDim tokens, we add an extra CTA tile in the token dimension.

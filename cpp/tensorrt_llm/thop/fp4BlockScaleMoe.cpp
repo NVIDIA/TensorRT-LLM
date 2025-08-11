@@ -364,10 +364,6 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.class_<torch_ext::FP4BlockScaleMoeRunner>("FP4BlockScaleMoERunner")
         .def(torch::init<int64_t>())
-        .def("get_num_prepend_tokens_fc1_output_buffer",
-            &torch_ext::FP4BlockScaleMoeRunner::getNumPrependTokensFc1OutputBuffer)
-        .def("get_num_prepend_tokens_fc2_output_buffer",
-            &torch_ext::FP4BlockScaleMoeRunner::getNumPrependTokensFc2OutputBuffer)
         .def("get_valid_configs", &torch_ext::FP4BlockScaleMoeRunner::getValidConfigs)
         .def("run_moe", &torch_ext::FP4BlockScaleMoeRunner::run);
 }
