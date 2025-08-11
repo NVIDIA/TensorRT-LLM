@@ -1497,6 +1497,13 @@ def test_openai_chat_with_logit_bias(llm_root, llm_venv, sampler: str):
     ])
 
 
+def test_openai_prometheus(llm_root, llm_venv):
+    test_root = unittest_path() / "llmapi" / "apps"
+    llm_venv.run_cmd(
+        ["-m", "pytest",
+         str(test_root / "_test_openai_prometheus.py")])
+
+
 def test_openai_lora(llm_root, llm_venv):
     test_root = unittest_path() / "llmapi" / "apps"
     llm_venv.run_cmd(["-m", "pytest", str(test_root / "_test_openai_lora.py")])
@@ -2174,7 +2181,7 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
     expected_keywords = {
         "NVILA-8B-FP16": {
             "image": [
-                ["stormy", "ocean", "waves", "clouds", "gray", "sky"],
+                ["stormy", "ocean", "waves", "cloudy", "sunlight", "sky"],
                 ["rock", "formation", "sunny", "sky", "clouds"],
                 ["road", "busy", "car", "black", "blue"],
             ],
@@ -2189,7 +2196,7 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
         "llava-v1.6-mistral-7b": {
             "image": [
                 ["ocean", "sky", "large", "waves", "shore", "blue"],
-                ['mountain', 'flat', 'dome', 'formation', 'sky'],
+                ['mountain', 'flat', 'clouds', 'road', 'sky'],
                 ["highway", "vehicles", "traffic", "bus", "suburban"],
             ],
         },
@@ -2206,9 +2213,12 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
         },
         "qwen2.5-vl-7b-instruct": {
             "image": [
-                ["dramatic", "moody", "ocean", "stormy", "sky", "clouds"],
+                ["dramatic", "moody", "ocean", "stormy", "sky", "waves"],
                 ["large", "dome", "yosemite", "landmark", "rock", "road"],
-                ["highway", "traffic", "vehicles", "bus", "police", "traffic"],
+                [
+                    "highway", "traffic", "vehicles", "lanes", "congestion",
+                    "road"
+                ],
             ],
             "video": [
                 ["woman", "neon", "night", "jacket", "wet"],

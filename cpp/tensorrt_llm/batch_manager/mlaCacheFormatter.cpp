@@ -45,12 +45,10 @@ std::vector<size_t> MLACacheFormatter::pickRecvConnections(
     auto targetInfo = executor::kv_cache::targetIRanks(destConfig, selfConfig, selfIdx);
     TLLM_CHECK(numConnections == targetInfo.mIRanks.size());
     std::vector<size_t> ret;
-    // targetInfo , mRanks [tpranks, ppranks]
-    int dpRank = selfConfig.getParallelConfig().mEnableAttentionDP ? selfConfig.getParallelConfig().mDPrank : 0;
-
+    // targetInfo , mRanks [tpranks, dpranks]
     for (int i = 0; i < targetInfo.mDomainPPSize; i++)
     {
-        ret.push_back(i + (dpRank % (targetInfo.mDomainTPSize)) * targetInfo.mDomainPPSize);
+        ret.push_back(i);
     }
     return ret;
 }
@@ -60,24 +58,19 @@ bool MLACacheFormatter::needSendCache(
 {
     int selfTpRank = selfIdx % selfConfig.getParallelConfig().mTensorParallelism;
 
-    int destTPNumInDPGroup = destConfig.getParallelConfig().mEnableAttentionDP
-        ? destConfig.getParallelConfig().mTensorParallelism / destConfig.getParallelConfig().mDPsize
-        : destConfig.getParallelConfig().mTensorParallelism;
-    int destDPRank = destConfig.getParallelConfig().mEnableAttentionDP ? destConfig.getParallelConfig().mDPrank : 0;
-
     if (selfConfig.getParallelConfig().mEnableAttentionDP)
     {
         int selfTPNumInDPGroup
             = selfConfig.getParallelConfig().mTensorParallelism / selfConfig.getParallelConfig().mDPsize;
-
+        int destTPNumInDPGroup = destConfig.getParallelConfig().mEnableAttentionDP
+            ? destConfig.getParallelConfig().mTensorParallelism / destConfig.getParallelConfig().mDPsize
+            : destConfig.getParallelConfig().mTensorParallelism;
         int selfTPrankINDPGroup = selfTpRank % selfTPNumInDPGroup;
         if (selfTPNumInDPGroup <= destTPNumInDPGroup)
         {
             return true;
         }
-
-        int dupHeadFactor = selfTPNumInDPGroup / destTPNumInDPGroup;
-        return selfTPrankINDPGroup % dupHeadFactor == destDPRank;
+        return selfTPrankINDPGroup % (selfTPNumInDPGroup / destTPNumInDPGroup) == 0;
     }
 
     int destTPNum = destConfig.getParallelConfig().mEnableAttentionDP
@@ -88,8 +81,7 @@ bool MLACacheFormatter::needSendCache(
     {
         return true;
     }
-    int dupHeadFactor = selfTPNum / destTPNum;
-    return selfTpRank % dupHeadFactor == destDPRank;
+    return selfTpRank % (selfTPNum / destTPNum) == 0;
 }
 
 void MLACacheFormatter::format(TransferSession& session)
@@ -244,7 +236,7 @@ void MLACacheFormatter::format(TransferSession& session)
         }
         double cacheTransferTime
             = std::max(0.0, std::chrono::duration<double, std::milli>(endTime - startTime).count());
-        kvCacheMeasureHelper.appendKVCacheTransfer(llmRequest.mRequestId, delay, cacheTransferTime, size);
+        session.appendMeasure(delay, cacheTransferTime, size);
     };
 
     if (connections.size() > 1)
@@ -441,7 +433,7 @@ void MLACacheFormatter::unformat(TransferSession& session)
             }
             double cacheTransferTime
                 = std::max(0.0, std::chrono::duration<double, std::milli>(endTime - startTime).count());
-            kvCacheMeasureHelper.appendKVCacheTransfer(ctxReqId, delay, cacheTransferTime, size);
+            session.appendMeasure(delay, cacheTransferTime, size);
         };
 
         if (pickUpConnections.size() > 1)
@@ -588,6 +580,28 @@ void MLACacheFormatter::unformat(TransferSession& session)
         && (destConfig.getParallelConfig().mTensorParallelism != destConfig.getParallelConfig().mDPsize))
     {
         TLLM_LOG_WARNING("MLACacheFormatter::inquireSupport: TP size must be equal to DP size");
+        return false;
+    }
+
+    int selfNumLayers = selfConfig.getModelConfig().mNbKvHeadsPerLayer.size();
+    int selfPPSize = selfConfig.getParallelConfig().mPipelineParallelism;
+    int destPPSize = destConfig.getParallelConfig().mPipelineParallelism;
+    int destNumLayers = destConfig.getModelConfig().mNbKvHeadsPerLayer.size();
+
+    if (selfPPSize == destPPSize)
+    {
+        return true;
+    }
+    if (selfNumLayers % selfPPSize != 0)
+    {
+        TLLM_LOG_WARNING("CacheFormatter::inquireSupport: layers %d must be divisible by pipeline parallelism :%d",
+            selfNumLayers, selfPPSize);
+        return false;
+    }
+    if (destNumLayers % destPPSize != 0)
+    {
+        TLLM_LOG_WARNING("CacheFormatter::inquireSupport: layers %d must be divisible by pipeline parallelism :%d ",
+            destNumLayers, destPPSize);
         return false;
     }
 

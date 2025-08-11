@@ -250,6 +250,12 @@ class LlmResult:
         self._result = tensorrt_llm.bindings.executor.deserialize_result(
             self._result)
 
+    def get_result(self):
+        if tmp_res := tensorrt_llm.bindings.executor.deserialize_result(
+                self._result):
+            return tmp_res
+        return None
+
 
 @dataclass
 class LlmResponse:
@@ -329,8 +335,11 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_return_generation_logits = return_generation_logits
         self.py_return_logits_device_memory = return_logits_device_memory
         self.py_is_draft = is_draft
+        # The request's sequence slot ID, an index between 0 (inclusive) and max_batch_size (exclusive).
         self.py_seq_slot = seq_slot
+        # If the request is a draft request, target_seq_slot is the sequence slot ID of its target request.
         self.py_target_seq_slot = target_seq_slot
+        self.use_draft_model = is_draft
 
         # TODO: remove this when use DynamicDecodeOp in pytorch flow.
         # currently, keep py_stop_words_list as python list, rather than tensor.

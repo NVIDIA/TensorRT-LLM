@@ -39,7 +39,7 @@ class GuidedDecoder:
                 guided_decoding_config, vocab_size_padded)
         else:
             raise ValueError(
-                f"invalid guided decoding backend: {self.guided_decoding_backend}"
+                f"Invalid guided decoding backend: {self.guided_decoding_backend}"
             )
         logger.info(
             f"Guided decoder initialized with backend: {self.guided_decoding_backend}"
@@ -71,7 +71,7 @@ class GuidedDecoder:
     def bitmask_size(self) -> int:
         return math.ceil(self.vocab_size_padded / 32)
 
-    def _is_matcher_init(self, llm_req: LlmRequest) -> bool:
+    def _require_matcher_init(self, llm_req: LlmRequest) -> bool:
         if llm_req.guided_decoding_params is None:
             return False
         if llm_req.py_is_draft:
@@ -79,7 +79,7 @@ class GuidedDecoder:
         # The request is in the last chunk of a context forward step.
         return llm_req.is_context_init_state and llm_req.is_last_context_chunk
 
-    def _is_matcher_in_progress(self, llm_req: LlmRequest) -> bool:
+    def _require_matcher_advance(self, llm_req: LlmRequest) -> bool:
         if llm_req.guided_decoding_params is None:
             return False
         if llm_req.py_is_draft:
@@ -102,12 +102,17 @@ class GuidedDecoder:
             self.num_advanced_tokens[slot] = 0
             self.num_guided_tokens[slot] = 0
 
-            if self._is_matcher_init(llm_req):
+            matcher_init: bool = self._require_matcher_init(llm_req)
+            matcher_advance: bool = self._require_matcher_advance(llm_req)
+            if not (matcher_init or matcher_advance):
+                continue
+
+            if matcher_init:
                 matcher = self.grammar_matcher_factory.create(
                     llm_req.guided_decoding_params)
                 self.grammar_matchers[slot] = matcher
 
-            elif self._is_matcher_in_progress(llm_req):
+            if matcher_advance:
                 matcher = self.grammar_matchers[slot]
                 # The last new token must be acceptable unless the matcher is terminated in a drafting loop.
                 if llm_req.py_is_draft and (matcher.is_terminated()
@@ -126,9 +131,6 @@ class GuidedDecoder:
                     raise ValueError(
                         f"Request {llm_req.py_request_id} failed to accept last new token: {last_new_token}."
                     )
-
-            else:
-                continue
 
             self.num_advanced_tokens[slot] += 1
             if not matcher.is_terminated():
@@ -244,3 +246,19 @@ class GuidedDecoder:
             # Reset the drafting states.
             self.num_advanced_draft_tokens[slot] = 0
             self.is_draft_terminated[slot] = False
+
+    @nvtx_range("GuidedDecoder.init_disagg_gen_requests")
+    def init_disagg_gen_requests(self,
+                                 scheduled_requests: ScheduledRequests) -> None:
+        """Initialize the grammar matchers for disagg gen requests.
+        """
+        for llm_req in scheduled_requests.generation_requests:
+            if llm_req.guided_decoding_params is None:
+                continue
+            assert not llm_req.py_is_draft
+            slot: int = llm_req.py_seq_slot
+            if llm_req.context_phase_params is not None and llm_req.py_decoding_iter == 1:
+                # The request is in the first generation forward step at the disagg gen instance.
+                self.grammar_matchers[
+                    slot] = self.grammar_matcher_factory.create(
+                        llm_req.guided_decoding_params)

@@ -591,6 +591,12 @@ def getMergeRequestChangedFileList(pipeline, globalVars) {
 }
 
 def getMergeRequestOneFileChanges(pipeline, globalVars, filePath) {
+    def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
+    if (env.alternativeTRT || isOfficialPostMergeJob) {
+        pipeline.echo("Force set changed file diff to empty string.")
+        return ""
+    }
+
     def githubPrApiUrl = globalVars[GITHUB_PR_API_URL]
     def diff = ""
 

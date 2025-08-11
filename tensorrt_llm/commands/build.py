@@ -31,7 +31,8 @@ from tensorrt_llm.auto_parallel.cluster_info import cluster_infos
 from tensorrt_llm.bindings import KVCacheType
 from tensorrt_llm.builder import BuildConfig, Engine, build
 from tensorrt_llm.logger import logger, severity_map
-from tensorrt_llm.lora_manager import LoraConfig, LoraManager
+from tensorrt_llm.lora_helper import LoraConfig
+from tensorrt_llm.lora_manager import LoraManager
 from tensorrt_llm.models import MODEL_MAP, PretrainedConfig
 from tensorrt_llm.models.modeling_utils import SpeculativeDecodingMode
 from tensorrt_llm.plugin import PluginConfig, add_plugin_argument

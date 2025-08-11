@@ -11,7 +11,7 @@ from tensorrt_llm.mapping import Mapping
 from ...distributed import allgather, reducescatter
 from ...expert_statistic import ExpertStatistic
 from ...model_config import ModelConfig
-from ...utils import EventType, Fp4QuantizedTensor, swizzle_sf
+from ...utils import EventType, Fp4QuantizedTensor
 from .deep_ep_utils import buffer_pool, deep_ep_installed
 from .interface import MoE
 from .moe_load_balancer import get_moe_load_balancer
@@ -562,9 +562,6 @@ class WideEPMoE(MoE):
                 dim=0,
                 sizes=None if use_dp_padding else all_rank_num_tokens)
             x_row = x.shape[0]
-            # Fp4 gemm has extra scaling factor
-            if x_sf is not None:
-                x_sf = swizzle_sf(x_sf, x_row, x_col, self.scaling_vector_size)
 
         if self.layer_load_balancer and not self.layer_load_balancer.is_static_routing(
         ):
@@ -605,9 +602,6 @@ class WideEPMoE(MoE):
                     x, x_sf, recv_topk_idx, token_final_scales)
                 if x_sf is not None:
                     x_sf = x_sf.view(x_sf_dtype)
-                    if self.has_nvfp4:
-                        x_sf = swizzle_sf(x_sf, x.shape[0], x.shape[1] * 2,
-                                          self.scaling_vector_size)
             elif self.alltoall_method_type == AlltoallMethodType.DeepEPLowLatency:
                 token_num = x_row
                 hidden_size = x_col
@@ -641,8 +635,6 @@ class WideEPMoE(MoE):
                 x = x.reshape(x.shape[0] * x.shape[1], x.shape[2])
                 x_sf = x_sf.reshape(x_sf.shape[0] * x_sf.shape[1],
                                     x_sf.shape[2])
-                x_sf = swizzle_sf(x_sf, x.shape[0], x.shape[1] * 2,
-                                  self.scaling_vector_size)
                 token_selected_slots = token_selected_slots.view(x.shape[0], 1)
                 token_final_scales = torch.ones_like(
                     token_selected_slots, dtype=token_final_scales.dtype)
@@ -662,6 +654,7 @@ class WideEPMoE(MoE):
             output_dtype,
             quant_scales=quant_scales,
             input_sf=x_sf,
+            swizzled_input_sf=False,
             tp_size=self.tp_size,
             tp_rank=self.tp_rank,
             ep_size=ep_size,
@@ -938,10 +931,6 @@ class WideEPMoE(MoE):
             x_sf = MnnvlMoe.mnnvl_moe_alltoallv(x_sf, alltoall_info,
                                                 self.alltoall_workspace,
                                                 self.ep_rank, self.ep_size)
-
-            if self.has_nvfp4:
-                x_sf = swizzle_sf(x_sf, x.shape[0], x.shape[1] * 2,
-                                  self.scaling_vector_size)
 
         return x, x_sf
 

@@ -20,7 +20,7 @@ from ..._utils import pad_vocab_size
 from ...functional import Tensor
 from ...layers import (MLP, Attention, AttentionMaskType, ColumnLinear,
                        Embedding, LayerNorm)
-from ...lora_manager import LoraConfig, use_lora
+from ...lora_helper import LoraConfig, use_lora
 from ...mapping import Mapping
 from ...module import Module
 from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,

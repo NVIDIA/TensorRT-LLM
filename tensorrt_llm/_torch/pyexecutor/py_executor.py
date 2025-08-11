@@ -17,7 +17,8 @@ try:
 except ImportError:
     from cuda import cudart
 
-from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
+from tensorrt_llm._torch.pyexecutor.resource_manager import (
+    ResourceManagerType, request_context)
 from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
 from tensorrt_llm._utils import (customized_gc_thresholds, global_mpi_rank,
                                  is_trace_enabled, nvtx_range, trace_func)
@@ -279,15 +280,12 @@ class PyExecutor:
             self._executor_loop_cleanup()
 
     def start_worker(self):
-        self.worker_lock.acquire()
-        try:
+        with self.worker_lock:
             if self.worker_started == False:
                 self.worker_thread = threading.Thread(
                     target=self._event_loop_wrapper, daemon=True)
                 self.worker_thread.start()
                 self.worker_started = True
-        finally:
-            self.worker_lock.release()
 
     def __enter__(self):
         return self
@@ -364,13 +362,9 @@ class PyExecutor:
             return []
 
         latest_stats = (IterationStats(), None)
-        try:
-            self.stats_lock.acquire()
+        with self.stats_lock:
             latest_stats = self.stats
             self.stats = []
-        finally:
-            self.stats_lock.release()
-
         return latest_stats
 
     def get_latest_kv_cache_events(self):
@@ -605,11 +599,8 @@ class PyExecutor:
                            stats: IterationStats,
                            req_stats: Optional[List[RequestStats]] = None):
 
-        try:
-            self.stats_lock.acquire()
+        with self.stats_lock:
             self.stats.append((stats, req_stats))
-        finally:
-            self.stats_lock.release()
 
     def _process_iter_stats(self, finished_requests: list[LlmRequest],
                             active_requests: List[LlmRequest],
@@ -749,6 +740,9 @@ class PyExecutor:
                             if self._need_return_logits(scheduled_batch):
                                 logits_host = batch_outputs["logits"].to(
                                     "cpu", non_blocking=True)
+                            if self.kv_cache_transceiver and self.guided_decoder:
+                                self.guided_decoder.init_disagg_gen_requests(
+                                    scheduled_batch)
                             self._execute_guided_decoder(
                                 scheduled_batch, batch_outputs['logits'])
 
@@ -939,12 +933,19 @@ class PyExecutor:
                         self._handle_first_token_response(scheduled_batch)
 
                     self.resource_manager.prepare_resources(scheduled_batch)
+
+                    if self.kv_cache_transceiver and self.guided_decoder:
+                        self.guided_decoder.init_disagg_gen_requests(
+                            scheduled_batch)
                     if self.drafter is not None and self.use_spec_decode:
-                        if self.guided_decoder is not None:
-                            self.guided_decoder.rollback_rejected_tokens(
-                                scheduled_batch)
-                        self.drafter.prepare_draft_tokens(
-                            scheduled_batch, self.resource_manager)
+                        with request_context(
+                                is_draft=True,
+                                scheduled_requests=scheduled_batch):
+                            if self.guided_decoder is not None:
+                                self.guided_decoder.rollback_rejected_tokens(
+                                    scheduled_batch)
+                            self.drafter.prepare_draft_tokens(
+                                scheduled_batch, self.resource_manager)
 
                     batch_outputs = self._forward_step(scheduled_batch)
                     self._execute_guided_decoder(scheduled_batch,
@@ -1063,6 +1064,9 @@ class PyExecutor:
                     if self.previous_batch is not None:
                         self._update_requests(self.previous_batch.sample_state)
 
+                    if self.kv_cache_transceiver and self.guided_decoder:
+                        self.guided_decoder.init_disagg_gen_requests(
+                            scheduled_batch)
                     self._execute_guided_decoder(scheduled_batch,
                                                  batch_outputs['logits'])
 
@@ -1319,7 +1323,9 @@ class PyExecutor:
             if req.is_disagg_generation_transmission_complete:
                 cache_trans_complete_requests.append(req)
         if len(cache_trans_complete_requests) > 0:
-            self._setup_sampler_step(cache_trans_complete_requests)
+            requests = ScheduledRequests()
+            requests.context_requests = cache_trans_complete_requests
+            self._setup_sampler_step(requests)
 
         for req in scheduled_batch.generation_requests:
             if req.is_disagg_generation_transmission_complete:
@@ -1473,7 +1479,7 @@ class PyExecutor:
             self._handle_errors(error_msg)
 
     @nvtx_range("_setup_sampler_step")
-    def _setup_sampler_step(self, requests):
+    def _setup_sampler_step(self, requests: ScheduledRequests):
         try:
             return self.sampler.setup_sampler_step(requests)
         except Exception as e:

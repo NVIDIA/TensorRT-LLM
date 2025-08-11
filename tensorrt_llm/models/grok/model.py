@@ -18,7 +18,7 @@ from ..._utils import pad_vocab_size
 from ...functional import Tensor, recv, send
 from ...layers import (MOE, Attention, AttentionMaskType, ColumnLinear,
                        Embedding, MoeConfig, PositionEmbeddingType, RmsNorm)
-from ...lora_manager import LoraConfig, use_lora
+from ...lora_helper import LoraConfig, use_lora
 from ...mapping import Mapping
 from ...module import Module
 from ..modeling_utils import (DecoderLayerList, DecoderModelForCausalLM,
