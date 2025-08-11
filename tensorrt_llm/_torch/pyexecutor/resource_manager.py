@@ -10,9 +10,10 @@ import torch
 import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
+from tensorrt_llm.lora_manager import LoraConfig, LoraManager, LoraModelConfig
 from tensorrt_llm.sampling_params import SamplingParams
 
-from ..._utils import binding_dtype_size, nvtx_range
+from ..._utils import binding_dtype_size, binding_to_str_dtype, nvtx_range
 from ...logger import logger
 from ...mapping import Mapping
 from .llm_request import (LlmRequest, LlmRequestState, SamplingConfig,
@@ -1170,6 +1171,7 @@ class PeftCacheManager(BaseResourceManager):
 
     def __init__(self,
                  peft_cache_config: PeftCacheConfig,
+                 lora_config: LoraConfig,
                  model_config: ModelConfig,
                  world_config: WorldConfig | None = None):
         import tensorrt_llm.bindings as _tb
@@ -1200,8 +1202,36 @@ class PeftCacheManager(BaseResourceManager):
                                         model_config=model_config,
                                         world_config=world_config,
                                         buffer_manager=buffer_manager)
+        self._lora_config = lora_config
+        self._lora_model_config = LoraModelConfig(
+            lora_config.lora_target_modules,
+            lora_config.trtllm_modules_to_hf_modules, model_config.hidden_size,
+            binding_to_str_dtype(model_config.data_type))
+        self._lora_manager = LoraManager()
 
     def add_request_peft(self, request: LlmRequest):
+        if request.lora_task_id is not None:
+            is_task_cached = self.impl.is_task_cached(request.lora_task_id)
+            if is_task_cached:
+                # PeftCacheManager::addRequestPeft in CPP doesn't allow having only one of [config tensor, weights
+                # tensor] without the other. Since there's no need for any of them when the LoRA adapter is already
+                # cached, we can safely remove both from the request.
+                request.remove_lora_tensors()
+            elif request.lora_weights is None and request.py_lora_path:
+                self._lora_manager.load_from_ckpt(
+                    [request.py_lora_path],
+                    model_config=self._lora_model_config,
+                    runtime_mapping=None,
+                    uids=[request.lora_task_id],
+                    ckpt_source=self._lora_config.lora_ckpt_source)
+                request.lora_weights = self._lora_manager.cpp_lora_weights[
+                    request.lora_task_id]
+
+            # PeftCacheManager CPP implementation expects an extra dim at index 0
+            if request.lora_weights is not None:
+                request.lora_weights = request.lora_weights.unsqueeze(0)
+            if request.lora_config is not None:
+                request.lora_config = request.lora_config.unsqueeze(0)
         self.impl.add_request_peft(request, True)
 
     def ensure_batch(self,
@@ -1221,12 +1251,7 @@ class PeftCacheManager(BaseResourceManager):
         context_batch = scheduled_batch.context_requests
         generation_batch = scheduled_batch.generation_requests
         for req in context_batch:
-            if req.lora_weights is not None and req.lora_config is not None:
-                req.lora_weights = req.lora_weights.reshape(
-                    [1] + list(req.lora_weights.shape))
-                req.lora_config = req.lora_config.reshape(
-                    [1] + list(req.lora_config.shape))
-            self.impl.add_request_peft(req, True)
+            self.add_request_peft(req)
 
         py_lora_task_layer_module_configs = self.impl.ensure_batch(
             context_batch, generation_batch, False)
