@@ -379,6 +379,8 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm100_dynamic_cluster_shape
     std::vector<CutlassGemmConfig> candidate_configs;
     if ((config & CutlassGemmConfig::FP4_ONLY) != 0)
     {
+        if (schedule != EpilogueScheduleType::TMA)
+            return {};
         candidate_configs.push_back(CutlassGemmConfig{CutlassTileConfigSM100::CtaShape128x128x128B,
             MainloopScheduleType::AUTO, schedule, cluster1sm, dynamic_cluster_shape, fallback_cluster_shape});
         candidate_configs.push_back(CutlassGemmConfig{CutlassTileConfigSM100::CtaShape128x256x128B,
@@ -454,8 +456,8 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm100(CutlassGemmConfig::Ca
                 auto fallback_cluster_shape = cluster_shape == ClusterShape::ClusterShape_1x1x1
                     ? ClusterShape::ClusterShape_1x1x1
                     : ClusterShape::ClusterShape_2x1x1;
-                auto configs
-                    = get_candidate_configs_sm100_dynamic_cluster_shape(config, schedule, cluster_shape, cluster_shape);
+                auto configs = get_candidate_configs_sm100_dynamic_cluster_shape(
+                    config, schedule, cluster_shape, fallback_cluster_shape);
                 candidate_configs.insert(candidate_configs.end(), configs.begin(), configs.end());
             }
 

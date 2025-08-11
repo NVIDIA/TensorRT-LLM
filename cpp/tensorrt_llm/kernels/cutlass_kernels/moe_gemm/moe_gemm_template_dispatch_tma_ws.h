@@ -135,48 +135,49 @@ void dispatchMoeGemmFinalDispatchTmaWarpSpecialized(TmaWarpSpecializedGroupedGem
         {
             bool const dynamic_cga = gemm_config.dynamic_cluster_shape != cutlass_extensions::ClusterShape::Undefined;
             auto cluster_shape = enum_to_shape_tuple(gemm_config.dynamic_cluster_shape);
-            auto cluster_shape_cute = cute::Shape<int64_t, int64_t, cute::_1>{
+            auto cluster_shape_cute = cute::Shape<int32_t, int32_t, cute::_1>{
                 std::get<0>(cluster_shape), std::get<1>(cluster_shape), cute::_1{}};
-            auto selected_function = [&]()
+            if constexpr (!std::is_same_v<T, __nv_fp4_e2m1> && !std::is_same_v<WeightType, __nv_fp4_e2m1>)
             {
-                if constexpr (!std::is_same_v<WeightType, __nv_fp4_e2m1>)
-                {
-                    auto func_map = std::array{
-                        std::array{kernels::cutlass_kernels::tma_warp_specialized_generic_moe_gemm_kernelLauncher<Arch,
-                                       T, WeightType, OutputType, cutlass::epilogue::PtrArrayNoSmemWarpSpecialized,
-                                       EpilogueTag, FUSION, TileShape, ClusterShape, is_wfp4afp8, false, false>,
-                            kernels::cutlass_kernels::tma_warp_specialized_generic_moe_gemm_kernelLauncher<Arch, T,
-                                WeightType, OutputType, cutlass::epilogue::PtrArrayNoSmemWarpSpecialized, EpilogueTag,
-                                FUSION, TileShape, ClusterShape, is_wfp4afp8, true, false>
+                auto func_map = std::array{
+                    std::array{kernels::cutlass_kernels::tma_warp_specialized_generic_moe_gemm_kernelLauncher<Arch, T,
+                                   WeightType, OutputType, cutlass::epilogue::PtrArrayNoSmemWarpSpecialized,
+                                   EpilogueTag, FUSION, TileShape, ClusterShape, is_wfp4afp8, false, false>,
+                        kernels::cutlass_kernels::tma_warp_specialized_generic_moe_gemm_kernelLauncher<Arch, T,
+                            WeightType, OutputType, cutlass::epilogue::PtrArrayNoSmemWarpSpecialized, EpilogueTag,
+                            FUSION, TileShape, ClusterShape, is_wfp4afp8, true, false>
 
-                        },
-                        std::array{kernels::cutlass_kernels::tma_warp_specialized_generic_moe_gemm_kernelLauncher<Arch,
-                                       T, WeightType, OutputType, cutlass::epilogue::PtrArrayTmaWarpSpecialized,
-                                       EpilogueTag, FUSION, TileShape, ClusterShape, is_wfp4afp8, false, false>,
-                            kernels::cutlass_kernels::tma_warp_specialized_generic_moe_gemm_kernelLauncher<Arch, T,
-                                WeightType, OutputType, cutlass::epilogue::PtrArrayTmaWarpSpecialized, EpilogueTag,
-                                FUSION, TileShape, ClusterShape, is_wfp4afp8, true, false>
-
-                        }};
-                    bool const tma_epilogue
-                        = gemm_config.epilogue_schedule == cutlass_extensions::EpilogueScheduleType::TMA;
-                    return func_map[tma_epilogue][dynamic_cga];
-                }
-                else
-                {
-                    TLLM_CHECK_WITH_INFO(gemm_config.epilogue_schedule == cutlass_extensions::EpilogueScheduleType::TMA,
-                        "No Smem epilogue schedule is not supported for block scaled");
-                    return dynamic_cga
-                        ? kernels::cutlass_kernels::tma_warp_specialized_generic_moe_gemm_kernelLauncher<Arch, T,
+                    },
+                    std::array{kernels::cutlass_kernels::tma_warp_specialized_generic_moe_gemm_kernelLauncher<Arch, T,
+                                   WeightType, OutputType, cutlass::epilogue::PtrArrayTmaWarpSpecialized, EpilogueTag,
+                                   FUSION, TileShape, ClusterShape, is_wfp4afp8, false, false>,
+                        kernels::cutlass_kernels::tma_warp_specialized_generic_moe_gemm_kernelLauncher<Arch, T,
                             WeightType, OutputType, cutlass::epilogue::PtrArrayTmaWarpSpecialized, EpilogueTag, FUSION,
                             TileShape, ClusterShape, is_wfp4afp8, true, false>
-                        : kernels::cutlass_kernels::tma_warp_specialized_generic_moe_gemm_kernelLauncher<Arch, T,
-                            WeightType, OutputType, cutlass::epilogue::PtrArrayTmaWarpSpecialized, EpilogueTag, FUSION,
-                            TileShape, ClusterShape, is_wfp4afp8, false, false>;
-                }
-            }();
-            selected_function(hopper_input, num_experts, multi_processor_count, stream, occupancy, workspace_size,
-                cluster_shape_cute);
+
+                    }};
+                bool const tma_epilogue
+                    = gemm_config.epilogue_schedule == cutlass_extensions::EpilogueScheduleType::TMA;
+                return func_map[tma_epilogue][dynamic_cga](hopper_input, num_experts, multi_processor_count, stream,
+                    occupancy, workspace_size, cluster_shape_cute);
+            }
+            else
+            {
+                static_assert(
+                    is_wfp4afp8 || (std::is_same_v<T, __nv_fp4_e2m1> && std::is_same_v<WeightType, __nv_fp4_e2m1>),
+                    "Non-block scaled shapes should try no smem epilogue");
+                TLLM_CHECK_WITH_INFO(gemm_config.epilogue_schedule == cutlass_extensions::EpilogueScheduleType::TMA,
+                    "No Smem epilogue schedule is not supported for block scaled");
+                auto selected_func = dynamic_cga
+                    ? &kernels::cutlass_kernels::tma_warp_specialized_generic_moe_gemm_kernelLauncher<Arch, T,
+                        WeightType, OutputType, cutlass::epilogue::PtrArrayTmaWarpSpecialized, EpilogueTag, FUSION,
+                        TileShape, ClusterShape, is_wfp4afp8, true, false>
+                    : &kernels::cutlass_kernels::tma_warp_specialized_generic_moe_gemm_kernelLauncher<Arch, T,
+                        WeightType, OutputType, cutlass::epilogue::PtrArrayTmaWarpSpecialized, EpilogueTag, FUSION,
+                        TileShape, ClusterShape, is_wfp4afp8, false, false>;
+                selected_func(hopper_input, num_experts, multi_processor_count, stream, occupancy, workspace_size,
+                    cluster_shape_cute);
+            }
         }
         else if constexpr (Arch::kMinComputeCapability == 120)
         {

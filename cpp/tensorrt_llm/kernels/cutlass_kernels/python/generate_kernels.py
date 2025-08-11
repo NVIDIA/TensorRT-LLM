@@ -741,8 +741,8 @@ def generate_sm100_grouped_gemm_operations(is_arch_enabled):
                     is_mx_fpx=(dtype == DataType.e4m3 and weight_type == e2m1),
                     dynamic_cga=dynamic_cga)
 
-            if is_op_valid(moe_gemm_operation):
-                operations.append(moe_gemm_operation)
+                if is_op_valid(moe_gemm_operation):
+                    operations.append(moe_gemm_operation)
     return operations
 
 

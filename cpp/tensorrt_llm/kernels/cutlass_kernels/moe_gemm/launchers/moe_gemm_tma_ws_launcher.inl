@@ -108,7 +108,7 @@ template <typename ArchTag, typename T, typename WeightType, typename OutputType
     bool DYNAMIC_CGA, bool BIAS>
 void tma_warp_specialized_generic_moe_gemm_kernelLauncher(TmaWarpSpecializedGroupedGemmInput tma_ws_input,
     int num_experts, int const multi_processor_count, cudaStream_t stream, int* kernel_occupancy,
-    size_t* workspace_size, cute::Shape<int64_t, int64_t, cute::_1> dynamic_cluster_shape)
+    size_t* workspace_size, cute::Shape<int32_t, int32_t, cute::_1> dynamic_cluster_shape)
 {
     if constexpr (ArchTag::kMinComputeCapability < 90)
     {
@@ -183,7 +183,7 @@ using SafeBF16 = void;
         tma_warp_specialized_generic_moe_gemm_kernelLauncher_##ArchTag_##_##DataType_##_##WeightType_##_##OutputType_##_##EpilogueSchedule_##_##EpilogueTag_##_##FUSION_##_##CTA_M_##_##CTA_N_##_##CTA_K_##_##CGA_M_##_##CGA_N_##_##CGA_K_##_##MXFPX_##_##DYNAMIC_CGA_##_##BIAS_(                              \
             TmaWarpSpecializedGroupedGemmInput tma_ws_input, int num_experts, int const multi_processor_count,                                                                                                                                                                                                 \
             cudaStream_t stream, int* kernel_occupancy, size_t* workspace_size,                                                                                                                                                                                                                                \
-            cute::Shape<int64_t, int64_t, cute::_1> dynamic_cluster_shape)                                                                                                                                                                                                                                     \
+            cute::Shape<int32_t, int32_t, cute::_1> dynamic_cluster_shape)                                                                                                                                                                                                                                     \
     {                                                                                                                                                                                                                                                                                                          \
         constexpr static EpilogueFusion FUSION = EpilogueFusion::FUSION_;                                                                                                                                                                                                                                      \
         /* constexpr static bool BIAS = BIAS_; */ /* Always false */                                                                                                                                                                                                                                           \
@@ -199,7 +199,7 @@ using SafeBF16 = void;
         using InputClusterShape = cute::Shape<cute::Int<CGA_M_>, cute::Int<CGA_N_>, cute::Int<CGA_K_>>;                                                                                                                                                                                                        \
         constexpr static bool Is2SM = IsSM100 && cute::size<0>(InputClusterShape{}) == 2;                                                                                                                                                                                                                      \
         using ClusterShape                                                                                                                                                                                                                                                                                     \
-            = std::conditional_t<DYNAMIC_CGA, cute::Shape<int64_t, int64_t, cute::_1>, InputClusterShape>;                                                                                                                                                                                                     \
+            = std::conditional_t<DYNAMIC_CGA, cute::Shape<int32_t, int32_t, cute::_1>, InputClusterShape>;                                                                                                                                                                                                     \
         using MmaTileShape = cute::Shape<cute::Int<CTA_M_*(Is2SM ? 2 : 1)>, cute::Int<CTA_N_>, cute::Int<CTA_K_>>;                                                                                                                                                                                             \
         constexpr static bool IsMXFPX = MXFPX_;                                                                                                                                                                                                                                                                \
         using InputEpilogueSchedule = cutlass::epilogue::EpilogueSchedule_;                                                                                                                                                                                                                                    \
@@ -647,7 +647,7 @@ using SafeBF16 = void;
         cute::Shape<cute::Int<CGA_M_>, cute::Int<CGA_N_>, cute::Int<CGA_K_>>, MXFPX_, DYNAMIC_CGA_, BIAS_>(                                                                                                                                                                                                    \
         TmaWarpSpecializedGroupedGemmInput tma_ws_input, int num_experts, int const multi_processor_count,                                                                                                                                                                                                     \
         cudaStream_t stream, int* kernel_occupancy, size_t* workspace_size,                                                                                                                                                                                                                                    \
-        cute::Shape<int64_t, int64_t, cute::_1> dynamic_cluster_shape);
+        cute::Shape<int32_t, int32_t, cute::_1> dynamic_cluster_shape);
 
 } // namespace cutlass_kernels
 } // namespace kernels

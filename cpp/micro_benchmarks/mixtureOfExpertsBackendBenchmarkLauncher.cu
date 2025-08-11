@@ -299,7 +299,7 @@ void argGenLoadFile(benchmark::internal::Benchmark* benchmark)
     std::ifstream file{workloadFile};
     if (!file.is_open())
     {
-        throw std::invalid_argument("Failed to open benchmark file: " + workloadFile);
+        throw std::invalid_argument("Failed to open benchmark file: " + std::string(workloadFile));
     }
     std::stringstream buffer;
     buffer << file.rdbuf();
