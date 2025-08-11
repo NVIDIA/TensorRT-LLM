@@ -2085,8 +2085,8 @@ TYPED_TEST(MixtureOfExpertsTest, ConfigSweep)
         if (conf.is_tma_warp_specialized)
         {
             tactic << conf.getTileConfigAsInt() << " and cluster shape " << (int) conf.cluster_shape
-                   << " mainloop sched " << (int) conf.mainloop_schedule << " epi sched "
-                   << (int) conf.epilogue_schedule;
+                   << " dynamic cluster shape " << (int) conf.dynamic_cluster_shape << " mainloop sched "
+                   << (int) conf.mainloop_schedule << " epi sched " << (int) conf.epilogue_schedule;
         }
         else if (conf.tile_config_sm80 != CutlassTileConfig::ChooseWithHeuristic)
         {

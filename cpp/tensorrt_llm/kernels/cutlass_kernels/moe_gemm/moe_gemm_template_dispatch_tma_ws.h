@@ -137,6 +137,9 @@ void dispatchMoeGemmFinalDispatchTmaWarpSpecialized(TmaWarpSpecializedGroupedGem
             auto cluster_shape = enum_to_shape_tuple(gemm_config.dynamic_cluster_shape);
             auto cluster_shape_cute = cute::Shape<int32_t, int32_t, cute::_1>{
                 std::get<0>(cluster_shape), std::get<1>(cluster_shape), cute::_1{}};
+            auto cluster_shape_fallback = enum_to_shape_tuple(gemm_config.fallback_cluster_shape);
+            auto cluster_shape_cute_fallback = cute::Shape<int32_t, int32_t, cute::_1>{
+                std::get<0>(cluster_shape_fallback), std::get<1>(cluster_shape_fallback), cute::_1{}};
             if constexpr (!std::is_same_v<T, __nv_fp4_e2m1> && !std::is_same_v<WeightType, __nv_fp4_e2m1>)
             {
                 auto func_map = std::array{
@@ -159,7 +162,7 @@ void dispatchMoeGemmFinalDispatchTmaWarpSpecialized(TmaWarpSpecializedGroupedGem
                 bool const tma_epilogue
                     = gemm_config.epilogue_schedule == cutlass_extensions::EpilogueScheduleType::TMA;
                 return func_map[tma_epilogue][dynamic_cga](hopper_input, num_experts, multi_processor_count, stream,
-                    occupancy, workspace_size, cluster_shape_cute);
+                    occupancy, workspace_size, cluster_shape_cute, cluster_shape_cute_fallback);
             }
             else
             {
@@ -176,7 +179,7 @@ void dispatchMoeGemmFinalDispatchTmaWarpSpecialized(TmaWarpSpecializedGroupedGem
                         WeightType, OutputType, cutlass::epilogue::PtrArrayTmaWarpSpecialized, EpilogueTag, FUSION,
                         TileShape, ClusterShape, is_wfp4afp8, false, false>;
                 selected_func(hopper_input, num_experts, multi_processor_count, stream, occupancy, workspace_size,
-                    cluster_shape_cute);
+                    cluster_shape_cute, cluster_shape_cute_fallback);
             }
         }
         else if constexpr (Arch::kMinComputeCapability == 120)
@@ -184,14 +187,14 @@ void dispatchMoeGemmFinalDispatchTmaWarpSpecialized(TmaWarpSpecializedGroupedGem
             kernels::cutlass_kernels::tma_warp_specialized_generic_moe_gemm_kernelLauncher<Arch, T, WeightType,
                 OutputType, cutlass::epilogue::TmaWarpSpecialized, EpilogueTag, FUSION, TileShape, ClusterShape,
                 is_wfp4afp8, false>(
-                hopper_input, num_experts, multi_processor_count, stream, occupancy, workspace_size, {});
+                hopper_input, num_experts, multi_processor_count, stream, occupancy, workspace_size, {}, {});
         }
         else if constexpr (Arch::kMinComputeCapability < 100)
         {
             kernels::cutlass_kernels::tma_warp_specialized_generic_moe_gemm_kernelLauncher<Arch, T, WeightType,
                 OutputType, cutlass::epilogue::PtrArrayTmaWarpSpecialized, EpilogueTag, FUSION, TileShape, ClusterShape,
                 is_wfp4afp8, false>(
-                hopper_input, num_experts, multi_processor_count, stream, occupancy, workspace_size, {});
+                hopper_input, num_experts, multi_processor_count, stream, occupancy, workspace_size, {}, {});
         }
     }
 }
@@ -328,6 +331,7 @@ void dispatchMoeGemmSelectClusterShapeTmaWarpSpecialized(TmaWarpSpecializedGroup
     int* occupancy, size_t* workspace_size)
 {
     using namespace cute;
+    // This uses the fallback cluster shape for sm100 if a dynamic cluster shape is requested.
     switch (gemm_config.cluster_shape)
     {
 #define SHAPE_CASE(M, N, K)                                                                                            \
@@ -359,7 +363,7 @@ void dispatchMoeGemmSelectClusterShapeTmaWarpSpecialized(TmaWarpSpecializedGroup
         SHAPE_CASE(2, 2, 1)
 
 #undef SHAPE_CASE
-    default: TLLM_THROW("Unsupported config %d for MoE gemm.", (int) gemm_config.cluster_shape);
+    default: TLLM_THROW("Unsupported cluster shape config %d for MoE gemm.", (int) gemm_config.cluster_shape);
     }
 } // namespace tensorrt_llm
 
@@ -387,7 +391,9 @@ void dispatchMoeGemmSelectTileShapeTmaWarpSpecialized(TmaWarpSpecializedGroupedG
     case cutlass_extensions::CutlassTileConfigSM##SMVERSION::ChooseWithHeuristic:                                      \
         TLLM_THROW("GEMM config should have already been set by heuristic.");                                          \
         break;                                                                                                         \
-    default: TLLM_THROW("Unsupported config %d for MoE gemm.", (int) gemm_config.tile_config_sm##SMVERSION); break;
+    default:                                                                                                           \
+        TLLM_THROW("Unsupported tile shape config %d for MoE gemm.", (int) gemm_config.tile_config_sm##SMVERSION);     \
+        break;
 
     if (gemm_config.sm_version == 90)
     {

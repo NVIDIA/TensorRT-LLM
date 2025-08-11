@@ -357,9 +357,6 @@ def is_gemm_op_valid_sm100(op):
 
     # FP4 Has some much more limited sizes
     if op.act_type == e2m1 or op.weight_type == e2m1:
-        # TODO 128x256x256 FP4 compiles but crashes
-        # if tile_n % 64 != 0 or tile_n < 128:
-        #     return False
         if tile_n not in [64, 128, 256] or tile_m != 128:
             return False
         # TODO Revert this once cutlass adds support for blockscaled + no smem

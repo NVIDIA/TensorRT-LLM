@@ -28,6 +28,7 @@ template <typename Arch, typename T, typename WeightType, typename OutputType, t
     typename ClusterShape, bool IsMXFPX, bool DYNAMIC_CGA, bool BIAS>
 void tma_warp_specialized_generic_moe_gemm_kernelLauncher(TmaWarpSpecializedGroupedGemmInput hopper_input,
     int num_experts, int multi_processor_count, cudaStream_t stream, int* kernel_occupancy, size_t* workspace_size,
-    cute::Shape<int32_t, int32_t, cute::_1> dynamic_cluster_shape);
+    cute::Shape<int32_t, int32_t, cute::_1> dynamic_cluster_shape,
+    cute::Shape<int32_t, int32_t, cute::_1> fallback_cluster_shape);
 
 } // namespace tensorrt_llm::kernels::cutlass_kernels
