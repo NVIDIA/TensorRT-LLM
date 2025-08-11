@@ -84,6 +84,8 @@ enum class SplitKStyle
 
 constexpr static int shape_tuple_to_enum(int m, int n, int k)
 {
+    assert(m >= 0 && n >= 0 && k >= 0);
+    assert(m < 1000 && n < 1000 && k < 1000);
     return m * 1000000 + n * 1000 + k;
 }
 
@@ -93,6 +95,8 @@ constexpr static std::tuple<int, int, int> enum_to_shape_tuple(TEnum shape_id_en
     static_assert(std::is_enum_v<TEnum> && std::is_same_v<std::underlying_type_t<TEnum>, int>,
         "TEnum must be an enum with underlying type int");
     auto shape_id = static_cast<int>(shape_id_enum);
+    assert(shape_id >= 0);
+    assert(shape_id < (int) 1e9);
     return std::make_tuple(shape_id / 1000000, (shape_id % 1000000) / 1000, shape_id % 1000);
 }
 
@@ -294,6 +298,10 @@ static std::string get_tile_shape_name(TEnum Shape_MNK)
     if ((int) Shape_MNK == 0)
     {
         return "undefined";
+    }
+    else if ((int) Shape_MNK == 1)
+    {
+        return "heuristic";
     }
     else
     {
