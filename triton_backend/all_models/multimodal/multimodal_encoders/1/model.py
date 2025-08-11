@@ -257,6 +257,9 @@ class TritonPythonModel:
                 image_sizes = from_dlpack(
                     pb_utils.get_input_tensor_by_name(
                         request, 'image_sizes').to_dlpack())
+                # Remove dimension 1, which was added to match the dimensions defined in config.pbtxt
+                assert image_sizes.shape[1] == 1
+                image_sizes.squeeze_(1)
                 from transformers.models.llava_onevision.modeling_llava_onevision import \
                     image_size_to_num_patches
                 image_num_patches = [
@@ -481,6 +484,9 @@ class TritonPythonModel:
                     image_sizes = from_dlpack(
                         pb_utils.get_input_tensor_by_name(
                             request, 'image_sizes').to_dlpack())
+                    # Remove dimension 1, which was added to match the dimensions defined in config.pbtxt
+                    assert image_sizes.shape[1] == 1
+                    image_sizes.squeeze_(1)
                     from transformers.models.llava_onevision.modeling_llava_onevision import \
                         image_size_to_num_patches
                     image_num_patches = [

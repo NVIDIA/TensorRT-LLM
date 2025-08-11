@@ -196,7 +196,6 @@ output [
         dims: [ -1, -1, -1 ]
     },
     # Required for image postprocessing in the llava_onevision and pixtral models
-    # TODO: Unbreak llava!
     {
         name: "IMAGE_SIZES"
         data_type: TYPE_INT64
