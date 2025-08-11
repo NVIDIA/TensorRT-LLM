@@ -66,7 +66,6 @@ class CUDAGraphModelEngine:
         self.padding_enabled = config.cuda_graph_padding_enabled
         self.supported_batch_sizes = engine._cuda_graph_batch_sizes
         self.max_supported_batch_size = engine._max_cuda_graph_batch_size
-        self.batch_size = engine.batch_size
         self.max_beam_width = engine.max_beam_width
 
         # Low-level state, storing resources per batch size
@@ -125,14 +124,13 @@ class CUDAGraphModelEngine:
 
         static_tensors = {
             "input_ids":
-            torch.ones(
-                (self.batch_size * self.max_beam_width * token_per_request, ),
-                device="cuda",
-                dtype=torch.int32),
+            torch.ones((batch_size * self.max_beam_width * token_per_request, ),
+                       device="cuda",
+                       dtype=torch.int32),
             "position_ids":
             torch.zeros((
                 1,
-                self.batch_size * self.max_beam_width * token_per_request,
+                batch_size * self.max_beam_width * token_per_request,
             ),
                         device="cuda",
                         dtype=torch.int32),
