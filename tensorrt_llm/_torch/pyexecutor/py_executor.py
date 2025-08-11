@@ -211,8 +211,7 @@ class PyExecutor:
         self.micro_batches: List[BatchStatePP
                                  | None] = [None] * self.num_micro_batches
         self.send_handles = [None] * self.num_micro_batches
-        self.model_engine.set_lora_manager_cpp_peft_cache_manager(
-            self.resource_manager)
+        self.model_engine.set_lora_manager(self.resource_manager)
         self.model_engine.prefetch_lora_dirs()
 
         self.inflight_req_ids = ReqIdsSet()

@@ -4,7 +4,7 @@ import pytest
 
 from tensorrt_llm import LLM
 from tensorrt_llm.llmapi import KvCacheConfig
-from tensorrt_llm.llmapi.llm_args import PeftCacheConfig
+from tensorrt_llm.llmapi.llm_args import CudaGraphConfig, PeftCacheConfig
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -785,7 +785,9 @@ def test_gqa_nemo_lora(tmp_path):
         llm.shutdown()
 
 
-def test_lora_dir_with_graph():
+@pytest.mark.parametrize("cuda_graph_config",
+                         [None, CudaGraphConfig(max_batch_size=1)])
+def test_lora_dir_with_graph(cuda_graph_config):
     lora_req = LoRARequest(
         "task-0", 0, f"{llm_models_root()}/llama-models/luotuo-lora-7b-0.1")
 
@@ -796,8 +798,7 @@ def test_lora_dir_with_graph():
 
     llm = LLM(model=f"{llm_models_root()}/llama-models/llama-7b-hf",
               lora_config=lora_config,
-              cuda_graph_config=None)
-    #   cuda_graph_config=CudaGraphConfig(max_batch_size=1))
+              cuda_graph_config=cuda_graph_config)
 
     prompts = [
         "美国的首都在哪里? \n答案:",
@@ -813,3 +814,71 @@ def test_lora_dir_with_graph():
     assert similar(outputs[0].outputs[0].text, references[0])
     print(f"lora output: {outputs[0].outputs[0].text}")
     print(f"ref  output: {references[0]}")
+
+
+def test_lora_graph_single_request():
+    lora_req = LoRARequest(
+        "task-0", 0, f"{llm_models_root()}/llama-models/luotuo-lora-7b-0.1")
+
+    lora_config = LoraConfig(
+        lora_dir=[f"{llm_models_root()}/llama-models/luotuo-lora-7b-0.1"],
+        max_lora_rank=8,
+        lora_request=[lora_req])
+
+    llm = LLM(model=f"{llm_models_root()}/llama-models/llama-7b-hf",
+              lora_config=lora_config,
+              cuda_graph_config=CudaGraphConfig(max_batch_size=1))
+
+    prompts = [
+        "美国的首都在哪里? \n答案:",
+    ]
+    references = [
+        "美国的首都是华盛顿。\n\n美国的",
+    ]
+    sampling_params = SamplingParams(max_tokens=20)
+    lora_request = [lora_req]
+
+    outputs = llm.generate(prompts, sampling_params, lora_request=lora_request)
+
+    assert similar(outputs[0].outputs[0].text, references[0])
+    print(f"lora output: {outputs[0].outputs[0].text}")
+    print(f"ref  output: {references[0]}")
+
+
+def test_lora_graph_multiple_requests():
+    lora_req = LoRARequest(
+        "task-0", 0, f"{llm_models_root()}/llama-models/luotuo-lora-7b-0.1")
+    lora_req2 = LoRARequest(
+        "task-1", 1,
+        f"{llm_models_root()}/llama-models/Japanese-Alpaca-LoRA-7b-v0")
+
+    lora_requests = [lora_req, lora_req2]
+    lora_config = LoraConfig(
+        lora_dir=[f"{llm_models_root()}/llama-models/luotuo-lora-7b-0.1"],
+        max_lora_rank=8,
+        lora_request=lora_requests)
+
+    llm = LLM(
+        model=f"{llm_models_root()}/llama-models/llama-7b-hf",
+        lora_config=lora_config,
+        #   cuda_graph_config=None)
+        cuda_graph_config=CudaGraphConfig(max_batch_size=2))
+
+    prompts = [
+        "美国的首都在哪里? \n答案:",
+        "美国的首都在哪里? \n答案:",
+    ]
+    references = [
+        "美国的首都是华盛顿。\n\n美国的",
+        "纽约\n\n### カンファレンスの",
+    ]
+    sampling_params = SamplingParams(max_tokens=20)
+
+    outputs = llm.generate(prompts, sampling_params, lora_request=lora_requests)
+
+    print(f"lora output 0: {outputs[0].outputs[0].text}")
+    print(f"ref  output 0: {references[0]}")
+    print(f"lora output 1: {outputs[1].outputs[0].text}")
+    print(f"ref  output 1: {references[1]}")
+    assert similar(outputs[0].outputs[0].text, references[0])
+    assert similar(outputs[1].outputs[0].text, references[1])

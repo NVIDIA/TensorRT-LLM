@@ -386,21 +386,21 @@ class KVCacheManager(BaseResourceManager):
                 self.impl.add_token(req.py_request_id)
 
     def add_dummy_requests(
-        self,
-        request_ids: List[int],
-        # Note that token_nums should be past_kv_len + input_len (without
-        # spec decoding). The draft tokens will be added in this function,
-        # so we don't need to take care of it in the caller. When preparing
-        # token_nums, we should not take the draft tokens into account, so
-        # don't use the kv_cache_manager.max_seq_len, which includes both
-        # extra tokens and draft tokens.
-        token_nums: Optional[List[int]] = None,
-        is_gen: bool = False,
-        prepare_resource: bool = True,
-        max_num_draft_tokens: int = 0,
-        use_mrope: bool = False,
-        max_beam_width: int = 1,
-        lora_request=None,
+            self,
+            request_ids: List[int],
+            # Note that token_nums should be past_kv_len + input_len (without
+            # spec decoding). The draft tokens will be added in this function,
+            # so we don't need to take care of it in the caller. When preparing
+            # token_nums, we should not take the draft tokens into account, so
+            # don't use the kv_cache_manager.max_seq_len, which includes both
+            # extra tokens and draft tokens.
+            token_nums: Optional[List[int]] = None,
+            is_gen: bool = False,
+            prepare_resource: bool = True,
+            max_num_draft_tokens: int = 0,
+            use_mrope: bool = False,
+            max_beam_width: int = 1,
+            lora_request: Optional[List] = None,  # TODO smor fill type hint
     ):
         beam_width = max_beam_width
         requests = []
@@ -425,11 +425,14 @@ class KVCacheManager(BaseResourceManager):
             lora_weights = None
             lora_config = None
 
-            if lora_request is not None:
+            if lora_request is not None and i < len(lora_request):
                 # TODO smor currently work with single adapter only, not sure how this should work with request ids
-                lora_task_id = lora_request.task_id
-                lora_weights = lora_request.weights
-                lora_config = lora_request.config
+                # print("SMOR, resource manager, handling lora_request parameter in add_dummy_requests, how it works with multiple requests?")
+                # from IPython import embed
+                # embed()
+                lora_task_id = lora_request[i].task_id
+                lora_weights = lora_request[i].weights
+                lora_config = lora_request[i].config
 
             req = LlmRequest(request_id=req_id,
                              max_new_tokens=1,
@@ -1255,6 +1258,10 @@ class PeftCacheManager(BaseResourceManager):
                      reset_gpu_cache: bool = False) -> List[LlmRequest]:
         return self.impl.ensure_batch(context_batch, generation_batch,
                                       reset_gpu_cache)
+
+    def get_lora_manager(self):
+        assert self._lora_manager is not None, "Lora manager not initialized"
+        return self._lora_manager
 
     def get_max_resource_count(self) -> int:
         return 0
