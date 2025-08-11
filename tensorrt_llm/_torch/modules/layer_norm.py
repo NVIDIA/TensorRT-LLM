@@ -86,11 +86,13 @@ class LayerNorm(nn.Module):
             hidden_states = hidden_states + residual.to(torch.float32)
             residual = hidden_states.to(input_dtype)
 
-        mean = hidden_states.mean(-1, keepdim=True)
-        variance = hidden_states.var(-1, keepdim=True, unbiased=False)
-        hidden_states = (hidden_states -
-                         mean) * torch.rsqrt(variance + self.variance_epsilon)
-        hidden_states = self.weight * hidden_states.to(input_dtype) + self.bias
+        hidden_states = nn.functional.layer_norm(
+            hidden_states,
+            hidden_states.shape[-1],
+            weight=self.weight,
+            bias=self.bias,
+            eps=self.variance_epsilon,
+        )
 
         if residual is ...:
             return hidden_states
