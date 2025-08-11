@@ -108,7 +108,7 @@ def masked_index_copy_group_quant_fp8(
     row_size = output.shape[0]
     col_size = output.shape[1]
     dim_size = output.shape[2]
-    
+
     alignment = 4
     scale_dim = (dim_size + group_size - 1) // group_size
     padded_dim_size = (scale_dim + alignment - 1) // alignment * alignment
@@ -335,32 +335,33 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
             apply_router_weight_on_input=apply_router_weight_on_input,
             layer_idx=layer_idx,
         )
-    
+
     def get_workspace(self, m_max: int, group_size: int):
         hidden_size_0 = max(self.hidden_size, self.w3_w1_weight.shape[1] // 2)
         workspace_0 = torch.empty(
             (self.expert_size_per_partition * m_max * hidden_size_0),
             dtype=torch.float8_e4m3fn,
             device='cuda')
-        
-        hidden_size_1 = max(self.w3_w1_weight.shape[1], self.w2_weight.shape[1])
+
+        max(self.w3_w1_weight.shape[1], self.w2_weight.shape[1])
         workspace_1 = torch.empty(
             (self.expert_size_per_partition * m_max * self.hidden_size),
             dtype=torch.bfloat16,
             device='cuda')
-        
+
         alignment = 4
         scale_dim = (self.hidden_size + group_size - 1) // group_size
         padded_dim_size = (scale_dim + alignment - 1) // alignment * alignment
         padded_col_size = (m_max + alignment - 1) // alignment * alignment
-        scale_k = (self.w3_w1_weight.shape[1] // 2 + group_size - 1) // group_size
+        scale_k = (self.w3_w1_weight.shape[1] // 2 + group_size -
+                   1) // group_size
         scale_k_padded = (scale_k + alignment - 1) // alignment * alignment
         row_size = max(padded_dim_size // 4, scale_k_padded // 4)
         workspace_sf = torch.empty(
             (self.expert_size_per_partition * row_size * padded_col_size),
             dtype=torch.int32,
             device='cuda')
-        
+
         workspace = {
             "workspace_0": workspace_0,
             "workspace_1": workspace_1,
@@ -469,7 +470,9 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
                       1) // self.expert_size_per_partition
         # prepare workspace
         m_max = (x.shape[0] + 127) // 128 * 128
-        act_input_fp8 = workspace["workspace_0"][0: self.expert_size_per_partition * m_max * self.hidden_size]
+        act_input_fp8 = workspace["workspace_0"][0:self.
+                                                 expert_size_per_partition *
+                                                 m_max * self.hidden_size]
         # act_input_fp8.view(self.expert_size_per_partition, m_max, self.hidden_size)
         act_input_fp8 = act_input_fp8.as_strided(
             size=(self.expert_size_per_partition, m_max, self.hidden_size),
@@ -479,10 +482,14 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
         scale_dim = (self.hidden_size + 128 - 1) // 128
         padded_dim_size = (scale_dim + alignment - 1) // alignment * alignment
         padded_col_size = (m_max + alignment - 1) // alignment * alignment
-        act_input_sf = workspace["workspace_sf"][0: self.expert_size_per_partition * padded_dim_size // 4 * padded_col_size]
+        act_input_sf = workspace["workspace_sf"][0:self.
+                                                 expert_size_per_partition *
+                                                 padded_dim_size // 4 *
+                                                 padded_col_size]
         # act_input_sf.view(self.expert_size_per_partition, padded_dim_size // 4, padded_col_size)
         act_input_sf = act_input_sf.as_strided(
-            size=(self.expert_size_per_partition, padded_dim_size // 4, padded_col_size),
+            size=(self.expert_size_per_partition, padded_dim_size // 4,
+                  padded_col_size),
             stride=(padded_dim_size // 4 * padded_col_size, padded_col_size, 1),
         )
         act_input_sf = masked_index_copy_group_quant_fp8(
@@ -492,13 +499,16 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
             expert_first_token_offset_tensor,
             token_to_expert_map,
             group_size=128)
-        
+
         # prepare workspace
-        h1 = workspace["workspace_1"][0: self.expert_size_per_partition * m_max * self.w3_w1_weight.shape[1]]
+        h1 = workspace["workspace_1"][0:self.expert_size_per_partition * m_max *
+                                      self.w3_w1_weight.shape[1]]
         # h1.view(self.expert_size_per_partition, m_max, self.w3_w1_weight.shape[1])
         h1 = h1.as_strided(
-            size=(self.expert_size_per_partition, m_max, self.w3_w1_weight.shape[1]),
-            stride=(m_max * self.w3_w1_weight.shape[1], self.w3_w1_weight.shape[1], 1),
+            size=(self.expert_size_per_partition, m_max,
+                  self.w3_w1_weight.shape[1]),
+            stride=(m_max * self.w3_w1_weight.shape[1],
+                    self.w3_w1_weight.shape[1], 1),
         )
         deepgemm_fp8_group_blockwise_gemm(
             d=h1,
@@ -509,32 +519,44 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
             masked_m=masked_m,
             expected_m=expected_m,
         )
-        
+
         # prepare workspace
-        h2 = workspace["workspace_0"][0: self.expert_size_per_partition * m_max * self.w3_w1_weight.shape[1] // 2]
+        h2 = workspace["workspace_0"][0:self.expert_size_per_partition * m_max *
+                                      self.w3_w1_weight.shape[1] // 2]
         # h2.view(self.expert_size_per_partition, m_max, self.w3_w1_weight.shape[1] // 2)
         h2 = h2.as_strided(
-            size=(self.expert_size_per_partition, m_max, self.w3_w1_weight.shape[1] // 2),
-            stride=(m_max * self.w3_w1_weight.shape[1] // 2, self.w3_w1_weight.shape[1] // 2, 1),
+            size=(self.expert_size_per_partition, m_max,
+                  self.w3_w1_weight.shape[1] // 2),
+            stride=(m_max * self.w3_w1_weight.shape[1] // 2,
+                    self.w3_w1_weight.shape[1] // 2, 1),
         )
         scale_k = (self.w3_w1_weight.shape[1] // 2 + 128 - 1) // 128
         scale_k_padded = (scale_k + alignment - 1) // alignment * alignment
-        h2_sf = workspace["workspace_sf"][0: self.expert_size_per_partition * scale_k_padded // 4 * padded_col_size]
+        h2_sf = workspace["workspace_sf"][0:self.expert_size_per_partition *
+                                          scale_k_padded // 4 * padded_col_size]
         # h2_sf.view(self.expert_size_per_partition, scale_k_padded // 4, padded_col_size)
         h2_sf = h2_sf.as_strided(
-            size=(self.expert_size_per_partition, scale_k_padded // 4, padded_col_size),
+            size=(self.expert_size_per_partition, scale_k_padded // 4,
+                  padded_col_size),
             stride=(scale_k_padded // 4 * padded_col_size, padded_col_size, 1),
         )
         act_input_sf = fp8_utils.silu_and_mul_masked_post_quant_fwd(
-            output=h2, output_scale=h2_sf,
-            input=h1, quant_group_size=128, masked_m=masked_m, scale_ue8m0=True)
-        
+            output=h2,
+            output_scale=h2_sf,
+            input=h1,
+            quant_group_size=128,
+            masked_m=masked_m,
+            scale_ue8m0=True)
+
         # prepare workspace
-        h3 = workspace["workspace_1"][0: self.expert_size_per_partition * m_max * self.w2_weight.shape[1]]
+        h3 = workspace["workspace_1"][0:self.expert_size_per_partition * m_max *
+                                      self.w2_weight.shape[1]]
         # h3.view(self.expert_size_per_partition, m_max, self.w2_weight.shape[1])
         h3 = h3.as_strided(
-            size=(self.expert_size_per_partition, m_max, self.w2_weight.shape[1]),
-            stride=(m_max * self.w2_weight.shape[1], self.w2_weight.shape[1], 1),
+            size=(self.expert_size_per_partition, m_max,
+                  self.w2_weight.shape[1]),
+            stride=(m_max * self.w2_weight.shape[1], self.w2_weight.shape[1],
+                    1),
         )
         deepgemm_fp8_group_blockwise_gemm(
             d=h3,
@@ -630,12 +652,16 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
             else:
                 all_rank_num_tokens_list = [None] * num_chunks
                 chunk_size_list = self.split_chunk(x.shape[0], num_chunks)
-                
+
             # create workspace
-            chunk_size_0 = sum(all_rank_num_tokens_list[0]) if self.use_dp else chunk_size_list[0]
-            workspace_0 = self.get_workspace((chunk_size_0 + 127) // 128 * 128, 128)
-            chunk_size_1 = sum(all_rank_num_tokens_list[1]) if self.use_dp else chunk_size_list[1]
-            workspace_1 = self.get_workspace((chunk_size_1 + 127) // 128 * 128, 128)
+            chunk_size_0 = sum(all_rank_num_tokens_list[0]
+                               ) if self.use_dp else chunk_size_list[0]
+            workspace_0 = self.get_workspace((chunk_size_0 + 127) // 128 * 128,
+                                             128)
+            chunk_size_1 = sum(all_rank_num_tokens_list[1]
+                               ) if self.use_dp else chunk_size_list[1]
+            workspace_1 = self.get_workspace((chunk_size_1 + 127) // 128 * 128,
+                                             128)
 
             x_list = x.split(chunk_size_list)
             router_logits_list = router_logits.split(chunk_size_list)
@@ -645,11 +671,6 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
                 self.event_dict[EventType.Main].wait()
 
             def _forward_chunk(x_, router_logits_, idx, workspace):
-                # num_rows = x_.shape[0]
-                # if self.use_dp:
-                #     num_rows = sum(all_rank_num_tokens_list[idx])
-                # m_max = (num_rows + 127) // 128 * 128
-                # workspace = self.get_workspace(m_max, 128)
                 return self.forward_chunk(
                     x_,
                     router_logits_,
@@ -671,20 +692,14 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
 
                 if idx_chunk % 2 == 0:
                     with torch.cuda.stream(self.aux_stream):
-                        chunk_size = sum(all_rank_num_tokens_list[idx_chunk]) if self.use_dp else chunk_size_list[idx_chunk]
-                        if chunk_size != chunk_size_0:
-                            workspace_0 = self.get_workspace((chunk_size + 127) // 128 * 128, 128)
-                            chunk_size_0 = chunk_size
-                        outputs = _forward_chunk(x, router_logits, idx_chunk, workspace_0)
+                        outputs = _forward_chunk(x, router_logits, idx_chunk,
+                                                 workspace_0)
                     if idx_chunk > 0:
                         outputs_list[-1] = _reducescatter_or_allreduce(
                             outputs_list[-1], idx_chunk - 1)
                 else:
-                    chunk_size = sum(all_rank_num_tokens_list[idx_chunk]) if self.use_dp else chunk_size_list[idx_chunk]
-                    if chunk_size != chunk_size_1:
-                        workspace_1 = self.get_workspace((chunk_size + 127) // 128 * 128, 128)
-                        chunk_size_1 = chunk_size
-                    outputs = _forward_chunk(x, router_logits, idx_chunk, workspace_1)
+                    outputs = _forward_chunk(x, router_logits, idx_chunk,
+                                             workspace_1)
                     with torch.cuda.stream(self.aux_stream):
                         outputs_list[-1] = _reducescatter_or_allreduce(
                             outputs_list[-1], idx_chunk - 1)
