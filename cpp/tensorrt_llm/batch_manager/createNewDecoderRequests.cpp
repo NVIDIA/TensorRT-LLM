@@ -176,7 +176,7 @@ void CreateNewDecoderRequests::newRequest(SizeType32 batchSlot, runtime::decoder
 
     BufferManager manager{std::make_shared<CudaStream>(decoderStream.get())};
 
-    auto const batchSize = decoderState.getMaxBatchSize();
+    auto const batchSize = decoderState.getMaxNumSequences();
     TLLM_CHECK(0 <= batchSize && batchSlot < batchSize);
     auto const maxBeamWidth = decoderState.getMaxBeamWidth();
     auto const beamWidth = samplingConfig.beamWidth;
@@ -272,22 +272,8 @@ void CreateNewDecoderRequests::newRequest(SizeType32 batchSlot, runtime::decoder
         manager.setZero(*newTokensVec);
     }
 
-    // FIXME: we call setZero mMaxDecodingEngineTokens times for only 1 element
-    for (SizeType32 ti = 0; ti < decoderState.getMaxDecodingEngineTokens(); ++ti)
-    {
-        TensorPtr const finishedStepsView = ITensor::slice(decoderState.getFinishedSteps(), ti, 1);
-        finishedStepsView->squeeze(0);
-        TensorPtr const finishedSteps = ITensor::slice(finishedStepsView, batchSlot, 1);
-        if (ti < numDecodingEngineTokens)
-        {
-            manager.setZero(*finishedSteps);
-        }
-        else
-        {
-            runtime::kernels::invokeFill(
-                *finishedSteps, tk::FinishedState::skipDecoding().toUnderlying(), decoderStream);
-        }
-    }
+    TensorPtr const finishedStepsSlice = ITensor::slice(decoderState.getFinishReasons(), batchSlot, 1);
+    manager.setZero(*finishedStepsSlice);
 
     // cumLogProb is mandatory for beamWidth > 1
     if ((samplingConfig.cumLogProbs.has_value() && samplingConfig.cumLogProbs->at(0)) || beamWidth > 1)

@@ -162,7 +162,8 @@ def test_KvCacheConfig_declaration():
                            secondary_offload_min_priority=1,
                            event_buffer_max_size=0,
                            enable_partial_reuse=True,
-                           copy_on_partial_reuse=True)
+                           copy_on_partial_reuse=True,
+                           attention_dp_events_gather_period_ms=10)
 
     pybind_config = config._to_pybind()
     assert pybind_config.enable_block_reuse == True
@@ -177,6 +178,7 @@ def test_KvCacheConfig_declaration():
     assert pybind_config.event_buffer_max_size == 0
     assert pybind_config.enable_partial_reuse == True
     assert pybind_config.copy_on_partial_reuse == True
+    assert pybind_config.attention_dp_events_gather_period_ms == 10
 
 
 def test_KvCacheConfig_default_values():
@@ -223,10 +225,6 @@ def test_SchedulerConfig_declaration():
                                       config.dynamic_batch_config._to_pybind())
 
 
-def test_PeftCacheConfig_default_values():
-    check_defaults(PeftCacheConfig, tle.PeftCacheConfig)
-
-
 def test_PeftCacheConfig_declaration():
     config = PeftCacheConfig(num_host_module_layer=1,
                              num_device_module_layer=1,
@@ -254,6 +252,67 @@ def test_PeftCacheConfig_declaration():
     assert pybind_config.device_cache_percent == 0.5
     assert pybind_config.host_cache_size == 1024
     assert pybind_config.lora_prefetch_dir == "."
+
+
+def test_PeftCacheConfig_from_pybind():
+    pybind_config = tle.PeftCacheConfig(num_host_module_layer=1,
+                                        num_device_module_layer=1,
+                                        optimal_adapter_size=64,
+                                        max_adapter_size=128,
+                                        num_put_workers=1,
+                                        num_ensure_workers=1,
+                                        num_copy_streams=1,
+                                        max_pages_per_block_host=24,
+                                        max_pages_per_block_device=8,
+                                        device_cache_percent=0.5,
+                                        host_cache_size=1024,
+                                        lora_prefetch_dir=".")
+
+    config = PeftCacheConfig.from_pybind(pybind_config)
+    assert config.num_host_module_layer == 1
+    assert config.num_device_module_layer == 1
+    assert config.optimal_adapter_size == 64
+    assert config.max_adapter_size == 128
+    assert config.num_put_workers == 1
+    assert config.num_ensure_workers == 1
+    assert config.num_copy_streams == 1
+    assert config.max_pages_per_block_host == 24
+    assert config.max_pages_per_block_device == 8
+    assert config.device_cache_percent == 0.5
+    assert config.host_cache_size == 1024
+    assert config.lora_prefetch_dir == "."
+
+
+def test_PeftCacheConfig_from_pybind_gets_python_only_default_values_when_none(
+):
+    pybind_config = tle.PeftCacheConfig(num_host_module_layer=1,
+                                        num_device_module_layer=1,
+                                        optimal_adapter_size=64,
+                                        max_adapter_size=128,
+                                        num_put_workers=1,
+                                        num_ensure_workers=1,
+                                        num_copy_streams=1,
+                                        max_pages_per_block_host=24,
+                                        max_pages_per_block_device=8,
+                                        device_cache_percent=None,
+                                        host_cache_size=None,
+                                        lora_prefetch_dir=".")
+
+    config = PeftCacheConfig.from_pybind(pybind_config)
+    assert config.num_host_module_layer == 1
+    assert config.num_device_module_layer == 1
+    assert config.optimal_adapter_size == 64
+    assert config.max_adapter_size == 128
+    assert config.num_put_workers == 1
+    assert config.num_ensure_workers == 1
+    assert config.num_copy_streams == 1
+    assert config.max_pages_per_block_host == 24
+    assert config.max_pages_per_block_device == 8
+    assert config.device_cache_percent == PeftCacheConfig.model_fields[
+        "device_cache_percent"].default
+    assert config.host_cache_size == PeftCacheConfig.model_fields[
+        "host_cache_size"].default
+    assert config.lora_prefetch_dir == "."
 
 
 def test_update_llm_args_with_extra_dict_with_nested_dict():

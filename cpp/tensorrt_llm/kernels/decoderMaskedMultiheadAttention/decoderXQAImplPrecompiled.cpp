@@ -97,7 +97,7 @@ public:
             }
             XQAKernelRuntimeHashKey hash_key{kernelMeta.mKVDataType, kernelMeta.mHeadDim, kernelMeta.mBeamWidth,
                 kernelMeta.mNumQHeadsOverKV, kernelMeta.mMTileSize, kernelMeta.mTokensPerPage, kernelMeta.mPagedKVCache,
-                kernelMeta.mMultiQueryTokens, 0 /* xqa jit param is_fp8_output */};
+                kernelMeta.mMultiQueryTokens, false, std::nullopt};
 
             mFunctions.insert(std::make_pair(hash_key, funcInfo));
         }
@@ -128,7 +128,8 @@ public:
         XQAKernelRuntimeHashKey hash_key
             = {xqaParams.kv_cache_data_type, head_size, beam_width, kernel_num_q_heads_over_kv, m_tilesize,
                 xqaParams.paged_kv_cache ? static_cast<unsigned int>(xqaParams.tokens_per_block) : 0,
-                xqaParams.paged_kv_cache, xqaParams.multi_query_tokens, 0 /* xqa jit param is_fp8_output */};
+                xqaParams.paged_kv_cache, xqaParams.multi_query_tokens, 0, /* xqa jit param is_fp8_output */
+                std::nullopt};
         auto const findIter = mFunctions.find(hash_key);
         return findIter != mFunctions.end();
     }
@@ -286,14 +287,8 @@ public:
             void* kernelParams[] = {&maxQSeqLen, &launchParams.num_k_heads, &headGrpSize, &cuQSeqLens,
                 &launchParams.output, &xqa_q_input_ptr, &maskPtr, &launchParams.kvCacheParams, &launchParams.batch_size,
                 &launchParams.kv_scale_quant_orig, &launchParams.scratch};
+            // precompiled XQA Spec-dec kernel does not support multi-block mode
             int multi_block = 1;
-            if (xqaParams.multi_block_mode)
-            {
-                multi_block = computeMultiBlockCount(xqaParams, xqaParams.batch_size, multiprocessor_count);
-                check_cuda_error(cudaMemsetAsync(xqaParams.workspaces, 0,
-                    sizeof(int) * xqaParams.batch_size * qSeqLen * xqaParams.num_kv_heads, stream));
-                sync_check_cuda_error(stream);
-            }
             TLLM_CU_CHECK(mDriver->cuLaunchKernel(func, multi_block, xqaParams.num_kv_heads * nbTokenBlocksPerGrp,
                 xqaParams.batch_size, 128, 1, 2, shared_mem_bytes, stream, kernelParams, nullptr));
         }

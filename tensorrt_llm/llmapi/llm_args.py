@@ -3,12 +3,13 @@ import functools
 import json
 import math
 import os
+import types
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum, EnumMeta
 from pathlib import Path
 from typing import (TYPE_CHECKING, Any, ClassVar, Dict, List, Literal, Optional,
-                    TypeAlias, Union)
+                    Type, TypeAlias, TypeVar, Union, get_args, get_origin)
 
 import torch
 import yaml
@@ -59,6 +60,8 @@ from .tokenizer import TokenizerBase, tokenizer_factory
 from .utils import generate_api_docs_as_docstring, get_type_repr
 
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
+
+TypeBaseModel = TypeVar("T", bound=BaseModel)
 
 
 def Field(default: Any = ...,
@@ -146,7 +149,7 @@ class CudaGraphConfig(StrictBaseModel):
 
         # Add powers of 2 up to max_batch_size
         batch_sizes += [
-            2**i for i in range(8, math.floor(math.log(max_batch_size, 2)))
+            2**i for i in range(8, math.ceil(math.log(max_batch_size, 2)))
         ]
 
         # Filter and sort batch sizes
@@ -164,9 +167,10 @@ class MoeConfig(StrictBaseModel):
     """
     Configuration for MoE.
     """
-    backend: Literal["CUTLASS", "CUTEDSL", "WIDEEP", "TRTLLM",
-                     "VANILLA"] = Field(default='CUTLASS',
-                                        description="MoE backend to use.")
+    backend: Literal["CUTLASS", "CUTEDSL", "WIDEEP", "TRTLLM", "DEEPGEMM",
+                     "VANILLA",
+                     "TRITON"] = Field(default='CUTLASS',
+                                       description="MoE backend to use.")
 
     max_num_tokens: Optional[int] = Field(
         default=None,
@@ -178,6 +182,23 @@ class MoeConfig(StrictBaseModel):
         default=None,
         description="Configuration for MoE load balancing.",
         json_schema_extra={"type": "Union[MoeLoadBalancerConfig, str]"})
+
+    @classmethod
+    def from_dict(cls, data: dict):
+        return cls(**data)
+
+
+class AttentionDpConfig(StrictBaseModel):
+    """
+    Configuration for attention DP.
+    """
+    enable_balance: bool = Field(default=False,
+                                 description="Whether to enable balance.")
+    timeout_iters: int = Field(
+        default=50, description="The number of iterations to timeout.")
+    batching_wait_iters: int = Field(
+        default=10,
+        description="The number of iterations to wait for batching.")
 
     @classmethod
     def from_dict(cls, data: dict):
@@ -321,6 +342,11 @@ class DecodingBaseConfig(StrictBaseModel):
     max_draft_len: Optional[int] = None
     speculative_model_dir: Optional[Union[str, Path]] = None
 
+    # PyTorch only.
+    # When specified, speculation will be disabled at batch sizes above
+    # this value. Otherwise, speculation will always be on.
+    max_concurrency: Optional[int] = None
+
     @classmethod
     def from_dict(cls, data: dict):
         # dispatch to the correct decoding config
@@ -333,6 +359,7 @@ class DecodingBaseConfig(StrictBaseModel):
             "NGram": NGramDecodingConfig,
             "DraftTarget": DraftTargetDecodingConfig,
             "UserProvided": UserProvidedDecodingConfig,
+            "AUTO": AutoDecodingConfig,
         }
 
         config_class = config_classes.get(decoding_type)
@@ -443,8 +470,7 @@ class NGramDecodingConfig(DecodingBaseConfig):
         is_public_pool: bool = True
             Whether to use a common pool for all requests, or the pool is private for each request if False.
     """
-
-    max_matching_ngram_size: int = 4
+    max_matching_ngram_size: int = 0
     is_keep_all: bool = True
     is_use_oldest: bool = True
     is_public_pool: bool = True
@@ -505,6 +531,26 @@ class MTPDecodingConfig(DecodingBaseConfig):
         if self.num_nextn_predict_layers_from_model_config == 1 and not self.use_mtp_vanilla:
             return TorchSpeculativeDecodingMode.MTP_EAGLE
         return TorchSpeculativeDecodingMode.MTP
+
+
+class AutoDecodingConfig(DecodingBaseConfig):
+    """
+    Configuration for auto speculative decoding.
+
+    This config will automatically select a good, draft-model free
+    speculation algorithm with some heuristic.
+
+    Attributes that are inherited from the base class are ignored.
+    """
+
+    @classmethod
+    def from_dict(cls, data: dict):
+        return cls(**data)
+
+    decoding_type: ClassVar[str] = "AUTO"
+
+    def supports_backend(self, backend: str) -> bool:
+        return backend == "pytorch"
 
 
 class PybindMirror(ABC):
@@ -596,6 +642,62 @@ class PybindMirror(ABC):
             if getattr(obj0, field) != getattr(obj1, field):
                 return False
         return True
+
+    @classmethod
+    def from_pybind(cls: Type[TypeBaseModel],
+                    pybind_instance: "PybindMirror") -> TypeBaseModel:
+        """Construct an instance of the given class from the fields in the given
+        pybind class instance.
+
+        Args:
+            cls: Type of the class to construct, must be a subclass of pydantic
+                 BaseModel
+            pybind_instance: Instance of the pybind class to construct from its
+                             fields
+
+        Notes:
+            When a field value is None in the pybind class, but it's not
+            optional and has a default value in the BaseModel class, it would
+            get the default value defined in the BaseModel class.
+
+        Returns:
+            Instance of the given class, populated with the fields of the given
+            pybind instance
+        """  # noqa: D205
+        assert issubclass(cls, BaseModel)
+
+        # Some of the fields are optional in the C++ class but in python they aren't
+        # optional and have a default value, so copy the value from C++ instance
+        # only if it has a value, so otherwise the default value defined in the
+        # python class would be set.
+        def _is_optional_type(annotation: Any) -> bool:
+            """Returns True if a type annotation represents an Optional type
+            (Optional[X]) or a Union type that includes None (Union[X, Y, None]
+            or X | Y | None).
+            """  # noqa: D205
+            origin = get_origin(annotation)
+            args = get_args(annotation)
+
+            # Union is for Optional[x]
+            # UnionType is for the new | operation in Python 3.10+
+            return (origin is Union
+                    or origin is types.UnionType) and type(None) in args
+
+        fields_non_optional_with_default_value_in_basemodel = {
+            field_name
+            for field_name, field_info in cls.model_fields.items()
+            if not (_is_optional_type(field_info.annotation)
+                    and field_info.is_required())
+        }
+
+        kwargs = {}
+        cpp_fields = PybindMirror.get_pybind_variable_fields(
+            type(pybind_instance))
+        for field_name in cpp_fields:
+            field_value = getattr(pybind_instance, field_name)
+            if field_value is not None or field_name not in fields_non_optional_with_default_value_in_basemodel:
+                kwargs[field_name] = field_value
+        return cls(**kwargs)
 
 
 class PybindMirrorMeta(type(PybindMirror)):
@@ -694,11 +796,12 @@ class PeftCacheConfig(StrictBaseModel, PybindMirror):
         default=0,
         description=
         "number of max sized 1-layer 1-module adapterSize=1 sets of weights that can be stored in host cache"
-    )
+        ", affects host cache size and overrides value of host_cache_size")
     num_device_module_layer: int = Field(
         default=0,
         description=
-        "number of max sized 1-layer 1-module sets of weights that can be stored in host cache"
+        "number of max sized 1-layer 1-module sets of weights that can be stored in device cache"
+        ", affects device cache size and overrides value of device_cache_percent"
     )
     optimal_adapter_size: int = Field(
         default=
@@ -725,15 +828,17 @@ class PeftCacheConfig(StrictBaseModel, PybindMirror):
     max_pages_per_block_device: int = Field(
         default=8,
         description="Number of cache pages per allocation block (device)")
-    device_cache_percent: Optional[float] = Field(
-        default=None,
-        description="percent of memory after engine load to use for cache")
-    host_cache_size: Optional[int] = Field(
-        default=None, description="size in bytes to use for host cache")
+    device_cache_percent: float = Field(
+        default=0.02,
+        description=
+        "Proportion of free device memory after engine load to use for cache, as a fraction from 0 to 1"
+    )
+    host_cache_size: int = Field(
+        default=1024**3, description="size in bytes to use for host cache")
     lora_prefetch_dir: Optional[str] = Field(
         default=None,
         description=
-        "folder to store the LoRA weights we hope to load during engine initialization"
+        "folder to store the LoRA weights we hope to load during engine initialization, currently not supported"
     )
 
     def _to_pybind(self):
@@ -810,6 +915,7 @@ SpeculativeConfig: TypeAlias = Optional[Union[
     MTPDecodingConfig,
     NGramDecodingConfig,
     UserProvidedDecodingConfig,
+    AutoDecodingConfig,
 ]]
 
 
@@ -863,6 +969,11 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         description=
         "Maximum size of the event buffer. If set to 0, the event buffer will not be used."
     )
+    attention_dp_events_gather_period_ms: int = Field(
+        default=5,
+        description=
+        "The period in milliseconds to gather attention DP events across ranks."
+    )
     enable_partial_reuse: bool = Field(
         default=True,
         description=
@@ -879,6 +990,14 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
     dtype: str = Field(default="auto",
                        description="The data type to use for the KV cache.")
 
+    # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
+    mamba_ssm_cache_dtype: Literal[
+        "auto", "float16", "bfloat16", "float32"] = Field(
+            default="auto",
+            description=
+            "The data type to use for the Mamba SSM cache. If set to 'auto', the data type will be inferred from the model config."
+        )
+
     def _to_pybind(self):
         return _KvCacheConfig(
             enable_block_reuse=self.enable_block_reuse,
@@ -893,7 +1012,10 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             event_buffer_max_size=self.event_buffer_max_size,
             enable_partial_reuse=self.enable_partial_reuse,
             copy_on_partial_reuse=self.copy_on_partial_reuse,
-            use_uvm=self.use_uvm)
+            use_uvm=self.use_uvm,
+            attention_dp_events_gather_period_ms=self.
+            attention_dp_events_gather_period_ms,
+        )
 
 
 @PybindMirror.mirror_pybind_fields(_ExtendedRuntimePerfKnobConfig)
@@ -1083,27 +1205,6 @@ class BaseLlmArgs(StrictBaseModel):
     # LoRA arguments
     enable_lora: bool = Field(default=False, description="Enable LoRA.")
 
-    max_lora_rank: Optional[int] = Field(
-        default=None,
-        description="The maximum LoRA rank.",
-        deprecated="Use lora_config.max_lora_rank instead.",
-        status="deprecated",
-    )
-
-    max_loras: int = Field(
-        default=4,
-        description="The maximum number of LoRA.",
-        deprecated="Use lora_config.max_loras instead.",
-        status="deprecated",
-    )
-
-    max_cpu_loras: int = Field(
-        default=4,
-        description="The maximum number of LoRA on CPU.",
-        deprecated="Use lora_config.max_cpu_loras instead.",
-        status="deprecated",
-    )
-
     lora_config: Optional[LoraConfig] = Field(
         default=None, description="LoRA configuration for the model.")
 
@@ -1218,6 +1319,10 @@ class BaseLlmArgs(StrictBaseModel):
         status="deprecated",
     )
 
+    return_perf_metrics: bool = Field(default=False,
+                                      description="Return perf metrics.",
+                                      status="prototype")
+
     _parallel_config: Optional[object] = PrivateAttr(default=None)
     _model_format: Optional[_ModelFormatKind] = PrivateAttr(default=None)
     _speculative_model: Optional[str] = PrivateAttr(default=None)
@@ -1251,7 +1356,6 @@ class BaseLlmArgs(StrictBaseModel):
             tensorrt_llm.llmapi.llm_utils.BaseLlmArgs: The `BaseLlmArgs` instance.
         """
         kwargs = BaseLlmArgs._check_consistency(dict(kwargs))
-
         ret = cls(**kwargs)
         return ret
 
@@ -1494,10 +1598,10 @@ class BaseLlmArgs(StrictBaseModel):
         if self.parallel_config._world_size == 1 and self.build_config:
             self.build_config.plugin_config.nccl_plugin = None
 
-        if self.enable_lora and self.lora_config is None and self.backend != 'pytorch':
+        if self.enable_lora and self.backend != 'pytorch':
             self.build_config.plugin_config.lora_plugin = 'auto'
-            if self.max_lora_rank is not None:
-                self.build_config.lora_config.max_lora_rank = self.max_lora_rank
+            if self.lora_config is not None:
+                self.build_config.lora_config.max_lora_rank = self.lora_config.max_lora_rank
 
         if hasattr(self,
                    'enable_prompt_adapter') and self.enable_prompt_adapter:
@@ -1580,6 +1684,11 @@ class BaseLlmArgs(StrictBaseModel):
                 self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.USER_PROVIDED
                 self.build_config.max_draft_len = self.speculative_config.max_draft_len
 
+            elif isinstance(self.speculative_config, AutoDecodingConfig):
+                assert self.backend in ['pytorch', '_autodeploy']
+                self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.AUTO
+                self.build_config.max_draft_len = self.speculative_config.max_draft_len
+
             else:
                 raise ValueError(
                     f"Unrecognized speculative config type {type(self.speculative_config)}"
@@ -1601,16 +1710,6 @@ class BaseLlmArgs(StrictBaseModel):
     @model_validator(mode="after")
     def validate_lora_config_consistency(self):
         if self.lora_config:
-            if self.max_lora_rank is not None:
-                logger.warning(
-                    "max_lora_rank is ignored when lora_config is provided.")
-            if self.max_loras != self.lora_config.max_loras:
-                logger.warning(
-                    "max_loras is ignored when lora_config is provided.")
-            if self.max_cpu_loras != self.lora_config.max_cpu_loras:
-                logger.warning(
-                    "max_cpu_loras is ignored when lora_config is provided.")
-
             if len(self.lora_config.lora_dir) == 0:
                 # TODO [TRTLLM-5173]
                 logger.warning(
@@ -1635,6 +1734,14 @@ class BaseLlmArgs(StrictBaseModel):
                 )
                 self.lora_config.lora_target_modules = list(
                     default_trtllm_modules_to_hf_modules.keys())
+        return self
+
+    @model_validator(mode="after")
+    def validate_peft_cache_config(self):
+        if self.peft_cache_config is not None and self.peft_cache_config.lora_prefetch_dir is not None:
+            raise ValueError(
+                f"lora_prefetch_dir was set to '{self.peft_cache_config.lora_prefetch_dir}' "
+                "while LoRA prefetch is not supported")
         return self
 
     def _update_plugin_config(self, key: str, value: Any):
@@ -1918,6 +2025,11 @@ class TorchLlmArgs(BaseLlmArgs):
          Note that each CUDA graph can use up to 200 MB of extra memory.",
         status="beta")
 
+    attention_dp_config: Optional[AttentionDpConfig] = Field(
+        default=None,
+        description="Optimized load-balancing for the DP Attention scheduler.",
+        status="beta")
+
     disable_overlap_scheduler: bool = Field(
         default=False,
         description="Disable the overlap scheduler.",
@@ -1937,11 +2049,11 @@ class TorchLlmArgs(BaseLlmArgs):
         "If true, will iterate over sampling_params of each request and use the corresponding sampling strategy, e.g. top-k, top-p, etc.",
         status="beta")
 
-    enable_trtllm_sampler: bool = Field(
+    use_torch_sampler: bool = Field(
         default=False,
         description=
-        "If true, will use the TRTLLM sampler instead of the PyTorch sampler. The TRTLLM sampler has a wide coverage of sampling strategies.",
-        status="prototype")
+        "If true, will use the Torch sampler instead of the TRTLLM sampler.",
+        status="beta")
 
     enable_iter_perf_stats: bool = Field(
         default=False,
@@ -1998,14 +2110,12 @@ class TorchLlmArgs(BaseLlmArgs):
         status="prototype",
     )
 
-    allreduce_strategy: Optional[
-        Literal['AUTO', 'NCCL', 'UB', 'MINLATENCY', 'ONESHOT', 'TWOSHOT',
-                'LOWPRECISION', 'MNNVL']] = Field(
-                    default='AUTO',
-                    description="Allreduce strategy to use.",
-                    status="beta",
-                )
-
+    allreduce_strategy: Optional[Literal[
+        'AUTO', 'NCCL', 'UB', 'MINLATENCY', 'ONESHOT', 'TWOSHOT',
+        'LOWPRECISION', 'MNNVL',
+        'NCCL_SYMMETRIC']] = Field(default='AUTO',
+                                   description="Allreduce strategy to use.",
+                                   status="beta")
     checkpoint_loader: Optional[object] = Field(
         default=None,
         description="The checkpoint loader to use for this LLM instance.",
@@ -2183,6 +2293,29 @@ class TorchLlmArgs(BaseLlmArgs):
 
         return self
 
+    @model_validator(mode='after')
+    def validate_attention_dp_config(self) -> 'TorchLlmArgs':
+        """Validate attention DP configuration.
+
+        Ensures that:
+        1. If attention_dp_config.enable_balance is true, attention_dp_config.batching_wait_iters must be greater or equal to 0
+        2. If attention_dp_config.enable_balance is true, attention_dp_config.timeout_iters must be greater or equal to 0
+        """
+        if self.attention_dp_config is None:
+            return self
+
+        config = self.attention_dp_config
+        if config.enable_balance:
+            if config.batching_wait_iters < 0:
+                raise ValueError(
+                    "attention_dp_config.batching_wait_iters must be greater or equal to 0 when enable_balance is true"
+                )
+            if config.timeout_iters < 0:
+                raise ValueError(
+                    "attention_dp_config.timeout_iters must be greater or equal to 0 when enable_balance is true"
+                )
+        return self
+
     # TODO: Remove this after the PyTorch backend is fully migrated to TorchLlmArgs from ExecutorConfig
     def get_pytorch_backend_config(self) -> "PyTorchConfig":
         from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
@@ -2205,8 +2338,9 @@ class TorchLlmArgs(BaseLlmArgs):
             attn_backend=self.attn_backend,
             moe_backend=self.moe_config.backend,
             enable_mixed_sampler=self.enable_mixed_sampler,
-            enable_trtllm_sampler=self.enable_trtllm_sampler,
+            use_torch_sampler=self.use_torch_sampler,
             kv_cache_dtype=self.kv_cache_config.dtype,
+            mamba_ssm_cache_dtype=self.kv_cache_config.mamba_ssm_cache_dtype,
             enable_iter_perf_stats=self.enable_iter_perf_stats,
             enable_iter_req_stats=self.enable_iter_req_stats,
             print_iter_log=self.print_iter_log,
@@ -2233,7 +2367,16 @@ class TorchLlmArgs(BaseLlmArgs):
             enable_min_latency=self.enable_min_latency,
             stream_interval=self.stream_interval,
             force_dynamic_quantization=self.force_dynamic_quantization,
-            allreduce_strategy=self.allreduce_strategy)
+            allreduce_strategy=self.allreduce_strategy,
+            attention_dp_enable_balance=bool(
+                self.attention_dp_config is not None
+                and self.attention_dp_config.enable_balance),
+            attention_dp_time_out_iters=self.attention_dp_config.timeout_iters
+            if self.attention_dp_config is not None else
+            AttentionDpConfig.model_fields['timeout_iters'].default,
+            attention_dp_batching_wait_iters=self.attention_dp_config.
+            batching_wait_iters if self.attention_dp_config is not None else
+            AttentionDpConfig.model_fields['batching_wait_iters'].default)
 
 
 def update_llm_args_with_extra_dict(
@@ -2250,6 +2393,7 @@ def update_llm_args_with_extra_dict(
         "speculative_config": DecodingBaseConfig,
         "lora_config": LoraConfig,
         "moe_config": MoeConfig,
+        "attention_dp_config": AttentionDpConfig,
     }
     for field_name, field_type in field_mapping.items():
         if field_name in llm_args_dict:

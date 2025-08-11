@@ -37,8 +37,8 @@ using ::tensorrt_llm::kernels::XQAKernelMetaInfo;
 XQAKernelRuntimeHashKey getRuntimeHashKeyFromKernelMeta(XQAKernelMetaInfo const& kernelMeta)
 {
     return {kernelMeta.mKVDataType, kernelMeta.mHeadDim, kernelMeta.mBeamWidth, kernelMeta.mNumQHeadsOverKV,
-        kernelMeta.mMTileSize, kernelMeta.mTokensPerPage, kernelMeta.mPagedKVCache, kernelMeta.mMultiQueryTokens,
-        0 /* xqa jit param is_fp8_output */};
+        kernelMeta.mMTileSize, kernelMeta.mTokensPerPage, kernelMeta.mPagedKVCache, kernelMeta.mMultiQueryTokens, false,
+        std::nullopt};
 }
 
 } // anonymous namespace
@@ -394,7 +394,9 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
     else
     {
         appendParam(&launchParams.num_k_heads);
-        bool const allowSlidingWindow = !isSpecDec;
+        bool const allowSlidingWindow
+            = !(isSpecDec && xqaParams.is_spec_dec_tree); // sliding windows does not support spec dec with tree-based
+                                                          // token, only chained tokens
         if (allowSlidingWindow)
         {
             appendParam(&launchParams.slidingWindowSize);
@@ -410,6 +412,7 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
         {
             appendParam(&launchParams.ropeCosSin);
         }
+        appendParam(&xqaParams.attention_sinks);
         appendParam(&launchParams.kvCacheParams);
         if (xqaParams.beam_width > 1)
         {
@@ -441,7 +444,15 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
         uint32_t multi_block = 1;
         if (xqaParams.multi_block_mode)
         {
-            multi_block = computeMultiBlockCount(xqaParams, xqaParams.batch_size, multiprocessor_count);
+            if (isSpecDec && isGMMAKernel)
+            {
+                multi_block = computeMultiBlockCountSpecDecGMMA(
+                    xqaParams, xqaParams.batch_size, multiprocessor_count, specDecBlocks);
+            }
+            else if (!isSpecDec)
+            {
+                multi_block = computeMultiBlockCount(xqaParams, xqaParams.batch_size, multiprocessor_count);
+            }
         }
         uint32_t const nbKVHeads = xqaParams.num_kv_heads;
         auto const gridDim = (isGMMAKernel ? dim3{specDecBlocks, multi_block, nbKVHeads * xqaParams.batch_size}

@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -27,7 +27,6 @@
 #include "tensorrt_llm/common/quantization.h"
 #include "tensorrt_llm/pybind/batch_manager/algorithms.h"
 #include "tensorrt_llm/pybind/batch_manager/bindings.h"
-#include "tensorrt_llm/pybind/batch_manager/buffers.h"
 #include "tensorrt_llm/pybind/batch_manager/cacheTransceiver.h"
 #include "tensorrt_llm/pybind/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/pybind/batch_manager/llmRequest.h"
@@ -45,7 +44,6 @@
 
 namespace py = pybind11;
 namespace tb = tensorrt_llm::batch_manager;
-namespace tbk = tensorrt_llm::batch_manager::kv_cache_manager;
 namespace tpb = tensorrt_llm::pybind::batch_manager;
 namespace tc = tensorrt_llm::common;
 namespace tr = tensorrt_llm::runtime;
@@ -239,12 +237,15 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
         .def_property_readonly("has_fp8_qdq", &tc::QuantMode::hasFp8Qdq)
         .def_property_readonly("has_nvfp4", &tc::QuantMode::hasNvfp4)
         .def_property_readonly("has_w4a8_mxfp4_fp8", &tc::QuantMode::hasW4a8Mxfp4Fp8)
+        .def_property_readonly("has_w4a8_mxfp4_mxfp8", &tc::QuantMode::hasW4a8Mxfp4Mxfp8)
+        .def_property_readonly("has_w4a16_mxfp4", &tc::QuantMode::hasW4a16Mxfp4)
         .def_property_readonly("has_kv_cache_quant", &tc::QuantMode::hasKvCacheQuant)
         .def_static("from_description", &tc::QuantMode::fromDescription, py::arg("quantize_weights"),
             py::arg("quantize_activations"), py::arg("per_token"), py::arg("per_channel"), py::arg("per_group"),
             py::arg("use_int4_weights"), py::arg("use_int8_kv_cache"), py::arg("use_fp8_kv_kache"),
             py::arg("use_fp8_qdq"), py::arg("use_fp8_rowwise"), py::arg("use_w4a8_qserve"), py::arg("use_nvfp4"),
-            py::arg("use_fp8_block_scales"), py::arg("use_w4a8_mxfp4_fp8"))
+            py::arg("use_fp8_block_scales"), py::arg("use_w4a8_mxfp4_fp8"), py::arg("use_w4a8_mxfp4_mxfp8"),
+            py::arg("use_w4a16_mxfp4"))
         .def_static("use_smooth_quant", &tc::QuantMode::useSmoothQuant, py::arg("per_token") = false,
             py::arg("per_channel") = false)
         .def_static("use_weight_only", &tc::QuantMode::useWeightOnly, py::arg("use_int4_weights") = false,
@@ -467,7 +468,6 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
     tb::kv_cache_manager::KVCacheManagerBindings::initBindings(mInternalBatchManager);
     tb::BasePeftCacheManagerBindings::initBindings(mInternalBatchManager);
     tb::CacheTransceiverBindings::initBindings(mInternalBatchManager);
-    tpb::Buffers::initBindings(mInternalBatchManager);
 
     auto mInternalAlgorithms = mInternal.def_submodule("algorithms", "Algorithms internal bindings");
     tpb::algorithms::initBindings(mInternalAlgorithms);

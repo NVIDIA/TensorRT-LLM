@@ -1,10 +1,11 @@
 import pytest
 import torch
-from _graph_test_helpers import run_test
+from _graph_test_helpers import FakeFactory, run_test_transformed_gm
 from _model_test_utils import MoEOpModel
 from _torch_test_utils import fp4_compatible, fp8_compatible, trtllm_ops_available
 
-from tensorrt_llm._torch.auto_deploy.transformations.library import quantize_moe
+from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
+from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 
 
@@ -62,13 +63,20 @@ def test_quantize_moe_transformation(quant_algo, expected_op):
 
     quant_config = {"quant_algo": quant_algo}
 
-    def _transform(gm, *args):
-        return quantize_moe(gm, quant_config)
+    gm = torch_export_to_gm(model, args=(x,), clone=True)
+    gm_transformed = InferenceOptimizer(
+        FakeFactory(quant_config=quant_config),
+        {
+            "quantize_moe": {
+                "stage": "pattern_matcher",
+            },
+        },
+    )(None, gm)
 
-    _ = run_test(
+    run_test_transformed_gm(
         model=model,
         x=x,
-        transform=_transform,
+        gm_transformed=gm_transformed,
         check_transformed_graph=_check_transformed_graph,
         _get_expected_num_params=_expected_num_params,
         atol=0.5,
