@@ -1225,6 +1225,10 @@ class W4A8_AWQ_LinearMethod(LinearMethodBase):
         module.alpha = Parameter(torch.empty([1], dtype=torch.float32),
                                  requires_grad=False)
 
+        # WAR for CUDA graph. Mixed w4a8 gemm does not accept alpha in device buffer.
+        # Hence we prepare a separate plain float to be updated during the weight load.
+        module.alpha_value = 1.0
+
         if bias:
             module.bias = Parameter(torch.empty((out_features), dtype=dtype),
                                     requires_grad=False)
@@ -1261,7 +1265,7 @@ class W4A8_AWQ_LinearMethod(LinearMethodBase):
             has_zero_point=module.quant_config.has_zero_point,
             output_dtype=module.dtype
             or input.dtype,  # NOTE: output_dtype can only be bf16/fp16 for W4A8
-            alpha=module.alpha.item(),
+            alpha=module.alpha_value,
             bias=bias,
             zeros=None)
 
@@ -1343,6 +1347,8 @@ class W4A8_AWQ_LinearMethod(LinearMethodBase):
         copy_weight(module.input_scale, input_scale)
         copy_weight(module.alpha, alpha)
 
+        module.alpha_value = alpha.item()
+
         module.inv_input_scale.data = 1.0 / module.input_scale
 
     def load_weights_fused_qkv_linear(self, module: Linear,
@@ -1371,6 +1377,7 @@ class W4A8_AWQ_LinearMethod(LinearMethodBase):
         copy_weight(module.input_scale, input_scale)
         copy_weight(module.alpha, alpha)
 
+        module.alpha_value = alpha.item()
         # NOTE: pre_quant_scale is the same for q,k,v since modelopt checks which layer shared the same input and create an avg pre_quant_scale
         # Usually when modelopt exports the quantized model, pre_quant_Scale is fused in the layer norm (this case relevant if fused is disabled - modelopt internal)
         if "pre_quant_scale" in weights[0].keys():
@@ -1416,6 +1423,8 @@ class W4A8_AWQ_LinearMethod(LinearMethodBase):
         copy_weight(module.weight_scale, fused_scale)
         copy_weight(module.input_scale, input_scale)
         copy_weight(module.alpha, alpha)
+
+        module.alpha_value = alpha.item()
 
         if "pre_quant_scale" in weights[0].keys():
             # Use the same device as the weight tensor
