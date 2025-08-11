@@ -2020,16 +2020,13 @@ class PyTorchModelEngine(ModelEngine):
                         gather_context_logits=gather_context_logits)
 
             # 3. Ask the manager to execute the graph
-            graph_output = self.cuda_graph_model_engine.execute(
+            outputs = self.cuda_graph_model_engine.execute(
                 batch=padded_requests,
                 inputs=inputs,
                 forward_fn=capture_forward_fn)
 
-            if graph_output is not None:
-                # Graph was successfully run
-                outputs = {"logits": graph_output}
-            else:
-                # 4. Fallback to eager execution if graph was not used
+            # 4. Fallback to eager execution if graph was not used
+            if outputs is None:
                 with MoeLoadBalancerIterContext(moe_load_balancer):
                     outputs = self._forward_step(inputs, gather_ids,
                                                  gather_context_logits)
