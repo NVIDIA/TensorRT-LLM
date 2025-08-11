@@ -106,7 +106,6 @@ def run_allreduce_op(x: torch.Tensor, residual: torch.Tensor, hidden_size: int,
             e2m1_tensor, ufp8_scale_tensor, global_scale_tensor, sf_vec_size,
             ufp8_type, is_sf_swizzled_layout)
 
-    print(f"DBG AMEY: run_allreduce_op: i am here")
     x = x.cuda()
     residual = residual.cuda()
     norm_weight = torch.randn((hidden_size, ), dtype=dtype, device="cuda")
@@ -383,14 +382,12 @@ def run_allreduce_op(x: torch.Tensor, residual: torch.Tensor, hidden_size: int,
 def test_allreduce_fusion_patterns(seq_len, hidden_size, fusion_op,
                                    mpi_pool_executor):
     torch.manual_seed(0)
-    print("DBG AMEY: test_allreduce_fusion_patterns: i am here")
     # dtype = torch.bfloat16
     dtype = torch.float32
     tensor_parallel_size = mpi_pool_executor.num_workers
     x = torch.randn((seq_len, hidden_size), dtype=dtype)
     residual = torch.randn_like(x)
     linear_weight = torch.randn((hidden_size, hidden_size), dtype=dtype)
-    print(f"DBG AMEY: test_allreduce_fusion_patterns: seq_len={seq_len}, hidden_size={hidden_size}, fusion_op={fusion_op}")
     results = mpi_pool_executor.map(
         run_single_rank,
         *zip(*[(tensor_parallel_size, run_allreduce_op, x, residual,

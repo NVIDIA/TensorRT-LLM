@@ -1069,6 +1069,7 @@ class MTPWorker(nn.Module):
         original_last_dim = combined.shape[-1]
         
         # Ensure the combined tensor has at least 4 elements by padding with zeros
+        # This is required by the Lamport ALLGATHER kernel implementation
         if combined.numel() < 4:
             padding_size = 4 - combined.numel()
             # Create padding tensor with same shape as combined except for the last dimension

@@ -691,11 +691,6 @@ void allreduce_fusion_kernel_launcher(AllReduceFusionParams const& params)
     TLLM_CHECK(oneshot || threads_per_block >= params.nranks);
     int block_size = threads_per_block;
 
-    // // Override block size to 1024 for AllGather operations
-    // if (params.pattern == AllReduceFusionPattern::kAllGather) {
-    //     block_size = 1024;
-    // }
-    
     TLLM_CHECK(block_size <= 1024 && cluster_size > 0);
 
     int grid_size = (std::min(sm_count, cluster_num * cluster_size) / cluster_size) * cluster_size;
