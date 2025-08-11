@@ -44,7 +44,8 @@ def get_test_config(test_desc, example_dir, test_root):
         "gen_only": (2, f"{test_configs_root}/disagg_config_gen_only.yaml"),
         "gen_only_trt_backend":
         (2, f"{test_configs_root}/disagg_config_gen_only_trt_backend.yaml"),
-        "genbs1": (4, f"{test_configs_root}/disagg_config_genbs1.yaml"),
+        "gen_only_bs1":
+        (4, f"{test_configs_root}/disagg_config_gen_only_bs1.yaml"),
         "4_ranks": (4, f"{test_configs_root}/disagg_config_ctxtp2_gentp1.yaml"),
         "4_ranks_trt_backend":
         (4,
@@ -400,8 +401,10 @@ def test_disaggregated_genbs1(disaggregated_test_root,
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             os.symlink(src, dst, target_is_directory=True)
 
+    env = llm_venv._new_env.copy()
+    env['TRTLLM_DISAGG_BENCHMARK_GEN_ONLY'] = '1'
     run_disaggregated_test(disaggregated_example_root,
-                           "genbs1",
+                           "gen_only_bs1",
                            env=llm_venv._new_env,
                            cwd=llm_venv.get_working_directory())
 
