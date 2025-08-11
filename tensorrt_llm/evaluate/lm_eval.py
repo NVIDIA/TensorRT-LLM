@@ -133,6 +133,7 @@ class LmEvalEvaluator(Evaluator):
                  num_samples: Optional[int] = None,
                  random_seed: int = 0,
                  apply_chat_template: bool = False,
+                 fewshot_as_multiturn: bool = False,
                  system_prompt: Optional[str] = None):
         try:
             import lm_eval
@@ -141,8 +142,10 @@ class LmEvalEvaluator(Evaluator):
                 f"Evaluation task {self.__class__.__name__} requires `lm_eval`. "
                 "Please install the package first, e.g., `pip install lm_eval`."
             ) from e
+        import lm_eval.tasks
         super().__init__(random_seed=random_seed,
                          apply_chat_template=apply_chat_template,
+                         fewshot_as_multiturn=fewshot_as_multiturn,
                          system_prompt=system_prompt)
         self.task_name = task_name
         self.dataset_path = dataset_path
@@ -190,14 +193,16 @@ class LmEvalEvaluator(Evaluator):
     def evaluate(self,
                  llm: Union[LLM, PyTorchLLM],
                  sampling_params: Optional[SamplingParams] = None,
-                 streaming: bool = False) -> float:
+                 streaming: bool = False,
+                 scores_filter: str = None) -> float:
         import lm_eval
-        results = lm_eval.evaluate(lm=LmEvalWrapper(llm, sampling_params,
-                                                    streaming),
-                                   task_dict=self.task_dict,
-                                   limit=self.num_samples,
-                                   apply_chat_template=self.apply_chat_template,
-                                   system_instruction=self.system_prompt)
+        results = lm_eval.evaluate(
+            lm=LmEvalWrapper(llm, sampling_params, streaming),
+            task_dict=self.task_dict,
+            limit=self.num_samples,
+            apply_chat_template=self.apply_chat_template,
+            fewshot_as_multiturn=self.fewshot_as_multiturn,
+            system_instruction=self.system_prompt)
         # Normalize scores to range 0~100
         scores = results["results"][self.task_name]
         for metric in scores.keys():
@@ -206,12 +211,17 @@ class LmEvalEvaluator(Evaluator):
         logger.info(
             f"lm-eval {self.task_name} results (scores normalized to range 0~100):\n{lm_eval.utils.make_table(results)}"
         )
-
-        average_acc = np.mean(
-            [acc for m, acc in scores.items() if "_stderr" not in m])
-        logger.info(
-            f"lm-eval {self.task_name} average accuracy: {average_acc:.2f}")
-        return average_acc
+        if scores_filter is not None:
+            result_acc = results["results"][self.task_name][scores_filter]
+            logger.info(
+                f"lm-eval {self.task_name} {scores_filter} accuracy: {result_acc:.2f}"
+            )
+        else:
+            result_acc = np.mean(
+                [acc for m, acc in scores.items() if "_stderr" not in m])
+            logger.info(
+                f"lm-eval {self.task_name} average accuracy: {result_acc:.2f}")
+        return result_acc
 
     @classmethod
     def command_harness(cls, ctx, **kwargs):
@@ -221,6 +231,8 @@ class LmEvalEvaluator(Evaluator):
                         random_seed=kwargs.pop("random_seed", 0),
                         apply_chat_template=kwargs.pop("apply_chat_template",
                                                        False),
+                        fewshot_as_multiturn=kwargs.pop("fewshot_as_multiturn",
+                                                        False),
                         system_prompt=kwargs.pop("system_prompt", None))
         sampling_params = SamplingParams(
             max_tokens=kwargs.pop("max_output_length"),
@@ -254,6 +266,10 @@ class GSM8K(LmEvalEvaluator):
                   is_flag=True,
                   default=False,
                   help="Whether to apply chat template.")
+    @click.option("--fewshot_as_multiturn",
+                  is_flag=True,
+                  default=False,
+                  help="Apply fewshot as multiturn.")
     @click.option("--system_prompt",
                   type=str,
                   default=None,
@@ -269,6 +285,10 @@ class GSM8K(LmEvalEvaluator):
     @click.pass_context
     @staticmethod
     def command(ctx, **kwargs) -> None:
+        if kwargs.get("fewshot_as_multiturn", False):
+            assert kwargs.get(
+                "apply_chat_template", False
+            ), "apply_chat_template must be True when fewshot_as_multiturn is True"
         GSM8K.command_harness(ctx, **kwargs)
 
 
