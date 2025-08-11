@@ -828,8 +828,10 @@ public:
         // for enc-dec models, pause means saving generated tokens to prompt but need to re-do encoder phase
         mState = mEncoderTokens.has_value() || mEncoderInputFeatures ? LlmRequestState::kENCODER_INIT
                                                                      : LlmRequestState::kCONTEXT_INIT;
-        mContextCurrentPosition = 0;
-        mPrepopulatedPromptLen = 0;
+        mContextCurrentPositionTarget = 0;
+        mContextCurrentPositionDraft = 0;
+        mPrepopulatedPromptLenTarget = 0;
+        mPrepopulatedPromptLenDraft = 0;
         mContextChunkSize = mPromptLen;
         mSeqSlot.reset();
     }
@@ -1049,7 +1051,7 @@ public:
 
     [[nodiscard]] SizeType32 getPrepopulatedPromptLen() const
     {
-        return mPrepopulatedPromptLen;
+        return mUseDraftModel ? mPrepopulatedPromptLenDraft : mPrepopulatedPromptLenTarget;
     }
 
     void setPrepopulatedPromptLen(SizeType32 prepopulatedPromptLen, SizeType32 kvTokensPerBlock)
@@ -1066,7 +1068,10 @@ public:
             "Invalid state: prepopulatedPromptLen (%d) >= promptLen (%d) for request %lu", prepopulatedPromptLen,
             promptLen, mRequestId);
         TLLM_CHECK(prepopulatedPromptLen < promptLen);
-        mPrepopulatedPromptLen = prepopulatedPromptLen;
+
+        auto& prePromptLen = mUseDraftModel ? mPrepopulatedPromptLenDraft : mPrepopulatedPromptLenTarget;
+        auto& contextCurrentPosition = mUseDraftModel ? mContextCurrentPositionDraft : mContextCurrentPositionTarget;
+        prePromptLen = prepopulatedPromptLen;
 
         if (prepopulatedPromptLen > 0)
         {
@@ -1081,7 +1086,7 @@ public:
                 chunkSize = flooredEndPosition - prepopulatedPromptLen;
                 TLLM_CHECK(chunkSize <= getContextChunkSize());
             }
-            setContextCurrentPosition(prepopulatedPromptLen);
+            contextCurrentPosition = prepopulatedPromptLen;
             setContextChunkSize(chunkSize);
 
             if (!isLastContextChunk())
@@ -1522,14 +1527,15 @@ public:
 
     void setContextCurrentPosition(SizeType32 contextCurrentPosition)
     {
-        mContextCurrentPosition = contextCurrentPosition;
+        mContextCurrentPositionDraft = contextCurrentPosition;
+        mContextCurrentPositionTarget = contextCurrentPosition;
     }
 
     /// When chunked, the position of the current chunk is returned. Otherwise, only the beginning
     /// or end of the context is returned.
     [[nodiscard]] SizeType32 getContextCurrentPosition() const noexcept
     {
-        return mContextCurrentPosition;
+        return mUseDraftModel ? mContextCurrentPositionDraft : mContextCurrentPositionTarget;
     }
 
     /// Return the length of the context that has not yet been processed.
@@ -1570,14 +1576,16 @@ public:
     {
         // The number of cached token is encountered in mContextCurrentPosition,
         // so the start position of the context is mPrepopulatedPromptLen.
-        return mContextCurrentPosition == mPrepopulatedPromptLen;
+        return getContextCurrentPosition() == getPrepopulatedPromptLen();
     }
 
     /// Move the cursor forward one chunk. When not chunked, move forward to the end of the context.
     void moveToNextContextChunk()
     {
         TLLM_CHECK_WITH_INFO(isContextInitState(), "Chunking is only possible during the context phase.");
-        mContextCurrentPosition += getContextChunkSize();
+
+        mContextCurrentPositionDraft += getContextChunkSize();
+        mContextCurrentPositionTarget += getContextChunkSize();
         setContextChunkSize(0);
     }
 
@@ -1843,6 +1851,16 @@ public:
         return mIsDummyRequest;
     }
 
+    void setUseDraftModel(bool useDraftModel)
+    {
+        mUseDraftModel = useDraftModel;
+    }
+
+    [[nodiscard]] bool useDraftModel() const
+    {
+        return mUseDraftModel;
+    }
+
     RequestIdType mRequestId;
     SizeType32 mPromptLen;
     SizeType32 mMaxNewTokens;
@@ -1885,7 +1903,8 @@ protected:
     // Number of tokens already in KV cache before context phase.
     // A value > 0 indicates cached KV cache blocks were reused.
     // Up to inputLen - 1 tokens can be reused.
-    SizeType32 mPrepopulatedPromptLen{0};
+    SizeType32 mPrepopulatedPromptLenTarget{0};
+    SizeType32 mPrepopulatedPromptLenDraft{0};
 
     SizeType32 mMaxSentTokenLen;
 
@@ -1916,7 +1935,8 @@ protected:
     // The size of the context chunk must be multiple of the KV-Cache block size except the last one.
     // Value `0` means Chunked-Context is disabled.
     SizeType32 mContextChunkSize{0};
-    SizeType32 mContextCurrentPosition{0};
+    SizeType32 mContextCurrentPositionTarget{0};
+    SizeType32 mContextCurrentPositionDraft{0};
 
     std::vector<VecLogProbs> mLogProbs; // [beamSize, seqLen]
     VecLogProbs mCumLogProbs;           // [beamSize]
@@ -2016,6 +2036,8 @@ protected:
     std::vector<size_t> mRequestedBlockHashes;
 
     bool mIsDummyRequest{false};
+
+    bool mUseDraftModel{false};
 
 private:
     void initialize(VecTokens const& inputTokens, bool outputLogProbs)

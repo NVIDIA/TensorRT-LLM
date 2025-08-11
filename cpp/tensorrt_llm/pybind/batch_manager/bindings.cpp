@@ -253,7 +253,8 @@ void initBindings(pybind11::module_& m)
                 }
             })
         .def_property("is_dummy_request", &GenLlmReq::isDummyRequest, &GenLlmReq::setIsDummyRequest)
-        .def_property_readonly("return_perf_metrics", &GenLlmReq::getReturnPerfMetrics);
+        .def_property_readonly("return_perf_metrics", &GenLlmReq::getReturnPerfMetrics)
+        .def_property("use_draft_model", &GenLlmReq::useDraftModel, &GenLlmReq::setUseDraftModel);
 
     py::classh<tb::LlmRequest, GenLlmReq>(m, "LlmRequest", pybind11::dynamic_attr())
         .def(py::init<>(
