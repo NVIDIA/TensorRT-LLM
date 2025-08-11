@@ -86,6 +86,7 @@ def get_llm_args(model: str,
                  trust_remote_code: bool = False,
                  reasoning_parser: Optional[str] = None,
                  fail_fast_on_attention_window_too_large: bool = False,
+                 otlp_traces_endpoint: Optional[str] = None,
                  **llm_args_extra_dict: Any):
 
     if gpus_per_node is None:
@@ -147,6 +148,7 @@ def get_llm_args(model: str,
         reasoning_parser,
         "fail_fast_on_attention_window_too_large":
         fail_fast_on_attention_window_too_large,
+        "otlp_traces_endpoint": otlp_traces_endpoint,
     }
 
     return llm_args, llm_args_extra_dict
@@ -303,6 +305,12 @@ def launch_mm_encoder_server(
     help=
     "Exit with runtime error when attention window is too large to fit even a single sequence in the KV cache."
 )
+@click.option(
+    "--otlp_traces_endpoint",
+    type=str,
+    default=None,
+    help="Target URL to which OpenTelemetry traces will be sent."
+)
 def serve(
         model: str, tokenizer: Optional[str], host: str, port: int,
         log_level: str, backend: str, max_beam_width: int, max_batch_size: int,
@@ -312,7 +320,8 @@ def serve(
         num_postprocess_workers: int, trust_remote_code: bool,
         extra_llm_api_options: Optional[str], reasoning_parser: Optional[str],
         metadata_server_config_file: Optional[str], server_role: Optional[str],
-        fail_fast_on_attention_window_too_large: bool):
+        fail_fast_on_attention_window_too_large: bool,
+        otlp_traces_endpoint: Optional[str]):
     """Running an OpenAI API compatible server
 
     MODEL: model name | HF checkpoint path | TensorRT engine path
@@ -337,7 +346,8 @@ def serve(
         trust_remote_code=trust_remote_code,
         reasoning_parser=reasoning_parser,
         fail_fast_on_attention_window_too_large=
-        fail_fast_on_attention_window_too_large)
+        fail_fast_on_attention_window_too_large,
+        otlp_traces_endpoint=otlp_traces_endpoint)
 
     llm_args_extra_dict = {}
     if extra_llm_api_options is not None:
