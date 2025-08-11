@@ -28,23 +28,21 @@ namespace tensorrt_llm::nanobind::thop
 
 void initBindings(nb::module_& m)
 {
-    m.def(
-        "attention",
-        &torch_ext::attention,
+    m.def("attention", &torch_ext::attention,
         // Parameters with default values using std::nullopt for optional arguments
         nb::arg("q"), nb::arg("k") = std::nullopt, nb::arg("v") = std::nullopt, nb::arg("output"),
-        nb::arg("output_sf") = std::nullopt, nb::arg("out_dtype") = std::nullopt,
-        nb::arg("workspace_") = std::nullopt, nb::arg("sequence_length"), nb::arg("host_past_key_value_lengths"),
-        nb::arg("context_lengths"), nb::arg("host_context_lengths"), nb::arg("host_request_types"),
+        nb::arg("output_sf") = std::nullopt, nb::arg("out_dtype") = std::nullopt, nb::arg("workspace_") = std::nullopt,
+        nb::arg("sequence_length"), nb::arg("host_past_key_value_lengths"), nb::arg("context_lengths"),
+        nb::arg("host_context_lengths"), nb::arg("host_request_types"),
         nb::arg("kv_cache_block_offsets") = std::nullopt, nb::arg("host_kv_cache_block_offsets") = std::nullopt,
         nb::arg("host_kv_cache_pool_pointers") = std::nullopt, nb::arg("host_kv_cache_pool_mapping") = std::nullopt,
         nb::arg("cache_indirection") = std::nullopt, nb::arg("kv_scale_orig_quant") = std::nullopt,
         nb::arg("kv_scale_quant_orig") = std::nullopt, nb::arg("out_scale") = std::nullopt,
         nb::arg("rotary_inv_freq") = std::nullopt, nb::arg("rotary_cos_sin") = std::nullopt,
         nb::arg("latent_cache") = std::nullopt, nb::arg("q_pe") = std::nullopt,
-        nb::arg("block_ids_per_seq") = std::nullopt, nb::arg("attention_sinks") = std::nullopt,
-        nb::arg("is_fused_qkv"), nb::arg("update_kv_cache"), nb::arg("predicted_tokens_per_seq"), nb::arg("layer_idx"),
-        nb::arg("num_heads"), nb::arg("num_kv_heads"), nb::arg("head_size"), nb::arg("tokens_per_block") = std::nullopt,
+        nb::arg("block_ids_per_seq") = std::nullopt, nb::arg("attention_sinks") = std::nullopt, nb::arg("is_fused_qkv"),
+        nb::arg("update_kv_cache"), nb::arg("predicted_tokens_per_seq"), nb::arg("layer_idx"), nb::arg("num_heads"),
+        nb::arg("num_kv_heads"), nb::arg("head_size"), nb::arg("tokens_per_block") = std::nullopt,
         nb::arg("max_num_requests"), nb::arg("max_context_length"), nb::arg("attention_window_size"),
         nb::arg("sink_token_length"), nb::arg("beam_width"), nb::arg("mask_type"), nb::arg("quant_mode"),
         nb::arg("q_scaling"), nb::arg("position_embedding_type"), nb::arg("rotary_embedding_dim"),
@@ -56,7 +54,6 @@ void initBindings(nb::module_& m)
         nb::arg("mrope_rotary_cos_sin") = std::nullopt, nb::arg("mrope_position_deltas") = std::nullopt,
         nb::arg("mla_context_paged_kv") = std::nullopt, nb::arg("mla_context_kv_cache_block_offsets") = std::nullopt,
         nb::arg("attention_chunk_size") = std::nullopt, nb::arg("softmax_stats_tensor") = std::nullopt,
-        nb::arg("spec_decoding_bool_params"), nb::arg("spec_decoding_tensor_params"),
-        "Multi-head attention operation");
+        nb::arg("spec_decoding_bool_params"), nb::arg("spec_decoding_tensor_params"), "Multi-head attention operation");
 }
-} // namespace tensorrt_llm::nanobind::thop::attentionOp
+} // namespace tensorrt_llm::nanobind::thop

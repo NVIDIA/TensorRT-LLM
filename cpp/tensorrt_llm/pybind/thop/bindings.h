@@ -24,4 +24,4 @@ namespace tensorrt_llm::pybind::thop
 
 void initBindings(pybind11::module_& m);
 
-} // namespace tensorrt_llm::pybind::thop::attentionOp
+} // namespace tensorrt_llm::pybind::thop

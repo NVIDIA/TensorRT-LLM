@@ -24,4 +24,4 @@ namespace tensorrt_llm::nanobind::thop
 
 void initBindings(nb::module_& m);
 
-} // namespace tensorrt_llm::nanobind::thop::attentionOp
+} // namespace tensorrt_llm::nanobind::thop
