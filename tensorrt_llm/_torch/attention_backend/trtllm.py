@@ -7,7 +7,7 @@ from typing import Optional, Tuple, Union
 import torch
 
 from tensorrt_llm._utils import get_sm_version
-from tensorrt_llm.bindings.internal import thop as trtllm_thop
+from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -420,7 +420,7 @@ class TrtllmAttentionWrapper:
             self.spec_decoding_position_offsets, self.spec_decoding_packed_mask
         ]
 
-        trtllm_thop.attention_inplace(
+        thop.attention(
             q,
             k,
             v,
@@ -516,7 +516,7 @@ class TrtllmAttentionWrapper:
         else:
             raise ValueError("Unexpected attention mask type")
 
-        return trtllm_thop.attention_supports_nvfp4_output(
+        return torch.ops.trtllm.attention_supports_nvfp4_output(
             self.num_heads,
             self.num_kv_heads,
             self.head_size,

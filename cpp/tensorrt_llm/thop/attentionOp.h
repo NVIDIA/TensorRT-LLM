@@ -23,7 +23,7 @@ namespace torch_ext
 {
 
 /**
- * @brief In-place attention operation for TensorRT-LLM
+ * @brief Attention operation for TensorRT-LLM
  *
  * This function performs multi-head attention computation in-place, supporting both
  * context and generation phases with various optimization features including:
@@ -34,32 +34,31 @@ namespace torch_ext
  * - Multi-layer attention (MLA)
  * - Speculative decoding
  */
-void attention_inplace(torch::Tensor q, torch::optional<torch::Tensor> k, torch::optional<torch::Tensor> v,
-    torch::Tensor& output, torch::optional<torch::Tensor> output_sf, std::optional<torch::ScalarType> out_dtype,
-    torch::optional<torch::Tensor> workspace_, torch::Tensor sequence_length, torch::Tensor host_past_key_value_lengths,
+void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<torch::Tensor> v, torch::Tensor& output,
+    std::optional<torch::Tensor> output_sf, std::optional<torch::ScalarType> out_dtype,
+    std::optional<torch::Tensor> workspace_, torch::Tensor sequence_length, torch::Tensor host_past_key_value_lengths,
     torch::Tensor context_lengths, torch::Tensor host_context_lengths, torch::Tensor host_request_types,
-    torch::optional<torch::Tensor> kv_cache_block_offsets, torch::optional<torch::Tensor> host_kv_cache_block_offsets,
-    torch::optional<torch::Tensor> host_kv_cache_pool_pointers,
-    torch::optional<torch::Tensor> host_kv_cache_pool_mapping, torch::optional<torch::Tensor> cache_indirection,
-    torch::optional<torch::Tensor> kv_scale_orig_quant, torch::optional<torch::Tensor> kv_scale_quant_orig,
-    torch::optional<torch::Tensor> out_scale, torch::optional<torch::Tensor> rotary_inv_freq,
-    torch::optional<torch::Tensor> rotary_cos_sin, torch::optional<torch::Tensor> latent_cache,
-    torch::optional<torch::Tensor> q_pe, torch::optional<torch::Tensor> block_ids_per_seq,
-    torch::optional<torch::Tensor> attention_sinks, bool const is_fused_qkv, bool const update_kv_cache,
-    int64_t const predicted_tokens_per_seq, int64_t const layer_idx, int64_t const num_heads,
-    int64_t const num_kv_heads, int64_t const head_size, std::optional<int64_t> const tokens_per_block,
-    int64_t const max_num_requests, int64_t const max_context_length, int64_t const attention_window_size,
-    int64_t const sink_token_length, int64_t const beam_width, int64_t const mask_type, int64_t const quant_mode,
-    double const q_scaling, int64_t const position_embedding_type, int64_t const rotary_embedding_dim,
-    double const rotary_embedding_base, int64_t const rotary_embedding_scale_type,
-    c10::ArrayRef<double> rotary_embedding_scales, c10::ArrayRef<int64_t> rotary_embedding_max_position_info,
+    std::optional<torch::Tensor> kv_cache_block_offsets, std::optional<torch::Tensor> host_kv_cache_block_offsets,
+    std::optional<torch::Tensor> host_kv_cache_pool_pointers, std::optional<torch::Tensor> host_kv_cache_pool_mapping,
+    std::optional<torch::Tensor> cache_indirection, std::optional<torch::Tensor> kv_scale_orig_quant,
+    std::optional<torch::Tensor> kv_scale_quant_orig, std::optional<torch::Tensor> out_scale,
+    std::optional<torch::Tensor> rotary_inv_freq, std::optional<torch::Tensor> rotary_cos_sin,
+    std::optional<torch::Tensor> latent_cache, std::optional<torch::Tensor> q_pe,
+    std::optional<torch::Tensor> block_ids_per_seq, std::optional<torch::Tensor> attention_sinks,
+    bool const is_fused_qkv, bool const update_kv_cache, int64_t const predicted_tokens_per_seq,
+    int64_t const layer_idx, int64_t const num_heads, int64_t const num_kv_heads, int64_t const head_size,
+    std::optional<int64_t> const tokens_per_block, int64_t const max_num_requests, int64_t const max_context_length,
+    int64_t const attention_window_size, int64_t const sink_token_length, int64_t const beam_width,
+    int64_t const mask_type, int64_t const quant_mode, double const q_scaling, int64_t const position_embedding_type,
+    int64_t const rotary_embedding_dim, double const rotary_embedding_base, int64_t const rotary_embedding_scale_type,
+    std::vector<double> rotary_embedding_scales, std::vector<int64_t> rotary_embedding_max_position_info,
     bool const use_paged_context_fmha, std::optional<int64_t> attention_input_type, bool is_mla_enable,
     std::optional<int64_t> q_lora_rank, std::optional<int64_t> kv_lora_rank, std::optional<int64_t> qk_nope_head_dim,
     std::optional<int64_t> qk_rope_head_dim, std::optional<int64_t> v_head_dim,
     torch::optional<torch::Tensor> mrope_rotary_cos_sin, torch::optional<torch::Tensor> mrope_position_deltas,
     std::optional<torch::Tensor> mla_context_paged_kv, std::optional<torch::Tensor> mla_context_kv_cache_block_offsets,
     std::optional<int64_t> attention_chunk_size, std::optional<torch::Tensor> softmax_stats_tensor,
-    c10::List<bool> spec_decoding_bool_params, c10::ArrayRef<std::optional<torch::Tensor>> spec_decoding_tensor_params);
+    std::vector<bool> spec_decoding_bool_params, std::vector<std::optional<torch::Tensor>> spec_decoding_tensor_params);
 
 /**
  * @brief Check if attention operation supports NVFP4 output format

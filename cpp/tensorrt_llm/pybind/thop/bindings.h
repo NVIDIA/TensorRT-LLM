@@ -16,12 +16,12 @@
 
 #pragma once
 
-#include "tensorrt_llm/nanobind/common/customCasters.h"
-#include <nanobind/nanobind.h>
+#include "tensorrt_llm/pybind/common/customCasters.h"
+#include <pybind11/pybind11.h>
 
-namespace tensorrt_llm::nanobind::thop::attentionOp
+namespace tensorrt_llm::pybind::thop
 {
 
-void initBindings(nb::module_& m);
+void initBindings(pybind11::module_& m);
 
-} // namespace tensorrt_llm::nanobind::thop::attentionOp
+} // namespace tensorrt_llm::pybind::thop::attentionOp

@@ -18,7 +18,7 @@ set(SRCS
     runtime/moeBindings.cpp
     userbuffers/bindings.cpp
     ../runtime/ipcNvlsMemory.cu
-    thop/attentionOp.cpp
+    thop/bindings.cpp
     bindings.cpp)
 
 include_directories(${PROJECT_SOURCE_DIR}/include)

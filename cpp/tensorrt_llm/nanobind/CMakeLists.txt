@@ -17,7 +17,7 @@ set(SRCS
     testing/modelSpecBinding.cpp
     runtime/moeBindings.cpp
     userbuffers/bindings.cpp
-    thop/attentionOp.cpp
+    thop/bindings.cpp
     ../runtime/ipcNvlsMemory.cu
     bindings.cpp)
 

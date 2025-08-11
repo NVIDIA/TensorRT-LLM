@@ -33,7 +33,7 @@
 #include "tensorrt_llm/pybind/executor/bindings.h"
 #include "tensorrt_llm/pybind/runtime/bindings.h"
 #include "tensorrt_llm/pybind/testing/modelSpecBinding.h"
-#include "tensorrt_llm/pybind/thop/attentionOp.h"
+#include "tensorrt_llm/pybind/thop/bindings.h"
 #include "tensorrt_llm/pybind/userbuffers/bindings.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/cudaStream.h"
@@ -117,11 +117,11 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
     auto mInternalRuntime = mInternal.def_submodule("runtime", "Runtime internal bindings");
     auto mInternalTesting = mInternal.def_submodule("testing", "Testing internal bindings");
     auto mInternalBatchManager = mInternal.def_submodule("batch_manager", "Batch manager internal bindings");
-    auto mInternalThop = mInternal.def_submodule("thop", "THOP internal bindings");
+    auto mInternalThop = mInternal.def_submodule("thop", "Torch op internal bindings");
 
     tensorrt_llm::pybind::executor::initBindings(mExecutor);
     tensorrt_llm::pybind::runtime::initBindingsEarly(mInternalRuntime);
-    tensorrt_llm::pybind::thop::attentionOp::initBindings(mInternalThop);
+    tensorrt_llm::pybind::thop::initBindings(mInternalThop);
 
     auto buildInfo = m.def_submodule("BuildInfo");
     buildInfo.attr("ENABLE_MULTI_DEVICE") = py::int_(ENABLE_MULTI_DEVICE);
