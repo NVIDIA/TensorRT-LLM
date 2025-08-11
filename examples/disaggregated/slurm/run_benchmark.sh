@@ -16,7 +16,7 @@ isl=$1
 osl=$2
 multi_round=$3
 model_name=$4
-concurrency=$5
+concurrency_list=$5
 streaming=$6
 log_path=$7
 
@@ -89,32 +89,31 @@ do_get_logs(){
 }
 
 # run the loadgen
+cp ${log_path}/output_workers.log ${log_path}/workers_start.log
+for concurrency in ${concurrency_list}; do
+    mkdir -p ${log_path}/concurrency_${concurrency}
+    max_count=$((${concurrency} * ${multi_round}))
+    echo "Running loadgen with concurrency: ${concurrency}, max_count: ${max_count}"
+    python -m tensorrt_llm.serve.scripts.benchmark_serving \
+        --model ${model_name} \
+        --tokenizer ${model_name} \
+        --dataset-name random \
+        --dataset-path ${shared_gpt_path} \
+        --random-input-len ${isl} \
+        --random-output-len ${osl} \
+        --random-prefix-len 0 \
+        --num-prompts ${max_count} \
+        --max-concurrency ${concurrency} \
+        --host ${hostname} \
+        --port ${port} \
+        --ignore-eos \
+        --no-test-input \
+        $(if [ "${streaming}" = "false" ]; then echo "--non-streaming"; fi)
 
-export PATH=${HOME}/.local/bin:${PATH}
-mkdir -p ${log_path}/concurrency_${concurrency}
-cp ${log_path}/output_workers.log ${log_path}/concurrency_${concurrency}/workers_start.log
-max_count=$((${concurrency} * ${multi_round}))
-echo "Running loadgen with concurrency: ${concurrency}, max_count: ${max_count}"
-
-python -m tensorrt_llm.serve.scripts.benchmark_serving \
-    --model ${model_name} \
-    --tokenizer ${model_name} \
-    --dataset-name random \
-    --dataset-path ${shared_gpt_path} \
-    --random-input-len ${isl} \
-    --random-output-len ${osl} \
-    --random-prefix-len 0 \
-    --num-prompts ${max_count} \
-    --max-concurrency ${concurrency} \
-    --host ${hostname} \
-    --port ${port} \
-    --ignore-eos \
-    --no-test-input \
-    $(if [ "${streaming}" = "false" ]; then echo "--non-streaming"; fi)
-
-do_get_logs ${log_path}/output_workers.log ${log_path}/concurrency_${concurrency}
-# echo "" > ${log_path}/output_workers.log
-echo "done for ${concurrency} in folder ${log_path}/concurrency_${concurrency}"
+    do_get_logs ${log_path}/output_workers.log ${log_path}/concurrency_${concurrency}
+    echo "" > ${log_path}/output_workers.log
+    echo "done for ${concurrency} in folder ${log_path}/concurrency_${concurrency}"
+done
 
 echo "Benchmark done, gracefully shutting down server and workers..."
 kill -9 $(ps aux | grep '[s]tart_server.sh' | awk '{print $2}') >/dev/null 2>&1 || true

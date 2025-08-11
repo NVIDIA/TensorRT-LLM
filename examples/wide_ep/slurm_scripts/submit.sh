@@ -29,7 +29,7 @@ for b in 1 64 1024; do
 
         args=(
             ${ctx_num} 4 4 4480 true   # Context servers arguments
-            1 16 1024 1024 "0.7"       # Generation servers arguments
+            1 16 1024 1024 true "0.7"       # Generation servers arguments
             $eplb_num_slots $mtp_size  # Other arguments
             $concurrency               # Benchmarking arguments
             $isl
@@ -76,6 +76,7 @@ for b in 512; do
         $mounts
         $workdir
         $model_dir
+        $repo_dir
     )
 
     sbatch --nodes=${total_node_num} \

@@ -38,7 +38,34 @@ container_image=${19}
 mounts=${20}
 workdir=${21}
 model_dir=${22}
-repo_dir=${23}
+trtllm_repo=${23}
+
+echo "================= parameters ================="
+echo "num_ctx_servers: ${num_ctx_servers}"
+echo "ctx_tp_size: ${ctx_tp_size}"
+echo "ctx_batch_size: ${ctx_batch_size}"
+echo "ctx_max_num_tokens: ${ctx_max_num_tokens}"
+echo "ctx_enable_attention_dp: ${ctx_enable_attention_dp}"
+echo "num_gen_servers: ${num_gen_servers}"
+echo "gen_tp_size: ${gen_tp_size}"
+echo "gen_batch_size: ${gen_batch_size}"
+echo "gen_max_num_tokens: ${gen_max_num_tokens}"
+echo "gen_enable_attention_dp: ${gen_enable_attention_dp}"
+echo "gen_gpu_memory_fraction: ${gen_gpu_memory_fraction}"
+echo "eplb_num_slots: ${eplb_num_slots}"
+echo "mtp_size: ${mtp_size}"
+echo "concurrency: ${concurrency}"
+echo "isl: ${isl}"
+echo "osl: ${osl}"
+echo "multi_round: ${multi_round}"
+echo "streaming: ${streaming}"
+echo "container_image: ${container_image}"
+echo "mounts: ${mounts}"
+echo "workdir: ${workdir}"
+echo "model_dir: ${model_dir}"
+echo "trtllm_repo: ${trtllm_repo}"
+echo "==========================================="
+
 
 ctx_max_seq_len=$((isl + 1))
 gen_max_seq_len=$((isl + osl))
@@ -46,7 +73,7 @@ ctx_gpu_frac=0.75
 cache_transceiver_max_num_tokens=8448
 
 container_name=disaggr
-logdir=${workdir}/benchmark-${isl}-${osl}/
+logdir=${workdir}/benchmark-${isl}-${osl}
 mkdir -p ${logdir}
 full_logdir=${logdir}/ctx${num_ctx_servers}_gen${num_gen_servers}_dep${gen_tp_size}_batch${gen_batch_size}_eplb${eplb_num_slots}_mtp${mtp_size}
 
@@ -66,15 +93,26 @@ fi
 mkdir -p ${full_logdir}
 echo "Log will be saved to: ${full_logdir}"
 
+if [ -z "${TRT_LLM_GIT_COMMIT}" ]; then
+    export TRT_LLM_GIT_COMMIT=$(git -C ${trtllm_repo} rev-parse --short HEAD 2>/dev/null || echo "unknown")
+    echo "TRT_LLM_GIT_COMMIT: ${TRT_LLM_GIT_COMMIT}"
+fi
+
 nsys_on=""
 # nsys_on=${full_logdir} # Uncomment this line to enable Nsys profiling
-
 # start the container
 srun -l --container-image=${container_image} \
         --container-name=${container_name} \
         --container-mounts=${mounts} \
         --mpi=pmix \
         echo "Container up."
+
+if [ -n "${trtllm_repo}" ]; then
+    srun --container-name=${container_name} \
+        --container-mounts=${mounts} \
+        --mpi=pmix --overlap -N $SLURM_NNODES --ntasks-per-node=1 \
+        bash -c "cd ${trtllm_repo} && echo 'Running install operation...' && pip install -e .  " 2>&1 | tee ${full_logdir}/install.log
+fi
 
 # generate the yaml file
 srun -l --container-name=${container_name} \
@@ -105,18 +143,19 @@ echo "YAML file generated."
 hostname_value=$(grep '^hostname:' ${full_logdir}/config.yaml | awk -F': ' '{print $2}')
 echo "server host name: $hostname_value"
 
+
 # start the workers
 srun -l --container-name=${container_name} \
         --container-mounts=${mounts} \
-    --mpi=pmix --overlap \
-    bash ${workdir}/start_worker.sh ${full_logdir}/config.yaml "${enable_pdl}" ${ctx_gpus} ${nsys_on} ${repo_dir} &> ${full_logdir}/output_workers.log &
+        --mpi=pmix --overlap \
+        bash ${workdir}/start_worker.sh ${full_logdir}/config.yaml "${enable_pdl}" ${ctx_gpus} ${nsys_on} &> ${full_logdir}/output_workers.log &
 
 # start the server
 srun -l --container-name=${container_name} \
         --container-mounts=${mounts} \
         --mpi=pmix --overlap -N 1 -n 1 \
         -w ${hostname_value} \
-        bash ${workdir}/start_server.sh ${full_logdir}/config.yaml ${repo_dir} &> ${full_logdir}/output_server.log &
+        bash ${workdir}/start_server.sh ${full_logdir}/config.yaml &> ${full_logdir}/output_server.log &
 
 # start benchmarking
 srun -l --container-name=${container_name} \
