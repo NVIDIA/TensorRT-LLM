@@ -906,7 +906,6 @@ class PyExecutor:
             self.guided_decoder.execute(scheduled_batch, logits)
 
     def _executor_loop(self):
-        self._log_ctx_transmission_state("Starting _executor_loop")
         torch.cuda.set_device(self.device_id)
         # ensure the context is created, otherwise, some MPI calls will fail.
         CUASSERT(cudart.cudaSetDevice(self.device_id))
@@ -976,8 +975,8 @@ class PyExecutor:
                         self._add_kv_cache_events()
 
                 if self.kv_cache_transceiver and self.ctx_in_transmission_requests:
-                    self._terminate_ctx_finished_requests()
                     self._check_kv_transfer_timeout()
+                    self._terminate_ctx_finished_requests()
 
                 if self.enable_iter_perf_stats:
                     iter_stats.inflight_batching_stats.num_ctx_tokens = self.model_engine.iter_states[
@@ -988,23 +987,6 @@ class PyExecutor:
                             scheduled_requests=scheduled_batch),
                                    iter_stats=iter_stats,
                                    iter_start_time=iter_start_time))
-
-    def _log_ctx_transmission_state(self, context: str):
-        """Helper method to log the current state of ctx_in_transmission_requests"""
-        if not self.ctx_in_transmission_requests:
-            logger.debug(
-                f"[CTX_TRANSMISSION] {context}: ctx_in_transmission_requests is EMPTY"
-            )
-        else:
-            request_ids = [
-                req.py_request_id for req in self.ctx_in_transmission_requests
-            ]
-            client_ids = [
-                req.py_client_id for req in self.ctx_in_transmission_requests
-            ]
-            logger.debug(
-                f"[CTX_TRANSMISSION] {context}: ctx_in_transmission_requests has {len(self.ctx_in_transmission_requests)} requests - request_ids: {request_ids}, client_ids: {client_ids}"
-            )
 
     def _prepare_draft_requests(self):
         try:
@@ -1118,9 +1100,8 @@ class PyExecutor:
                         ctx_transmission_reqs=ctx_transmission_reqs)
 
                 if self.kv_cache_transceiver and self.ctx_in_transmission_requests:
+                    self._check_kv_transfer_timeout()
                     self._terminate_ctx_finished_requests()
-                    # Not sure about this one...
-                    # self._check_kv_transfer_timeout()
 
     def _process_previous_batch(self):
         if self.kv_cache_transceiver and self.previous_batch.ctx_transmission_reqs:
@@ -1657,7 +1638,6 @@ class PyExecutor:
 
     @nvtx_range("_handle_responses")
     def _handle_responses(self):
-        self._log_ctx_transmission_state("Start of _handle_responses")
         new_responses = []
         requests_to_terminate = []
         new_active_requests = []
@@ -1704,8 +1684,6 @@ class PyExecutor:
             if request_done:
                 if request.is_disagg_context_transmission_state:
                     self.ctx_in_transmission_requests.append(request)
-                    self._log_ctx_transmission_state(
-                        "After adding request in _handle_responses")
                 else:
                     requests_to_terminate.append(request)
             else:
@@ -1715,22 +1693,15 @@ class PyExecutor:
         self._enqueue_responses(new_responses)
         for request in requests_to_terminate:
             self._terminate_request(request)
-        self._log_ctx_transmission_state("End of _handle_responses")
         return requests_to_terminate
 
     @nvtx_range("_terminate_ctx_finished_requests")
     def _terminate_ctx_finished_requests(self):
-        self._log_ctx_transmission_state(
-            "Start of _terminate_ctx_finished_requests")
         for request in self.ctx_in_transmission_requests[:]:
             if request.is_disagg_context_complete_state or request.py_to_cleanup:
-                self._log_ctx_transmission_state(
-                    f"After removing request {request.py_request_id}")
                 request.py_kv_transfer_start_time = None
                 self._terminate_request(request)
                 self.ctx_in_transmission_requests.remove(request)
-        self._log_ctx_transmission_state(
-            "End of _terminate_ctx_finished_requests")
 
     def _await_any_response(self,
                             timeout: Optional[float] = None
