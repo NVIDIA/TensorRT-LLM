@@ -17,6 +17,8 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.plugin.plugin import CustomAllReduceHelper
 
+from .communicator import TorchDist
+
 try:
     import flashinfer.comm as flashinfer_comm
 except ImportError:
@@ -26,6 +28,30 @@ except ImportError:
     exit(1)
 
 _thread_local = threading.local()
+
+_enable_debug = os.environ.get("_FLASHINFER_DEBUG", "0") == "1"
+
+
+def get_flashinfer_allreduce_workspace(mapping: Mapping, max_num_tokens: int, hidden_dim: int):
+    if not hasattr(_thread_local, f'flashinfer_allreduce_workspaces_{mapping.pp_rank}'):
+        setattr(_thread_local, f'flashinfer_allreduce_workspaces_{mapping.pp_rank}', {})
+    
+    flashinfer_allreduce_workspaces = getattr(_thread_local, f'flashinfer_allreduce_workspaces_{mapping.pp_rank}')
+
+    if mapping not in flashinfer_allreduce_workspaces:
+        dist = TorchDist(mapping)
+        flashinfer_allreduce_workspaces[mapping] = flashinfer_comm.trtllm_create_ipc_workspace_for_all_reduce(
+            rank=mapping.rank,
+            tp_size=mapping.tp_size,
+            max_token_num=max_num_tokens,
+            hidden_dim=hidden_dim,
+            group=None,
+        )
+        if _enable_debug:
+            print(
+                f"FlashInferAllReduce.init: {mapping.rank} {mapping.tp_size} {max_num_tokens} {hidden_dim}"
+            )
+    return flashinfer_allreduce_workspaces[mapping]
 
 
 def get_allreduce_workspace(mapping: Mapping) -> torch.LongTensor:
@@ -725,30 +751,24 @@ class FlashInferAllReduce(nn.Module):
                  hidden_dim: int, dtype: torch.dtype):
         super().__init__()
         self.mapping = mapping
-        self.max_message_size = 70 * 1024 * 1024  # 70MB
+        # self.max_message_size = 70 * 1024 * 1024  # 70MB
         self.dtype = dtype
-        self.hidden_dim = hidden_dim
+        self.hidden_dim = 8192
         self.strategy = strategy
 
         # flashinfer all reduce is better for message sizes < ~70MB
         # num tokens * hidden dim * 2 < 70 *1024*1024
         # TODO: 2 is for bf16,fp16. need to add fp8, fp4
-        self.max_num_tokens = self.max_message_size // (self.hidden_dim * 2)
+        self.max_num_tokens = 8192 #self.max_message_size // (self.hidden_dim * 2)
 
-        self.workspace = flashinfer_comm.trtllm_create_ipc_workspace_for_all_reduce(
-            rank=self.mapping.rank,
-            tp_size=self.mapping.tp_size,
-            max_token_num=self.max_num_tokens,
-            hidden_dim=self.hidden_dim,
-            group=None,
-        )
+        self.workspace = get_flashinfer_allreduce_workspace(self.mapping, self.max_num_tokens, self.hidden_dim)
         self._flag_value = 1
-        self._enable_debug = os.environ.get("_FLASHINFER_DEBUG", "0") == "1"
 
-        if self._enable_debug:
-            print(
-                f"FlashInferAllReduce.forward: {self.mapping.rank} {self.mapping.tp_size} {self.max_num_tokens} {self.hidden_dim}"
-            )
+        self.all_reduce_params = FlashInferAllReduceParams(
+            strategy=self.strategy,
+            fusion_op=flashinfer_comm.AllReduceFusionOp.NONE,
+            config_mode=flashinfer_comm.AllReduceStrategyConfig.USE_MEMCPY,
+        )
 
     def forward(
         self,
@@ -762,17 +782,13 @@ class FlashInferAllReduce(nn.Module):
         hidden_dim = input.size(1)
 
         output_buffer = torch.empty(num_token * hidden_dim)
-        if self._enable_debug:
+        if _enable_debug:
             print(
-                f"FlashInferAllReduce.forward: {num_token} {hidden_dim} {all_reduce_params}"
+                f"FlashInferAllReduce.forward: {num_token} {hidden_dim} {self.all_reduce_params}"
             )
 
-        if all_reduce_params is None:
-            all_reduce_params = FlashInferAllReduceParams(
-                strategy=self.strategy,
-                fusion_op=flashinfer_comm.AllReduceFusionOp.NONE,
-                config_mode=flashinfer_comm.AllReduceStrategyConfig.USE_MEMCPY,
-            )
+        # if all_reduce_params is None:
+        
 
         flashinfer_comm.trtllm_custom_all_reduce(
             inp=input.ravel(),
@@ -780,9 +796,9 @@ class FlashInferAllReduce(nn.Module):
             tp_size=self.mapping.tp_size,
             tp_rank=self.mapping.rank,
             token_num=num_token,
-            fusion_op_code=all_reduce_params.fusion_op,
-            strategy_code=all_reduce_params.strategy,
-            config_code=all_reduce_params.config_mode,
+            fusion_op_code=self.all_reduce_params.fusion_op,
+            strategy_code=self.all_reduce_params.strategy,
+            config_code=self.all_reduce_params.config_mode,
             launch_with_pdl=False,
             flag_value=self._flag_value,
             peer_comm_buffer_ptrs=torch.tensor(self.workspace[0],
