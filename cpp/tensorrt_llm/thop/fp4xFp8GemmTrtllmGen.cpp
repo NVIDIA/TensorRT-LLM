@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2023, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -37,13 +37,11 @@ template <tg::Dtype outDtype>
 void runGemm(at::Tensor& out, at::Tensor const& mat1, at::Tensor const& mat2, at::Tensor const& mat2Scale,
     at::Tensor const& globalScale, int64_t m, int64_t n, int64_t k)
 {
-    auto eltType = tg::Dtype::E2m1;
-
-    tensorrt_llm::kernels::TrtllmGenGemmRunnerOptions options = {.eltType = eltType,
+    tensorrt_llm::kernels::TrtllmGenGemmRunnerOptions options = {.eltTypeA = tg::Dtype::E2m1,
         .outputType = outDtype,
         .deepSeekFp8 = false,
         .transposeMmaOutput = true,
-        .dtypeMmaA = tg::Dtype::E4m3};
+        .eltTypeB = tg::Dtype::E4m3};
 
     tensorrt_llm::kernels::TrtllmGenGemmRunner runner(options);
 
@@ -60,7 +58,7 @@ void runGemm(at::Tensor& out, at::Tensor const& mat1, at::Tensor const& mat2, at
         out.data_ptr(), outScalePtr, /* cScalePtr */ nullptr, workspace.data_ptr(), stream.stream(), mat1.get_device());
 }
 
-at::Tensor nvfp4_fp8_gemm_impl(at::Tensor const& mat1, at::Tensor const& mat2, at::Tensor const& mat2Scale,
+at::Tensor fp4_fp8_gemm_impl(at::Tensor const& mat1, at::Tensor const& mat2, at::Tensor const& mat2Scale,
     at::Tensor const& globalScale, std::optional<c10::ScalarType> out_dtype)
 {
     using tensorrt_llm::kernels::Data_type;
@@ -107,10 +105,10 @@ at::Tensor nvfp4_fp8_gemm_impl(at::Tensor const& mat1, at::Tensor const& mat2, a
 
 } // namespace
 
-at::Tensor nvfp4_fp8_gemm_trtllmgen(at::Tensor const& mat1, at::Tensor const& mat2, at::Tensor const& mat2Scale,
+at::Tensor fp4_fp8_gemm_trtllmgen(at::Tensor const& mat1, at::Tensor const& mat2, at::Tensor const& mat2Scale,
     at::Tensor const& globalScale, std::optional<c10::ScalarType> out_dtype)
 {
-    return nvfp4_fp8_gemm_impl(mat1, mat2, mat2Scale, globalScale, out_dtype);
+    return fp4_fp8_gemm_impl(mat1, mat2, mat2Scale, globalScale, out_dtype);
 }
 
 } // namespace torch_ext
@@ -118,11 +116,11 @@ at::Tensor nvfp4_fp8_gemm_trtllmgen(at::Tensor const& mat1, at::Tensor const& ma
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
-        "nvfp4_fp8_gemm_trtllmgen(Tensor mat1, Tensor mat2, Tensor mat2Scale, Tensor globalScale, "
+        "fp4_fp8_gemm_trtllmgen(Tensor mat1, Tensor mat2, Tensor mat2Scale, Tensor globalScale, "
         "ScalarType? out_dtype=None) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("nvfp4_fp8_gemm_trtllmgen", &torch_ext::nvfp4_fp8_gemm_trtllmgen);
+    m.impl("fp4_fp8_gemm_trtllmgen", &torch_ext::fp4_fp8_gemm_trtllmgen);
 }

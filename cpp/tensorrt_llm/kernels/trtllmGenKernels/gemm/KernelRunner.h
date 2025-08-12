@@ -28,11 +28,11 @@ namespace kernels
 
 struct TrtllmGenGemmRunnerOptions
 {
-    gemm::trtllm::gen::Dtype eltType;
+    gemm::trtllm::gen::Dtype eltTypeA;
     gemm::trtllm::gen::Dtype outputType;
     bool deepSeekFp8{false};
     bool transposeMmaOutput{false};
-    gemm::trtllm::gen::Dtype dtypeMmaA{gemm::trtllm::gen::Dtype::Void};
+    gemm::trtllm::gen::Dtype eltTypeB{gemm::trtllm::gen::Dtype::Void};
 };
 
 class TrtllmGenGemmRunner

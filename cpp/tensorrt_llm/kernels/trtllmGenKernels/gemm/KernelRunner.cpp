@@ -18,6 +18,7 @@
 
 #include "KernelRunner.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/envUtils.h"
 #include "trtllmGen_gemm_export/GemmInterface.h"
 #include "trtllmGen_gemm_export/GemmOptions.h"
 #include "trtllmGen_gemm_export/trtllm/gen/DtypeDecl.h"
@@ -46,10 +47,10 @@ TrtllmGenGemmRunner::TrtllmGenGemmRunner(TrtllmGenGemmRunnerOptions const& optio
         auto const options = configs[i].mOptions;
 
         // When we include low-latency kernels we can set transposeMmaOutput via constructor
-        if (options.mDtypeA == mOptions.eltType && options.mDtypeC == mOptions.outputType
+        if (options.mDtypeA == mOptions.eltTypeA && options.mDtypeC == mOptions.outputType
             && options.mUseDeepSeekFp8 == mOptions.deepSeekFp8
             && options.mTransposeMmaOutput == mOptions.transposeMmaOutput
-            && (mOptions.dtypeMmaA == gemm::trtllm::gen::Dtype::Void || options.mDtypeMmaA == mOptions.dtypeMmaA))
+            && (mOptions.eltTypeB == gemm::trtllm::gen::Dtype::Void || options.mDtypeB == mOptions.eltTypeB))
         {
             mPassingConfigIndices.push_back(i);
         }
@@ -114,8 +115,8 @@ void TrtllmGenGemmRunner::run(int32_t m, int32_t n, int32_t k, void const* a, fl
     // FIXME once we start using all-reduce in the epilogue of the gemm this can be moved elsewhere
     gemm.runInitBeforeWorldSync(config, gemmData, static_cast<void*>(stream));
 
-    auto const err = gemm.run(config, workspace, gemmData, static_cast<void*>(stream), multiProcessorCount, true,
-        globalTrtllmGenGemmModuleCache);
+    auto const err = gemm.run(config, workspace, gemmData, static_cast<void*>(stream), multiProcessorCount,
+        tensorrt_llm::common::getEnvEnablePDL(), globalTrtllmGenGemmModuleCache);
 
     TLLM_CHECK_WITH_INFO(err == 0, "Error occurred when running GEMM!");
 }
