@@ -28,6 +28,8 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
         [True, "TRTLLM", True, False, True, True],
         # TODO: nvbugs/5461761
         # [True, "TRTLLM", True, False, False, True],
+        [True, "TRTLLM", True, False, False, True],
+        [True, "TRTLLM", False, False, False, False],
     ])
 @pytest.mark.high_cuda_memory
 def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
