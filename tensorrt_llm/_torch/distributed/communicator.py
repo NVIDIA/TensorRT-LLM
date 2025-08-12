@@ -447,6 +447,9 @@ class TorchDist(Distributed):
         else:
             pass
 
+    def allgather(self, obj, root=0):
+        raise NotImplementedError('allgather is not implemented for TorchDist')
+
 
 class PPComm:
 
