@@ -1268,17 +1268,19 @@ class PyExecutor:
         return
 
     def _check_kv_transfer_timeout(self):
-        current_time = time.time()
-        timeout_ms = self.kv_cache_transceiver.kv_transfer_timeout_ms
-        if timeout_ms is None:
+        if not self.kv_cache_transceiver:
             return
+        timeout_ms = self.kv_cache_transceiver.kv_transfer_timeout_ms
+        if timeout_ms is None or timeout_ms <= 0:
+            return
+        current_time = time.time()
 
         for req in self.ctx_in_transmission_requests[:]:
             if req.py_kv_transfer_start_time is None:
                 continue
             elapsed_time = (current_time - req.py_kv_transfer_start_time) * 1000
             if elapsed_time > timeout_ms:
-                logger.debug(
+                logger.warning(
                     f"Terminating context request {req.py_request_id} due to KV cache transfer timeout"
                 )
                 req.py_to_cleanup = True
@@ -1288,7 +1290,7 @@ class PyExecutor:
                 elapsed_time = (current_time -
                                 req.py_kv_transfer_start_time) * 1000
                 if elapsed_time > timeout_ms:
-                    logger.debug(
+                    logger.warning(
                         f"Terminating generation request {req.py_request_id} due to KV cache transfer timeout"
                     )
                     req.py_to_cleanup = True
