@@ -17,7 +17,7 @@
 # and s2wrapper: https://github.com/bfshi/scaling_on_scales
 
 import math
-from typing import List, Optional, Tuple, Callable, Dict, Any, Union
+from typing import List, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -31,8 +31,7 @@ from tensorrt_llm.logger import logger
 
 
 def _get_active_multimodal_params(
-    multimodal_params: List[MultimodalParams],
-) -> List[MultimodalParams]:
+    multimodal_params: List[MultimodalParams], ) -> List[MultimodalParams]:
     """
     Get active multimodal params that need encoder processing for chunk prefill.
     """
@@ -44,10 +43,12 @@ def _get_active_multimodal_params(
             continue
 
         # Check if embeddings are already cached
-        if (param.multimodal_data and
-            "multimodal_embedding" in param.multimodal_data and
-            param.multimodal_data["multimodal_embedding"] is not None):
-            logger.debug(f"Skipping encoder forward for param with cached multimodal_embedding")
+        if (param.multimodal_data
+                and "multimodal_embedding" in param.multimodal_data
+                and param.multimodal_data["multimodal_embedding"] is not None):
+            logger.debug(
+                f"Skipping encoder forward for param with cached multimodal_embedding"
+            )
             continue
 
         # This param needs encoder processing
@@ -65,11 +66,15 @@ def _cache_multimodal_embeddings(
     Uses torch.split for efficient tensor splitting without manual indexing.
     """
     # TODO: support multiple multimodal modalities per request
-    assert len(embeddings) == 1, "Currently only support single mm_embeds (single modality) per request"
+    assert len(
+        embeddings
+    ) == 1, "Currently only support single mm_embeds (single modality) per request"
     mm_embed = embeddings[0]
 
     # Collect embedding lengths for each parameter
-    embed_lengths = [param.multimodal_runtime.total_mm_tokens for param in multimodal_params]
+    embed_lengths = [
+        param.multimodal_runtime.total_mm_tokens for param in multimodal_params
+    ]
 
     # Validate total length matches
     total_expected = sum(embed_lengths)
@@ -83,7 +88,9 @@ def _cache_multimodal_embeddings(
     for param, embed_chunk in zip(multimodal_params, split_embeddings):
         param.multimodal_data["multimodal_embedding"] = embed_chunk
 
-    logger.debug(f"Cached {len(split_embeddings)} multimodal embedding chunks in this iteration")
+    logger.debug(
+        f"Cached {len(split_embeddings)} multimodal embedding chunks in this iteration"
+    )
 
 
 def get_multimodal_embeddings(
@@ -111,9 +118,7 @@ def get_multimodal_embeddings(
         return []
 
     # Step 1: Find active multimodal params that need encoder processing
-    active_multimodal_params = _get_active_multimodal_params(
-        multimodal_params
-    )
+    active_multimodal_params = _get_active_multimodal_params(multimodal_params)
 
     # Step 2: Run encoder forward only on uncached parameters
     if active_multimodal_params:
@@ -124,19 +129,24 @@ def get_multimodal_embeddings(
             return encoder_outputs
 
         # Validate that multimodal_runtime has required attributes for caching
-        if (not hasattr(active_multimodal_params[0], 'multimodal_runtime') or
-            active_multimodal_params[0].multimodal_runtime is None or
-            active_multimodal_params[0].multimodal_runtime.total_mm_tokens is None):
-            logger.warning("Multimodal runtime data missing or incomplete - recomputed all embeddings")
+        if (not hasattr(active_multimodal_params[0], 'multimodal_runtime')
+                or active_multimodal_params[0].multimodal_runtime is None or
+                active_multimodal_params[0].multimodal_runtime.total_mm_tokens
+                is None):
+            logger.warning(
+                "Multimodal runtime data missing or incomplete - recomputed all embeddings"
+            )
             return encoder_outputs
 
         # Step 3: Cache the computed embeddings to multimodal_data["multimodal_embedding"]
-        _cache_multimodal_embeddings(
-            active_multimodal_params, encoder_outputs
-        )
+        _cache_multimodal_embeddings(active_multimodal_params, encoder_outputs)
 
     # Step 4: Gather all embeddings for the batch
-    all_embeddings = torch.cat([param.multimodal_data["multimodal_embedding"] for param in multimodal_params], dim=0)
+    all_embeddings = torch.cat([
+        param.multimodal_data["multimodal_embedding"]
+        for param in multimodal_params
+    ],
+                               dim=0)
     return [all_embeddings]
 
 
@@ -176,28 +186,27 @@ def find_input_mm_embeds(
         return mm_embeds
 
     # Calculate total tokens that need processing (both cached and current chunk)
-    total_mm_tokens = sum([
-        param.multimodal_runtime.num_mm_tokens
-        for param in multimodal_params
-    ])
+    total_mm_tokens = sum(
+        [param.multimodal_runtime.num_mm_tokens for param in multimodal_params])
 
     if total_mm_tokens == 0:
         # No tokens need processing, return empty list
         logger.debug(
-            "All multimodal tokens are cached or beyond current chunk, skipping vision encoder forward")
+            "All multimodal tokens are cached or beyond current chunk, skipping vision encoder forward"
+        )
         return []
 
     if total_mm_tokens == sum(mm_embed.shape[0] for mm_embed in mm_embeds):
         return mm_embeds
 
-
     current_pos = 0
     slices = []
     for param in multimodal_params:
         runtime = param.multimodal_runtime
-        slices.append((current_pos + runtime.num_unseen_mm_tokens,
-                       current_pos + runtime.num_unseen_mm_tokens + runtime.num_mm_tokens))
-        if len(mm_embeds) == 1:  # pre-concatenated mm_embeds, need global offset
+        slices.append((current_pos + runtime.num_unseen_mm_tokens, current_pos +
+                       runtime.num_unseen_mm_tokens + runtime.num_mm_tokens))
+        if len(mm_embeds
+               ) == 1:  # pre-concatenated mm_embeds, need global offset
             current_pos += runtime.total_mm_tokens
 
     sliced_mm_embeds = []
