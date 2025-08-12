@@ -1,7 +1,9 @@
 from pathlib import Path
 
+import defs.ci_profiler
 import pytest
-from defs.common import convert_weights, venv_check_call, venv_mpi_check_call
+from defs.common import (convert_weights, test_llm_torch_multi_lora_support,
+                         venv_check_call, venv_mpi_check_call)
 from defs.conftest import get_device_memory, get_sm_version
 from defs.trt_test_alternative import check_call
 
@@ -122,3 +124,102 @@ def test_nemotron_nas_summary_2gpu(nemotron_nas_example_root, llm_venv,
     ]
 
     venv_mpi_check_call(llm_venv, mpi_cmd, summary_cmd)
+
+
+@pytest.mark.skip_less_device_memory(80000)
+@pytest.mark.parametrize("nemotron_nas_model_root", [
+    "Llama-3.1-Nemotron-Nano-8B-v1",
+],
+                         indirect=True)
+def test_nemotron_nano_8b_lora_torch(nemotron_nas_example_root, llm_venv,
+                                     nemotron_nas_model_root, llm_datasets_root,
+                                     llm_rouge_root, engine_dir, cmodel_dir):
+    """Run Nemotron Nano 8B with multiple dummy LoRAs using LLM-API Torch backend."""
+
+    print("Testing with LLM-API Torch backend...")
+
+    defs.ci_profiler.start("test_llm_torch_multi_lora_support")
+    test_llm_torch_multi_lora_support(
+        hf_model_dir=nemotron_nas_model_root,
+        llm_venv=llm_venv,
+        num_loras=2,
+        lora_rank=8,
+        target_hf_modules=["q_proj", "k_proj", "v_proj"],
+        zero_lora_weights=True,
+        use_code_prompts=False,
+        tensor_parallel_size=1,
+    )
+    defs.ci_profiler.stop("test_llm_torch_multi_lora_support")
+    print(
+        f"test_llm_torch_multi_lora_support: {defs.ci_profiler.elapsed_time_in_sec('test_llm_torch_multi_lora_support')} sec"
+    )
+
+
+@pytest.mark.skip(reason="TODO: test on 4 GPUs locally")
+@pytest.mark.skip_less_device(4)
+@pytest.mark.skip_less_device_memory(80000)
+@pytest.mark.parametrize("nemotron_nas_model_root", [
+    "Llama-3_3-Nemotron-Super-49B-v1",
+],
+                         indirect=True)
+def test_nemotron_super_49b_lora_torch(nemotron_nas_example_root, llm_venv,
+                                       nemotron_nas_model_root,
+                                       llm_datasets_root, llm_rouge_root,
+                                       engine_dir, cmodel_dir):
+    """Run Nemotron Super 49B with multiple dummy LoRAs using LLM-API Torch backend."""
+
+    print("Testing with LLM-API Torch backend...")
+
+    defs.ci_profiler.start("test_llm_torch_multi_lora_support")
+    test_llm_torch_multi_lora_support(hf_model_dir=nemotron_nas_model_root,
+                                      llm_venv=llm_venv,
+                                      num_loras=2,
+                                      lora_rank=8,
+                                      target_hf_modules=[
+                                          "q_proj", "k_proj", "v_proj",
+                                          "gate_proj", "up_proj", "down_proj"
+                                      ],
+                                      target_trtllm_modules=[
+                                          "attn_q", "attn_k", "attn_v",
+                                          "mlp_h_to_4h", "mlp_gate",
+                                          "mlp_4h_to_h"
+                                      ],
+                                      zero_lora_weights=True,
+                                      use_code_prompts=False,
+                                      tensor_parallel_size=4)
+    defs.ci_profiler.stop("test_llm_torch_multi_lora_support")
+    print(
+        f"test_llm_torch_multi_lora_support: {defs.ci_profiler.elapsed_time_in_sec('test_llm_torch_multi_lora_support')} sec"
+    )
+
+
+@pytest.mark.skip(reason="TODO: test on 8 GPUs locally")
+@pytest.mark.skip_less_device(8)
+@pytest.mark.skip_less_device_memory(80000)
+@pytest.mark.parametrize("nemotron_nas_model_root", [
+    "Llama-3_1-Nemotron-Ultra-253B-v1",
+],
+                         indirect=True)
+def test_nemotron_ultra_253b_lora_torch(nemotron_nas_example_root, llm_venv,
+                                        nemotron_nas_model_root,
+                                        llm_datasets_root, llm_rouge_root,
+                                        engine_dir, cmodel_dir):
+    """Run Nemotron Ultra 253B with multiple dummy LoRAs using LLM-API Torch backend."""
+
+    print("Testing with LLM-API Torch backend...")
+
+    defs.ci_profiler.start("test_llm_torch_multi_lora_support")
+    test_llm_torch_multi_lora_support(
+        hf_model_dir=nemotron_nas_model_root,
+        llm_venv=llm_venv,
+        num_loras=2,
+        lora_rank=8,
+        target_hf_modules=["q_proj", "k_proj", "v_proj"],
+        zero_lora_weights=True,
+        use_code_prompts=False,
+        tensor_parallel_size=8,
+    )
+    defs.ci_profiler.stop("test_llm_torch_multi_lora_support")
+    print(
+        f"test_llm_torch_multi_lora_support: {defs.ci_profiler.elapsed_time_in_sec('test_llm_torch_multi_lora_support')} sec"
+    )
