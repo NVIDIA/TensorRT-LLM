@@ -8,17 +8,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from _dist_test_utils import get_device_counts
-from _graph_test_helpers import run_sharding_pattern_detection_test, run_test
+from _graph_test_helpers import run_sharding_pattern_detection_test, run_test_transformed_gm
 
 import tensorrt_llm._torch.auto_deploy.distributed.common as dist_common
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
-from tensorrt_llm._torch.auto_deploy.transformations.library import (
-    ShardingConfig,
+from tensorrt_llm._torch.auto_deploy.transform.library.sharding import (
     SplitDimension,
     TPShardingInfo,
-    detect_column_row_shard,
-    sharding_transform_executor,
 )
+from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_linear_op, is_op
 
 
@@ -146,10 +144,18 @@ def _run_job(
     # now run the test
     op_expected = getattr(torch.ops.auto_deploy, dist_op_expected)
 
-    def transform_func(gm) -> None:
-        sharding_config = ShardingConfig()
-        detect_column_row_shard(gm, rank, world_size, sharding_config)
-        sharding_transform_executor(gm, sharding_config)
+    gm = torch_export_to_gm(model, args=(x,), clone=True)
+    gm_transformed = InferenceOptimizer(
+        None,
+        {
+            "detect_column_row_shard": {
+                "stage": "sharding",
+            },
+            "sharding_transform_executor": {
+                "stage": "sharding",
+            },
+        },
+    )(None, gm)
 
     def combined_graph_check(gm) -> bool:
         # Check for expected distributed operations
@@ -160,10 +166,10 @@ def _run_job(
         weight_sizes_valid = verify_local_weight_sizes(gm)
         return has_expected_dist_ops and weight_sizes_valid
 
-    run_test(
+    run_test_transformed_gm(
         model,
         x,
-        transform=transform_func,
+        gm_transformed,
         check_transformed_graph=combined_graph_check,
         _get_expected_num_params=_get_expected_num_params,
     )
@@ -262,9 +268,18 @@ def _run_pattern_detection_job(
                     )
 
     # get detected transformations
-    sharding_config = ShardingConfig()
-    detect_column_row_shard(gm, rank, world_size, sharding_config)
-    detected_transformations = sharding_config.tp_transforms
+    optimizer = InferenceOptimizer(
+        None,
+        {
+            "detect_column_row_shard": {
+                "stage": "sharding",
+            },
+        },
+    )
+    optimizer.shared_config.local_rank = rank
+    optimizer.shared_config.world_size = world_size
+    _ = optimizer(None, gm)
+    detected_transformations = optimizer.shared_config.sharding_config.tp_transforms
 
     # Run pattern detection test
     run_sharding_pattern_detection_test(detected_transformations, expected_transformations)
