@@ -26,7 +26,8 @@ from tensorrt_llm._utils import (is_trace_enabled, nvtx_range, release_gc,
 from tensorrt_llm.inputs.multimodal import (MultimodalParams,
                                             MultimodalRuntimeData)
 from tensorrt_llm.logger import logger
-from tensorrt_llm.lora_manager import LoraConfig, LoraModelConfig
+from tensorrt_llm.lora_helper import LoraConfig
+from tensorrt_llm.lora_manager import LoraModelConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 from tensorrt_llm.quantization.utils.fp4_utils import float4_e2m1x2
