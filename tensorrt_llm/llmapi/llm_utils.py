@@ -12,8 +12,8 @@ from typing import Callable, List, Optional, Tuple, Union
 import torch
 from tqdm import tqdm
 
-from .._utils import (global_mpi_rank, mpi_barrier, mpi_broadcast, mpi_rank,
-                      release_gc)
+from .._utils import (global_mpi_rank, local_mpi_rank, mpi_barrier,
+                      mpi_broadcast, mpi_rank, release_gc)
 from ..auto_parallel import AutoParallelConfig
 # yapf: disable
 from ..bindings.executor import (BatchingType, CapacitySchedulerPolicy,
@@ -627,9 +627,11 @@ class CachedModelLoader:
                     f'backend {self.llm_args.backend} is not supported.')
 
             if self.model_loader.model_obj.is_hub_model:
-                self._hf_model_dir = download_hf_model(
-                    self.model_loader.model_obj.model_name,
-                    self.llm_args.revision)
+                hf_model_dirs = self.mpi_session.submit_sync(
+                    CachedModelLoader._node_download_hf_model,
+                    model=self.model_loader.model_obj.model_name,
+                    revision=self.llm_args.revision)
+                self._hf_model_dir = hf_model_dirs[0]
             else:
                 self._hf_model_dir = self.model_loader.model_obj.model_dir
 
@@ -805,6 +807,17 @@ class CachedModelLoader:
             build_task(self.get_engine_dir())
 
         return self.get_engine_dir()
+
+    @print_traceback_on_error
+    @staticmethod
+    def _node_download_hf_model(
+        model: str,
+        revision: Optional[str] = None,
+    ) -> Optional[Path]:
+        if local_mpi_rank() == 0:
+            return download_hf_model(model, revision)
+        else:
+            return None
 
     @print_traceback_on_error
     @staticmethod
