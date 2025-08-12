@@ -101,14 +101,15 @@ class MultimodalRuntimeData:
         num_mm_tokens: Number of multimodal tokens in the current chunk (computed)
         total_mm_tokens: Total number of multimodal tokens in the request sequence (computed)
     """
-    past_seen_token_num: int # == num_cached_tokens
+    past_seen_token_num: int
     mm_token_lengths: List[int]
     mm_token_positions: List[int]
-    chunk_end_pos: int # == end_pos
+    chunk_end_pos: int
 
     num_unseen_mm_tokens: Optional[int] = None
     num_mm_tokens: Optional[int] = None
     total_mm_tokens: Optional[int] = None
+
     # TODO: fine-grained control of encoder runner/cache to each mm_item
 
     def __post_init__(self):
@@ -159,7 +160,8 @@ class MultimodalRuntimeData:
                         # Full overlap - count the entire mm item chunk
                         self.num_mm_tokens += length
 
-        if self.num_unseen_mm_tokens + self.num_mm_tokens > sum(self.mm_token_lengths):
+        if self.num_unseen_mm_tokens + self.num_mm_tokens > sum(
+                self.mm_token_lengths):
             raise ValueError(
                 f"num_unseen_mm_tokens ({self.num_unseen_mm_tokens}) + num_mm_tokens ({self.num_mm_tokens}) must be less than or equal to sum of mm_token_lengths ({sum(self.mm_token_lengths)})"
             )
