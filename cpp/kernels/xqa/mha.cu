@@ -1379,6 +1379,19 @@ __device__ inline ThrdRegRowMax mergeRowMax(
     return mergedRowMax;
 }
 
+__device__ inline void addAttentionSinks(
+    ThrdRegRowMax& globalRowSum, ThrdRegRowMax const globalRowMax, float const* attentionSinks)
+{
+    for (uint32_t i = 0; i < globalRowSum.size; i++)
+    {
+        uint32_t srcOffset = warp_size * i + laneId();
+        if (srcOffset < headGrpSize)
+        {
+            globalRowSum[i] += expf(attentionSinks[srcOffset] - globalRowMax[i]);
+        }
+    }
+}
+
 #ifdef NDEBUG
 __device__ __forceinline__
 #else
@@ -1405,6 +1418,7 @@ CUBIN_EXPORT __global__
 #if SPEC_DEC
         MaskType const* __restrict__ mask,  // [qSeqLen, divUp(qSeqLen, 32)].
 #endif
+        float const* attentionSinks,        // [headGrpSize]
 #ifdef NDEBUG
         KVCacheList<usePagedKVCache> const& cacheList,
 #if BEAM_WIDTH > 1
@@ -2371,6 +2385,12 @@ CUBIN_EXPORT __global__
         float voScale = (isKVCacheQuantized ? kvCacheScale[0] : 1.F);
         if (seqIterInit < nbSeqIters)
         { // otherwise rcpRowSum will be NAN.
+            // The attention sinks are moved to the multi-block reduction part if the multi-block is enabled.
+            if (!isMultiBlock && attentionSinks != nullptr)
+            {
+                // Attention sinks are per head.
+                addAttentionSinks(globalRowSum, globalRowMax, attentionSinks + headGrpSize * idxHeadGrp);
+            }
             ThrdRegRowMax const rcpRowSum = __frcp_rn(globalRowSum);
 #if LOW_PREC_OUTPUT
             voScale *= rcpOutScale[0];
@@ -2559,6 +2579,11 @@ CUBIN_EXPORT __global__
                         assert(std::isfinite(mergedRowSum[0]));
                     }
                 }
+                if (attentionSinks != nullptr)
+                {
+                    // Attention sinks are per head.
+                    addAttentionSinks(mergedRowSum, mergedRowMax, attentionSinks + headGrpSize * idxHeadGrp);
+                }
                 __syncthreads();
                 rescaleAcc(warp, sumAcc, fullRescaleMask, __frcp_rn(mergedRowSum));
                 GemmOutRegTile const mergedOutTile = toFp16(sumAcc);
@@ -2615,6 +2640,7 @@ CUBIN_EXPORT __global__ __launch_bounds__(256, nbCtaPerSM) void kernel_mha(
     MaskType const* __restrict__ mask,  // [qSeqLen, divUp(qSeqLen, 32))] uint2 (each bit represents mask for one col
                                         // position).
 #endif
+    float const* attentionSinks,        // [headGrpSize]
     KVCacheList<usePagedKVCache> const cacheList,
 #if BEAM_WIDTH > 1
     BeamSearchParams const beamSearchParams,
@@ -2640,7 +2666,7 @@ CUBIN_EXPORT __global__ __launch_bounds__(256, nbCtaPerSM) void kernel_mha(
 #if SPEC_DEC
         mask,
 #endif
-        cacheList,
+        attentionSinks, cacheList,
 #if BEAM_WIDTH > 1
         beamSearchParams,
 #endif
@@ -2667,6 +2693,7 @@ void launchMHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
 #else
     InputHead const* q,
 #endif
+    float const* attentionSinks, // [headGrpSize]
 #if USE_PAGED_KV_CACHE
 #if PAGED_KV_CACHE_LAYOUT == 1
     GMemCacheHead* kCacheVLLM, GMemCacheHead* vCacheVLLM,
@@ -2760,7 +2787,7 @@ void launchMHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
 #if SPEC_DEC
         mask,
 #endif
-        cacheList,
+        attentionSinks, cacheList,
 #if BEAM_WIDTH > 1
         beamSearchParams,
 #endif
@@ -2788,7 +2815,7 @@ void launchMHA(cudaDeviceProp const& prop, uint32_t nbKHeads,
 #if SPEC_DEC
         mask,
 #endif
-        cacheList,
+        attentionSinks, cacheList,
 #if BEAM_WIDTH > 1
         beamSearchParams,
 #endif

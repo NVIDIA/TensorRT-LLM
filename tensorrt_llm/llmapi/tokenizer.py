@@ -330,7 +330,8 @@ def _llguidance_tokenizer_info(tokenizer):
 
 def load_hf_tokenizer(model_dir: str,
                       trust_remote_code: bool = True,
-                      use_fast: bool = True) -> Optional[TransformersTokenizer]:
+                      use_fast: bool = True,
+                      **kwargs) -> Optional[TransformersTokenizer]:
     ''' Load a tokenizer from a Hugging Face model directory.
 
     Args:
@@ -349,7 +350,8 @@ def load_hf_tokenizer(model_dir: str,
             padding_side='left',
             truncation_side='left',
             trust_remote_code=trust_remote_code,
-            use_fast=use_fast)
+            use_fast=use_fast,
+            **kwargs)
 
     except Exception:
         return None
