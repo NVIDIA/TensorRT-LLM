@@ -1017,6 +1017,88 @@ private:
     int mFifoEntryIndex;
 };
 
+__global__ void moeAllToAllKernel(FusedMoeCommKernelParam params, FusedMoeWorkspace workspace, bool hasBasicFields)
+{
+    __shared__ uint64_t allWarpSmemBar[32];
+    extern __shared__ int4 allWarpShm[];
+
+
+    bool isSender = blockIdx.z == 0;
+    int channelCount = gridDim.y;
+    int group = threadIdx.y;
+    SendRecvDispls dataDispls = isSender ? params.sendDispls : params.recvDispls;
+
+    FusedMoePairInfo pairInfo;  
+    int peerRank = blockIdx.x * blockDim.y + group;
+    if (peerRank >= params.worldInfo.epInfo.epSize)
+    {
+        return;
+    }
+    int tokenCount;
+    int* groupStartPtr = dataDispls.getGroupStart(peerRank, tokenCount);
+    if (tokenCount == 0)
+    {
+        return;
+    }
+
+    pairInfo.channel = blockIdx.y;
+    pairInfo.channelCount = channelCount;
+    pairInfo.senderRank = isSender ? params.worldInfo.epInfo.epRank : peerRank;
+    pairInfo.receiverRank = isSender ? peerRank : params.worldInfo.epInfo.epRank;
+
+    if (isSender)
+    {
+        if (hasBasicFields)
+        {
+            SingleChannelCommunicator<true, false> comm(
+                params.sendFieldInfo, params.expertParallelInfo, params.sendCommMeta, workspace, params.worldInfo, pairInfo, 
+                allWarpSmemBar + group, reinterpret_cast<uint8_t*>(allWarpShm) + params.sendCommMeta.singleUnpackedAlignedSize * group);
+            comm.doSend(tokenCount, groupStartPtr);
+        }
+        else
+        {
+            SingleChannelCommunicator<false, false> comm(
+                params.sendFieldInfo, params.expertParallelInfo, params.sendCommMeta, workspace, params.worldInfo, pairInfo, 
+                allWarpSmemBar + group, reinterpret_cast<uint8_t*>(allWarpShm) + params.sendCommMeta.singleUnpackedAlignedSize * group);
+            comm.doSend(tokenCount, groupStartPtr);
+        }
+    }
+    else
+    {
+        if (hasBasicFields)
+        {
+            SingleChannelCommunicator<true, false> comm(
+                params.recvFieldInfo, params.expertParallelInfo, params.recvCommMeta, workspace, params.worldInfo, pairInfo, 
+                allWarpSmemBar + group, reinterpret_cast<uint8_t*>(allWarpShm) + params.recvCommMeta.singleUnpackedAlignedSize * group);
+            comm.doReceive(tokenCount, groupStartPtr);
+        }
+        else
+        {
+            SingleChannelCommunicator<false, false> comm(
+                params.recvFieldInfo, params.expertParallelInfo, params.recvCommMeta, workspace, params.worldInfo, pairInfo, 
+                allWarpSmemBar + group, reinterpret_cast<uint8_t*>(allWarpShm) + params.recvCommMeta.singleUnpackedAlignedSize * group);
+            comm.doReceive(tokenCount, groupStartPtr);
+        }
+    }
+}
+
+void moeAllToAll(FusedMoeCommKernelParam params, FusedMoeWorkspace workspace, cudaStream_t stream)
+{
+    bool hasBasicFields = params.sendFieldInfo.isBasicInterleaved != 0;
+    bool hasScales = params.sendFieldInfo.expertScales != nullptr;
+    int warpSendShmSize = params.sendFieldInfo.computeSingleWarpShmSize(
+        params.expertParallelInfo.topK, hasScales, hasBasicFields);
+    int warpRecvShmSize = params.recvFieldInfo.computeSingleWarpShmSize(
+        params.expertParallelInfo.topK, hasScales, hasBasicFields);
+    int warpShmSize = warpSendShmSize;
+    TLLM_CHECK_WITH_INFO(warpSendShmSize == warpRecvShmSize, "warpSendShmSize(%d) not same as warpRecvShmSize(%d)",
+        warpSendShmSize, warpRecvShmSize);
+
+    dim3 block = FusedMoeCommunicator::getLaunchBlockDim();
+    dim3 grid = FusedMoeCommunicator::getLaunchGridDim(params.worldInfo.epInfo.epSize);
+    moeAllToAllKernel<<<grid, block, warpSendShmSize * FusedMoeCommunicator::GROUP_COUNT_PER_BLOCK, stream>>>(params, workspace, hasBasicFields);
+}
+
 } // namespace fused_moe_impl
 
 namespace fused_moe_comm_tests

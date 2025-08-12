@@ -15,8 +15,11 @@
  */
 #pragma once
 
+#include <map>
+
 #include <cuda_runtime_api.h>
 
+#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/moeCommKernelsCommon.h"
 
 namespace tensorrt_llm
@@ -34,6 +37,33 @@ struct ALIGN_256 ReceiverSideFifoInfo
 {
     volatile uint64_t head; // write position do we use this?
     volatile uint64_t tail; // read position
+};
+
+// struct holding Send/Recv data pointer and its displacement information.
+struct SendRecvDispls
+{
+    int const* rankCountCumSum;  // length = epSize
+    int* rankLocalIndices; // length = rankCountCumSum[epRank] - rankCountCumSum[epRank - 1] if epRank > 0 else
+                                 // rankCountCumSum[epRank]
+
+#ifdef __CUDACC__
+    __inline__ __device__ int getCount(int rank) const
+    {
+        return rank == 0 ? rankCountCumSum[rank] : rankCountCumSum[rank] - rankCountCumSum[rank - 1];
+    }
+
+    __inline__ __device__ int getRankStart(int rank) const
+    {
+        return rank == 0 ? 0 : rankCountCumSum[rank - 1];
+    }
+
+    __inline__ __device__ int* getGroupStart(int rank, int& tokenCount) const
+    {
+        tokenCount = getCount(rank);
+        int rankStart = getRankStart(rank);
+        return rankLocalIndices + rankStart;
+    }
+#endif
 };
 
 struct MoeCommFieldInfo
@@ -174,6 +204,8 @@ struct MoeSingleCommMeta
     int singleUnpackedAlignedSize; // unpacked shared memory size, aligned to 128 bytes, might be larger than packed
                                    // buffer
 
+    int tokenPerFifoEntry;
+
     // TODO: Do we need reduce shared memory usage, make it able to be smaller, and enable multiple wave?
 
     __device__ __host__ __forceinline__ int getPacked128ByteCount() const
@@ -194,6 +226,87 @@ struct FusedMoePairInfo
     int channel;
     int runChannelCount;
     int channelCount;
+};
+
+class FusedMoeCommunicator
+{
+public:
+    static constexpr int FIFO_DEPTH = 4;
+    static constexpr int FIFO_ENTRY_BYTES = 256 * 1024;
+    static constexpr int FIFO_ENTRY_128_BYTE_COUNT = FIFO_ENTRY_BYTES / 128;
+    static constexpr int FIFO_TOTAL_BYTES = FIFO_ENTRY_BYTES * FIFO_DEPTH;
+    static constexpr int FIFO_TOTAL_U64 = FIFO_TOTAL_BYTES / sizeof(uint64_t);
+    static constexpr int GROUP_COUNT_PER_BLOCK = 8;
+    // Here we use fixed INVALID_VALUE, which is -0.0 for all kinds of float types and -INT_MAX for all signed integers
+    // Real data should not use these values.
+    static constexpr uint32_t INVALID_VALUE = 1U << 31U;
+    static constexpr uint32_t FIXED_VALUE = 0U; // if raw data has INVALID_VALUE, fix it to FIXED_VALUE
+
+    static constexpr int WARP_SIZE = 32;
+
+    static int maxSmCount;
+    static bool maxSmCountUsed;
+
+    static void setMaxUsableSmCount(int maxUsableSmCount)
+    {
+        TLLM_CHECK_WITH_INFO(FusedMoeCommunicator::maxSmCountUsed == false,
+            "setMaxUsableSmCount can be called only before it is used");
+        int smCount = tensorrt_llm::common::getMultiProcessorCount();
+        if (maxUsableSmCount > smCount)
+        {
+            TLLM_LOG_WARNING("setMaxUsableSmCount, maxUsableSmCount=%d, larger than smCount=%d, using smCount instead",
+                maxUsableSmCount, smCount);
+            maxUsableSmCount = smCount;
+        }
+        FusedMoeCommunicator::maxSmCount = maxUsableSmCount;
+    }
+
+    static int getMaxUsableSmCount()
+    {
+        FusedMoeCommunicator::maxSmCountUsed = true;
+        if (FusedMoeCommunicator::maxSmCount == -1)
+        {
+            int smCount = tensorrt_llm::common::getMultiProcessorCount();
+            FusedMoeCommunicator::maxSmCount = smCount;
+        }
+        return FusedMoeCommunicator::maxSmCount;
+    }
+
+    static int computeMoeCommChannelCount(int epSize)
+    {
+        int smCount = getMaxUsableSmCount();
+        int blockCountPerChannel = (epSize + GROUP_COUNT_PER_BLOCK - 1) / GROUP_COUNT_PER_BLOCK;
+        blockCountPerChannel *= 2; // for send and recv
+        TLLM_CHECK_WITH_INFO(
+            blockCountPerChannel <= smCount, "GPU should support at lease one channel, usableSmCount=%d", smCount);
+        int perferredChannel = smCount / 2 / blockCountPerChannel; // use half SMs for communication
+        int channelCount = std::max(perferredChannel, 1);          // at lease one channel
+        return channelCount;
+    }
+
+    static int getMoeCommChannelCount(int epSize)
+    {
+        static std::map<int, int> channelCountMap{};
+        auto iter = channelCountMap.find(epSize);
+        if (iter == channelCountMap.end())
+        {
+            auto channelCount = FusedMoeCommunicator::computeMoeCommChannelCount(epSize);
+            channelCountMap[epSize] = channelCount;
+            return channelCount;
+        }
+        return iter->second;
+    }
+
+    static dim3 getLaunchBlockDim()
+    {
+        return dim3(WARP_SIZE, GROUP_COUNT_PER_BLOCK);
+    }
+
+    static dim3 getLaunchGridDim(int epSize)
+    {
+        int channelCount = FusedMoeCommunicator::getMoeCommChannelCount(epSize);
+        return dim3((epSize + GROUP_COUNT_PER_BLOCK - 1) / GROUP_COUNT_PER_BLOCK, channelCount, 2);
+    }
 };
 
 struct FusedMoeFieldInfo
@@ -276,6 +389,7 @@ struct FusedMoeFieldInfo
     {
         singleCommMeta->singlePackedAlignedSize = computeSinglePackedSize(topK, hasScales, hasBasicFields);
         singleCommMeta->singleUnpackedAlignedSize = computeSingleWarpShmSize(topK, hasScales, hasBasicFields);
+        singleCommMeta->tokenPerFifoEntry = FusedMoeCommunicator::FIFO_ENTRY_BYTES / singleCommMeta->singlePackedAlignedSize;
     }
 
     void fillFieldPlacementInfo(int topK, bool hasBasicFields);
@@ -287,25 +401,10 @@ struct FusedMoeCommKernelParam
     MoeExpertParallelInfo expertParallelInfo; // expertCount inside should be slotCount if using redundant experts.
     MoeSingleCommMeta sendCommMeta;
     MoeSingleCommMeta recvCommMeta;
-    int tokenCount;
+    SendRecvDispls sendDispls;
+    SendRecvDispls recvDispls;
     FusedMoeFieldInfo sendFieldInfo;
     FusedMoeFieldInfo recvFieldInfo;
-};
-
-class FusedMoeCommunicator
-{
-public:
-    static constexpr int FIFO_DEPTH = 4;
-    static constexpr int FIFO_ENTRY_BYTES = 256 * 1024;
-    static constexpr int FIFO_ENTRY_128_BYTE_COUNT = FIFO_ENTRY_BYTES / 128;
-    static constexpr int FIFO_TOTAL_BYTES = FIFO_ENTRY_BYTES * FIFO_DEPTH;
-    static constexpr int FIFO_TOTAL_U64 = FIFO_TOTAL_BYTES / sizeof(uint64_t);
-    static constexpr int GROUP_COUNT_PER_BLOCK = 8;
-    static constexpr int WARP_PER_GROUP = 2;
-    // Here we use fixed INVALID_VALUE, which is -0.0 for all kinds of float types and -INT_MAX for all signed integers
-    // Real data should not use these values.
-    static constexpr uint32_t INVALID_VALUE = 1U << 31U;
-    static constexpr uint32_t FIXED_VALUE = 0U; // if raw data has INVALID_VALUE, fix it to FIXED_VALUE
 };
 
 /*
@@ -410,6 +509,8 @@ struct FusedMoeWorkspace
 
     void initializeLocalWorkspace(FusedMoeWorldInfo const& worldInfo, int channelCount);
 };
+
+void moeAllToAll(FusedMoeCommKernelParam params, FusedMoeWorkspace workspace, cudaStream_t stream);
 
 namespace fused_moe_comm_tests
 {
