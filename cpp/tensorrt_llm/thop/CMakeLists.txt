@@ -56,6 +56,7 @@ add_library(
   fp8BatchedGemmTrtllmGen.cpp
   fp4Quantize.cpp
   fp4BatchedQuantize.cpp
+  fp4xFp8GemmTrtllmGen.cpp
   fp8BlockScalingGemm.cpp
   fp8RowwiseGemm.cpp
   fp8Quantize.cpp
@@ -78,7 +79,6 @@ add_library(
   fp4BlockScaleMoe.cpp
   noAuxTcOp.cpp
   ncclCommunicatorOp.cpp
-  nvfp4xFp8GemmTrtllmGen.cpp
   parallelDecodeKVCacheUpdateOp.cpp
   redrafterCurandOp.cpp
   reducescatterOp.cpp

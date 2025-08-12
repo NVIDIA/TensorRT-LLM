@@ -138,7 +138,7 @@ class TestFunctional(unittest.TestCase):
     )
     @skip_pre_blackwell_unittest
     @skip_blackwell_geforce
-    def test_nvfp4_fp8_gemm_trtllmgen(self, m, n, k):
+    def test_fp4_fp8_gemm_trtllmgen(self, m, n, k):
         a = torch.ones([m, k], dtype=torch.float32)
         b = torch.zeros([n, k], dtype=torch.float32).to(torch.float8_e4m3fn).cuda()
         b[0, 128] = 1
@@ -156,7 +156,7 @@ class TestFunctional(unittest.TestCase):
         print(a_fp4)
         print(a_sf)
         print(torch.any(a_fp4==0), torch.any(a_sf == 0))
-        c = torch.ops.trtllm.nvfp4_fp8_gemm_trtllmgen(b, a_fp4, a_sf, ab_global_sf).float().cpu()
+        c = torch.ops.trtllm.fp4_fp8_gemm_trtllmgen(b, a_fp4, a_sf, ab_global_sf).float().cpu()
 
         torch.cuda.synchronize()
 
