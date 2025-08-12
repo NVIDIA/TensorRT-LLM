@@ -249,7 +249,7 @@
             "gridWaitForPrimaryB": true,
             "usePdl": true
         },
-        "GemmNvfp4xFp8LowLatency": {
+        "GemmFp4xFp8": {
             "dtypeA": "e2m1",
             "dtypeMmaA": "e4m3",
             "dtypeB": "e4m3",
@@ -265,8 +265,8 @@
             "epilogueTileM": 128,
             "epilogueTileN": 8,
             "numStages": 2,
-            "numSlicesForSplitK": 2,
-            "clusterDimZ": 2,
+            "numSlicesForSplitK": 1,
+            "clusterDimZ": 1,
             "useTwoTmaLoadWarps": true,
             "sliceK": false,
             "transposeMmaOutput": true,
@@ -276,34 +276,6 @@
             "useTwoMmaWarps": false,
             "usePdl": true,
             "tileScheduler": "static"
-        },
-        "GemmNvfp4xFp8Throughput": {
-            "dtypeA": "e2m1",
-            "dtypeMmaA": "e4m3",
-            "dtypeB": "e4m3",
-            "dtypeC": "fp16",
-            "sfBlockSizeA": 32,
-            "sfLayoutA" : "128x4",
-            "mmaM": 128,
-            "mmaN": 128,
-            "mmaK": 256,
-            "tileM": 128,
-            "tileN": 128,
-            "tileK": 256,
-            "epilogueTileM": 128,
-            "epilogueTileN": 128,
-            "numStages": 2,
-            "numSlicesForSplitK": 1,
-            "clusterDimZ": 1,
-            "useTwoTmaLoadWarps": true,
-            "sliceK": false,
-            "transposeMmaOutput": true,
-            "useShuffledMatrixA": true,
-            "useCustomMmaSchedule": true,
-            "numStagesMma": 2,
-            "useTwoMmaWarps": false,
-            "usePdl": true,
-            "tileScheduler": "persistent"
         }
     },
     "configs": [
@@ -378,49 +350,11 @@
             "dtypeC": ["bf16", "fp16", "fp32", "mxe4m3"]
         },
         {
-            "_template": "GemmNvfp4xFp8LowLatency",
-            "_comment": "TileN 8",
+            "_template": "GemmFp4xFp8",
+            "_comment": "Tile 8 to 128",
             "dtypeC": ["bf16", "fp16", "e4m3"],
             "useUnrollLoop2xForMma": [true, false],
-            "mmaN": 8,
-            "tileN": 8,
-            "epilogueTileN": 8
-        },
-        {
-            "_template": "GemmNvfp4xFp8LowLatency",
-            "_comment": "TileN 16",
-            "dtypeC": ["bf16", "fp16", "e4m3"],
-            "useUnrollLoop2xForMma": [true, false],
-            "mmaN": 16,
-            "tileN": 16,
-            "epilogueTileN": 16
-        },
-        {
-            "_template": "GemmNvfp4xFp8LowLatency",
-            "_comment": "TileN 32",
-            "dtypeC": ["bf16", "fp16", "e4m3"],
-            "useUnrollLoop2xForMma": [true, false],
-            "mmaN": 32,
-            "tileN": 32,
-            "epilogueTileN": 32
-        },
-        {
-            "_template": "GemmNvfp4xFp8Throughput",
-            "_comment": "TileN 64",
-            "dtypeC": ["bf16", "fp16", "e4m3"],
-            "useUnrollLoop2xForMma": [true, false],
-            "mmaN": 64,
-            "tileN": 64,
-            "epilogueTileN": 64
-        },
-        {
-            "_template": "GemmNvfp4xFp8Throughput",
-            "_comment": "TileN 64",
-            "dtypeC": ["bf16", "fp16", "e4m3"],
-            "useUnrollLoop2xForMma": [true, false],
-            "mmaN": 128,
-            "tileN": 128,
-            "epilogueTileN": 128
+            "mmaN,tileN,epilogueTileN,mmaK,tileK": [[8, 8, 8, 512, 512], [16, 16, 16, 512, 512], [32, 32, 32, 512, 512], [64, 64, 64, 512, 512], [128, 128, 128, 256, 256]]
         }
     ]
 }
