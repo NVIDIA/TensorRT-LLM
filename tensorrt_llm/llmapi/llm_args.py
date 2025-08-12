@@ -2607,6 +2607,10 @@ class TorchLlmArgs(BaseLlmArgs):
             return 'pytorch'
         return v
 
+    enable_sleep: bool = Field(
+        default=False,
+        description="Enable extra setup to support sleep feature.")
+
     @field_validator('load_format', mode='before')
     @classmethod
     def convert_load_format(cls, v):
@@ -2901,6 +2905,7 @@ class TorchLlmArgs(BaseLlmArgs):
             batch_wait_timeout_ms=self.batch_wait_timeout_ms,
             batch_wait_timeout_iters=self.batch_wait_timeout_iters,
             batch_wait_max_tokens_ratio=self.batch_wait_max_tokens_ratio,
+            enable_sleep=self.enable_sleep,
         )
 
 

@@ -18,6 +18,9 @@ from .llm_request import (ExecutorRequest, LlmRequest,
                           executor_request_to_llm_request)
 
 SHUTDOWN_REQUEST_ID = -1
+UPDATE_WEIGHT_REQUEST_ID = -2
+SLEEP_REQUEST_ID = -3
+WAKEUP_REQUEST_ID = -4
 
 
 @dataclasses.dataclass
@@ -28,6 +31,9 @@ class RequestQueueItem:
     child_req_ids: Optional[list] = None
     is_canceled_request: bool = False
     query: Optional[list] = None  # only used in `StarAttention`
+    weight_ipc_handles: Optional[dict] = None
+    sleep_tags: Optional[List[str]] = None
+    wakeup_tags: Optional[List[str]] = None
 
     @property
     def is_shutdown_request(self):
@@ -35,7 +41,23 @@ class RequestQueueItem:
 
     @property
     def is_normal_request(self):
-        return not (self.is_shutdown_request or self.is_canceled_request)
+        return self.id > 0 and not self.is_canceled_request
+
+    @property
+    def is_update_weight_request(self):
+        return self.id == UPDATE_WEIGHT_REQUEST_ID
+
+    @property
+    def is_sleep_request(self):
+        return self.id == SLEEP_REQUEST_ID
+
+    @property
+    def is_wakeup_request(self):
+        return self.id == WAKEUP_REQUEST_ID
+
+    @property
+    def is_control_request(self):
+        return self.is_update_weight_request or self.is_sleep_request or self.is_wakeup_request
 
 
 class ExecutorRequestQueue:
@@ -68,6 +90,7 @@ class ExecutorRequestQueue:
         self.new_active_requests_queue_latency_ms = 0
         self.is_shutdown = False
         self.should_exclude_last_generation_logits = False
+        self.control_requests: List[RequestQueueItem] = []
 
         self._disable_mpi = mpi_disabled()
 
@@ -250,6 +273,22 @@ class ExecutorRequestQueue:
         with self.enqueue_lock:
             self.request_queue.put(
                 RequestQueueItem(req_id, is_canceled_request=True))
+
+    def enqueue_sleep_request(self, sleep_tags: List[str]):
+        with self.enqueue_lock:
+            self.request_queue.put(
+                RequestQueueItem(id=SLEEP_REQUEST_ID, sleep_tags=sleep_tags))
+
+    def enqueue_wakeup_request(self, wakeup_tags: List[str]):
+        with self.enqueue_lock:
+            self.request_queue.put(
+                RequestQueueItem(id=WAKEUP_REQUEST_ID, wakeup_tags=wakeup_tags))
+
+    def enqueue_update_weight_request(self, weight_ipc_handles: dict):
+        with self.enqueue_lock:
+            self.request_queue.put(
+                RequestQueueItem(id=UPDATE_WEIGHT_REQUEST_ID,
+                                 weight_ipc_handles=weight_ipc_handles))
 
     def enqueue_shutdown_request(self):
         with self.enqueue_lock:
@@ -469,6 +508,8 @@ class ExecutorRequestQueue:
                 break
             elif req_item.is_canceled_request:
                 self.canceled_req_ids.append(req_item.id)
+            elif req_item.is_control_request:
+                self.control_requests.append(req_item)
             else:
                 valid_new_requests.append(req_item)
 
