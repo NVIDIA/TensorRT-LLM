@@ -774,9 +774,12 @@ inline bool checkAndUpdateGemmOptions(GemmOptions& options,
                      " dtypeB=",
                      tg::dtypeToString(options.mDtypeB));
 
-    // sfBlockSizeA must be 16, 32, 64, 128.
+    // sfBlockSizeA must be 16 or 32.
+    // SfBlockSizeA can also support 64 and 128, although they are not officially supported Nvida
+    // format. Note that the type conversion needs to happen before TCs.
+    // For example, convert e2m1 to e4m3 inside TmemCastA.
     // If we want to support sfBlockSizeA=8, we can write another version of convertE2m1ToSfE4m3,
-    // which only packs 8 E2m1 elements.
+    // which only packs 8 e2m1 elements.
     TLLM_CHECK_ERROR(options.mSfBlockSizeA.value() == 16 || options.mSfBlockSizeA.value() == 32,
                      "SfBlockSizeA (",
                      options.mSfBlockSizeA.value(),
