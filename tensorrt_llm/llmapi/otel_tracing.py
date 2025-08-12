@@ -129,3 +129,9 @@ def contains_trace_headers(headers: Mapping[str, str]) -> bool:
 def log_tracing_disabled_warning() -> None:
     logger.warning(
         "Received a request with trace context but tracing is disabled")
+
+
+@run_once
+def insufficient_request_metrics_warning() -> None:
+    logger.warning(
+        "Insufficient request metrics available; trace generation aborted.")

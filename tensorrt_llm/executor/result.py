@@ -1,5 +1,6 @@
 import asyncio
 import json
+import time
 import weakref
 from dataclasses import dataclass, field
 from queue import Empty, Queue
@@ -10,9 +11,9 @@ from weakref import WeakMethod
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm.llmapi.otel_tracing import (SpanAttributes, SpanKind,
-                                              extract_trace_context,
-                                              global_otlp_tracer)
+from tensorrt_llm.llmapi.otel_tracing import (
+    SpanAttributes, SpanKind, extract_trace_context, global_otlp_tracer,
+    insufficient_request_metrics_warning)
 
 from .._utils import nvtx_range_debug
 from ..bindings import executor as tllm
@@ -399,23 +400,25 @@ class GenerationResultBase:
         output: CompletionOutput,
         req_perf_metrics_dict: Optional[dict[str, float]] = None,
     ):
-        if not global_otlp_tracer() or not req_perf_metrics_dict:
+        if not global_otlp_tracer():
             return
 
         metrics_dict = self.metrics_dict
-        if not metrics_dict:
+        if not metrics_dict or not req_perf_metrics_dict:
             # Insufficient request metrics available; trace generation aborted.
+            insufficient_request_metrics_warning()
             return
 
         trace_context = extract_trace_context(self.trace_headers)
         sampling_params = self.sampling_params
+
+        # TODO: Add request arrival time
+        arrival_time = time.time() - metrics_dict.get(MetricNames.E2E, -1)
         with global_otlp_tracer().start_as_current_span(
                 "llm_request",
                 kind=SpanKind.SERVER,
                 context=trace_context,
-                start_time=int(
-                    req_perf_metrics_dict.get(RequestEventTiming.ARRIVAL_TIME,
-                                              0)),
+                start_time=int(arrival_time * 1e9),
         ) as span:
 
             def safe_set_attr(span, attr, value):
@@ -437,6 +440,7 @@ class GenerationResultBase:
             )
             safe_set_attr(span, SpanAttributes.GEN_AI_REQUEST_N,
                           sampling_params.n)
+            # TODO: Add prompt info in result base
             safe_set_attr(
                 span,
                 SpanAttributes.GEN_AI_USAGE_PROMPT_TOKENS,
