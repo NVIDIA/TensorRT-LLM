@@ -159,8 +159,8 @@ inline __device__ void dequantCopy(
 // merged_softmax_sum [q_total_len, H, 2] (float, max/sum)
 template <typename T>
 __global__ void mergeAttnWithSoftmaxKernel(T* merged_attn, float2* merged_softmax_stats, T const* pre_attn,
-    float2 const* pre_softmax_stats, T const* curr_attn, float2 const* curr_softmax_stats, float bmm1_scale,
-    int64_t const* cu_q_seq_len, int64_t const* merge_op, int const num_heads, int const head_size)
+    float2 const* pre_softmax_stats, T const* curr_attn, float2 const* curr_softmax_stats, int64_t const* cu_q_seq_len,
+    int64_t const* merge_op, int const num_heads, int const head_size)
 {
     using KT = MergeSoftmaxTraits<T>;
     int const batch_idx = static_cast<int>(blockIdx.y);

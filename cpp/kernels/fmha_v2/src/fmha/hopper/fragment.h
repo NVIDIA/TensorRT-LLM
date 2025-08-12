@@ -486,7 +486,7 @@ struct Softmax_saver_tma
         int lane = threadIdx.x % Cta_tile::THREADS_PER_WARP;
         if (lane % 4 < 2)
         {
-            values = p_sum[lane % 2] == 0.f ? 1.f : 1.0f / p_sum[lane % 2];
+            values = p_sum[lane % 2];
         }
         else
         {
