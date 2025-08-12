@@ -2,7 +2,7 @@ import bisect
 import contextlib
 import threading
 import weakref
-from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Tuple
 
 import torch
 
@@ -67,14 +67,26 @@ class CUDAGraphRunner:
         self.supported_batch_sizes = engine._cuda_graph_batch_sizes
         self.max_supported_batch_size = engine._max_cuda_graph_batch_size
         self.max_beam_width = engine.max_beam_width
+        self.spec_config = engine.spec_config
+        self.attn_metadata = engine.attn_metadata
+        self.spec_metadata = engine.spec_metadata
+        self.draft_tokens_cuda = engine.draft_tokens_cuda
 
-        # Low-level state, storing resources per batch size
-        self.graphs: Dict[int, torch.cuda.CUDAGraph] = {}
-        self.static_inputs: Dict[int, Dict[str, torch.Tensor]] = {}
-        self.graph_outputs: Dict[int, Callable[[], Optional[torch.Tensor]]] = {}
-        self.graph_metadata: Dict[int, Dict[str, Any]] = {}
+        self.graphs: Dict[Tuple[int, int], torch.cuda.CUDAGraph] = {}
+        self.static_inputs: Dict[Tuple[int, int], Dict[str, torch.Tensor]] = {}
+        self.graph_outputs: Dict[Tuple[int, int],
+                                 Callable[[], Optional[torch.Tensor]]] = {}
+        self.graph_metadata: Dict[Tuple[int, int], Dict[str, Any]] = {}
         self.memory_pool = engine._cuda_graph_mem_pool
         self.padding_dummy_request: Optional["Request"] = None
+
+    @property
+    def enable_spec_decode(self):
+        return self._get_engine().is_spec_decode
+
+    @property
+    def draft_len(self):
+        return self.spec_config.max_draft_len if self.enable_spec_decode else 0
 
     def __del__(self):
         self.clear()
@@ -86,6 +98,34 @@ class CUDAGraphRunner:
             raise RuntimeError(
                 "The parent PyTorchModelEngine has been garbage collected.")
         return engine
+
+    def maybe_get_cuda_graph(self, batch: ScheduledRequests):
+        if not self._can_run_graph(batch):
+            return False, None, None
+
+        batch_size = len(batch.generation_requests)
+
+        key = (batch_size, self.draft_len)
+        if key in self.graphs:
+            return True, self.graph_metadata[key][
+                "attn_metadata"], self.graph_metadata[key]["spec_metadata"]
+
+        if batch_size not in self.supported_batch_sizes:
+            return False, None, None
+
+        num_sequences_in_batch = batch_size * self.max_beam_width
+        attn_metadata = self.attn_metadata.create_cuda_graph_metadata(
+            num_sequences_in_batch, False, self.draft_len)
+        assert attn_metadata.is_cuda_graph
+
+        if self.enable_spec_decode:
+            spec_metadata = self.spec_metadata.create_cuda_graph_metadata(
+                num_sequences_in_batch)
+            spec_metadata.draft_tokens = self.draft_tokens_cuda
+        else:
+            spec_metadata = None
+
+        return True, attn_metadata, spec_metadata
 
     def execute(self, batch: ScheduledRequests, inputs: Dict[str, Any],
                 forward_fn: Callable) -> Optional[torch.Tensor]:
@@ -111,6 +151,7 @@ class CUDAGraphRunner:
                        initial_inputs: Dict[str, Any]):
         """Captures the forward pass for a given batch size."""
         engine = self._get_engine()
+        key = (batch_size, self.draft_len)
 
         max_tokens_per_req = 1
         if engine.is_spec_decode:
@@ -138,12 +179,12 @@ class CUDAGraphRunner:
         if engine.use_mrope:
             static_tensors["mrope_position_deltas"] = torch.zeros(
                 (batch_size, 1), device="cuda", dtype=torch.int32)
-        self.static_inputs[batch_size] = static_tensors
+        self.static_inputs[key] = static_tensors
 
         capture_inputs = initial_inputs.copy()
         capture_inputs.update(static_tensors)
 
-        self.graph_metadata[batch_size] = {
+        self.graph_metadata[key] = {
             "attn_metadata": initial_inputs["attn_metadata"],
             "spec_metadata": spec_metadata,
         }
@@ -156,13 +197,14 @@ class CUDAGraphRunner:
             with torch.cuda.graph(graph, pool=self.memory_pool):
                 output = forward_fn(capture_inputs)
 
-        self.graphs[batch_size] = graph
-        self.graph_outputs[batch_size] = make_weak_ref(output)
+        self.graphs[key] = graph
+        self.graph_outputs[key] = make_weak_ref(output)
         self.memory_pool = graph.pool()
 
     def _run_graph(self, batch_size: int,
                    current_inputs: Dict[str, Any]) -> Optional[torch.Tensor]:
         """Replays a previously captured graph."""
+        (batch_size, self.draft_len)
         stored_meta = self.graph_metadata[batch_size]
         assert current_inputs["attn_metadata"] is stored_meta["attn_metadata"]
         if stored_meta["spec_metadata"] is not None:

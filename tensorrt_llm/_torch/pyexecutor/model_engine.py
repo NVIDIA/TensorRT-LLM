@@ -2012,9 +2012,22 @@ class PyTorchModelEngine(ModelEngine):
                                           gather_context_logits)
         with self.cuda_graph_runner.pad_batch(
                 scheduled_requests, resource_manager) as padded_requests:
+
+            maybe_graph, maybe_attn_metadata, maybe_spec_metadata = self.cuda_graph_runner.maybe_get_cuda_graph(
+                padded_requests)
+            if maybe_graph:
+                attn_metadata = maybe_attn_metadata
+                spec_metadata = maybe_spec_metadata
+            else:
+                attn_metadata = self.attn_metadata
+                if self.enable_spec_decode:
+                    spec_metadata = self.spec_metadata
+                else:
+                    spec_metadata = None
+
             inputs, gather_ids = self._prepare_inputs(
-                scheduled_requests, kv_cache_manager, attn_metadata,
-                spec_metadata, new_tensors_device, cache_indirection_buffer)
+                padded_requests, kv_cache_manager, attn_metadata, spec_metadata,
+                new_tensors_device, cache_indirection_buffer)
 
             self.iter_counter += 1
 
