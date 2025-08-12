@@ -130,7 +130,7 @@ class TestFindInputMmEmbed:
         runtime = Mock(spec=MultimodalRuntimeData)
         runtime.num_unseen_mm_tokens = num_unseen_mm_tokens
         runtime.num_mm_tokens = num_mm_tokens
-        runtime.mm_token_lengths = mm_token_lengths
+        runtime.total_mm_tokens = sum(mm_token_lengths)
 
         return runtime
 
