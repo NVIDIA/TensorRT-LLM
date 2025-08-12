@@ -247,7 +247,6 @@ examples/test_recurrentgemma.py::test_llm_recurrentgemma_1gpu[use_cpp_session-re
 examples/test_recurrentgemma.py::test_llm_recurrentgemma_2gpu[recurrentgemma-2b] SKIP (https://nvbugs/5401233)
 test_e2e.py::test_openai_multi_chat_example SKIP (https://nvbugs/5409416)
 test_e2e.py::test_ptp_star_attention_example[Llama3.1-8B-BF16-llama-3.1-model/Meta-Llama-3.1-8B] SKIP (https://nvbugs/5409420)
-llmapi/test_llm_examples.py::test_llmapi_speculative_decoding_mtp SKIP (https://nvbugs/5410399)
 unittest/trt/attention/test_gpt_attention.py -k "partition0" SKIP (https://nvbugs/5412456)
 unittest/trt/attention/test_gpt_attention.py -k "partition1" SKIP (https://nvbugs/5412456)
 unittest/trt/attention/test_gpt_attention.py -k "partition2" SKIP (https://nvbugs/5412456)
