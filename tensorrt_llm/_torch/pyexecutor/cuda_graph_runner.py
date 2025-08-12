@@ -213,14 +213,14 @@ class CUDAGraphRunner:
     def _run_graph(self, batch_size: int,
                    current_inputs: Dict[str, Any]) -> Optional[torch.Tensor]:
         """Replays a previously captured graph."""
-        (batch_size, self.draft_len)
-        stored_meta = self.graph_metadata[batch_size]
+        key = (batch_size, self.draft_len)
+        stored_meta = self.graph_metadata[key]
         assert current_inputs["attn_metadata"] is stored_meta["attn_metadata"]
         if stored_meta["spec_metadata"] is not None:
             assert current_inputs.get(
                 "spec_metadata") is stored_meta["spec_metadata"]
 
-        static_tensors = self.static_inputs[batch_size]
+        static_tensors = self.static_inputs[key]
 
         input_ids = current_inputs["input_ids"]
         seqlen = input_ids.shape[0]
@@ -233,8 +233,8 @@ class CUDAGraphRunner:
             static_tensors["mrope_position_deltas"].copy_(
                 current_inputs["mrope_position_deltas"])
 
-        self.graphs[batch_size].replay()
-        output_ref = self.graph_outputs[batch_size]
+        self.graphs[key].replay()
+        output_ref = self.graph_outputs[key]
 
         return output_ref
 
