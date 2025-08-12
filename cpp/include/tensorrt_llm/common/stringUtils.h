@@ -78,13 +78,13 @@ class va_list_guard
 {
 public:
     explicit va_list_guard(va_list& args)
-        : args_(args)
+        : mArgs(args)
     {
     }
 
     ~va_list_guard()
     {
-        va_end(args_);
+        va_end(mArgs);
     }
 
     va_list_guard(va_list_guard const&) = delete;
@@ -92,15 +92,8 @@ public:
     va_list_guard(va_list_guard&&) = delete;
     va_list_guard& operator=(va_list_guard&&) = delete;
 
-    va_list& get()
-    {
-        return args_;
-    }
-
-    va_list get() && = delete;
-
 private:
-    va_list& args_;
+    va_list& mArgs;
 };
 
 } // namespace
@@ -132,7 +125,7 @@ inline std::string fmtstr(std::string&& s)
 }
 
 typedef char* (*fmtstr_allocator)(void* target, size_t count);
-void fmtstr_(char const* format, fmtstr_allocator alloc, void* target, va_list_guard& args_guard);
+void fmtstr_(char const* format, fmtstr_allocator alloc, void* target, va_list args);
 
 #if defined(_MSC_VER)
 inline std::string fmtstr(char const* format, ...);
@@ -161,7 +154,7 @@ inline std::string fmtstr(char const* format, ...)
             str->resize(count);
             return str->data();
         },
-        &result, args_guard);
+        &result, args);
 
     return result;
 }
