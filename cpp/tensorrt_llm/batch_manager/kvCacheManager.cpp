@@ -2043,13 +2043,10 @@ void KVCacheManager::addSequence(
 void KVCacheManager::storeContextBlocks(LlmRequest const& llmRequest)
 {
     auto const requestId = llmRequest.mRequestId;
-    if (mSequences.find(requestId) != mSequences.end())
+    auto& sequence = getSequence(requestId);
+    if (mEnableBlockReuse && !sequence.isCyclic() && !llmRequest.isDummyRequest())
     {
-        auto& sequence = getSequence(requestId);
-        if (mEnableBlockReuse && !sequence.isCyclic() && !llmRequest.isDummyRequest())
-        {
-            mBlockManager.storeContextBlocks(sequence, llmRequest);
-        }
+        mBlockManager.storeContextBlocks(sequence, llmRequest);
     }
 }
 
