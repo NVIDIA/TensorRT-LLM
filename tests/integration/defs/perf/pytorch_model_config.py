@@ -191,12 +191,12 @@ def get_model_yaml_config(model_label: str,
         }
         if 'phi_4_multimodal_instruct' in model_label:
             lora_config['lora_config']['lora_target_modules'] = [
-                "attn_qkv", "attn_dense", "mlp_h_to_4h", "mlp_4h_to_h"
+                "attn_qkv", "attn_dense", "mlp_gate_up", "mlp_4h_to_h"
             ]
             lora_config['lora_config']['trtllm_modules_to_hf_modules'] = {
                 "attn_qkv": "qkv_proj",
                 "attn_dense": "o_proj",
-                "mlp_h_to_4h": "gate_up_proj",
+                "mlp_gate_up": "gate_up_proj",
                 "mlp_4h_to_h": "down_proj"
             }
             lora_config['lora_config']['max_lora_rank'] = 320

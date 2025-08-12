@@ -611,20 +611,16 @@ class Phi4MMForCausalLM(transformers.PreTrainedModel):
     @staticmethod
     def lora_config(model_dir: str):
         _lora_config = LoraConfig(
-            lora_dir=[
-                f"{model_dir}/vision-lora",
-                f"{model_dir}/speech-lora",
-            ],
             lora_target_modules=[
                 "attn_qkv",
                 "attn_dense",
-                "mlp_h_to_4h",
+                "mlp_gate_up",
                 "mlp_4h_to_h",
             ],
             trtllm_modules_to_hf_modules={
                 "attn_qkv": "qkv_proj",
                 "attn_dense": "o_proj",
-                "mlp_h_to_4h": "gate_up_proj",
+                "mlp_gate_up": "gate_up_proj",
                 "mlp_4h_to_h": "down_proj",
             },
             max_lora_rank=320,  # Max rank for Phi4MM.
