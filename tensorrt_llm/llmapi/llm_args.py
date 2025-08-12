@@ -1036,6 +1036,37 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
                 "kv_cache_config.max_gpu_total_bytes must be non-negative")
         return v
 
+    @field_validator('max_attention_window')
+    @classmethod
+    def validate_max_attention_window(cls, v: Optional[List[int]]):
+        # Allow unset
+        if v is None:
+            return v
+
+        # Must be a non-empty list of positive integers
+        if not isinstance(v, list) or len(v) == 0:
+            raise ValueError(
+                "kv_cache_config.max_attention_window must be a non-empty list of positive integers"
+            )
+        for i in v:
+            if not isinstance(i, int):
+                raise ValueError(
+                    "kv_cache_config.max_attention_window must contain only integers"
+                )
+            if i <= 0:
+                raise ValueError(
+                    "kv_cache_config.max_attention_window values must be positive"
+                )
+
+        # Must not be a redundant repetition of a shorter pattern
+        n = len(v)
+        for k in range(1, n):
+            if n % k == 0 and v == v[:k] * (n // k):
+                raise ValueError(
+                    f"kv_cache_config.max_attention_window should contain only the minimal repeating pattern; use {v[:k]} instead of {v}"
+                )
+        return v
+
 
 @PybindMirror.mirror_pybind_fields(_ExtendedRuntimePerfKnobConfig)
 class ExtendedRuntimePerfKnobConfig(StrictBaseModel, PybindMirror):
