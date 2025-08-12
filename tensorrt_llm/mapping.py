@@ -179,31 +179,33 @@ class Mapping(object):
 
         if attn_cp_size != 1 and cp_type == CpType.ULYSSES:
             raise ValueError(
-                f"attn_cp_size must be 1 for now for ulysse, but got {attn_tp_size}, {attn_cp_size}."
+                f"attn_cp_size must be 1 for now for ulysses, but got {attn_tp_size}, {attn_cp_size}."
             )
 
         if auto_parallel:
             if tp_size != 1 or pp_size != 1 or cp_size != 1:
                 raise ValueError(
-                    f"When auto parallel is enabled, tp_size, pp_size, cp_size must be 1, but got {tp_size}, {pp_size}, {cp_size}."
-                )
+                    "When auto parallel is enabled, tp_size, pp_size, cp_size must be 1, "
+                    f"but got {tp_size}, {pp_size}, {cp_size}.")
         else:
             if tp_size * pp_size * cp_size != world_size:
                 raise ValueError(
-                    f"world_size must equal to tp_size * pp_size * cp_size, but got {world_size} != {tp_size} * {pp_size} * {cp_size}."
+                    "world_size must equal to tp_size * pp_size * cp_size, "
+                    f"but got {world_size} != {tp_size} * {pp_size} * {cp_size}."
                 )
 
         moe_tp_ep_size = moe_tp_size * moe_ep_size
         moe_tp_cluster_ep_size = moe_tp_ep_size * moe_cluster_size
         if moe_tp_cluster_ep_size != moe_world_size:
             raise ValueError(
-                f"moe_tp_size * moe_ep_size * moe_cluster_size must equal to moe_world_size, but got {moe_tp_cluster_ep_size} != {moe_world_size}"
-            )
+                "moe_tp_size * moe_ep_size * moe_cluster_size must equal to moe_world_size, "
+                f"but got {moe_tp_cluster_ep_size} != {moe_world_size}")
 
         attn_tp_cp_size = attn_tp_size * attn_cp_size
         if attn_tp_cp_size != tp_size * cp_size:
             raise ValueError(
-                f"tp_size * cp_size must equal to attn_tp_size * attn_cp_size, but got {tp_size} * {cp_size} != {attn_tp_size} * {attn_cp_size}"
+                "tp_size * cp_size must equal to attn_tp_size * attn_cp_size, "
+                f"but got {tp_size} * {cp_size} != {attn_tp_size} * {attn_cp_size}"
             )
 
         if moe_ep_size != 1 and cp_size > 1 and cp_type == CpType.ULYSSES:
