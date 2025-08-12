@@ -1,4 +1,5 @@
 from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import Dict, List, Optional, Union
 
 from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import \
@@ -11,6 +12,13 @@ from ...logger import logger
 from ...mapping import Mapping
 from ..model_config import MoeLoadBalancerConfig
 from .resource_manager import BaseResourceManager
+
+
+class SamplerType(StrEnum):
+    """Enum for sampler type options."""
+    TRTLLMSampler = "TRTLLMSampler"
+    TorchSampler = "TorchSampler"
+    auto = "auto"
 
 
 @dataclass
@@ -60,9 +68,10 @@ class PyTorchConfig:
     If true, will iterate over sampling_params of each request and use the
     corresponding sampling strategy, e.g. top-k, top-p, etc.
     """
-    use_torch_sampler: bool = False
+    sampler_type: SamplerType = SamplerType.auto
     """
-    If true, will use the Torch sampler instead of the TRTLLM sampler.
+    The type of sampler to use. Options are TRTLLMSampler, TorchSampler or auto.
+    Defaults to auto, which will use TorchSampler unless BeamSearch is requested.
     """
 
     kv_cache_dtype: str = "auto"

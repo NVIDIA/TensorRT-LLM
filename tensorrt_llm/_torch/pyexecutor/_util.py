@@ -20,7 +20,7 @@ from tensorrt_llm.mapping import CpType, Mapping
 
 from ..model_config import ModelConfig
 from ..speculative import get_num_extra_kv_tokens, get_spec_decoder
-from .config import PyTorchConfig
+from .config import PyTorchConfig, SamplerType
 from .config_utils import is_mla, is_nemotron_hybrid
 from .guided_decoder import GuidedDecoder
 from .kv_cache_transceiver import AttentionTypeCpp, create_kv_cache_transceiver
@@ -589,20 +589,24 @@ def instantiate_sampler(engine: PyTorchModelEngine,
         mapping,
         max_seq_len=engine.max_seq_len,
         enable_mixed_sampler=pytorch_backend_config.enable_mixed_sampler)
+    decoding_mode = get_decoding_mode(executor_config)
     if mapping.cp_config.get('cp_type') == CpType.STAR:
         assert pytorch_backend_config.attn_backend == "FLASHINFER_STAR_ATTENTION", "attention backend of star attention should be 'FLASHINFER_STAR_ATTENTION'"
         return TorchSampler(sampler_args)
     if engine.spec_config is not None and engine.spec_config.spec_dec_mode.has_spec_decoder(
     ):
         return get_spec_decoder(sampler_args, engine.spec_config)
-    if pytorch_backend_config.use_torch_sampler or pytorch_backend_config.enable_mixed_sampler or engine.spec_config is not None:
-        return TorchSampler(sampler_args)
+    if pytorch_backend_config.sampler_type == SamplerType.TRTLLMSampler or (
+            pytorch_backend_config.sampler_type == SamplerType.auto
+            and decoding_mode.isBeamSearch()):
+        logger.debug(f"DecodingMode: {decoding_mode.name}")
+        return TRTLLMSampler(executor_config, engine.model, engine.dtype,
+                             mapping, decoding_mode,
+                             pytorch_backend_config.disable_overlap_scheduler)
     if not engine.model.model_config.is_generation:
         # NOTE: choose sampler based on model type
         return EarlyStopSampler()
-    return TRTLLMSampler(executor_config, engine.model, engine.dtype, mapping,
-                         get_decoding_mode(executor_config),
-                         pytorch_backend_config.disable_overlap_scheduler)
+    return TorchSampler(sampler_args)
 
 
 def get_decoding_mode(executor_config: ExecutorConfig) -> DecodingMode:
@@ -623,90 +627,6 @@ def get_decoding_mode(executor_config: ExecutorConfig) -> DecodingMode:
         )
         decoding_mode = DecodingMode.TopKTopP()
 
-    # Override decoding mode when Medusa is used
-    if getattr(executor_config.speculative_config, "is_medusa",
-               False) and not decoding_mode.isMedusa():
-        logger.warning(
-            "Model is Medusa, but decoding mode is not Medusa. Overwriting decoding mode to Medusa."
-        )
-        decoding_mode = DecodingMode.Medusa()
-
-    # Override decoding mode when Medusa is not used
-    if (not getattr(executor_config.speculative_config, "is_medusa",
-                    False)) and decoding_mode.isMedusa():
-        logger.warning(
-            "Model is not Medusa, but decoding mode is Medusa. Overwriting decoding mode."
-        )
-        if executor_config.max_beam_width == 1:
-            decoding_mode = DecodingMode.TopKTopP()
-        else:
-            decoding_mode = DecodingMode.BeamSearch()
-
-    # Override decoding mode when lookahead decoding is used
-    if getattr(executor_config.speculative_config, "is_lookahead",
-               False) and not decoding_mode.isLookahead():
-        logger.warning(
-            "Model is Lookahead, but decoding mode is not Lookahead. Overwriting decoding mode to Lookahead."
-        )
-        decoding_mode = DecodingMode.Lookahead()
-
-    # Override decoding mode when lookahead decoding is not used
-    if (not getattr(executor_config.speculative_config, "is_lookahead",
-                    False)) and decoding_mode.isLookahead():
-        logger.warning(
-            "Model is not built with Lookahead decoding, but decoding mode is Lookahead. Overwriting decoding mode."
-        )
-        if executor_config.max_beam_width == 1:
-            decoding_mode = DecodingMode.TopKTopP()
-        else:
-            decoding_mode = DecodingMode.BeamSearch()
-
-    # Override decoding mode when 'explicit draft tokens' is used
-    if getattr(executor_config.speculative_config, "is_explicit_draft_tokens",
-               False) and not decoding_mode.isExplicitDraftTokens():
-        logger.warning(
-            "Model is built with 'explicit draft tokens' decoding, but decoding mode is something else. Overwriting decoding mode."
-        )
-        decoding_mode = DecodingMode.ExplicitDraftTokens()
-
-    # Override decoding mode when 'explicit draft tokens' is not used
-    if (not getattr(executor_config.speculative_config,
-                    "is_explicit_draft_tokens",
-                    False)) and decoding_mode.isExplicitDraftTokens():
-        logger.warning(
-            "Model is not built with 'explicit draft tokens' decoding, but decoding mode is set to it. Overwriting decoding mode to default."
-        )
-        if executor_config.max_beam_width == 1:
-            decoding_mode = DecodingMode.TopKTopP()
-        else:
-            decoding_mode = DecodingMode.BeamSearch()
-
-    # Override decoding mode when EAGLE is used
-    if getattr(executor_config.speculative_config, "is_eagle",
-               False) and not decoding_mode.isEagle():
-        logger.warning(
-            "Model is Eagle, but decoding mode is not Eagle. Overwriting decoding mode to Eagle."
-        )
-        decoding_mode = DecodingMode.Eagle()
-
-    # Override decoding mode when Eagle is not used
-    if (not getattr(executor_config.speculative_config, "is_eagle",
-                    False)) and decoding_mode.isEagle():
-        logger.warning(
-            "Model is not Eagle, but decoding mode is Eagle. Overwriting decoding mode."
-        )
-        if executor_config.max_beam_width == 1:
-            decoding_mode = DecodingMode.TopKTopP()
-        else:
-            decoding_mode = DecodingMode.BeamSearch()
-
-    # Override decoding mode when draft tokens are external
-    if getattr(executor_config.speculative_config, "is_draft_tokens_external",
-               False):
-        logger.warning("Overwriting decoding mode to external draft token")
-        decoding_mode = DecodingMode.ExternalDraftTokens()
-
-    logger.debug(f"DecodingMode: {decoding_mode.name}")
     return decoding_mode
 
 

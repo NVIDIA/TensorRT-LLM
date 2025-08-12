@@ -27,6 +27,7 @@ from ..auto_parallel import AutoParallelConfig, infer_cluster_config
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
+from tensorrt_llm._torch.pyexecutor.config import SamplerType
 
 # yapf: disable
 # isort: off
@@ -2055,10 +2056,10 @@ class TorchLlmArgs(BaseLlmArgs):
         "If true, will iterate over sampling_params of each request and use the corresponding sampling strategy, e.g. top-k, top-p, etc.",
         status="beta")
 
-    use_torch_sampler: bool = Field(
-        default=False,
+    sampler_type: SamplerType = Field(
+        default=SamplerType.auto,
         description=
-        "If true, will use the Torch sampler instead of the TRTLLM sampler.",
+        "The type of sampler to use. Options are TRTLLMSampler, TorchSampler or auto. Defaults to auto, which will use TorchSampler unless BeamSearch is requested.",
         status="beta")
 
     enable_iter_perf_stats: bool = Field(
@@ -2344,7 +2345,7 @@ class TorchLlmArgs(BaseLlmArgs):
             attn_backend=self.attn_backend,
             moe_backend=self.moe_config.backend,
             enable_mixed_sampler=self.enable_mixed_sampler,
-            use_torch_sampler=self.use_torch_sampler,
+            sampler_type=self.sampler_type,
             kv_cache_dtype=self.kv_cache_config.dtype,
             mamba_ssm_cache_dtype=self.kv_cache_config.mamba_ssm_cache_dtype,
             enable_iter_perf_stats=self.enable_iter_perf_stats,
