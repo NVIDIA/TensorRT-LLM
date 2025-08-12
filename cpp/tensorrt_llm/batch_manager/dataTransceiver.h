@@ -112,7 +112,6 @@ private:
     executor::DataTransceiverState mTransState;
 };
 
-
 class CacheSender
 {
 public:

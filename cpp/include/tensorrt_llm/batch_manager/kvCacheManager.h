@@ -115,6 +115,8 @@ struct BlockKey
     // Each extra key is a pair of (mm_hash, start_offset_in_block)
     std::vector<MmKey> extraKeys;
 
+    size_t hash{0};
+
     BlockKey() = default;
 
     explicit BlockKey(VecTokens const& tokens, std::optional<LoraTaskIdType> loraTaskId = std::nullopt)
@@ -125,6 +127,11 @@ struct BlockKey
         {
             uniqueTokens.push_back(UniqueToken{token, 0});
         }
+    }
+
+    explicit BlockKey(size_t hash)
+        : hash{hash}
+    {
     }
 
     explicit BlockKey(bool usesExtraIds, std::optional<LoraTaskIdType> loraTaskId, VecUniqueTokens uniqueTokens,
@@ -164,6 +171,10 @@ struct BlockKeyHasher
 
     std::size_t operator()(BlockKey const& blockKey, std::size_t parentHash = 0) const noexcept
     {
+        if (blockKey.hash != 0)
+        {
+            return blockKey.hash;
+        }
         return hash(blockKey, parentHash);
     }
 };
@@ -566,6 +577,8 @@ public:
 
     void storeNewBlock(GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest);
 
+    void pinBlocks(GenerationRequest& sequence);
+
     //! \brief Release blocks of the sequence.
     void releaseBlocks(GenerationRequest& sequence);
 
@@ -737,6 +750,8 @@ public:
         return 0;
     }
 
+    [[nodiscard]] std::optional<KVCacheBlock> findBlocksInReuseTreeByHashes(std::vector<size_t> const& hashes) const;
+
 private:
     //! \brief Add single block to beam of sequence and mAllocatedBlocksPerSeq.
     void addBlockToBeam(BlockPtr& block, GenerationRequest& sequence, SizeType32 beamIdx);
@@ -882,6 +897,8 @@ public:
     void releaseBlocks(GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest = std::nullopt);
 
     void schedulingReleaseBlocks(LlmRequest::RequestIdType requestId);
+
+    void pinBlocks(GenerationRequest& sequence);
 
     void releaseLastBlock(GenerationRequest& sequence, SizeType32 windowSize);
 
@@ -1200,6 +1217,8 @@ public:
     /// @return  The number of blocks
     [[nodiscard]] virtual SizeType32 getRemainingBlocksToCompletion(LlmRequest const& req, SizeType32 windowSize) const
         = 0;
+
+    virtual void pinBlocks(LlmRequest::RequestIdType requestId) = 0;
 
     /// @brief Increase size for request at seqSlotIdx. Allocate new KV cache block(s) if needed.
     virtual void addToken(LlmRequest::RequestIdType requestId) = 0;
@@ -1587,6 +1606,8 @@ public:
     /// @return SizeType32 A number of blocks.
     [[nodiscard]] static SizeType32 calculateMaxBlockRequirements(SizeType32 inputLength, SizeType32 outputLength,
         SizeType32 sinkTokenLength, SizeType32 windowSize, SizeType32 beamWidth, SizeType32 tokensPerBlock);
+
+    void pinBlocks(LlmRequest::RequestIdType requestId);
 
     /// @brief Calculates the number of kv-cache blocks that a sequence will require, for a single beam.
     ///

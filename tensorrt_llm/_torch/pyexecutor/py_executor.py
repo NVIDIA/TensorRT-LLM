@@ -180,6 +180,7 @@ class PyExecutor:
         self.max_beam_width = max_beam_width
         self.max_draft_len = max_draft_len
         self.print_log = model_engine.pytorch_backend_config.print_iter_log
+        self.block_reuse_enabled = model_engine.pytorch_backend_config.kv_cache_config.enable_block_reuse
         self.enable_iter_perf_stats = model_engine.pytorch_backend_config.enable_iter_perf_stats
         self.enable_iter_req_stats = model_engine.pytorch_backend_config.enable_iter_req_stats
         self.stream_interval = model_engine.pytorch_backend_config.stream_interval
@@ -957,6 +958,11 @@ class PyExecutor:
                     self._update_request_states(scheduled_batch)
                     self._update_requests(sample_state)
 
+                    if not self.block_reuse_enabled:
+                        ctx_transmission_reqs = self._send_disagg_ctx_cache(
+                            scheduled_batch.context_requests
+                        ) if self.kv_cache_transceiver else []
+
                     if self.kv_cache_transceiver:
                         ctx_transmission_reqs = self._send_disagg_ctx_cache(
                             scheduled_batch.context_requests)
@@ -1632,7 +1638,11 @@ class PyExecutor:
 
             if request_done:
                 if request.is_disagg_context_transmission_state:
-                    self.ctx_in_transmission_requests.append(request)
+                    if self.block_reuse_enabled:
+                        self.kv_cache_manager.pin_blocks(request.py_request_id)
+                        requests_to_terminate.append(request)
+                    else:
+                        self.ctx_in_transmission_requests.append(request)
                 else:
                     requests_to_terminate.append(request)
             else:
