@@ -47,7 +47,7 @@ def capturing_cuda_graph_context():
         set_piecewise_cuda_graph_flag(True)
 
 
-class CUDAGraphModelEngine:
+class CUDAGraphRunner:
     """
     Manages the lifecycle and execution of CUDA graphs for the model engine.
 

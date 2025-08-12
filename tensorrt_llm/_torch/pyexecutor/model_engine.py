@@ -54,7 +54,7 @@ from ..utils import (get_model_extra_attrs, set_torch_compiling,
                      with_model_extra_attrs)
 from .config import LoadFormat, PyTorchConfig
 from .config_utils import is_mla
-from .cuda_graph_model_engine import CUDAGraphModelEngine
+from .cuda_graph_runner import CUDAGraphRunner
 from .layerwise_nvtx_marker import LayerwiseNvtxMarker
 from .llm_request import get_draft_token_length
 from .resource_manager import (BaseResourceManager, KVCacheManager,
@@ -439,7 +439,7 @@ class PyTorchModelEngine(ModelEngine):
         self.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
         self.lora_model_config: Optional[LoraModelConfig] = None
         self.cuda_graph_dummy_request = None
-        self.cuda_graph_model_engine = CUDAGraphModelEngine(self)
+        self.cuda_graph_runner = CUDAGraphRunner(self)
 
         # Setup the local cache indirection buffer only once and reuse it.
         # This way it can also be used for CUDA graphs.
@@ -1006,7 +1006,7 @@ class PyTorchModelEngine(ModelEngine):
         self._init_max_num_tokens()
 
     def _release_cuda_graphs(self):
-        self.cuda_graph_model_engine.clear()
+        self.cuda_graph_runner.clear()
 
     def get_max_num_sequences(self) -> int:
         """
@@ -2008,7 +2008,7 @@ class PyTorchModelEngine(ModelEngine):
             with MoeLoadBalancerIterContext(moe_load_balancer):
                 return self._forward_step(inputs, gather_ids,
                                           gather_context_logits)
-        with self.cuda_graph_model_engine.pad_batch(
+        with self.cuda_graph_runner.pad_batch(
                 scheduled_requests, resource_manager) as padded_requests:
             inputs, gather_ids = self._prepare_inputs(
                 scheduled_requests, kv_cache_manager, attn_metadata,
@@ -2024,7 +2024,7 @@ class PyTorchModelEngine(ModelEngine):
                         gather_context_logits=gather_context_logits)
 
             # 3. Ask the manager to execute the graph
-            outputs = self.cuda_graph_model_engine.execute(
+            outputs = self.cuda_graph_runner.execute(
                 batch=padded_requests,
                 inputs=inputs,
                 forward_fn=capture_forward_fn)
