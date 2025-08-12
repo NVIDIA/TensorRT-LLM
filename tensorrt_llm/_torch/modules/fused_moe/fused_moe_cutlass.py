@@ -16,10 +16,10 @@ from .interface import MoE
 # isort: off
 from .quantization import (
     DeepSeekFP8BlockScalesFusedMoEMethod, FP8QDQFusedMoEMethod,
-    MoEWeightLoadingMode, NVFP4CutlassFusedMoEMethod, UnquantizedFusedMoEMethod, WeightOnlyFusedMoEMethod,
-                          
-    W4A8MXFP4FP8CutlassFusedMoEMethod, W4A8MXFP4MXFP8CutlassFusedMoEMethod,
-    WFP4A16FusedMoEMethod, WInt4AFP8FusedMoEMethod)
+    MoEWeightLoadingMode, NVFP4CutlassFusedMoEMethod, UnquantizedFusedMoEMethod,
+    INT8WoqPerChannelFusedMoEMethod, W4A8MXFP4FP8CutlassFusedMoEMethod,
+    W4A8MXFP4MXFP8CutlassFusedMoEMethod, WFP4A16FusedMoEMethod,
+    WInt4AFP8FusedMoEMethod)
 # isort: on
 from .routing import BaseMoeRoutingMethod
 
@@ -45,8 +45,6 @@ class CutlassFusedMoE(MoE):
                 FusedMoE Op: dynamic quant + scatter + gemm1 + swiglu + gemm2 + finalizeMoeRoute (return one tensor)
             p8 qdq, nvfp4:
                 FusedMoE Op: scatter + gemm1 + swiglu + gemm2 + finalizeMoeRoute (return one tensor)
-            weight only:
-                FusedMoE Op: ... to finish
 
     FusedMoE module:
         max-throughput mode:
@@ -185,14 +183,9 @@ class CutlassFusedMoE(MoE):
         )
 
     @property
-    def has_woq_per_channel(self):
-        return self.quant_config.layer_quant_mode.is_weight_only(
+    def has_int8_woq_per_channel(self):
+        return self.quant_config.layer_quant_mode.is_int8_weight_only(
         ) and not self.quant_config.layer_quant_mode.has_per_group_scaling()
-
-    @property
-    def has_woq_per_group_scaling(self):
-        return self.quant_config.layer_quant_mode.is_weight_only(
-        ) and self.quant_config.layer_quant_mode.has_per_group_scaling()
 
     @cached_property
     def enable_alltoall(self):
@@ -216,8 +209,8 @@ class CutlassFusedMoE(MoE):
             elif self.quant_config.layer_quant_mode.is_int4_weight_only_per_group(
             ):
                 return WInt4AFP8FusedMoEMethod()
-            elif self.has_woq_per_channel:
-                return WeightOnlyFusedMoEMethod()
+            elif self.has_int8_woq_per_channel:
+                return INT8WoqPerChannelFusedMoEMethod()
             elif self.quant_config.layer_quant_mode.has_w4a8_mxfp4_fp8():
                 return W4A8MXFP4FP8CutlassFusedMoEMethod()
             elif self.quant_config.layer_quant_mode.has_w4a16_mxfp4():
@@ -275,8 +268,7 @@ class CutlassFusedMoE(MoE):
         # quantize inputs
         use_deepseek_fp8_block_scale = False
         use_w4_group_scaling = False
-        use_woq_per_channel = False
-        use_woq_group_scaling = False
+        use_int8_woq_per_channel = False
         use_mxfp8_act_scaling = False
         weight_dtype = self.w3_w1_weight.dtype
         x_sf = None
@@ -290,19 +282,15 @@ class CutlassFusedMoE(MoE):
                 use_deepseek_fp8_block_scale = True
             elif self.has_w4afp8:
                 use_w4_group_scaling = True
-                use_woq_group_scaling = True
                 weight_dtype = torch.quint4x2
-            elif self.has_woq_per_channel:
-                use_woq_per_channel = True
-            elif self.has_woq_per_group_scaling:
-                use_woq_group_scaling = True
             elif self.has_w4a16_mxfp4:
                 pad_size = self.hidden_size - x.shape[1]
                 original_hidden_size = x.shape[1]
                 x = torch.nn.functional.pad(x, (0, pad_size))
-
                 use_w4_group_scaling = True
                 weight_dtype = torch.uint8
+            elif self.has_int8_woq_per_channel:
+                use_int8_woq_per_channel = True
             elif self.has_nvfp4:
                 if run_post_quant_allgather or self.enable_alltoall:
                     if isinstance(x, Fp4QuantizedTensor):
@@ -442,8 +430,7 @@ class CutlassFusedMoE(MoE):
             enable_alltoall=self.enable_alltoall,
             use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
             use_w4_group_scaling=use_w4_group_scaling,
-            use_woq_per_channel=use_woq_per_channel,
-            use_woq_group_scaling=use_woq_group_scaling,
+            use_int8_woq_per_channel=use_int8_woq_per_channel,
             use_mxfp8_act_scaling=use_mxfp8_act_scaling,
             min_latency_mode=False,
             use_fused_finalize=self.use_fused_finalize,

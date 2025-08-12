@@ -14,19 +14,22 @@
 # limitations under the License.
 import unittest
 
+import pytest
+
 # isort: off
 import torch
 # isort: on
 
 from parameterized import parameterized
-from utils.util import (create_session, run_session, skip_non_ada_unittest,
+from utils.util import (create_session, run_session,
+                        skip_neither_ada_nor_hopper_unittest,
                         unittest_name_func)
 
 import tensorrt_llm
 import tensorrt_llm.quantization.functional
 from tensorrt_llm import Tensor
-from tensorrt_llm._utils import (str_dtype_to_trt, torch_to_numpy,
-                                 trt_dtype_to_str)
+from tensorrt_llm._utils import (get_sm_version, str_dtype_to_trt,
+                                 torch_to_numpy, trt_dtype_to_str)
 from tensorrt_llm.layers.moe import MoeConfig
 from tensorrt_llm.quantization import QuantMode
 
@@ -66,7 +69,10 @@ class TestMoEWeightOnlyQuantMatmul(unittest.TestCase):
         dtype = str_dtype_to_trt(str_dtype)
         norm_mode = MoeConfig.ExpertScaleNormalizationMode.RENORMALIZE
         k = act.shape[1]
-        n = weight_scaling_factor_1.shape[-1] // 2
+        if has_pre_quant:
+            n = fc2_prequant_scale.shape[-1]
+        else:
+            n = weight_scaling_factor_1.shape[-1] // 2
         num_experts = weight_scaling_factor_1.shape[0]
 
         use_int8 = True if self.quant_mode.is_int8_weight_only() else False
@@ -211,17 +217,49 @@ class TestMoEWeightOnlyQuantMatmul(unittest.TestCase):
             ref_weight_1 += zero_1.repeat_interleave(group_size, dim=1)
             ref_weight_2 += zero_2.repeat_interleave(group_size, dim=1)
         activation_type = torch.float8_e4m3fn if has_alpha else activation_dtype
+        # Hopper w4a8 does not interleave weight
+        do_weight_interleave = get_sm_version() != 90 or not has_alpha
         cuda_q_weight_1 = preprocessor(
-            unprocessed_weight_1.cpu(), quantized_weight_dtype,
-            activation_type).view(activation_dtype).cpu()
+            unprocessed_weight_1.cpu(),
+            quantized_weight_dtype,
+            activation_type,
+            do_weight_interleave=do_weight_interleave).view(
+                activation_dtype).cpu()
         cuda_q_weight_2 = preprocessor(
-            unprocessed_weight_2.cpu(), quantized_weight_dtype,
-            activation_type).view(activation_dtype).cpu()
-        if has_alpha and activation_dtype == torch.bfloat16:
+            unprocessed_weight_2.cpu(),
+            quantized_weight_dtype,
+            activation_type,
+            do_weight_interleave=do_weight_interleave).view(
+                activation_dtype).cpu()
+        if get_sm_version() == 89 and has_alpha:
             scale_1 = scale_1.to(torch.float16).view(activation_dtype)
             scale_2 = scale_2.to(torch.float16).view(activation_dtype)
             zero_1 = zero_1.to(torch.float16).view(activation_dtype)
             zero_2 = zero_2.to(torch.float16).view(activation_dtype)
+
+        if get_sm_version() == 90 and has_alpha:
+            if has_zero:
+                pytest.skip(
+                    "has_zero is not supported in Hopper with WINT4AFP8.")
+
+            def interleave_scales(scales: torch.Tensor, interleave_dim: int):
+                # [num_experts, num_groups, num_cols] --> [num_experts, num_groups // interleave, num_cols * interleave]
+                # Note: num_groups = num_rows // group_size
+                E, G, C = scales.shape
+                I = tensorrt_llm.quantization.functional.get_weight_scale_interleave_factor(
+                    interleave_dim, group_size)
+                assert G % I == 0, f"Group dimension ({G}) must be divisible by interleave factor ({I})."
+                scales_interleaved = scales.reshape(E, G // I, I, C)
+                scales_interleaved = scales_interleaved.permute(0, 1, 3, 2)
+                scales_interleaved = scales_interleaved.reshape(
+                    E, G // I, C * I)
+                return scales_interleaved.contiguous()
+
+            scale_1 = scale_1.to(torch.bfloat16).view(activation_dtype)
+            scale_2 = scale_2.to(torch.bfloat16).view(activation_dtype)
+            scale_1 = interleave_scales(scale_1, k)
+            scale_2 = interleave_scales(scale_2, n)
+            zero_1, zero_2 = None, None
 
         session = self.create_trt_session(
             activation_dtype_str, activation, router, pre_quant_scale_1,
@@ -380,7 +418,7 @@ class TestMoEWeightOnlyQuantMatmul(unittest.TestCase):
                            (1, 14336, 4096, 8, "bfloat16", True, False),
                            (1, 14336, 4096, 8, "bfloat16", True, True)],
                           name_func=unittest_name_func)
-    @skip_non_ada_unittest
+    @skip_neither_ada_nor_hopper_unittest
     def test_moe_w4a8_groupwise(self, m, n, k, experts, dtype, has_pre_quant,
                                 has_zero):
         self.quant_mode = QuantMode.use_weight_only(True, True)

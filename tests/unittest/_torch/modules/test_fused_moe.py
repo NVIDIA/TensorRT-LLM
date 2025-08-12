@@ -1904,111 +1904,115 @@ def test_fused_moe_triton_mxfp4(experts, hidden_size, intermediate_size,
         check_accuracy(output, ref_output, rtol=0.6, atol=0.6, percent=0.945)
 
 
-@pytest.mark.parametrize("dtype", [torch.float16])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("weight_dtype", [torch.int8])
-def test_fused_moe_weight_only(dtype, weight_dtype):
+def test_fused_moe_int8_woq_per_channel(dtype, weight_dtype):
 
-    SEQ_LEN = 4
-    HIDDEN_SIZE = 768
-    INTERMEDIATE_SIZE = 640
-    NUM_EXPERTS = 3
-    TOP_K = 2
-    routing_method = RenormalizeMoeRoutingMethod(top_k=TOP_K)
-    torch.manual_seed(0)
-    torch.cuda.manual_seed(0)
-    x = torch.randn((SEQ_LEN, HIDDEN_SIZE), dtype=dtype, device="cuda")
+    mapping = Mapping()
+    mapping.rank = mpi_rank()
 
-    router_logits = torch.randn((SEQ_LEN, NUM_EXPERTS),
-                                dtype=dtype,
-                                device="cuda")
+    with torch.device(f'cuda:{mapping.rank}'):
+        SEQ_LEN = 4
+        HIDDEN_SIZE = 768
+        INTERMEDIATE_SIZE = 640
+        NUM_EXPERTS = 3
+        TOP_K = 2
+        routing_method = RenormalizeMoeRoutingMethod(top_k=TOP_K)
+        torch.manual_seed(0)
+        torch.cuda.manual_seed(0)
+        x = torch.randn((SEQ_LEN, HIDDEN_SIZE), dtype=dtype, device="cuda")
 
-    weight_id = 1  # 1 for w8a16, 2 for w4a16
-    quant_config = QuantConfig(quant_algo=QuantAlgo.W8A16)
-    weights = {}
-    for expert_id in range(NUM_EXPERTS):
-        w1_weight = torch.randint(-128,
-                                  127,
-                                  (INTERMEDIATE_SIZE, HIDDEN_SIZE // weight_id),
-                                  dtype=torch.int8).cuda()
-        w2_weight = torch.randint(-128,
-                                  127,
-                                  (HIDDEN_SIZE, INTERMEDIATE_SIZE // weight_id),
-                                  dtype=torch.int8).cuda()
-        w3_weight = torch.randint(-128,
-                                  127,
-                                  (INTERMEDIATE_SIZE, HIDDEN_SIZE // weight_id),
-                                  dtype=torch.int8).cuda()
+        router_logits = torch.randn((SEQ_LEN, NUM_EXPERTS),
+                                    dtype=dtype,
+                                    device="cuda")
 
-        w1_scale = torch.randn(
-            (INTERMEDIATE_SIZE), dtype=dtype, device="cuda") / HIDDEN_SIZE
-        w2_scale = torch.randn(
-            (HIDDEN_SIZE), dtype=dtype, device="cuda") / INTERMEDIATE_SIZE
-        w3_scale = torch.randn(
-            (INTERMEDIATE_SIZE), dtype=dtype, device="cuda") / HIDDEN_SIZE
+        weight_id = 1  # 1 for w8a16, 2 for w4a16
+        quant_config = QuantConfig(quant_algo=QuantAlgo.W8A16)
+        weights = {}
+        for expert_id in range(NUM_EXPERTS):
+            w1_weight = torch.randint(
+                -128,
+                127, (INTERMEDIATE_SIZE, HIDDEN_SIZE // weight_id),
+                dtype=torch.int8).cuda()
+            w2_weight = torch.randint(
+                -128,
+                127, (HIDDEN_SIZE, INTERMEDIATE_SIZE // weight_id),
+                dtype=torch.int8).cuda()
+            w3_weight = torch.randint(
+                -128,
+                127, (INTERMEDIATE_SIZE, HIDDEN_SIZE // weight_id),
+                dtype=torch.int8).cuda()
 
-        weights[f"{expert_id}.w1.weight"] = w1_weight
-        weights[f"{expert_id}.w2.weight"] = w2_weight
-        weights[f"{expert_id}.w3.weight"] = w3_weight
-        weights[f"{expert_id}.w1.weight_scale_inv"] = w1_scale
-        weights[f"{expert_id}.w2.weight_scale_inv"] = w2_scale
-        weights[f"{expert_id}.w3.weight_scale_inv"] = w3_scale
+            w1_scale = torch.randn(
+                (INTERMEDIATE_SIZE), dtype=dtype, device="cuda") / HIDDEN_SIZE
+            w2_scale = torch.randn(
+                (HIDDEN_SIZE), dtype=dtype, device="cuda") / INTERMEDIATE_SIZE
+            w3_scale = torch.randn(
+                (INTERMEDIATE_SIZE), dtype=dtype, device="cuda") / HIDDEN_SIZE
 
-    fused_moe = CutlassFusedMoE(
-        num_experts=NUM_EXPERTS,
-        routing_method=routing_method,
-        hidden_size=HIDDEN_SIZE,
-        intermediate_size=INTERMEDIATE_SIZE,
-        dtype=dtype,
-        reduce_results=False,
-        model_config=ModelConfig(quant_config=quant_config))
-    fused_moe.load_weights([weights])
-    fused_moe.cuda()
+            weights[f"{expert_id}.w1.weight"] = w1_weight
+            weights[f"{expert_id}.w2.weight"] = w2_weight
+            weights[f"{expert_id}.w3.weight"] = w3_weight
+            weights[f"{expert_id}.w1.weight_scale"] = w1_scale
+            weights[f"{expert_id}.w2.weight_scale"] = w2_scale
+            weights[f"{expert_id}.w3.weight_scale"] = w3_scale
 
-    def ref():
-        results = torch.zeros_like(x)
-        selected_experts, final_scales = routing_method.apply(router_logits)
-        for e_idx in range(NUM_EXPERTS):
-            mask = selected_experts == e_idx
-            activated_tokens = mask.sum(1).bool()
-            act = x[activated_tokens, :]
-            if act.shape[0] == 0:
-                continue
-            final_scale = (final_scales *
-                           mask).sum(1)[activated_tokens].unsqueeze(1)
-            # weights
-            w1 = weights[f"{e_idx}.w1.weight"].T.contiguous().cuda()
-            w2 = weights[f"{e_idx}.w2.weight"].T.contiguous().cuda()
-            w3 = weights[f"{e_idx}.w3.weight"].T.contiguous().cuda()
-            w3_w1 = torch.cat([w3, w1], dim=-1)
-            # scales
-            s1 = weights[f"{e_idx}.w1.weight_scale_inv"].cuda()
-            s2 = weights[f"{e_idx}.w2.weight_scale_inv"].cuda()
-            s3 = weights[f"{e_idx}.w3.weight_scale_inv"].cuda()
-            s3_s1 = torch.cat([s3, s1], dim=-1)
-            # calculation
-            w3_w1 = (w3_w1.float() * s3_s1).to(dtype)
-            fc1 = torch.matmul(act, w3_w1)
-            fc1, gate = fc1.chunk(2, dim=-1)
-            act = fc1 * torch.nn.functional.silu(gate)
-            w2 = (w2.float() * s2).to(dtype)
-            fc2 = torch.matmul(act, w2)
-            results[activated_tokens, :] += (fc2 * final_scale).to(
-                results.dtype)
-        return results
+        fused_moe = CutlassFusedMoE(
+            num_experts=NUM_EXPERTS,
+            routing_method=routing_method,
+            hidden_size=HIDDEN_SIZE,
+            intermediate_size=INTERMEDIATE_SIZE,
+            dtype=dtype,
+            reduce_results=False,
+            model_config=ModelConfig(quant_config=quant_config))
+        fused_moe.load_weights([weights])
+        fused_moe.cuda()
 
-    AutoTuner.get().clear_cache()
-    with torch.inference_mode(), autotune():
-        fused_moe.forward(x, router_logits)
+        def ref():
+            results = torch.zeros_like(x)
+            selected_experts, final_scales = routing_method.apply(router_logits)
+            for e_idx in range(NUM_EXPERTS):
+                mask = selected_experts == e_idx
+                activated_tokens = mask.sum(1).bool()
+                act = x[activated_tokens, :]
+                if act.shape[0] == 0:
+                    continue
+                final_scale = (final_scales *
+                               mask).sum(1)[activated_tokens].unsqueeze(1)
+                # weights
+                w1 = weights[f"{e_idx}.w1.weight"].T.contiguous().cuda()
+                w2 = weights[f"{e_idx}.w2.weight"].T.contiguous().cuda()
+                w3 = weights[f"{e_idx}.w3.weight"].T.contiguous().cuda()
+                w3_w1 = torch.cat([w3, w1], dim=-1)
+                # scales
+                s1 = weights[f"{e_idx}.w1.weight_scale"].cuda()
+                s2 = weights[f"{e_idx}.w2.weight_scale"].cuda()
+                s3 = weights[f"{e_idx}.w3.weight_scale"].cuda()
+                s3_s1 = torch.cat([s3, s1], dim=-1)
+                # calculation
+                w3_w1 = (w3_w1.float() * s3_s1).to(dtype)
+                fc1 = torch.matmul(act, w3_w1)
+                fc1, gate = fc1.chunk(2, dim=-1)
+                act = fc1 * torch.nn.functional.silu(gate)
+                w2 = (w2.float() * s2).to(dtype)
+                fc2 = torch.matmul(act, w2)
+                results[activated_tokens, :] += (fc2 * final_scale).to(
+                    results.dtype)
+            return results
 
-    torch.cuda.synchronize()
-    with torch.inference_mode():
-        output = fused_moe.forward(x, router_logits)
-        ref_output = ref()
+        AutoTuner.get().clear_cache()
+        with torch.inference_mode(), autotune():
+            fused_moe.forward(x, router_logits)
 
-    # compare
-    torch.cuda.synchronize()
-    atol = calc_woq_tolerence(ref_output, weight_dtype)
-    torch.testing.assert_close(output, ref_output, rtol=1e-27, atol=atol)
+        torch.cuda.synchronize()
+        with torch.inference_mode():
+            output = fused_moe.forward(x, router_logits)
+            ref_output = ref()
+
+        # compare
+        torch.cuda.synchronize()
+        atol = calc_woq_tolerence(ref_output, weight_dtype)
+        torch.testing.assert_close(output, ref_output, rtol=1e-7, atol=atol)
 
 
 class RefGatedMLPFusedMoE(nn.Module):

@@ -97,7 +97,7 @@ public:
     template <typename TypeAct>
     std::unique_ptr<kernels::CutlassMoeFCRunnerInterface> create_weight_quant_runner()
     {
-        if (isWInt8Quant())
+        if (isInt8Quant())
         {
             return std::make_unique<kernels::CutlassMoeFCRunner<TypeAct, uint8_t>>();
         }
@@ -109,10 +109,6 @@ public:
                 return std::make_unique<
                     kernels::CutlassMoeFCRunner<__nv_fp8_e4m3, cutlass::uint4b_t, TypeAct, TypeAct>>();
             }
-            else
-            {
-                return std::make_unique<kernels::CutlassMoeFCRunner<TypeAct, cutlass::uint4b_t>>();
-            }
 #endif
             return std::make_unique<kernels::CutlassMoeFCRunner<TypeAct, cutlass::uint4b_t>>();
         }
@@ -123,7 +119,7 @@ public:
     }
 
     FusedMoeRunner(c10::ScalarType activation_dtype, c10::ScalarType weight_dtype, c10::ScalarType output_dtype,
-        bool use_deepseek_fp8_block_scale, bool use_w4_group_scaling, bool use_woq_group_scaling,
+        bool use_deepseek_fp8_block_scale, bool use_w4_group_scaling, bool use_int8_woq_per_channel,
         bool use_mxfp8_act_scaling, bool use_fused_finalize)
     {
         mActivationDtype = activation_dtype;
@@ -131,8 +127,7 @@ public:
         mOutputDtype = output_dtype;
         mUseDeepSeekFP8BlockScaling = use_deepseek_fp8_block_scale;
         mUseW4GroupScaling = use_w4_group_scaling;
-        mUseWoqPerChannel = use_woq_per_channel;
-        mUseWoqGroupScaling = use_woq_group_scaling;
+        mUseINT8WoqPerChannel = use_int8_woq_per_channel;
         mUseMxfp8ActScaling = use_mxfp8_act_scaling;
         mUseFusedFinalize = use_fused_finalize;
         mInnerDimMultiplier = 1;
@@ -167,7 +162,6 @@ public:
             mInnerDimMultiplier = 16; // 16 FP4 -> 1 LONG
             mKernelRunner = switch_output_type<__nv_fp8_e4m3, __nv_fp4_e2m1>(mOutputDtype);
         }
-
         if (isNvfp4Quant())
         {
             mInnerDimMultiplier = 16; // 16 FP4 -> 1 LONG
@@ -182,7 +176,6 @@ public:
             default: mKernelRunner = switch_output_type<__nv_fp4_e2m1, __nv_fp4_e2m1, false>(mOutputDtype);
             }
         }
-
         if (isWFP4A16Quant())
         {
             mInnerDimMultiplier = 2;
@@ -197,9 +190,8 @@ public:
             }
 #endif
         }
-
 #endif
-        if (isWeightOnlyQuant())
+        if (isIntWeightOnlyQuant())
         {
             if (isInt4Quant())
             {
@@ -316,8 +308,10 @@ public:
         TORCH_CHECK(fc1_expert_weights.sizes()[0] == fc2_expert_weights.sizes()[0],
             "fc1_expert_weights and fc2_expert_weights must have the same number of experts.");
 
-        if (mUseWoqPerChannel)
+        if (mUseINT8WoqPerChannel)
         {
+            // Note: The weight shape for INT8 weight only quantization is different, e.g., fc2_expert_weights:
+            // [num_experts, inter_size, hidden_size]
             TORCH_CHECK(fc1_expert_weights.sizes()[2] == fc2_expert_weights.sizes()[1] * mInnerDimMultiplier * 2,
                 "fc1_expert_weights inter size must be 2 times fc2_expert_weights inter size.");
         }
@@ -331,8 +325,10 @@ public:
         int64_t num_rows = input.sizes()[0];
         int64_t hidden_size = fc2_expert_weights.sizes()[1];
         int64_t inter_size = fc2_expert_weights.sizes()[2] * mInnerDimMultiplier;
-        if (mUseWoqPerChannel)
+        if (mUseINT8WoqPerChannel)
         {
+            // Note: The weight shape for INT8 weight only quantization is different, e.g., fc2_expert_weights:
+            // [num_experts, inter_size, hidden_size]
             hidden_size = fc2_expert_weights.sizes()[2] * mInnerDimMultiplier;
             inter_size = fc2_expert_weights.sizes()[1];
         }
@@ -614,8 +610,10 @@ public:
         int64_t const num_rows = input.sizes()[0];
         int64_t hidden_size = fc2_expert_weights.sizes()[1];
         int64_t inter_size = fc2_expert_weights.sizes()[2] * mInnerDimMultiplier;
-        if (mUseWoqPerChannel)
+        if (mUseINT8WoqPerChannel)
         {
+            // Note: The weight shape for INT8 weight only quantization is different, e.g., fc2_expert_weights:
+            // [num_experts, inter_size, hidden_size]
             hidden_size = fc2_expert_weights.sizes()[2] * mInnerDimMultiplier;
             inter_size = fc2_expert_weights.sizes()[1];
         }
@@ -701,8 +699,7 @@ private:
 
     bool mUseDeepSeekFP8BlockScaling = false;
     bool mUseW4GroupScaling = false;
-    bool mUseWoqPerChannel = false;
-    bool mUseWoqGroupScaling = false;
+    bool mUseINT8WoqPerChannel = false;
     bool mUseMxfp8ActScaling = false;
     bool mUseFusedFinalize = true;
 
@@ -917,7 +914,6 @@ private:
             TORCH_CHECK(false, "MXFP8 x MXFP4 quantization is not supported in OSS Cutlass Moe Gemm");
 #endif
         }
-
         else if (isNvfp4Quant())
         {
             TORCH_CHECK(quant_scales.has_value(), "Expecting quant scales for nvfp4 quantization");
@@ -990,30 +986,31 @@ private:
             return kernels::QuantParams::FP8BlockScaling(
                 static_cast<float const*>(fc1_scales.data_ptr()), static_cast<float const*>(fc2_scales.data_ptr()));
         }
-        else if (isWeightOnlyQuant())
+        else if (isWFP4A16Quant())
         {
             TORCH_CHECK(quant_scales.has_value(), "Expecting quant scales for weight only quantization");
-            if (mUseWoqPerChannel)
+            TORCH_CHECK(quant_scales.value().size() == 2, "Expecting 2 quant scales for W4A16 quantization");
+
+            auto& fc1_weight_scales = quant_scales.value()[0];
+            auto& fc2_weight_scales = quant_scales.value()[1];
+            int group_size = TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::wfp4a16_group_size;
+            return kernels::QuantParams::GroupWise(group_size, static_cast<void const*>(fc1_weight_scales.data_ptr()),
+                static_cast<void const*>(fc2_weight_scales.data_ptr()), nullptr, nullptr, nullptr, nullptr, nullptr,
+                nullptr);
+        }
+        else if (isIntWeightOnlyQuant())
+        {
+            TORCH_CHECK(quant_scales.has_value(), "Expecting quant scales for weight only quantization");
+            if (mUseINT8WoqPerChannel)
             {
-                TORCH_CHECK(quant_scales.value().size() == 2, "Expecting 2 quant scales for weight only quantization");
+                TORCH_CHECK(
+                    quant_scales.value().size() == 2, "Expecting 2 quant scales for INT8 weight only quantization");
                 auto& fc1_weight_scales = quant_scales.value()[0];
                 auto& fc2_weight_scales = quant_scales.value()[1];
                 return kernels::QuantParams::Int(static_cast<float const*>(fc1_weight_scales.data_ptr()),
                     static_cast<float const*>(fc2_weight_scales.data_ptr()));
             }
-            // TODO: support groupwise quantization for int8 weight only
-            else if (isWFP4A16Quant())
-            {
-                TORCH_CHECK(quant_scales.value().size() == 2, "Expecting 2 quant scales for W4A16 quantization");
-
-                auto& fc1_weight_scales = quant_scales.value()[0];
-                auto& fc2_weight_scales = quant_scales.value()[1];
-                int group_size = TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::wfp4a16_group_size;
-                return kernels::QuantParams::GroupWise(group_size, static_cast<void const*>(fc1_weight_scales.data_ptr()),
-                    static_cast<void const*>(fc2_weight_scales.data_ptr()), nullptr, nullptr, nullptr, nullptr, nullptr,
-                    nullptr);
-            }
-            else if (isInt4Quant() && mUseWoqGroupScaling)
+            else if (isInt4Quant() && mUseW4GroupScaling)
             {
                 TORCH_CHECK(quant_scales.value().size() == 8, "Expecting 8 quant scales for W4A8 quantization");
 
@@ -1026,7 +1023,8 @@ private:
                 auto& fc1_alpha = quant_scales.value()[6];
                 auto& fc2_alpha = quant_scales.value()[7];
                 int group_size = TmaWarpSpecializedGroupedGemmInput::INT4GroupwiseParams::int4_group_size;
-                return kernels::QuantParams::GroupWise(group_size, static_cast<void const*>(fc1_weight_scales.data_ptr()),
+                return kernels::QuantParams::GroupWise(group_size,
+                    static_cast<void const*>(fc1_weight_scales.data_ptr()),
                     static_cast<void const*>(fc2_weight_scales.data_ptr()),
                     static_cast<void const*>(fc1_act_scales.numel() > 0 ? fc1_act_scales.data_ptr() : nullptr),
                     static_cast<void const*>(fc2_act_scales.numel() > 0 ? fc2_act_scales.data_ptr() : nullptr),
@@ -1035,7 +1033,7 @@ private:
                     static_cast<float const*>(fc1_alpha.numel() > 0 ? fc1_alpha.data_ptr() : nullptr),
                     static_cast<float const*>(fc2_alpha.numel() > 0 ? fc2_alpha.data_ptr() : nullptr));
             }
-            else 
+            else
             {
                 TORCH_CHECK(false, "Unsupported weight only quantization");
             }
@@ -1044,7 +1042,6 @@ private:
         {
             return kernels::QuantParams{};
         }
-
     }
 
     bool isFp8Quant() const
@@ -1064,7 +1061,7 @@ private:
         return mUseW4GroupScaling && mWeightDtype == c10::ScalarType::Byte;
     }
 
-    bool isWInt8Quant() const
+    bool isInt8Quant() const
     {
         return mWeightDtype == c10::ScalarType::Char;
     }
@@ -1079,9 +1076,9 @@ private:
         return mActivationDtype == c10::ScalarType::Float8_e4m3fn && isInt4Quant();
     }
 
-    bool isWeightOnlyQuant() const
+    bool isIntWeightOnlyQuant() const
     {
-        return isWInt8Quant() || isInt4Quant();
+        return isInt8Quant() || isInt4Quant();
     }
 
     bool isWMxfp4AFp8Quant() const

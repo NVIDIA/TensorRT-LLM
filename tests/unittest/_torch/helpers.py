@@ -76,6 +76,7 @@ def calc_diff(x, y):
 
 
 def calc_woq_tolerence(x: torch.Tensor, weight_dtype: torch.dtype):
+    # align with woq_assert_near_eq function in tests/unittest/trt/quantization/_utils.py
     if weight_dtype == torch.int8:
         bits_in_type = 8
     elif weight_dtype == torch.quint4x2:

@@ -43,8 +43,7 @@ class MoERunner(TunableRunner):
         cluster_rank: int,
         use_deepseek_fp8_block_scale: bool,
         use_w4_group_scaling: bool,
-        use_woq_per_channel: bool,
-        use_woq_group_scaling: bool,
+        use_int8_woq_per_channel: bool,
         use_mxfp8_act_scaling: bool,
         min_latency_mode: bool,
         use_fused_finalize: bool,
@@ -63,23 +62,21 @@ class MoERunner(TunableRunner):
         self.enable_alltoall = False
         self.use_deepseek_fp8_block_scale = use_deepseek_fp8_block_scale
         self.use_w4_group_scaling = use_w4_group_scaling
-        self.use_woq_per_channel = use_woq_per_channel
-        self.use_woq_group_scaling = use_woq_group_scaling
+        self.use_int8_woq_per_channel = use_int8_woq_per_channel
         self.use_mxfp8_act_scaling = use_mxfp8_act_scaling
         self.min_latency_mode = min_latency_mode
         self.use_fused_finalize = use_fused_finalize
 
         instance_key = (x_dtype, weight_dtype, output_dtype,
                         use_deepseek_fp8_block_scale, use_w4_group_scaling,
-                        use_woq_per_channel, use_woq_group_scaling,
-                        use_mxfp8_act_scaling)
+                        use_int8_woq_per_channel, use_mxfp8_act_scaling)
 
         if instance_key not in MoERunner.runner_dict:
             MoERunner.runner_dict[
                 instance_key] = torch.classes.trtllm.FusedMoeRunner(
                     x_dtype, weight_dtype, output_dtype,
                     use_deepseek_fp8_block_scale, use_w4_group_scaling,
-                    use_woq_per_channel, use_mxfp8_act_scaling,
+                    use_int8_woq_per_channel, use_mxfp8_act_scaling,
                     use_fused_finalize)
         self.fused_moe_runner = MoERunner.runner_dict[instance_key]
 
@@ -144,8 +141,7 @@ def fused_moe(
     enable_alltoall: bool = False,
     use_deepseek_fp8_block_scale: bool = False,
     use_w4_group_scaling: bool = False,
-    use_woq_per_channel: bool = False,
-    use_woq_group_scaling: bool = False,
+    use_int8_woq_per_channel: bool = False,
     use_mxfp8_act_scaling: bool = False,
     min_latency_mode: bool = False,
     use_fused_finalize: bool = True,
@@ -182,8 +178,7 @@ def fused_moe(
         cluster_rank=cluster_rank,
         use_deepseek_fp8_block_scale=use_deepseek_fp8_block_scale,
         use_w4_group_scaling=use_w4_group_scaling,
-        use_woq_per_channel=use_woq_per_channel,
-        use_woq_group_scaling=use_woq_group_scaling,
+        use_int8_woq_per_channel=use_int8_woq_per_channel,
         use_mxfp8_act_scaling=use_mxfp8_act_scaling,
         min_latency_mode=min_latency_mode,
         use_fused_finalize=use_fused_finalize,
@@ -267,15 +262,16 @@ def _(
     enable_alltoall: bool = False,
     use_deepseek_fp8_block_scale: bool = False,
     use_w4_group_scaling: bool = False,
-    use_woq_per_channel: bool = False,
-    use_woq_group_scaling: bool = False,
+    use_int8_woq_per_channel: bool = False,
     use_mxfp8_act_scaling: bool = False,
     min_latency_mode: bool = False,
     use_fused_finalize: bool = True,
     tune_max_num_tokens: int = 8192,
 ):
     seq_len = input.shape[0]
-    if use_woq_per_channel:
+    if use_int8_woq_per_channel:
+        # Note: The weight shape for INT8 weight only quantization is different, i.e.,
+        # fc2_expert_weights: [num_experts, inter_size, hidden_size]
         hidden_size = fc2_expert_weights.shape[2]
     else:
         hidden_size = fc2_expert_weights.shape[1]
