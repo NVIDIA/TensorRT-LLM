@@ -24,10 +24,38 @@ from tensorrt_llm.llmapi.tokenizer import TokenizerBase, TransformersTokenizer
 logger = logging.get_logger(__name__)
 
 
+def rgba_to_rgb(
+    image: Image.Image,
+    background_color: Union[tuple[int, int, int], list[int]] = (255, 255, 255)
+) -> Image.Image:
+    """Convert an RGBA image to RGB with filled background color.
+
+    Uses white (255, 255, 255) as the default background color because:
+    1. It's the most neutral and commonly expected background for images
+    2. Maintains backward compatibility with existing code
+    """
+    if image.mode != "RGBA":
+        raise ValueError(
+            f"Expected image mode to be 'RGBA', but got '{image.mode}'")
+    converted = Image.new("RGB", image.size, background_color)
+    converted.paste(image, mask=image.split()[3])  # 3 is the alpha channel
+    return converted
+
+
+def convert_image_mode(image: Image.Image, to_mode: str) -> Image.Image:
+    """Convert image to specified mode with proper handling of RGBA to RGB conversion."""
+    if image.mode == to_mode:
+        return image
+    elif image.mode == "RGBA" and to_mode == "RGB":
+        return rgba_to_rgb(image)
+    else:
+        return image.convert(to_mode)
+
+
 def _load_and_convert_image(image):
     image = Image.open(image)
     image.load()
-    return image.convert("RGB")
+    return convert_image_mode(image, "RGB")
 
 
 def load_base64_image(parsed_url: str) -> Image.Image:
@@ -43,10 +71,13 @@ def load_base64_image(parsed_url: str) -> Image.Image:
     return image
 
 
-def load_image(image: str,
+def load_image(image: Union[str, Image.Image],
                format: str = "pt",
                device: str = "cpu") -> Union[Image.Image, torch.Tensor]:
     assert format in ["pt", "pil"], "format must be either Pytorch or PIL"
+
+    if isinstance(image, Image.Image):
+        return image.convert('RGB')
 
     parsed_url = urlparse(image)
 
@@ -65,10 +96,13 @@ def load_image(image: str,
 
 
 async def async_load_image(
-        image: str,
+        image: Union[str, Image.Image],
         format: str = "pt",
         device: str = "cpu") -> Union[Image.Image, torch.Tensor]:
     assert format in ["pt", "pil"], "format must be either Pytorch or PIL"
+
+    if isinstance(image, Image.Image):
+        return image.convert('RGB')
 
     parsed_url = urlparse(image)
 
@@ -419,12 +453,13 @@ def resolve_hf_chat_template(
 
 def handle_placeholder_exceptions(model_type: str,
                                   conversation: list[ConversationMessage],
-                                  mm_placeholder_counts: dict[str, int]):
+                                  mm_placeholder_counts: list[dict[str, int]]):
     if model_type == "llava_next":
         # we need to convert the flattened content back to conversation format
-        for conv in conversation:
+        for conv, mm_placeholder_count in zip(conversation,
+                                              mm_placeholder_counts):
             conv["content"] = [{"type": "text", "text": conv["content"]}, \
-                *[{"type": "image"} for _ in mm_placeholder_counts]]
+                *[{"type": "image"} for _ in mm_placeholder_count]]
     else:
         raise ValueError(f"This path should not be reached for: {model_type}")
     return conversation
@@ -605,7 +640,10 @@ def default_multimodal_input_loader(
             # Check if mdata is a MultimodalData
             if isinstance(mdata,
                           dict) and "modality" in mdata and "data" in mdata:
-                mm_data_tracker.add_data(mdata["modality"], mdata["data"])
+                modality = mdata["modality"]
+                if modality == "multiple_image":
+                    modality = "image"
+                mm_data_tracker.add_data(modality, mdata["data"])
             else:
                 # Add embeddings to the tracker for placeholder handling
                 mm_data_tracker.add_data(mdata["modality"],
