@@ -2025,13 +2025,13 @@ class PyTorchModelEngine(ModelEngine):
                         gather_ids=gather_ids,
                         gather_context_logits=gather_context_logits)
 
-            # 3. Ask the manager to execute the graph
+            # Ask the runner to execute the graph
             outputs = self.cuda_graph_runner.execute(
                 batch=padded_requests,
                 inputs=inputs,
                 forward_fn=capture_forward_fn)
 
-            # 4. Fallback to eager execution if graph was not used
+            # Fallback to eager execution if graph was not used
             if outputs is None:
                 with MoeLoadBalancerIterContext(moe_load_balancer):
                     outputs = self._forward_step(inputs, gather_ids,
