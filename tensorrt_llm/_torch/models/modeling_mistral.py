@@ -371,7 +371,7 @@ class Mistral3VLM(PreTrainedModel):
                     f"Expected as many `pixel_values` ({len(pixel_values)}) and "
                     f"`image_sizes` ({len(image_sizes)}) as number of multimodal parameters "
                     f"({multimodal_params_len}).")
-            batched_pixel_values, batched_image_sizes = self._batch_pixel_values(
+            batched_pixel_values, batched_image_sizes = self.batch_pixel_values(
                 pixel_values=pixel_values, image_sizes=image_sizes)
             mm_embeds = [
                 self._get_image_features(pixel_values=batched_pixel_values,
@@ -436,21 +436,38 @@ class Mistral3VLM(PreTrainedModel):
     # (the transformers one expected numpy arrays).
     @staticmethod
     @torch.inference_mode()
-    def _batch_pixel_values(
+    def batch_pixel_values(
         pixel_values: List[torch.Tensor],
         image_sizes: List[torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        # NOTES:
+        # * `pixel_values` is a list of `[B_idx, C, H_idx, W_idx]` tensors, i.e. a batch of images as
+        #   padded + batched by the input processor.
+        #   The height (H_idx) and width (W_idx) of each element need not coincide.
+        # * Similarly, each element in `image_sizes` describes the original image sizes prior to
+        #   padding for the corresponding element in `pixel_values`.
+
+        # The below creates a single `[sum(B_idx), 2]` tensor describing all image sizes, and then
+        # calculates the maximum height / width across all of them.
         batched_image_sizes = torch.cat(image_sizes)
         max_shape = batched_image_sizes.max(dim=0).values
+
+        # This next step then pads the pixel values potentially a second time by using the `max_shape`
+        # computed above. Note that as far as this function is concerned, the original sizes for
+        # batching purposes can be deduced from looking at the tensors in `pixel_values`, NOT in
+        # `image_sizes`.
         pixel_values = [
             torchvision.transforms.v2.functional.pad(
                 image,
                 # Per torchvision docs, this should be in LTRB order if it's a sequence of 4 numbers.
-                padding=[0, 0, max_shape[1] - size[1], max_shape[0] - size[0]],
+                padding=[
+                    0, 0, max_shape[1] - image.shape[-1],
+                    max_shape[0] - image.shape[-2]
+                ],
                 # Values extracted from HF implementation.
                 fill=0.0,
                 padding_mode="constant",
-            ) for image, size in zip(pixel_values, batched_image_sizes)
+            ) for image in pixel_values
         ]
         return torch.cat(pixel_values), batched_image_sizes
 
