@@ -42,9 +42,9 @@ struct ALIGN_256 ReceiverSideFifoInfo
 // struct holding Send/Recv data pointer and its displacement information.
 struct SendRecvDispls
 {
-    int const* rankCountCumSum;  // length = epSize
-    int* rankLocalIndices; // length = rankCountCumSum[epRank] - rankCountCumSum[epRank - 1] if epRank > 0 else
-                                 // rankCountCumSum[epRank]
+    int const* rankCountCumSum; // length = epSize
+    int* rankLocalIndices;      // length = rankCountCumSum[epRank] - rankCountCumSum[epRank - 1] if epRank > 0 else
+                                // rankCountCumSum[epRank]
 
 #ifdef __CUDACC__
     __inline__ __device__ int getCount(int rank) const
@@ -225,7 +225,6 @@ struct FusedMoePairInfo
     int receiverRank;
     int channel;
     int runChannelCount;
-    int channelCount;
 };
 
 class FusedMoeCommunicator
@@ -236,7 +235,7 @@ public:
     static constexpr int FIFO_ENTRY_128_BYTE_COUNT = FIFO_ENTRY_BYTES / 128;
     static constexpr int FIFO_TOTAL_BYTES = FIFO_ENTRY_BYTES * FIFO_DEPTH;
     static constexpr int FIFO_TOTAL_U64 = FIFO_TOTAL_BYTES / sizeof(uint64_t);
-    static constexpr int GROUP_COUNT_PER_BLOCK = 8;
+    static constexpr int MAX_GROUP_COUNT_PER_BLOCK = 8;
     // Here we use fixed INVALID_VALUE, which is -0.0 for all kinds of float types and -INT_MAX for all signed integers
     // Real data should not use these values.
     static constexpr uint32_t INVALID_VALUE = 1U << 31U;
@@ -249,8 +248,8 @@ public:
 
     static void setMaxUsableSmCount(int maxUsableSmCount)
     {
-        TLLM_CHECK_WITH_INFO(FusedMoeCommunicator::maxSmCountUsed == false,
-            "setMaxUsableSmCount can be called only before it is used");
+        TLLM_CHECK_WITH_INFO(
+            FusedMoeCommunicator::maxSmCountUsed == false, "setMaxUsableSmCount can be called only before it is used");
         int smCount = tensorrt_llm::common::getMultiProcessorCount();
         if (maxUsableSmCount > smCount)
         {
@@ -275,7 +274,7 @@ public:
     static int computeMoeCommChannelCount(int epSize)
     {
         int smCount = getMaxUsableSmCount();
-        int blockCountPerChannel = (epSize + GROUP_COUNT_PER_BLOCK - 1) / GROUP_COUNT_PER_BLOCK;
+        int blockCountPerChannel = (epSize + MAX_GROUP_COUNT_PER_BLOCK - 1) / MAX_GROUP_COUNT_PER_BLOCK;
         blockCountPerChannel *= 2; // for send and recv
         TLLM_CHECK_WITH_INFO(
             blockCountPerChannel <= smCount, "GPU should support at lease one channel, usableSmCount=%d", smCount);
@@ -297,15 +296,20 @@ public:
         return iter->second;
     }
 
-    static dim3 getLaunchBlockDim()
+    static dim3 getLaunchBlockDim(int groupCountPerCta)
     {
-        return dim3(WARP_SIZE, GROUP_COUNT_PER_BLOCK);
+        return dim3(WARP_SIZE, groupCountPerCta);
     }
 
-    static dim3 getLaunchGridDim(int epSize)
+    static dim3 getLaunchGridDim(int epSize, int groupCountPerCta)
     {
-        int channelCount = FusedMoeCommunicator::getMoeCommChannelCount(epSize);
-        return dim3((epSize + GROUP_COUNT_PER_BLOCK - 1) / GROUP_COUNT_PER_BLOCK, channelCount, 2);
+        int maxChannelCount = FusedMoeCommunicator::getMoeCommChannelCount(epSize);
+        int targetCtaCount = (epSize + MAX_GROUP_COUNT_PER_BLOCK - 1) / MAX_GROUP_COUNT_PER_BLOCK * maxChannelCount * 2;
+        int ctaPerChannel = (epSize + groupCountPerCta - 1) / groupCountPerCta;
+        int ctaLimitedChannelCount = targetCtaCount / 2 / ctaPerChannel;
+        ctaLimitedChannelCount = std::max(1, ctaLimitedChannelCount);
+        int channelCount = std::min(ctaLimitedChannelCount, maxChannelCount);
+        return dim3(ctaPerChannel, channelCount, 2);
     }
 };
 
@@ -389,7 +393,8 @@ struct FusedMoeFieldInfo
     {
         singleCommMeta->singlePackedAlignedSize = computeSinglePackedSize(topK, hasScales, hasBasicFields);
         singleCommMeta->singleUnpackedAlignedSize = computeSingleWarpShmSize(topK, hasScales, hasBasicFields);
-        singleCommMeta->tokenPerFifoEntry = FusedMoeCommunicator::FIFO_ENTRY_BYTES / singleCommMeta->singlePackedAlignedSize;
+        singleCommMeta->tokenPerFifoEntry
+            = FusedMoeCommunicator::FIFO_ENTRY_BYTES / singleCommMeta->singlePackedAlignedSize;
     }
 
     void fillFieldPlacementInfo(int topK, bool hasBasicFields);
@@ -459,6 +464,7 @@ struct FusedMoeWorkspace
 {
     uint64_t* workspacePtr;
     size_t rankStrideInU64;
+    int channelCount;
 
     template <bool isSenderSideBuffer>
     __device__ __forceinline__ uint8_t* commonGetPtrBase(
@@ -468,7 +474,7 @@ struct FusedMoeWorkspace
         int rankInsideMappedMemory = isSenderSideBuffer ? pairInfo.receiverRank : pairInfo.senderRank;
         auto* mappedMemory = reinterpret_cast<uint8_t*>(workspacePtr + mappedMemoryrank * rankStrideInU64);
         mappedMemory += fieldOffset;
-        mappedMemory += rankInsideMappedMemory * pairInfo.channelCount * fieldSingleSize;
+        mappedMemory += rankInsideMappedMemory * channelCount * fieldSingleSize;
         mappedMemory += pairInfo.channel * fieldSingleSize;
         return mappedMemory;
     }
@@ -484,8 +490,8 @@ struct FusedMoeWorkspace
         FusedMoeWorldInfo const& worldInfo, FusedMoePairInfo const& pairInfo) const
     {
         constexpr int fieldSingleSize = sizeof(SenderSideFifoInfo);
-        size_t fieldOffset = static_cast<size_t>(FusedMoeCommunicator::FIFO_TOTAL_BYTES) * worldInfo.epInfo.epSize
-            * pairInfo.channelCount;
+        size_t fieldOffset
+            = static_cast<size_t>(FusedMoeCommunicator::FIFO_TOTAL_BYTES) * worldInfo.epInfo.epSize * channelCount;
         return reinterpret_cast<SenderSideFifoInfo*>(commonGetPtrBase<true>(pairInfo, fieldOffset, fieldSingleSize));
     }
 
@@ -493,9 +499,9 @@ struct FusedMoeWorkspace
         FusedMoeWorldInfo const& worldInfo, FusedMoePairInfo const& pairInfo) const
     {
         constexpr int fieldSingleSize = sizeof(ReceiverSideFifoInfo);
-        size_t fieldOffset = static_cast<size_t>(FusedMoeCommunicator::FIFO_TOTAL_BYTES) * worldInfo.epInfo.epSize
-                * pairInfo.channelCount
-            + sizeof(SenderSideFifoInfo) * worldInfo.epInfo.epSize * pairInfo.channelCount;
+        size_t fieldOffset
+            = static_cast<size_t>(FusedMoeCommunicator::FIFO_TOTAL_BYTES) * worldInfo.epInfo.epSize * channelCount
+            + sizeof(SenderSideFifoInfo) * worldInfo.epInfo.epSize * channelCount;
         return reinterpret_cast<ReceiverSideFifoInfo*>(commonGetPtrBase<false>(pairInfo, fieldOffset, fieldSingleSize));
     }
 
@@ -507,7 +513,7 @@ struct FusedMoeWorkspace
         return fifoSize + senderSideInfoSize + receiverSideInfoSize;
     }
 
-    void initializeLocalWorkspace(FusedMoeWorldInfo const& worldInfo, int channelCount);
+    void initializeLocalWorkspace(FusedMoeWorldInfo const& worldInfo);
 };
 
 void moeAllToAll(FusedMoeCommKernelParam params, FusedMoeWorkspace workspace, cudaStream_t stream);

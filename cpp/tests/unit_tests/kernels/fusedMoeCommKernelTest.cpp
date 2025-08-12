@@ -634,12 +634,13 @@ protected:
         FusedMoeWorkspace fusedMoeWorkspace;
         fusedMoeWorkspace.workspacePtr = deviceWorkspacePtr;
         fusedMoeWorkspace.rankStrideInU64 = workspaceSize / sizeof(uint64_t);
+        fusedMoeWorkspace.channelCount = totalChannelCount;
 
         // Initialize workspace
         FusedMoeWorldInfo worldInfo;
         worldInfo.epInfo.epRank = 0;
         worldInfo.epInfo.epSize = 1;
-        fusedMoeWorkspace.initializeLocalWorkspace(worldInfo, totalChannelCount);
+        fusedMoeWorkspace.initializeLocalWorkspace(worldInfo);
 
         // Launch local send/recv kernel
         fused_moe_comm_tests::launchLocalSendRecv(sendFieldInfo, recvFieldInfo, expertParallelInfo,
@@ -1509,10 +1510,11 @@ protected:
 
         // Setup workspace for FIFO communication
         FusedMoeWorkspace fusedMoeWorkspace;
-        size_t workspaceSizePerRank
-            = FusedMoeWorkspace::computeWorkspaceSizePreRank(1, blockChannelCount * warpsPerBlock);
+        int totalChannelCount = blockChannelCount * warpsPerBlock;
+        size_t workspaceSizePerRank = FusedMoeWorkspace::computeWorkspaceSizePreRank(1, totalChannelCount);
         size_t totalWorkspaceSize = workspaceSizePerRank;
         fusedMoeWorkspace.rankStrideInU64 = workspaceSizePerRank / sizeof(uint64_t);
+        fusedMoeWorkspace.channelCount = totalChannelCount;
 
         TLLM_CUDA_CHECK(cudaMalloc(&fusedMoeWorkspace.workspacePtr, totalWorkspaceSize));
 
@@ -1520,7 +1522,7 @@ protected:
         FusedMoeWorldInfo worldInfo;
         worldInfo.epInfo.epRank = 0;
         worldInfo.epInfo.epSize = 1;
-        fusedMoeWorkspace.initializeLocalWorkspace(worldInfo, blockChannelCount * warpsPerBlock);
+        fusedMoeWorkspace.initializeLocalWorkspace(worldInfo);
 
         // Launch FIFO send/recv kernel
         fused_moe_comm_tests::launchLocalFifoSendRecv(sendFieldInfo, recvFieldInfo, expertParallelInfo,
