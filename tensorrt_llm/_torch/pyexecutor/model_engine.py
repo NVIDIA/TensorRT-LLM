@@ -498,10 +498,12 @@ class PyTorchModelEngine(ModelEngine):
     def no_cuda_graph(self):
         _run_cuda_graphs = self._run_cuda_graphs
         self._run_cuda_graphs = False
+        self.cuda_graph_runner.enabled = False
         try:
             yield
         finally:
             self._run_cuda_graphs = _run_cuda_graphs
+            self.cuda_graph_runner.enabled = _run_cuda_graphs
 
     @with_warmup_flag
     def warmup(self, resource_manager: ResourceManager) -> None:
