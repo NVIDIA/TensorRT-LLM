@@ -40,7 +40,7 @@ from .interface import Evaluator
 
 # NOTE: lm_eval uses "<image>" as the default image placeholder
 # https://github.com/EleutherAI/lm-evaluation-harness/blob/7f04db12d2f8e7a99a0830d99eb78130e1ba2122/lm_eval/models/hf_vlms.py#L25
-DEFAULT_IMAGE_PLACEHOLDER = "<image>"
+LM_EVAL_DEFAULT_IMAGE_PLACEHOLDER = "<image>"
 
 
 class LmEvalWrapper(TemplateLM):
@@ -131,6 +131,13 @@ class LmEvalWrapper(TemplateLM):
         return [output.outputs[0].text for output in outputs]
 
 
+from tensorrt_llm.inputs import (ConversationMessage, MultimodalDataTracker,
+                                 add_multimodal_placeholders,
+                                 convert_image_mode)
+from tensorrt_llm.inputs.utils import \
+    apply_chat_template as trtllm_apply_chat_template
+
+
 class MultimodalLmEvalWrapper(LmEvalWrapper):
     """
     Multimodal wrapper for lm-evaluation-harness that handles vision-language models.
@@ -159,6 +166,7 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
         self.MULTIMODAL = True
         self.max_images = max_images
         self.model_type = self._get_model_type(llm)
+        self.interleave = False
 
     def _get_model_type(self, llm: Union[LLM, PyTorchLLM]) -> str:
         """Extract model type from the model configuration."""
@@ -182,35 +190,42 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
 
         Adapted from: https://github.com/EleutherAI/lm-evaluation-harness/blob/7f04db12d2f8e7a99a0830d99eb78130e1ba2122/lm_eval/models/hf_vlms.py#L225
         """
-        for content in chat_history:
-            c = []
+
+        for i in range(len(chat_history)):
+            content = chat_history[i]
             text = content["content"]
-            expected_image_count = min(self.max_images,
-                                       text.count(DEFAULT_IMAGE_PLACEHOLDER))
-            actual_image_count = 0
 
-            text_parts = text.split(DEFAULT_IMAGE_PLACEHOLDER)
+            image_count = min(self.max_images,
+                              text.count(LM_EVAL_DEFAULT_IMAGE_PLACEHOLDER))
 
-            for i, part in enumerate(text_parts):
-                # TODO: concatenate text parts (esp. if skipping images)?
-                if part:  # Add non-empty text parts
-                    c.append({"type": "text", "text": part})
-                if ((i < len(text_parts) - 1) and i < self.max_images
-                    ):  # Add image placeholder after each split except the last
-                    c.append({"type": "image"})
-                    actual_image_count += 1
+            if self.interleave:
+                # TODO: Implement interleaved text and image.
+                text.split(LM_EVAL_DEFAULT_IMAGE_PLACEHOLDER)
+                ...
+            else:
+                text = text.replace(LM_EVAL_DEFAULT_IMAGE_PLACEHOLDER, "")
 
-            content["content"] = c
+            conv = ConversationMessage(role="user", content=text)
+            mm_data_tracker = MultimodalDataTracker(self.model_type)
 
-            if actual_image_count != expected_image_count:
-                raise ValueError(
-                    f"Mismatch in image placeholder count. Expected: {expected_image_count}, Actual: {actual_image_count}"
-                )
+            # NOTE: Since we already have loaded images, for the placeholder purpose, we add data here.
+            for _ in range(image_count):
+                mm_data_tracker.add_data("image", None)
+            mm_placeholder_counts = mm_data_tracker.placeholder_counts()
+            if mm_placeholder_counts:
+                # TODO: This is an assumption of not interleaving text and image. Need to extend to interleaved texts.
+                conv["content"] = add_multimodal_placeholders(
+                    self.model_type, conv["content"], mm_placeholder_counts)
+            chat_history[i] = conv
 
-        return self.llm.input_processor.processor.apply_chat_template(
-            chat_history,
+        return trtllm_apply_chat_template(
+            model_type=self.model_type,
+            tokenizer=self.llm.tokenizer,
+            processor=self.llm.input_processor.processor,
+            conversation=chat_history,
             add_generation_prompt=add_generation_prompt,
-            continue_final_message=not add_generation_prompt,
+            mm_placeholder_counts={},
+            tools=None,
         )
 
     def generate_until(self, requests, disable_tqdm: bool = False) -> List[str]:
@@ -236,7 +251,12 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
             # NOTE: For now, only this part is different from the original generate_until
             prompt, gen_kwargs, media_data = request.args
             prompt = prompt_inputs(prompt)
-            prompt["multi_modal_data"] = {"image": media_data["visual"]}
+
+            # NOTE: Convert RGBA format to RGB format
+            images = [
+                convert_image_mode(img, "RGB") for img in media_data["visual"]
+            ]
+            prompt["multi_modal_data"] = {"image": images}
 
             sampling_params = self._get_sampling_params(gen_kwargs)
             output = self.llm.generate_async(prompt,
@@ -621,11 +641,11 @@ class MMMU(LmEvalEvaluator):
                   help="System prompt.")
     @click.option("--max_input_length",
                   type=int,
-                  default=8192,
+                  default=16384,
                   help="Maximum prompt length.")
     @click.option("--max_output_length",
                   type=int,
-                  default=8192,
+                  default=16384,
                   help="Maximum generation length.")
     @click.option("--is_multimodal",
                   is_flag=True,
