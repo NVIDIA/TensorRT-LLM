@@ -23,7 +23,10 @@ def temp_extra_llm_api_options_file(request):
     temp_dir = tempfile.gettempdir()
     temp_file_path = os.path.join(temp_dir, "extra_llm_api_options.yaml")
     try:
-        extra_llm_api_options_dict = {"guided_decoding_backend": "xgrammar"}
+        extra_llm_api_options_dict = {
+            "guided_decoding_backend": "xgrammar",
+            "max_batch_size": 32
+        }
 
         with open(temp_file_path, 'w') as f:
             yaml.dump(extra_llm_api_options_dict, f)
