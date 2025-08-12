@@ -73,14 +73,7 @@ class AutoModelForCausalLMFactory(ModelFactory):
 
     _model_defaults = {
         "use_cache": False,
-        "max_position_embeddings": 1024,
     }
-
-    def _get_max_position_embeddings_config(self) -> Dict[str, Any]:
-        """Get the max position embeddings config for the model."""
-        return {
-            "max_position_embeddings": self.max_seq_len,
-        }
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -90,7 +83,6 @@ class AutoModelForCausalLMFactory(ModelFactory):
         self.model_kwargs = deep_merge_dicts(
             self._model_defaults,
             self.model_kwargs,
-            self._get_max_position_embeddings_config(),
         )
 
         # special handling for torch_dtype in model_kwargs since HF does not correctly update
@@ -342,21 +334,10 @@ class AutoModelForCausalLMFactory(ModelFactory):
 class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
     _model_defaults = {
         "use_cache": False,
-        "max_position_embeddings": 1024,
         "text_config": {
-            "max_position_embeddings": 1024,
             "use_cache": False,
         },
     }
-
-    def _get_max_position_embeddings_config(self) -> Dict[str, Any]:
-        """Get the max position embeddings config for the model."""
-        return {
-            "max_position_embeddings": self.max_seq_len,
-            "text_config": {
-                "max_position_embeddings": self.max_seq_len,
-            },
-        }
 
     @property
     def automodel_from_config(self):
