@@ -20,7 +20,6 @@ set(SHARED_TARGET
 set(API_INCLUDE_DIR ${PROJECT_SOURCE_DIR}/include)
 
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/cutlass_extensions/include
-		/usr/local/cuda-13.0/targets/x86_64-linux/include/cccl
                     ${API_INCLUDE_DIR})
 
 set(TARGET_ARCH "unknown")
