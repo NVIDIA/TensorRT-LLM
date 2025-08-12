@@ -110,6 +110,9 @@ private:
     std::vector<Measure> mMeasures;
     bool mRecordMeasure{false};
 };
+using TransferSession = kv_cache_manager::TransferSession;
+using UniqueToken = tensorrt_llm::runtime::UniqueToken;
+using BlockKey = tensorrt_llm::batch_manager::kv_cache_manager::BlockKey;
 
 struct TransceiverTag
 {
@@ -134,8 +137,8 @@ public:
     /// @param transState The state of the data transceiver.
     RequestInfo(LlmRequest::RequestIdType requestId, executor::DataTransceiverState transState);
 
-    RequestInfo(LlmRequest::RequestIdType requestId, std::vector<size_t> blockHashes,
-        executor::DataTransceiverState transState);
+    RequestInfo(LlmRequest::RequestIdType requestId, executor::DataTransceiverState transState, int32_t indexFromEnd,
+        BlockKey const& lastBlockKey);
     RequestInfo() = default;
 
     /// @brief Equality comparison operator.
@@ -146,11 +149,19 @@ public:
     /// @return The request ID.
     [[nodiscard]] LlmRequest::RequestIdType getRequestId() const noexcept;
 
-    [[nodiscard]] std::vector<size_t> const& getBlockHashes() const noexcept;
+    [[nodiscard]] int32_t getIndexFromEnd() const noexcept
+    {
+        return mIndexFromEnd;
+    }
 
     /// @brief Return the state of the data transceiver.
     /// @return The state of the data transceiver.
     [[nodiscard]] executor::DataTransceiverState const& getTransState() const noexcept;
+
+    [[nodiscard]] BlockKey const& getLastBlockKey() const noexcept
+    {
+        return mLastBlockKey;
+    }
 
     /// @brief Serialization.
     /// @param requestInfo Request information to be serialized.
@@ -169,8 +180,11 @@ public:
 private:
     // The ID used in the context phase of the current request.
     LlmRequest::RequestIdType mRequestId;
+    // Index from end indicating how many trailing blocks to transfer (index+1)
+    int32_t mIndexFromEnd{0};
 
-    std::vector<size_t> mBlockHashes;
+    // Last block key, used to derive other block keys on receiver
+    BlockKey mLastBlockKey{};
 
     // The state of the data transceiver.
     executor::DataTransceiverState mTransState;
