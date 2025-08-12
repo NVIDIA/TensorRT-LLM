@@ -20,10 +20,10 @@ from ..modules.fused_moe import (BaseMoeRoutingMethod,
                                  RoutingMethodType, TRTLLMGenFusedMoE,
                                  create_moe)
 from ..modules.linear import TensorParallelMode
+from ..modules.qk_norm_attention import QKNormRoPEAttention
 from ..modules.rms_norm import RMSNorm
 from ..speculative import SpecMetadata
 from ..utils import AuxStreamType
-from .modeling_qwen3 import Qwen3Attention
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import DecoderModel, EagerFusionConfig, register_auto_model
 
@@ -166,7 +166,7 @@ class Qwen3MoEDecoderLayer(DecoderLayer):
         super().__init__()
         self.model_config = model_config
         config = model_config.pretrained_config
-        self.self_attn = Qwen3Attention(
+        self.self_attn = QKNormRoPEAttention(
             model_config,
             layer_idx=layer_idx,
         )
