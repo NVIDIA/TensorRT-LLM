@@ -17,7 +17,10 @@ import pytest
 
 from tensorrt_llm import LLM
 from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
+from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
+                                          ContextChunkingPolicy)
 from tensorrt_llm.quantization import QuantAlgo
+from tensorrt_llm.sampling_params import SamplingParams
 
 from ..conftest import llm_models_root, skip_pre_blackwell
 from .accuracy_core import MMLU, CnnDailymail, LlmapiAccuracyTestHarness
@@ -27,13 +30,67 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "meta-llama/Llama-3.1-8B"
     MODEL_PATH = f"{llm_models_root()}/llama-3.1-model/Meta-Llama-3.1-8B"
 
+    def get_default_kwargs(self):
+        return {
+            'skip_tokenizer_init': False,
+            'trust_remote_code': True,
+            'kv_cache_config': {
+                'enable_block_reuse': False,
+                'max_tokens': None,
+                'max_attention_window': None,
+                'sink_token_length': None,
+                'free_gpu_memory_fraction': 0.9,
+                'host_cache_size': None,
+                'onboard_blocks': True,
+                'cross_kv_cache_fraction': None,
+                'secondary_offload_min_priority': None,
+                'event_buffer_max_size': 0,
+                'attention_dp_events_gather_period_ms': 5,
+                'enable_partial_reuse': True,
+                'copy_on_partial_reuse': True,
+                'use_uvm': False,
+                'dtype': 'auto'
+            },
+            'enable_chunked_prefill': True,
+            'scheduler_config': {
+                'capacity_scheduler_policy':
+                CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
+                'context_chunking_policy':
+                ContextChunkingPolicy.FIRST_COME_FIRST_SERVED,
+                'dynamic_batch_config': {
+                    'enable_batch_size_tuning': True,
+                    'enable_max_num_tokens_tuning': False,
+                    'dynamic_batch_moving_average_window': 128
+                }
+            },
+            'max_batch_size': 512,
+            'max_seq_len': 256,
+            'max_num_tokens': 3840,
+            'skip_loading_weights': False,
+            'compile_backend': 'torch-opt',
+            'free_mem_ratio': 0.7,
+            'cuda_graph_batch_sizes': [1, 2, 4, 8, 16, 32, 64, 128, 256]
+        }
+
+    def get_default_sampling_params(self):
+        eos_id = -1
+        beam_width = 1
+        return SamplingParams(end_id=eos_id,
+                              pad_id=eos_id,
+                              n=beam_width,
+                              use_beam_search=beam_width > 1)
+
     @pytest.mark.skip_less_device_memory(32000)
     def test_auto_dtype(self):
-        with AutoDeployLLM(self.MODEL_PATH) as llm:
-            # task = CnnDailymail(self.MODEL_NAME)
-            # task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
+        kwargs = self.get_default_kwargs()
+        sampling_params = self.get_default_sampling_params()
+        with AutoDeployLLM(model=self.MODEL_PATH,
+                           tokenizer=self.MODEL_PATH,
+                           **kwargs) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm, sampling_params=sampling_params)
 
     @skip_pre_blackwell
     def test_nvfp4(self):
