@@ -147,16 +147,6 @@ def parse_arguments():
     return args
 
 
-def clear_cuda_cache():
-    """Clear CUDA cache to prevent memory issues"""
-    try:
-        import torch
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    except:
-        pass
-
-
 def main():
     args = parse_arguments()
 
@@ -247,8 +237,6 @@ def main():
                 import traceback
                 traceback.print_exc()
                 continue
-
-            clear_cuda_cache()
 
         for i, output in enumerate(generated_outputs):
             print(

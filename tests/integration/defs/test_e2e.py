@@ -2555,19 +2555,19 @@ def test_ptp_quickstart_multimodal_multiturn(llm_root, llm_venv, model_name,
         "gemma-3-27b-it": {
             "image": [
                 ["half", "dome", "yosemite", "landmark", "rounded"],
-                ["atmosphere", "serene", "sense", "clear", "calm"],
+                ["atmosphere", "peaceful", "majestic", "calm", "quiet"],
             ],
         },
         "mistral-small-3.1-24b-instruct": {
             "image": [
-                ["depicts", "landscape", "rock", "sky", "yosemite"],
-                ["serene", "natural", "beauty", "grand", "tranquility"],
+                ["depicts", "landscape", "rock", "sky", "high", "altitude"],
+                ["atmosphere", "serene", "majestic", "sense", "tranquility"],
             ],
         },
         "Phi-4-multimodal-instruct": {
             "image": [
-                ["depicts", "landscape", "mountain", "half", "rock"],
-                ["atmosphere", "beauty", "mountain", "sheer", "landscape"],
+                ["depicts", "landscape", "mountain", "half", "dome"],
+                ["atmosphere", "serene", "sense", "tranquility", "peace."],
             ],
         },
     }
