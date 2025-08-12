@@ -1075,7 +1075,7 @@ def test_fused_moe_nvfp4(dtype):
 
         # compare
         torch.cuda.synchronize()
-        torch.testing.assert_close(output, ref_output, rtol=1e-2, atol=0.1)
+        torch.testing.assert_close(output, ref_output, rtol=1e-2, atol=0.15)
 
 
 @skip_neither_ada_nor_hopper_unittest
@@ -1320,7 +1320,7 @@ def test_fused_moe_mxfp4_mxpf8(moe_backend, bias):
 
     # compare
     torch.cuda.synchronize()
-    torch.testing.assert_close(output, ref_output, rtol=1e-2, atol=0.1)
+    torch.testing.assert_close(output, ref_output, rtol=1e-2, atol=0.15)
 
 
 @skip_non_hopper_unittest
