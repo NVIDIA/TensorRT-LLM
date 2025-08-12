@@ -72,13 +72,14 @@ input [
         dims: [ 1 ]
         optional: true
     },
-    # input tensors for llava_onevision
+    # Required for llava_onevision and pixtral
     {
         name: "image_sizes"
         data_type: TYPE_INT64
         dims: [ -1, 2 ]
         optional: true
     },
+    # Required for llava_onevision
     {
         name: "is_video_input"
         data_type: TYPE_BOOL

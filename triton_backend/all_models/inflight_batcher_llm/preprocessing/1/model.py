@@ -291,11 +291,9 @@ class TritonPythonModel:
                 request, 'IMAGE_BYTES')
             video_bytes = pb_utils.get_input_tensor_by_name(
                 request, 'VIDEO_BYTES')
-            input_images = pb_utils.get_input_tensor_by_name(request, 'IMAGES')
             vision_processed_tensors = []
             visual_tokens = []
-            if self.is_multimodal and (img_urls or image_bytes or input_images
-                                       or video_bytes):
+            if self.is_multimodal and (img_urls or image_bytes or video_bytes):
                 assert self.vision_preprocessor != None, "Vision preprocessor for preparing images before encoding is None"
                 processed_tensors = {}
                 if self.model_type == 'mllama':
@@ -328,11 +326,13 @@ class TritonPythonModel:
                         "REQUEST_INPUT_LEN")
                     processed_tensors.pop("REQUEST_INPUT_LEN")
                 elif self.model_type == 'pixtral':
+                    image_sizes = pb_utils.get_input_tensor_by_name(
+                        request, 'IMAGE_SIZES')
                     processed_tensors, visual_tokens = self.vision_preprocessor.pixtral_process(
                         queries=query.astype(str).tolist(),
                         img_urls=img_urls,
                         image_bytes=image_bytes,
-                        input_images=input_images,
+                        image_sizes=image_sizes,
                     )
                     pixtral_input_id_tensor = processed_tensors.pop("INPUT_IDS")
                     request_input_len = np.array([[
@@ -1042,39 +1042,30 @@ class VisionPreProcessor:
                         queries,
                         img_urls=None,
                         image_bytes=None,
-                        input_images=None):
+                        image_sizes=None):
         import torch
-        if img_urls is None and image_bytes is None and input_images is None:
-            return {}
         vision_processed_tensors = {}
         if img_urls is not None:
             # download and read images
-            images = [
+            images = np.array([
                 self.load_images_from_urls(urls)
                 for urls in img_urls.as_numpy()
-            ]
+            ])
         elif image_bytes is not None:
-            images = [
-                img for img_list in self.load_images_tensor(image_bytes)
-                for img in img_list
-            ]
-        else:  # input_images is not None
-            input_images = input_images.as_numpy()
-            if input_images.ndim != 2:
-                raise ValueError(
-                    f"Expected input_images to have 2 dimensions, got {input_images.ndim}"
-                )
-            images = []
-            for input_images_per_batch in input_images:
-                images.append([
-                    Image.open(io.BytesIO(image)).convert("RGB")
-                    for image in input_images_per_batch
-                ])
+            images = self.load_images_tensor(image_bytes)
+        else:
+            images = np.empty((0, 0, 0, 0, 0), dtype=np.uint8)
 
         batch_size = len(images)
         assert len(
             queries
         ) == batch_size, f"Image must have the same batch size as Query."
+
+        if image_sizes is not None:
+            image_sizes = self.load_images_tensor(image_sizes)
+        else:
+            s = images.shape
+            image_sizes = np.array([[[s[2], s[3]]] * s[1]] * s[0])
 
         preprocessor_outputs = {}
         possible_output_names = ['PIXEL_VALUES', 'IMAGE_SIZES', 'INPUT_IDS']
@@ -1092,20 +1083,34 @@ class VisionPreProcessor:
                 images[batch_id]
             ), "Number of [IMG] tags must match number of images"
 
+            if not query.startswith("[INST]"):
+                query = "[INST]" + query
+            if not query.endswith("[/INST]"):
+                query = query + "[/INST]"
+
+            sizes = image_sizes[batch_id]
+            curr_images = [
+                img[:sizes[idx][0], :sizes[idx][1], :]
+                for idx, img in enumerate(images[batch_id])
+            ]
+            if not curr_images:
+                curr_images = None
+
             processed_vision_data = self.vision_model_processor(
-                images=images[batch_id], text=query, return_tensors="pt")
+                images=curr_images, text=query, return_tensors="pt")
             visual_tokens.append(processed_vision_data['input_ids'].shape[1])
-            # Pad to self.image_size x self.image_size
-            processed_vision_data['pixel_values'] = torch.nn.functional.pad(
-                processed_vision_data['pixel_values'], (
-                    0,
-                    self.image_size -
-                    processed_vision_data['pixel_values'].shape[-1],
-                    0,
-                    self.image_size -
-                    processed_vision_data['pixel_values'].shape[-2],
-                ),
-                mode='constant')
+            if "pixel_values" in processed_vision_data:
+                # Pad to self.image_size x self.image_size
+                processed_vision_data['pixel_values'] = torch.nn.functional.pad(
+                    processed_vision_data['pixel_values'], (
+                        0,
+                        self.image_size -
+                        processed_vision_data['pixel_values'].shape[-1],
+                        0,
+                        self.image_size -
+                        processed_vision_data['pixel_values'].shape[-2],
+                    ),
+                    mode='constant')
             # Create vision output tensors
             for key in possible_output_names:
                 val = processed_vision_data.get(key.lower())
