@@ -219,7 +219,6 @@ class LlavaNextVisionModel(nn.Module):
             multimodal_param.multimodal_data["image"]["image_sizes"]
             for multimodal_param in multimodal_params
         ]
-
         pixel_values = torch.cat(pixel_values, dim=0)
         image_sizes = torch.cat(image_sizes, dim=0)
 
