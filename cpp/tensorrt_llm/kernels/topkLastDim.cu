@@ -25,6 +25,7 @@
 #include "topkLastDim.h"
 #include <cub/cub.cuh>
 #include <cuda/atomic>
+#include <thrust/iterator/transform_iterator.h>
 
 namespace tensorrt_llm
 {
