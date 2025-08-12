@@ -1,3 +1,4 @@
+import random
 from contextlib import contextmanager, nullcontext
 
 import pytest
@@ -821,3 +822,17 @@ def test_llm_with_proxy_error():
                 match="Mock GenerationExecutorWorker initialization failed"):
             llm = LLM(model=llama_model_path,
                       kv_cache_config=global_kvcache_config)
+
+
+class TestLlmError:
+
+    def test_max_num_token_check(self):
+        """ LLM should raise error when got prompt length exceed the valid range. """
+        llm = LLM(llama_model_path,
+                  kv_cache_config=global_kvcache_config,
+                  max_num_tokens=100)
+
+        with pytest.raises(ValueError,
+                           match="should not exceed max_num_tokens"):
+            ids = [random.randint(10, 100) for _ in range(101)]
+            llm.generate([ids])
