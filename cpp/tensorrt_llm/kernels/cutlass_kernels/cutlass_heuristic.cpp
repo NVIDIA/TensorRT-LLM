@@ -441,16 +441,18 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm100(CutlassGemmConfig::Ca
 #ifdef FAST_BUILD
     // Fast build disables all configs except this one for SM100
     return {CutlassGemmConfig{CutlassTileConfigSM100::CtaShape128x128x128B, MainloopScheduleType::AUTO,
-        EpilogueScheduleType::AUTO, ClusterShape::ClusterShape_1x1x1, ClusterShape::ClusterShape_1x1x1,
-        ClusterShape::ClusterShape_1x1x1}};
+        EpilogueScheduleType::TMA, ClusterShape::ClusterShape_1x1x1, ClusterShape::Undefined, ClusterShape::Undefined}};
 #else
     if (config & CutlassGemmConfig::GROUPED_GEMM)
     {
         std::vector<CutlassGemmConfig> candidate_configs;
         for (auto schedule : {EpilogueScheduleType::TMA, EpilogueScheduleType::NO_SMEM})
         {
-            for (auto cluster_shape : {ClusterShape::ClusterShape_1x1x1, ClusterShape::ClusterShape_4x1x1,
-                     ClusterShape::ClusterShape_4x2x1, ClusterShape::ClusterShape_4x4x1})
+            // TODO The tactic profiling is a bit long with all of these shapes enabled
+            //   Shape 4x4x1 shapes do not seem to give better performance in the cases I tested so we disable it here
+            auto cluster_shapes = {ClusterShape::ClusterShape_1x1x1, ClusterShape::ClusterShape_4x1x1,
+                ClusterShape::ClusterShape_4x2x1 /*, ClusterShape::ClusterShape_4x4x1*/};
+            for (auto cluster_shape : cluster_shapes)
             {
                 auto fallback_cluster_shape = cluster_shape == ClusterShape::ClusterShape_1x1x1
                     ? ClusterShape::ClusterShape_1x1x1
