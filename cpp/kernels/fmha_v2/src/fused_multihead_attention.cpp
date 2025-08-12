@@ -901,7 +901,7 @@ int main(int argc, char** argv)
         }
         if (data_type == DATA_TYPE_E4M3)
         {
-            fprintf(stderr, "Currently fp8 kernel doesn't support fp8.\n");
+            fprintf(stderr, "Currently fp8 kernel doesn't support saving softmax.\n");
             exit(1);
         }
     }
