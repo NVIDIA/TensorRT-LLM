@@ -68,7 +68,6 @@ class CUDAGraphRunner:
         self.max_supported_batch_size = engine._max_cuda_graph_batch_size
         self.max_beam_width = engine.max_beam_width
         self.spec_config = engine.spec_config
-        self.attn_metadata = engine.attn_metadata
 
         self.graphs: Dict[Tuple[int, int], torch.cuda.CUDAGraph] = {}
         self.static_inputs: Dict[Tuple[int, int], Dict[str, torch.Tensor]] = {}
@@ -93,6 +92,10 @@ class CUDAGraphRunner:
     @property
     def draft_tokens_cuda(self):
         return self._get_engine().draft_tokens_cuda
+
+    @property
+    def attn_metadata(self):
+        return self._get_engine().attn_metadata
 
     def __del__(self):
         self.clear()
