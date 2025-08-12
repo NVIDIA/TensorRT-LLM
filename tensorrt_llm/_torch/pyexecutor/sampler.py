@@ -909,10 +909,6 @@ class TRTLLMSampler(Sampler):
         sequence_lengths_host_data = state.host.sequence_lengths.flatten(
         ).tolist()
         finish_reasons = state.host.finish_reasons.flatten().tolist()
-        log_probs_host = state.host.log_probs.tolist(
-        ) if state.host.log_probs is not None else None
-        cum_log_probs_host = state.host.cum_log_probs.tolist(
-        ) if state.host.cum_log_probs is not None else None
 
         reqs = [
             r for r in state.scheduled_requests.context_requests
@@ -940,14 +936,16 @@ class TRTLLMSampler(Sampler):
                 seq_len = sequence_lengths_host_data[seq_slot]
                 begin_log_probs_offset = request.prompt_len
                 current_token = seq_len - request.prompt_len - 1
-                log_probs = [{
-                    new_tokens_host[seq_slot]:
-                    Logprob(logprob=log_probs_host[seq_slot][0][
-                        begin_log_probs_offset + current_token],
-                            rank=1)
-                }]
-                cum_log_probs = [cum_log_probs_host[seq_slot]]
-                request.py_result.append_log_probs([log_probs], cum_log_probs)
+                if state.host.log_probs is not None:
+                    log_probs = [{
+                        new_tokens_host[seq_slot]:
+                        Logprob(logprob=state.host.log_probs[seq_slot][0][
+                            begin_log_probs_offset + current_token].item(),
+                                rank=1)
+                    }]
+                    cum_log_probs = [state.host.cum_log_probs[seq_slot].item()] \
+                        if state.host.cum_log_probs is not None else None
+                    request.py_result.append_log_probs([log_probs], cum_log_probs)
 
         for request in reqs:
             request.py_decoding_iter += 1
