@@ -190,12 +190,16 @@ def main():
         max_turns = min(args.conversation_turns, len(args.prompt))
         generated_outputs = []  # Store generated outputs for return
 
+        # Initialize conversation history with the first prompt
+        conversation_history = args.prompt[0] if args.prompt else ""
+
         for i in range(max_turns):
             print(f"\n--- Turn {i+1} ---")
 
             try:
                 # Use multimodal input loader to process input with conversation context
-                cur_prompt = args.prompt[i]
+                # Use accumulated conversation history instead of just the current prompt
+                cur_prompt = conversation_history
                 inputs = default_multimodal_input_loader(
                     tokenizer=llm.tokenizer,
                     model_dir=llm._hf_model_dir,
@@ -233,8 +237,10 @@ def main():
                     "media": args.media
                 })
 
-                # Add to cur_prompt
-                cur_prompt = cur_prompt + response
+                conversation_history = conversation_history + "\n" + response
+                if i + 1 < len(args.prompt):
+                    conversation_history = conversation_history + "\n" + args.prompt[
+                        i + 1]
 
             except Exception as e:
                 print(f"Error in turn {i+1}: {e}")
