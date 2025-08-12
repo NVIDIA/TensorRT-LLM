@@ -2108,8 +2108,15 @@ TYPED_TEST(MixtureOfExpertsTest, ConfigSweep)
     {
         for (auto conf1 : configs)
         {
+            if (conf1.dynamic_cluster_shape != tensorrt_llm::cutlass_extensions::ClusterShape::Undefined
+                && conf1.dynamic_cluster_shape != tensorrt_llm::cutlass_extensions::ClusterShape::ClusterShape_4x1x1)
+                continue; // To reduce the number of iterations we only test one dynamic cluster shape
             for (auto conf2 : configs)
             {
+                if (conf2.dynamic_cluster_shape != tensorrt_llm::cutlass_extensions::ClusterShape::Undefined
+                    && conf2.dynamic_cluster_shape
+                        != tensorrt_llm::cutlass_extensions::ClusterShape::ClusterShape_4x1x1)
+                    continue; // To reduce the number of iterations we only test one dynamic cluster shape
                 auto name1 = genConfigName(conf1);
                 auto name2 = genConfigName(conf2);
                 if (name1.empty() || name2.empty())
