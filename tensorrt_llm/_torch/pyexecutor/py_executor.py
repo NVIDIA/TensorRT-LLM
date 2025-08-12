@@ -1277,18 +1277,22 @@ class PyExecutor:
         for req in self.ctx_in_transmission_requests[:]:
             if req.py_kv_transfer_start_time is None:
                 continue
-            if (current_time -
-                    req.py_kv_transfer_start_time) * 1000 > timeout_ms:
+            elapsed_time = (current_time - req.py_kv_transfer_start_time) * 1000
+            if elapsed_time > timeout_ms:
                 logger.debug(
                     f"Terminating context request {req.py_request_id} due to KV cache transfer timeout"
                 )
-                self._terminate_request(req)
+                req.py_to_cleanup = True
 
         for req in self.active_requests[:]:
             if req.is_disagg_generation_transmission_in_progress and req.py_kv_transfer_start_time is not None:
-                if (current_time -
-                        req.py_kv_transfer_start_time) * 1000 > timeout_ms:
-                    self._terminate_request(req)
+                elapsed_time = (current_time -
+                                req.py_kv_transfer_start_time) * 1000
+                if elapsed_time > timeout_ms:
+                    logger.debug(
+                        f"Terminating generation request {req.py_request_id} due to KV cache transfer timeout"
+                    )
+                    req.py_to_cleanup = True
 
         return
 
@@ -1648,6 +1652,12 @@ class PyExecutor:
                 requests_to_terminate.append(request)
                 continue
 
+            # Check if generation request needs cleanup due to KV cache transfer timeout
+            if request.py_to_cleanup:
+                request.state = LlmRequestState.GENERATION_COMPLETE
+                requests_to_terminate.append(request)
+                continue
+
             if request.is_generation_only_request():
                 # If request is in transmission, so we don't need to emit a response
                 # Also, for the first iteration with overlap, we should skip since first
@@ -1689,7 +1699,7 @@ class PyExecutor:
     @nvtx_range("_terminate_ctx_finished_requests")
     def _terminate_ctx_finished_requests(self):
         for request in self.ctx_in_transmission_requests[:]:
-            if request.is_disagg_context_complete_state:
+            if request.is_disagg_context_complete_state or request.py_to_cleanup:
                 request.py_kv_transfer_start_time = None
                 self._terminate_request(request)
                 self.ctx_in_transmission_requests.remove(request)
