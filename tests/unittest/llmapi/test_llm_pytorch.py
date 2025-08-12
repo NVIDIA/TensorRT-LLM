@@ -544,7 +544,7 @@ def test_codellama_fp8_with_bf16_lora() -> None:
                                  max_loras=2,
                                  max_cpu_loras=2)
 
-        llm = LLM(model_dir, lora_config=lora_config)
+        llm = LLM(model_dir, quant_config=quant_config, lora_config=lora_config)
 
         prompts = [
             "Write a function that calculates the Fibonacci sequence.",
