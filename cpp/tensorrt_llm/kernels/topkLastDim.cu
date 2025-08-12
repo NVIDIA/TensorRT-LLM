@@ -1221,8 +1221,8 @@ void standalone_stable_radix_topk_(void* buf, size_t& buf_size, T const* in, Idx
     IdxT* sort_in_idx = nullptr;
 
     air_topk_stable::ComputeOffset<IdxT> computeoffset(k);
-    cub::CountingInputIterator<IdxT> counting_iter(0);
-    cub::TransformInputIterator<IdxT, air_topk_stable::ComputeOffset<IdxT>, cub::CountingInputIterator<IdxT>>
+    thrust::counting_iterator<IdxT> counting_iter(0);
+    thrust::transform_iterator<IdxT, air_topk_stable::ComputeOffset<IdxT>, thrust::counting_iterator<IdxT>>
         transform_iter(counting_iter, computeoffset);
     cub::DeviceSegmentedSort::SortPairs(NULL, temp_storage_bytes, out_idx, out_idx, out, out, k * batch_size,
         batch_size, transform_iter, transform_iter + 1, stream);
@@ -1348,8 +1348,8 @@ void standalone_stable_radix_topk_one_block_(void* buf, size_t& buf_size, T cons
     const IdxT buf_len = air_topk_stable::calc_buf_len<T, IdxT, unsigned>(len);
 
     air_topk_stable::ComputeOffset<IdxT> computeoffset(k);
-    cub::CountingInputIterator<IdxT> counting_iter(0);
-    cub::TransformInputIterator<IdxT, air_topk_stable::ComputeOffset<IdxT>, cub::CountingInputIterator<IdxT>>
+    thrust::counting_iterator<IdxT> counting_iter(0);
+    thrust::transform_iterator<IdxT, air_topk_stable::ComputeOffset<IdxT>, thrust::counting_iterator<IdxT>>
         transform_iter(counting_iter, computeoffset);
 
     cub::DeviceSegmentedSort::SortPairs(NULL, temp_storage_bytes, out_idx, out_idx, out, out, k * batch_size,

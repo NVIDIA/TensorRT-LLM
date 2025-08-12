@@ -24,11 +24,7 @@ StrEnum
 sentencepiece>=0.1.99
 tensorrt~=10.13.0
 # https://docs.nvidia.com/deeplearning/frameworks/pytorch-release-notes/rel-25-05.html#rel-25-05 uses 2.8.0a0.
-<<<<<<< HEAD
 torch>=2.7.1,<=2.9.0a0
-=======
-torch>=2.7.1,<=2.8.0
->>>>>>> cuda13
 torchvision
 nvidia-modelopt[torch]~=0.33.0
 nvidia-nccl-cu13
