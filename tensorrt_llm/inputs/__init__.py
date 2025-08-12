@@ -5,9 +5,9 @@ from .registry import (ExtraProcessedInputs, InputProcessor,
                        register_input_processor)
 from .utils import (ALL_SUPPORTED_MULTIMODAL_MODELS, ConversationMessage,
                     MultimodalData, MultimodalDataTracker,
-                    add_multimodal_placeholders, async_load_audio,
-                    async_load_image, async_load_video,
-                    default_multimodal_input_loader,
+                    add_multimodal_placeholders, apply_chat_template,
+                    async_load_audio, async_load_image, async_load_video,
+                    convert_image_mode, default_multimodal_input_loader,
                     encode_base64_content_from_url, load_image, load_video)
 
 __all__ = [
@@ -29,6 +29,8 @@ __all__ = [
     "async_load_image",
     "async_load_video",
     "add_multimodal_placeholders",
+    "apply_chat_template",
+    "convert_image_mode",
     "default_multimodal_input_loader",
     "encode_base64_content_from_url",
     "load_image",
