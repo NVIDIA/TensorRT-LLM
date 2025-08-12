@@ -63,9 +63,6 @@ from .python_plugin import PluginBase
 from .sampling_params import SamplingParams
 from .version import __version__
 
-# Lazy import to avoid circular dependency on lora_manager
-import tensorrt_llm._torch.models as torch_models  # isort:skip
-
 __all__ = [
     'AutoConfig',
     'AutoModelForCausalLM',
