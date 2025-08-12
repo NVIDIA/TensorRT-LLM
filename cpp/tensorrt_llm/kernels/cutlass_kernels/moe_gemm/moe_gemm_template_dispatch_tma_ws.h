@@ -134,10 +134,10 @@ void dispatchMoeGemmFinalDispatchTmaWarpSpecialized(TmaWarpSpecializedGroupedGem
         if constexpr (Arch::kMinComputeCapability >= 100 && Arch::kMinComputeCapability < 120)
         {
             bool const dynamic_cga = gemm_config.dynamic_cluster_shape != cutlass_extensions::ClusterShape::Undefined;
-            auto cluster_shape = enum_to_shape_tuple(gemm_config.dynamic_cluster_shape);
+            auto cluster_shape = cutlass_extensions::enum_to_shape_tuple(gemm_config.dynamic_cluster_shape);
             auto cluster_shape_cute = cute::Shape<int32_t, int32_t, cute::_1>{
                 std::get<0>(cluster_shape), std::get<1>(cluster_shape), cute::_1{}};
-            auto cluster_shape_fallback = enum_to_shape_tuple(gemm_config.fallback_cluster_shape);
+            auto cluster_shape_fallback = cutlass_extensions::enum_to_shape_tuple(gemm_config.fallback_cluster_shape);
             auto cluster_shape_cute_fallback = cute::Shape<int32_t, int32_t, cute::_1>{
                 std::get<0>(cluster_shape_fallback), std::get<1>(cluster_shape_fallback), cute::_1{}};
             if constexpr (!std::is_same_v<T, __nv_fp4_e2m1> && !std::is_same_v<WeightType, __nv_fp4_e2m1>)
@@ -161,8 +161,8 @@ void dispatchMoeGemmFinalDispatchTmaWarpSpecialized(TmaWarpSpecializedGroupedGem
                     }};
                 bool const tma_epilogue
                     = gemm_config.epilogue_schedule == cutlass_extensions::EpilogueScheduleType::TMA;
-                return func_map[tma_epilogue][dynamic_cga](hopper_input, num_experts, multi_processor_count, stream,
-                    occupancy, workspace_size, cluster_shape_cute, cluster_shape_cute_fallback);
+                func_map[tma_epilogue][dynamic_cga](hopper_input, num_experts, multi_processor_count, stream, occupancy,
+                    workspace_size, cluster_shape_cute, cluster_shape_cute_fallback);
             }
             else
             {
