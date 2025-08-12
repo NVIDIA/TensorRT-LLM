@@ -278,11 +278,10 @@ class PyExecutor:
             self.event_loop = trace_func(self.event_loop)
 
         if self.drafter is not None:
-            if self.event_loop.__name__ != self._executor_loop.__name__:
+            if self.event_loop.__name__ == self._executor_loop_pp.__name__:
                 raise NotImplementedError(
                     "Drafting is not supported for selected executor loop. "
-                    "Please disable disagg/pipeline parallelism/overlap scheduler."
-                )
+                    "Please disable disagg/pipeline parallelism scheduler.")
             self.draft_seq_slot_manager = SeqSlotManager(max_num_sequences)
         self.garbage_collection_gen0_threshold = garbage_collection_gen0_threshold
         self.max_seq_len = max_seq_len
