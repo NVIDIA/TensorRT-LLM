@@ -14,11 +14,12 @@
 # limitations under the License.
 """Module test_mistral test mistral examples."""
 import multiprocessing
-import platform
 
+import defs.ci_profiler
 import psutil
 import pytest
 from defs.common import (convert_weights, quantize_data,
+                         test_llm_torch_multi_lora_support,
                          test_multi_lora_support, venv_check_call)
 from defs.conftest import get_sm_version, skip_post_blackwell, skip_pre_ada
 from defs.trt_test_alternative import check_call
@@ -45,23 +46,23 @@ def get_optimal_jobs():
     return optimal_jobs
 
 
-@pytest.fixture(autouse=True, scope="module")
-def mistral_example_root(llm_venv):
-    if platform.system() != "Windows":
-        # https://github.com/Dao-AILab/flash-attention/issues/345
-        # No wheel for flash-attn on windows and compilation fails locally.
-        max_jobs = get_optimal_jobs()
-        install_cmd = [
-            f"MAX_JOBS={max_jobs}",
-            "python3",
-            "-m",
-            "pip",
-            "install",
-            "--upgrade",
-            "flash-attn==2.4.2",
-        ]
+# @pytest.fixture(autouse=True, scope="module")
+# def mistral_example_root(llm_venv):
+#     if platform.system() != "Windows":
+#         # https://github.com/Dao-AILab/flash-attention/issues/345
+#         # No wheel for flash-attn on windows and compilation fails locally.
+#         max_jobs = get_optimal_jobs()
+#         install_cmd = [
+#             f"MAX_JOBS={max_jobs}",
+#             "python3",
+#             "-m",
+#             "pip",
+#             "install",
+#             "--upgrade",
+#             "flash-attn==2.4.2",
+#         ]
 
-        check_call(" ".join(install_cmd), shell=True, env=llm_venv._new_env)
+#         check_call(" ".join(install_cmd), shell=True, env=llm_venv._new_env)
 
 
 @skip_post_blackwell  #nvbug 5298661
@@ -295,3 +296,57 @@ def test_mistral_nemo_minitron_fp8_with_bf16_lora(
         target_trtllm_modules=["attn_q", "attn_k", "attn_v"],
         zero_lora_weights=True,
     )
+
+
+@skip_pre_ada
+@pytest.mark.skip_less_device_memory(80000)
+@pytest.mark.parametrize("llm_mistral_model_root", ['mistral-7b-v0.1'],
+                         indirect=True)
+def test_mistral_7b_v0_1_with_bf16_lora_torch(
+        llama_example_root, llm_datasets_root,
+        qcache_dir_without_install_package, llm_venv, engine_dir,
+        llm_mistral_model_root):
+    """Run Mistral-7b-v0.1 with multiple dummy LoRAs using LLM-API Torch backend."""
+
+    print("Testing Mistral-7b-v0.1 with LLM-API Torch backend...")
+
+    defs.ci_profiler.start("test_llm_torch_multi_lora_support")
+    test_llm_torch_multi_lora_support(
+        hf_model_dir=llm_mistral_model_root,
+        llm_venv=llm_venv,
+        num_loras=2,
+        lora_rank=8,
+        target_hf_modules=["q_proj", "k_proj", "v_proj"],
+        zero_lora_weights=True,
+        use_code_prompts=False,
+        tensor_parallel_size=1,
+    )
+    defs.ci_profiler.stop("test_llm_torch_multi_lora_support")
+
+
+@skip_pre_ada
+@pytest.mark.skip_less_device(2)
+@pytest.mark.skip_less_device_memory(80000)
+@pytest.mark.parametrize("llm_mistral_model_root",
+                         ['mistral-nemo-instruct-2407'],
+                         indirect=True)
+def test_mistral_nemo_instruct_2407_with_bf16_lora_torch(
+        llama_example_root, llm_datasets_root,
+        qcache_dir_without_install_package, llm_venv, engine_dir,
+        llm_mistral_model_root):
+    """Run Mistral-NeMo-Instruct-2407 with multiple dummy LoRAs using LLM-API Torch backend on 2 GPUs."""
+
+    print("Testing Mistral-NeMo-Instruct-2407 with LLM-API Torch backend...")
+
+    defs.ci_profiler.start("test_llm_torch_multi_lora_support")
+    test_llm_torch_multi_lora_support(
+        hf_model_dir=llm_mistral_model_root,
+        llm_venv=llm_venv,
+        num_loras=2,
+        lora_rank=8,
+        target_hf_modules=["q_proj", "k_proj", "v_proj"],
+        zero_lora_weights=True,
+        use_code_prompts=False,
+        tensor_parallel_size=2,
+    )
+    defs.ci_profiler.stop("test_llm_torch_multi_lora_support")
