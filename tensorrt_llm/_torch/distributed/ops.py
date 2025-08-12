@@ -6,6 +6,7 @@ from typing import List, Optional, Tuple, Union
 
 import torch
 from torch import nn
+import torch.distributed as dist
 
 from tensorrt_llm._utils import mpi_comm, mpi_disabled
 from tensorrt_llm.bindings.internal.runtime import McastGPUBuffer
@@ -39,13 +40,12 @@ def get_flashinfer_allreduce_workspace(mapping: Mapping, max_num_tokens: int, hi
     flashinfer_allreduce_workspaces = getattr(_thread_local, f'flashinfer_allreduce_workspaces_{mapping.pp_rank}')
 
     if mapping not in flashinfer_allreduce_workspaces:
-        dist = TorchDist(mapping)
         flashinfer_allreduce_workspaces[mapping] = flashinfer_comm.trtllm_create_ipc_workspace_for_all_reduce(
             rank=mapping.rank,
             tp_size=mapping.tp_size,
             max_token_num=max_num_tokens,
             hidden_dim=hidden_dim,
-            group=None,
+            group=dist.group.WORLD,
         )
         if _enable_debug:
             print(
@@ -743,6 +743,7 @@ class MoEAllReduce(nn.Module):
                 eps=all_reduce_params.eps,
             )
 
+_RANK_DIST_INITIALIZED = False
 
 class FlashInferAllReduce(nn.Module):
 
@@ -750,11 +751,17 @@ class FlashInferAllReduce(nn.Module):
                  strategy: flashinfer_comm.AllReduceStrategyType,
                  hidden_dim: int, dtype: torch.dtype):
         super().__init__()
+        global _RANK_DIST_INITIALIZED
+
         self.mapping = mapping
         # self.max_message_size = 70 * 1024 * 1024  # 70MB
         self.dtype = dtype
         self.hidden_dim = 8192
         self.strategy = strategy
+
+        if not _RANK_DIST_INITIALIZED:
+            TorchDist(mapping)
+            _RANK_DIST_INITIALIZED = True
 
         # flashinfer all reduce is better for message sizes < ~70MB
         # num tokens * hidden dim * 2 < 70 *1024*1024
@@ -781,10 +788,10 @@ class FlashInferAllReduce(nn.Module):
         num_token = input.size(0)
         hidden_dim = input.size(1)
 
-        output_buffer = torch.empty(num_token * hidden_dim)
+        output_buffer = torch.empty(num_token * hidden_dim, dtype=input.dtype, device=input.device)
         if _enable_debug:
             print(
-                f"FlashInferAllReduce.forward: {num_token} {hidden_dim} {self.all_reduce_params}"
+                f"FlashInferAllReduce.forward: {num_token} {hidden_dim}"
             )
 
         # if all_reduce_params is None:
