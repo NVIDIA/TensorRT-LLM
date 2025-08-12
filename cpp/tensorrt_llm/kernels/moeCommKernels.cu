@@ -795,10 +795,11 @@ void moeLocalGather(MoeEpWorldInfo worldInfo, MoeExpertParallelInfo expertParall
 
 int AllToAllChannelCommunicatorBase::maxSmCount = -1;
 bool AllToAllChannelCommunicatorBase::maxSmCountUsed = false;
-
+/*
 void setMaxUsableSmCount(int smCount)
 {
     AllToAllChannelCommunicatorBase::setMaxUsableSmCount(smCount);
 }
+*/
 
 } // namespace tensorrt_llm::kernels

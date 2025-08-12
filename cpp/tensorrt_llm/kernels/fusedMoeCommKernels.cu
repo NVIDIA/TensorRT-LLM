@@ -1025,7 +1025,7 @@ __global__ void moeAllToAllKernel(FusedMoeCommKernelParam params, FusedMoeWorksp
     bool isSender = blockIdx.z == 0;
     int runChannelCount = gridDim.y;
     int group = threadIdx.y;
-    SendRecvDispls dataDispls = isSender ? params.sendDispls : params.recvDispls;
+    SendRecvIndices dataIndices = isSender ? params.sendIndices : params.recvIndices;
 
     FusedMoePairInfo pairInfo;
     int peerRank = blockIdx.x * blockDim.y + group;
@@ -1034,7 +1034,7 @@ __global__ void moeAllToAllKernel(FusedMoeCommKernelParam params, FusedMoeWorksp
         return;
     }
     int tokenCount;
-    int* groupStartPtr = dataDispls.getGroupStart(peerRank, tokenCount);
+    int* groupStartPtr = dataIndices.getGroupStart(peerRank, tokenCount);
     if (tokenCount == 0)
     {
         return;
@@ -1081,6 +1081,8 @@ __global__ void moeAllToAllKernel(FusedMoeCommKernelParam params, FusedMoeWorksp
     }
 }
 
+} // namespace fused_moe_impl
+
 void moeAllToAll(FusedMoeCommKernelParam params, FusedMoeWorkspace workspace, cudaStream_t stream)
 {
     bool hasBasicFields = params.sendFieldInfo.isBasicInterleaved != 0;
@@ -1100,7 +1102,7 @@ void moeAllToAll(FusedMoeCommKernelParam params, FusedMoeWorkspace workspace, cu
         int dynamicShmSize = groupCountPerCta * warpShmSize;
         int numBlocks = 0;
         if (cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-                &numBlocks, moeAllToAllKernel, WARP_SIZE * groupCountPerCta, dynamicShmSize)
+                &numBlocks, fused_moe_impl::moeAllToAllKernel, WARP_SIZE * groupCountPerCta, dynamicShmSize)
             != cudaSuccess)
         {
             continue;
@@ -1119,19 +1121,22 @@ void moeAllToAll(FusedMoeCommKernelParam params, FusedMoeWorkspace workspace, cu
     if (totalDynamicShmSize > 48 * 1024)
     {
         TLLM_CUDA_CHECK(
-            cudaFuncSetAttribute(moeAllToAllKernel, cudaFuncAttributeMaxDynamicSharedMemorySize, totalDynamicShmSize));
+            cudaFuncSetAttribute(fused_moe_impl::moeAllToAllKernel, cudaFuncAttributeMaxDynamicSharedMemorySize, totalDynamicShmSize));
     }
 
     dim3 block = FusedMoeCommunicator::getLaunchBlockDim(groupCountPerCta);
     dim3 grid = FusedMoeCommunicator::getLaunchGridDim(params.worldInfo.epInfo.epSize, groupCountPerCta);
-    moeAllToAllKernel<<<grid, block, totalDynamicShmSize, stream>>>(params, workspace, hasBasicFields);
+    fused_moe_impl::moeAllToAllKernel<<<grid, block, totalDynamicShmSize, stream>>>(params, workspace, hasBasicFields);
     TLLM_CUDA_CHECK(cudaGetLastError());
 }
 
-} // namespace fused_moe_impl
-
 int FusedMoeCommunicator::maxSmCount = -1;
 bool FusedMoeCommunicator::maxSmCountUsed = false;
+
+void setMaxUsableSmCount(int smCount)
+{
+    FusedMoeCommunicator::setMaxUsableSmCount(smCount);
+}
 
 namespace fused_moe_comm_tests
 {

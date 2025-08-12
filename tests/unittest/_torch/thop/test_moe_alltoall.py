@@ -82,8 +82,8 @@ class TestMoeAlltoAllSingleGPU(unittest.TestCase):
                                      dtype=torch.uint64,
                                      device=torch.device('cuda'))
 
-        torch.ops.trtllm.moe_comm(input_tensor, send_cumsum, send_indices,
-                                  output_tensor, recv_cumsum, recv_indices,
+        torch.ops.trtllm.moe_comm([input_tensor], send_cumsum, send_indices,
+                                  [output_tensor], recv_cumsum, recv_indices,
                                   all_workspaces, 0, 1)
 
         torch.testing.assert_close(output_tensor,
@@ -113,30 +113,37 @@ class TestMoeAlltoAllSingleGPU(unittest.TestCase):
         recv_indices = torch.zeros(1,
                                    dtype=torch.int32,
                                    device=torch.device('cuda'))
+        input_tensors = [input_tensor]
+        output_tensors = [output_tensor]
         workspace_size = torch.ops.trtllm.get_moe_commworkspace_size_per_rank(1)
         all_workspaces = torch.zeros(1,
                                      workspace_size,
                                      dtype=torch.uint64,
                                      device=torch.device('cuda'))
-        torch.ops.trtllm.moe_comm(input_tensor, send_cumsum, send_indices,
-                                  output_tensor, recv_cumsum, recv_indices,
+        torch.ops.trtllm.moe_comm(input_tensors, send_cumsum, send_indices,
+                                  output_tensors, recv_cumsum, recv_indices,
                                   all_workspaces, 0, 1)
         torch.cuda.synchronize()
 
     @parameterized.expand([
-        (2, 5, 8, torch.float16),  # small input as smoke test
-        (2, 1, 8, torch.float16),  # some ranks have no data to send/recv
-        (4, 5, 8, torch.float16),  # small input with larger world size
-        (4, 901, 32768, torch.bfloat16),  # large input that reuses workspace
-        (8, 901, 32768,
+        (2, 5, [4, 4], torch.float16),  # small input as smoke test
+        (2, 1, [8], torch.float16),  # some ranks have no data to send/recv
+        (4, 5, [8], torch.float16),  # small input with larger world size
+        (4, 901, [1472, 46, 4, 4], torch.float16),  # large input that reuses workspace
+        (4, 5, [2944], torch.bfloat16),  # large input that reuses workspace
+        (8, 901, [
+            32768,
+        ],
          torch.float16),  # large input that reuses workspace, larger world size
         (
-            8, 16384, 128, torch.float16
+            8, 16384, [
+                128,
+            ], torch.float16
         ),  # large input count with small vector dim that requires more indices per fifo
     ])
     def test_moe_alltoall_multi_rank_single_gpu(self, world_size,
                                                 input_entry_per_rank,
-                                                vector_dim, dtype):
+                                                vector_dims, dtype):
         torch.cuda.set_device(0)
         max_world_size = 8
         assert world_size <= max_world_size, f"should run with world_size at most {max_world_size}"
@@ -148,27 +155,38 @@ class TestMoeAlltoAllSingleGPU(unittest.TestCase):
             torch.ops.trtllm.set_moe_max_usable_sm_count(max_sm_count)
             has_setup_max_sm_count = True
 
-        # Create a random input tensor
-        input_tensor = torch.randn(input_entry_per_rank * world_size,
-                                   vector_dim,
-                                   dtype=dtype,
-                                   device=torch.device('cuda'))
-        output_tensor = torch.zeros(input_entry_per_rank * world_size,
-                                    vector_dim,
-                                    dtype=dtype,
-                                    device=torch.device('cuda'))
-        ref_output_tensor = torch.zeros(input_entry_per_rank * world_size,
-                                        vector_dim,
-                                        dtype=dtype,
-                                        device=torch.device('cuda'))
+        tensor_count = len(vector_dims)
+        input_tensors = []
+        output_tensors = []
+        ref_output_tensors = []
+        for vector_dim in vector_dims:
+            input_tensors.append(
+                torch.randn(input_entry_per_rank * world_size,
+                            vector_dim,
+                            dtype=dtype,
+                            device=torch.device('cuda')))
+            output_tensors.append(
+                torch.zeros(input_entry_per_rank * world_size,
+                            vector_dim,
+                            dtype=dtype,
+                            device=torch.device('cuda')))
+            ref_output_tensors.append(
+                torch.zeros(input_entry_per_rank * world_size,
+                            vector_dim,
+                            dtype=dtype,
+                            device=torch.device('cuda')))
+
         target_rank_ids = torch.randint(0,
                                         world_size,
                                         (input_entry_per_rank * world_size, ),
                                         dtype=torch.int32,
                                         device=torch.device('cuda'))
 
-        input_tensors_all_ranks = list(
-            torch.split(input_tensor, input_entry_per_rank))
+        input_tensors_all_ranks = []
+        for i in range(tensor_count):
+            input_tensors_all_ranks.append(
+                list(torch.split(input_tensors[i], input_entry_per_rank)))
+
         target_rank_ids_all_ranks = list(
             torch.split(target_rank_ids, input_entry_per_rank))
 
@@ -210,7 +228,8 @@ class TestMoeAlltoAllSingleGPU(unittest.TestCase):
         recv_ids_all_ranks = []
         recv_cumsum_all_ranks = []
 
-        output_tensors_all_ranks = []
+        # Initialize output_tensors_all_ranks as a list of lists
+        output_tensors_all_ranks = [[] for _ in range(tensor_count)]
 
         total_recv_all_ranks_cpu = []
         output_indice_offset = 0
@@ -227,17 +246,21 @@ class TestMoeAlltoAllSingleGPU(unittest.TestCase):
                 local_recv_count_pair = local_recv_counts[other_rank].cpu(
                 ).item()
                 send_rank_start_end = send_start_end_all_ranks[other_rank][rank]
-                ref_output_tensor[output_indice_offset:output_indice_offset + local_recv_count_pair] = \
-                    input_tensors_all_ranks[other_rank][send_ids_all_ranks[other_rank][send_rank_start_end[0]:send_rank_start_end[1]]]
+                for i in range(tensor_count):
+                    ref_output_tensors[i][output_indice_offset:output_indice_offset + local_recv_count_pair] = \
+                        input_tensors_all_ranks[i][other_rank][send_ids_all_ranks[other_rank][send_rank_start_end[0]:send_rank_start_end[1]]]
                 output_indice_offset += local_recv_count_pair
             local_recv_cumsum = torch.cumsum(local_recv_counts,
                                              dim=0).to(torch.int32)
             recv_cumsum_all_ranks.append(local_recv_cumsum)
             total_recv_count = local_recv_cumsum[-1].cpu()
             total_recv_all_ranks_cpu.append(total_recv_count)
-            output_tensors_all_ranks.append(output_tensor[
-                output_start_current_rank:output_start_current_rank +
-                total_recv_count])
+            # Correctly append output tensors for each tensor index
+            for i in range(tensor_count):
+                output_tensors_all_ranks[i].append(
+                    output_tensors[i]
+                    [output_start_current_rank:output_start_current_rank +
+                     total_recv_count])
             output_start_current_rank += total_recv_count
             local_recv_ids = torch.arange(total_recv_count,
                                           dtype=torch.int32,
@@ -264,19 +287,116 @@ class TestMoeAlltoAllSingleGPU(unittest.TestCase):
 
         # do alltoall in parallel
         for rank in range(world_size):
+            input_tensors_this_rank = [
+                input_tensors_all_ranks[i][rank] for i in range(tensor_count)
+            ]
+            output_tensors_this_rank = [
+                output_tensors_all_ranks[i][rank] for i in range(tensor_count)
+            ]
             with torch.cuda.stream(cuda_streams_all_ranks[rank]):
                 torch.ops.trtllm.moe_comm(
-                    input_tensors_all_ranks[rank], send_cumsum_all_ranks[rank],
-                    send_ids_all_ranks[rank], output_tensors_all_ranks[rank],
+                    input_tensors_this_rank, send_cumsum_all_ranks[rank],
+                    send_ids_all_ranks[rank], output_tensors_this_rank,
                     recv_cumsum_all_ranks[rank], recv_ids_all_ranks[rank],
                     all_workspaces, rank, world_size)
         for rank in range(world_size):
             cuda_streams_all_ranks[rank].synchronize()
 
-        torch.testing.assert_close(output_tensor,
-                                   ref_output_tensor,
-                                   atol=1e-5,
-                                   rtol=1e-5)
+        for i in range(tensor_count):
+            # Concatenate output tensors from all ranks for comparison
+            actual_output = torch.cat(output_tensors_all_ranks[i], dim=0)
+            torch.testing.assert_close(actual_output,
+                                       ref_output_tensors[i],
+                                       atol=1e-5,
+                                       rtol=1e-5)
+            
+class TestMoeAlltoAllFP8SingleGPU(unittest.TestCase):
+
+    def setUp(self):
+        torch.manual_seed(0x1234)
+        tllm.logger.set_level('error')
+
+    def test_moe_alltoall_fp8_with_indices(self):
+        """Test fp8 alltoall with properly constructed indices"""
+        torch.cuda.set_device(0)
+        
+        # Match dimensions from the error
+        input_entry_count = 16384
+        output_entry_count = 16384
+        vector_dim = 2944
+        sf_vector_dim = 92  # Scaling factor dimension from error
+        send_recv_count = 1000  # Number of entries to send/receive
+        
+        # Create input tensors - first as float16, then convert
+        input_tensor_fp16 = torch.randn(input_entry_count, vector_dim, 
+                                       dtype=torch.float16, device='cuda')
+        input_tensor_fp8 = input_tensor_fp16.to(torch.float8_e4m3fn)
+        
+        # Scaling factor tensor
+        input_sf_tensor = torch.randint(1, 255, (input_entry_count, sf_vector_dim),
+                                       dtype=torch.uint8, device='cuda')
+        
+        # Expert selection tensors
+        input_experts = torch.randint(0, 64, (input_entry_count, 4), 
+                                     dtype=torch.int32, device='cuda')
+        input_scales = torch.rand(input_entry_count, 4, 
+                                 dtype=torch.float32, device='cuda')
+        
+        # Output tensors
+        output_tensor_fp8 = torch.zeros(output_entry_count, vector_dim,
+                                       dtype=torch.float8_e4m3fn, device='cuda')
+        output_sf_tensor = torch.zeros(output_entry_count, sf_vector_dim,
+                                      dtype=torch.uint8, device='cuda')
+        output_experts = torch.zeros(output_entry_count, 4,
+                                    dtype=torch.int32, device='cuda')
+        output_scales = torch.zeros(output_entry_count, 4,
+                                   dtype=torch.float32, device='cuda')
+        
+        # Construct send/recv indices
+        send_cumsum = torch.tensor([send_recv_count], dtype=torch.int32, device='cuda')
+        recv_cumsum = torch.tensor([send_recv_count], dtype=torch.int32, device='cuda')
+        
+        # Random indices for sending
+        send_indices = torch.randperm(input_entry_count, dtype=torch.int32, 
+                                     device='cuda')[:send_recv_count]
+        recv_indices = torch.randperm(output_entry_count, dtype=torch.int32,
+                                     device='cuda')[:send_recv_count]
+        
+        # Create workspace
+        workspace_size = torch.ops.trtllm.get_moe_commworkspace_size_per_rank(1)
+        all_workspaces = torch.zeros(1, workspace_size, dtype=torch.uint64, device='cuda')
+        
+        print(f"Test configuration:")
+        print(f"  Input entries: {input_entry_count}")
+        print(f"  Vector dim: {vector_dim}")
+        print(f"  SF vector dim: {sf_vector_dim}")
+        print(f"  Send/recv count: {send_recv_count}")
+        print(f"  FP8 tensor shape: {input_tensor_fp8.shape}")
+        print(f"  SF tensor shape: {input_sf_tensor.shape}")
+        
+        try:
+            # Test with all 4 tensors
+            torch.ops.trtllm.moe_comm(
+                [input_tensor_fp8, input_sf_tensor, input_experts, input_scales],
+                send_cumsum, send_indices,
+                [output_tensor_fp8, output_sf_tensor, output_experts, output_scales],
+                recv_cumsum, recv_indices,
+                all_workspaces, 0, 1)
+            
+            torch.cuda.synchronize()
+            print("FP8 alltoall test PASSED!")
+            
+            # Verify outputs
+            print(f"\nOutput verification:")
+            print(f"  Output FP8 shape: {output_tensor_fp8.shape}")
+            print(f"  Output SF shape: {output_sf_tensor.shape}")
+            print(f"  Non-zero FP8 elements: {(output_tensor_fp8 != 0).sum().item()}")
+            print(f"  Non-zero SF elements: {(output_sf_tensor != 0).sum().item()}")
+            
+        except Exception as e:
+            print(f"FP8 alltoall test FAILED: {e}")
+            print(f"Error type: {type(e)}")
+            raise
 
     @parameterized.expand([
         (0, 8, 256, 4, 3, False),

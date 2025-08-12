@@ -40,7 +40,7 @@ struct ALIGN_256 ReceiverSideFifoInfo
 };
 
 // struct holding Send/Recv data pointer and its displacement information.
-struct SendRecvDispls
+struct SendRecvIndices
 {
     int const* rankCountCumSum; // length = epSize
     int* rankLocalIndices;      // length = rankCountCumSum[epRank] - rankCountCumSum[epRank - 1] if epRank > 0 else
@@ -203,8 +203,6 @@ struct MoeSingleCommMeta
     int singlePackedAlignedSize;   // packed buffer is always aligned to 128 bytes
     int singleUnpackedAlignedSize; // unpacked shared memory size, aligned to 128 bytes, might be larger than packed
                                    // buffer
-
-    int tokenPerFifoEntry;
 
     // TODO: Do we need reduce shared memory usage, make it able to be smaller, and enable multiple wave?
 
@@ -393,8 +391,6 @@ struct FusedMoeFieldInfo
     {
         singleCommMeta->singlePackedAlignedSize = computeSinglePackedSize(topK, hasScales, hasBasicFields);
         singleCommMeta->singleUnpackedAlignedSize = computeSingleWarpShmSize(topK, hasScales, hasBasicFields);
-        singleCommMeta->tokenPerFifoEntry
-            = FusedMoeCommunicator::FIFO_ENTRY_BYTES / singleCommMeta->singlePackedAlignedSize;
     }
 
     void fillFieldPlacementInfo(int topK, bool hasBasicFields);
@@ -406,8 +402,8 @@ struct FusedMoeCommKernelParam
     MoeExpertParallelInfo expertParallelInfo; // expertCount inside should be slotCount if using redundant experts.
     MoeSingleCommMeta sendCommMeta;
     MoeSingleCommMeta recvCommMeta;
-    SendRecvDispls sendDispls;
-    SendRecvDispls recvDispls;
+    SendRecvIndices sendIndices;
+    SendRecvIndices recvIndices;
     FusedMoeFieldInfo sendFieldInfo;
     FusedMoeFieldInfo recvFieldInfo;
 };
@@ -515,6 +511,8 @@ struct FusedMoeWorkspace
 
     void initializeLocalWorkspace(FusedMoeWorldInfo const& worldInfo);
 };
+
+void setMaxUsableSmCount(int smCount);
 
 void moeAllToAll(FusedMoeCommKernelParam params, FusedMoeWorkspace workspace, cudaStream_t stream);
 

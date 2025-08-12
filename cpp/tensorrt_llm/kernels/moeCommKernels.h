@@ -229,7 +229,7 @@ struct MoeCommWorkspace
 #endif
 };
 
-void setMaxUsableSmCount(int smCount);
+//void setMaxUsableSmCount(int smCount);
 
 void moeAllToAll(MoeEpWorldInfo worldInfo, SendRecvDataInfo sendRecvDataInfo, SendRecvDispls sendDispls,
     SendRecvDispls recvDispls, MoeCommWorkspace workspace, cudaStream_t stream);
