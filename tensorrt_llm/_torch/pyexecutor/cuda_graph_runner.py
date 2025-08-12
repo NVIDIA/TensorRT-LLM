@@ -69,7 +69,6 @@ class CUDAGraphRunner:
         self.max_beam_width = engine.max_beam_width
         self.spec_config = engine.spec_config
         self.attn_metadata = engine.attn_metadata
-        self.draft_tokens_cuda = engine.draft_tokens_cuda
 
         self.graphs: Dict[Tuple[int, int], torch.cuda.CUDAGraph] = {}
         self.static_inputs: Dict[Tuple[int, int], Dict[str, torch.Tensor]] = {}
@@ -90,6 +89,10 @@ class CUDAGraphRunner:
     @property
     def spec_metadata(self):
         return self._get_engine().spec_metadata
+
+    @property
+    def draft_tokens_cuda(self):
+        return self._get_engine().draft_tokens_cuda
 
     def __del__(self):
         self.clear()
