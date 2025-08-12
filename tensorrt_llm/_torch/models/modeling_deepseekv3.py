@@ -453,7 +453,7 @@ class Deepseekv3MoE(nn.Module):
             False,  # In both low‑latency and attention‑DP modes, FusedMoE skips the in‑op all‑reduce.
             model_config=model_config,
             override_quant_config=override_quant_config,
-            aux_stream=aux_stream_dict[AuxStreamType.MoeChunkingOverlap],
+            aux_stream_dict=aux_stream_dict,
             layer_idx=layer_idx)
 
         self.mapping = model_config.mapping
@@ -1049,11 +1049,12 @@ class DeepseekV3Model(DecoderModel):
         config = model_config.pretrained_config
         self.vocab_size = config.vocab_size
         self.num_hidden_layers = config.num_hidden_layers
-        aux_stream_list = [torch.cuda.Stream() for _ in range(2)]
+        aux_stream_list = [torch.cuda.Stream() for _ in range(3)]
         self.aux_stream_dict = {
             AuxStreamType.Attention: aux_stream_list[0],
             AuxStreamType.MoeShared: aux_stream_list[0],
             AuxStreamType.MoeChunkingOverlap: aux_stream_list[1],
+            AuxStreamType.MoeBalancer: aux_stream_list[2],
         }
 
         self.embed_tokens = Embedding(
