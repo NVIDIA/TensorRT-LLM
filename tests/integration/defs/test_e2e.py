@@ -2336,6 +2336,7 @@ def test_ptp_quickstart_advanced_mixed_precision(llm_root, llm_venv):
 
 @pytest.mark.parametrize("use_cuda_graph", [False, True])
 @pytest.mark.parametrize("modality", ["image", "video", "mixture_text_image"])
+@pytest.mark.parametrize("enable_chunked_prefill", [False, True])
 @pytest.mark.parametrize("model_name,model_path", [
     ("NVILA-8B-FP16", "vila/NVILA-8B"),
     ("NVILA-15B-FP16", "NVILA-15B"),
@@ -2351,9 +2352,16 @@ def test_ptp_quickstart_advanced_mixed_precision(llm_root, llm_venv):
                         skip_post_blackwell)),
 ])
 def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
-                                   modality, use_cuda_graph):
+                                   modality, use_cuda_graph,
+                                   enable_chunked_prefill):
     # NOTE: individual tests need to be enabled in
     # tests/integration/test_lists/qa/examples_test_list.txt
+    if model_name not in ["qwen2-vl-7b-instruct", "qwen2.5-vl-7b-instruct"
+                          ] and enable_chunked_prefill:
+        pytest.skip(
+            "Only Qwen2-VL and Qwen2-5-VL support chunked prefill for now")
+    if modality != "image" and enable_chunked_prefill:
+        pytest.skip("Chunked prefill is only supported for image modality")
 
     example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
     test_data_root = Path(
@@ -2480,6 +2488,11 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
     if model_name in ["qwen2-vl-7b-instruct", "qwen2.5-vl-7b-instruct"
                       ] and modality == "video":
         cmd.append("--max_num_tokens=16384")
+    else:
+        if enable_chunked_prefill:
+            cmd.append("--enable_chunked_prefill")
+            cmd.append("--max_num_tokens=256")
+
     if use_cuda_graph:
         cmd.append("--use_cuda_graph")
     # Gemma3 VLM needs a custom mask which is only supported by flashinfer backend currently.
