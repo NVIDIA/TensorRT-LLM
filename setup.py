@@ -120,14 +120,14 @@ package_data += [
 ]
 
 
-def download_precompiled(workspace: str) -> str:
+def download_precompiled(workspace: str, version: str) -> str:
     import glob
     import subprocess
 
     from setuptools.errors import SetupError
 
     cmd = [
-        "pip", "download", f"tensorrt_llm={get_version()}",
+        "python3", "-m", "pip", "download", f"tensorrt_llm=={version}",
         f"--dest={workspace}", "--no-deps",
         "--extra-index-url=https://pypi.nvidia.com"
     ]
@@ -201,17 +201,16 @@ def extract_from_precompiled(precompiled_location: str, package_data: List[str],
             wheel.extract(file)
 
 
-use_precompiled: bool = os.getenv("TRTLLM_USE_PRECOMPILED") == "1"
-precompiled_location: str = os.getenv("TRTLLM_PRECOMPILED_LOCATION")
-
-if precompiled_location:
-    use_precompiled = True
+precompiled: str | None = os.getenv("TRTLLM_USE_PRECOMPILED")
+precompiled_location: str | None = os.getenv("TRTLLM_PRECOMPILED_LOCATION")
+use_precompiled: bool = precompiled is not None or precompiled_location is not None
 
 if use_precompiled:
     from tempfile import TemporaryDirectory
     with TemporaryDirectory() as tempdir:
         if not precompiled_location:
-            precompiled_location = download_precompiled(tempdir)
+            version = precompiled if precompiled != "1" else get_version()
+            precompiled_location = download_precompiled(tempdir, version)
         extract_from_precompiled(precompiled_location, package_data, tempdir)
 
 sanity_check()
