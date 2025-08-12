@@ -10,7 +10,8 @@ import torch
 import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
-from tensorrt_llm.lora_manager import LoraConfig, LoraManager, LoraModelConfig
+from tensorrt_llm.lora_helper import LoraConfig
+from tensorrt_llm.lora_manager import LoraManager, LoraModelConfig
 from tensorrt_llm.sampling_params import SamplingParams
 
 from ..._utils import binding_dtype_size, binding_to_str_dtype, nvtx_range
@@ -509,6 +510,10 @@ class KVCacheManager(BaseResourceManager):
             if request.state != LlmRequestState.GENERATION_COMPLETE:
                 if request.py_rewind_len > 0:
                     self.rewind_kv_cache(request, request.py_rewind_len)
+
+        # For context requests, we store the blocks for reuse.
+        for request in scheduled_batch.context_requests:
+            self.impl.store_context_blocks(request)
 
     def free_resources(self, request: LlmRequest):
         self.impl.remove_sequence(request.py_request_id, request)

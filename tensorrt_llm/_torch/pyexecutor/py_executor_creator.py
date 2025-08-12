@@ -17,7 +17,7 @@ from tensorrt_llm.bindings.executor import (CapacitySchedulerPolicy,
 from tensorrt_llm.bindings.internal.batch_manager import ContextChunkingConfig
 from tensorrt_llm.llmapi.llm_args import KvCacheConnectorConfig
 from tensorrt_llm.logger import logger
-from tensorrt_llm.lora_manager import LoraConfig
+from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization import QuantAlgo
 

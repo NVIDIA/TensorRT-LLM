@@ -663,13 +663,14 @@ def test_disaggregated_ctxtp2pp2_gentp2pp2(disaggregated_test_root, llm_venv,
 
 
 @pytest.mark.skip_less_device(8)
-@pytest.mark.parametrize("llama_model_root", ['llama-3.1-8b'], indirect=True)
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
 def test_disaggregated_ctxpp4_genpp4(disaggregated_test_root, llm_venv,
                                      disaggregated_example_root,
                                      llama_model_root):
     src_dst_dict = {
         llama_model_root:
-        f"{llm_venv.get_working_directory()}/llama-3.1-models/Meta-Llama-3.1-8B",
+        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
     }
     for src, dst in src_dst_dict.items():
         if not os.path.islink(dst):

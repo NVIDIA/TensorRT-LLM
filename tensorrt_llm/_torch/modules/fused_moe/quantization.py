@@ -6,7 +6,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from tensorrt_llm import logger
+import tensorrt_llm.logger as trtllm_logger
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.quantization.utils.fp4_utils import (
     float4_sf_dtype, get_reorder_rows_for_gated_act_gemm_row_indices,
@@ -743,7 +743,7 @@ class DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm(
                     if int(name.split(".")[0]) not in expert_ids:
                         continue
                     weight_name = name.replace("weight_scale_inv", "weight")
-                    logger.debug(f"Resmoothing {weight_name}")
+                    trtllm_logger.logger.debug(f"Resmoothing {weight_name}")
                     weight = weights[weight_name][:]
                     scale = weights[name][:]
                     weights[weight_name], weights[name] = resmooth_to_fp8_e8m0(
@@ -1401,6 +1401,14 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
                 )
 
             expert_idx = local_slot_id
+
+            if not torch.allclose(w1_weight_scale_2, w3_weight_scale_2):
+                logger.warning(
+                    f"w1_weight_scale_2 != w3_weight_scale_2 ({w1_weight_scale_2} != {w3_weight_scale_2}), selecting the larger value. Accuracy may be affected."
+                )
+                w1_weight_scale_2 = torch.max(w1_weight_scale_2,
+                                              w3_weight_scale_2)
+                w3_weight_scale_2 = w1_weight_scale_2
 
             self.load_expert_w3_w1_weight_scale_nvfp4(
                 module, w1_weight_scale, w3_weight_scale,

@@ -18,6 +18,7 @@ set(SRCS
     testing/modelSpecBinding.cpp
     runtime/moeBindings.cpp
     userbuffers/bindings.cpp
+    thop/bindings.cpp
     ../runtime/ipcNvlsMemory.cu
     bindings.cpp)
 
@@ -43,7 +44,8 @@ target_link_libraries(
          ${Python3_LIBRARIES}
          ${TORCH_LIBRARIES}
          torch_python
-         ${CUDA_NVML_LIB})
+         ${CUDA_NVML_LIB}
+         th_common)
 target_compile_definitions(
   ${TRTLLM_NB_MODULE} PUBLIC TRTLLM_NB_MODULE=${TRTLLM_NB_MODULE}
                              PYBIND11_DETAILED_ERROR_MESSAGES=1)
