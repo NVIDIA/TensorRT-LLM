@@ -10,7 +10,8 @@ import torch
 import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
-from tensorrt_llm.lora_manager import LoraConfig, LoraManager, LoraModelConfig
+from tensorrt_llm.lora_helper import LoraConfig
+from tensorrt_llm.lora_manager import LoraManager, LoraModelConfig
 from tensorrt_llm.sampling_params import SamplingParams
 
 from ..._utils import binding_dtype_size, binding_to_str_dtype, nvtx_range

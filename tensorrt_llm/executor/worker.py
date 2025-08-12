@@ -24,7 +24,8 @@ from ..llmapi.tracer import VizTracer, global_tracer, set_global_tracer
 from ..llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue,
                             clear_sched_affinity, print_colored_debug,
                             print_traceback_on_error)
-from ..lora_manager import LoraConfig, LoraManager
+from ..lora_helper import LoraConfig
+from ..lora_manager import LoraManager
 from ..metrics import RequestEventTiming
 from ..prompt_adapter_manager import PromptAdapterManager
 from ..runtime import ModelConfig

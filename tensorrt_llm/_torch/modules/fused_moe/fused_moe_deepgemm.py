@@ -1,4 +1,4 @@
-from typing import List, Optional, Union
+from typing import Dict, List, Optional, Union
 
 import torch
 import torch.nn.functional as F
@@ -11,7 +11,7 @@ from tensorrt_llm._utils import nvtx_range
 
 from ...distributed import allgather
 from ...model_config import ModelConfig
-from ...utils import Fp4QuantizedTensor
+from ...utils import AuxStreamType, Fp4QuantizedTensor
 from .fused_moe_cutlass import CutlassFusedMoE
 from .quantization import (DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm,
                            MoEWeightLoadingMode, UnquantizedFusedMoEMethod)
@@ -299,7 +299,7 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
         top_k (int): Number of top experts to select for each input token.
         hidden_size (int): Size of the hidden state.
         intermediate_size (int): Size of the intermediate state.
-        aux_stream (Optional[torch.cuda.Stream]): Auxiliary CUDA stream to overlap chunks.
+        aux_stream_dict (Optional[Dict[AuxStreamType, torch.cuda.Stream]]): Auxiliary CUDA streams for overlapping.
         dtype (Optional[torch.dtype]): Data type for the weights.
         reduce_results (bool): Whether to reduce the results across devices.
         model_config (ModelConfig): Configuration object for the model.
@@ -320,7 +320,8 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
         dtype: Optional[torch.dtype] = None,
         reduce_results: bool = False,
         model_config: ModelConfig = ModelConfig(),
-        aux_stream: Optional[torch.cuda.Stream] = None,
+        aux_stream_dict: Optional[Dict[AuxStreamType,
+                                       torch.cuda.Stream]] = None,
         weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.
         VANILLA,
         apply_router_weight_on_input: bool = False,
@@ -335,7 +336,7 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
             dtype=dtype,
             reduce_results=reduce_results,
             model_config=model_config,
-            aux_stream=aux_stream,
+            aux_stream_dict=aux_stream_dict,
             weight_loading_mode=weight_loading_mode,
             apply_router_weight_on_input=apply_router_weight_on_input,
             layer_idx=layer_idx,

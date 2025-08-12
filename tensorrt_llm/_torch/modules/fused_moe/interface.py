@@ -24,7 +24,6 @@ class MoE(nn.Module):
         top_k (int): Number of top experts to select for each input token.
         hidden_size (int): Size of the hidden state.
         intermediate_size (int): Size of the intermediate state.
-        aux_stream (Optional[torch.cuda.Stream]): Auxiliary CUDA stream to overlap chunks.
         dtype (Optional[torch.dtype]): Data type for the weights.
         reduce_results (bool): Whether to reduce the results across devices.
         model_config (ModelConfig): Configuration object for the model.

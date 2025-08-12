@@ -42,7 +42,7 @@ from tensorrt_llm.llmapi.llm_utils import (BuildConfig, QuantAlgo, QuantConfig,
 from tensorrt_llm.llmapi.tokenizer import (TokenizerBase, TransformersTokenizer,
                                            load_hf_tokenizer)
 from tensorrt_llm.llmapi.utils import get_total_gpu_memory
-from tensorrt_llm.lora_manager import LoraConfig
+from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.models.automodel import AutoConfig, AutoModelForCausalLM
 from tensorrt_llm.models.modeling_utils import SpeculativeDecodingMode
 from tensorrt_llm.sampling_params import (BatchedLogitsProcessor,
