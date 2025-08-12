@@ -90,26 +90,24 @@ class MultimodalRuntimeData:
     """Runtime data for tracking multimodal token caching and reuse per request sequence.
 
     This class tracks which multimodal tokens are cached vs. need to be processed
-    for each request sequence during KV cache reuse scenarios.
+    for each request sequence during both KV cache reuse and chunked prefill scenarios.
 
     Attributes:
-        num_cached_tokens: Total number of cached tokens for this sequence
+        past_seen_token_num: Total number of tokens seen in previous iterations (cached)
         mm_token_lengths: Length of each multimodal token chunk
         mm_token_positions: Starting positions of each multimodal token chunk
-        prompt_tokens: Current iteration of prompt tokens for this sequence (optional). Need it for chunk prefill if enabled (#TODO)
-        num_cached_mm_tokens: Number of multimodal tokens that are cached in this iteration (computed)
-        total_mm_tokens: Total number of multimodal tokens in this sequence (computed)
+        chunk_end_pos: End position of the current chunk for chunked prefill
+        num_unseen_mm_tokens: Number of multimodal tokens that are cached (computed)
+        num_mm_tokens: Number of multimodal tokens in the current chunk (computed)
     """
-    num_cached_tokens: int
+    past_seen_token_num: int # == num_cached_tokens
     mm_token_lengths: List[int]
     mm_token_positions: List[int]
+    chunk_end_pos: int # == end_pos
 
-    # TODO: support chunk prefill for multimodal
-    # When chunk prefill is enabled, we need to pass the prompt tokens for current chunk and mask to find the included mm tokens
-    prompt_tokens: Optional[List[int]] = None
-
-    num_cached_mm_tokens: Optional[int] = None
-    total_mm_tokens: Optional[int] = None
+    num_unseen_mm_tokens: Optional[int] = None
+    num_mm_tokens: Optional[int] = None
+    # TODO: fine-grained control of encoder runner/cache to each mm_item
 
     def __post_init__(self):
         # Validate input data
@@ -118,9 +116,9 @@ class MultimodalRuntimeData:
                 f"mm_token_positions ({len(self.mm_token_positions)}) and mm_token_lengths ({len(self.mm_token_lengths)}) must have the same length"
             )
 
-        if self.num_cached_tokens < 0:
+        if self.past_seen_token_num < 0:
             raise ValueError(
-                f"num_cached_tokens must be non-negative, got {self.num_cached_tokens}"
+                f"past_seen_token_num must be non-negative, got {self.past_seen_token_num}"
             )
 
         if any(length <= 0 for length in self.mm_token_lengths):
@@ -133,22 +131,34 @@ class MultimodalRuntimeData:
                 f"All mm_token_positions must be non-negative, got {self.mm_token_positions}"
             )
 
-        if self.num_cached_mm_tokens is None:
+        if self.num_unseen_mm_tokens is None or self.num_mm_tokens is None:
             # Compute cached multimodal tokens based on positions and cached tokens
-            self.num_cached_mm_tokens = 0
+            self.num_unseen_mm_tokens = 0
+            self.num_mm_tokens = 0
             for pos, length in zip(self.mm_token_positions,
                                    self.mm_token_lengths):
-                if pos + length <= self.num_cached_tokens:
-                    self.num_cached_mm_tokens += length
-                elif pos < self.num_cached_tokens:
+                if pos + length <= self.past_seen_token_num:
+                    self.num_unseen_mm_tokens += length
+                elif pos < self.past_seen_token_num:
                     # Partial overlap - only count the cached portion
-                    self.num_cached_mm_tokens += self.num_cached_tokens - pos
+                    self.num_unseen_mm_tokens += self.past_seen_token_num - pos
+                    if pos + length > self.chunk_end_pos:
+                        self.num_mm_tokens += self.chunk_end_pos - self.past_seen_token_num
+                    else:
+                        self.num_mm_tokens += pos + length - self.past_seen_token_num
+                else:
+                    if pos + length > self.chunk_end_pos:
+                        # Partial overlap - only count the cached portion
+                        if pos < self.chunk_end_pos:
+                            self.num_mm_tokens += self.chunk_end_pos - pos
+                    else:
+                        # Full overlap - count the entire mm item chunk
+                        self.num_mm_tokens += length
 
-        if self.num_cached_mm_tokens > self.num_cached_tokens:
+        if self.num_unseen_mm_tokens + self.num_mm_tokens > sum(self.mm_token_lengths):
             raise ValueError(
-                f"num_cached_mm_tokens ({self.num_cached_mm_tokens}) must be less than or equal to "
-                f"num_cached_tokens ({self.num_cached_tokens})")
-        self.total_mm_tokens = sum(self.mm_token_lengths)
+                f"num_unseen_mm_tokens ({self.num_unseen_mm_tokens}) + num_mm_tokens ({self.num_mm_tokens}) must be less than or equal to sum of mm_token_lengths ({sum(self.mm_token_lengths)})"
+            )
 
 
 @dataclass
