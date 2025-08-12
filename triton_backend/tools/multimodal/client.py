@@ -20,8 +20,30 @@ from transformers import AutoProcessor, Blip2Processor
 from utils import utils
 
 
+def pixtral_pad_images(raw_image):
+    if not raw_image:
+        return np.empty((0, 0, 0, 0), dtype=np.uint8), np.empty((0, 2),
+                                                                dtype=np.int64)
+    raw_image = [np.array(img) for img in raw_image]
+    shapes = [img.shape for img in raw_image]
+    assert all(len(s) == 3
+               for s in shapes), "All input images must have three dimensions"
+    assert all(s[-1] == shapes[0][-1] for s in
+               shapes), "All input images must have the same number of channels"
+    max_h, max_w = max(s[0] for s in shapes), max(s[1] for s in shapes)
+    for i in range(len(raw_image)):
+        raw_image[i] = np.pad(raw_image[i],
+                              ((0, max_h - raw_image[i].shape[0]),
+                               (0, max_w - raw_image[i].shape[1]), (0, 0)),
+                              mode='constant')
+    raw_image = np.stack(raw_image, axis=0)
+    image_sizes = np.array([s[:2] for s in shapes], dtype=np.int64)
+    return raw_image, image_sizes
+
+
 def prepare_inputs(text_data,
                    image_data,
+                   image_sizes,
                    request_output_len_data,
                    beam_width_data,
                    temperature_data,
@@ -37,6 +59,7 @@ def prepare_inputs(text_data,
     inputs = [
         utils.prepare_tensor("text_input", text_data, grpcclient),
         utils.prepare_tensor(image_input_name, image_data, grpcclient),
+        utils.prepare_tensor("image_sizes_input", image_sizes, grpcclient),
         utils.prepare_tensor("max_tokens", request_output_len_data, grpcclient),
         utils.prepare_tensor("beam_width", beam_width_data, grpcclient),
         utils.prepare_tensor("temperature", temperature_data, grpcclient),
@@ -249,16 +272,18 @@ if __name__ == "__main__":
                         help="path to the model directory")
     FLAGS = parser.parse_args()
     # load and process images or video
+    image_sizes = np.empty((0, 2), dtype=np.int64)
     if 'vila' in FLAGS.model_type:
         image_paths = FLAGS.image.split(",")
         raw_image = []
         for image_path in image_paths:
             raw_image.append(load_image(image_path))
     elif 'pixtral' in FLAGS.model_type:
-        image_paths = FLAGS.image.split(",")
+        image_paths = FLAGS.image.split(",") if FLAGS.image else []
         raw_image = []
         for image_path in image_paths:
-            raw_image.append(load_image(image_path, as_pil_image=False))
+            raw_image.append(load_image(image_path))
+        raw_image, image_sizes = pixtral_pad_images(raw_image)
     elif FLAGS.video is not None:
         assert FLAGS.video_num_frames is not None, "Number of frames should be provided for video input."
         raw_video = load_video(FLAGS.video, FLAGS.video_num_frames)
@@ -309,8 +334,8 @@ if __name__ == "__main__":
         image_data = np.array([[raw_image]])
         image_input_name = "image_bytes_input"
     elif 'pixtral' in FLAGS.model_type:
-        image_data = np.array([raw_image], dtype=np.object_)
-        image_input_name = "images_input"
+        image_data = np.array([raw_image])
+        image_input_name = "image_bytes_input"
     elif 'llava_onevision' in FLAGS.model_type:
         if FLAGS.video is not None:
             image_data = np.array([raw_video])
@@ -342,6 +367,7 @@ if __name__ == "__main__":
     temperature_data = np.array(temperature, dtype=np.float32)
     streaming = [[FLAGS.streaming]]
     streaming_data = np.array(streaming, dtype=bool)
+    image_sizes_data = np.array([image_sizes], dtype=np.int64)
 
     model_name = "ensemble"
     if FLAGS.use_bls:
@@ -364,6 +390,7 @@ if __name__ == "__main__":
 
     inputs = prepare_inputs(text_data,
                             image_data,
+                            image_sizes_data,
                             request_output_len_data,
                             beam_width_data,
                             temperature_data,

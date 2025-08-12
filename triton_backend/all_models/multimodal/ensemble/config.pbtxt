@@ -59,9 +59,9 @@ input [
   },
   # An arbitrary number of images for pixtral
   {
-      name: "images_input"
-      data_type: TYPE_STRING
-      dims: [ -1 ]
+      name: "image_sizes_input"
+      data_type: TYPE_INT64
+      dims: [ -1, 2 ]
       optional: true
   },
   {
@@ -261,8 +261,8 @@ ensemble_scheduling {
         value: "image_url_input"
       }
       input_map {
-        key: "IMAGES"
-        value: "images_input"
+        key: "IMAGE_SIZES"
+        value: "image_sizes_input"
       }
       input_map {
         key: "VIDEO_BYTES"

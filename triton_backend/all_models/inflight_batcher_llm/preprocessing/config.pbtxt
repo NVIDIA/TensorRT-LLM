@@ -58,11 +58,11 @@ input [
         dims: [ 1 ]
         optional: true
     },
-    # An arbitrary number of images for pixtral
+    # Required for pixtral
     {
-        name: "IMAGES"
-        data_type: TYPE_STRING
-        dims: [ -1 ]
+        name: "IMAGE_SIZES"
+        data_type: TYPE_INT64
+        dims: [ -1, 2 ]
         optional: true
     },
     {
