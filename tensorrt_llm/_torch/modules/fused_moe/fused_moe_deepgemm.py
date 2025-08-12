@@ -336,7 +336,9 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
             # It can avoid OOM for 8k/1k cases.
             default_moe_max_num_tokens = 18688
             if moe_max_num_tokens > default_moe_max_num_tokens:
+                model_config._frozen = False
                 model_config.moe_max_num_tokens = default_moe_max_num_tokens
+                model_config._frozen = True
 
         super().__init__(
             routing_method=routing_method,
