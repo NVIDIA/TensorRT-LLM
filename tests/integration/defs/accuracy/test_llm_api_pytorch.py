@@ -1394,6 +1394,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             pytest.skip("PP with torch.compile is not supported yet.")
         if moe_backend == "TRTLLM" and get_sm_version() == 120:
             pytest.skip("MOE TRTLLM backend does not support SM version 120")
+        if fp8kv and get_sm_version() == 120:
+            pytest.skip("https://nvbugs/5451373")
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
         # Picewise Cuda Graph cannot be enabled for nvfp4 attention dp.
         torch_compile_config = TorchCompileConfig(
