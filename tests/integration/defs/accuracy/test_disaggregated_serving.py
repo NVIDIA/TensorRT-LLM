@@ -801,19 +801,20 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
 @skip_pre_blackwell
 @pytest.mark.timeout(3600)
 class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
-    fp4_model = f"{llm_models_root()}/Qwen3/saved_models_Qwen3-30B-A3B_nvfp4_hf"
-    fp8_model = f"{llm_models_root()}/Qwen3/saved_models_Qwen3-30B-A3B_fp8_hf"
+    FP4_MODEL = f"{llm_models_root()}/Qwen3/saved_models_Qwen3-30B-A3B_nvfp4_hf"
+    FP8_MODEL = f"{llm_models_root()}/Qwen3/saved_models_Qwen3-30B-A3B_fp8_hf"
 
-    @pytest.mark.parametrize("ctxpp,gentp", [(2, 2)], ids=["ctxpp2gentp2"])
-    def test_mixed_ctx_gen_model(self, ctxpp, gentp):
-        ctx_model = self.fp4_model
-        gen_model = self.fp8_model
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.parametrize("ctx_pp,gen_tp", [(2, 2)], ids=["ctxpp2gentp2"])
+    def test_mixed_ctx_gen_model(self, ctx_pp, gen_tp):
+        ctx_model = self.FP4_MODEL
+        gen_model = self.FP8_MODEL
         return run_parallel_test("Qwen3/Qwen3-30B-A3B",
                                  ctx_model,
-                                 ctx_pp=ctxpp,
+                                 ctx_pp=ctx_pp,
                                  ctx_tp=1,
                                  gen_pp=1,
-                                 gen_tp=gentp,
+                                 gen_tp=gen_tp,
                                  test_sets=[GSM8K, MMLU],
                                  ctx_model=ctx_model,
                                  gen_model=gen_model)
