@@ -478,7 +478,6 @@ class ChatCompletionRequest(OpenAIBaseModel):
                                 ChatCompletionNamedToolChoiceParam]] = "none"
     #FIXME: maybe remove this field because it could be added to chat_template_kwargs
     reasoning_effort: Optional[Literal["low", "medium", "high"]] = None
-    use_harmony: bool = False
     user: Optional[str] = None
 
     # doc: begin-chat-completion-sampling-params

@@ -59,7 +59,6 @@ class ChatPostprocArgs(PostprocArgs):
             tool_choice=request.tool_choice,
             stream_options=request.stream_options,
             return_logprobs=request.logprobs,
-            use_harmony=request.use_harmony,
         )
 
 

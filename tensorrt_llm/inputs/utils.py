@@ -361,7 +361,7 @@ def add_multimodal_placeholders(model_type: str, text_prompt: str,
 
 def resolve_hf_chat_template(
     tokenizer: TokenizerBase,
-    processor: ProcessorMixin,
+    processor: ProcessorMixin | None,
     chat_template: Optional[str],
     tools: Optional[list[dict[str, Any]]],
 ) -> Optional[str]:
@@ -401,7 +401,7 @@ def apply_chat_template(
     *,
     model_type: str,
     tokenizer: Union[TransformersTokenizer, TokenizerBase],
-    processor: ProcessorMixin,
+    processor: ProcessorMixin | None,
     conversation: list[ConversationMessage],
     add_generation_prompt: bool,
     mm_placeholder_counts: dict[str, int],

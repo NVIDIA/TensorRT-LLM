@@ -14,8 +14,8 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response, StreamingResponse
-from starlette.routing import Mount
 from openai_harmony import HarmonyEncodingName, load_harmony_encoding
+from starlette.routing import Mount
 from transformers import AutoConfig, AutoProcessor
 
 from tensorrt_llm._tensorrt_engine import LLM
@@ -71,11 +71,7 @@ class OpenAIServer:
         except Exception:
             logger.debug("Failed to load AutoProcessor or AutoConfig for %s", hf_tokenizer_path)
             self.processor = None
-        try:
-            self.model_config = AutoConfig.from_pretrained(hf_tokenizer_path, trust_remote_code=trust_remote_code)
-        except Exception:
-            logger.debug("Failed to load AutoConfig for %s", hf_tokenizer_path)
-            self.model_config = None
+        self.model_config = AutoConfig.from_pretrained(hf_tokenizer_path, trust_remote_code=trust_remote_code)
 
         model_dir = Path(model)
         if model_dir.exists() and model_dir.is_dir():
@@ -301,18 +297,10 @@ class OpenAIServer:
             # TODO: better way to enable metrics
             if len(os.getenv("TRTLLM_KVCACHE_TIME_OUTPUT_PATH", "")) > 0:
                 sampling_params.return_perf_metrics = True
-            if request.use_harmony:
-                encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
-                harmony_stop_token_ids = encoding.stop_tokens_for_assistant_actions()
-                if stop_token_ids := sampling_params.stop_token_ids:
-                    stop_token_ids += harmony_stop_token_ids
-                else:
-                    stop_token_ids = harmony_stop_token_ids
-            postproc_args = ChatPostprocArgs.from_request(request)
-            disaggregated_params = to_llm_disaggregated_params(request.disaggregated_params)
 
-            conversation, mm_coroutines, mm_placeholder_counts = parse_chat_messages_coroutines(request.messages, self.model_config)
-
+            # Prompt rendering
+            conversation, mm_coroutines, mm_placeholder_counts = parse_chat_messages_coroutines(
+                request.messages, self.model_config)
             if request.prompt_token_ids is not None:
                 prompt = request.prompt_token_ids
             else:
@@ -332,11 +320,12 @@ class OpenAIServer:
                     chat_template_kwargs=chat_template_kwargs,
                 )
             prompt = prompt_inputs(prompt)
-
             mm_data = await mm_coroutines
             if mm_data is not None:
                 prompt["multi_modal_data"] = mm_data
 
+            # Configure post processor
+            postproc_args = ChatPostprocArgs.from_request(request)
             postproc_args.reasoning_parser = self.llm.args.reasoning_parser
             if conversation and conversation[-1].get(
                     "content") and conversation[-1].get("role") == get_role():
@@ -347,6 +336,18 @@ class OpenAIServer:
                 postproc_args=postproc_args,
             )
 
+            # For gpt-oss
+            use_harmony = self.model_config.model_type == "gpt_oss"
+            postproc_args.use_harmony = use_harmony
+            if use_harmony:
+                encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
+                harmony_stop_token_ids = encoding.stop_tokens_for_assistant_actions()
+                if stop_token_ids := sampling_params.stop_token_ids:
+                    stop_token_ids += harmony_stop_token_ids
+                else:
+                    stop_token_ids = harmony_stop_token_ids
+
+            disaggregated_params = to_llm_disaggregated_params(request.disaggregated_params)
             promise = self.llm.generate_async(
                 inputs=prompt,
                 sampling_params=sampling_params,
