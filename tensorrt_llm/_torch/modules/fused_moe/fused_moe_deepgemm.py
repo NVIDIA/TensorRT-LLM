@@ -330,6 +330,16 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
         apply_router_weight_on_input: bool = False,
         layer_idx: Optional[int] = None,
     ):
+        if model_config.moe_max_num_tokens is None:
+            moe_max_num_tokens = model_config.max_num_tokens * model_config.mapping.dp_size
+            # The default moe_max_num_tokens is calculated from the following formula:
+            # max_isl = 8196, max_batch_size = 1024, mtp = 0
+            # max_num_tokens = ((mtp+1)*max_batch_size+max_isl+128+63)//64*64 = 9344
+            # moe_max_num_tokens = max_num_tokens * 2 = 18688
+            # It can avoid OOM for 8k/1k cases.
+            default_moe_max_num_tokens = 18688
+            if moe_max_num_tokens > default_moe_max_num_tokens:
+                model_config.moe_max_num_tokens = default_moe_max_num_tokens
 
         super().__init__(
             routing_method=routing_method,

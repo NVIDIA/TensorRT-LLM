@@ -83,11 +83,8 @@ class VanillaMoE(nn.ModuleList):
 
         max_num_tokens = model_config.max_num_tokens
         # The maximum number of tokens in MoE are multiplied by DP size when attention DP is enabled
-        if self.use_dp:
-            max_num_tokens *= model_config.mapping.world_size
-        self.moe_max_num_tokens = (model_config.moe_max_num_tokens
-                                   if model_config.moe_max_num_tokens
-                                   is not None else max_num_tokens)
+        moe_max_num_tokens = model_config.max_num_tokens * model_config.mapping.dp_size
+        self.moe_max_num_tokens = model_config.moe_max_num_tokens or moe_max_num_tokens
 
         self._weights_created = False
         if not model_config.skip_create_weights_in_init:

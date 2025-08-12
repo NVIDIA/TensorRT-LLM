@@ -112,11 +112,10 @@ class CutlassFusedMoE(MoE):
 
         max_num_tokens = model_config.max_num_tokens
         # The maximum number of tokens in MoE are multiplied by DP size when attention DP is enabled
-        if self.use_dp:
-            max_num_tokens *= model_config.mapping.world_size
-        self.moe_max_num_tokens = model_config.moe_max_num_tokens or max_num_tokens
+        moe_max_num_tokens = model_config.max_num_tokens * model_config.mapping.dp_size
+        self.moe_max_num_tokens = model_config.moe_max_num_tokens or moe_max_num_tokens
         # The auxiliary CUDA stream and CUDA events are only used when MoE chunking is applied
-        if self.moe_max_num_tokens < max_num_tokens:
+        if self.moe_max_num_tokens < moe_max_num_tokens:
             self.aux_stream = aux_stream_dict[
                 AuxStreamType.
                 MoeChunkingOverlap] if aux_stream_dict is not None else torch.cuda.Stream(
