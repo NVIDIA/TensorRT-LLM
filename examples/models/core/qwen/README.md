@@ -26,6 +26,7 @@ This document shows how to build and run a [Qwen](https://huggingface.co/Qwen) m
     - [Serving](#serving)
       - [trtllm-serve](#trtllm-serve)
       - [Disaggregated Serving](#disaggregated-serving)
+    - [Eagle3](#eagle3)
   - [Dynamo](#dynamo)
   - [Notes and Troubleshooting](#notes-and-troubleshooting)
   - [Credits](#credits)
@@ -624,7 +625,7 @@ git clone https://huggingface.co/Qwen/Qwen3-30B-A3B <YOUR_MODEL_DIR>
 
 #### Run a single inference
 
-To quickly run Qwen3, [examples/llm-api/quickstart_advanced.py](../../../pytorch/quickstart_advanced.py):
+To quickly run Qwen3, [examples/llm-api/quickstart_advanced.py](../../../llm-api/quickstart_advanced.py):
 
 ```bash
 python3 examples/llm-api/quickstart_advanced.py --model_dir Qwen3-30B-A3B/ --kv_cache_fraction 0.6
@@ -765,7 +766,6 @@ trtllm-serve \
   Qwen3-30B-A3B/ \
   --host localhost \
   --port 8000 \
-  --backend pytorch \
   --max_batch_size 161 \
   --max_num_tokens 1160 \
   --tp_size 1 \
@@ -804,7 +804,6 @@ trtllm-serve \
   Qwen3-30B-A3B/ \
   --host localhost \
   --port 8001 \
-  --backend pytorch \
   --max_batch_size 161 \
   --max_num_tokens 1160 \
   --tp_size 1 \
@@ -842,7 +841,6 @@ trtllm-serve \
   Qwen3-30B-A3B/ \
   --host localhost \
   --port ${port} \
-  --backend pytorch \
   --max_batch_size 161 \
   --max_num_tokens 1160 \
   --tp_size 1 \
@@ -890,6 +888,38 @@ curl http://localhost:8000/v1/completions \
 Note that the optimal disaggregated serving configuration (i.e. tp/pp/ep mappings, number of ctx/gen instances, etc.) will depend
 on the request parameters, the number of concurrent requests and the GPU type. It is recommended to experiment to identify optimal
 settings for your specific use case.
+
+#### Eagle3
+
+Qwen3 now supports Eagle3 (Speculative Decoding with Eagle3). To enable Eagle3 on Qwen3, you need to set the following arguments when running `trtllm-bench` or `trtllm-serve`:
+
+- `speculative_config.decoding_type: Eagle`
+  Set the decoding type to "Eagle" to enable Eagle3 speculative decoding.
+- `speculative_config.max_draft_len: 3`
+  Set the maximum number of draft tokens generated per step (this value can be adjusted as needed).
+- `speculative_config.speculative_model_dir: <EAGLE3_DRAFT_MODEL_PATH>`
+  Specify the path to the Eagle3 draft model (ensure the corresponding draft model weights are prepared).
+
+Currently, there are some limitations when enabling Eagle3:
+
+1. `attention_dp` is not supported. Please disable it or do not set the related flag (it is disabled by default).
+2. If you want to use `enable_block_reuse`, the kv cache type of the target model and the draft model must be the same. Since the draft model only supports fp16/bf16, you need to disable `enable_block_reuse` when using fp8 kv cache.
+
+Example `extra-llm-api-config.yml` snippet for Eagle3:
+
+```bash
+echo "
+enable_attention_dp: false
+speculative_config:
+    decoding_type: Eagle
+    max_draft_len: 3
+    speculative_model_dir: <EAGLE3_DRAFT_MODEL_PATH>
+kv_cache_config:
+    enable_block_reuse: false
+" >> ${path_config}
+```
+
+For further details, please refer to [speculative-decoding.md](../../../../docs/source/advanced/speculative-decoding.md)
 
 ### Dynamo
 

@@ -57,12 +57,12 @@ def _register_fake():
 
     #MNNVL Allreduce
     @torch.library.register_fake("trtllm::mnnvl_twoshot_allreduce")
-    def _(input, buffer, buffer_flags, wait_for_results):
+    def _(input, buffer, buffer_flags, buffer_size, wait_for_results):
         output = input.new_empty(input.shape)
         return output
 
     @torch.library.register_fake("trtllm::mnnvl_twoshot_rmsnorm")
-    def _(comm_buf, gamma, eps, residual, buffer_flags):
+    def _(comm_buf, gamma, eps, residual, buffer_flags, buffer_size):
         output = residual.new_empty(residual.shape)
         residual_out = residual.new_empty(residual.shape)
         return [output, residual_out]
@@ -458,7 +458,7 @@ def _register_fake():
         gemm2_output: torch.Tensor,
         fc2_expert_biases: torch.Tensor,
         unpermuted_final_scales: torch.Tensor,
-        expanded_source_row_to_expanded_dest_row: torch.Tensor,
+        unpermuted_row_to_permuted_row: torch.Tensor,
         expert_for_source_row: torch.Tensor,
         expert_first_token_offset_tensor: torch.Tensor,
         num_rows: torch.SymInt,
@@ -501,52 +501,7 @@ def _register_fake():
             shape[0] = sizes[local_rank]
         return input.new_empty(shape)
 
-    @torch.library.register_fake("trtllm::fp4_block_scale_moe_runner")
-    def _(
-        routing_logits,
-        routing_bias,
-        hidden_states,
-        hidden_states_scale,
-        gemm1_weights,
-        gemm1_weights_scale,
-        gemm2_weights,
-        gemm2_weights_scale,
-        output1_scale_scalar,
-        output1_scale_gate_scalar,
-        output2_scale_scalar,
-        num_experts,
-        top_k,
-        n_group,
-        topk_group,
-        intermediate_size,
-        local_expert_offset,
-        local_num_experts,
-        routed_scaling_factor,
-        tile_tokens_dim,
-        routing_method_type,
-        do_finalize,
-    ) -> List[torch.Tensor]:
-        num_tokens = hidden_states.shape[0]
-        hidden_size = hidden_states.shape[1] * 2
-        if do_finalize:
-            return [
-                hidden_states.new_empty((num_tokens, hidden_size),
-                                        dtype=torch.bfloat16)
-            ]
-
-        expanded_row_count = num_tokens * top_k
-        max_padding_required = (tile_tokens_dim - 1) * num_experts
-        max_num_padded_tokens = fp4_utils.pad_up(
-            expanded_row_count + max_padding_required, tile_tokens_dim)
-        wt_dtype = routing_bias.dtype if routing_bias is not None else torch.bfloat16
-        return [
-            hidden_states.new_empty((max_num_padded_tokens, hidden_size),
-                                    dtype=torch.bfloat16),
-            hidden_states.new_empty((num_tokens, top_k), dtype=wt_dtype),
-            hidden_states.new_empty((num_tokens, top_k), dtype=torch.int32)
-        ]
-
-    @torch.library.register_fake("trtllm::nvfp4_block_scale_interleave")
+    @torch.library.register_fake("trtllm::block_scale_interleave")
     def _(sf: torch.Tensor):
         rows = sf.shape[-2]
         cols = sf.shape[-1]
@@ -556,6 +511,23 @@ def _register_fake():
         return sf.new_empty((num_experts * expert_out_size, ),
                             dtype=torch.uint8)
 
-    @torch.library.register_fake("trtllm::nvfp4_block_scale_interleave_reverse")
+    @torch.library.register_fake("trtllm::block_scale_interleave_reverse")
     def _(sf: torch.Tensor):
         return torch.empty_like(sf, dtype=torch.uint8)
+
+    @torch.library.register_fake("trtllm::moe_finalize_allreduce")
+    def _(input, residual, norm_weight, expanded_idx_to_permuted_idx,
+          shared_expert_output, expert_scale_factor, workspace, rank, nranks,
+          eps) -> List[torch.Tensor]:
+        return [
+            torch.empty_like(residual),
+            torch.empty_like(residual),
+        ]
+
+    @torch.library.register_fake("trtllm::renorm_moe_routing_op")
+    def _(router_logits, topk):
+        num_tokens = router_logits.shape[0]
+        sz = (num_tokens, topk)
+        return router_logits.new_empty(
+            sz, dtype=torch.int32), router_logits.new_empty(sz,
+                                                            dtype=torch.float32)

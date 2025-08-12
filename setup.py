@@ -107,7 +107,8 @@ else:
         'libs/libdecoder_attention_1.so', 'libs/nvshmem/License.txt',
         'libs/nvshmem/nvshmem_bootstrap_uid.so.3',
         'libs/nvshmem/nvshmem_transport_ibgda.so.103', 'bindings.*.so',
-        'deep_ep/LICENSE', 'deep_ep_cpp_tllm.*.so', "include/**/*"
+        'deep_ep/LICENSE', 'deep_ep_cpp_tllm.*.so', "include/**/*",
+        'deep_gemm/LICENSE', 'deep_gemm/include/**/*', 'deep_gemm_cpp_tllm.*.so'
     ]
 
 package_data += [
@@ -115,6 +116,7 @@ package_data += [
     'tools/plugin_gen/templates/*',
     'bench/build/benchmark_config.yml',
     'evaluate/lm_eval_tasks/**/*',
+    "_torch/auto_deploy/config/*.yaml",
 ]
 
 
@@ -185,7 +187,7 @@ def extract_from_precompiled(precompiled_location: str, package_data: List[str],
 
     with zipfile.ZipFile(wheel_path) as wheel:
         for file in wheel.filelist:
-            if file.filename.endswith(".py"):
+            if file.filename.endswith((".py", ".yaml")):
                 continue
             for filename_pattern in package_data:
                 if fnmatch.fnmatchcase(file.filename,

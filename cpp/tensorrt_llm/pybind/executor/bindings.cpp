@@ -240,11 +240,22 @@ void initBindings(pybind11::module_& m)
     py::class_<tle::KVCacheEvent>(executor_kv_cache, "KVCacheEvent")
         .def_readonly("event_id", &tle::KVCacheEvent::eventId)
         .def_readonly("data", &tle::KVCacheEvent::data)
-        .def_readonly("window_size", &tle::KVCacheEvent::windowSize);
+        .def_readonly("window_size", &tle::KVCacheEvent::windowSize)
+        .def_readonly("attention_dp_rank", &tle::KVCacheEvent::attentionDpRank);
 
     py::class_<tle::KVCacheEventManager, std::shared_ptr<tle::KVCacheEventManager>>(
         executor_kv_cache, "KVCacheEventManager")
-        .def("get_latest_events", &tle::KVCacheEventManager::getLatestEvents, py::arg("timeout") = std::nullopt);
+        .def(
+            "get_latest_events",
+            [](tle::KVCacheEventManager& self, std::optional<double> timeout_ms = std::nullopt)
+            {
+                if (timeout_ms)
+                {
+                    return self.getLatestEvents(std::chrono::milliseconds(static_cast<int64_t>(*timeout_ms)));
+                }
+                return self.getLatestEvents(std::nullopt);
+            },
+            py::arg("timeout_ms") = std::nullopt);
 
     tensorrt_llm::pybind::executor::initRequestBindings(m);
     tensorrt_llm::pybind::executor::initConfigBindings(m);

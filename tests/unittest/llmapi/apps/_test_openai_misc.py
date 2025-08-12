@@ -10,22 +10,30 @@ from ..test_llm import get_model_path
 from .openai_server import RemoteOpenAIServer
 
 
-@pytest.fixture(scope="module")
-def model_name():
-    return "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
-
-
-@pytest.fixture(scope="module", params=["trt", 'pytorch'])
+@pytest.fixture(scope="module", params=["trt", "pytorch"])
 def backend(request):
     return request.param
 
 
-@pytest.fixture(scope="module", params=['8'])
+@pytest.fixture(scope="module")
+def model_name(backend):
+    # Note: TRT backend does not support Qwen3-0.6B-Base,
+    # and PyTorch backend does not support going over the limit of "max_position_embeddings" tokens
+    # of TinyLlama.
+    if backend == "trt":
+        return "llama-models-v2/TinyLlama-1.1B-Chat-v1.0"
+    else:
+        return "Qwen3/Qwen3-0.6B-Base"
+
+
+@pytest.fixture(scope="module", params=["8"])
 def max_batch_size(request):
     return request.param
 
 
-@pytest.fixture(scope="module", params=['80000'])
+# Note: In the model Qwen3-0.6B-Base, "max_position_embeddings" is 32768,
+# so the inferred max_seq_len is 32768.
+@pytest.fixture(scope="module", params=["32768"])
 def max_seq_len(request):
     return request.param
 
@@ -34,19 +42,13 @@ def max_seq_len(request):
 def server(model_name: str, backend: str, max_batch_size: str,
            max_seq_len: str):
     model_path = get_model_path(model_name)
-    args = []
-    if backend == "pytorch":
-        args.append("--backend")
-        args.append(backend)
+    args = ["--backend", f"{backend}"]
     if backend != "pytorch":
-        args.append("--max_beam_width")
-        args.append("4")
+        args.extend(["--max_beam_width", "4"])
     if max_batch_size is not None:
-        args.append("--max_batch_size")
-        args.append(max_batch_size)
+        args.extend(["--max_batch_size", max_batch_size])
     if max_seq_len is not None:
-        args.append("--max_seq_len")
-        args.append(max_seq_len)
+        args.extend(["--max_seq_len", max_seq_len])
     with RemoteOpenAIServer(model_path, args) as remote_server:
         yield remote_server
 

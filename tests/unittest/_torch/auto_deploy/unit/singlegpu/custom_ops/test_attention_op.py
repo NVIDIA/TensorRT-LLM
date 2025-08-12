@@ -1,6 +1,7 @@
 import pytest
 import torch
 from _custom_op_utils import torch_rope_reference
+from torch_attention_reference import TorchAttentionReference
 
 import tensorrt_llm._torch.auto_deploy  # noqa: F401
 
@@ -24,12 +25,8 @@ def test_attention_op():
     output = torch.ops.auto_deploy.triton_attention_fused_mha_with_cache(
         q, k, v, input_positions, k_cache, v_cache, None
     )
-    ref = torch.nn.functional.scaled_dot_product_attention(
-        q.transpose(1, 2),
-        k_cache[:, : input_positions[0] + 1].transpose(1, 2),
-        v_cache[:, : input_positions[0] + 1].transpose(1, 2),
-    )
-    ref = ref.transpose(1, 2).contiguous().view(BATCH_SIZE, 1, -1)
+    # Use torch backend as clean reference
+    ref = TorchAttentionReference.basic_mha_with_cache(q, k, v, k_cache, v_cache, input_positions)
     assert torch.allclose(
         ref.cpu().to(torch.float32),
         output.cpu().to(torch.float32),
@@ -70,27 +67,8 @@ def test_gqa_op(device, dtype, n_heads, group_size, seq_len):
         q, k, v, input_positions, k_cache, v_cache, None
     )
 
-    k_cache[:, input_positions[0] : input_positions[0] + seq_len] = k
-    v_cache[:, input_positions[0] : input_positions[0] + seq_len] = v
-
-    k_cache = torch.repeat_interleave(k_cache, group_size, dim=2)  # [b,s,n,d]
-    v_cache = torch.repeat_interleave(v_cache, group_size, dim=2)  # [b,s,n,d]
-
-    mask = torch.cat(
-        [
-            torch.ones(seq_len, input_positions[0], device=device, dtype=torch.bool),
-            torch.tril(torch.ones(seq_len, seq_len, device=device, dtype=torch.bool)),
-        ],
-        dim=1,
-    )
-
-    ref = torch.nn.functional.scaled_dot_product_attention(
-        q.transpose(1, 2),
-        k_cache[:, : input_positions[0] + seq_len].transpose(1, 2),
-        v_cache[:, : input_positions[0] + seq_len].transpose(1, 2),
-        attn_mask=mask,
-    )
-    ref = ref.transpose(1, 2).contiguous().view(BATCH_SIZE, seq_len, n_heads * D_HEAD)
+    # Use torch backend as clean reference
+    ref = TorchAttentionReference.basic_mha_with_cache(q, k, v, k_cache, v_cache, input_positions)
 
     assert torch.allclose(
         ref.cpu().to(torch.float32),
@@ -167,47 +145,10 @@ def test_flat_gqa_op(
         scale=None,
     )
 
-    # prep batched tensors for comparison
-    q_b = torch.zeros(batch_size, n_heads, max_seq_len, D_HEAD, **dtype_kwargs)
-    k_cache_b = k_cache[cache_loc].transpose(1, 2)
-    v_cache_b = v_cache[cache_loc].transpose(1, 2)
-
-    def _store(t_batched, t_flat):
-        # batched layout: [n,s,d]; flat layout: [s,n*d]
-        n_h, _, d_h = t_batched.shape
-        t_batched[:] = t_flat.view(-1, n_h, d_h).transpose(0, 1)
-
-    for i_b, (i_pos, s_start, s_len) in enumerate(zip(input_positions, seq_start, seq_len)):
-        # fill q in a batched manner
-        _store(q_b[i_b, :, :s_len], q[0, s_start : s_start + s_len])
-        # fill k, v in a batched manner
-        _store(k_cache_b[i_b, :, i_pos : i_pos + s_len], k[0, s_start : s_start + s_len])
-        _store(v_cache_b[i_b, :, i_pos : i_pos + s_len], v[0, s_start : s_start + s_len])
-
-    k_cache_b = torch.repeat_interleave(k_cache_b, group_size, dim=1)  # [b,n,s,d]
-    v_cache_b = torch.repeat_interleave(v_cache_b, group_size, dim=1)  # [b,n,s,d]
-
-    # run comparison
-    refs = []
-    for i_b, (i_pos, s_start, s_len) in enumerate(zip(input_positions, seq_start, seq_len)):
-        mask = torch.cat(
-            [
-                torch.ones(s_len, i_pos, device=device, dtype=torch.bool),
-                torch.tril(torch.ones(s_len, s_len, device=device, dtype=torch.bool)),
-            ],
-            dim=1,
-        )
-        ref_i = torch.nn.functional.scaled_dot_product_attention(
-            q_b[i_b, :, :s_len],
-            k_cache_b[i_b, :, : i_pos + s_len],
-            v_cache_b[i_b, :, : i_pos + s_len],
-            attn_mask=mask,
-        )  # [n,s,d]
-        ref_i = ref_i.transpose(0, 1).contiguous().view(s_len, n_heads * D_HEAD)  # [s,n*d]
-        refs.append(ref_i)
-
-    # flatten output for comparison
-    ref_flat = torch.cat(refs, dim=0)[None]  # [1,s_total,n*d]
+    # Use torch backend as clean reference
+    ref_flat = TorchAttentionReference.flattened_mha_with_cache(
+        q, k, v, seq_len, input_positions, cache_loc, seq_start, k_cache, v_cache
+    )
 
     assert torch.allclose(
         ref_flat.cpu().to(torch.float32),
@@ -480,6 +421,8 @@ def test_paged_gqa_op(
         v_cache,
         None,
     )
+
+    # TODO (nvchenghaoz): Replace this with torch backend reference.
 
     # prep batched tensors for comparison
     def compute_reference(q, k_cache, v_cache):

@@ -1,16 +1,21 @@
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 from torch import nn
 
 from ..attention_backend import AttentionMetadata
+from ..distributed.ops import allgather
+from ..model_config import ModelConfig
 from ..pyexecutor.llm_request import LlmRequest, LlmRequestState
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
 from ..pyexecutor.sampler import (SampleState, SampleStateTensors, TorchSampler,
                                   add_token, int_tensor)
 from ..pyexecutor.scheduler import ScheduledRequests
 from .interface import SpecMetadata
+
+if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
 
 
 @dataclass(kw_only=True)
@@ -62,7 +67,8 @@ class MTPHiddenStatesManager(BaseResourceManager):
             if req.is_first_context_chunk:
                 slot_id = self.slot_manager.add_slot(req.request_id)
                 if self.use_relaxed_acceptance_for_thinking:
-                    self.mtp_relaxed_delta_pool[slot_id] = 0.
+                    self.mtp_relaxed_delta_pool[slot_id].copy_(
+                        0, non_blocking=True)
 
     def update_resources(self, scheduled_batch: ScheduledRequests):
         pass
@@ -70,7 +76,8 @@ class MTPHiddenStatesManager(BaseResourceManager):
     def free_resources(self, request: LlmRequest):
         free_slot_id = self.slot_manager.get_slot(request.request_id)
         if self.use_relaxed_acceptance_for_thinking:
-            self.mtp_relaxed_delta_pool[free_slot_id] = 0.
+            self.mtp_relaxed_delta_pool[free_slot_id].copy_(0,
+                                                            non_blocking=True)
         self.slot_manager.remove_slot(request.request_id)
 
     def add_dummy_requests(self, request_ids: List[int]):
@@ -311,9 +318,10 @@ class MTPSampler(TorchSampler):
 
 class MTPWorker(nn.Module):
 
-    def __init__(self, spec_config: "MTPDecodingConfig"):
+    def __init__(self, spec_config: "MTPDecodingConfig", model_config=None):
         super().__init__()
         self.spec_config = spec_config
+        self.model_config = model_config
         self.is_thop = False
 
     def forward(
@@ -670,6 +678,26 @@ class MTPWorker(nn.Module):
             mtp_past_hidden_states_pool.index_copy_(0, slot_ids,
                                                     new_mtp_past_hidden_states)
 
+    @torch.compile(options={"max-autotune": True})
+    def topk_kernel(self, gen_logprobs, num_gens, mtp_num_modules,
+                    spec_metadata):
+        topk_value, topk_indices = torch.topk(gen_logprobs,
+                                              k=self.spec_config.relaxed_topk,
+                                              dim=-1)
+        topk_indices = topk_indices.reshape(num_gens, mtp_num_modules + 1,
+                                            self.spec_config.relaxed_topk)
+        topk_value = topk_value.reshape(num_gens, mtp_num_modules + 1,
+                                        self.spec_config.relaxed_topk)
+        draft_tokens = spec_metadata.draft_tokens.reshape(
+            num_gens, mtp_num_modules)
+        return topk_value, topk_indices, draft_tokens
+
+    @torch.compile(options={"max-autotune": True})
+    def process_generation_logits(self, logits, num_contexts):
+        gen_logits = logits[num_contexts:]
+        gen_logprobs = torch.softmax(gen_logits, dim=-1)
+        return gen_logprobs
+
     def sample_and_accept_draft_tokens(
         self,
         input_ids: torch.IntTensor,
@@ -787,20 +815,9 @@ class MTPWorker(nn.Module):
             mtp_relaxed_delta_pool.index_copy_(0, ctx_slot_ids, ctx_delta)
 
             # generation
-            gen_logits = logits[num_contexts:]
-            gen_logprobs = torch.softmax(gen_logits, dim=-1)
-
-            topk_value, topk_indices = torch.topk(
-                gen_logprobs, k=self.spec_config.relaxed_topk, dim=-1)
-            # [num_gens, mtp_num_modules + 1, relaxed_topk]
-            topk_indices = topk_indices.reshape(num_gens, mtp_num_modules + 1,
-                                                self.spec_config.relaxed_topk)
-            topk_value = topk_value.reshape(num_gens, mtp_num_modules + 1,
-                                            self.spec_config.relaxed_topk)
-
-            # [num_gens, mtp_num_modules]
-            draft_tokens = spec_metadata.draft_tokens.reshape(
-                num_gens, mtp_num_modules)
+            gen_logprobs = self.process_generation_logits(logits, num_contexts)
+            topk_value, topk_indices, draft_tokens = self.topk_kernel(
+                gen_logprobs, num_gens, mtp_num_modules, spec_metadata)
 
             accepted_tokens, num_accepted_tokens = torch.ops.trtllm.mtp_relaxed_acceptance_op(
                 spec_metadata.slot_ids, topk_value, topk_indices, draft_tokens,
@@ -1024,6 +1041,37 @@ class MTPWorker(nn.Module):
             "attn_metadata": attn_metadata,
         }
 
+    @torch.compile(options={"max-autotune": True})
+    def get_local_max_and_combined(self, logits):
+        local_max_values, local_argmax = torch.max(logits, dim=-1, keepdim=True)
+        # Adjust indices based on TP rank and size
+        vocab_per_rank = logits.shape[-1]
+        max_index_per_rank = local_argmax.type(
+            torch.int32) + (self.model_config.mapping.tp_rank * vocab_per_rank)
+        # Use torch.stack and flatten instead of view+cat to avoid torch.compile issues
+        # Convert both to float32 to ensure consistent dtype
+        max_index_per_rank_float = max_index_per_rank.float()
+        local_max_values_float32 = local_max_values.float()
+
+        # Stack and flatten to get interleaved layout: [idx0, val0, idx1, val1, ...]
+        combined = torch.stack(
+            [max_index_per_rank_float, local_max_values_float32],
+            dim=-1).flatten(-2)
+        return combined
+
+    @torch.compile(options={"max-autotune": True})
+    def get_draft_tokens_from_gathered(self, gathered):
+        gathered_indices_float = gathered[..., 0::2]  # Even positions: indices
+        gathered_values_float = gathered[..., 1::2]  # Odd positions: values
+
+        # Find the rank with maximum value
+        max_indices = torch.argmax(gathered_values_float, dim=-1, keepdim=True)
+
+        # Get the corresponding token indices and convert back to int32
+        draft_tokens = torch.gather(gathered_indices_float, -1,
+                                    max_indices).squeeze(-1).type(torch.int32)
+        return draft_tokens
+
     def draft_sampler(
         self,
         logits: torch.Tensor,
@@ -1041,16 +1089,37 @@ class MTPWorker(nn.Module):
                 [batch_size * max_draft_len]
                 Draft token ids. Flattened.
         '''
+        if (self.model_config is not None
+                and hasattr(self.model_config, 'mapping')
+                and self.model_config.mapping.tp_size
+                > 1) and not (self.model_config.mapping.enable_attention_dp):
+            combined = self.get_local_max_and_combined(logits)
+            gathered = allgather(combined, self.model_config.mapping, dim=-1)
+            draft_tokens = self.get_draft_tokens_from_gathered(gathered)
+        else:
+            # Simple argmax if no TP or no model config
+            draft_tokens = torch.argmax(logits, dim=-1).type(torch.int32)
 
-        draft_tokens = torch.argmax(logits, dim=-1).type(torch.int32)
         return draft_tokens
 
 
 class MTPEagleWorker(MTPWorker):
 
-    def __init__(self, spec_config: "MTPDecodingConfig"):
-        super().__init__(spec_config)
+    def __init__(self,
+                 spec_config: "MTPDecodingConfig",
+                 model_config: Optional[ModelConfig] = None):
+        super().__init__(spec_config, model_config)
+        self.model_config = model_config
         self.mtp_num_modules = spec_config.num_nextn_predict_layers
+
+    @torch.compile(options={"max-autotune": True})
+    def update_draft_tokens(self, next_draft_tokens, new_draft_token,
+                            hidden_states, gather_ids, inputs):
+        next_draft_tokens.append(new_draft_token)
+        # update inputs
+        hidden_states = hidden_states[gather_ids]
+        position_ids = inputs["position_ids"][gather_ids] + 1
+        return hidden_states, position_ids
 
     def forward(
         self,
@@ -1079,16 +1148,25 @@ class MTPEagleWorker(MTPWorker):
             seq_len_cuda = attn_metadata._seq_lens_cuda[:batch_size].clone()
 
         # Prepare inputs for the 1st MTP layer
-        position_ids = position_ids.squeeze(0)
-        last_tokens_idx = torch.cumsum(
-            attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
-        inputs = self.prepare_drafter_inputs(input_ids=input_ids,
-                                             position_ids=position_ids,
-                                             last_tokens_idx=last_tokens_idx,
-                                             hidden_states=hidden_states,
-                                             accepted_tokens=accepted_tokens,
-                                             attn_metadata=attn_metadata,
-                                             spec_metadata=spec_metadata)
+        @torch.compile(options={"max-autotune": True})
+        def prepare_position_ids_and_last_tokens(position_ids, attn_metadata):
+            position_ids = position_ids.squeeze(0)
+            last_tokens_idx = torch.cumsum(
+                attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
+            last_tokens_idx_host = torch.cumsum(
+                attn_metadata.seq_lens, dim=0, dtype=torch.long) - 1
+            return position_ids, last_tokens_idx, last_tokens_idx_host
+
+        position_ids, last_tokens_idx, last_tokens_idx_host = prepare_position_ids_and_last_tokens(
+            position_ids, attn_metadata)
+        inputs = self.prepare_drafter_inputs(
+            input_ids=input_ids,
+            position_ids=position_ids,
+            last_tokens_idx_host=last_tokens_idx_host,
+            hidden_states=hidden_states,
+            accepted_tokens=accepted_tokens,
+            attn_metadata=attn_metadata,
+            spec_metadata=spec_metadata)
 
         # Predict draft tokens
         next_draft_tokens = []
@@ -1122,10 +1200,10 @@ class MTPEagleWorker(MTPWorker):
             logits = mtp_layers[0].shared_head(hidden_states[gather_ids],
                                                lm_head, attn_metadata, True)
             new_draft_token = self.draft_sampler(logits)
-            next_draft_tokens.append(new_draft_token)
-            # update inputs
-            hidden_states = hidden_states[gather_ids]
-            position_ids = inputs["position_ids"][gather_ids] + 1
+
+            hidden_states, position_ids = self.update_draft_tokens(
+                next_draft_tokens, new_draft_token, hidden_states, gather_ids,
+                inputs)
             # update attn_metadata
             if i == 0:
                 attn_metadata._seq_lens[:batch_size].fill_(1)
@@ -1154,14 +1232,18 @@ class MTPEagleWorker(MTPWorker):
                     attn_metadata.block_ids_per_seq[:batch_size, :].copy_(
                         reorder_block_ids_per_seq, non_blocking=True)
             elif hasattr(attn_metadata, 'kv_lens_cuda'):
-                attn_metadata.kv_lens_cuda[:batch_size] += 1
+
+                @torch.compile(options={"max-autotune": True})
+                def update_kv_lens(kv_lens_cuda, batch_size):
+                    kv_lens_cuda[:batch_size] += 1
+
+                update_kv_lens(attn_metadata.kv_lens_cuda, batch_size)
             inputs = {
                 "input_ids": new_draft_token,
                 "position_ids": position_ids,
                 "hidden_states": hidden_states,
                 "attn_metadata": attn_metadata,
             }
-        next_draft_tokens = torch.stack(next_draft_tokens, dim=1)
 
         # restore attn_metadata to support cuda graph
         if attn_metadata.is_cuda_graph:
@@ -1169,12 +1251,21 @@ class MTPEagleWorker(MTPWorker):
             attn_metadata._seq_lens_cuda[:batch_size].copy_(seq_len_cuda)
             attn_metadata.on_update()
 
-        # prepare next new tokens to support overlap scheduler
-        next_new_tokens = accepted_tokens[
-            spec_metadata.batch_indices_cuda[:batch_size],
-            num_accepted_tokens - 1].unsqueeze(1)
-        next_new_tokens = torch.concat([next_new_tokens, next_draft_tokens],
-                                       dim=1)
+        @torch.compile(options={"max-autotune": True})
+        def prepare_next_tokens(next_draft_tokens, accepted_tokens,
+                                spec_metadata, batch_size, num_accepted_tokens):
+            next_draft_tokens = torch.stack(next_draft_tokens, dim=1)
+            # prepare next new tokens to support overlap scheduler
+            next_new_tokens = accepted_tokens[
+                spec_metadata.batch_indices_cuda[:batch_size],
+                num_accepted_tokens - 1].unsqueeze(1)
+            next_new_tokens = torch.concat([next_new_tokens, next_draft_tokens],
+                                           dim=1)
+            return next_draft_tokens, next_new_tokens
+
+        next_draft_tokens, next_new_tokens = prepare_next_tokens(
+            next_draft_tokens, accepted_tokens, spec_metadata, batch_size,
+            num_accepted_tokens)
 
         return {
             'logits': raw_logits,
@@ -1184,11 +1275,12 @@ class MTPEagleWorker(MTPWorker):
             'next_new_tokens': next_new_tokens
         }
 
+    @torch.compile(options={"max-autotune": True})
     def prepare_drafter_inputs(
         self,
         input_ids: torch.IntTensor,
         position_ids: torch.IntTensor,
-        last_tokens_idx: torch.LongTensor,
+        last_tokens_idx_host: torch.LongTensor,
         hidden_states: torch.Tensor,
         accepted_tokens: torch.Tensor,
         attn_metadata: AttentionMetadata,
@@ -1203,7 +1295,9 @@ class MTPEagleWorker(MTPWorker):
                                          device="cuda")
         input_ids_ctx[:-1].copy_(input_prompt_ids[1:])
         input_ids_ctx[
-            last_tokens_idx[:num_contexts]] = accepted_tokens[:num_contexts, 0]
+            last_tokens_idx_host[:
+                                 num_contexts]] = accepted_tokens[:num_contexts,
+                                                                  0]
 
         # generation
         input_ids_gen = accepted_tokens[num_contexts:, :].flatten()

@@ -36,6 +36,8 @@ template <
     int STEP_KV_,
     // The head dimension.
     int D_,
+    // The head dimension of V.
+    int DV_,
     // The number of smem buffers for Q tiles.
     int Q_BUFFERS_,
     // The number of smem buffers for K, and V tiles.
@@ -83,16 +85,15 @@ struct Kernel_traits
         STEP_KV = STEP_KV_
     };
 
-    // The padded head dimension.
-    enum
-    {
-        D = Next_power_of_two<D_>::VALUE
-    };
-
     // The valid head dimension.
     enum
     {
         VALID_D = D_
+    };
+
+    enum
+    {
+        VALID_DV = (DV_ == 0 ? D_ : DV_)
     };
 
     // Bootstrap GMMA_K from dummy Instruction_traits where FP16/BF16 K = 16, FP8 K = 32.
@@ -111,6 +112,17 @@ struct Kernel_traits
     enum
     {
         ELEMENT_BYTES = sizeof(Element_data_type)
+    };
+
+    // The padded head dimension.
+    enum
+    {
+        D = std::min<int>(Round_up<VALID_D, 128 / ELEMENT_BYTES>::VALUE, Next_power_of_two<VALID_D>::VALUE)
+    };
+
+    enum
+    {
+        DV = std::min<int>(Round_up<VALID_DV, 128 / ELEMENT_BYTES>::VALUE, Next_power_of_two<VALID_DV>::VALUE)
     };
 
     // The number of smem buffers for Q tiles.
@@ -326,6 +338,18 @@ struct Kernel_traits
         D_BYTES_PER_GROUP = D_BYTES / D_GROUPS
     };
 
+    // The bytes of head dimension of V.
+    enum
+    {
+        DV_BYTES = DV * ELEMENT_BYTES
+    };
+
+    // The number of head_dimension groups of V.
+    enum
+    {
+        DV_GROUPS = fmha::Div_up<DV_BYTES, 128>::VALUE
+    };
+
     // QGMMA: BMM2 will be split into multiple K groups as we explicitly transpose v (128 * D) in the smem.
     // HGMMA: BMM2 will load from row-major (K * N) smem_v, so we don't need to explicitly split K.
     static constexpr auto BMM2_LEADING_DIM_BYTES = ELEMENT_BYTES == 1 ? 128 : STEP_KV * ELEMENT_BYTES;
@@ -364,7 +388,7 @@ struct Kernel_traits
 
     // The instruction traits for the BMM2.
     // FP16/BF16 K = 16, FP8 K = 32.
-    using Traits_o = Instruction_traits<STEP_Q, D, GMMA_K, true, false>;
+    using Traits_o = Instruction_traits<STEP_Q, DV, GMMA_K, true, false>;
 
     // The CTA description for BMM1.
     using Cta_tile_p =
@@ -375,7 +399,7 @@ struct Kernel_traits
         typename Traits_p::template Cta_tile<STEP_Q, STEP_KV, D_PER_GROUP, WARP_GROUP_M, WARP_GROUP_N, WARP_GROUP_K>;
 
     // The CTA description for BMM2.
-    using Cta_tile_o = typename Traits_o::template Cta_padded_tile<STEP_Q, D, STEP_KV, VALID_D, STEP_KV, WARP_GROUP_M,
+    using Cta_tile_o = typename Traits_o::template Cta_padded_tile<STEP_Q, DV, STEP_KV, VALID_DV, STEP_KV, WARP_GROUP_M,
         WARP_GROUP_K, WARP_GROUP_N>;
 
     // The MMA tile for the 1st GEMM.
@@ -415,9 +439,9 @@ struct Kernel_traits
     // The q, k, v tile buffer.
     using Buffer_q_t = cuda::std::array<Element_data_type, D * STEP_Q * Q_BUFFERS>;
     using Buffer_k_t = cuda::std::array<Element_data_type, D * STEP_KV * KV_BUFFERS>;
-    using Buffer_v_t = cuda::std::array<Element_data_type, D * STEP_KV * KV_BUFFERS>;
+    using Buffer_v_t = cuda::std::array<Element_data_type, DV * STEP_KV * KV_BUFFERS>;
     // We need one kv buffer to explicitly transose fp8 smem_tile.
-    using Buffer_v_scratch_t = cuda::std::array<Element_data_type, D * STEP_KV * V_SCRATCH_BUFFERS>;
+    using Buffer_v_scratch_t = cuda::std::array<Element_data_type, DV * STEP_KV * V_SCRATCH_BUFFERS>;
 
     // The smem bytes of q, k, v tiles.
     enum
@@ -521,6 +545,8 @@ template < // The step size in query sequence dimension (M of BMM1 and BMM2).
     int STEP_KV_,
     // The head dimension.
     int D_,
+    // The head dimension of V.
+    int DV_,
     // The number of smem buffers for Q tiles.
     int Q_BUFFERS_,
     // The number of smem buffers for K, and V tiles.
@@ -554,14 +580,14 @@ template < // The step size in query sequence dimension (M of BMM1 and BMM2).
     // The sage attention block size for Q, K and V
     int SAGE_BLOCK_SIZE_Q_ = 0, int SAGE_BLOCK_SIZE_K_ = 0, int SAGE_BLOCK_SIZE_V_ = 0>
 struct Kernel_traits_Hopper_qgmma_e4m3_fp32
-    : public Kernel_traits<Hopper_qgmma_e4m3_fp32_traits, STEP_Q_, STEP_KV_, D_, Q_BUFFERS_, KV_BUFFERS_,
+    : public Kernel_traits<Hopper_qgmma_e4m3_fp32_traits, STEP_Q_, STEP_KV_, D_, DV_, Q_BUFFERS_, KV_BUFFERS_,
           NUM_COMPUTE_GROUPS_, DMA2COMPUTE_DEPTH_, ATTENTION_MASK_TYPE_, HEADS_INTERLEAVED_, APPLY_ALIBI_,
           ENABLE_MUTEX_, SCHEDULING_MODE_, INPUT_LAYOUT_, USE_TMA_STORE_, ENABLE_BMM1_SOFTCAPPING_SCALE_,
           RETURN_SOFTMAX_STATS_, OutputType, SAGE_BLOCK_SIZE_Q_, SAGE_BLOCK_SIZE_K_, SAGE_BLOCK_SIZE_V_>
 {
 
     // Base class.
-    using Base = Kernel_traits<Hopper_qgmma_e4m3_fp32_traits, STEP_Q_, STEP_KV_, D_, Q_BUFFERS_, KV_BUFFERS_,
+    using Base = Kernel_traits<Hopper_qgmma_e4m3_fp32_traits, STEP_Q_, STEP_KV_, D_, DV_, Q_BUFFERS_, KV_BUFFERS_,
         NUM_COMPUTE_GROUPS_, DMA2COMPUTE_DEPTH_, ATTENTION_MASK_TYPE_, HEADS_INTERLEAVED_, APPLY_ALIBI_, ENABLE_MUTEX_,
         SCHEDULING_MODE_, INPUT_LAYOUT_, USE_TMA_STORE_, ENABLE_BMM1_SOFTCAPPING_SCALE_>;
 
@@ -601,7 +627,7 @@ struct Kernel_traits_Hopper_qgmma_e4m3_fp32
     using Buffer_v_scratch_t = typename Base::Buffer_v_scratch_t;
     // Extra O buffer if TMA is used for epilogue
     using Element_data_type = typename Base::Element_data_type;
-    using Buffer_o_t = cuda::std::array<Element_data_type, Base::D * Base::STEP_Q * O_BUFFERS>;
+    using Buffer_o_t = cuda::std::array<Element_data_type, Base::DV * Base::STEP_Q * O_BUFFERS>;
 
     // The struct of shared memory buffers.
     struct __align__(128) Shared

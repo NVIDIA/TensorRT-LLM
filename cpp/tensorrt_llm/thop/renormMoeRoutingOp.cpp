@@ -74,7 +74,7 @@ std::tuple<at::Tensor, at::Tensor> renorm_moe_routing_op(th::Tensor const& route
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
-        "renorm_moe_routing_op(Tensor router_logits, int topk"
+        "renorm_moe_routing_op(Tensor router_logits, SymInt topk"
         ") -> (Tensor, Tensor)");
 }
 

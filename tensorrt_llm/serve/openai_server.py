@@ -1,5 +1,7 @@
 #!/usr/bin/env python
 import asyncio
+import os
+import re
 import signal
 import traceback
 from contextlib import asynccontextmanager
@@ -12,6 +14,7 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response, StreamingResponse
+from starlette.routing import Mount
 from transformers import AutoConfig, AutoProcessor
 
 from tensorrt_llm._tensorrt_engine import LLM
@@ -24,6 +27,7 @@ from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
 from tensorrt_llm.llmapi.disagg_utils import MetadataServerConfig, ServerRole
 from tensorrt_llm.llmapi.llm import RequestOutput
 from tensorrt_llm.logger import logger
+from tensorrt_llm.metrics.collector import MetricsCollector
 from tensorrt_llm.serve.chat_utils import (check_multiple_response,
                                            parse_chat_messages_coroutines)
 from tensorrt_llm.serve.metadata_server import create_metadata_server
@@ -41,7 +45,7 @@ from tensorrt_llm.serve.postprocess_handlers import (
     completion_stream_post_processor)
 from tensorrt_llm.version import __version__ as VERSION
 
-from .._utils import nvtx_mark
+from .._utils import nvtx_mark, set_prometheus_multiproc_dir
 
 # yapf: enale
 TIMEOUT_KEEP_ALIVE = 5  # seconds.
@@ -67,7 +71,7 @@ class OpenAIServer:
             logger.debug("Failed to load AutoProcessor or AutoConfig for %s", hf_tokenizer_path)
             self.processor = None
         try:
-            self.model_config = AutoConfig.from_pretrained(hf_tokenizer_path)
+            self.model_config = AutoConfig.from_pretrained(hf_tokenizer_path, trust_remote_code=trust_remote_code)
         except Exception:
             logger.debug("Failed to load AutoConfig for %s", hf_tokenizer_path)
             self.model_config = None
@@ -77,6 +81,13 @@ class OpenAIServer:
             self.model = model_dir.name
         else:
             self.model = model
+        self.metrics_collector = None
+        if self.llm.args.return_perf_metrics:
+            set_prometheus_multiproc_dir()
+            self.metrics_collector = MetricsCollector({
+                "model_name": "undefined",
+                "engine_type": "undefined"
+            })
 
         @asynccontextmanager
         async def lifespan(app: FastAPI):
@@ -150,6 +161,32 @@ class OpenAIServer:
         self.app.add_api_route("/v1/chat/completions",
                                self.openai_chat,
                                methods=["POST"])
+        if self.llm.args.return_perf_metrics:
+            # register /prometheus/metrics
+            self.mount_metrics()
+
+    def mount_metrics(self):
+        # Lazy import for prometheus multiprocessing.
+        # We need to set PROMETHEUS_MULTIPROC_DIR environment variable
+        # before prometheus_client is imported.
+        # See https://prometheus.github.io/client_python/multiprocess/
+        from prometheus_client import (CollectorRegistry, make_asgi_app,
+                                       multiprocess)
+        from prometheus_fastapi_instrumentator import Instrumentator
+        registry = CollectorRegistry()
+        multiprocess.MultiProcessCollector(registry)
+        Instrumentator(
+            should_group_status_codes=False,
+            should_respect_env_var=True,
+            excluded_handlers=[
+                ".*"
+            ],
+            registry=registry,
+        ).add().instrument(self.app).expose(self.app)
+        metrics_app = make_asgi_app(registry=registry)
+        metrics_route = Mount("/prometheus/metrics", metrics_app)
+        metrics_route.path_regex = re.compile("^/prometheus/metrics(?P<path>.*)$")
+        self.app.routes.append(metrics_route)
 
     async def health(self) -> Response:
         return Response(status_code=200)
@@ -227,6 +264,8 @@ class OpenAIServer:
                 post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
             async for res in promise:
                 pp_results = res.outputs[0]._postprocess_result if self.postproc_worker_enabled else post_processor(res, args)
+                if res.finished and self.metrics_collector:
+                    self.metrics_collector.log_metrics_dict(res.metrics_dict)
                 for pp_res in pp_results:
                     yield pp_res
             yield "data: [DONE]\n\n"
@@ -244,6 +283,8 @@ class OpenAIServer:
             # Add prompt_tokens_ids to the response
             if disaggregated_params and disaggregated_params.request_type and disaggregated_params.request_type == "context_only":
                 chat_response.prompt_token_ids = promise.prompt_token_ids
+            if promise.finished and self.metrics_collector:
+                self.metrics_collector.log_metrics_dict(promise.metrics_dict)
             return chat_response
 
         try:
@@ -252,7 +293,13 @@ class OpenAIServer:
             tool_dicts = None if request.tools is None else [
                 tool.model_dump() for tool in request.tools
             ]
-            sampling_params = request.to_sampling_params()
+            # Pass the tokenizer vocabulary size so ``logit_bias`` can be
+            # expanded into an embedding bias tensor in the sampler.
+            sampling_params = request.to_sampling_params(
+                vocab_size=self.tokenizer.tokenizer.vocab_size)
+            # TODO: better way to enable metrics
+            if len(os.getenv("TRTLLM_KVCACHE_TIME_OUTPUT_PATH", "")) > 0:
+                sampling_params.return_perf_metrics = True
             postproc_args = ChatPostprocArgs.from_request(request)
             disaggregated_params = to_llm_disaggregated_params(request.disaggregated_params)
 
@@ -330,6 +377,8 @@ class OpenAIServer:
             if disaggregated_params and disaggregated_params.request_type and disaggregated_params.request_type == "context_only":
                 # Include prompt token ids for context-only requests
                 pp_result.prompt_token_ids = response.prompt_token_ids
+            if response.finished and self.metrics_collector:
+                self.metrics_collector.log_metrics_dict(response.metrics_dict)
             return pp_result
 
         def merge_completion_responses(responses: List[CompletionResponse]) -> CompletionResponse:
@@ -365,6 +414,8 @@ class OpenAIServer:
                     pp_result = post_processor(output, args)
                 else:
                     pp_result = output.outputs[0]._postprocess_result
+                if output.finished and self.metrics_collector:
+                    self.metrics_collector.log_metrics_dict(output.metrics_dict)
                 for pp_res in pp_result:
                     yield pp_res
 
@@ -401,7 +452,13 @@ class OpenAIServer:
 
             promises: List[RequestOutput] = []
             postproc_params_collection: List[Optional[PostprocParams]] = []
-            sampling_params = request.to_sampling_params()
+            # Pass the tokenizer vocabulary size so ``logit_bias`` can be
+            # expanded into an embedding bias tensor in the sampler.
+            sampling_params = request.to_sampling_params(
+                vocab_size=self.tokenizer.tokenizer.vocab_size)
+            # TODO: better way to enable metrics
+            if len(os.getenv("TRTLLM_KVCACHE_TIME_OUTPUT_PATH", "")) > 0:
+                sampling_params.return_perf_metrics = True
             disaggregated_params = to_llm_disaggregated_params(request.disaggregated_params)
             for idx, prompt in enumerate(prompts):
                 postproc_args = CompletionPostprocArgs.from_request(request)

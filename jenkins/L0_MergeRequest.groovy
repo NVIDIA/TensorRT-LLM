@@ -105,15 +105,13 @@ def EXTRA_STAGE_LIST = "extra_stage"
 @Field
 def MULTI_GPU_FILE_CHANGED = "multi_gpu_file_changed"
 @Field
-def ONLY_PYTORCH_FILE_CHANGED = "only_pytorch_file_changed"
+def ONLY_ONE_GROUP_CHANGED = "only_one_group_changed"
 @Field
 def AUTO_TRIGGER_TAG_LIST = "auto_trigger_tag_list"
 @Field
 def DEBUG_MODE = "debug"
 @Field
 def DETAILED_LOG = "detailed_log"
-@Field
-def ONLY_DOCS_FILE_CHANGED = "only_docs_file_changed"
 
 def testFilter = [
     (REUSE_STAGE_LIST): trimForStageList(gitlabParamsFromBot.get(REUSE_STAGE_LIST, null)?.tokenize(',')),
@@ -127,11 +125,10 @@ def testFilter = [
     (DISABLE_MULTI_GPU_TEST): gitlabParamsFromBot.get((DISABLE_MULTI_GPU_TEST), false),
     (EXTRA_STAGE_LIST): trimForStageList(gitlabParamsFromBot.get((EXTRA_STAGE_LIST), null)?.tokenize(',')),
     (MULTI_GPU_FILE_CHANGED): false,
-    (ONLY_PYTORCH_FILE_CHANGED): false,
+    (ONLY_ONE_GROUP_CHANGED): "",
     (DEBUG_MODE): gitlabParamsFromBot.get(DEBUG_MODE, false),
     (AUTO_TRIGGER_TAG_LIST): [],
     (DETAILED_LOG): gitlabParamsFromBot.get(DETAILED_LOG, false),
-    (ONLY_DOCS_FILE_CHANGED): false,
 ]
 
 String reuseBuild = gitlabParamsFromBot.get('reuse_build', null)
@@ -142,10 +139,16 @@ def GITHUB_PR_API_URL = "github_pr_api_url"
 def CACHED_CHANGED_FILE_LIST = "cached_changed_file_list"
 @Field
 def ACTION_INFO = "action_info"
+@Field
+def IMAGE_KEY_TO_TAG = "image_key_to_tag"
+@Field
+def TARGET_BRANCH = "target_branch"
 def globalVars = [
     (GITHUB_PR_API_URL): gitlabParamsFromBot.get('github_pr_api_url', null),
     (CACHED_CHANGED_FILE_LIST): null,
     (ACTION_INFO): gitlabParamsFromBot.get('action_info', null),
+    (IMAGE_KEY_TO_TAG): [:],
+    (TARGET_BRANCH): gitlabParamsFromBot.get('target_branch', null),
 ]
 
 // If not running all test stages in the L0 pre-merge, we will not update the GitLab status at the end.
@@ -301,31 +304,76 @@ def echoNodeAndGpuInfo(pipeline, stageName)
 
 def setupPipelineEnvironment(pipeline, testFilter, globalVars)
 {
+    sh "env | sort"
+    updateGitlabCommitStatus name: "${BUILD_STATUS_NAME}", state: 'running'
+    echo "Using GitLab repo: ${LLM_REPO}."
+    sh "git config --global --add safe.directory \"*\""
+    // NB: getContainerURIs reads files in ${LLM_ROOT}/jenkins/
+    if (env.gitlabMergeRequestLastCommit) {
+        env.gitlabCommit = env.gitlabMergeRequestLastCommit
+        trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
+    } else {
+        branch = env.gitlabBranch ? env.gitlabBranch : "main"
+        trtllm_utils.checkoutSource(LLM_REPO, branch, LLM_ROOT, true, true)
+        checkoutCommit = sh (script: "cd ${LLM_ROOT} && git rev-parse HEAD",returnStdout: true).trim()
+        env.gitlabCommit = checkoutCommit
+    }
+    echo "Env.gitlabMergeRequestLastCommit: ${env.gitlabMergeRequestLastCommit}."
+    echo "Freeze GitLab commit. Branch: ${env.gitlabBranch}. Commit: ${env.gitlabCommit}."
+    testFilter[(MULTI_GPU_FILE_CHANGED)] = getMultiGpuFileChanged(pipeline, testFilter, globalVars)
+    testFilter[(ONLY_ONE_GROUP_CHANGED)] = getOnlyOneGroupChanged(pipeline, testFilter, globalVars)
+    testFilter[(AUTO_TRIGGER_TAG_LIST)] = getAutoTriggerTagList(pipeline, testFilter, globalVars)
+    getContainerURIs().each { k, v ->
+        globalVars[k] = v
+    }
+}
+
+def mergeWaiveList(pipeline, globalVars)
+{
+    // Get current waive list
+    sh "git config --global --add safe.directory \"*\""
+    sh "cp ${LLM_ROOT}/tests/integration/test_lists/waives.txt ./waives_CUR_${env.gitlabCommit}.txt"
+    sh "cp ${LLM_ROOT}/jenkins/scripts/mergeWaiveList.py ./"
+
+    // Get TOT waive list
+    LLM_TOT_ROOT = "llm-tot"
+    targetBranch = env.gitlabTargetBranch ? env.gitlabTargetBranch : globalVars[TARGET_BRANCH]
+    echo "Target branch: ${targetBranch}"
+    withCredentials([string(credentialsId: 'default-sync-llm-repo', variable: 'DEFAULT_SYNC_LLM_REPO')]) {
+        trtllm_utils.checkoutSource(DEFAULT_SYNC_LLM_REPO, targetBranch, LLM_TOT_ROOT, false, false)
+    }
+    targetBranchTOTCommit = sh (script: "cd ${LLM_TOT_ROOT} && git rev-parse HEAD", returnStdout: true).trim()
+    echo "Target branch TOT commit: ${targetBranchTOTCommit}"
+    sh "cp ${LLM_TOT_ROOT}/tests/integration/test_lists/waives.txt ./waives_TOT_${targetBranchTOTCommit}.txt"
+
+    // Get waive list diff in current MR
+    def diff = getMergeRequestOneFileChanges(pipeline, globalVars, "tests/integration/test_lists/waives.txt")
+
+    // Write diff to a temporary file to avoid shell escaping issues
+    writeFile file: 'diff_content.txt', text: diff
+
+    // Merge waive lists
+    sh """
+        python3 mergeWaiveList.py \
+        --cur-waive-list=waives_CUR_${env.gitlabCommit}.txt \
+        --latest-waive-list=waives_TOT_${targetBranchTOTCommit}.txt \
+        --diff-file=diff_content.txt \
+        --output-file=waives.txt
+    """
+    trtllm_utils.uploadArtifacts("waives*.txt", "${UPLOAD_PATH}/waive_list/")
+    echo "New merged test waive list: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/waive_list/waives.txt"
+}
+
+def preparation(pipeline, testFilter, globalVars)
+{
     image = "urm.nvidia.com/docker/golang:1.22"
     setupPipelineSpec = createKubernetesPodConfig(image, "package")
     trtllm_utils.launchKubernetesPod(pipeline, setupPipelineSpec, "trt-llm", {
-        sh "env | sort"
-        updateGitlabCommitStatus name: "${BUILD_STATUS_NAME}", state: 'running'
-        echo "Using GitLab repo: ${LLM_REPO}."
-        sh "git config --global --add safe.directory \"*\""
-        // NB: getContainerURIs reads files in ${LLM_ROOT}/jenkins/
-        if (env.gitlabMergeRequestLastCommit) {
-            env.gitlabCommit = env.gitlabMergeRequestLastCommit
-            trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
-        } else {
-            branch = env.gitlabBranch ? env.gitlabBranch : "main"
-            trtllm_utils.checkoutSource(LLM_REPO, branch, LLM_ROOT, true, true)
-            checkoutCommit = sh (script: "cd ${LLM_ROOT} && git rev-parse HEAD",returnStdout: true).trim()
-            env.gitlabCommit = checkoutCommit
+        stage("Setup Environment") {
+            setupPipelineEnvironment(pipeline, testFilter, globalVars)
         }
-        echo "Env.gitlabMergeRequestLastCommit: ${env.gitlabMergeRequestLastCommit}."
-        echo "Freeze GitLab commit. Branch: ${env.gitlabBranch}. Commit: ${env.gitlabCommit}."
-        testFilter[(MULTI_GPU_FILE_CHANGED)] = getMultiGpuFileChanged(pipeline, testFilter, globalVars)
-        testFilter[(ONLY_PYTORCH_FILE_CHANGED)] = getOnlyPytorchFileChanged(pipeline, testFilter, globalVars)
-        testFilter[(AUTO_TRIGGER_TAG_LIST)] = getAutoTriggerTagList(pipeline, testFilter, globalVars)
-        testFilter[(ONLY_DOCS_FILE_CHANGED)] = getOnlyDocsFileChanged(pipeline, testFilter, globalVars)
-        getContainerURIs().each { k, v ->
-            globalVars[k] = v
+        stage("Merge Test Waive List") {
+            mergeWaiveList(pipeline, globalVars)
         }
     })
 }
@@ -338,30 +386,11 @@ def launchReleaseCheck(pipeline)
             -y""")
         sh "pip3 config set global.break-system-packages true"
         sh "git config --global --add safe.directory \"*\""
-        // Step 1: cloning tekit source code
+        // Step 1: Clone TRT-LLM source codes
         trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
         sh "cd ${LLM_ROOT} && git config --unset-all core.hooksPath"
-        trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${LLM_ROOT} && python3 -u scripts/release_check.py || (git restore . && false)")
 
-        // Step 2: build tools
-        withEnv(['GONOSUMDB=*.nvidia.com']) {
-            withCredentials([
-                gitUsernamePassword(
-                    credentialsId: 'svc_tensorrt_gitlab_read_api_token',
-                    gitToolName: 'git-tool'
-                ),
-                string(
-                    credentialsId: 'default-git-url',
-                    variable: 'DEFAULT_GIT_URL'
-                )
-            ]) {
-                sh "go install ${DEFAULT_GIT_URL}/TensorRT/Infrastructure/licensechecker/cmd/license_checker@v0.3.0"
-            }
-        }
-        // Step 3: Run license check
-        sh "cd ${LLM_ROOT}/cpp && /go/bin/license_checker -config ../jenkins/license_cpp.json include tensorrt_llm"
-
-        // Step 4: Run guardwords scan
+        // Step 2: Run guardwords scan
         def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
         if (env.alternativeTRT || isOfficialPostMergeJob) {
             trtllm_utils.checkoutSource(SCAN_REPO, SCAN_COMMIT, SCAN_ROOT, true, true)
@@ -386,6 +415,26 @@ def launchReleaseCheck(pipeline)
                 echo "Guardwords Scan Results: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/guardwords-scan-results/scan.log"
             }
         }
+
+        // Step 3: Run pre-commit checks
+        trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${LLM_ROOT} && python3 -u scripts/release_check.py || (git restore . && false)")
+
+        // Step 4: Run license check
+        withEnv(['GONOSUMDB=*.nvidia.com']) {
+            withCredentials([
+                gitUsernamePassword(
+                    credentialsId: 'svc_tensorrt_gitlab_read_api_token',
+                    gitToolName: 'git-tool'
+                ),
+                string(
+                    credentialsId: 'default-git-url',
+                    variable: 'DEFAULT_GIT_URL'
+                )
+            ]) {
+                sh "go install ${DEFAULT_GIT_URL}/TensorRT/Infrastructure/licensechecker/cmd/license_checker@v0.3.0"
+            }
+        }
+        sh "cd ${LLM_ROOT}/cpp && /go/bin/license_checker -config ../jenkins/license_cpp.json include tensorrt_llm"
     }
 
     def image = "urm.nvidia.com/docker/golang:1.22"
@@ -416,8 +465,8 @@ def launchReleaseCheck(pipeline)
     })
 }
 
-def getMergeRequestChangedFileListGitlab(pipeline) {
-    def changedFileList = []
+def getGitlabMRChangedFile(pipeline, function, filePath="") {
+    def result = null
     def pageId = 0
     withCredentials([
         usernamePassword(
@@ -437,19 +486,34 @@ def getMergeRequestChangedFileListGitlab(pipeline) {
                 returnStdout: true
             )
             def rawDataList = readJSON text: rawDataJson, returnPojo: true
-            rawDataList.each { rawData ->
-                changedFileList += [rawData.get("old_path"), rawData.get("new_path")]
+            if (function == "getOneFileChanges") {
+                if (result == null) {
+                    result = ""
+                }
+                rawDataList.find { rawData ->
+                    if (rawData.get("new_path") == filePath || rawData.get("old_path") == filePath) {
+                        result = rawData.get("diff")
+                        return true
+                    }
+                    return false
+                }
+                if (result != "") { break }
+            } else if (function == "getChangedFileList") {
+                if (result == null) {
+                    result = []
+                }
+                rawDataList.each { rawData ->
+                    result += [rawData.get("old_path"), rawData.get("new_path")]
+                }
             }
             if (!rawDataList) { break }
         }
     }
-    def changedFileListStr = changedFileList.join(",\n")
-    pipeline.echo("The changeset of this MR is: ${changedFileListStr}.")
-    return changedFileList
+    return result
 }
 
-def getMergeRequestChangedFileListGithub(pipeline, githubPrApiUrl) {
-    def changedFileList = []
+def getGithubMRChangedFile(pipeline, githubPrApiUrl, function, filePath="") {
+    def result = null
     def pageId = 0
     withCredentials([
         string(
@@ -468,15 +532,30 @@ def getMergeRequestChangedFileListGithub(pipeline, githubPrApiUrl) {
             )
             echo "rawDataJson: ${rawDataJson}"
             def rawDataList = readJSON text: rawDataJson, returnPojo: true
-            rawDataList.each { rawData ->
-                changedFileList += [rawData.get("filename"), rawData.get("previous_filename")].findAll { it }
+            if (function == "getOneFileChanges") {
+                if (result == null) {
+                    result = ""
+                }
+                rawDataList.find { rawData ->
+                    if (rawData.get("filename") == filePath || rawData.get("previous_filename") == filePath) {
+                        result = rawData.get("patch")
+                        return true
+                    }
+                    return false
+                }
+                if (result != "") { break }
+            } else if (function == "getChangedFileList") {
+                if (result == null) {
+                    result = []
+                }
+                rawDataList.each { rawData ->
+                    result += [rawData.get("filename"), rawData.get("previous_filename")].findAll { it }
+                }
             }
             if (!rawDataList) { break }
         }
     }
-    def changedFileListStr = changedFileList.join(",\n")
-    pipeline.echo("The changeset of this PR is: ${changedFileListStr}.")
-    return changedFileList
+    return result
 }
 
 def getMergeRequestChangedFileList(pipeline, globalVars) {
@@ -492,11 +571,15 @@ def getMergeRequestChangedFileList(pipeline, globalVars) {
         return globalVars[CACHED_CHANGED_FILE_LIST]
     }
     try {
+        def changedFileList = []
         if (githubPrApiUrl != null) {
-            globalVars[CACHED_CHANGED_FILE_LIST] = getMergeRequestChangedFileListGithub(pipeline, githubPrApiUrl)
+            changedFileList = getGithubMRChangedFile(pipeline, githubPrApiUrl, "getChangedFileList")
         } else {
-            globalVars[CACHED_CHANGED_FILE_LIST] = getMergeRequestChangedFileListGitlab(pipeline)
+            changedFileList = getGitlabMRChangedFile(pipeline, "getChangedFileList")
         }
+        def changedFileListStr = changedFileList.join(",\n")
+        pipeline.echo("The changeset of this MR is: ${changedFileListStr}.")
+        globalVars[CACHED_CHANGED_FILE_LIST] = changedFileList
         return globalVars[CACHED_CHANGED_FILE_LIST]
     } catch (InterruptedException e) {
         throw e
@@ -504,6 +587,32 @@ def getMergeRequestChangedFileList(pipeline, globalVars) {
         pipeline.echo("Get merge request changed file list failed. Error: ${e.toString()}")
         globalVars[CACHED_CHANGED_FILE_LIST] = []
         return globalVars[CACHED_CHANGED_FILE_LIST]
+    }
+}
+
+def getMergeRequestOneFileChanges(pipeline, globalVars, filePath) {
+    def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
+    if (env.alternativeTRT || isOfficialPostMergeJob) {
+        pipeline.echo("Force set changed file diff to empty string.")
+        return ""
+    }
+
+    def githubPrApiUrl = globalVars[GITHUB_PR_API_URL]
+    def diff = ""
+
+    try {
+        if (githubPrApiUrl != null) {
+            diff = getGithubMRChangedFile(pipeline, githubPrApiUrl, "getOneFileChanges", filePath)
+        } else {
+            diff = getGitlabMRChangedFile(pipeline, "getOneFileChanges", filePath)
+        }
+        pipeline.echo("The change of ${filePath} is: ${diff}")
+        return diff
+    } catch (InterruptedException e) {
+        throw e
+    } catch (Exception e) {
+        pipeline.echo("Get merge request one changed file diff failed. Error: ${e.toString()}")
+        return ""
     }
 }
 
@@ -547,68 +656,69 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
     }
 
     def relatedFileList = [
+        "cpp/include/tensorrt_llm/batch_manager/",
+        "cpp/include/tensorrt_llm/executor/",
         "cpp/include/tensorrt_llm/runtime/gptJsonConfig.h",
-        "cpp/include/tensorrt_llm/runtime/worldConfig.h",
         "cpp/include/tensorrt_llm/runtime/utils/mpiUtils.h",
         "cpp/include/tensorrt_llm/runtime/utils/multiDeviceUtils.h",
-        "cpp/tensorrt_llm/runtime/utils/mpiUtils.cpp",
-        "cpp/tests/runtime/mpiUtilsTest.cpp",
-        "cpp/tensorrt_llm/batch_manager/trtGptModelFactory.h",
-        "cpp/tensorrt_llm/runtime/worldConfig.cpp",
-        "cpp/tensorrt_llm/runtime/ncclCommunicator.cpp",
-        "cpp/tensorrt_llm/runtime/workerPool.h",
-        "cpp/tensorrt_llm/executor_worker/executorWorker.cpp",
-        "cpp/tensorrt_llm/runtime/ipcUtils.cpp",
-        "cpp/tensorrt_llm/executor/executor.cpp",
-        "cpp/tensorrt_llm/executor/executorImpl.cpp",
-        "cpp/tensorrt_llm/executor/executorImpl.h",
-        "cpp/tensorrt_llm/runtime/ncclCommunicator.cpp",
+        "cpp/include/tensorrt_llm/runtime/worldConfig.h",
+        "cpp/tensorrt_llm/batch_manager/",
+        "cpp/tensorrt_llm/executor/",
+        "cpp/tensorrt_llm/executor_worker/",
         "cpp/tensorrt_llm/kernels/communicationKernels/",
-        "cpp/tensorrt_llm/thop/allreduceOp.cpp",
-        "cpp/tensorrt_llm/thop/allgatherOp.cpp",
-        "cpp/tensorrt_llm/thop/reducescatterOp.cpp",
-        "cpp/tensorrt_llm/kernels/customAllReduceKernels.h",
         "cpp/tensorrt_llm/kernels/customAllReduceKernels.cu",
-        "cpp/tensorrt_llm/kernels/gptKernels.h",
+        "cpp/tensorrt_llm/kernels/customAllReduceKernels.h",
         "cpp/tensorrt_llm/kernels/gptKernels.cu",
-        "cpp/tensorrt_llm/kernels/unfusedAttentionKernels.h",
-        "cpp/tensorrt_llm/kernels/unfusedAttentionKernels.cu",
-        "cpp/tensorrt_llm/kernels/userbuffers/",
+        "cpp/tensorrt_llm/kernels/gptKernels.h",
         "cpp/tensorrt_llm/kernels/moe",
-        "cpp/tensorrt_llm/pybind/",
-        "cpp/tests/kernels/allReduce/",
-        "cpp/tensorrt_llm/plugins/cpSplitPlugin/cpSplitPlugin.h",
+        "cpp/tensorrt_llm/kernels/unfusedAttentionKernels.cu",
+        "cpp/tensorrt_llm/kernels/unfusedAttentionKernels.h",
+        "cpp/tensorrt_llm/kernels/userbuffers/",
         "cpp/tensorrt_llm/plugins/cpSplitPlugin/cpSplitPlugin.cpp",
-        "cpp/tensorrt_llm/plugins/gptAttentionCommon/gptAttentionCommon.h",
+        "cpp/tensorrt_llm/plugins/cpSplitPlugin/cpSplitPlugin.h",
         "cpp/tensorrt_llm/plugins/gptAttentionCommon/gptAttentionCommon.cpp",
-        "cpp/tensorrt_llm/plugins/gptAttentionPlugin/gptAttentionPlugin.h",
+        "cpp/tensorrt_llm/plugins/gptAttentionCommon/gptAttentionCommon.h",
         "cpp/tensorrt_llm/plugins/gptAttentionPlugin/gptAttentionPlugin.cpp",
-        "cpp/tests/runtime/mpiUtilsTest.cpp",
+        "cpp/tensorrt_llm/plugins/gptAttentionPlugin/gptAttentionPlugin.h",
         "cpp/tensorrt_llm/plugins/ncclPlugin/",
-        "tensorrt_llm/functional.py",
-        "tensorrt_llm/mapping.py",
-        "tensorrt_llm/llmapi/",
-        "tensorrt_llm/executor/",
+        "cpp/tensorrt_llm/pybind/",
+        "cpp/tensorrt_llm/runtime/ipcUtils.cpp",
+        "cpp/tensorrt_llm/runtime/ncclCommunicator.cpp",
+        "cpp/tensorrt_llm/runtime/utils/mpiUtils.cpp",
+        "cpp/tensorrt_llm/runtime/workerPool.h",
+        "cpp/tensorrt_llm/runtime/worldConfig.cpp",
+        "cpp/tensorrt_llm/thop/allgatherOp.cpp",
+        "cpp/tensorrt_llm/thop/allreduceOp.cpp",
+        "cpp/tensorrt_llm/thop/reducescatterOp.cpp",
+        "cpp/tests/executor/",
+        "cpp/tests/kernels/allReduce/",
+        "cpp/tests/runtime/mpiUtilsTest.cpp",
+        "jenkins/L0_Test.groovy",
         "tensorrt_llm/_ipc_utils.py",
-        "tensorrt_llm/parameter.py",
-        "tensorrt_llm/models/llama/",
         "tensorrt_llm/_torch/compilation/patterns/ar_residual_norm.py",
         "tensorrt_llm/_torch/compilation/patterns/ub_allreduce.py",
         "tensorrt_llm/_torch/custom_ops/userbuffers_custom_ops.py",
-        "tensorrt_llm/_torch/pyexecutor/model_engine.py",
-        "tensorrt_llm/_torch/pyexecutor/py_executor.py",
-        "tensorrt_llm/_torch/pyexecutor/_util.py",
         "tensorrt_llm/_torch/models/modeling_llama.py",
         "tensorrt_llm/_torch/modules/fused_moe/",
+        "tensorrt_llm/_torch/pyexecutor/_util.py",
+        "tensorrt_llm/_torch/pyexecutor/model_engine.py",
+        "tensorrt_llm/_torch/pyexecutor/py_executor.py",
+        "tensorrt_llm/executor/",
+        "tensorrt_llm/functional.py",
+        "tensorrt_llm/llmapi/",
+        "tensorrt_llm/mapping.py",
+        "tensorrt_llm/models/llama/",
+        "tensorrt_llm/parameter.py",
+        "tensorrt_llm/serve/",
         "tests/integration/defs/cpp/test_multi_gpu.py",
         "tests/integration/test_lists/test-db/l0_dgx_h100.yml",
         "tests/integration/test_lists/test-db/l0_dgx_h200.yml",
+        "tests/unittest/_torch/auto_deploy/unit/multigpu",
         "tests/unittest/_torch/multi_gpu/",
         "tests/unittest/_torch/multi_gpu_modeling/",
-        "tests/unittest/_torch/auto_deploy/unit/multigpu",
+        "tests/unittest/disaggregated/",
         "tests/unittest/llmapi/test_llm_multi_gpu.py",
         "tests/unittest/llmapi/test_llm_multi_gpu_pytorch.py",
-        "jenkins/L0_Test.groovy",
     ]
 
     def changedFileList = getMergeRequestChangedFileList(pipeline, globalVars)
@@ -640,86 +750,62 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
     return relatedFileChanged
 }
 
-def getOnlyPytorchFileChanged(pipeline, testFilter, globalVars) {
+def getOnlyOneGroupChanged(pipeline, testFilter, globalVars) {
     def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
     if (env.alternativeTRT || isOfficialPostMergeJob) {
-        pipeline.echo("Force set ONLY_PYTORCH_FILE_CHANGED false.")
-        return false
+        pipeline.echo("Force set ONLY_ONE_GROUP_CHANGED \"\".")
+        return ""
     }
-    def pytorchOnlyList = [
-        "tensorrt_llm/_torch/",
-        "tensorrt_llm/scaffolding/",
-        "tests/unittest/_torch/",
-        "tests/unittest/scaffolding/",
-        "tests/unittest/llmapi/test_llm_pytorch.py",
-        "tests/unittest/llmapi/test_llm_multi_gpu_pytorch.py",
-        "tests/integration/defs/accuracy/test_llm_api_pytorch.py",
-        "tests/integration/defs/disaggregated/",
-        "examples/auto_deploy",
-        "examples/disaggregated",
-        "examples/pytorch/",
-        "examples/scaffolding/",
-        "docs/"
-    ]
-
-    def changedFileList = getMergeRequestChangedFileList(pipeline, globalVars)
-
-    if (!changedFileList || changedFileList.isEmpty()) {
-        return false
-    }
-
-    def result = true
-    for (file in changedFileList) {
-        def isPytorchFile = false
-        for (prefix in pytorchOnlyList) {
-            if (file.startsWith(prefix)) {
-                isPytorchFile = true
-                break
-            }
-        }
-        if (!isPytorchFile) {
-            pipeline.echo("Found non-PyTorch file: ${file}")
-            result = false
-            break
-        }
-    }
-
-    pipeline.echo("Only PyTorch files changed: ${result}")
-    return result
-}
-
-def getOnlyDocsFileChanged(pipeline, testFilter, globalVars) {
-    def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
-    if (env.alternativeTRT || isOfficialPostMergeJob) {
-        pipeline.echo("Force set ONLY_DOCS_FILE_CHANGED false.")
-        return false
-    }
-
-    // TODO: Add more docs path to the list, e.g. *.md files in other directories
-    def docsFileList = [
-        "docs/",
+    def groupFileMap = [
+        "Docs": [ // TODO: Add more docs path to the list, e.g. *.md files in other directories
+            "docs/",
+        ],
+        "PyTorch": [
+            "tensorrt_llm/_torch/",
+            "tensorrt_llm/scaffolding/",
+            "tests/unittest/_torch/",
+            "tests/unittest/scaffolding/",
+            "tests/unittest/llmapi/test_llm_pytorch.py",
+            "tests/unittest/llmapi/test_llm_multi_gpu_pytorch.py",
+            "tests/integration/defs/accuracy/test_llm_api_pytorch.py",
+            "tests/integration/defs/disaggregated/",
+            "examples/auto_deploy",
+            "examples/disaggregated",
+            "examples/pytorch/",
+            "examples/scaffolding/",
+            "docs/",
+        ],
+        "Triton": [
+            "tests/integration/defs/triton_server/",
+            "triton_backend/",
+        ],
     ]
 
     def changedFileList = getMergeRequestChangedFileList(pipeline, globalVars)
     if (!changedFileList || changedFileList.isEmpty()) {
-        return false
+        return ""
     }
 
-    for (file in changedFileList) {
-        def isDocsFile = false
-        for (prefix in docsFileList) {
-            if (file.startsWith(prefix)) {
-                isDocsFile = true
-                break
+    for (group in groupFileMap.keySet()) {
+        def groupPrefixes = groupFileMap[group]
+        def allFilesInGroup = changedFileList.every { file ->
+            groupPrefixes.any { prefix -> file.startsWith(prefix) }
+        }
+
+        if (allFilesInGroup) {
+            pipeline.echo("Only ${group} files changed.")
+            return group
+        } else {
+            def nonGroupFile = changedFileList.find { file ->
+                !groupPrefixes.any { prefix -> file.startsWith(prefix) }
+            }
+            if (nonGroupFile != null) {
+                pipeline.echo("Found non-${group} file: ${nonGroupFile}")
             }
         }
-        if (!isDocsFile) {
-            pipeline.echo("Found non-docs file: ${file}")
-            return false
-        }
     }
-    pipeline.echo("Only docs files changed.")
-    return true
+
+    return ""
 }
 
 def collectTestResults(pipeline, testFilter)
@@ -773,7 +859,7 @@ def collectTestResults(pipeline, testFilter)
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "apk add py3-pip")
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 config set global.break-system-packages true")
             sh """
-                python3 llm/jenkins/test_rerun.py \
+                python3 llm/jenkins/scripts/test_rerun.py \
                 generate_rerun_report \
                 --output-file=rerun/rerun_report.xml \
                 --input-files=${inputfiles}
@@ -974,21 +1060,21 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                     }
                 }
 
-                def requireMultiGpuTesting = currentBuild.description?.contains("Require Multi-GPU Testing") ?: false
+                def requireMultiGpuTesting = currentBuild.description?.contains("Require x86_64 Multi-GPU Testing") ?: false
                 echo "requireMultiGpuTesting: ${requireMultiGpuTesting}"
                 if (!requireMultiGpuTesting) {
                     if (singleGpuTestFailed) {
-                        error "Single-GPU test failed"
+                        error "x86_64 single-GPU test failed"
                     }
                     return
                 }
 
                 if (singleGpuTestFailed) {
                     if (env.JOB_NAME ==~ /.*PostMerge.*/) {
-                        echo "In the official post-merge pipeline, single-GPU test failed, whereas multi-GPU test is still kept running."
+                        echo "In the official post-merge pipeline, x86_64 single-GPU test failed, whereas multi-GPU test is still kept running."
                     } else {
                         stage("[Test-x86_64-Multi-GPU] Blocked") {
-                            error "This pipeline requires running multi-GPU test, but single-GPU test has failed."
+                            error "This pipeline requires running multi-GPU test, but x86_64 single-GPU test has failed."
                         }
                         return
                     }
@@ -1031,12 +1117,10 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
             script {
                 def jenkinsUrl = ""
                 def credentials = ""
-                def testStageName = "[Test-SBSA] Run"
-                if (env.localJobCredentials) {
-                    testStageName = "[Test-SBSA] Remote Run"
-                }
+                def testStageName = "[Test-SBSA-Single-GPU] ${env.localJobCredentials ? "Remote Run" : "Run"}"
+                def singleGpuTestFailed = false
 
-                if (testFilter[(ONLY_DOCS_FILE_CHANGED)]) {
+                if (testFilter[(ONLY_ONE_GROUP_CHANGED)] == "Docs") {
                     echo "SBSA build job is skipped due to Jenkins configuration or conditional pipeline run"
                     return
                 }
@@ -1053,13 +1137,67 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         return
                     }
                     try {
+                        String testFilterJson = writeJSON returnText: true, json: testFilter
+                        def additionalParameters = [
+                            'testFilter': testFilterJson,
+                            "dockerImage": globalVars["LLM_SBSA_DOCKER_IMAGE"],
+                        ]
+
+                        launchJob("L0_Test-SBSA-Single-GPU", false, enableFailFast, globalVars, "SBSA", additionalParameters)
+                    } catch (InterruptedException e) {
+                        throw e
+                    } catch (Exception e) {
+                        if (SBSA_TEST_CHOICE == STAGE_CHOICE_IGNORE) {
+                            catchError(
+                                buildResult: 'SUCCESS',
+                                stageResult: 'FAILURE') {
+                                error "SBSA test failed but ignored due to Jenkins configuration"
+                            }
+                        } else {
+                            catchError(
+                                buildResult: 'FAILURE',
+                                stageResult: 'FAILURE') {
+                                error "SBSA single-GPU test failed"
+                            }
+                            singleGpuTestFailed = true
+                        }
+                    }
+                }
+
+                def requireMultiGpuTesting = currentBuild.description?.contains("Require SBSA Multi-GPU Testing") ?: false
+                echo "requireMultiGpuTesting: ${requireMultiGpuTesting}"
+                if (!requireMultiGpuTesting) {
+                    if (singleGpuTestFailed) {
+                        error "SBSA single-GPU test failed"
+                    }
+                    return
+                }
+
+                if (singleGpuTestFailed) {
+                    if (env.JOB_NAME ==~ /.*PostMerge.*/) {
+                        echo "In the official post-merge pipeline, SBSA single-GPU test failed, whereas multi-GPU test is still kept running."
+                    } else {
+                        stage("[Test-SBSA-Multi-GPU] Blocked") {
+                            error "This pipeline requires running SBSA multi-GPU test, but SBSA single-GPU test has failed."
+                        }
+                        return
+                    }
+                }
+
+                testStageName = "[Test-SBSA-Multi-GPU] ${env.localJobCredentials ? "Remote Run" : "Run"}"
+                stage(testStageName) {
+                    if (SBSA_TEST_CHOICE == STAGE_CHOICE_SKIP) {
+                        echo "SBSA test job is skipped due to Jenkins configuration"
+                        return
+                    }
+                    try {
                         def testFilterJson = writeJSON returnText: true, json: testFilter
                         def additionalParameters = [
                             'testFilter': testFilterJson,
                             "dockerImage": globalVars["LLM_SBSA_DOCKER_IMAGE"],
                         ]
 
-                        launchJob("L0_Test-SBSA", false, enableFailFast, globalVars, "SBSA", additionalParameters)
+                        launchJob("L0_Test-SBSA-Multi-GPU", false, enableFailFast, globalVars, "SBSA", additionalParameters)
 
                     } catch (InterruptedException e) {
                         throw e
@@ -1091,6 +1229,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         'branch': branch,
                         'action': "push",
                         'triggerType': env.JOB_NAME ==~ /.*PostMerge.*/ ? "post-merge" : "pre-merge",
+                        'runSanityCheck': true,
                     ]
 
                     launchJob("/LLM/helpers/BuildDockerImages", false, enableFailFast, globalVars, "x86_64", additionalParameters)
@@ -1159,12 +1298,12 @@ pipeline {
         }
     }
     stages {
-        stage("Setup environment")
+        stage("Preparation")
         {
             steps
             {
                 script {
-                    setupPipelineEnvironment(this, testFilter, globalVars)
+                    preparation(this, testFilter, globalVars)
                     println globalVars
                     globalVars[ACTION_INFO] = trtllm_utils.setupPipelineDescription(this, globalVars[ACTION_INFO])
                     echo "enableFailFast is: ${enableFailFast}"

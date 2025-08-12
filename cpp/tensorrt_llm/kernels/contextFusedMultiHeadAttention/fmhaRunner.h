@@ -71,11 +71,8 @@ private:
     // Set the launch params to select kernels.
     void setupLaunchParams(MHARunnerParams runnerParams);
 
-    // Set the tma descriptors for packed qkv input.
-    void setPackedQkvTmaDescriptors(MHARunnerParams runnerParams);
-
-    // Set the tma descriptors for separate q and kv input.
-    void setSeparateQKvTmaDescriptors(MHARunnerParams runnerParams);
+    // Set the tma descriptors.
+    void setTmaDescriptors(MHARunnerParams runnerParams);
 
     // Check if it is a valid sequence length (only used by non-flash-attention kernels).
     bool isValidS(int s) const;

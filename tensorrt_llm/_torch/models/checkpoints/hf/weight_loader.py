@@ -12,7 +12,8 @@ from tensorrt_llm._torch.models.checkpoints.base_weight_loader import \
     BaseWeightLoader
 from tensorrt_llm._torch.models.modeling_utils import (
     register_checkpoint_weight_loader, run_concurrently)
-from tensorrt_llm._utils import local_mpi_rank, local_mpi_size
+from tensorrt_llm._utils import (local_mpi_barrier, local_mpi_rank,
+                                 local_mpi_size)
 from tensorrt_llm.logger import logger
 
 
@@ -38,6 +39,8 @@ class HfWeightLoader(BaseWeightLoader):
                     f"Prefetching {prefetch_size / (1024**3):.2f}GB checkpoint files."
                 )
                 self.prefetch_files(weight_files)
+                # Ensure that all local ranks have finished prefetching before loading weights
+                local_mpi_barrier()
 
             return self._load_weights_in_parallel(
                 weight_files, self._load_safetensors_file,

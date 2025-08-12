@@ -14,6 +14,7 @@ l0_a100:
       backend: "pytorch"
   tests:
     - unittest/llmapi/test_llm_pytorch.py
+    - unittest/llmapi/test_mpi_session.py # generic tests
 - condition:
     ranges:
       system_gpu_count:
@@ -27,7 +28,7 @@ l0_a100:
       stage: post_merge
       backend: tensorrt
   tests:
-  - unittest/trt/attention/test_sage_attention.py unittest/llmapi/test_llm_download.py unittest/llmapi/test_llm_kv_cache_events.py unittest/llmapi/test_mpi_session.py unittest/trt/model/redrafter unittest/trt/model/test_phi.py unittest/trt/model/test_unet.py unittest/trt/python_plugin unittest/tools unittest/utils unittest/others
+  - unittest/trt/attention/test_sage_attention.py unittest/llmapi/test_llm_download.py unittest/llmapi/test_llm_kv_cache_events.py unittest/trt/model/redrafter unittest/trt/model/test_phi.py unittest/trt/model/test_unet.py unittest/trt/python_plugin unittest/tools unittest/utils unittest/others
   - unittest/llmapi/test_llm_models.py -m "part1"
   - unittest/llmapi/test_llm_models.py -m "not (part0 or part1)"
   - unittest/llmapi/test_llm.py -m "part0"

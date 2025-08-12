@@ -8,7 +8,7 @@ from _model_test_utils import (
 
 from tensorrt_llm._torch.auto_deploy.compile.backends.torch_cudagraph import CapturedGraph
 from tensorrt_llm._torch.auto_deploy.compile.compiler import _flatten_args
-from tensorrt_llm._torch.auto_deploy.transformations.export import torch_export_to_gm
+from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 
 
 class ModelWithMultipleInputs(torch.nn.Module):

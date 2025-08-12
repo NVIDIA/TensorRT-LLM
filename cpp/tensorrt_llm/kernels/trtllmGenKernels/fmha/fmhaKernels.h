@@ -322,7 +322,7 @@ private:
                 {
                     // Consider that the first tileKv might contain tokensKv that is out of the attention window.
                     maxAttentionWindow
-                        = std::min(params.mMaxSeqLenKv, params.mAttentionWindowSize + kernelMeta.mStepKv - 1);
+                        = std::min(params.mMaxSeqLenKv, params.mAttentionWindowSize + kernelMeta.mTileSizeKv - 1);
                 }
                 else
                 {
@@ -413,9 +413,13 @@ private:
         return std::make_tuple(numCtasPerSeqQ, numCtasPerSeqKv, numCtasX, numCtasY, numCtasZ, clusterDimX);
     }
 
-    // Compute the seqLenPerCtaKv for selecting the MLA generation kernel.
-    int computeSeqLenPerCtaKv(RunnerParams const& params) const
+    // Determine if we should use the SwapsMmaAbForGeneration kernel for MLA generation.
+    bool useSwapsMmaAbMlaGenKernel(RunnerParams const& params) const
     {
+        // Use the SwapsMmaAbForGeneration kernel for MLA generation when the following conditions are met:
+        // 1. The seqLenPerCtaKv <= 1024 based on the benchmark results (this might be fine-tuned later).
+        // 2. The numCtas (after splitting the heads across multiple CTAs) <= params.mMultiProcessorCount.
+
         // The maximum number Ctas per Kv sequence, which makes sure that each CtaKv has work to do.
         // Here we assume the stepKv is 256.
         int const maxNumCtasPerSeqKv = (params.mMaxSeqLenKv + 256 - 1) / 256;
@@ -427,8 +431,8 @@ private:
             = std::min(maxNumCtasPerSeqKv, std::max(1, int32_t(params.mMultiProcessorCount / numCtas)));
         // Compute the seqLenPerCtaKv.
         int const seqLenPerCtaKv = (params.mMaxSeqLenKv + numCtasPerSeqKv - 1) / numCtasPerSeqKv;
-        // Return the seqLenPerCtaKv.
-        return seqLenPerCtaKv;
+        // Whether we should use the SwapsMmaAbForGeneration kernel for MLA generation.
+        return seqLenPerCtaKv <= 1024 && numCtas <= params.mMultiProcessorCount;
     }
 
     std::pair<uint64_t, std::string> hashFromRunnerParams(
@@ -442,10 +446,11 @@ private:
             // We use the low-latency kernel (SwapsMmaAbForGeneration with tileSizeQ = 16) when any of the following
             // conditions are met:
             // 1. The number of headsQPerKv is <= 32.
-            // 2. The seqLenPerCtaKv <= 1024 based on the benchmark results (this might be fine-tuned later).
+            // 2. The seqLenPerCtaKv <= 1024 based on the benchmark results (this might be fine-tuned later) and
+            //    the numCtas (after splitting the heads across multiple CTAs) <= params.mMultiProcessorCount.
 
             // Check the conditions.
-            if (params.mNumHeadsQPerKv <= 32 || computeSeqLenPerCtaKv(params) <= 1024)
+            if (params.mNumHeadsQPerKv <= 32 || useSwapsMmaAbMlaGenKernel(params))
             {
                 kernelType = FmhaKernelType::SwapsMmaAbForGeneration;
             }

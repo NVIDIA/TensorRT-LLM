@@ -20,6 +20,7 @@ import linecache
 import math
 import os
 import struct
+import tempfile
 import trace
 import weakref
 from contextlib import contextmanager
@@ -32,6 +33,7 @@ from typing import Any, Dict, List, Optional, Sequence, Union
 import numpy as np
 import nvtx
 from mpi4py import MPI
+from mpi4py.util import pkl5
 from packaging import version
 
 # isort: off
@@ -179,6 +181,7 @@ _str_to_binding_dtype_dict = dict(
     bool=DataType.BOOL,
     fp8=DataType.FP8,
 )
+_binding_to_str_dtype = {v: k for k, v in _str_to_binding_dtype_dict.items()}
 
 _binding_dtype_size = {
     DataType.INT64: 8,
@@ -191,6 +194,12 @@ _binding_dtype_size = {
     DataType.INT8: 1,
     DataType.UINT8: 1,
 }
+
+
+def binding_to_str_dtype(binding_dtype) -> str:
+    ret = _binding_to_str_dtype.get(binding_dtype)
+    assert ret is not None, f'Unsupported binding dtype: {binding_dtype}'
+    return ret
 
 
 def binding_dtype_size(dtype: DataType):
@@ -455,7 +464,7 @@ def dim_resolve_negative(dim, ndim):
 # mpi4py only exports MPI_COMM_TYPE_SHARED, so we define OMPI_COMM_TYPE_HOST here
 OMPI_COMM_TYPE_HOST = 9
 
-comm = MPI.COMM_WORLD
+comm = pkl5.Intracomm(MPI.COMM_WORLD)
 
 
 def set_mpi_comm(new_comm):
@@ -468,6 +477,10 @@ def mpi_comm():
 
 
 local_comm = mpi_comm().Split_type(split_type=OMPI_COMM_TYPE_HOST)
+
+
+def local_mpi_comm():
+    return local_comm
 
 
 def mpi_rank():
@@ -506,6 +519,11 @@ def default_gpus_per_node():
 def mpi_barrier():
     if ENABLE_MULTI_DEVICE:
         mpi_comm().Barrier()
+
+
+def local_mpi_barrier():
+    if ENABLE_MULTI_DEVICE:
+        local_comm.Barrier()
 
 
 def mpi_broadcast(obj, root=0):
@@ -1004,10 +1022,15 @@ class KVCacheEventSerializer:
         if event_serialize_func is None:
             raise ValueError(f"Unknown KVCache event data type: {event_type}")
 
-        return {
+        json_str = {
             "event_id": event.event_id,
             "data": event_serialize_func(event.data),
+            "window_size": event.window_size,
         }
+        if event.attention_dp_rank is not None:
+            json_str["attention_dp_rank"] = event.attention_dp_rank
+
+        return json_str
 
     @staticmethod
     def _created_to_json(data):
@@ -1090,3 +1113,17 @@ def is_multi_device_enable():
     the number of devices
     """
     return local_mpi_size() > 1
+
+
+def set_prometheus_multiproc_dir() -> object:
+    # Adapted from: https://github.com/sgl-project/sglang/blob/v0.4.10/python/sglang/srt/utils.py#L1266
+    global prometheus_multiproc_dir
+    if "PROMETHEUS_MULTIPROC_DIR" in os.environ:
+        logger.info("User set PROMETHEUS_MULTIPROC_DIR detected.")
+        prometheus_multiproc_dir = tempfile.TemporaryDirectory(
+            dir=os.environ["PROMETHEUS_MULTIPROC_DIR"])
+    else:
+        prometheus_multiproc_dir = tempfile.TemporaryDirectory()
+        os.environ["PROMETHEUS_MULTIPROC_DIR"] = prometheus_multiproc_dir.name
+    logger.info(
+        f"PROMETHEUS_MULTIPROC_DIR: {os.environ['PROMETHEUS_MULTIPROC_DIR']}")

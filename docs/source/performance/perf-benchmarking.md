@@ -79,7 +79,7 @@ that have been validated extensively and is the same listing as seen on the
 - [meta-llama/Llama-3.1-8B-Instruct](https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct)
 - [meta-llama/Llama-3.1-70B-Instruct](https://huggingface.co/meta-llama/Llama-3.1-70B-Instruct)
 - [meta-llama/Llama-3.1-405B-Instruct](https://huggingface.co/meta-llama/Llama-3.1-405B-Instruct)
-- [mistralai/Mixtral-8x7B-v0.1-Instruct](https://huggingface.co/mistralai/Mixtral-8x7B-v0.1-Instruct)
+- [mistralai/Mixtral-8x7B-Instruct-v0.1](https://huggingface.co/mistralai/Mixtral-8x7B-Instruct-v0.1)
 
 ```{tip}
 `trtllm-bench` can automatically download the model from Hugging Face Model Hub.
@@ -234,15 +234,6 @@ The following command builds an FP8 quantized engine by specifying the engine tu
 
 ```shell
 trtllm-bench --model meta-llama/Llama-3.1-8B build --quantization FP8 --max_seq_len 4096 --max_batch_size 1024 --max_num_tokens 2048
-```
-
-- [Experimental] Build engine with target ISL/OSL for optimization:
-In this experimental mode, you can provide hints to `trtllm-bench`'s tuning heuristic to optimize the engine on specific ISL and OSL targets.
-Generally, the target ISL and OSL aligns with the average ISL and OSL of the dataset, but you can experiment with different values to optimize the engine using this mode.
-The following command builds an FP8 quantized engine and optimizes for ISL:OSL targets of 128:128.
-
-```shell
-trtllm-bench --model meta-llama/Llama-3.1-8B build --quantization FP8 --max_seq_len 4096 --target_isl 128 --target_osl 128
 ```
 
 
@@ -438,7 +429,7 @@ for build heuristics.
 ```
 
 ```shell
-trtllm-bench --model meta-llama/Llama-3.1-8B --model_path /Ckpt/Path/To/Llama-3.1-8B throughput --dataset /tmp/synthetic_128_128.txt --backend pytorch
+trtllm-bench --model meta-llama/Llama-3.1-8B --model_path /Ckpt/Path/To/Llama-3.1-8B throughput --dataset /tmp/synthetic_128_128.txt
 
 # Example output
 <snip verbose logging>
@@ -544,7 +535,6 @@ lora_config:
 trtllm-bench --model /path/to/base/model \
   throughput \
   --dataset synthetic_lora_data.json \
-  --backend pytorch \
   --extra_llm_api_options extra-llm-api-options.yaml
 ```
 
@@ -586,7 +576,6 @@ Run the benchmark:
 trtllm-bench --model Qwen/Qwen2-VL-2B-Instruct \
   throughput \
   --dataset mm_data.jsonl \
-  --backend pytorch \
   --num_requests 10 \
   --max_batch_size 4 \
   --modality image

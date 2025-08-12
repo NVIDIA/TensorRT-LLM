@@ -29,7 +29,8 @@ class Phi3Attention(Attention):
         layer_idx: Optional[int] = None,
     ):
         config = model_config.pretrained_config
-
+        # Pass max_seq_len to config for LongRoPE.
+        config.max_seq_len = model_config.max_seq_len
         rope_params = RopeParams.from_config(config)
         super().__init__(
             hidden_size=config.hidden_size,
@@ -66,6 +67,7 @@ class Phi3DecoderLayer(DecoderLayer):
             bias=False,
             dtype=config.torch_dtype,
             config=model_config,
+            layer_idx=layer_idx,
         )
 
         self.input_layernorm = RMSNorm(
@@ -107,7 +109,11 @@ class Phi3DecoderLayer(DecoderLayer):
         # Fully connected
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
-        hidden_states = self.mlp(hidden_states, **kwargs)
+        hidden_states = self.mlp(
+            hidden_states,
+            lora_params=lora_params,
+            **kwargs,
+        )
         return hidden_states, residual
 
 

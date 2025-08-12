@@ -71,6 +71,8 @@ add_library(
   moeUtilOp.cpp
   moeCommOp.cpp
   moeLoadBalanceOp.cpp
+  mxFp4BlockScaleMoe.cpp
+  mxFp8Quantize.cpp
   fp8BlockScaleMoe.cpp
   fp8PerTensorScaleMoe.cpp
   fp4BlockScaleMoe.cpp
@@ -85,6 +87,8 @@ add_library(
   selectiveScanOp.cpp
   userbuffersFinalizeOp.cpp
   userbuffersTensor.cpp
+  virtualMemoryAllocator.cpp
+  weightOnlyQuantGemm.cpp
   weightOnlyQuantOp.cpp
   mtpOp.cpp
   loraOp.cpp

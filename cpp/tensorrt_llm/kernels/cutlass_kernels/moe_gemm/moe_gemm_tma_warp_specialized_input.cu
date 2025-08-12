@@ -27,14 +27,14 @@
 
 namespace tensorrt_llm::kernels::cutlass_kernels
 {
-std::array<size_t, 17> TmaWarpSpecializedGroupedGemmInput::workspaceBuffers(
+std::array<size_t, 20> TmaWarpSpecializedGroupedGemmInput::workspaceBuffers(
     int num_experts, FpXBlockScalingType scaling_type)
 {
     size_t problem_shape_size = sizeof(ProblemShape::UnderlyingProblemShape) * num_experts;
     size_t stride_a_size = sizeof(StrideA) * num_experts;
     size_t stride_b_size = sizeof(StrideB) * num_experts;
     size_t stride_c_size = sizeof(StrideC) * num_experts;
-    size_t stride_d_size = sizeof(DefaultEpilogue::StrideD) * num_experts;
+    size_t stride_d_size = sizeof(StrideD) * num_experts;
 
     size_t ptr_buf_size = sizeof(void*) * num_experts;
     size_t scale_buf_size = sizeof(float*) * num_experts;
@@ -53,9 +53,12 @@ std::array<size_t, 17> TmaWarpSpecializedGroupedGemmInput::workspaceBuffers(
     size_t int4_groupwise_sf_a_size = sizeof(INT4GroupwiseParams::SFA*) * num_experts;
     size_t int4_groupwise_stride_sf_a_size = sizeof(INT4GroupwiseParams::StrideSFA) * num_experts;
 
+    size_t ptr_token_map_size = sizeof(int**) * num_experts;
+
     return std::array{problem_shape_size, stride_a_size, stride_b_size, stride_c_size, stride_d_size, ptr_buf_size,
         ptr_buf_size, ptr_buf_size, ptr_buf_size, scale_buf_size, sf_a_size, sf_b_size, stride_sf_a_size,
-        stride_sf_b_size, int4_groupwise_problem_shape_size, int4_groupwise_sf_a_size, int4_groupwise_stride_sf_a_size};
+        stride_sf_b_size, int4_groupwise_problem_shape_size, int4_groupwise_sf_a_size, int4_groupwise_stride_sf_a_size,
+        ptr_buf_size, scale_buf_size, ptr_token_map_size};
 }
 
 size_t TmaWarpSpecializedGroupedGemmInput::workspaceSize(int num_experts, FpXBlockScalingType scaling_type)
@@ -68,7 +71,7 @@ void TmaWarpSpecializedGroupedGemmInput::configureWorkspace(int8_t* start_ptr, i
     size_t gemm_workspace_size, FpXBlockScalingType scaling_type)
 {
     auto buffers = workspaceBuffers(num_experts, scaling_type);
-    std::array<int8_t*, 17> pointers{};
+    std::array<int8_t*, 20> pointers{};
     TLLM_CHECK_WITH_INFO(pointers.size() == buffers.size(), "Mismatching workspace size and number of buffers");
     for (int i = 0; i < buffers.size(); i++)
     {
@@ -82,12 +85,12 @@ void TmaWarpSpecializedGroupedGemmInput::configureWorkspace(int8_t* start_ptr, i
     stride_a = reinterpret_cast<StrideA*>(pointers[1]);
     stride_b = reinterpret_cast<StrideB*>(pointers[2]);
     stride_c = reinterpret_cast<StrideC*>(pointers[3]);
-    default_epilogue.stride_d = reinterpret_cast<DefaultEpilogue::StrideD*>(pointers[4]);
+    stride_d = reinterpret_cast<StrideD*>(pointers[4]);
 
     ptr_a = reinterpret_cast<void const**>(pointers[5]);
     ptr_b = reinterpret_cast<void const**>(pointers[6]);
     ptr_c = reinterpret_cast<void const**>(pointers[7]);
-    default_epilogue.ptr_d = reinterpret_cast<void**>(pointers[8]);
+    ptr_d = reinterpret_cast<void**>(pointers[8]);
 
     alpha_scale_ptr_array = reinterpret_cast<float const**>(pointers[9]);
 
@@ -103,28 +106,24 @@ void TmaWarpSpecializedGroupedGemmInput::configureWorkspace(int8_t* start_ptr, i
     int4_groupwise_params.ptr_s_a = reinterpret_cast<INT4GroupwiseParams::SFA const**>(pointers[15]);
     int4_groupwise_params.stride_s_a = reinterpret_cast<INT4GroupwiseParams::StrideSFA*>(pointers[16]);
 
+    fused_finalize_epilogue.ptr_bias = reinterpret_cast<void const**>(pointers[17]);
+    fused_finalize_epilogue.ptr_router_scales = reinterpret_cast<float const**>(pointers[18]);
+    fused_finalize_epilogue.ptr_source_token_index = reinterpret_cast<int const**>(pointers[19]);
+
     this->gemm_workspace = reinterpret_cast<uint8_t*>(gemm_workspace);
     this->gemm_workspace_size = gemm_workspace_size;
 }
 
-void TmaWarpSpecializedGroupedGemmInput::setFinalizeFusionParams(void* final_output, float const* router_scales,
-    int64_t const* expert_first_token_offset, int const* source_token_index, void const* bias, int hidden_size,
-    int num_output_tokens)
+void TmaWarpSpecializedGroupedGemmInput::setFinalizeFusionParams(
+    void* final_output, int hidden_size, int num_output_tokens, bool use_reduction)
 {
     fused_finalize_epilogue.ptr_final_output = final_output;
-    fused_finalize_epilogue.ptr_router_scales = router_scales;
-    fused_finalize_epilogue.ptr_bias = bias;
-    fused_finalize_epilogue.ptr_expert_first_token_offset = expert_first_token_offset;
-    fused_finalize_epilogue.ptr_source_token_index = source_token_index;
 
-    fused_finalize_epilogue.stride_final_output
-        = cutlass::make_cute_packed_stride(FusedFinalizeEpilogue::StrideFinalOutput{},
-            transpose_stride(cute::make_shape(num_output_tokens, hidden_size, 1)));
-    fused_finalize_epilogue.stride_bias
-        = transpose_stride(cute::make_stride(cute::Int<0>{}, cute::Int<1>{}, hidden_size));
-    fused_finalize_epilogue.stride_router_scales = {};
+    fused_finalize_epilogue.stride_final_output = cutlass::make_cute_packed_stride(
+        FusedFinalizeEpilogue::StrideFinalOutput{}, cute::make_shape(hidden_size, num_output_tokens, 1));
 
     fused_finalize_epilogue.num_rows_in_final_output = num_output_tokens;
+    fused_finalize_epilogue.use_reduction = use_reduction;
 }
 
 std::string TmaWarpSpecializedGroupedGemmInput::toString() const
@@ -143,16 +142,13 @@ std::string TmaWarpSpecializedGroupedGemmInput::toString() const
             ss << "Final Output: " << (PrintType) fused_finalize_epilogue.ptr_final_output;
             ss << " with Stride: " << fused_finalize_epilogue.stride_final_output;
             ss << ",\nBias: " << (PrintType) fused_finalize_epilogue.ptr_bias;
-            ss << " with Stride: " << fused_finalize_epilogue.stride_bias;
             ss << ",\nRouter Scales: " << fused_finalize_epilogue.ptr_router_scales;
-            ss << " with Stride: " << fused_finalize_epilogue.stride_router_scales;
-            ss << ",\nExpert Offset: " << (PrintType) fused_finalize_epilogue.ptr_expert_first_token_offset;
             ss << ", Source Map: " << (PrintType) fused_finalize_epilogue.ptr_source_token_index;
         }
         else
         {
-            ss << "Ptr D: " << (PrintType) default_epilogue.ptr_d;
-            ss << " with Stride: " << (PrintType) default_epilogue.stride_d;
+            ss << "Ptr D: " << (PrintType) ptr_d;
+            ss << " with Stride: " << (PrintType) stride_d;
         }
         ss << '\n';
         ss << "Alpha scale ptr: " << (PrintType) alpha_scale_ptr_array << "\n";

@@ -187,9 +187,8 @@ void selfAttentionRef(T* output, T* const Q, T* const KV, int batch_size, int nu
                 float sum = 0;
                 for (int s_kv = 0; s_kv < curr_kv_len; s_kv++)
                 {
-                    // P[s_q * curr_kv_len + s_kv] = std::exp(P[s_q * curr_kv_len + s_kv] * bmm1_scale);
-                    // hack for real mla kernel
-                    P[s_q * curr_kv_len + s_kv] = std::exp(P[s_q * curr_kv_len + s_kv] * 0.072168784);
+                    // P[s_q * curr_kv_len + s_kv] = std::exp(P[s_q * curr_kv_len + s_kv]);
+                    P[s_q * curr_kv_len + s_kv] = std::exp(P[s_q * curr_kv_len + s_kv]);
                     sum += P[s_q * curr_kv_len + s_kv];
                 }
                 for (int s_kv = 0; s_kv < curr_kv_len; s_kv++)

@@ -118,7 +118,8 @@ class QWenInfer(object):
         num_kv_heads = config["pretrained_config"].get("num_key_value_heads",
                                                        num_heads)
         if "kv_cache_type" in config["build_config"]:
-            kv_cache_type = KVCacheType(config["build_config"]["kv_cache_type"])
+            kv_cache_type = KVCacheType.from_string(
+                config["build_config"]["kv_cache_type"])
         else:
             kv_cache_type = KVCacheType.CONTINUOUS
 

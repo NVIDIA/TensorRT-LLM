@@ -59,7 +59,7 @@ def load_buffers_and_params(
         if clone:
             v_new = v.detach().clone()
             if isinstance(v, torch.nn.Parameter):
-                v_new = nn.Parameter(v_new)
+                v_new = nn.Parameter(v_new, requires_grad=False)
         else:
             v_new = state_dict[k]
         setattr(submod, name, v_new)
@@ -96,23 +96,24 @@ def named_graphmodules(gm: fx.GraphModule) -> Iterator[Tuple[str, fx.GraphModule
             yield name, m
 
 
-def _move_single_gm_to_device(
-    gm: GraphModule, device: torch.device, recompile_graph: bool = False
-) -> None:
+def _move_single_gm_to_device(gm: GraphModule, device: torch.device) -> None:
     """Move one GraphModule and its nodes to the specified device in-place.
     Partially inspired by https://github.com/pytorch/pytorch/blob/05cb98f91d49df9eadfcb3fc29bbd1b621d88860/torch/export/passes/__init__.py#L11
     """
     # move state dict
     gm.to(device)
+    recompile_graph = False
 
     for node in gm.graph.nodes:
         # move all the nodes kwargs with burnt-in device
         if "device" in node.kwargs:
+            recompile_graph = True
             kwargs = node.kwargs.copy()
             kwargs["device"] = device
             node.kwargs = kwargs
 
         if is_op(node, torch.ops.aten.to.device):
+            recompile_graph = True
             args = list(node.args)
             args[1] = device
             node.args = tuple(args)
@@ -135,7 +136,7 @@ def move_to_device(gm: fx.GraphModule, device: DeviceLikeType) -> fx.GraphModule
 
     for _, subgm in reversed(list(named_graphmodules(gm))):
         # recompile graph to update self generated codes in subgraph
-        _move_single_gm_to_device(subgm, device, subgm is not gm)
+        _move_single_gm_to_device(subgm, device)
 
 
 def _is_impure_node(node: Node) -> bool:
@@ -192,7 +193,7 @@ def _canonicalize_single_gm(
 
 def canonicalize_graph(
     gm: GraphModule, shape_prop: bool = False, args_static: Optional[Tuple[Any, ...]] = None
-) -> GraphModule:
+) -> None:
     """Canonicalize the graph of the given GraphModule.
 
     Args:
@@ -216,8 +217,6 @@ def canonicalize_graph(
         )
 
     ad_logger.debug(f"After canonicalizing: {gm}")
-
-    return gm
 
 
 def add_graph_input(

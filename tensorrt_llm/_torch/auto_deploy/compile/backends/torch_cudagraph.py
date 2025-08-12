@@ -35,10 +35,11 @@ class CapturedGraph(nn.Module):
         self._out_buffer_flat: List[torch.Tensor] = None
         self._args_hash: Optional[Tuple[int, ...]] = None
         self.cuda_graph_batch_sizes = (
-            cuda_graph_batch_sizes
+            sorted(cuda_graph_batch_sizes, reverse=True)
             if cuda_graph_batch_sizes is not None
             else self._get_graph_batch_sizes(self.max_batch_size)
         )
+        self._cuda_graph_mem_pool = None
 
     def _get_hash(self, flat_args: List[Any]) -> Tuple[int, ...]:
         return tuple(hash(a) for a in flat_args)
@@ -64,7 +65,7 @@ class CapturedGraph(nn.Module):
         # capture graph now
         torch.cuda.synchronize()
         graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
+        with torch.cuda.graph(graph, pool=self._cuda_graph_mem_pool):
             # compute output
             out = self.model(*args, **kwargs)
             # write out into output buffer up to out batch size
@@ -73,7 +74,7 @@ class CapturedGraph(nn.Module):
             for o_buffer, o in zip(self._out_buffer_flat, out_flat):
                 o_buffer[: o.shape[0]] = o
         torch.cuda.synchronize()
-
+        self._cuda_graph_mem_pool = self._cuda_graph_mem_pool or graph.pool()
         return graph
 
     @staticmethod
@@ -88,7 +89,7 @@ class CapturedGraph(nn.Module):
         batch_sizes.update(range(multiplier, max_bs + 1, multiplier))
 
         # return as sorted list
-        return sorted(batch_sizes)
+        return sorted(batch_sizes, reverse=True)
 
     def capture_graph(self, *args, **kwargs):
         """Capture and pre-fetch the graph for variable batch size."""
@@ -118,6 +119,7 @@ class CapturedGraph(nn.Module):
 
         # capture output once with max batch size to capture output buffers
         with CudaGraphWarmUpPhase():
+            ad_logger.info(f"Warm up with {self.max_batch_size=} before graph capture")
             out = self.model(*args, **kwargs)
         self._out_buffer_flat, out_spec = tree_flatten(out)
         assert out_spec == self._out_spec, "Output spec mismatch."
@@ -160,7 +162,7 @@ class CapturedGraph(nn.Module):
 
         # copy inputs to input buffers
         for i, input_tensor in enumerate(args_batched):
-            self._input_buffers[i][: input_tensor.shape[0]] = input_tensor
+            self._input_buffers[i][: input_tensor.shape[0]].copy_(input_tensor, non_blocking=True)
 
         # run forward pass via graph
         self.graphs[combined_shape].replay()

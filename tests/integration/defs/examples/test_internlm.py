@@ -14,8 +14,14 @@
 # limitations under the License.
 import pytest
 from defs.common import convert_weights, parse_mpi_cmd, venv_mpi_check_call
-from defs.conftest import get_device_memory
+from defs.conftest import get_device_memory, get_sm_version
 from defs.trt_test_alternative import check_call
+
+# skip trt flow cases on post-Blackwell-Ultra
+if get_sm_version() >= 103:
+    pytest.skip(
+        "TRT workflow tests are not supported on post Blackwell-Ultra architecture",
+        allow_module_level=True)
 
 
 # @pytest.mark.skip_less_device(2)

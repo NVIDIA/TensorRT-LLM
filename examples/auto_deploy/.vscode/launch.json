@@ -16,8 +16,10 @@
                 "--args.model-factory=AutoModelForCausalLM",
                 "--benchmark.enabled=false",
                 "--prompt.batch-size=2",
-                "--args.model-kwargs",
-                "num_hidden_layers=3,num_attention_heads=32",
+                "--args.model-kwargs.num-hidden-layers=3",
+                "--args.model-kwargs.num-attention-heads=32",
+                "--prompt.sp-kwargs.max-tokens=128",
+                // "--dry-run", // uncomment to print the final config and return
             ],
             "console": "integratedTerminal",
             "justMyCode": false,

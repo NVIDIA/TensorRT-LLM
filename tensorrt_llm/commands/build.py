@@ -31,11 +31,29 @@ from tensorrt_llm.auto_parallel.cluster_info import cluster_infos
 from tensorrt_llm.bindings import KVCacheType
 from tensorrt_llm.builder import BuildConfig, Engine, build
 from tensorrt_llm.logger import logger, severity_map
-from tensorrt_llm.lora_manager import LoraConfig, LoraManager
+from tensorrt_llm.lora_helper import LoraConfig
+from tensorrt_llm.lora_manager import LoraManager
 from tensorrt_llm.models import MODEL_MAP, PretrainedConfig
 from tensorrt_llm.models.modeling_utils import SpeculativeDecodingMode
 from tensorrt_llm.plugin import PluginConfig, add_plugin_argument
 from tensorrt_llm.quantization.mode import QuantAlgo
+
+
+def enum_type(enum_class):
+
+    def parse_enum(value):
+        if isinstance(value, enum_class):
+            return value
+
+        if isinstance(value, str):
+            return enum_class.from_string(value)
+
+        valid_values = [e.name for e in enum_class]
+        raise argparse.ArgumentTypeError(
+            f"Invalid value '{value}' of type {type(value).__name__}. Expected one of {valid_values}"
+        )
+
+    return parse_enum
 
 
 def parse_arguments():
@@ -131,7 +149,7 @@ def parse_arguments():
     parser.add_argument(
         '--kv_cache_type',
         default=argparse.SUPPRESS,
-        type=KVCacheType,
+        type=enum_type(KVCacheType),
         help=
         "Set KV cache type (continuous, paged, or disabled). For disabled case, KV cache is disabled and only context phase is allowed."
     )
@@ -332,8 +350,8 @@ def build_model(
         model_config.logits_dtype = logits_dtype
 
     architecture = model_config.architecture
-    assert not build_config.plugin_config.streamingllm or architecture == "LlamaForCausalLM", \
-        "StreamingLLM is only supported in the llama model."
+    assert not build_config.plugin_config.streamingllm, \
+        "StreamingLLM is no longer supported because attention sink cannot work with the non-cyclic kv cache kernel & runtime changes."
     assert not build_config.plugin_config.pp_reduce_scatter or architecture == "MixtralForCausalLM", \
         "PP reduce scatter is only supported in the mixtral model."
 

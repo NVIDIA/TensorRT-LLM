@@ -256,9 +256,9 @@ public:
             constexpr int SF_VEC_SIZE = 16;
             using PackedVec = PackedVec<DType>;
             PackedVec pack_val = *reinterpret_cast<PackedVec const*>(&val);
-            auto sf_out = cvt_quant_to_fp4_get_sf_out_offset<uint32_t, 2, SF_VEC_SIZE>(std::nullopt, token_id,
-                m_access_id_in_token, std::nullopt, m_params.hidden_dim,
-                reinterpret_cast<uint32_t*>(m_params.scale_out), m_params.layout);
+            auto sf_out = cvt_quant_get_sf_out_offset<uint32_t, 2>(std::nullopt, token_id, m_access_id_in_token,
+                std::nullopt, m_params.hidden_dim / SF_VEC_SIZE, reinterpret_cast<uint32_t*>(m_params.scale_out),
+                m_params.layout);
             reinterpret_cast<uint32_t*>(m_params.quant_out)[m_access_id]
                 = cvt_warp_fp16_to_fp4<DType, SF_VEC_SIZE, false>(pack_val, m_scale_factor, sf_out);
         }
@@ -520,7 +520,7 @@ __global__ void __launch_bounds__(1024) allreduce_fusion_kernel_oneshot_lamport(
 }
 
 template <AllReduceFusionPattern Pattern, typename DType, int NRanks, bool Fp32Acc>
-__global__ void allreduce_fusion_kernel_twoshot_sync(
+__global__ void __launch_bounds__(1024) allreduce_fusion_kernel_twoshot_sync(
     AllReduceFusionParams params, std::array<int, NRanks> begin_tokens, std::array<int, NRanks> token_num_per_ranks)
 {
     IndexHelper<DType> index_helper(params);

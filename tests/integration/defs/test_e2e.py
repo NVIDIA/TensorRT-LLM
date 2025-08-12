@@ -16,6 +16,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -551,7 +552,7 @@ class BenchRunner:
         if self.use_pytorch_backend:
             benchmark_cmd += " --backend pytorch"
         else:
-            benchmark_cmd += " --backend trt"
+            benchmark_cmd += " --backend tensorrt"
 
         if self.extra_llm_api_options:
             benchmark_cmd += f" --extra_llm_api_options {self.extra_llm_api_options}"
@@ -576,6 +577,59 @@ def test_trtllm_bench_llmapi_launch(llm_root, llm_venv, model_name,
                          use_mpirun=True,
                          tp_size=2)
     runner()
+
+
+@pytest.mark.parametrize(
+    "model_name, llama_model_root",
+    [pytest.param("TinyLlama-1.1B-Chat-v1.0", "TinyLlama-1.1B-Chat-v1.0")],
+    indirect=["llama_model_root"])
+def test_trtllm_bench_invalid_token_pytorch(llm_root, llm_venv, model_name,
+                                            llama_model_root):
+    # Prepare dataset with invalid tokens
+    _, _, dataset_path = trtllm_bench_prolog(llm_root,
+                                             llm_venv,
+                                             engine_dir=None,
+                                             model_subdir=llama_model_root,
+                                             model_name=model_name,
+                                             quant=None,
+                                             streaming=False,
+                                             skip_engine_build=True)
+    with open(dataset_path) as f:
+        dataset = [json.loads(line) for line in f.readlines()]
+    dataset[0]["input_ids"][-1] = -1
+    with open(dataset_path, "w") as f:
+        f.writelines(f"{json.dumps(data)}\n" for data in dataset)
+
+    # Run benchmark
+    extra_options = {
+        "cuda_graph_config": {
+            "enable_padding": True,
+            "batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128, 256, 384],
+        },
+    }
+    with tempfile.TemporaryDirectory() as tmpdir:
+        extra_options_path = Path(tmpdir) / "extra-llm-api-options.yml"
+        with open(extra_options_path, "w") as f:
+            yaml.dump(extra_options, f)
+
+        output_path = Path(tmpdir) / "stdout.log"
+        benchmark_cmd = \
+                f"trtllm-bench --model {model_name} " \
+                f"--model_path {llama_model_root} " \
+                f"throughput " \
+                f"--dataset {str(dataset_path)} --backend pytorch " \
+                f"--extra_llm_api_options {extra_options_path} " \
+                f"> {output_path}"
+        # Check clean shutdown (no hang)
+        with pytest.raises(subprocess.CalledProcessError) as exc_info:
+            check_call(benchmark_cmd, shell=True, env=llm_venv._new_env)
+        # Check non-zero exit code
+        assert exc_info.value.returncode != 0
+        with open(output_path) as f:
+            stdout = f.read()
+
+    # Check that error is reported correctly
+    assert "Error during benchmarking: Requests failed: Token ID out of range (1 requests)" in stdout
 
 
 def trtllm_bench_prolog(
@@ -1399,24 +1453,20 @@ def test_openai_misc_example(llm_root, llm_venv, backend: str):
 @pytest.mark.parametrize("backend", ["pytorch", "trt"])
 def test_openai_completions_example(llm_root, llm_venv, backend: str):
     test_root = unittest_path() / "llmapi" / "apps"
+    filter_expr = f"{backend} and not sampler"
     llm_venv.run_cmd([
         "-m", "pytest",
-        str(test_root / "_test_openai_completions.py"), "-k", backend
+        str(test_root / "_test_openai_completions.py"), "-k", filter_expr
     ])
 
 
 @pytest.mark.parametrize("backend", ["pytorch", "trt"])
 def test_openai_chat_example(llm_root, llm_venv, backend: str):
-    example_root = Path(os.path.join(llm_root, "examples", "apps"))
     test_root = unittest_path() / "llmapi" / "apps"
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(example_root, "requirements.txt")
-    ])
-
+    filter_expr = f"{backend} and not sampler"
     llm_venv.run_cmd([
         "-m", "pytest",
-        str(test_root / "_test_openai_chat.py"), "-k", backend
+        str(test_root / "_test_openai_chat.py"), "-k", filter_expr
     ])
 
 
@@ -1429,19 +1479,38 @@ def test_openai_reasoning(llm_root, llm_venv, backend: str):
     ])
 
 
+@pytest.mark.parametrize("sampler", ["torch_sampler", "trtllm_sampler"])
+def test_openai_completions_with_logit_bias(llm_root, llm_venv, sampler: str):
+    test_root = unittest_path() / "llmapi" / "apps"
+    llm_venv.run_cmd([
+        "-m", "pytest",
+        str(test_root / "_test_openai_completions.py"), "-k", sampler
+    ])
+
+
+@pytest.mark.parametrize("sampler", ["torch_sampler", "trtllm_sampler"])
+def test_openai_chat_with_logit_bias(llm_root, llm_venv, sampler: str):
+    test_root = unittest_path() / "llmapi" / "apps"
+    llm_venv.run_cmd([
+        "-m", "pytest",
+        str(test_root / "_test_openai_chat.py"), "-k", sampler
+    ])
+
+
+def test_openai_prometheus(llm_root, llm_venv):
+    test_root = unittest_path() / "llmapi" / "apps"
+    llm_venv.run_cmd(
+        ["-m", "pytest",
+         str(test_root / "_test_openai_prometheus.py")])
+
+
 def test_openai_lora(llm_root, llm_venv):
     test_root = unittest_path() / "llmapi" / "apps"
     llm_venv.run_cmd(["-m", "pytest", str(test_root / "_test_openai_lora.py")])
 
 
 def test_openai_chat_multimodal_example(llm_root, llm_venv):
-    example_root = Path(os.path.join(llm_root, "examples", "apps"))
     test_root = unittest_path() / "llmapi" / "apps"
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(example_root, "requirements.txt")
-    ])
-
     llm_venv.run_cmd(
         ["-m", "pytest",
          str(test_root / "_test_openai_chat_multimodal.py")])
@@ -1449,23 +1518,24 @@ def test_openai_chat_multimodal_example(llm_root, llm_venv):
 
 def test_openai_chat_structural_tag_example(llm_venv):
     test_root = unittest_path() / "llmapi" / "apps"
-
     llm_venv.run_cmd([
         "-m", "pytest",
         str(test_root / "_test_openai_chat_structural_tag.py")
     ])
 
 
+def test_openai_chat_json_example(llm_venv):
+    test_root = unittest_path() / "llmapi" / "apps"
+
+    llm_venv.run_cmd(
+        ["-m", "pytest",
+         str(test_root / "_test_openai_chat_json.py")])
+
+
 @pytest.mark.skip_less_device(2)
 @pytest.mark.skip_less_device_memory(40000)
 def test_openai_multi_chat_example(llm_root, llm_venv):
-    example_root = Path(os.path.join(llm_root, "examples", "apps"))
     test_root = unittest_path() / "llmapi" / "apps"
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(example_root, "requirements.txt")
-    ])
-
     llm_venv.run_cmd(
         ["-m", "pytest",
          str(test_root / "_test_openai_multi_chat.py")])
@@ -1475,13 +1545,7 @@ def test_openai_multi_chat_example(llm_root, llm_venv):
 @pytest.mark.skip_less_device(4)
 @pytest.mark.skip_less_device_memory(80000)
 def test_openai_consistent_chat(llm_root, llm_venv):
-    example_root = Path(os.path.join(llm_root, "examples", "apps"))
     test_root = unittest_path() / "llmapi" / "apps"
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(example_root, "requirements.txt")
-    ])
-
     llm_venv.run_cmd(
         ["-m", "pytest",
          str(test_root / "_test_openai_consistent_chat.py")])
@@ -1491,13 +1555,7 @@ def test_openai_consistent_chat(llm_root, llm_venv):
 @pytest.mark.skip_less_device(4)
 @pytest.mark.skip_less_device_memory(80000)
 def test_openai_multinodes_chat_tp16pp1(llm_root, llm_venv):
-    example_root = Path(os.path.join(llm_root, "examples", "apps"))
     test_root = unittest_path() / "llmapi" / "apps"
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(example_root, "requirements.txt")
-    ])
-
     llm_venv.run_cmd([
         "-m", "pytest", "-k", "tp16pp1",
         str(test_root / "_test_openai_multi_nodes.py")
@@ -1508,13 +1566,7 @@ def test_openai_multinodes_chat_tp16pp1(llm_root, llm_venv):
 @pytest.mark.skip_less_device(4)
 @pytest.mark.skip_less_device_memory(80000)
 def test_openai_multinodes_chat_tp8pp2(llm_root, llm_venv):
-    example_root = Path(os.path.join(llm_root, "examples", "apps"))
     test_root = unittest_path() / "llmapi" / "apps"
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(example_root, "requirements.txt")
-    ])
-
     llm_venv.run_cmd([
         "-m", "pytest", "-k", "tp8pp2",
         str(test_root / "_test_openai_multi_nodes.py")
@@ -1523,13 +1575,7 @@ def test_openai_multinodes_chat_tp8pp2(llm_root, llm_venv):
 
 @pytest.mark.skip_less_device_memory(80000)
 def test_trtllm_benchmark_serving(llm_root, llm_venv):
-    example_root = Path(os.path.join(llm_root, "examples", "apps"))
     test_root = unittest_path() / "llmapi" / "apps"
-    llm_venv.run_cmd([
-        "-m", "pip", "install", "-r",
-        os.path.join(example_root, "requirements.txt")
-    ])
-
     llm_venv.run_cmd(
         ["-m", "pytest",
          str(test_root / "_test_trtllm_serve_benchmark.py")])
@@ -1663,6 +1709,8 @@ def test_ptp_quickstart_advanced(llm_root, llm_venv, model_name, model_path):
             ]
             if "Qwen3" in model_name:
                 cmds.append(f"--kv_cache_fraction=0.6")
+            if "Llama3.1-70B" in model_name:
+                cmds.append(f"--max_num_tokens=1024")
             llm_venv.run_cmd(cmds, stdout=running_log)
             if model_name in mapping:
                 _check_mem_usage(running_log, [mapping[model_name], 0, 0, 0])
@@ -1684,7 +1732,7 @@ def test_ptp_quickstart_advanced_mtp(llm_root, llm_venv, model_name,
             [
                 str(example_root / "quickstart_advanced.py"),
                 "--use_cuda_graph",
-                "--spec_decode_nextn",
+                "--spec_decode_max_draft_len",
                 "1",  # test 1 MTP module
                 "--spec_decode_algo",
                 "MTP",
@@ -1763,13 +1811,13 @@ def test_ptp_quickstart_advanced_eagle3(llm_root, llm_venv, model_name,
                                      delete_on_close=True) as running_log:
         llm_venv.run_cmd([
             str(example_root / "quickstart_advanced.py"),
-            "--spec_decode_nextn",
+            "--spec_decode_max_draft_len",
             "4",
             "--spec_decode_algo",
             "eagle3",
             "--model_dir",
             f"{llm_models_root()}/{model_path}",
-            "--eagle_model_dir",
+            "--draft_model_dir",
             f"{llm_models_root()}/{eagle_model_path}",
             "--disable_kv_cache_reuse",
             "--disable_overlap_scheduler",
@@ -1796,7 +1844,7 @@ def test_ptp_quickstart_advanced_ngram(llm_root, llm_venv, model_name,
             f"{llm_models_root()}/{model_path}",
             "--spec_decode_algo",
             "NGRAM",
-            "--spec_decode_nextn",
+            "--spec_decode_max_draft_len",
             "4",
             "--max_matching_ngram_size",
             "2",
@@ -1806,6 +1854,70 @@ def test_ptp_quickstart_advanced_ngram(llm_root, llm_venv, model_name,
         ],
                          stdout=running_log)
         _check_mem_usage(running_log, [27.0, 0, 0, 0])
+
+
+@pytest.mark.parametrize("model_name,model_path", [
+    ("Llama-3.1-8B-Instruct", "llama-3.1-model/Llama-3.1-8B-Instruct"),
+])
+def test_ptp_quickstart_advanced_auto(llm_root, llm_venv, model_name,
+                                      model_path):
+    print(f"Testing {model_name}.")
+    example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
+    with tempfile.NamedTemporaryFile(mode='w+t',
+                                     suffix=f".{model_name}.log",
+                                     dir="./",
+                                     delete=True,
+                                     delete_on_close=True) as running_log:
+        llm_venv.run_cmd([
+            str(example_root / "quickstart_advanced.py"),
+            "--model_dir",
+            f"{llm_models_root()}/{model_path}",
+            "--spec_decode_algo",
+            "AUTO",
+            "--use_cuda_graph",
+            "--max_batch_size=4",
+        ],
+                         stdout=running_log)
+        _check_mem_usage(running_log, [27.0, 0, 0, 0])
+
+
+@skip_post_blackwell
+@pytest.mark.skip_less_device_memory(80000)
+@pytest.mark.skip_less_device(4)
+@pytest.mark.parametrize("model_name,model_path", [
+    pytest.param(
+        'DeepSeek-V3-Lite-FP8', 'DeepSeek-V3-Lite/fp8', marks=skip_pre_hopper),
+])
+def test_ptp_quickstart_advanced_deepseek_v3_lite_4gpus_adp_balance(
+        llm_root, llm_venv, model_name, model_path):
+    print(f"Testing {model_name}.")
+    example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
+    with tempfile.NamedTemporaryFile(mode='w+t',
+                                     suffix=f".{model_name}.log",
+                                     dir="./",
+                                     delete=True,
+                                     delete_on_close=True) as running_log:
+        llm_venv.run_cmd([
+            str(example_root / "quickstart_advanced.py"),
+            "--model_dir",
+            f"{llm_models_root()}/{model_path}",
+            "--moe_tp_size=1",
+            "--moe_ep_size=4",
+            "--tp_size=4",
+            "--use_cuda_graph",
+            "--enable_attention_dp",
+            f"--kv_cache_fraction={_MEM_FRACTION_95}",
+            "--max_batch_size=1",
+            "--max_seq_len=3000",
+            "--disable_kv_cache_reuse",
+            "--attention_dp_enable_balance",
+            "--attention_dp_time_out_iters",
+            "10",
+            "--attention_dp_batching_wait_iters",
+            "10",
+        ],
+                         stdout=running_log)
+        _check_mem_usage(running_log, [106.3, 0, 0, 0], 8)
 
 
 @skip_post_blackwell
@@ -1872,7 +1984,7 @@ def test_relaxed_acceptance_quickstart_advanced_deepseek_r1_8gpus(
             "--disable_kv_cache_reuse",
             "--spec_decode_algo",
             "MTP",
-            "--spec_decode_nextn",
+            "--spec_decode_max_draft_len",
             "5",
             "--use_relaxed_acceptance_for_thinking",
             "--relaxed_topk=10",
@@ -1931,6 +2043,40 @@ def test_ptp_quickstart_advanced_8gpus(llm_root, llm_venv, model_name,
             _check_mem_usage(running_log, [mapping[model_name], 0, 0, 0], 8)
 
 
+@skip_pre_hopper
+@pytest.mark.skip_less_device(8)
+@pytest.mark.parametrize("cuda_graph", [False, True])
+@pytest.mark.parametrize("model_name,model_path", [
+    ("Llama-4-Maverick-17B-128E-Instruct-FP8",
+     "llama4-models/nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8"),
+    ("Llama-4-Scout-17B-16E-Instruct-FP8",
+     "llama4-models/Llama-4-Scout-17B-16E-Instruct-FP8"),
+    pytest.param('Llama-4-Scout-17B-16E-Instruct-FP4',
+                 'llama4-models/Llama-4-Scout-17B-16E-Instruct-FP4',
+                 marks=skip_pre_blackwell),
+])
+def test_ptp_quickstart_advanced_8gpus_chunked_prefill_sq_22k(
+        llm_root, llm_venv, model_name, model_path, cuda_graph):
+    print(f"Testing {model_name} on 8 GPUs.")
+    example_root = Path(os.path.join(llm_root, "examples", "pytorch"))
+    cmd = [
+        str(example_root / "quickstart_advanced.py"),
+        "--enable_chunked_prefill",
+        "--model_dir",
+        f"{llm_models_root()}/{model_path}",
+        "--tp_size=8",
+        "--moe_ep_size=8",
+        "--max_seq_len=22000",
+        "--kv_cache_fraction=0.1",
+    ]
+    if cuda_graph:
+        cmd.extend([
+            "--use_cuda_graph",
+            "--cuda_graph_padding_enabled",
+        ])
+    llm_venv.run_cmd(cmd)
+
+
 # This test is specifically to be run on 2 GPUs on Blackwell RTX 6000 Pro (SM120) architecture
 # TODO: remove once we have a node with 8 GPUs and reuse test_ptp_quickstart_advanced_8gpus
 @skip_no_sm120
@@ -1974,22 +2120,24 @@ def test_ptp_quickstart_advanced_mixed_precision(llm_root, llm_venv):
 
 
 @pytest.mark.parametrize("use_cuda_graph", [False, True])
-@pytest.mark.parametrize("modality", ["image", "video"])
+@pytest.mark.parametrize("modality", ["image", "video", "mixture_text_image"])
 @pytest.mark.parametrize("model_name,model_path", [
     ("NVILA-8B-FP16", "vila/NVILA-8B"),
     ("NVILA-15B-FP16", "NVILA-15B"),
     ("llava-v1.6-mistral-7b", "llava-v1.6-mistral-7b-hf"),
     ("qwen2-vl-7b-instruct", "Qwen2-VL-7B-Instruct"),
     ("qwen2.5-vl-7b-instruct", "Qwen2.5-VL-7B-Instruct"),
-    ("mistral-small-3.1-24b-instruct", "Mistral-Small-3.1-24B-Instruct-2503"),
-    ("gemma-3-27b-it", "gemma/gemma-3-27b-it"),
+    pytest.param("mistral-small-3.1-24b-instruct",
+                 "Mistral-Small-3.1-24B-Instruct-2503",
+                 marks=pytest.mark.skip_less_device_memory(80000)),
+    pytest.param("gemma-3-27b-it",
+                 "gemma/gemma-3-27b-it",
+                 marks=pytest.mark.skip_less_device_memory(80000)),
 ])
 def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
                                    modality, use_cuda_graph):
     # NOTE: individual tests need to be enabled in
     # tests/integration/test_lists/qa/examples_test_list.txt
-    llm_venv.run_cmd(
-        ['-m', 'pip', 'install', 'flash-attn==2.7.3', '--no-build-isolation'])
 
     example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
     test_data_root = Path(
@@ -2018,12 +2166,22 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
                 str(test_data_root / "world.mp4"),
             ],
         },
+        "mixture_text_image": {
+            "prompt": [
+                "Who invented the internet?",
+                "Describe the scene in the image briefly.",
+            ],
+            "media": [
+                "",
+                str(test_data_root / "inpaint.png"),
+            ],
+        }
     }
 
     expected_keywords = {
         "NVILA-8B-FP16": {
             "image": [
-                ["stormy", "ocean", "waves", "clouds", "gray", "sky"],
+                ["stormy", "ocean", "waves", "cloudy", "sunlight", "sky"],
                 ["rock", "formation", "sunny", "sky", "clouds"],
                 ["road", "busy", "car", "black", "blue"],
             ],
@@ -2037,22 +2195,16 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
         },
         "llava-v1.6-mistral-7b": {
             "image": [
-                [
-                    "ocean", "cloud", "waves", "white", "shore", "large",
-                    "dramatic", "breaking"
-                ],
-                ["mountain", "butte", "flat", "top", "sky"],
-                ["highway", "vehicles", "traffic", "divider", "suburban"],
+                ["ocean", "sky", "large", "waves", "shore", "blue"],
+                ['mountain', 'flat', 'clouds', 'road', 'sky'],
+                ["highway", "vehicles", "traffic", "bus", "suburban"],
             ],
         },
         "qwen2-vl-7b-instruct": {
             "image": [
-                ["ocean", "waves", "shore", "natural", "clouds", "turbulent"],
-                [
-                    "mountainous", "landscape", "rock", "peak", "weather",
-                    "steep"
-                ],
-                ["traffic", "vehicles", "moderate", "lanes", "road"],
+                ["ocean", "waves", "atmosphere", "stormy", "clouds", "intense"],
+                ["trees", "winding", "road", "sunny", "sky", "atmosphere"],
+                ["traffic", "vehicles", "moderate", "lanes", "road", "cars"],
             ],
             "video": [
                 ["city", "night", "lights", "jacket", "wet"],
@@ -2061,33 +2213,36 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
         },
         "qwen2.5-vl-7b-instruct": {
             "image": [
-                ["dramatic", "moody", "stormy", "turbulent", "wave"],
+                ["dramatic", "moody", "ocean", "stormy", "sky", "waves"],
+                ["large", "dome", "yosemite", "landmark", "rock", "road"],
                 [
-                    "large", "dome", "yosemite", "landmark", "rock", "road",
-                    "formation"
+                    "highway", "traffic", "vehicles", "lanes", "congestion",
+                    "road"
                 ],
-                ["highway", "traffic", "vehicles", "bus", "police"],
             ],
             "video": [
                 ["woman", "neon", "night", "jacket", "wet"],
-                ["earth", "rotating", "night", "lights", "cities"],
+                ["earth", "world", "night", "lights", "cities"],
             ],
         },
         "mistral-small-3.1-24b-instruct": {
             "image": [
+                ["dramatic", "seascape", "ocean", "turbulent", "waves", "dark"],
+                ["scenic", "rock", "landscape", "monolith", "formation"],
                 [
-                    "dramatic", "seascape", "stormy", "turbulent", "waves",
-                    "rough"
+                    "multi-lane", "highway", "moderate", "traffic", "flow",
+                    "vehicles", "congestion"
                 ],
-                ["scenic", "rock", "landscape", "snow", "formation"],
-                ["highway", "traffic", "directions", "lanes", "Jurong"],
             ],
+            "mixture_text_image":
+            [["invention", "person", "scientists", "Lick", "engineers"],
+             ["landscape", "trees", "road", "natural", "rock"]]
         },
         "gemma-3-27b-it": {
             "image": [
                 ["dramatic", "turbulent", "waves", "ocean", "overcast"],
                 ["half", "dome", "yosemite", "landmark", "rounded"],
-                ["flowing", "standstill", "vehicles", "road", "Changi"],
+                ["flowing", "traffic", "vehicles", "road", "Changi"],
             ],
         },
     }
@@ -2231,15 +2386,15 @@ def test_ptp_quickstart_multimodal_phi4mm(llm_root, llm_venv, modality):
     }
     expected_keywords = {
         "image": [
-            ["clear", "sunny", "sky", "image", "object"],
-            ["road", "car", "lane", "strip", "bus"],
+            ["image", "depicts", "mountain", "half", "rock"],
+            ["road", "car", "lane", "traffic", "bus"],
         ],
         "audio": [
             ["what", "is", "the", "traffic", "sign", "in", "image"],
             ["what", "is", "shown", "in", "this", "image"],
         ],
         "image_audio": [
-            ["Half", "Dome", "Park", "natural", "image"],
+            ["image", "depicts", "Grand", "rock", "scene"],
         ],
     }
 
@@ -2253,6 +2408,8 @@ def test_ptp_quickstart_multimodal_phi4mm(llm_root, llm_venv, modality):
         *accuracy_inputs[modality]["prompt"],
         "--media",
         *accuracy_inputs[modality]["media"],
+        # Set max_seq_len to 4096 to use short rope factor.
+        "--max_seq_len=4096",
         "--load_lora",
         "--auto_model_name",
         "Phi4MMForCausalLM",

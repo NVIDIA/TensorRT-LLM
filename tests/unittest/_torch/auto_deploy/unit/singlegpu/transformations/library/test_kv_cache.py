@@ -2,14 +2,17 @@ from typing import Optional
 
 import pytest
 import torch
+from _graph_test_helpers import FakeFactory
 from _model_test_utils import GQA
 from _torch_test_utils import all_close
 
 from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import CacheConfig, SequenceInfo
 from tensorrt_llm._torch.auto_deploy.custom_ops.flashinfer_attention import FlashInferAttention
 from tensorrt_llm._torch.auto_deploy.custom_ops.triton_attention import TritonAttention
+from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.shim.interface import CachedSequenceInterface
-from tensorrt_llm._torch.auto_deploy.transformations.export import torch_export, torch_export_to_gm
+from tensorrt_llm._torch.auto_deploy.transform.interface import InferenceOptimizerConfig
+from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.transformations.library import update_in_out_nodes
 from tensorrt_llm._torch.auto_deploy.transformations.library.kvcache import insert_cached_attention
 
@@ -65,6 +68,43 @@ class GQAWithSdpa(GQA):
         return self.o_proj(attn_output)
 
 
+def _get_optimizer_config() -> InferenceOptimizerConfig:
+    return {
+        "build_model": {
+            "stage": "factory",
+            "device": "cuda",
+            "run_graph_cleanup": False,
+            "requires_clean_graph": False,
+        },
+        "export_to_gm": {
+            "stage": "export",
+            "strict": False,
+            "clone_state_dict": True,
+            "run_graph_cleanup": False,
+            "requires_clean_graph": False,
+        },
+        "cleanup_input_constraints": {
+            "stage": "post_export",
+        },
+    }
+
+
+class SequenceEmbeddingInfo(SequenceInfo):
+    hidden_size: int
+    dtype: torch.dtype
+
+    def set_example_sequence(self) -> None:
+        super().set_example_sequence()
+        # set input ids to a 3D tensor (actually input embeddings)
+        self.input_ids = torch.rand(
+            *self.input_ids.shape,
+            self.hidden_size,
+            device=self.input_ids.device,
+            dtype=self.dtype,
+        )
+
+
+# TODO (lucaslie): consider rewriting this test with a custom InferenceOptimizer config
 @pytest.mark.parametrize(
     "dtype",
     [torch.float16, torch.float32],
@@ -103,18 +143,21 @@ def test_sdpa_with_kv_cache(dtype, attn_descriptor, gqa_config):
     max_position_embeddings = 128
 
     # set up sequence+cache objects
-    ci = SequenceInfo(
+    ci = SequenceEmbeddingInfo(
         max_seq_len=max_position_embeddings,
         max_batch_size=batch_size,
     )
+    ci.hidden_size = hidden_size
+    ci.dtype = dtype
     cm = CachedSequenceInterface(sequence_info=ci, device="cuda")
 
-    # Create the model with SDPA
+    # Create the model with SDPA and wrap it in a fake factory
     model = GQAWithSdpa(
         num_attention_heads,
         hidden_size,
         num_key_value_heads,
-    ).to(device="cuda", dtype=dtype)
+    ).to(dtype=dtype, device="cuda")
+    factory = FakeFactory(model)
 
     # Create input tensor and position_ids
     x = torch.rand(batch_size, seq_len, hidden_size).to(device="cuda", dtype=dtype)
@@ -123,13 +166,10 @@ def test_sdpa_with_kv_cache(dtype, attn_descriptor, gqa_config):
     # Get the model's regular output
     y_model = model(x, position_ids)  # b, s, d
 
-    # Export to graph module
-    gm = torch_export_to_gm(
-        model,
-        args=(x, position_ids),
-        clone=True,
-        dynamic_shapes=cm.dynamic_shapes[:2],  # Include both inputs in dynamic shapes
-    )
+    # run modular inference optimizer up to post_export
+    optimizer = InferenceOptimizer(factory, _get_optimizer_config())  # type: ignore
+    gm = optimizer(cm)
+
     y_gm = gm(x, position_ids)
     assert all_close(y_model, y_gm, atol=atol, rtol=rtol)
 
@@ -137,22 +177,20 @@ def test_sdpa_with_kv_cache(dtype, attn_descriptor, gqa_config):
     cache_config = CacheConfig()
 
     # Get input node(s)
-    gm_transformed = update_in_out_nodes(gm, cm)
+    update_in_out_nodes(gm, cm)
 
     # Apply the transformation
-    gm_transformed = insert_cached_attention(
-        gm_transformed, cm, attn_descriptor=attn_descriptor, cache_config=cache_config
-    )
-    gm_transformed.to("cuda")
+    insert_cached_attention(gm, cm, attn_descriptor=attn_descriptor, cache_config=cache_config)
+    gm.to("cuda")
     cm.initialize_caches()
 
     # Helper function to call the model with proper sequence nesting
     def _call_and_unnest(x):
         # Use nest_sequences to properly set input_ids and automatically update position_ids
-        cm.info.nest_sequences(x)
+        cm.info.nest_sequences(x, allow_realloc=True)
 
         # Use the cm.args as is - it already contains the correct position_ids
-        y = gm_transformed(*cm.args)
+        y = gm(*cm.args)
 
         # Unnest the output sequences
         return torch.stack(cm.info.unnest_sequences(y))
@@ -187,6 +225,5 @@ def test_sdpa_with_kv_cache(dtype, attn_descriptor, gqa_config):
     assert all_close(y_model, y_with_cache, atol=atol, rtol=rtol)
 
     # Test 4: Exportability of the transformed model
-    torch_export(gm_transformed, args=cm.args)
-    exported_gm = torch_export_to_gm(gm_transformed, args=cm.args)
+    exported_gm = torch_export_to_gm(gm, args=cm.args)
     assert exported_gm is not None

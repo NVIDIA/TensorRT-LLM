@@ -202,7 +202,7 @@ class CLIPVisionModel(nn.Module):
             request_ids=request_ids,
             prompt_lens=prompt_lens,
         )
-        attn_metadata.max_seq_len = seq_len * batch_size
+        attn_metadata.max_seq_len = seq_len
         attn_metadata.prepare()
         return attn_metadata
 

@@ -10,6 +10,7 @@ from tensorrt_llm.inputs.multimodal import MultimodalParams
 from ..disaggregated_params import DisaggregatedParams
 from ..llmapi.llm_utils import KvCacheRetentionConfig
 from ..sampling_params import SamplingParams
+from ..scheduling_params import SchedulingParams
 from .postproc_worker import PostprocParams
 
 __all__ = [
@@ -25,10 +26,15 @@ class LoRARequest:
     lora_name: str
     lora_int_id: int
     lora_path: str = ""
+    lora_ckpt_source: str = "hf"
 
     def __post_init__(self):
         if self.lora_path is not None and not os.path.exists(self.lora_path):
             raise ValueError(f"lora_path ({self.lora_path}) does not exist.")
+        if self.lora_ckpt_source not in ["hf", "nemo"]:
+            raise ValueError(
+                f"lora_ckpt_source must be 'hf' or 'nemo', got '{self.lora_ckpt_source}'"
+            )
 
     @property
     def adapter_id(self):
@@ -41,6 +47,10 @@ class LoRARequest:
     @property
     def path(self):
         return self.lora_path
+
+    @property
+    def ckpt_source(self):
+        return self.lora_ckpt_source
 
 
 @dataclass(slots=True)
@@ -86,6 +96,7 @@ class GenerationRequest:
         disaggregated_params: Optional[DisaggregatedParams] = None,
         postproc_params: Optional[PostprocParams] = None,
         multimodal_params: Optional[MultimodalParams] = None,
+        scheduling_params: Optional[SchedulingParams] = None,
     ):
         if isinstance(prompt_token_ids, list):
             self.prompt_token_ids = prompt_token_ids
@@ -110,6 +121,7 @@ class GenerationRequest:
         self.kv_cache_retention_config = kv_cache_retention_config
         self.id: Optional[int] = None
         self.disaggregated_params = disaggregated_params
+        self.scheduling_params = scheduling_params
 
     def set_id(self, id):
         assert self.id is None, f"Request ID is already set: {self.id}"

@@ -30,9 +30,10 @@ from ..inputs import (PromptInputs, create_input_processor,
                       create_input_processor_with_hash, prompt_inputs)
 from ..logger import logger
 from ..sampling_params import SamplingParams
+from ..scheduling_params import SchedulingParams
 from .llm_args import (TORCH_LLMARGS_EXPLICIT_DOCSTRING,
-                       TRT_LLMARGS_EXPLICIT_DOCSTRING, PybindMirror,
-                       TorchLlmArgs, TrtLlmArgs)
+                       TRT_LLMARGS_EXPLICIT_DOCSTRING, PeftCacheConfig,
+                       PybindMirror, TorchLlmArgs, TrtLlmArgs)
 from .llm_utils import (CachedModelLoader, KvCacheRetentionConfig,
                         LlmBuildStats, ModelLoader, _ModelRuntimeContext)
 from .mpi_session import MpiPoolSession, external_mpi_comm_available
@@ -40,7 +41,7 @@ from .tokenizer import (TokenizerBase, _llguidance_tokenizer_info,
                         _xgrammar_tokenizer_info)
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
 from .utils import (append_docstring, exception_handler, get_device_count,
-                    print_colored_debug)
+                    print_colored_debug, set_api_status)
 
 
 class RequestOutput(DetokenizedGenerationResultBase, GenerationResult):
@@ -212,6 +213,7 @@ class BaseLLM:
         atexit.register(LLM._shutdown_wrapper, weakref.ref(self))
 
     @property
+    @set_api_status("beta")
     def llm_id(self) -> str:
         if self._llm_id is None:
             hostname = socket.gethostname()
@@ -235,6 +237,8 @@ class BaseLLM:
             KvCacheRetentionConfig, Sequence[KvCacheRetentionConfig]]] = None,
         disaggregated_params: Optional[Union[
             DisaggregatedParams, Sequence[DisaggregatedParams]]] = None,
+        scheduling_params: Optional[Union[SchedulingParams,
+                                          List[SchedulingParams]]] = None,
     ) -> Union[RequestOutput, List[RequestOutput]]:
         """Generate output for the given prompts in the synchronous mode.
         Synchronous generation accepts either single prompt or batched prompts.
@@ -253,6 +257,8 @@ class BaseLLM:
                 Configuration for the request's retention in the KV Cache. Defaults to None.
             disaggregated_params (tensorrt_llm.disaggregated_params.DisaggregatedParams, Sequence[tensorrt_llm.disaggregated_params.DisaggregatedParams], optional):
                 Disaggregated parameters. Defaults to None.
+            scheduling_params (tensorrt_llm.scheduling_params.SchedulingParams, List[tensorrt_llm.scheduling_params.SchedulingParams], optional):
+                Scheduling parameters. Defaults to None.
         Returns:
             Union[tensorrt_llm.llmapi.RequestOutput, List[tensorrt_llm.llmapi.RequestOutput]]: The output data of the completion request to the LLM.
         """
@@ -282,6 +288,7 @@ class BaseLLM:
                 kv_cache_retention_config=_item_at(kv_cache_retention_config,
                                                    i),
                 disaggregated_params=_item_at(disaggregated_params, i),
+                scheduling_params=_item_at(scheduling_params, i),
                 streaming=False)
             futures.append(future)
 
@@ -307,6 +314,7 @@ class BaseLLM:
         kv_cache_retention_config: Optional[KvCacheRetentionConfig] = None,
         disaggregated_params: Optional[DisaggregatedParams] = None,
         _postproc_params: Optional[PostprocParams] = None,
+        scheduling_params: Optional[SchedulingParams] = None,
     ) -> RequestOutput:
         """Generate output for the given prompt in the asynchronous mode.
         Asynchronous generation accepts single prompt only.
@@ -320,6 +328,7 @@ class BaseLLM:
             streaming (bool): Whether to use the streaming mode for the generation. Defaults to False.
             kv_cache_retention_config (tensorrt_llm.bindings.executor.KvCacheRetentionConfig, optional): Configuration for the request's retention in the KV Cache. Defaults to None.
             disaggregated_params (tensorrt_llm.disaggregated_params.DisaggregatedParams, optional): Disaggregated parameters. Defaults to None.
+            scheduling_params (tensorrt_llm.scheduling_params.SchedulingParams, optional): Scheduling parameters. Defaults to None.
 
         Returns:
             tensorrt_llm.llmapi.RequestOutput: The output data of the completion request to the LLM.
@@ -341,10 +350,10 @@ class BaseLLM:
 
         inputs = prompt_inputs(inputs)
 
-        if not inputs.get("prompt") and inputs.get(
-                "prompt_token_ids") and inputs.get(
-                    "multi_modal_data") and not isinstance(
-                        self.input_processor, DefaultInputProcessor):
+        if not inputs.get("prompt") and inputs.get("prompt_token_ids") and (
+                inputs.get("multi_modal_data")
+                or inputs.get("multi_modal_embeddings")) and not isinstance(
+                    self.input_processor, DefaultInputProcessor):
             # VLMs need to process/tokenize the prompt in their own way
             prompt = self.tokenizer.decode(inputs['prompt_token_ids'])
             inputs = TextPrompt(
@@ -377,6 +386,10 @@ class BaseLLM:
                 with nvtx_range_debug("input_processor_with_hash"):
                     prompt_token_ids, extra_processed_inputs = input_processor_with_hash(
                         inputs, sampling_params)
+            elif 'multi_modal_embeddings' in inputs:
+                mm_embedding_info = inputs['multi_modal_embeddings']
+                prompt_token_ids, extra_processed_inputs = self.input_processor.attach_multimodal_embeddings(
+                    inputs, mm_embedding_info, sampling_params)
             else:
                 with nvtx_range_debug("input_processor"):
                     prompt_token_ids, extra_processed_inputs = self.input_processor(
@@ -393,6 +406,9 @@ class BaseLLM:
                 # Only pass it if it has content
                 if not multimodal_params.has_content():
                     multimodal_params = None
+                else:
+                    # Convert to shared tensor handle to reduce IPC overhead
+                    multimodal_params.to_handle("multimodal_data")
         else:
             raise TypeError(
                 f"The inputs must be type str or list of int, but got {type(inputs)}"
@@ -417,11 +433,13 @@ class BaseLLM:
             disaggregated_params=disaggregated_params,
             postproc_params=_postproc_params,
             multimodal_params=multimodal_params,
+            scheduling_params=scheduling_params,
         )
 
         return RequestOutput._from_generation_result(result, prompt,
                                                      self.tokenizer)
 
+    @set_api_status("beta")
     def get_stats(self, timeout: Optional[float] = 2) -> List[dict]:
         '''Get iteration statistics from the runtime.
         To collect statistics, call this function after prompts have been submitted with LLM().generate().
@@ -435,6 +453,7 @@ class BaseLLM:
         '''
         return self._executor.get_stats(timeout=timeout)
 
+    @set_api_status("beta")
     def get_stats_async(self, timeout: Optional[float] = 2) -> IterationResult:
         '''Get iteration statistics from the runtime.
         To collect statistics, you can call this function in an async coroutine or the /metrics endpoint (if you're using trtllm-serve)
@@ -448,6 +467,7 @@ class BaseLLM:
         '''
         return self._executor.aget_stats(timeout=timeout)
 
+    @set_api_status("beta")
     def get_kv_cache_events(self, timeout: Optional[float] = 2) -> List[dict]:
         '''Get iteration KV events from the runtime.
 
@@ -469,6 +489,7 @@ class BaseLLM:
         '''
         return self._executor.get_kv_events(timeout=timeout)
 
+    @set_api_status("beta")
     def get_kv_cache_events_async(self,
                                   timeout: Optional[float] = 2
                                   ) -> IterationResult:
@@ -526,7 +547,7 @@ class BaseLLM:
         if sampling_params._stream_interval is None:
             sampling_params._stream_interval = getattr(self.args,
                                                        "stream_interval", 1)
-
+        sampling_params.return_perf_metrics = sampling_params.return_perf_metrics or self.args.return_perf_metrics
         return sampling_params
 
     def _check_arguments(self, prompt_len: int, query_len: int,
@@ -667,6 +688,7 @@ class BaseLLM:
     def tokenizer(self, tokenizer: TokenizerBase):
         self._tokenizer = tokenizer
 
+    @set_api_status("beta")
     def shutdown(self) -> None:
         if hasattr(self, "_executor") and self._executor is not None:
             self._executor.shutdown()
@@ -787,7 +809,9 @@ class _TrtLLM(BaseLLM):
             or tllm.BatchingType.INFLIGHT,
             max_batch_size=max_batch_size,
             max_num_tokens=max_num_tokens,
-            gather_generation_logits=self.args.gather_generation_logits)
+            gather_generation_logits=self.args.gather_generation_logits,
+            fail_fast_on_attention_window_too_large=getattr(
+                self.args, 'fail_fast_on_attention_window_too_large', False))
 
         # also set executor_config.max_seq_len in TRT workflow, to deduce default max_tokens
         if max_seq_len is not None:
@@ -807,19 +831,35 @@ class _TrtLLM(BaseLLM):
         if self.args.peft_cache_config is not None:
             self._executor_config.peft_cache_config = PybindMirror.maybe_to_pybind(
                 self.args.peft_cache_config)
-        elif self.args.build_config.plugin_config.lora_plugin:
+
+        lora_config = None
+        if self.args.build_config.plugin_config.lora_plugin:
             engine_config = EngineConfig.from_json_file(self._engine_dir /
                                                         "config.json")
             lora_config = engine_config.build_config.lora_config
+            if self.args.lora_config is not None:
+                logger.info(
+                    "Overriding lora_config from engine with lora_config from LLM args"
+                )
+                lora_config = self.args.lora_config
+
             max_lora_rank = lora_config.max_lora_rank
             num_lora_modules = engine_config.pretrained_config.num_hidden_layers * \
                 len(lora_config.lora_target_modules + lora_config.missing_qkv_modules)
-            self._executor_config.peft_cache_config = tllm.PeftCacheConfig(
-                num_device_module_layer=max_lora_rank * num_lora_modules *
-                self.args.max_loras,
-                num_host_module_layer=max_lora_rank * num_lora_modules *
-                self.args.max_cpu_loras,
+
+            peft_cache_config_model = PeftCacheConfig.from_pybind(
+                self._executor_config.peft_cache_config
+            ) if self._executor_config.peft_cache_config is not None else PeftCacheConfig(
             )
+            if lora_config.max_loras is not None:
+                peft_cache_config_model.num_device_module_layer = \
+                    max_lora_rank * num_lora_modules * lora_config.max_loras
+            if lora_config.max_cpu_loras is not None:
+                peft_cache_config_model.num_host_module_layer = \
+                    max_lora_rank * num_lora_modules * lora_config.max_cpu_loras
+            self._executor_config.peft_cache_config = peft_cache_config_model._to_pybind(
+            )
+
         if self.args.decoding_config is not None:
             self._executor_config.decoding_config = self.args.decoding_config
         if self.args.guided_decoding_backend == 'xgrammar':
@@ -860,7 +900,7 @@ class _TrtLLM(BaseLLM):
                 postprocess_tokenizer_dir=self.args.postprocess_tokenizer_dir,
             ),
             is_llm_executor=True,
-            lora_config=self.args.lora_config)
+            lora_config=lora_config)
 
 
 @append_docstring(TORCH_LLM_DOCSTRING)
@@ -920,15 +960,21 @@ class _TorchLLM(BaseLLM):
         max_num_tokens = self.args.max_num_tokens
         max_seq_len = self.args.max_seq_len
 
+        kwargs = {}
+        if self._on_trt_backend:
+            kwargs[
+                "batching_type"] = self.args.batching_type or tllm.BatchingType.INFLIGHT
+
         self._executor_config = tllm.ExecutorConfig(
             max_beam_width=self.args.max_beam_width,
             scheduler_config=PybindMirror.maybe_to_pybind(
                 self.args.scheduler_config),
-            batching_type=PybindMirror.maybe_to_pybind(self.args.batching_type)
-            or tllm.BatchingType.INFLIGHT,
             max_batch_size=max_batch_size,
             max_num_tokens=max_num_tokens,
-            gather_generation_logits=self.args.gather_generation_logits)
+            gather_generation_logits=self.args.gather_generation_logits,
+            fail_fast_on_attention_window_too_large=getattr(
+                self.args, 'fail_fast_on_attention_window_too_large', False),
+            **kwargs)
 
         if self.args.kv_cache_config is not None:
             self._executor_config.kv_cache_config = PybindMirror.maybe_to_pybind(
@@ -957,20 +1003,29 @@ class _TorchLLM(BaseLLM):
                 f"Unsupported guided decoding backend {self.args.guided_decoding_backend}"
             )
 
-        self._executor_config.normalize_log_probs = self.args.normalize_log_probs
+        if self._on_trt_backend:
+            self._executor_config.normalize_log_probs = self.args.normalize_log_probs
         self._executor_config.enable_chunked_context = self.args.enable_chunked_prefill
         self._executor_config.max_beam_width = self.args.max_beam_width
         if self.args.cache_transceiver_config is not None:
             self._executor_config.cache_transceiver_config = PybindMirror.maybe_to_pybind(
                 self.args.cache_transceiver_config)
         from tensorrt_llm._torch.pyexecutor.config import update_executor_config
+
+        spec_config = self.args.speculative_config
+        max_batch_size = self._executor_config.max_batch_size
+
+        if spec_config is not None and spec_config.decoding_type == "AUTO":
+            from tensorrt_llm._torch.speculative import suggest_spec_config
+            spec_config = suggest_spec_config(max_batch_size)
+
         update_executor_config(
             self._executor_config,
             backend=self.args.backend,
             pytorch_backend_config=self.args.get_pytorch_backend_config()
             if self.args.backend in ["pytorch", "_autodeploy"] else None,
             mapping=self.args.parallel_config.to_mapping(),
-            speculative_config=self.args.speculative_config,
+            speculative_config=spec_config,
             hf_model_dir=self._hf_model_dir,
             max_input_len=self.args.max_input_len,
             max_seq_len=max_seq_len,
@@ -1040,13 +1095,11 @@ class LLM(_TorchLLM):
                          revision, tokenizer_revision, **kwargs)
 
 
-_LLM_REPR = "TorchLLM"
-
 # sphinx will ignore the LLM's docstring if it is not explicitly set
 LLM.__doc__ = \
     f"""LLM class is the main class for running a LLM model.
 
-    This class is an alias of {_LLM_REPR}.
+    For more details about the arguments, please refer to :class:`TorchLlmArgs`.
 
     Parameters:
 """ + TORCH_LLM_DOCSTRING

@@ -172,7 +172,7 @@ struct Gmem_tile_qkv
     template <typename Block_info>
     inline __device__ Gmem_tile_qkv(bert::Fused_multihead_attention_params_v2 const& params, int qkv_offset,
         Block_info const& binfo, int tidx, int cta_row_offset = 0, int cta_col_offset_in_bytes = 0)
-        : Gmem_tile_qkv(params.qkv_ptr, params.qkv_stride_in_bytes, params.d, params.dv, params.h, qkv_offset, binfo,
+        : Gmem_tile_qkv(params.qkv_ptr, params.q_stride_in_bytes, params.d, params.dv, params.h, qkv_offset, binfo,
             tidx, params.h_kv, cta_row_offset, cta_col_offset_in_bytes)
     {
     }
@@ -181,7 +181,7 @@ struct Gmem_tile_qkv
     template <typename Params, typename Block_info>
     inline __device__ Gmem_tile_qkv(Params const& params, int qkv_offset, Block_info const& binfo, int tidx,
         int cta_row_offset = 0, int cta_col_offset_in_bytes = 0)
-        : Gmem_tile_qkv(params.qkv_ptr, params.qkv_stride_in_bytes, params.d, params.dv, params.h, qkv_offset, binfo,
+        : Gmem_tile_qkv(params.qkv_ptr, params.q_stride_in_bytes, params.d, params.dv, params.h, qkv_offset, binfo,
             tidx, cta_row_offset, cta_col_offset_in_bytes)
     {
     }
@@ -741,7 +741,7 @@ struct Gmem_tile_contiguous_kv
     inline __device__ Gmem_tile_contiguous_kv(bert::Fused_multihead_attention_params_v2 const& params,
         int qkv_offset, // q = 0, k = 1, v = 2.
         Block_info const& binfo, int tidx, int cta_row_offset = 0, int cta_col_offset_in_bytes = 0)
-        : Gmem_tile_contiguous_kv(params.kv_ptr, params.kv_stride_in_bytes, params.h_kv, params.h_q_per_kv, qkv_offset,
+        : Gmem_tile_contiguous_kv(params.kv_ptr, params.k_stride_in_bytes, params.h_kv, params.h_q_per_kv, qkv_offset,
             binfo, tidx, cta_row_offset, cta_col_offset_in_bytes)
     {
     }
@@ -796,7 +796,6 @@ struct Gmem_tile_contiguous_kv
     template <typename Smem_tile>
     inline __device__ void load(Smem_tile& smem_tile)
     {
-        // TODO(perkzz): add remap_kv_row for sliding window attention.
         uint32_t preds[LDGS];
 #pragma unroll
         for (int ii = 0; ii < LDGS; ++ii)
@@ -1070,35 +1069,11 @@ struct Gmem_tile_paged_kv
         // Do not load/store if the thread is in the padded area
         col_in_bytes_ = cta_col_offset_in_bytes + col * BYTES_PER_LDG;
 
-        // In DeepSeek, V is a prefix of K, and they share the same memory space.
-        // Therefore, when generating the cubin, only `kv_stride_in_bytes` field is needed.
-        // However, for ease of testing, the FMHA has been designed to support independent K and V,
-        // which requires an additional `v_stride_in_bytes` field.
-#ifdef GENERATE_CUBIN
-        // The head offset.
-        head_stride_in_bytes_ = (int64_t) (binfo.bidh / params.h_q_per_kv) * params.kv_stride_in_bytes;
-        token_stride_in_bytes_ = BYTES_PER_ELEMENT * params.d;
-#else
-        int64_t kv_stride_in_bytes;
-        if (qkv_offset == 1)
-        {
-            kv_stride_in_bytes = params.kv_stride_in_bytes;
-        }
-        else if (params.v_stride_in_bytes != 0)
-        {
-            kv_stride_in_bytes = params.v_stride_in_bytes;
-        }
-        else
-        {
-            kv_stride_in_bytes = params.kv_stride_in_bytes * params.dv / params.d;
-        }
+        int64_t kv_stride_in_bytes = qkv_offset == 1 ? params.k_stride_in_bytes : params.v_stride_in_bytes;
         // The head offset.
         head_stride_in_bytes_ = (int64_t) (binfo.bidh / params.h_q_per_kv) * kv_stride_in_bytes;
-        // In DeepSeek MLA, params.kv_stride_in_bytes == params.v_stride_in_bytes,
-        // token_stride_in_bytes_ of both K and V = d * sizeof(dtype),
-        // so the stride of V != VALID_BYTES_PER_ROW
+        // When V is padded (like MLA), we cannot use VALID_BYTES_PER_ROW
         token_stride_in_bytes_ = kv_stride_in_bytes >> paged_kv_log2_block_size_;
-#endif
 
         // Take the CTA offset to modify the sequence length.
         // Actually we don't need that for flash attention.
@@ -1112,42 +1087,6 @@ struct Gmem_tile_paged_kv
         if (!USE_LDGSTS)
         {
             smem_tile.store(fetch_);
-        }
-    }
-
-    ////////////////////////////////////////////////////////////////////////////////////////////////////
-    // Remap the row to the one in cyclic kv cache.
-    inline __device__ void remap_kv_row(int& row)
-    {
-        // Sliding window attention + chunked context needs special handling.
-        if constexpr (SLIDING_WINDOW_ATTENTION)
-        {
-            // For chunked context (i.e. separate q and kv layout), the kv cache might be overwritten
-            // after last chunk is processed.
-            // To deal with this issue, the new tokens' kv will be appended to the kv cache first, and
-            // overwrite the kv cache after FMHA is done.
-            // The kv input layout is like: [cyclic kv cache] + [new tokens' kv].
-            // There are two possible cases:
-            // 1. The kv cache hasn't been overwritten while processing previous chunks, so we can take
-            //    it normally, where we have full kv cache.
-            // 2. The kv cache has been overwritten while processing previous chunks. we need to mask
-            //    out the tokens in the kv cache based on the sliding window size. It needs to track the
-            //    last kv cache token's position in a circular way.
-
-            // Remap the kv row when kv cache has been overwritten in a circular way.
-            if (past_seqlen_ > sliding_window_size_)
-            {
-                // Map the kv row to the new tokens' kv.
-                if (row >= past_seqlen_)
-                {
-                    row = sliding_window_size_ + (row - past_seqlen_);
-                }
-                else
-                {
-                    // Map the kv row to the cyclic kv cache.
-                    row = row % sliding_window_size_;
-                }
-            }
         }
     }
 
@@ -1168,13 +1107,6 @@ struct Gmem_tile_paged_kv
         for (int ii = 0; ii < LDGS; ++ii)
         {
             int row_idx = row_ + ii * (int) ROWS_PER_LDG;
-
-            // Remap row_idx if sliding window attention is used.
-            // This will be removed later as the remapping will be handled by the kvCacheManger in TRTLLM.
-#ifdef GENERATE_CUBIN
-            remap_kv_row(row_idx);
-#endif
-
             int paged_kv_block_idx = (row_idx >> paged_kv_log2_block_size_);
             char const* local_kv_ptr = reinterpret_cast<char*>(paged_kv_block_pool_ptr_
                 + params_kv_block_size_in_bytes_ * paged_kv_global_block_offsets_[paged_kv_block_idx]);
@@ -1552,7 +1484,7 @@ struct Gmem_tile_qkv_interleaved
     inline __device__ Gmem_tile_qkv_interleaved(
         Params const& params, int qkv_select, Block_info const& block_info, int tidx, int cta_row_offset = 0)
         : actual_seqlen_(block_info.actual_seqlen - cta_row_offset)
-        , total_(params.qkv_stride_in_bytes)
+        , total_(params.q_stride_in_bytes)
         , kv_ptr_(reinterpret_cast<char const*>(params.qkv_ptr))
     {
 

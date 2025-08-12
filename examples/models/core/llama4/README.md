@@ -8,6 +8,7 @@ This document shows how to run Llama4-Maverick on B200 with PyTorch workflow and
 - [Performance Benchmarks](#performance-benchmarks)
   - [B200 Max-throughput](#b200-max-throughput)
   - [B200 Min-latency](#b200-min-latency)
+  - [B200 Balanced](#b200-balanced)
 - [Advanced Configuration](#advanced-configuration)
   - [Configuration tuning](#configuration-tuning)
   - [Troubleshooting](#troubleshooting)
@@ -44,7 +45,6 @@ Explanation:
 TensorRT-LLM supports nvidia TensorRT Model Optimizer quantized FP8 checkpoint
 ``` bash
 trtllm-serve nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8 \
-    --backend pytorch \
     --max_batch_size 512 \
     --tp_size 8 \
     --ep_size 8 \
@@ -95,11 +95,8 @@ Explanation:
 
 #### 2. Launch trtllm-serve OpenAI-compatible API server
 TensorRT-LLM supports nvidia TensorRT Model Optimizer quantized FP8 checkpoint.
-Currently parallel weight loading conflicts with min_latency, disable the parallel weight loading to enable min_latency for now.
 ``` bash
-TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL=True \
 trtllm-serve nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8 \
-    --backend pytorch \
     --max_batch_size 8 \
     --tp_size 8 \
     --ep_size 1 \
@@ -123,6 +120,52 @@ python -m tensorrt_llm.serve.scripts.benchmark_serving \
         --max-concurrency 1 \
 ```
 
+### B200 Balanced
+
+
+#### 1. Prepare TensorRT-LLM extra configs
+```bash
+cat >./extra-llm-api-config.yml <<EOF
+stream_interval: 2
+cuda_graph_config:
+  max_batch_size: 1024
+  enable_padding: true
+EOF
+```
+Explanation:
+- `stream_interval`: The iteration interval to create responses under the streaming mode.
+- `cuda_graph_config`: CUDA Graph config.
+  - `max_batch_size`: Max CUDA graph batch size to capture.
+  - `enable_padding`: Whether to enable CUDA graph padding.
+
+
+#### 2. Launch trtllm-serve OpenAI-compatible API server
+TensorRT-LLM supports nvidia TensorRT Model Optimizer quantized FP8 checkpoint.
+``` bash
+trtllm-serve nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8 \
+    --tp_size 8 \
+    --ep_size 2 \
+    --num_postprocess_workers 2 \
+    --trust_remote_code \
+    --extra_llm_api_options ./extra-llm-api-config.yml
+```
+
+
+#### 3. Run performance benchmark
+TensorRT-LLM provides a benchmark tool to benchmark trtllm-serve
+Prepare a new terminal and run `benchmark_serving`
+```bash
+python -m tensorrt_llm.serve.scripts.benchmark_serving \
+        --model nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8 \
+        --dataset-name random \
+        --ignore-eos \
+        --num-prompts 1000 \
+        --random-input-len 1024 \
+        --random-output-len 2048 \
+        --random-ids \
+        --max-concurrency 64 \
+```
+
 ## Advanced Configuration
 
 ### Configuration tuning
@@ -134,7 +177,7 @@ python -m tensorrt_llm.serve.scripts.benchmark_serving \
 - `max_batch_size` and `max_num_tokens` can easily affect the performance. The default values for them are already carefully designed and should deliver good performance on overall cases, however, you may still need to tune it for peak performance.
 - `max_batch_size` should not be too low to bottleneck the throughput. Note with Attention DP, the the whole system's max_batch_size will be `max_batch_size*dp_size`.
 - CUDA grah `max_batch_size` should be same value as TensorRT-LLM server's `max_batch_size`.
-- For more details on `max_batch_size` and `max_num_tokens`, refer to [Tuning Max Batch Size and Max Num Tokens](../performance/performance-tuning-guide/tuning-max-batch-size-and-max-num-tokens.md).
+- For more details on `max_batch_size` and `max_num_tokens`, refer to [Tuning Max Batch Size and Max Num Tokens](../../../../docs/source/performance/performance-tuning-guide/tuning-max-batch-size-and-max-num-tokens.md).
 
 ### Troubleshooting
 

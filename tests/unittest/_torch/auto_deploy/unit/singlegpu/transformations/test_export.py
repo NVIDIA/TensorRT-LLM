@@ -7,15 +7,15 @@ import torch.nn as nn
 import torch.nn.functional as F
 from _model_test_utils import MLP
 from _torch_test_utils import all_close
-from torch.export import Dim
+from torch.export import Dim, export
 from torch.fx import GraphModule
 
-from tensorrt_llm._torch.auto_deploy.transformations.export import torch_export, torch_export_to_gm
+from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 
 
 def _torch_export_non_strict(model, *args, **kwargs):
     kwargs["strict"] = False
-    return torch_export(model, *args, **kwargs)
+    return export(model, *args, **kwargs)
 
 
 class ModuleForExport(ABC, nn.Module):
@@ -94,7 +94,7 @@ class ModuleWithWhere(ModuleForExport):
 
     def check_xfail(self, f_export, use_dynamic_shape, device) -> bool:
         return (
-            use_dynamic_shape and f_export in [torch_export, _torch_export_non_strict]
+            use_dynamic_shape and f_export in [export, _torch_export_non_strict]
         ) or device == "meta"
 
 
@@ -133,7 +133,7 @@ class ModuleWithRouting(ModuleForExport):
 
     def check_xfail(self, f_export, use_dynamic_shape, device) -> bool:
         return (
-            use_dynamic_shape and f_export in [torch_export, _torch_export_non_strict]
+            use_dynamic_shape and f_export in [export, _torch_export_non_strict]
         ) or device == "meta"
 
 
@@ -162,7 +162,7 @@ class ModuleWithModuleList(ModuleForExport):
 
 @pytest.mark.parametrize(
     "f_export",
-    [torch.export.export, torch_export, _torch_export_non_strict, torch_export_to_gm],
+    [torch.export.export, export, _torch_export_non_strict, torch_export_to_gm],
 )
 @pytest.mark.parametrize("use_dynamic_shape", [True, False])
 @pytest.mark.parametrize("device", ["cpu", "cuda", "meta"])

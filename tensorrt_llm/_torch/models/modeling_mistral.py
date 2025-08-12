@@ -3,6 +3,7 @@ import os
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
+import torchvision
 from torch import nn
 from transformers import (AutoProcessor, AutoTokenizer, Mistral3Config,
                           MistralConfig, PretrainedConfig, PreTrainedModel)
@@ -226,7 +227,6 @@ class Mistral3InputProcessor(InputProcessor):
         self.model_config = model_config
         self.tokenizer = tokenizer
 
-        self._device = "cuda"
         self._processor = AutoProcessor.from_pretrained(model_path,
                                                         use_fast=False)
 
@@ -256,7 +256,6 @@ class Mistral3InputProcessor(InputProcessor):
         if pixel_values is not None:
             # We have no use for the `attention_mask`.
             processed.pop("attention_mask")
-            processed = processed.to(self._device)
             # NOTE: `processed` is a dict-like object, but not actually a dict.
             extra_processed_inputs = {
                 "multimodal_data": {
@@ -347,7 +346,6 @@ class Mistral3VLM(PreTrainedModel):
         attn_metadata: AttentionMetadata,
         input_ids: Optional[torch.LongTensor] = None,
         position_ids: Optional[torch.LongTensor] = None,
-        inputs_embeds: Optional[torch.Tensor] = None,
         return_context_logits: bool = False,
         **kwargs,
     ) -> torch.Tensor:
@@ -356,32 +354,34 @@ class Mistral3VLM(PreTrainedModel):
         logger.debug(f"{num_context_requests=}, {num_generation_requests=}")
 
         multimodal_params = kwargs.get("multimodal_params", [])
-        image_features = []
+        mm_embeds = []
         multimodal_params_len = len(multimodal_params)
         if multimodal_params_len > 0:
-            if multimodal_params_len != num_context_requests:
-                raise RuntimeError(
-                    f"Number of multimodal tensors ({multimodal_params_len}) should be equal to number of "
-                    f"context requests ({num_context_requests}) in the batch.")
-            # NOTES:
-            # 1. the pixel values in `multimodal_data["image"]` might vary in (height, width) between
-            #    images, making them unsafe to batch in general. The input processor also cannot produce
-            #    them in a batch, since it is always called with a single input - otherwise, we would
-            #    have been able to naturally leverage the padding / resizing capabilities of the underlying
-            #    `PixtralProcessor`.
-            # 2. After each `pixel_values` tensor has gone through the vision tower's `patch_conv` layer,
-            #    they are divided into patches that are then concatenated in order to treat them as a
-            #    single "sequence" in the vision tower's attention layers, so some form of batching still
-            #    happens in the vision tower.
-            image_features = [
-                self._get_image_features(**x.multimodal_data["image"])
+            pixel_values = [
+                x.multimodal_data["image"]["pixel_values"]
                 for x in multimodal_params
+            ]
+            image_sizes = [
+                x.multimodal_data["image"]["image_sizes"]
+                for x in multimodal_params
+            ]
+            if not (len(pixel_values) == len(image_sizes) ==
+                    multimodal_params_len):
+                raise ValueError(
+                    f"Expected as many `pixel_values` ({len(pixel_values)}) and "
+                    f"`image_sizes` ({len(image_sizes)}) as number of multimodal parameters "
+                    f"({multimodal_params_len}).")
+            batched_pixel_values, batched_image_sizes = self._batch_pixel_values(
+                pixel_values=pixel_values, image_sizes=image_sizes)
+            mm_embeds = [
+                self._get_image_features(pixel_values=batched_pixel_values,
+                                         image_sizes=batched_image_sizes)
             ]
 
         input_ids, inputs_embeds = fuse_input_embeds(
             embedding_layer=self.llm.model.embed_tokens,
             input_ids=input_ids,
-            mm_embeds=image_features,
+            mm_embeds=mm_embeds,
             mm_token_ids=self._image_token_ids,
         )
 
@@ -429,6 +429,31 @@ class Mistral3VLM(PreTrainedModel):
                                                      image_sizes)
         return image_features
 
+    # Original HF implementation:
+    # https://github.com/huggingface/transformers/blob/v4.51.3/src/transformers/models/pixtral/
+    # image_processing_pixtral.py#L276
+    # We switch to using torchvision's padding functionality since it supports torch tensors
+    # (the transformers one expected numpy arrays).
+    @staticmethod
+    @torch.inference_mode()
+    def _batch_pixel_values(
+        pixel_values: List[torch.Tensor],
+        image_sizes: List[torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        batched_image_sizes = torch.cat(image_sizes)
+        max_shape = batched_image_sizes.max(dim=0).values
+        pixel_values = [
+            torchvision.transforms.v2.functional.pad(
+                image,
+                # Per torchvision docs, this should be in LTRB order if it's a sequence of 4 numbers.
+                padding=[0, 0, max_shape[1] - size[1], max_shape[0] - size[0]],
+                # Values extracted from HF implementation.
+                fill=0.0,
+                padding_mode="constant",
+            ) for image, size in zip(pixel_values, batched_image_sizes)
+        ]
+        return torch.cat(pixel_values), batched_image_sizes
+
 
 # Original implementation:
 # https://github.com/huggingface/transformers/blob/v4.51.3/src/transformers/models/mistral3/modeling_mistral3.py#L66
@@ -450,6 +475,7 @@ class Mistral3PatchMerger(torch.nn.Module):
             out_features=hidden_size,
             bias=False,
             dtype=config.torch_dtype,
+            mapping=model_config.mapping,
         )
 
     @torch.inference_mode()
@@ -514,6 +540,7 @@ class Mistral3MultiModalProjector(torch.nn.Module):
             out_features=config.text_config.hidden_size,
             bias=config.multimodal_projector_bias,
             dtype=dtype,
+            mapping=model_config.mapping,
         )
         self.act = ACT2FN[config.projector_hidden_act]
         self.linear_2 = Linear(
@@ -521,6 +548,7 @@ class Mistral3MultiModalProjector(torch.nn.Module):
             out_features=config.text_config.hidden_size,
             bias=config.multimodal_projector_bias,
             dtype=dtype,
+            mapping=model_config.mapping,
         )
 
     @torch.inference_mode()

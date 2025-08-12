@@ -115,7 +115,6 @@ public:
 private:
     BaseKVCacheManager* mCacheManager;
     CacheTransBufferManager* mCacheTransBufferManager;
-    KvCacheMeasureHelper kvCacheMeasureHelper{common::getEnvKVCacheTransferOutputPath()};
 };
 
 std::unique_ptr<BaseCacheFormatter> createCacheFormatter(

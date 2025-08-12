@@ -26,7 +26,8 @@ def test_quant_mode():
 
     quant_mode = _tb.QuantMode.from_description(True, True, True, True, True,
                                                 True, True, True, False, False,
-                                                False, False, False, False)
+                                                False, False, False, False,
+                                                False, False)
     assert quant_mode.has_int4_weights
     quant_mode -= _tb.QuantMode.int4_weights()
     assert not quant_mode.has_int4_weights
@@ -442,7 +443,6 @@ def test_SamplingConfig_pickle():
     config.beam_width_array = [[2, 3, 4, 5]]
 
     config1 = pickle.loads(pickle.dumps(config))
-
     assert config1 == config
 
 

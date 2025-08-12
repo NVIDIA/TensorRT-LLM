@@ -15,7 +15,7 @@
 
 from typing import Optional
 
-from .lora_manager import LoraConfig
+from .lora_helper import LoraConfig
 from .mapping import Mapping
 from .plugin.plugin import PluginConfig
 

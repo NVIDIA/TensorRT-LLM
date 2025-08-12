@@ -106,11 +106,18 @@ class PixtralAttentionLayer(torch.nn.Module):
 class PixtralTransformer(torch.nn.Module):
     def __init__(self, config: model_config_lib.ModelConfig[transformers.PixtralVisionConfig]):
         super().__init__()
+        tp_size = config.mapping.tp_size
+        num_heads = config.pretrained_config.num_attention_heads
+        if (num_heads % tp_size) > 0:
+            raise ValueError(f"{tp_size=} must divide {num_heads=}.")
+        num_heads //= tp_size
+
+        self._head_dim = config.pretrained_config.head_dim
+        self._num_heads = num_heads
+
         self.layers = torch.nn.ModuleList()
         for i in range(config.pretrained_config.num_hidden_layers):
             self.layers.append(PixtralAttentionLayer(config=config, layer_idx=i))
-        self._head_dim = config.pretrained_config.head_dim
-        self._num_heads = config.pretrained_config.num_attention_heads
 
     def forward(
         self,
@@ -165,12 +172,6 @@ class PixtralVisionModel(torch.nn.Module):
         self, model_config: model_config_lib.ModelConfig[transformers.PixtralVisionConfig]
     ):
         super().__init__()
-        tp_size = model_config.mapping.tp_size
-        # TODO: implement support for `tp_size > 1`.
-        if tp_size > 1:
-            raise NotImplementedError(
-                f"Mistral3VLM does not support `mapping.tp_size > 1` yet (got {tp_size})."
-            )
         # Both the below are needed in order to use `_load_weights_impl`.
         self.model_config = model_config
         self.config: transformers.PixtralVisionConfig = model_config.pretrained_config
@@ -204,12 +205,14 @@ class PixtralVisionModel(torch.nn.Module):
     ):
         with torch.autocast(device_type="cuda", dtype=self.config.torch_dtype):
             patch_embeds = self.patch_conv(pixel_values)
+
         patch_embeds_list = [
             embed[..., : (size[0] // self._patch_size), : (size[1] // self._patch_size)]
             for embed, size in zip(patch_embeds, image_sizes)
         ]
 
-        patch_embeds = torch.cat([p.flatten(1).T for p in patch_embeds_list], dim=0)
+        flattened_embeds = [p.flatten(1).T for p in patch_embeds_list]
+        patch_embeds = torch.cat(flattened_embeds, dim=0)
         patch_embeds = self.ln_pre(patch_embeds)
 
         position_ids = transformers.models.pixtral.modeling_pixtral.position_ids_in_meshgrid(
@@ -218,10 +221,8 @@ class PixtralVisionModel(torch.nn.Module):
         position_embeddings = self._patch_positional_embedding(patch_embeds, position_ids)
 
         attn_metadata = self._prepare_attn_metadata(
-            # The `torch.cat` that creates the `patch_embeds` flattens the conv features from multiple
-            # images into a single sequence - hence why we hardcode the batch size to 1 here.
-            batch_size=1,
-            seq_len=position_ids.size(0),
+            batch_size=pixel_values.size(0),
+            seq_lengths=[x.size(0) for x in flattened_embeds],
         )
         out = self.transformer(
             patch_embeds,
@@ -235,19 +236,18 @@ class PixtralVisionModel(torch.nn.Module):
     def load_weights(self, weights):
         modeling_utils._load_weights_impl(self, weights)
 
-    def _prepare_attn_metadata(self, batch_size: int, seq_len: int):
+    def _prepare_attn_metadata(self, batch_size: int, seq_lengths: List[int]):
         request_ids = list(range(1, batch_size + 1))
-        prompt_lens = [seq_len] * batch_size
         attn_metadata = self._metadata_cls(
-            seq_lens=torch.tensor([seq_len] * batch_size, dtype=torch.int),
+            seq_lens=torch.tensor(seq_lengths, dtype=torch.int),
             num_contexts=batch_size,
             max_num_requests=batch_size,
-            max_num_tokens=seq_len * batch_size,
+            max_num_tokens=sum(seq_lengths),
             kv_cache_manager=None,
             request_ids=request_ids,
-            prompt_lens=prompt_lens,
+            prompt_lens=seq_lengths,
         )
-        attn_metadata.max_seq_len = seq_len * batch_size
+        attn_metadata.max_seq_len = max(seq_lengths)
         attn_metadata.prepare()
         return attn_metadata
 

@@ -1,7 +1,12 @@
 import subprocess
 
 import pytest
-from cuda import cuda, nvrtc
+
+try:
+    from cuda.bindings import driver as cuda
+    from cuda.bindings import nvrtc
+except ImportError:
+    from cuda import cuda, nvrtc
 
 
 def ASSERT_DRV(err):
@@ -50,7 +55,7 @@ def getSMVersion():
                          ids=["fp16", "bf16", "fp16-fp32", "e4m3"])
 @pytest.mark.parametrize('flag', [
     "-s-q 128 -paged-kv", "-s-q 63 -paged-kv", "-paged-kv",
-    "-softcapping-scale-bmm1 30", "-contiguous-q-kv"
+    "-softcapping-scale-bmm1 30", "-contiguous-q-kv", "-use-attention-sinks"
 ])
 @pytest.mark.parametrize('tiled_kernel', ["", "-force-non-tiled"])
 def test_trtllm_flash_attention_fmha(d, s, dtype, flag, tiled_kernel):
@@ -117,8 +122,8 @@ def test_trtllm_flash_attention_fmha(d, s, dtype, flag, tiled_kernel):
             f"bin/fmha.exe -d {d} -h 16 -b 8 -s {s} -min-s 128 -custom-mask -gqa 2 -v {verbose} {dtype} {epsilon} {flag} {tiled_kernel}",
             shell=True,
             check=True)
-    # alibi and softcapping-scale-bmm1 are mutually exclusive.
-    if '-softcapping-scale-bmm1' not in flag:
+    # alibi doesn't work with softcapping-scale-bmm1/use-attention-sinks.
+    if '-softcapping-scale-bmm1' not in flag and '-use-attention-sinks' not in flag:
         subprocess.run(
             f"bin/fmha.exe -d {d} -h 16 -b 8 -s {s} -min-s 128 -causal-mask -alibi -v {verbose} {dtype} {epsilon} {flag} {tiled_kernel}",
             shell=True,
@@ -150,14 +155,17 @@ def test_trtllm_sage_attention_fmha(d, s):
 @pytest.mark.parametrize('dtype', ["-bf16", "-e4m3", "-e4m3 -bf16-output"],
                          ids=["bf16", "e4m3", "e4m3-bf16"])
 @pytest.mark.parametrize('s', [1024, 4096], ids=["seqlen-1024", "seqlen-4096"])
-def test_trtllm_context_mla_attention_fmha(dtype, s):
+@pytest.mark.parametrize(
+    'input_layout', ["", "-paged-kv", "-contiguous-q-kv", "-separate-q-k-v"],
+    ids=["packed-qkv", "paged-kv", "q-contiguous-kv", "separate-q-k-v"])
+def test_trtllm_context_mla_attention_fmha(dtype, s, input_layout):
     # use higher error tolerance for bf16 and s = 4096.
     epsilon = ''
     if dtype == "-bf16" and s == 4096:
         epsilon += ' -epsilon 0.03'
 
     sm_version = getSMVersion()
-    if sm_version != 89:
+    if dtype in ["-e4m3", "-e4m3 -bf16-output"] and sm_version != 89:
         pytest.skip("FP8 MLAs only supported on sm89 currently.")
 
     # Context phase kernels.
@@ -166,6 +174,14 @@ def test_trtllm_context_mla_attention_fmha(dtype, s):
     -force-non-warp-specialization -causal-mask {epsilon}",
         shell=True,
         check=True)
+
+    if sm_version == 90:
+        # Now only hopper-style supports separate-q-k-v
+        subprocess.run(
+            f"bin/fmha.exe -v 0 -runs 1 -min-s 1024 -s {s} -b 8 -h 8 -d 192 -dv 128 {dtype} \
+            -causal-mask {epsilon} {input_layout}",
+            shell=True,
+            check=True)
 
 
 @pytest.mark.parametrize('dtype', ["-bf16", "-e4m3", "-e4m3 -bf16-output"],

@@ -1,4 +1,5 @@
-from typing import Dict, List, Tuple, Union
+from fnmatch import fnmatch
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -12,7 +13,9 @@ from ..custom_ops.quant import (
 )
 from .logger import ad_logger
 from .node_utils import (
+    extract_param_names_from_lin_node,
     get_quantization_params_from_linear_node,
+    is_bmm_op,
     is_linear_op,
     is_op,
     modelopt_dynamic_block_quantize_op,
@@ -20,7 +23,7 @@ from .node_utils import (
 )
 
 try:
-    from ...quantization.utils import float4_sf_dtype
+    from ....quantization.utils.fp4_utils import float4_sf_dtype
 except ImportError:
     float4_sf_dtype = None
 
@@ -83,6 +86,7 @@ class QuantizationImpl:
                 quantization_impl_map = {
                     "": None,
                     "FP8": FP8QuantizationImpl,
+                    "NVFP4": FP4QuantizationImpl,
                 }
             return quantization_impl_map[quant_type_or_node]
 
@@ -300,7 +304,7 @@ class FP4QuantizationImpl(QuantizationImpl):
                     weight_scale = state_dict[weight_name + "_scale"].view(float4_sf_dtype)
                     ori_shape = weight_scale.shape
                     state_dict[weight_name + "_scale"] = (
-                        torch.ops.trtllm.nvfp4_block_scale_interleave(
+                        torch.ops.trtllm.block_scale_interleave(
                             weight_scale.view(torch.uint8).cpu().contiguous()
                         )
                         .reshape(ori_shape)
@@ -461,3 +465,48 @@ class FP8BMMQuantizationImpl(QuantizationImpl):
                             attr_name,
                             torch.nn.Parameter(param_cm, requires_grad=param.requires_grad),
                         )
+
+
+def should_skip_quantization(
+    node_or_name: Union[Node, str],
+    excluded_patterns: list[str],
+) -> bool:
+    """Check if a node or parameter name should be skipped based on excluded patterns."""
+    if isinstance(node_or_name, str):
+        modname, _, _ = node_or_name.rpartition(".")
+    else:
+        if not (is_linear_op(node_or_name, include_quantization=False) or is_bmm_op(node_or_name)):
+            return True
+        param_name, _ = extract_param_names_from_lin_node(node_or_name)
+        modname, _, _ = param_name.rpartition(".")
+
+    return any(fnmatch(modname, pattern) for pattern in excluded_patterns)
+
+
+def extract_scales_from_node(node: Node, scale_names: list[str]) -> Dict[str, Optional[Node]]:
+    """
+    Extracts scale tensors from node.args/kwargs using a fixed list of expected scale names.
+    """
+    scales = {}
+    args = list(node.args)
+
+    # Try kwargs first
+    for i, name in enumerate(scale_names):
+        scales[name] = node.kwargs.get(name, None)
+
+    # Fallback to positional args (starting after input, weight, bias)
+    for i, name in enumerate(scale_names):
+        if scales[name] is None and len(args) > 3 + i:
+            scales[name] = args[3 + i]
+
+    return scales
+
+
+def get_scales_and_type_from_node(node: Node) -> Tuple[Dict[str, Node], str]:
+    """Returns a dict of scale args and quantization type string ('fp4', 'fp8', etc)."""
+    for qtype in [FP4QuantizationImpl, FP8QuantizationImpl]:
+        if is_op(node, qtype.target_op()):
+            return extract_scales_from_node(
+                node, qtype.scale_names()
+            ), qtype.__name__.lower().replace("quantizationimpl", "")
+    return None, "simple"

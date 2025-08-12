@@ -135,6 +135,9 @@ class AttentionMetadata:
     _num_ctx_tokens: int = field(init=False, default=0, repr=False)
     _num_tokens: int = field(init=False, default=0, repr=False)
 
+    # This buffer is currently only used for TrtllmAttentionMetadata.
+    cache_indirection: Optional[torch.Tensor] = None
+
     def __post_init__(self) -> None:
         if self.is_cross:
             assert self.cross is None or self.cross is self, "Cross attention metadata should not have sub metadata"
@@ -353,6 +356,8 @@ class RopeParams:
     mscale_all_dim: float = 0.0
     short_factor: Optional[Tuple[float]] = None
     long_factor: Optional[Tuple[float]] = None
+    max_seq_len: Optional[int] = None
+    duplicate_data: bool = True
 
     @staticmethod
     def from_config(config) -> "RopeParams":
@@ -403,6 +408,8 @@ class RopeParams:
         # Workaround for DeepSeek V3 Lite since its rope_scaling is null in config.json.
         elif config.model_type == "deepseek_v3":
             rope_params.scale_type = RotaryScalingType.yarn
+        # Other metdadata for RoPE.
+        rope_params.max_seq_len = getattr(config, 'max_seq_len', None)
 
         return rope_params
 
@@ -434,15 +441,17 @@ class RopeParams:
                 self.beta_slow,
                 self.mscale,
                 self.mscale_all_dim,
+                self.duplicate_data,
             )
         elif self.scale_type == RotaryScalingType.longrope:
-            rope_inv_freq, rope_cos_sin = RopeEmbeddingUtils.create_sinusoidal_positions_long_rope_for_attention_plugin(
+            rope_inv_freq, rope_cos_sin = RopeEmbeddingUtils.create_sinusoidal_positions_long_rope(
                 num_pos=self.max_positions,
                 dim=self.dim,
                 theta=self.theta,
                 original_max_pos=self.original_max_positions,
                 short_factor=self.short_factor,
                 long_factor=self.long_factor,
+                max_seq_len=self.max_seq_len,
             )
         else:
             rope_inv_freq, rope_cos_sin = RopeEmbeddingUtils.create_sinusoidal_positions_for_attention_plugin(

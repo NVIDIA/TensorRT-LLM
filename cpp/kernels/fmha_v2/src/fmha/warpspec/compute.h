@@ -173,7 +173,7 @@ struct Compute
 
     enum
     {
-        TILE_SIZE_V = STEP_KV * Kernel_traits::D
+        TILE_SIZE_V = STEP_KV * Kernel_traits::DV
     };
 
     enum
@@ -288,7 +288,7 @@ struct Compute
             // The kv_left_mask_end is the start of the chunk.
             kv_left_mask_end = div_up(is_chunked_attention
                     ? ((tile_offset_end >> params.log2_chunked_attention_size) << params.log2_chunked_attention_size)
-                    : (tile_offset_end - params.sliding_window_size),
+                    : (tile_offset_end + 1 - params.sliding_window_size),
                 STEP_KV);
         }
 
@@ -325,9 +325,6 @@ struct Compute
         // Ctile_o initialize (relies on kv_stage).
         uint32_t smem_v = __cvta_generic_to_shared(&shared->smem_v[0]);
         Compute_tile_o ctile_o(0, smem_v);
-
-        // BMM2 epilogue
-        Tile_o_epilogue tile_o_epilogue(params);
 
         // Mutex between two compute groups.
         OrderedMutexAccessor mutex_accessor(shared->compute_mutex, warpgroup_id, SYNC_BARRIER);
@@ -367,6 +364,9 @@ struct Compute
             {
                 sage_scale_row = head_info.bidb * params.h + head_info.bidh;
             }
+
+            // BMM2 epilogue
+            Tile_o_epilogue tile_o_epilogue(params, head_info);
 
             int q_step_idx = warpgroup_id;
 
@@ -490,7 +490,7 @@ struct Compute
                 if (valid_run)
                 {
                     // Final step's update.
-                    tile_o_epilogue.scale(ctile_o, p_sum);
+                    tile_o_epilogue.scale(ctile_o, p_max, p_sum);
                     // Store o_tile to gmem.
                     gmem_o.store(ctile_o.acc_);
                 }
