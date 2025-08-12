@@ -227,7 +227,6 @@ class CUDAGraphRunner:
         engine = self._get_engine()
         kv_cache_manager = resource_manager.get_resource_manager(
             engine.kv_cache_manager_key)
-
         padding_size = 0
         if self.padding_enabled and self._can_run_graph(scheduled_requests):
             current_batch_size = len(scheduled_requests.generation_requests)
@@ -248,8 +247,6 @@ class CUDAGraphRunner:
                 if padding_size > 0:
                     if self.padding_dummy_request is None:
                         if kv_cache_manager.get_num_free_blocks() > 0:
-                            spec_res_mgr = resource_manager.get_resource_manager(
-                                ResourceManagerType.SPEC_RESOURCE_MANAGER)
                             self.padding_dummy_request = kv_cache_manager.add_dummy_requests(
                                 [CUDA_GRAPH_DUMMY_REQUEST_ID],
                                 is_gen=True,
@@ -257,6 +254,8 @@ class CUDAGraphRunner:
                                 use_mrope=engine.use_mrope,
                                 max_beam_width=engine.max_beam_width)[0]
                             self.padding_dummy_request.is_cuda_graph_dummy = True
+                            spec_res_mgr = resource_manager.get_resource_manager(
+                                ResourceManagerType.SPEC_RESOURCE_MANAGER)
                             if spec_res_mgr:
                                 spec_res_mgr.add_dummy_requests(
                                     [CUDA_GRAPH_DUMMY_REQUEST_ID])

@@ -439,7 +439,6 @@ class PyTorchModelEngine(ModelEngine):
         # with different KV cache managers.
         self.kv_cache_manager_key = ResourceManagerType.KV_CACHE_MANAGER
         self.lora_model_config: Optional[LoraModelConfig] = None
-        self.cuda_graph_dummy_request = None
         self.cuda_graph_runner = CUDAGraphRunner(self)
 
         # Setup the local cache indirection buffer only once and reuse it.
@@ -518,7 +517,7 @@ class PyTorchModelEngine(ModelEngine):
 
         # The lifetime of model engine and kv cache manager can be different.
         # Reset the global cuda graph dummy request to None in warmup.
-        self.cuda_graph_dummy_request = None
+        self.cuda_graph_runner.padding_dummy_request = None
 
         def get_cuda_graph_warmup_request(batch_size, draft_len):
             # Divide by max_beam_width to get an approximation of the number of requests that can be run in parallel.
