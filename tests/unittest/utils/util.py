@@ -7,7 +7,13 @@ import pynvml
 import pytest
 import tensorrt as trt
 import torch
-from cuda import cuda, nvrtc
+
+try:
+    from cuda.bindings import driver as cuda
+    from cuda.bindings import nvrtc
+except ImportError:
+    from cuda import cuda, nvrtc
+
 from parameterized import parameterized
 
 import tensorrt_llm
