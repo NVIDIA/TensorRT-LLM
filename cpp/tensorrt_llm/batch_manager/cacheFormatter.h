@@ -33,10 +33,86 @@
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
+BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest,
+    BlockKey const& lastBlockKey, SizeType32 indexFromEnd);
 
-BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest);
+BlockRange getBlockRangeForReceiving(
+    BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest, bool srcEnableBlockReuse);
 
-BlockRange getBlockRangeForReceiving(BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest);
+class KvCacheMeasureHelper
+{
+public:
+    struct Measure
+    {
+        double delay;     // from last token (ctx) or arrival time (gen), in ms
+        double duration;  // in ms
+        double bandwidth; // in Gbps
+    };
+
+    KvCacheMeasureHelper(std::string output_path)
+        : mOutputPath(std::move(output_path))
+    {
+    }
+
+    void markAsSender(bool isSender)
+    {
+        mIsSender = isSender;
+    }
+
+    void appendKVCacheTransfer(LlmRequest::RequestIdType requestId, double delay, double duration, size_t size)
+    {
+        auto bandwidth = size * 8 / (duration / 1000) / 1e9;
+        if (mOutputPath.empty())
+        {
+            return;
+        }
+
+        std::lock_guard<std::mutex> lock(mMutex);
+        mRequestKVCacheTranfserMeasure[requestId].emplace_back(Measure{delay, duration, bandwidth});
+    }
+
+    ~KvCacheMeasureHelper()
+    {
+        if (!mRequestKVCacheTranfserMeasure.empty() && !mOutputPath.empty())
+        {
+            TLLM_CHECK(mIsSender.has_value());
+            auto rank = mpi::MpiComm::world().getRank();
+            std::string outFilePath
+                = mOutputPath + "rank_" + std::to_string(rank) + "_" + (mIsSender.value() ? "send" : "recv") + ".csv";
+            std::ofstream outFile(outFilePath);
+
+            TLLM_CHECK_WITH_INFO(outFile.is_open(), "Cannot write to file " + outFilePath);
+
+            size_t numTransferMeasure = mRequestKVCacheTranfserMeasure.begin()->second.size();
+
+            outFile << "RequestID";
+            for (size_t i = 0; i < numTransferMeasure; i++)
+            {
+                outFile << ",Delay(ms),Duration(ms),Bandwidth(Gbps)";
+            }
+            outFile << '\n';
+
+            for (auto const& [requestID, measures] : mRequestKVCacheTranfserMeasure)
+            {
+                outFile << requestID;
+
+                for (auto const& measure : measures)
+                {
+                    outFile << "," << measure.delay << "," << measure.duration << "," << measure.bandwidth;
+                }
+                outFile << '\n';
+            }
+
+            outFile.close();
+        }
+    }
+
+private:
+    std::map<LlmRequest::RequestIdType, std::vector<Measure>> mRequestKVCacheTranfserMeasure;
+    std::string mOutputPath;
+    std::mutex mMutex;
+    std::optional<bool> mIsSender;
+};
 
 using DataContext = tensorrt_llm::executor::kv_cache::DataContext;
 using Connection = tensorrt_llm::executor::kv_cache::Connection;
@@ -54,14 +130,17 @@ public:
 
     TransferSession(std::vector<Connection const*> connections, DataContext dataContext,
         executor::DataTransceiverState const& selfState, executor::DataTransceiverState otherState,
-        runtime::BufferManager const& bufferManager, LlmRequest const* llmRequest = nullptr, bool recordMeasure = false)
+        runtime::BufferManager const& bufferManager, int32_t indexFromEnd = 0, BlockKey lastBlockKey = {},
+        LlmRequest const* llmRequest = nullptr, bool recordMeasure = false)
         : mConnections(std::move(connections))
         , mDataContext(dataContext)
         , mSelfState(&selfState)
         , mOtherState(std::move(otherState))
         , mBufferManager(&bufferManager)
-        , mRequest(llmRequest)
         , mRecordMeasure(recordMeasure)
+        , mIndexFromEnd(indexFromEnd)
+        , mLastBlockKey(std::move(lastBlockKey))
+        , mRequest(llmRequest)
     {
         TLLM_CHECK(!mConnections.empty());
     }
@@ -157,15 +236,27 @@ public:
         outFile << '\n' << std::flush;
     }
 
+    [[nodiscard]] int32_t getIndexFromEnd() const
+    {
+        return mIndexFromEnd;
+    }
+
+    [[nodiscard]] BlockKey const& getLastBlockKey() const
+    {
+        return mLastBlockKey;
+    }
+
 private:
     std::vector<Connection const*> mConnections;
     DataContext mDataContext;
     executor::DataTransceiverState const* mSelfState; // stored in CacheReceiver/CacheSender
     executor::DataTransceiverState mOtherState;
     runtime::BufferManager const* mBufferManager;
-    LlmRequest const* mRequest;
     std::vector<Measure> mMeasures;
     bool mRecordMeasure{false};
+    int32_t mIndexFromEnd;
+    BlockKey mLastBlockKey;
+    LlmRequest const* mRequest;
 };
 
 // Used to support the cache transmission with different layouts and different protocols.
@@ -206,66 +297,6 @@ public:
 
     /// @brief Destructor.
     virtual ~BaseCacheFormatter() = default;
-};
-
-class KvCacheMeasureHelper
-{
-public:
-    KvCacheMeasureHelper(std::string output_path)
-        : mOutputPath(std::move(output_path))
-    {
-    }
-
-    void appendKVCacheTransfer(LlmRequest::RequestIdType requestId, double duration, size_t size)
-    {
-        auto bandwidth = size * 8 / (duration / 1000) / 1e9;
-        if (mOutputPath.empty())
-        {
-            return;
-        }
-
-        std::lock_guard<std::mutex> lock(mMutex);
-        mRequestKVCacheTranfserMeasure[requestId].emplace_back(duration, bandwidth);
-    }
-
-    ~KvCacheMeasureHelper()
-    {
-        if (!mRequestKVCacheTranfserMeasure.empty() && !mOutputPath.empty())
-        {
-            auto rank = mpi::MpiComm::world().getRank();
-            std::string outFilePath = mOutputPath + "rank_" + std::to_string(rank) + ".txt";
-            std::ofstream outFile(outFilePath);
-
-            TLLM_CHECK_WITH_INFO(outFile.is_open(), "Cannot write to file " + outFilePath);
-
-            size_t numTransferMeasure = mRequestKVCacheTranfserMeasure.begin()->second.size();
-
-            outFile << "RequestID";
-            for (size_t i = 0; i < numTransferMeasure; i++)
-            {
-                outFile << ",TimeDuration,Bandwidth";
-            }
-            outFile << '\n';
-
-            for (auto const& [requestID, measures] : mRequestKVCacheTranfserMeasure)
-            {
-                outFile << requestID;
-
-                for (auto const& [time, bandwidth] : measures)
-                {
-                    outFile << "," << time << "," << bandwidth;
-                }
-                outFile << '\n';
-            }
-
-            outFile.close();
-        }
-    }
-
-private:
-    std::map<LlmRequest::RequestIdType, std::vector<std::pair<double, double>>> mRequestKVCacheTranfserMeasure;
-    std::string mOutputPath;
-    std::mutex mMutex;
 };
 
 // Simple cache block copy. Because it does not involve data splitting or merging, it performs best when the
