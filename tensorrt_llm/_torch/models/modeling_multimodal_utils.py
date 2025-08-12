@@ -30,19 +30,28 @@ from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.logger import logger
 
 
-def find_uncached_mm_embeds(
+def find_input_mm_embeds(
         mm_embeds: List[torch.Tensor],
-        multimodal_params: List[MultimodalParams]) -> torch.Tensor:
+        multimodal_params: List[MultimodalParams]) -> List[torch.Tensor]:
     """
-    Find the uncached multimodal mm_embeds from multimodal_params for each batch.
+    Find the multimodal mm_embeds that need processing from multimodal_params for each batch.
+    Supports both KV cache reuse and chunked prefill scenarios.
+
     Args:
-        - mm_embeds: List[torch.Tensor]
-        - multimodal_params: List[MultimodalParams]
+        - mm_embeds: List[torch.Tensor] - Multimodal embeddings for each batch
+        - multimodal_params: List[MultimodalParams] - Multimodal parameters with runtime data
+
     Returns:
-        - sliced_mm_embeds: List[torch.Tensor]
-          When kv_cache reuse is disabled or model not enabled/support kv_cache reuse, return the full mm_embeds.
+        - List[torch.Tensor] - Sliced mm_embeds containing only tokens that need processing:
+          - For KV cache reuse: tokens that are not cached
+          - For chunked prefill: tokens that are in the current chunk
+          - For mixed scenarios: both uncached and current chunk tokens
+          - Empty list if all tokens are cached or beyond current chunk
+
     Note:
-        - Current implementation assumes chunk prefill is disabled. To support chunk prefill, we might need to slightly modify the logic (see TODO below).
+        - Supports both individual batching (len(mm_embeds) == len(multimodal_params))
+          and pre-concatenated batching (len(mm_embeds) == 1)
+        - Handles chunked prefill by considering chunk boundaries and current chunk tokens
     """
     # Current support two batching modes:
     # 1. Pre-concatenated mm_embeds for each batch, i.e., len(mm_embeds) == 1
@@ -56,37 +65,34 @@ def find_uncached_mm_embeds(
         # No slicing, return the full mm_embeds
         return mm_embeds
 
-    total_cached_mm_tokens = sum([
-        param.multimodal_runtime.num_cached_mm_tokens
+    # Calculate total tokens that need processing (both cached and current chunk)
+    total_unseen_mm_tokens = sum([
+        param.multimodal_runtime.num_unseen_mm_tokens
         for param in multimodal_params
     ])
-    if total_cached_mm_tokens == 0:
-        # No cached tokens, return the full mm_embeds
-        # TODO: support chunk prefill for multimodal, then we need to extract full mm_embeds for each CHUNK
-        logger.debug(
-            "No multimodal cached tokens can be reused, return the full mm_embeds"
-        )
-        return mm_embeds
+    total_mm_tokens = sum([
+        param.multimodal_runtime.num_mm_tokens
+        for param in multimodal_params
+    ])
 
-    if total_cached_mm_tokens == sum([
-            param.multimodal_runtime.total_mm_tokens
-            for param in multimodal_params
-    ]):
-        # All tokens are cached, return empty list
+    if total_mm_tokens == 0:
+        # No tokens need processing, return empty list
         logger.debug(
-            "All multimodal tokens cached, skipping vision encoder forward")
+            "All multimodal tokens are cached or beyond current chunk, skipping vision encoder forward")
         return []
 
-    # Partial caching, return the sliced mm_embeds
+    if total_mm_tokens == sum(mm_embed.shape[0] for mm_embed in mm_embeds):
+        return mm_embeds
+
+
     current_pos = 0
     slices = []
     for param in multimodal_params:
         runtime = param.multimodal_runtime
-        slices.append((current_pos + runtime.num_cached_mm_tokens,
-                       current_pos + runtime.total_mm_tokens))
-        if len(mm_embeds
-               ) == 1:  # pre-concatenated mm_embeds, need global offset
-            current_pos += runtime.total_mm_tokens
+        slices.append((current_pos + runtime.num_unseen_mm_tokens,
+                       current_pos + runtime.num_unseen_mm_tokens + runtime.num_mm_tokens))
+        if len(mm_embeds) == 1:  # pre-concatenated mm_embeds, need global offset
+            current_pos += sum(runtime.mm_token_lengths)
 
     sliced_mm_embeds = []
     if len(mm_embeds) == 1:
@@ -99,9 +105,6 @@ def find_uncached_mm_embeds(
     if len(mm_embeds) == 1:
         sliced_mm_embeds = [torch.cat(sliced_mm_embeds, dim=0)]
 
-    logger.debug(
-        f"Partial caching, return sliced_mm_embeds: {sliced_mm_embeds[0].shape}"
-    )
     return sliced_mm_embeds
 
 
