@@ -1,3 +1,19 @@
+/*
+ * Copyright (c) 2020-2025, NVIDIA CORPORATION.  All rights reserved.
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_preprocessors.h"
@@ -355,7 +371,7 @@ protected:
     float mSparseMixerEpsilon = 0.2f;
 
     // Default this to true. This only matters for K>2, and so by doing this we will test the fused and unfused paths
-    bool mUseDeterminsiticHopperReduce = true;
+    bool mUseDeterministicHopperReduce = true;
 
     // Disable this for long running tests to speed up runtime
     bool mIsLongTest = false;
@@ -440,7 +456,7 @@ protected:
     {
         managed_buffers.clear();
 
-        mMoERunner.use_deterministic_hopper_reduce_ = k > 2 && mUseDeterminsiticHopperReduce;
+        mMoERunner.use_fused_finalize_ = k < 3 || !mUseDeterministicHopperReduce;
 
         mHiddenSize = hidden_size;
         mInterSize = hidden_size * mInterSizeFraction;
@@ -1614,7 +1630,7 @@ void MixtureOfExpertsTest<TypeParam_>::BasicPermuteTest(
 
         runMoEPermute(hidden_input, expected_experts, token_final_scales, hidden_size, num_experts, k);
         bool should_be_deterministic
-            = mUseDeterminsiticHopperReduce || mK < 3 || getSMVersion() < 90 || getSMVersion() >= 120;
+            = mUseDeterministicHopperReduce || mK < 3 || getSMVersion() < 90 || getSMVersion() >= 120;
         if (should_be_deterministic && !mIsLongTest)
         {
             auto first_iter = getDataFromDevice(mFinalOutput, mTotalTokens * mHiddenSize);
@@ -1733,7 +1749,7 @@ TYPED_TEST(MixtureOfExpertsTest, PermuteSwigluBias)
 
 TYPED_TEST(MixtureOfExpertsTest, PermuteNonDeterministic)
 {
-    this->mUseDeterminsiticHopperReduce = false;
+    this->mUseDeterministicHopperReduce = false;
     // Just test case 3, cases 1&2 always use the fused paths
     this->BasicPermuteTest(3);
 }
@@ -1881,7 +1897,7 @@ void MixtureOfExpertsTest<TypeParam_>::ParallelismTest(
                     runMoEPermute(hidden_input, expected_experts, token_final_scales, hidden_size, num_experts, k,
                         MOEParallelismConfig{tp_size, i, ep_size, j}, enable_alltoall);
                     bool should_be_deterministic
-                        = mUseDeterminsiticHopperReduce || mK < 3 || getSMVersion() < 90 || getSMVersion() >= 120;
+                        = mUseDeterministicHopperReduce || mK < 3 || getSMVersion() < 90 || getSMVersion() >= 120;
                     if (should_be_deterministic && !mIsLongTest)
                     {
                         auto first_iter = getDataFromDevice(mFinalOutput, mTotalTokens * mHiddenSize);
@@ -1897,7 +1913,7 @@ void MixtureOfExpertsTest<TypeParam_>::ParallelismTest(
                 {
                     runMoEPermute(MOEParallelismConfig{tp_size, i, ep_size, j}, enable_alltoall);
                     bool should_be_deterministic
-                        = mUseDeterminsiticHopperReduce || mK < 3 || getSMVersion() < 90 || getSMVersion() >= 120;
+                        = mUseDeterministicHopperReduce || mK < 3 || getSMVersion() < 90 || getSMVersion() >= 120;
                     if (should_be_deterministic && !mIsLongTest)
                     {
                         auto first_iter = getDataFromDevice(mFinalOutput, mTotalTokens * mHiddenSize);
