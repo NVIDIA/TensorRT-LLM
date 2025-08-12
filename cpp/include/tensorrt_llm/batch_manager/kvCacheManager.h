@@ -84,6 +84,32 @@ using MmKey = std::pair<std::array<uint8_t, 32>, SizeType32>;
 template <typename T>
 using OptionalRef = tensorrt_llm::common::OptionalRef<T>;
 
+//! \brief Split vector into list of blocks of given size.
+//! \param vec vector to split
+//! \param usableSize part of the vector that is processed
+//! \param elementsPerBlock desired size of blocks
+//! \param allowPartial whether to append a block smaller than `elementsPerBlock` at the end
+//! \return list of blocks
+template <typename T>
+std::list<std::vector<T>> chopVectorIntoBlocks(
+    std::vector<T> const& vec, SizeType32 usableSize, SizeType32 elementsPerBlock, bool allowPartial)
+{
+    TLLM_CHECK_WITH_INFO(
+        usableSize <= static_cast<SizeType32>(vec.size()), "usableSize=%d > %ld=vec.size()", usableSize, vec.size());
+    std::list<std::vector<T>> blockedVectors;
+    auto const vecEnd = vec.begin() + usableSize;
+    for (auto begin = vec.begin(); begin < vecEnd; begin += elementsPerBlock)
+    {
+        auto blockSize = std::min(elementsPerBlock, static_cast<SizeType32>(std::distance(begin, vecEnd)));
+        auto end = begin + blockSize;
+        if (blockSize == elementsPerBlock || allowPartial)
+        {
+            blockedVectors.emplace_back(begin, end);
+        }
+    }
+    return blockedVectors;
+}
+
 struct TempAttentionWindowInputs
 {
     bool pagedContextFMHA;
@@ -113,6 +139,9 @@ struct WindowSizeMetadata
             maxNumBlocks, temporaryAttentionWindow);
     }
 };
+
+std::vector<MmKey> generateBlockHashExtraKeys(
+    tensorrt_llm::batch_manager::LlmRequest const& llmRequest, SizeType32 startTokenIdx, SizeType32 endTokenIdx);
 
 struct BlockKey
 {
@@ -147,11 +176,7 @@ struct BlockKey
     {
     }
 
-    bool operator==(BlockKey const& other) const noexcept
-    {
-        return (usesExtraIds == other.usesExtraIds && loraTaskId == other.loraTaskId
-            && uniqueTokens == other.uniqueTokens && extraKeys == other.extraKeys && cacheSaltID == other.cacheSaltID);
-    }
+    bool operator==(BlockKey const& other) const noexcept;
 
     int partialMatch(BlockKey const& other) const noexcept
     {
@@ -165,6 +190,8 @@ struct BlockKey
         return numMatched;
     }
 };
+
+std::vector<BlockKey> buildBlockKeys(std::list<VecUniqueTokens>& blockedUniqueTokens, LlmRequest const& llmRequest);
 
 // Implement hash functor for BlockKey.
 // This allows us to use unordered_map with BlockKey as key.
@@ -582,6 +609,9 @@ public:
 
     void storeNewBlock(GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest);
 
+    //! \brief Pin blocks associated with a sequence to prevent eviction.
+    void pinBlocks(GenerationRequest& sequence);
+
     //! \brief Release blocks of the sequence.
     //! \details When llmRequest is provided and reuse is enabled, blocks will be stored.
     void releaseBlocks(GenerationRequest& sequence, OptionalRef<LlmRequest const> llmRequest);
@@ -785,6 +815,11 @@ public:
     {
         return mIsSWA;
     }
+    [[nodiscard]] std::optional<std::shared_ptr<KVCacheBlock>> findBlocksInReuseTreeByBlockKey(
+        BlockKey const& blockKey);
+
+    //! \brief Unpin blocks by starting from a block id and walking prev pointers.
+    void unpinBlocksById(KVCacheBlock::IdType blockId);
 
 private:
     //! \brief Add single block to beam of sequence and mAllocatedBlocksPerSeq.
@@ -890,6 +925,9 @@ private:
     bool mCopyOnPartialReuse;
     // The kv cache connector manager
     std::shared_ptr<kv_connector::KvCacheConnectorManager> mKvCacheConnectorManager;
+
+    // Mutex for the cached blocks root
+    std::mutex mCachedBlocksRootMutex;
 };
 
 class BlockManager
@@ -947,6 +985,12 @@ public:
 
     void schedulingReleaseBlocks(LlmRequest::RequestIdType requestId);
 
+    /// @brief Pin all blocks associated with a sequence across all window managers.
+    /// @param sequence The generation request whose blocks should be pinned.
+    void pinBlocks(GenerationRequest& sequence);
+
+    void unpinBlocksById(KVCacheBlock::IdType blockId);
+
     void releaseLastBlock(GenerationRequest& sequence, SizeType32 windowSize);
 
     void setOffsets(kernels::KVCacheIndex* offsetsPtr, nvinfer1::Dims const& offsetsShape, SizeType32 beamIdx,
@@ -1001,6 +1045,15 @@ public:
     [[nodiscard]] SizeType32 getNumAllocTotalBlocks() const
     {
         return sumWindows([](auto const& manager) { return manager.getNumAllocTotalBlocks(); });
+    }
+
+    [[nodiscard]] SizeType32 getFirstWindowSize() const
+    {
+        if (mWindowBlockManagers.empty())
+        {
+            return 0;
+        }
+        return mWindowBlockManagers.begin()->first;
     }
 
     [[nodiscard]] SizeType32 getNumAllocNewBlocks() const
@@ -1131,6 +1184,12 @@ public:
     [[nodiscard]] BlockPtr const& getBlockById(KVCacheBlock::IdType blockId, SizeType32 windowSize) const
     {
         return mWindowBlockManagers.at(windowSize).getBlockById(blockId);
+    }
+
+    [[nodiscard]] std::optional<std::shared_ptr<KVCacheBlock>> findBlocksInReuseTreeByBlockKey(
+        BlockKey const& blockKey, SizeType32 windowSize)
+    {
+        return mWindowBlockManagers.at(windowSize).findBlocksInReuseTreeByBlockKey(blockKey);
     }
 
     [[nodiscard]] SizeType32 getNumPrimaryBlocks() const
@@ -1274,6 +1333,10 @@ public:
     [[nodiscard]] virtual SizeType32 getRemainingBlocksToCompletion(LlmRequest const& req, SizeType32 windowSize) const
         = 0;
 
+    /// @brief Pin blocks associated with a request to prevent eviction.
+    /// @param requestId The ID of the request whose blocks should be pinned.
+    virtual void pinBlocks(LlmRequest::RequestIdType requestId) = 0;
+
     /// @brief Increase size for request at seqSlotIdx. Allocate new KV cache block(s) if needed.
     virtual void addToken(LlmRequest::RequestIdType requestId) = 0;
 
@@ -1346,6 +1409,10 @@ public:
         LlmRequest::RequestIdType requestId, SizeType32 windowSize) const
         = 0;
 
+    /// @brief Get the last block id (beam 0) for a given sequence and window size
+    [[nodiscard]] virtual std::optional<KVCacheBlock::IdType> getLastBlockId(LlmRequest::RequestIdType requestId) const
+        = 0;
+
     [[nodiscard]] virtual runtime::ITensor::SharedPtr getUniquePrimaryPool() const = 0;
     [[nodiscard]] virtual runtime::ITensor::SharedPtr getPrimaryPool(SizeType32 layer_idx) const = 0;
     [[nodiscard]] virtual SizeType32 getPoolLayerIdx(SizeType32 layer_idx) const = 0;
@@ -1414,6 +1481,12 @@ public:
     [[nodiscard]] virtual SizeType32 getMaxCapacityBatchSize(SizeType32 inputLength, SizeType32 outputLength) const = 0;
 
     [[nodiscard]] virtual CacheType getCacheType() const = 0;
+
+    [[nodiscard]] virtual std::optional<std::shared_ptr<KVCacheBlock>> findBlocksInReuseTreeByBlockKey(
+        BlockKey const& blockKey, SizeType32 windowSize)
+        = 0;
+
+    virtual void unpinBlocksById(KVCacheBlock::IdType blockId) = 0;
 };
 
 class KVCacheManager : public BaseKVCacheManager
@@ -1668,6 +1741,12 @@ public:
     [[nodiscard]] static SizeType32 calculateMaxBlockRequirements(SizeType32 inputLength, SizeType32 outputLength,
         SizeType32 sinkTokenLength, SizeType32 windowSize, SizeType32 beamWidth, SizeType32 tokensPerBlock);
 
+    void pinBlocks(LlmRequest::RequestIdType requestId) override;
+
+    void unpinBlocksById(KVCacheBlock::IdType blockId) override;
+
+    std::optional<KVCacheBlock::IdType> getLastBlockId(LlmRequest::RequestIdType requestId) const override;
+
     /// @brief Calculates the number of kv-cache blocks that a sequence will require, for a single beam.
     ///
     /// @param sequenceLength The total length of the sequence (input and output).
@@ -1704,6 +1783,12 @@ public:
     void flushIterationEvents() override
     {
         mBlockManager.flushIterationEvents();
+    }
+
+    std::optional<std::shared_ptr<KVCacheBlock>> findBlocksInReuseTreeByBlockKey(
+        BlockKey const& blockKey, SizeType32 windowSize) override
+    {
+        return mBlockManager.findBlocksInReuseTreeByBlockKey(blockKey, windowSize);
     }
 
     /// @brief Finds the maximum attention window that can be used on a sequence, given some kv-cache block capacity.

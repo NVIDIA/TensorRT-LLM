@@ -644,6 +644,12 @@ class KVCacheManager(BaseResourceManager):
         assert len(result) == 1
         return result[0]
 
+    def unpin_blocks_by_id(self, kv_cache_block_id: int):
+        self.impl.unpin_blocks_by_id(kv_cache_block_id)
+
+    def get_last_block_id(self, request_id: int) -> int:
+        return self.impl.get_last_block_id(request_id)
+
     def get_batch_cache_indices(
         self,
         request_ids: List[int],

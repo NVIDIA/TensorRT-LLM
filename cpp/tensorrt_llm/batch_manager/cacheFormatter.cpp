@@ -40,37 +40,34 @@
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
 
-BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest)
+BlockRange getBlockRangeForSending(
+    BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest, BlockKey const& lastBlockKey, int32_t indexFromEnd)
 {
-    size_t requestBlockNum = llmRequest.getRequestedBlockHashes().size();
     constexpr SizeType32 beam{0};
-    auto blockRange = BlockRange::fromAllBlockIds(*cacheManager, llmRequest.mRequestId, beam);
     auto poolNum = cacheManager->getBlockManager().getNumPools();
-    if (poolNum > 1 || common::getEnvDisableSelectiveCacheTransfer())
+    if (poolNum > 1 || !cacheManager->isEnableBlockReuse() || lastBlockKey.uniqueTokens.size() == 0)
     {
-        // disable selective cache transfer for poolNum > 1
+        auto blockRange = BlockRange::fromAllBlockIds(*cacheManager, llmRequest.mRequestId, beam);
         return blockRange;
     }
-    if (requestBlockNum < blockRange.size() && requestBlockNum > 0)
-    {
-        // handle block reuse, the prefix blocks are reused
-        // TODO(zhengd): pass the hashes directly instead of from llmRequest; use hash instead of block num
-        auto const& ids = blockRange.getBlockIds();
-        blockRange.setBlockIds({ids.end() - requestBlockNum, ids.end()});
-    }
-    return blockRange;
+    TLLM_CHECK_WITH_INFO(lastBlockKey.uniqueTokens.size() > 0, "lastBlockKey must be non-empty when reuse is enabled");
+    return BlockRange::fromReuseTree(*cacheManager, lastBlockKey, indexFromEnd);
 }
 
-BlockRange getBlockRangeForReceiving(BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest)
+BlockRange getBlockRangeForReceiving(
+    BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest, bool srcEnableBlockReuse)
 {
 
     auto poolNum = cacheManager->getBlockManager().getNumPools();
-    if (poolNum > 1 || common::getEnvDisableSelectiveCacheTransfer())
+    if (poolNum == 1 && cacheManager->isEnableBlockReuse() && srcEnableBlockReuse)
+    {
+        return BlockRange::fromNewlyAllocatedBlockIds(*cacheManager, llmRequest.mRequestId);
+    }
+    else
     {
         constexpr SizeType32 beam{0};
         return BlockRange::fromAllBlockIds(*cacheManager, llmRequest.mRequestId, beam);
     }
-    return BlockRange::fromNewlyAllocatedBlockIds(*cacheManager, llmRequest.mRequestId);
 }
 
 bool CacheFormatter::needSendCache(
@@ -168,6 +165,7 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
     auto const& selfConfig = session.getSelfState().getCacheState().value();
     auto const& destConfig = session.getOtherState().getCacheState().value();
     auto const selfIdx = session.getSelfState().getCommState().value().getSelfIdx();
+    auto indexFromEnd = session.getIndexFromEnd();
     auto& bufferManager = session.getBufferManager();
     // Some TP rank don't need to send cache since duplicate header is not needed.
     if (!needSendCache(selfConfig, destConfig, selfIdx))
@@ -175,8 +173,8 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
         return;
     }
     auto& blockManager = mCacheManager->getBlockManager();
-    auto blockRange = getBlockRangeForSending(mCacheManager, llmRequest);
-
+    auto const& lastBlockKey = session.getLastBlockKey();
+    auto blockRange = getBlockRangeForSending(mCacheManager, llmRequest, lastBlockKey, indexFromEnd);
     auto const numPools = blockManager.getNumPools();
     // TODO(oargov): are we sure the other side has the same number of pools? this might not hold for pp_size>1...
 
@@ -225,7 +223,10 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
         std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>> inputKvCacheBlocksPerWindow;
         for (auto poolIdx = 0; poolIdx < numPools; poolIdx++)
         {
-            blockRange.updatePoolIdx(poolIdx);
+            if (numPools > 1)
+            {
+                blockRange.updatePoolIdx(poolIdx);
+            }
             SizeType32 window = mCacheManager->getBlockManager().getPoolWindowSize(poolIdx);
             TLLM_CHECK_WITH_INFO(inputKvCacheBlocksPerWindow.find(window) == inputKvCacheBlocksPerWindow.end(),
                 "window size already exists, which is not supported");
@@ -482,7 +483,7 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
     auto const& destConfig = session.getOtherState().getCacheState().value();
     auto const selfIdx = session.getSelfState().getCommState().value().getSelfIdx();
     auto& bufferManager = session.getBufferManager();
-    auto blockRange = getBlockRangeForReceiving(mCacheManager, llmRequest);
+    auto blockRange = getBlockRangeForReceiving(mCacheManager, llmRequest, destConfig.getEnableBlockReuse());
 
     auto arrivalTime = llmRequest.getPerfMetrics().timingMetrics.arrivalTime;
     bool recordDelay = arrivalTime != std::chrono::steady_clock::time_point();
@@ -498,7 +499,10 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
     size_t cacheBlockSizeSum = 0;
     for (auto poolIdx = 0; poolIdx < numPools; poolIdx++)
     {
-        blockRange.updatePoolIdx(poolIdx);
+        if (numPools > 1)
+        {
+            blockRange.updatePoolIdx(poolIdx);
+        }
         SizeType32 window = mCacheManager->getBlockManager().getPoolWindowSize(poolIdx);
         TLLM_CHECK_WITH_INFO(outputBuffersPerWindow.find(window) == outputBuffersPerWindow.end(),
             "window size already exists, which is not supported");

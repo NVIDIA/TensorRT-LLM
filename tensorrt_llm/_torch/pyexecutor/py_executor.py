@@ -216,6 +216,7 @@ class PyExecutor:
         # kv cache events
         self.kv_cache_manager = self.resource_manager.resource_managers.get(
             ResourceManagerType.KV_CACHE_MANAGER)
+        self.block_reuse_enabled = self.kv_cache_manager.enable_block_reuse
         self.enable_kv_cache_events = self.kv_cache_manager is not None and self.kv_cache_manager.event_buffer_max_size > 0
         self.enable_kv_cache_reuse = self.kv_cache_manager is not None and self.kv_cache_manager.enable_block_reuse
 
@@ -1921,24 +1922,32 @@ class PyExecutor:
 
             if request_done:
                 if request.is_disagg_context_transmission_state:
-                    self.ctx_in_transmission_requests.append(request)
+                    if self.block_reuse_enabled and not self.kv_cache_manager.is_vswa:
+                        requests_to_terminate.append(request)
+                    self.ctx_in_transmission_requests.append(
+                        (request,
+                         self.kv_cache_manager.get_last_block_id(
+                             request.py_request_id)))
                 else:
                     requests_to_terminate.append(request)
             else:
                 new_active_requests.append(request)
         self.active_requests.clear()
         self.active_requests.extend(new_active_requests)
-        self._enqueue_responses(new_responses)
         for request in requests_to_terminate:
             self._terminate_request(request)
+        self._enqueue_responses(new_responses)
         return requests_to_terminate
 
     @nvtx_range("_terminate_ctx_finished_requests")
     def _terminate_ctx_finished_requests(self):
-        for request in self.ctx_in_transmission_requests[:]:
+        for request, block_id in self.ctx_in_transmission_requests[:]:
             if request.is_disagg_context_complete_state:
-                self._terminate_request(request)
-                self.ctx_in_transmission_requests.remove(request)
+                if not self.block_reuse_enabled or self.kv_cache_manager.is_vswa:
+                    self._terminate_request(request)
+                else:
+                    self.kv_cache_manager.unpin_blocks_by_id(block_id)
+                self.ctx_in_transmission_requests.remove((request, block_id))
 
     def _handle_logits_communication(self, previous_batch, prev_microbatch_id):
         """Handle logits communication between pipeline parallel ranks.

@@ -42,6 +42,8 @@ class TransferSession;
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
+BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest,
+    BlockKey const& lastBlockKey, SizeType32 indexFromEnd);
 
 using DataContext = tensorrt_llm::executor::kv_cache::DataContext;
 using Connection = tensorrt_llm::executor::kv_cache::Connection;
@@ -51,8 +53,83 @@ using CacheTransBufferManager = kv_cache_manager::CacheTransBufferManager;
 using BlockRange = kv_cache_manager::BlockRange;
 
 BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest);
+BlockRange getBlockRangeForReceiving(
+    BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest, bool srcEnableBlockReuse);
 
-BlockRange getBlockRangeForReceiving(BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest);
+class KvCacheMeasureHelper
+{
+public:
+    struct Measure
+    {
+        double delay;     // from last token (ctx) or arrival time (gen), in ms
+        double duration;  // in ms
+        double bandwidth; // in Gbps
+    };
+
+    KvCacheMeasureHelper(std::string output_path)
+        : mOutputPath(std::move(output_path))
+    {
+    }
+
+    void markAsSender(bool isSender)
+    {
+        mIsSender = isSender;
+    }
+
+    void appendKVCacheTransfer(LlmRequest::RequestIdType requestId, double delay, double duration, size_t size)
+    {
+        auto bandwidth = size * 8 / (duration / 1000) / 1e9;
+        if (mOutputPath.empty())
+        {
+            return;
+        }
+
+        std::lock_guard<std::mutex> lock(mMutex);
+        mRequestKVCacheTranfserMeasure[requestId].emplace_back(Measure{delay, duration, bandwidth});
+    }
+
+    ~KvCacheMeasureHelper()
+    {
+        if (!mRequestKVCacheTranfserMeasure.empty() && !mOutputPath.empty())
+        {
+            TLLM_CHECK(mIsSender.has_value());
+            auto rank = mpi::MpiComm::world().getRank();
+            std::string outFilePath
+                = mOutputPath + "rank_" + std::to_string(rank) + "_" + (mIsSender.value() ? "send" : "recv") + ".csv";
+            std::ofstream outFile(outFilePath);
+
+            TLLM_CHECK_WITH_INFO(outFile.is_open(), "Cannot write to file " + outFilePath);
+
+            size_t numTransferMeasure = mRequestKVCacheTranfserMeasure.begin()->second.size();
+
+            outFile << "RequestID";
+            for (size_t i = 0; i < numTransferMeasure; i++)
+            {
+                outFile << ",Delay(ms),Duration(ms),Bandwidth(Gbps)";
+            }
+            outFile << '\n';
+
+            for (auto const& [requestID, measures] : mRequestKVCacheTranfserMeasure)
+            {
+                outFile << requestID;
+
+                for (auto const& measure : measures)
+                {
+                    outFile << "," << measure.delay << "," << measure.duration << "," << measure.bandwidth;
+                }
+                outFile << '\n';
+            }
+
+            outFile.close();
+        }
+    }
+
+private:
+    std::map<LlmRequest::RequestIdType, std::vector<Measure>> mRequestKVCacheTranfserMeasure;
+    std::string mOutputPath;
+    std::mutex mMutex;
+    std::optional<bool> mIsSender;
+};
 
 // Used to support the cache transmission with different layouts and different protocols.
 class BaseCacheFormatter

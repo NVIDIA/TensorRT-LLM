@@ -14,6 +14,7 @@
 #include "tensorrt_llm/batch_manager/common.h"
 #include "tensorrt_llm/batch_manager/kvCacheEventManager.h"
 #include "tensorrt_llm/batch_manager/kvCacheTransferManager.h"
+#include "tensorrt_llm/batch_manager/kvCacheUtils.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -590,6 +591,96 @@ TEST_F(KVCacheManagerTest, BlockManagerTestWindowSizeToShare)
             result.begin(), result.end(), 0.0f, [](float sum, auto const& kv) { return sum + kv.second; });
         EXPECT_NEAR(sumShares, 1.0f, 1e-6f);
     }
+}
+
+TEST_F(KVCacheManagerTest, FindBlocksInReuseTreeByBlockKeysTest)
+{
+    auto constexpr numLayers = 12;
+    auto constexpr numKvHeads = 6;
+    auto constexpr sizePerHead = 128;
+    auto constexpr tokensPerBlock = 8;
+    auto constexpr blocksInPrimaryPool = 4;
+    auto constexpr blocksInSecondaryPool = 4;
+    auto constexpr maxNumSequences = 8;
+    auto const stream = std::make_shared<tr::CudaStream>();
+    auto constexpr onboardBlocks = true;
+
+    auto constexpr batchSize = 1;
+    auto constexpr maxBlocksPerSeq = 10;
+    auto constexpr bytesPerToken = 4;
+    auto constexpr maxAttentionWindow = 4096;
+    auto constexpr maxAttentionWindowAllLayer = 4096;
+    auto constexpr sinkTokenLen = 0;
+    auto constexpr canUseOneMoreBlock = true;
+
+    SizeType32 constexpr maxNewTokens{0};
+    auto constexpr beamWidth = 1;
+    auto constexpr beamIdx = 0;
+    tr::SamplingConfig const samplingConfig{beamWidth};
+    bool constexpr isStreaming{false};
+
+    auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}}};
+    KVCacheManager kvCacheManager(numLayers, numKvHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
+        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, std::nullopt, nvinfer1::DataType::kHALF,
+        false, stream, true, onboardBlocks);
+
+    // Add sequence [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16] (17 tokens, three blocks)
+    auto inputTokens = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16});
+    auto const inputLength = static_cast<SizeType32>(inputTokens->size());
+    LlmRequest::RequestIdType requestId{0};
+    auto llmRequest0 = std::make_shared<LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming);
+    kvCacheManager.addSequence(requestId, inputLength, beamWidth, llmRequest0);
+    EXPECT_EQ(llmRequest0->getContextCurrentPosition(), 0);
+    auto cacheBlockIds = kvCacheManager.getSequence(requestId).getCacheBlockIds(maxAttentionWindow).at(beamIdx);
+    EXPECT_THAT(cacheBlockIds, ::testing::ElementsAreArray({0, 1, 2}));
+
+    // Print all the block ids fromAllBlockIds
+    auto blockRange = BlockRange::fromAllBlockIds(kvCacheManager, requestId);
+    for (auto& block : blockRange.getBlockIds())
+    {
+        std::cout << block << " ";
+    }
+    std::cout << std::endl;
+    kvCacheManager.removeSequence(requestId, llmRequest0);
+    std::cout << "Removed sequence 0" << std::endl;
+
+    requestId = 1;
+    auto llmRequest1 = std::make_shared<LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, isStreaming);
+    kvCacheManager.addSequence(requestId, inputLength, beamWidth, llmRequest1);
+    std::cout << "Added sequence 1" << std::endl;
+    cacheBlockIds = kvCacheManager.getSequence(requestId).getCacheBlockIds(maxAttentionWindow).at(beamIdx);
+    std::cout << "Cache Block IDs: ";
+    for (auto& block : cacheBlockIds)
+    {
+        std::cout << block << " ";
+    }
+    std::cout << std::endl;
+    EXPECT_THAT(cacheBlockIds, ::testing::ElementsAreArray({0, 1, 2}));
+    auto blockRange2 = BlockRange::fromAllBlockIds(kvCacheManager, requestId);
+    std::cout << "All Block IDs: ";
+    for (auto& block : blockRange2.getBlockIds())
+    {
+        std::cout << block << " ";
+    }
+    std::cout << std::endl;
+
+    auto blockRange3 = BlockRange::fromNewlyAllocatedBlockIds(kvCacheManager, requestId);
+    std::cout << "Newly Allocated Block IDs: ";
+    for (auto& block : blockRange2.getBlockIds())
+    {
+        std::cout << block << " ";
+    }
+    std::cout << std::endl;
+
+    // BlockKey emptyKey{};
+    // auto result = blockManager.findBlocksInReuseTreeByBlockKey(emptyKey, maxAttentionWindow);
+    // ASSERT_TRUE(result.has_value());
+    // EXPECT_EQ((*result)->getBlockId(), KVCacheBlock::kCachedBlocksRootId);
+
+    // BlockKey key{BlockKey{block0->getHash()}};
+    // result = blockManager.findBlocksInReuseTreeByBlockKey(key, maxAttentionWindow);
+    // ASSERT_TRUE(result.has_value());
+    // EXPECT_EQ((*result)->getBlockId(), block0->getBlockId());
 }
 
 #ifdef ENABLE_FP4
