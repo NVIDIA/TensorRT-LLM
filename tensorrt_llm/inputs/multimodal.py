@@ -99,6 +99,7 @@ class MultimodalRuntimeData:
         chunk_end_pos: End position of the current chunk for chunked prefill
         num_unseen_mm_tokens: Number of multimodal tokens that are cached (computed)
         num_mm_tokens: Number of multimodal tokens in the current chunk (computed)
+        total_mm_tokens: Total number of multimodal tokens in the request sequence (computed)
     """
     past_seen_token_num: int # == num_cached_tokens
     mm_token_lengths: List[int]
@@ -107,10 +108,13 @@ class MultimodalRuntimeData:
 
     num_unseen_mm_tokens: Optional[int] = None
     num_mm_tokens: Optional[int] = None
+    total_mm_tokens: Optional[int] = None
     # TODO: fine-grained control of encoder runner/cache to each mm_item
 
     def __post_init__(self):
         # Validate input data
+        if self.total_mm_tokens is None:
+            self.total_mm_tokens = sum(self.mm_token_lengths)
         if len(self.mm_token_positions) != len(self.mm_token_lengths):
             raise ValueError(
                 f"mm_token_positions ({len(self.mm_token_positions)}) and mm_token_lengths ({len(self.mm_token_lengths)}) must have the same length"

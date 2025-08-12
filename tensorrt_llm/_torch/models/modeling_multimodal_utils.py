@@ -17,7 +17,7 @@
 # and s2wrapper: https://github.com/bfshi/scaling_on_scales
 
 import math
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, Callable, Dict, Any, Union
 
 import torch
 import torch.nn.functional as F
@@ -28,6 +28,116 @@ from torchvision.transforms import Normalize, Resize, ToTensor
 from tensorrt_llm._torch.modules.embedding import Embedding
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.logger import logger
+
+
+def _get_active_multimodal_params(
+    multimodal_params: List[MultimodalParams],
+) -> List[MultimodalParams]:
+    """
+    Get active multimodal params that need encoder processing for chunk prefill.
+    """
+    params_to_run = []
+
+    for param in multimodal_params:
+        # Skip if no multimodal content
+        if not param.has_content():
+            continue
+
+        # Check if embeddings are already cached
+        if (param.multimodal_data and
+            "multimodal_embedding" in param.multimodal_data and
+            param.multimodal_data["multimodal_embedding"] is not None):
+            logger.debug(f"Skipping encoder forward for param with cached multimodal_embedding")
+            continue
+
+        # This param needs encoder processing
+        params_to_run.append(param)
+
+    return params_to_run
+
+
+def _cache_multimodal_embeddings(
+    multimodal_params: List[MultimodalParams],
+    embeddings: List[torch.Tensor],
+) -> None:
+    """
+    Cache computed multimodal embeddings back to multimodal_data to avoid recomputation.
+    Uses torch.split for efficient tensor splitting without manual indexing.
+    """
+    # TODO: support multiple multimodal modalities per request
+    assert len(embeddings) == 1, "Currently only support single mm_embeds (single modality) per request"
+    mm_embed = embeddings[0]
+
+    # Collect embedding lengths for each parameter
+    embed_lengths = [param.multimodal_runtime.total_mm_tokens for param in multimodal_params]
+
+    # Validate total length matches
+    total_expected = sum(embed_lengths)
+    assert len(mm_embed) == total_expected, \
+        f"Number of mm_embeds ({len(mm_embed)}) does not match expected total ({total_expected})"
+
+    # Use torch.split for efficient tensor splitting
+    split_embeddings = torch.split(mm_embed, embed_lengths, dim=0)
+
+    # Cache split embeddings to each parameter
+    for param, embed_chunk in zip(multimodal_params, split_embeddings):
+        param.multimodal_data["multimodal_embedding"] = embed_chunk
+
+    logger.debug(f"Cached {len(split_embeddings)} multimodal embedding chunks in this iteration")
+
+
+def get_multimodal_embeddings(
+    encoder_forward_fn,
+    multimodal_params: List[MultimodalParams],
+) -> List[torch.Tensor]:
+    """
+    High-level utility to get multimodal embeddings from encoder or cached embeddings.
+
+    This function will:
+    1. Identify which parameters need encoder processing
+    2. Run encoder forward only on uncached parameters
+    3. Cache newly computed embeddings (if enabled)
+    4. Gather all embeddings for the batch
+
+    Args:
+        encoder_forward_fn: Callable that performs encoder forward pass
+                           Should accept List[MultimodalParams] and return List[torch.Tensor]
+        multimodal_params: All multimodal parameters in the batch
+
+    Returns:
+        List of multimodal embeddings for all multimodal params in the batch
+    """
+    if not multimodal_params:
+        return []
+
+    # Step 1: Find active multimodal params that need encoder processing
+    active_multimodal_params = _get_active_multimodal_params(
+        multimodal_params
+    )
+
+    # Step 2: Run encoder forward only on uncached parameters
+    if active_multimodal_params:
+        encoder_outputs = encoder_forward_fn(active_multimodal_params)
+
+        # TODO: support multiple multimodal modalities per request
+        if len(encoder_outputs) > 1:
+            return encoder_outputs
+
+        # Validate that multimodal_runtime has required attributes for caching
+        if (not hasattr(active_multimodal_params[0], 'multimodal_runtime') or
+            active_multimodal_params[0].multimodal_runtime is None or
+            active_multimodal_params[0].multimodal_runtime.total_mm_tokens is None):
+            logger.warning("Multimodal runtime data missing or incomplete - recomputed all embeddings")
+            return encoder_outputs
+
+        # Step 3: Cache the computed embeddings to multimodal_data["multimodal_embedding"]
+        _cache_multimodal_embeddings(
+            active_multimodal_params, encoder_outputs
+        )
+
+    # Step 4: Gather all embeddings for the batch
+    all_embeddings = torch.cat([param.multimodal_data["multimodal_embedding"] for param in multimodal_params], dim=0)
+    return [all_embeddings]
 
 
 def find_input_mm_embeds(
@@ -66,10 +176,6 @@ def find_input_mm_embeds(
         return mm_embeds
 
     # Calculate total tokens that need processing (both cached and current chunk)
-    total_unseen_mm_tokens = sum([
-        param.multimodal_runtime.num_unseen_mm_tokens
-        for param in multimodal_params
-    ])
     total_mm_tokens = sum([
         param.multimodal_runtime.num_mm_tokens
         for param in multimodal_params
@@ -92,12 +198,11 @@ def find_input_mm_embeds(
         slices.append((current_pos + runtime.num_unseen_mm_tokens,
                        current_pos + runtime.num_unseen_mm_tokens + runtime.num_mm_tokens))
         if len(mm_embeds) == 1:  # pre-concatenated mm_embeds, need global offset
-            current_pos += sum(runtime.mm_token_lengths)
+            current_pos += runtime.total_mm_tokens
 
     sliced_mm_embeds = []
     if len(mm_embeds) == 1:
-        for start, end in slices:
-            sliced_mm_embeds.append(mm_embeds[0][start:end])
+        sliced_mm_embeds = [mm_embeds[0][start:end] for start, end in slices]
     else:  # slice each mm_embeds individually
         for i, (start, end) in enumerate(slices):
             sliced_mm_embeds.append(mm_embeds[i][start:end])
