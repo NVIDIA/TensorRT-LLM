@@ -940,10 +940,10 @@ class TRTLLMSampler(Sampler):
                     log_probs = [{
                         new_tokens_host[seq_slot]:
                         Logprob(logprob=state.host.log_probs[seq_slot][0][
-                            begin_log_probs_offset + current_token],
+                            begin_log_probs_offset + current_token].item(),
                                 rank=1)
                     }]
-                    cum_log_probs = [state.host.cum_log_probs[seq_slot]] \
+                    cum_log_probs = [state.host.cum_log_probs[seq_slot].item()] \
                         if state.host.cum_log_probs is not None else None
                     request.py_result.append_log_probs([log_probs], cum_log_probs)
 
