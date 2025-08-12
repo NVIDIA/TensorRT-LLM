@@ -706,9 +706,7 @@ def main(*,
             with working_directory(project_dir):
                 if binding_type == "nanobind":
                     build_run(f"\"{venv_python}\" -m pip install nanobind")
-                else:
-                    build_run(
-                        f"\"{venv_python}\" -m pip install pybind11-stubgen")
+                build_run(f"\"{venv_python}\" -m pip install pybind11-stubgen")
             with working_directory(pkg_dir):
                 if on_windows:
                     if binding_type == "nanobind":
@@ -771,13 +769,13 @@ def main(*,
                         build_run(
                             f"\"{venv_python}\" -m pybind11_stubgen -o . bindings --exit-code",
                             env=env_ld)
-                        if deep_ep_cuda_architectures:
-                            build_run(
-                                f"\"{venv_python}\" -m pybind11_stubgen -o . deep_ep_cpp_tllm --exit-code",
-                                env=env_ld)
+                    if deep_ep_cuda_architectures:
                         build_run(
-                            f"\"{venv_python}\" -m pybind11_stubgen -o . deep_gemm_cpp_tllm --exit-code",
+                            f"\"{venv_python}\" -m pybind11_stubgen -o . deep_ep_cpp_tllm --exit-code",
                             env=env_ld)
+                    build_run(
+                        f"\"{venv_python}\" -m pybind11_stubgen -o . deep_gemm_cpp_tllm --exit-code",
+                        env=env_ld)
 
     if not skip_building_wheel:
         if dist_dir is None:

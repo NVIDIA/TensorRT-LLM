@@ -157,6 +157,12 @@ example:
 python3 ./scripts/build_wheel.py --cuda_architectures "80-real;86-real"
 ```
 
+When building with Python dependencies, the default binding library used is nanobind. It is possible to switch back to the previously used library pybind11, but this can impact performance negatively:
+
+```bash
+python3 ./scripts/build_wheel.py --binding_type pybind
+```
+
 To use the C++ benchmark scripts under [benchmark/cpp](/benchmarks/cpp/), for example `gptManagerBenchmark.cpp`, add the `--benchmarks` option:
 
 ```bash
