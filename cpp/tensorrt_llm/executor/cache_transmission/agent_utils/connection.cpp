@@ -234,7 +234,6 @@ AgentConnection const* AgentConnectionManager::recvConnectionAndRequestInfo(batc
 
     while (true)
     {
-
         updateUnhandledNotifications();
         std::scoped_lock lock(mNotificationMutex);
         auto it = mUnhandledNotifications.begin();
