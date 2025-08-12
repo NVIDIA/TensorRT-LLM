@@ -1,6 +1,3 @@
-import json
-from pathlib import Path
-
 import pytest
 from utils.llm_data import llm_models_root
 from utils.util import similar
@@ -8,15 +5,6 @@ from utils.util import similar
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.llmapi import CudaGraphConfig
 from tensorrt_llm.llmapi import KvCacheConfig as TRT_KvCacheConfig
-
-
-# A test case of mmlu_llama from lm_eval
-@pytest.fixture(scope="module")
-def test_case():
-    with open(
-            Path(__file__).parent.parent / "executor" /
-            "test_overlap_scheduler_input.json") as f:
-        return json.load(f)
 
 
 @pytest.fixture(scope="module")
@@ -41,7 +29,7 @@ def create_llm(model_dir):
 
 
 @pytest.mark.high_cuda_memory
-def test_trtllm_sampler(model_path, test_case):
+def test_trtllm_sampler(model_path):
     prompts = [
         "Magellan and Elcano lead the first",
         "The capital of France is",
@@ -52,10 +40,10 @@ def test_trtllm_sampler(model_path, test_case):
                         ["La Paz"]]
 
     # Test configuration
-    max_new_tokens = test_case["max_new_tokens"]
-    temperature = test_case["temperature"]
-    top_p = test_case["top_p"]
-    stop_words = test_case["stop_words"]
+    max_new_tokens = 10
+    temperature = 1.0
+    top_p = None
+    stop_words = ["."]
 
     sampling_config = SamplingParams(max_tokens=max_new_tokens,
                                      n=1,
