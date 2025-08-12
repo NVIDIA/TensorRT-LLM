@@ -21,8 +21,11 @@ from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
 from ..model_config import ModelConfig
 from .modeling_auto import AutoModelForCausalLM
-from .modeling_multimodal_utils import (find_input_mm_embeds,
-                                        fuse_input_embeds)
+from .modeling_multimodal_utils import (
+    find_input_mm_embeds,
+    fuse_input_embeds,
+    get_multimodal_embeddings
+)
 from .modeling_utils import register_auto_model, register_vision_encoder
 
 DISAGG = os.getenv('TLLM_MULTIMODAL_DISAGGREGATED', '0') == '1'
@@ -594,11 +597,9 @@ class Qwen2VLModelBase(PreTrainedModel):
 
         if len(multimodal_params) > 0:
             if not DISAGG:
-                #mm_embeds = self.mm_encoder.forward(
-                #    multimodal_params[:num_context_requests])
-                # Get the full mm embeds (from cache or compute)
-                mm_embeds = self._get_or_compute_mm_embeds(
-                    multimodal_params[:num_context_requests]
+                mm_embeds = get_multimodal_embeddings(
+                    encoder_forward_fn=self.mm_encoder.forward,
+                    multimodal_params=multimodal_params[:num_context_requests]
                 )
             else:
                 # TODO: this is a dead path for now
