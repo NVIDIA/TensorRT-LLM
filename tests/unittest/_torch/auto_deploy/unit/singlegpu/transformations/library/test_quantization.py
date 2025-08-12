@@ -73,7 +73,7 @@ def test_quantization(quant_config, atol, rtol, num_p_og):
     gm_transformed = InferenceOptimizer(
         DummyFactory(quant_config),
         {
-            "quantize": {
+            "quantize_from_config": {
                 "stage": "pattern_matcher",
             },
         },
@@ -155,7 +155,7 @@ def test_bmm_quantization(quant_config, atol, rtol, num_p_og, model_class):
     gm_transformed = InferenceOptimizer(
         DummyFactory(quant_config),
         {
-            "quantize": {
+            "quantize_from_config": {
                 "stage": "pattern_matcher",
             },
         },
