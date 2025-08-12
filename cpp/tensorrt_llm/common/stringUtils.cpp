@@ -28,7 +28,6 @@ namespace tensorrt_llm::common
 
 void fmtstr_(char const* format, fmtstr_allocator alloc, void* target, va_list args)
 {
-    va_list_guard args_guard(args);
     va_list args0;
     va_copy(args0, args);
 
