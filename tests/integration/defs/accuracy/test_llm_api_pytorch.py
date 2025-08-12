@@ -250,7 +250,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                                               enable_padding=True),
         )
         kv_cache_config = KvCacheConfig(
-            enable_block_reuse=True
+            enable_block_reuse=True, free_gpu_memory_fraction=0.8
         )  # both one-model and two-model supports this feature
 
         eagle_model_dir = f"{llm_models_root()}/EAGLE3-LLaMA3.1-Instruct-8B"
@@ -280,7 +280,8 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             cuda_graph_config=CudaGraphConfig(batch_sizes=[1]),
         )
 
-        kv_cache_config = KvCacheConfig(enable_block_reuse=False)
+        kv_cache_config = KvCacheConfig(enable_block_reuse=False,
+                                        free_gpu_memory_fraction=0.8)
 
         spec_config = NGramDecodingConfig(
             max_draft_len=4,
