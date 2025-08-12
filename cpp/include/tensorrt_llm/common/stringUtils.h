@@ -74,37 +74,33 @@ void printElement(std::ostream& os, std::tuple<Args...> const& t)
     printTupleImpl(os, t, std::index_sequence_for<Args...>{});
 }
 
-// Using RAII to automatically manage the allocation and release of va_list
-class va_list_wrapper
+class va_list_guard
 {
 public:
-    explicit va_list_wrapper(char const* format)
+    explicit va_list_guard(va_list& args)
+        : args_(args)
     {
-        va_start(args_, format);
     }
 
-    // Constructor for copying existing va_list
-    explicit va_list_wrapper(va_list args)
-    {
-        va_copy(args_, args);
-    }
-
-    ~va_list_wrapper()
+    ~va_list_guard()
     {
         va_end(args_);
     }
 
-    // Non-copyable - avoid double-free issues
-    va_list_wrapper(va_list_wrapper const&) = delete;
-    va_list_wrapper& operator=(va_list_wrapper const&) = delete;
+    va_list_guard(va_list_guard const&) = delete;
+    va_list_guard& operator=(va_list_guard const&) = delete;
+    va_list_guard(va_list_guard&&) = delete;
+    va_list_guard& operator=(va_list_guard&&) = delete;
 
     va_list& get()
     {
         return args_;
     }
 
+    va_list get() && = delete;
+
 private:
-    va_list args_;
+    va_list& args_;
 };
 
 } // namespace
@@ -136,7 +132,7 @@ inline std::string fmtstr(std::string&& s)
 }
 
 typedef char* (*fmtstr_allocator)(void* target, size_t count);
-void fmtstr_(char const* format, fmtstr_allocator alloc, void* target, va_list_wrapper& args_wrapper);
+void fmtstr_(char const* format, fmtstr_allocator alloc, void* target, va_list_guard& args_guard);
 
 #if defined(_MSC_VER)
 inline std::string fmtstr(char const* format, ...);
@@ -148,7 +144,10 @@ inline std::string fmtstr(char const* format, ...)
 {
     std::string result;
 
-    va_list_wrapper args_wrapper(format);
+    va_list args;
+    va_start(args, format);
+    va_list_guard args_guard(args);
+
     fmtstr_(
         format,
         [](void* target, size_t count) -> char*
@@ -162,7 +161,7 @@ inline std::string fmtstr(char const* format, ...)
             str->resize(count);
             return str->data();
         },
-        &result, args_wrapper);
+        &result, args_guard);
 
     return result;
 }
