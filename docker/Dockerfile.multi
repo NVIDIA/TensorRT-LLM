@@ -1,8 +1,8 @@
 # Multi-stage Dockerfile
 ARG BASE_IMAGE=gitlab-master.nvidia.com:5005/dl/dgx/pytorch
 ARG TRITON_IMAGE=gitlab-master.nvidia.com:5005/dl/dgx/tritonserver
-ARG BASE_TAG=25.08-py3.32224057-base
-ARG TRITON_BASE_TAG=25.08-RC-py3.32078257
+ARG BASE_TAG=25.08-py3.32674667-devel
+ARG TRITON_BASE_TAG=25.08-py3.32978230
 ARG DEVEL_IMAGE=devel
 
 FROM ${BASE_IMAGE}:${BASE_TAG} AS base
@@ -74,12 +74,28 @@ ENV PYTORCH_CUDA_ALLOC_CONF="garbage_collection_threshold:0.99999"
 RUN pip3 uninstall -y opencv && rm -rf /usr/local/lib/python3*/dist-packages/cv2/
 RUN pip3 install opencv-python-headless --force-reinstall --no-deps --no-cache-dir
 
-COPY bringup_fix.sh bringup_fix.sh
-RUN bash ./bringup_fix.sh && rm bringup_fix.sh
+# COPY bringup_fix.sh bringup_fix.sh
+# RUN bash ./bringup_fix.sh && rm bringup_fix.sh
 
 # WARs against security issues inherited from pytorch:25.06
+# * https://github.com/advisories/GHSA-8qvm-5x2c-j2w7
 RUN pip3 install --upgrade --no-cache-dir \
     "protobuf>=4.25.8"
+
+# wait for new triton to be published
+# Rename pytorch_triton package to triton
+RUN cd /usr/local/lib/python3.12/dist-packages/ && \
+    ls -la | grep pytorch_triton && \
+    mv pytorch_triton-3.3.1+gitc8757738.dist-info triton-3.3.1+gitc8757738.dist-info && \
+    cd triton-3.3.1+gitc8757738.dist-info && \
+    echo "Current directory: $(pwd)" && \
+    echo "Files in directory:" && \
+    ls -la && \
+    sed -i 's/^Name: pytorch-triton/Name: triton/' METADATA && \
+    sed -i 's|pytorch_triton-3.3.1+gitc8757738.dist-info/|triton-3.3.1+gitc8757738.dist-info/|g' RECORD && \
+    echo "METADATA after update:" && \
+    grep "^Name:" METADATA
+
 
 FROM ${TRITON_IMAGE}:${TRITON_BASE_TAG} AS triton
 
@@ -90,6 +106,8 @@ COPY --from=triton /opt/tritonserver/lib /opt/tritonserver/lib
 COPY --from=triton /opt/tritonserver/include /opt/tritonserver/include
 COPY --from=triton /opt/tritonserver/bin /opt/tritonserver/bin
 COPY --from=triton /opt/tritonserver/caches /opt/tritonserver/caches
+# WAR for the datacenter-gpu-manager 4.4.0 is not available in the apt repository
+COPY --from=triton /usr/lib/*-linux-gnu/libdcgm.so* /tmp/
 COPY docker/common/install_triton.sh install_triton.sh
 RUN bash ./install_triton.sh && rm install_triton.sh
 

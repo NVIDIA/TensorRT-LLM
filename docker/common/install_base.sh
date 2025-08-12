@@ -56,6 +56,7 @@ init_ubuntu() {
     llvm \
     libclang-rt-dev \
     libffi-dev \
+    libstdc++-14-dev \
     libnuma1 \
     libnuma-dev \
     python3-dev \
