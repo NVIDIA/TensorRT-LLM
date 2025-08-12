@@ -503,6 +503,7 @@ if(ENABLE_UCX)
                   "$ENV{GITHUB_MIRROR}/rapidsai/rapids-cmake/raw/refs/heads"
                   FILE_CONTENTS "${FILE_CONTENTS}")
         file(WRITE "${3RDPARTY_DIR}/ucxx/fetch_rapids.cmake" "${FILE_CONTENTS}")
+        message(WARNING "Replace UCXX fetch_rapids.cmake with ${FILE_CONTENTS}")
       endif()
     endif()
     # installing ucxx via add_subdirectory results in strange cudart linking
