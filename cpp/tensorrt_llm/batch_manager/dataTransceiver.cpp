@@ -62,17 +62,19 @@ RequestInfo::RequestInfo(LlmRequest::RequestIdType requestId, executor::DataTran
 {
 }
 
-RequestInfo::RequestInfo(
-    LlmRequest::RequestIdType requestId, std::vector<size_t> blockHashes, executor::DataTransceiverState transState)
+RequestInfo::RequestInfo(LlmRequest::RequestIdType requestId, std::vector<size_t> allBlockHashes,
+    executor::DataTransceiverState transState, std::vector<size_t> requestedBlockHashes)
     : mRequestId{requestId}
-    , mBlockHashes{std::move(blockHashes)}
+    , mAllBlockHashes{std::move(allBlockHashes)}
+    , mRequestedBlockHashes{std::move(requestedBlockHashes)}
     , mTransState{std::move(transState)}
 {
 }
 
 bool RequestInfo::operator==(RequestInfo const& rhs) const
 {
-    return mRequestId == rhs.mRequestId && mBlockHashes == rhs.mBlockHashes && mTransState == rhs.mTransState;
+    return mRequestId == rhs.mRequestId && mAllBlockHashes == rhs.mAllBlockHashes
+        && mRequestedBlockHashes == rhs.mRequestedBlockHashes && mTransState == rhs.mTransState;
 }
 
 LlmRequest::RequestIdType RequestInfo::getRequestId() const noexcept
@@ -89,7 +91,8 @@ void RequestInfo::serialize(RequestInfo const& requestInfo, std::ostream& os)
 {
     namespace su = executor::serialize_utils;
     su::serialize(requestInfo.mRequestId, os);
-    su::serialize(requestInfo.mBlockHashes, os);
+    su::serialize(requestInfo.mAllBlockHashes, os);
+    su::serialize(requestInfo.mRequestedBlockHashes, os);
     su::serialize(requestInfo.mTransState, os);
 }
 
@@ -97,9 +100,10 @@ RequestInfo RequestInfo::deserialize(std::istream& is)
 {
     namespace su = executor::serialize_utils;
     auto requestId = su::deserialize<decltype(mRequestId)>(is);
-    auto blockHashes = su::deserialize<decltype(mBlockHashes)>(is);
+    auto allBlockHashes = su::deserialize<decltype(mAllBlockHashes)>(is);
+    auto requestedBlockHashes = su::deserialize<decltype(mRequestedBlockHashes)>(is);
     auto transState = su::deserialize<decltype(mTransState)>(is);
-    return RequestInfo{requestId, std::move(blockHashes), std::move(transState)};
+    return RequestInfo{requestId, std::move(allBlockHashes), std::move(transState), std::move(requestedBlockHashes)};
 }
 
 std::size_t RequestInfo::serializedSize(RequestInfo const& requestInfo)
@@ -107,7 +111,8 @@ std::size_t RequestInfo::serializedSize(RequestInfo const& requestInfo)
     namespace su = executor::serialize_utils;
     std::size_t totalSize = 0;
     totalSize += su::serializedSize(requestInfo.mRequestId);
-    totalSize += su::serializedSize(requestInfo.mBlockHashes);
+    totalSize += su::serializedSize(requestInfo.mAllBlockHashes);
+    totalSize += su::serializedSize(requestInfo.mRequestedBlockHashes);
     totalSize += su::serializedSize(requestInfo.mTransState);
     return totalSize;
 }
@@ -138,8 +143,8 @@ public:
         {
             {
                 std::unique_lock lkResp(mSenderMutex);
-                mReadyResponses.emplace(
-                    llmRequest.mRequestId, Response{std::addressof(llmRequest), std::move(promise)});
+                mReadyRequests.emplace(llmRequest.mRequestId, std::addressof(llmRequest));
+                mReadyPromises.emplace(llmRequest.mRequestId, std::move(promise));
             }
             std::unique_lock lkCond(mCondMutex);
             mAnyReady = true;
@@ -178,25 +183,18 @@ public:
         auto* agentConnectionManager = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager);
         bool isAgent = agentConnectionManager != nullptr;
 
-        auto agentRecvFun = [&](RequestInfo& requestInfo)
-        {
-            auto const* connection = agentConnectionManager->recvConnectionAndRequestInfo(requestInfo);
-            return connection;
-        };
         TransceiverTag::Id id;
         RequestInfo info;
-        auto const* connection = isAgent ? agentRecvFun(info)
+        auto const* connection = isAgent ? agentConnectionManager->recvConnectionAndRequestInfo(info)
                                          : mManager->recvConnect(DataContext{TransceiverTag::kID_TAG}, &id, sizeof(id));
         if (!isAgent)
         {
             TLLM_CHECK(id == TransceiverTag::Id::REQUEST_SEND);
             std::uint64_t infoSize{0};
-            connection->recv(
-                executor::kv_cache::DataContext{TransceiverTag::kINFO_SIZE_TAG}, &infoSize, sizeof(infoSize));
+            connection->recv(DataContext{TransceiverTag::kINFO_SIZE_TAG}, &infoSize, sizeof(infoSize));
             std::string serializedInfo;
             serializedInfo.resize(infoSize);
-            connection->recv(
-                executor::kv_cache::DataContext{TransceiverTag::kINFO_TAG}, serializedInfo.data(), infoSize);
+            connection->recv(DataContext{TransceiverTag::kINFO_TAG}, serializedInfo.data(), infoSize);
             std::istringstream iss(serializedInfo);
             info = RequestInfo::deserialize(iss);
         }
@@ -219,7 +217,8 @@ public:
             if (it == mRequestToSession.end())
             {
                 auto session = TransferSession(std::vector<Connection const*>(peerRelativeRanks.size(), nullptr),
-                    DataContext{tagFromRequestId(requestId)}, mSelfState, info.getTransState(), mBufferManager);
+                    DataContext{tagFromRequestId(requestId)}, mSelfState, info.getTransState(), mBufferManager,
+                    info.getAllBlockHashes(), info.getRequestedBlockHashes());
                 it = mRequestToSession.emplace(requestId, std::move(session)).first;
             }
             it->second.setConnection(peerIdx, connection);
@@ -242,25 +241,42 @@ public:
     }
 
 private:
-    struct Response
+    void sendAndRemoveResponse(RequestIdType id) noexcept
     {
-        LlmRequest* mRequest;
-        std::promise<void> mPromise;
-    };
+        LlmRequest* request = nullptr;
+        std::promise<void> promise;
 
-    void sendAndRemoveResponse(RequestIdType id, Response resp) noexcept
-    {
+        // Extract request and promise
+        {
+            std::unique_lock lkResp(mSenderMutex);
+            auto requestIt = mReadyRequests.find(id);
+            auto promiseIt = mReadyPromises.find(id);
+
+            if (requestIt != mReadyRequests.end() && promiseIt != mReadyPromises.end())
+            {
+                request = requestIt->second;
+                promise = std::move(promiseIt->second);
+                mReadyRequests.erase(requestIt);
+                mReadyPromises.erase(promiseIt);
+            }
+        }
+
+        if (request == nullptr)
+        {
+            return; // Request not found
+        }
+
         try
         {
             TLLM_CUDA_CHECK(cudaSetDevice(mDeviceId));
-            sendSync(*resp.mRequest);
+            sendSync(*request);
             release(id);
-            resp.mPromise.set_value();
+            promise.set_value();
         }
         catch (std::exception const& e)
         {
             TLLM_LOG_ERROR("Exception in sendAndRemoveResponse: %s ", e.what());
-            resp.mPromise.set_exception(std::current_exception());
+            promise.set_exception(std::current_exception());
         }
     }
 
@@ -281,12 +297,10 @@ private:
                 {
                     break;
                 }
-                std::vector<size_t> blockHashes;
-                if (!isSending() && !mReadyResponses.empty())
+                if (!isSending() && !mReadyPromises.empty())
                 {
                     auto const& requestInfo = recvRequestInfo();
                     auto reqId = requestInfo.getRequestId();
-                    blockHashes = requestInfo.getBlockHashes();
 
                     mCurrentRequest = reqId;
                     if (mRemainSendCount.find(reqId) == mRemainSendCount.end())
@@ -294,32 +308,26 @@ private:
                         mRemainSendCount[reqId] = getCounterpartsCount(reqId);
                     }
                 }
-                auto it = getCurrentResponse();
-                if (it != mReadyResponses.end())
+                auto reqId = mCurrentRequest.value();
+                auto it = mReadyPromises.find(reqId);
+                if (it != mReadyPromises.end())
                 {
-                    auto reqId = mCurrentRequest.value();
                     auto count = --mRemainSendCount[reqId];
                     TLLM_CHECK(count >= 0);
                     if (count == 0)
                     {
                         mRemainSendCount.erase(reqId);
 
-                        // TODO(zhengd): pass the hashes directly instead of update llmRequest
-                        auto llmRequest = it->second.mRequest;
-                        llmRequest->setRequestedBlockHashes(std::move(blockHashes));
-
                         if (common::getEnvParallelCacheSend())
                         {
                             // TODO: Use a thread pool and check for thread safety.
-                            std::thread(
-                                &CacheSender::Impl::sendAndRemoveResponse, this, it->first, std::move(it->second))
-                                .detach();
+                            std::thread(&CacheSender::Impl::sendAndRemoveResponse, this, reqId).detach();
                         }
                         else
                         {
-                            CacheSender::Impl::sendAndRemoveResponse(it->first, std::move(it->second));
+                            CacheSender::Impl::sendAndRemoveResponse(reqId);
                         }
-                        removeResponse(it);
+                        removeResponse(reqId);
                     }
                     mCurrentRequest = std::nullopt;
                 }
@@ -327,8 +335,8 @@ private:
                 {
                     TLLM_CHECK_WITH_INFO(!mCurrentRequest.has_value(),
                         "This executor does not have a prepared KV cache for request ID: %zu, and the "
-                        "mReadyResponses size is: %zu. mpi rank :%d     ",
-                        mCurrentRequest.value(), mReadyResponses.size(), mpi::MpiComm::world().getRank());
+                        "mReadyPromises size is: %zu. mpi rank :%d     ",
+                        mCurrentRequest.value(), mReadyPromises.size(), mpi::MpiComm::world().getRank());
                     std::unique_lock lk(mCondMutex);
                     mSenderCv.wait(lk, [this]() { return (mAnyReady || mTerminate); });
                 }
@@ -337,9 +345,9 @@ private:
         catch (std::exception const& err)
         {
             TLLM_LOG_ERROR("Exception in CacheSender response: %s", err.what());
-            for (auto& it : mReadyResponses)
+            for (auto& it : mReadyPromises)
             {
-                it.second.mPromise.set_exception(std::current_exception());
+                it.second.set_exception(std::current_exception());
             }
         }
     }
@@ -355,13 +363,14 @@ private:
         mSenderCv.notify_all();
     }
 
-    void removeResponse(std::map<RequestIdType, Response>::iterator it)
+    void removeResponse(RequestIdType id)
     {
         {
             std::unique_lock lkResp(mSenderMutex);
-            mReadyResponses.erase(it);
+            mReadyRequests.erase(id);
+            mReadyPromises.erase(id);
         }
-        if (mReadyResponses.empty())
+        if (mReadyRequests.empty())
         {
             std::unique_lock lkCond(mCondMutex);
             mAnyReady = false;
@@ -378,15 +387,18 @@ private:
         return mCurrentRequest.value();
     }
 
-    [[nodiscard]] std::map<RequestIdType, Response>::iterator getCurrentResponse()
+    [[nodiscard]] bool hasCurrentResponse()
     {
-        std::unique_lock lk(mSenderMutex);
-        return mReadyResponses.find(getCurrentRequestId());
+        std::unique_lock<std::mutex> lk(mSenderMutex);
+        auto requestId = getCurrentRequestId();
+        return mReadyRequests.find(requestId) != mReadyRequests.end()
+            && mReadyPromises.find(requestId) != mReadyPromises.end();
     }
 
 private:
     std::optional<RequestIdType> mCurrentRequest;
-    std::map<RequestIdType, Response> mReadyResponses;
+    std::map<RequestIdType, LlmRequest*> mReadyRequests;
+    std::map<RequestIdType, std::promise<void>> mReadyPromises;
     std::mutex mSenderMutex, mCondMutex;
     std::atomic<bool> mAnyReady{false}, mTerminate{false};
     std::condition_variable mSenderCv;
@@ -473,14 +485,15 @@ public:
 
         RequestInfo requestInfo(requestId, mSelfState);
 
-        auto disableSelectiveCacheTransfer = common::getEnvDisableSelectiveCacheTransfer()
-            || (mFormatter->getCacheManager()->getBlockManager().getNumPools() > 1);
-        if (!disableSelectiveCacheTransfer)
+        if (mFormatter->getCacheManager()->isEnableBlockReuse()
+            && mFormatter->getCacheManager()->getBlockManager().getNumPools() == 1)
         {
             auto* cacheManager = mFormatter->getCacheManager();
-            auto blockRange
-                = kv_cache_manager::BlockRange::fromNewlyAllocatedBlockIds(*cacheManager, llmRequest.mRequestId);
-            requestInfo = RequestInfo(requestId, blockRange.getBlockHashes(), mSelfState);
+            auto beam = 0;
+            auto allBlockRange = BlockRange::fromAllBlockIds(*cacheManager, llmRequest.mRequestId, beam);
+            auto requestedBlockRange = getBlockRangeForReceiving(cacheManager, llmRequest);
+            requestInfo = RequestInfo(
+                requestId, allBlockRange.getBlockHashes(), mSelfState, requestedBlockRange.getBlockHashes());
         }
 
         auto* agentConnectionManager = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager);
@@ -525,7 +538,8 @@ public:
         }
         auto const& resource = getReceiveCacheResource(llmRequest);
         return TransferSession(std::move(counterPartConnections), DataContext{tagFromRequestId(requestId)}, mSelfState,
-            contextState, resource->mBufferManager, &llmRequest);
+            contextState, resource->mBufferManager, requestInfo.getAllBlockHashes(),
+            requestInfo.getRequestedBlockHashes(), &llmRequest);
     }
 
     std::unique_ptr<ReceiveCacheResource> const& getReceiveCacheResource(LlmRequest const& llmRequest)
@@ -553,9 +567,9 @@ public:
         auto const& serializedInfo = oss.str();
         std::size_t const infoSize = serializedInfo.size();
         TransceiverTag::Id id{TransceiverTag::Id::REQUEST_SEND};
-        connection->send(executor::kv_cache::DataContext{TransceiverTag::kID_TAG}, &id, sizeof(id));
-        connection->send(executor::kv_cache::DataContext{TransceiverTag::kINFO_SIZE_TAG}, &infoSize, sizeof(infoSize));
-        connection->send(executor::kv_cache::DataContext{TransceiverTag::kINFO_TAG}, serializedInfo.data(), infoSize);
+        connection->send(DataContext{TransceiverTag::kID_TAG}, &id, sizeof(id));
+        connection->send(DataContext{TransceiverTag::kINFO_SIZE_TAG}, &infoSize, sizeof(infoSize));
+        connection->send(DataContext{TransceiverTag::kINFO_TAG}, serializedInfo.data(), infoSize);
     }
 
     ~Impl()

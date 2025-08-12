@@ -346,6 +346,7 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
         .def("add_sequence", &BaseKVCacheManager::addSequence)
         .def("remove_sequence", &BaseKVCacheManager::removeSequence)
         .def("scheduling_remove_sequence", &BaseKVCacheManager::schedulingRemoveSequence)
+        .def("pin_blocks", &BaseKVCacheManager::pinBlocks)
         .def("get_block_pool_pointers",
             [](tbk::BaseKVCacheManager& self)
             {

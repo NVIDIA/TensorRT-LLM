@@ -67,8 +67,8 @@ public:
     /// @param transState The state of the data transceiver.
     RequestInfo(LlmRequest::RequestIdType requestId, executor::DataTransceiverState transState);
 
-    RequestInfo(LlmRequest::RequestIdType requestId, std::vector<size_t> blockHashes,
-        executor::DataTransceiverState transState);
+    RequestInfo(LlmRequest::RequestIdType requestId, std::vector<size_t> allBlockHashes,
+        executor::DataTransceiverState transState, std::vector<size_t> requestedBlockHashes);
     RequestInfo() = default;
 
     /// @brief Equality comparison operator.
@@ -79,9 +79,14 @@ public:
     /// @return The request ID.
     [[nodiscard]] LlmRequest::RequestIdType getRequestId() const noexcept;
 
-    [[nodiscard]] std::vector<size_t> const& getBlockHashes() const noexcept
+    [[nodiscard]] std::vector<size_t> const& getAllBlockHashes() const noexcept
     {
-        return mBlockHashes;
+        return mAllBlockHashes;
+    }
+
+    [[nodiscard]] std::vector<size_t> const& getRequestedBlockHashes() const noexcept
+    {
+        return mRequestedBlockHashes;
     }
 
     /// @brief Return the state of the data transceiver.
@@ -106,12 +111,15 @@ private:
     // The ID used in the context phase of the current request.
     LlmRequest::RequestIdType mRequestId;
 
-    std::vector<size_t> mBlockHashes;
+    // The block hashes of the request.
+    std::vector<size_t> mAllBlockHashes;
+
+    // The block hashes of the requested data.
+    std::vector<size_t> mRequestedBlockHashes;
 
     // The state of the data transceiver.
     executor::DataTransceiverState mTransState;
 };
-
 
 class CacheSender
 {

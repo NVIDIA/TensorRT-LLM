@@ -106,12 +106,8 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
     : mMpiGroupComm(std::addressof(tensorrt_llm::mpi::MpiComm::session()))
     , mCacheTransceiverConfig{cacheTransceiverConfig}
 {
+    // mCacheServer = std::make_unique<CacheServer>(CacheServerConfig{cacheManager});
     using tensorrt_llm::batch_manager::kv_cache_manager::CacheFormatter;
-    if (worldConfig.isPipelineParallel())
-    {
-        mMpiGroupPipeParaComm = std::make_shared<tensorrt_llm::mpi::MpiComm>(
-            mMpiGroupComm->split(worldConfig.getTensorParallelRank(), worldConfig.getPipelineParallelRank()));
-    }
     if (worldConfig.isTensorParallel())
     {
         mMpiGroupTensorParaComm = std::make_shared<tensorrt_llm::mpi::MpiComm>(

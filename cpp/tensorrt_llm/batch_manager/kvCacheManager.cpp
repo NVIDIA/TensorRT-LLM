@@ -1008,6 +1008,30 @@ bool WindowBlockManager::blockInRadixTree(BlockPtr const& block)
     return !block->getUniqueTokens().empty() && block->getPrevBlock() != nullptr;
 }
 
+std::optional<std::shared_ptr<KVCacheBlock>> WindowBlockManager::findBlocksInReuseTreeByHashes(
+    std::vector<size_t> const& hashes) const
+{
+    std::vector<BlockKey> blockKeys;
+    for (auto const& hash : hashes)
+    {
+        blockKeys.emplace_back(hash);
+    }
+
+    auto searchRoot = mCachedBlocksRoot;
+    for (auto const& blockKey : blockKeys)
+    {
+        auto [partialMatch, numMatched, matchingBlock] = searchRoot != nullptr
+            ? searchRoot->findMatchingBlock(blockKey, false, false)
+            : std::make_tuple(false, 0, nullptr);
+        if (matchingBlock == nullptr)
+        {
+            return std::nullopt;
+        }
+        searchRoot = std::move(matchingBlock);
+    }
+    return searchRoot;
+}
+
 SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const& blockKeys, SizeType32 numContextBlocks,
     GenerationRequest& sequence, std::vector<executor::RetentionPriorityAndDuration> const& perBlockRetentions)
 {
@@ -1465,6 +1489,24 @@ void BlockManager::releaseBlocks(GenerationRequest& sequence, OptionalRef<LlmReq
             manager.storeBlocksForReuse(sequence, llmRequest);
         }
         manager.releaseBlocks(sequence);
+    }
+}
+
+void BlockManager::pinBlocks(GenerationRequest& sequence)
+{
+    for (auto& [_, manager] : mWindowBlockManagers)
+    {
+        manager.pinBlocks(sequence);
+    }
+}
+
+void WindowBlockManager::pinBlocks(GenerationRequest& sequence)
+{
+    auto const requestId = sequence.getRequestId();
+    auto& allocatedBlocks = mAllocatedBlocksPerSeq.at(requestId);
+    for (auto& block : allocatedBlocks)
+    {
+        block->incRefCount();
     }
 }
 
@@ -2050,6 +2092,12 @@ void KVCacheManager::schedulingRemoveSequence(RequestIdType requestId)
 {
     // Mimic Free all blocks for this sequence
     mBlockManager.schedulingReleaseBlocks(requestId);
+}
+
+void KVCacheManager::pinBlocks(RequestIdType requestId)
+{
+    auto& sequence = getSequence(requestId);
+    mBlockManager.pinBlocks(sequence);
 }
 
 SizeType32 KVCacheManager::copyBlockOffsets(ITensor& output, SizeType32 outputSlotOffset, RequestIdType requestId) const
