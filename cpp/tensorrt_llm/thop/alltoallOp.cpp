@@ -81,7 +81,7 @@ public:
                 output_list.push_back(output);
             }
         }
-        ncclGroupEnd();
+        NCCLCHECK_THROW(ncclGroupEnd());
         return output_list;
     }
 

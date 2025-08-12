@@ -248,7 +248,8 @@ def alltoall(
         new_dims (Union[Optional[int], List[Optional[int]]]): The dimension to stack the splits along (per tensor).
             If None (default), the splits are concatenated along dimension given by `dims`.
     Returns:
-        The tensor when combining all splits from all participating ranks, or a list of tensors when `inputs` is a list of tensors.
+        The tensor when combining all splits from all participating ranks,
+        or a list of tensors if `inputs` is a list of tensors.
     '''
     n_ranks = len(group)
     if n_ranks == 1:
