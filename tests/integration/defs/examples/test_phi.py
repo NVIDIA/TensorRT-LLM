@@ -15,8 +15,10 @@
 import csv
 import os
 
+import defs.ci_profiler
 import pytest
 from defs.common import (convert_weights, quantize_data,
+                         test_llm_torch_multi_lora_support,
                          test_multi_lora_support, venv_check_call,
                          venv_mpi_check_call)
 from defs.conftest import (get_device_memory, get_sm_version, skip_fp8_pre_ada,
@@ -446,3 +448,29 @@ def test_phi_fp8_with_bf16_lora(llm_phi_model_root,
         target_trtllm_modules=trtllm_target_modules[model_name],
         zero_lora_weights=True,
     )
+
+
+@skip_pre_ada
+@pytest.mark.skip_less_device_memory(80000)
+@pytest.mark.parametrize("llm_phi_model_root", ['Phi-4-mini-instruct'],
+                         indirect=True)
+def test_phi_4_mini_instruct_with_bf16_lora_torch(
+        phi_example_root, llm_datasets_root, qcache_dir_without_install_package,
+        llm_venv, engine_dir, llm_phi_model_root):
+    """Run Phi-4-mini-instruct with multiple dummy LoRAs using LLM-API Torch backend."""
+
+    print("Testing Phi-4-mini-instruct with LLM-API Torch backend...")
+
+    defs.ci_profiler.start("test_llm_torch_multi_lora_support")
+    test_llm_torch_multi_lora_support(
+        hf_model_dir=llm_phi_model_root,
+        llm_venv=llm_venv,
+        num_loras=2,
+        lora_rank=8,
+        target_hf_modules=["qkv_proj"],
+        target_trtllm_modules=["attn_qkv"],
+        zero_lora_weights=True,
+        use_code_prompts=False,
+        tensor_parallel_size=1,
+    )
+    defs.ci_profiler.stop("test_llm_torch_multi_lora_support")
