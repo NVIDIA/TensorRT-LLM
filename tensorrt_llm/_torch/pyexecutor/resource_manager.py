@@ -250,7 +250,7 @@ class KVCacheManager(BaseResourceManager):
                              else 0)
 
         # Determine if this is VSWA (Variable Sliding Window Attention)
-        self.is_vswa = len(self.max_attention_window_vec) > 1
+        self.is_vswa = len(set(self.max_attention_window_vec)) > 1
 
         # Calculate blocks per window using appropriate method
         if self.is_vswa:

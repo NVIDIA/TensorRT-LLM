@@ -287,7 +287,7 @@ class KvCacheCreator:
                                                    allocated_bytes)
 
         max_attention_window = executor_config.kv_cache_config.max_attention_window
-        is_vswa = max_attention_window and len(max_attention_window) > 1
+        is_vswa = max_attention_window and len(set(max_attention_window)) > 1
 
         # NOTE:
         # KvCacheCreator currently controls KV-cache capacity using two parameters in KVCacheConfig:
