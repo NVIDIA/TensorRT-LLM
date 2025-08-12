@@ -9,6 +9,7 @@ from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import fp4_global_
 torch.manual_seed(0)
 
 scaling_vector_size = 16
+FORMAT_FP8 = 0
 
 
 @pytest.mark.parametrize("bias", [torch.rand(32).to("cuda") * 10, None])
@@ -105,3 +106,35 @@ def test_fp8_bmm(input_dtype, mat2_dtype):
     )
     assert cos_sim > 0.99
     assert cos_sim_unquantized > 0.99
+
+
+@pytest.mark.parametrize("bias", [torch.rand(32, device="cuda") * 10, None])
+@pytest.mark.skipif(not fp8_compatible(), reason="Requires fp8 support")
+def test_quant_linear_fp8_matches_fused_op(bias):
+    input = torch.rand(3, 16, device="cuda")
+    weight = torch.rand(32, 16, device="cuda")
+
+    weight_scale = (torch.max(torch.abs(weight)) / 448).to("cuda")
+    weight_fp8 = (weight / weight_scale).to(torch.float8_e4m3fn)
+
+    out_fused = torch.ops.auto_deploy.torch_quant_fp8_linear(
+        input,
+        weight_fp8,
+        bias=bias,
+        input_scale=torch.tensor(1.0, device="cuda"),
+        weight_scale=weight_scale,
+    )
+
+    out_unified = torch.ops.auto_deploy.custom_quant_linear(
+        input,
+        weight_fp8,
+        bias,
+        [torch.tensor(1.0, device="cuda")],
+        [weight_scale],
+        [],
+        [],
+        format_type=FORMAT_FP8,
+    )
+
+    assert out_unified.shape == out_fused.shape
+    torch.testing.assert_close(out_unified, out_fused, rtol=5e-4, atol=5e-4)
