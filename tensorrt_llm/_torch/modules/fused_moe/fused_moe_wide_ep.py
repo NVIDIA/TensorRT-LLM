@@ -150,7 +150,6 @@ class WideEPMoE(MoE):
         assert len(
             self.initial_local_expert_ids) == self.expert_size_per_partition
 
-        max_num_tokens = model_config.max_num_tokens
         # The maximum number of tokens in MoE are multiplied by DP size when attention DP is enabled
         moe_max_num_tokens = model_config.max_num_tokens * model_config.mapping.dp_size
         self.moe_max_num_tokens = model_config.moe_max_num_tokens or moe_max_num_tokens
