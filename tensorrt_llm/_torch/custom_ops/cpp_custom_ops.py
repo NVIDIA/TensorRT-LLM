@@ -504,3 +504,9 @@ def _register_fake():
         return router_logits.new_empty(
             sz, dtype=torch.int32), router_logits.new_empty(sz,
                                                             dtype=output_dtype)
+
+    @torch.library.register_fake("trtllm::alltoall")
+    def _(input_list, group, num_lists):
+        assert len(input_list) > 0
+        assert len(input_list) == len(group)
+        return [i.new_empty(i.shape) for i in input_list]
