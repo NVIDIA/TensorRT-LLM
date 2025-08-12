@@ -5,6 +5,7 @@ from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Generator
 
+import psutil
 import pynvml
 import pytest
 import tensorrt as trt
@@ -451,3 +452,32 @@ def check_accuracy(a, b, atol, rtol, percent):
 
 skip_ray = pytest.mark.skipif(
     mpi_disabled(), reason="This test is skipped for Ray orchestrator.")
+
+_pynvmlInited = False
+
+
+def get_current_process_gpu_memory(include_subprocess: bool = False) -> int:
+    """
+    Returns GPU memory usage for current process in bytes.
+    """
+    global _pynvmlInited
+    if not _pynvmlInited:
+        pynvml.nvmlInit()
+        _pynvmlInited = True
+
+    # Get current process ID
+    targets = [os.getpid()]
+    if include_subprocess:
+        targets.extend(
+            p.pid for p in psutil.Process(targets[0]).children(recursive=True))
+    targets = frozenset(targets)
+
+    # Get device handle for GPU 0
+    device_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+
+    # Get running processes
+    processes = pynvml.nvmlDeviceGetComputeRunningProcesses(device_handle)
+
+    # Find current process
+    return sum(process.usedGpuMemory for process in processes
+               if process.pid in targets)
