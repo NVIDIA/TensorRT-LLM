@@ -69,7 +69,6 @@ class CUDAGraphRunner:
         self.max_beam_width = engine.max_beam_width
         self.spec_config = engine.spec_config
         self.attn_metadata = engine.attn_metadata
-        self.spec_metadata = engine.spec_metadata
         self.draft_tokens_cuda = engine.draft_tokens_cuda
 
         self.graphs: Dict[Tuple[int, int], torch.cuda.CUDAGraph] = {}
@@ -87,6 +86,10 @@ class CUDAGraphRunner:
     @property
     def draft_len(self):
         return self.spec_config.max_draft_len if self.enable_spec_decode else 0
+
+    @property
+    def spec_metadata(self):
+        return self._get_engine().spec_metadata
 
     def __del__(self):
         self.clear()
