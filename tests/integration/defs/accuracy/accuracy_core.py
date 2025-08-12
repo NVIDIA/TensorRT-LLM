@@ -155,6 +155,8 @@ class AccuracyTask:
             spec_dec_algo = None
         elif isinstance(llm.args.speculative_config, DecodingBaseConfig):
             spec_dec_algo = llm.args.speculative_config.decoding_type
+            if spec_dec_algo == 'AUTO':
+                spec_dec_algo = 'NGram'
         else:
             raise ValueError(
                 f"Not recognized speculative_config: {llm.args.speculative_config}."
@@ -192,7 +194,11 @@ class AccuracyTask:
             evaluator_kwargs.update(extra_evaluator_kwargs)
         evaluator = self.EVALUATOR_CLS(num_samples=num_samples,
                                        **evaluator_kwargs)
-        accuracy = evaluator.evaluate(llm, sampling_params, streaming)
+        evaluate_kwargs = {}
+        if hasattr(self, 'EVALUATE_KWARGS'):
+            evaluate_kwargs.update(self.EVALUATE_KWARGS)
+        accuracy = evaluator.evaluate(llm, sampling_params, streaming,
+                                      **evaluate_kwargs)
         if self.HIGHER_IS_BETTER:
             assert accuracy >= threshold, f"Expected accuracy >= {threshold}, but got {accuracy}."
         else:
@@ -297,6 +303,8 @@ class GSM8K(AccuracyTask):
 
     EVALUATOR_CLS = tensorrt_llm.evaluate.GSM8K
     EVALUATOR_KWARGS = dict(dataset_path=DATASET_DIR, random_seed=0)
+
+    EVALUATE_KWARGS = dict(scores_filter=None)
 
 
 class GPQADiamond(AccuracyTask):

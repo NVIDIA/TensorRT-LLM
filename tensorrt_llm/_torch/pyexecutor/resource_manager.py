@@ -10,7 +10,8 @@ import torch
 import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
-from tensorrt_llm.lora_manager import LoraConfig, LoraManager, LoraModelConfig
+from tensorrt_llm.lora_helper import LoraConfig
+from tensorrt_llm.lora_manager import LoraManager, LoraModelConfig
 from tensorrt_llm.sampling_params import SamplingParams
 
 from ..._utils import binding_dtype_size, binding_to_str_dtype, nvtx_range
@@ -492,6 +493,10 @@ class KVCacheManager(BaseResourceManager):
                 if request.py_rewind_len > 0:
                     self.rewind_kv_cache(request, request.py_rewind_len)
 
+        # For context requests, we store the blocks for reuse.
+        for request in scheduled_batch.context_requests:
+            self.impl.store_context_blocks(request)
+
     def free_resources(self, request: LlmRequest):
         self.impl.remove_sequence(request.py_request_id, request)
 
@@ -939,8 +944,11 @@ class MambaCacheManager(BaseResourceManager):
         max_batch_size: int,
         mapping: Mapping,
         dtype: torch.dtype,
+        ssm_cache_dtype: torch.dtype,
         layer_mask: Optional[List[bool]] = None,
     ) -> None:
+
+        self.mamba_ssm_cache_dtype = ssm_cache_dtype
 
         # get tp size
         tp_size = mapping.tp_size
@@ -993,7 +1001,7 @@ class MambaCacheManager(BaseResourceManager):
                 head_dim,
                 d_state,
             ],
-            dtype=dtype,
+            dtype=self.mamba_ssm_cache_dtype,
             device=device,
         )
 
@@ -1051,6 +1059,9 @@ class MambaCacheManager(BaseResourceManager):
         layer_offset = self.mamba_layer_offsets[layer_idx]
         return self.ssm_states[layer_offset]
 
+    def get_mamba_ssm_cache_dtype(self) -> torch.dtype:
+        return self.mamba_ssm_cache_dtype
+
     def shutdown(self):
         # release tensor memory, keeping python references as tensors
         self.conv_states = torch.tensor([])
@@ -1072,6 +1083,8 @@ class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
         mamba_num_layers: int,
         mamba_layer_mask: List[bool],
         mamba_cache_dtype: torch.dtype,
+        mamba_ssm_cache_dtype: torch.dtype,
+
         # kv cache parameters
         kv_cache_config: KvCacheConfigCpp,
         kv_cache_type: CacheTypeCpp,
@@ -1105,6 +1118,7 @@ class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
             max_batch_size,
             mapping,
             mamba_cache_dtype,
+            mamba_ssm_cache_dtype,
             mamba_layer_mask,
         )
 

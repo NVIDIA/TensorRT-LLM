@@ -33,11 +33,13 @@ class Evaluator(ABC):
     def __init__(self,
                  random_seed: int = 0,
                  apply_chat_template: bool = False,
+                 fewshot_as_multiturn: bool = False,
                  system_prompt: Optional[str] = None):
         random.seed(random_seed)
         np.random.seed(random_seed)
         torch.manual_seed(random_seed)
         self.apply_chat_template = apply_chat_template
+        self.fewshot_as_multiturn = fewshot_as_multiturn
         self.system_prompt = system_prompt
 
     @abstractmethod
