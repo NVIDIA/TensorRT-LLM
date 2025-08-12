@@ -1,6 +1,5 @@
 import math
 import weakref
-from enum import IntEnum
 from typing import Optional, Union, cast
 
 import torch
@@ -26,15 +25,6 @@ from .linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
 from .multi_stream_utils import maybe_execute_in_parallel
 from .rms_norm import RMSNorm
 from .rotary_embedding import RotaryEmbedding
-
-
-class QkNormType(IntEnum):
-    """
-    The type of QK normalization.
-    """
-    none = 0  # No normalization applied to Q and K
-    pre_rope = 1  # Apply normalization before Rope
-    post_rope = 2  # Apply normalization after Rope
 
 
 def extract_extra_attrs(layer_idx: str, attn_type: str):
@@ -123,7 +113,6 @@ class Attention(nn.Module):
         dense_bias: Optional[bool] = None,
         config: Optional[ModelConfig] = None,
         q_scaling: float = 1.0,
-        qk_norm_type: QkNormType = QkNormType.none,
         attention_chunk_size: Optional[int] = None,
     ):
         """
@@ -141,7 +130,6 @@ class Attention(nn.Module):
             dtype (torch.dtype): The data type.
             dense_bias (Optional[bool]): Whether to use bias in the output projection layer.
             config (Optional[ModelConfig]): The model configuration.
-            qk_norm_type (QkNormType): The type of QK normalization.
             q_scaling (float): The scaling factor for the qk_scale. The definition is $O = softmax(QK^T * qk_scale) * V, qk_scale = 1 / (sqrt(head_dim) * q_scaling)$. The default value is 1.0.
             attention_chunk_size (Optional[int]): See [Chunked Attention] below.
         """
@@ -168,7 +156,6 @@ class Attention(nn.Module):
         self.num_key_value_groups = self.num_heads // self.num_key_value_heads
         self.max_position_embeddings = max_position_embeddings
         self.pos_embd_params = pos_embd_params
-        self.qk_norm_type = qk_norm_type
         self.dense_bias = dense_bias
         self.q_scaling = q_scaling
 
@@ -271,8 +258,7 @@ class Attention(nn.Module):
             self.rope_fusion = False
         # If rope_fusion is not specified, enable if the attention backend supports it.
         if self.rope_fusion is None:
-            self.rope_fusion = attn_cls.support_fused_rope(
-            ) and qk_norm_type != QkNormType.post_rope
+            self.rope_fusion = attn_cls.support_fused_rope()
 
         self.rotary_emb = None
         if not self.rope_fusion and self.pos_embd_params is not None:
@@ -444,15 +430,7 @@ class Attention(nn.Module):
         output = None
 
         q, k, v = qkv, None, None
-        if self.qk_norm_type == QkNormType.pre_rope:
-            q, k, v = self.split_qkv(q, k, v)
-            q, k = self.apply_qk_norm(q, k)
-        if not self.rope_fusion and position_ids is not None:
-            q, k, v = self.split_qkv(q, k, v)
-            q, k = self.rotary_emb(position_ids, [q, k])
-            if self.qk_norm_type == QkNormType.post_rope:
-                q, k = self.apply_qk_norm(q, k)
-        #q, k, v = self.apply_rope(q, k, v, position_ids)
+        q, k, v = self.apply_rope(q, k, v, position_ids)
         q, k, v = self.convert_qkv(q, k, v)
 
         # Currently only TRTLLM and FLASHINFER are torch compile compatible backends.

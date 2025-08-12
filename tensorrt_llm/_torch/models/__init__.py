@@ -40,7 +40,6 @@ __all__ = [
     "Gemma3VLM",
     "HCXVisionForCausalLM",
     "HunYuanMoEV1ForCausalLM",
-    "Gemma3Model",
     "LlamaForCausalLM",
     "LlavaNextModel",
     "Mistral3VLM",

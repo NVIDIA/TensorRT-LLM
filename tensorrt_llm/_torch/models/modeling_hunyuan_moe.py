@@ -12,7 +12,7 @@ from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import (PositionalEmbeddingParams,
                                            PredefinedAttentionMask, RopeParams)
 from ..model_config import ModelConfig
-from ..modules.attention import Attention, QkNormType
+from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.fused_moe import (CutlassFusedMoE, RenormalizeMoeRoutingMethod,
@@ -120,8 +120,7 @@ class HunYuanAttention(Attention):
             max_position_embeddings=config.max_position_embeddings,
             bias=config.attention_bias,
             pos_embd_params=pos_embd_params,
-            qk_norm_type=QkNormType.post_rope
-            if use_qk_norm else QkNormType.none,
+            rope_fusion=not self.use_qk_norm,
             layer_idx=layer_idx,
             dtype=config.torch_dtype,
             config=model_config,
