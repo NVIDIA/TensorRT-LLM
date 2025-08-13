@@ -22,7 +22,8 @@ from tensorrt_llm.bench.benchmark.utils.general import (
 from tensorrt_llm import LLM as PyTorchLLM
 from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
-from tensorrt_llm.bench.benchmark.utils.general import generate_warmup_dataset
+from tensorrt_llm.bench.benchmark.utils.general import (
+    generate_warmup_dataset, update_sampler_args_with_extra_options)
 from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
 from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
 from tensorrt_llm.bench.dataclasses.reporting import ReportUtility
@@ -30,7 +31,6 @@ from tensorrt_llm.bench.utils.data import (create_dataset_from_stream,
                                            initialize_tokenizer,
                                            update_metadata_for_multimodal)
 from tensorrt_llm.llmapi import CapacitySchedulerPolicy
-from tensorrt_llm.llmapi.llm_utils import update_sampler_args_with_extra_options
 from tensorrt_llm.logger import logger
 from tensorrt_llm.sampling_params import SamplingParams
 
