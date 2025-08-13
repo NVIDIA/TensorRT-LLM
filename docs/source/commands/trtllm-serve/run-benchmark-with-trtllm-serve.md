@@ -3,11 +3,12 @@
 TensorRT-LLM provides the OpenAI-compatiable API via `trtllm-serve` command.
 A complete reference for the API is available in the [OpenAI API Reference](https://platform.openai.com/docs/api-reference).
 
-This step-by-step tutorial covers the following topics for running online serving benchmarking with Llama 3.1 70B:
+This step-by-step tutorial covers the following topics for running online serving benchmarking with Llama 3.1 70B and Qwen2.5-VL-7B for multimodal models:
  * Methodology Introduction
  * Launch the OpenAI-Compatibale Server with NGC container
  * Run the performance benchmark
  * Using `extra_llm_api_options`
+ * Multimodal Serving and Benchmarking
 
 
 ## Methodology Introduction
@@ -220,3 +221,78 @@ The following is a list of common performance switches.
 &emsp;**Default**: TRTLLM
 
 See the [TorchLlmArgs class](https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs) for the full list of options which can be used in the extra\_llm\_api\_options`.`
+
+## Multimodal Serving and Benchmarking
+
+TensorRT-LLM supports multimodal models for both serving and benchmarking. This section covers how to set up multimodal serving and run benchmarks for multimodal models.
+
+### Setting up Multimodal Serving
+
+Here's an example of setting up multimodal serving with Qwen2.5-VL:
+
+```bash
+#!/bin/bash
+model_path=/path/to/qwen2.5vl-7B_model
+
+trtllm-serve ${model_path} \
+    --max_batch_size 64 \
+    --max_num_tokens 8192 \
+    --max_seq_len 4096 \
+    --kv_cache_free_gpu_memory_fraction 0.9 \
+    --tp_size 1 \
+    --ep_size 1 \
+    --trust_remote_code
+```
+
+### Multimodal Benchmarking
+
+For multimodal serving benchmarks, you can use the `benchmark_serving.py` script with multimodal datasets:
+
+```bash
+python -m tensorrt_llm.serve.scripts.benchmark_serving \
+    --model ${model_path} \
+    --backend openai-chat \
+    --dataset-name "random_image" \
+    --random-input-len 128 \
+    --random-output-len 128 \
+    --random-image-width 512 \
+    --random-image-height 512 \
+    --random-num-images 1 \
+    --num-prompts 100 \
+    --max-concurrency 8 \
+    --ignore-eos
+```
+
+Below is some example TensorRT-LLM serving benchmark output. Your actual results may vary.
+```
+============ Serving Benchmark Result ============
+Successful requests:                     1         
+Benchmark duration (s):                  0.83      
+Total input tokens:                      128       
+Total generated tokens:                  128       
+Request throughput (req/s):              1.20      
+Output token throughput (tok/s):         153.92    
+Total Token throughput (tok/s):          307.85    
+User throughput (tok/s):                 154.15    
+Mean Request AR:                         0.9845    
+Median Request AR:                       0.9845    
+---------------Time to First Token----------------
+Mean TTFT (ms):                          84.03     
+Median TTFT (ms):                        84.03     
+P99 TTFT (ms):                           84.03     
+-----Time per Output Token (excl. 1st token)------
+Mean TPOT (ms):                          5.88      
+Median TPOT (ms):                        5.88      
+P99 TPOT (ms):                           5.88      
+---------------Inter-token Latency----------------
+Mean ITL (ms):                           5.83      
+Median ITL (ms):                         5.88      
+P99 ITL (ms):                            6.14      
+==================================================
+```
+
+**Notes for Multimodal Benchmarking:**
+- Set `--backend` as `openai-chat` since multimodal models are only supported on the chat API and require a chat template
+- Control the number of images per request with `--random-num-images`
+- Use `--random-image-width` and `--random-image-height` to specify image dimensions or `--random-image-size` for squared image dimensions.
+- The `random_image` dataset generates synthetic images for benchmarking
