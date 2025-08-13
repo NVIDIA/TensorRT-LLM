@@ -172,7 +172,8 @@ meta-llama/Llama-3.2-3B:
     kv_cache_quant_algo: FP8
     accuracy: 33.629
 meta-llama/Llama-3.3-70B-Instruct:
-  - spec_dec_algo: Eagle
+  - quant_algo: FP8
+    spec_dec_algo: Eagle
     accuracy: 33.244
   - quant_algo: NVFP4
     kv_cache_quant_algo: FP8
