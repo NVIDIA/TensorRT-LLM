@@ -1057,14 +1057,6 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
                 raise ValueError(
                     "kv_cache_config.max_attention_window values must be positive"
                 )
-
-        # Must not be a redundant repetition of a shorter pattern
-        n = len(v)
-        for k in range(1, n):
-            if n % k == 0 and v == v[:k] * (n // k):
-                raise ValueError(
-                    f"kv_cache_config.max_attention_window should contain only the minimal repeating pattern; use {v[:k]} instead of {v}"
-                )
         return v
 
 

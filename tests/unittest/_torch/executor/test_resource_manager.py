@@ -3,6 +3,8 @@ import pathlib
 import subprocess
 import sys
 import unittest
+from typing import NamedTuple, Tuple
+from unittest.mock import patch
 
 import numpy as np
 import torch
@@ -13,11 +15,13 @@ from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import (KVCacheManager,
                                                              PeftCacheConfig,
                                                              PeftCacheManager)
+from tensorrt_llm.bindings import LayerType
 from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
 from tensorrt_llm.bindings import executor as tllm
 from tensorrt_llm.bindings.internal.batch_manager import \
     PeftTaskNotCachedException
 from tensorrt_llm.lora_helper import LoraConfig
+from tensorrt_llm.mapping import Mapping
 
 DataType = tensorrt_llm.bindings.DataType
 LoraModule = tensorrt_llm.bindings.LoraModule
@@ -543,6 +547,148 @@ class TestResourceManager(unittest.TestCase):
                     f"Memory bytes: {memory_bytes}\n"
                     f"Actual: {adjusted_max_attention_window_vec}\n"
                     f"Expected: {expected_max_attention_window_vec}")
+
+    @staticmethod
+    def _create_model_config_for_kv_cache_manager() -> ModelConfigCpp:
+        """
+        Create a simple model config for KVCacheManager test.
+        """
+
+        model_config_params = {
+            "vocab_size": 0,
+            "num_layers": 4,
+            "num_attention_layers": 4,
+            "num_rnn_layers": 0,
+            "num_heads": 64,
+            "hidden_size": 64,
+            "data_type": DataType.HALF
+        }
+        num_kv_heads = 8
+
+        model_config = ModelConfigCpp(**model_config_params)
+        model_config.layer_types = [LayerType.ATTENTION
+                                    ] * model_config.num_attention_layers()
+        model_config.set_num_kv_heads(num_kv_heads)
+
+        return model_config
+
+    @staticmethod
+    def _create_kv_cache_config_for_kv_cache_manager(
+            params: dict) -> tllm.KvCacheConfig:
+        """
+        Create a KV cache config for KVCacheManager test.
+        """
+        return tllm.KvCacheConfig(**params)
+
+    def test_calculate_max_num_blocks_from_cpp(self):
+        # Construct a minimal mapping (single-rank, no TP/PP)
+        mapping = Mapping(world_size=1, tp_size=1, pp_size=1)
+
+        # Construct model config
+        model_config = TestResourceManager._create_model_config_for_kv_cache_manager(
+        )
+
+        # Construct KV cache config
+        free_gpu_memory_fraction = 0.1
+        max_attention_window = [64, 128]
+        max_gpu_total_bytes = 32 * 1024 * 1024  # 32MB
+        enable_block_reuse = False
+        host_cache_size = 32 * 1024 * 1024  # 32MB
+
+        # mock values for torch.cuda.mem_get_info to return a fixed value
+        fixed_free_mem = 128 * 1024 * 1024  # 128MB
+        fixed_total_mem = 256 * 1024 * 1024  # 256MB
+
+        class MemTestCase(NamedTuple):
+            case_name: str
+            kv_cache_config_params: dict
+            expected_memory_bytes: Tuple[
+                int,
+                int]  # (primary_pool_memory_bytes, secondary_pool_memory_bytes)
+
+        test_cases = [
+            # Case 1:
+            # max_gpu_total_bytes is set, even if free_gpu_memory_fraction is set, we will use max_gpu_total_bytes
+            # host_cache_size is set, we will use host_cache_size
+            MemTestCase(
+                case_name="max_gpu_total_bytes is set, host_cache_size is set",
+                kv_cache_config_params={
+                    "max_attention_window": max_attention_window,
+                    "free_gpu_memory_fraction": free_gpu_memory_fraction,
+                    "max_gpu_total_bytes": max_gpu_total_bytes,
+                    "enable_block_reuse": enable_block_reuse,
+                    "host_cache_size": host_cache_size,
+                },
+                expected_memory_bytes=(max_gpu_total_bytes, host_cache_size),
+            ),
+
+            # Case 2:
+            # max_gpu_total_bytes is not set, we will use free_gpu_memory_fraction
+            # host_cache_size is not set, we will use 0
+            MemTestCase(
+                case_name=
+                "max_gpu_total_bytes is not set, host_cache_size is not set",
+                kv_cache_config_params={
+                    "max_attention_window": max_attention_window,
+                    "free_gpu_memory_fraction": free_gpu_memory_fraction,
+                    "enable_block_reuse": enable_block_reuse,
+                },
+                # NOTE: use np.float32 to avoid float precision issue between python(double in most cases) and cpp binding(float)
+                expected_memory_bytes=(int(
+                    fixed_free_mem * np.float32(free_gpu_memory_fraction)), 0),
+            ),
+        ]
+
+        tokens_per_block = 32
+        model_config.tokens_per_block = tokens_per_block
+        max_seq_len = max(max_attention_window)
+        max_batch_size = 1
+        max_beam_width = 1
+
+        for case_name, kv_cache_config_params, expected_memory_bytes in test_cases:
+            with self.subTest(case=case_name):
+                kv_cache_config = TestResourceManager._create_kv_cache_config_for_kv_cache_manager(
+                    kv_cache_config_params)
+                with patch('torch.cuda.mem_get_info',
+                           return_value=(fixed_free_mem, fixed_total_mem)):
+                    # Create a real KVCacheManager, it will run calculate_max_num_blocks_from_cpp in __init__
+                    manager = KVCacheManager(
+                        kv_cache_config=kv_cache_config,
+                        kv_cache_type=tensorrt_llm.bindings.internal.
+                        batch_manager.CacheType.SELF,
+                        num_layers=model_config.num_attention_layers(),
+                        num_kv_heads=model_config.num_kv_heads(
+                            0
+                        ),  # NOTE: assume same number of kv heads for all layers
+                        head_dim=model_config.head_size,
+                        tokens_per_block=tokens_per_block,
+                        max_seq_len=max_seq_len,
+                        max_batch_size=max_batch_size,
+                        mapping=mapping,
+                        dtype=model_config.data_type,
+                        model_config=model_config,
+                        max_beam_width=max_beam_width,
+                    )
+                    try:
+                        expected_primary, expected_secondary = expected_memory_bytes
+                        self.assertEqual(
+                            manager._primary_pool_memory_bytes,
+                            expected_primary,
+                            f"Test case '{case_name}' failed.\n"
+                            f"Expected primary pool memory bytes: {expected_primary}\n"
+                            f"Actual primary pool memory bytes: {manager._primary_pool_memory_bytes}"
+                        )
+                        self.assertEqual(
+                            manager._secondary_pool_memory_bytes,
+                            expected_secondary,
+                            f"Test case '{case_name}' failed.\n"
+                            f"Expected secondary pool memory bytes: {expected_secondary}\n"
+                            f"Actual secondary pool memory bytes: {manager._secondary_pool_memory_bytes}"
+                        )
+                    except Exception as e:
+                        self.fail(f"Test case '{case_name}' failed: {e}")
+                    finally:
+                        manager.shutdown()
 
 
 if __name__ == "__main__":
