@@ -32,6 +32,7 @@
 #include "tensorrt_llm/pybind/batch_manager/llmRequest.h"
 #include "tensorrt_llm/pybind/common/tllmExceptions.h"
 #include "tensorrt_llm/pybind/executor/bindings.h"
+#include "tensorrt_llm/pybind/executor/dataTransceiverStateUtils.h"
 #include "tensorrt_llm/pybind/runtime/bindings.h"
 #include "tensorrt_llm/pybind/testing/modelSpecBinding.h"
 #include "tensorrt_llm/pybind/userbuffers/bindings.h"
@@ -122,6 +123,7 @@ PYBIND11_MODULE(TRTLLM_PYBIND_MODULE, m)
     tensorrt_llm::pybind::executor::initBindings(mExecutor);
     tensorrt_llm::pybind::runtime::initBindingsEarly(mInternalRuntime);
     tensorrt_llm::pybind::common::initExceptionsBindings(mExceptions);
+    tensorrt_llm::pybind::executor::bindDataTransceiverStateUtils(mExceptions);
 
     auto buildInfo = m.def_submodule("BuildInfo");
     buildInfo.attr("ENABLE_MULTI_DEVICE") = py::int_(ENABLE_MULTI_DEVICE);

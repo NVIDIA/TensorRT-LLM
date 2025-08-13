@@ -13,6 +13,7 @@ set(SRCS
     executor/executor.cpp
     executor/executorConfig.cpp
     executor/request.cpp
+    executor/dataTransceiverStateUtils.cpp
     runtime/bindings.cpp
     common/tllmExceptions.cpp
     testing/modelSpecBinding.cpp

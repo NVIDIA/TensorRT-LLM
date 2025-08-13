@@ -29,6 +29,7 @@
 namespace tensorrt_llm::executor
 {
 
+// Forward declaration
 class Serialization;
 
 namespace kv_cache
