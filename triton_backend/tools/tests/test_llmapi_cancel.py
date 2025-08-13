@@ -25,14 +25,17 @@
 # (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
+import os
+import sys
 from functools import partial
 
 import numpy as np
 from tritonclient import grpc as grpcclient
 from tritonclient.utils import InferenceServerException
 
-from triton_backend.tools.llmapi_client import (UserData, _prepare_inputs,
-                                                callback, prepare_stop_signals)
+sys.path.append(os.path.dirname(os.path.abspath(__file__)) + '/..')
+from llmapi_client import (UserData, _prepare_inputs, callback,
+                           prepare_stop_signals)
 
 if __name__ == "__main__":
     input_data = np.array([
