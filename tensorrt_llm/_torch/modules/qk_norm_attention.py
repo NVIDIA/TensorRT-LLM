@@ -19,48 +19,57 @@ class QKNormRoPEAttention(Attention):
 
     def __init__(
         self,
-        model_config: ModelConfig,
-        layer_idx: Optional[int] = None,
+        *,
+        hidden_size: int,
+        num_attention_heads: int,
+        num_key_value_heads: int,
+        max_position_embeddings: int,
+        bias: bool,
         fuse_qk_norm_rope: bool = True,
+        layer_idx: Optional[int] = None,
+        dtype: torch.dtype = None,
+        dense_bias: Optional[bool] = None,
+        config: ModelConfig,
     ):
-        config = model_config.pretrained_config
+        pretrained_config = config.pretrained_config
 
-        if getattr(config, "rope_scaling", None) is not None:
+        if getattr(pretrained_config, "rope_scaling", None) is not None:
             pos_embd_params = PositionalEmbeddingParams(
                 type=PositionEmbeddingType.from_string(
-                    config.rope_scaling["type"]),
-                rope=RopeParams.from_config(config),
+                    pretrained_config.rope_scaling["type"]),
+                rope=RopeParams.from_config(pretrained_config),
             )
         else:
             pos_embd_params = PositionalEmbeddingParams(
                 type=PositionEmbeddingType.rope_gpt_neox,
-                rope=RopeParams.from_config(config),
+                rope=RopeParams.from_config(pretrained_config),
             )
 
         self.fuse_qk_norm_rope = fuse_qk_norm_rope
 
         super().__init__(
-            hidden_size=config.hidden_size,
-            num_attention_heads=config.num_attention_heads,
-            num_key_value_heads=config.num_key_value_heads,
-            max_position_embeddings=config.max_position_embeddings,
-            bias=config.attention_bias,
+            hidden_size=hidden_size,
+            num_attention_heads=num_attention_heads,
+            num_key_value_heads=num_key_value_heads,
+            max_position_embeddings=max_position_embeddings,
+            bias=bias,
             pos_embd_params=pos_embd_params,
-            rope_fusion=not self.
-            fuse_qk_norm_rope,  # If fuse_qk_norm_rope is true, do not apply fused RoPE in attention OP, and self.rotary_emb will be skipped in the overridden apply_rope.
+            # If fuse_qk_norm_rope is true, do not apply fused RoPE in attention OP,
+            # and self.rotary_emb will be skipped in the overridden apply_rope.
+            rope_fusion=not self.fuse_qk_norm_rope,
             layer_idx=layer_idx,
-            dtype=config.torch_dtype,
-            dense_bias=config.attention_bias,
-            config=model_config,
+            dtype=dtype,
+            dense_bias=dense_bias,
+            config=config,
         )
 
         self.q_norm = RMSNorm(hidden_size=self.head_dim,
                               eps=1e-6,
-                              dtype=config.torch_dtype,
+                              dtype=pretrained_config.torch_dtype,
                               has_weights=True)
         self.k_norm = RMSNorm(hidden_size=self.head_dim,
                               eps=1e-6,
-                              dtype=config.torch_dtype,
+                              dtype=pretrained_config.torch_dtype,
                               has_weights=True)
         self.aux_stream = torch.cuda.Stream()
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]

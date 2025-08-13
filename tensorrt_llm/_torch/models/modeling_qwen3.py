@@ -129,13 +129,20 @@ class Qwen3DecoderLayer(DecoderLayer):
         self,
         model_config: ModelConfig[Qwen3Config],
         layer_idx: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ):
         super().__init__()
         self.layer_idx = layer_idx
         config = model_config.pretrained_config
         self.self_attn = QKNormRoPEAttention(
-            model_config,
+            hidden_size=config.hidden_size,
+            num_attention_heads=config.num_attention_heads,
+            num_key_value_heads=config.num_key_value_heads,
+            max_position_embeddings=config.max_position_embeddings,
+            bias=config.attention_bias,
             layer_idx=layer_idx,
+            dtype=config.torch_dtype,
+            dense_bias=config.attention_bias,
+            config=model_config,
         )
 
         self.mlp = GatedMLP(
