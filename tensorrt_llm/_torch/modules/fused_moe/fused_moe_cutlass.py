@@ -110,13 +110,11 @@ class CutlassFusedMoE(MoE):
         assert len(
             self.initial_local_expert_ids) == self.expert_size_per_partition
 
-        max_num_tokens = model_config.max_num_tokens
         # The maximum number of tokens in MoE are multiplied by DP size when attention DP is enabled
-        if self.use_dp:
-            max_num_tokens *= model_config.mapping.world_size
-        self.moe_max_num_tokens = model_config.moe_max_num_tokens or max_num_tokens
+        moe_max_num_tokens = model_config.max_num_tokens * model_config.mapping.dp_size
+        self.moe_max_num_tokens = model_config.moe_max_num_tokens or moe_max_num_tokens
         # The auxiliary CUDA stream and CUDA events are only used when MoE chunking is applied
-        if self.moe_max_num_tokens < max_num_tokens:
+        if self.moe_max_num_tokens < moe_max_num_tokens:
             self.aux_stream = aux_stream_dict[
                 AuxStreamType.
                 MoeChunkingOverlap] if aux_stream_dict is not None else torch.cuda.Stream(
@@ -151,6 +149,8 @@ class CutlassFusedMoE(MoE):
 
         # If True, the router weight will be multiplied on the input rather than at the end of FC2
         self.apply_router_weight_on_input = apply_router_weight_on_input
+
+        self.use_fused_finalize = not model_config.moe_disable_finalize_fusion
 
         self._weights_created = False
         if not model_config.skip_create_weights_in_init:
@@ -421,6 +421,7 @@ class CutlassFusedMoE(MoE):
             use_w4_group_scaling=use_w4_group_scaling,
             use_mxfp8_act_scaling=use_mxfp8_act_scaling,
             min_latency_mode=False,
+            use_fused_finalize=self.use_fused_finalize,
             tune_max_num_tokens=self.tune_max_num_tokens,
             tuner_num_tokens=tuner_num_tokens,
             tuner_top_k=tuner_top_k,

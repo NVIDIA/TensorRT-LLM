@@ -53,6 +53,8 @@ class PyTorchConfig:
     attn_backend: str = 'TRTLLM'
     moe_backend: str = 'CUTLASS'
 
+    moe_disable_finalize_fusion: bool = False
+
     enable_mixed_sampler: bool = False
     """
     If true, will iterate over sampling_params of each request and use the

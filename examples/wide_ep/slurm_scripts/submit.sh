@@ -9,6 +9,7 @@ container_image=<container_image>
 mounts=<mounts>  # e.g. /mnt/data:/mnt/data
 workdir=<workdir>  # Path to disaggr_torch.slurm
 model_dir=<model_dir>  # Path to the model checkpoint
+repo_dir=<repo_dir>  # Path to the repo to install TensorRT-LLM, if this is empty, the pre-installed version will be used
 
 mtp_size=0
 ntasks_per_node=4 # 4 GPUs per GB200 node
@@ -28,7 +29,7 @@ for b in 1 64 1024; do
 
         args=(
             ${ctx_num} 4 4 4480 true   # Context servers arguments
-            1 16 1024 1024 "0.7"       # Generation servers arguments
+            1 16 1024 1024 true "0.7"       # Generation servers arguments
             $eplb_num_slots $mtp_size  # Other arguments
             $concurrency               # Benchmarking arguments
             $isl
@@ -39,6 +40,7 @@ for b in 1 64 1024; do
             $mounts
             $workdir
             $model_dir
+            $repo_dir
         )
 
         sbatch --nodes=${total_node_num} \
@@ -74,6 +76,7 @@ for b in 512; do
         $mounts
         $workdir
         $model_dir
+        $repo_dir
     )
 
     sbatch --nodes=${total_node_num} \

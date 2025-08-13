@@ -297,6 +297,11 @@ void FusedMHARunnerV2::setupLaunchParams(MHARunnerParams runnerParams)
         = mFixedParams.isSPadded ? runnerParams.b * runnerParams.qSeqLen : runnerParams.totalQSeqLen;
     mLaunchParams.total_kv_seqlen
         = mFixedParams.isSPadded ? runnerParams.b * runnerParams.kvSeqLen : runnerParams.totalKvSeqLen;
+    // Workaround for nvbug 5412456: total_kv_seqlen fallbacks to total_q_seqlen if it's zero.
+    if (mLaunchParams.total_kv_seqlen == 0)
+    {
+        mLaunchParams.total_kv_seqlen = mLaunchParams.total_q_seqlen;
+    }
 
     TLLM_CHECK_WITH_INFO(mFixedParams.headSize > 0, "Head size should be greater than 0.");
     // Pad head size to next power of 2.
