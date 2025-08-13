@@ -199,6 +199,8 @@ def generate_warmup_dataset(requests, steps) -> List[InferenceRequest]:
     warm_up_dataset = choices(requests, k=steps)
     shuffle(warm_up_dataset)
     return warm_up_dataset
+
+
 def update_sampler_args_with_extra_options(sampler_args: Dict,
                                            sampler_options: str) -> Dict:
     """Update sampler arguments with options from a YAML file.
@@ -220,15 +222,16 @@ def update_sampler_args_with_extra_options(sampler_args: Dict,
             with open(sampler_options, 'r') as f:
                 sampler_options_dict = yaml.safe_load(f)
         except FileNotFoundError:
-            raise FileNotFoundError(f"Sampler options file not found: {sampler_options}")
+            raise FileNotFoundError(
+                f"Sampler options file not found: {sampler_options}")
         except yaml.YAMLError as e:
-            raise yaml.YAMLError(f"Invalid YAML in sampler options file {sampler_options}: {e}")
+            raise yaml.YAMLError(
+                f"Invalid YAML in sampler options file {sampler_options}: {e}")
 
         if not isinstance(sampler_options_dict, dict):
             raise TypeError(
                 f"Sampler options file {sampler_options} must contain a dictionary, "
-                f"got {type(sampler_options_dict)}"
-            )
+                f"got {type(sampler_options_dict)}")
 
         sampler_args = sampler_args | sampler_options_dict
     return sampler_args

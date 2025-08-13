@@ -328,9 +328,6 @@ def latency_command(
 
         ignore_eos = True if runtime_config.decoding_config.decoding_mode == SpeculativeDecodingMode.NONE else False
         eos_id = tokenizer.eos_token_id if not ignore_eos else -1
-        tokenizer.pad_token_id if not ignore_eos else -1
-
-        eos_id = tokenizer.eos_token_id if not ignore_eos else -1
         pad_id = tokenizer.pad_token_id if not ignore_eos else -1
 
         sampler_args = {
