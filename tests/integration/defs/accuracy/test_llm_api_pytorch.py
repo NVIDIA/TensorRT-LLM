@@ -604,11 +604,14 @@ class TestLlama4MaverickInstruct(LlmapiAccuracyTestHarness):
                                           speculative_model_dir=eagle_model_dir)
         kv_cache_config = KvCacheConfig(enable_block_reuse=False,
                                         free_gpu_memory_fraction=0.75)
+        torch_compile_config = TorchCompileConfig(
+            enable_fullgraph=True,
+            enable_piecewise_cuda_graph=True,
+            max_num_streams=3) if torch_compile else None
         pytorch_config = dict(
             cuda_graph_config=CudaGraphConfig(max_batch_size=8),
             enable_attention_dp=False,
-            torch_compile_config=TorchCompileConfig(
-                enable_fullgraph=torch_compile))
+            torch_compile_config=torch_compile_config)
         with LLM(model_path,
                  kv_cache_config=kv_cache_config,
                  tensor_parallel_size=tp_size,
