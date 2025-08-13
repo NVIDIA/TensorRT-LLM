@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 
 import pytest
@@ -3896,13 +3897,6 @@ def test_tiny_llama_ifb_token_counts(
 
 
 @pytest.mark.skip_less_device_memory(80000)
-@pytest.mark.parametrize("TEXT,IMAGE", [
-    ("[IMG]\nDescribe the image in one sentence.",
-     "https://storage.googleapis.com/sfr-vision-language-research/LAVIS/assets/merlion.png"),
-    ("Image A: [IMG]\nImage B: [IMG]\nSummarize the differences between the two images.",
-     "https://images.pexels.com/photos/32285228/pexels-photo-32285228.jpeg?cs=srgb&dl=pexels-franco-monsalvo-252430633-32285228.jpg&fm=jpg&w=1280&h=720," \
-        "https://images.pexels.com/photos/8975010/pexels-photo-8975010.jpeg?cs=srgb&dl=pexels-ron-lach-8975010.jpg&fm=jpg&w=640&h=960"),
-])
 @pytest.mark.parametrize("E2E_MODEL_NAME", ["ensemble"])  # BLS optional later
 @pytest.mark.parametrize("ACCUMULATE_TOKEN", ["False"])
 @pytest.mark.parametrize("BLS_INSTANCE_COUNT", ["1"])
@@ -3933,8 +3927,6 @@ def test_tiny_llama_ifb_token_counts(
 @pytest.mark.parametrize("ENCODER_INPUT_FEATURES_DTYPE",
                          ["TYPE_FP16"])  # pixtral uses fp16 vision by default
 def test_mistral_small_3_1_24b_pixtral(
-    TEXT,
-    IMAGE,
     E2E_MODEL_NAME,
     MAX_TOKENS_IN_KV_CACHE,
     MAX_ATTENTION_WINDOW_SIZE,
@@ -4026,19 +4018,54 @@ def test_mistral_small_3_1_24b_pixtral(
         shell=True)
     check_server_ready()
 
-    # Run Test: use multimodal client; set model_type to pixtral
-    run_cmd = [
-        f"{llm_backend_multimodal_example_root}/client.py",
-        "--model_type=pixtral",
-        f"--hf_model_dir={mistral_small_3_1_24b_model_root}",
-        f"--text={TEXT}",
-        # Use a simple image URL (same as mllama test) to validate end-to-end
-        f"--image={IMAGE}",
+
+    test_cases = [
+        {
+            "text": "What is the capital of England?",
+            "image": "",
+            "match": re.compile("london", re.IGNORECASE)
+        },
+        {
+            "text": "In as few words as possible, what city is this?",
+            "image": "https://storage.googleapis.com/sfr-vision-language-research/LAVIS/assets/merlion.png",
+            "match": re.compile("singapore", re.IGNORECASE)
+        },
+        {
+            "text": "In as few words as possible, what sports are depicted in the images?",
+            "image": "https://images.pexels.com/photos/32285228/pexels-photo-32285228.jpeg?cs=srgb&fm=jpg&w=1280&h=720," \
+                     "https://images.pexels.com/photos/8975010/pexels-photo-8975010.jpeg?cs=srgb&fm=jpg&w=640&h=960",
+            "match": re.compile("(football|soccer).*hockey", re.IGNORECASE | re.DOTALL)
+        },
+        {
+            "text": "In as few words as possible, what sports are depicted in the images?",
+            "image": "https://images.pexels.com/photos/32285228/pexels-photo-32285228.jpeg?cs=srgb&fm=jpg&w=1280&h=720," \
+                     "https://images.pexels.com/photos/8975010/pexels-photo-8975010.jpeg?cs=srgb&fm=jpg&w=640&h=960," \
+                     "https://images.pexels.com/photos/2914194/pexels-photo-2914194.jpeg?cs=srgb&fm=jpg&w=640&h=853",
+            "match": re.compile("(football|soccer).*hockey.*basket", re.IGNORECASE | re.DOTALL)
+        },
     ]
-    if DECOUPLED_MODE == "True":
-        run_cmd += ["--streaming"]
 
-        if E2E_MODEL_NAME == "tensorrt_llm_bls":
-            run_cmd += ["--use_bls"]
+    for test_case in test_cases:
+        TEXT = test_case["text"]
+        IMAGE = test_case["image"]
+        MATCH = test_case["match"]
 
-    venv_check_call(llm_backend_venv, run_cmd)
+        # Run Test: use multimodal client; set model_type to pixtral
+        run_cmd = [
+            f"{llm_backend_multimodal_example_root}/client.py",
+            "--model_type=pixtral",
+            f"--text={TEXT}",
+            f"--image={IMAGE}",
+            "--request-output-len=128",
+            "--end-id=2",
+        ]
+        if DECOUPLED_MODE == "True":
+            run_cmd += ["--streaming"]
+
+            if E2E_MODEL_NAME == "tensorrt_llm_bls":
+                run_cmd += ["--use_bls"]
+
+        output = venv_check_output(llm_backend_venv, run_cmd)
+        print(output)
+
+        assert MATCH.search(output), f"Test failed for input: {TEXT}, {IMAGE}"
