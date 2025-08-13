@@ -16,6 +16,7 @@
 
 import os
 import platform
+import re
 import sys
 import sysconfig
 import warnings
@@ -280,25 +281,25 @@ def generate_fmha_cu(project_dir, venv_python):
     os.chdir(project_dir)
 
 
-def create_cuda_stub_links(cuda_stub_dir: str):
+def create_cuda_stub_links(cuda_stub_dir: str, missing_libs: list[str]):
     """
   Creates symbolic links for CUDA stub libraries in the provided directory.
 
   Args:
       cuda_stub_dir (str): Path to the directory containing CUDA stubs.
+      missing_libs: Versioned names of the missing libraries.
   """
     cuda_stub_path = Path(cuda_stub_dir)
     if not cuda_stub_path.exists():
         raise RuntimeError(
             f"CUDA stub directory '{cuda_stub_dir}' does not exist.")
 
-    shared_objects = ["cuda.so",
-                      "nvidia-ml.so"]  # List of shared object names to process.
-
-    for lib_name in shared_objects:
-        # Define the full paths for the library (.so) and its versioned link (.so.1).
-        so = cuda_stub_path / f"lib{lib_name}"  # e.g., libcuda.so
-        so_versioned = cuda_stub_path / f"lib{lib_name}.1"  # e.g., libcuda.so.1
+    version_pattern = r'\.\d+$'
+    for missing_lib in filter(lambda x: re.search(version_pattern, x),
+                              missing_libs):
+        # Define `so` as the first part of `missing_lib` with trailing '.' and digits removed
+        so = cuda_stub_path / re.sub(version_pattern, '', missing_lib)
+        so_versioned = cuda_stub_path / missing_lib
 
         # Check if the library exists and the versioned link does not.
         if so.exists() and not so_versioned.exists():
@@ -315,6 +316,20 @@ def create_cuda_stub_links(cuda_stub_dir: str):
                     )
 
 
+def check_missing_libs(so_prefix: str) -> list[str]:
+    result = build_run(f"ldd {so_prefix}.cpython*.so",
+                       capture_output=True,
+                       text=True)
+    missing = []
+    for line in result.stdout.splitlines():
+        if "not found" in line:
+            lib_name = line.split()[
+                0]  # Extract the library name before "=> not found"
+            if lib_name not in missing:
+                missing.append(lib_name)
+    return missing
+
+
 def generate_python_stubs_linux(binding_type: str, venv_python: Path,
                                 deep_ep: bool):
     is_nanobind = binding_type == "nanobind"
@@ -325,13 +340,16 @@ def generate_python_stubs_linux(binding_type: str, venv_python: Path,
     env_stub_gen = os.environ.copy()
     cuda_home_dir = env_stub_gen.get("CUDA_HOME") or env_stub_gen.get(
         "CUDA_PATH") or "/usr/local/cuda"
+    missing_libs = check_missing_libs("bindings")
     cuda_stub_dir = f"{cuda_home_dir}/lib64/stubs"
-    ld_library_path = env_stub_gen.get("LD_LIBRARY_PATH")
-    if Path(cuda_stub_dir).exists():
+
+    if missing_libs and Path(cuda_stub_dir).exists():
         # Create symbolic links for the CUDA stubs
-        create_cuda_stub_links(cuda_stub_dir)
+        create_cuda_stub_links(cuda_stub_dir, missing_libs)
+        ld_library_path = env_stub_gen.get("LD_LIBRARY_PATH")
         env_stub_gen[
             "LD_LIBRARY_PATH"] = f"{ld_library_path}:{cuda_stub_dir}" if ld_library_path else cuda_stub_dir
+
     if is_nanobind:
         build_run(f"\"{venv_python}\" -m nanobind.stubgen -m bindings -O .",
                   env=env_stub_gen)
