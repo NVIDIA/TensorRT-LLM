@@ -38,10 +38,10 @@ void runGemm(at::Tensor& out, at::Tensor const& mat1, at::Tensor const& mat2, at
     at::Tensor const& globalScale, int64_t m, int64_t n, int64_t k)
 {
     tensorrt_llm::kernels::TrtllmGenGemmRunnerOptions options = {.eltTypeA = tg::Dtype::E2m1,
+        .eltTypeB = tg::Dtype::E4m3,
         .outputType = outDtype,
         .deepSeekFp8 = false,
-        .transposeMmaOutput = true,
-        .eltTypeB = tg::Dtype::E4m3};
+        .transposeMmaOutput = true};
 
     tensorrt_llm::kernels::TrtllmGenGemmRunner runner(options);
 
