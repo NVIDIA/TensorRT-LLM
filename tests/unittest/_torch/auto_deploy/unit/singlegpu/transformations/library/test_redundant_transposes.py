@@ -3,14 +3,15 @@
 import pytest
 import torch
 import torch.nn as nn
-from _graph_test_helpers import run_test
+from _graph_test_helpers import run_test_transformed_gm
 from torch.fx import GraphModule
 
-from tensorrt_llm._torch.auto_deploy.transformations.library.eliminate_redundant_transposes import (
+from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
+from tensorrt_llm._torch.auto_deploy.transform.library.eliminate_redundant_transposes import (
     _is_contiguous_op,
     _is_transpose_op,
-    eliminate_redundant_transposes,
 )
+from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 
 
 class RedundantTransposeModel(nn.Module):
@@ -217,16 +218,25 @@ def test_eliminate_redundant_transposes_with_contiguous(model_class):
     # Setup model and input
     model = model_class().cuda()
     x = torch.randn(2, 3, 4).cuda()
+    gm = torch_export_to_gm(model, args=(x,), clone=True)
+    gm_transformed = InferenceOptimizer(
+        None,
+        {
+            "eliminate_redundant_transposes": {
+                "stage": "pattern_matcher",
+            },
+        },
+    )(None, gm)
 
     # Create a check function for this specific model
     expected_transpose_count = model.expected_remaining_transposes
     expected_contiguous_count = model.expected_remaining_contiguous
 
     # Run the test using the helper
-    run_test(
+    run_test_transformed_gm(
         model=model,
         x=x,
-        transform=eliminate_redundant_transposes,
+        gm_transformed=gm_transformed,
         check_transformed_graph=lambda gm: check_transpose_and_contiguous_count(
             gm, expected_transpose_count, expected_contiguous_count
         ),
