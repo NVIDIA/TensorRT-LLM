@@ -473,3 +473,8 @@ class GroupwiseQuantAlgo:
     PRE_QUANT_SCALE = 4
     W4A8_ALPHA = 8
     INT8_WEIGHT = 16
+
+
+class ActivationScheme(StrEnum, metaclass=BaseEnumMeta):
+    STATIC = auto()
+    DYNAMIC = auto()
