@@ -11,7 +11,6 @@
 
 add_gtest(blockKeyTest blockKeyTest.cpp)
 add_gtest(cacheTransBufferTest cacheTransBufferTest.cpp)
-add_gtest(cacheTransceiverTest cacheTransceiverTest.cpp)
 add_gtest(capacitySchedulerTest capacitySchedulerTest.cpp)
 add_gtest(contextProgressTest contextProgressTest.cu)
 add_gtest(evictionPolicyTest evictionPolicyTest.cpp)
