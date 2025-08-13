@@ -19,8 +19,14 @@ transforms:
     stage: post_export
   cleanup_input_constraints:
     stage: post_export
+  quantize_annotate:
+    stage: post_export
+    backend: real_quant
+    requires_clean_graph: false
+  # old quantization transform - for backward
   quantize:
     stage: pattern_matcher
+    enabled: false
   quantize_moe:
     stage: pattern_matcher
   match_repeat_kv:
@@ -31,3 +37,6 @@ transforms:
     stage: pattern_matcher
   match_attention_layout:
     stage: pattern_matcher
+  quantize_late_fusion:
+    stage: perf_optimization
+    requires_clean_graph: false

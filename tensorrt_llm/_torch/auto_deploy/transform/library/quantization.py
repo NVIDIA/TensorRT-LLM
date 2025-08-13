@@ -22,6 +22,7 @@ from ...utils.quantization_utils import (
     should_skip_quantization,
 )
 from ..interface import BaseTransform, TransformInfo, TransformRegistry
+from tensorrt_llm.quantization.quant_annotation import QuantAnnotation, annotate_node, has_quant_annotation, get_quant_annotation
 
 
 def _insert_quantized_linear(
@@ -230,6 +231,141 @@ class Quantization(BaseTransform):
 
         info = TransformInfo(
             skipped=False, num_matches=num_matches, is_clean=False, has_valid_shapes=True
+        )
+
+        return gm, info
+
+
+@TransformRegistry.register("quantize_annotate")
+class QuantizationAnnotate(BaseTransform):
+    """Early annotation pass: annotate nodes for quantization without replacing them."""
+
+    def _apply(
+        self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory
+    ) -> Tuple[GraphModule, TransformInfo]:
+        # extract info from quant_config
+        quant_config = factory.get_quant_config()
+        if not quant_config:
+            return gm, TransformInfo(
+                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+            )
+
+        quant_algo = quant_config.get("quant_algo")
+        excluded_patterns = quant_config.get("exclude_modules", [])
+        quant_backend = quant_config.get("backend", "real_quant")  
+        
+        if not quant_algo:
+            return gm, TransformInfo(
+                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+            )
+
+        # tracking annotated operations in the graph
+        annotated_count = 0
+        
+        for n in gm.graph.nodes:
+            if should_skip_quantization(n, excluded_patterns):
+                continue
+
+            # Annotate linear operations
+            if is_linear_op(n, include_quantization=False):
+                quant_group = None  # Could be set based on sharding requirements
+                annotation = QuantAnnotation(
+                    quant_scheme=quant_algo,
+                    backend=quant_backend,
+                    quant_group=quant_group,
+                    metadata={"op_type": "linear", "excluded_patterns": excluded_patterns}
+                )
+                annotate_node(n, annotation)
+                annotated_count += 1
+
+            # Annotate BMM operations  
+            elif is_bmm_op(n):
+                annotation = QuantAnnotation(
+                    quant_scheme=quant_algo,
+                    backend=quant_backend,
+                    quant_group=None,
+                    metadata={"op_type": "bmm", "excluded_patterns": excluded_patterns}
+                )
+                annotate_node(n, annotation)
+                annotated_count += 1
+
+        info = TransformInfo(
+            skipped=False, 
+            num_matches=annotated_count, 
+            is_clean=True,  # No graph structure changes
+            has_valid_shapes=True
+        )
+
+        return gm, info
+
+
+@TransformRegistry.register("quantize_late_fusion")
+class QuantizationLateFusion(BaseTransform):
+    """Late fusion pass: convert quantization annotations to actual quantized operations."""
+
+    def _apply(
+        self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory
+    ) -> Tuple[GraphModule, TransformInfo]:
+        
+        # Check if we have any annotated nodes
+        annotated_nodes = []
+        for n in gm.graph.nodes:
+            if has_quant_annotation(n):
+                annotated_nodes.append(n)
+        
+        if not annotated_nodes:
+            return gm, TransformInfo(
+                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+            )
+
+        # tracking quantized operations in the graph
+        quantized_nodes: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+        
+        for n in annotated_nodes:
+            annotation = get_quant_annotation(n)
+            if not annotation:
+                continue
+                
+            quant_algo = annotation.quant_scheme
+            backend = annotation.backend
+            op_type = annotation.metadata.get("op_type", "unknown")
+            
+            # Skip if backend doesn't match current execution context
+            # (This allows for configurable backends)
+            current_backend = factory.get_quant_config().get("backend", "real_quant")
+            if backend != current_backend:
+                continue
+
+            # Process linear operations
+            if op_type == "linear" and is_linear_op(n, include_quantization=False):
+                # Use existing quantization implementation
+                _insert_quantized_linear(
+                    gm, n, QuantizationImpl.create(quant_algo), is_quantized_graph(gm)
+                )
+                quantized_nodes[quant_algo]["linear"] += 1
+
+            # Process BMM operations
+            elif op_type == "bmm" and is_bmm_op(n):
+                # Use existing quantization implementation
+                _insert_quantized_bmm(
+                    gm, n, QuantizationImpl.create(quant_algo, is_bmm=True), is_quantized_graph(gm)
+                )
+                quantized_nodes[quant_algo]["bmm"] += 1
+
+        # Clean up output quantizers if needed
+        if is_quantized_graph(gm):
+            remove_output_quantizers(gm)
+
+        num_matches = 0
+        for quant_algo in quantized_nodes:
+            for op_type, count in quantized_nodes[quant_algo].items():
+                num_matches += count
+
+        info = TransformInfo(
+            skipped=False, 
+            num_matches=num_matches, 
+            is_clean=False,  # Graph structure changed
+            has_valid_shapes=True
         )
 
         return gm, info
