@@ -116,4 +116,6 @@ bool getEnvDisaggBenchmarkGenOnly();
 // Whether to disable the chunked-attention in the generation phase.
 bool getEnvDisableChunkedAttentionInGenPhase();
 
+bool getEnvKVCacheTransferAllBlocksForWindow();
+
 } // namespace tensorrt_llm::common

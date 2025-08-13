@@ -52,7 +52,7 @@ TEST_F(BlockIteratorTest, BasicTest)
         auto blockTensor = tr::ITensor::slice(pool, blockIds.at(idx), 1);
         std::fill_n(tr::bufferCast<DataType>(*blockTensor), blockTensor->getSize(), idx);
     }
-    auto range = BlockRange(pool, blockIds);
+    auto range = BlockRangeForWindow(std::move(blockIds), std::move(pool));
     auto begin = range.begin();
     auto end = range.end();
     auto allEqualTo = [](tr::ITensor const& tensor, auto x) -> bool
@@ -124,7 +124,9 @@ TEST_F(BlockIteratorTest, CacheManagerTest)
 
     auto const pool = blockManager.getPrimaryPool(0);
     TLLM_CHECK(pool);
-    auto range = BlockRange(pool, blockIds);
+    auto blockIdsVec = std::vector<SizeType32>(blockIds.begin(), blockIds.end());
+    auto poolCopy = pool;
+    auto range = BlockRangeForWindow(std::move(blockIdsVec), std::move(poolCopy));
     size_t cnt{0};
     for (auto iter = range.begin(); iter != range.end(); ++iter, ++cnt)
     {

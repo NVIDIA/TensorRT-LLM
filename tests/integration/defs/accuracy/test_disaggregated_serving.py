@@ -673,9 +673,6 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
 
     @pytest.mark.parametrize("overlap_scheduler", [False, True])
     def test_auto_dtype(self, overlap_scheduler):
-        pytest.skip(
-            "Currently we require full kvcache for variable sliding window. "
-            "This test only transfers the kvcache inside the sliding window.")
 
         ctx_server_config = {
             "disable_overlap_scheduler": True,
