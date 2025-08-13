@@ -16,7 +16,7 @@ context_servers:
     batch_sizes: [1,3000]
   disable_overlap_scheduler: True
   cache_transceiver_config:
-    backend: default
+    backend: DEFAULT
   urls:
       - "localhost:8001"
 generation_servers:
@@ -34,6 +34,6 @@ generation_servers:
     batch_sizes: [1,4,8,16,24,32]
   disable_overlap_scheduler: True
   cache_transceiver_config:
-    backend: default
+    backend: DEFAULT
   urls:
       - "localhost:8002"
