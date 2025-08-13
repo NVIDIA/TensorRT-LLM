@@ -1252,8 +1252,8 @@ int main(int argc, char** argv)
 
     // Allocate the reference on the host.
     float* o_ref_h = (float*) malloc(o_size * sizeof(float));
-    float* softmax_sum_ref_h = (float*) malloc(2 * b * s * h * sizeof(float));
-    float* softmax_sum_h = (float*) malloc(2 * b * s * h * sizeof(float));
+    float* softmax_stats_ref_h = (float*) malloc(2 * b * s * h * sizeof(float));
+    float* softmax_stats_h = (float*) malloc(2 * b * s * h * sizeof(float));
 
     // The P matrix is stored as one big matrix of size S x B x H x S.
     const size_t p_size = s * b * h * s;
@@ -1947,7 +1947,7 @@ int main(int argc, char** argv)
 
         // Read the results.
         FMHA_CHECK_CUDA(cuda_memcpy_d2h(o_ref_h, o_d, o_size, data_type));
-        FMHA_CHECK_CUDA(cuda_memcpy_d2h(softmax_sum_ref_h, softmax_stats_d, 2 * b * s * h, DATA_TYPE_FP32));
+        FMHA_CHECK_CUDA(cuda_memcpy_d2h(softmax_stats_ref_h, softmax_stats_d, 2 * b * s * h, DATA_TYPE_FP32));
     }
 
     // Fill-in p/s/o with garbage data.
@@ -2033,7 +2033,7 @@ int main(int argc, char** argv)
             std::vector<float> o_ref_trans_h(o_size);
 
             FMHA_CHECK_CUDA(cuda_memcpy_d2h(o_h, o_d_view, o_view_size, output_dtype));
-            FMHA_CHECK_CUDA(cuda_memcpy_d2h(softmax_sum_h, softmax_stats_d, 2 * b * s * h, DATA_TYPE_FP32));
+            FMHA_CHECK_CUDA(cuda_memcpy_d2h(softmax_stats_h, softmax_stats_d, 2 * b * s * h, DATA_TYPE_FP32));
 
             if (interleaved)
             {
@@ -2053,7 +2053,7 @@ int main(int argc, char** argv)
                 dv, epsilon, verbose, true);
             if (save_softmax)
             {
-                auto errors = check_softmax_results(softmax_sum_h, softmax_sum_ref_h, b, s, h, seqlens, cu_seqlens);
+                auto errors = check_softmax_results(softmax_stats_h, softmax_stats_ref_h, b, s, h, seqlens, cu_seqlens);
                 status = status | ((errors.first + errors.second) > 0);
             }
         }
@@ -2149,8 +2149,8 @@ int main(int argc, char** argv)
     free(s_h);
     free(o_h);
     free(o_ref_h);
-    free(softmax_sum_h);
-    free(softmax_sum_ref_h);
+    free(softmax_stats_h);
+    free(softmax_stats_ref_h);
     free(contiguous_kv_h);
     free(kv_cache_ptrs_h);
     free(kv_cache_block_offsets_h);
