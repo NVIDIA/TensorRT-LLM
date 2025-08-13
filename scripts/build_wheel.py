@@ -318,8 +318,9 @@ def create_cuda_stub_links(cuda_stub_dir: str):
 def generate_python_stubs_linux(binding_type: str, venv_python: Path,
                                 deep_ep: bool):
     is_nanobind = binding_type == "nanobind"
-    package = "nanobind" if is_nanobind else "pybind11-stubgen"
-    build_run(f"\"{venv_python}\" -m pip install {package}")
+    if is_nanobind:
+        build_run(f"\"{venv_python}\" -m pip install nanobind")
+    build_run(f"\"{venv_python}\" -m pip install pybind11-stubgen")
 
     env_stub_gen = os.environ.copy()
     cuda_home_dir = env_stub_gen.get("CUDA_HOME") or env_stub_gen.get(
@@ -338,13 +339,13 @@ def generate_python_stubs_linux(binding_type: str, venv_python: Path,
         build_run(
             f"\"{venv_python}\" -m pybind11_stubgen -o . bindings --exit-code",
             env=env_stub_gen)
+    build_run(
+        f"\"{venv_python}\" -m pybind11_stubgen -o . deep_gemm_cpp_tllm --exit-code",
+        env=env_stub_gen)
+    if deep_ep:
         build_run(
-            f"\"{venv_python}\" -m pybind11_stubgen -o . deep_gemm_cpp_tllm --exit-code",
+            f"\"{venv_python}\" -m pybind11_stubgen -o . deep_ep_cpp_tllm --exit-code",
             env=env_stub_gen)
-        if deep_ep:
-            build_run(
-                f"\"{venv_python}\" -m pybind11_stubgen -o . deep_ep_cpp_tllm --exit-code",
-                env=env_stub_gen)
 
 
 def generate_python_stubs_windows(binding_type: str, venv_python: Path,
