@@ -91,6 +91,8 @@ def run_alltoall_test(mpi_pool_executor, all_dims, dtypes, shape):
     world_size = mpi_pool_executor.num_workers
     dims, new_dims = all_dims
     assert not isinstance(dims, list) or len(dims) > 1
+    # This is the number of original tensors used in the alltoall op.
+    # They might be of different shape and dtype.
     num_lists = len(dims) if isinstance(dims, list) else 1
 
     # Create input tensors for each rank
@@ -99,12 +101,16 @@ def run_alltoall_test(mpi_pool_executor, all_dims, dtypes, shape):
     for rank in range(world_size):
         input_tensors.append([])
         expected_send_tensors.append([])
+        # For each original tensor, generate the data
         for list_idx in range(num_lists):
             # Each rank creates a tensor with unique data
             tensor = torch.randn(*shape, dtype=dtypes[list_idx])
             input_tensors[-1].append(tensor)
             d = dims[list_idx] if isinstance(dims, list) else dims
             send_tensors = []
+            # We keep track of the data sent by this `rank` to all other ranks
+            # `r`: this is simply a split of the original tensor w.r.t. `r`
+            # on the right dimension
             for r in range(world_size):
                 idx = [slice(None)] * len(shape)
                 split = shape[d] // world_size
@@ -112,15 +118,21 @@ def run_alltoall_test(mpi_pool_executor, all_dims, dtypes, shape):
                 send_tensors.append(tensor[idx])
             expected_send_tensors[-1].append(send_tensors)
     expected_recv_tensors = []
+    # Given the expected tensors sent by rank `rank` to all other ranks `r`,
+    # we can now determine the expected tensors received by each rank `rank`
     for rank in range(world_size):
         expected_recv_tensors.append([])
+        # For each original tensor, determine the received tensors
         for list_idx in range(num_lists):
+            # The received tensors are a transpose of the sent tensors
             recv_tensors = [
                 expected_send_tensors[r][list_idx][rank]
                 for r in range(world_size)
             ]
             new_dim = new_dims[list_idx] if isinstance(new_dims,
                                                        list) else new_dims
+            # Depending on whether new_dim is provided or not, we either
+            # concatenate or stack the tensors received from all other ranks
             if new_dim is None:
                 new_dim = dims[list_idx] if isinstance(dims, list) else dims
                 expected_recv_tensors[-1].append(
@@ -128,7 +140,8 @@ def run_alltoall_test(mpi_pool_executor, all_dims, dtypes, shape):
             else:
                 expected_recv_tensors[-1].append(
                     torch.stack(recv_tensors, dim=new_dim))
-    # if we have single tensors, replace the list with a single tensor
+    # If we have single tensors, replace the list with a single tensor,
+    # as expected by the `alltoall` interface
     if num_lists == 1:
         input_tensors = [t[0] for t in input_tensors]
         expected_recv_tensors = [t[0] for t in expected_recv_tensors]
