@@ -80,7 +80,7 @@ def create_logprobs(token_ids: List[int],
     return chat_logprobs
 
 
-def apply_reasoning_parser(args: ChatPostprocArgs, output_index: int, text: str, streaming: bool) -> Tuple[bool, str, str]:
+def apply_reasoning_parser(args: ChatPostprocArgs, output_index: int, text: str, streaming: bool) -> Tuple[bool, str | None, str | None]:
     reasoning_parser = None
     if args.reasoning_parser is not None:
         if output_index not in args.reasoning_parser_dict:
@@ -94,7 +94,7 @@ def apply_reasoning_parser(args: ChatPostprocArgs, output_index: int, text: str,
             result = reasoning_parser.parse(text)
         else:
             result = reasoning_parser.parse_delta(text)
-        in_reasoning, content, reasoning_text = result.in_reasoning, result.content, result.reasoning_text
+        in_reasoning, content, reasoning_text = result.in_reasoning, result.content, result.reasoning_content
     else:
         in_reasoning, content, reasoning_text = False, text, None
 
