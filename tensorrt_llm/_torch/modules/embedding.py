@@ -64,6 +64,7 @@ class LMHead(Linear):
             tensor_parallel_mode=tensor_parallel_mode,
             gather_output=gather_output,
             use_custom_cublas_mm=use_custom_cublas_mm,
+            use_flashinfer_allreduce=False,
         )
 
         if tensor_parallel_mode == TensorParallelMode.ROW:
