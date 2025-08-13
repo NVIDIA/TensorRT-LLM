@@ -2090,7 +2090,7 @@ def test_ptp_quickstart_advanced_8gpus(llm_root, llm_venv, model_name,
 def test_ptp_quickstart_advanced_8gpus_chunked_prefill_sq_22k(
         llm_root, llm_venv, model_name, model_path, cuda_graph):
     print(f"Testing {model_name} on 8 GPUs.")
-    example_root = Path(os.path.join(llm_root, "examples", "pytorch"))
+    example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
     cmd = [
         str(example_root / "quickstart_advanced.py"),
         "--enable_chunked_prefill",
@@ -2115,10 +2115,12 @@ def test_ptp_quickstart_advanced_8gpus_chunked_prefill_sq_22k(
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.skip_less_device(2)
 @pytest.mark.parametrize("model_name,model_path", [
-    ("Llama3.1-70B-BF16", "llama-3.1-model/Meta-Llama-3.1-70B"),
     ('Nemotron-Super-49B-v1-BF16',
      'nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1'),
     ("Mixtral-8x7B-BF16", "Mixtral-8x7B-Instruct-v0.1"),
+    pytest.param('Llama3.1-70B-BF16',
+                 'llama-3.1-model/Meta-Llama-3.1-70B',
+                 marks=pytest.mark.skip_less_device_memory(95000)),
 ])
 def test_ptp_quickstart_advanced_2gpus_sm120(llm_root, llm_venv, model_name,
                                              model_path):
@@ -2560,6 +2562,106 @@ def test_ptp_quickstart_multimodal_2gpu(llm_root, llm_venv, model_name,
             keyword in prompt_output.lower() for keyword in prompt_keywords
         ]
         obs_match_ratio = 1. * sum(matches) / len(matches)
+        assert obs_match_ratio >= match_ratio, f"Incorrect output!\nGenerated \"{prompt_output}\"\nExpected keywords \"{prompt_keywords}\"\n Matched keywords: {matches}\n Observed match ratio {obs_match_ratio} below threshold {match_ratio}"
+
+    print("All answers are correct!")
+
+
+@pytest.mark.skip_less_device_memory(80000)
+@pytest.mark.parametrize("model_name,model_path", [
+    ("gemma-3-27b-it", "gemma/gemma-3-27b-it"),
+    ("mistral-small-3.1-24b-instruct", "Mistral-Small-3.1-24B-Instruct-2503"),
+    ("Phi-4-multimodal-instruct", "multimodals/Phi-4-multimodal-instruct"),
+])
+def test_ptp_quickstart_multimodal_multiturn(llm_root, llm_venv, model_name,
+                                             model_path):
+    example_root = Path(os.path.join(llm_root, "examples", "llm-api"))
+    test_data_root = Path(
+        os.path.join(llm_models_root(), "multimodals", "test_data"))
+
+    print(f"Accuracy test {model_name} image mode with example inputs.")
+
+    # Define accuracy inputs for image modality
+    accuracy_inputs = {
+        "image": {
+            "prompt": [
+                "Describe what you see in this image.",
+                "How would you describe the atmosphere of this scene?",
+            ],
+            "media": [
+                str(test_data_root / "inpaint.png"),
+            ],
+        }
+    }
+
+    # Define expected keywords for each model
+    expected_keywords = {
+        "gemma-3-27b-it": {
+            "image": [
+                ["half", "dome", "yosemite", "landmark", "rounded"],
+                ["atmosphere", "peaceful", "majestic", "calm", "quiet"],
+            ],
+        },
+        "mistral-small-3.1-24b-instruct": {
+            "image": [
+                ["depicts", "landscape", "rock", "sky", "high", "altitude"],
+                ["atmosphere", "serene", "majestic", "sense", "tranquility"],
+            ],
+        },
+        "Phi-4-multimodal-instruct": {
+            "image": [
+                ["depicts", "landscape", "mountain", "half", "dome"],
+                ["atmosphere", "serene", "sense", "tranquility", "peace."],
+            ],
+        },
+    }
+    # Build command for image modality
+    cmd = [
+        str(example_root / "quickstart_multimodal.py"),
+        "--model_dir",
+        f"{llm_models_root()}/{model_path}",
+        "--modality",
+        "image",
+        "--multiturn",
+        "--prompt",
+        *accuracy_inputs["image"]["prompt"],
+        "--media",
+        *accuracy_inputs["image"]["media"],
+    ]
+
+    # Add model-specific configurations
+    if model_name == "gemma-3-27b-it":
+        # Gemma3 VLM needs a custom mask which is only supported by flashinfer backend currently.
+        # Custom mask involves bidirectional masking of image tokens in context phase. To get this
+        # correct, chunked prefill and kv cache reuse need to be turned off.
+        cmd.append("--image_format=pil")
+        cmd.append("--attention_backend=FLASHINFER")
+        cmd.append("--disable_kv_cache_reuse")
+    elif model_name == "Phi-4-multimodal-instruct":
+        # Set max_seq_len to 4096 to use short rope factor.
+        cmd.append("--max_seq_len=4096")
+        cmd.append("--load_lora")
+        cmd.append("--auto_model_name")
+        cmd.append("Phi4MMForCausalLM")
+
+    output = llm_venv.run_cmd(cmd, caller=check_output)
+    print("output:", output)
+    # Set match ratio based on model
+    match_ratio = 4.0 / 5
+    if model_name == "Phi-4-multimodal-instruct":
+        match_ratio = 0.6
+
+    # Check output accuracy
+    for prompt_output, prompt_keywords in zip(
+            parse_output(output), expected_keywords[model_name]["image"]):
+        matches = [
+            keyword in prompt_output.lower() for keyword in prompt_keywords
+        ]
+        obs_match_ratio = 1. * sum(matches) / len(matches)
+        print("prompt_output:", prompt_output)
+        print("prompt_keywords:", prompt_keywords)
+        print("matches:", matches)
+        print("obs_match_ratio:", obs_match_ratio)
         assert obs_match_ratio >= match_ratio, f"Incorrect output!\nGenerated \"{prompt_output}\"\nExpected keywords \"{prompt_keywords}\"\n Matched keywords: {matches}\n Observed match ratio {obs_match_ratio} below threshold {match_ratio}"
 
     print("All answers are correct!")
