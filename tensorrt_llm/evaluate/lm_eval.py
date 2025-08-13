@@ -190,11 +190,10 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
 
         Adapted from: https://github.com/EleutherAI/lm-evaluation-harness/blob/7f04db12d2f8e7a99a0830d99eb78130e1ba2122/lm_eval/models/hf_vlms.py#L225
         """
-
+        mm_placeholder_counts = []
         for i in range(len(chat_history)):
             content = chat_history[i]
             text = content["content"]
-
             image_count = min(self.max_images,
                               text.count(LM_EVAL_DEFAULT_IMAGE_PLACEHOLDER))
 
@@ -211,22 +210,24 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
             # NOTE: Since we already have loaded images, for the placeholder purpose, we add data here.
             for _ in range(image_count):
                 mm_data_tracker.add_data("image", None)
-            mm_placeholder_counts = mm_data_tracker.placeholder_counts()
-            if mm_placeholder_counts:
+            mm_placeholder_count = mm_data_tracker.placeholder_counts()
+            if mm_placeholder_count:
                 # TODO: This is an assumption of not interleaving text and image. Need to extend to interleaved texts.
                 conv["content"] = add_multimodal_placeholders(
-                    self.model_type, conv["content"], mm_placeholder_counts)
+                    self.model_type, conv["content"], mm_placeholder_count)
+            mm_placeholder_counts.append(mm_placeholder_count)
             chat_history[i] = conv
 
-        return trtllm_apply_chat_template(
+        output = trtllm_apply_chat_template(
             model_type=self.model_type,
             tokenizer=self.llm.tokenizer,
             processor=self.llm.input_processor.processor,
             conversation=chat_history,
             add_generation_prompt=add_generation_prompt,
-            mm_placeholder_counts={},
+            mm_placeholder_counts=mm_placeholder_counts,
             tools=None,
         )
+        return output
 
     def generate_until(self, requests, disable_tqdm: bool = False) -> List[str]:
         """

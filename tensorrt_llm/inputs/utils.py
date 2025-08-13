@@ -398,7 +398,7 @@ def handle_placeholder_exceptions(model_type: str,
         for conv, mm_placeholder_count in zip(conversation,
                                               mm_placeholder_counts):
             conv["content"] = [{"type": "text", "text": conv["content"]}, \
-                *[{"type": "image"} for _ in mm_placeholder_count]]
+                *[{"type": "image"} for _ in range(mm_placeholder_count['<image>'])]]
     else:
         raise ValueError(f"This path should not be reached for: {model_type}")
     return conversation
