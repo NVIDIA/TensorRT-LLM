@@ -2042,9 +2042,9 @@ void finalizeMoeRoutingKernelLauncher(GemmOutputType const* expanded_permuted_ro
         GemmOutputT const* expanded_permuted_rows, OutputT* reduced_unpermuted_output, ScaleBiasT const* bias,         \
         float const* final_scales, int const* unpermuted_row_to_permuted_row,                                          \
         int const* permuted_row_to_unpermuted_row, int const* expert_for_source_row,                                   \
-        int64_t const* expert_first_token_offset, int64_t const num_rows, int64_t const padded_cols,                          \
-        int64_t const actual_cols, int64_t const experts_per_token, int64_t const num_experts_per_node, MOEParallelismConfig parallelism_config,  \
-        bool const enable_alltoall, cudaStream_t stream);
+        int64_t const* expert_first_token_offset, int64_t const num_rows, int64_t const padded_cols,                   \
+        int64_t const actual_cols, int64_t const experts_per_token, int64_t const num_experts_per_node,                \
+        MOEParallelismConfig parallelism_config, bool const enable_alltoall, cudaStream_t stream);
 
 // Instantiate the data types that are used by the external pytorch op
 INSTANTIATE_FINALIZE_MOE_ROUTING(half, half, half);
@@ -3275,7 +3275,8 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
             //
             // This also means it is included in the timing for the profiler, which is probably more representative
             // until we can overlap it
-            check_cuda_error(cudaMemsetAsync(final_output, 0x0, sizeof(OutputType) * num_rows * hidden_size, stream));
+            check_cuda_error(
+                cudaMemsetAsync(final_output, 0x0, sizeof(OutputType) * num_rows * orig_hidden_size, stream));
         }
     }
     else if (use_fp8)
