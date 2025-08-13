@@ -21,15 +21,15 @@ streaming=true
 benchmark_mode=e2e
 
 args=(
-    1 4 4 4480 true "0.75"          # Context servers arguments
-    1 8 1024 1024 true "0.8" # Generation servers arguments
-    0 0                      # Other arguments
-    $concurrency             # Benchmarking arguments
+    1 4 1 4 4480 true "0.75"   # Context servers arguments
+    1 8 1 1024 1024 true "0.8" # Generation servers arguments
+    0 0                        # Other arguments
+    $concurrency               # Benchmarking arguments
     $isl
     $osl
     $multi_round
     $streaming
-    $container_image         # User specific arguments
+    $container_image           # User specific arguments
     $mounts
     $workdir
     $model_dir
@@ -38,7 +38,7 @@ args=(
 )
 
 # This command starts a job with 8 nodes, 32 GPUs in total.
-# The server will include 4 context workers with DEP4, and 1 generation worker with DEP8.
+# The server will include 4 context workers with TP=4, PP=1, and 1 generation worker with TP=8, PP=1.
 # `--segment` makes sure that all nodes are in the same NVLink domain
 sbatch --nodes=${total_node_num} \
     --ntasks=${ntasks} \
