@@ -179,6 +179,7 @@ l0_dgx_h100:
   - cpp/test_multi_gpu.py::test_cache_transceiver[2proc-ucx_kvcache-90]
   - cpp/test_multi_gpu.py::test_cache_transceiver[8proc-mpi_kvcache-90]
   - cpp/test_multi_gpu.py::test_cache_transceiver[8proc-ucx_kvcache-90]
+  - cpp/test_multi_gpu.py::test_user_buffer[2proc-90]
   - cpp/test_multi_gpu.py::test_enc_dec[t5-90]
   - cpp/test_multi_gpu.py::test_llama_executor[llama-orchestrator-90]
   - cpp/test_multi_gpu.py::test_llama_executor[llama-leader-90]

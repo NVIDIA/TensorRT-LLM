@@ -125,6 +125,24 @@ def run_cache_transceiver_tests(build_dir: _pl.Path,
                      timeout=600)
 
 
+def run_user_buffer_tests(build_dir: _pl.Path, nprocs=2, timeout=300):
+    tests_dir = build_dir / "tests" / "unit_tests" / "multi_gpu"
+    mgpu_env = get_multi_gpu_env()
+
+    user_buffer_test = [
+        "mpirun",
+        "-n",
+        f"{nprocs}",
+        "--allow-run-as-root",
+        "userBufferTest",
+    ]
+
+    _cpp.run_command(user_buffer_test,
+                     cwd=tests_dir,
+                     env=mgpu_env,
+                     timeout=timeout)
+
+
 def run_llama_executor_leader_tests(build_dir: _pl.Path, timeout=1500):
     tests_dir = build_dir / "tests" / "e2e_tests"
 
@@ -488,11 +506,19 @@ def test_fused_gemm_allreduce(build_google_tests, nprocs, build_dir):
 def test_cache_transceiver(build_google_tests, nprocs, kvcache_type, build_dir):
 
     if platform.system() != "Windows":
-
         run_cache_transceiver_tests(build_dir=build_dir,
                                     nprocs=nprocs,
                                     kv_cache_type=kvcache_type,
                                     timeout=600)
+
+
+@pytest.mark.parametrize("build_google_tests", ["80", "86", "89", "90"],
+                         indirect=True)
+@pytest.mark.parametrize("nprocs", [2, 8], ids=["2proc", "8proc"])
+def test_user_buffer(build_google_tests, nprocs, build_dir):
+
+    if platform.system() != "Windows":
+        run_user_buffer_tests(build_dir=build_dir, nprocs=nprocs, timeout=300)
 
 
 @pytest.mark.parametrize("build_google_tests", ["80", "86", "89", "90"],

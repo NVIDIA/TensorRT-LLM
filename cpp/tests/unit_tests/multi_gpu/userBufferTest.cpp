@@ -26,7 +26,7 @@ TEST(UserBuffer, basic)
 {
     if (!tr::ub::ub_supported())
     {
-        return;
+        GTEST_SKIP() << "UserBuffer is not supported";
     }
     auto& comm = mpi::MpiComm::world();
     auto world_size = comm.getSize();
