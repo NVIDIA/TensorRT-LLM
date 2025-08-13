@@ -258,7 +258,7 @@
             "sfLayoutA" : "128x4",
             "mmaM": 128,
             "mmaN": 8,
-            "mmaK": 512,
+            "mmaK": 32,
             "tileM": 128,
             "tileN": 8,
             "tileK": 512,
@@ -354,7 +354,7 @@
             "_comment": "Tile 8 to 128",
             "dtypeC": ["bf16", "fp16", "e4m3"],
             "useUnrollLoop2xForMma": [true, false],
-            "mmaN,tileN,epilogueTileN,mmaK,tileK": [[8, 8, 8, 512, 512], [16, 16, 16, 512, 512], [32, 32, 32, 512, 512], [64, 64, 64, 512, 512], [128, 128, 128, 256, 256]]
+            "mmaN,tileN,epilogueTileN,tileK": [[8, 8, 8, 512], [16, 16, 16, 512], [32, 32, 32, 512], [64, 64, 64, 512], [128, 128, 128, 256]]
         }
     ]
 }
