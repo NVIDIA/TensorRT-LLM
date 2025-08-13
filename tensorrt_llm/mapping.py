@@ -208,9 +208,9 @@ class Mapping(object):
                 f"but got {tp_size} * {cp_size} != {attn_tp_size} * {attn_cp_size}"
             )
 
-        if moe_ep_size != 1 and cp_size > 1 and cp_type == CpType.ULYSSES:
+        if moe_ep_size != 1 and cp_size > 1 and cp_type != CpType.HELIX:
             raise NotImplementedError(
-                "CP ulysses doesn't support MoE tp/ep yet")
+                f"CP {cp_type} doesn't support MoE tp/ep yet")
 
         self.tp_size = tp_size
         self.cp_size = cp_size
@@ -410,9 +410,6 @@ class Mapping(object):
     def has_cp_helix(self):
         return self.cp_size > 1 and self.cp_config.get(
             "cp_type") == CpType.HELIX
-
-    def is_last_helix_rank(self):
-        return self.cp_rank == self.cp_size - 1
 
     def get_node_rank(self, rank: int):
         return rank // self.gpus_per_node
