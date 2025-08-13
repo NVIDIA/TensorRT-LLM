@@ -4,7 +4,6 @@
 # Please take a look at the existing test_llm_api_pytorch.py file for reference.
 import concurrent
 import contextlib
-import json
 import os
 import tempfile
 import time
@@ -20,7 +19,6 @@ import yaml
 from tensorrt_llm.executor.result import GenerationResultBase
 from tensorrt_llm.llmapi import CompletionOutput, RequestOutput, SamplingParams
 from tensorrt_llm.llmapi.llm_args import LlmArgs
-from tensorrt_llm.llmapi.tokenizer import load_hf_tokenizer
 
 from ..conftest import (get_device_count, llm_models_root, parametrize_with_ids,
                         skip_pre_hopper)
