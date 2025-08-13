@@ -22,9 +22,12 @@ def bmm_out(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor) -> None:
 class MoERunner(TunableRunner):
     # avoid overhead of creating a new runner in forward pass
     runner_dict = dict()
-    tuning_config = TuningConfig(dynamic_tensor_specs=(
-        DynamicTensorSpec(0, 0, get_last_power_of_2_num_tokens_buckets(8192),
-                          lambda x: min(last_positive_power_of_2(x), 8192)), ))
+    tuning_config = TuningConfig(
+        dynamic_tensor_specs=(DynamicTensorSpec(
+            0, 0, get_last_power_of_2_num_tokens_buckets(8192),
+            lambda x: min(last_positive_power_of_2(x), 8192)), ),
+        tune_max_num_tokens=8192,
+    )
 
     def __init__(
         self,
@@ -109,15 +112,6 @@ class MoERunner(TunableRunner):
             do_preparation,
         )
 
-    @classmethod
-    @lru_cache(maxsize=None)
-    def refine_tuning_config(cls, tune_max_num_tokens: int):
-        cls.tuning_config = TuningConfig(
-            dynamic_tensor_specs=(DynamicTensorSpec(
-                0, 0, get_last_power_of_2_num_tokens_buckets(
-                    tune_max_num_tokens), lambda x: min(
-                        last_positive_power_of_2(x), tune_max_num_tokens)), ))
-
 
 @torch.library.custom_op("trtllm::fused_moe", mutates_args=())
 def fused_moe(
@@ -153,7 +147,6 @@ def fused_moe(
 ) -> List[torch.Tensor]:
 
     tuner = AutoTuner.get()
-    MoERunner.refine_tuning_config(tune_max_num_tokens)
 
     # Only the non-alltoall case is considered for profiling in the warmup phase.
     # Therefore, to get the correct tactics during the actual inference, the inputs to the tuner should be the same as when not using alltoall.
@@ -185,6 +178,8 @@ def fused_moe(
         min_latency_mode=min_latency_mode,
         use_fused_finalize=use_fused_finalize,
     )
+
+    MoERunner.tuning_config.tune_max_num_tokens = tune_max_num_tokens
 
     _, gemm_tactic_1 = tuner.choose_one(
         "trtllm::fused_moe::gemm1",

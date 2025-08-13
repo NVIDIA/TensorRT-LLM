@@ -235,11 +235,12 @@ Here is an example response, showing that the TRT-LLM server returns “New York
 
 ### Troubleshooting Tips
 
-* If you encounter CUDA out-of-memory errors, try reducing max\_batch\_size or max\_seq\_len  
-* Ensure your model checkpoints are compatible with the expected format  
-* For performance issues, check GPU utilization with nvidia-smi while the server is running  
-* If the container fails to start, verify that the NVIDIA Container Toolkit is properly installed  
-* For connection issues, make sure port 8000 is not being used by another application
+* If you encounter CUDA out-of-memory errors, try reducing `max_batch_size` or `max_seq_len`.
+  * For running input/output sequence lengths of 8K/1K on H200, there is a known CUDA Out-Of-Memory issue caused by the PyTorch CUDA Caching Allocator fragmenting memory. As a workaround, you can set the environment variable `PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:8192`. For more details, please refer to the [PyTorch documentation on optimizing memory usage](https://docs.pytorch.org/docs/stable/notes/cuda.html#optimizing-memory-usage-with-pytorch-cuda-alloc-conf).
+* Ensure your model checkpoints are compatible with the expected format.
+* For performance issues, check GPU utilization with nvidia-smi while the server is running.
+* If the container fails to start, verify that the NVIDIA Container Toolkit is properly installed.
+* For connection issues, make sure port 8000 is not being used by another application.
 
 ### Running Evaluations to Verify Accuracy (Optional)
 

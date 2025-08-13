@@ -277,7 +277,7 @@ We also conducted performance evaluations of Qwen 3 on GB200 GPUs. The data indi
 
 ### Reproducing Steps
 
-We provide a set of scripts to reproduce the performance data presented in this paper. Please refer to the usage instructions described in [this document](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/disaggregated/slurm).
+We provide a set of scripts to reproduce the performance data presented in this paper. Please refer to the usage instructions described in [this document](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/disaggregated/slurm/benchmark).
 
 ## Future Work
 
