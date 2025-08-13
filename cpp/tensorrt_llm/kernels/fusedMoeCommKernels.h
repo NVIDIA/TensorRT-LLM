@@ -311,6 +311,8 @@ public:
     }
 };
 
+size_t getFusedMoeCommWorkspaceSize(int epSize);
+
 struct FusedMoeFieldInfo
 {
     int8_t isBasicInterleaved; // using tokenSelectedSlots and expertScales interleaving?
@@ -515,6 +517,10 @@ struct FusedMoeWorkspace
 void setMaxUsableSmCount(int smCount);
 
 void moeAllToAll(FusedMoeCommKernelParam params, FusedMoeWorkspace workspace, cudaStream_t stream);
+
+void constructWorkspace(FusedMoeWorkspace* workspace, uint64_t* workspacePtr, size_t rankStrideInU64, int epSize);
+
+void initializeFusedMoeLocalWorkspace(FusedMoeWorkspace* workspace, FusedMoeWorldInfo const& worldInfo);
 
 namespace fused_moe_comm_tests
 {

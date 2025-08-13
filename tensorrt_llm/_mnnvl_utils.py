@@ -366,6 +366,10 @@ class MnnvlMoe:
         )
         MnnvlMoe.moe_workspace = MnnvlMemory(mapping, workspace_size_per_rank)
         MnnvlMoe.moe_workspace_tensor = MnnvlMoe.moe_workspace.as_torch_strided_tensor(torch.uint64)
+        torch.ops.trtllm.moe_initialize_workspace(
+            MnnvlMoe.moe_workspace_tensor, mapping.tp_rank, mapping.tp_size
+        )
+        MnnvlMoe.moe_workspace.comm.barrier()
         return MnnvlMoe.moe_workspace_tensor
 
     @staticmethod

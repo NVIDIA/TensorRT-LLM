@@ -16,8 +16,8 @@
  */
 
 #include "tensorrt_llm/common/opUtils.h"
-#include "tensorrt_llm/kernels/moeCommKernels.h"
 #include "tensorrt_llm/kernels/fusedMoeCommKernels.h"
+#include "tensorrt_llm/kernels/moeCommKernels.h"
 #include "tensorrt_llm/kernels/moePrepareKernels.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/thop/thUtils.h"
@@ -159,7 +159,7 @@ void moeCommOp(c10::List<torch::Tensor> inputs, torch::Tensor sendRankCumSum, to
     CHECK_INPUT(sendIndiceTensor, torch::kInt32);
     CHECK_INPUT(recvRankCumSum, torch::kInt32);
     CHECK_INPUT(recvIndiceTensor, torch::kInt32);
-    
+
     TORCH_CHECK(sendRankCumSum.dim() == 1, "sendRankCumSum must be a 1D tensor");
     TORCH_CHECK(sendIndiceTensor.dim() == 1, "sendIndices must be a 1D tensor");
     TORCH_CHECK(recvRankCumSum.dim() == 1, "recvRankCumSum must be a 1D tensor");
@@ -183,7 +183,6 @@ void moeCommOp(c10::List<torch::Tensor> inputs, torch::Tensor sendRankCumSum, to
     recvIndices.rankCountCumSum = recvRankCumSum.data_ptr<int>();
     recvIndices.rankLocalIndices = recvIndiceTensor.data_ptr<int>();
 
-
     int fieldCount = inputs.size();
     tensorrt_llm::kernels::FusedMoeFieldInfo sendFieldInfo, recvFieldInfo;
     sendFieldInfo.isBasicInterleaved = false;
@@ -200,6 +199,8 @@ void moeCommOp(c10::List<torch::Tensor> inputs, torch::Tensor sendRankCumSum, to
         setMoeCommFieldInfo(sendFieldInfo.fieldsInfo[i], inputs[i]);
         setMoeCommFieldInfo(recvFieldInfo.fieldsInfo[i], outputs[i]);
     }
+    sendFieldInfo.fillFieldPlacementInfo(0, false);
+    recvFieldInfo.fillFieldPlacementInfo(0, false);
 
     tensorrt_llm::kernels::FusedMoeCommKernelParam params;
     params.worldInfo = worldInfo;
@@ -208,15 +209,13 @@ void moeCommOp(c10::List<torch::Tensor> inputs, torch::Tensor sendRankCumSum, to
     params.sendFieldInfo = sendFieldInfo;
     params.recvFieldInfo = recvFieldInfo;
     // Do not need expertParallelInfo for fused moe comm now
-    
-    params.sendFieldInfo.fillMetaInfo(
-        &(params.sendCommMeta), params.expertParallelInfo.topK, false, false);
-    params.recvFieldInfo.fillMetaInfo(
-        &(params.recvCommMeta), params.expertParallelInfo.topK, false, false);
+
+    params.sendFieldInfo.fillMetaInfo(&(params.sendCommMeta), params.expertParallelInfo.topK, false, false);
+    params.recvFieldInfo.fillMetaInfo(&(params.recvCommMeta), params.expertParallelInfo.topK, false, false);
 
     tensorrt_llm::kernels::FusedMoeWorkspace fusedMoeWorkspace;
-    fusedMoeWorkspace.workspacePtr = allWorkspaces.data_ptr<uint64_t>();
-    fusedMoeWorkspace.rankStrideInU64 = allWorkspaces.stride(0);
+    tensorrt_llm::kernels::constructWorkspace(
+        &fusedMoeWorkspace, allWorkspaces.data_ptr<uint64_t>(), allWorkspaces.stride(0), epSize);
 
     auto stream = at::cuda::getCurrentCUDAStream();
 
@@ -226,7 +225,7 @@ void moeCommOp(c10::List<torch::Tensor> inputs, torch::Tensor sendRankCumSum, to
 int64_t getWorkspaceSizePerRank(int64_t epSize)
 {
     int epSize32 = static_cast<int>(epSize);
-    return tensorrt_llm::kernels::getMoeCommWorkspaceSize(epSize32);
+    return tensorrt_llm::kernels::getFusedMoeCommWorkspaceSize(epSize32);
 }
 
 void setMaxUsableSmCount(int64_t maxSmCount)
@@ -238,6 +237,21 @@ int64_t getPrepareWorkspaceSizePerRank(int64_t epSize)
 {
     int epSize32 = static_cast<int>(epSize);
     return tensorrt_llm::kernels::moe_prepare::getMoePrepareWorkspaceSize(epSize32);
+}
+
+void initializeMoeWorkspace(torch::Tensor allWorkspaces, int64_t epRank, int64_t epSize)
+{
+    TORCH_CHECK(allWorkspaces.dim() == 2, "allWorkspaces must be a 2D tensor");
+    TORCH_CHECK(epRank >= 0 && epRank < epSize, "epRank must be in the range [0, epSize)");
+
+    tensorrt_llm::kernels::MoeEpWorldInfo epWorldInfo = {static_cast<int>(epSize), static_cast<int>(epRank)};
+    tensorrt_llm::kernels::FusedMoeWorldInfo worldInfo = {epWorldInfo};
+
+    tensorrt_llm::kernels::FusedMoeWorkspace fusedMoeWorkspace;
+    tensorrt_llm::kernels::constructWorkspace(
+        &fusedMoeWorkspace, allWorkspaces.data_ptr<uint64_t>(), allWorkspaces.stride(0), epSize);
+
+    tensorrt_llm::kernels::initializeFusedMoeLocalWorkspace(&fusedMoeWorkspace, worldInfo);
 }
 
 std::tuple<torch::Tensor, c10::optional<torch::Tensor>, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
@@ -364,6 +378,16 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("moe_comm", &torch_ext::moeCommOp);
+}
+
+TORCH_LIBRARY_FRAGMENT(trtllm, m)
+{
+    m.def("moe_initialize_workspace(Tensor all_workspaces, int ep_rank, int ep_size) -> ()");
+}
+
+TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
+{
+    m.impl("moe_initialize_workspace", &torch_ext::initializeMoeWorkspace);
 }
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)

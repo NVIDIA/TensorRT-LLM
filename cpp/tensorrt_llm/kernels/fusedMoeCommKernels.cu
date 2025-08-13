@@ -1081,6 +1081,18 @@ __global__ void moeAllToAllKernel(FusedMoeCommKernelParam params, FusedMoeWorksp
     }
 }
 
+int computeMoeAlltoallMaxDynamicSharedMemorySize()
+{
+    int devId = -1;
+    TLLM_CUDA_CHECK(cudaGetDevice(&devId));
+    cudaFuncAttributes attr{};
+    TLLM_CUDA_CHECK(cudaFuncGetAttributes(&attr, (void const*) moeAllToAllKernel));
+    int staticSmem = static_cast<int>(attr.sharedSizeBytes);
+    int maxPerBlockShmOptin = 0;
+    TLLM_CUDA_CHECK(cudaDeviceGetAttribute(&maxPerBlockShmOptin, cudaDevAttrMaxSharedMemoryPerBlockOptin, devId));
+    return maxPerBlockShmOptin - staticSmem;
+}
+
 } // namespace fused_moe_impl
 
 void moeAllToAll(FusedMoeCommKernelParam params, FusedMoeWorkspace workspace, cudaStream_t stream)
@@ -1096,7 +1108,13 @@ void moeAllToAll(FusedMoeCommKernelParam params, FusedMoeWorkspace workspace, cu
     TLLM_CHECK_WITH_INFO(warpSendShmSize == warpRecvShmSize, "warpSendShmSize(%d) not same as warpRecvShmSize(%d)",
         warpSendShmSize, warpRecvShmSize);
     int maxGroupCountPerCta = std::min(params.worldInfo.epInfo.epSize, FusedMoeCommunicator::MAX_GROUP_COUNT_PER_BLOCK);
-    int groupCountPerCta = maxGroupCountPerCta;
+    static int maxDynamicShmSize = fused_moe_impl::computeMoeAlltoallMaxDynamicSharedMemorySize();
+    int groupCountPerCta = std::min(maxGroupCountPerCta, maxDynamicShmSize / warpShmSize);
+    if (groupCountPerCta * warpShmSize > 48 * 1024)
+    {
+        TLLM_CUDA_CHECK(cudaFuncSetAttribute(fused_moe_impl::moeAllToAllKernel,
+            cudaFuncAttributeMaxDynamicSharedMemorySize, groupCountPerCta * warpShmSize));
+    }
     for (; groupCountPerCta > 0; groupCountPerCta--)
     {
         int dynamicShmSize = groupCountPerCta * warpShmSize;
@@ -1118,12 +1136,6 @@ void moeAllToAll(FusedMoeCommKernelParam params, FusedMoeWorkspace workspace, cu
     groupCountPerCta = (epSize + ctaPerChannel - 1) / ctaPerChannel;
     int totalDynamicShmSize = warpShmSize * groupCountPerCta;
 
-    if (totalDynamicShmSize > 48 * 1024)
-    {
-        TLLM_CUDA_CHECK(
-            cudaFuncSetAttribute(fused_moe_impl::moeAllToAllKernel, cudaFuncAttributeMaxDynamicSharedMemorySize, totalDynamicShmSize));
-    }
-
     dim3 block = FusedMoeCommunicator::getLaunchBlockDim(groupCountPerCta);
     dim3 grid = FusedMoeCommunicator::getLaunchGridDim(params.worldInfo.epInfo.epSize, groupCountPerCta);
     fused_moe_impl::moeAllToAllKernel<<<grid, block, totalDynamicShmSize, stream>>>(params, workspace, hasBasicFields);
@@ -1136,6 +1148,25 @@ bool FusedMoeCommunicator::maxSmCountUsed = false;
 void setMaxUsableSmCount(int smCount)
 {
     FusedMoeCommunicator::setMaxUsableSmCount(smCount);
+}
+
+size_t getFusedMoeCommWorkspaceSize(int epSize)
+{
+    int channelCount = FusedMoeCommunicator::getMoeCommChannelCount(epSize);
+    size_t workspaceSize = FusedMoeWorkspace::computeWorkspaceSizePreRank(epSize, channelCount);
+    return workspaceSize;
+}
+
+void constructWorkspace(FusedMoeWorkspace* workspace, uint64_t* workspacePtr, size_t rankStrideInU64, int epSize)
+{
+    workspace->workspacePtr = workspacePtr;
+    workspace->rankStrideInU64 = rankStrideInU64;
+    workspace->channelCount = FusedMoeCommunicator::getMoeCommChannelCount(epSize);
+}
+
+void initializeFusedMoeLocalWorkspace(FusedMoeWorkspace* workspace, FusedMoeWorldInfo const& worldInfo)
+{
+    workspace->initializeLocalWorkspace(worldInfo);
 }
 
 namespace fused_moe_comm_tests
