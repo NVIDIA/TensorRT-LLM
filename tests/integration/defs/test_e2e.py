@@ -2280,6 +2280,8 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
         cmd.append("--image_format=pil")
         cmd.append("--attention_backend=FLASHINFER")
         cmd.append("--disable_kv_cache_reuse")
+        cmd.append("--kv_cache_fraction=0.5")
+        cmd.append("--max_seq_len=1024")
 
     output = llm_venv.run_cmd(cmd, caller=check_output)
 
