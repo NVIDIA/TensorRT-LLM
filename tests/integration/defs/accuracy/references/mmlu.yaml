@@ -73,6 +73,9 @@ meta-llama/Llama-4-Maverick-17B-128E-Instruct:
     kv_cache_quant_algo: FP8
     spec_dec_algo: Eagle
     accuracy: 86.40
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 86.40
 meta-llama/Llama-4-Scout-17B-16E-Instruct:
   - accuracy: 80.00
   - quant_algo: NVFP4

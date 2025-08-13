@@ -695,6 +695,7 @@ class TestMistralSmall24B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "mistralai/Mistral-Small-3.1-24B-Instruct-2503"
     MODEL_PATH = f"{llm_models_root()}/Mistral-Small-3.1-24B-Instruct-2503"
 
+    @pytest.mark.skip_less_device_memory(80000)
     def test_auto_dtype(self):
         with LLM(self.MODEL_PATH) as llm:
             task = CnnDailymail(self.MODEL_NAME)
@@ -1033,7 +1034,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             max_num_streams=3) if torch_compile else None)
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
-            use_cuda_graph=cuda_graph,
+            cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
             torch_compile_config=torch_compile_config,
             moe_config=MoeConfig(backend="CUTEDSL"),
         )
@@ -1191,7 +1192,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             max_num_streams=3) if torch_compile else None)
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
-            use_cuda_graph=cuda_graph,
+            cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
             torch_compile_config=torch_compile_config,
             moe_config=MoeConfig(backend="CUTEDSL"),
         )
