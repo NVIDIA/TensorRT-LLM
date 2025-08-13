@@ -12,7 +12,7 @@ prompts = ["A B C"]
 global_kvcache_config = KvCacheConfig(max_tokens=10000)
 
 
-@force_ampere  # Save H100 resource
+# @force_ampere  # Save H100 resource
 @pytest.mark.parametrize("return_log_probs", [False, True])
 @pytest.mark.parametrize("gather_generation_logits", [False, True])
 @pytest.mark.parametrize("gather_context_logits", [False, True])
