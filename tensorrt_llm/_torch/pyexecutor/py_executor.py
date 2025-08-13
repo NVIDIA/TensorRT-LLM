@@ -175,7 +175,6 @@ class PyExecutor:
         self.guided_decoder = guided_decoder
         self.dist = dist
         self.disable_overlap_scheduler = disable_overlap_scheduler
-        self.max_num_sequences = max_num_sequences
 
         # enqueue and _fetch_new_requests used data
         self.active = True
@@ -1541,16 +1540,9 @@ class PyExecutor:
     def _handle_logits(self, scheduled_batch, batch_outputs):
         if any(r.py_return_context_logits or r.py_return_generation_logits
                for r in scheduled_batch.all_requests()):
-            num_context_logits_prefix_sum = [0]
-            prefix_sum = 0
-            for request in scheduled_batch.context_requests:
-                prefix_sum += request.context_chunk_size if request.py_return_context_logits else 1
-                num_context_logits_prefix_sum.append(prefix_sum)
-
             HandleLogits()(
                 scheduled_batch.context_requests,
                 scheduled_batch.generation_requests, batch_outputs["logits"],
-                num_context_logits_prefix_sum, self.max_num_sequences,
                 self.sampler.beam_width(scheduled_batch.all_requests()))
 
     @nvtx_range("_setup_sampler_step")
