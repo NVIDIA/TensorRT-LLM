@@ -234,14 +234,14 @@ void runMoEFinalizeScaleOp(UnfusedGemmOutputType const* const gemm2_output, Scal
     float const* const unpermuted_final_scales, int const* const unpermuted_row_to_permuted_row,
     int const* const permuted_row_to_unpermuted_row, int const* const token_selected_experts,
     int64_t const* const expert_first_token_offset, int64_t const num_rows, int64_t const hidden_size,
-    int64_t const orig_hidden_size, int64_t const experts_per_token, int const num_experts_per_node,
+    int64_t const unpadded_hidden_size, int64_t const experts_per_token, int const num_experts_per_node,
     cutlass_kernels::MOEParallelismConfig parallelism_config, bool enable_alltoall, cudaStream_t stream,
     OutputType* const final_output)
 {
     cutlass_kernels::finalizeMoeRoutingKernelLauncher<OutputType, UnfusedGemmOutputType>(
         static_cast<UnfusedGemmOutputType const*>(gemm2_output), final_output, biases, unpermuted_final_scales,
         unpermuted_row_to_permuted_row, permuted_row_to_unpermuted_row, token_selected_experts,
-        expert_first_token_offset, num_rows, hidden_size, orig_hidden_size, experts_per_token, num_experts_per_node,
+        expert_first_token_offset, num_rows, hidden_size, unpadded_hidden_size, experts_per_token, num_experts_per_node,
         parallelism_config, enable_alltoall, stream);
 }
 
@@ -249,13 +249,13 @@ torch::Tensor run_moe_finalize_scale_op(torch::Tensor const& gemm2_output, torch
     torch::Tensor const& unpermuted_final_scales, torch::Tensor const& unpermuted_row_to_permuted_row,
     torch::Tensor const& permuted_row_to_unpermuted_row, torch::Tensor const& token_selected_experts,
     torch::Tensor const& expert_first_token_offset_tensor, bool enable_alltoall, c10::SymInt num_rows_param,
-    c10::SymInt hidden_size_param, c10::SymInt orig_hidden_size_param, int64_t const experts_per_token,
+    c10::SymInt hidden_size_param, c10::SymInt unpadded_hidden_size_param, int64_t const experts_per_token,
     int64_t const num_experts_per_node, int64_t const tp_size, int64_t const tp_rank, int64_t const ep_size,
     int64_t const ep_rank)
 {
     int64_t num_rows = num_rows_param.guard_int(__FILE__, __LINE__);
     int64_t hidden_size = hidden_size_param.guard_int(__FILE__, __LINE__);
-    int64_t orig_hidden_size = orig_hidden_size_param.guard_int(__FILE__, __LINE__);
+    int64_t unpadded_hidden_size = unpadded_hidden_size_param.guard_int(__FILE__, __LINE__);
 
     TORCH_CHECK(gemm2_output.dim() == 2, "gemm2_output must be 2D.");
     TORCH_CHECK(unpermuted_final_scales.dim() == 2, "unpermuted_final_scales must be 2D.");
@@ -279,7 +279,7 @@ torch::Tensor run_moe_finalize_scale_op(torch::Tensor const& gemm2_output, torch
 
     auto parallelism_config = cutlass_kernels::MOEParallelismConfig(tp_size, tp_rank, ep_size, ep_rank);
 
-    auto final_output = torch::empty({num_rows, orig_hidden_size}, gemm2_output.options());
+    auto final_output = torch::empty({num_rows, unpadded_hidden_size}, gemm2_output.options());
 
     auto stream = at::cuda::getCurrentCUDAStream(gemm2_output.get_device());
     auto data_type = gemm2_output.scalar_type();
@@ -293,7 +293,7 @@ torch::Tensor run_moe_finalize_scale_op(torch::Tensor const& gemm2_output, torch
             static_cast<int const*>(permuted_row_to_unpermuted_row.const_data_ptr()),
             static_cast<int const*>(token_selected_experts.const_data_ptr()),
             static_cast<int64_t const*>(expert_first_token_offset_tensor.const_data_ptr()), num_rows, hidden_size,
-            orig_hidden_size, experts_per_token, num_experts_per_node, parallelism_config, enable_alltoall, stream,
+            unpadded_hidden_size, experts_per_token, num_experts_per_node, parallelism_config, enable_alltoall, stream,
             static_cast<float*>(final_output.data_ptr()));
         break;
     case torch::kBFloat16:
@@ -305,7 +305,7 @@ torch::Tensor run_moe_finalize_scale_op(torch::Tensor const& gemm2_output, torch
             static_cast<int const*>(permuted_row_to_unpermuted_row.const_data_ptr()),
             static_cast<int const*>(token_selected_experts.const_data_ptr()),
             static_cast<int64_t const*>(expert_first_token_offset_tensor.const_data_ptr()), num_rows, hidden_size,
-            orig_hidden_size, experts_per_token, num_experts_per_node, parallelism_config, enable_alltoall, stream,
+            unpadded_hidden_size, experts_per_token, num_experts_per_node, parallelism_config, enable_alltoall, stream,
             static_cast<__nv_bfloat16*>(final_output.data_ptr()));
         break;
     case torch::kHalf:
@@ -316,7 +316,7 @@ torch::Tensor run_moe_finalize_scale_op(torch::Tensor const& gemm2_output, torch
             static_cast<int const*>(permuted_row_to_unpermuted_row.const_data_ptr()),
             static_cast<int const*>(token_selected_experts.const_data_ptr()),
             static_cast<int64_t const*>(expert_first_token_offset_tensor.const_data_ptr()), num_rows, hidden_size,
-            orig_hidden_size, experts_per_token, num_experts_per_node, parallelism_config, enable_alltoall, stream,
+            unpadded_hidden_size, experts_per_token, num_experts_per_node, parallelism_config, enable_alltoall, stream,
             static_cast<half*>(final_output.data_ptr()));
         break;
     default:
@@ -341,7 +341,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "moe_finalize_scale_op(Tensor gemm2_output, Tensor? biases, Tensor unpermuted_final_scales, Tensor "
         "unpermuted_row_to_permuted_row, Tensor permuted_row_to_unpermuted_row, Tensor token_selected_experts, Tensor "
         "expert_first_token_offset_tensor, bool enable_alltoall, SymInt num_rows, SymInt hidden_size, SymInt "
-        "orig_hidden_size, int "
+        "unpadded_hidden_size, int "
         "experts_per_token, int "
         "num_experts_per_node, int tp_size, int tp_rank, int ep_size, int ep_rank)"
         "-> (Tensor)");

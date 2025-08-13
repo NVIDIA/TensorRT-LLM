@@ -798,7 +798,7 @@ private:
         WeightType const* const fc2_expert_weights, ScaleBiasType const* const fc2_expert_biases,
         float const* const token_topk_unpermuted_scales, int const* const unpermuted_row_to_permuted_row,
         int const* const expert_for_source_row, int64_t const* const num_valid_tokens_ptr, int64_t const num_rows,
-        int64_t const expanded_num_rows, int64_t const hidden_size, int64_t const orig_hidden_size,
+        int64_t const expanded_num_rows, int64_t const hidden_size, int64_t const unpadded_hidden_size,
         int64_t const inter_size, int const num_experts_per_node, int64_t const k,
         MOEParallelismConfig parallelism_config, QuantParams& quant_params, cudaStream_t stream);
 

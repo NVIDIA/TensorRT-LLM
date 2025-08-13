@@ -1801,14 +1801,14 @@ template <typename OutputType, class GemmOutputType, class ScaleBiasType, ScaleM
 __global__ void finalizeMoeRoutingKernel(GemmOutputType const* expanded_permuted_rows,
     OutputType* reduced_unpermuted_output, ScaleBiasType const* bias, float const* scales,
     int const* unpermuted_row_to_permuted_row, int const* token_selected_experts, int64_t const padded_cols,
-    int64_t const orig_cols, int64_t const experts_per_token, int const num_experts_per_node, int const start_expert_id)
+    int64_t const unpadded_cols, int64_t const experts_per_token, int const num_experts_per_node, int const start_expert_id)
 {
     assert(padded_cols % 4 == 0);
-    assert(orig_cols % 4 == 0);
-    assert(orig_cols <= padded_cols);
+    assert(unpadded_cols % 4 == 0);
+    assert(unpadded_cols <= padded_cols);
     int64_t const original_row = blockIdx.x;
     int64_t const num_rows = gridDim.x;
-    auto const offset = original_row * orig_cols;
+    auto const offset = original_row * unpadded_cols;
     OutputType* reduced_row_ptr = reduced_unpermuted_output + offset;
 
     // Load 128-bits per thread, according to the smallest data type we read/write
@@ -1818,7 +1818,7 @@ __global__ void finalizeMoeRoutingKernel(GemmOutputType const* expanded_permuted
     int64_t const start_offset = threadIdx.x;
     int64_t const stride = FINALIZE_THREADS_PER_BLOCK;
     int64_t const num_elems_in_padded_col = padded_cols / FINALIZE_ELEM_PER_THREAD;
-    int64_t const num_elems_in_orig_col = orig_cols / FINALIZE_ELEM_PER_THREAD;
+    int64_t const num_elems_in_orig_col = unpadded_cols / FINALIZE_ELEM_PER_THREAD;
 
     using BiasElem = cutlass::Array<ScaleBiasType, FINALIZE_ELEM_PER_THREAD>;
     using InputElem = cutlass::Array<GemmOutputType, FINALIZE_ELEM_PER_THREAD>;
@@ -1880,12 +1880,12 @@ __global__ void finalizeMoeRoutingNoFillingKernel(GemmOutputType const* expanded
     OutputType* reduced_unpermuted_output, ScaleBiasType const* bias, float const* scales,
     int const* const unpermuted_row_to_permuted_row, int const* permuted_row_to_unpermuted_row,
     int const* token_selected_experts, int64_t const* expert_first_token_offset, int64_t const num_rows,
-    int64_t const padded_cols, int64_t const orig_cols, int64_t const experts_per_token, int const num_experts_per_node,
+    int64_t const padded_cols, int64_t const unpadded_cols, int64_t const experts_per_token, int const num_experts_per_node,
     int const start_expert_id)
 {
     assert(padded_cols % 4 == 0);
-    assert(orig_cols % 4 == 0);
-    assert(orig_cols <= padded_cols);
+    assert(unpadded_cols % 4 == 0);
+    assert(unpadded_cols <= padded_cols);
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     asm volatile("griddepcontrol.wait;");
@@ -1918,7 +1918,7 @@ __global__ void finalizeMoeRoutingNoFillingKernel(GemmOutputType const* expanded
             continue;
         }
 
-        OutputType* reduced_row_ptr = reduced_unpermuted_output + source_row * orig_cols;
+        OutputType* reduced_row_ptr = reduced_unpermuted_output + source_row * unpadded_cols;
 
         // Load 128-bits per thread, according to the smallest data type we read/write
         constexpr int64_t FINALIZE_ELEM_PER_THREAD
@@ -1927,7 +1927,7 @@ __global__ void finalizeMoeRoutingNoFillingKernel(GemmOutputType const* expanded
         int64_t const start_offset = threadIdx.x;
         int64_t const stride = FINALIZE_THREADS_PER_BLOCK;
         int64_t const num_elems_in_padded_col = padded_cols / FINALIZE_ELEM_PER_THREAD;
-        int64_t const num_elems_in_orig_col = orig_cols / FINALIZE_ELEM_PER_THREAD;
+        int64_t const num_elems_in_orig_col = unpadded_cols / FINALIZE_ELEM_PER_THREAD;
 
         using BiasElem = cutlass::Array<ScaleBiasType, FINALIZE_ELEM_PER_THREAD>;
         using InputElem = cutlass::Array<GemmOutputType, FINALIZE_ELEM_PER_THREAD>;
@@ -1986,7 +1986,7 @@ void finalizeMoeRoutingKernelLauncher(GemmOutputType const* expanded_permuted_ro
     OutputType* reduced_unpermuted_output, ScaleBiasType const* bias, float const* final_scales,
     int const* unpermuted_row_to_permuted_row, int const* permuted_row_to_unpermuted_row,
     int const* token_selected_experts, int64_t const* expert_first_token_offset, int64_t const num_rows,
-    int64_t const padded_cols, int64_t const orig_cols, int64_t const experts_per_token,
+    int64_t const padded_cols, int64_t const unpadded_cols, int64_t const experts_per_token,
     int64_t const num_experts_per_node, MOEParallelismConfig parallelism_config, bool const enable_alltoall,
     cudaStream_t stream)
 {
@@ -2018,7 +2018,7 @@ void finalizeMoeRoutingKernelLauncher(GemmOutputType const* expanded_permuted_ro
             : &finalizeMoeRoutingNoFillingKernel<OutputType, GemmOutputType, ScaleBiasType, ScaleMode::NO_SCALE>;
         cudaLaunchKernelEx(&config, func, expanded_permuted_rows, reduced_unpermuted_output, bias_ptr, final_scales,
             unpermuted_row_to_permuted_row, permuted_row_to_unpermuted_row, token_selected_experts,
-            expert_first_token_offset, num_rows, padded_cols, orig_cols, experts_per_token, num_experts_per_node,
+            expert_first_token_offset, num_rows, padded_cols, unpadded_cols, experts_per_token, num_experts_per_node,
             start_expert_id);
     }
     else
@@ -2032,7 +2032,7 @@ void finalizeMoeRoutingKernelLauncher(GemmOutputType const* expanded_permuted_ro
             ? &finalizeMoeRoutingKernel<OutputType, GemmOutputType, ScaleBiasType, ScaleMode::DEFAULT>
             : &finalizeMoeRoutingKernel<OutputType, GemmOutputType, ScaleBiasType, ScaleMode::NO_SCALE>;
         cudaLaunchKernelEx(&config, func, expanded_permuted_rows, reduced_unpermuted_output, bias_ptr, final_scales,
-            unpermuted_row_to_permuted_row, token_selected_experts, padded_cols, orig_cols, experts_per_token,
+            unpermuted_row_to_permuted_row, token_selected_experts, padded_cols, unpadded_cols, experts_per_token,
             num_experts_per_node, start_expert_id);
     }
 }
@@ -2996,7 +2996,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType, Ena
     float const* const unpermuted_final_scales, int const* const unpermuted_row_to_permuted_row,
     int const* const permuted_row_to_unpermuted_row, int const* const token_selected_experts,
     int64_t const* const num_valid_tokens_ptr, int64_t const num_rows, int64_t const expanded_num_rows,
-    int64_t const hidden_size, int64_t const orig_hidden_size, int64_t const inter_size,
+    int64_t const hidden_size, int64_t const unpadded_hidden_size, int64_t const inter_size,
     int64_t const num_experts_per_node, int64_t const k, MOEParallelismConfig parallelism_config,
     bool const enable_alltoall, QuantParams& quant_params, cudaStream_t stream)
 {
@@ -3012,7 +3012,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, ScaleBiasType, Ena
     finalizeMoeRoutingKernelLauncher<OutputType, UnfusedGemmOutputType>(
         static_cast<UnfusedGemmOutputType const*>(gemm_output), final_output, fc2_expert_biases,
         unpermuted_final_scales, unpermuted_row_to_permuted_row, permuted_row_to_unpermuted_row, token_selected_experts,
-        expert_first_token_offset, num_rows, hidden_size, orig_hidden_size, k, num_experts_per_node, parallelism_config,
+        expert_first_token_offset, num_rows, hidden_size, unpadded_hidden_size, k, num_experts_per_node, parallelism_config,
         enable_alltoall, stream);
 }
 
@@ -3237,7 +3237,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
     QuantParams quant_params, float const* const unpermuted_final_scales, float const* const permuted_final_scales,
     int const* const unpermuted_row_to_permuted_row, int const* permuted_row_to_unpermuted_row,
     int const* const token_selected_experts, int64_t const* const num_valid_tokens_ptr, int64_t const num_rows,
-    int64_t const expanded_num_rows, int64_t const hidden_size, int64_t const orig_hidden_size,
+    int64_t const expanded_num_rows, int64_t const hidden_size, int64_t const unpadded_hidden_size,
     int64_t const inter_size, int const num_experts_per_node, int64_t const k, float const** alpha_scale_ptr_array,
     bool use_lora, void* fc2_lora, cudaStream_t stream, MOEParallelismConfig parallelism_config,
     bool const enable_alltoall, cutlass_extensions::CutlassGemmConfig config, bool min_latency_mode,
@@ -3258,7 +3258,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
         Self::BlockScaleFC2(*fp8_blockscale_gemm_runner, input, gemm_output, final_output, expert_first_token_offset,
             fc2_expert_weights, fc2_expert_biases, unpermuted_final_scales, unpermuted_row_to_permuted_row,
             permuted_row_to_unpermuted_row, token_selected_experts, num_valid_tokens_ptr, num_rows, expanded_num_rows,
-            hidden_size, orig_hidden_size, inter_size, num_experts_per_node, k, parallelism_config, enable_alltoall,
+            hidden_size, unpadded_hidden_size, inter_size, num_experts_per_node, k, parallelism_config, enable_alltoall,
             quant_params, stream);
         return;
     }
@@ -3276,7 +3276,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
             // This also means it is included in the timing for the profiler, which is probably more representative
             // until we can overlap it
             check_cuda_error(
-                cudaMemsetAsync(final_output, 0x0, sizeof(OutputType) * num_rows * orig_hidden_size, stream));
+                cudaMemsetAsync(final_output, 0x0, sizeof(OutputType) * num_rows * unpadded_hidden_size, stream));
         }
     }
     else if (use_fp8)
@@ -3330,14 +3330,14 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
         finalizeMoeRoutingKernelLauncher<OutputType, UnfusedGemmOutputType>(
             static_cast<UnfusedGemmOutputType const*>(gemm_output), final_output, fc2_expert_biases,
             unpermuted_final_scales, unpermuted_row_to_permuted_row, permuted_row_to_unpermuted_row,
-            token_selected_experts, expert_first_token_offset, num_rows, hidden_size, orig_hidden_size, k,
+            token_selected_experts, expert_first_token_offset, num_rows, hidden_size, unpadded_hidden_size, k,
             num_experts_per_node, parallelism_config, enable_alltoall, stream);
     }
     else if (!using_tma_ws_gemm2)
     {
         finalizeMoeRoutingKernelLauncher<OutputType, T>(static_cast<T const*>(gemm_output), final_output,
             fc2_expert_biases, unpermuted_final_scales, unpermuted_row_to_permuted_row, permuted_row_to_unpermuted_row,
-            token_selected_experts, expert_first_token_offset, num_rows, hidden_size, orig_hidden_size, k,
+            token_selected_experts, expert_first_token_offset, num_rows, hidden_size, unpadded_hidden_size, k,
             num_experts_per_node, parallelism_config, enable_alltoall, stream);
     }
     sync_check_cuda_error(stream);
@@ -3552,7 +3552,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
     int const* token_selected_experts, float const* token_final_scales, void const* fc1_expert_weights_void,
     void const* fc1_expert_biases_void, ActivationParams fc1_activation_type, void const* fc2_expert_weights_void,
     void const* fc2_expert_biases_void, QuantParams quant_params, int64_t const num_rows, int64_t const hidden_size,
-    int64_t const orig_hidden_size, int64_t const inter_size, int const full_num_experts, int const experts_per_token,
+    int64_t const unpadded_hidden_size, int64_t const inter_size, int const full_num_experts, int const experts_per_token,
     char* workspace_ptr, void* final_output_void, int* unpermuted_row_to_permuted_row,
     MOEParallelismConfig parallelism_config, bool const enable_alltoall, bool use_lora, LoraParams& lora_params,
     bool use_deepseek_fp8_block_scale, bool min_latency_mode, MoeMinLatencyParams& min_latency_params,
@@ -3718,7 +3718,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
             expert_first_token_offset_, gemm2_tma_ws_input, fc2_expert_weights, fc2_expert_biases, fc2_int_scales,
             fc2_fp8_dequant, fc2_fp4_act_scale_, quant_params, token_topk_unpermuted_scales,
             permuted_token_final_scales_, unpermuted_row_to_permuted_row, permuted_row_to_unpermuted_row_,
-            token_selected_experts, num_valid_tokens_ptr, num_rows, expanded_num_rows, hidden_size, orig_hidden_size,
+            token_selected_experts, num_valid_tokens_ptr, num_rows, expanded_num_rows, hidden_size, unpadded_hidden_size,
             inter_size, num_experts_per_node, experts_per_token, alpha_scale_ptr_array_fc2_, use_lora, lora_fc2_result_,
             stream, parallelism_config, enable_alltoall, *gemm2_config_, true,
             min_latency_params.num_active_experts_per_node, min_latency_params.active_expert_global_ids);
@@ -3825,7 +3825,7 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
             expert_first_token_offset_, gemm2_tma_ws_input, fc2_expert_weights, fc2_expert_biases, fc2_int_scales,
             fc2_fp8_dequant, fc2_fp4_act_scale_, quant_params, token_topk_unpermuted_scales,
             permuted_token_final_scales_, unpermuted_row_to_permuted_row, permuted_row_to_unpermuted_row_,
-            token_selected_experts, num_valid_tokens_ptr, num_rows, expanded_num_rows, hidden_size, orig_hidden_size,
+            token_selected_experts, num_valid_tokens_ptr, num_rows, expanded_num_rows, hidden_size, unpadded_hidden_size,
             inter_size, num_experts_per_node, experts_per_token, alpha_scale_ptr_array_fc2_, use_lora, lora_fc2_result_,
             stream, parallelism_config, enable_alltoall, *gemm2_config_, false, nullptr, nullptr);
         sync_check_cuda_error(stream);
