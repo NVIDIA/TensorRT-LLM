@@ -7,7 +7,7 @@ import time
 import weakref
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Callable, List, Optional, Tuple, Union
+from typing import Any, Callable, List, Optional, Tuple, Union
 
 import torch
 from tqdm import tqdm
@@ -607,6 +607,17 @@ class CachedModelLoader:
             self._workspace, tempfile.TemporaryDirectory) else Path(
                 self._workspace)
 
+    def submit_to_all_workers(
+        self,
+        task: Callable[..., Any],
+        *args,
+        **kwargs,
+    ) -> List[Any]:
+        if self.llm_args.parallel_config.is_multi_gpu:
+            return self.mpi_session.submit_sync(task, *args, **kwargs)
+        else:
+            return [task(*args, **kwargs)]
+
     def __call__(self) -> Tuple[Path, Union[Path, None]]:
 
         if self.llm_args.model_format is _ModelFormatKind.TLLM_ENGINE:
@@ -627,7 +638,7 @@ class CachedModelLoader:
                     f'backend {self.llm_args.backend} is not supported.')
 
             if self.model_loader.model_obj.is_hub_model:
-                hf_model_dirs = self.mpi_session.submit_sync(
+                hf_model_dirs = self.submit_to_all_workers(
                     CachedModelLoader._node_download_hf_model,
                     model=self.model_loader.model_obj.model_name,
                     revision=self.llm_args.revision)
