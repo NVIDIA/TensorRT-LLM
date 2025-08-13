@@ -78,7 +78,7 @@ at::Tensor fp4_fp8_gemm_impl(at::Tensor const& mat1, at::Tensor const& mat2, at:
 
     auto const m = mat1.sizes()[0];
     auto const n = mat2.sizes()[0];
-    auto const k = mat2.sizes()[1];
+    auto const k = mat1.sizes()[1];
 
     if (!out_dtype)
     {
