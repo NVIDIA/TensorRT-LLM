@@ -10,44 +10,48 @@
 # Context servers arguments
 num_ctx_servers=${1}
 ctx_tp_size=${2}
-ctx_batch_size=${3}
-ctx_max_num_tokens=${4}
-ctx_enable_attention_dp=${5}
+ctx_pp_size=${3}
+ctx_batch_size=${4}
+ctx_max_num_tokens=${5}
+ctx_enable_attention_dp=${6}
 
 # Generation servers arguments
-num_gen_servers=${6}
-gen_tp_size=${7}
-gen_batch_size=${8}
-gen_max_num_tokens=${9}
-gen_enable_attention_dp=${10}
-gen_gpu_memory_fraction=${11}
+num_gen_servers=${7}
+gen_tp_size=${8}
+gen_pp_size=${9}
+gen_batch_size=${10}
+gen_max_num_tokens=${11}
+gen_enable_attention_dp=${12}
+gen_gpu_memory_fraction=${13}
 
 # Other arguments
-eplb_num_slots=${12}
-mtp_size=${13}
+eplb_num_slots=${14}
+mtp_size=${15}
 
 # Benchmarking arguments
-concurrency=${14}
-isl=${15}
-osl=${16}
-multi_round=${17}
-streaming=${18}
+concurrency=${16}
+isl=${17}
+osl=${18}
+multi_round=${19}
+streaming=${20}
 
 # User specific arguments
-container_image=${19}
-mounts=${20}
-workdir=${21}
-model_dir=${22}
-trtllm_repo=${23}
+container_image=${21}
+mounts=${22}
+workdir=${23}
+model_dir=${24}
+trtllm_repo=${25}
 
 echo "================= parameters ================="
 echo "num_ctx_servers: ${num_ctx_servers}"
 echo "ctx_tp_size: ${ctx_tp_size}"
+echo "ctx_pp_size: ${ctx_pp_size}"
 echo "ctx_batch_size: ${ctx_batch_size}"
 echo "ctx_max_num_tokens: ${ctx_max_num_tokens}"
 echo "ctx_enable_attention_dp: ${ctx_enable_attention_dp}"
 echo "num_gen_servers: ${num_gen_servers}"
 echo "gen_tp_size: ${gen_tp_size}"
+echo "gen_pp_size: ${gen_pp_size}"
 echo "gen_batch_size: ${gen_batch_size}"
 echo "gen_max_num_tokens: ${gen_max_num_tokens}"
 echo "gen_enable_attention_dp: ${gen_enable_attention_dp}"
@@ -79,8 +83,8 @@ full_logdir=${logdir}/ctx${num_ctx_servers}_gen${num_gen_servers}_dep${gen_tp_si
 
 echo "concurrency: ${concurrency}"
 
-ctx_gpus=$((num_ctx_servers * ctx_tp_size))
-gen_gpus=$((num_gen_servers * gen_tp_size))
+ctx_gpus=$((num_ctx_servers * ctx_tp_size * ctx_pp_size))
+gen_gpus=$((num_gen_servers * gen_tp_size * gen_pp_size))
 
 echo "enable_attention_dp: ${ctx_enable_attention_dp}, ${gen_enable_attention_dp}, gpu_memory_fraction: ${gen_gpu_memory_fraction}"
 
@@ -122,6 +126,7 @@ srun -l --container-name=${container_name} \
             --model ${model_dir} \
             --num_ctx_servers ${num_ctx_servers} \
             --ctx_tp_size ${ctx_tp_size} \
+            --ctx_pp_size ${ctx_pp_size} \
             --ctx_batch_size ${ctx_batch_size} \
             --ctx_max_num_tokens ${ctx_max_num_tokens} \
             --ctx_max_seq_len ${ctx_max_seq_len} \
@@ -129,6 +134,7 @@ srun -l --container-name=${container_name} \
             --cache_transceiver_max_num_tokens ${cache_transceiver_max_num_tokens} \
             --num_gen_servers ${num_gen_servers} \
             --gen_tp_size ${gen_tp_size} \
+            --gen_pp_size ${gen_pp_size} \
             --gen_batch_size ${gen_batch_size} \
             --gen_max_num_tokens ${gen_max_num_tokens} \
             --gen_max_seq_len ${gen_max_seq_len} \
