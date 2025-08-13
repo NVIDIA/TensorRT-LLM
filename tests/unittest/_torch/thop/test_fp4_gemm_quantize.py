@@ -130,8 +130,8 @@ class TestFunctional(unittest.TestCase):
     @parameterized.expand(
         list(
             [
-#                [1024, 1024, 1024],
-                [128, 1, 256],
+                [1024, 1024, 1024],
+                [128, 8, 256],
             ]
         ),
         name_func=unittest_name_func,
@@ -139,10 +139,9 @@ class TestFunctional(unittest.TestCase):
     @skip_pre_blackwell_unittest
     @skip_blackwell_geforce
     def test_fp4_fp8_gemm_trtllmgen(self, m, n, k):
-        a = torch.ones([m, k], dtype=torch.float32)
-        b = torch.zeros([n, k], dtype=torch.float32).to(torch.float8_e4m3fn).cuda()
-        b[0, 128] = 1
-        a_global_sf = 200.0 / a.abs().max().float()
+        a = torch.randn([m, k], dtype=torch.float32)
+        b = torch.randn([n, k], dtype=torch.float32).to(torch.float8_e4m3fn).cuda()
+        a_global_sf = 448 / a.abs().max().float()
 
         sf_vec_size = 32
         a_fp4, a_sf, rep_float = torch.ops.tensorrt_llm.float_to_e2m1_and_ufp8sf_scale(
@@ -153,9 +152,6 @@ class TestFunctional(unittest.TestCase):
         a_sf = a_sf.view(dtype=torch.float8_e4m3fn).cuda()
         ab_global_sf = 1.0 / a_global_sf
         ab_global_sf = ab_global_sf.cuda()
-        print(a_fp4)
-        print(a_sf)
-        print(torch.any(a_fp4==0), torch.any(a_sf == 0))
         c = torch.ops.trtllm.fp4_fp8_gemm_trtllmgen(b, a_fp4, a_sf, ab_global_sf).float().cpu()
 
         torch.cuda.synchronize()
@@ -165,9 +161,7 @@ class TestFunctional(unittest.TestCase):
         )
         b_pt = b.to(torch.float32).cpu()
         c_pt = torch.nn.functional.linear(b_pt, a_pt)
-        print(c_pt)
-        print(c)
-        self.assertTrue(torch.allclose(c_pt, c, atol=1e-2, rtol=1e-2))
+        self.assertTrue(torch.allclose(c_pt, c.reshape(-1, 8, 4).permute(0, 2, 1).reshape(c_pt.shape), atol=1e-2, rtol=1e-2))
 
     @parameterized.expand(list([[1024, 1024, torch.half, False, True],
                                 [2, 512, torch.bfloat16, False, True],
