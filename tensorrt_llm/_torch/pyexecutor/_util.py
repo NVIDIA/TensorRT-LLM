@@ -10,7 +10,7 @@ import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._utils import str_dtype_to_binding, torch_dtype_to_str
 from tensorrt_llm.bindings.executor import DecodingMode, ExecutorConfig
-from tensorrt_llm.llmapi.llm_args import PeftCacheConfig
+from tensorrt_llm.llmapi.llm_args import PeftCacheConfig, SamplerType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import (LoraConfig,
                                       get_default_trtllm_modules_to_hf_modules)
@@ -19,7 +19,7 @@ from tensorrt_llm.mapping import CpType, Mapping
 
 from ..model_config import ModelConfig
 from ..speculative import get_num_extra_kv_tokens, get_spec_decoder
-from .config import PyTorchConfig, SamplerType
+from .config import PyTorchConfig
 from .config_utils import is_mla, is_nemotron_hybrid
 from .guided_decoder import GuidedDecoder
 from .kv_cache_transceiver import AttentionTypeCpp, create_kv_cache_transceiver
