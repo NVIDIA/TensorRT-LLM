@@ -23,6 +23,7 @@
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/utils.h"
+#include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include <future>
 #include <map>
@@ -41,17 +42,19 @@ RequestInfo::RequestInfo(LlmRequest::RequestIdType requestId, executor::DataTran
 {
 }
 
-RequestInfo::RequestInfo(
-    LlmRequest::RequestIdType requestId, std::vector<size_t> blockHashes, executor::DataTransceiverState transState)
+RequestInfo::RequestInfo(LlmRequest::RequestIdType requestId,
+    std::unordered_map<SizeType32, std::vector<size_t>>&& blockHashesPerWindow,
+    executor::DataTransceiverState transState)
     : mRequestId{requestId}
-    , mBlockHashes{std::move(blockHashes)}
+    , mBlockHashesPerWindow{std::move(blockHashesPerWindow)}
     , mTransState{std::move(transState)}
 {
 }
 
 bool RequestInfo::operator==(RequestInfo const& rhs) const
 {
-    return mRequestId == rhs.mRequestId && mBlockHashes == rhs.mBlockHashes && mTransState == rhs.mTransState;
+    return mRequestId == rhs.mRequestId && mBlockHashesPerWindow == rhs.mBlockHashesPerWindow
+        && mTransState == rhs.mTransState;
 }
 
 LlmRequest::RequestIdType RequestInfo::getRequestId() const noexcept
@@ -68,7 +71,13 @@ void RequestInfo::serialize(RequestInfo const& requestInfo, std::ostream& os)
 {
     namespace su = executor::serialize_utils;
     su::serialize(requestInfo.mRequestId, os);
-    su::serialize(requestInfo.mBlockHashes, os);
+
+    su::serialize(requestInfo.mBlockHashesPerWindow.size(), os);
+    for (auto const& [windowSize, blockHashes] : requestInfo.mBlockHashesPerWindow)
+    {
+        su::serialize(windowSize, os);
+        su::serialize(blockHashes, os);
+    }
     su::serialize(requestInfo.mTransState, os);
 }
 
@@ -76,9 +85,16 @@ RequestInfo RequestInfo::deserialize(std::istream& is)
 {
     namespace su = executor::serialize_utils;
     auto requestId = su::deserialize<decltype(mRequestId)>(is);
-    auto blockHashes = su::deserialize<decltype(mBlockHashes)>(is);
+    std::unordered_map<SizeType32, std::vector<size_t>> blockHashesPerWindow;
+    auto size = su::deserialize<decltype(blockHashesPerWindow.size())>(is);
+    for (size_t i = 0; i < size; i++)
+    {
+        auto windowSize = su::deserialize<SizeType32>(is);
+        std::vector<size_t> blockHashes = su::deserialize<decltype(blockHashes)>(is);
+        blockHashesPerWindow.emplace(windowSize, std::move(blockHashes));
+    }
     auto transState = su::deserialize<decltype(mTransState)>(is);
-    return RequestInfo{requestId, std::move(blockHashes), std::move(transState)};
+    return RequestInfo{requestId, std::move(blockHashesPerWindow), std::move(transState)};
 }
 
 std::size_t RequestInfo::serializedSize(RequestInfo const& requestInfo)
@@ -86,7 +102,12 @@ std::size_t RequestInfo::serializedSize(RequestInfo const& requestInfo)
     namespace su = executor::serialize_utils;
     std::size_t totalSize = 0;
     totalSize += su::serializedSize(requestInfo.mRequestId);
-    totalSize += su::serializedSize(requestInfo.mBlockHashes);
+    totalSize += su::serializedSize(requestInfo.mBlockHashesPerWindow.size());
+    for (auto const& [windowSize, blockHashes] : requestInfo.mBlockHashesPerWindow)
+    {
+        totalSize += su::serializedSize(windowSize);
+        totalSize += su::serializedSize(blockHashes);
+    }
     totalSize += su::serializedSize(requestInfo.mTransState);
     return totalSize;
 }
@@ -214,12 +235,12 @@ private:
                 {
                     break;
                 }
-                std::vector<size_t> blockHashes;
+                std::unordered_map<SizeType32, std::vector<size_t>> blockHashesPerWindow;
                 if (!isSending() && !mReadyResponses.empty())
                 {
                     auto const& requestInfo = mSender->recvRequestInfo();
                     auto reqId = requestInfo.getRequestId();
-                    blockHashes = requestInfo.getBlockHashes();
+                    blockHashesPerWindow = requestInfo.getBlockHashesPerWindow();
 
                     mCurrentRequest = reqId;
                     if (mRemainSendCount.find(reqId) == mRemainSendCount.end())
@@ -239,7 +260,7 @@ private:
 
                         // TODO(zhengd): pass the hashes directly instead of update llmRequest
                         auto llmRequest = it->second.mRequest;
-                        llmRequest->setRequestedBlockHashes(std::move(blockHashes));
+                        llmRequest->setRequestedBlockHashes(std::move(blockHashesPerWindow));
 
                         if (common::getEnvParallelCacheSend())
                         {

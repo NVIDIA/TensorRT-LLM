@@ -178,14 +178,13 @@ TransferSession DataReceiverImpl::sendRequestInfo(LlmRequest const& llmRequest)
 
     RequestInfo requestInfo(requestId, mSelfState);
 
-    auto disableSelectiveCacheTransfer = common::getEnvDisableSelectiveCacheTransfer()
-        || (mFormatter->getCacheManager()->getBlockManager().getNumPools() > 1);
+    auto disableSelectiveCacheTransfer = common::getEnvDisableSelectiveCacheTransfer();
     if (!disableSelectiveCacheTransfer)
     {
         auto* cacheManager = mFormatter->getCacheManager();
         auto blockRange
             = kv_cache_manager::BlockRange::fromNewlyAllocatedBlockIds(*cacheManager, llmRequest.mRequestId);
-        requestInfo = RequestInfo(requestId, blockRange.getBlockHashes(), mSelfState);
+        requestInfo = RequestInfo(requestId, blockRange.getBlockHashesPerWindow(), mSelfState);
     }
 
     auto* agentConnectionManager = dynamic_cast<executor::kv_cache::AgentConnectionManager*>(mManager);
