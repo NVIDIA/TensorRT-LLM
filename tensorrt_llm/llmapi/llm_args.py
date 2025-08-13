@@ -6,7 +6,7 @@ import os
 import types
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from enum import Enum, EnumMeta, StrEnum
+from enum import Enum, EnumMeta
 from pathlib import Path
 from typing import (TYPE_CHECKING, Any, ClassVar, Dict, List, Literal, Optional,
                     Type, TypeAlias, TypeVar, Union, get_args, get_origin)
@@ -16,6 +16,7 @@ import yaml
 from pydantic import BaseModel
 from pydantic import Field as PydanticField
 from pydantic import PrivateAttr, field_validator, model_validator
+from strenum import StrEnum
 from transformers import PreTrainedTokenizerBase
 
 from tensorrt_llm.lora_helper import (LoraConfig,
