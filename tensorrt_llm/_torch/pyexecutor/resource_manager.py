@@ -264,7 +264,6 @@ class KVCacheManager(BaseResourceManager):
             assert isinstance(
                 kv_cache_config, KvCacheConfigCpp
             ), "calculate_max_num_blocks_from_cpp only accepts KvCacheConfigCpp"
-
             blocks_per_window = self.calculate_max_num_blocks_from_cpp(
                 kv_cache_config=kv_cache_config,
                 model_config=model_config,
@@ -828,12 +827,12 @@ class KVCacheManager(BaseResourceManager):
         free_mem, total_mem = torch.cuda.mem_get_info()
         # Respect max_gpu_total_bytes if provided
         free_gpu_memory_fraction = kv_cache_config.free_gpu_memory_fraction if kv_cache_config.free_gpu_memory_fraction else 0.9
-        primary_pool_memory_bytes = kv_cache_config.max_gpu_total_bytes if kv_cache_config.max_gpu_total_bytes > 0 else int(
+        self._primary_pool_memory_bytes = kv_cache_config.max_gpu_total_bytes if kv_cache_config.max_gpu_total_bytes > 0 else int(
             free_mem * free_gpu_memory_fraction)
-        secondary_pool_memory_bytes = kv_cache_config.host_cache_size if kv_cache_config.host_cache_size else 0
+        self._secondary_pool_memory_bytes = kv_cache_config.host_cache_size if kv_cache_config.host_cache_size else 0
         logger.debug(
-            f"primary_pool_memory_bytes is set to {primary_pool_memory_bytes/1024**3}GB, \n"
-            f"secondary_pool_memory_bytes is set to {secondary_pool_memory_bytes/1024**3}GB"
+            f"primary_pool_memory_bytes is set to {self._primary_pool_memory_bytes/1024**3}GB, \n"
+            f"secondary_pool_memory_bytes is set to {self._secondary_pool_memory_bytes/1024**3}GB"
         )
 
         # Adjust the window sizes to fit the memory if even a single sequence
@@ -843,7 +842,7 @@ class KVCacheManager(BaseResourceManager):
             max_attention_window_vec=self.max_attention_window_vec,
             model_config=model_config,
             kv_cache_config=kv_cache_config,
-            pool_memory_bytes=primary_pool_memory_bytes,
+            pool_memory_bytes=self._primary_pool_memory_bytes,
             kv_factor=self.kv_factor,
             dtype=self.dtype,
             is_cross_attention=is_cross_attention,
@@ -858,8 +857,8 @@ class KVCacheManager(BaseResourceManager):
             model_config=model_config,
             world_config=world_config_cpp,
             window_size_to_layers=window_size_to_layers,
-            allotted_primary_mem_bytes=primary_pool_memory_bytes,
-            allotted_secondary_mem_bytes=secondary_pool_memory_bytes,
+            allotted_primary_mem_bytes=self._primary_pool_memory_bytes,
+            allotted_secondary_mem_bytes=self._secondary_pool_memory_bytes,
             extra_cost_memory=extra_cost_memory,
             kv_factor=self.kv_factor,
         )
