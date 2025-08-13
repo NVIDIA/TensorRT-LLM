@@ -13,3 +13,4 @@ add_subdirectory(kernels)
 
 add_gtest(cacheTransceiverTest cacheTransceiverTest.cpp)
 add_gtest(mpiUtilsTest mpiUtilsTest.cpp)
+add_gtest(userBufferTest userBufferTest.cpp)
