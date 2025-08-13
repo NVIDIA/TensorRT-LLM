@@ -420,7 +420,7 @@ class TorchSampler(Sampler):
                                      new_tokens: torch.Tensor) -> int:
         new_token = add_token(request, new_tokens, beam=self.BEAM)
         stop = self._handle_stop_criteria(request, new_token)
-        if stop or len(request.py_draft_tokens) == 0:
+        if stop or get_draft_token_length(request) == 0:
             return 0
         num_accepted = 0
 
@@ -452,7 +452,7 @@ class TorchSampler(Sampler):
         sample_last = True
         stop = False
         if rejected_indices.numel() == 0:
-            num_initially_accepted = len(request.py_draft_tokens)
+            num_initially_accepted = get_draft_token_length(request)
             sample_last = False
         else:
             num_initially_accepted = rejected_indices[0].item()
