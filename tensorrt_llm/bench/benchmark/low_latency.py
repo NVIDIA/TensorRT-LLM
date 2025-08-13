@@ -330,9 +330,12 @@ def latency_command(
         eos_id = tokenizer.eos_token_id if not ignore_eos else -1
         tokenizer.pad_token_id if not ignore_eos else -1
 
+        eos_id = tokenizer.eos_token_id if not ignore_eos else -1
+        pad_id = tokenizer.pad_token_id if not ignore_eos else -1
+
         sampler_args = {
             "end_id": eos_id,
-            "pad_id": eos_id,
+            "pad_id": pad_id,
             "n": beam_width,
             "use_beam_search": beam_width > 1
         }
