@@ -897,28 +897,28 @@ public:
             }
             __syncwarp();
 #endif
+            if (needNewEntry())
+            {
+                if (mFifoEntryIndex >= 0)
+                {
+                    // not first entry, update FIFO info from last entry.
+                    mTail++;
+                    needRelease = true;
+                }
+                newReceiveEntry();
+#ifdef DEBUG_PRINT
+                if (mLaneId == 0)
+                {
+                    printf(
+                        "[Receive] warpId=%d, blockIdx=(%d, %d, %d), recvIndex=%d, tokenIndex=%d, head=%lu, "
+                        "tail=%lu, new receive entry done\n",
+                        mWarpId, blockIdx.x, blockIdx.y, blockIdx.z, recvIndex, tokenIndex, mHead, mTail);
+                }
+                __syncwarp();
+#endif
+            }
             while (loaded128ByteCount < mSingleTransfer128ByteCount)
             {
-                if (needNewEntry())
-                {
-                    if (mFifoEntryIndex >= 0)
-                    {
-                        // not first entry, update FIFO info from last entry.
-                        mTail++;
-                        needRelease = true;
-                    }
-                    newReceiveEntry();
-#ifdef DEBUG_PRINT
-                    if (mLaneId == 0)
-                    {
-                        printf(
-                            "[Receive] warpId=%d, blockIdx=(%d, %d, %d), recvIndex=%d, tokenIndex=%d, head=%lu, "
-                            "tail=%lu, new receive entry done\n",
-                            mWarpId, blockIdx.x, blockIdx.y, blockIdx.z, recvIndex, tokenIndex, mHead, mTail);
-                    }
-                    __syncwarp();
-#endif
-                }
                 tensorrt_llm::kernels::fused_moe_impl::startWorkspaceG2S(mShmemBase, getFifoEntryPtr(),
                     mSingleTransfer128ByteCount, mFifoEntry128ByteIndexBase, loaded128ByteCount, mSmemBar, mWarpId,
                     mLaneId);

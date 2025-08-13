@@ -138,7 +138,7 @@ struct MoeCommFieldInfo
     __device__ __forceinline__ uint8_t* getRawPtr(int index, int* rawSize) const
     {
         int alignedBytes = 1 << alignedUnitBit;
-        uint8_t* dataPtr = dataPtrBase + index * alignedBytes * alignedUnitStride;
+        uint8_t* dataPtr = dataPtrBase + static_cast<size_t>(index) * alignedBytes * alignedUnitStride;
         if (rawSize != nullptr)
         {
             *rawSize = alignedUnitCount * alignedBytes;
