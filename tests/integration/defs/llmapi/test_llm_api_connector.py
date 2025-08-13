@@ -279,7 +279,7 @@ def test_connector_scheduler_output(enforce_single_worker, model_with_connector,
     assert len(scheduler.request_finished.call_args.args[1]) == math.ceil(
         (NUM_INPUT_TOKENS + NUM_TOKENS) / BLOCK_SIZE)
 
-    model.generate([0] * NUM_INPUT_TOKENS, sampling_params)
+    model.generate([1] * NUM_INPUT_TOKENS, sampling_params)
 
     # The initial computed position should be 0, since we haven't yet onboarded any blocks.
     assert scheduler.build_connector_meta.call_args_list[0].args[

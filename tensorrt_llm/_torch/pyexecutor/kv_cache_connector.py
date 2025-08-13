@@ -291,7 +291,7 @@ class KvCacheConnectorSchedulerOutputRequest:
 
         computed_position = len(
             tokens
-        ) - 1 if req.state != LlmRequestState.CONTEXT_INIT else req.context_current_position
+        ) - 1 if req.state != LlmRequestState.CONTEXT_INIT and req.state != LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS else req.context_current_position
 
         return RequestData(req.request_id, new_tokens, new_block_ids,
                            computed_position)
