@@ -11,8 +11,12 @@ from .routing import BaseMoeRoutingMethod
 
 
 class MoEWeightLoadingMode(Enum):
+    # Gate and up projection are not fused
     VANILLA = 0
+    # Gate and up projection are fused
     FUSED_GATE_UP_PROJ = 1
+    # Custom W4A8 weights from examples/quantization/quantize_mixed_precision_moe.py
+    W4A8_CUSTOM = 2
 
 
 class MoE(nn.Module):
