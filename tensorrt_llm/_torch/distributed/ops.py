@@ -744,6 +744,7 @@ class MoEAllReduce(nn.Module):
             )
 
 _RANK_DIST_INITIALIZED = False
+_GLOBAL_FLAG_VALUE = 1
 
 class FlashInferAllReduce(nn.Module):
 
@@ -767,14 +768,35 @@ class FlashInferAllReduce(nn.Module):
         # num tokens * hidden dim * 2 < 70 *1024*1024
         # TODO: 2 is for bf16,fp16. need to add fp8, fp4
         self.max_num_tokens = 8192 #self.max_message_size // (self.hidden_dim * 2)
-        self._flag_value = 1
 
         self.workspace = get_flashinfer_allreduce_workspace(self.mapping, self.max_num_tokens, self.hidden_dim)
 
         self.all_reduce_params = FlashInferAllReduceParams(
-            strategy=self.strategy,
+            strategy=flashinfer_comm.AllReduceStrategyType.TWOSHOT,
             fusion_op=flashinfer_comm.AllReduceFusionOp.NONE,
             config_mode=flashinfer_comm.AllReduceStrategyConfig.USE_MEMCPY,
+        )
+
+        # each linear layer will have its own pointers to the workspace.
+        # The workspace is common
+        # Can we use common pointers?
+        self.peer_comm_buffer_ptrs = torch.tensor(
+            self.workspace[0], dtype=torch.int64
+        )
+        self.peer_barrier_ptrs_in = torch.tensor(
+            self.workspace[2], dtype=torch.int64
+        )
+        self.peer_barrier_ptrs_out = torch.tensor(
+            self.workspace[3], dtype=torch.int64
+        )
+        self.lamport_peer_comm_buffer_ptrs_0 = torch.tensor(
+            self.workspace[4], dtype=torch.int64
+        )
+        self.lamport_peer_comm_buffer_ptrs_1 = torch.tensor(
+            self.workspace[5], dtype=torch.int64
+        )
+        self.lamport_peer_comm_buffer_ptrs_2 = torch.tensor(
+            self.workspace[6], dtype=torch.int64
         )
 
     def forward(
@@ -783,6 +805,7 @@ class FlashInferAllReduce(nn.Module):
         *,
         all_reduce_params: Optional[FlashInferAllReduceParams] = None,
     ) -> torch.Tensor:
+        global _GLOBAL_FLAG_VALUE
 
         input = input.contiguous()
         num_token = input.size(0)
@@ -811,13 +834,10 @@ class FlashInferAllReduce(nn.Module):
             strategy_code=self.all_reduce_params.strategy,
             config_code=self.all_reduce_params.config_mode,
             launch_with_pdl=False,
-            flag_value=self._flag_value,
-            peer_comm_buffer_ptrs=torch.tensor(self.workspace[0],
-                                               dtype=torch.int64),
-            peer_barrier_ptrs_in=torch.tensor(self.workspace[2],
-                                              dtype=torch.int64),
-            peer_barrier_ptrs_out=torch.tensor(self.workspace[3],
-                                               dtype=torch.int64),
+            flag_value=_GLOBAL_FLAG_VALUE,
+            peer_comm_buffer_ptrs=self.peer_comm_buffer_ptrs,
+            peer_barrier_ptrs_in=self.peer_barrier_ptrs_in,
+            peer_barrier_ptrs_out=self.peer_barrier_ptrs_out,
             bias=None,
             residual=None,
             weight=None,
@@ -827,16 +847,10 @@ class FlashInferAllReduce(nn.Module):
             lamport_peer_comm_buffer_ptrs_0=None,
             lamport_peer_comm_buffer_ptrs_1=None,
             lamport_peer_comm_buffer_ptrs_2=None,
-            # lamport_peer_comm_buffer_ptrs_0=torch.tensor(
-            #     self.workspace[4], dtype=torch.int64
-            # ),
-            # lamport_peer_comm_buffer_ptrs_1=torch.tensor(
-            #     self.workspace[5], dtype=torch.int64
-            # ),
-            # lamport_peer_comm_buffer_ptrs_2=torch.tensor(
-            #     self.workspace[6], dtype=torch.int64
-            # ),
+            # lamport_peer_comm_buffer_ptrs_0=self.lamport_peer_comm_buffer_ptrs_0,
+            # lamport_peer_comm_buffer_ptrs_1=self.lamport_peer_comm_buffer_ptrs_1,
+            # lamport_peer_comm_buffer_ptrs_2=self.lamport_peer_comm_buffer_ptrs_2,
         )
-        self._flag_value += 1
+        _GLOBAL_FLAG_VALUE += 1
 
         return output_buffer
