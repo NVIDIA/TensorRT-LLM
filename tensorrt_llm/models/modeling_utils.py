@@ -139,6 +139,7 @@ class QuantConfig:
         has_zero_point (bool): Whether to use zero point for quantization. Defaults to False.
         pre_quant_scale (bool): Whether to use pre-quant scale for quantization. Defaults to False.
         exclude_modules (List[str], optional): The module name patterns that are skipped in quantization. Defaults to None.
+        mamba_ssm_cache_dtype (str, optional): The data type for mamba SSM cache. Defaults to None.
     """
     quant_algo: Optional[QuantAlgo] = None
     kv_cache_quant_algo: Optional[QuantAlgo] = None
@@ -149,6 +150,7 @@ class QuantConfig:
     has_zero_point: bool = False
     pre_quant_scale: bool = False
     exclude_modules: Optional[List[str]] = None
+    mamba_ssm_cache_dtype: Optional[str] = None
 
     @cached_property
     def quant_mode(self) -> QuantModeWrapper:

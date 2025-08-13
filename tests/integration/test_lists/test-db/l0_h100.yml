@@ -15,6 +15,7 @@ l0_h100:
   tests:
   # ------------- PyTorch tests ---------------
   # Only key models in H100: llama/mixtral/nemotron/deepseek
+  - unittest/_torch/auto_deploy/unit/singlegpu/test_ad_trtllm_bench.py::test_trtllm_bench_backend_comparison
   - unittest/_torch -k "not (modeling or multi_gpu or auto_deploy)" TIMEOUT (90)
   - unittest/_torch -k "modeling_llama"
   - unittest/_torch/modeling -k "modeling_mixtral"

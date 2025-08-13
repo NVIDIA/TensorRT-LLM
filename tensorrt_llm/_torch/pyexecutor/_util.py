@@ -13,9 +13,9 @@ from tensorrt_llm._utils import str_dtype_to_binding, torch_dtype_to_str
 from tensorrt_llm.bindings.executor import DecodingMode, ExecutorConfig
 from tensorrt_llm.llmapi.llm_args import PeftCacheConfig
 from tensorrt_llm.logger import logger
-from tensorrt_llm.lora_manager import (LoraConfig,
-                                       get_default_trtllm_modules_to_hf_modules,
-                                       load_torch_lora)
+from tensorrt_llm.lora_helper import (LoraConfig,
+                                      get_default_trtllm_modules_to_hf_modules)
+from tensorrt_llm.lora_manager import load_torch_lora
 from tensorrt_llm.mapping import Mapping
 
 from ..model_config import ModelConfig
@@ -314,6 +314,7 @@ class KvCacheCreator:
                 dtype=kv_cache_dtype,
                 spec_config=spec_config,
                 max_beam_width=executor_config.max_beam_width,
+                is_draft=model_engine.is_draft_model,
             )
         elif is_nemotron_hybrid(config):
             if executor_config.max_beam_width > 1:
@@ -329,6 +330,7 @@ class KvCacheCreator:
             mamba_layer_mask = [
                 char == "M" for char in config.hybrid_override_pattern
             ]
+
             kv_cache_manager = MambaHybridCacheManager(
                 # mamba cache parameters
                 config.ssm_state_size,
@@ -339,6 +341,8 @@ class KvCacheCreator:
                 mamba_num_layers,
                 mamba_layer_mask,
                 config.torch_dtype,
+                model_engine.model.model_config.quant_config.
+                mamba_ssm_cache_dtype,
                 # kv cache parameters
                 executor_config.kv_cache_config,
                 tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
@@ -376,6 +380,7 @@ class KvCacheCreator:
                 max_num_tokens=executor_config.max_num_tokens,
                 model_config=binding_model_config,
                 max_beam_width=executor_config.max_beam_width,
+                is_draft=model_engine.is_draft_model,
             )
         # KVCacheManager (Non-draft) modifies the max_seq_len field, update it to executor_config
         if model_engine.kv_cache_manager_key == ResourceManagerType.KV_CACHE_MANAGER:

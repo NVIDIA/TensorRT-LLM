@@ -53,6 +53,8 @@ class PyTorchConfig:
     attn_backend: str = 'TRTLLM'
     moe_backend: str = 'CUTLASS'
 
+    moe_disable_finalize_fusion: bool = False
+
     enable_mixed_sampler: bool = False
     """
     If true, will iterate over sampling_params of each request and use the
@@ -64,6 +66,8 @@ class PyTorchConfig:
     """
 
     kv_cache_dtype: str = "auto"
+    mamba_ssm_cache_dtype: str = "auto"
+
     enable_iter_perf_stats: bool = False
     # If true, enables per request stats per iteration
     # Must also set enable_iter_perf_stats to true to get request stats

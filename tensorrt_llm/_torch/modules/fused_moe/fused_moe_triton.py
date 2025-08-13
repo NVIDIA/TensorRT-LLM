@@ -634,6 +634,15 @@ def swizzle_weight_and_scale(w: torch.Tensor, w_scale: torch.Tensor):
         mx_axis=1)
     scale_layout, scale_layout_opts = layout.make_default_matmul_mxfp4_w_scale_layout(
         mx_axis=1, num_warps=num_warps)
+    # swizzling path is broken for H20
+    if torch.cuda.get_device_name() == "NVIDIA H20":
+        from triton_kernels.tensor_details.layout_details.strided import \
+            StridedLayout
+        value_layout = StridedLayout
+        value_layout_opts = dict()
+        scale_layout = StridedLayout
+        scale_layout_opts = dict()
+
     opt = {"value_layout": value_layout, "value_layout_opts": value_layout_opts, \
             "scale_layout": scale_layout, "scale_layout_opts": scale_layout_opts}
 
@@ -1198,7 +1207,6 @@ class TritonFusedMoE(MoE):
         dtype: Optional[torch.dtype] = None,
         reduce_results: bool = False,
         model_config: ModelConfig = ModelConfig(),
-        aux_stream: Optional[torch.cuda.Stream] = None,
         weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.
         VANILLA,
         bias: bool = False,

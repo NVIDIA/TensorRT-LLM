@@ -159,12 +159,12 @@ microsoft/Phi-4-multimodal-instruct-long-rope:
 microsoft/Phi-4-mini-instruct:
   - accuracy: 82.30
 GPT-OSS/BF16:
-  - accuracy: 88.5
+  - accuracy: 90.3
 GPT-OSS/MXFP4:
-  - accuracy: 88.5
+  - accuracy: 90.3
   - quant_algo: W4A8_MXFP4_MXFP8
-    accuracy: 88.5
+    accuracy: 90.3
   - quant_algo: W4A8_MXFP4_FP8
-    accuracy: 88.5
+    accuracy: 90.3
 LGAI-EXAONE/EXAONE-4.0-32B:
   - accuracy: 88.36
