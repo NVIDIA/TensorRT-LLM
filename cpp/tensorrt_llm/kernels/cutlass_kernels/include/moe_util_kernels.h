@@ -66,7 +66,7 @@ void finalizeMoeRoutingKernelLauncher(GemmOutputType const* expanded_permuted_ro
     OutputType* reduced_unpermuted_output, ScaleBiasType const* bias, float const* final_scales,
     int const* unpermuted_row_to_permuted_row, int const* permuted_row_to_unpermuted_row,
     int const* token_selected_experts, int64_t const* expert_first_token_offset, int64_t const num_rows,
-    int64_t const padded_cols, int64_t const orig_cols, int64_t const experts_per_token,
+    int64_t const padded_cols, int64_t const unpadded_cols, int64_t const experts_per_token,
     int64_t const num_experts_per_node, MOEParallelismConfig parallelism_config, bool const enable_alltoall,
     cudaStream_t stream);
 
