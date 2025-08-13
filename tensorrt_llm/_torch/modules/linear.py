@@ -558,11 +558,19 @@ class FP8BlockScalesLinearMethod(LinearMethodBase):
         module.weight = Parameter(torch.empty(weight_shape,
                                               dtype=torch.float8_e4m3fn),
                                   requires_grad=False)
-        scale_shape = (math.ceil(out_features / 128),
-                       math.ceil(in_features / 128))
-        module.weight_scale = Parameter(torch.empty(scale_shape,
-                                                    dtype=torch.float32),
-                                        requires_grad=False)
+
+        if get_sm_version() == 100:
+            scale_shape = (math.ceil(in_features / 512),
+                           math.ceil(out_features))
+            module.weight_scale = Parameter(torch.empty(scale_shape,
+                                                        dtype=torch.int32).T,
+                                            requires_grad=False)
+        else:
+            scale_shape = (math.ceil(out_features / 128),
+                           math.ceil(in_features / 128))
+            module.weight_scale = Parameter(torch.empty(scale_shape,
+                                                        dtype=torch.float32),
+                                            requires_grad=False)
         # Not really used for Gemm now.
         # Only used to quantize output of FP8 attention.
         module.input_scale = Parameter(torch.tensor(1., dtype=torch.float32),
@@ -592,14 +600,30 @@ class FP8BlockScalesLinearMethod(LinearMethodBase):
                     module.weight_scale)
             else:
                 from tensorrt_llm import deep_gemm
-                a, a_sf = fp8_utils.per_token_quant_and_transform(input)
-                output = torch.empty((input.shape[0], module.weight.shape[0]),
-                                     device=input.device,
-                                     dtype=torch.bfloat16)
-                deep_gemm.fp8_gemm_nt((a, a_sf),
-                                      (module.weight, module.weight_scale),
-                                      output,
-                                      disable_ue8m0_cast=True)
+                if input.shape[0] < 32:
+                    # Swap AB
+                    a, a_sf = fp8_utils.per_token_quant_and_transform(
+                        input, swap_ab=True)
+                    output_padded = torch.empty(
+                        (module.weight.shape[0], a.shape[0]),
+                        device=input.device,
+                        dtype=torch.bfloat16)
+                    deep_gemm.fp8_gemm_nt((module.weight, module.weight_scale),
+                                          (a, a_sf),
+                                          output_padded,
+                                          disable_ue8m0_cast=True)
+                    output = fp8_utils.masked_transpose(output_padded,
+                                                        input.shape[0])
+                else:
+                    a, a_sf = fp8_utils.per_token_quant_and_transform(input)
+                    output = torch.empty(
+                        (input.shape[0], module.weight.shape[0]),
+                        device=input.device,
+                        dtype=torch.bfloat16)
+                    deep_gemm.fp8_gemm_nt((a, a_sf),
+                                          (module.weight, module.weight_scale),
+                                          output,
+                                          disable_ue8m0_cast=True)
         else:
             act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
                 input)
@@ -625,6 +649,13 @@ class FP8BlockScalesLinearMethod(LinearMethodBase):
         weight_scale = load_weight_shard(weights[0][scale_name], module.tp_size,
                                          module.tp_rank,
                                          module.tp_mode).squeeze()
+        if get_sm_version() == 100:
+            weight_scale = fp8_utils.transform_sf_into_required_layout(
+                weight_scale,
+                mn=module.weight.shape[0],
+                k=module.weight.shape[1],
+                recipe=(1, 128, 128),
+                is_sfa=False)
         copy_weight(module.weight_scale, weight_scale)
         if "input_scale" in weights[0]:
             copy_weight(module.input_scale, weights[0]["input_scale"])
@@ -661,6 +692,13 @@ class FP8BlockScalesLinearMethod(LinearMethodBase):
                                         module.tp_rank, module.tp_mode)
         fused_scale = torch.cat([left_scale, right_scale], dim=0).squeeze()
         copy_weight(module.weight, fused_weight)
+        if get_sm_version() == 100:
+            fused_scale = fp8_utils.transform_sf_into_required_layout(
+                fused_scale,
+                mn=fused_weight.shape[0],
+                k=fused_weight.shape[1],
+                recipe=(1, 128, 128),
+                is_sfa=False)
         copy_weight(module.weight_scale, fused_scale)
 
 
