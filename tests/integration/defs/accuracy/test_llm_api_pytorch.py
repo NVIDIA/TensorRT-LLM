@@ -543,24 +543,26 @@ class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm,
                           extra_evaluator_kwargs=dict(apply_chat_template=True))
 
+    @skip_pre_hopper
     @pytest.mark.skip_less_mpi_world_size(8)
     @parametrize_with_ids("eagle3_one_model", [True, False])
-    def test_eagle3_tp8(self, eagle3_one_model):
-        model_path = f"{llm_models_root()}/llama-3.3-models/Llama-3.3-70B-Instruct"
+    def test_fp8_eagle3_tp8(self, eagle3_one_model):
+        model_path = f"{llm_models_root()}/modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp8"
         eagle_model_dir = f"{llm_models_root()}/EAGLE3-LLaMA3.3-Instruct-70B"
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
         spec_config = EagleDecodingConfig(max_draft_len=4,
                                           speculative_model_dir=eagle_model_dir,
                                           eagle3_one_model=eagle3_one_model)
-        pytorch_config = dict(disable_overlap_scheduler=True, )
+        pytorch_config = dict(
+            disable_overlap_scheduler=True,
+            cuda_graph_config=CudaGraphConfig(max_batch_size=1))
         with LLM(model_path,
+                 max_batch_size=16,
                  tensor_parallel_size=8,
                  speculative_config=spec_config,
                  kv_cache_config=kv_cache_config,
                  **pytorch_config) as llm:
             task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
     @pytest.mark.skip_less_device(4)

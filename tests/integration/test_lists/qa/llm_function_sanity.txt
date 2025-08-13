@@ -86,10 +86,10 @@ accuracy/test_llm_api_pytorch.py::TestLlama3_2_1B::test_auto_dtype
 accuracy/test_llm_api_pytorch.py::TestLlama3_2_1B::test_fp8_prequantized
 accuracy/test_llm_api_pytorch.py::TestLlama3_2_3B::test_auto_dtype
 accuracy/test_llm_api_pytorch.py::TestLlama3_2_3B::test_fp8_prequantized
-accuracy/test_llm_api_pytorch.py::TestLlama3_3_70BInstruct::test_eagle3_tp8[eagle3_one_model=False]
-accuracy/test_llm_api_pytorch.py::TestLlama3_3_70BInstruct::test_eagle3_tp8[eagle3_one_model=True]
 accuracy/test_llm_api_pytorch.py::TestLlama3_3_70BInstruct::test_fp8_tp4
 accuracy/test_llm_api_pytorch.py::TestLlama3_3_70BInstruct::test_nvfp4_tp4
+accuracy/test_llm_api_pytorch.py::TestLlama3_3_70BInstruct::test_fp8_eagle3_tp8[eagle3_one_model=True]
+accuracy/test_llm_api_pytorch.py::TestLlama3_3_70BInstruct::test_fp8_eagle3_tp8[eagle3_one_model=False]
 accuracy/test_llm_api_pytorch.py::TestLlama4MaverickInstruct::test_auto_dtype[tp4-cuda_graph=False]
 accuracy/test_llm_api_pytorch.py::TestLlama4MaverickInstruct::test_auto_dtype[tp4ep2-cuda_graph=True]
 accuracy/test_llm_api_pytorch.py::TestLlama4MaverickInstruct::test_auto_dtype[tp4ep4-cuda_graph=True]
