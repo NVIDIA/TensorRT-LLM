@@ -5,7 +5,6 @@ from typing import List, Literal, Optional
 
 import torch
 
-from tensorrt_llm._torch.pyexecutor.handle_logits import HandleLogits
 from tensorrt_llm._torch.pyexecutor.make_decoding_batch_input_output import \
     MakeDecodingBatchInputOutput
 from tensorrt_llm._utils import nvtx_range, torch_dtype_to_binding
@@ -30,7 +29,6 @@ from .scheduler import ScheduledRequests
 @dataclass(kw_only=True)
 class SampleStateTensors:
     new_tokens: torch.Tensor
-    logits: torch.Tensor | None = None
     log_probs: torch.Tensor | None = None
 
     def values(self):
@@ -66,6 +64,12 @@ class Sampler(ABC):
     def update_requests(self, state: SampleState) -> None:
         raise NotImplementedError
 
+    @staticmethod
+    def beam_width(scheduled_requests: Iterable[LlmRequest]) -> int:
+        for req in scheduled_requests:
+            return req.sampling_config.beam_width
+        return 0
+
 
 class EarlyStopSampler(Sampler):
     """
@@ -75,8 +79,7 @@ class EarlyStopSampler(Sampler):
 
     def sample_async(self, scheduled_requests: ScheduledRequests,
                      model_outputs) -> SampleState:
-        host = SampleStateTensors(logits=model_outputs['logits'],
-                                  new_tokens=torch.empty(0))
+        host = SampleStateTensors(new_tokens=torch.empty(0))
         return SampleState(scheduled_requests=scheduled_requests, host=host)
 
     def update_requests(self, state: SampleState) -> None:
@@ -87,14 +90,6 @@ class EarlyStopSampler(Sampler):
             request.state = LlmRequestState.GENERATION_COMPLETE
             # NOTE: This is a hack: set finish reason manually and set the beam 0
             request.set_finished_reason(FinishReason.LENGTH, 0)
-            if request.py_return_context_logits:
-                logits = state.host.logits[idx]
-                if logits.ndim == 1:
-                    # For BERT: Add axis to be compatible with LogitsStorage
-                    # (LogitsStorage will interpret this dim as the prompt_len which
-                    # is not relevant for outputting logits of encoder only model).
-                    logits = logits.unsqueeze(0)
-                request.py_result.append_context_logits(logits)
 
 
 @dataclass(kw_only=True)
@@ -445,13 +440,9 @@ class TorchSampler(Sampler):
 
         return False
 
-    def handle_logits(self, request: LlmRequest, state: SampleState, *,
-                      beam: int, count: int):
+    def handle_logprobs(self, request: LlmRequest, state: SampleState, *,
+                        beam: int, count: int):
         current_slice = slice(0, count), request.py_seq_slot, beam
-        if request.py_return_generation_logits:
-            assert state.host.logits is not None
-            current_logits = state.host.logits[current_slice]
-            request.py_result.append_generation_logits(current_logits)
         if request.py_return_log_probs:
             assert state.host.log_probs is not None
             log_probs = state.host.log_probs[request.py_seq_slot][beam][:count]
@@ -546,7 +537,7 @@ class TorchSampler(Sampler):
                 continue
             new_token = add_token(req, new_tokens, beam=self.BEAM)
             self._handle_stop_criteria(req, new_token)
-            self.handle_logits(req, state, beam=self.BEAM, count=1)
+            self.handle_logprobs(req, state, beam=self.BEAM, count=1)
             req.py_decoding_iter += 1
 
         for req in state.scheduled_requests.generation_requests:
@@ -558,7 +549,7 @@ class TorchSampler(Sampler):
                 req.py_num_accepted_draft_tokens = num_accepted
                 req.py_rewind_len = req.py_draft_pages_allocated - num_accepted
             processed += num_accepted
-            self.handle_logits(req, state, beam=self.BEAM, count=processed)
+            self.handle_logprobs(req, state, beam=self.BEAM, count=processed)
             req.py_decoding_iter += 1
 
     def log_probs_host(self, requests: Iterable[LlmRequest]):
@@ -596,8 +587,7 @@ class TorchSampler(Sampler):
         return SampleState(scheduled_requests=scheduled_requests,
                            device=SampleStateTensors(new_tokens=new_tokens),
                            host=SampleStateTensors(new_tokens=new_tokens_host,
-                                                   log_probs=log_probs_host,
-                                                   logits=gen_logits_host),
+                                                   log_probs=log_probs_host),
                            sampler_event=sampler_event)
 
     @staticmethod
@@ -864,7 +854,6 @@ class TRTLLMSampler(Sampler):
             speculative_decoding_fast_logits=False,
             is_leader_in_orch_mode=False,
             is_normalize_log_probs=False)
-        self.algs.handle_logits = HandleLogits()
         self.algs.make_decoding_batch_input_output = MakeDecodingBatchInputOutput(
         )
 
@@ -897,13 +886,6 @@ class TRTLLMSampler(Sampler):
         config = make_sampling_config([r.sampling_config for r in adp])
         slots = torch.tensor([r.py_seq_slot for r in adp], dtype=torch.int32)
         self.algs.decoder.underlying_decoder().setup(config, batch_size, slots)
-
-    @staticmethod
-    @torch.inference_mode()
-    def beam_width(scheduled_requests: Iterable[LlmRequest]) -> int:
-        for req in scheduled_requests:
-            return req.sampling_config.beam_width
-        return 0
 
     def get_cache_indirection(self) -> torch.Tensor | None:
         return self.store["decoder_state"].cache_indirection_output
@@ -940,22 +922,9 @@ class TRTLLMSampler(Sampler):
             prefix_sum += request.context_chunk_size if request.py_return_context_logits else 1
             num_context_logits_prefix_sum.append(prefix_sum)
 
-        if any(r.py_return_context_logits or r.py_return_generation_logits
-               for r in scheduled_requests.all_requests()):
-            self.algs.handle_logits(scheduled_requests.context_requests,
-                                    scheduled_requests.generation_requests,
-                                    model_outputs["logits"],
-                                    num_context_logits_prefix_sum,
-                                    self.max_num_sequences, beam_width)
-
         # For beam search, cache indirection needs to be updated
         if beam_width > 1:
             self._update_cache_indirection_buffer(scheduled_requests)
-
-        # TODO: Enable this back once nanobind is merged and/or llm request is a pure python object
-        # decoding_input = self.algs.make_decoding_batch_input_output(
-        #     scheduled_requests, model_outputs["logits"], beam_width,
-        #     num_context_logits_prefix_sum)
 
         self.store["decoding_input"][
             self.micro_batch_idx] = make_decoding_batch_input(
