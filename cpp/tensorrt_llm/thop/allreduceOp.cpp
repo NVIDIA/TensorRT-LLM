@@ -163,9 +163,9 @@ public:
     {
         size_t size = input.numel();
         size_t seq_len = input.size(0);
+        size_t bytes_per_element = input.element_size();
+        TLLM_LOG_DEBUG("All reduce message size is %zu", size * bytes_per_element);
 
-        // If strategy is set to UB, UB must be used as UB impl output is special and cannot be used
-        // by others.
         AllReduceStrategyType runtime_strategy = getRuntimeStrategy(seq_len, size);
 
         // Log runtime strategy
@@ -177,6 +177,8 @@ public:
         {
         case AllReduceStrategyType::UB: return runUBAllReduce(input, residual, norm_weight, scale, bias);
         case AllReduceStrategyType::NCCL: return runNCCLAllReduce(input, residual, norm_weight, scale, bias);
+        case AllReduceStrategyType::NCCL_SYMMETRIC:
+            return runNCCLAllReduceSymmetric(input, residual, norm_weight, scale, bias);
         case AllReduceStrategyType::MIN_LATENCY:
         case AllReduceStrategyType::ONESHOT:
         case AllReduceStrategyType::TWOSHOT:
@@ -301,6 +303,39 @@ private:
 
         // Treat any other patterns as fallback cases.
         return fallbackRunSubsequentOps(input, residual, norm_weight, scale, bias, reduce_output);
+    }
+
+    std::vector<torch::Tensor> runNCCLAllReduceSymmetric(torch::Tensor const& input,
+        torch::optional<torch::Tensor> const& residual, torch::optional<torch::Tensor> const& norm_weight,
+        torch::optional<torch::Tensor> const& scale, torch::optional<torch::Tensor> const& bias) noexcept
+    {
+
+        auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
+        int size = input.numel();
+        auto& ub_manager = tensorrt_llm::runtime::ub::UserBuffersManager::get_instance();
+        auto ub_buffer0 = ub_manager.search_buffer(input.data_ptr());
+        if (ub_buffer0.invalid())
+        {
+            auto [symmetric_input, symmetric_ub_buffer0]
+                = torch_ext::create_userbuffers_tensor(input.sizes(), input.scalar_type());
+            cudaMemcpyAsync(symmetric_ub_buffer0.addr, input.data_ptr(), size * input.element_size(),
+                cudaMemcpyDeviceToDevice, stream);
+            ub_buffer0 = symmetric_ub_buffer0;
+        }
+
+        TLLM_CHECK(!ub_buffer0.invalid());
+        auto [norm_out, ub_buffer1] = torch_ext::create_userbuffers_tensor(input.sizes(), input.scalar_type());
+
+        NCCLCHECK(ncclAllReduce(
+            ub_buffer0.addr, norm_out.mutable_data_ptr(), size, (*getDtypeMap())[mType], ncclSum, *mNcclComm, stream));
+
+        if (mOp == AllReduceFusionOp::NONE)
+        {
+            return {norm_out};
+        }
+
+        // Treat any other patterns as fallback cases.
+        return fallbackRunSubsequentOps(input, residual, norm_weight, scale, bias, norm_out);
     }
 
     std::vector<torch::Tensor> runLowPrecisionAllReduce(torch::Tensor const& input,
@@ -487,7 +522,7 @@ private:
             output_shape[r - 1] = k / 2;
 
             quant_out = at::detail::empty_cuda(output_shape, FLOAT4_E2M1X2, input.device(), std::nullopt);
-            scale_out = at::detail::empty_cuda({tensorrt_llm::computeFP4SwizzledLayoutSFSize(m, k / sf_vec_size)},
+            scale_out = at::detail::empty_cuda({tensorrt_llm::computeSwizzledLayoutSFSize(m, k / sf_vec_size)},
                 SF_DTYPE, input.device(), std::nullopt);
             residual_out = torch::empty_like(residual.value());
 
@@ -633,6 +668,10 @@ private:
         {
             runtime_strategy = AllReduceStrategyType::NCCL;
         }
+        else if (mStrategy == AllReduceStrategyType::NCCL_SYMMETRIC)
+        {
+            runtime_strategy = AllReduceStrategyType::NCCL_SYMMETRIC;
+        }
         else
         {
             // This is for DEBUG and BENCHMARK purpose. It will overried the strategy if AUTO is set.
@@ -658,6 +697,11 @@ private:
             TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d: NCCL", rank);
             break;
         }
+        case AllReduceStrategyType::NCCL_SYMMETRIC:
+        {
+            TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d: NCCL_SYMMETRIC", rank);
+            break;
+        }
         case AllReduceStrategyType::MIN_LATENCY:
         {
             TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d: MIN_LATENCY", rank);
@@ -673,7 +717,7 @@ private:
             TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d: LOWPRECISION", rank);
             break;
         }
-        default: break;
+        default: TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d: UNKNOWN: %d", rank, strategy); break;
         }
     }
 
@@ -1108,7 +1152,7 @@ std::vector<torch::Tensor> moe_finalize_allreduce(torch::Tensor const& input, to
 }
 
 at::Tensor mnnvlTwoShotAllReduce(
-    at::Tensor& input, at::Tensor& comm_buffer, at::Tensor& buffer_flags, bool wait_for_results)
+    at::Tensor& input, at::Tensor& comm_buffer, at::Tensor& buffer_flags, int64_t buffer_size, bool wait_for_results)
 {
     auto* mcast_mem = tensorrt_llm::common::findMcastDevMemBuffer(comm_buffer.data_ptr());
     TORCH_CHECK(mcast_mem != nullptr, "two_shot_all_reduce: comm_buffer must be obtained from a mcastBuffer instance.");
@@ -1120,6 +1164,7 @@ at::Tensor mnnvlTwoShotAllReduce(
     allreduce_params.dtype = dtype;
     allreduce_params.output = output.data_ptr();
     allreduce_params.input = input.data_ptr();
+    allreduce_params.buffer_size = static_cast<uint32_t>(buffer_size);
     allreduce_params.buffer_flags = buffer_flags.data_ptr();
     allreduce_params.wait_for_results = wait_for_results;
     allreduce_params.stream = at::cuda::getCurrentCUDAStream(output.get_device());
@@ -1137,7 +1182,7 @@ at::Tensor mnnvlTwoShotAllReduce(
 }
 
 std::vector<torch::Tensor> twoShotRMSNorm(torch::Tensor const& comm_buf, torch::Tensor const& gamma, double epsilon,
-    torch::Tensor const& residual, torch::Tensor& buffer_flags)
+    torch::Tensor const& residual, torch::Tensor& buffer_flags, int64_t buffer_size)
 {
     auto const dtype = tensorrt_llm::runtime::TorchUtils::dataType(comm_buf.scalar_type());
     auto rmsnorm_params = tensorrt_llm::kernels::mnnvl::RMSNormParams();
@@ -1153,6 +1198,7 @@ std::vector<torch::Tensor> twoShotRMSNorm(torch::Tensor const& comm_buf, torch::
     rmsnorm_params.gamma = gamma.data_ptr();
     rmsnorm_params.epsilon = epsilon;
     rmsnorm_params.residual = residual.data_ptr();
+    rmsnorm_params.buffer_size = static_cast<uint32_t>(buffer_size);
     rmsnorm_params.buffer_flags = reinterpret_cast<uint32_t*>(buffer_flags.data_ptr());
     rmsnorm_params.batch = normed_output.size(0);
     rmsnorm_params.hidden_dim = normed_output.size(1);
@@ -1168,10 +1214,10 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
         "mnnvl_twoshot_allreduce(Tensor(input!) input, Tensor(comm_buf!) comm_buffer, "
-        "Tensor(buffer_flags!) buffer_flags, bool wait_for_result) -> Tensor");
+        "Tensor(buffer_flags!) buffer_flags, int buffer_size, bool wait_for_result) -> Tensor");
     m.def(
         "mnnvl_twoshot_rmsnorm(Tensor comm_buf, Tensor gamma, "
-        "float epsilon, Tensor residual, Tensor buffer_flags) -> Tensor[]");
+        "float epsilon, Tensor residual, Tensor buffer_flags, int buffer_size) -> Tensor[]");
     m.def(
         "allreduce("
         "Tensor input,"

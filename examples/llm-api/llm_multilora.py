@@ -5,7 +5,7 @@ from huggingface_hub import snapshot_download
 
 from tensorrt_llm import LLM
 from tensorrt_llm.executor import LoRARequest
-from tensorrt_llm.lora_manager import LoraConfig
+from tensorrt_llm.lora_helper import LoraConfig
 
 
 def main():

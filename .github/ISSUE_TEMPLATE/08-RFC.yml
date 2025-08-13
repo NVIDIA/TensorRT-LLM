@@ -1,0 +1,58 @@
+# Adapted from https://github.com/vllm-project/vllm/tree/main/.github/ISSUE_TEMPLATE/750-RFC.yml
+name: 💬 Request for comments (RFC).
+description: Ask for feedback on major architectural changes or design choices.
+title: "[RFC]: "
+labels: ["RFC"]
+assignees: ["laikhtewari"]
+
+body:
+- type: markdown
+  attributes:
+    value: >
+      #### Please take a look at previous [RFCs](https://github.com/NVIDIA/TensorRT-LLM/issues?q=label%3ARFC+sort%3Aupdated-desc) for reference.
+- type: textarea
+  attributes:
+    label: Motivation.
+    description: >
+      The motivation of the RFC.
+  validations:
+    required: true
+- type: textarea
+  attributes:
+    label: Proposed Change.
+    description: >
+      The proposed change of the RFC.
+  validations:
+    required: true
+- type: textarea
+  attributes:
+    label: Feedback Period.
+    description: >
+      The feedback period of the RFC. Usually at least one week.
+  validations:
+    required: false
+- type: textarea
+  attributes:
+    label: CC List.
+    description: >
+      The list of people you want to CC.
+  validations:
+    required: false
+- type: textarea
+  attributes:
+    label: Any Other Things.
+    description: >
+      Any other things you would like to mention.
+  validations:
+    required: false
+- type: markdown
+  attributes:
+    value: >
+      Thanks for contributing 🎉! The TensorRT-LLM team reviews RFCs during regular team meetings. Most RFCs can be discussed online, but you can also reach out to the team through GitHub discussions or issues for additional feedback.
+- type: checkboxes
+  id: askllm
+  attributes:
+    label: Before submitting a new issue...
+    options:
+      - label: Make sure you already searched for relevant issues, and checked the [documentation](https://nvidia.github.io/TensorRT-LLM/) and [examples](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples) for answers to frequently asked questions.
+        required: true

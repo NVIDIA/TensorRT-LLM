@@ -136,6 +136,7 @@ l0_dgx_h200:
   - unittest/llmapi/test_llm_multi_gpu.py -m "gpu2 and part3"
   - unittest/llmapi/test_llm_multi_gpu.py -m "gpu4 and part0"
   - unittest/llmapi/test_llm_multi_gpu.py -m "not (gpu2 or gpu4)"
+  - unittest/llmapi/test_llm_kv_cache_events.py::test_llm_api_attention_dp_kv_events
   - examples/test_enc_dec.py::test_llm_enc_dec_general[compare_hf-t5-small-float32-enable_gemm_plugin-enable_attention_plugin-enable_paged_kv_cache-tp:2-pp:2-nb:1-enable_fp8]
   - llmapi/test_llm_e2e.py::test_llmapi_exit_multi_gpu
   - test_e2e.py::test_trtllm_bench_llmapi_launch[trt_backend-llama-v3-llama3-8b]

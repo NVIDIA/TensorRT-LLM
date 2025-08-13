@@ -20,7 +20,9 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_manager import HfLoraLoader
 from tensorrt_llm.models.convert_utils import split_matrix_tp
 
-from ...inputs import (ExtraProcessedInputs, InputProcessor, TextPrompt,
+from ...inputs import (ExtraProcessedInputs, InputProcessor,
+                       MultimodalPlaceholderMetadata,
+                       MultimodalPlaceholderPlacement, TextPrompt,
                        register_input_processor)
 from ...sampling_params import SamplingParams
 from ..attention_backend import AttentionMetadata
@@ -74,6 +76,11 @@ class Llama4Attention(Attention):
         elif get_sm_version() <= 90 and model_config.spec_config is not None:
             # pre-Blackwell spec-dec kernel does not support
             attention_chunk_size = None
+        else:
+            # Disable chunked attention when max_seq_len is smaller than attention_chunk_size
+            # TODO: Remove this after all attention kernels in TRTLLM backend support chunked attention
+            if attention_chunk_size and model_config.max_seq_len and model_config.max_seq_len < attention_chunk_size:
+                attention_chunk_size = None
 
         super().__init__(
             hidden_size=config.hidden_size,
@@ -1168,7 +1175,13 @@ class Llama4InputProcessor(InputProcessor):
 
 
 @register_auto_model("Llama4ForConditionalGeneration")
-@register_input_processor(Llama4InputProcessor, model_type="llama4")
+@register_input_processor(
+    Llama4InputProcessor,
+    model_type="llama4",
+    placeholder_metadata=MultimodalPlaceholderMetadata(
+        placeholder_map={"image": "<|image|>"},
+        placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
+    ))
 class Llama4ForConditionalGeneration(SpecDecOneEngineForCausalLM[Llama4Model,
                                                                  Llama4Config]):
 
