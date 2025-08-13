@@ -279,9 +279,7 @@ def parse_benchmark_results(input_folder, output_csv, config_file):
 
         # Find matching test case in table
         matched = False
-        print(f"log_config: {log_config}")
         for test_case in all_test_cases:
-            print(f"test_case: {test_case}")
             if match_log_to_test_case(log_config, test_case):
                 # Update performance data
                 test_case['TPS/System'] = total_throughput

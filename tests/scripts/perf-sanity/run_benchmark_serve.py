@@ -61,8 +61,38 @@ class BenchmarkRunner:
         os.environ['TQDM_MININTERVAL'] = '1000'
         os.environ['PRINT_ITER_LOG'] = 'false'
 
+        # Capture system information
+        self.node_name = self.get_node_name()
+        self.gpu_info = self.get_gpu_info()
+
         # Change to output directory
         os.chdir(self.output_folder)
+
+    def get_node_name(self) -> str:
+        """Get the current node name"""
+        try:
+            result = subprocess.run("hostname",
+                                    shell=True,
+                                    capture_output=True,
+                                    text=True,
+                                    check=True)
+            return result.stdout.strip()
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            return "unknown"
+
+    def get_gpu_info(self) -> str:
+        """Get GPU information from nvidia-smi"""
+        try:
+            result = subprocess.run("nvidia-smi",
+                                    shell=True,
+                                    capture_output=True,
+                                    text=True,
+                                    check=True)
+            return result.stdout
+        except subprocess.CalledProcessError as e:
+            return f"nvidia-smi failed with error code {e.returncode}\nError output: {e.stderr}"
+        except FileNotFoundError:
+            return "nvidia-smi not found"
 
     def parse_skip_pattern(self, skip_pattern: str) -> None:
         """Parse skip pattern like '2,4-1' to determine what to skip"""
@@ -390,21 +420,44 @@ class BenchmarkRunner:
             f"concurrency{concurrency}.iter{iteration}.log")
 
         try:
+            with open(benchmark_log_filename, 'w') as f:
+                f.write(f"GPU Info: {self.gpu_info}\n")
+
             # Start benchmark as subprocess
-            with open(benchmark_log_filename, 'w') as log_file:
+            with open(benchmark_log_filename, 'a') as log_file:
                 benchmark_process = subprocess.Popen(benchmark_cmd,
                                                      stdout=log_file,
                                                      stderr=subprocess.STDOUT)
 
-            # Monitor logs every 60 seconds
+            # Monitor logs every 60 seconds with timeout
             print(
                 f"Starting log monitoring for benchmark process (PID: {benchmark_process.pid})"
             )
+
+            start_time = time.time()
+            timeout_seconds = 5000
+
             while benchmark_process.poll() is None:  # Process is still running
                 time.sleep(60)  # Wait 60 seconds
 
+                # Check if benchmark has been running for more than 1 hour
+                elapsed_time = time.time() - start_time
+                if elapsed_time > timeout_seconds:
+                    print(
+                        f"Benchmark timeout after {elapsed_time:.0f} seconds (>{timeout_seconds} seconds)"
+                    )
+                    print("Killing benchmark process due to timeout")
+                    try:
+                        subprocess.run(f"kill -9 {benchmark_process.pid}",
+                                       shell=True,
+                                       check=False)
+                        benchmark_process.wait(timeout=10)
+                    except Exception as e:
+                        print(f"Warning: Error killing benchmark process: {e}")
+                    return False  # Signal to skip test case
+
                 print(
-                    f"Checking logs for RuntimeError... (benchmark PID: {benchmark_process.pid})"
+                    f"Checking logs for RuntimeError... (benchmark PID: {benchmark_process.pid}, elapsed: {elapsed_time:.0f}s)"
                 )
 
                 # Check server log for RuntimeError
@@ -607,6 +660,8 @@ class BenchmarkRunner:
 
     def run_benchmarks(self) -> None:
         """Main function to run all benchmarks from config file"""
+        script_start_time = time.time()
+
         print(f"Using config file: {self.config_file}")
         if self.select_pattern:
             print(f"Select pattern: {self.select_pattern}")
@@ -652,6 +707,20 @@ class BenchmarkRunner:
 
             self.run_test_case(test_case)
 
+        # Calculate and display total script runtime
+        script_total_time = time.time() - script_start_time
+        hours = int(script_total_time // 3600)
+        minutes = int((script_total_time % 3600) // 60)
+        seconds = int(script_total_time % 60)
+
+        print("=" * 80)
+        print("SCRIPT COMPLETION SUMMARY")
+        print("=" * 80)
+        print(
+            f"Total script runtime: {hours:02d}:{minutes:02d}:{seconds:02d} (HH:MM:SS)"
+        )
+        print(f"Total runtime in seconds: {script_total_time:.2f}")
+        print("=" * 80)
         print("All benchmarks completed!")
 
 
