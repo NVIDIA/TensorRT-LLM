@@ -64,6 +64,7 @@ class LMHead(Linear):
             mapping=mapping,
             tensor_parallel_mode=tensor_parallel_mode,
             gather_output=gather_output,
+            use_flashinfer_allreduce=False,
         )
 
         if tensor_parallel_mode == TensorParallelMode.ROW:
