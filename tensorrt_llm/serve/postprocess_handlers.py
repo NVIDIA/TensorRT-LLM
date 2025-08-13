@@ -68,7 +68,7 @@ def create_logprobs(token_ids: List[int],
         # returning multiple logprobs is not supported
         first_logprob = ChatCompletionLogProbsContent(
             token=token,
-            logprob=max(logprob, -9999.0),
+            logprob=max(logprob[token_id].logprob, -9999.0),
             bytes=list(token.encode("utf-8", errors="replace")))
         content.append(first_logprob)
     chat_logprobs = ChatCompletionLogProbs(content=content)
