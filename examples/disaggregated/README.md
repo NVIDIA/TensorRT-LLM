@@ -16,6 +16,9 @@ cache_transceiver_config:
   backend: <str>
   # KV cache buffer size. Set it ≥ the maximum ISL (Input Sequence Length) for best performance.
   max_tokens_in_buffer: <int>
+  # KV cache transfer timeout in milliseconds.
+  # For requests, if they do not send/receive the KV cache in time they are removed and cleaned up.
+  kv_transfer_timeout_ms: <int>
 ```
 
 The following is an example, consisting of the `ctx_extra-llm-api-config.yaml` and `gen_extra-llm-api-config.yaml` files needed in the sections below.
