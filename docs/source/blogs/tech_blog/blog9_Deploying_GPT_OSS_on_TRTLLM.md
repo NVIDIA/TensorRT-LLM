@@ -4,9 +4,9 @@ In the guide below, we will walk you through how to launch your own
 high-performance TensorRT-LLM server for **gpt-oss-120b** for inference.
 This guide covers both low-latency and max-throughput cases.
 
-The typical use case for **low-latency**, is when we try to maximize the number of tokens per second per user with a limited concurrency (4, 8 or 16 users).
+The typical use case for **low-latency** is when we try to maximize the number of tokens per second per user with a limited concurrency (4, 8 or 16 users).
 
-For **maximum throughput**, the goal is to maximize the amount of tokens produced per GPU per second. The former is an indication of how fast a system can produce tokens, the latter measures how many tokens a "chip" can generate per unit of time.
+For **maximum throughput**, the goal is to maximize the amount of tokens produced per GPU per second. The former indicates how fast a system can produce tokens per user; the latter measures how many tokens a chip can generate per unit of time.
 
 
 ## Prerequisites
@@ -17,14 +17,14 @@ For **maximum throughput**, the goal is to maximize the amount of tokens produce
 - Fast SSD storage for model weights
 - Access to the gpt-oss-120b model checkpoint
 
-We have a forthcoming guide for getting great performance on H100, however this guide focuses on the above GPUs.
+A forthcoming guide will cover H100 performance; this guide focuses on the GPUs listed above.
 
 
 ## Launching the TensorRT-LLM docker container
 
 The container image that you will use will be pulled from NVIDIA's NGC. This container is multi-platform and will run on both x64 and arm64 architectures: `nvcr.io/nvidia/tensorrt-llm/release:gpt-oss-dev`
 
-Run the follow docker command to start the TensorRT-LLM container in interactive mode:
+Run the following docker command to start the TensorRT-LLM container in interactive mode:
 
 ```bash
 docker run --rm --ipc=host -it \
@@ -46,15 +46,15 @@ This command:
 - Runs the container in interactive mode (`-it`)
 - Sets up shared memory and stack limits for optimal performance
 - Maps port 8000 from the container to your host
-- enables PDL for low-latency perf optimization
-- disables parallel weight loading
+- Enables PDL for low-latency perf optimization
+- Disables parallel weight loading
 
-Lastly the container mounts your user `.cache` directory to save the downloaded model checkpoints which are saved to `~/.cache/huggingface/hub/` by default. This prevents having to redownload the weights each time you rerun the container.
+Lastly, the container mounts your user `.cache` directory to save the downloaded model checkpoints which are saved to `~/.cache/huggingface/hub/` by default. This prevents having to redownload the weights each time you rerun the container.
 
 
 ## Running the TensorRT-LLM Server
 
-As pointed out in the introduction, this guide covers low-latency and max-throughput cases. Each requires a different configurations and commands to run. We will first cover the Low-Latency use-case, followed by the max throughput use-case.
+As pointed out in the introduction, this guide covers low-latency and max-throughput cases. Each requires different configurations and commands. We will first cover the Low-Latency use-case, followed by the max throughput use-case.
 
 ### Low-latency Use-Case
 
@@ -74,7 +74,7 @@ moe_config:
 EOF
 ```
 
-> Note: If you are using NVIDIA H200 GPUs it is highly recommended to set the `moe_config.backend` to TRITON to use the OpenAI Triton MoE kernel. See the section [(H200 Only) Using OpenAI Triton Kernels for MoE](#h200-only-using-openai-triton-kernels-for-moe) for more details.
+> Note: If you are using NVIDIA H200 GPUs, NVIDIA strongly recommends that you to set the `moe_config.backend` to TRITON to use the OpenAI Triton MoE kernel. See the section [(H200 Only) Using OpenAI Triton Kernels for MoE](#h200-only-using-openai-triton-kernels-for-moe) for more details.
 
 
 #### Launching TensorRT-LLM Serve

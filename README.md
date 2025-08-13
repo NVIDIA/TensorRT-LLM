@@ -43,7 +43,7 @@ TensorRT-LLM
 ✨ [➡️ link](./docs/source/blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.md)
 
 ## Latest News
-* [08/05] 🌟 TensorRT-LLM delivers Day-0 support for OpenAI's latest open-weights models, GPT-OSS-120b [➡️ link](https://huggingface.co/openai/gpt-oss-120b) and GPT-OSS-20b [➡️ link](https://huggingface.co/openai/gpt-oss-20b)
+* [08/05] 🌟 TensorRT-LLM delivers Day-0 support for OpenAI's latest open-weights models: GPT-OSS-120b [➡️ link](https://huggingface.co/openai/gpt-oss-120b) and GPT-OSS-20b [➡️ link](https://huggingface.co/openai/gpt-oss-20b)
 * [07/15] 🌟 TensorRT-LLM delivers Day-0 support for LG AI Research's latest model, EXAONE 4.0 [➡️ link](https://huggingface.co/LGAI-EXAONE/EXAONE-4.0-32B)
 * [06/17] Join NVIDIA and DeepInfra for a developer meetup on June 26 ✨ [➡️ link](https://events.nvidia.com/scaletheunscalablenextgenai)
 * [05/22] Blackwell Breaks the 1,000 TPS/User Barrier With Meta’s Llama 4 Maverick
