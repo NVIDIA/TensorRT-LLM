@@ -20,6 +20,7 @@
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/batch_manager/medusaBuffers.h"
 #include "tensorrt_llm/batch_manager/utils/logitsThread.h"
+#include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
 #include "tensorrt_llm/runtime/common.h"
@@ -339,8 +340,12 @@ void retrieveDraftLogits(TensorPtr& draftLogitsHost, std::shared_ptr<runtime::IT
 
     if (isLeaderInOrchMode)
     {
-        te::SpeculativeDecodingFastLogitsInfo fastLogitsInfo;
-        std::memcpy(&fastLogitsInfo, reqDraftLogits->data(), sizeof(fastLogitsInfo));
+        // reqDraftLogits contains metadata for fast-logits path; validate size.
+        auto constexpr fastLogitsInfoSize = sizeof(te::SpeculativeDecodingFastLogitsInfo);
+        TLLM_CHECK_WITH_INFO(reqDraftLogits->getSizeInBytes() >= fastLogitsInfoSize,
+            "Draft logits metadata buffer is too small to hold SpeculativeDecodingFastLogitsInfo.");
+        te::SpeculativeDecodingFastLogitsInfo fastLogitsInfo{};
+        std::memcpy(&fastLogitsInfo, reqDraftLogits->data(), fastLogitsInfoSize);
         utils::targetModelReceiveLogits(draftLogitsHost, fastLogitsInfo, modelConfig.getLogitsDtype());
 
         // Broadcast to other ranks if needed
@@ -355,6 +360,9 @@ void retrieveDraftLogits(TensorPtr& draftLogitsHost, std::shared_ptr<runtime::IT
     }
     else
     {
+        TLLM_CHECK_WITH_INFO(worldConfig.isTensorParallel(),
+            "Fast logits path requires tensor-parallel broadcast for non-leader ranks.");
+
         // Get logits from leader rank
         auto const& commSession = COMM_SESSION;
         int64_t dims[2];
