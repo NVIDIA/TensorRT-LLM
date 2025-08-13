@@ -3,8 +3,9 @@ from typing import Dict, List, Optional, Union
 import torch
 from torch import nn
 
+from ...distributed import allgather
 from ...model_config import ModelConfig
-from ...utils import Fp4QuantizedTensor, next_positive_power_of_2
+from ...utils import Fp4QuantizedTensor, ceil_div, next_positive_power_of_2
 from .interface import MoE, MoEWeightLoadingMode
 from .quantization import (DeepSeekFP8BlockScalesFusedMoEMethod,
                            NVFP4TRTLLMGenFusedMoEMethod,
@@ -205,6 +206,64 @@ class TRTLLMGenFusedMoE(MoE):
             topk_group = None
             routed_scaling_factor = None
 
+        run_post_quant_allgather = self.use_dp and self.parallel_size > 1
+
+        x_sf = None
+        token_selected_experts = None
+        token_final_scales = None
+        x_row = x.shape[0]
+        x_col = x.shape[1]
+        if run_post_quant_allgather:
+            # apply routing
+            token_selected_experts, token_final_scales = self.routing_method.apply(
+                router_logits)
+            token_final_scales = token_final_scales.to(torch.bfloat16)
+            assert token_final_scales.dtype == torch.bfloat16
+            assert token_selected_experts.dtype == torch.int32
+            # quantize inputs
+            if self.has_fp8_qdq or self.has_w4a8_mxfp4_fp8:
+                x, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
+                    x, self.fc31_input_dequant[0])
+                # Update x_row and x_col to the padded shape
+                x_row, x_col = x.shape[0], x.shape[1]
+            elif self.has_nvfp4:
+                if isinstance(x, Fp4QuantizedTensor):
+                    assert not x.is_sf_swizzled, "Fp4QuantizedTensor should not be swizzled before communication"
+                    x_row = x.shape[0]
+                    # note: we use uint8 to store 2 fp4 values
+                    x_col = x.shape[1] * 2
+                    x, x_sf = x.fp4_tensor, x.scaling_factor
+                else:
+                    x_row = x.shape[0]
+                    x_col = x.shape[1]
+                    x, x_sf = torch.ops.trtllm.fp4_quantize(
+                        x, self.fc31_input_scale, self.scaling_vector_size,
+                        False, False)
+            elif self.has_w4a8_mxfp4_mxfp8:
+                x, x_sf = torch.ops.trtllm.mxfp8_quantize(
+                    x, False, alignment=self.quant_method.weight_alignment)
+                # Update x_row and x_col to the padded shape
+                x_row, x_col = x.shape[0], x.shape[1]
+            else:
+                raise ValueError(
+                    f"unsupported quantization mode with run_post_quant_allgather: {self.quant_config.quant_mode}"
+                )
+
+            #allgather for attention DP
+            if x_sf is not None:
+                x_sf = x_sf.view(x_row, ceil_div(x_col,
+                                                 self.scaling_vector_size))
+                assert len(
+                    x_sf.shape
+                ) == 2, "The hidden states scaling factor should be 2D tensor before allgather"
+            x, x_sf, token_selected_experts, token_final_scales = allgather(
+                [x, x_sf, token_selected_experts, token_final_scales],
+                self.mapping,
+                dim=0,
+                sizes=None if use_dp_padding else all_rank_num_tokens)
+            if x_sf is not None:
+                x_sf = x_sf.flatten()
+
         # TODO: since routing kernel is integrated into moe_runner for fp8,
         #       here we just route the I/Os for moe_runner
         if self.has_deepseek_fp8_block_scales:
@@ -234,14 +293,18 @@ class TRTLLMGenFusedMoE(MoE):
         elif self.has_nvfp4:
             scale_factor_use_ue8m0 = False
             is_scale_factor_swizzled = False  # use linear layout here
-            hidden_states_fp4, hidden_states_scale_linear_fp4 = (
-                torch.ops.trtllm.fp4_quantize(
-                    x,
-                    self.fc31_input_scale,
-                    self.scaling_vector_size,
-                    scale_factor_use_ue8m0,
-                    is_scale_factor_swizzled,
-                ))
+
+            if not run_post_quant_allgather:
+                hidden_states_fp4, hidden_states_scale_linear_fp4 = (
+                    torch.ops.trtllm.fp4_quantize(
+                        x,
+                        self.fc31_input_scale,
+                        self.scaling_vector_size,
+                        scale_factor_use_ue8m0,
+                        is_scale_factor_swizzled,
+                    ))
+            else:
+                hidden_states_fp4, hidden_states_scale_linear_fp4 = x, x_sf
 
             outputs = torch.ops.trtllm.fp4_block_scale_moe_runner(
                 router_logits,
@@ -266,6 +329,8 @@ class TRTLLMGenFusedMoE(MoE):
                 routed_scaling_factor,
                 self.routing_method.routing_method_type,
                 do_finalize=do_finalize,
+                topk_ids=token_selected_experts,
+                topk_weights=token_final_scales,
             )
 
             if not do_finalize:
@@ -305,14 +370,19 @@ class TRTLLMGenFusedMoE(MoE):
                 self._get_tile_tokens_dim(x),
                 self.routing_method.routing_method_type,
                 0,  # act_type
+                token_final_scales,
+                token_selected_experts,
             )
             final_hidden_states = final_hidden_states[:, :self.
                                                       hidden_size].contiguous()
         elif self.has_w4a8_mxfp4_fp8:
             pad_size = self.w3_w1_weight.shape[-1] * 2 - x.shape[-1]
-            x = torch.nn.functional.pad(x, (0, pad_size))
-            x, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
-                x, self.fc31_input_gate_dequant[0])
+            if not run_post_quant_allgather:
+                x = torch.nn.functional.pad(x, (0, pad_size))
+                x, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
+                    x, self.fc31_input_gate_dequant[0])
+            else:
+                x = x
             intermediate_size_per_partition_padded = self.w3_w1_weight.shape[
                 -2] // 2
 
@@ -344,13 +414,19 @@ class TRTLLMGenFusedMoE(MoE):
                 self._get_tile_tokens_dim(x),
                 self.routing_method.routing_method_type,
                 0,  # act_type
+                token_final_scales,
+                token_selected_experts,
             )
             final_hidden_states = final_hidden_states[:, :self.
                                                       hidden_size].contiguous()
         elif self.has_w4a8_mxfp4_mxfp8:
-            # TRTLLM-Gen uses linear SF layout for the mxfp8 input.
-            mxfp8_x, sf = torch.ops.trtllm.mxfp8_quantize(
-                x, False, alignment=self.quant_method.weight_alignment)
+            if not run_post_quant_allgather:
+                # TRTLLM-Gen uses linear SF layout for the mxfp8 input.
+                mxfp8_x, sf = torch.ops.trtllm.mxfp8_quantize(
+                    x, False, alignment=self.quant_method.weight_alignment)
+            else:
+                mxfp8_x, sf = x, x_sf
+
             intermediate_size_per_partition_padded = self.w3_w1_weight.shape[
                 -2] // 2
 
@@ -381,6 +457,8 @@ class TRTLLMGenFusedMoE(MoE):
                 self._get_tile_tokens_dim(x),
                 self.routing_method.routing_method_type,
                 0,  # act_type
+                token_final_scales,
+                token_selected_experts,
             )
         else:
             raise NotImplementedError(
