@@ -99,3 +99,5 @@ l0_a100:
   - triton_server/test_triton.py::test_eagle[eagle]
   - triton_server/test_triton.py::test_llava_onevision[llava_onevision]
   - triton_server/test_triton.py::test_qwen2_vl[qwen2_vl]
+  - triton_server/test_triton.py::test_mistral_small_3_1[mistral_small_3_1]
+  - triton_server/test_triton_llm.py::test_mistral_small_3_1_24b_pixtral[TYPE_FP16-TYPE_BF16-False-1---False-True-False-0-1-disableDecoupleMode-inflight_fused_batching-disableTrtOverlap--0.7-max_utilization---1-1-1-False-ensemble]
