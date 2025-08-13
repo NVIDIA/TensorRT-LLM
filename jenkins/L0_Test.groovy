@@ -724,8 +724,10 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
         if(!GlobalState.uploadResultStageNames.contains(stageName)) {
             GlobalState.uploadResultStageNames.add(stageName)
         } else {
-            catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
-                error "Upload test results for ${stageName} failed because it has already been uploaded."
+            stage('Upload Test Results') {
+                catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                    error "Upload test results for ${stageName} failed because it has already been uploaded."
+                }
             }
         }
         if (stageIsInterrupted) {
