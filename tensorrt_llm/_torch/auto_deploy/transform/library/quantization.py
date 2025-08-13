@@ -238,7 +238,7 @@ class Quantization(BaseTransform):
 
 @TransformRegistry.register("quantize_annotate")
 class QuantizationAnnotate(BaseTransform):
-    """Early annotation pass: annotate nodes for quantization without replacing them."""
+    """Go over the nodes in graph, find linear/BMM nodes and just annotate for quantization"""
 
     def _apply(
         self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory
@@ -268,7 +268,7 @@ class QuantizationAnnotate(BaseTransform):
 
             # Annotate linear operations
             if is_linear_op(n, include_quantization=False):
-                quant_group = None  # Could be set based on sharding requirements
+                quant_group = None  # can be set for sharding requirements
                 annotation = QuantAnnotation(
                     quant_scheme=quant_algo,
                     backend=quant_backend,
@@ -280,10 +280,11 @@ class QuantizationAnnotate(BaseTransform):
 
             # Annotate BMM operations  
             elif is_bmm_op(n):
+                quant_group = None  # can be set for sharding requirements
                 annotation = QuantAnnotation(
                     quant_scheme=quant_algo,
                     backend=quant_backend,
-                    quant_group=None,
+                    quant_group=quant_group,
                     metadata={"op_type": "bmm", "excluded_patterns": excluded_patterns}
                 )
                 annotate_node(n, annotation)
@@ -292,7 +293,7 @@ class QuantizationAnnotate(BaseTransform):
         info = TransformInfo(
             skipped=False, 
             num_matches=annotated_count, 
-            is_clean=True,  # No graph structure changes
+            is_clean=True,
             has_valid_shapes=True
         )
 
@@ -301,7 +302,7 @@ class QuantizationAnnotate(BaseTransform):
 
 @TransformRegistry.register("quantize_late_fusion")
 class QuantizationLateFusion(BaseTransform):
-    """Late fusion pass: convert quantization annotations to actual quantized operations."""
+    """convert quantization annotations of linear/BMM nodes to actual quantized operations."""
 
     def _apply(
         self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory
@@ -330,8 +331,7 @@ class QuantizationLateFusion(BaseTransform):
             backend = annotation.backend
             op_type = annotation.metadata.get("op_type", "unknown")
             
-            # Skip if backend doesn't match current execution context
-            # (This allows for configurable backends)
+            # if backend doesn't match current execution context
             current_backend = factory.get_quant_config().get("backend", "real_quant")
             if backend != current_backend:
                 continue
@@ -364,7 +364,7 @@ class QuantizationLateFusion(BaseTransform):
         info = TransformInfo(
             skipped=False, 
             num_matches=num_matches, 
-            is_clean=False,  # Graph structure changed
+            is_clean=False,
             has_valid_shapes=True
         )
 

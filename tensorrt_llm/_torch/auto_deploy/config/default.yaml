@@ -23,7 +23,6 @@ transforms:
     stage: post_export
     backend: real_quant
     requires_clean_graph: false
-  # old quantization transform - for backward
   quantize:
     stage: pattern_matcher
     enabled: false

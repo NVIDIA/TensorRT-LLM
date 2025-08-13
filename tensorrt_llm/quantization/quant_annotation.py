@@ -3,13 +3,12 @@ from typing import Optional, Dict, Any
 
 @dataclass
 class QuantAnnotation:
-    """Annotation for quantization metadata.
-    
-    Attributes:
-        quant_scheme: Quantization scheme (e.g., 'int8', 'fp8')
-        backend: Quantization backend implementation
-        quant_group: Group ID for shard-aware quantization
-        metadata: Additional quantization parameters
+    """
+    metadata for annotation
+    quant_scheme: Quantization scheme (e.g., 'int8', 'fp8')
+    backend: Quantization backend implementation
+    quant_group: Group ID for shard-aware quantization
+    metadata: Additional quantization parameters
     """
     quant_scheme: str
     backend: str
