@@ -138,11 +138,11 @@ void dispatchMoeGemmSelectBiasTmaWarpSpecialized(TmaWarpSpecializedGroupedGemmIn
     }
 }
 
-template <typename ClusterTileShape, typename ClusterShape, typename DataType, typename WeightType>
+template <typename CtaShape, typename ClusterShape, typename DataType, typename WeightType>
 constexpr bool are_tile_shapes_supported_sm100()
 {
     using namespace cute;
-    using CtaShape = decltype(shape_div(ClusterTileShape{}, ClusterShape{}));
+
     // This is the epilogue shape. The MMA shape will be twice this for 2SM
     constexpr auto TileM = size<0>(CtaShape{});
     constexpr auto TileN = size<1>(CtaShape{});
@@ -353,6 +353,7 @@ void dispatchMoeGemmSelectTileShapeTmaWarpSpecialized(TmaWarpSpecializedGroupedG
         {
             switch (gemm_config.tile_config_sm100)
             {
+                SHAPE_CASE(100, 64, 32, 128)
                 SHAPE_CASE(100, 64, 64, 128)
                 SHAPE_CASE(100, 64, 128, 128)
                 SHAPE_CASE(100, 64, 256, 128)
@@ -363,13 +364,8 @@ void dispatchMoeGemmSelectTileShapeTmaWarpSpecialized(TmaWarpSpecializedGroupedG
                 SHAPE_CASE(100, 128, 128, 128)
                 SHAPE_CASE(100, 128, 256, 128)
 
-                SHAPE_CASE(100, 256, 64, 128)
-                SHAPE_CASE(100, 256, 128, 128)
-                SHAPE_CASE(100, 256, 256, 128)
-
                 // SHAPE_CASE(100, 128, 128, 64)
                 // SHAPE_CASE(100, 128, 256, 64)
-                // SHAPE_CASE(100, 256, 256, 64)
                 DEFAULT_CASE(100)
             }
         }

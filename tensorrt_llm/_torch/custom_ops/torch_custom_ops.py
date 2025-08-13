@@ -62,6 +62,7 @@ class MoERunner(TunableRunner):
         use_w4_group_scaling: bool,
         use_mxfp8_act_scaling: bool,
         min_latency_mode: bool,
+        use_fused_finalize: bool,
     ):
         self.x_dtype = x_dtype
         self.weight_dtype = weight_dtype
@@ -79,6 +80,8 @@ class MoERunner(TunableRunner):
         self.use_w4_group_scaling = use_w4_group_scaling
         self.use_mxfp8_act_scaling = use_mxfp8_act_scaling
         self.min_latency_mode = min_latency_mode
+        self.use_fused_finalize = use_fused_finalize
+
         instance_key = (x_dtype, weight_dtype, output_dtype,
                         use_deepseek_fp8_block_scale, use_w4_group_scaling,
                         use_mxfp8_act_scaling)
@@ -88,7 +91,7 @@ class MoERunner(TunableRunner):
                 instance_key] = torch.classes.trtllm.FusedMoeRunner(
                     x_dtype, weight_dtype, output_dtype,
                     use_deepseek_fp8_block_scale, use_w4_group_scaling,
-                    use_mxfp8_act_scaling)
+                    use_mxfp8_act_scaling, use_fused_finalize)
         self.fused_moe_runner = MoERunner.runner_dict[instance_key]
 
     def get_valid_tactics(
@@ -163,6 +166,7 @@ def fused_moe(
     use_w4_group_scaling: bool = False,
     use_mxfp8_act_scaling: bool = False,
     min_latency_mode: bool = False,
+    use_fused_finalize: bool = True,
     tune_max_num_tokens: int = 8192,
     tuner_num_tokens: Optional[int] = None,
     tuner_top_k: Optional[int] = None,
@@ -199,6 +203,7 @@ def fused_moe(
         use_w4_group_scaling=use_w4_group_scaling,
         use_mxfp8_act_scaling=use_mxfp8_act_scaling,
         min_latency_mode=min_latency_mode,
+        use_fused_finalize=use_fused_finalize,
     )
 
     _, gemm_tactic_1 = tuner.choose_one(
@@ -279,6 +284,7 @@ def _(
     use_w4_group_scaling: bool = False,
     use_mxfp8_act_scaling: bool = False,
     min_latency_mode: bool = False,
+    use_fused_finalize: bool = True,
     tune_max_num_tokens: int = 8192,
 ):
     seq_len = input.shape[0]

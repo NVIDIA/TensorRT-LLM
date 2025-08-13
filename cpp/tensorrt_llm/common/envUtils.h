@@ -86,6 +86,9 @@ bool getEnvForceDeterministic();
 // Force deterministic behavior for MoE plugin.
 bool getEnvForceDeterministicMOE();
 
+// Disable finalize fusion in MoE plugin
+bool getEnvMOEDisableFinalizeFusion();
+
 // Force deterministic behavior for attention plugin.
 bool getEnvForceDeterministicAttention();
 

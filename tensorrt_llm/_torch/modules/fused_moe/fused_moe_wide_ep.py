@@ -6,12 +6,13 @@ import torch
 
 from tensorrt_llm._mnnvl_utils import MnnvlMemory, MnnvlMoe, MoEAlltoallInfo
 from tensorrt_llm._utils import logger
+from tensorrt_llm.functional import AllReduceStrategy
 from tensorrt_llm.mapping import Mapping
 
-from ...distributed import allgather, reducescatter
+from ...distributed import AllReduce, allgather, reducescatter
 from ...expert_statistic import ExpertStatistic
 from ...model_config import ModelConfig
-from ...utils import EventType, Fp4QuantizedTensor
+from ...utils import AuxStreamType, EventType, Fp4QuantizedTensor
 from .deep_ep_utils import buffer_pool, deep_ep_installed
 from .interface import MoE
 from .moe_load_balancer import get_moe_load_balancer
@@ -43,7 +44,7 @@ class WideEPMoE(MoE):
         top_k (int): Number of top experts to select for each input token.
         hidden_size (int): Size of the hidden state.
         intermediate_size (int): Size of the intermediate state.
-        aux_stream (Optional[torch.cuda.Stream]): Auxiliary CUDA stream to overlap chunks.
+        aux_stream_dict (Optional[Dict[AuxStreamType, torch.cuda.Stream]]): Auxiliary CUDA streams for overlapping.
         dtype (Optional[torch.dtype]): Data type for the weights.
         reduce_results (bool): Whether to reduce the results across devices.
         model_config (ModelConfig): Configuration object for the model.
@@ -64,7 +65,8 @@ class WideEPMoE(MoE):
         dtype: Optional[torch.dtype] = None,
         reduce_results: bool = False,
         model_config: ModelConfig = ModelConfig(),
-        aux_stream: Optional[torch.cuda.Stream] = None,
+        aux_stream_dict: Optional[Dict[AuxStreamType,
+                                       torch.cuda.Stream]] = None,
         weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.
         VANILLA,
         apply_router_weight_on_input: bool = False,
@@ -106,7 +108,11 @@ class WideEPMoE(MoE):
             top_k = self.routing_method.experts_per_token
             self.expert_size_per_partition = moe_load_balancer_config.num_local_slots
             self.layer_load_balancer = moe_load_balancer.add_layer(
-                self.num_experts, top_k, self.expert_size_per_partition)
+                self.num_experts,
+                top_k,
+                self.expert_size_per_partition,
+                aux_stream=None if aux_stream_dict is None else
+                aux_stream_dict[AuxStreamType.MoeBalancer])
             self.repeat_count = self.layer_load_balancer.get_repeat_count()
             loaded_initial_global_assignments = moe_load_balancer_config.get_layer_initial_global_assignments(
                 self.layer_idx)
@@ -130,6 +136,12 @@ class WideEPMoE(MoE):
             assert num_experts % self.ep_size == 0
             self.expert_size_per_partition = num_experts // self.ep_size
             self.num_slots = num_experts
+        if self.layer_load_balancer and not self.layer_load_balancer.is_static_routing(
+        ):
+            self.allreduce = AllReduce(mapping=model_config.mapping,
+                                       strategy=AllReduceStrategy.NCCL)
+        else:
+            self.allreduce = None
 
         self.slot_start = self.ep_rank * self.expert_size_per_partition
         self.slot_end = self.slot_start + self.expert_size_per_partition
@@ -138,14 +150,15 @@ class WideEPMoE(MoE):
         assert len(
             self.initial_local_expert_ids) == self.expert_size_per_partition
 
-        max_num_tokens = model_config.max_num_tokens
         # The maximum number of tokens in MoE are multiplied by DP size when attention DP is enabled
-        max_num_tokens *= model_config.mapping.world_size
-        self.moe_max_num_tokens = model_config.moe_max_num_tokens if model_config.moe_max_num_tokens is not None else max_num_tokens
+        moe_max_num_tokens = model_config.max_num_tokens * model_config.mapping.dp_size
+        self.moe_max_num_tokens = model_config.moe_max_num_tokens or moe_max_num_tokens
         # The auxiliary CUDA stream and CUDA events are only used when MoE chunking is applied
-        if self.moe_max_num_tokens < max_num_tokens:
-            self.aux_stream = aux_stream if aux_stream is not None else torch.cuda.Stream(
-            )
+        if self.moe_max_num_tokens < moe_max_num_tokens:
+            self.aux_stream = aux_stream_dict[
+                AuxStreamType.
+                MoeChunkingOverlap] if aux_stream_dict is not None else torch.cuda.Stream(
+                )
             self.event_dict = {
                 key: torch.cuda.Event()
                 for key in [EventType.Main, EventType.MoeChunkingOverlap]
@@ -371,9 +384,8 @@ class WideEPMoE(MoE):
 
         is_first_call, is_last_call = repeating_info
 
-        if self.layer_load_balancer and not self.layer_load_balancer.is_static_routing(
-        ) and is_first_call:
-            self.layer_load_balancer.wait_for_gpu_stage()
+        if self.layer_load_balancer and is_first_call:
+            self.layer_load_balancer.start_wait_gpu_stage()
 
         use_deepseek_fp8_block_scale = False
         use_w4_group_scaling = False
@@ -401,39 +413,31 @@ class WideEPMoE(MoE):
             else:
                 token_final_scales = None
 
-        if self.layer_load_balancer and not self.layer_load_balancer.is_static_routing(
-        ) and is_first_call:
-            self.layer_load_balancer.maybe_cudagraph_done_wait()
-
-        use_allgather = not use_all_to_all
-
-        loadbalancer_local_statistic_info = None
-        gathered_loadbalancer_local_statistic_info = None
-        token_selected_experts_for_statistic = None
-        if self.layer_load_balancer is None:
-            token_selected_slots = token_selected_experts
-        else:
-            if not self.layer_load_balancer.is_static_routing(
-            ) and use_all_to_all:
-                self.layer_load_balancer.local_statistic(
+        if self.layer_load_balancer:
+            if is_first_call:
+                self.layer_load_balancer.done_wait_gpu_stage()
+            if use_all_to_all and self.alltoall_method_type == AlltoallMethodType.MNNVL:
+                self.layer_load_balancer.update_local_statistic(
                     token_selected_experts,
                     is_first_stage=is_first_call,
                     is_last_stage=is_last_call)
+            else:
+                self.layer_load_balancer.update_statistic_with_local_ids(
+                    token_selected_experts,
+                    is_first_stage=is_first_call,
+                    is_last_stage=is_last_call,
+                    allreduce=self.allreduce)
             token_selected_slots = self.layer_load_balancer.route(
                 token_selected_experts, self.use_dp)
-            if not self.layer_load_balancer.is_static_routing():
-                # split into two part to get possible overlap with load balancer routing
-                if use_all_to_all:
-                    if is_last_call:
-                        loadbalancer_local_statistic_info = self.layer_load_balancer.get_local_statistic_tensor(
-                        )
-                else:
-                    token_selected_experts_for_statistic = token_selected_experts
+        else:
+            token_selected_slots = token_selected_experts
 
         # If load balancer is disabled, the statistics are collected from expert IDs.
         # If load balancer is enabled, the statistics are collected from expert slot IDs.
         ExpertStatistic.set_layer(self.layer_idx)
         ExpertStatistic.maybe_add_info(self.num_slots, token_selected_slots)
+
+        use_allgather = not use_all_to_all
 
         # If alltoall is disabled, we need also disable use_postquant_alltoall
         use_postquant_alltoall = self.use_postquant_alltoall and use_all_to_all
@@ -456,6 +460,11 @@ class WideEPMoE(MoE):
                     self.dummy_allreduce()
                 token_count = x.shape[0]
                 alltoall_info = None
+                if is_last_call:
+                    loadbalancer_local_statistic_info = self.layer_load_balancer.get_local_statistic_tensor(
+                    )
+                else:
+                    loadbalancer_local_statistic_info = None
                 x, token_selected_slots, token_final_scales, gathered_loadbalancer_local_statistic_info, alltoall_info = \
                     self.alltoall_prepare_maybe_dispatch(all_rank_max_num_tokens,
                                                          x,
@@ -463,6 +472,11 @@ class WideEPMoE(MoE):
                                                          token_final_scales,
                                                          use_postquant_alltoall,
                                                          loadbalancer_local_statistic_info)
+                if gathered_loadbalancer_local_statistic_info is not None:
+                    gathered_loadbalancer_local_statistic_info = gathered_loadbalancer_local_statistic_info.view(
+                        (self.mapping.moe_ep_size, self.num_experts))
+                    self.layer_load_balancer.update_statistic_with_gathered_statistic(
+                        gathered_loadbalancer_local_statistic_info)
             elif self.alltoall_method_type == AlltoallMethodType.DeepEP:
                 if not use_postquant_alltoall:
                     x, recv_topk_idx, token_final_scales, num_recv_tokens_per_expert_list, deep_ep_handle = \
@@ -470,10 +484,6 @@ class WideEPMoE(MoE):
                         self.expert_size_per_partition * self.mapping.moe_ep_rank)
                     padded, x, _, token_selected_slots, token_final_scales = self.pad_empty_recv_tensors(
                         x, None, recv_topk_idx, token_final_scales)
-                if is_last_call and self.layer_load_balancer and not self.layer_load_balancer.is_static_routing(
-                ):
-                    gathered_loadbalancer_local_statistic_info = allgather(
-                        loadbalancer_local_statistic_info, self.mapping, dim=0)
             elif self.alltoall_method_type == AlltoallMethodType.DeepEPLowLatency:
                 if not use_postquant_alltoall:
                     deep_ep_topk_idx = token_selected_slots
@@ -503,10 +513,6 @@ class WideEPMoE(MoE):
                         x.shape[0], 1)
                     token_final_scales = torch.ones_like(
                         token_selected_slots, dtype=token_final_scales.dtype)
-                if is_last_call and self.layer_load_balancer and not self.layer_load_balancer.is_static_routing(
-                ):
-                    gathered_loadbalancer_local_statistic_info = allgather(
-                        loadbalancer_local_statistic_info, self.mapping, dim=0)
 
         x_sf = None
         x_row = x.shape[0]
@@ -533,7 +539,7 @@ class WideEPMoE(MoE):
                             self.fc31_input_scale,
                             self.scaling_vector_size,
                             sfUseUE8M0=False,
-                            swizzedLayout=False)
+                            isSfSwizzledLayout=False)
                     x_sf = x_sf.view((x_row, -1))
 
             elif self.has_deepseek_fp8_block_scales:
@@ -550,32 +556,17 @@ class WideEPMoE(MoE):
             # using allgather case.
             if self.enable_dummy_allreduce:
                 self.dummy_allreduce()
-            x, x_sf, token_selected_slots, token_final_scales, gathered_token_selected_experts_for_statistic = allgather(
+            x, x_sf, token_selected_slots, token_final_scales = allgather(
                 [
                     x,
                     x_sf,
                     token_selected_slots,
                     token_final_scales,
-                    token_selected_experts_for_statistic,
                 ],
                 self.mapping,
                 dim=0,
                 sizes=None if use_dp_padding else all_rank_num_tokens)
             x_row = x.shape[0]
-
-        if self.layer_load_balancer and not self.layer_load_balancer.is_static_routing(
-        ):
-            if use_all_to_all:
-                if is_last_call:
-                    gathered_loadbalancer_local_statistic_info = gathered_loadbalancer_local_statistic_info.view(
-                        (self.mapping.moe_ep_size, self.num_experts))
-                    self.layer_load_balancer.update_statistic(
-                        gathered_loadbalancer_local_statistic_info)
-            else:
-                self.layer_load_balancer.statistic(
-                    gathered_token_selected_experts_for_statistic,
-                    is_first_stage=is_first_call,
-                    is_last_stage=is_last_call)
 
         ep_size = self.ep_size
         ep_rank = self.ep_rank
@@ -670,9 +661,8 @@ class WideEPMoE(MoE):
             tuner_top_k=tuner_top_k,
         )
 
-        if self.layer_load_balancer and not self.layer_load_balancer.is_static_routing(
-        ) and is_last_call:
-            self.layer_load_balancer.set_cpu_stage()
+        if self.layer_load_balancer and is_last_call:
+            self.layer_load_balancer.start_set_cpu_stage()
 
         # Only in cutlass_min_latency_mode, the output is a list of tensors.
         # Otherwise, the output should be unpacked as a single tensor.
@@ -702,9 +692,8 @@ class WideEPMoE(MoE):
                     f"Not available alltoall method type: {self.alltoall_method_type!r}"
                 )
 
-        if self.layer_load_balancer and not self.layer_load_balancer.is_static_routing(
-        ) and is_last_call:
-            self.layer_load_balancer.maybe_cudagraph_done_set_cpu_stage()
+        if self.layer_load_balancer and is_last_call:
+            self.layer_load_balancer.done_set_cpu_stage()
 
         return final_hidden_states
 
