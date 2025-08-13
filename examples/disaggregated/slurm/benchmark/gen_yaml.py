@@ -247,9 +247,9 @@ def gen_config_file(config_path: str,
     if num_ctx_servers > 0:
         config['context_servers']['urls'] = ctx_urls
 
-    gen_urls, _ = generate_urls("gen", num_gen_servers, gen_tp_size, gen_pp_size,
-                                max_tasks_per_node, nodes, task_nodes,
-                                node_ports, task_nodes_offset)
+    gen_urls, _ = generate_urls("gen", num_gen_servers, gen_tp_size,
+                                gen_pp_size, max_tasks_per_node, nodes,
+                                task_nodes, node_ports, task_nodes_offset)
     config['generation_servers']['urls'] = gen_urls
 
     # set the hostname to the first node
