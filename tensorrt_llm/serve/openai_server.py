@@ -342,10 +342,10 @@ class OpenAIServer:
             if use_harmony:
                 encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
                 harmony_stop_token_ids = encoding.stop_tokens_for_assistant_actions()
-                if stop_token_ids := sampling_params.stop_token_ids:
-                    stop_token_ids += harmony_stop_token_ids
+                if sampling_params.stop_token_ids:
+                    sampling_params.stop_token_ids += harmony_stop_token_ids
                 else:
-                    stop_token_ids = harmony_stop_token_ids
+                    sampling_params.stop_token_ids = harmony_stop_token_ids
 
             disaggregated_params = to_llm_disaggregated_params(request.disaggregated_params)
             promise = self.llm.generate_async(
