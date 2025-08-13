@@ -45,8 +45,6 @@ run_benchmark_and_parse() {
     docker run --rm --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 \
         --gpus all \
         -v /home/scratch.trt_llm_data:/home/scratch.trt_llm_data:ro \
-        -v /home/scratch.svc_compute_arch:/home/scratch.svc_compute_arch:ro \
-        -v /home/scratch.omniml_data_2:/home/scratch.omniml_data_2:ro \
         -v $output_dir:$output_dir:rw \
         -v $bench_dir:$bench_dir:ro \
         -w `pwd`  \

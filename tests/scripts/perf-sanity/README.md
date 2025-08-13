@@ -1,6 +1,6 @@
-# TRT-LLM Benchmark System
+# TensorRT-LLM Benchmark Test System
 
-A benchmarking system for TensorRT-LLM serving performance evaluation with configuration-driven test cases and CSV report generation.
+Benchmarking scripts for TensorRT-LLM serving performance tests with configuration-driven test cases and CSV report generation.
 
 ## Overview
 
@@ -8,9 +8,6 @@ A benchmarking system for TensorRT-LLM serving performance evaluation with confi
 - Manage test cases through YAML configuration files
 - Generate comprehensive CSV reports with complete test case coverage
 - Support selective execution of specific test cases
-- Run efficiently on multi-GPU nodes
-- **NEW**: Enhanced results parsing with complete test case matrix generation
-- **NEW**: Automatic handling of missing test cases and skipped log files
 
 ## Scripts Overview
 

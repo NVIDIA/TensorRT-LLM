@@ -44,9 +44,9 @@ class BenchmarkRunner:
         # Model path mapping
         self.model_paths = {
             "70B-FP4":
-            "/home/scratch.omniml_data_2/HF_model_hub/Llama-3.3-70B-Instruct-FP4",
+            "/home/scratch.trt_llm_data/llm-models/llama-3.3-models/Llama-3.3-70B-Instruct-FP4",
             "70B-FP8":
-            "/home/scratch.omniml_data_2/HF_model_hub/Llama-3.3-70B-Instruct-FP8",
+            "/home/scratch.trt_llm_data/llm-models/llama-3.3-models/Llama-3.3-70B-Instruct-FP8",
             "Scout-FP4":
             "/home/scratch.trt_llm_data/llm-models/llama4-models/Llama-4-Scout-17B-16E-Instruct-FP4",
             "Scout-FP8":
@@ -308,6 +308,10 @@ class BenchmarkRunner:
             "  enable_block_reuse: false",
         ]
 
+        # https://nvbugs/5437106: WAR to avoid illegal memory access in Scout
+        if "Scout" in test_case['model']:
+            config_lines.append("use_torch_sampler: true")
+
         # Add moe_config if moe_backend is specified
         if test_case['moe_backend']:
             config_lines.append("moe_config:")
@@ -435,7 +439,7 @@ class BenchmarkRunner:
             )
 
             start_time = time.time()
-            timeout_seconds = 5000
+            timeout_seconds = 3600  # 1 hour timeout
 
             while benchmark_process.poll() is None:  # Process is still running
                 time.sleep(60)  # Wait 60 seconds
@@ -603,6 +607,11 @@ class BenchmarkRunner:
 
         try:
             with open(server_log_filename, 'w') as log_file:
+                log_file.write(f"extra-llm-api-config.yml:\n")
+                log_file.write(config_content)
+                log_file.write("\n")
+
+            with open(server_log_filename, 'a') as log_file:
                 server_process = subprocess.Popen(serve_cmd,
                                                   stdout=log_file,
                                                   stderr=subprocess.STDOUT)
