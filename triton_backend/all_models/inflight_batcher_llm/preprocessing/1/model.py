@@ -335,10 +335,9 @@ class TritonPythonModel:
                         image_sizes=image_sizes,
                     )
                     pixtral_input_id_tensor = processed_tensors.pop("INPUT_IDS")
-                    request_input_len = np.array([[
-                        len(input_ids_for_batch)
-                        for input_ids_for_batch in pixtral_input_id_tensor
-                    ]])
+                    request_input_len = np.array(
+                        [[len(input_ids_for_batch)]
+                         for input_ids_for_batch in pixtral_input_id_tensor])
                 else:
                     raise ValueError(
                         "Unsupported model type for IMAGE_BYTES or IMAGE_URL inputs"
