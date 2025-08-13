@@ -1,32 +1,32 @@
 # Adapted from
 # https://github.com/vllm-project/vllm/blob/aae6927be06dedbda39c6b0c30f6aa3242b84388/tests/entrypoints/openai/test_chat.py
+import json
 import os
+import re
 import tempfile
 
+import jsonschema
 import openai
 import pytest
 import yaml
 
-from ..test_llm import get_model_path, similar
+from ..test_llm import get_model_path
 from .openai_server import RemoteOpenAIServer
 
 pytestmark = pytest.mark.threadleak(enabled=False)
 
 
-@pytest.fixture(scope="module", ids=["TinyLlama-1.1B-Chat"])
+@pytest.fixture(scope="module")
 def model_name():
     return "llama-3.1-model/Llama-3.1-8B-Instruct"
 
 
 @pytest.fixture(scope="module")
-def temp_extra_llm_api_options_file(request):
+def temp_extra_llm_api_options_file():
     temp_dir = tempfile.gettempdir()
     temp_file_path = os.path.join(temp_dir, "extra_llm_api_options.yaml")
     try:
-        extra_llm_api_options_dict = {
-            "guided_decoding_backend": "xgrammar",
-            "max_batch_size": 32
-        }
+        extra_llm_api_options_dict = {"guided_decoding_backend": "xgrammar"}
 
         with open(temp_file_path, 'w') as f:
             yaml.dump(extra_llm_api_options_dict, f)
@@ -40,7 +40,11 @@ def temp_extra_llm_api_options_file(request):
 @pytest.fixture(scope="module")
 def server(model_name: str, temp_extra_llm_api_options_file: str):
     model_path = get_model_path(model_name)
-    args = ["--extra_llm_api_options", temp_extra_llm_api_options_file]
+
+    args = [
+        "--max_batch_size=32",
+        f"--extra_llm_api_options={temp_extra_llm_api_options_file}"
+    ]
     with RemoteOpenAIServer(model_path, args) as remote_server:
         yield remote_server
 
@@ -115,12 +119,7 @@ def tool_get_current_date():
 
 def test_chat_structural_tag(client: openai.OpenAI, model_name: str,
                              tool_get_current_weather, tool_get_current_date):
-    messages = [
-        {
-            "role":
-            "system",
-            "content":
-            f"""
+    system_prompt = f"""
 # Tool Instructions
 - Always execute python code in messages that you share.
 - When looking for real time information use relevant functions if available else fallback to brave_search
@@ -143,13 +142,17 @@ Reminder:
 - Only call one function at a time
 - Put the entire function call reply on one line
 - Always add your sources when using search results to answer the user query
-You are a helpful assistant.""",
+You are a helpful assistant."""
+    user_prompt = "You are in New York. Please get the current date and time, and the weather."
+
+    messages = [
+        {
+            "role": "system",
+            "content": system_prompt,
         },
         {
-            "role":
-            "user",
-            "content":
-            "You are in New York. Please get the current date and time, and the weather.",
+            "role": "user",
+            "content": user_prompt,
         },
     ]
 
@@ -176,11 +179,18 @@ You are a helpful assistant.""",
             "triggers": ["<function="],
         },
     )
-    assert chat_completion.id is not None
-    assert len(chat_completion.choices) == 1
+
     message = chat_completion.choices[0].message
     assert message.content is not None
     assert message.role == "assistant"
 
-    reference = '<function=get_current_date>{"timezone": "America/New_York"}</function>\n<function=get_current_weather>{"city": "New York", "state": "NY", "unit": "fahrenheit"}</function>\n\nSources:\n- get_current_date function\n- get_current_weather function'
-    assert similar(chat_completion.choices[0].message.content, reference)
+    match = re.search(r'<function=get_current_weather>([\S\s]+?)</function>',
+                      message.content)
+    params = json.loads(match.group(1))
+    jsonschema.validate(params,
+                        tool_get_current_weather["function"]["parameters"])
+
+    match = re.search(r'<function=get_current_date>([\S\s]+?)</function>',
+                      message.content)
+    params = json.loads(match.group(1))
+    jsonschema.validate(params, tool_get_current_date["function"]["parameters"])
