@@ -13,7 +13,13 @@ from ...shim.interface import CachedSequenceInterface
 from ...utils.logger import ad_logger
 from ...utils.node_utils import is_op
 from ...utils.pattern_matcher import ADPatternMatcherPass, register_ad_pattern
-from ..interface import BaseTransform, TransformConfig, TransformInfo, TransformRegistry
+from ..interface import (
+    BaseTransform,
+    SharedConfig,
+    TransformConfig,
+    TransformInfo,
+    TransformRegistry,
+)
 
 
 def _apply_pattern(
@@ -325,7 +331,11 @@ class MatchRepeatKV(BaseTransform):
     """
 
     def _apply(
-        self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory
+        self,
+        gm: GraphModule,
+        cm: CachedSequenceInterface,
+        factory: ModelFactory,
+        shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
         def register_repeat_kv(patterns: ADPatternMatcherPass):
             dummy_args = [
@@ -366,7 +376,11 @@ class MatchEagerAttention(BaseTransform):
     """
 
     def _apply(
-        self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory
+        self,
+        gm: GraphModule,
+        cm: CachedSequenceInterface,
+        factory: ModelFactory,
+        shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
         def register_eager_attention(patterns: ADPatternMatcherPass):
             for pattern_config in _get_sfdp_patterns():
@@ -392,7 +406,11 @@ class MatchGroupedAttention(BaseTransform):
     """
 
     def _apply(
-        self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory
+        self,
+        gm: GraphModule,
+        cm: CachedSequenceInterface,
+        factory: ModelFactory,
+        shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
         def register_grouped_attention(patterns: ADPatternMatcherPass):
             q = torch.randn(8, 8, 16, 64, device="cuda", dtype=torch.float16)
@@ -478,7 +496,11 @@ class MatchAttentionLayout(BaseTransform):
         return MatchAttentionLayoutConfig
 
     def _apply(
-        self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory
+        self,
+        gm: GraphModule,
+        cm: CachedSequenceInterface,
+        factory: ModelFactory,
+        shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
         # Get attention layout from attention_op
         attention_layout = self.config.attention_op.get_attention_layout()

@@ -8,7 +8,13 @@ from torch.fx import GraphModule
 from ...export import torch_export_to_gm
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
-from ..interface import BaseTransform, TransformConfig, TransformInfo, TransformRegistry
+from ..interface import (
+    BaseTransform,
+    SharedConfig,
+    TransformConfig,
+    TransformInfo,
+    TransformRegistry,
+)
 
 
 class ExportToGMConfig(TransformConfig):
@@ -44,7 +50,11 @@ class ExportToGM(BaseTransform):
         return ExportToGMConfig
 
     def _apply(
-        self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory
+        self,
+        gm: GraphModule,
+        cm: CachedSequenceInterface,
+        factory: ModelFactory,
+        shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
         # at this point we assume the gm is just a dummy graph module
         assert len(gm.graph.nodes) == 0, "Expected empty graph module."

@@ -305,6 +305,8 @@ class PyTorchModelEngine(ModelEngine):
             checkpoint_loader=checkpoint_loader,
             attn_backend=attn_backend,
             moe_backend=pytorch_backend_config.moe_backend,
+            moe_disable_finalize_fusion=pytorch_backend_config.
+            moe_disable_finalize_fusion,
             load_format=pytorch_backend_config.load_format,
             max_num_tokens=max_num_tokens,
             moe_max_num_tokens=pytorch_backend_config.moe_max_num_tokens,
