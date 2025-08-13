@@ -425,6 +425,10 @@ def runLLMTestlistOnSlurm(pipeline, platform, testList, config=VANILLA_CONFIG, p
             } else {
                 error "The Slurm node does not come online in the waiting period. Terminating the job."
             }
+            slurmRunner = runInDockerOnNodeMultiStage(LLM_DOCKER_IMAGE, nodeName, dockerArgs, false)
+            executeLLMTestOnSlurm(pipeline, platform, testList, config, perfMode, stageName, splitId, splits, skipInstallWheel, cpver, slurmRunner)
+        } else {
+            echo "The node does not come online in 2 hours, terminating the job"
         }
     } finally {
         stage("Clean up SLURM Resources") {
