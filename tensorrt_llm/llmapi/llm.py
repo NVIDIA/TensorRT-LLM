@@ -135,10 +135,8 @@ class BaseLLM:
 
             # check the kwargs and raise ValueError directly
             valid_keys = set(
-                list(llm_args_cls.model_fields.keys()) + [
-                    '_mpi_session',
-                    'backend',
-                ])
+                list(llm_args_cls.model_fields.keys()) +
+                ['_mpi_session', 'backend'])
             for key in kwargs:
                 if key not in valid_keys:
                     raise ValueError(
