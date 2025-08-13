@@ -7,6 +7,7 @@ import os
 import sys
 from datetime import datetime
 from pathlib import Path
+from typing import List, Tuple
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 
@@ -20,23 +21,25 @@ from transformers import AutoProcessor, Blip2Processor
 from utils import utils
 
 
-def pixtral_pad_images(raw_image):
-    if not raw_image:
+def pixtral_pad_images(
+        image_list: List[Image.Image]) -> Tuple[np.ndarray, np.ndarray]:
+    if not image_list:
         return np.empty((0, 0, 0, 0), dtype=np.uint8), np.empty((0, 2),
                                                                 dtype=np.int64)
-    raw_image = [np.array(img) for img in raw_image]
-    shapes = [img.shape for img in raw_image]
+    image_list_np = [np.array(img) for img in image_list]
+    shapes = [img.shape for img in image_list_np]
     assert all(len(s) == 3
                for s in shapes), "All input images must have three dimensions"
     assert all(s[-1] == shapes[0][-1] for s in
                shapes), "All input images must have the same number of channels"
     max_h, max_w = max(s[0] for s in shapes), max(s[1] for s in shapes)
-    for i in range(len(raw_image)):
-        raw_image[i] = np.pad(raw_image[i],
-                              ((0, max_h - raw_image[i].shape[0]),
-                               (0, max_w - raw_image[i].shape[1]), (0, 0)),
-                              mode='constant')
-    raw_image = np.stack(raw_image, axis=0)
+    for i in range(len(image_list_np)):
+        image_list_np[i] = np.pad(image_list_np[i],
+                                  ((0, max_h - image_list_np[i].shape[0]),
+                                   (0, max_w - image_list_np[i].shape[1]),
+                                   (0, 0)),
+                                  mode='constant')
+    raw_image = np.stack(image_list_np, axis=0)
     image_sizes = np.array([s[:2] for s in shapes], dtype=np.int64)
     return raw_image, image_sizes
 
@@ -87,7 +90,7 @@ def prepare_inputs(text_data,
     return inputs
 
 
-def load_image(image_path, as_pil_image=True):
+def load_image(image_path) -> Image.Image:
     if image_path.startswith("http") or image_path.startswith("https"):
         image_bytes = requests.get(image_path, stream=True).content
     elif image_path.startswith("data:image/jpeg;base64,"):
@@ -96,10 +99,7 @@ def load_image(image_path, as_pil_image=True):
     else:
         image_bytes = Path(image_path).read_bytes()
 
-    if as_pil_image:
-        return Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    else:
-        return image_bytes
+    return Image.open(io.BytesIO(image_bytes)).convert("RGB")
 
 
 def load_video(video_path, num_of_frames):

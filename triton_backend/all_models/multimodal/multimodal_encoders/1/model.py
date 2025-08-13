@@ -673,7 +673,8 @@ class TritonPythonModel:
         # of this list must match the length of `requests` list.
         return responses
 
-    def run_vision_encoder(self, vit_input):
+    def run_vision_encoder(self, vit_input: Dict[str,
+                                                 torch.Tensor]) -> torch.Tensor:
         batch_size = [v.shape[0] for v in vit_input.values()]
         assert all(
             b == batch_size[0]

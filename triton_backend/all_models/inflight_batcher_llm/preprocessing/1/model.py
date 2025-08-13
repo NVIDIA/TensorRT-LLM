@@ -29,7 +29,7 @@ import io
 import json
 import os
 from collections import defaultdict
-from typing import List
+from typing import Dict, List, Tuple
 
 import numpy as np
 import requests
@@ -1041,7 +1041,8 @@ class VisionPreProcessor:
                         queries,
                         img_urls=None,
                         image_bytes=None,
-                        image_sizes=None):
+                        image_sizes=None
+                        ) -> Tuple[Dict[str, "torch.Tensor"], List[int]]:
         import torch
         vision_processed_tensors = {}
         if img_urls is not None:
