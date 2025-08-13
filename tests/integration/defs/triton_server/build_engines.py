@@ -1790,6 +1790,8 @@ def prepare_mistral3_pixtral_engine(tensorrt_llm_multimodal_example_root,
         "--max_batch_size=8",
         "--max_input_len=4096",
         "--max_seq_len=4096",
+        # Allow an arbitrary number of image tokens by setting:
+        # max_multimodal_len = max_batch_size * max_input_len
         "--max_multimodal_len=32768",
         "--use_paged_context_fmha=enable",
         f"--output_dir={engine_dir}",
@@ -1812,7 +1814,8 @@ def prepare_mistral3_pixtral_engine(tensorrt_llm_multimodal_example_root,
     convert_cmd = " ".join(convert_cmd)
     build_cmd = " ".join(build_cmd)
     build_visual_engine_cmd = " ".join(build_visual_engine_cmd)
-    if not os.path.exists(engine_dir):
+    if not os.path.exists(engine_dir) or not os.path.exists(
+            multimodal_engine_dir):
         check_call(install_requirement_cmd,
                    shell=True,
                    cwd=tensorrt_llm_llama_example_root)

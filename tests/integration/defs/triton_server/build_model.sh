@@ -701,9 +701,8 @@ fi
 
 if [ "$MODEL" = "mistral_small_3_1" ]; then
 
-    echo "Install pixtral requirements if any"
-    # Reuse general requirements (multimodal run path supports pixtral)
-    pip install -r $LLM_BACKEND_ROOT/requirements.txt || true
+    echo "Install Mistral Small 3.1 requirements"
+    pip install -r $LLM_BACKEND_ROOT/all_models/multimodal/requirements-mistral3.1.txt
 
     pushd examples/models/core/multimodal
 
