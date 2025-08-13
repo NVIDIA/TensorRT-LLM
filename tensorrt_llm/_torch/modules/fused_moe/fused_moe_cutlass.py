@@ -9,8 +9,7 @@ from tensorrt_llm.math_utils import pad_up
 
 from ...distributed import allgather
 from ...model_config import ModelConfig
-from ...utils import (AuxStreamType, EventType, Fp4QuantizedTensor, ceil_div,
-                      swizzle_sf)
+from ...utils import AuxStreamType, EventType, Fp4QuantizedTensor, ceil_div
 from .interface import MoE
 
 # isort: off
@@ -388,8 +387,6 @@ class CutlassFusedMoE(MoE):
                 # TODO: Remove this slicing required by padding if possible
                 x_sf = x_sf[:, :x_sf_col_orig].contiguous()
 
-                x_sf = swizzle_sf(x_sf, x_row, x_col, self.scaling_vector_size)
-
         elif run_post_quant_allgather:
             # Original allgather logic
             if x_sf is not None:
@@ -405,8 +402,6 @@ class CutlassFusedMoE(MoE):
                 sizes=None if use_dp_padding else all_rank_num_tokens)
             x_row = x.shape[0]
             # Fp4 gemm has extra scaling factor
-            if x_sf is not None:
-                x_sf = swizzle_sf(x_sf, x_row, x_col, self.scaling_vector_size)
 
         final_hidden_states = torch.ops.trtllm.fused_moe(
             x,
@@ -419,7 +414,7 @@ class CutlassFusedMoE(MoE):
             output_dtype,
             quant_scales=self.quant_scales,
             input_sf=x_sf,
-            swizzled_input_sf=True,
+            swizzled_input_sf=False,
             swiglu_alpha=self.swiglu_alpha,
             swiglu_beta=self.swiglu_beta,
             swiglu_limit=self.swiglu_limit,
