@@ -1968,6 +1968,13 @@ class LoadFormat(Enum):
     DUMMY = 1
 
 
+class SamplerType(StrEnum):
+    """Enum for sampler type options."""
+    TRTLLMSampler = "TRTLLMSampler"
+    TorchSampler = "TorchSampler"
+    auto = "auto"
+
+
 class TorchCompileConfig(StrictBaseModel):
     """
     Configuration for torch.compile.
@@ -2055,8 +2062,8 @@ class TorchLlmArgs(BaseLlmArgs):
         "If true, will iterate over sampling_params of each request and use the corresponding sampling strategy, e.g. top-k, top-p, etc.",
         status="beta")
 
-    sampler_type: str = Field(
-        default="auto",
+    sampler_type: SamplerType = Field(
+        default=SamplerType.auto,
         description=
         "The type of sampler to use. Options are TRTLLMSampler, TorchSampler or auto. Defaults to auto, which will use TorchSampler unless BeamSearch is requested.",
         status="beta")

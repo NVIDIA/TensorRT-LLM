@@ -1,5 +1,4 @@
 from dataclasses import dataclass, field
-from enum import StrEnum
 from typing import Dict, List, Optional, Union
 
 from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import \
@@ -7,18 +6,11 @@ from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import \
 from tensorrt_llm.bindings.executor import ExecutorConfig
 
 from ...builder import BuildConfig
-from ...llmapi.llm_args import LoadFormat
+from ...llmapi.llm_args import LoadFormat, SamplerType
 from ...logger import logger
 from ...mapping import Mapping
 from ..model_config import MoeLoadBalancerConfig
 from .resource_manager import BaseResourceManager
-
-
-class SamplerType(StrEnum):
-    """Enum for sampler type options."""
-    TRTLLMSampler = "TRTLLMSampler"
-    TorchSampler = "TorchSampler"
-    auto = "auto"
 
 
 @dataclass

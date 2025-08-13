@@ -112,7 +112,7 @@ methods:
         default: False
         status: beta
       sampler_type:
-        annotation: tensorrt_llm._torch.pyexecutor.config.SamplerType
+        annotation: tensorrt_llm.llmapi.llm_args.SamplerType
         default: auto
         status: beta
       enable_iter_perf_stats:
