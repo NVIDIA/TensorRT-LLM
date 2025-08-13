@@ -206,7 +206,8 @@ class FusedMoEMethodBase(ABC):
             load_expert_ids: List[int], dst_w3_w1_weights_tensor: torch.Tensor,
             dst_w2_weights_tensor: torch.Tensor,
             dst_w3_w1_bias_tensor: Optional[torch.Tensor],
-            dst_w2_bias_tensor: Optional[torch.Tensor]):
+            dst_w2_bias_tensor: Optional[torch.Tensor],
+            weight_name: str = "weight"):
         # Multithread weight load is superseded by prefetch_files() in model_engine.py
         # Also, threading adds overhead in order to protect shuffle index cache with critical section.
         for local_slot_id, expert_id in enumerate(load_expert_ids):
@@ -214,9 +215,9 @@ class FusedMoEMethodBase(ABC):
             expert_idx = local_slot_id
 
             if weight_loading_mode == MoEWeightLoadingMode.VANILLA:
-                w1_weight = weights[f"{expert_id}.w1.weight"]
-                w3_weight = weights[f"{expert_id}.w3.weight"]
-                w2_weight = weights[f"{expert_id}.w2.weight"]
+                w1_weight = weights[f"{expert_id}.w1.{weight_name}"]
+                w3_weight = weights[f"{expert_id}.w3.{weight_name}"]
+                w2_weight = weights[f"{expert_id}.w2.{weight_name}"]
                 if module.bias:
                     w1_bias = weights[f"{expert_id}.w1.bias"]
                     w3_bias = weights[f"{expert_id}.w3.bias"]
@@ -251,14 +252,16 @@ class FusedMoEMethodBase(ABC):
                                            dst_w2_bias_tensor.data[expert_idx])
 
     def load_weights(self, module: torch.nn.Module, weights: List[Dict],
-                     weight_loading_mode: MoEWeightLoadingMode):
+                     weight_loading_mode: MoEWeightLoadingMode,
+                     weight_name: str = "weight"):
 
         self.load_expert_weights_to_dst(
             module, weights, weight_loading_mode,
             module.initial_local_expert_ids, module.w3_w1_weight.data,
             module.w2_weight.data,
             module.w3_w1_bias.data if module.bias else None,
-            module.w2_bias.data if module.bias else None)
+            module.w2_bias.data if module.bias else None,
+            weight_name)
 
         self.load_quant_scales(module, weights)
         # Re-setup quant scales after loading weights as the tensors may have been modified.
@@ -953,6 +956,11 @@ class WInt4AFP8FusedMoEMethod(FusedMoEMethodBase):
         dst_w2_weight.copy_(w2_weight_shard.view(dst_w2_weight.dtype),
                             non_blocking=True)
 
+    def load_weights(self, module: torch.nn.Module, weights: List[Dict],
+                     weight_loading_mode: MoEWeightLoadingMode,
+                     weight_name: str = "qweight"):
+        super().load_weights(module, weights, weight_loading_mode, weight_name)
+
     def load_quant_scales(self, module: torch.nn.Module, weights: Dict):
         assert self.device.type == "cuda"
 
@@ -974,7 +982,13 @@ class WInt4AFP8FusedMoEMethod(FusedMoEMethodBase):
         module.fc31_act_scale.data.copy_(
             torch.ones_like(module.fc31_act_scale) *
             (1 / all_w3_w1_input_scales_max))
-        module.fc31_alpha.data.copy_((torch.ones_like(module.fc31_alpha) *
+        all_w3_w1_scales_fp8_max = []
+        for expert_id in module.initial_local_expert_ids:
+            w1_weight_scale_fp8 = load_weight_shard(weights[f"{expert_id}.w1.weight_scale"])
+            w3_weight_scale_fp8 = load_weight_shard(weights[f"{expert_id}.w3.weight_scale"])
+            all_w3_w1_scales_fp8_max.append(torch.max(w3_weight_scale_fp8, w1_weight_scale_fp8))
+        all_w3_w1_scales_fp8_max = torch.stack(all_w3_w1_scales_fp8_max).reshape(module.fc31_alpha.shape)
+        module.fc31_alpha.data.copy_((all_w3_w1_scales_fp8_max *
                                       all_w3_w1_input_scales_max).float())
 
         all_w3_scales = [
@@ -985,17 +999,19 @@ class WInt4AFP8FusedMoEMethod(FusedMoEMethodBase):
                               device=self.device)
             for expert_id in module.initial_local_expert_ids
         ]
+        all_w3_scales = torch.stack(all_w3_scales) / all_w3_w1_scales_fp8_max.unsqueeze(2)
         all_w1_scales = [
-            load_weight_shard(weights[f"{expert_id}.w1.weight_scale_inv"],
+            load_weight_shard(weights[f"{expert_id}.w1.weight_scale.int4"],
                               module.tp_size,
                               module.tp_rank,
                               TensorParallelMode.COLUMN,
                               device=self.device)
             for expert_id in module.initial_local_expert_ids
         ]
+        all_w1_scales = torch.stack(all_w1_scales) / all_w3_w1_scales_fp8_max.unsqueeze(2)
         all_w3_w1_scales = torch.cat(
-            [torch.stack(all_w3_scales),
-             torch.stack(all_w1_scales)], dim=-2)
+            [all_w3_scales,
+             all_w1_scales], dim=-2)
         if module.sm_version == 89:
             w3_w1_scales = all_w3_w1_scales.to(torch.float16).view(module.dtype)
         else:
@@ -1023,22 +1039,28 @@ class WInt4AFP8FusedMoEMethod(FusedMoEMethodBase):
         module.fc2_act_scale.data.copy_(
             torch.ones_like(module.fc2_act_scale) *
             (1 / all_w2_input_scales_max))
-        module.fc2_alpha.data.copy_((torch.ones_like(module.fc2_alpha) *
+        all_w2_scales_fp8 = [
+            load_weight_shard(weights[f"{expert_id}.w2.weight_scale"])
+            for expert_id in module.initial_local_expert_ids
+        ]
+        all_w2_scales_fp8 = torch.stack(all_w2_scales_fp8).reshape(module.fc2_alpha.shape)
+        module.fc2_alpha.data.copy_((all_w2_scales_fp8 *
                                      all_w2_input_scales_max).float())
 
         all_w2_scales = [
-            load_weight_shard(weights[f"{expert_id}.w2.weight_scale_inv"],
+            load_weight_shard(weights[f"{expert_id}.w2.weight_scale.int4"],
                               module.tp_size,
                               module.tp_rank,
                               TensorParallelMode.ROW,
                               device=self.device)
             for expert_id in module.initial_local_expert_ids
         ]
+        all_w2_scales = torch.stack(all_w2_scales) / all_w2_scales_fp8.unsqueeze(2)
         if module.sm_version == 89:
-            w2_scales = torch.stack(all_w2_scales).to(torch.float16).view(
+            w2_scales = all_w2_scales.to(torch.float16).view(
                 module.dtype)
         else:
-            w2_scales = torch.stack(all_w2_scales).to(torch.bfloat16).view(
+            w2_scales = all_w2_scales.to(torch.bfloat16).view(
                 module.dtype)
         w2_s_shape = w2_scales.shape
         w2_scales_interleaved = w2_scales.reshape(
