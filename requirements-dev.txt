@@ -24,7 +24,6 @@ cloudpickle
 typing-extensions==4.12.2
 bandit==1.7.7
 jsonlines==4.0.0
-jsonschema
 jieba==0.42.1
 rouge==1.0.1
 pytest-rerunfailures
