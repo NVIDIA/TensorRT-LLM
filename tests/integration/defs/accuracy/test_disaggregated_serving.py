@@ -505,11 +505,12 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task = JsonModeEval(self.MODEL_NAME)
             task.evaluate(llm)
 
-    @pytest.mark.skip_less_device(2)
     @pytest.mark.parametrize("tp,pp", [(1, 2), (2, 1), (2, 2)],
                              ids=["tp1pp2", "tp2pp1", "tp2pp2"])
     @pytest.mark.parametrize("testset", ["GSM8K", "MMLU"])
     def test_tp_pp_symmetric(self, tp, pp, testset):
+        if tp * pp * 2 > get_device_count():
+            pytest.skip(f"Not enough devices for tp={tp}*pp={pp} test")
         return run_parallel_test(self.MODEL_NAME, self.MODEL_PATH, pp, tp, pp,
                                  tp, get_accuracy_task(testset))
 
@@ -517,6 +518,9 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     @parametrize_with_ids("gen_tp", [1, 2])
     @pytest.mark.parametrize("testset", ["GSM8K", "MMLU"])
     def test_ctx_pp_gen_tp_asymmetric(self, ctx_pp, gen_tp, testset):
+        if ctx_pp * gen_tp * 2 > get_device_count():
+            pytest.skip(
+                f"Not enough devices for ctx_pp={ctx_pp}*gen_tp={gen_tp} test")
         return run_parallel_test(self.MODEL_NAME, self.MODEL_PATH, ctx_pp, 1, 1,
                                  gen_tp, get_accuracy_task(testset))
 
@@ -527,6 +531,7 @@ class TestLlama4ScoutInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "meta-llama/Llama-4-Scout-17B-16E-Instruct"
     MODEL_PATH = f"{llm_models_root()}/llama4-models/Llama-4-Scout-17B-16E-Instruct"
 
+    @pytest.mark.skip_less_device(8)
     @pytest.mark.parametrize("overlap_scheduler", [False, True])
     def test_auto_dtype(self, overlap_scheduler):
         ctx_server_config = {"disable_overlap_scheduler": True}
@@ -565,6 +570,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     MODEL_NAME = "deepseek-ai/DeepSeek-V3-Lite"
     MODEL_PATH = f"{llm_models_root()}/DeepSeek-V3-Lite/bf16"
 
+    @pytest.mark.skip_less_device(8)
     @parametrize_with_ids("overlap_scheduler", [True, False])
     @parametrize_with_ids("mtp_nextn",
                           [0, pytest.param(2, marks=skip_pre_hopper)])

@@ -9,7 +9,7 @@ from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils.node_utils import is_op
 from ...utils.quantization_utils import QuantizationImpl, should_skip_quantization
-from ..interface import BaseTransform, TransformInfo, TransformRegistry
+from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
 
 quantized_moe_op_map = {
     "FP8": torch.ops.auto_deploy.torch_quant_fp8_moe,
@@ -139,7 +139,11 @@ class QuantizeMOE(BaseTransform):
     """
 
     def _apply(
-        self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory
+        self,
+        gm: GraphModule,
+        cm: CachedSequenceInterface,
+        factory: ModelFactory,
+        shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
         quant_config = factory.get_quant_config()
         quant_algo = quant_config.get("quant_algo") if quant_config else None

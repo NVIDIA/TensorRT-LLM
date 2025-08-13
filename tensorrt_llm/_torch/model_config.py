@@ -83,6 +83,9 @@ class ModelConfig(Generic[TConfig]):
 
     attn_backend: str = 'TRTLLM'
     moe_backend: str = 'CUTLASS'  # options can be CUTLASS, TRTLLM
+    # IF true, disables FC2+finalize fusion in CUTLASS MoE backend
+    moe_disable_finalize_fusion: bool = False
+
     allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO
 
     # If true, enable min-latency mode. Currently only used for Llama4.

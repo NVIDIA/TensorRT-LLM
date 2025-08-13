@@ -7,7 +7,7 @@ from torch.utils._sympy.value_ranges import ValueRanges
 
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
-from ..interface import BaseTransform, TransformInfo, TransformRegistry
+from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
 
 
 # TODO (lucaslie): consider reconfiguring this transform to run before we switch to flattened
@@ -22,7 +22,11 @@ class CleanupInputConstraints(BaseTransform):
     """
 
     def _apply(
-        self, gm: GraphModule, cm: CachedSequenceInterface, factory: ModelFactory
+        self,
+        gm: GraphModule,
+        cm: CachedSequenceInterface,
+        factory: ModelFactory,
+        shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
         graph: Graph = gm.graph
         input_node = graph.find_nodes(op="placeholder")[0]

@@ -150,12 +150,11 @@ class WideEPMoE(MoE):
         assert len(
             self.initial_local_expert_ids) == self.expert_size_per_partition
 
-        max_num_tokens = model_config.max_num_tokens
         # The maximum number of tokens in MoE are multiplied by DP size when attention DP is enabled
-        max_num_tokens *= model_config.mapping.world_size
-        self.moe_max_num_tokens = model_config.moe_max_num_tokens if model_config.moe_max_num_tokens is not None else max_num_tokens
+        moe_max_num_tokens = model_config.max_num_tokens * model_config.mapping.dp_size
+        self.moe_max_num_tokens = model_config.moe_max_num_tokens or moe_max_num_tokens
         # The auxiliary CUDA stream and CUDA events are only used when MoE chunking is applied
-        if self.moe_max_num_tokens < max_num_tokens:
+        if self.moe_max_num_tokens < moe_max_num_tokens:
             self.aux_stream = aux_stream_dict[
                 AuxStreamType.
                 MoeChunkingOverlap] if aux_stream_dict is not None else torch.cuda.Stream(
@@ -184,11 +183,15 @@ class WideEPMoE(MoE):
             f"{self.__class__.__name__} selects alltoall_method_type {self.alltoall_method_type!r}",
             key="alltoall_method_type")
         self.use_postquant_alltoall = False
+        self.use_low_precision_combine = False
         if self.enable_alltoall:
             qm = self.quant_config.quant_mode
             self.use_postquant_alltoall = (os.environ.get(
                 "TRTLLM_MOE_POST_QUANT_ALLTOALLV", "1")
                                            == "1") and qm.has_nvfp4()
+            self.use_low_precision_combine = (os.environ.get(
+                "TRTLLM_MOE_USE_LOW_PRECISION_COMBINE", "0")
+                                              == "1") and qm.has_nvfp4()
             # TODO: support alltoall without allgather for top_k % 4 != 0
             self.enable_alltoall_without_allgather = (
                 os.environ.get("TRTLLM_MOE_ENABLE_ALLTOALL_WITHOUT_ALLGATHER",
@@ -540,7 +543,7 @@ class WideEPMoE(MoE):
                             self.fc31_input_scale,
                             self.scaling_vector_size,
                             sfUseUE8M0=False,
-                            swizzedLayout=False)
+                            isSfSwizzledLayout=False)
                     x_sf = x_sf.view((x_row, -1))
 
             elif self.has_deepseek_fp8_block_scales:
@@ -685,9 +688,16 @@ class WideEPMoE(MoE):
                 final_hidden_states = final_hidden_states.view(
                     self.expert_size_per_partition,
                     num_tokens_per_expert_for_fused_moe, self.hidden_size)
-                final_hidden_states = self.deep_ep_buffer.low_latency_combine(
-                    final_hidden_states, deep_ep_topk_idx, deep_ep_topk_weights,
-                    deep_ep_handle)
+                if self.use_low_precision_combine:
+                    global_scales = (448 * 6) / final_hidden_states.abs().max(
+                        dim=-1, keepdim=True).values.to(torch.float32)
+                    final_hidden_states = self.deep_ep_buffer.low_latency_combine_fp4(
+                        final_hidden_states, global_scales, deep_ep_topk_idx,
+                        deep_ep_topk_weights, deep_ep_handle)
+                else:
+                    final_hidden_states = self.deep_ep_buffer.low_latency_combine(
+                        final_hidden_states, deep_ep_topk_idx,
+                        deep_ep_topk_weights, deep_ep_handle)
             else:
                 raise NotImplementedError(
                     f"Not available alltoall method type: {self.alltoall_method_type!r}"

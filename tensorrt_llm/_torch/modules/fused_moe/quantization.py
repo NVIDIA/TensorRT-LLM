@@ -347,8 +347,8 @@ class FusedMoEMethodBase(ABC):
         Load w1 and w3 weights for each expert.
         Override this method if you need to preprocess the weights differently.
         """
+        # device don't have to be 'cuda', e.g. 'cpu' for online EPLB
         device = dst_w3_w1_weight.device
-        assert device.type == "cuda"
         w1_weight_shard = load_weight_shard(w1_weight,
                                             module.tp_size,
                                             module.tp_rank,
@@ -372,8 +372,8 @@ class FusedMoEMethodBase(ABC):
         Load w2 weight for each expert.
         Override this method if you need to preprocess the weights differently.
         """
+        # device don't have to be 'cuda', e.g. 'cpu' for online EPLB
         device = dst_w2_weight.device
-        assert device.type == "cuda"
         w2_weight_shard = load_weight_shard(w2_weight,
                                             module.tp_size,
                                             module.tp_rank,
@@ -1402,6 +1402,14 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
 
             expert_idx = local_slot_id
 
+            if not torch.allclose(w1_weight_scale_2, w3_weight_scale_2):
+                logger.warning(
+                    f"w1_weight_scale_2 != w3_weight_scale_2 ({w1_weight_scale_2} != {w3_weight_scale_2}), selecting the larger value. Accuracy may be affected."
+                )
+                w1_weight_scale_2 = torch.max(w1_weight_scale_2,
+                                              w3_weight_scale_2)
+                w3_weight_scale_2 = w1_weight_scale_2
+
             self.load_expert_w3_w1_weight_scale_nvfp4(
                 module, w1_weight_scale, w3_weight_scale,
                 dst_w3_w1_weight_scale[expert_idx])
@@ -1537,8 +1545,8 @@ class NVFP4CutlassFusedMoEMethod(NVFP4FusedMoEMethod):
             self, module: torch.nn.Module, w1_weight_scale: torch.Tensor,
             w3_weight_scale: torch.Tensor,
             dst_w3_w1_weight_scale: torch.Tensor):
+        # device don't have to be 'cuda', e.g. 'cpu' for online EPLB
         device = dst_w3_w1_weight_scale.device
-        assert device.type == "cuda"
         w1_weight_scale = load_weight_shard(w1_weight_scale,
                                             module.tp_size,
                                             module.tp_rank,
@@ -1577,8 +1585,8 @@ class NVFP4CutlassFusedMoEMethod(NVFP4FusedMoEMethod):
     def load_expert_w2_weight_scale_nvfp4(self, module: torch.nn.Module,
                                           w2_weight_scale: torch.Tensor,
                                           dst_w2_weight_scale: torch.Tensor):
+        # device don't have to be 'cuda', e.g. 'cpu' for online EPLB
         device = dst_w2_weight_scale.device
-        assert device.type == "cuda"
         w2_weight_scale = load_weight_shard(w2_weight_scale,
                                             module.tp_size,
                                             module.tp_rank,
