@@ -1275,7 +1275,7 @@ class PyExecutor:
             return
         current_time = time.time()
 
-        for req in self.ctx_in_transmission_requests[:]:
+        for req in self.ctx_in_transmission_requests:
             if req.py_kv_transfer_start_time is None:
                 continue
             elapsed_time = (current_time - req.py_kv_transfer_start_time) * 1000
@@ -1285,7 +1285,7 @@ class PyExecutor:
                 )
                 req.py_to_cleanup = True
 
-        for req in self.active_requests[:]:
+        for req in self.active_requests:
             if req.is_disagg_generation_transmission_in_progress and req.py_kv_transfer_start_time is not None:
                 elapsed_time = (current_time -
                                 req.py_kv_transfer_start_time) * 1000
