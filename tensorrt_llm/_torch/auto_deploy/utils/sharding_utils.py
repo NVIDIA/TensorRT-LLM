@@ -5,13 +5,14 @@ import operator
 from abc import ABC, abstractmethod
 from enum import IntEnum
 from functools import partial
-from typing import Callable, Dict, List, Literal, Optional
+from typing import Any, Callable, Dict, List, Literal, Optional
 
 import torch
 import torch.nn as nn
 from pydantic import BaseModel, ConfigDict, Field
 from torch.fx import GraphModule, Node
 
+from ..models.factory import ShardingConfigSource
 from ..utils.logger import ad_logger
 from .node_utils import extract_param_names_from_lin_node, is_op, num_users_of_weight_node
 from .quantization_utils import QuantizationImpl
@@ -477,6 +478,111 @@ class EPShardingInfo(ShardingTransformInfo):
 class ShardingConfig(BaseModel):
     """Configuration for sharding the model."""
 
+    factory_source: ShardingConfigSource = Field(default=ShardingConfigSource.UNKNOWN)
+    rank: int = Field(default=0)
+    world_size: int = Field(default=1)
+    _predefined_config: Optional[Dict[str, Any]] = None
+    simple_shard_only: bool = Field(default=False)
+    use_sharding_from_factory: bool = False
     tp_transforms: List[TPShardingInfo] = Field(default_factory=list)
     bmm_transforms: List[BMMShardingInfo] = Field(default_factory=list)
     ep_transforms: List[EPShardingInfo] = Field(default_factory=list)
+
+    def __init__(
+        self,
+        rank: int = 0,
+        world_size: int = 1,
+        factory_source: ShardingConfigSource = ShardingConfigSource.UNKNOWN,
+        sharding_config: Dict[str, Any] = None,
+        simple_shard_only: bool = False,
+        use_sharding_from_factory: bool = False,
+    ):
+        super().__init__(
+            factory_source=factory_source,
+            rank=rank,
+            world_size=world_size,
+            _predefined_config=sharding_config,
+            simple_shard_only=simple_shard_only,
+            use_sharding_from_factory=use_sharding_from_factory,
+        )
+
+        # Pydantic does not support setting private fields directly.
+        self._predefined_config = sharding_config
+        # Validate the config after initialization
+        if self._predefined_config is not None:
+            self.validate_config()
+
+    def validate_config(self) -> bool:
+        if self.factory_source != ShardingConfigSource.HUGGINGFACE:
+            ad_logger.warning(
+                "Sharding config is is currently only " + "supported for HuggingFace. Skipping."
+            )
+            # invalidate the config
+            self._predefined_config = {}
+            return False
+
+        if not isinstance(self._predefined_config, dict):
+            ad_logger.warning("Sharding config is not a dictionary. Skipping.")
+            # invalidate the config
+            self._predefined_config = {}
+            return False
+
+        if "head_dim" not in self._predefined_config:
+            ad_logger.warning("Sharding config does not contain head_dim. Skipping.")
+            # invalidate the config
+            self._predefined_config = {}
+            return False
+
+        if "tp_plan" not in self._predefined_config:
+            ad_logger.warning("Sharding config does not contain tp_plan. Skipping.")
+            # invalidate the config
+            self._predefined_config = {}
+            return False
+        tp_plan = self._predefined_config["tp_plan"]
+
+        values = set(tp_plan.values())
+        allowed_values = {
+            "colwise",  # row split and no collective
+            "rowwise",  # column split and all-reduce
+            "gather",  # simple shard (row + all_gather)
+            # TODO: remaining values are not supported yet.
+            # They require hybrid EP+TP and/or SP support.
+            # "sequence_parallel", # sequence parallelism
+            # "local_colwise",
+            # "local_rowwise",
+            # "local_packed_rowwise",
+            # "local",
+        }
+        if not values.issubset(allowed_values):
+            ad_logger.warning("Sharding config contains invalid values. Skipping.")
+            # invalidate the config
+            self._predefined_config = {}
+            return False
+        return True
+
+    def get_predefined_config(self) -> Dict[str, Any]:
+        return self._predefined_config
+
+
+def _append_simple_shard(
+    nodes_linear: Dict[Node, List[Node]],
+    rank: int,
+    world_size: int,
+    sharding_config: ShardingConfig,
+) -> None:
+    # for every linear node:
+    # --> row_split (dim 0 of weight) + all_gather (dim -1 of output)
+    tp_shards: List[TPShardingInfo] = []
+    for node_group in nodes_linear.values():
+        for n in node_group:
+            tp_shards.append(
+                TPShardingInfo(
+                    target_node=n.name,
+                    split_dim=SplitDimension.ROW,
+                    rank=rank,
+                    world_size=world_size,
+                    dist_op="all_gather",
+                    min_local_shape=1,
+                )
+            )
+    sharding_config.tp_transforms.extend(tp_shards)

@@ -39,8 +39,9 @@ def _run_ep_shard_job(num_experts: int, rank: int, world_size: int) -> None:
     gm_transformed = InferenceOptimizer(
         None,
         {
-            "detect_ep_shard": {
+            "detect_sharding": {
                 "stage": "sharding",
+                "use_sharding_from_factory": False,
             },
             "sharding_transform_executor": {
                 "stage": "sharding",
@@ -96,8 +97,9 @@ def _run_pattern_detection_job(num_experts: int, rank: int, world_size: int) -> 
     optimizer = InferenceOptimizer(
         None,
         {
-            "detect_ep_shard": {
+            "detect_sharding": {
                 "stage": "sharding",
+                "use_sharding_from_factory": False,
             },
         },
     )
