@@ -21,7 +21,7 @@ from tensorrt_llm.llmapi.llm_args import DeepSeekSparseAttentionConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
-from tensorrt_llm.quantization.mode import QuantAlgo
+from tensorrt_llm.quantization.mode import QuantAlgo, ActivationScheme
 
 TConfig = TypeVar("TConfig", bound=transformers.PretrainedConfig)
 
@@ -325,6 +325,47 @@ class ModelConfig(Generic[TConfig]):
         return quant_config, layer_quant_config
 
     @staticmethod
+    def load_angelslim_quant_config(quant_config_file, checkpoint_dir, moe_backend):
+        quant_config = QuantConfig()
+        layer_quant_config = None
+
+        with open(quant_config_file) as f:
+            quant_config_dict = json.load(f)
+
+        json_quant_configs = quant_config_dict['quantization']
+
+        quant_config.quant_algo = QuantAlgo(
+            json_quant_configs.get('quant_algo', None).upper()) if json_quant_configs.get("quant_algo") else None
+        # fp8_pb_wo from modelopt is the same as FP8_BLOCK_SCALES
+        if quant_config.quant_algo == "fp8_pb_wo":
+            quant_config.quant_algo = QuantAlgo('FP8_BLOCK_SCALES')
+
+        quant_config.kv_cache_quant_algo = QuantAlgo(
+            json_quant_configs.get("kv_cache_quant_algo").upper()
+        ) if json_quant_configs.get("kv_cache_quant_algo") else None
+        quant_config.group_size = json_quant_configs.get('group_size', None)
+        quant_config.exclude_modules = json_quant_configs.get(
+            'exclude_modules', None)
+        quant_config.activation_scheme = ActivationScheme(
+            json_quant_configs.get('activation_scheme', None).upper()
+        ) if json_quant_configs.get("activation_scheme") else None
+
+        json_exclude_quant_configs = json_quant_configs.get('exclude_quantization', None)
+        if json_exclude_quant_configs:
+            quant_config.exclude_quant_config = {
+                "quant_algo": QuantAlgo(
+                    json_exclude_quant_configs.get('quant_algo', None).upper()
+                ) if json_exclude_quant_configs.get("quant_algo") else None,
+                "kv_cache_quant_algo": QuantAlgo(
+                    json_exclude_quant_configs.get("kv_cache_quant_algo").upper()
+                ) if json_exclude_quant_configs.get("kv_cache_quant_algo") else None,
+                "activation_scheme": ActivationScheme(
+                    json_exclude_quant_configs.get('activation_scheme', None).upper()
+                ) if json_exclude_quant_configs.get("activation_scheme") else None,
+            }
+        return quant_config, layer_quant_config
+
+    @staticmethod
     def get_mxfp4_quant_algo(moe_backend, is_dynamic_quant=False):
         quant_algo = ModelConfig.override_quant_algo()
         if quant_algo is None and not is_dynamic_quant:
@@ -368,6 +409,40 @@ class ModelConfig(Generic[TConfig]):
                 'block.*.attn.out', 'block.*.mlp.gate', 'block.*.attn.qkv',
                 'embedding', 'unembedding'
             ]
+        elif hf_quant_config.get("quant_method") == "w4a8_awq":
+            quant_config.quant_algo = QuantAlgo.W4A8_AWQ
+        else:
+            raise NotImplementedError(f"Unsupported quantization_config: {hf_quant_config}.")
+
+        # set kv_cache_quant_algo
+        quant_config.kv_cache_quant_algo = QuantAlgo(hf_quant_config.get("kv_cache_quant_method").upper()) \
+            if hf_quant_config.get("kv_cache_quant_method") else None
+        # set activation_scheme
+        quant_config.activation_scheme = ActivationScheme(hf_quant_config.get("activation_scheme").upper()) \
+            if hf_quant_config.get("activation_scheme") else None
+        # set exclude_modules
+        if quant_config.exclude_modules:
+            if hf_quant_config.get("ignored_modules"):
+                quant_config.exclude_modules += hf_quant_config.get("ignored_modules")
+        else:
+            quant_config.exclude_modules = hf_quant_config.get("ignored_modules")
+
+        # set exclude_quant_config
+        hf_ignored_quantization_config = hf_quant_config.get("ignored_quantization_config")
+        if hf_ignored_quantization_config:
+            quant_config.exclude_quant_config = {
+                "quant_algo": QuantAlgo(
+                    hf_ignored_quantization_config.get("quant_method").upper()
+                ) if hf_ignored_quantization_config.get("quant_method") else None,
+                "kv_cache_quant_algo": QuantAlgo(
+                    hf_ignored_quantization_config.get("kv_cache_quant_method").upper()
+                ) if hf_ignored_quantization_config.get("kv_cache_quant_method") else None,
+                "activation_scheme": ActivationScheme(
+                    hf_ignored_quantization_config.get("activation_scheme").upper()
+                ) if hf_ignored_quantization_config.get("activation_scheme") else None,
+            }
+
+        logger.info(f"Load quantization config from pretrained config, quant_config: {quant_config}")
 
         return quant_config, layer_quant_config
 
@@ -483,6 +558,10 @@ class ModelConfig(Generic[TConfig]):
         if quant_config_file := cached_file(checkpoint_dir,
                                             'hf_quant_config.json'):
             quant_config, layer_quant_config = cls.load_modelopt_quant_config(
+                quant_config_file, checkpoint_dir, moe_backend)
+        elif quant_config_file := cached_file(checkpoint_dir,
+                                            'angelslim_hf_quant_config.json'):
+            quant_config, layer_quant_config = cls.load_angelslim_quant_config(
                 quant_config_file, checkpoint_dir, moe_backend)
         # quantized ckpt in other formats
         elif hasattr(pretrained_config, "quantization_config"):

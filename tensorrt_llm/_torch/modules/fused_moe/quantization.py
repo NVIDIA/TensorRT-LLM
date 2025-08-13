@@ -224,9 +224,10 @@ class FusedMoEMethodBase(ABC):
                     MoEWeightLoadingMode.VANILLA,
                     MoEWeightLoadingMode.W4A8_CUSTOM
             ]:
-                w1_weight = weights[f"{expert_id}.w1.weight"]
-                w3_weight = weights[f"{expert_id}.w3.weight"]
-                w2_weight = weights[f"{expert_id}.w2.weight"]
+                weight_name = "qweight" if f"{expert_id}.w1.qweight" in weights else "weight"
+                w1_weight = weights[f"{expert_id}.w1.{weight_name}"]
+                w3_weight = weights[f"{expert_id}.w3.{weight_name}"]
+                w2_weight = weights[f"{expert_id}.w2.{weight_name}"]
                 if module.bias:
                     w1_bias = weights[f"{expert_id}.w1.bias"]
                     w3_bias = weights[f"{expert_id}.w3.bias"]
@@ -1085,6 +1086,10 @@ class WInt4AFP8FusedMoEMethod(FusedMoEMethodBase):
         w4a8_custom = module.weight_loading_mode == MoEWeightLoadingMode.W4A8_CUSTOM
         if w4a8_custom:
             weight_scale_name = "weight_scale_inv"
+            for expert_id in module.initial_local_expert_ids:
+                if f"{expert_id}.w3.weight_scale.int4" in weights:
+                    weight_scale_name = "weight_scale.int4"
+                    break
         else:
             weight_scale_name = "weight_scale"
 
@@ -1107,13 +1112,31 @@ class WInt4AFP8FusedMoEMethod(FusedMoEMethodBase):
         all_w3_w1_input_scales_max = torch.max(
             torch.stack(all_w3_input_scales),
             torch.stack(all_w1_input_scales)).max()
+        all_w3_w1_scales_fp8_max = None
+        has_fp8_weight_scale = False
         if w4a8_custom:
             # In custom W4A8 ckpt, per-tensor input_scale and per-channel pre_quant_scale are fused into input_scale
             module.fc31_act_scale.data.copy_(
                 torch.ones_like(module.fc31_act_scale, device=self.device) *
                 (1 / all_w3_w1_input_scales_max))
+
+            for expert_id in module.initial_local_expert_ids:
+                if f"{expert_id}.w1.weight_scale" in weights:
+                    has_fp8_weight_scale = True
+                    break
+            if has_fp8_weight_scale:
+                all_w3_w1_scales_fp8_max = []
+                for expert_id in module.initial_local_expert_ids:
+                    w1_weight_scale_fp8 = load_weight_shard(weights[f"{expert_id}.w1.weight_scale"],
+                                                            device=self.device)
+                    w3_weight_scale_fp8 = load_weight_shard(weights[f"{expert_id}.w3.weight_scale"],
+                                                            device=self.device)
+                    all_w3_w1_scales_fp8_max.append(torch.max(w3_weight_scale_fp8, w1_weight_scale_fp8))
+                all_w3_w1_scales_fp8_max = torch.stack(all_w3_w1_scales_fp8_max).reshape(module.fc31_alpha.shape)
+            else:
+                all_w3_w1_scales_fp8_max = torch.ones_like(module.fc31_alpha, device=self.device)
             module.fc31_alpha.data.copy_(
-                (torch.ones_like(module.fc31_alpha, device=self.device) *
+                (all_w3_w1_scales_fp8_max *
                  all_w3_w1_input_scales_max).float())
         else:
             # In vanilla ckpt (at least from ModelOpt), per-tensor input_scale and per-channel pre_quant_scale are separately stored
@@ -1192,6 +1215,8 @@ class WInt4AFP8FusedMoEMethod(FusedMoEMethodBase):
                               device=self.device)
             for expert_id in module.initial_local_expert_ids
         ]
+        if w4a8_custom and has_fp8_weight_scale:
+            all_w3_scales = torch.stack(all_w3_scales) / all_w3_w1_scales_fp8_max.unsqueeze(2)
         all_w1_scales = [
             load_weight_shard(weights[f"{expert_id}.w1.{weight_scale_name}"],
                               module.tp_size,
@@ -1200,9 +1225,15 @@ class WInt4AFP8FusedMoEMethod(FusedMoEMethodBase):
                               device=self.device)
             for expert_id in module.initial_local_expert_ids
         ]
-        all_w3_w1_scales = torch.cat(
-            [torch.stack(all_w3_scales),
-             torch.stack(all_w1_scales)], dim=-2)
+        if w4a8_custom and has_fp8_weight_scale:
+            all_w1_scales = torch.stack(all_w1_scales) / all_w3_w1_scales_fp8_max.unsqueeze(2)
+            all_w3_w1_scales = torch.cat(
+                [all_w3_scales,
+                 all_w1_scales], dim=-2)
+        else:
+            all_w3_w1_scales = torch.cat(
+                [torch.stack(all_w3_scales),
+                 torch.stack(all_w1_scales)], dim=-2)
         if module.sm_version == 89:
             w3_w1_scales = all_w3_w1_scales.to(torch.float16).view(module.dtype)
         else:
@@ -1234,14 +1265,23 @@ class WInt4AFP8FusedMoEMethod(FusedMoEMethodBase):
         all_w2_input_scales_max = torch.stack(all_w2_input_scales).to(
             module.dtype).max()
 
+        all_w2_scales_fp8 = None
         if w4a8_custom:
             # In custom W4A8 ckpt, per-tensor input_scale and per-channel pre_quant_scale are fused into input_scale
             module.fc2_act_scale.data.copy_(
                 torch.ones_like(module.fc2_act_scale, device=self.device) *
                 (1 / all_w2_input_scales_max))
             # In custom W4A8 ckpt, per-tensor weight_scale_2 is fused into alpha
+            if has_fp8_weight_scale:
+                all_w2_scales_fp8 = [
+                    load_weight_shard(weights[f"{expert_id}.w2.weight_scale"], device=self.device)
+                    for expert_id in module.initial_local_expert_ids
+                ]
+                all_w2_scales_fp8 = torch.stack(all_w2_scales_fp8).reshape(module.fc2_alpha.shape)
+            else:
+                all_w2_scales_fp8 = torch.ones_like(module.fc2_alpha, device=self.device)
             module.fc2_alpha.data.copy_(
-                (torch.ones_like(module.fc2_alpha, device=self.device) *
+                (all_w2_scales_fp8 *
                  all_w2_input_scales_max).float())
         else:
             # In vanilla ckpt (at least from ModelOpt), per-tensor input_scale and per-channel pre_quant_scale are separately stored
@@ -1288,6 +1328,8 @@ class WInt4AFP8FusedMoEMethod(FusedMoEMethodBase):
                               device=self.device)
             for expert_id in module.initial_local_expert_ids
         ]
+        if w4a8_custom and has_fp8_weight_scale:
+            all_w2_scales = torch.stack(all_w2_scales) / all_w2_scales_fp8.unsqueeze(2)
         if module.sm_version == 89:
             w2_scales = torch.stack(all_w2_scales).to(torch.float16).view(
                 module.dtype)

@@ -45,7 +45,7 @@ from ..quantization.layers import (FP8Linear, Fp8RowwiseFusedGatedMLP,
                                    WeightOnlyQuantLinear,
                                    WeightOnlyQuantRowLinear)
 from ..quantization.mode import (KV_CACHE_QUANT_ALGO_LIST, QUANT_ALGO_LIST,
-                                 W8A8_SQ_PLUGIN_LIST, QuantAlgo)
+                                 W8A8_SQ_PLUGIN_LIST, QuantAlgo, ActivationScheme)
 from ..quantization.utils import fp4_utils
 from ..top_model_mixin import TopModelMixin
 from .convert_utils import weight_only_quantize_dict
@@ -143,6 +143,8 @@ class QuantConfig:
         pre_quant_scale (bool): Whether to use pre-quant scale for quantization. Defaults to False.
         exclude_modules (List[str], optional): The module name patterns that are skipped in quantization. Defaults to None.
         mamba_ssm_cache_dtype (str, optional): The data type for mamba SSM cache. Defaults to None.
+        exclude_quant_config  (Dict, optional): The model of exclude_modules will use exclude_quant_config.
+        activation_scheme (tensorrt_llm.quantization.mode.ActivationScheme, optional): The input of activation quantize scheme.
     """
     quant_algo: Optional[QuantAlgo] = None
     kv_cache_quant_algo: Optional[QuantAlgo] = None
@@ -154,6 +156,8 @@ class QuantConfig:
     pre_quant_scale: bool = False
     exclude_modules: Optional[List[str]] = None
     mamba_ssm_cache_dtype: Optional[str] = None
+    exclude_quant_config: Optional[Dict] = None
+    activation_scheme: Optional[ActivationScheme] = None
 
     @cached_property
     def quant_mode(self) -> QuantModeWrapper:
