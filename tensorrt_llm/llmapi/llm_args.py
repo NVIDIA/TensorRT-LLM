@@ -2428,7 +2428,8 @@ def update_llm_args_with_extra_options(llm_args: Dict,
     return llm_args
 
 
-def update_sampler_args_with_extra_options(sampler_args: Dict, sampler_options: str) -> Dict:
+def update_sampler_args_with_extra_options(sampler_args: Dict,
+                                           sampler_options: str) -> Dict:
     if sampler_options is not None:
         with open(sampler_options, 'r') as f:
             sampler_options_dict = yaml.safe_load(f)

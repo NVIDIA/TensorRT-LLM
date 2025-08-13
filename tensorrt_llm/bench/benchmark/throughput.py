@@ -30,9 +30,9 @@ from tensorrt_llm.bench.utils.data import (create_dataset_from_stream,
                                            initialize_tokenizer,
                                            update_metadata_for_multimodal)
 from tensorrt_llm.llmapi import CapacitySchedulerPolicy
+from tensorrt_llm.llmapi.llm_utils import update_sampler_args_with_extra_options
 from tensorrt_llm.logger import logger
 from tensorrt_llm.sampling_params import SamplingParams
-from tensorrt_llm.llmapi.llm_utils import update_sampler_args_with_extra_options
 
 
 @click.command(name="throughput")
@@ -68,13 +68,10 @@ from tensorrt_llm.llmapi.llm_utils import update_sampler_args_with_extra_options
     help=
     "Path to a YAML file that overwrites the parameters specified by trtllm-bench."
 )
-@optgroup.option(
-    "--sampler_options",
-    type=str,
-    default=None,
-    help=
-    "Path to a YAML file that sets sampler options."
-)
+@optgroup.option("--sampler_options",
+                 type=str,
+                 default=None,
+                 help="Path to a YAML file that sets sampler options.")
 @optgroup.option(
     "--max_batch_size",
     type=int,
@@ -469,9 +466,10 @@ def throughput_command(
             "n": beam_width,
             "use_beam_search": beam_width > 1
         }
-        sampler_args = update_sampler_args_with_extra_options(sampler_args, params.pop("sampler_options"))
-            
+        sampler_args = update_sampler_args_with_extra_options(
+            sampler_args, params.pop("sampler_options"))
         sampling_params = SamplingParams(**sampler_args)
+
         post_proc_params = None  # No detokenization
 
         # Perform warmup if requested.
