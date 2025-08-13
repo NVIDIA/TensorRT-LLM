@@ -30,6 +30,7 @@
 #include <torch/extension.h>
 
 namespace tb = tensorrt_llm::batch_manager;
+namespace tbc = tensorrt_llm::batch_manager::kv_connector;
 namespace tbk = tensorrt_llm::batch_manager::kv_cache_manager;
 namespace tr = tensorrt_llm::runtime;
 namespace py = pybind11;
@@ -96,12 +97,10 @@ public:
     }
 
     void addSequence(tb::LlmRequest::RequestIdType requestId, SizeType32 inputLength, SizeType32 beamWidth,
-        tensorrt_llm::common::OptionalRef<tb::LlmRequest> llmRequest = std::nullopt,
-        tensorrt_llm::common::OptionalRef<tb::kv_connector::KvCacheConnectorManager> kvCacheConnectorManager
-        = std::nullopt) override
+        tensorrt_llm::common::OptionalRef<tb::LlmRequest> llmRequest = std::nullopt) override
     {
-        PYBIND11_OVERLOAD_PURE(void, tbk::BaseKVCacheManager, addSequence, requestId, inputLength, beamWidth,
-            llmRequest, kvCacheConnectorManager);
+        PYBIND11_OVERLOAD_PURE(
+            void, tbk::BaseKVCacheManager, addSequence, requestId, inputLength, beamWidth, llmRequest);
     }
 
     void removeSequence(tb::LlmRequest::RequestIdType requestId,
@@ -350,9 +349,7 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
         .def("get_needed_blocks_one_step", &BaseKVCacheManager::getNeededBlocksOneStep)
         .def("get_remaining_blocks_to_completion", &BaseKVCacheManager::getRemainingBlocksToCompletion)
         .def("add_token", &BaseKVCacheManager::addToken)
-        .def("add_sequence", &BaseKVCacheManager::addSequence, py::arg("request_id"), py::arg("input_length"),
-            py::arg("beam_width"), py::arg("llm_request") = std::nullopt,
-            py::arg("kv_cache_connector_manager") = std::nullopt)
+        .def("add_sequence", &BaseKVCacheManager::addSequence)
         .def("remove_sequence", &BaseKVCacheManager::removeSequence)
         .def("scheduling_remove_sequence", &BaseKVCacheManager::schedulingRemoveSequence)
         .def("get_block_pool_pointers",
@@ -447,7 +444,7 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
                  std::vector<SizeType32> const&, std::optional<tbk::TempAttentionWindowInputs> const&,
                  nvinfer1::DataType, SizeType32, bool, int64_t, bool, bool, tbk::CacheType,
                  std::optional<tensorrt_llm::executor::RetentionPriority>, std::shared_ptr<tbk::KVCacheEventManager>,
-                 bool, bool>(),
+                 bool, bool, std::shared_ptr<tbc::KvCacheConnectorManager>>(),
             py::arg("num_kv_heads_per_layer"), py::arg("size_per_head"), py::arg("tokens_per_block"),
             py::arg("blocks_per_window"), py::arg("max_num_sequences"), py::arg("max_beam_width"),
             py::arg("max_attention_window_vec"), py::arg("temp_attention_window_inputs"), py::arg("dtype"),
@@ -455,7 +452,8 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
             py::arg("enable_block_reuse") = false, py::arg("onboard_blocks") = true,
             py::arg_v("cache_type", tbk::CacheType::kSELF, "bindings.internal.batch_manager.CacheType.SELF"),
             py::arg("secondary_offload_min_priority") = std::nullopt, py::arg("event_manager") = nullptr,
-            py::arg("enable_partial_reuse") = true, py::arg("copy_on_partial_reuse") = true);
+            py::arg("enable_partial_reuse") = true, py::arg("copy_on_partial_reuse") = true,
+            py::arg("kv_connector_manager") = nullptr);
 }
 
 void tb::BasePeftCacheManagerBindings::initBindings(py::module_& m)

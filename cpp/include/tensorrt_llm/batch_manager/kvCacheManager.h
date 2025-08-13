@@ -537,7 +537,8 @@ public:
         SizeType32 sizePerHead, SizeType32 tokensPerBlock, SizeType32 blocksInPrimaryPool,
         SizeType32 blocksInSecondaryPool, SizeType32 maxNumSequences, std::shared_ptr<runtime::CudaStream> stream,
         bool onboardBlocks, CacheType cacheType, std::optional<executor::RetentionPriority> secondaryOffloadMinPriority,
-        std::shared_ptr<KVCacheEventManager> eventManager, bool enablePartialReuse, bool copyOnPartialReuse);
+        std::shared_ptr<KVCacheEventManager> eventManager, bool enablePartialReuse, bool copyOnPartialReuse,
+        std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager);
 
     ~WindowBlockManager();
 
@@ -548,8 +549,8 @@ public:
     void startScheduling();
 
     //! \brief Assign blocks for new sequence. Try to reuse blocks.
-    void addSequence(GenerationRequest& sequence, SizeType32 inputLength, SizeType32 numContextBlocks,
-        LlmRequest& llmRequest, OptionalRef<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager);
+    void addSequence(
+        GenerationRequest& sequence, SizeType32 inputLength, SizeType32 numContextBlocks, LlmRequest& llmRequest);
 
     //! \brief Assign blocks for new sequence. Does not try to reuse blocks.
     void addSequence(GenerationRequest& sequence, SizeType32 numBlocks, SizeType32 unsharedBlockIdx);
@@ -834,6 +835,8 @@ private:
     bool mEnablePartialReuse;
     // Whether partially matched blocks that are already in use should be copied and reused.
     bool mCopyOnPartialReuse;
+    // The kv cache connector manager
+    std::shared_ptr<kv_connector::KvCacheConnectorManager> mKvCacheConnectorManager;
 };
 
 class BlockManager
@@ -851,7 +854,8 @@ public:
         SizeType32 sinkBubbleLength, bool onboardBlocks, CacheType cacheType = CacheType::kSELF,
         std::optional<executor::RetentionPriority> secondaryOffloadMinPriority = std::nullopt,
         std::shared_ptr<KVCacheEventManager> eventManager = nullptr, bool enablePartialReuse = true,
-        bool copyOnPartialReuse = true);
+        bool copyOnPartialReuse = true,
+        std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager = nullptr);
 
     BlockManager(BlockManager const&) = delete;
     BlockManager& operator=(BlockManager const&) = delete;
@@ -868,8 +872,7 @@ public:
     void allocatePools(bool useUvm);
 
     void addSequence(GenerationRequest& sequence, SizeType32 inputLength, SizeType32 numContextBlocks,
-        LlmRequest& llmRequest, OptionalRef<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager,
-        SizeType32 windowSize);
+        LlmRequest& llmRequest, SizeType32 windowSize);
 
     void addSequence(
         GenerationRequest& sequence, SizeType32 numBlocks, SizeType32 unsharedBlockIdx, SizeType32 windowSize);
@@ -1213,8 +1216,7 @@ public:
     /// @details If llmRequest is supplied and KV cache reuse is enabled, try to recover KV cache blocks for
     /// inputLength - 1 tokens and populate prepopulatedPromptLen.
     virtual void addSequence(LlmRequest::RequestIdType requestId, SizeType32 inputLength, SizeType32 beamWidth,
-        OptionalRef<LlmRequest> llmRequest = std::nullopt,
-        OptionalRef<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager = std::nullopt)
+        OptionalRef<LlmRequest> llmRequest = std::nullopt)
         = 0;
 
     virtual void removeSequence(
@@ -1361,7 +1363,8 @@ public:
         bool enableBlockReuse = false, bool onboardBlocks = true, CacheType cacheType = CacheType::kSELF,
         std::optional<executor::RetentionPriority> secondaryOffloadMinPriority = std::nullopt,
         std::shared_ptr<KVCacheEventManager> eventManager = nullptr, bool enablePartialReuse = true,
-        bool copyOnpartialReuse = true);
+        bool copyOnpartialReuse = true,
+        std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager = nullptr);
 
     KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
         BlocksPerWindow const& blocksPerWindow, SizeType32 maxNumSequences, SizeType32 maxBeamWidth,
@@ -1371,7 +1374,8 @@ public:
         bool enableBlockReuse = false, bool onboardBlocks = true, CacheType cacheType = CacheType::kSELF,
         std::optional<executor::RetentionPriority> secondaryOffloadMinPriority = std::nullopt,
         std::shared_ptr<KVCacheEventManager> eventManager = nullptr, bool enablePartialReuse = true,
-        bool copyOnpartialReuse = true);
+        bool copyOnpartialReuse = true,
+        std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager = nullptr);
 
     KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
         BlocksPerWindow const& blocksPerWindow, SizeType32 maxNumSequences, SizeType32 maxBeamWidth,
@@ -1381,7 +1385,8 @@ public:
         bool enableBlockReuse = true, bool onboardBlocks = true, CacheType cacheType = CacheType::kSELF,
         std::optional<executor::RetentionPriority> secondaryOffloadMinPriority = std::nullopt,
         std::shared_ptr<KVCacheEventManager> eventManager = nullptr, bool enablePartialReuse = true,
-        bool copyOnpartialReuse = true);
+        bool copyOnpartialReuse = true,
+        std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager = nullptr);
 
     KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, SizeType32 sizePerHead, SizeType32 tokensPerBlock,
         BlocksPerWindow const& blocksPerWindow, SizeType32 maxNumSequences, SizeType32 maxBeamWidth,
@@ -1513,8 +1518,7 @@ public:
     /// @details If llmRequest is supplied and KV cache reuse is enabled, try to recover KV cache blocks for
     /// inputLength - 1 tokens and populate prepopulatedPromptLen.
     void addSequence(LlmRequest::RequestIdType requestId, SizeType32 inputLength, SizeType32 beamWidth,
-        OptionalRef<LlmRequest> llmRequest = std::nullopt,
-        OptionalRef<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager = std::nullopt) override;
+        OptionalRef<LlmRequest> llmRequest = std::nullopt) override;
 
     void removeSequence(
         LlmRequest::RequestIdType requestId, OptionalRef<LlmRequest const> llmRequest = std::nullopt) override;

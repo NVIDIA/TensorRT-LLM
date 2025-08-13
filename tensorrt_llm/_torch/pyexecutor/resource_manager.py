@@ -333,6 +333,7 @@ class KVCacheManager(BaseResourceManager):
             'cache_type': kv_cache_type,
             'enable_partial_reuse': kv_cache_config.enable_partial_reuse,
             'copy_on_partial_reuse': kv_cache_config.copy_on_partial_reuse,
+            'kv_connector_manager': self.kv_connector_manager,
         }
         if self.event_buffer_max_size > 0:
             if mapping.enable_attention_dp:
@@ -415,13 +416,13 @@ class KVCacheManager(BaseResourceManager):
                             req.py_request_id,
                             seq_len + (len(req.query_id) if self.mapping.cp_rank
                                        == self.mapping.cp_size - 1 else 0),
-                            req_beam_width, req, None)
+                            req_beam_width, req)
                 else:
                     if req.is_first_context_chunk and self._kv_connector_should_add_sequence(
                             req):
                         self.impl.add_sequence(req.py_request_id,
                                                req.prompt_len, req_beam_width,
-                                               req, self.kv_connector_manager)
+                                               req)
                         for _ in range(self.num_extra_kv_tokens):
                             self.impl.add_token(req.py_request_id)
                         for _ in range(get_draft_token_length(req)):
