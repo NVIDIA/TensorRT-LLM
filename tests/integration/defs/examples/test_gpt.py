@@ -24,8 +24,15 @@ from defs.common import (convert_weights, generate_summary_cmd, parse_mpi_cmd,
                          similarity_score, test_multi_lora_support,
                          venv_check_call, venv_check_output,
                          venv_mpi_check_call, venv_mpi_check_output)
-from defs.conftest import get_device_memory, skip_fp8_pre_ada, skip_pre_ada
+from defs.conftest import (get_device_memory, get_sm_version, skip_fp8_pre_ada,
+                           skip_post_blackwell, skip_pre_ada)
 from defs.trt_test_alternative import check_call
+
+# skip trt flow cases on post-Blackwell-Ultra
+if get_sm_version() >= 103:
+    pytest.skip(
+        "TRT workflow tests are not supported on post Blackwell-Ultra architecture",
+        allow_module_level=True)
 
 INPUT_TEXT_1 = "After Washington had returned to Williamsburg, " + \
                "Dinwiddie ordered him to lead a larger force to assist Trent in his work. " + \
@@ -702,6 +709,7 @@ def test_llm_gpt3_175b_1node_8gpus(gpt_example_root, llm_venv, engine_dir,
             timeout=timeout_manager.remaining_timeout)
 
 
+@skip_post_blackwell
 @pytest.mark.parametrize("per_token_channel", [True, False],
                          ids=["enable_ptpc", "disable_ptpc"])
 def test_llm_gpt2_smooth_single_gpu_summary(gpt_example_root, llm_venv,
@@ -746,6 +754,7 @@ def test_llm_gpt2_smooth_single_gpu_summary(gpt_example_root, llm_venv,
     ])
 
 
+@skip_post_blackwell
 def test_llm_gpt2_int8_kv_1gpu(gpt_example_root, llm_venv, llm_gpt2_model_root,
                                llm_datasets_root, engine_dir, cmodel_dir):
     "gpt2 INT8 KV Cache test on 1 gpu"
@@ -1374,6 +1383,7 @@ def test_llm_gpt2_starcoder_1node_4gpus(gpt_example_root,
         summary_cmd)
 
 
+@skip_post_blackwell
 @pytest.mark.skip_less_host_memory(250000)
 def test_llm_gpt2_starcoder_1gpus(gpt_example_root,
                                   llm_gpt2_starcoder_model_root, llm_venv,
@@ -1415,6 +1425,7 @@ def test_llm_gpt2_starcoder_1gpus(gpt_example_root,
     venv_check_call(llm_venv, summary_cmd)
 
 
+@skip_post_blackwell
 @pytest.mark.skip_less_host_memory(250000)
 @pytest.mark.parametrize("dtype", ["float16"])
 @pytest.mark.parametrize("precision", ["int8", "int4"])
@@ -1724,6 +1735,7 @@ def test_llm_gpt2_multi_lora_1gpu(gpt_example_root, llm_venv,
                     for item in expected_output[idx]]), f"output is {output}"
 
 
+@skip_post_blackwell
 @pytest.mark.skip_less_device_memory(50000)
 @pytest.mark.parametrize("data_type", ['float16', 'fp8'],
                          ids=['base_fp16', 'base_fp8'])

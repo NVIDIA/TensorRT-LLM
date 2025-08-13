@@ -1,8 +1,8 @@
 # Multi-stage Dockerfile
 ARG BASE_IMAGE=nvcr.io/nvidia/pytorch
 ARG TRITON_IMAGE=nvcr.io/nvidia/tritonserver
-ARG BASE_TAG=25.05-py3
-ARG TRITON_BASE_TAG=25.05-py3
+ARG BASE_TAG=25.06-py3
+ARG TRITON_BASE_TAG=25.06-py3
 ARG DEVEL_IMAGE=devel
 
 FROM ${BASE_IMAGE}:${BASE_TAG} AS base
@@ -74,18 +74,10 @@ ENV PYTORCH_CUDA_ALLOC_CONF="garbage_collection_threshold:0.99999"
 RUN pip3 uninstall -y opencv && rm -rf /usr/local/lib/python3*/dist-packages/cv2/
 RUN pip3 install opencv-python-headless --force-reinstall --no-deps --no-cache-dir
 
-# WARs against security issues inherited from pytorch:25.04
-# * https://github.com/advisories/GHSA-vqfr-h8mv-ghfj
-# * https://github.com/advisories/GHSA-7cx3-6m66-7c5m
-# * https://github.com/advisories/GHSA-5rjg-fvgr-3xxf
+# WARs against security issues inherited from pytorch:25.06
 # * https://github.com/advisories/GHSA-8qvm-5x2c-j2w7
-# * https://github.com/advisories/GHSA-33p9-3p43-82vq
 RUN pip3 install --upgrade --no-cache-dir \
-    "h11>=0.16" \
-    "tornado>=6.5.0" \
-    "setuptools>=78.1.1,<80" \
-    "protobuf>=4.25.8" \
-    "jupyter-core>=5.8.1"
+    "protobuf>=4.25.8"
 
 FROM ${TRITON_IMAGE}:${TRITON_BASE_TAG} AS triton
 
@@ -128,8 +120,9 @@ ENV CCACHE_DIR=/root/.cache/ccache
 # Build the TRT-LLM wheel
 ARG GITHUB_MIRROR=""
 ARG BUILD_WHEEL_ARGS="--clean --benchmarks"
+ARG BUILD_WHEEL_SCRIPT="scripts/build_wheel.py"
 RUN --mount=type=cache,target=/root/.cache/pip --mount=type=cache,target=${CCACHE_DIR} \
-    GITHUB_MIRROR=$GITHUB_MIRROR python3 scripts/build_wheel.py ${BUILD_WHEEL_ARGS}
+    GITHUB_MIRROR=$GITHUB_MIRROR python3 ${BUILD_WHEEL_SCRIPT} ${BUILD_WHEEL_ARGS}
 
 FROM ${DEVEL_IMAGE} AS release
 

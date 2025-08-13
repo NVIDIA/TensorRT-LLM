@@ -19,7 +19,7 @@ class GuidedDecodingParams:
         regex (str, optional): The generated text is amenable to the user-specified regular expression. Defaults to None.
         grammar (str, optional): The generated text is amenable to the user-specified extended Backus-Naur form (EBNF) grammar. Defaults to None.
         json_object (bool): If True, the generated text is amenable to json format. Defaults to False.
-        structural_tag (str, optional): The generated text is amenable to the user-specified structural tag. Structural tag is supported by xgrammar in PyTorch backend only. Defaults to None.
+        structural_tag (str, optional): The generated text is amenable to the user-specified structural tag. Structural tag is supported by xgrammar backend only. Defaults to None.
     """  # noqa: E501
 
     json: Optional[Union[str, BaseModel, dict]] = None
@@ -279,6 +279,12 @@ class SamplingParams:
 
         self.best_of = self.best_of or self.n
 
+        if self.embedding_bias is not None:
+            if isinstance(self.embedding_bias, torch.Tensor):
+                self.embedding_bias = self.embedding_bias.detach().clone()
+            else:
+                self.embedding_bias = torch.tensor(self.embedding_bias, dtype=torch.float32)
+
         self._validate()
 
     def _validate(self):
@@ -340,17 +346,20 @@ class SamplingParams:
             if self.pad_id is None:
                 self.pad_id = self.end_id
 
+        def _encode(tokenizer, text, add_special_tokens):
+            try:
+                return tokenizer.encode(text, add_special_tokens=add_special_tokens)
+            except TypeError:
+                # For tiktokenizer, the encode method does not have add_special_tokens argument
+                return tokenizer.encode(text)
+
         if self.bad is not None:
             strs = [self.bad] if isinstance(self.bad, str) else self.bad
-            self._bad_word_ids = [
-                tokenizer.encode(s, add_special_tokens=add_special_tokens) for s in strs
-            ]
+            self._bad_word_ids = [_encode(tokenizer, s, add_special_tokens) for s in strs]
 
         if self.stop is not None:
             strs = [self.stop] if isinstance(self.stop, str) else self.stop
-            self._stop_word_ids = [
-                tokenizer.encode(s, add_special_tokens=add_special_tokens) for s in strs
-            ]
+            self._stop_word_ids = [_encode(tokenizer, s, add_special_tokens) for s in strs]
 
         return self
 

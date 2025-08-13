@@ -13,6 +13,7 @@ from huggingface_hub import snapshot_download
 
 from tensorrt_llm import LLM as PyTorchLLM
 from tensorrt_llm._tensorrt_engine import LLM
+from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
 from tensorrt_llm.bench.benchmark.utils.asynchronous import async_benchmark
 from tensorrt_llm.bench.benchmark.utils.general import generate_warmup_dataset
 from tensorrt_llm.bench.benchmark.utils.processes import IterationWriter
@@ -54,6 +55,12 @@ from tensorrt_llm.sampling_params import SamplingParams
     type=float,
     default=.90,
     help="The percentage of memory to use for KV Cache after model load.",
+)
+@optgroup.option(
+    "--mamba_ssm_cache_dtype",
+    type=click.Choice(["auto", "float16", "bfloat16", "float32"]),
+    default="auto",
+    help="Data type for Mamba SSM cache. If 'auto', inferred from model config.",
 )
 @optgroup.option(
     "--max_seq_len",
@@ -180,23 +187,23 @@ def latency_command(
     logger.info("Preparing to run latency benchmark...")
     # Parameters from CLI
     # Model, experiment, and engine params
-    dataset_path: Path = params.pop("dataset")
-    num_requests: int = params.pop("num_requests")
+    dataset_path: Path = params.get("dataset")
+    num_requests: int = params.get("num_requests")
     model: str = bench_env.model
     checkpoint_path: Path = bench_env.checkpoint_path or bench_env.model
-    engine_dir: Path = params.pop("engine_dir")
-    concurrency: int = params.pop("concurrency")
-    beam_width: int = params.pop("beam_width")
+    engine_dir: Path = params.get("engine_dir")
+    concurrency: int = params.get("concurrency")
+    beam_width: int = params.get("beam_width")
     warmup: int = params.get("warmup")
-    modality: str = params.pop("modality")
-    max_input_len: int = params.pop("max_input_len")
-    max_seq_len: int = params.pop("max_seq_len")
+    modality: str = params.get("modality")
+    max_input_len: int = params.get("max_input_len")
+    max_seq_len: int = params.get("max_seq_len")
     backend: str = params.get("backend")
     model_type = get_model_config(model, checkpoint_path).model_type
 
     # Runtime Options
-    kv_cache_percent = params.pop("kv_cache_free_gpu_mem_fraction")
-    medusa_choices = params.pop("medusa_choices")
+    kv_cache_percent = params.get("kv_cache_free_gpu_mem_fraction")
+    medusa_choices = params.get("medusa_choices")
 
     # Reporting Options
     report_json: Path = params.pop("report_json")
@@ -298,7 +305,20 @@ def latency_command(
             kwargs["pytorch_backend_config"].enable_iter_perf_stats = True
 
         if runtime_config.backend == 'pytorch':
+            if kwargs.pop("extended_runtime_perf_knob_config", None):
+                logger.warning(
+                    "Ignore extended_runtime_perf_knob_config for pytorch backend."
+                )
             llm = PyTorchLLM(**kwargs)
+        elif runtime_config.backend == "_autodeploy":
+            if kwargs.pop("extended_runtime_perf_knob_config", None):
+                logger.warning(
+                    "Ignore extended_runtime_perf_knob_config for _autodeploy backend."
+                )
+            kwargs["world_size"] = kwargs.pop("tensor_parallel_size", None)
+            kwargs.pop("pipeline_parallel_size", None)
+
+            llm = AutoDeployLLM(**kwargs)
         else:
             llm = LLM(**kwargs)
 

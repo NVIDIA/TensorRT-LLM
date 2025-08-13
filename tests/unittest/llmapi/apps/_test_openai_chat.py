@@ -11,6 +11,8 @@ import yaml
 
 from ..test_llm import get_model_path
 from .openai_server import RemoteOpenAIServer
+from .utils import (invalid_logit_bias_helper, logit_bias_effect_helper,
+                    make_server_with_custom_sampler_fixture)
 
 pytestmark = pytest.mark.threadleak(enabled=False)
 
@@ -521,3 +523,33 @@ def test_stop_reason(client: openai.OpenAI, model_name: str, backend: str):
     )
     assert resp.choices[0].finish_reason == "stop"
     assert resp.choices[0].stop_reason == "two"
+
+
+server_with_custom_sampler = make_server_with_custom_sampler_fixture('chat')
+
+
+@pytest.mark.asyncio(loop_scope='function')
+@pytest.mark.parametrize(
+    'server_with_custom_sampler',
+    [
+        {
+            'use_torch_sampler': True
+        },  # torch_sampler
+        {
+            'use_torch_sampler': False
+        },  # trtllm_sampler
+    ],
+    indirect=True,
+    ids=['torch_sampler', 'trtllm_sampler'])
+async def test_chat_completion_with_logit_bias_effect(
+        server_with_custom_sampler, model_name: str) -> None:
+    '''Test that logit bias affects output as expected for both samplers (chat endpoint).'''
+    client = server_with_custom_sampler.get_async_client()
+    await logit_bias_effect_helper(client, model_name, 'chat')
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_chat_completion_with_invalid_logit_bias(
+        async_client: openai.AsyncOpenAI, model_name: str):
+    """Test with invalid token IDs (non-integer keys) for chat completions"""
+    await invalid_logit_bias_helper(async_client, model_name, 'chat')

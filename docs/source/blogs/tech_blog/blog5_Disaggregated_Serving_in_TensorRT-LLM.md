@@ -76,12 +76,12 @@ In the example below, two context servers are launched on ports 8001 and 8002, a
 
 ```shell
 # Launching context servers
-trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8001 --kv_cache_free_gpu_memory_fraction 0.15 --backend pytorch &> output_ctx0 &
-trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8002 --kv_cache_free_gpu_memory_fraction 0.15 --backend pytorch &> output_ctx1 &
+trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8001 --kv_cache_free_gpu_memory_fraction 0.15 &> output_ctx0 &
+trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8002 --kv_cache_free_gpu_memory_fraction 0.15 &> output_ctx1 &
 
 # Launching generation servers
-trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8003 --kv_cache_free_gpu_memory_fraction 0.15 --backend pytorch &> output_gen0 &
-trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8004 --kv_cache_free_gpu_memory_fraction 0.15 --backend pytorch &> output_gen1 &
+trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8003 --kv_cache_free_gpu_memory_fraction 0.15 &> output_gen0 &
+trtllm-serve TinyLlama/TinyLlama-1.1B-Chat-v1.0 --host localhost --port 8004 --kv_cache_free_gpu_memory_fraction 0.15 &> output_gen1 &
 
 # Launching disaggregated server
 trtllm-serve disaggregated -c disagg_config.yaml
@@ -277,7 +277,7 @@ We also conducted performance evaluations of Qwen 3 on GB200 GPUs. The data indi
 
 ### Reproducing Steps
 
-We provide a set of scripts to reproduce the performance data presented in this paper. Please refer to the usage instructions described in [this document](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/disaggregated/slurm).
+We provide a set of scripts to reproduce the performance data presented in this paper. Please refer to the usage instructions described in [this document](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/disaggregated/slurm/benchmark).
 
 ## Future Work
 

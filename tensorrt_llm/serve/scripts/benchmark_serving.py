@@ -41,8 +41,8 @@ from tensorrt_llm.serve.scripts.backend_request_func import (
     RequestFuncInput, RequestFuncOutput, get_tokenizer)
 from tensorrt_llm.serve.scripts.benchmark_dataset import (
     AIMODataset, BurstGPTDataset, ConversationDataset, CustomDataset,
-    HuggingFaceDataset, InstructCoderDataset, RandomDataset, SampleRequest,
-    ShareGPTDataset, SonnetDataset, VisionArenaDataset)
+    HuggingFaceDataset, InstructCoderDataset, RandomDataset, RandomImageDataset,
+    SampleRequest, ShareGPTDataset, SonnetDataset, VisionArenaDataset)
 from tensorrt_llm.serve.scripts.benchmark_utils import (
     convert_to_pytorch_benchmark_format, write_to_json)
 # isort: on
@@ -79,6 +79,11 @@ class BenchmarkMetrics:
     std_e2el_ms: float
     percentiles_e2el_ms: list[tuple[float, float]]
     tput_user: list[float]
+    # Request accuracy rate metrics
+    mean_request_ar: float
+    median_request_ar: float
+    std_request_ar: float
+    percentiles_request_ar: list[tuple[float, float]]
 
 
 async def get_request(
@@ -131,7 +136,7 @@ def calculate_metrics(
     selected_percentile_metrics: list[str],
     selected_percentiles: list[float],
     goodput_config_dict: dict[str, float],
-) -> tuple[BenchmarkMetrics, list[int]]:
+) -> tuple[BenchmarkMetrics, list[int], list[float]]:
     actual_output_lens: list[int] = []
     total_input = 0
     completed = 0
@@ -142,6 +147,7 @@ def calculate_metrics(
     ttfts: list[float] = []
     e2els: list[float] = []
     tput_user: list[float] = []
+    request_ars: list[float] = []  # Request accuracy rates
     for i in range(len(outputs)):
         if outputs[i].success:
             output_len = outputs[i].output_tokens
@@ -167,9 +173,24 @@ def calculate_metrics(
             ttfts.append(outputs[i].ttft)
             e2els.append(outputs[i].latency)
             tput_user.append(output_len / (outputs[i].latency))
+
+            # Calculate request accuracy rate (num_generated_tokens / (decode_iteration + 1))
+            decode_iter = outputs[i].decode_iteration
+            if decode_iter >= 0:
+                # For generated tokens, we use output_len - 1 (excluding the first token if needed)
+                # But according to the reference, it should be num_generated_tokens
+                num_generated_tokens = max(0, output_len -
+                                           1) if output_len > 1 else output_len
+                request_ar = num_generated_tokens / (
+                    decode_iter + 1) if decode_iter >= 0 else 0.0
+                request_ars.append(request_ar)
+            else:
+                request_ars.append(0.0)
+
             completed += 1
         else:
             actual_output_lens.append(0)
+            request_ars.append(0.0)
 
     if goodput_config_dict:
         valid_metrics = []
@@ -228,8 +249,13 @@ def calculate_metrics(
         percentiles_e2el_ms=[(p, np.percentile(e2els or 0, p) * 1000)
                              for p in selected_percentiles],
         tput_user=np.mean(tput_user or 0),
+        mean_request_ar=np.mean(request_ars or 0),
+        median_request_ar=np.median(request_ars or 0),
+        std_request_ar=np.std(request_ars or 0),
+        percentiles_request_ar=[(p, np.percentile(request_ars or 0, p))
+                                for p in selected_percentiles],
     )
-    return metrics, actual_output_lens
+    return metrics, actual_output_lens, request_ars
 
 
 async def benchmark(
@@ -262,10 +288,13 @@ async def benchmark(
 
     if not no_test_input:
         print("Starting initial single prompt test run...")
-        test_prompt, test_prompt_len, test_output_len = \
+        test_prompt, test_prompt_len, test_output_len, test_mm_content = \
             input_requests[0].prompt, input_requests[0].prompt_len, \
-            input_requests[0].expected_output_len
+            input_requests[0].expected_output_len, input_requests[0].multi_modal_data
 
+        assert test_mm_content is None or isinstance(
+            test_mm_content, list) and all(
+                isinstance(item, dict) for item in test_mm_content)
         test_input = RequestFuncInput(
             model=model_id,
             model_name=model_name,
@@ -276,6 +305,7 @@ async def benchmark(
             logprobs=logprobs,
             ignore_eos=ignore_eos,
             extra_body=extra_body,
+            multi_modal_content=test_mm_content,
         )
 
         test_output = await request_func(request_func_input=test_input,
@@ -297,15 +327,18 @@ async def benchmark(
 
     if profile:
         print("Starting profiler...")
-        profile_input = RequestFuncInput(model=model_id,
-                                         model_name=model_name,
-                                         prompt=test_prompt,
-                                         api_url=base_url + "/start_profile",
-                                         prompt_len=test_prompt_len,
-                                         output_len=test_output_len,
-                                         logprobs=logprobs,
-                                         ignore_eos=ignore_eos,
-                                         extra_body=extra_body)
+        profile_input = RequestFuncInput(
+            model=model_id,
+            model_name=model_name,
+            prompt=test_prompt,
+            api_url=base_url + "/start_profile",
+            prompt_len=test_prompt_len,
+            output_len=test_output_len,
+            logprobs=logprobs,
+            ignore_eos=ignore_eos,
+            extra_body=extra_body,
+            multi_modal_content=test_mm_content,
+        )
         profile_output = await request_func(request_func_input=profile_input,
                                             streaming=streaming)
         if profile_output.success:
@@ -353,23 +386,26 @@ async def benchmark(
 
     i = 0
     async for request in get_request(input_requests, request_rate, burstiness):
-        prompt, prompt_len, output_len = request.prompt, \
-            request.prompt_len, request.expected_output_len
+        prompt, prompt_len, output_len, mm_content = request.prompt, \
+            request.prompt_len, request.expected_output_len, request.multi_modal_data
 
         req_model_id, req_model_name = model_id, model_name
         if lora_modules:
             req_lora_module = next(lora_modules)
             req_model_id, req_model_name = req_lora_module, req_lora_module
 
-        request_func_input = RequestFuncInput(model=req_model_id,
-                                              model_name=req_model_name,
-                                              prompt=prompt,
-                                              api_url=api_url,
-                                              prompt_len=prompt_len,
-                                              output_len=output_len,
-                                              logprobs=logprobs,
-                                              ignore_eos=ignore_eos,
-                                              extra_body=extra_body)
+        request_func_input = RequestFuncInput(
+            model=req_model_id,
+            model_name=req_model_name,
+            prompt=prompt,
+            api_url=api_url,
+            prompt_len=prompt_len,
+            output_len=output_len,
+            logprobs=logprobs,
+            ignore_eos=ignore_eos,
+            extra_body=extra_body,
+            multi_modal_content=mm_content,
+        )
         tasks.append(
             asyncio.create_task(
                 limited_request_func(request_func_input=request_func_input,
@@ -403,7 +439,7 @@ async def benchmark(
     # Close the session
     await session.close()
 
-    metrics, actual_output_lens = calculate_metrics(
+    metrics, actual_output_lens, request_ars = calculate_metrics(
         input_requests=input_requests,
         outputs=outputs,
         dur_s=benchmark_duration,
@@ -431,6 +467,10 @@ async def benchmark(
                                     metrics.total_token_throughput))
     print("{:<40} {:<10.2f}".format("User throughput (tok/s):",
                                     metrics.tput_user))
+    print("{:<40} {:<10.4f}".format("Mean Request AR:",
+                                    metrics.mean_request_ar))
+    print("{:<40} {:<10.4f}".format("Median Request AR:",
+                                    metrics.median_request_ar))
 
     result = {
         "duration": benchmark_duration,
@@ -443,12 +483,17 @@ async def benchmark(
         "output_throughput": metrics.output_throughput,
         "total_token_throughput": metrics.total_token_throughput,
         "user_throughput": metrics.tput_user,
+        "mean_request_ar": metrics.mean_request_ar,
+        "median_request_ar": metrics.median_request_ar,
+        "std_request_ar": metrics.std_request_ar,
         "input_lens": [output.prompt_len for output in outputs],
         "output_lens": actual_output_lens,
         "ttfts": [output.ttft for output in outputs],
         "itls": [output.itl for output in outputs],
         "generated_texts": [output.generated_text for output in outputs],
         "errors": [output.error for output in outputs],
+        "request_ars": request_ars,
+        "decode_iterations": [output.decode_iteration for output in outputs],
     }
 
     def process_one_metric(
@@ -534,11 +579,15 @@ def save_to_pytorch_benchmark_format(args: argparse.Namespace,
     metrics = [
         "median_ttft_ms", "mean_ttft_ms", "std_ttft_ms", "p99_ttft_ms",
         "mean_tpot_ms", "median_tpot_ms", "std_tpot_ms", "p99_tpot_ms",
-        "median_itl_ms", "mean_itl_ms", "std_itl_ms", "p99_itl_ms"
+        "median_itl_ms", "mean_itl_ms", "std_itl_ms", "p99_itl_ms",
+        "mean_request_ar", "median_request_ar", "std_request_ar"
     ]
     # These raw data might be useful, but they are rather big. They can be added
     # later if needed
-    ignored_metrics = ["ttfts", "itls", "generated_texts", "errors"]
+    ignored_metrics = [
+        "ttfts", "itls", "generated_texts", "errors", "request_ars",
+        "decode_iterations"
+    ]
     pt_records = convert_to_pytorch_benchmark_format(
         args=args,
         metrics={k: [results[k]]
@@ -563,6 +612,9 @@ def main(args: argparse.Namespace):
     model_name = args.served_model_name
     tokenizer_id = args.tokenizer if args.tokenizer is not None else args.model
     tokenizer_mode = args.tokenizer_mode
+
+    if backend == "openai-chat":
+        args.endpoint = "/v1/chat/completions"
 
     if args.base_url is not None:
         api_url = f"{args.base_url}{args.endpoint}"
@@ -626,6 +678,13 @@ def main(args: argparse.Namespace):
                 f" from one of following: {supported_datasets}. "
                 "Please consider contributing if you would "
                 "like to add support for additional dataset formats.")
+        if dataset_class.IS_MULTIMODAL and backend not in [
+                "openai-chat",
+        ]:
+            # multi-modal benchmark is only available on OpenAI Chat backend.
+            raise ValueError(
+                "Multi-modal content is only supported on 'openai-chat' backend."
+            )
         input_requests = dataset_class(
             dataset_path=args.dataset_path,
             dataset_subset=args.hf_subset,
@@ -645,41 +704,78 @@ def main(args: argparse.Namespace):
                                        )
 
     else:
-        # For datasets that follow a similar structure, use a mapping.
-        dataset_mapping = {
-            "sharegpt":
-            lambda: ShareGPTDataset(download_path=args.download_path,
-                                    download_timeout=args.download_timeout,
-                                    random_seed=args.seed,
-                                    dataset_path=args.dataset_path).sample(
-                                        tokenizer=tokenizer,
-                                        num_requests=args.num_prompts,
-                                        output_len=args.sharegpt_output_len,
-                                    ),
-            "burstgpt":
-            lambda: BurstGPTDataset(random_seed=args.seed,
-                                    dataset_path=args.dataset_path).
-            sample(tokenizer=tokenizer, num_requests=args.num_prompts),
-            "random":
-            lambda: RandomDataset(sample_from_sharegpt=not args.random_ids,
-                                  return_text=not args.tokenize_on_client,
-                                  dataset_path=args.dataset_path,
-                                  download_path=args.download_path,
-                                  download_timeout=args.download_timeout
-                                  ).sample(
-                                      tokenizer=tokenizer,
-                                      num_requests=args.num_prompts,
-                                      prefix_len=args.random_prefix_len,
-                                      input_len=args.random_input_len,
-                                      output_len=args.random_output_len,
-                                      range_ratio=args.random_range_ratio,
-                                  )
+
+        def create_dataset_and_sample(dataset_name: str):
+            """Factory function to create dataset instance and generate samples."""
+
+            # Dataset factory mapping with lambda functions for lazy evaluation
+            dataset_factories = {
+                "sharegpt":
+                lambda: ShareGPTDataset(download_path=args.download_path,
+                                        download_timeout=args.download_timeout,
+                                        random_seed=args.seed,
+                                        dataset_path=args.dataset_path).
+                sample(tokenizer=tokenizer,
+                       num_requests=args.num_prompts,
+                       output_len=args.sharegpt_output_len),
+                "burstgpt":
+                lambda: BurstGPTDataset(random_seed=args.seed,
+                                        dataset_path=args.dataset_path).
+                sample(tokenizer=tokenizer, num_requests=args.num_prompts),
+                "random":
+                lambda: RandomDataset(sample_from_sharegpt=not args.random_ids,
+                                      return_text=not args.tokenize_on_client,
+                                      dataset_path=args.dataset_path,
+                                      download_path=args.download_path,
+                                      download_timeout=args.download_timeout,
+                                      random_seed=args.seed).sample(
+                                          tokenizer=tokenizer,
+                                          num_requests=args.num_prompts,
+                                          prefix_len=args.random_prefix_len,
+                                          input_len=args.random_input_len,
+                                          output_len=args.random_output_len,
+                                          range_ratio=args.random_range_ratio),
+                "random_image":
+                lambda: RandomImageDataset(
+                    random_seed=args.seed,
+                    return_text=not args.tokenize_on_client,
+                ).sample(tokenizer=tokenizer,
+                         num_requests=args.num_prompts,
+                         prefix_len=args.random_prefix_len,
+                         input_len=args.random_input_len,
+                         output_len=args.random_output_len,
+                         range_ratio=args.random_range_ratio,
+                         width=args.random_image_width,
+                         height=args.random_image_height,
+                         image_size=args.random_image_size,
+                         num_images=args.random_num_images),
+            }
+
+            if dataset_name not in dataset_factories:
+                raise ValueError(
+                    f"Unknown dataset: {dataset_name}. "
+                    f"Available datasets: {list(dataset_factories.keys())}")
+
+            return dataset_factories[dataset_name]()
+
+        # Check multimodal compatibility before creating dataset
+        dataset_class_mapping = {
+            "sharegpt": ShareGPTDataset,
+            "burstgpt": BurstGPTDataset,
+            "random": RandomDataset,
+            "random_image": RandomImageDataset,
         }
 
-        try:
-            input_requests = dataset_mapping[args.dataset_name]()
-        except KeyError as err:
-            raise ValueError(f"Unknown dataset: {args.dataset_name}") from err
+        dataset_class = dataset_class_mapping.get(args.dataset_name)
+        if dataset_class and dataset_class.IS_MULTIMODAL and backend not in [
+                "openai-chat"
+        ]:
+            raise ValueError(
+                "Multi-modal content is only supported on 'openai-chat' backend."
+            )
+
+        # Create dataset and generate samples
+        input_requests = create_dataset_and_sample(args.dataset_name)
     goodput_config_dict = check_goodput_args(args)
 
     # Collect the sampling parameters.
@@ -762,7 +858,8 @@ def main(args: argparse.Namespace):
             # Remove fields with too many data points
             for field in [
                     "input_lens", "output_lens", "ttfts", "itls",
-                    "generated_texts", "errors"
+                    "generated_texts", "errors", "request_ars",
+                    "decode_iterations"
             ]:
                 if field in result_json:
                     del result_json[field]
@@ -816,7 +913,8 @@ if __name__ == "__main__":
         type=str,
         default="sharegpt",
         choices=[
-            "sharegpt", "burstgpt", "sonnet", "random", "hf", "trtllm_custom"
+            "sharegpt", "burstgpt", "sonnet", "random", "random_image", "hf",
+            "trtllm_custom"
         ],
         help="Name of the dataset to benchmark on.",
     )
@@ -963,11 +1061,11 @@ if __name__ == "__main__":
     parser.add_argument(
         "--percentile-metrics",
         type=str,
-        default="ttft,tpot,itl",
+        default="ttft,tpot,itl,request_ar",
         help="Comma-separated list of selected metrics to report percentils. "
         "This argument specifies the metrics to report percentiles. "
-        "Allowed metric names are \"ttft\", \"tpot\", \"itl\", \"e2el\". "
-        "Default value is \"ttft,tpot,itl\".")
+        "Allowed metric names are \"ttft\", \"tpot\", \"itl\", \"e2el\", \"request_ar\". "
+        "Default value is \"ttft,tpot,itl,request_ar\".")
     parser.add_argument(
         "--metric-percentiles",
         type=str,
@@ -1065,6 +1163,32 @@ if __name__ == "__main__":
         action="store_true",
         help=
         "Tokenize on client instead of server. This option only takes effect with random dataset to let the server run exactly the same ISL specified by cli.",
+    )
+    random_image_group = parser.add_argument_group(
+        "random image dataset options")
+    random_image_group.add_argument(
+        "--random-image-width",
+        type=int,
+        default=512,
+        help="Width of the image.",
+    )
+    random_image_group.add_argument(
+        "--random-image-height",
+        type=int,
+        default=512,
+        help="Height of the image.",
+    )
+    random_image_group.add_argument(
+        "--random-image-size",
+        type=int,
+        default=512,
+        help="Squared size of the image.",
+    )
+    random_image_group.add_argument(
+        "--random-num-images",
+        type=int,
+        default=1,
+        help="Number of images per request.",
     )
 
     hf_group = parser.add_argument_group("hf dataset options")

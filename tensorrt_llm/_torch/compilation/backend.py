@@ -13,9 +13,8 @@ import tensorrt_llm
 from tensorrt_llm import logger
 
 from .multi_stream.auto_multi_stream import multi_stream_schedule
-from .patterns.ar_residual_norm import register_ar_residual_norm
+from .patterns.ar_residual_norm import register_ar_fusions
 from .patterns.residual_add_norm import register_add_norm
-from .patterns.ub_allreduce import register_ub_patterns
 from .piecewise_optimizer import piecewise_optimizer
 from .recover_pass import recover_pass
 from .remove_copy_pass import remove_copy_for_mutates_args
@@ -76,10 +75,9 @@ class Backend:
                 # Currently torch compile cannot work properly with lamport fusion kernel
                 # TO-DO: Fix this issue
                 os.environ["DISABLE_LAMPORT_REDUCE_NORM_FUSION"] = "1"
-                register_ar_residual_norm(cls._custom_pass_instances[0])
-                if enable_userbuffers and tensorrt_llm.bindings.internal.userbuffers.ub_supported(
-                ):
-                    register_ub_patterns(cls._custom_pass_instances)
+                ub_enabled = enable_userbuffers and tensorrt_llm.bindings.internal.userbuffers.ub_supported(
+                )
+                register_ar_fusions(cls._custom_pass_instances, ub_enabled)
             else:
                 register_add_norm(cls._custom_pass_instances[0])
         return cls._custom_pass_instances

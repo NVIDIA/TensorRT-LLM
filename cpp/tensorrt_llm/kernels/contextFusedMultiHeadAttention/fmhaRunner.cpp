@@ -238,6 +238,9 @@ void FusedMHARunnerV2::setupKernelParams(MHARunnerParams runnerParams)
         mKernelParams.packed_mask_ptr = runnerParams.packedMaskPtr;
         mKernelParams.cu_mask_rows = reinterpret_cast<int const*>(runnerParams.cuMaskRowsPtr);
     }
+    TLLM_CHECK_WITH_INFO(
+        runnerParams.attentionSinksPtr == nullptr || mSM == kSM_90, "The attention sinks is only supported on SM90.");
+    mKernelParams.attention_sinks_ptr = runnerParams.attentionSinksPtr;
     mKernelParams.cu_q_seqlens = reinterpret_cast<int const*>(runnerParams.cuQSeqLenPtr);
     mKernelParams.tile_id_counter_ptr = reinterpret_cast<uint32_t*>(runnerParams.tileCounterPtr);
     // TRT doesn't support host scales. Use device scales instead.
@@ -294,6 +297,11 @@ void FusedMHARunnerV2::setupLaunchParams(MHARunnerParams runnerParams)
         = mFixedParams.isSPadded ? runnerParams.b * runnerParams.qSeqLen : runnerParams.totalQSeqLen;
     mLaunchParams.total_kv_seqlen
         = mFixedParams.isSPadded ? runnerParams.b * runnerParams.kvSeqLen : runnerParams.totalKvSeqLen;
+    // Workaround for nvbug 5412456: total_kv_seqlen fallbacks to total_q_seqlen if it's zero.
+    if (mLaunchParams.total_kv_seqlen == 0)
+    {
+        mLaunchParams.total_kv_seqlen = mLaunchParams.total_q_seqlen;
+    }
 
     TLLM_CHECK_WITH_INFO(mFixedParams.headSize > 0, "Head size should be greater than 0.");
     // Pad head size to next power of 2.
@@ -538,7 +546,7 @@ void FusedMHARunnerV2::setTmaDescriptors(MHARunnerParams runnerParams)
         // Box size of TMA
         const uint32_t box_size_o[3] = {d_per_group, 1, 16};
 
-        // Yuxin: dataTypeOut may be different with dataType, so desc_format and swizzle_mode
+        // dataTypeOut may be different with dataType, so desc_format and swizzle_mode
         // may be incorrect. For example, QKV are in bf16 while O is in fp8.
         // Luckily, this case doesn't exist so far. But we should keep one eye on it.
         qo_tma_descriptor.set_tma_desctriptor(o_ptr, desc_format, cudaTmaDescInterleave::INTERLEAVE_DISABLED,
@@ -634,21 +642,6 @@ void FusedMHARunnerV2::run(MHARunnerParams runnerParams)
     {
         setTmaDescriptors(runnerParams);
     }
-    // Check if the sliding window size is valid or not.
-    if (mFixedParams.attentionInputLayout == AttentionInputLayout::Q_PAGED_KV
-        && mLaunchParams.attention_mask_type == ContextAttentionMaskType::SLIDING_OR_CHUNKED_CAUSAL)
-    {
-        uint32_t q_step = 0, kv_step = 0;
-        xmmaKernel->getStepSize(q_step, kv_step, mKernelParams, mLaunchParams);
-        // The sliding window size needs to be multiple of kv_step, so that the paged context fmha can read the cyclic
-        // kv cache correctly.
-        if (runnerParams.kvSeqLen > runnerParams.slidingWindowSize)
-        {
-            TLLM_CHECK_WITH_INFO(mKernelParams.sliding_window_size % kv_step == 0,
-                "The sliding window size doesn't work with paged context fmha kv_step_size = %d.", kv_step);
-        }
-    }
-
     // Select the kernel and run it.
     xmmaKernel->run(mKernelParams, mLaunchParams, runnerParams.stream);
 }

@@ -506,9 +506,20 @@ def test_cpp_unit_tests(tritonserver_test_root, test_name, llm_root):
         "rm -rf build && "
         "mkdir -p build", llm_root)
 
+    # Get the value of TRITON_SHORT_TAG from docker/Dockerfile.multi
+    import subprocess
+    triton_short_tag = subprocess.check_output(
+        [f"{llm_root}/jenkins/scripts/get_triton_tag.sh", llm_root],
+        text=True).strip()
+    print(f"using triton tag from docker/Dockerfile.multi: {triton_short_tag}")
     run_shell_command(
         f"cd {llm_root}/triton_backend/inflight_batcher_llm/build && "
-        f"cmake .. -DTRTLLM_DIR={llm_root} -DCMAKE_INSTALL_PREFIX=install/ -DBUILD_TESTS=ON  -DUSE_CXX11_ABI=ON -DTRITON_COMMON_REPO_TAG=r25.05 -DTRITON_CORE_REPO_TAG=r25.05 -DTRITON_THIRD_PARTY_REPO_TAG=r25.05 -DTRITON_BACKEND_REPO_TAG=r25.05 "
+        f"cmake .. -DTRTLLM_DIR={llm_root} -DCMAKE_INSTALL_PREFIX=install/ "
+        f"-DBUILD_TESTS=ON  -DUSE_CXX11_ABI=ON "
+        f"-DTRITON_COMMON_REPO_TAG={triton_short_tag} "
+        f"-DTRITON_CORE_REPO_TAG={triton_short_tag} "
+        f"-DTRITON_THIRD_PARTY_REPO_TAG={triton_short_tag} "
+        f"-DTRITON_BACKEND_REPO_TAG={triton_short_tag} "
         "&& make -j8 install", llm_root)
 
     # Run the cpp unit tests

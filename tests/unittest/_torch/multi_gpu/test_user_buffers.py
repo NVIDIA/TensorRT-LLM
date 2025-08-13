@@ -35,7 +35,8 @@ pytestmark = pytest.mark.threadleak(enabled=False)
 
 def init_userbuffers_allocator(tp_size, rank, max_ub_size):
     ub.initialize_userbuffers_manager(tp_size, 1, 1, rank,
-                                      torch.cuda.device_count(), max_ub_size)
+                                      torch.cuda.device_count(), max_ub_size,
+                                      False)
 
 
 def create_userbuffers_tensor(shape, dtype):
@@ -457,10 +458,10 @@ def run_single_rank_ub_pass(
             output_fused = model_opt(input)
         # 3 AR_NORM fusion happens first
         # 2 AR_NORM fused with Quant
-        # 1 AR_NORM replacement
+        # 3 AR_NORM replacement
         # 3 Scaled MM Prologue
         # 2 UB Finalize Removal
-        assert backend.match_count == [3, 0, 2, 0, 1, 0, 3, 0, 2, 0]
+        assert backend.match_count == [3, 0, 2, 0, 3, 0, 3, 0, 2, 0]
         torch.cuda.synchronize()
 
         if rank == 0:
@@ -977,7 +978,7 @@ def run_single_rank_ub_pass_fp4(
 
         def block_scale_unswizzled(scale):
             sz = fp4_utils.pad_up(hidden_size, 128)
-            return torch.ops.trtllm.nvfp4_block_scale_interleave_reverse(
+            return torch.ops.trtllm.block_scale_interleave_reverse(
                 scale.cpu().view(sz, -1))[0:hidden_size]
 
         l0_weight_scale_block_unswizzled = block_scale_unswizzled(
@@ -1013,10 +1014,10 @@ def run_single_rank_ub_pass_fp4(
 
         # 3 AR_NORM fusion happens first
         # 2 AR_NORM fused with Quant
-        # 1 AR_NORM replacement
+        # 3 AR_NORM replacement
         # 3 Scaled MM Prologue
         # 2 UB Finalize Removal
-        assert backend.match_count == [3, 0, 2, 0, 1, 0, 3, 0, 2, 0]
+        assert backend.match_count == [3, 0, 2, 0, 3, 0, 3, 0, 2, 0]
         torch.cuda.synchronize()
         torch.testing.assert_close(output_fused,
                                    output_ref,

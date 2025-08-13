@@ -63,8 +63,16 @@ class MLPLayer(MLP):
         layer_idx: int,
     ):
         config = model_config.pretrained_config
+        if isinstance(config.intermediate_size, list):
+            if len(config.intermediate_size) == 1:
+                intermediate_size = config.intermediate_size[0]
+            else:
+                intermediate_size = config.intermediate_size[layer_idx]
+        else:
+            intermediate_size = config.intermediate_size
+
         super().__init__(hidden_size=config.hidden_size,
-                         intermediate_size=config.intermediate_size,
+                         intermediate_size=intermediate_size,
                          bias=False,
                          activation=relu2,
                          dtype=config.torch_dtype,
@@ -139,7 +147,7 @@ class NemotronHLayer(DecoderLayer):
             self.mixer = Mamba2Mixer(d_model=config.hidden_size,
                                      d_state=config.ssm_state_size,
                                      d_conv=config.conv_kernel,
-                                     expand=config.expand,
+                                     nheads=config.mamba_num_heads,
                                      n_groups=config.n_groups,
                                      head_dim=config.mamba_head_dim,
                                      chunk_size=config.chunk_size,

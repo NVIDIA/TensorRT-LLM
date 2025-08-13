@@ -5,7 +5,7 @@ from utils.llm_data import llm_models_root
 from utils.util import force_ampere, similar
 
 from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm.llmapi.llm_utils import KvCacheConfig
+from tensorrt_llm.llmapi import CudaGraphConfig, KvCacheConfig
 
 
 @pytest.fixture(scope="module")
@@ -43,16 +43,14 @@ def llm(fixed_params, input_prompts):
             input_prompts
         ),  # use small batch size to prevent large buffers from possibly hiding wrong data accesses.
         max_seq_len=32,
-        enable_trtllm_sampler=True,
         max_beam_width=fixed_params["max_beam_width"],
         disable_overlap_scheduler=True,
-        #TODO: remove this once we have a proper fix for CUDA graph in beam search
         cuda_graph_config=None,
     )
 
 
 @pytest.fixture(scope="module")
-def llm_overlap(fixed_params, input_prompts):
+def llm_cuda_graph(fixed_params, input_prompts):
     return LLM(
         model=os.path.join(llm_models_root(), "llama-models-v2",
                            "TinyLlama-1.1B-Chat-v1.0"),
@@ -61,11 +59,10 @@ def llm_overlap(fixed_params, input_prompts):
             input_prompts
         ),  # use small batch size to prevent large buffers from possibly hiding wrong data accesses.
         max_seq_len=32,
-        enable_trtllm_sampler=True,
         max_beam_width=fixed_params["max_beam_width"],
         disable_overlap_scheduler=False,
-        #TODO: remove this once we have a proper fix for CUDA graph in beam search
-        cuda_graph_config=None,
+        cuda_graph_config=CudaGraphConfig(batch_sizes=[1, 2, 4, 8],
+                                          enable_padding=True),
     )
 
 
@@ -130,12 +127,12 @@ def test_beam_search_output_shapes(gather_context_logits: bool,
 @pytest.mark.parametrize("gather_generation_logits", [True, False])
 @pytest.mark.parametrize("gather_context_logits", [True, False])
 @pytest.mark.parametrize("num_output_beams", [1, 2])
-@pytest.mark.parametrize("num_prompts", [1, 2])
+@pytest.mark.parametrize("num_prompts", [1, 2, 3])
 @pytest.mark.threadleak(enabled=False)
-def test_beam_search_output_shapes_overlap(
+def test_beam_search_output_shapes_cuda_graph_and_overlap(
         gather_context_logits: bool, gather_generation_logits: bool,
         return_log_probs: bool, num_output_beams: int, num_prompts: int,
-        llm_overlap, fixed_params, input_prompts, expected_outputs):
+        llm_cuda_graph, fixed_params, input_prompts, expected_outputs):
     if return_log_probs and num_prompts > 1:
         pytest.skip(
             "Beam search currently does not support return_log_probs with multiple prompts"
@@ -149,8 +146,12 @@ def test_beam_search_output_shapes_overlap(
         return_generation_logits=gather_generation_logits,
         logprobs=return_log_probs,
     )
-    outputs = llm_overlap.generate(input_prompts[:num_prompts],
-                                   sampling_params=sampling_params)
+    # test padding of cuda graph with 3 prompts
+    # replicate the prompts to have more than 2 prompts available
+    if (num_prompts == 3 and len(input_prompts) == 2):
+        input_prompts = [input_prompts[0]] * 3
+    outputs = llm_cuda_graph.generate(input_prompts[:num_prompts],
+                                      sampling_params=sampling_params)
     assert len(outputs) == num_prompts
     for output_idx, output in enumerate(outputs):
         if gather_context_logits:

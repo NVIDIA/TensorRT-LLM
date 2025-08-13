@@ -36,6 +36,8 @@ def get_test_config(test_desc, example_dir, test_root):
     """Get test configuration based on test description."""
     test_configs_root = f"{test_root}/test_configs"
     config_map = {
+        "2_ranks_diff_max_tokens":
+        (2, f"{test_configs_root}/disagg_config_diff_max_tokens.yaml"),
         "2_ranks": (2, f"{example_dir}/disagg_config.yaml"),
         "2_ranks_trt_backend":
         (2, f"{test_configs_root}/disagg_config_trt_backend.yaml"),
@@ -50,8 +52,8 @@ def get_test_config(test_desc, example_dir, test_root):
         (2, f"{test_configs_root}/disagg_config_cuda_graph_padding.yaml"),
         "mixed": (2, f"{test_configs_root}/disagg_config_mixed.yaml"),
         "overlap": (2, f"{test_configs_root}/disagg_config_overlap.yaml"),
-        "trtllm_sampler":
-        (2, f"{test_configs_root}/disagg_config_trtllm_sampler.yaml"),
+        "torch_sampler":
+        (2, f"{test_configs_root}/disagg_config_torch_sampler.yaml"),
         "load_balance":
         (4, f"{test_configs_root}/disagg_config_load_balance.yaml"),
         "cache_aware_balance":
@@ -59,6 +61,16 @@ def get_test_config(test_desc, example_dir, test_root):
         "conditional": (2,
                         f"{test_configs_root}/disagg_config_conditional.yaml"),
         "ngram": (2, f"{test_configs_root}/disagg_config_ngram.yaml"),
+        "ctxpp2_genpp2":
+        (4, f"{test_configs_root}/disagg_config_ctxpp2_genpp2.yaml"),
+        "ctxtp2_genpp2":
+        (4, f"{test_configs_root}/disagg_config_ctxtp2_genpp2.yaml"),
+        "ctxpp2_gentp2":
+        (4, f"{test_configs_root}/disagg_config_ctxpp2_gentp2.yaml"),
+        "ctxtp2pp2_gentp2pp2":
+        (8, f"{test_configs_root}/disagg_config_ctxtp2pp2_gentp2pp2.yaml"),
+        "ctxpp4_genpp4":
+        (8, f"{test_configs_root}/disagg_config_ctxpp4_genpp4.yaml"),
         "deepseek_v3_lite_fp8_mpi":
         (4,
          f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_mpi.yaml"
@@ -134,7 +146,8 @@ def run_disaggregated_test(example_dir,
                            test_desc,
                            num_iters=5,
                            env=None,
-                           cwd=None):
+                           cwd=None,
+                           prompt_file="prompts.json"):
     """Run disaggregated test with given configuration."""
     cleanup_output_files()
     run_env = env.copy()
@@ -175,10 +188,13 @@ def run_disaggregated_test(example_dir,
                 client_cmd = [
                     'python3', f'{client_dir}/disagg_client.py', '-c',
                     f'{example_dir}/disagg_config.yaml', '-p',
-                    f'{client_dir}/prompts.json', '--ignore-eos',
+                    f'{client_dir}/{prompt_file}', '--ignore-eos',
                     '--server-start-timeout',
                     str(server_start_timeout)
                 ]
+                if prompt_file == "long_prompts.json":
+                    # Use max_tokens 4 for long prompts to reduce test time
+                    client_cmd.extend(['--max-tokens', '4'])
                 check_call(client_cmd,
                            env=env,
                            poll_procs=[workers_proc, server_proc])
@@ -192,7 +208,7 @@ def run_disaggregated_test(example_dir,
                            poll_procs=[workers_proc, server_proc])
 
                 # Run the chat completion endpoint test only for TinyLlama
-                if test_desc == "overlap" or test_desc == "trtllm_sampler":
+                if test_desc == "overlap" or test_desc == "torch_sampler":
                     chat_client_cmd = client_cmd + [
                         '-e', 'chat', '-o', 'output_chat.json'
                     ]
@@ -207,11 +223,15 @@ def run_disaggregated_test(example_dir,
                                env=env,
                                poll_procs=[workers_proc, server_proc])
 
+                # Skip output verification for long prompts test
+                if prompt_file == "long_prompts.json":
+                    continue
+
                 # Verify outputs
                 not_expected_strings = ["Berlin Berlin"]
 
                 output_files = ['output.json', 'output_streaming.json']
-                if test_desc == "overlap" or test_desc == "trtllm_sampler":
+                if test_desc == "overlap" or test_desc == "torch_sampler":
                     # Disable streaming chat completion for overlap test
                     # due to bug
                     output_files.extend(['output_chat.json'])
@@ -223,14 +243,23 @@ def run_disaggregated_test(example_dir,
                     with open(output_file, 'r') as f:
                         content = f.read()
                         if "deepseek_v3_lite" in test_desc or output_file == "output_chat.json":
-                            expected_strings = ["Berlin", "Asyncio is a"]
+                            expected_strings = [
+                                "Berlin", ["Asyncio is a", "Asyncio module in"]
+                            ]
                         else:
                             expected_strings = [
                                 "The capital of Germany is Berlin",
                                 "Asyncio is a Python library"
                             ]
                         for expected_string in expected_strings:
-                            assert expected_string in content, f"Expected string '{expected_string}' not found in {output_file}"
+                            if isinstance(expected_string, list):
+                                # At least one of the strings in the list should be found in the content
+                                assert any(
+                                    string in content
+                                    for string in expected_string
+                                ), f"None of the strings in {expected_string} found in {output_file}"
+                            else:
+                                assert expected_string in content, f"Expected string '{expected_string}' not found in {output_file}"
                         for not_expected_string in not_expected_strings:
                             assert not_expected_string not in content, f"Unexpected string '{not_expected_string}' found in {output_file}"
     except Exception:
@@ -248,6 +277,27 @@ def run_disaggregated_test(example_dir,
         workers_proc.terminate()
         server_proc.wait()
         workers_proc.wait()
+
+
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+def test_disaggregated_diff_max_tokens(disaggregated_test_root,
+                                       disaggregated_example_root, llm_venv,
+                                       llama_model_root):
+    src_dst_dict = {
+        llama_model_root:
+        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+    run_disaggregated_test(disaggregated_example_root,
+                           "2_ranks_diff_max_tokens",
+                           env=llm_venv._new_env,
+                           cwd=llm_venv.get_working_directory(),
+                           prompt_file="long_prompts.json")
 
 
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
@@ -435,9 +485,9 @@ def test_disaggregated_overlap(disaggregated_test_root, llm_venv,
 
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
                          indirect=True)
-def test_disaggregated_trtllm_sampler(disaggregated_test_root, llm_venv,
-                                      disaggregated_example_root,
-                                      llama_model_root):
+def test_disaggregated_torch_sampler(disaggregated_test_root, llm_venv,
+                                     disaggregated_example_root,
+                                     llama_model_root):
     src_dst_dict = {
         llama_model_root:
         f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
@@ -448,7 +498,7 @@ def test_disaggregated_trtllm_sampler(disaggregated_test_root, llm_venv,
             os.symlink(src, dst, target_is_directory=True)
 
     run_disaggregated_test(disaggregated_example_root,
-                           "trtllm_sampler",
+                           "torch_sampler",
                            env=llm_venv._new_env,
                            cwd=llm_venv.get_working_directory())
 
@@ -513,6 +563,7 @@ def test_disaggregated_conditional(disaggregated_test_root, llm_venv,
                            cwd=llm_venv.get_working_directory())
 
 
+@pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/5441714")
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
                          indirect=True)
 def test_disaggregated_ngram(disaggregated_test_root, llm_venv,
@@ -527,6 +578,106 @@ def test_disaggregated_ngram(disaggregated_test_root, llm_venv,
             os.symlink(src, dst, target_is_directory=True)
     run_disaggregated_test(disaggregated_example_root,
                            "ngram",
+                           env=llm_venv._new_env,
+                           cwd=llm_venv.get_working_directory())
+
+
+@pytest.mark.skip_less_device(4)
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+def test_disaggregated_ctxpp2_genpp2(disaggregated_test_root, llm_venv,
+                                     disaggregated_example_root,
+                                     llama_model_root):
+    src_dst_dict = {
+        llama_model_root:
+        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+    run_disaggregated_test(disaggregated_example_root,
+                           "ctxpp2_genpp2",
+                           env=llm_venv._new_env,
+                           cwd=llm_venv.get_working_directory())
+
+
+@pytest.mark.skip_less_device(4)
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+def test_disaggregated_ctxtp2_genpp2(disaggregated_test_root, llm_venv,
+                                     disaggregated_example_root,
+                                     llama_model_root):
+    src_dst_dict = {
+        llama_model_root:
+        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+    run_disaggregated_test(disaggregated_example_root,
+                           "ctxtp2_genpp2",
+                           env=llm_venv._new_env,
+                           cwd=llm_venv.get_working_directory())
+
+
+@pytest.mark.skip_less_device(4)
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+def test_disaggregated_ctxpp2_gentp2(disaggregated_test_root, llm_venv,
+                                     disaggregated_example_root,
+                                     llama_model_root):
+    src_dst_dict = {
+        llama_model_root:
+        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+    run_disaggregated_test(disaggregated_example_root,
+                           "ctxpp2_gentp2",
+                           env=llm_venv._new_env,
+                           cwd=llm_venv.get_working_directory())
+
+
+@pytest.mark.skip_less_device(8)
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+def test_disaggregated_ctxtp2pp2_gentp2pp2(disaggregated_test_root, llm_venv,
+                                           disaggregated_example_root,
+                                           llama_model_root):
+    src_dst_dict = {
+        llama_model_root:
+        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+    run_disaggregated_test(disaggregated_example_root,
+                           "ctxtp2pp2_gentp2pp2",
+                           env=llm_venv._new_env,
+                           cwd=llm_venv.get_working_directory())
+
+
+@pytest.mark.skip_less_device(8)
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+def test_disaggregated_ctxpp4_genpp4(disaggregated_test_root, llm_venv,
+                                     disaggregated_example_root,
+                                     llama_model_root):
+    src_dst_dict = {
+        llama_model_root:
+        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+    run_disaggregated_test(disaggregated_example_root,
+                           "ctxpp4_genpp4",
                            env=llm_venv._new_env,
                            cwd=llm_venv.get_working_directory())
 

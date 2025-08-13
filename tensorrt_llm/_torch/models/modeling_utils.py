@@ -421,8 +421,7 @@ class DecoderModelForCausalLM(nn.Module,
 
         self.model.__pp_init__()
 
-    def __post_init__(self):
-        # 1. mixed precision
+    def apply_layerwise_quant_config(self):
         quant_config_dict = self.model_config.quant_config_dict
         if quant_config_dict is not None:
             for name, module in self.named_modules():
@@ -458,19 +457,22 @@ class DecoderModelForCausalLM(nn.Module,
                         if name + '.q_proj' in n:
                             module.quant_config = q
                             break
-                elif hasattr(module, 'fused_a'):
+                elif hasattr(module, 'kv_a_proj_with_mqa'):
                     # DeepseekV3Attention
                     for n, q in quant_config_dict.items():
                         # reuse q_proj quant config as the attention quant config
-                        if name + '.fused_a' in n:
+                        if name + '.kv_a_proj_with_mqa' in n:
                             module.quant_config = q
                             break
 
-        # 2. skip quant for modules in QuantConfig.exclude_modules.
-        # kv_cache_quant_algo takes precedence over exclude_modules.
-        # kv_cache_quant_algo, if not None, is set for non-Attention
-        # modules too, which is the same practice as when there's no
-        # exclude_modules.
+    def apply_quant_config_exclude_modules(self):
+        """
+        Skip quant for modules in QuantConfig.exclude_modules.
+        kv_cache_quant_algo takes precedence over exclude_modules.
+        kv_cache_quant_algo, if not None, is set for non-Attention
+        modules too, which is the same practice as when there's no
+        exclude_modules.
+        """
         quant_config = self.model_config.quant_config
         kv_cache_quant_algo = None
         if quant_config:
@@ -485,6 +487,10 @@ class DecoderModelForCausalLM(nn.Module,
                     if is_excluded and getattr(module, "quant_config",
                                                None) is not None:
                         module.quant_config = new_config
+
+    def __post_init__(self):
+        self.apply_layerwise_quant_config()
+        self.apply_quant_config_exclude_modules()
 
         for _, module in self.named_modules():
             if callable(getattr(module, "create_weights", None)):
@@ -865,7 +871,7 @@ def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
                           skip_modules: List[str] = [],
                           params_map: Optional[Dict[str, str]] = None,
                           preload_weight_modules: Optional[List[str]] = None):
-    # TODO: remove preload_weight_modules - it is a workaround for min-latency llama4 model loading where
+    # TODO: remove preload_weight_modules - it is a workaround for min-latency llama4 and Qwen3 model loading where
     # we need some order in the module loading. Once this is resolved, we can remove this workaround.
     weight_mapper.add_skip_modules(skip_modules)
     if params_map is not None:

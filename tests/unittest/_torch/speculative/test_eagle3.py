@@ -14,21 +14,21 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 
 
 @pytest.mark.parametrize(
-    "use_cuda_graph,attn_backend,disable_overlap_scheduler,enable_block_reuse,use_one_model",
+    "use_cuda_graph,attn_backend,disable_overlap_scheduler,enable_block_reuse,use_one_model,enable_chunked_prefill",
     [
-        [True, "TRTLLM", True, False, False],
-        [False, "TRTLLM", True, False, False],
-        [True, "TRTLLM", True, True, False],
-        [False, "TRTLLM", True, True, False],
-        [True, "FLASHINFER", True, False, False],
-        [False, "FLASHINFER", True, False, False],
-        [False, "TRTLLM", False, True, True],
-        [True, "TRTLLM", False, True, True],
+        [True, "TRTLLM", True, False, False, False],
+        [False, "TRTLLM", True, False, False, False],
+        [True, "FLASHINFER", True, False, False, False],
+        [False, "FLASHINFER", True, False, False, False],
+        [False, "TRTLLM", False, True, True, False],
+        [True, "TRTLLM", False, True, True, False],
+        [True, "TRTLLM", True, False, True, True],
+        [True, "TRTLLM", True, False, False, True],
     ])
 @pytest.mark.high_cuda_memory
 def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
                       disable_overlap_scheduler: bool, enable_block_reuse: bool,
-                      use_one_model: bool):
+                      use_one_model: bool, enable_chunked_prefill: bool):
     # Eagle3 one model works with overlap scheduler and block reuse.
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
     if total_mem_gb < 35:
@@ -59,7 +59,12 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
         # that the draft model won't go above its max in warmup
         # in this test.
         max_seq_len=8192,
+        enable_chunked_prefill=enable_chunked_prefill,
+        use_torch_sampler=True,
     )
+    if enable_chunked_prefill:
+        # Use a small max_num_tokens so that the chunked prefill path gets exercised.
+        llm_common_config['max_num_tokens'] = 64
 
     spec_config = EagleDecodingConfig(
         max_draft_len=max_draft_len,
@@ -71,7 +76,19 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
     llm_spec = LLM(**llm_common_config, speculative_config=spec_config)
 
     # Acceptance rate tests
-    tok_ids = llm_spec.tokenizer.encode("The future of AI is")
+    if enable_chunked_prefill:
+        # Use a long prompt for chunked prefill tests.
+        prompts = [
+            "The capital of France is a city of romance, art, fashion, and cuisine. Paris is a must-visit destination for anyone who loves history, architecture, and culture. From the iconic Eiffel Tower to the world-famous Louvre Museum, Paris has something to offer for every interest and age.\nThe city is divided into 20 arrondissements, each with its own unique character and charm. The Latin Quarter is a popular area for students and young travelers, while the Champs-Élysées is a hub for shopping and dining. The Montmartre neighborhood is famous for its bohemian vibe and stunning views of the city.\nParis is also known for its beautiful parks and gardens, such as the Luxembourg Gardens and the Tuileries Garden. The city has a rich history, with landmarks like the Notre-Dame Cathedral and the Arc de Triomphe. Visitors can also explore the city's many museums, including the Musée d'Orsay and the Musée Rodin.\nIn addition to its cultural and historical attractions, Paris is also a great destination for foodies. The city is famous for its cuisine, including croissants, baguettes, and cheese. Visitors can sample the city's famous dishes at one of the many restaurants, cafes, and "
+        ]
+        tok_ids = llm_spec.tokenizer.encode(prompts[0])
+    else:
+        prompts = [
+            "The capital of France is",
+            "The president of the United States is",
+        ]
+        tok_ids = llm_spec.tokenizer.encode("The future of AI is")
+
     num_tokens = 0
     num_drafted = 0
     num_accepted = 0
@@ -88,10 +105,6 @@ def test_llama_eagle3(use_cuda_graph: bool, attn_backend: str,
     assert accept_rate > 0.15
 
     # Output tests
-    prompts = [
-        "The capital of France is",
-        "The president of the United States is",
-    ]
     sampling_params = SamplingParams(max_tokens=10, temperature=0)
 
     results_spec = llm_spec.generate(prompts, sampling_params)

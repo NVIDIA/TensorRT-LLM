@@ -16,6 +16,7 @@ import copy
 import os
 import platform
 import re
+import time
 from difflib import SequenceMatcher
 from pathlib import Path
 
@@ -773,7 +774,9 @@ def test_multi_lora_support(
     zero_lora_weights=True,
     use_code_prompts=False,
 ):
+    start_time = time.time()
     print("Creating dummy LoRAs...")
+    lora_start = time.time()
     lora_paths = generate_dummy_loras(
         hf_model_dir=hf_model_dir,
         lora_output_dir=llm_venv.get_working_directory(),
@@ -781,8 +784,13 @@ def test_multi_lora_support(
         lora_rank=lora_rank,
         target_modules=target_hf_modules,
         zero_weights=zero_lora_weights)
+    lora_end = time.time()
+    print(
+        f"Creating dummy LoRAs completed in {(lora_end - lora_start):.2f} seconds."
+    )
 
     print("Build engines...")
+    build_start = time.time()
     build_cmd = [
         "trtllm-build",
         f"--checkpoint_dir={tllm_ckpt_dir}",
@@ -803,6 +811,9 @@ def test_multi_lora_support(
         "--max_beam_width=1",
     ]
     check_call(" ".join(build_cmd), shell=True, env=llm_venv._new_env)
+    build_end = time.time()
+    print(
+        f"Build engines completed in {(build_end - build_start):.2f} seconds.")
 
     if use_code_prompts:
         input_prompts = [
@@ -824,6 +835,7 @@ def test_multi_lora_support(
         ]
 
     print("Run inference with C++ runtime with pybind...")
+    inference_start = time.time()
     run_script = f"{example_root}/../../../run.py" if "core" in example_root else f"{example_root}/../run.py"
     run_cmd = [
         run_script,
@@ -844,6 +856,15 @@ def test_multi_lora_support(
         "--max_output_len=30",
     ]
     venv_check_call(llm_venv, run_cmd)
+    inference_end = time.time()
+    print(
+        f"Inference completed in {(inference_end - inference_start):.2f} seconds."
+    )
+
+    total_time = time.time() - start_time
+    print(
+        f"Total test_multi_lora_support execution time: {total_time:.2f} seconds"
+    )
 
 
 def get_dummy_spec_decoding_heads(hf_model_dir,

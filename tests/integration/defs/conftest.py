@@ -1892,6 +1892,10 @@ skip_post_blackwell = pytest.mark.skipif(
     get_sm_version() >= 100,
     reason="This test is not supported in post-Blackwell architecture")
 
+skip_post_blackwell_ultra = pytest.mark.skipif(
+    get_sm_version() >= 103,
+    reason="This test is not supported in post-Blackwell-Ultra architecture")
+
 skip_device_contain_gb200 = pytest.mark.skipif(
     check_device_contain(["GB200"]),
     reason="This test is not supported on GB200 or GB100")
@@ -2370,7 +2374,7 @@ def timeout_from_command_line(request):
 
 @pytest.fixture
 def timeout_manager(timeout_from_command_line, timeout_from_marker):
-    """Create a TimeoutManager instance with priority: command line > marker > config."""
+    """Create a TimeoutManager instance with priority: marker > cmdline > config."""
     from defs.utils.timeout_manager import TimeoutManager
 
     # Priority: marker > command line

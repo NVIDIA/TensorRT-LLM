@@ -6,7 +6,6 @@ set(TRTLLM_PYBIND_MODULE
 set(SRCS
     batch_manager/algorithms.cpp
     batch_manager/bindings.cpp
-    batch_manager/buffers.cpp
     batch_manager/cacheTransceiver.cpp
     batch_manager/kvCacheManager.cpp
     batch_manager/llmRequest.cpp
@@ -19,6 +18,7 @@ set(SRCS
     runtime/moeBindings.cpp
     userbuffers/bindings.cpp
     ../runtime/ipcNvlsMemory.cu
+    thop/bindings.cpp
     bindings.cpp)
 
 include_directories(${PROJECT_SOURCE_DIR}/include)
@@ -44,7 +44,8 @@ target_link_libraries(
          ${Python3_LIBRARIES}
          ${TORCH_LIBRARIES}
          torch_python
-         ${CUDA_NVML_LIB})
+         ${CUDA_NVML_LIB}
+         th_common)
 target_compile_definitions(
   ${TRTLLM_PYBIND_MODULE} PUBLIC TRTLLM_PYBIND_MODULE=${TRTLLM_PYBIND_MODULE}
                                  PYBIND11_DETAILED_ERROR_MESSAGES=1)

@@ -208,11 +208,6 @@ def call(*popenargs,
     poll_procs = poll_procs or []
     if not suppress_output_info:
         print(f"Start subprocess with call({popenargs}, {kwargs})")
-    timeout = get_pytest_timeout(timeout)
-    if timeout is None:
-        actual_timeout = None
-    else:
-        actual_timeout = max(30, int(timeout * 0.9))
     with popen(*popenargs,
                start_new_session=start_new_session,
                suppress_output_info=True,
@@ -221,9 +216,10 @@ def call(*popenargs,
         while True:
             try:
                 return p.wait(timeout=spin_time)
-            except subprocess.TimeoutExpired:
+            except subprocess.TimeoutExpired as e:
                 elapsed_time += spin_time
-                if actual_timeout is not None and elapsed_time >= actual_timeout:
+                if timeout is not None and elapsed_time >= timeout:
+                    e.timeout = timeout
                     raise
             for p_poll in poll_procs:
                 if p_poll.poll() is None:
@@ -231,12 +227,9 @@ def call(*popenargs,
                 raise RuntimeError("A sub-process has exited.")
 
 
-def check_call(*popenargs, timeout=None, **kwargs):
+def check_call(*popenargs, **kwargs):
     print(f"Start subprocess with check_call({popenargs}, {kwargs})")
-    retcode = call(*popenargs,
-                   suppress_output_info=True,
-                   timeout=timeout,
-                   **kwargs)
+    retcode = call(*popenargs, suppress_output_info=True, **kwargs)
     if retcode:
         cmd = kwargs.get("args")
         if cmd is None:
@@ -327,28 +320,3 @@ def check_call_negative_test(*popenargs, **kwargs):
             f"Subprocess expected to fail with check_call_negative_test({popenargs}, {kwargs}), but passed."
         )
         raise subprocess.CalledProcessError(1, cmd)
-
-
-def get_pytest_timeout(timeout=None):
-    if timeout:
-        return timeout
-
-    try:
-        import sys
-        for i, arg in enumerate(sys.argv):
-            if arg == '--timeout' and i + 1 < len(sys.argv):
-                try:
-                    timeout = int(sys.argv[i + 1])
-                except ValueError:
-                    pass
-            elif arg.startswith('--timeout='):
-                try:
-                    timeout = int(arg.split('=', 1)[1])
-                except ValueError:
-                    pass
-        if timeout and isinstance(timeout, (int, float)):
-            return timeout
-    except (ImportError, Exception):
-        pass
-
-    return timeout
