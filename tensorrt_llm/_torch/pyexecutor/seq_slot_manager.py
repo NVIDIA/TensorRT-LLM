@@ -16,7 +16,11 @@ class SeqSlotManager(BaseResourceManager):
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests) -> None:
         for llm_req in scheduled_batch.all_requests():
-            if llm_req.seq_slot is None or llm_req.is_disagg_generation_transmission_complete:
+            # If the request is in the disagg generation init state,
+            # we don't need to add a slot for it.
+            if llm_req.seq_slot is None and not (
+                    llm_req.is_disagg_generation_init_state
+                    or llm_req.is_disagg_generation_transmission_in_progress):
                 llm_req.seq_slot = self.slot_manager.add_slot(
                     llm_req.request_id)
                 llm_req.py_seq_slot = llm_req.seq_slot
