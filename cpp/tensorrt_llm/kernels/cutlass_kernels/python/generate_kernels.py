@@ -346,6 +346,9 @@ def is_gemm_op_valid_sm100(op):
     tile_m, tile_n, _ = op.cta_shape
     cga_m, cga_n, cga_k = op.cga_shape
 
+    if op.epi_fusion == TrtLlm_EpilogueFusion.epilogue_fusion_finalize and op.epi_schedule != EpilogueScheduleType.PtrArrayTmaWarpSpecialized1Sm:
+        return False
+
     # We use a runtime cluster shape for SM100, so we only use cluster shapes to distinguish between 1SM and 2SM variants.
     if cga_m > 2 or cga_n != 1 or cga_k != 1:
         return False
