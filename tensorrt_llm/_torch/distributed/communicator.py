@@ -765,9 +765,6 @@ class TorchDist(Distributed):
                 device=torch.device("cpu"))
             return ret[0]
 
-    def allgather(self, obj, root=0):
-        raise NotImplementedError('allgather is not implemented for TorchDist')
-
 
 # TODO: rename to PPCommNCCL
 class PPComm:

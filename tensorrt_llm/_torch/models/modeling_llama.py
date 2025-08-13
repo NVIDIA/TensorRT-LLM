@@ -10,10 +10,8 @@ from transformers import (AutoProcessor, Llama4Config, Llama4VisionModel,
 from transformers.modeling_utils import load_sharded_checkpoint
 from transformers.models.llama4.modeling_llama4 import Llama4MultiModalProjector
 
-import flashinfer.comm as flashinfer_comm
-
 from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
-                                             AllReduceParams, MoEAllReduce, FlashInferAllReduce, FlashInferAllReduceParams)
+                                             AllReduceParams, MoEAllReduce)
 from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
 from tensorrt_llm._utils import get_sm_version
@@ -688,12 +686,6 @@ class LlamaDecoderLayer(DecoderLayer):
                                       or self.mapping.tp_size == 1
                                       or self.enable_attention_dp)
 
-        self.flash_infer_all_reduce = FlashInferAllReduce(
-                mapping=self.mapping,
-                hidden_dim=8192,
-                strategy=flashinfer_comm.AllReduceStrategyType.TWOSHOT,
-                dtype=config.torch_dtype)
-
     def forward(
         self,
         position_ids: torch.IntTensor,
@@ -714,23 +706,15 @@ class LlamaDecoderLayer(DecoderLayer):
             attn_metadata=attn_metadata,
             attention_mask=self.attention_mask,
             all_reduce_params=AllReduceParams(
-                enable_allreduce=False),
+                enable_allreduce=not self.disable_attn_allreduce),
             **kwargs,
         )
-        hidden_states = self.flash_infer_all_reduce(
-            hidden_states,
-            all_reduce_params=FlashInferAllReduceParams(
-                strategy=flashinfer_comm.AllReduceStrategyType.TWOSHOT,
-                fusion_op=flashinfer_comm.AllReduceFusionOp.NONE,
-                config_mode=flashinfer_comm.AllReduceStrategyConfig.USE_MEMCPY,
-            ))
         # Fully Connected
         if self.PRE_MLP_FUSION:
             if self.is_nvfp4 or self.is_fp8_quant:
                 scale = self.mlp.gate_up_proj.input_scale
             else:
                 scale = None
-
             all_reduce_output = self.all_reduce(
                 hidden_states,
                 all_reduce_params=AllReduceParams(
@@ -761,7 +745,7 @@ class LlamaDecoderLayer(DecoderLayer):
         hidden_states = self.mlp(
             hidden_states,
             final_all_reduce_params=AllReduceParams(
-                enable_allreduce=False),
+                enable_allreduce=not self.disable_mlp_allreduce),
             **kwargs,
         )
 

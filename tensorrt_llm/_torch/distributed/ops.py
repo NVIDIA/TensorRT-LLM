@@ -18,8 +18,6 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.plugin.plugin import CustomAllReduceHelper
 
-from .communicator import TorchDist
-
 try:
     import flashinfer.comm as flashinfer_comm
 except ImportError:
@@ -754,9 +752,9 @@ class FlashInferAllReduce(nn.Module):
         global _RANK_DIST_INITIALIZED
 
         self.mapping = mapping
-        # self.max_message_size = 70 * 1024 * 1024  # 70MB
+        self.max_message_size = 70 * 1024 * 1024  # 70MB
         self.dtype = dtype
-        self.hidden_dim = 8192
+        self.hidden_dim = hidden_dim
         self.strategy = strategy
 
         if not _RANK_DIST_INITIALIZED:
@@ -766,16 +764,22 @@ class FlashInferAllReduce(nn.Module):
         # flashinfer all reduce is better for message sizes < ~70MB
         # num tokens * hidden dim * 2 < 70 *1024*1024
         # TODO: 2 is for bf16,fp16. need to add fp8, fp4
-        self.max_num_tokens = 8192 #self.max_message_size // (self.hidden_dim * 2)
+        self.max_num_tokens = self.max_message_size // (self.hidden_dim * 2)
 
-        self.workspace = get_flashinfer_allreduce_workspace(self.mapping, self.max_num_tokens, self.hidden_dim)
-        self._flag_value = 1
-
-        self.all_reduce_params = FlashInferAllReduceParams(
-            strategy=self.strategy,
-            fusion_op=flashinfer_comm.AllReduceFusionOp.NONE,
-            config_mode=flashinfer_comm.AllReduceStrategyConfig.USE_MEMCPY,
+        self.workspace = flashinfer_comm.trtllm_create_ipc_workspace_for_all_reduce(
+            rank=self.mapping.rank,
+            tp_size=self.mapping.tp_size,
+            max_token_num=self.max_num_tokens,
+            hidden_dim=self.hidden_dim,
+            group=None,
         )
+        self._flag_value = 1
+        self._enable_debug = os.environ.get("_FLASHINFER_DEBUG", "0") == "1"
+
+        if self._enable_debug:
+            print(
+                f"FlashInferAllReduce.forward: {self.mapping.rank} {self.mapping.tp_size} {self.max_num_tokens} {self.hidden_dim}"
+            )
 
     def forward(
         self,
@@ -794,8 +798,12 @@ class FlashInferAllReduce(nn.Module):
                 f"FlashInferAllReduce.forward: {num_token} {hidden_dim}"
             )
 
-        # if all_reduce_params is None:
-        
+        if all_reduce_params is None:
+            all_reduce_params = FlashInferAllReduceParams(
+                strategy=self.strategy,
+                fusion_op=flashinfer_comm.AllReduceFusionOp.NONE,
+                config_mode=flashinfer_comm.AllReduceStrategyConfig.USE_MEMCPY,
+            )
 
         flashinfer_comm.trtllm_custom_all_reduce(
             inp=input.ravel(),
@@ -803,9 +811,9 @@ class FlashInferAllReduce(nn.Module):
             tp_size=self.mapping.tp_size,
             tp_rank=self.mapping.rank,
             token_num=num_token,
-            fusion_op_code=self.all_reduce_params.fusion_op,
-            strategy_code=self.all_reduce_params.strategy,
-            config_code=self.all_reduce_params.config_mode,
+            fusion_op_code=all_reduce_params.fusion_op,
+            strategy_code=all_reduce_params.strategy,
+            config_code=all_reduce_params.config_mode,
             launch_with_pdl=False,
             flag_value=self._flag_value,
             peer_comm_buffer_ptrs=torch.tensor(self.workspace[0],

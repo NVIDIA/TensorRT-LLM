@@ -15,7 +15,7 @@ from torch.nn.parameter import Parameter
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm._torch.peft.lora.layer import LoraLayer
 from tensorrt_llm.functional import (AllReduceFusionOp, AllReduceParams,
-                                     AllReduceStrategy, FlashInferAllReduceParams)
+                                     AllReduceStrategy, FlashInferAllReduce)
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization.functional import \
     preprocess_weights_for_mixed_gemm
@@ -1824,8 +1824,7 @@ class Linear(nn.Module):
         use_cute_dsl_nvfp4_blockscaling_mm: bool = False,
         disable_deep_gemm: bool = False,
     ):
-
-        from ..distributed import AllReduce
+        import flashinfer.comm as flashinfer_comm
 
         super().__init__()
         self.has_bias = bias
@@ -1864,10 +1863,15 @@ class Linear(nn.Module):
         self.in_features = local_in_features
         self.out_features = local_out_features
 
-        # Needed for embedding layer
-        self.all_reduce = AllReduce(mapping=self.mapping,
-                                    strategy=allreduce_strategy,
-                                    dtype=self.dtype) if reduce_output else None
+        # self.all_reduce = AllReduce(mapping=self.mapping,
+        #                             strategy=allreduce_strategy,
+        #                             dtype=self.dtype) if reduce_output else None
+
+        self.flash_infer_all_reduce = FlashInferAllReduce(
+            mapping=self.mapping,
+            hidden_dim=self.out_features,
+            strategy=flashinfer_comm.AllReduceStrategyType.TWOSHOT,
+            dtype=self.dtype) if reduce_output else None
 
         self._weights_created = False
         self.reduce_output = reduce_output
@@ -2003,7 +2007,11 @@ class Linear(nn.Module):
                     bias, all_reduce_params)
                 bias = None if fuse_bias else bias
                 output = self.apply_linear(input, bias, lora_params, layer_idx)
-                output = self.all_reduce(
+                # output = self.all_reduce(
+                #     output,
+                #     all_reduce_params=all_reduce_params,
+                # )
+                output = self.flash_infer_all_reduce(
                     output,
                     all_reduce_params=all_reduce_params,
                 )
