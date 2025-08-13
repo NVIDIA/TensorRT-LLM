@@ -9,18 +9,13 @@
 # license agreement from NVIDIA CORPORATION or its affiliates is strictly
 # prohibited.
 
-if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/batch_manager)
-  add_subdirectory(batch_manager)
+if(NOT ENABLE_MULTI_DEVICE EQUAL 0)
+  add_gtest(allReduceKernelTest allReduce/allReduceKernelTest.cu)
+  add_gtest(allReduceFusionTest allReduce/allReduceFusionTest.cu)
+  add_gtest(gemmAllReduceTest allReduce/gemmAllReduceTest.cu)
+  if(USING_OSS_CUTLASS_ALLREDUCE_GEMM)
+    target_link_libraries(gemmAllReduceTest PRIVATE ar_gemm_src)
+    target_compile_definitions(gemmAllReduceTest
+                               PRIVATE USING_OSS_CUTLASS_ALLREDUCE_GEMM)
+  endif()
 endif()
-
-if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/executor)
-  add_subdirectory(executor)
-endif()
-
-add_subdirectory(common)
-add_subdirectory(kernels)
-add_subdirectory(multi_gpu)
-add_subdirectory(layers)
-add_subdirectory(runtime)
-add_subdirectory(thop)
-add_subdirectory(utils)

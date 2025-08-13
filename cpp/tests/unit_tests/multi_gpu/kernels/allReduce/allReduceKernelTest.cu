@@ -573,8 +573,7 @@ TEST(Kernel, AllReduce)
     auto& comm = mpi::MpiComm::world();
     auto world_size = comm.getSize();
     auto rank = comm.getRank();
-    if (world_size % 2)
-        return;
+    ASSERT_EQ(world_size % 2, 0) << "Requires even world size (got " << world_size << ")";
 
     int warmup = 100, iter = 100;
     // clang-format off
@@ -645,8 +644,7 @@ TEST(Kernel, AllReduceOneShot)
     auto& comm = mpi::MpiComm::world();
     auto world_size = comm.getSize();
     auto rank = comm.getRank();
-    if (world_size % 2)
-        return;
+    ASSERT_EQ(world_size % 2, 0) << "Requires even world size (got " << world_size << ")";
 
     int warmup = 100, iter = 100;
     std::vector<int> candidate_bs{1, 2, 4, 8, 16};
@@ -673,19 +671,14 @@ TEST(Kernel, AllReduceOneShotPreNorm)
     char const* value = "1";
     int overwrite = 1; // Set to 1 to overwrite existing values, 0 to preserve
 
-    if (setenv(varName, value, overwrite) != 0)
-    {
-        perror("Error setting environment variable");
-        return;
-    }
+    ASSERT_EQ(setenv(varName, value, overwrite), 0) << "Error setting environment variable";
 
     std::cout << varName << " set to " << getenv(varName) << std::endl;
 
     auto& comm = mpi::MpiComm::world();
     auto world_size = comm.getSize();
     auto rank = comm.getRank();
-    if (world_size % 2)
-        return;
+    ASSERT_EQ(world_size % 2, 0) << "Requires even world size (got " << world_size << ")";
 
     int warmup = 100, iter = 100;
     std::vector<int> candidate_bs{1, 2, 4, 8, 16};
