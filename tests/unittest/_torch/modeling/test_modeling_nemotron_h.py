@@ -46,6 +46,7 @@ def create_nemotron_h_llm(use_cuda_graph,
             enable_block_reuse=False,
             mamba_ssm_cache_dtype="auto"
             if mamba_ssm_cache_dtype is None else mamba_ssm_cache_dtype),
+        sampler_type="TRTLLMSampler",
     )
 
 
