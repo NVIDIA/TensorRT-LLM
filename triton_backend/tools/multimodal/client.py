@@ -61,8 +61,6 @@ def prepare_inputs(text_data,
                    image_input_name="image_input"):
     inputs = [
         utils.prepare_tensor("text_input", text_data, grpcclient),
-        utils.prepare_tensor(image_input_name, image_data, grpcclient),
-        utils.prepare_tensor("image_sizes_input", image_sizes, grpcclient),
         utils.prepare_tensor("max_tokens", request_output_len_data, grpcclient),
         utils.prepare_tensor("beam_width", beam_width_data, grpcclient),
         utils.prepare_tensor("temperature", temperature_data, grpcclient),
@@ -72,6 +70,14 @@ def prepare_inputs(text_data,
         utils.prepare_tensor("top_p", top_p_data, grpcclient),
         utils.prepare_tensor("stream", streaming_data, grpcclient),
     ]
+    if image_data is not None:
+        inputs += [
+            utils.prepare_tensor(image_input_name, image_data, grpcclient),
+        ]
+    if image_sizes is not None:
+        inputs += [
+            utils.prepare_tensor("image_sizes_input", image_sizes, grpcclient),
+        ]
     if repetition_penalty_data is not None:
         inputs += [
             utils.prepare_tensor("repetition_penalty", repetition_penalty_data,
@@ -367,7 +373,9 @@ if __name__ == "__main__":
     temperature_data = np.array(temperature, dtype=np.float32)
     streaming = [[FLAGS.streaming]]
     streaming_data = np.array(streaming, dtype=bool)
-    image_sizes_data = np.array([image_sizes], dtype=np.int64)
+    image_data = None if image_data.size == 0 else image_data
+    image_sizes_data = None if image_sizes.size == 0 else np.array(
+        [image_sizes], dtype=np.int64)
 
     model_name = "ensemble"
     if FLAGS.use_bls:

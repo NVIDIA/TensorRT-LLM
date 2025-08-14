@@ -293,7 +293,9 @@ class TritonPythonModel:
                 request, 'VIDEO_BYTES')
             vision_processed_tensors = []
             visual_tokens = []
-            if self.is_multimodal and (img_urls or image_bytes or video_bytes):
+            # Pixtral supports text-only input
+            if self.is_multimodal and (img_urls or image_bytes or video_bytes
+                                       or self.model_type == 'pixtral'):
                 assert self.vision_preprocessor != None, "Vision preprocessor for preparing images before encoding is None"
                 processed_tensors = {}
                 if self.model_type == 'mllama':
@@ -1054,7 +1056,7 @@ class VisionPreProcessor:
         elif image_bytes is not None:
             images = self.load_images_tensor(image_bytes)
         else:
-            images = np.empty((0, 0, 0, 0, 0), dtype=np.uint8)
+            images = np.empty((len(queries), 0, 0, 0, 0), dtype=np.uint8)
 
         batch_size = len(images)
         assert len(
