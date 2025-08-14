@@ -4,7 +4,6 @@ from contextlib import contextmanager, nullcontext
 import pytest
 
 from tensorrt_llm import LLM
-from tensorrt_llm.executor import GenerationExecutorWorker
 from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.llmapi.llm_args import PeftCacheConfig
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
