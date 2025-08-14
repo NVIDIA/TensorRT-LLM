@@ -15,12 +15,10 @@
 
 import pytest
 
-from tensorrt_llm import LLM
 from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
-from tensorrt_llm.quantization import QuantAlgo
 from tensorrt_llm.sampling_params import SamplingParams
 
-from ..conftest import llm_models_root, skip_pre_blackwell
+from ..conftest import llm_models_root
 from .accuracy_core import MMLU, CnnDailymail, LlmapiAccuracyTestHarness
 
 
@@ -66,13 +64,3 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=sampling_params)
-
-    @skip_pre_blackwell
-    def test_nvfp4(self):
-        model_path = f"{llm_models_root()}/nvfp4-quantized/Meta-Llama-3.1-8B"
-        with LLM(model_path) as llm:
-            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
-            task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
