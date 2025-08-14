@@ -203,7 +203,9 @@ def extract_from_precompiled(precompiled_location: str, package_data: List[str],
 
 precompiled: str | None = os.getenv("TRTLLM_USE_PRECOMPILED")
 precompiled_location: str | None = os.getenv("TRTLLM_PRECOMPILED_LOCATION")
-use_precompiled: bool = precompiled is not None or precompiled_location is not None
+use_precompiled: bool = (precompiled is not None
+                         and precompiled != "0") or (precompiled_location
+                                                     is not None)
 
 if use_precompiled:
     from tempfile import TemporaryDirectory
