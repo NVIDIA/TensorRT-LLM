@@ -619,7 +619,7 @@ def test_trtllm_bench_invalid_token_pytorch(llm_root, llm_venv, model_name,
                 f"throughput " \
                 f"--dataset {str(dataset_path)} --backend pytorch " \
                 f"--extra_llm_api_options {extra_options_path} " \
-                f"> {output_path}"
+                f"> {output_path} 2>&1"
         # Check clean shutdown (no hang)
         with pytest.raises(subprocess.CalledProcessError) as exc_info:
             check_call(benchmark_cmd, shell=True, env=llm_venv._new_env)
