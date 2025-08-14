@@ -746,10 +746,12 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             )
 
             if tp > self.mapping.gpus_per_node and (
-                    self.allreduce.strategy not in (
+                    self.model_config.allreduce_strategy not in (
                         AllReduceStrategy.AUTO,
                         AllReduceStrategy.MNNVL,
-                    ) or not MNNVLAllReduce.is_mnnvl()):
+                    ) or not MNNVLAllReduce.is_mnnvl(
+                        self.mapping,
+                        self.model_config.pretrained_config.torch_dtype)):
                 mlp_tp_size = math.gcd(
                     tp,
                     self.mapping.gpus_per_node,
