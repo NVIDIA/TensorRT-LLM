@@ -624,6 +624,8 @@ class Phi4MMForCausalLM(transformers.PreTrainedModel):
                 "mlp_4h_to_h": "down_proj",
             },
             max_lora_rank=320,  # Max rank for Phi4MM.
+            swap_gate_up_proj_lora_b_weight=
+            False,  # Disable swap gate_up_proj.lora_B.weight for Phi4MM.
         )
         return _lora_config
 

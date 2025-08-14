@@ -200,6 +200,8 @@ def get_model_yaml_config(model_label: str,
                 "mlp_4h_to_h": "down_proj"
             }
             lora_config['lora_config']['max_lora_rank'] = 320
+            lora_config['lora_config'][
+                'swap_gate_up_proj_lora_b_weight'] = False
         base_config.update(lora_config)
 
     kv_cache_config = base_config.get('kv_cache_config', KvCacheConfig())
