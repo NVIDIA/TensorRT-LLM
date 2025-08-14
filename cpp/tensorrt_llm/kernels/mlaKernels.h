@@ -89,6 +89,9 @@ struct MlaParams
     int32_t context_paged_kv_max_blocks_per_seq = 0;
     // for FP8 context qkv quantization
     float const* quant_scale_qkv = nullptr;
+
+    // for Helix parallelism: the rotary position offsets [b]
+    int32_t const* helix_position_offsets{nullptr};
 };
 
 template <typename T, typename KVCacheBuffer>
