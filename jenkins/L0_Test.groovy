@@ -643,8 +643,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
         def hasMultipleGPUs = (gpuCount > 1)
         def memorySize = "${TESTER_MEMORY}"
         def storageSize = "300Gi"
-        // def driverVersion = type.contains("rtx-pro-6000") ? Constants.DEFAULT_NVIDIA_OPEN_DRIVER_VERSION : Constants.DEFAULT_NVIDIA_DRIVER_VERSION
-        def driverVersion = type.contains("rtx-pro-6000") ? "580.50-open" : Constants.DEFAULT_NVIDIA_DRIVER_VERSION
+        def driverVersion = type.contains("rtx-pro-6000") ? Constants.DEFAULT_NVIDIA_OPEN_DRIVER_VERSION : Constants.DEFAULT_NVIDIA_DRIVER_VERSION
         def cpuCount = "${TESTER_CORES}"
 
         // Multi-GPU only supports DGX-H100 and DGX-H200 due to the hardware stability.
@@ -1801,6 +1800,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         "RTX5090-PyTorch-1": ["rtx-5090", "l0_gb202", 1, 1],
         "RTX5080-TensorRT-1": ["rtx-5080", "l0_gb203", 1, 2],
         "RTX5080-TensorRT-2": ["rtx-5080", "l0_gb203", 2, 2],
+        "RTXPro6000-Pytorch-1": ["rtx-pro-6000", "l0_rtx_pro_6000", 1, 1],
         // Currently post-merge test stages only run tests with "stage: post_merge" mako
         // in the test-db. This behavior may change in the future.
         "A10-PyTorch-Post-Merge-1": ["a10", "l0_a10", 1, 1],
@@ -1844,8 +1844,8 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         "DGX_H200-4_GPUs-TensorRT-Post-Merge-1": ["dgx-h200-x4", "l0_dgx_h200", 1, 3, 4],
         "DGX_H200-4_GPUs-TensorRT-Post-Merge-2": ["dgx-h200-x4", "l0_dgx_h200", 2, 3, 4],
         "DGX_H200-4_GPUs-TensorRT-Post-Merge-3": ["dgx-h200-x4", "l0_dgx_h200", 3, 3, 4],
-        "RTXPro6000-4_GPUs-Pytorch-DeepSeek-Post-Merge-1": ["rtx-pro-6000-x4", "l0_rtx_pro_6000", 1, 1, 4],
-        //"RTXPro6000-4_GPUs-Pytorch-DeepSeek-Post-Merge-2": ["rtx-pro-6000-x4", "l0_rtx_pro_6000", 2, 2, 4],
+        "RTXPro6000-4_GPUs-Pytorch-DeepSeek-Post-Merge-1": ["rtx-pro-6000-x4", "l0_rtx_pro_6000", 1, 2, 4],
+        "RTXPro6000-4_GPUs-Pytorch-DeepSeek-Post-Merge-2": ["rtx-pro-6000-x4", "l0_rtx_pro_6000", 2, 2, 4],
     ]
 
     parallelJobs = x86TestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, values[0], "amd64", values[4] ?: 1, key.contains("Perf")), {
