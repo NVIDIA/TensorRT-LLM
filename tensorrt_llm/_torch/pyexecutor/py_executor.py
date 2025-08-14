@@ -403,11 +403,16 @@ class PyExecutor:
         it = -1
         enabled = False
         start_time = None
+
+        # These events are used to record the time of the previous batch.
+        # We need two set of the start-end events to record the time through
+        # a ping-pong way so that it works with overlap scheduler.
         start_event_1 = None
         end_event_1 = torch.cuda.Event(enable_timing=True)
         start_event_2 = None
         end_event_2 = torch.cuda.Event(enable_timing=True)
         prev_device_step_time = None
+
         torch_trace_path = os.environ.get(PROFILE_TRACE_ENV_VAR_NAME, None)
         profile_start_stop = os.environ.get(PROFILE_START_STOP_ENV_VAR_NAME,
                                             None)
