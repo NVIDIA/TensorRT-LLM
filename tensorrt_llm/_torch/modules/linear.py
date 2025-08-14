@@ -12,6 +12,7 @@ from torch import nn
 from torch.nn.parameter import Parameter
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
+import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
 from tensorrt_llm._torch.peft.lora.layer import LoraLayer
 from tensorrt_llm.functional import (AllReduceFusionOp, AllReduceParams,
                                      AllReduceStrategy)
