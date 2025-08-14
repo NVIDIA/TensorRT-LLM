@@ -746,10 +746,15 @@ def _run_test_for_backend(backend_name, num_heads, num_kv_heads, num_layers,
                 )
                 latent_cache_ref_all_list[layer_idx] = latent_cache_ref
             # Compare results
-            print(f"{backend_name} output mean: {result.abs().mean().item()}")
-            print(f"Reference output mean: {ref_result.abs().mean().item()}")
             print(
-                f"Difference mean: {(result - ref_result).abs().mean().item()}")
+                f"{backend_name} output mean: {result.abs().mean().item()}, max: {result.abs().max().item()}"
+            )
+            print(
+                f"Reference output mean: {ref_result.abs().mean().item()}, max: {ref_result.abs().max().item()}"
+            )
+            print(
+                f"Difference mean: {(result - ref_result).abs().mean().item()}, max: {(result - ref_result).abs().max().item()}"
+            )
 
             # Assert results are close
             atol, rtol = accuracy_dict[kv_cache_dtype]

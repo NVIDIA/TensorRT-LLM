@@ -186,9 +186,8 @@ inline __device__ void dequantCopy(
 template <typename T, int BLOCK_SIZE, int K_DIM, int ROPE_DIM, typename KVCacheBuffer>
 __global__ void applyMLARopeAndAssignQKVKernelOptContext(T* q_ptr, T* k_ptr, T const* fuse_buf, KVCacheBuffer kv_cache,
     float2 const* cos_sin_cache, size_t head_num, int head_size, int c_k, int* cu_q_seqlens,
-    int32_t const* kv_cache_lengths, uint32_t max_input_seq_len, KvCacheDataType cache_type, float* bmm1_scale,
-    float* bmm2_scale, float const* quant_scale_o, float const* quant_scale_kv, float const* dequant_scale_q,
-    float const* dequant_scale_kv, float host_bmm1_scale)
+    int32_t const* kv_cache_lengths, uint32_t max_input_seq_len, KvCacheDataType cache_type,
+    float const* quant_scale_kv)
 {
 
     // Constants.
@@ -211,31 +210,7 @@ __global__ void applyMLARopeAndAssignQKVKernelOptContext(T* q_ptr, T* k_ptr, T c
     size_t const batch_idx = blockIdx.y;
     size_t const head_idx = blockIdx.z;
 
-    if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0)
-    {
 
-        // Calculate bmm scale for FP8 MLA
-        if (cache_type == KvCacheDataType::FP8)
-        {
-            float dequant_scale_q_val = dequant_scale_q ? dequant_scale_q[0] : 1.f;
-            float dequant_scale_kv_val = dequant_scale_kv ? dequant_scale_kv[0] : 1.f;
-            float quant_scale_o_val = quant_scale_o ? quant_scale_o[0] : 1.f;
-            if (bmm1_scale)
-            {
-                // The scale prepared for log2 optimization.
-                constexpr float kLog2e = 1.4426950408889634074f;
-                // The scale after fmha bmm1.
-                float bmm1_scale_val = dequant_scale_q_val * dequant_scale_kv_val * host_bmm1_scale;
-                bmm1_scale[0] = bmm1_scale_val;
-                bmm1_scale[1] = bmm1_scale_val * kLog2e;
-            }
-            if (bmm2_scale)
-            {
-                // The scale after fmha bmm2.
-                bmm2_scale[0] = quant_scale_o_val * dequant_scale_kv_val;
-            }
-        }
-    }
 
     if (head_idx < head_num)
     {
@@ -845,20 +820,22 @@ __global__ void applyMLARopeAppendPagedKVAssignQKernel(KVBlockArray kv_cache, T*
 }
 
 template <typename T, int BLOCK_SIZE, int QK_NOPE_HEAD_DIM, int QK_ROPE_HEAD_DIM, int V_HEAD_DIM>
-__global__ void QuantizeCopyInputToFp8Kernel(
-    T const* q_buf, __nv_fp8_e4m3* quant_q_buf, T const* k_buf, __nv_fp8_e4m3* quant_k_buf, T const* v_buf,
-    __nv_fp8_e4m3* quant_v_buf, int total_q_len, int total_kv_len, float const* quant_scale_qkv_ptr)
+__global__ void quantizeCopyInputToFp8Kernel(T const* q_buf, __nv_fp8_e4m3* quant_q_buf, T const* k_buf,
+    __nv_fp8_e4m3* quant_k_buf, T const* v_buf, __nv_fp8_e4m3* quant_v_buf, int total_q_len, int total_kv_len,
+    float const* quant_scale_qkv_ptr, float* bmm1_scale, float* bmm2_scale, float const* quant_scale_o,
+    float const* dequant_scale_q, float const* dequant_scale_kv, float host_bmm1_scale)
 {
     // Constants.
     using VecT = typename VecType<T>::Type;
-    constexpr auto BYTES_PER_ELT = sizeof(T); // 2
+    constexpr auto BYTES_PER_ELT = sizeof(T);
     constexpr auto BYTES_PER_LOAD = 16;
-    constexpr auto ELTS_PER_VEC = BYTES_PER_LOAD / BYTES_PER_ELT; // 8
+    constexpr auto ELTS_PER_VEC = BYTES_PER_LOAD / BYTES_PER_ELT;
     constexpr auto QK_HEAD_DIM = QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM;
-    static_assert((QK_HEAD_DIM * BYTES_PER_ELT) % BYTES_PER_LOAD == 0, "QK head size needs to be multiple of 16 bytes.");
+    static_assert(
+        (QK_HEAD_DIM * BYTES_PER_ELT) % BYTES_PER_LOAD == 0, "QK head size needs to be multiple of 16 bytes.");
     static_assert((V_HEAD_DIM * BYTES_PER_ELT) % BYTES_PER_LOAD == 0, "V head size needs to be multiple of 16 bytes.");
-    constexpr auto QK_VECS_PER_HEAD = QK_HEAD_DIM * BYTES_PER_ELT / BYTES_PER_LOAD; // 24
-    constexpr auto V_VECS_PER_HEAD = V_HEAD_DIM * BYTES_PER_ELT / BYTES_PER_LOAD;  //16
+    constexpr auto QK_VECS_PER_HEAD = QK_HEAD_DIM * BYTES_PER_ELT / BYTES_PER_LOAD;
+    constexpr auto V_VECS_PER_HEAD = V_HEAD_DIM * BYTES_PER_ELT / BYTES_PER_LOAD;
     static_assert(BLOCK_SIZE % QK_VECS_PER_HEAD == 0, "Kernel block should be able to handle entire heads.");
     static_assert(BLOCK_SIZE % V_VECS_PER_HEAD == 0, "Kernel block should be able to handle entire heads.");
     constexpr auto QK_TOKENS_PER_BLOCK = BLOCK_SIZE / QK_VECS_PER_HEAD;
@@ -866,6 +843,28 @@ __global__ void QuantizeCopyInputToFp8Kernel(
 
     size_t const head_idx = blockIdx.z;
     size_t const head_num = gridDim.z;
+
+    if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 && threadIdx.x == 0)
+    {
+        // Calculate bmm scale for FP8 MLA
+        float dequant_scale_q_val = dequant_scale_q ? dequant_scale_q[0] : 1.f;
+        float dequant_scale_kv_val = dequant_scale_kv ? dequant_scale_kv[0] : 1.f;
+        float quant_scale_o_val = quant_scale_o ? quant_scale_o[0] : 1.f;
+        if (bmm1_scale)
+        {
+            // The scale prepared for log2 optimization.
+            constexpr float kLog2e = 1.4426950408889634074f;
+            // The scale after fmha bmm1.
+            float bmm1_scale_val = dequant_scale_q_val * dequant_scale_kv_val * host_bmm1_scale;
+            bmm1_scale[0] = bmm1_scale_val;
+            bmm1_scale[1] = bmm1_scale_val * kLog2e;
+        }
+        if (bmm2_scale)
+        {
+            // The scale after fmha bmm2.
+            bmm2_scale[0] = quant_scale_o_val * dequant_scale_kv_val;
+        }
+    }
 
     size_t const qk_head_dim_vec_idx = (threadIdx.x % QK_VECS_PER_HEAD);
     size_t const v_head_dim_vec_idx = (threadIdx.x % V_VECS_PER_HEAD);
@@ -882,7 +881,7 @@ __global__ void QuantizeCopyInputToFp8Kernel(
 
     // Quantize Q, both src and dst are contiguous
     for (int q_token_idx = (threadIdx.x / QK_VECS_PER_HEAD) + blockIdx.x * QK_TOKENS_PER_BLOCK;
-        q_token_idx < q_len_loop_end; q_token_idx += QK_TOKENS_PER_BLOCK * gridDim.x)
+         q_token_idx < q_len_loop_end; q_token_idx += QK_TOKENS_PER_BLOCK * gridDim.x)
     {
         if (q_token_idx < total_q_len)
         {
@@ -895,7 +894,7 @@ __global__ void QuantizeCopyInputToFp8Kernel(
 
     // Quantize K, both src and dst are contiguous
     for (int k_token_idx = (threadIdx.x / QK_VECS_PER_HEAD) + blockIdx.x * QK_TOKENS_PER_BLOCK;
-        k_token_idx < k_len_loop_end; k_token_idx += QK_TOKENS_PER_BLOCK * gridDim.x)
+         k_token_idx < k_len_loop_end; k_token_idx += QK_TOKENS_PER_BLOCK * gridDim.x)
     {
         if (k_token_idx < total_kv_len)
         {
@@ -909,7 +908,7 @@ __global__ void QuantizeCopyInputToFp8Kernel(
     // Quantize V, dst V is contiguous, but src V is not contiguous, so we need to calculate the stride
     size_t const src_v_token_stride = (QK_NOPE_HEAD_DIM + V_HEAD_DIM) * head_num;
     for (int v_token_idx = (threadIdx.x / V_VECS_PER_HEAD) + blockIdx.x * V_TOKENS_PER_BLOCK;
-        v_token_idx < v_len_loop_end; v_token_idx += V_TOKENS_PER_BLOCK * gridDim.x)
+         v_token_idx < v_len_loop_end; v_token_idx += V_TOKENS_PER_BLOCK * gridDim.x)
     {
         if (v_token_idx < total_kv_len)
         {
@@ -930,8 +929,7 @@ void invokeMLARopeContext(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer, c
     applyMLARopeAndAssignQKVKernelOptContext<T, 256, 512, 64, KVCacheBuffer><<<grid, 256, 0, stream>>>(params.q_buf,
         params.k_buf, params.latent_cache, kv_cache_buffer, params.cos_sin_cache, params.head_num, head_size,
         params.meta.kv_lora_rank, params.cu_q_seqlens, params.cache_seq_lens, params.max_input_seq_len,
-        params.cache_type, params.bmm1_scale, params.bmm2_scale, params.quant_scale_o, params.quant_scale_kv,
-        params.dequant_scale_q, params.dequant_scale_kv, params.host_bmm1_scale);
+        params.cache_type, params.quant_scale_kv);
 }
 
 template <typename T>
@@ -944,7 +942,6 @@ void invokeMLAContextFp8Quantize(MlaParams<T>& params, int total_kv_len, cudaStr
     TLLM_CHECK_WITH_INFO(params.quant_q_buf != nullptr, "MLA Context: quant_q_buf must be non-null");
     TLLM_CHECK_WITH_INFO(params.quant_k_buf != nullptr, "MLA Context: quant_k_buf must be non-null");
     TLLM_CHECK_WITH_INFO(params.quant_v_buf != nullptr, "MLA Context: quant_v_buf must be non-null");
-    TLLM_CHECK_WITH_INFO(params.quant_scale_qkv != nullptr, "MLA Context: quant_scale_qkv must be non-null");
 
     TLLM_LOG_DEBUG("MLA RoPE Context: Quantizing separate qkv to FP8");
 
@@ -954,16 +951,16 @@ void invokeMLAContextFp8Quantize(MlaParams<T>& params, int total_kv_len, cudaStr
         dim3 grid(int(tensorrt_llm::common::divUp(total_kv_len, 48)), 1, params.head_num);
 
         TLLM_LOG_DEBUG(
-            "Launching QuantizeCopyInputToFp8Kernel with grid_size: (%d, %d, %d), threads_per_block: %d",
-            grid.x, grid.y, grid.z, threads_per_block);
+            "Launching QuantizeCopyInputToFp8Kernel with grid_size: (%d, %d, %d), threads_per_block: %d, "
+            "total_kv_len: %d, acc_q_len: %d",
+            grid.x, grid.y, grid.z, threads_per_block, total_kv_len, params.acc_q_len);
 
-        QuantizeCopyInputToFp8Kernel<T, threads_per_block, 128, 64, 128>
-            <<<grid, threads_per_block, 0, stream>>>(
-                params.q_buf, params.quant_q_buf, params.k_buf, params.quant_k_buf, params.v_buf, params.quant_v_buf,
-                params.acc_q_len, total_kv_len, params.quant_scale_qkv);
-        sync_check_cuda_error(stream);
-
-        cudaStreamSynchronize(stream);
+        quantizeCopyInputToFp8Kernel<T, threads_per_block, 128, 64, 128>
+            <<<grid, threads_per_block, 0, stream>>>(params.q_buf, static_cast<__nv_fp8_e4m3*>(params.quant_q_buf),
+                params.k_buf, static_cast<__nv_fp8_e4m3*>(params.quant_k_buf), params.v_buf,
+                static_cast<__nv_fp8_e4m3*>(params.quant_v_buf), params.acc_q_len, total_kv_len, params.quant_scale_qkv,
+                params.bmm1_scale, params.bmm2_scale, params.quant_scale_o, params.dequant_scale_q,
+                params.dequant_scale_kv, params.host_bmm1_scale);
     }
     else
     {
@@ -992,12 +989,12 @@ void invokeMLARopeGeneration(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer
     attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
     config.numAttrs = 1;
     config.attrs = attrs;
-    cudaLaunchKernelEx(&config, kernel_instance, params.q_buf, params.q_pe, params.latent_cache,
-        params.quant_q_buf, kv_cache_buffer, params.cos_sin_cache, params.head_num,
-        params.meta.kv_lora_rank, params.acc_q_len, seq_len, params.seqQOffset, params.fmha_tile_counter,
-        params.cache_seq_lens, params.cu_kv_seqlens, params.q_pe_ld, params.q_pe_stride, params.cache_type,
-        params.bmm1_scale, params.bmm2_scale, params.quant_scale_o, params.quant_scale_q, params.quant_scale_kv,
-        params.dequant_scale_q, params.dequant_scale_kv, params.host_bmm1_scale);
+    cudaLaunchKernelEx(&config, kernel_instance, params.q_buf, params.q_pe, params.latent_cache, params.quant_q_buf,
+        kv_cache_buffer, params.cos_sin_cache, params.head_num, params.meta.kv_lora_rank, params.acc_q_len, seq_len,
+        params.seqQOffset, params.fmha_tile_counter, params.cache_seq_lens, params.cu_kv_seqlens, params.q_pe_ld,
+        params.q_pe_stride, params.cache_type, params.bmm1_scale, params.bmm2_scale, params.quant_scale_o,
+        params.quant_scale_q, params.quant_scale_kv, params.dequant_scale_q, params.dequant_scale_kv,
+        params.host_bmm1_scale);
 }
 
 template <typename T, typename TCache>
@@ -1037,11 +1034,15 @@ INSTANTIATE_MLA_ROPE(float, KVBlockArray);
 INSTANTIATE_MLA_ROPE(half, KVBlockArray);
 INSTANTIATE_MLA_ROPE(float, KVLinearBuffer);
 INSTANTIATE_MLA_ROPE(half, KVLinearBuffer);
-
-#ifdef ENABLE_BF16
 INSTANTIATE_MLA_ROPE(__nv_bfloat16, KVBlockArray);
 INSTANTIATE_MLA_ROPE(__nv_bfloat16, KVLinearBuffer);
-#endif
+
+#define INSTANTIATE_MLA_QUANTIZE(T)                                                                                    \
+    template void invokeMLAContextFp8Quantize<T>(MlaParams<T> & params, int total_kv_len, cudaStream_t stream);
+
+INSTANTIATE_MLA_QUANTIZE(float);
+INSTANTIATE_MLA_QUANTIZE(half);
+INSTANTIATE_MLA_QUANTIZE(__nv_bfloat16);
 
 #define INSTANTIATE_RW_KVCACHE_MLA(T, TCache)                                                                          \
     template void invokeMLALoadPagedKV<T, TCache>(T * compressed_kv_ptr, T * k_pe_ptr, KVBlockArray & kv_cache,        \

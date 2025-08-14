@@ -187,9 +187,10 @@ void FusedMHARunnerV2::setupKernelParams(MHARunnerParams runnerParams)
             // Tensor K is contiguous.
             mKernelParams.k_stride_in_bytes
                 = get_size_in_bytes(mFixedParams.numKvHeads * mFixedParams.headSize, mFixedParams.dataType);
-            if (mFixedParams.headSizeQkNope > 0)
+            if (mFixedParams.headSizeQkNope > 0 && mFixedParams.dataType != DATA_TYPE_E4M3)
             {
-                // Tensor V for context MLA is not contiguous, so we need to add the headSizeQkNope to the stride.
+                // Tensor V for non-fp8 context MLA is not contiguous, so we need to add the headSizeQkNope to the
+                // stride.
                 mKernelParams.v_stride_in_bytes = get_size_in_bytes(
                     mFixedParams.numKvHeads * (mFixedParams.headSizeQkNope + mFixedParams.headSizeV),
                     mFixedParams.dataType);
