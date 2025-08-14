@@ -587,13 +587,15 @@ class BenchRunner:
                 try:
                     throughput = line.split(":")[1].strip()
                     result['throughput'] = throughput
-                except:
+                except (IndexError, ValueError) as e:
+                    print(f"Failed to parse throughput from line: {line}. Error: {e}")
                     pass
             elif 'total latency' in line.lower() and 'ms' in line.lower():
                 try:
                     latency = line.split(":")[1].strip()
                     result['latency'] = latency
-                except:
+                except (IndexError, ValueError) as e:
+                    print(f"Failed to parse latency from line: {line}. Error: {e}")
                     pass
 
         return result
