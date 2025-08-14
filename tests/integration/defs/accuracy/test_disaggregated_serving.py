@@ -512,7 +512,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
         if tp * pp * 2 > get_device_count():
             pytest.skip(f"Not enough devices for tp={tp}*pp={pp} test")
         return run_parallel_test(self.MODEL_NAME, self.MODEL_PATH, pp, tp, pp,
-                                 tp, 1, 1, get_accuracy_task(testset))
+                                 tp, get_accuracy_task(testset))
 
     @pytest.mark.skip_less_device(4)
     @parametrize_with_ids("ctx_pp", [2, 4])
@@ -523,7 +523,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             pytest.skip(
                 f"Not enough devices for ctx_pp={ctx_pp}*gen_tp={gen_tp} test")
         return run_parallel_test(self.MODEL_NAME, self.MODEL_PATH, ctx_pp, 1, 1,
-                                 gen_tp, 1, 1, get_accuracy_task(testset))
+                                 gen_tp, get_accuracy_task(testset))
 
 
 @pytest.mark.skip_less_device_memory(140000)
@@ -720,7 +720,6 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
                 "backend": "nixl"
             }
         }
-
         disaggregated_server_config = {
             "hostname": "localhost",
             "port": 8000,
