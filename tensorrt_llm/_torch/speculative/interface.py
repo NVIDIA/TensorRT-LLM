@@ -93,7 +93,7 @@ class SpeculativeDecodingMode(IntEnum):
             return False
 
         # The special XQA generation kernels only exist with the TRTLLM backend on blackwell.
-        return not isinstance(attention_backend,
+        return not issubclass(attention_backend,
                               TrtllmAttention) or get_sm_version() != 100
 
     def attention_need_spec_dec_mode(self):
