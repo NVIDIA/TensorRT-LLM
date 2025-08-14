@@ -57,7 +57,8 @@ from ..models.modeling_utils import ModelConfig, QuantConfig
 from ..modules.attention import MLA
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import (DeepSeekV3MoeRoutingMethod, TRTLLMGenFusedMoE,
+from ..modules.fused_moe import (DeepSeekV3MoeRoutingMethod,
+                                 MoEWeightLoadingMode, TRTLLMGenFusedMoE,
                                  create_moe,
                                  moe_load_balancer_set_repeated_for_next_layer)
 from ..modules.gated_mlp import GatedMLP
@@ -454,7 +455,13 @@ class Deepseekv3MoE(nn.Module):
             model_config=model_config,
             override_quant_config=override_quant_config,
             aux_stream_dict=aux_stream_dict,
-            layer_idx=layer_idx)
+            layer_idx=layer_idx,
+            # DS-R1 W4A8 is only supported through custom quantization script from
+            # examples/quantization/quantize_mixed_precision_moe.py
+            weight_loading_mode=(MoEWeightLoadingMode.W4A8_CUSTOM
+                                 if model_config.quant_config.quant_mode.
+                                 is_int4_weight_only_per_group() else
+                                 MoEWeightLoadingMode.VANILLA))
 
         self.mapping = model_config.mapping
 

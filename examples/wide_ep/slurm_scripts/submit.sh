@@ -1,6 +1,6 @@
 #!/bin/bash
 
-echo "Please find the \`disaggr_torch.slurm\` script in the \`examples/disaggregated/slurm/\` directory."
+echo "Please find the \`disaggr_torch.slurm\` script in the \`examples/disaggregated/slurm/benchmark/\` directory."
 
 partition=<partition>
 account=<account>
