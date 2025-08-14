@@ -52,9 +52,9 @@ setuptools<80
 ordered-set
 peft
 einops
-# flashinfer-python>=0.2.5
+### flashinfer-python>=0.2.5 ### installs triton
 opencv-python-headless
-xgrammar>=0.1.19
+### xgrammar>=0.1.19  ### installs triton
 backoff
 nvtx
 matplotlib # FIXME: this is added to make nvtx happy
@@ -64,4 +64,3 @@ etcd3
 blake3
 llguidance>=0.7.29
 soundfile
-

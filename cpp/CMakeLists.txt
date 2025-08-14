@@ -208,11 +208,11 @@ if(BINDING_TYPE STREQUAL "nanobind")
                    ${CMAKE_CURRENT_BINARY_DIR}/nanobind)
 endif()
 
+
 # include as system to suppress warnings
 include_directories(
   SYSTEM
   ${CUDAToolkit_INCLUDE_DIRS}
-  /usr/local/cuda-13.0/targets/x86_64-linux/include/cccl
   ${CUDNN_ROOT_DIR}/include
   $<TARGET_PROPERTY:TensorRT::NvInfer,INTERFACE_INCLUDE_DIRECTORIES>
   ${3RDPARTY_DIR}/cutlass/include
@@ -250,14 +250,6 @@ if(${CUDAToolkit_VERSION} VERSION_GREATER_EQUAL "12.8")
   )
 endif()
 
-if(${CUDAToolkit_VERSION} VERSION_GREATER_EQUAL "13.0")
-  message(
-    STATUS
-      "CUDAToolkit_VERSION ${CUDAToolkit_VERSION_MAJOR}.${CUDAToolkit_VERSION_MINOR} is greater or equal than 13.0, adding visibility flags"
-  )
-  set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --device-entity-has-hidden-visibility=false -cudart=shared")
-  ### set(CMAKE_CUDA_RUNTIME_LIBRARY Shared)
-endif()
 
 if(ENABLE_MULTI_DEVICE)
   # MPI MPI isn't used until tensorrt_llm/CMakeLists.txt is invoked. However, if
