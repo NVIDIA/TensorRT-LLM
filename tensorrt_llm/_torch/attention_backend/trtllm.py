@@ -658,7 +658,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     dtype=torch.int32,
                     device='cuda',
                 )
-            if self.enable_paged_context_mla:
+            if self.enable_context_mla_with_cached_kv:
                 # for kv cache reuse/chunked context in MLA
                 self.ctx_cached_token_indptr = torch.zeros(
                     (self.max_num_requests + 1, ),
@@ -747,8 +747,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self.host_request_types[self.num_contexts:self.num_seqs].fill_(1)
 
         # prepare for kv cache reuse/chunked context in MLA
-        if self.enable_paged_context_mla:
-            self.prepare_paged_context_mla(cached_token_lens, kv_lens)
+        if self.enable_context_mla_with_cached_kv:
+            self.prepare_context_mla_with_cached_kv(cached_token_lens, kv_lens)
 
         # kv block offsets
         assert self.request_ids is not None
@@ -835,8 +835,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
             else:
                 merge_op_tensor[chunked_loop_num, s] = 1  # merge
 
-    def prepare_paged_context_mla(self, cached_token_lens: torch.Tensor,
-                                  kv_lens: torch.Tensor) -> None:
+    def prepare_context_mla_with_cached_kv(self,
+                                           cached_token_lens: torch.Tensor,
+                                           kv_lens: torch.Tensor) -> None:
         if self.num_contexts > 0:
             self.num_ctx_cached_tokens = cached_token_lens[:self.
                                                            num_contexts].sum(
@@ -1118,9 +1119,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         ) if metadata.runtime_features else False
 
         if self.is_mla_enable:
-            # for MLA, we only use paged_context_fmha when there is cached kv
-            use_paged_context_fmha = use_paged_context_fmha and self.has_cached_kv_for_mla_context(
-                metadata)
+            # Context MLA uses separate qkv instead of paged_context_fmha
+            use_paged_context_fmha = False
 
         use_nvfp4_output = False
         if enable_attn_nvfp4_output and self.has_nvfp4 and self.support_nvfp4_output(
@@ -1225,7 +1225,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         metadata: TrtllmAttentionMetadata,
     ) -> bool:
         return (self.is_mla_enable and metadata.kv_cache_manager is not None
-                and metadata.enable_paged_context_mla
+                and metadata.enable_context_mla_with_cached_kv
                 and metadata.num_ctx_cached_tokens > 0)
 
     def is_chunked_prefill_for_mla_context(
@@ -1233,7 +1233,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         metadata: TrtllmAttentionMetadata,
     ) -> bool:
         return (self.is_mla_enable and metadata.kv_cache_manager is not None
-                and metadata.enable_paged_context_mla
+                and metadata.enable_context_mla_with_cached_kv
                 and metadata.num_ctx_cached_tokens > 0
                 and metadata.runtime_features.chunked_prefill)
 
