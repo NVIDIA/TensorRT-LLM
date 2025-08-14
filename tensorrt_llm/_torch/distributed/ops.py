@@ -403,7 +403,7 @@ class AllReduce(nn.Module):
                  strategy: AllReduceStrategy = AllReduceStrategy.AUTO,
                  dtype: Optional[torch.dtype] = None):
         super().__init__()
-        '''
+        """
         AllReduce is a module that performs an all-reduce operation on a tensor.
 
         Args:
@@ -440,7 +440,7 @@ class AllReduce(nn.Module):
             https://github.com/NVIDIA/TensorRT-LLM/blob/main/tests/unittest/_torch/multi_gpu/test_allreduce.py
 
             The LOWPRECISION strategy can be selected either by directly specifying it in the constructor.
-        '''
+        """
 
         self.mapping = mapping
         self.workspace = None
@@ -486,7 +486,7 @@ class AllReduce(nn.Module):
         *,
         all_reduce_params: Optional[AllReduceParams] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, ...]]:
-        """
+        '''
         The input tensors in the different ranks must have the same shape.
         The output tensor will have that same shape with the input tensor.
         The output tensor will be replicated among the TP group.
@@ -508,7 +508,7 @@ class AllReduce(nn.Module):
             RESIDUAL_RMS_NORM_OUT_QUANT_FP8: [norm, norm_quant, residual]
             RESIDUAL_RMS_NORM_QUANT_NVFP4: [norm_quant_fp4, scale_factor, residual]
             RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4: [norm, norm_quant_fp4, scale_factor, residual]
-        """
+        '''
         if self.mapping.tp_size == 1 or (all_reduce_params is not None
                                          and all_reduce_params.enable_allreduce
                                          == False):
