@@ -2540,10 +2540,6 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         if moe_backend == "TRITON":
             if not IS_TRITON_KERNELS_AVAILABLE:
                 pytest.skip("Triton kernels are not available")
-            if tp_size != ep_size:
-                pytest.skip(
-                    "TRITON moe backend currently doesn't supported mxfp4 tp for this size"
-                )
 
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
