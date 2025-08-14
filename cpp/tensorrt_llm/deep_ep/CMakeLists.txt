@@ -38,12 +38,13 @@ endif()
 
 # Ensure that dependent libraries are installed
 find_library(MLX5_lib NAMES mlx5 REQUIRED)
-set(NVSHMEM_INSTALL_PREFIX "${TORCH_INSTALL_PREFIX}/../nvidia/shmem")
+set(NVSHMEM_INSTALL_PREFIX "${TORCH_INSTALL_PREFIX}/../nvidia/nvshmem")
 # message("Torch Install Prefix: ${TORCH_INSTALL_PREFIX}")
 
 find_path(NVSHMEM_INCLUDE_DIR nvshmem.h HINTS ${NVSHMEM_INSTALL_PREFIX}/include)
-find_library(NVSHMEM_HOST_LIBRARY nvshmem_host.so.3 HINTS ${NVSHMEM_INSTALL_PREFIX}/lib)
+# set(NVSHMEM_HOST_LIBRARY ${NVSHMEM_INSTALL_PREFIX}/lib/libnvshmem_host.so.3)
 find_library(NVSHMEM_DEVICE_LIBRARY nvshmem_device HINTS ${NVSHMEM_INSTALL_PREFIX}/lib)
+find_library(NVSHMEM_HOST_LIBRARY libnvshmem_host.so.3 HINTS ${NVSHMEM_INSTALL_PREFIX}/lib)
 
 
 # Prepare files
@@ -114,7 +115,7 @@ set_target_properties(
              CUDA_SEPARABLE_COMPILATION ON
              CUDA_ARCHITECTURES "${DEEP_EP_CUDA_ARCHITECTURES}"
              LINK_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/deep_ep_cpp_tllm.version
-             INSTALL_RPATH "${TORCH_INSTALL_PREFIX}/lib"
+             INSTALL_RPATH "${TORCH_INSTALL_PREFIX}/lib;${NVSHMEM_INSTALL_PREFIX}/lib"
              BUILD_WITH_INSTALL_RPATH TRUE)
 target_compile_options(
   deep_ep_cpp_tllm
@@ -125,7 +126,7 @@ target_compile_definitions(
                            TORCH_EXTENSION_NAME=deep_ep_cpp_tllm)
 target_include_directories(deep_ep_cpp_tllm PRIVATE ${NVSHMEM_INCLUDE_DIR})
 target_link_libraries(
-  deep_ep_cpp_tllm PRIVATE ${NVSHMEM_DEVICE_LIBRARY} ${TORCH_LIBRARIES}
+  deep_ep_cpp_tllm PRIVATE ${NVSHMEM_DEVICE_LIBRARY} ${NVSHMEM_HOST_LIBRARY} ${TORCH_LIBRARIES}
                            ${TORCH_PYTHON_LIB})
 target_link_options(
   deep_ep_cpp_tllm PRIVATE
