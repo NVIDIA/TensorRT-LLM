@@ -4,6 +4,7 @@
 # Please take a look at the existing test_llm_api_pytorch.py file for reference.
 import concurrent
 import contextlib
+import json
 import os
 import tempfile
 import time
@@ -19,6 +20,7 @@ import yaml
 from tensorrt_llm.executor.result import GenerationResultBase
 from tensorrt_llm.llmapi import CompletionOutput, RequestOutput, SamplingParams
 from tensorrt_llm.llmapi.llm_args import LlmArgs
+from tensorrt_llm.llmapi.tokenizer import load_hf_tokenizer
 
 from ..conftest import (get_device_count, llm_models_root, parametrize_with_ids,
                         skip_pre_hopper)
@@ -562,6 +564,12 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                 f"Not enough devices for ctx_pp={ctx_pp}*gen_tp={gen_tp} test")
         return run_parallel_test(self.MODEL_NAME, self.MODEL_PATH, ctx_pp, 1, 1,
                                  gen_tp, 1, 1, get_accuracy_task(testset))
+
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.parametrize("testset", ["GSM8K", "MMLU"])
+    def test_multi_instance(self, testset):
+        return run_parallel_test(self.MODEL_NAME, self.MODEL_PATH, 1, 1, 1, 1,
+                                 2, 2, get_accuracy_task(testset))
 
     @pytest.mark.skip_less_device(4)
     @pytest.mark.parametrize("testset", ["GSM8K", "MMLU"])

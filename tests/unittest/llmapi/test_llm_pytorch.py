@@ -810,6 +810,42 @@ def test_gqa_nemo_lora(tmp_path):
         llm.shutdown()
 
 
+class FailingExecutorWorker(GenerationExecutorWorker):
+    """Mock worker that fails during initialization to test error handling."""
+
+    def __init__(self, *args, **kwargs):
+        # Simulate a constructor failure
+        raise RuntimeError(
+            "Mock GenerationExecutorWorker initialization failed")
+
+
+FailingExecutor = type(
+    "FailingExecutor", (), {
+        "create":
+        classmethod(
+            lambda cls, *args, **kwargs: FailingExecutorWorker(*args, **kwargs))
+    })
+
+
+def test_llm_with_proxy_error():
+    """Test that LLM properly handles GenerationExecutorWorker constructor failures.
+    This test mocks the GenerationExecutorWorker to fail during __init__ and
+    verifies that the LLM class properly catches and re-raises the error.
+    """
+    from unittest.mock import patch
+
+    # Test that the error is properly caught and re-raised by LLM
+    # We patch GenerationExecutor.create directly to return our failing worker
+    with patch('tensorrt_llm.executor.executor.GenerationExecutor.create',
+               side_effect=lambda *args, **kwargs: FailingExecutorWorker(
+                   *args, **kwargs)):
+        with pytest.raises(
+                RuntimeError,
+                match="Mock GenerationExecutorWorker initialization failed"):
+            llm = LLM(model=llama_model_path,
+                      kv_cache_config=global_kvcache_config)
+
+
 class TestLlmError:
 
     def test_max_num_token_check(self):
