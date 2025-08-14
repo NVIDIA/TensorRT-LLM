@@ -2533,16 +2533,17 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             (4, 1, 1, False, True, True),
             (4, 1, 4, False, True, True),
             (4, 1, 4, True, True, True),
-            (2, 1, 1, False, True, True),
-            (2, 1, 2, False, True, True),
-            (2, 1, 2, True, True, True),
         ],
-        ids=["tp4", "ep4", "dp4", "tp2", "ep2", "dp2"])
-    def test_w4_multigpu(self, moe_backend, tp_size, pp_size, ep_size,
-                         attention_dp, cuda_graph, overlap_scheduler):
+        ids=["tp4", "ep4", "dp4"])
+    def test_w4_4gpus(self, moe_backend, tp_size, pp_size, ep_size,
+                      attention_dp, cuda_graph, overlap_scheduler):
         if moe_backend == "TRITON":
             if not IS_TRITON_KERNELS_AVAILABLE:
                 pytest.skip("Triton kernels are not available")
+            if tp_size != ep_size:
+                pytest.skip(
+                    "TRITON moe backend currently doesn't supported mxfp4 tp for this size"
+                )
 
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,

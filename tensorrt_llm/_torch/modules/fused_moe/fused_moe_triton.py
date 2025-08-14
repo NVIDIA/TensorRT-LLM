@@ -687,7 +687,7 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
         # Full scale is loaded at the beginning, later we will slice properly for TP
         w3_w1_scale_shape = (
             w3_w1_weight_shape[0],
-            ceil_div(module.hidden_size, 32),  # block size of 32 for mxfp4,
+            ceil_div(module.hidden_size, 32),  # block size of 32 for mxfp4
             module.intermediate_size * 2,
         )
 
