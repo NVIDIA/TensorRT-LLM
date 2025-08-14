@@ -109,6 +109,9 @@ mistralai/Mixtral-8x22B-v0.1:
     accuracy: 77.63
 mistralai/Mistral-Small-3.1-24B-Instruct-2503:
   - accuracy: 81.7
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
+    accuracy: 81.1
 google/gemma-2-9b-it:
   - accuracy: 73.05
 google/gemma-3-1b-it:
