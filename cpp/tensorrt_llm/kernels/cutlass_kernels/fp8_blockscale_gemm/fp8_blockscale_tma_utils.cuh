@@ -24,8 +24,6 @@
 #include <cuda/barrier>
 #include <cute/arch/util.hpp>
 
-#define PFN_cuTensorMapEncodeTiled PFN_cuTensorMapEncodeTiled_v12000
-
 namespace tensorrt_llm::kernels::fp8_blockscale_gemm
 {
 

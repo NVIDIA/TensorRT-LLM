@@ -130,11 +130,11 @@ void invokeTopkBeamSearch(T const* logProbs, T const* bias, void* workspace, Bea
 void invokeUpdateCacheIndirection(int* tgtCI, int const* srcCI, BeamHypotheses& bh,
     runtime::SizeType32 const maxAttentionWindow, runtime::SizeType32 sinkTokenLength, cudaStream_t stream);
 
+#ifdef __CUDACC__
 template <typename T>
 __global__ __attribute__((visibility("default"))) void addCumLogProbs(T* __restrict pStage1LogProbs, float const* __restrict cumLogProbs,
     FinishedState const* finished, int const* endIds, float const* diversityRates,
     runtime::SizeType32 const* batchSlots, size_t const nBS, size_t const nBMIn, size_t const nBMOut, size_t const nBM)
-#ifdef __CUDACC__
 {
     int const bid = blockIdx.x; // Index of request in batch
     runtime::SizeType32 const slot = batchSlots[bid];
@@ -156,15 +156,6 @@ __global__ __attribute__((visibility("default"))) void addCumLogProbs(T* __restr
     }
     return;
 }
-#else
-;
-extern template __global__ __attribute__((visibility("default"))) void addCumLogProbs<float>(float* __restrict pStage1LogProbs, float const* __restrict cumLogProbs,
-    FinishedState const* finished, int const* endIds, float const* diversityRates,
-    runtime::SizeType32 const* batchSlots, size_t const nBS, size_t const nBMIn, size_t const nBMOut, size_t const nBM);
-
-extern template __global__ __attribute__((visibility("default"))) void addCumLogProbs<half>(half* __restrict pStage1LogProbs, float const* __restrict cumLogProbs,
-    FinishedState const* finished, int const* endIds, float const* diversityRates,
-    runtime::SizeType32 const* batchSlots, size_t const nBS, size_t const nBMIn, size_t const nBMOut, size_t const nBM);
 #endif
 
 
