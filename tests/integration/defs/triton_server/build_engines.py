@@ -1787,9 +1787,9 @@ def prepare_mistral3_pixtral_engine(tensorrt_llm_multimodal_example_root,
     build_cmd = [
         "trtllm-build",
         f"--checkpoint_dir={ckpt_dir}",
-        "--max_batch_size=8",
-        "--max_input_len=4096",
-        "--max_seq_len=4096",
+        "--max_batch_size=4",
+        "--max_input_len=8192",
+        "--max_seq_len=8192",
         # Allow an arbitrary number of image tokens by setting:
         # max_multimodal_len = max_batch_size * max_input_len
         "--max_multimodal_len=32768",
