@@ -290,11 +290,12 @@ def create_py_executor(
                 f"Change tokens_per_block to: {executor_config.tokens_per_block} for using FlashMLA"
             )
 
+        sm_version = get_sm_version()
         if executor_config.kv_cache_config.enable_block_reuse and not (
-                get_sm_version() >= 90 and get_sm_version() <= 100):
+                sm_version == 90 or sm_version == 100 or sm_version == 120):
             logger.warning(
-                f"KV cache reuse for MLA can only be enabled on SM90/SM100, "
-                f"disable enable_block_reuse for SM{get_sm_version()}")
+                f"KV cache reuse for MLA can only be enabled on SM90/SM100/SM120, "
+                f"disable enable_block_reuse for SM{sm_version}")
             executor_config.kv_cache_config.enable_block_reuse = False
 
         kv_cache_quant_algo = model_engine.model.model_config.quant_config.kv_cache_quant_algo
@@ -306,11 +307,11 @@ def create_py_executor(
                 f"disable enable_block_reuse for KV cache quant algorithm: {kv_cache_quant_algo}"
             )
             executor_config.kv_cache_config.enable_block_reuse = False
-        if executor_config.enable_chunked_context and not (
-                get_sm_version() == 100 or get_sm_version() == 90):
+        if executor_config.enable_chunked_context and not (sm_version == 90 or
+                                                           sm_version == 100):
             logger.warning(
-                "Chunked Prefill for MLA can only be enabled on SM90/100, "
-                f"disable enable_block_reuse for SM{get_sm_version()}")
+                "Chunked Prefill for MLA can only be enabled on SM90/SM100, "
+                f"disable enable_chunked_context for SM{sm_version}")
             executor_config.enable_chunked_context = False
             model_engine.attn_runtime_features.chunked_prefill = False
             if draft_model_engine is not None:
