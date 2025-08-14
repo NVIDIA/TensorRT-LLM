@@ -117,7 +117,7 @@ KvCacheTransferMode KvCacheRetentionConfig::getTransferMode() const
     return mTransferMode;
 }
 
-std::optional<std::string> KvCacheRetentionConfig::getDirectory() const
+std::optional<std::string> const& KvCacheRetentionConfig::getDirectory() const
 {
     return mDirectory;
 }
