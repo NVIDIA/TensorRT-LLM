@@ -34,10 +34,10 @@ namespace cutlass_extensions
 enum class CutlassTileConfig
 {
     // Signals that we should run heuristics do choose a config
-    Undefined,
+    Undefined = 0,
 
     // Signals that we should run heuristics do choose a config
-    ChooseWithHeuristic,
+    ChooseWithHeuristic = 1,
 
     // SiMT config
     CtaShape128x128x8_WarpShape64x64x8,
@@ -103,10 +103,10 @@ constexpr static std::tuple<int, int, int> enum_to_shape_tuple(TEnum shape_id_en
 enum class CutlassTileConfigSM90 : int
 {
     // Signals that we should run heuristics do choose a config
-    Undefined,
+    Undefined = 0,
 
     // Signals that we should run heuristics do choose a config
-    ChooseWithHeuristic,
+    ChooseWithHeuristic = 1,
 
     // CTA configs for M=64
     CtaShape64x16x128B = shape_tuple_to_enum(64, 16, 128),
@@ -130,10 +130,10 @@ enum class CutlassTileConfigSM90 : int
 enum class CutlassTileConfigSM100 : int
 {
     // Signals that we should run heuristics do choose a config
-    Undefined,
+    Undefined = 0,
 
     // Signals that we should run heuristics do choose a config
-    ChooseWithHeuristic,
+    ChooseWithHeuristic = 1,
 
     /*
      * Grouped GEMM
@@ -158,10 +158,10 @@ enum class CutlassTileConfigSM100 : int
 enum class CutlassTileConfigSM120 : int
 {
     // Signals that we should run heuristics do choose a config
-    Undefined,
+    Undefined = 0,
 
     // Signals that we should run heuristics do choose a config
-    ChooseWithHeuristic,
+    ChooseWithHeuristic = 1,
 
     CtaShape128x128x128B = shape_tuple_to_enum(128, 128, 128),
     CtaShape128x128x64B = shape_tuple_to_enum(128, 128, 64),
@@ -212,7 +212,7 @@ enum class EpilogueScheduleType
 
 enum class TileShape : int
 {
-    Undefined,
+    Undefined = 0,
     TileShape_64x16x128 = shape_tuple_to_enum(64, 16, 128),
     TileShape_64x32x128 = shape_tuple_to_enum(64, 32, 128),
     TileShape_64x64x128 = shape_tuple_to_enum(64, 64, 128),
@@ -232,62 +232,11 @@ template <TileShape Shape_MNK>
 constexpr auto get_tile_shape()
 {
     using namespace cute;
-    if constexpr (Shape_MNK == TileShape::TileShape_64x16x128)
-    {
-        return cute::Shape<_64, _16, _128>{};
-    }
-    else if constexpr (Shape_MNK == TileShape::TileShape_64x32x128)
-    {
-        return cute::Shape<_64, _32, _128>{};
-    }
-    else if constexpr (Shape_MNK == TileShape::TileShape_64x64x128)
-    {
-        return cute::Shape<_64, _64, _128>{};
-    }
-    else if constexpr (Shape_MNK == TileShape::TileShape_64x128x128)
-    {
-        return cute::Shape<_64, _128, _128>{};
-    }
-    else if constexpr (Shape_MNK == TileShape::TileShape_64x256x128)
-    {
-        return cute::Shape<_64, _256, _128>{};
-    }
-    else if constexpr (Shape_MNK == TileShape::TileShape_64x512x128)
-    {
-        return cute::Shape<_64, _512, _128>{};
-    }
-    else if constexpr (Shape_MNK == TileShape::TileShape_128x16x128)
-    {
-        return cute::Shape<_128, _16, _128>{};
-    }
-    else if constexpr (Shape_MNK == TileShape::TileShape_128x32x128)
-    {
-        return cute::Shape<_128, _32, _128>{};
-    }
-    else if constexpr (Shape_MNK == TileShape::TileShape_128x64x128)
-    {
-        return cute::Shape<_128, _64, _128>{};
-    }
-    else if constexpr (Shape_MNK == TileShape::TileShape_128x128x128)
-    {
-        return cute::Shape<_128, _128, _128>{};
-    }
-    else if constexpr (Shape_MNK == TileShape::TileShape_128x256x128)
-    {
-        return cute::Shape<_128, _256, _128>{};
-    }
-    else if constexpr (Shape_MNK == TileShape::TileShape_256x128x128)
-    {
-        return cute::Shape<_256, _128, _128>{};
-    }
-    else if constexpr (Shape_MNK == TileShape::TileShape_256x256x128)
-    {
-        return cute::Shape<_256, _256, _128>{};
-    }
-    else
-    {
-        return cute::Shape<_0, _0, _0>{};
-    }
+    static_assert(Shape_MNK != TileShape::Undefined, "TileShape is undefined");
+
+    constexpr auto shape_tuple = enum_to_shape_tuple(Shape_MNK);
+    return cute::Shape<cute::Int<std::get<0>(shape_tuple)>, cute::Int<std::get<1>(shape_tuple)>,
+        cute::Int<std::get<2>(shape_tuple)>>{};
 }
 
 template <class TEnum>
@@ -312,7 +261,7 @@ static std::string get_tile_shape_name(TEnum Shape_MNK)
 
 enum class ClusterShape : int
 {
-    Undefined,
+    Undefined = 0,
     ClusterShape_1x1x1 = shape_tuple_to_enum(1, 1, 1),
     ClusterShape_2x1x1 = shape_tuple_to_enum(2, 1, 1),
     ClusterShape_1x2x1 = shape_tuple_to_enum(1, 2, 1),
