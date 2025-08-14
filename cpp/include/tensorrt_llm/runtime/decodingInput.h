@@ -102,11 +102,13 @@ public:
     {
     public:
         TensorPtr draftLogits;
+        TensorPtr draftLogitsHost;
         TensorPtr draftProbs;
         TensorPtr targetProbs;
         TensorPtr numDraftTokens;
         TensorPtr numDraftTokensHost;
         TensorPtr draftTokenIds;
+        TensorPtr draftTokenIdsHost;
         TensorPtr useDraftLogits;
         TensorPtr useDraftLogitsHost;
 
