@@ -53,11 +53,11 @@ struct MlaParams
 {
     T const* latent_cache;       // cKV + k_pe
     T* q_buf;
-    T* k_buf = nullptr;          // [total_kv_lens, h, d_nope + d_rope], for context MLA, contiguous
-    T* v_buf = nullptr;          // [total_kv_lens, h, d_v], for context MLA, not contiguous
+    T* k_buf = nullptr;          // [total_kv_len, h, d_nope + d_rope], for context MLA, contiguous
+    T* v_buf = nullptr;          // [total_kv_len, h, d_v], for context MLA, not contiguous
     void* quant_q_buf = nullptr;
-    void* quant_k_buf = nullptr; // [total_kv_lens, h, d_nope + d_rope], for fp8 context MLA, contiguous
-    void* quant_v_buf = nullptr; // [total_kv_lens, h, d_v], for fp8 context MLA, contiguous
+    void* quant_k_buf = nullptr; // [total_kv_len, h, d_nope + d_rope], for fp8 context MLA, contiguous
+    void* quant_v_buf = nullptr; // [total_kv_len, h, d_v], for fp8 context MLA, contiguous
     T* context_buf;
     T* q_pe;                     // [b, h, d_r], strided
 

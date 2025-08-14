@@ -173,6 +173,7 @@ public:
             ss << "host_secondary_pool_pointer: " << this->host_secondary_pool_pointer << std::endl;
             ss << "batch_size: " << this->batch_size << std::endl;
             ss << "num_tokens: " << this->num_tokens << std::endl;
+            ss << "total_kv_len: " << this->total_kv_len << std::endl;
             ss << "max_blocks_per_sequence: " << this->max_blocks_per_sequence << std::endl;
             ss << "workspace: " << this->workspace << std::endl;
             ss << "logn_scaling_ptr: " << this->logn_scaling_ptr << std::endl;

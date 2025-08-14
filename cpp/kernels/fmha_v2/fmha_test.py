@@ -191,23 +191,6 @@ def test_trtllm_context_mla_attention_fmha(dtype, s):
             shell=True,
             check=True)
 
-        # For chunked prefill, we need to enable -save-softmax (dtype: bf16, sm90, layout: paged-kv or separate-q-k-v).
-        if dtype == "-bf16" and input_layout in [
-                "-paged-kv", "-separate-q-k-v"
-        ]:
-            # padding mask
-            subprocess.run(
-                f"bin/fmha.exe -v 0 -runs 1 -min-s 1024 -s {s} -b 8 -h 8 -d 192 -dv 128 {dtype} \
-                {epsilon} {input_layout} -save-softmax",
-                shell=True,
-                check=True)
-            # causal mask
-            subprocess.run(
-                f"bin/fmha.exe -v 0 -runs 1 -min-s 1024 -s {s} -b 8 -h 8 -d 192 -dv 128 {dtype} \
-                -causal-mask {epsilon} {input_layout} -save-softmax",
-                shell=True,
-                check=True)
-
 
 @pytest.mark.parametrize('dtype', ["-bf16", "-e4m3", "-e4m3 -bf16-output"],
                          ids=["bf16", "e4m3", "e4m3-bf16"])
