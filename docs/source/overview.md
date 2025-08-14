@@ -14,7 +14,7 @@ Some of the major benefits that TensorRT-LLM provides are:
 
 ### Common LLM Support
 
-TensorRT-LLM supports the latest LLMs. Refer to the {ref}`support-matrix-software` for the full list.
+TensorRT-LLM supports the latest LLMs. Refer to the {ref}`support-matrix` for the full list.
 
 ### In-Flight Batching and Paged Attention
 
@@ -24,6 +24,9 @@ TensorRT-LLM supports the latest LLMs. Refer to the {ref}`support-matrix-softwar
 
 TensorRT-LLM consists of pre– and post-processing steps and multi-GPU multi-node communication primitives in a simple, open-source Model Definition API for groundbreaking LLM inference performance on GPUs. Refer to the {ref}`multi-gpu-multi-node` section for more information.
 
+### FP4 Support
+[NVIDIA B200 GPUs](https://www.nvidia.com/en-us/data-center/dgx-b200/) , when used with TensorRT-LLM, enable seamless loading of model weights in the new [FP4 format](https://developer.nvidia.com/blog/introducing-nvfp4-for-efficient-and-accurate-low-precision-inference/#what_is_nvfp4), allowing you to automatically leverage optimized FP4 kernels for efficient and accurate low-precision inference.
+
 ### FP8 Support
 
 [NVIDIA H100 GPUs](https://www.nvidia.com/en-us/data-center/dgx-h100/) with TensorRT-LLM give you the ability to convert model weights into a new FP8 format easily and compile models to take advantage of optimized FP8 kernels automatically. This is made possible through [NVIDIA Hopper](https://blogs.nvidia.com/blog/h100-transformer-engine/) and done without having to change any model code.
@@ -31,7 +34,7 @@ TensorRT-LLM consists of pre– and post-processing steps and multi-GPU multi-no
 ### Latest GPU Support
 
 TensorRT-LLM supports GPUs based on the NVIDIA Hopper, NVIDIA Ada Lovelace, and NVIDIA Ampere architectures.
-Certain limitations might apply. Refer to the {ref}`support-matrix` for more information.
+Certain limitations might apply. Refer to the {ref}`support-matrix-software` for more information.
 
 ### Native Windows Support
 
