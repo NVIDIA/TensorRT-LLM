@@ -169,19 +169,24 @@ class Sharding(BaseTransform):
             )
 
         assert isinstance(gm, GraphModule), "Expecting GraphModule"
-
-        sharding_config = ShardingConfig(
-            local_rank,
-            world_size,
-            factory.get_sharding_config_source() if factory else ShardingConfigSource.UNKNOWN,
-            factory.get_sharding_config() if factory else {},
-            self.config.simple_shard_only,
-            self.config.use_sharding_from_factory,
+        shared_config.sharding_config.rank = local_rank
+        shared_config.sharding_config.world_size = world_size
+        shared_config.sharding_config.factory_source = (
+            factory.get_sharding_config_source() if factory else ShardingConfigSource.UNKNOWN
+        )
+        shared_config.sharding_config.predefined_config = (
+            factory.get_sharding_config() if factory else {}
+        )
+        shared_config.sharding_config.simple_shard_only = self.config.simple_shard_only
+        shared_config.sharding_config.use_sharding_from_factory = (
+            self.config.use_sharding_from_factory
         )
 
+        sharding_config = shared_config.sharding_config
+
         if (
-            sharding_config.use_sharding_from_factory
-            and len(sharding_config.get_predefined_config()) > 0
+            shared_config.sharding_config.use_sharding_from_factory
+            and len(shared_config.sharding_config.get_predefined_config()) > 0
         ):
             ad_logger.info("Applying sharding from config")
             factory_info = detect_sharding_from_factory_config(gm, sharding_config)

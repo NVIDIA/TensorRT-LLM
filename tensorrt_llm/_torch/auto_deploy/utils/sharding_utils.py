@@ -183,8 +183,12 @@ def _insert_sharded_matmul(
 class SplitDimension(IntEnum):
     """Enum for tensor split dimensions in sharding."""
 
-    ROW = 0  # Split along rows (first dimension)
-    COLUMN = 1  # Split along columns (second dimension)
+    # NOTE: The names COLUMN/ROW reflect the hugging face
+    # base_tp_plan sharding notation, but since we assume Y = W @ X^T,
+    # when splitting weight matrix W^T across columns, the actual split
+    # is over dimension 0
+    COLUMN = 0  # Split along columns (second dimension)
+    ROW = 1  # Split along rows (first dimension)
 
 
 class ShardingTransformInfo(BaseModel, ABC):
@@ -481,7 +485,7 @@ class ShardingConfig(BaseModel):
     factory_source: ShardingConfigSource = Field(default=ShardingConfigSource.UNKNOWN)
     rank: int = Field(default=0)
     world_size: int = Field(default=1)
-    _predefined_config: Optional[Dict[str, Any]] = None
+    predefined_config: Optional[Dict[str, Any]] = None
     simple_shard_only: bool = Field(default=False)
     use_sharding_from_factory: bool = False
     tp_transforms: List[TPShardingInfo] = Field(default_factory=list)
@@ -501,15 +505,15 @@ class ShardingConfig(BaseModel):
             factory_source=factory_source,
             rank=rank,
             world_size=world_size,
-            _predefined_config=sharding_config,
+            predefined_config=sharding_config,
             simple_shard_only=simple_shard_only,
             use_sharding_from_factory=use_sharding_from_factory,
         )
 
         # Pydantic does not support setting private fields directly.
-        self._predefined_config = sharding_config
+        self.predefined_config = sharding_config
         # Validate the config after initialization
-        if self._predefined_config is not None:
+        if self.predefined_config is not None:
             self.validate_config()
 
     def validate_config(self) -> bool:
@@ -518,27 +522,27 @@ class ShardingConfig(BaseModel):
                 "Sharding config is is currently only " + "supported for HuggingFace. Skipping."
             )
             # invalidate the config
-            self._predefined_config = {}
+            self.predefined_config = {}
             return False
 
-        if not isinstance(self._predefined_config, dict):
+        if not isinstance(self.predefined_config, dict):
             ad_logger.warning("Sharding config is not a dictionary. Skipping.")
             # invalidate the config
-            self._predefined_config = {}
+            self.predefined_config = {}
             return False
 
-        if "head_dim" not in self._predefined_config:
+        if "head_dim" not in self.predefined_config:
             ad_logger.warning("Sharding config does not contain head_dim. Skipping.")
             # invalidate the config
-            self._predefined_config = {}
+            self.predefined_config = {}
             return False
 
-        if "tp_plan" not in self._predefined_config:
+        if "tp_plan" not in self.predefined_config:
             ad_logger.warning("Sharding config does not contain tp_plan. Skipping.")
             # invalidate the config
-            self._predefined_config = {}
+            self.predefined_config = {}
             return False
-        tp_plan = self._predefined_config["tp_plan"]
+        tp_plan = self.predefined_config["tp_plan"]
 
         values = set(tp_plan.values())
         allowed_values = {
@@ -556,12 +560,12 @@ class ShardingConfig(BaseModel):
         if not values.issubset(allowed_values):
             ad_logger.warning("Sharding config contains invalid values. Skipping.")
             # invalidate the config
-            self._predefined_config = {}
+            self.predefined_config = {}
             return False
         return True
 
-    def get_predefined_config(self) -> Dict[str, Any]:
-        return self._predefined_config
+    def getpredefined_config(self) -> Dict[str, Any]:
+        return self.predefined_config
 
 
 def _append_simple_shard(

@@ -319,7 +319,6 @@ def _run_pattern_detection_job(
     _ = optimizer(None, gm)
     detected_transformations = optimizer.shared_config.sharding_config.tp_transforms
 
-    print(f"optimizer.shared_config.sharding_config: {optimizer.shared_config.sharding_config}")
     print(f"detected_transformations: {detected_transformations}")
     print(f"expected_transformations: {expected_transformations}")
     # Run pattern detection test
