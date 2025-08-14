@@ -1110,7 +1110,7 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const&
         SizeType32 tokenIdx = 0, blockSize = getTokensPerBlock();
         for (auto block : maybeOnboard)
         {
-            tokenIdx += blockSize; // advance idx to start of next block
+            tokenIdx += blockSize;                          // advance idx to start of next block
             if (earliestOnboardedTokenIndex < tokenIdx - 1) // compare against last token in current block
             {
                 onboardBlock(block);
