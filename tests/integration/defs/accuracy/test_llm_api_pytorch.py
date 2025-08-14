@@ -2442,11 +2442,14 @@ class TestStarCoder2_7B(LlmapiAccuracyTestHarness):
 
 
 class TestCodestral_22B_V01(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "codestral/codestral-22b-v0.1"
-    MODEL_PATH = f"{llm_models_root()}/codestral-22b-v0.1"
+    MODEL_NAME = "mistralai/Codestral-22B-v0.1"
+    MODEL_PATH = f"{llm_models_root()}/Codestral-22B-v0.1"
 
+    @pytest.mark.timeout(2400)
+    @pytest.mark.skip_less_device_memory(80000)
     def test_auto_dtype(self):
-        with LLM(self.MODEL_PATH) as llm:
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
+        with LLM(self.MODEL_PATH, kv_cache_config=kv_cache_config) as llm:
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)
