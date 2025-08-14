@@ -297,7 +297,13 @@ public:
     static std::vector<cutlass_extensions::CutlassGemmConfig> getAmpereConfigs(int sm);
 
     [[nodiscard]] bool isTmaWarpSpecialized(cutlass_extensions::CutlassGemmConfig gemm_config) const;
-    [[nodiscard]] bool supportsTmaWarpSpecialized() const;
+
+    [[nodiscard]] bool supportsTmaWarpSpecialized() const
+    {
+        return supportsTmaWarpSpecialized(sm_);
+    }
+
+    [[nodiscard]] static bool supportsTmaWarpSpecialized(int sm);
     [[nodiscard]] bool isFusedGatedActivation(cutlass_extensions::CutlassGemmConfig gemm_config,
         ActivationType activation_type, int gemm_n, int gemm_k) const;
     [[nodiscard]] bool supportsFusedGatedActivation(ActivationType activation_type, int gemm_n, int gemm_k) const;

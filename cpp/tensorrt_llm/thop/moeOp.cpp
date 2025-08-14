@@ -48,6 +48,7 @@ namespace common = tensorrt_llm::common;
 namespace kernels = CUTLASS_MOE_GEMM_KERNELS_NAMESPACE;
 using ActivationParams = CUTLASS_MOE_GEMM_NAMESPACE::ActivationParams;
 using ActivationType = CUTLASS_MOE_GEMM_NAMESPACE::ActivationType;
+using MoeGemmId = CUTLASS_MOE_GEMM_NAMESPACE::MoeGemmId;
 // Always use public header as it is just utility functions and types
 using TmaWarpSpecializedGroupedGemmInput = tensorrt_llm::kernels::cutlass_kernels::TmaWarpSpecializedGroupedGemmInput;
 using profiler_backend = CUTLASS_MOE_GEMM_KERNELS_NAMESPACE::GemmProfilerBackend;
@@ -586,9 +587,10 @@ public:
         return std::make_tuple(output, num_active_experts_per_node, experts_to_token_score, active_expert_global_ids);
     }
 
-    int64_t getTacticNum(int gemm_idx)
+    int64_t getTacticNum(int64_t const gemm_idx)
     {
         std::lock_guard<std::mutex> lock(mMutex);
+        TORCH_CHECK(gemm_idx == 1 || gemm_idx == 2, "gemm_idx must be 1 or 2");
         return (gemm_idx == 1) ? mGemm1Profiles.size() : mGemm2Profiles.size();
     }
 

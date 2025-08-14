@@ -1120,15 +1120,17 @@ protected:
     auto selectTacticsForArch(int sm)
     {
         bool is_tma_warp_specialized = sm >= 90 && !INT_QUANT;
-        bool is_finalize_fusion = is_tma_warp_specialized && mUseFusedFinalize;
+        bool epilogue_fusion_type = is_tma_warp_specialized && mUseFusedFinalize
+            ? cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::FINALIZE
+            : cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::NONE;
         auto tactics1 = getFilteredConfigs(sm, MoeGemmId::GEMM_1);
         auto tactics2 = getFilteredConfigs(sm, MoeGemmId::GEMM_2);
         auto it1 = std::find_if(tactics1.begin(), tactics1.end(),
             [is_tma_warp_specialized](auto& c) { return c.is_tma_warp_specialized == is_tma_warp_specialized; });
         auto it2 = std::find_if(tactics2.begin(), tactics2.end(),
-            [is_tma_warp_specialized, is_finalize_fusion](auto& c) {
+            [is_tma_warp_specialized, epilogue_fusion_type](auto& c) {
                 return c.is_tma_warp_specialized == is_tma_warp_specialized
-                    && c.using_fused_finalize == is_finalize_fusion;
+                    && c.epilogue_fusion_type == epilogue_fusion_type;
             });
         if (it1 == tactics1.end() || it2 == tactics2.end())
         {
@@ -1175,7 +1177,7 @@ protected:
         if (!tactic1 || !tactic2)
         {
             int sm = getSMVersion();
-            std::tie(tactic1, tactic2) = selectTacticsForArch(sm, mUseFusedFinalize);
+            std::tie(tactic1, tactic2) = selectTacticsForArch(sm);
         }
         ASSERT_TRUE(tactic1.has_value());
         ASSERT_TRUE(tactic2.has_value());
@@ -1637,8 +1639,9 @@ void MixtureOfExpertsTest<TypeParam_>::BasicPermuteTest(
         auto [expected_experts, token_final_scales] = populateRouting(num_experts, num_tokens, k);
 
         runMoEPermute(hidden_input, expected_experts, token_final_scales, hidden_size, num_experts, k);
-        bool should_be_deterministic
-            = !gemm2.is_finalize_fusion || mK < 3 || getSMVersion() < 90 || getSMVersion() >= 120;
+        bool is_finalize_fusion
+            = gemm2.epilogue_fusion_type == cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::FINALIZE;
+        bool should_be_deterministic = !is_finalize_fusion || mK < 3 || getSMVersion() < 90 || getSMVersion() >= 120;
         if (should_be_deterministic && !mIsLongTest)
         {
             auto first_iter = getDataFromDevice(mFinalOutput, mTotalTokens * mHiddenSize);
@@ -1904,8 +1907,10 @@ void MixtureOfExpertsTest<TypeParam_>::ParallelismTest(
                     // Only need to init the inputs on the first iteration
                     runMoEPermute(hidden_input, expected_experts, token_final_scales, hidden_size, num_experts, k,
                         MOEParallelismConfig{tp_size, i, ep_size, j}, enable_alltoall);
+                    bool is_finalize_fusion = gemm2.epilogue_fusion_type
+                        == cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::FINALIZE;
                     bool should_be_deterministic
-                        = !gemm2.is_finalize_fusion || mK < 3 || getSMVersion() < 90 || getSMVersion() >= 120;
+                        = !is_finalize_fusion || mK < 3 || getSMVersion() < 90 || getSMVersion() >= 120;
                     if (should_be_deterministic && !mIsLongTest)
                     {
                         auto first_iter = getDataFromDevice(mFinalOutput, mTotalTokens * mHiddenSize);
@@ -1920,8 +1925,10 @@ void MixtureOfExpertsTest<TypeParam_>::ParallelismTest(
                 else
                 {
                     runMoEPermute(MOEParallelismConfig{tp_size, i, ep_size, j}, enable_alltoall);
+                    bool is_finalize_fusion = gemm2.epilogue_fusion_type
+                        == cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::FINALIZE;
                     bool should_be_deterministic
-                        = !gemm2.is_finalize_fusion || mK < 3 || getSMVersion() < 90 || getSMVersion() >= 120;
+                        = !is_finalize_fusion || mK < 3 || getSMVersion() < 90 || getSMVersion() >= 120;
                     if (should_be_deterministic && !mIsLongTest)
                     {
                         auto first_iter = getDataFromDevice(mFinalOutput, mTotalTokens * mHiddenSize);

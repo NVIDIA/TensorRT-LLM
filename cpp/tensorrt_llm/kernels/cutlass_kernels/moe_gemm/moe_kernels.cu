@@ -2847,8 +2847,10 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
     expert_first_token_offset_ = getWsPtr(int64_t{}, "expert_first_token_offset");
 
     // We check if the provided config uses fused finalize and disable it if it does not
+    bool gemm2_using_finalize_fusion
+        = gemm2_config_->epilogue_fusion_type == cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::FINALIZE;
     permuted_token_final_scales_
-        = gemm2_config_->using_fused_finalize ? getWsPtr(float{}, "permuted_token_final_scales") : nullptr;
+        = gemm2_using_finalize_fusion ? getWsPtr(float{}, "permuted_token_final_scales") : nullptr;
 
     bool const is_gated_activation = isGatedActivation(activation_type);
     bool const gemm1_using_fused_moe
@@ -4005,9 +4007,11 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::
 
         bool apply_bias = parallelism_config.tp_rank == 0;
         auto* fc2_bias = apply_bias ? fc2_expert_biases : nullptr;
+        bool gemm2_using_finalize_fusion = gemm2_config_->epilogue_fusion_type
+            == cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::FINALIZE;
         bool using_fused_finalize
-            = use_fused_finalize_ && gemm2_config_->is_finalize_fusion && !use_w4_groupwise && !use_lora;
-        TLLM_CHECK_WITH_INFO(using_fused_finalize == gemm2_config_->using_fused_finalize,
+            = use_fused_finalize_ && gemm2_using_finalize_fusion && !use_w4_groupwise && !use_lora;
+        TLLM_CHECK_WITH_INFO(using_fused_finalize == gemm2_using_finalize_fusion,
             "GEMM2 tactic requests finalize fusion, but the runner is not configured to use it");
         if (using_fused_finalize)
         {
