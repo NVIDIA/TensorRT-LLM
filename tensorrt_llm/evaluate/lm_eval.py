@@ -33,6 +33,9 @@ except ImportError:
 
 from .. import LLM as PyTorchLLM
 from .._tensorrt_engine import LLM
+from ..inputs import (ConversationMessage, MultimodalDataTracker,
+                      add_multimodal_placeholders, convert_image_mode)
+from ..inputs.utils import apply_chat_template as trtllm_apply_chat_template
 from ..llmapi import RequestOutput
 from ..logger import logger
 from ..sampling_params import SamplingParams
@@ -129,13 +132,6 @@ class LmEvalWrapper(TemplateLM):
         profiler.reset("trtllm exec")
 
         return [output.outputs[0].text for output in outputs]
-
-
-from tensorrt_llm.inputs import (ConversationMessage, MultimodalDataTracker,
-                                 add_multimodal_placeholders,
-                                 convert_image_mode)
-from tensorrt_llm.inputs.utils import \
-    apply_chat_template as trtllm_apply_chat_template
 
 
 class MultimodalLmEvalWrapper(LmEvalWrapper):
@@ -409,29 +405,19 @@ class LmEvalEvaluator(Evaluator):
     def command_harness(cls, ctx, **kwargs):
         llm: Union[LLM, PyTorchLLM] = ctx.obj
 
-        evaluator_kwargs = {
-            "dataset_path": kwargs.pop("dataset_path", None),
-            "num_samples": kwargs.pop("num_samples", None),
-            "random_seed": kwargs.pop("random_seed", 0),
-            "apply_chat_template": kwargs.pop("apply_chat_template", False),
-            "fewshot_as_multiturn": kwargs.pop("fewshot_as_multiturn", False),
-            "system_prompt": kwargs.pop("system_prompt", None),
-            "is_multimodal": kwargs.pop("is_multimodal", False),
-        }
-        evaluator = cls(**evaluator_kwargs)
-
-        sampling_kwargs = {
-            "max_tokens": kwargs.pop("max_output_length"),
-            "truncate_prompt_tokens": kwargs.pop("max_input_length")
-        }
-        sampling_params = SamplingParams(**sampling_kwargs)
-
-        evaluate_kwargs = {
-            "llm": llm,
-            "sampling_params": sampling_params,
-            "streaming": kwargs.pop("streaming", False),
-        }
-        evaluator.evaluate(**evaluate_kwargs)
+        evaluator = cls(dataset_path=kwargs.pop("dataset_path", None),
+                        num_samples=kwargs.pop("num_samples", None),
+                        random_seed=kwargs.pop("random_seed", 0),
+                        apply_chat_template=kwargs.pop("apply_chat_template",
+                                                       False),
+                        fewshot_as_multiturn=kwargs.pop("fewshot_as_multiturn",
+                                                        False),
+                        system_prompt=kwargs.pop("system_prompt", None),
+                        is_multimodal=kwargs.pop("is_multimodal", False))
+        sampling_params = SamplingParams(
+            max_tokens=kwargs.pop("max_output_length"),
+            truncate_prompt_tokens=kwargs.pop("max_input_length"))
+        evaluator.evaluate(llm, sampling_params)
         llm.shutdown()
 
 
@@ -648,15 +634,10 @@ class MMMU(LmEvalEvaluator):
                   type=int,
                   default=16384,
                   help="Maximum generation length.")
-    @click.option("--is_multimodal",
-                  is_flag=True,
-                  default=True,
-                  help="Whether to use multimodal model.")
-    @click.option("--apply_chat_template",
-                  is_flag=True,
-                  default=True,
-                  help="Whether to apply chat template.")
     @click.pass_context
     @staticmethod
     def command(ctx, **kwargs) -> None:
+        # NOTE: MMMU is a multimodal task, so we need to set the is_multimodal and apply_chat_template flags to True
+        kwargs["is_multimodal"] = True
+        kwargs["apply_chat_template"] = True
         MMMU.command_harness(ctx, **kwargs)
