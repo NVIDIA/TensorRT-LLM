@@ -747,8 +747,11 @@ class VisionPreProcessor:
     in preparation for the vision encoder.
     """
 
-    def __init__(self, vision_model_type, vision_model_processor,
-                 preprocessor_model_config, hf_config):
+    def __init__(self,
+                 vision_model_type,
+                 vision_model_processor,
+                 preprocessor_model_config={},
+                 hf_config=None):
         # import libraries that are only relevant for multimodal models
         import torch
         from torch.utils.dlpack import from_dlpack
@@ -797,6 +800,7 @@ class VisionPreProcessor:
         self.vision_model_type = vision_model_type
 
         if vision_model_type == 'pixtral':
+            assert hf_config is not None, "Pixtral model requires hf_config to be set"
             self.vocab_size = hf_config.text_config.vocab_size
             self.image_size = hf_config.vision_config.image_size
             self.image_token_index = hf_config.image_token_index
