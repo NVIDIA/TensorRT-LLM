@@ -422,7 +422,7 @@ class AllReduce(nn.Module):
                 if self.mapping.tp_size != self.mapping.world_size:
                     logger.debug(f"MNNVLAllReduce is disabled due to tp_size != world_size")
                     self.mnnvl_allreduce = None
-                if MNNVLAllReduce.is_mnnvl(self.mapping, dtype):
+                elif MNNVLAllReduce.is_mnnvl(self.mapping, dtype):
                     try:
                         self.mnnvl_allreduce = MNNVLAllReduce(self.mapping, dtype) if dtype else None
                         if self.mnnvl_allreduce:
