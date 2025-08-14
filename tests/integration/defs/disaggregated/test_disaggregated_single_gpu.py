@@ -131,7 +131,7 @@ def verify_disaggregated(model, generation_overlap, enable_cuda_graph, prompt,
 
     kv_cache_configs = [KvCacheConfig(max_tokens=2048 * 8) for _ in range(2)]
     cache_transceiver_configs = [
-        CacheTransceiverConfig(backend="default") for _ in range(2)
+        CacheTransceiverConfig(backend="DEFAULT") for _ in range(2)
     ]
     model_names = [model_path(model) for _ in range(2)]
     ranks = [0, 1]
@@ -274,7 +274,7 @@ def test_disaggregated_llama_context_capacity(model, enable_cuda_graph,
         for _ in range(2)
     ]
     cache_transceiver_configs = [
-        CacheTransceiverConfig(backend="default") for _ in range(2)
+        CacheTransceiverConfig(backend="DEFAULT") for _ in range(2)
     ]
     model_names = [model_path(model) for _ in range(2)]
     ranks = [0, 1]
@@ -377,7 +377,7 @@ def test_disaggregated_spec_dec_batch_slot_limit(model, spec_dec_model_path,
         for _ in range(2)
     ]
     cache_transceiver_configs = [
-        CacheTransceiverConfig(backend="default") for _ in range(2)
+        CacheTransceiverConfig(backend="DEFAULT") for _ in range(2)
     ]
     model_names = [model_path(model) for _ in range(2)]
     ranks = [0, 1]

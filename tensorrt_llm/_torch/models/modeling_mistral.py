@@ -29,7 +29,9 @@ from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.speculative import SpecMetadata
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.inputs import (ExtraProcessedInputs, InputProcessor,
-                                 TextPrompt, register_input_processor)
+                                 MultimodalPlaceholderMetadata,
+                                 MultimodalPlaceholderPlacement, TextPrompt,
+                                 register_input_processor)
 from tensorrt_llm.llmapi import SamplingParams
 from tensorrt_llm.logger import logger
 
@@ -269,8 +271,20 @@ class Mistral3InputProcessor(InputProcessor):
 
 
 @register_auto_model("Mistral3ForConditionalGeneration")
-# The below informs the registry which input registry to create for this in `tensorrt_llm/llmapi/llm.py`.
-@register_input_processor(Mistral3InputProcessor, model_type="mistral3")
+@register_input_processor(
+    Mistral3InputProcessor,
+    model_type="mistral3",
+    placeholder_metadata=MultimodalPlaceholderMetadata(
+        placeholder_map={
+            "image": "[IMG]",
+        },
+        # NOTE: for mistral3 multimodal models, it does not strictly have to be before the text.
+        # Ref: https://github.com/mistralai/mistral-common/blob/039465db2bdc0486df36365c9bdb428188482a18/
+        #      src/mistral_common/tokens/tokenizers/base.py#L326
+        # However, accuracy tests show that the model generates higher quality output when the image
+        # precedes the text (the relative difference can be as much as ~30% for both vLLM and TRT-LLM).
+        placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
+    ))
 class Mistral3VLM(PreTrainedModel):
     """Mistral3VLM implementation for TRTLLM.
 

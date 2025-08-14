@@ -54,7 +54,7 @@ def test_llama_ngram(disable_overlap_scheduler: bool, use_cuda_graph: bool,
         "The capital of France is",
         "The president of the United States is",
     ]
-    sampling_params = SamplingParams(max_tokens=32)
+    sampling_params = SamplingParams(max_tokens=32, ignore_eos=True)
 
     llm_spec = LLM(**llm_common_config, speculative_config=spec_config)
     results_spec = llm_spec.generate(prompts, sampling_params)

@@ -31,26 +31,16 @@ public:
     using TensorPtr = ITensor::SharedPtr;
     using BufferPtr = IBuffer::SharedPtr;
 
-    explicit Request(TensorConstPtr ids, SizeType32 inputLen, std::optional<SizeType32> maxNewTokens = std::nullopt,
-        std::optional<SizeType32> endId = std::nullopt)
-        : ids{std::move(ids)}
-        , inputLen(inputLen)
-        , maxNewTokens{maxNewTokens}
-        , endId{endId}
+    explicit Request(SizeType32 inputLen)
+        : inputLen(inputLen)
     {
     }
 
     //! Mandatory parameters
-    TensorConstPtr ids;  // The input sequence of token ids, [inputSeqLen], on gpu
     SizeType32 inputLen; // Input length without draft tokens, increasing with generation steps
 
     // optional parameters
-    std::optional<SizeType32> maxNewTokens;     // maximum number of tokens to generate for this request
-    std::optional<SizeType32> endId;            // end token id
     SizeType32 generatedTokensPerEngineStep{1}; //
-    TensorPtr embeddingBias;                    // [vocabSizePadded], on gpu
-    TensorPtr badWordsList;                     // [2, badWordsLength] on gpu
-    TensorPtr stopWordsList;                    // [2, stopWordsLength] on gpu
 
     //! Optional parameters for speculative decoding
     BufferPtr draftTokens;                // [generatedTokensPerEngineStep - 1] on gpu

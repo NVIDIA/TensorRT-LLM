@@ -10,7 +10,9 @@ from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
     BaseWeightMapper
 
 from ..._utils import nvtx_range
-from ...inputs import (ExtraProcessedInputs, InputProcessor, TextPrompt,
+from ...inputs import (ExtraProcessedInputs, InputProcessor,
+                       MultimodalPlaceholderMetadata,
+                       MultimodalPlaceholderPlacement, TextPrompt,
                        register_input_processor)
 from ...logger import logger
 from ...sampling_params import SamplingParams
@@ -137,7 +139,13 @@ class Gemma3MultiModalProjector(torch.nn.Module):
 
 
 @register_auto_model("Gemma3ForConditionalGeneration")
-@register_input_processor(Gemma3InputProcessor, model_type="gemma3")
+@register_input_processor(
+    Gemma3InputProcessor,
+    model_type="gemma3",
+    placeholder_metadata=MultimodalPlaceholderMetadata(
+        placeholder_map={"image": "<start_of_image>"},
+        placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
+    ))
 class Gemma3VLM(PreTrainedModel):
 
     def __init__(self, model_config: ModelConfig[Gemma3Config]):

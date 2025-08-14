@@ -19,10 +19,6 @@ transforms:
     stage: post_export
   cleanup_input_constraints:
     stage: post_export
-  quantize:
-    stage: pattern_matcher
-  quantize_moe:
-    stage: pattern_matcher
   match_repeat_kv:
     stage: pattern_matcher
   match_eager_attention:
@@ -31,3 +27,35 @@ transforms:
     stage: pattern_matcher
   match_attention_layout:
     stage: pattern_matcher
+  match_moe_pattern:
+    stage: pattern_matcher
+  match_rope_pattern:
+    stage: pattern_matcher
+  match_rope_layout:
+    stage: pattern_matcher
+  eliminate_redundant_transposes:
+    stage: pattern_matcher
+  # TODO (lucaslie): let's move this to perf optimization once TP sharding is improved
+  # see https://github.com/NVIDIA/TensorRT-LLM/pull/3668#discussion_r2052714528
+  optimize_rope:
+    stage: pattern_matcher
+  quantize_from_config:
+    stage: pattern_matcher
+  quantize_from_graph:
+    stage: pattern_matcher
+  quantize_moe:
+    stage: pattern_matcher
+  # TODO: Infer sharding parameters (tp_size, row/column sharding) from the model config.
+  detect_column_row_shard:
+    stage: sharding
+    simple_shard_only: false
+  detect_ep_shard:
+    stage: sharding
+  detect_dp_bmm_shard:
+    stage: sharding
+  # TODO: (hg) need to ensure run_shape_prop after sharding.
+  sharding_transform_executor:
+    stage: sharding
+    run_shape_prop: true
+  load_weights:
+    stage: weight_load

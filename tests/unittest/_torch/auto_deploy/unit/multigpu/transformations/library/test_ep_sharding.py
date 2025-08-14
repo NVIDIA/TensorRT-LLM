@@ -5,17 +5,13 @@ from functools import partial
 import pytest
 import torch
 from _dist_test_utils import get_device_counts
-from _graph_test_helpers import run_sharding_pattern_detection_test, run_test
+from _graph_test_helpers import run_sharding_pattern_detection_test, run_test_transformed_gm
 from _model_test_utils import MoEOpModel
 
 import tensorrt_llm._torch.auto_deploy.distributed.common as dist_common
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
-from tensorrt_llm._torch.auto_deploy.transformations.library.sharding import (
-    EPShardingInfo,
-    ShardingConfig,
-    detect_ep_shard,
-    sharding_transform_executor,
-)
+from tensorrt_llm._torch.auto_deploy.transform.library.sharding import EPShardingInfo
+from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 
 
@@ -39,17 +35,25 @@ def _run_ep_shard_job(num_experts: int, rank: int, world_size: int) -> None:
         expected_expert = num_experts_per_rank * hidden_size * intermediate_size * 3
         return n_gate + expected_expert
 
-    def transform_func(gm) -> None:
-        sharding_config = ShardingConfig()
-        detect_ep_shard(gm, rank, world_size, sharding_config)
-        sharding_transform_executor(gm, sharding_config)
+    gm = torch_export_to_gm(model, args=(x,), clone=True)
+    gm_transformed = InferenceOptimizer(
+        None,
+        {
+            "detect_ep_shard": {
+                "stage": "sharding",
+            },
+            "sharding_transform_executor": {
+                "stage": "sharding",
+            },
+        },
+    )(None, gm)
 
     op_expected = torch.ops.auto_deploy.torch_dist_all_reduce
 
-    run_test(
+    run_test_transformed_gm(
         model,
         x,
-        transform=transform_func,
+        gm_transformed,
         check_transformed_graph=lambda gm: any(is_op(n, op_expected) for n in gm.graph.nodes)
         == (world_size > 1),
         _get_expected_num_params=partial(_get_expected_num_params, rank, world_size),
@@ -89,9 +93,18 @@ def _run_pattern_detection_job(num_experts: int, rank: int, world_size: int) -> 
                 )
 
     # get detected transformations
-    sharding_config = ShardingConfig()
-    detect_ep_shard(gm, rank, world_size, sharding_config)
-    detected_transformations = sharding_config.ep_transforms
+    optimizer = InferenceOptimizer(
+        None,
+        {
+            "detect_ep_shard": {
+                "stage": "sharding",
+            },
+        },
+    )
+    optimizer.shared_config.local_rank = rank
+    optimizer.shared_config.world_size = world_size
+    _ = optimizer(None, gm)
+    detected_transformations = optimizer.shared_config.sharding_config.ep_transforms
 
     # Run pattern detection test
     run_sharding_pattern_detection_test(detected_transformations, expected_transformations)

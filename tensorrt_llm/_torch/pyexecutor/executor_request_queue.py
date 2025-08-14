@@ -11,6 +11,7 @@ from typing import Dict, Iterable, List, Optional, Tuple
 import torch
 
 from tensorrt_llm._utils import nvtx_range
+from tensorrt_llm.mapping import CpType
 
 from ..distributed import Distributed
 from .llm_request import (ExecutorRequest, LlmRequest,
@@ -569,9 +570,9 @@ class ExecutorRequestQueue:
         cp_config = self.dist.cp_config
         if 'cp_type' in cp_config:
             cp_type = cp_config['cp_type']
-            if cp_type == 'star_attention':
+            if cp_type == CpType.STAR:
                 return self._merge_star_attention_requests(new_requests)
-            elif cp_type == 'ring_attention':
+            elif cp_type == CpType.RING:
                 raise NotImplementedError("ring attention not implemented yet")
             else:
                 raise NotImplementedError(f'unsupport cp type {cp_type}')

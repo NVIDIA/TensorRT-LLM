@@ -173,6 +173,11 @@ public:
     //! @brief Workspace for beam search in streaming mode.
     [[nodiscard]] BeamSearchBuffers const& getBeamSearchBuffers() const;
 
+    //! @brief Set the beam width for a specific request in the batch.
+    //! @param batchIdx The index of the request in the batch.
+    //! @param beamWidth The beam width for the specified request.
+    void setBeamWidth(SizeType32 batchIdx, SizeType32 beamWidth);
+
     //! @brief Cache indirection input for beam search.
     [[nodiscard]] TensorPtr getCacheIndirectionInput() const;
 

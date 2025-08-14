@@ -11,8 +11,12 @@ from .routing import BaseMoeRoutingMethod
 
 
 class MoEWeightLoadingMode(Enum):
+    # Gate and up projection are not fused
     VANILLA = 0
+    # Gate and up projection are fused
     FUSED_GATE_UP_PROJ = 1
+    # Custom W4A8 weights from examples/quantization/quantize_mixed_precision_moe.py
+    W4A8_CUSTOM = 2
 
 
 class MoE(nn.Module):
@@ -24,7 +28,6 @@ class MoE(nn.Module):
         top_k (int): Number of top experts to select for each input token.
         hidden_size (int): Size of the hidden state.
         intermediate_size (int): Size of the intermediate state.
-        aux_stream (Optional[torch.cuda.Stream]): Auxiliary CUDA stream to overlap chunks.
         dtype (Optional[torch.dtype]): Data type for the weights.
         reduce_results (bool): Whether to reduce the results across devices.
         model_config (ModelConfig): Configuration object for the model.

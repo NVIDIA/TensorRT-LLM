@@ -7,6 +7,7 @@ from typing import Optional, Tuple, Union
 import torch
 
 from tensorrt_llm._utils import get_sm_version
+from tensorrt_llm.bindings.internal import thop
 from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -419,7 +420,7 @@ class TrtllmAttentionWrapper:
             self.spec_decoding_position_offsets, self.spec_decoding_packed_mask
         ]
 
-        torch.ops.trtllm.attention_inplace(
+        thop.attention(
             q,
             k,
             v,

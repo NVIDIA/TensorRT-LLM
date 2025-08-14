@@ -1324,6 +1324,7 @@ def compute_rotary_pos_emb(grid_thw, hf_config, VisionRotaryEmbedding):
 
 
 def build_qwen2_vl_engine(args):
+    import transformers
     from qwen_vl_utils import process_vision_info
     from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
     from transformers.models.qwen2_vl.configuration_qwen2_vl import \
@@ -1391,8 +1392,15 @@ def build_qwen2_vl_engine(args):
     class VisionAttentionOpt(VisionAttention):
 
         def __init__(self, config: Qwen2VLVisionConfig):
-            super().__init__(config)
-            self.head_dim = config.embed_dim // config.num_heads
+            # Fallback for compatibility with older transformers versions (for certain nvbugs/tests)
+            if transformers.__version__ >= '4.53.0':
+                super().__init__(config)
+                self.head_dim = config.embed_dim // config.num_heads
+            else:
+                num_heads = config.num_heads
+                dim = config.embed_dim
+                super().__init__(dim, num_heads)
+                self.head_dim = dim // num_heads
 
         def forward(self,
                     hidden_states: torch.Tensor,

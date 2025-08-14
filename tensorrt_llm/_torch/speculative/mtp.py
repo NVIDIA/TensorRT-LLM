@@ -330,11 +330,9 @@ class MTPWorker(nn.Module):
         position_ids,
         hidden_states,
         logits,
-        lm_head,
-        embed_tokens,
         attn_metadata,
         spec_metadata,
-        mtp_layers,
+        draft_model,
     ):
         '''
         Example:
@@ -470,9 +468,10 @@ class MTPWorker(nn.Module):
         next_draft_tokens = []
         last_tokens_idx = torch.cumsum(
             attn_metadata.seq_lens_cuda, dim=0, dtype=torch.long) - 1
-        for _, mtp_layer in enumerate(mtp_layers):
-            hidden_states = mtp_layer(embed_tokens=embed_tokens, **draft_inputs)
-            logits = mtp_layer.shared_head(hidden_states, lm_head,
+        for _, mtp_layer in enumerate(draft_model.mtp_layers):
+            hidden_states = mtp_layer(embed_tokens=draft_model.embed_tokens,
+                                      **draft_inputs)
+            logits = mtp_layer.shared_head(hidden_states, draft_model.lm_head,
                                            attn_metadata).float()
             new_draft_token = self.draft_sampler(logits)
             next_draft_tokens.append(new_draft_token)
@@ -517,11 +516,9 @@ class MTPWorker(nn.Module):
         position_ids,
         hidden_states,
         logits,
-        lm_head,
-        embed_tokens,
         attn_metadata,
         spec_metadata,
-        mtp_layers,
+        draft_model,
     ):
         batch_size = attn_metadata.num_seqs
         mtp_num_modules = self.spec_config.num_nextn_predict_layers
@@ -1127,11 +1124,9 @@ class MTPEagleWorker(MTPWorker):
         position_ids,
         hidden_states,
         logits,
-        lm_head,
-        embed_tokens,
         attn_metadata,
         spec_metadata,
-        mtp_layers,
+        draft_model,
     ):
         batch_size = attn_metadata.num_seqs
         num_contexts = attn_metadata.num_contexts
@@ -1172,8 +1167,8 @@ class MTPEagleWorker(MTPWorker):
         next_draft_tokens = []
         for i in range(self.mtp_num_modules):
             if i == 0:
-                hidden_states = mtp_layers[0](
-                    embed_tokens=embed_tokens,
+                hidden_states = draft_model.mtp_layers[0](
+                    embed_tokens=draft_model.embed_tokens,
                     all_rank_num_tokens=spec_metadata.all_rank_num_tokens,
                     all_rank_max_num_tokens=spec_metadata.
                     all_rank_max_num_tokens,
@@ -1186,8 +1181,8 @@ class MTPEagleWorker(MTPWorker):
                 gather_ids = torch.concat(
                     [last_tokens_idx[:num_contexts], gather_ids_gen], dim=0)
             else:
-                hidden_states = mtp_layers[0](
-                    embed_tokens=embed_tokens,
+                hidden_states = draft_model.mtp_layers[0](
+                    embed_tokens=draft_model.embed_tokens,
                     all_rank_num_tokens=spec_metadata.
                     subseq_all_rank_num_tokens,
                     all_rank_max_num_tokens=max(
@@ -1197,8 +1192,9 @@ class MTPEagleWorker(MTPWorker):
                     **inputs)
                 # All of the seq_len are 1, use batch_indices_cuda as gather_ids
                 gather_ids = spec_metadata.batch_indices_cuda[:batch_size]
-            logits = mtp_layers[0].shared_head(hidden_states[gather_ids],
-                                               lm_head, attn_metadata, True)
+            logits = draft_model.mtp_layers[0].shared_head(
+                hidden_states[gather_ids], draft_model.lm_head, attn_metadata,
+                True)
             new_draft_token = self.draft_sampler(logits)
 
             hidden_states, position_ids = self.update_draft_tokens(

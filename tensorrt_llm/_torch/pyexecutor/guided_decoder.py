@@ -83,7 +83,11 @@ class GuidedDecoder:
         if llm_req.guided_decoding_params is None:
             return False
         if llm_req.py_is_draft:
-            return True
+            if llm_req.is_context_init_state and llm_req.is_last_context_chunk:
+                return True
+            if llm_req.is_generation_in_progress_state:
+                return True
+            return False
         # The request is in a generation forward step.
         return llm_req.is_generation_in_progress_state
 
@@ -189,7 +193,8 @@ class GuidedDecoder:
                 batched_bitmask.append(self.bitmask[slot, i])
             offset += len(llm_req.py_draft_tokens) + 1
 
-        assert offset == logits.size(0)
+        # Dummy logits may exist for CUDA graph dummy requests.
+        assert offset <= logits.size(0)
 
         if len(batched_logits) > 0:
             torch.ops.trtllm.logits_bitmask(batched_logits, batched_bitmask)

@@ -1590,6 +1590,15 @@ def test_build_time_benchmark_sanity(llm_root, llm_venv):
     ])
 
 
+@pytest.mark.skip_less_device_memory(80000)
+def test_trtllm_multimodal_benchmark_serving(llm_root, llm_venv):
+    test_root = unittest_path() / "llmapi" / "apps"
+    llm_venv.run_cmd([
+        "-m", "pytest",
+        str(test_root / "_test_trtllm_serve_multimodal_benchmark.py")
+    ])
+
+
 ### PyTorch examples
 
 
