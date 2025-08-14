@@ -80,6 +80,18 @@ def test_single_completion(client: openai.OpenAI, model_name):
     assert len(completion.choices[0].text) >= 1
 
 
+def test_single_completion_with_too_long_prompt(client: openai.OpenAI,
+                                                model_name):
+    completion = client.completions.create(
+        model=model_name,
+        prompt="Hello, my name is" * 100,
+        max_tokens=5,
+        temperature=0.0,
+    )
+
+    print(completion)
+
+
 @pytest.mark.asyncio(loop_scope="module")
 @pytest.mark.parametrize("echo", [True, False])
 async def test_completion_streaming(async_client: openai.AsyncOpenAI,

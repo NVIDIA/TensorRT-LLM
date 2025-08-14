@@ -16,7 +16,7 @@ from tensorrt_llm.sampling_params import SamplingParams
 
 from ..._utils import binding_dtype_size, binding_to_str_dtype, nvtx_range
 from ...logger import logger
-from ...mapping import Mapping
+from ...mapping import CpType, Mapping
 from .kv_cache_connector import KvCacheConnectorManager
 from .llm_request import (LlmRequest, LlmRequestState, SamplingConfig,
                           get_draft_token_length)
@@ -407,7 +407,7 @@ class KVCacheManager(BaseResourceManager):
             # allocate KV Cache
             for req in context_batch:
                 req_beam_width = req.sampling_config.beam_width
-                if 'cp_type' in self.mapping.cp_config and 'star_attention' == self.mapping.cp_config[
+                if 'cp_type' in self.mapping.cp_config and CpType.STAR == self.mapping.cp_config[
                         'cp_type']:
                     if req.ctx_iters == 0:
                         seq_len = sum(

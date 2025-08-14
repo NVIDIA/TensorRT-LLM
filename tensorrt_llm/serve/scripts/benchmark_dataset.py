@@ -17,19 +17,24 @@ TODO: Implement CustomDataset to parse a JSON file and convert its contents into
 SampleRequest instances, similar to the approach used in ShareGPT.
 """
 
+import base64
+import io
 import json
 import logging
 import random
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any, Callable, Optional, Union
+from typing import Any, Callable, Mapping, Optional, Union
 
 import numpy as np
 import pandas as pd
+import torch
 from datasets import load_dataset
+from PIL import Image
 from transformers import PreTrainedTokenizerBase
 
+from tensorrt_llm.inputs.utils import convert_image_mode
 from tensorrt_llm.serve.scripts.benchmark_utils import download_and_cache_file
 
 logger = logging.getLogger(__name__)
@@ -204,6 +209,7 @@ class SampleRequest:
     prompt: Union[str, Any]
     prompt_len: int
     expected_output_len: int
+    multi_modal_data: Optional[dict] = None
 
 
 # -----------------------------------------------------------------------------
@@ -230,11 +236,14 @@ class BenchmarkDataset(ABC):
             sampling. Defaults to DEFAULT_SEED.
         """
         self.dataset_path = dataset_path
+        self.data = None
         # Set the random seed, ensuring that a None value is replaced with the
         # default seed.
         self.random_seed = (random_seed
                             if random_seed is not None else self.DEFAULT_SEED)
-        self.data = None
+        self.rng = torch.Generator()
+        self.rng.manual_seed(self.random_seed)
+        random.seed(self.random_seed)
 
     def load_data(self) -> None:
         """
@@ -281,12 +290,25 @@ class BenchmarkDataset(ABC):
             requests.  num_requests (int): The target number of requests.
         """
         if len(requests) < num_requests:
-            random.seed(self.random_seed)
             additional = random.choices(requests,
                                         k=num_requests - len(requests))
             requests.extend(additional)
             logger.info("Oversampled requests to reach %d total samples.",
                         num_requests)
+
+    def apply_multimodal_chat_transformation(self,
+                                             prompt: str,
+                                             mm_content: Optional[dict] = None
+                                             ) -> list[dict]:
+        """
+        Transform a prompt and optional multimodal content into a chat format.
+        This method is used for chat models that expect a specific conversation
+        format.
+        """
+        content = [{"text": prompt, "type": "text"}]
+        if mm_content is not None:
+            content.append(mm_content)
+        return [{"role": "user", "content": content}]
 
 
 # -----------------------------------------------------------------------------
@@ -319,6 +341,50 @@ def is_valid_sequence(
     # Return True if none of the invalid conditions are met
     return not (prompt_too_short or output_too_short or prompt_too_long
                 or combined_too_long)
+
+
+def process_image(image: Any) -> Mapping[str, Any]:
+    """
+    Process a single image input and return a multimedia content dictionary.
+
+    Supports three input types:
+
+    1. Dictionary with raw image bytes: - Expects a dict with a 'bytes' key
+       containing raw image data.  - Loads the bytes as a PIL.Image.Image.
+
+    2. PIL.Image.Image input: - Converts the image to RGB.  - Saves the image as
+       a JPEG in memory.  - Encodes the JPEG data as a base64 string.  - Returns
+       a dictionary with the image as a base64 data URL.
+
+    3. String input: - Treats the string as a URL or local file path.  -
+       Prepends "file://" if the string doesn't start with "http://" or
+       "file://".  - Returns a dictionary with the image URL.
+
+    Raises:
+        TypeError: If the input is not a supported type.
+    """
+    if isinstance(image, dict) and "bytes" in image:
+        image = Image.open(io.BytesIO(image["bytes"]))
+    if isinstance(image, Image.Image):
+        image = convert_image_mode(image, "RGB")
+        with io.BytesIO() as image_data:
+            image.save(image_data, format="JPEG")
+            image_base64 = base64.b64encode(
+                image_data.getvalue()).decode("utf-8")
+        return {
+            "type": "image_url",
+            "image_url": {
+                "url": f"data:image/jpeg;base64,{image_base64}"
+            },
+        }
+
+    if isinstance(image, str):
+        image_url = (image if image.startswith(
+            ("http://", "file://")) else f"file://{image}")
+        return {"type": "image_url", "image_url": {"url": image_url}}
+
+    raise TypeError(f"Invalid image input {image}. Must be a PIL.Image.Image"
+                    " or str or dictionary with raw image bytes.")
 
 
 # -----------------------------------------------------------------------------
@@ -368,13 +434,16 @@ class RandomDataset(BenchmarkDataset):
         **kwargs,
     ) -> list[SampleRequest]:
         # Enforce range_ratio < 1
-        assert range_ratio < 1.0, (
-            "random_range_ratio must be < 1.0 to ensure a valid sampling range")
+        if range_ratio >= 1.0:
+            raise ValueError(
+                "random_range_ratio must be < 1.0 to ensure a valid sampling range"
+            )
 
         vocab_size = tokenizer.vocab_size
 
-        prefix_token_ids = (np.random.randint(
-            0, vocab_size, size=prefix_len).tolist() if prefix_len > 0 else [])
+        prefix_token_ids = (torch.randint(
+            0, vocab_size, size=(prefix_len, ), generator=self.rng).tolist()
+                            if prefix_len > 0 else [])
 
         # New sampling logic: [X * (1 - b), X * (1 + b)]
         input_low = int(input_len * (1 - range_ratio))
@@ -383,17 +452,22 @@ class RandomDataset(BenchmarkDataset):
         output_high = int(output_len * (1 + range_ratio))
 
         # Add logging for debugging
-        logger.info("Sampling input_len from [%s, %s]", input_low, input_high)
-        logger.info("Sampling output_len from [%s, %s]", output_low,
-                    output_high)
+        logger.debug("Sampling input_len from [%s, %s]", input_low, input_high)
+        logger.debug("Sampling output_len from [%s, %s]", output_low,
+                     output_high)
 
-        input_lens = np.random.randint(input_low,
-                                       input_high + 1,
-                                       size=num_requests)
-        output_lens = np.random.randint(output_low,
-                                        output_high + 1,
-                                        size=num_requests)
-        offsets = np.random.randint(0, vocab_size, size=num_requests)
+        input_lens = torch.randint(input_low,
+                                   input_high + 1,
+                                   size=(num_requests, ),
+                                   generator=self.rng).tolist()
+        output_lens = torch.randint(output_low,
+                                    output_high + 1,
+                                    size=(num_requests, ),
+                                    generator=self.rng).tolist()
+        offsets = torch.randint(0,
+                                vocab_size,
+                                size=(num_requests, ),
+                                generator=self.rng).tolist()
 
         requests = []
         if self.sample_from_sharegpt:
@@ -485,6 +559,131 @@ class RandomDataset(BenchmarkDataset):
 # -----------------------------------------------------------------------------
 
 
+class RandomImageDataset(BenchmarkDataset):
+    DEFAULT_PREFIX_LEN = 0
+    DEFAULT_RANGE_RATIO = 0.0
+    DEFAULT_INPUT_LEN = 128
+    DEFAULT_OUTPUT_LEN = 128
+    DEFAULT_WIDTH = 512
+    DEFAULT_HEIGHT = 512
+    DEFAULT_IMAGE_SIZE = 512
+    DEFAULT_NUM_IMAGES = 1
+    IS_MULTIMODAL = True
+
+    def __init__(
+        self,
+        return_text: bool = True,
+        **kwargs,
+    ) -> None:
+        super().__init__(**kwargs)
+        self.return_text = return_text
+
+    def sample(
+        self,
+        tokenizer: PreTrainedTokenizerBase,
+        num_requests: int,
+        prefix_len: int = DEFAULT_PREFIX_LEN,
+        range_ratio: float = DEFAULT_RANGE_RATIO,
+        input_len: int = DEFAULT_INPUT_LEN,
+        output_len: int = DEFAULT_OUTPUT_LEN,
+        width: int = DEFAULT_WIDTH,
+        height: int = DEFAULT_HEIGHT,
+        image_size: int = DEFAULT_IMAGE_SIZE,
+        num_images: int = DEFAULT_NUM_IMAGES,
+        enable_multimodal_chat: bool = False,
+        **kwargs,
+    ) -> list[SampleRequest]:
+        # Enforce range_ratio < 1
+        if range_ratio >= 1.0:
+            raise ValueError(
+                "random_range_ratio must be < 1.0 to ensure a valid sampling range"
+            )
+
+        vocab_size = tokenizer.vocab_size
+
+        prefix_token_ids = (torch.randint(
+            0, vocab_size, size=(prefix_len, ), generator=self.rng).tolist()
+                            if prefix_len > 0 else [])
+
+        # New sampling logic: [X * (1 - b), X * (1 + b)]
+        input_low = int(input_len * (1 - range_ratio))
+        input_high = int(input_len * (1 + range_ratio))
+        output_low = int(output_len * (1 - range_ratio))
+        output_high = int(output_len * (1 + range_ratio))
+
+        # Add logging for debugging
+        logger.debug("Sampling input_len from [%s, %s]", input_low, input_high)
+        logger.debug("Sampling output_len from [%s, %s]", output_low,
+                     output_high)
+
+        input_lens = torch.randint(input_low,
+                                   input_high + 1,
+                                   size=(num_requests, ),
+                                   generator=self.rng).tolist()
+        output_lens = torch.randint(output_low,
+                                    output_high + 1,
+                                    size=(num_requests, ),
+                                    generator=self.rng).tolist()
+        offsets = torch.randint(0,
+                                vocab_size,
+                                size=(num_requests, ),
+                                generator=self.rng).tolist()
+
+        # Determine final image dimensions
+        # When both width/height and image_size are provided, prioritize width/height
+        final_width = width
+        final_height = height
+
+        # If width and height are still at default values but image_size is different, use image_size
+        if (width == self.DEFAULT_WIDTH and height == self.DEFAULT_HEIGHT
+                and image_size != self.DEFAULT_IMAGE_SIZE):
+            final_width = image_size
+            final_height = image_size
+        logger.info("Using width: %s, height: %s for random image dimensions",
+                    final_width, final_height)
+        logger.info("Generating %d images per request", num_images)
+
+        sampled_requests = []
+        for i in range(num_requests):
+            # Generate random text prompt
+            inner_seq = ((offsets[i] + i + np.arange(input_lens[i])) %
+                         vocab_size).tolist()
+            prompt = prefix_token_ids + inner_seq
+            if self.return_text:
+                prompt = tokenizer.decode(prompt)
+            total_input_len = prefix_len + int(input_lens[i])
+
+            # Generate random images (support multiple images per request)
+            images = []
+            for _ in range(num_images):
+                random_image = torch.randint(0,
+                                             256,
+                                             (final_height, final_width, 3),
+                                             dtype=torch.uint8,
+                                             generator=self.rng).numpy()
+                pil_image = Image.fromarray(random_image)
+                images.append(pil_image)
+
+            # Process images for multimodal content
+            mm_content = [process_image(img) for img in images]
+
+            # Handle multimodal chat transformation
+            if enable_multimodal_chat:
+                prompt = self.apply_multimodal_chat_transformation(
+                    prompt, mm_content)
+
+            sampled_requests.append(
+                SampleRequest(
+                    prompt=prompt,
+                    prompt_len=total_input_len,
+                    expected_output_len=int(output_lens[i]),
+                    multi_modal_data=mm_content,
+                ))
+
+        self.maybe_oversample_requests(sampled_requests, num_requests)
+        return sampled_requests
+
+
 class CustomDataset(BenchmarkDataset):
     """
     TensorRT-LLM customized dataset implementation.
@@ -519,7 +718,6 @@ class CustomDataset(BenchmarkDataset):
         with open(self.dataset_path, encoding="utf-8") as f:
             for line in f:
                 self.data.append(json.loads(line))
-        random.seed(self.random_seed)
         random.shuffle(self.data)
 
     def sample(self, tokenizer: PreTrainedTokenizerBase,
@@ -592,7 +790,6 @@ class ShareGPTDataset(BenchmarkDataset):
             entry for entry in self.data
             if "conversations" in entry and len(entry["conversations"]) >= 2
         ]
-        random.seed(self.random_seed)
         random.shuffle(self.data)
 
     def sample(
@@ -938,20 +1135,17 @@ class VisionArenaDataset(HuggingFaceDataset):
             if len(prompts) >= num_requests:
                 break
             prompt = parser_fn(item)
-            prompts.append(prompt)
-
-        # Batch tokenize prompts
-        prompt_lengths, _ = batch_tokenize_prompts(
-            prompts, tokenizer, progress_name="vision arena prompts")
-
-        # Create samples
-        sampled_requests = []
-        for prompt, prompt_len in zip(prompts, prompt_lengths):
+            mm_content = process_image(item["images"][0])
+            prompt_len = len(tokenizer(prompt).input_ids)
+            if enable_multimodal_chat:
+                prompt = self.apply_multimodal_chat_transformation(
+                    prompt, mm_content)
             sampled_requests.append(
                 SampleRequest(
                     prompt=prompt,
                     prompt_len=prompt_len,
                     expected_output_len=output_len,
+                    multi_modal_data=mm_content,
                 ))
         self.maybe_oversample_requests(sampled_requests, num_requests)
         return sampled_requests

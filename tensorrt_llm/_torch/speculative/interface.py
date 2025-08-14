@@ -23,6 +23,9 @@ class SpeculativeDecodingMode(IntEnum):
     def is_mtp(self):
         return self == SpeculativeDecodingMode.MTP or self == SpeculativeDecodingMode.MTP_EAGLE
 
+    def is_mtp_vanilla(self):
+        return self == SpeculativeDecodingMode.MTP
+
     def is_mtp_eagle(self):
         return self == SpeculativeDecodingMode.MTP_EAGLE
 

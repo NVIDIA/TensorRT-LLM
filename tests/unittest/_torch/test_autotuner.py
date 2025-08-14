@@ -1,4 +1,4 @@
-from typing import List
+from typing import Dict, List
 
 import torch
 
@@ -19,14 +19,16 @@ def test_multi_dynamic_dims():
     x = torch.rand([5, 1024])
     w = torch.rand([7, 19])
     dynamic_tensor_specs = (
-        DynamicTensorSpec(0, 0, [1, 3, 5], lambda x: x // 2),
-        DynamicTensorSpec(0, 1, [16, 24, 1024], lambda x: x // 2),
+        DynamicTensorSpec(0, 0, [1, 3, 5]),
+        DynamicTensorSpec(0, 1, [16, 24, 1024]),
         DynamicTensorSpec(1, 1, [3, 7, 9], lambda x: x // 2),
     )
 
     profiles = tuner._optimization_profiles(
         tuning_config=TuningConfig(dynamic_tensor_specs=dynamic_tensor_specs),
         inputs=[x, w])
+    # choice(0, 0) * choice(0, 1) * choice(1, 1)
+    # 3 * 3 * 3 = 27, because 19 is mapped to 9 and already inside the bucket
     assert len(profiles) == 27
     sample_0 = OptimizationProfile(shapes=[[
         DynamicDim(min=1, opt=1, max=3),
@@ -90,7 +92,7 @@ def check_gemm_tactic_valid(tactic: int, m: int) -> bool:
 class GemmRunner(TunableRunner):
 
     def get_valid_tactics(self, inputs: List[FakeTensor],
-                          profile: OptimizationProfile) -> List[int]:
+                          profile: OptimizationProfile, **kwargs) -> List[int]:
         # The simulated delay is not deterministic, so we need to return specific tactics here
         return [-1, 0, 1]
 
@@ -98,7 +100,8 @@ class GemmRunner(TunableRunner):
                 /,
                 inputs: List[torch.Tensor],
                 *,
-                tactic: int = -1) -> torch.Tensor:
+                tactic: int = -1,
+                **kwargs) -> torch.Tensor:
         assert tactic in [-1, 0, 1]
         return [gemm_0, gemm_1, gemm_fallback][tactic](*inputs)
 
@@ -258,14 +261,18 @@ def test_multiple_runners_different_attributes():
 
         # Verify different cache keys are generated
         shapes = (x.shape, w.shape)
-        cache_key_0 = tuner._get_cache_key(custom_op="test_multiple_runners",
-                                           input_shapes=shapes,
-                                           runner=runner_0,
-                                           tuning_config=tuning_config)
-        cache_key_1 = tuner._get_cache_key(custom_op="test_multiple_runners",
-                                           input_shapes=shapes,
-                                           runner=runner_1,
-                                           tuning_config=tuning_config)
+        cache_key_0 = tuner._get_cache_key(
+            custom_op="test_multiple_runners",
+            input_shapes=shapes,
+            runner=runner_0,
+            tuning_config=tuning_config,
+        )
+        cache_key_1 = tuner._get_cache_key(
+            custom_op="test_multiple_runners",
+            input_shapes=shapes,
+            runner=runner_1,
+            tuning_config=tuning_config,
+        )
 
         assert cache_key_0 != cache_key_1, "Runners with different attributes should have different cache keys"
 
@@ -301,3 +308,47 @@ def test_multiple_dynamic_shapes_cache():
     ]
     assert len(cache_entries) == 12, \
         f"Expected 12 cache entries for 3x4 shape combinations, got {len(cache_entries)}"
+
+
+class GemmRunnerWithTacticConfigs(TunableRunner):
+    valid_tactic_ids = [-1, 0, 1]
+
+    def get_valid_tactics(
+        self,
+        inputs: List[FakeTensor],
+        profile: OptimizationProfile,
+    ) -> List[Dict[str, int]]:
+        # The simulated delay is not deterministic, so we need to return specific tactics here
+        return [{
+            "block_size": block_size,
+            "tactic_id": tactic_id
+        } for tactic_id in self.valid_tactic_ids for block_size in [128, 256]]
+
+    def forward(
+        self,
+        /,
+        inputs: List[torch.Tensor],
+        *,
+        tactic: dict = {},
+    ) -> torch.Tensor:
+        # Notice that in fallback case tactic is -1
+        if tactic == -1:
+            # assign default configs for fallback case
+            block_size, tactic_id = 128, -1
+        else:
+            block_size, tactic_id = tactic["block_size"], tactic["tactic_id"]
+        assert tactic_id in self.valid_tactic_ids
+        return [gemm_0, gemm_1, gemm_fallback][tactic_id](*inputs)
+
+
+def test_autotuner_tactic_configs():
+    runner_0 = GemmRunnerWithTacticConfigs()
+    runners = [runner_0]
+    x, w = torch.randn(64, 64), torch.randn(64, 128)
+    tuning_config = TuningConfig()
+    with autotune():
+        tuner = AutoTuner.get()
+        runner, tactic = tuner.choose_one("test_autotuner_tactic_configs",
+                                          runners, tuning_config, [x, w])
+
+    runner_0.forward(inputs=[x, w], tactic=tactic)

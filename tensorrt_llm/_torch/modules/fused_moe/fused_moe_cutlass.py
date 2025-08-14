@@ -110,13 +110,11 @@ class CutlassFusedMoE(MoE):
         assert len(
             self.initial_local_expert_ids) == self.expert_size_per_partition
 
-        max_num_tokens = model_config.max_num_tokens
         # The maximum number of tokens in MoE are multiplied by DP size when attention DP is enabled
-        if self.use_dp:
-            max_num_tokens *= model_config.mapping.world_size
-        self.moe_max_num_tokens = model_config.moe_max_num_tokens or max_num_tokens
+        moe_max_num_tokens = model_config.max_num_tokens * model_config.mapping.dp_size
+        self.moe_max_num_tokens = model_config.moe_max_num_tokens or moe_max_num_tokens
         # The auxiliary CUDA stream and CUDA events are only used when MoE chunking is applied
-        if self.moe_max_num_tokens < max_num_tokens:
+        if self.moe_max_num_tokens < moe_max_num_tokens:
             self.aux_stream = aux_stream_dict[
                 AuxStreamType.
                 MoeChunkingOverlap] if aux_stream_dict is not None else torch.cuda.Stream(
@@ -187,6 +185,8 @@ class CutlassFusedMoE(MoE):
     @cached_property
     def enable_alltoall(self):
         return (self.mapping.moe_ep_size > self.routing_method.experts_per_token
+                and self.routing_method.experts_per_token % 4 ==
+                0  # alltoall without allgather only supports top_k % 4 == 0
                 and self.mapping.enable_attention_dp
                 and self.mapping.tp_size > 1
                 and os.environ.get("TRTLLM_MOE_DISABLE_ALLTOALLV", "0") != "1"

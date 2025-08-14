@@ -931,7 +931,9 @@ class AwaitResponseHelper:
 
         for response in responses:
 
-            if self.worker._has_background_error():
+            if isinstance(response, ErrorResponse):
+                pass  # send ErrorResponse directly
+            elif self.worker._has_background_error():
                 response = self.worker._create_error_response(response)
             elif response.has_error():
                 # Convert to ErrorResponse, because tllm.Response cannot be
