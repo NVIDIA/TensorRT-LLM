@@ -157,7 +157,7 @@ microsoft/Phi-4-multimodal-instruct:
 microsoft/Phi-4-multimodal-instruct-long-rope:
   - accuracy: 75.85
 microsoft/Phi-4-mini-instruct:
-  - accuracy: 82.30
+  - accuracy: 75.00
 GPT-OSS/BF16:
   - accuracy: 90.3
 GPT-OSS/MXFP4:
