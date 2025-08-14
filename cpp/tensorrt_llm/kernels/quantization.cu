@@ -143,9 +143,7 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
         dim3 block(std::min(int(n / CVT_FP8_TO_FP4_ELTS_PER_THREAD), 512));
         // Get number of blocks per SM (assume we can fully utilize the SM).
         int const numBlocksPerSM = std::max(1u, 2048u / block.x);
-        // The number of blocks for m. The m dimension will be padded to 128 for swizzled layout.
-        int numBlocksForM = layout == QuantizationSFLayout::SWIZZLED ? PadUpFn(m, 128) : m;
-        dim3 grid(std::min(numBlocksForM, multiProcessorCount * numBlocksPerSM));
+        dim3 grid(std::min(int(m), multiProcessorCount * numBlocksPerSM));
 
         // Launch the cvt kernel.
         auto* kernel_instance = useUE8M0
@@ -162,9 +160,7 @@ void invokeFP4Quantization(int b, int m, int n, T const* input, float const* SFS
         dim3 block(std::min(int(n / CVT_ELTS_PER_THREAD), 512));
         // Get number of blocks per SM (assume we can fully utilize the SM).
         int const numBlocksPerSM = std::max(1u, 2048u / block.x);
-        // The number of blocks for m. The m dimension will be padded to 128 for swizzled layout.
-        int numBlocksForM = layout == QuantizationSFLayout::SWIZZLED ? PadUpFn(m, 128) : m;
-        dim3 grid(std::min(numBlocksForM, multiProcessorCount * numBlocksPerSM));
+        dim3 grid(std::min(int(m), multiProcessorCount * numBlocksPerSM));
 
         // Launch the cvt kernel.
         auto* kernel_instance = useUE8M0
@@ -200,9 +196,7 @@ void invokeMxFP8Quantization(int b, int m, int n, int padded_n, T const* input, 
     dim3 block(std::min(int(padded_n / CVT_ELTS_PER_THREAD), 512));
     // Get number of blocks per SM (assume we can fully utilize the SM).
     int const numBlocksPerSM = std::max(1u, 2048u / block.x);
-    // The number of blocks for m. The m dimension will be padded to 128 for swizzled layout.
-    int numBlocksForM = layout == QuantizationSFLayout::SWIZZLED ? PadUpFn(m, 128) : m;
-    dim3 grid(std::min(numBlocksForM, multiProcessorCount * numBlocksPerSM));
+    dim3 grid(std::min(int(m), multiProcessorCount * numBlocksPerSM));
 
     // Launch the cvt kernel.
     cudaLaunchConfig_t config;
