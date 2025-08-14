@@ -185,6 +185,8 @@ class CutlassFusedMoE(MoE):
     @cached_property
     def enable_alltoall(self):
         return (self.mapping.moe_ep_size > self.routing_method.experts_per_token
+                and self.routing_method.experts_per_token % 4 ==
+                0  # alltoall without allgather only supports top_k % 4 == 0
                 and self.mapping.enable_attention_dp
                 and self.mapping.tp_size > 1
                 and os.environ.get("TRTLLM_MOE_DISABLE_ALLTOALLV", "0") != "1"
