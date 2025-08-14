@@ -1019,6 +1019,7 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const&
     auto const beamWidth = sequence.getBeamWidth();
     SizeType32 numSharedContextBlocks = beamWidth > 1 ? numContextBlocks - 1 : numContextBlocks;
 
+    std::list<BlockPtr> maybeOnboard;
     auto blockItr = blockKeys.begin();
     for (int bi = 0; bi < numSharedContextBlocks; ++bi)
     {
@@ -1044,6 +1045,7 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const&
                 {
                     // Somebody else is using block or it is not a leaf, copy reusable tokens
                     auto newBlock = getFreeBlock(matchingBlock->getPriority(), matchingBlock->getDurationMs());
+                    // TODO: Only copy if block is within attention window of earliest computed token
                     mTransferManager->onboard(matchingBlock, newBlock, mPools, numMatched);
                     // TODO: (optional) Send out event
                     matchingBlock = newBlock;
@@ -1068,7 +1070,8 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const&
                 TLLM_LOG_DEBUG("%s::loadOrAllocateBlocks - Matched full block %d", mLogPrefix.c_str(), matchingBlockId);
                 searchRoot = matchingBlock;
             }
-            onboardBlock(matchingBlock);
+            // Delay onboarding until we know it is necessary
+            maybeOnboard.push_back(matchingBlock);
             addBlockToAllBeams(matchingBlock, sequence);
             // TODO: only add once for reused blocks
             ++mReusedBlocks;
@@ -1097,6 +1100,21 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const&
             }
             freeBlock->setHash();
             ++mMissedBlocks;
+        }
+    }
+
+    if (numMatchedTokens > 0)
+    {
+        // Onboard blocks that fall within attention window of earliest token computed during prefill
+        SizeType32 earliestOnboardedTokenIndex = numMatchedTokens - mWindowSize;
+        SizeType32 tokenIdx = 0, blockSize = getTokensPerBlock();
+        for (auto block : maybeOnboard)
+        {
+            tokenIdx += blockSize; // advance idx to start of next block
+            if (earliestOnboardedTokenIndex < tokenIdx - 1) // compare against last token in current block
+            {
+                onboardBlock(block);
+            }
         }
     }
 
