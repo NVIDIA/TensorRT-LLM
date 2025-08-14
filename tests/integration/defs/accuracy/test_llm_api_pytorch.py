@@ -383,24 +383,26 @@ class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm,
                           extra_evaluator_kwargs=dict(apply_chat_template=True))
 
+    @skip_pre_hopper
     @pytest.mark.skip_less_mpi_world_size(8)
     @parametrize_with_ids("eagle3_one_model", [True, False])
-    def test_eagle3_tp8(self, eagle3_one_model):
-        model_path = f"{llm_models_root()}/llama-3.3-models/Llama-3.3-70B-Instruct"
+    def test_fp8_eagle3_tp8(self, eagle3_one_model):
+        model_path = f"{llm_models_root()}/modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp8"
         eagle_model_dir = f"{llm_models_root()}/EAGLE3-LLaMA3.3-Instruct-70B"
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
         spec_config = EagleDecodingConfig(max_draft_len=4,
                                           speculative_model_dir=eagle_model_dir,
                                           eagle3_one_model=eagle3_one_model)
-        pytorch_config = dict(disable_overlap_scheduler=True, )
+        pytorch_config = dict(
+            disable_overlap_scheduler=True,
+            cuda_graph_config=CudaGraphConfig(max_batch_size=1))
         with LLM(model_path,
+                 max_batch_size=16,
                  tensor_parallel_size=8,
                  speculative_config=spec_config,
                  kv_cache_config=kv_cache_config,
                  **pytorch_config) as llm:
             task = CnnDailymail(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
     @pytest.mark.skip_less_device(4)
@@ -503,7 +505,8 @@ class TestLlama4MaverickInstruct(LlmapiAccuracyTestHarness):
                 max_seq_len=8192,
                 pipeline_parallel_size=pp_size,
                 moe_expert_parallel_size=ep_size,
-                use_cuda_graph=cuda_graph) as llm:
+                cuda_graph_config=CudaGraphConfig()
+                if cuda_graph else None) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
             assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
             task = MMLU(self.MODEL_NAME)
@@ -526,7 +529,8 @@ class TestLlama4MaverickInstruct(LlmapiAccuracyTestHarness):
                 moe_expert_parallel_size=ep_size,
                 enable_chunked_prefill=True,
                 max_num_tokens=256,
-                use_cuda_graph=cuda_graph) as llm:
+                cuda_graph_config=CudaGraphConfig()
+                if cuda_graph else None) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
             assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
             task = MMLU(self.MODEL_NAME)
@@ -646,7 +650,8 @@ class TestLlama4ScoutInstruct(LlmapiAccuracyTestHarness):
                 moe_expert_parallel_size=ep_size,
                 enable_chunked_prefill=True,
                 max_num_tokens=256,
-                use_cuda_graph=cuda_graph) as llm:
+                cuda_graph_config=CudaGraphConfig()
+                if cuda_graph else None) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
             assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
             task = MMLU(self.MODEL_NAME)
@@ -668,7 +673,8 @@ class TestLlama4ScoutInstruct(LlmapiAccuracyTestHarness):
                 max_seq_len=22000,
                 enable_chunked_prefill=True,
                 max_num_tokens=256,
-                use_cuda_graph=cuda_graph) as llm:
+                cuda_graph_config=CudaGraphConfig()
+                if cuda_graph else None) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
             assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
             task = MMLU(self.MODEL_NAME)
@@ -689,10 +695,24 @@ class TestMistral7B(LlmapiAccuracyTestHarness):
 
 class TestMistralSmall24B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "mistralai/Mistral-Small-3.1-24B-Instruct-2503"
-    MODEL_PATH = f"{llm_models_root()}/Mistral-Small-3.1-24B-Instruct-2503"
 
-    def test_auto_dtype(self):
-        with LLM(self.MODEL_PATH) as llm:
+    @pytest.mark.skip_less_device_memory(80000)
+    @pytest.mark.parametrize(
+        "model_path, expected_quant_algo",
+        [
+            # Original bfloat16 model.
+            (f"{llm_models_root()}/Mistral-Small-3.1-24B-Instruct-2503", None),
+            # FP8 model.
+            pytest.param(
+                f"{llm_models_root()}/Mistral-Small-3.1-24B-Instruct-2503-fp8",
+                QuantAlgo.FP8,
+                marks=skip_pre_ada,
+            ),
+        ],
+    )
+    def test_auto_dtype(self, model_path, expected_quant_algo):
+        with LLM(model_path) as llm:
+            assert llm.args.quant_config.quant_algo == expected_quant_algo
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)
@@ -1029,7 +1049,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             max_num_streams=3) if torch_compile else None)
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
-            use_cuda_graph=cuda_graph,
+            cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
             torch_compile_config=torch_compile_config,
             moe_config=MoeConfig(backend="CUTEDSL"),
         )
@@ -1187,7 +1207,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             max_num_streams=3) if torch_compile else None)
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
-            use_cuda_graph=cuda_graph,
+            cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
             torch_compile_config=torch_compile_config,
             moe_config=MoeConfig(backend="CUTEDSL"),
         )

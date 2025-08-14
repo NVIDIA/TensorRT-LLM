@@ -2347,6 +2347,9 @@ public:
     void movePromptEmbeddingTableToGpu(runtime::BufferManager const& manager);
 
     void moveLoraWeightsToGpu(runtime::BufferManager const& manager);
+
+    // Remove LoRA weights and LoRA config tensors
+    void removeLoraTensors();
 };
 
 } // namespace tensorrt_llm::batch_manager

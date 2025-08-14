@@ -372,6 +372,7 @@ class GenerationExecutorWorker(GenerationExecutor):
 
     def _enqueue_request(self, request: GenerationRequest) -> int:
         assert request.id is not None
+        py_lora_path = None
         if self._lora_manager is not None and request.lora_request is not None:
             adapter_in_cache = self._lora_manager.is_adapter_in_cpu_cache(
                 request.lora_request.adapter_id)
@@ -381,8 +382,8 @@ class GenerationExecutorWorker(GenerationExecutor):
                 task_id=request.lora_request.adapter_id,
                 weights=self._lora_manager.cpp_lora_weights[uid]
                 if not adapter_in_cache else None,
-                config=self._lora_manager.cpp_lora_config[uid]
-                if not adapter_in_cache else None)
+                config=self._lora_manager.cpp_lora_config[uid])
+            py_lora_path = request.lora_request.lora_path
         else:
             lora_config = None
 
@@ -497,6 +498,7 @@ class GenerationExecutorWorker(GenerationExecutor):
                 kv_cache_retention_config=request.kv_cache_retention_config,
                 context_phase_params=context_phase_params,
                 type=request_type)
+            executor_request.py_lora_path = py_lora_path
 
             if self._is_pytorch_backend and request.multimodal_params is not None:
                 if request.multimodal_params.multimodal_data is not None:
@@ -779,7 +781,7 @@ def worker_main(
         logger.error(traceback.format_exc())
         print_colored_debug(f"error: {traceback.format_exc()}", "red")
         if is_leader:
-            worker_init_status_queue.put(e)
+            worker_init_status_queue.put((e, traceback.format_exc()))
         return
 
     with worker:
@@ -797,7 +799,7 @@ def worker_main(
                                                    mp_stats_queue)
                 worker._set_iteration_result_queue(worker.kv_events_queues,
                                                    kv_cache_events_queue)
-                worker_init_status_queue.put(ready_signal)
+                worker_init_status_queue.put((ready_signal, None))
                 while (req := request_queue.get()) is not None:
                     if isinstance(req, CancellingRequest):
                         worker.abort_request(req.id)
