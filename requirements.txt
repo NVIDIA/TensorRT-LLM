@@ -28,6 +28,7 @@ torch>=2.7.1,<=2.9.0a0
 torchvision
 nvidia-modelopt[torch]~=0.33.0
 nvidia-nccl-cu13
+nvidia-nvshmem-cu13
 nvidia-cuda-nvrtc-cu13
 transformers~=4.55.0
 pydantic>=2.9.1
@@ -63,3 +64,4 @@ etcd3
 blake3
 llguidance>=0.7.29
 soundfile
+

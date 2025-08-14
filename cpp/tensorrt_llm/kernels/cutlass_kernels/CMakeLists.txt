@@ -190,7 +190,7 @@ set_cuda_architectures(fb_gemm_src 89 90 120f)
 # ${INSTANTIATION_GENERATION_DIR}/fp8_rowwise_gemm)
 
 add_library(fp8_blockscale_gemm_src STATIC ${FP8_BLOCKSCALE_GEMM_SRC_CU})
-set_cuda_architectures(fp8_blockscale_gemm_src 89 90 100f)
+set_cuda_architectures(fp8_blockscale_gemm_src 90)
 
 set(GEMM_SWIGLU_SM90_SRC_CU
     ${CMAKE_CURRENT_SOURCE_DIR}/fused_gated_gemm/gemm_swiglu_e4m3.cu)

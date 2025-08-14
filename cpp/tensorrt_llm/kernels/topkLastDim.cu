@@ -25,6 +25,7 @@
 #include "topkLastDim.h"
 #include <cub/cub.cuh>
 #include <cuda/atomic>
+#include <thrust/iterator/counting_iterator.h>
 #include <thrust/iterator/transform_iterator.h>
 
 namespace tensorrt_llm
@@ -1222,9 +1223,9 @@ void standalone_stable_radix_topk_(void* buf, size_t& buf_size, T const* in, Idx
     IdxT* sort_in_idx = nullptr;
 
     air_topk_stable::ComputeOffset<IdxT> computeoffset(k);
-    thrust::counting_iterator<IdxT> counting_iter(0);
-    thrust::transform_iterator<IdxT, air_topk_stable::ComputeOffset<IdxT>, thrust::counting_iterator<IdxT>>
-        transform_iter(counting_iter, computeoffset);
+    auto counting_iter = thrust::make_counting_iterator<IdxT>(0);
+    auto transform_iter = thrust::make_transform_iterator(counting_iter, computeoffset);
+    
     cub::DeviceSegmentedSort::SortPairs(NULL, temp_storage_bytes, out_idx, out_idx, out, out, k * batch_size,
         batch_size, transform_iter, transform_iter + 1, stream);
     if (sorted)
@@ -1349,9 +1350,8 @@ void standalone_stable_radix_topk_one_block_(void* buf, size_t& buf_size, T cons
     const IdxT buf_len = air_topk_stable::calc_buf_len<T, IdxT, unsigned>(len);
 
     air_topk_stable::ComputeOffset<IdxT> computeoffset(k);
-    thrust::counting_iterator<IdxT> counting_iter(0);
-    thrust::transform_iterator<IdxT, air_topk_stable::ComputeOffset<IdxT>, thrust::counting_iterator<IdxT>>
-        transform_iter(counting_iter, computeoffset);
+    auto counting_iter = thrust::make_counting_iterator<IdxT>(0);
+    auto transform_iter = thrust::make_transform_iterator(counting_iter, computeoffset);
 
     cub::DeviceSegmentedSort::SortPairs(NULL, temp_storage_bytes, out_idx, out_idx, out, out, k * batch_size,
         batch_size, transform_iter, transform_iter + 1, stream);

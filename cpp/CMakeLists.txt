@@ -250,6 +250,14 @@ if(${CUDAToolkit_VERSION} VERSION_GREATER_EQUAL "12.8")
   )
 endif()
 
+if(${CUDAToolkit_VERSION} VERSION_GREATER_EQUAL "13.0")
+  message(
+    STATUS
+      "CUDAToolkit_VERSION ${CUDAToolkit_VERSION_MAJOR}.${CUDAToolkit_VERSION_MINOR} is greater or equal than 13.0, adding visibility flags"
+  )
+  set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --device-entity-has-hidden-visibility=false -cudart=shared")
+endif()
+
 if(ENABLE_MULTI_DEVICE)
   # MPI MPI isn't used until tensorrt_llm/CMakeLists.txt is invoked. However, if
   # it's not called before "CMAKE_CXX_FLAGS" is set, it breaks on Windows for
@@ -366,6 +374,7 @@ if(NVCC_TIMING)
   set(CMAKE_CUDA_FLAGS
       "${CMAKE_CUDA_FLAGS} --time ${CMAKE_CURRENT_BINARY_DIR}/nvcc-timing.csv")
 endif()
+
 message("CMAKE_CUDA_FLAGS: ${CMAKE_CUDA_FLAGS}")
 
 set(COMMON_HEADER_DIRS ${PROJECT_SOURCE_DIR} ${CUDAToolkit_INCLUDE_DIR})
