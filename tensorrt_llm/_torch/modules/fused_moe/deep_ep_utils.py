@@ -154,24 +154,6 @@ class VariableLengthLowLatencyBuffer:
         # Later, you can use our GEMM library to do the computation with this specific format
         return recv_hidden_states, recv_expert_count, handle
 
-    def low_latency_dispatch_fp4(self, hidden_states: torch.Tensor,
-                                 scales: torch.Tensor, topk_idx: torch.Tensor,
-                                 num_max_dispatch_tokens_per_rank: int,
-                                 num_experts: int):
-        assert num_experts == self.num_experts
-
-        # Do MoE dispatch, compatible with CUDA graph (but you may restore some buffer status once you replay)
-        recv_hidden_states, recv_scales, recv_expert_count, handle, event, hook = \
-            self.buffer.low_latency_dispatch_fp4(hidden_states, scales, topk_idx, num_max_dispatch_tokens_per_rank, num_experts)
-        assert event.event is None
-        assert hook is None
-
-        # NOTES: the actual tensor will not be received only if you call `hook()`,
-        # it is useful for double-batch overlapping, but **without any SM occupation**
-        # If you don't want to overlap, please set `return_recv_hook=False`
-        # Later, you can use our GEMM library to do the computation with this specific format
-        return recv_hidden_states, recv_scales, recv_expert_count, handle
-
     def low_latency_combine(self, hidden_states: torch.Tensor,
                             topk_idx: torch.Tensor, topk_weights: torch.Tensor,
                             handle: Tuple):
@@ -182,6 +164,30 @@ class VariableLengthLowLatencyBuffer:
         assert hook is None
 
         # NOTES: the same behavior as described in the dispatch kernel
+        return combined_hidden_states
+
+    def low_latency_dispatch_fp4(self, hidden_states: torch.Tensor,
+                                 scales: torch.Tensor, topk_idx: torch.Tensor,
+                                 num_max_dispatch_tokens_per_rank: int,
+                                 num_experts: int):
+        assert num_experts == self.num_experts
+
+        recv_hidden_states, recv_scales, recv_expert_count, handle, event, hook = \
+            self.buffer.low_latency_dispatch_fp4(hidden_states, scales, topk_idx, num_max_dispatch_tokens_per_rank, num_experts)
+        assert event.event is None
+        assert hook is None
+
+        return recv_hidden_states, recv_scales, recv_expert_count, handle
+
+    def low_latency_combine_fp4(self, hidden_states: torch.Tensor,
+                                global_scales: torch.Tensor,
+                                topk_idx: torch.Tensor,
+                                topk_weights: torch.Tensor, handle: Tuple):
+        combined_hidden_states, event, hook = \
+            self.buffer.low_latency_combine_fp4(hidden_states, global_scales, topk_idx, topk_weights, handle)
+        assert event.event is None
+        assert hook is None
+
         return combined_hidden_states
 
     def clean_low_latency_buffer(self, num_max_dispatch_tokens_per_rank: int,
