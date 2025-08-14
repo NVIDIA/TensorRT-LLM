@@ -1281,7 +1281,6 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
             local_num_heads = num_heads // weight_divisor
 
             k_nope_weight_trans = k_nope_weight.transpose(2, 1).contiguous()
-            # k_nope_weight_trans = k_nope_weight.transpose(2, 1)
 
             kv_b_proj = torch.concat([
                 k_nope_weight.reshape(local_num_heads * local_qk_nope_head_dim,
@@ -1323,7 +1322,6 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
             local_num_heads = num_heads // weight_divisor
 
             k_nope_weight_trans = k_nope_weight.transpose(2, 1).contiguous()
-            # k_nope_weight_trans = k_nope_weight.transpose(2, 1)
 
             kv_b_proj = torch.concat([
                 k_nope_weight.reshape(local_num_heads * local_qk_nope_head_dim,

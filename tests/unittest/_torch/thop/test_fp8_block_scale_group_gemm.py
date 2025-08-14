@@ -77,12 +77,9 @@ def cute_dsl_fp8_group_blockwise_gemm_ref(
     for i in range(len_offset_array - 1):
         start = offset_array[i]
         end = offset_array[i + 1]
-        # assert start <= end, f"Invalid group boundaries: start={start} > end={end}"
         ref[start:end, :] = torch.einsum("mk,nk->mn", updated_a[start:end, :,
                                                                 0],
                                          updated_b[:, :, i])
-        # ref[start:end, :] = torch.matmul(updated_a[start:end, :, 0],
-        #                                  updated_b[:, :, i].T)
     ref = ref.to(torch.bfloat16)
     return ref
 
@@ -161,10 +158,6 @@ def test_cute_dsl_fp8_block_scale_group_gemm(num_experts, k, n,
           torch.allclose(c_actual_ref.cpu(), c_ref.cpu(), atol=1e-1))
     print("torch.allclose(c_actual.cpu(), c_ref.cpu(), atol=1e-1) = ",
           torch.allclose(c_actual.cpu(), c_ref.cpu(), atol=1e-1))
-    # assert torch.allclose(c_actual.cpu(), c_actual_ref.cpu(), atol=1e-2), "c_actual != c_actual_ref"
-    # assert torch.allclose(c_actual.cpu(), c_expected.cpu(), atol=1e-2), "c_actual != c_expected"
-    # assert torch.allclose(c_actual_ref.cpu(), c_expected.cpu(), atol=1e-2), "c_actual_ref != c_expected"
-    # torch.testing.assert_close(c_actual_ref.cpu(), c_ref.cpu(), atol=0.1, rtol=1e-03)
     torch.testing.assert_close(c_actual.cpu(),
                                c_ref.cpu(),
                                atol=0.1,
@@ -177,10 +170,4 @@ def test_cute_dsl_fp8_block_scale_group_gemm(num_experts, k, n,
 
 
 if __name__ == "__main__":
-    # for expect_m in [128, 256, 512]:
-    #     for num_experts in [4, 8, 16, 32, 64, 72]:
-    #         for k in [128, 256]:
-    #             for n in [64, 128, 256, 512]:
-    #                 print(f"limin: expect_m = {expect_m}, num_experts = {num_experts}, k = {k}, n = {n}")
-    #                 test_cute_dsl_group_gemm(num_experts = num_experts, k = k, n = n, expect_m = expect_m)
     test_cute_dsl_fp8_block_scale_group_gemm(72, 1536, 2560, 1024)
