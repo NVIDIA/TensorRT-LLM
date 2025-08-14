@@ -1081,7 +1081,10 @@ def test_fused_moe_nvfp4(dtype):
 
 @skip_neither_ada_nor_hopper_unittest
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
-def test_fused_moe_w4afp8(dtype):
+@pytest.mark.parametrize(
+    "weight_loading_mode",
+    [MoEWeightLoadingMode.VANILLA, MoEWeightLoadingMode.W4A8_CUSTOM])
+def test_fused_moe_w4afp8(dtype, weight_loading_mode):
     mapping = Mapping()
     mapping.rank = mpi_rank()
 
@@ -1102,21 +1105,54 @@ def test_fused_moe_w4afp8(dtype):
 
         affine_coeff = 0.005
 
+        lut = {
+            "weight":
+            "weight",
+            "weight_scale":
+            ("weight_scale_inv" if weight_loading_mode
+             == MoEWeightLoadingMode.W4A8_CUSTOM else "weight_scale"),
+            "weight_scale_2":
+            "weight_scale_2",
+            "pre_quant_scale":
+            "pre_quant_scale",
+            "input_scale":
+            "input_scale",
+        }
+
         weights = {}
         for expert_id in range(NUM_EXPERTS):
-            w1_weight = torch.randint(-128,
-                                      127,
-                                      (INTERMEDIATE_SIZE, HIDDEN_SIZE // 2),
+            # ModelOpt W4A8 packs pairs of 4b weights in the output dimension into one 8b element.
+            if weight_loading_mode == MoEWeightLoadingMode.VANILLA:
+                w1_shape = (INTERMEDIATE_SIZE // 2, HIDDEN_SIZE)
+                w2_shape = (HIDDEN_SIZE // 2, INTERMEDIATE_SIZE)
+                w3_shape = (INTERMEDIATE_SIZE // 2, HIDDEN_SIZE)
+            # The custom W4A8 quantization script examples/quantization/quantize_mixed_precision_moe.py
+            # packs pairs of 4b weight in the input dimension into one 8b element.
+            if weight_loading_mode == MoEWeightLoadingMode.W4A8_CUSTOM:
+                w1_shape = (INTERMEDIATE_SIZE, HIDDEN_SIZE // 2)
+                w2_shape = (HIDDEN_SIZE, INTERMEDIATE_SIZE // 2)
+                w3_shape = (INTERMEDIATE_SIZE, HIDDEN_SIZE // 2)
+
+            # The weights in int4 precision.
+            w1_weight = torch.randint(-128, 127, w1_shape,
                                       dtype=torch.int8).cuda()
-            w2_weight = torch.randint(-128,
-                                      127,
-                                      (HIDDEN_SIZE, INTERMEDIATE_SIZE // 2),
+            w2_weight = torch.randint(-128, 127, w2_shape,
                                       dtype=torch.int8).cuda()
-            w3_weight = torch.randint(-128,
-                                      127,
-                                      (INTERMEDIATE_SIZE, HIDDEN_SIZE // 2),
+            w3_weight = torch.randint(-128, 127, w3_shape,
                                       dtype=torch.int8).cuda()
 
+            # The pre-quant scale to be multiplied with the input activation.
+            w1_pre_quant_scale = torch.ones(HIDDEN_SIZE,
+                                            dtype=dtype,
+                                            device="cuda")
+            w2_pre_quant_scale = torch.ones(INTERMEDIATE_SIZE,
+                                            dtype=dtype,
+                                            device="cuda")
+            w3_pre_quant_scale = torch.ones(HIDDEN_SIZE,
+                                            dtype=dtype,
+                                            device="cuda")
+
+            # The weight scale to dequantize int4 weights (by multiplication).
             w1_scale = torch.randn(
                 (INTERMEDIATE_SIZE, HIDDEN_SIZE // SCALING_GROUP_SIZE),
                 dtype=dtype,
@@ -1130,19 +1166,41 @@ def test_fused_moe_w4afp8(dtype):
                 dtype=dtype,
                 device="cuda") * affine_coeff
 
-            w1_input = torch.randn(1, dtype=torch.float32, device="cuda") * 0.02
-            w2_input = w1_input
-            w3_input = w1_input
+            # The input scale to quantize the input activation (by division).
+            w1_input_scale = torch.randn(1, dtype=torch.float32,
+                                         device="cuda") * 0.2
+            w2_input_scale = w1_input_scale
+            w3_input_scale = w1_input_scale
 
-            weights[f"{expert_id}.w1.weight"] = w1_weight
-            weights[f"{expert_id}.w2.weight"] = w2_weight
-            weights[f"{expert_id}.w3.weight"] = w3_weight
-            weights[f"{expert_id}.w1.weight_scale_inv"] = w1_scale
-            weights[f"{expert_id}.w2.weight_scale_inv"] = w2_scale
-            weights[f"{expert_id}.w3.weight_scale_inv"] = w3_scale
-            weights[f"{expert_id}.w1.input_scale"] = w1_input
-            weights[f"{expert_id}.w2.input_scale"] = w2_input
-            weights[f"{expert_id}.w3.input_scale"] = w3_input
+            # The weight scale 2 to quantize the dequantized weights (by division).
+            w1_weight_scale_2 = torch.ones([1],
+                                           dtype=torch.float32,
+                                           device="cuda")
+            w2_weight_scale_2 = w1_weight_scale_2
+            w3_weight_scale_2 = w1_weight_scale_2
+
+            # Prepare weights.
+            weights[f"{expert_id}.w1.{lut['weight']}"] = w1_weight
+            weights[f"{expert_id}.w2.{lut['weight']}"] = w2_weight
+            weights[f"{expert_id}.w3.{lut['weight']}"] = w3_weight
+            weights[f"{expert_id}.w1.{lut['input_scale']}"] = w1_input_scale
+            weights[f"{expert_id}.w2.{lut['input_scale']}"] = w2_input_scale
+            weights[f"{expert_id}.w3.{lut['input_scale']}"] = w3_input_scale
+            weights[f"{expert_id}.w1.{lut['weight_scale']}"] = w1_scale
+            weights[f"{expert_id}.w2.{lut['weight_scale']}"] = w2_scale
+            weights[f"{expert_id}.w3.{lut['weight_scale']}"] = w3_scale
+            weights[
+                f"{expert_id}.w1.{lut['pre_quant_scale']}"] = w1_pre_quant_scale
+            weights[
+                f"{expert_id}.w2.{lut['pre_quant_scale']}"] = w2_pre_quant_scale
+            weights[
+                f"{expert_id}.w3.{lut['pre_quant_scale']}"] = w3_pre_quant_scale
+            weights[
+                f"{expert_id}.w1.{lut['weight_scale_2']}"] = w1_weight_scale_2
+            weights[
+                f"{expert_id}.w2.{lut['weight_scale_2']}"] = w2_weight_scale_2
+            weights[
+                f"{expert_id}.w3.{lut['weight_scale_2']}"] = w3_weight_scale_2
 
         quant_config = QuantConfig(quant_algo=QuantAlgo.W4A8_AWQ)
         fused_moe = CutlassFusedMoE(
@@ -1152,14 +1210,14 @@ def test_fused_moe_w4afp8(dtype):
             intermediate_size=INTERMEDIATE_SIZE,
             dtype=dtype,
             reduce_results=False,
-            model_config=ModelConfig(quant_config=quant_config))
+            model_config=ModelConfig(quant_config=quant_config),
+            weight_loading_mode=weight_loading_mode)
         fused_moe.load_weights([weights])
         fused_moe.cuda()
 
         def ref():
             results = torch.zeros_like(x)
             selected_experts, final_scales = routing_method.apply(router_logits)
-            unpacker = torch.ops.trtllm.unpack_int4_packed_tensor_to_int8
             for e_idx in range(NUM_EXPERTS):
                 mask = selected_experts == e_idx
                 activated_tokens = mask.sum(1).bool()
@@ -1170,42 +1228,97 @@ def test_fused_moe_w4afp8(dtype):
                                mask).sum(1)[activated_tokens].unsqueeze(1)
 
                 # weights
-                w1 = weights[f"{e_idx}.w1.weight"]
-                w1 = unpacker(w1.cpu()).T.contiguous().cuda()
-                w2 = weights[f"{e_idx}.w2.weight"]
-                w2 = unpacker(w2.cpu()).T.contiguous().cuda()
-                w3 = weights[f"{e_idx}.w3.weight"]
-                w3 = unpacker(w3.cpu()).T.contiguous().cuda()
+                def unpack_weights(weight: torch.Tensor) -> torch.Tensor:
+                    unpacker = torch.ops.trtllm.unpack_int4_packed_tensor_to_int8
+                    if weight_loading_mode == MoEWeightLoadingMode.VANILLA:
+                        return unpacker(weight.cpu().T.contiguous()).cuda()
+                    else:
+                        return unpacker(weight.cpu()).T.contiguous().cuda()
+
+                w1 = unpack_weights(weights[f"{e_idx}.w1.{lut['weight']}"])
+                w2 = unpack_weights(weights[f"{e_idx}.w2.{lut['weight']}"])
+                w3 = unpack_weights(weights[f"{e_idx}.w3.{lut['weight']}"])
                 w3_w1 = torch.cat([w3, w1], dim=-1)
 
-                # scales
-                s1 = weights[f"{e_idx}.w1.weight_scale_inv"].T.contiguous(
+                # weight_scale
+                s1 = weights[f"{e_idx}.w1.{lut['weight_scale']}"].T.contiguous(
                 ).cuda()
-                s2 = weights[f"{e_idx}.w2.weight_scale_inv"].T.contiguous(
+                s2 = weights[f"{e_idx}.w2.{lut['weight_scale']}"].T.contiguous(
                 ).cuda()
-                s3 = weights[f"{e_idx}.w3.weight_scale_inv"].T.contiguous(
+                s3 = weights[f"{e_idx}.w3.{lut['weight_scale']}"].T.contiguous(
                 ).cuda()
                 s3_s1 = torch.cat([s3, s1], dim=-1)
 
-                # prequant / alpha
-                p1 = weights[f"{e_idx}.w1.input_scale"].cuda()
-                p2 = weights[f"{e_idx}.w2.input_scale"].cuda()
-                p3 = weights[f"{e_idx}.w3.input_scale"].cuda()
-                p3_p1 = max(p1, p3)
+                # input_scale
+                p1 = weights[f"{e_idx}.w1.{lut['input_scale']}"].cuda()
+                p2 = weights[f"{e_idx}.w2.{lut['input_scale']}"].cuda()
+                p3 = weights[f"{e_idx}.w3.{lut['input_scale']}"].cuda()
+                p3_p1 = torch.max(p1, p3)
 
-                act = torch.clamp((act / p3_p1), -448.0,
-                                  448.0).to(torch.float8_e4m3fn).to(dtype)
-                w3_w1 = (w3_w1.float() *
-                         s3_s1.repeat_interleave(128, dim=0).float()).to(dtype)
-                fc1 = torch.matmul(act, w3_w1) * p3_p1
+                # pre_quant_scale
+                a1 = a2 = a3 = a1_a3 = None
+                if weight_loading_mode == MoEWeightLoadingMode.VANILLA:
+                    a1 = weights[
+                        f"{e_idx}.w1.{lut['pre_quant_scale']}"].T.contiguous(
+                        ).cuda()
+                    a2 = weights[
+                        f"{e_idx}.w2.{lut['pre_quant_scale']}"].T.contiguous(
+                        ).cuda()
+                    a3 = weights[
+                        f"{e_idx}.w3.{lut['pre_quant_scale']}"].T.contiguous(
+                        ).cuda()
+                    a1_a3 = torch.max(a1, a3)
+
+                # weight_scale_2
+                q1 = q2 = q3 = q3_q1 = None
+                if weight_loading_mode == MoEWeightLoadingMode.VANILLA:
+                    q1 = weights[f"{e_idx}.w1.{lut['weight_scale_2']}"].cuda()
+                    q2 = weights[f"{e_idx}.w3.{lut['weight_scale_2']}"].cuda()
+                    q3 = weights[f"{e_idx}.w2.{lut['weight_scale_2']}"].cuda()
+                    q3_q1 = torch.max(q3, q1)
+
+                # forward pass
+                def process_layer(
+                    act,
+                    weight,
+                    weight_scale,
+                    input_scale,
+                    pre_quant_scale=None,
+                    weight_scale_2=None,
+                ):
+                    if pre_quant_scale is not None:
+                        act = act * pre_quant_scale
+                    act = (torch.clamp((act / input_scale), -448.0,
+                                       448.0).to(torch.float8_e4m3fn).to(dtype))
+                    weight = (weight.float() * weight_scale.repeat_interleave(
+                        128, dim=0).float()).to(dtype)
+                    if weight_scale_2 is not None:
+                        weight /= weight_scale_2
+                    output = torch.matmul(act, weight) * input_scale
+                    if weight_scale_2 is not None:
+                        output *= weight_scale_2
+                    return output
+
+                # fc13
+                fc1 = process_layer(
+                    act,
+                    w3_w1,
+                    s3_s1,
+                    p3_p1,
+                    pre_quant_scale=a1_a3,
+                    weight_scale_2=q3_q1,
+                )
                 fc1, gate = fc1.chunk(2, dim=-1)
                 fc1 = fc1 * torch.nn.functional.silu(gate)
 
-                act = torch.clamp((fc1 / p2), -448.0,
-                                  448.0).to(torch.float8_e4m3fn).to(dtype)
-                w2 = (w2.float() *
-                      s2.repeat_interleave(128, dim=0).float()).to(dtype)
-                fc2 = torch.matmul(act, w2) * p2
+                # fc2
+                fc2 = process_layer(fc1,
+                                    w2,
+                                    s2,
+                                    p2,
+                                    pre_quant_scale=a2,
+                                    weight_scale_2=q2)
+
                 results[activated_tokens, :] += (fc2 * final_scale).to(
                     results.dtype)
             return results
@@ -1219,8 +1332,13 @@ def test_fused_moe_w4afp8(dtype):
             output = fused_moe.forward(x, router_logits)
             ref_output = ref()
 
-        # compare
         torch.cuda.synchronize()
+        # assert that result does not contain NaN or is all 0s
+        assert not torch.isnan(ref_output).any(), "ref_output contains NaN"
+        assert not torch.isnan(output).any(), "output contains NaN"
+        assert torch.nonzero(output).numel() > 0, "output is empty"
+        assert torch.nonzero(ref_output).numel() > 0, "ref_output is empty"
+        # compare
         torch.testing.assert_close(output, ref_output, rtol=1e-2, atol=0.1)
 
 
