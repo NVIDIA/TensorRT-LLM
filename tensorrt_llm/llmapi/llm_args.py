@@ -2141,12 +2141,12 @@ class TorchLlmArgs(BaseLlmArgs):
     # cute dsl op configs
     use_cute_dsl_blockscaling_mm: bool = Field(
         default=False,
-        description="If true, use cute dsl blockscaling fp8 mm op.",
+        description="If true, use CuTe DSL blockscaling fp8 mm op.",
         status="prototype",
     )
     use_cute_dsl_blockscaling_bmm: bool = Field(
         default=False,
-        description="If true, use cute dsl blockscaling fp8 bmm op.",
+        description="If true, use CuTe DSL blockscaling fp8 bmm op.",
         status="prototype",
     )
 
