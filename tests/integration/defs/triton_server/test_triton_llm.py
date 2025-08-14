@@ -3897,7 +3897,7 @@ def test_tiny_llama_ifb_token_counts(
 
 
 @pytest.mark.skip_less_device_memory(80000)
-@pytest.mark.parametrize("E2E_MODEL_NAME", ["ensemble"])  # BLS optional later
+@pytest.mark.parametrize("E2E_MODEL_NAME", ["ensemble", "tensorrt_llm_bls"])
 @pytest.mark.parametrize("ACCUMULATE_TOKEN", ["False"])
 @pytest.mark.parametrize("BLS_INSTANCE_COUNT", ["1"])
 @pytest.mark.parametrize("PREPROCESSING_INSTANCE_COUNT", ["1"])
@@ -4066,6 +4066,6 @@ def test_mistral_small_3_1_24b_pixtral(
                 run_cmd += ["--use_bls"]
 
         output = venv_check_output(llm_backend_venv, run_cmd)
-        print(output)
 
-        assert MATCH.search(output), f"Test failed for input: {TEXT}, {IMAGE}"
+        assert MATCH.search(
+            output), f"Test failed for input: {TEXT=}, {IMAGE=}, {output=}"
