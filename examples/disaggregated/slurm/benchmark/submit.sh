@@ -38,7 +38,7 @@ args=(
 )
 
 # This command starts a job with 8 nodes, 32 GPUs in total.
-# The server will include 4 context workers with TP=4, PP=1, and 1 generation worker with TP=8, PP=1.
+# The server will include 4 context workers with DEP=4, and 1 generation worker with DEP=8.
 # `--segment` makes sure that all nodes are in the same NVLink domain
 sbatch --nodes=${total_node_num} \
     --ntasks=${ntasks} \
