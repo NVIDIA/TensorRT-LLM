@@ -229,6 +229,8 @@ nvidia/Nemotron-H-56B-Base-8K:
     accuracy: 83.82
 microsoft/Phi-4-mini-instruct:
   - accuracy: 68.98
+  - quant_algo: FP8
+    accuracy: 68.30
 # Created a dummy accuracy to track tp_size=2 for phi4-mini model.
 # TODO: update once https://nvbugs/5393849 is fixed.
 microsoft/Phi-4-mini-instruct-tp2:
@@ -264,3 +266,7 @@ GPT-OSS/MXFP4:
     accuracy: 75.50
   - quant_algo: W4A8_MXFP4_FP8
     accuracy: 75.50
+mistralai/Mistral-Nemo-12b-Base:
+  - accuracy: 69.66
+  - quant_algo: FP8
+    accuracy: 69.66
