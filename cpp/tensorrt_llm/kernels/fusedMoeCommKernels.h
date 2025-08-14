@@ -74,7 +74,7 @@ struct MoeCommFieldInfo
     uint16_t alignedUnitStride;  // data stride in aligned unit
 
     uint8_t unalignedFieldIndex; // the index of unaligned Field, no decrease with field index
-    uint16_t packed16BOffset;    // aligned to 16 Bytes, offset is count of 16 Byte
+    uint16_t compact16BOffset;   // aligned to 16 Bytes, offset is count of 16 Byte
 
     static constexpr uint64_t kAlign16BytePtrMask = (1ULL << 4) - 1;
     static constexpr uint32_t kAligned16BMask = (1 << 4) - 1;
@@ -95,7 +95,7 @@ struct MoeCommFieldInfo
         fillFieldInfo(reinterpret_cast<uint8_t*>(dataPtr), elementSize, vectorSize, stride);
     }
 
-    __device__ __host__ __forceinline__ int getFieldUnpackedSize() const
+    __device__ __host__ __forceinline__ int getFieldUncompactSize() const
     {
         int alignedUnitBytes = 1 << alignedUnitBit;
         int currentFieldSize = alignedUnitCount * alignedUnitBytes;
@@ -108,23 +108,23 @@ struct MoeCommFieldInfo
         return currentFieldSize;
     }
 
-    __device__ __host__ __forceinline__ int getFieldPackedSize() const
+    __device__ __host__ __forceinline__ int getFieldCompactSize() const
     {
         int alignedUnitBytes = 1 << alignedUnitBit;
         int currentFieldSize = alignedUnitCount * alignedUnitBytes;
-        // Align to 16 bytes for packed size
+        // Align to 16 bytes for compact size
         return (currentFieldSize + BYTES_PER_16B_BLOCK - 1) / BYTES_PER_16B_BLOCK * BYTES_PER_16B_BLOCK;
     }
 
-    __device__ __forceinline__ int getPackedShmOffset() const
+    __device__ __forceinline__ int getCompactShmOffset() const
     {
-        return packed16BOffset * BYTES_PER_16B_BLOCK;
+        return compact16BOffset * BYTES_PER_16B_BLOCK;
     }
 
-    __device__ __forceinline__ int getUnpackedShmOffset() const
+    __device__ __forceinline__ int getUncompactShmOffset() const
     {
         // each unaligned field need 16 byte head and 16 byte tail
-        return packed16BOffset * BYTES_PER_16B_BLOCK + unalignedFieldIndex * BYTES_PER_16B_BLOCK;
+        return compact16BOffset * BYTES_PER_16B_BLOCK + unalignedFieldIndex * BYTES_PER_16B_BLOCK;
     }
 
     __device__ __forceinline__ int getMemmoveOffsets(int index) const
@@ -200,15 +200,26 @@ static constexpr int MOE_COMM_FIELD_MAX_COUNT = 8;
 
 struct MoeSingleCommMeta
 {
-    int singlePackedAlignedSize;   // packed buffer is always aligned to 128 bytes
-    int singleUnpackedAlignedSize; // unpacked shared memory size, aligned to 128 bytes, might be larger than packed
-                                   // buffer
+    int singleTransferAlignedSize;  // transfer size aligned to 128 bytes.
+    int singleCompactAlignedSize;   // compact buffer is always aligned to 128 bytes
+    int singleUncompactAlignedSize; // uncompact shared memory size, aligned to 128 bytes, might be larger than compact
+                                    // buffer if unaligned field exist.
 
     // TODO: Do we need reduce shared memory usage, make it able to be smaller, and enable multiple wave?
 
-    __device__ __host__ __forceinline__ int getPacked128ByteCount() const
+    __device__ __host__ __forceinline__ int getTransfer128ByteCount() const
     {
-        return singlePackedAlignedSize / MoeCommFieldInfo::BYTES_PER_128B_BLOCK;
+        return singleTransferAlignedSize / MoeCommFieldInfo::BYTES_PER_128B_BLOCK;
+    }
+
+    __device__ __host__ __forceinline__ int getCompactData128ByteCount() const
+    {
+        return singleCompactAlignedSize / MoeCommFieldInfo::BYTES_PER_128B_BLOCK;
+    }
+
+    __device__ __host__ __forceinline__ int getSingleShmSize() const
+    {
+        return std::max(singleUncompactAlignedSize, singleTransferAlignedSize);
     }
 };
 
@@ -234,10 +245,6 @@ public:
     static constexpr int FIFO_TOTAL_BYTES = FIFO_ENTRY_BYTES * FIFO_DEPTH;
     static constexpr int FIFO_TOTAL_U64 = FIFO_TOTAL_BYTES / sizeof(uint64_t);
     static constexpr int MAX_GROUP_COUNT_PER_BLOCK = 8;
-    // Here we use fixed INVALID_VALUE, which is -0.0 for all kinds of float types and -INT_MAX for all signed integers
-    // Real data should not use these values.
-    static constexpr uint32_t INVALID_VALUE = 1U << 31U;
-    static constexpr uint32_t FIXED_VALUE = 0U; // if raw data has INVALID_VALUE, fix it to FIXED_VALUE
 
     static constexpr int WARP_SIZE = 32;
 
@@ -321,7 +328,7 @@ struct FusedMoeFieldInfo
     int fieldCount;
     MoeCommFieldInfo fieldsInfo[MOE_COMM_FIELD_MAX_COUNT];
 
-    __host__ int computeSinglePackedSize(int topK, bool hasScales, bool hasBasicFields) const
+    __host__ int computeSingleCompactSize(int topK, bool hasScales, bool hasBasicFields) const
     {
         int basicFieldSize = 0;
         if (hasBasicFields)
@@ -335,7 +342,7 @@ struct FusedMoeFieldInfo
         for (int i = 0; i < fieldCount; i++)
         {
             MoeCommFieldInfo const& fieldInfo = fieldsInfo[i];
-            otherFieldSize += fieldInfo.getFieldPackedSize();
+            otherFieldSize += fieldInfo.getFieldCompactSize();
         }
         int totalSize = basicFieldSize + otherFieldSize;
         constexpr int totalSizeAlignment = MoeCommFieldInfo::BYTES_PER_128B_BLOCK;
@@ -343,7 +350,7 @@ struct FusedMoeFieldInfo
         return totalSize;
     }
 
-    __host__ int computeSingleWarpShmSize(int topK, bool hasScales, bool hasBasicFields) const
+    __host__ int computeSingleUncompactSize(int topK, bool hasScales, bool hasBasicFields) const
     {
         int basicFieldSize = 0;
         if (hasBasicFields)
@@ -357,7 +364,7 @@ struct FusedMoeFieldInfo
         for (int i = 0; i < fieldCount; i++)
         {
             MoeCommFieldInfo const& fieldInfo = fieldsInfo[i];
-            otherFieldSize += fieldInfo.getFieldUnpackedSize();
+            otherFieldSize += fieldInfo.getFieldUncompactSize();
         }
         int totalSize = basicFieldSize + otherFieldSize;
         constexpr int totalSizeAlignment = MoeCommFieldInfo::BYTES_PER_128B_BLOCK;
@@ -389,11 +396,7 @@ struct FusedMoeFieldInfo
         return getBasicFieldPtr<float, false>(tokenIndex, selectedIndex, topK);
     }
 
-    void fillMetaInfo(MoeSingleCommMeta* singleCommMeta, int topK, bool hasScales, bool hasBasicFields) const
-    {
-        singleCommMeta->singlePackedAlignedSize = computeSinglePackedSize(topK, hasScales, hasBasicFields);
-        singleCommMeta->singleUnpackedAlignedSize = computeSingleWarpShmSize(topK, hasScales, hasBasicFields);
-    }
+    void fillMetaInfo(MoeSingleCommMeta* singleCommMeta, int topK, bool hasScales, bool hasBasicFields) const;
 
     void fillFieldPlacementInfo(int topK, bool hasBasicFields);
 };
@@ -536,10 +539,6 @@ void launchSingleS2G(FusedMoeFieldInfo const& recvFieldInfo, MoeExpertParallelIn
 void launchLoopback(FusedMoeFieldInfo const& sendFieldInfo, FusedMoeFieldInfo const& recvFieldInfo,
     MoeExpertParallelInfo const& expertParallelInfo, int* recvIndexMapping, int tokenCount, int warpsPerBlock,
     bool hasBasicFields, cudaStream_t stream);
-
-void launchLocalSendRecv(FusedMoeFieldInfo const& sendFieldInfo, FusedMoeFieldInfo const& recvFieldInfo,
-    MoeExpertParallelInfo const& expertParallelInfo, int* recvIndexMapping, FusedMoeWorkspace fusedMoeWorkspace,
-    int tokenCount, int warpsPerBlock, int blockChannelCount, bool hasBasicFields, cudaStream_t stream);
 
 void launchLocalFifoSendRecv(FusedMoeFieldInfo const& sendFieldInfo, FusedMoeFieldInfo const& recvFieldInfo,
     MoeExpertParallelInfo const& expertParallelInfo, int* sendIndexMapping, int* recvIndexMapping,
