@@ -1,13 +1,12 @@
 # Running a High Performance GPT-OSS-120B Inference Server with TensorRT-LLM
 
-In the guide below, we will walk you through how to launch your own
+NVIDIA has [announced](https://developer.nvidia.com/blog/delivering-1-5-m-tps-inference-on-nvidia-gb200-nvl72-nvidia-accelerates-openai-gpt-oss-models-from-cloud-to-edge/) day-0 support for OpenAI's new open-source model series, [gpt-oss](https://openai.com/index/introducing-gpt-oss/). In the guide below, we will walk you through how to launch your own
 high-performance TensorRT-LLM server for **gpt-oss-120b** for inference.
 This guide covers both low-latency and max-throughput cases.
 
-The typical use case for **low-latency**, is when we try to maximize the number of tokens per second per user with a limited concurrency (4, 8 or 16 users).
+The typical use case for **low-latency**, is when we try to maximize the number of tokens per second per user (TPS/User) with a limited concurrency (4, 8 or 16 users).
 
-For **maximum throughput**, the goal is to maximize the amount of tokens produced per GPU per second. The former is an indication of how fast a system can produce tokens, the latter measures how many tokens a "chip" can generate per unit of time.
-
+For **maximum throughput**, the goal is to maximize the amount of tokens produced per GPU per second (TPS/GPU). TPS/User is an indication of the user experience, the latter measures the economic efficiency of the system.
 
 ## Prerequisites
 
@@ -19,10 +18,12 @@ For **maximum throughput**, the goal is to maximize the amount of tokens produce
 
 We have a forthcoming guide for getting great performance on H100, however this guide focuses on the above GPUs.
 
+## Install TensorRT-LLM
+To get started, we need to install TensorRT-LLM. We provide the following ways to do so.
 
-## Launching the TensorRT-LLM docker container
+###  NGC Docker Image of dev branch
 
-The container image that you will use will be pulled from NVIDIA's NGC. This container is multi-platform and will run on both x64 and arm64 architectures: `nvcr.io/nvidia/tensorrt-llm/release:gpt-oss-dev`
+Day-0 support for gpt-oss is provided via the NGC container image `nvcr.io/nvidia/tensorrt-llm/release:gpt-oss-dev`. This image was built on top of the pre-day-0 **dev branch**. This container is multi-platform and will run on both x64 and arm64 architectures.
 
 Run the follow docker command to start the TensorRT-LLM container in interactive mode:
 
@@ -49,23 +50,47 @@ This command:
 - enables PDL for low-latency perf optimization
 - disables parallel weight loading
 
-Lastly the container mounts your user `.cache` directory to save the downloaded model checkpoints which are saved to `~/.cache/huggingface/hub/` by default. This prevents having to redownload the weights each time you rerun the container.
+Lastly the container mounts your user `.cache` directory to save the downloaded model checkpoints which are saved to `~/.cache/huggingface/hub/` by default. This prevents having to redownload the weights each time you rerun the container. You can also download the weights to a custom location.
+
+### Build from source
+
+The support for gpt-oss is has been [merged](https://github.com/NVIDIA/TensorRT-LLM/pull/6645) into the **main branch** of TensorRT-LLM. We are continuing to optimize the performance of gpt-oss, you can build the TensorRT-LLM from source to get the latest features and support. Please refer to the [doc](https://nvidia.github.io/TensorRT-LLM/latest/installation/build-from-source-linux.html) if you want to build from source by yourself.
 
 
-## Running the TensorRT-LLM Server
+### Regular Release of TensorRT-LLM
 
-As pointed out in the introduction, this guide covers low-latency and max-throughput cases. Each requires a different configurations and commands to run. We will first cover the Low-Latency use-case, followed by the max throughput use-case.
+Since gpt-oss has been supported on the main branch, you can get TensorRT-LLM out of the box through its regular release in the future. Please check the latest [release notes](https://github.com/NVIDIA/TensorRT-LLM/releases) to keep track of the support status. The release is provided as [NGC Container Image](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release/tags) or [pip Python wheel](https://pypi.org/project/tensorrt-llm/#history). You can find instructions on pip install [here](https://nvidia.github.io/TensorRT-LLM/installation/linux.html).
+
+
+## Performance Benchmarking and Tuning
+
+As pointed out in the introduction, this guide covers how to configure for low-latency and max-throughput cases, as well as benchmark the end-to-end performance.
+
+### Prepare the dataset
+Before getting started, we need to prepare a dataset of randomized tokens for benchmarking:
+
+```bash
+python benchmarks/cpp/prepare_dataset.py \
+  --stdout \
+  --tokenizer openai/gpt-oss-120b \
+  token-norm-dist \
+  --input-mean 1024 \
+  --output-mean 2048 \
+  --input-stdev 0 \
+  --output-stdev 0 \
+  --num-requests 20000 > gpt-oss-120b-1k2k.txt
+```
 
 ### Low-latency Use-Case
 
 #### Creating the Extra Options Configuration
 
-To run a server for low-latency workloads, create a YAML configuration file, `low_latency.yaml`, as follows:
+Create a YAML configuration file, `low_latency.yaml`, as follows:
 
 ```yaml
 cat <<EOF > low_latency.yaml
 enable_attention_dp: false
-enable_mixed_sampler: true
+use_torch_sampler: true
 cuda_graph_config:
     max_batch_size: 8
     enable_padding: true
@@ -74,7 +99,53 @@ moe_config:
 EOF
 ```
 
+Key takeaways:
+- `enable_attention_dp` is set to `false` to use TP instead of DP for attention.
+- `use_torch_sampler` is set to `true` to use the PyTorch sampler. Currently the default choice is the `TRTLLM` sampler but it now has some performance issues, so we force it to use the PyTorch sampler instead.
+- `cuda_graph_config.max_batch_size` is set to a small value.
+- `cuda_graph_config.enable_padding` is set to `true` to enable CUDA graph padding.
+- `moe_config.backend` is set to `TRTLLM` to use the TRTLLM-gen MoE kernels which are optimized for low concurrency.
+
+
 > Note: If you are using NVIDIA H200 GPUs it is highly recommended to set the `moe_config.backend` to TRITON to use the OpenAI Triton MoE kernel. See the section [(H200 Only) Using OpenAI Triton Kernels for MoE](#h200-only-using-openai-triton-kernels-for-moe) for more details.
+
+
+#### Run the benchmark
+```bash
+    trtllm-bench \
+        --model openai/gpt-oss-120b \
+        --model_path ${local_model_path} \
+        throughput \
+        --backend pytorch \
+        --tp ${tp_size} \
+        --ep ${ep_size} \
+        --extra_llm_api_options ${path_config} \
+        --dataset ${path_data} \
+        --max_batch_size ${max_batch_size} \
+        --max_num_tokens ${max_num_tokens} \
+        --num_requests ${num_requests} \
+        --kv_cache_free_gpu_mem_fraction ${kv_cache_free_gpu_mem_fraction} \
+        --streaming \
+        --concurrency ${concurrency} \
+        --warmup 0 \
+        --report_json ${folder_out}/${LOG_NAME}.json \
+         2>&1 | tee ${folder_out}/${LOG_NAME}.txt
+```
+
+
+
+
+
+
+### Performance Tuning
+
+The configuration provided is optimized for 8xB200 GPUs, but you can adjust
+several parameters for your specific workload:
+
+- `max_batch_size`: Controls how many requests can be batched together
+- `max_draft_len`: The number of tokens Eagle can speculate ahead
+- `kv_cache_free_gpu_memory_fraction`: Controls memory allocation for the KV cache
+
 
 
 #### Launching TensorRT-LLM Serve
@@ -128,8 +199,6 @@ trtllm-serve  openai/gpt-oss-120b \
   --kv_cache_free_gpu_memory_fraction 0.75
 ```
 </details>
-
-
 
 
 ### Max-Throughput Use-Case
@@ -343,20 +412,12 @@ requests. You can adjust parameters like `max_tokens`, `temperature`, and
 others according to your needs.
 
 
+
 ## Troubleshooting Tips
 
-- If you encounter CUDA out-of-memory errors, try reducing `max_batch_size`, `max_seq_len`, or `--kv_cache_free_gpu_memory_fraction`
+- If you encounter CUDA out-of-memory errors, try reducing `max_batch_size`, `max_num_tokens`, or `kv_cache_free_gpu_memory_fraction`
+- Add `print_iter_log: true` to extra_llm_api_options to inspect the per-iteration log.
 - Ensure your model checkpoints are compatible with the expected format
 - For performance issues, check GPU utilization with `nvidia-smi` while the server is running
 - If the container fails to start, verify that the NVIDIA Container Toolkit is properly installed
 - For connection issues, make sure port 8000 is not being used by another application
-
-
-## Performance Tuning
-
-The configuration provided is optimized for 8xB200 GPUs, but you can adjust
-several parameters for your specific workload:
-
-- `max_batch_size`: Controls how many requests can be batched together
-- `max_draft_len`: The number of tokens Eagle can speculate ahead
-- `kv_cache_free_gpu_memory_fraction`: Controls memory allocation for the KV cache
