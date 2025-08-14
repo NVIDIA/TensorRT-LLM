@@ -223,11 +223,10 @@ public:
     // Real data should not use these values.
     static constexpr uint32_t INVALID_VALUE = 1U << 31U;
     static constexpr uint32_t FIXED_VALUE = 0U; // if raw data has INVALID_VALUE, fix it to FIXED_VALUE
-
-    __device__ __forceinline__ LamportProto() {}
+    static constexpr uint32_t INITIALIZED_VALUE = LamportProto::INVALID_VALUE;
 
     template <bool USE_FINISH>
-    static __device__ __forceinline__ int checkDataReceivedInShm(uint8_t* sharedMemoryBase, int64_t step,
+    static __device__ __forceinline__ int checkDataReceivedInShm(uint8_t* sharedMemoryBase, uint64_t step,
         int countIn128Bytes, int fifoEntry128ByteIndexBase, int loaded128ByteCount, int warpId, int laneId)
     {
         // return value should be how many package already been received.
@@ -277,7 +276,7 @@ public:
         return totalValidCount;
     }
 
-    static __device__ __forceinline__ void protoPack(uint8_t* sharedMemoryBase, int64_t step, int countIn128Bytes,
+    static __device__ __forceinline__ void protoPack(uint8_t* sharedMemoryBase, uint64_t step, int countIn128Bytes,
         int fifoEntry128ByteIndexBase, int warpId, int laneId)
     {
         int* aligned128BytesShm = reinterpret_cast<int*>(sharedMemoryBase);
@@ -301,14 +300,14 @@ public:
         __syncwarp();
     }
 
-    static __device__ __forceinline__ void protoUnpack(uint8_t* sharedMemoryBase, int64_t step, int countIn128Bytes,
+    static __device__ __forceinline__ void protoUnpack(uint8_t* sharedMemoryBase, uint64_t step, int countIn128Bytes,
         int fifoEntry128ByteIndexBase, int loaded128ByteCount, int warpId, int laneId)
     {
         // Lamport don't need unpack
     }
 
     static __device__ __forceinline__ void rearm(
-        uint32_t* u32FifoPtr, int64_t step, int countIn128Bytes, int fifoEntry128ByteIndexBase, int warpId, int laneId)
+        uint32_t* u32FifoPtr, uint64_t step, int countIn128Bytes, int fifoEntry128ByteIndexBase, int warpId, int laneId)
     {
         constexpr int kUint32CountPer128Byte = 128 / sizeof(uint32_t);
         for (int i = laneId; i < countIn128Bytes; i += WARP_SIZE)
@@ -319,14 +318,167 @@ public:
         __syncwarp();
     }
 
-    static __device__ __host__ __forceinline__ int computeProtoTransfer128ByteCount(int compact128ByteCountBeforeProto)
+    static __device__ __host__ __forceinline__ int computeProtoTransfer128ByteAlignedSize(
+        int compact128ByteSizeBeforeProto)
     {
         // Lamport is fully in place
-        return compact128ByteCountBeforeProto;
+        return compact128ByteSizeBeforeProto;
     }
 };
 
-using FusedMoeProto = LamportProto;
+class Ll128Proto
+{
+public:
+    static constexpr uint32_t INITIALIZED_VALUE = 0xFFFFFFFFU;
+
+    template <bool USE_FINISH>
+    static __device__ __forceinline__ int checkDataReceivedInShm(uint8_t* sharedMemoryBase, uint64_t step,
+        int countIn128Bytes, int fifoEntry128ByteIndexBase, int loaded128ByteCount, int warpId, int laneId)
+    {
+        // return value should be how many package already been received.
+        // 0 means no data received, -1 means has received finish package(should be the very first 128 Byte).
+        uint64_t* aligned128BytesShm = reinterpret_cast<uint64_t*>(sharedMemoryBase);
+        int totalValidCount = 0;
+        for (int idxBase = loaded128ByteCount; idxBase < countIn128Bytes; idxBase += WARP_SIZE)
+        {
+            int idx = idxBase + laneId;
+            bool valid = false;
+            bool finish = false;
+            if (idx < countIn128Bytes)
+            {
+                int indexInFifoEntry = fifoEntry128ByteIndexBase + idx;
+                uint64_t value = aligned128BytesShm[idx * MoeCommFieldInfo::UINT64_PER_128B_BLOCK
+                    + indexInFifoEntry % MoeCommFieldInfo::UINT64_PER_128B_BLOCK];
+                if (USE_FINISH)
+                {
+                    finish = (value == (step & (1ULL << 63ULL)));
+                    valid = (value == step) || finish;
+                }
+                else
+                {
+                    valid = (value == step);
+                }
+            }
+            __syncwarp();
+            unsigned validMask = __ballot_sync(WARP_MASK, valid);
+            // here we check valid in order, if previous valid is not true, we ignore the current valid.
+            int validCount = (validMask == WARP_MASK) ? WARP_SIZE : (__ffs(~validMask) - 1);
+            if (USE_FINISH)
+            {
+                unsigned finishedMask = __ballot_sync(WARP_MASK, finish);
+                // finish should be the very first 128 Byte.
+                if (finishedMask & 0x1)
+                {
+                    return -1;
+                }
+            }
+            totalValidCount += validCount;
+
+            if (validCount != WARP_SIZE)
+            {
+                break;
+            }
+        }
+        return totalValidCount;
+    }
+
+    static __device__ __forceinline__ void protoPack(uint8_t* sharedMemoryBase, uint64_t step, int countIn128Bytes,
+        int fifoEntry128ByteIndexBase, int warpId, int laneId)
+    {
+        uint64_t* aligned128BytesShm = reinterpret_cast<uint64_t*>(sharedMemoryBase);
+        int halfLaneId = laneId % 16;
+        int halfIndex = laneId / 16;
+        int tailOffsetIn128Bytes = countIn128Bytes + halfIndex;
+        // for LL128 15 * 128 Bytes will be packed to 16 * 128 Bytes, each 16 threads is used for one 15 * 128 bytes.
+        for (int idxIn128BytesBase = halfIndex * 15; idxIn128BytesBase < countIn128Bytes; idxIn128BytesBase += 30)
+        {
+            int tailFlagIndexFromFifoEntry = fifoEntry128ByteIndexBase + tailOffsetIn128Bytes;
+            int tailFlagInnerIndex = tailFlagIndexFromFifoEntry % MoeCommFieldInfo::UINT64_PER_128B_BLOCK;
+            int idxIn128Bytes = idxIn128BytesBase + halfLaneId;
+            int idxFromFifoEntry = fifoEntry128ByteIndexBase + idxIn128Bytes;
+            uint64_t tailValue = step;
+            uint64_t tailInnerIndex = (halfLaneId >= tailFlagInnerIndex) ? halfLaneId + 1 : halfLaneId;
+            if (halfLaneId == 15)
+            {
+                tailInnerIndex = tailFlagInnerIndex;
+            }
+            int targetTailIndex = tailOffsetIn128Bytes * MoeCommFieldInfo::UINT64_PER_128B_BLOCK + tailInnerIndex;
+            if (idxIn128Bytes < countIn128Bytes && halfLaneId < 15)
+            {
+                int flagIndex = idxIn128Bytes * MoeCommFieldInfo::UINT64_PER_128B_BLOCK
+                    + idxFromFifoEntry % MoeCommFieldInfo::UINT64_PER_128B_BLOCK;
+                tailValue = aligned128BytesShm[flagIndex];
+                aligned128BytesShm[flagIndex] = step;
+#ifdef DEBUG_PRINT
+                printf(
+                    "[!!protoPack] blockIdx=(%d, %d, %d), warpId=%d, laneId=%d, moving tailValue=%lx from index=%d to "
+                    "targetTailIndex=%d, fifoEntry128ByteIndexBase=%d, countIn128Bytes=%d\n",
+                    blockIdx.x, blockIdx.y, blockIdx.z, warpId, laneId, tailValue, flagIndex, targetTailIndex,
+                    fifoEntry128ByteIndexBase, countIn128Bytes);
+#endif
+            }
+            aligned128BytesShm[targetTailIndex] = tailValue;
+            tailOffsetIn128Bytes += 2;
+        }
+        __syncwarp();
+    }
+
+    static __device__ __forceinline__ void protoUnpack(uint8_t* sharedMemoryBase, uint64_t step, int countIn128Bytes,
+        int fifoEntry128ByteIndexBase, int loaded128ByteCount, int warpId, int laneId)
+    {
+        uint64_t* aligned128BytesShm = reinterpret_cast<uint64_t*>(sharedMemoryBase);
+        int halfLaneId = laneId % 16;
+        int halfIndex = laneId / 16;
+        int tailOffsetIn128Bytes = countIn128Bytes + halfIndex;
+        for (int idxIn128BytesBase = halfIndex * 15; idxIn128BytesBase < countIn128Bytes; idxIn128BytesBase += 30)
+        {
+            int tailFlagIndexFromFifoEntry = fifoEntry128ByteIndexBase + tailOffsetIn128Bytes;
+            int tailFlagInnerIndex = tailFlagIndexFromFifoEntry % MoeCommFieldInfo::UINT64_PER_128B_BLOCK;
+            int idxIn128Bytes = idxIn128BytesBase + halfLaneId;
+            int idxFromFifoEntry = fifoEntry128ByteIndexBase + idxIn128Bytes;
+            uint64_t tailValue = 0;
+            int tailInnerIndex = (halfLaneId >= tailFlagInnerIndex) ? halfLaneId + 1 : halfLaneId;
+            int targetTailIndex = tailOffsetIn128Bytes * MoeCommFieldInfo::UINT64_PER_128B_BLOCK + tailInnerIndex;
+            if (halfLaneId < 15)
+            {
+                tailValue = aligned128BytesShm[targetTailIndex];
+            }
+            if (idxIn128Bytes < countIn128Bytes && halfLaneId < 15)
+            {
+                int flagIndex = idxIn128Bytes * MoeCommFieldInfo::UINT64_PER_128B_BLOCK
+                    + idxFromFifoEntry % MoeCommFieldInfo::UINT64_PER_128B_BLOCK;
+                aligned128BytesShm[flagIndex] = tailValue;
+#ifdef DEBUG_PRINT
+                printf(
+                    "[!!protoUnpack] blockIdx=(%d, %d, %d), warpId=%d, laneId=%d, moving tailValue=%lx from "
+                    "targetTailIndex=%d to index=%d, fifoEntry128ByteIndexBase=%d, countIn128Bytes=%d\n",
+                    blockIdx.x, blockIdx.y, blockIdx.z, warpId, laneId, tailValue, targetTailIndex, flagIndex,
+                    fifoEntry128ByteIndexBase, countIn128Bytes);
+#endif
+            }
+            tailOffsetIn128Bytes += 2;
+        }
+        __syncwarp();
+    }
+
+    static __device__ __forceinline__ void rearm(
+        uint32_t* u32FifoPtr, uint64_t step, int countIn128Bytes, int fifoEntry128ByteIndexBase, int warpId, int laneId)
+    {
+        // LL128 don't need rearm
+    }
+
+    static __device__ __host__ __forceinline__ int computeProtoTransfer128ByteAlignedSize(
+        int compact128ByteSizeBeforeProto)
+    {
+        // each 15 * 128 byte need one tail 128 byte
+        int tail128ByteSize = (compact128ByteSizeBeforeProto + 15 * 128 - 1) / (15 * 128) * 128;
+        return compact128ByteSizeBeforeProto + tail128ByteSize;
+    }
+};
+
+using FusedMoeProto = Ll128Proto;
+
+// using FusedMoeProto = LamportProto;
 
 namespace fused_moe_impl
 {
@@ -645,7 +797,7 @@ __device__ __forceinline__ void s2gAllFields(FusedMoeFieldInfo const& recvFieldI
     cp_async_bulk_commit_group();
 }
 
-template <bool HAS_BASIC_FIELD = true, bool USE_SIMPLE_PROTO = false>
+template <bool HAS_BASIC_FIELD = true>
 class SingleChannelCommunicator
 {
 public:
@@ -724,23 +876,11 @@ public:
     {
         __syncwarp();
         mSenderSideFifoInfo->head = mHead;
-        if (USE_SIMPLE_PROTO)
-        {
-            fence_release_sys();
-            mReceiverSideFifoInfo->head = mHead;
-        }
     }
 
     __device__ __forceinline__ void waitEntryReadable()
     {
-        if (USE_SIMPLE_PROTO)
-        {
-            // only used in Simple Proto
-            while (mTail >= mHead)
-            {
-                mHead = mReceiverSideFifoInfo->head;
-            }
-        }
+        // always readable as long as flag matches.
     }
 
     __device__ __forceinline__ void updateReadEntry()
@@ -924,15 +1064,8 @@ public:
                     needRelease = false;
                 }
                 tensorrt_llm::kernels::fused_moe_impl::smemBarWait(mSmemBar, &phaseParity);
-                if (USE_SIMPLE_PROTO)
-                {
-                    loaded128ByteCount = mSingleTransfer128ByteCount;
-                }
-                else
-                {
-                    loaded128ByteCount += FusedMoeProto::template checkDataReceivedInShm<false>(mShmemBase, mTail,
-                        mSingleTransfer128ByteCount, mFifoEntry128ByteIndexBase, loaded128ByteCount, mWarpId, mLaneId);
-                }
+                loaded128ByteCount += FusedMoeProto::template checkDataReceivedInShm<false>(mShmemBase, mTail,
+                    mSingleTransfer128ByteCount, mFifoEntry128ByteIndexBase, loaded128ByteCount, mWarpId, mLaneId);
             }
 
 #ifdef DEBUG_PRINT
@@ -946,9 +1079,9 @@ public:
             __syncwarp();
 #endif
 
-            tensorrt_llm::kernels::fused_moe_impl::unpackAllFields(mFieldInfo, tokenIndex, mShmemBase, mLaneId);
             FusedMoeProto::protoUnpack(mShmemBase, mTail, mSingleCompactData128ByteCount, mFifoEntry128ByteIndexBase,
                 loaded128ByteCount, mWarpId, mLaneId);
+            tensorrt_llm::kernels::fused_moe_impl::unpackAllFields(mFieldInfo, tokenIndex, mShmemBase, mLaneId);
             tensorrt_llm::kernels::fused_moe_impl::s2gAllFields<HAS_BASIC_FIELD>(
                 mFieldInfo, mExpertParallelInfo, tokenIndex, mShmemBase, mWarpId, mLaneId);
             tensorrt_llm::kernels::fused_moe_impl::waitS2GBulkRead();
@@ -1047,15 +1180,15 @@ __global__ void moeAllToAllKernel(FusedMoeCommKernelParam params, FusedMoeWorksp
         int singleShmSize = params.sendCommMeta.getSingleShmSize();
         if (hasBasicFields)
         {
-            SingleChannelCommunicator<true, false> comm(params.sendFieldInfo, params.expertParallelInfo,
-                params.sendCommMeta, workspace, params.worldInfo, pairInfo, allWarpSmemBar + group,
+            SingleChannelCommunicator<true> comm(params.sendFieldInfo, params.expertParallelInfo, params.sendCommMeta,
+                workspace, params.worldInfo, pairInfo, allWarpSmemBar + group,
                 reinterpret_cast<uint8_t*>(allWarpShm) + singleShmSize * group);
             comm.doSend(tokenCount, groupStartPtr);
         }
         else
         {
-            SingleChannelCommunicator<false, false> comm(params.sendFieldInfo, params.expertParallelInfo,
-                params.sendCommMeta, workspace, params.worldInfo, pairInfo, allWarpSmemBar + group,
+            SingleChannelCommunicator<false> comm(params.sendFieldInfo, params.expertParallelInfo, params.sendCommMeta,
+                workspace, params.worldInfo, pairInfo, allWarpSmemBar + group,
                 reinterpret_cast<uint8_t*>(allWarpShm) + singleShmSize * group);
             comm.doSend(tokenCount, groupStartPtr);
         }
@@ -1065,15 +1198,15 @@ __global__ void moeAllToAllKernel(FusedMoeCommKernelParam params, FusedMoeWorksp
         int singleShmSize = params.recvCommMeta.getSingleShmSize();
         if (hasBasicFields)
         {
-            SingleChannelCommunicator<true, false> comm(params.recvFieldInfo, params.expertParallelInfo,
-                params.recvCommMeta, workspace, params.worldInfo, pairInfo, allWarpSmemBar + group,
+            SingleChannelCommunicator<true> comm(params.recvFieldInfo, params.expertParallelInfo, params.recvCommMeta,
+                workspace, params.worldInfo, pairInfo, allWarpSmemBar + group,
                 reinterpret_cast<uint8_t*>(allWarpShm) + singleShmSize * group);
             comm.doReceive(tokenCount, groupStartPtr);
         }
         else
         {
-            SingleChannelCommunicator<false, false> comm(params.recvFieldInfo, params.expertParallelInfo,
-                params.recvCommMeta, workspace, params.worldInfo, pairInfo, allWarpSmemBar + group,
+            SingleChannelCommunicator<false> comm(params.recvFieldInfo, params.expertParallelInfo, params.recvCommMeta,
+                workspace, params.worldInfo, pairInfo, allWarpSmemBar + group,
                 reinterpret_cast<uint8_t*>(allWarpShm) + singleShmSize * group);
             comm.doReceive(tokenCount, groupStartPtr);
         }
@@ -1100,7 +1233,7 @@ void FusedMoeFieldInfo::fillMetaInfo(
     singleCommMeta->singleCompactAlignedSize = computeSingleCompactSize(topK, hasScales, hasBasicFields);
     singleCommMeta->singleUncompactAlignedSize = computeSingleUncompactSize(topK, hasScales, hasBasicFields);
     singleCommMeta->singleTransferAlignedSize
-        = FusedMoeProto::computeProtoTransfer128ByteCount(singleCommMeta->singleCompactAlignedSize);
+        = FusedMoeProto::computeProtoTransfer128ByteAlignedSize(singleCommMeta->singleCompactAlignedSize);
 }
 
 void FusedMoeFieldInfo::fillFieldPlacementInfo(int topK, bool hasBasicFields)
@@ -1135,8 +1268,8 @@ void FusedMoeWorkspace::initializeLocalWorkspace(FusedMoeWorldInfo const& worldI
     size_t senderSideInfoSize = sizeof(SenderSideFifoInfo) * epSize * channelCount;
     size_t receiverSideInfoSize = sizeof(ReceiverSideFifoInfo) * epSize * channelCount;
     uint64_t* localWorkspacePtr = workspacePtr + epRank * rankStrideInU64;
-    TLLM_CU_CHECK(cuMemsetD32(
-        reinterpret_cast<CUdeviceptr>(localWorkspacePtr), LamportProto::INVALID_VALUE, fifoSize / sizeof(uint32_t)));
+    TLLM_CU_CHECK(cuMemsetD32(reinterpret_cast<CUdeviceptr>(localWorkspacePtr), FusedMoeProto::INITIALIZED_VALUE,
+        fifoSize / sizeof(uint32_t)));
     TLLM_CUDA_CHECK(cudaMemset(
         reinterpret_cast<uint8_t*>(localWorkspacePtr) + fifoSize, 0, senderSideInfoSize + receiverSideInfoSize));
 }
@@ -1237,7 +1370,7 @@ __global__ void g2sKernel(FusedMoeFieldInfo allFieldInfo, MoeExpertParallelInfo 
     }
 #endif
 
-    int singleShmSize = singleCommMeta.getSingleShmSize();
+    int singleShmSize = singleCommMeta.singleUncompactAlignedSize;
 
     tensorrt_llm::kernels::fused_moe_impl::initSmemBar(&allWarpSmemBar[warpId], laneId);
     uint32_t phaseParity = 0;
@@ -1299,7 +1432,7 @@ __global__ void s2gKernel(FusedMoeFieldInfo recvFieldInfo, MoeExpertParallelInfo
     {
         return;
     }
-    int singleShmSize = singleCommMeta.getSingleShmSize();
+    int singleShmSize = singleCommMeta.singleUncompactAlignedSize;
     uint8_t* sharedMemoryBase = reinterpret_cast<uint8_t*>(allWarpShm) + singleShmSize * warpId;
 
     for (int offset = laneId; offset < singleShmSize / sizeof(int); offset += WARP_SIZE)
@@ -1453,7 +1586,7 @@ void launchLoopback(FusedMoeFieldInfo const& sendFieldInfo, FusedMoeFieldInfo co
     TLLM_CUDA_CHECK(cudaGetLastError());
 }
 
-template <bool HAS_BASIC_FIELD = true, bool USE_SIMPLE_PROTO = false>
+template <bool HAS_BASIC_FIELD = true>
 __global__ void localFifoSendRecvKernel(FusedMoeFieldInfo sendFieldInfo, FusedMoeFieldInfo recvFieldInfo,
     MoeExpertParallelInfo expertParallelInfo, MoeSingleCommMeta sendCommMeta, MoeSingleCommMeta recvCommMeta,
     FusedMoeWorkspace fusedMoeWorkspace, int* sendIndexMapping, int* recvIndexMapping, int tokenCount)
@@ -1476,17 +1609,15 @@ __global__ void localFifoSendRecvKernel(FusedMoeFieldInfo sendFieldInfo, FusedMo
 
     if (blockIdx.y == 0)
     {
-        tensorrt_llm::kernels::fused_moe_impl::SingleChannelCommunicator<HAS_BASIC_FIELD, USE_SIMPLE_PROTO> senderComm(
-            sendFieldInfo, expertParallelInfo, sendCommMeta, fusedMoeWorkspace, worldInfo, pairInfo,
-            &allWarpSmemBar[warpId],
+        tensorrt_llm::kernels::fused_moe_impl::SingleChannelCommunicator<HAS_BASIC_FIELD> senderComm(sendFieldInfo,
+            expertParallelInfo, sendCommMeta, fusedMoeWorkspace, worldInfo, pairInfo, &allWarpSmemBar[warpId],
             reinterpret_cast<uint8_t*>(&allWarpShm[0]) + warpId * sendCommMeta.getSingleShmSize());
         senderComm.doSend(tokenCount, sendIndexMapping);
     }
     else
     {
-        tensorrt_llm::kernels::fused_moe_impl::SingleChannelCommunicator<HAS_BASIC_FIELD, USE_SIMPLE_PROTO> recverComm(
-            recvFieldInfo, expertParallelInfo, recvCommMeta, fusedMoeWorkspace, worldInfo, pairInfo,
-            &allWarpSmemBar[warpId],
+        tensorrt_llm::kernels::fused_moe_impl::SingleChannelCommunicator<HAS_BASIC_FIELD> recverComm(recvFieldInfo,
+            expertParallelInfo, recvCommMeta, fusedMoeWorkspace, worldInfo, pairInfo, &allWarpSmemBar[warpId],
             reinterpret_cast<uint8_t*>(&allWarpShm[0]) + warpId * recvCommMeta.getSingleShmSize());
         recverComm.doReceive(tokenCount, recvIndexMapping);
     }
@@ -1495,7 +1626,7 @@ __global__ void localFifoSendRecvKernel(FusedMoeFieldInfo sendFieldInfo, FusedMo
 void launchLocalFifoSendRecv(FusedMoeFieldInfo const& sendFieldInfo, FusedMoeFieldInfo const& recvFieldInfo,
     MoeExpertParallelInfo const& expertParallelInfo, int* sendIndexMapping, int* recvIndexMapping,
     FusedMoeWorkspace fusedMoeWorkspace, int tokenCount, int warpsPerBlock, int blockChannelCount, bool hasBasicFields,
-    bool useSimpleProto, cudaStream_t stream)
+    cudaStream_t stream)
 {
     MoeSingleCommMeta sendCommMeta, recvCommMeta;
     sendFieldInfo.fillMetaInfo(
@@ -1512,25 +1643,11 @@ void launchLocalFifoSendRecv(FusedMoeFieldInfo const& sendFieldInfo, FusedMoeFie
     auto* kernelFn = localFifoSendRecvKernel<>;
     if (hasBasicFields)
     {
-        if (useSimpleProto)
-        {
-            kernelFn = localFifoSendRecvKernel<true, true>;
-        }
-        else
-        {
-            kernelFn = localFifoSendRecvKernel<true, false>;
-        }
+        kernelFn = localFifoSendRecvKernel<true>;
     }
     else
     {
-        if (useSimpleProto)
-        {
-            kernelFn = localFifoSendRecvKernel<false, true>;
-        }
-        else
-        {
-            kernelFn = localFifoSendRecvKernel<false, false>;
-        }
+        kernelFn = localFifoSendRecvKernel<false>;
     }
     TLLM_CUDA_CHECK(
         cudaFuncSetAttribute(kernelFn, cudaFuncAttributeMaxDynamicSharedMemorySize, warpShmSize * warpsPerBlock));

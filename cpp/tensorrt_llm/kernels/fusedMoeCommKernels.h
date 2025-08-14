@@ -82,6 +82,7 @@ struct MoeCommFieldInfo
     // Constants for memory alignment and access
     static constexpr int BYTES_PER_128B_BLOCK = 128;
     static constexpr int INTS_PER_128B_BLOCK = BYTES_PER_128B_BLOCK / sizeof(int);
+    static constexpr int UINT64_PER_128B_BLOCK = BYTES_PER_128B_BLOCK / sizeof(uint64_t);
     static constexpr int BYTES_PER_16B_BLOCK = 16;
     // Will pad one 16 byte for each unaligned field, then head and tail 16 byte might not be aligned
 
@@ -543,7 +544,7 @@ void launchLoopback(FusedMoeFieldInfo const& sendFieldInfo, FusedMoeFieldInfo co
 void launchLocalFifoSendRecv(FusedMoeFieldInfo const& sendFieldInfo, FusedMoeFieldInfo const& recvFieldInfo,
     MoeExpertParallelInfo const& expertParallelInfo, int* sendIndexMapping, int* recvIndexMapping,
     FusedMoeWorkspace fusedMoeWorkspace, int tokenCount, int warpsPerBlock, int blockChannelCount, bool hasBasicFields,
-    bool useSimpleProto, cudaStream_t stream);
+    cudaStream_t stream);
 
 } // namespace fused_moe_comm_tests
 

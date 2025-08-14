@@ -982,7 +982,7 @@ protected:
     void runLocalFifoSendRecvTest(int topK, bool hasScales, bool hasBasicFields, int fieldCount,
         std::vector<size_t> const& elementSizes, std::vector<uint16_t> const& vectorSizes,
         std::vector<int> const& sendIndexMappingVec, std::vector<int> const& recvIndexMappingVec, int tokenCount = 4,
-        int warpsPerBlock = 2, int blockChannelCount = 1, bool useSimpleProto = false)
+        int warpsPerBlock = 2, int blockChannelCount = 1)
     {
         // Setup expert parallel info
         MoeExpertParallelInfo expertParallelInfo;
@@ -1103,7 +1103,7 @@ protected:
         // Launch FIFO send/recv kernel
         fused_moe_comm_tests::launchLocalFifoSendRecv(sendFieldInfo, recvFieldInfo, expertParallelInfo,
             deviceSendIndexMapping, deviceRecvIndexMapping, fusedMoeWorkspace, tokenCount, warpsPerBlock,
-            blockChannelCount, hasBasicFields, useSimpleProto, stream);
+            blockChannelCount, hasBasicFields, stream);
 
         TLLM_CUDA_CHECK(cudaStreamSynchronize(stream));
 
@@ -1290,216 +1290,116 @@ private:
     }
 };
 
-// Tests for Local FIFO Send/Recv functionality with Simple Protocol
-TEST_F(FusedMoeCommLocalFifoSendRecvTest, BasicFifoSendRecvSimpleProtocol)
-{
-    std::vector<int> sendMapping = {0, 1, 2, 3}; // Identity mapping for send
-    std::vector<int> recvMapping = {0, 1, 2, 3}; // Identity mapping for recv
-    runLocalFifoSendRecvTest(2, false, true, 1, {4}, {64}, sendMapping, recvMapping, 4, 1, 1, true); // Simple protocol
-}
-
-TEST_F(FusedMoeCommLocalFifoSendRecvTest, BasicFifoSendRecvWithScalesSimpleProtocol)
-{
-    std::vector<int> sendMapping = {0, 1, 2, 3};                               // Identity mapping for send
-    std::vector<int> recvMapping = {1, 0, 3, 2};                               // Different reordering for recv
-    runLocalFifoSendRecvTest(
-        4, true, true, 1, {4}, {32}, sendMapping, recvMapping, 4, 2, 1, true); // With scales, simple protocol
-}
-
-TEST_F(FusedMoeCommLocalFifoSendRecvTest, FifoSendRecvWithReorderingSimpleProtocol)
-{
-    std::vector<int> sendMapping = {3, 0, 2, 1}; // Send reorder mapping
-    std::vector<int> recvMapping = {1, 2, 0, 3}; // Different recv mapping
-    runLocalFifoSendRecvTest(2, true, true, 2, {4, 8}, {32, 64}, sendMapping, recvMapping, 256, 2, 2, true);
-}
-
-TEST_F(FusedMoeCommLocalFifoSendRecvTest, FifoSendRecvMultipleFieldsSimpleProtocol)
-{
-    std::vector<int> sendMapping = {1, 3, 0, 2}; // Complex send reordering
-    std::vector<int> recvMapping = {2, 0, 3, 1}; // Different complex recv mapping
-    runLocalFifoSendRecvTest(2, true, true, 3, {1, 2, 4}, {16, 32, 64}, sendMapping, recvMapping, 256, 2, 2, true);
-}
-
-TEST_F(FusedMoeCommLocalFifoSendRecvTest, FifoSendRecvLargeTopKSimpleProtocol)
-{
-    std::vector<int> sendMapping = {2, 0, 3, 1}; // Send reorder mapping
-    std::vector<int> recvMapping = {3, 1, 0, 2}; // Different recv mapping
-    runLocalFifoSendRecvTest(8, true, true, 2, {4, 8}, {128, 256}, sendMapping, recvMapping, 512, 3, 2, true);
-}
-
 // Tests for Local FIFO Send/Recv functionality with Packed Protocol
 TEST_F(FusedMoeCommLocalFifoSendRecvTest, BasicFifoSendRecvPackedProtocol)
 {
     std::vector<int> sendMapping = {0, 1, 2, 3}; // Identity mapping for send
     std::vector<int> recvMapping = {2, 3, 0, 1}; // Rotate mapping for recv
-    runLocalFifoSendRecvTest(2, false, true, 1, {4}, {64}, sendMapping, recvMapping, 4, 1, 1, false); // Packed protocol
+    runLocalFifoSendRecvTest(2, false, true, 1, {4}, {64}, sendMapping, recvMapping, 4, 1, 1); // Packed protocol
 }
 
 TEST_F(FusedMoeCommLocalFifoSendRecvTest, BasicFifoSendRecvWithScalesPackedProtocol)
 {
-    std::vector<int> sendMapping = {1, 2, 3, 0};                                // Rotate send mapping
-    std::vector<int> recvMapping = {3, 0, 1, 2};                                // Opposite rotation for recv
+    std::vector<int> sendMapping = {1, 2, 3, 0};                         // Rotate send mapping
+    std::vector<int> recvMapping = {3, 0, 1, 2};                         // Opposite rotation for recv
     runLocalFifoSendRecvTest(
-        4, true, true, 1, {4}, {32}, sendMapping, recvMapping, 4, 2, 1, false); // With scales, Packed protocol
+        4, true, true, 1, {4}, {32}, sendMapping, recvMapping, 4, 2, 1); // With scales, Packed protocol
 }
 
 TEST_F(FusedMoeCommLocalFifoSendRecvTest, FifoSendRecvWithReorderingPackedProtocol)
 {
     std::vector<int> sendMapping = {3, 0, 2, 1}; // Random send reorder
     std::vector<int> recvMapping = {0, 3, 1, 2}; // Different recv reorder
-    runLocalFifoSendRecvTest(2, true, true, 2, {4, 8}, {32, 64}, sendMapping, recvMapping, 256, 2, 2, false);
+    runLocalFifoSendRecvTest(2, true, true, 2, {4, 8}, {32, 64}, sendMapping, recvMapping, 256, 2, 2);
 }
 
 TEST_F(FusedMoeCommLocalFifoSendRecvTest, FifoSendRecvMultipleFieldsPackedProtocol)
 {
     std::vector<int> mapping = {1, 3, 0, 2}; // Complex reordering
-    runLocalFifoSendRecvTest(2, true, true, 3, {1, 2, 4}, {16, 32, 64}, mapping, mapping, 256, 2, 2, false);
+    runLocalFifoSendRecvTest(2, true, true, 3, {1, 2, 4}, {16, 32, 64}, mapping, mapping, 256, 2, 2);
 }
 
 TEST_F(FusedMoeCommLocalFifoSendRecvTest, FifoSendRecvLargeTopKPackedProtocol)
 {
     std::vector<int> mapping = {2, 0, 3, 1}; // Reorder mapping
-    runLocalFifoSendRecvTest(8, true, true, 2, {4, 8}, {128, 256}, mapping, mapping, 512, 3, 2, false);
-}
-
-// Tests without basic fields
-TEST_F(FusedMoeCommLocalFifoSendRecvTest, FifoSendRecvWithoutBasicFieldsSimpleProtocol)
-{
-    std::vector<int> sendMapping = {1, 3, 0, 2}; // Send reorder mapping
-    std::vector<int> recvMapping = {2, 1, 3, 0}; // Different recv reorder
-    runLocalFifoSendRecvTest(0, false, false, 2, {4, 8}, {32, 64}, sendMapping, recvMapping, 256, 2, 2,
-        true);                                   // No basic fields, simple protocol
+    runLocalFifoSendRecvTest(8, true, true, 2, {4, 8}, {128, 256}, mapping, mapping, 512, 3, 2);
 }
 
 TEST_F(FusedMoeCommLocalFifoSendRecvTest, FifoSendRecvWithoutBasicFieldsPackedProtocol)
 {
-    std::vector<int> sendMapping = {1, 3, 0, 2}; // Send reorder mapping
-    std::vector<int> recvMapping = {3, 2, 1, 0}; // Reverse recv mapping
-    runLocalFifoSendRecvTest(0, false, false, 2, {4, 8}, {32, 64}, sendMapping, recvMapping, 256, 2, 2,
-        false);                                  // No basic fields, Packed protocol
+    std::vector<int> sendMapping = {1, 3, 0, 2};                                    // Send reorder mapping
+    std::vector<int> recvMapping = {3, 2, 1, 0};                                    // Reverse recv mapping
+    runLocalFifoSendRecvTest(
+        0, false, false, 2, {4, 8}, {32, 64}, sendMapping, recvMapping, 256, 2, 2); // No basic fields, Packed protocol
 }
 
 // Mixed alignment tests
-TEST_F(FusedMoeCommLocalFifoSendRecvTest, FifoSendRecvMixedAlignmentsSimpleProtocol)
-{
-    std::vector<int> mapping = {1, 0, 3, 2}; // Pair swap
-    runLocalFifoSendRecvTest(3, true, true, 4, {1, 2, 4, 8}, {8, 16, 32, 64}, mapping, mapping, 512, 2, 2, true);
-}
-
 TEST_F(FusedMoeCommLocalFifoSendRecvTest, FifoSendRecvMixedAlignmentsPackedProtocol)
 {
     std::vector<int> mapping = {1, 0, 3, 2}; // Pair swap
-    runLocalFifoSendRecvTest(3, true, true, 4, {1, 2, 4, 8}, {8, 16, 32, 64}, mapping, mapping, 512, 2, 2, false);
+    runLocalFifoSendRecvTest(3, true, true, 4, {1, 2, 4, 8}, {8, 16, 32, 64}, mapping, mapping, 512, 2, 2);
 }
 
 // Edge cases
-TEST_F(FusedMoeCommLocalFifoSendRecvTest, FifoSendRecvEdgeCaseTopKOneSimpleProtocol)
-{
-    std::vector<int> mapping = {1, 0, 3, 2}; // Simple reordering
-    runLocalFifoSendRecvTest(1, false, true, 1, {4}, {16}, mapping, mapping, 128, 2, 1, true);
-}
-
 TEST_F(FusedMoeCommLocalFifoSendRecvTest, FifoSendRecvEdgeCaseTopKOnePackedProtocol)
 {
     std::vector<int> mapping = {1, 0, 3, 2}; // Simple reordering
-    runLocalFifoSendRecvTest(1, false, true, 1, {4}, {16}, mapping, mapping, 128, 2, 1, false);
+    runLocalFifoSendRecvTest(1, false, true, 1, {4}, {16}, mapping, mapping, 128, 2, 1);
 }
 
-TEST_F(FusedMoeCommLocalFifoSendRecvTest, FifoSendRecvEdgeCaseNoExtraFieldsSimpleProtocol)
-{
-    std::vector<int> sendMapping = {3, 1, 0, 2}; // Send random reordering
-    std::vector<int> recvMapping = {1, 3, 2, 0}; // Different recv reordering
-    runLocalFifoSendRecvTest(2, true, true, 0, {}, {}, sendMapping, recvMapping, 256, 2, 2, true); // Only basic fields
-}
-
+// Only basic fields cases
 TEST_F(FusedMoeCommLocalFifoSendRecvTest, FifoSendRecvEdgeCaseNoExtraFieldsPackedProtocol)
 {
-    std::vector<int> mapping = {3, 1, 0, 2};                                                // Random reordering
-    runLocalFifoSendRecvTest(2, true, true, 0, {}, {}, mapping, mapping, 256, 2, 2, false); // Only basic fields
+    std::vector<int> mapping = {3, 1, 0, 2};                                         // Random reordering
+    runLocalFifoSendRecvTest(2, true, true, 0, {}, {}, mapping, mapping, 256, 2, 2); // Only basic fields
 }
 
 // Large scale tests
-TEST_F(FusedMoeCommLocalFifoSendRecvTest, FifoSendRecvLargeTokenCountSimpleProtocol)
-{
-    std::vector<int> sendMapping = {7, 0, 5, 2, 3, 6, 1, 4, 15, 8, 11, 10, 9, 14, 13, 12}; // Complex send mapping
-    std::vector<int> recvMapping
-        = {12, 14, 3, 8, 1, 11, 6, 0, 9, 13, 10, 2, 15, 5, 7, 4}; // Different complex recv mapping
-    runLocalFifoSendRecvTest(
-        4, true, true, 2, {4, 8}, {64, 128}, sendMapping, recvMapping, 1024, 3, 3, true); // Large scale test
-}
-
 TEST_F(FusedMoeCommLocalFifoSendRecvTest, FifoSendRecvLargeTokenCountPackedProtocol)
 {
     std::vector<int> sendMapping = {7, 0, 5, 2, 3, 6, 1, 4, 15, 8, 11, 10, 9, 14, 13, 12}; // Complex send mapping
     std::vector<int> recvMapping = {15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0}; // Reverse recv mapping
     runLocalFifoSendRecvTest(
-        4, true, true, 2, {4, 8}, {64, 128}, sendMapping, recvMapping, 1024, 3, 3, false); // Large scale test
+        4, true, true, 2, {4, 8}, {64, 128}, sendMapping, recvMapping, 1024, 3, 3);        // Large scale test
 }
 
 // Perfect alignment tests
-TEST_F(FusedMoeCommLocalFifoSendRecvTest, FifoSendRecvPerfectAlignmentSimpleProtocol)
-{
-    std::vector<int> sendMapping = {0, 2, 1, 3}; // Partial send reordering
-    std::vector<int> recvMapping = {3, 1, 2, 0}; // Different recv reordering
-    runLocalFifoSendRecvTest(4, false, true, 2, {16}, {32}, sendMapping, recvMapping, 256, 2, 3, true);
-}
-
 TEST_F(FusedMoeCommLocalFifoSendRecvTest, FifoSendRecvPerfectAlignmentPackedProtocol)
 {
     std::vector<int> sendMapping = {2, 0, 3, 1}; // Different send reordering
     std::vector<int> recvMapping = {1, 3, 0, 2}; // Different recv reordering
-    runLocalFifoSendRecvTest(4, false, true, 2, {16}, {32}, sendMapping, recvMapping, 256, 2, 3, false);
+    runLocalFifoSendRecvTest(4, false, true, 2, {16}, {32}, sendMapping, recvMapping, 256, 2, 3);
 }
 
 // Single byte alignment tests
-TEST_F(FusedMoeCommLocalFifoSendRecvTest, FifoSendRecvSingleByteAlignmentSimpleProtocol)
+TEST_F(FusedMoeCommLocalFifoSendRecvTest, FifoSendRecvSmallSingleByteAlignmentPackedProtocol)
 {
     std::vector<int> mapping = {2, 3, 0, 1}; // Cyclic shift
-    runLocalFifoSendRecvTest(2, false, true, 2, {1}, {128}, mapping, mapping, 256, 3, 1, true);
+    runLocalFifoSendRecvTest(2, false, true, 1, {1}, {127}, mapping, mapping, 4, 1, 1);
 }
 
 TEST_F(FusedMoeCommLocalFifoSendRecvTest, FifoSendRecvSingleByteAlignmentPackedProtocol)
 {
     std::vector<int> mapping = {2, 3, 0, 1}; // Cyclic shift
-    runLocalFifoSendRecvTest(2, false, true, 2, {1}, {128}, mapping, mapping, 256, 3, 1, false);
+    runLocalFifoSendRecvTest(2, false, true, 2, {1}, {127}, mapping, mapping, 256, 3, 1);
 }
 
 // Stress tests
-TEST_F(FusedMoeCommLocalFifoSendRecvTest, FifoSendRecvStressTestManyChannelsSimpleProtocol)
-{
-    std::vector<int> mapping = {7, 2, 5, 0, 3, 6, 1, 4}; // Complex mapping
-    runLocalFifoSendRecvTest(4, true, true, 2, {8, 16}, {128, 256}, mapping, mapping, 512, 3, 4, true); // Many channels
-}
-
 TEST_F(FusedMoeCommLocalFifoSendRecvTest, FifoSendRecvStressTestManyChannelsPackedProtocol)
 {
-    std::vector<int> mapping = {7, 2, 5, 0, 3, 6, 1, 4};                            // Complex mapping
-    runLocalFifoSendRecvTest(
-        4, true, true, 2, {8, 16}, {128, 256}, mapping, mapping, 512, 3, 4, false); // Many channels
-}
-
-TEST_F(FusedMoeCommLocalFifoSendRecvTest, FifoSendRecvStressTest2ManyChannelsSimpleProtocol)
-{
-    std::vector<int> mapping = {7, 2, 5, 0, 3, 6, 1, 4};                                        // Complex mapping
-    runLocalFifoSendRecvTest(
-        4, true, true, 2, {2, 4, 8, 16}, {7, 15, 31, 255}, mapping, mapping, 4096, 1, 2, true); // Many channels
+    std::vector<int> mapping = {7, 2, 5, 0, 3, 6, 1, 4};                                          // Complex mapping
+    runLocalFifoSendRecvTest(4, true, true, 2, {8, 16}, {128, 256}, mapping, mapping, 512, 3, 4); // Many channels
 }
 
 TEST_F(FusedMoeCommLocalFifoSendRecvTest, FifoSendRecvStressTest2ManyChannelsPackedProtocol)
 {
-    std::vector<int> mapping = {7, 2, 5, 0, 3, 6, 1, 4};                                         // Complex mapping
+    std::vector<int> mapping = {7, 2, 5, 0, 3, 6, 1, 4};                                  // Complex mapping
     runLocalFifoSendRecvTest(
-        4, true, true, 2, {2, 4, 8, 16}, {7, 15, 31, 255}, mapping, mapping, 4096, 1, 2, false); // Many channels
-}
-
-TEST_F(FusedMoeCommLocalFifoSendRecvTest, FifoSendRecvStressTestManyWarpsSimpleProtocol)
-{
-    std::vector<int> mapping = {1, 0, 3, 2};                                                   // Simple reordering
-    runLocalFifoSendRecvTest(2, false, true, 1, {4}, {64}, mapping, mapping, 256, 4, 2, true); // Many warps per block
+        4, true, true, 2, {2, 4, 8, 16}, {7, 15, 31, 255}, mapping, mapping, 4096, 1, 2); // Many channels
 }
 
 TEST_F(FusedMoeCommLocalFifoSendRecvTest, FifoSendRecvStressTestManyWarpsPackedProtocol)
 {
-    std::vector<int> mapping = {1, 0, 3, 2};                                                    // Simple reordering
-    runLocalFifoSendRecvTest(2, false, true, 1, {4}, {64}, mapping, mapping, 256, 4, 2, false); // Many warps per block
+    std::vector<int> mapping = {1, 0, 3, 2};                                             // Simple reordering
+    runLocalFifoSendRecvTest(2, false, true, 1, {4}, {64}, mapping, mapping, 256, 4, 2); // Many warps per block
 }
