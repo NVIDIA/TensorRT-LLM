@@ -3654,12 +3654,9 @@ def enumerate_hgmma_flash_warpspec_kernels(specs, sm=90, dtype='fp16'):
         if alibi and enable_attn_logit_softcapping:
             continue
         # for normal attention, we only need contiguous kv as input layout when returning softmax.
-        skip_combination = return_softmax and (input_layout
-                                               != InputLayout.CONTIGUOUS_Q_KV)
-        # for context mla, we need paged kv or separate qkv as input layout when returning softmax.
-        skip_mla_combination = return_softmax and (
-            input_layout != InputLayout.Q_PAGED_KV
-            and input_layout != InputLayout.SEPARATE_Q_K_V)
+        skip_combination = return_softmax and input_layout != InputLayout.CONTIGUOUS_Q_KV
+        # for context mla, we need separate qkv as input layout when returning softmax.
+        skip_mla_combination = return_softmax and input_layout != InputLayout.SEPARATE_Q_K_V
         if not skip_combination:
             # only specify
             specs.append(

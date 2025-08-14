@@ -24,7 +24,7 @@ from .interface import (AttentionBackend, AttentionInputType, AttentionMask,
 class TrtllmAttentionWrapper:
     sequence_length: torch.Tensor
     host_past_key_value_lengths: torch.Tensor
-    total_kv_lens: torch.Tensor
+    host_total_kv_lens: torch.Tensor
     context_lengths: torch.Tensor
     host_context_lengths: torch.Tensor
     host_request_types: torch.Tensor
@@ -156,7 +156,7 @@ class TrtllmAttentionWrapper:
         beam_width: int = 1,
         sequence_length: torch.Tensor = ...,
         host_past_key_value_lengths: torch.Tensor = ...,
-        total_kv_lens: torch.Tensor = ...,
+        host_total_kv_lens: torch.Tensor = ...,
         context_lengths: torch.Tensor = ...,
         host_context_lengths: torch.Tensor = ...,
         host_request_types: torch.Tensor = ...,
@@ -202,7 +202,7 @@ class TrtllmAttentionWrapper:
             beam_width (int): Beam width in beam search.
             sequence_length (torch.Tensor): The length of each sequence with shape (batch_size) on GPU.
             host_past_key_value_lengths (torch.Tensor): Same as sequence_length, but on CPU.
-            total_kv_lens (torch.Tensor): The tensor to store the total KV lens for context requests and generation requests, with shape (2) on CPU.
+            host_total_kv_lens (torch.Tensor): The tensor to store the total KV lens for context requests and generation requests, with shape (2) on CPU.
             context_lengths (torch.Tensor): The context-phase sequence length of each request with shape (batch_size) on GPU.
             host_context_lengths (torch.Tensor): Same as context_lengths, but on CPU.
             host_request_types (torch.Tensor): The tensor that indicates whether a request is in context or generation phase, with shape (batch_size) on CPU.
@@ -230,7 +230,7 @@ class TrtllmAttentionWrapper:
         self.beam_width = beam_width
         self.sequence_length = sequence_length
         self.host_past_key_value_lengths = host_past_key_value_lengths
-        self.total_kv_lens = total_kv_lens
+        self.host_total_kv_lens = host_total_kv_lens
         self.context_lengths = context_lengths
         self.host_context_lengths = host_context_lengths
         self.host_request_types = host_request_types
@@ -423,7 +423,7 @@ class TrtllmAttentionWrapper:
             self.workspace,
             self.sequence_length,
             self.host_past_key_value_lengths,
-            self.total_kv_lens,
+            self.host_total_kv_lens,
             self.context_lengths,
             self.host_context_lengths,
             self.host_request_types,
@@ -615,7 +615,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self.kv_lens = torch.empty_like(self.kv_lens_cuda,
                                         device='cpu',
                                         pin_memory=True)
-        self.total_kv_lens = torch.empty(2, device='cpu', dtype=torch.int)
+        self.host_total_kv_lens = torch.empty(2, device='cpu', dtype=torch.int)
         self.host_request_types = torch.empty_like(self.prompt_lens_cpu)
 
         # For debugging, can use it to call the wrapper's plan function
@@ -740,9 +740,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self.kv_lens_cuda[:self.num_seqs].copy_(
             kv_lens[:self.num_seqs].pin_memory(), non_blocking=True)
         # total kv lens for context requests and generation requests, without extra tokens
-        self.total_kv_lens[0] = kv_lens[:self.num_contexts].sum().item()
-        self.total_kv_lens[1] = kv_lens[self.num_contexts:self.num_seqs].sum(
-        ).item()
+        self.host_total_kv_lens[0] = kv_lens[:self.num_contexts].sum().item()
+        self.host_total_kv_lens[1] = kv_lens[self.num_contexts:self.
+                                             num_seqs].sum().item()
         self.host_request_types[:self.num_contexts].fill_(0)
         self.host_request_types[self.num_contexts:self.num_seqs].fill_(1)
 
@@ -1144,7 +1144,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             beam_width=metadata.beam_width,
             sequence_length=metadata.kv_lens_cuda_runtime,
             host_past_key_value_lengths=metadata.kv_lens_runtime,
-            total_kv_lens=metadata.total_kv_lens,
+            host_total_kv_lens=metadata.host_total_kv_lens,
             context_lengths=metadata.prompt_lens_cuda_runtime,
             host_context_lengths=metadata.prompt_lens_cpu_runtime,
             host_request_types=metadata.host_request_types_runtime,

@@ -1723,7 +1723,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         //    - v_ptr: [B, S, H_kv, D_v], which supports variable sequence length
         //    - cu_q_seqlens: the cumulative query sequence lengths, needed for variable sequence length.
         //    - cu_kv_seqlens: the cumulative kv sequence lengths, needed for variable sequence length.
-        //    - total_kv_len: the total kv sequence lengths, needed for variable sequence length.
+        //    - total_kv_len: the total kv sequence length, needed for variable sequence length.
 
         // Construct the fmha params for running kernels.
         MHARunnerParams fmhaParams{};

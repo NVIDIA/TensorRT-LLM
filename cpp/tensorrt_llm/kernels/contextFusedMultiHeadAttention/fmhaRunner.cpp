@@ -487,13 +487,12 @@ void FusedMHARunnerV2::setupLaunchParams(MHARunnerParams runnerParams)
     {
         bool isHopperBF16ContextMLA = (mFixedParams.headSize == mFixedParams.headSizeV + 64) && isSm90
             && mFixedParams.dataType == DATA_TYPE_BF16 && mFixedParams.headSizeV == 128;
-        // TODO: add support for separate QKV input layout
         mLaunchParams.supportReturnSoftmaxStats = (runnerParams.softmaxStatsPtr != nullptr
             && mLaunchParams.flash_attention && mLaunchParams.warp_specialization
             && ((!isHopperBF16ContextMLA
                     && mLaunchParams.attention_input_layout == AttentionInputLayout::Q_CONTIGUOUS_KV)
                 || (isHopperBF16ContextMLA
-                    && (mLaunchParams.attention_input_layout == AttentionInputLayout::Q_PAGED_KV))));
+                    && (mLaunchParams.attention_input_layout == AttentionInputLayout::SEPARATE_Q_K_V))));
     }
 }
 

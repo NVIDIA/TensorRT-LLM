@@ -1201,7 +1201,7 @@ class MLA(nn.Module):
         # use fake cached_cu_seq_len for chunked loop
         origin_kv_lens_cuda_runtime = attn_metadata.kv_lens_cuda_runtime
         origin_kv_lens_runtime = attn_metadata.kv_lens_runtime
-        origin_ctx_total_kv_lens = attn_metadata.total_kv_lens[0]
+        origin_ctx_total_kv_len = attn_metadata.host_total_kv_lens[0]
 
         for loop_idx in range(chunked_loop_num):
             # {b, chunked_unit_size, h, kv_lora_rank + qk_rope_head_dim} zero padded
@@ -1246,7 +1246,7 @@ class MLA(nn.Module):
                 loop_idx]
             attn_metadata.kv_lens_cuda_runtime = attn_metadata.chunked_seq_len[
                 loop_idx]
-            attn_metadata.total_kv_lens[0] = total_ctx_chunked_tokens
+            attn_metadata.host_total_kv_lens[0] = total_ctx_chunked_tokens
 
             out_scale = None
             # do not apply mask for attention within loop
@@ -1293,7 +1293,7 @@ class MLA(nn.Module):
         # copy q_lens to replace kv_lens_runtime
         attn_metadata.kv_lens_runtime = attn_metadata.prompt_lens_cpu_runtime
         attn_metadata.kv_lens_cuda_runtime = attn_metadata.prompt_lens_cuda_runtime
-        attn_metadata.total_kv_lens[
+        attn_metadata.host_total_kv_lens[
             0] = attn_metadata.prompt_lens_cpu_runtime[:attn_metadata.
                                                        num_contexts].sum().item(
                                                        )
@@ -1322,7 +1322,7 @@ class MLA(nn.Module):
         # copy back kv_lens_runtime and kv_lens_cuda_runtime
         attn_metadata.kv_lens_runtime = origin_kv_lens_runtime
         attn_metadata.kv_lens_cuda_runtime = origin_kv_lens_cuda_runtime
-        attn_metadata.total_kv_lens[0] = origin_ctx_total_kv_lens
+        attn_metadata.host_total_kv_lens[0] = origin_ctx_total_kv_len
 
         return attn_output
 
