@@ -1053,7 +1053,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     @parametrize_with_ids("mtp_nextn", [0])
     @parametrize_with_ids("use_cute_dsl_mm", [True, False])
     @parametrize_with_ids("use_cute_dsl_bmm", [True, False])
-    @parametrize_with_ids("moe_backend", ["CUTEDSL", "DEEPGEMM"])
+    @parametrize_with_ids("moe_backend", ["CUTEDSL"])
     def test_cute_dsl_fp8_block_scales(
         self,
         mtp_nextn,

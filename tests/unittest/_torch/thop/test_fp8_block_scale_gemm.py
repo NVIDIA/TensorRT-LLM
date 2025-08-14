@@ -23,6 +23,8 @@ from _torch.helpers import (calc_diff, per_block_cast_to_fp8,
                             per_token_cast_to_fp8_e8m0)
 from utils.util import getSMVersion
 
+from tensorrt_llm._torch.autotuner import autotune
+
 
 @pytest.mark.skipif(
     getSMVersion() != 100,
@@ -124,6 +126,10 @@ def test_cute_dsl_fp8_block_scale_gemm(dtype, m, k, n):
 
     output_expected = a @ b.t()
 
+    with autotune():
+        cute_dsl_output = torch.ops.trtllm.cute_dsl_fp8_gemm_blackwell(
+            act_a_fp8, act_b_fp8, act_a_sf, act_b_sf)
+
     # test Cute DSL kernel
     cute_dsl_output = torch.ops.trtllm.cute_dsl_fp8_gemm_blackwell(
         act_a_fp8, act_b_fp8, act_a_sf, act_b_sf)
@@ -224,6 +230,14 @@ def test_cute_dsl_fp8_block_scale_bmm(dtype, m, k, n, num_groups):
     output = torch.empty((num_groups, m, n),
                          device='cuda',
                          dtype=torch.bfloat16)
+    # tune
+    with autotune():
+        torch.ops.trtllm.cute_dsl_fp8_bmm_blackwell(a_fp8, b_fp8, a_scales,
+                                                    b_scales, output)
+    # from tensorrt_llm._torch.autotuner import AutoTuner
+    # for k, v in AutoTuner.get().profiling_cache.items():
+    #     print(f"Autotuner profiling cache: {k} = {v}")
+    # run the tuned kernel
     torch.ops.trtllm.cute_dsl_fp8_bmm_blackwell(a_fp8, b_fp8, a_scales,
                                                 b_scales, output)
     diff = calc_diff(output, output_expected)
