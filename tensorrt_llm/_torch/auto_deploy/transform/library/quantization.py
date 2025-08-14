@@ -87,8 +87,12 @@ def _insert_quantized_bmm(
     node: Node,
     quantization_impl: QuantizationImpl,
     is_quantized_graph: bool = False,
-):
-    """Replaces the bmm node with a new quantized bmm node."""
+) -> bool:
+    """Replace a bmm op with its quantized equivalent and wire scales/state_dict hooks.
+
+    Returns:
+        True if quantization was applied; False if skipped (e.g., unknown shape).
+    """
     weight_node = node.args[1]
 
     # Weight is a parameter
@@ -140,7 +144,7 @@ def _insert_quantized_bmm(
 
     else:
         # If we can't determine the shape, skip quantization
-        return
+        return False
 
     # Common logic for both parameter and dynamic tensor cases
     # Register scales in the target module
@@ -163,16 +167,12 @@ def _insert_quantized_bmm(
     # Update node arguments and kwargs
     scale_values = [scales[scale_name] for scale_name in quantization_impl.scale_names()]
     node.args = (*node.args, *scale_values)
+    return True
 
 
-@TransformRegistry.register("quantize_from_config")
-class QuantizationFromConfig(BaseTransform):
-    """
-    Quantize linear and BMM ops using a quantization config.
-
-    Replaces eligible ops with quantized equivalents based on the quantization algorithm
-    and exclude patterns defined in the config.
-    """
+@TransformRegistry.register("quantize_linear_from_config")
+class LinearQuantizationFromConfig(BaseTransform):
+    """Quantize eligible linear ops per quant config (algo + exclude patterns)."""
 
     def _apply(
         self,
@@ -182,38 +182,69 @@ class QuantizationFromConfig(BaseTransform):
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
         quant_config = factory.get_quant_config()
-        if not quant_config:
+        if not quant_config or not quant_config.get("quant_algo"):
             return gm, TransformInfo(
                 skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
             )
-        quant_algo = quant_config.get("quant_algo", None)
-        excluded_patterns = quant_config.get("exclude_modules", [])
-        if not quant_algo:
-            return gm, TransformInfo(
-                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
-            )
+
+        quant_algo = quant_config["quant_algo"]
+        excluded = quant_config.get("exclude_modules", [])
 
         num_matches = 0
+        impl = QuantizationImpl.create(quant_algo, is_bmm=False)
 
         for n in gm.graph.nodes:
-            if should_skip_quantization(n, excluded_patterns):
+            # Only consider linear ops; skip if excluded
+            if not is_linear_op(n, include_quantization=False):
+                continue
+            if should_skip_quantization(n, excluded):
                 continue
 
-            if is_linear_op(n, include_quantization=False):
-                impl = QuantizationImpl.create(quant_algo, is_bmm=False)
-                _insert_quantized_linear(gm, n, impl, False)
-                num_matches += 1
+            _insert_quantized_linear(gm, n, impl, is_quantized_graph=False)
+            num_matches += 1
 
-            # TODO: Make _insert_quantized_bmm return a bool and increment only on success
-            elif is_bmm_op(n):
-                impl = QuantizationImpl.create(quant_algo, is_bmm=True)
-                _insert_quantized_bmm(gm, n, impl, False)
+        info = TransformInfo(
+            skipped=False, num_matches=num_matches, is_clean=False, has_valid_shapes=True
+        )
+        return gm, info
+
+
+@TransformRegistry.register("quantize_bmm_from_config")
+class BMMQuantizationFromConfig(BaseTransform):
+    """Quantize eligible BMM ops per quant config (algo + exclude patterns)."""
+
+    def _apply(
+        self,
+        gm: GraphModule,
+        cm: CachedSequenceInterface,
+        factory: ModelFactory,
+        shared_config: SharedConfig,
+    ) -> Tuple[GraphModule, TransformInfo]:
+        quant_config = factory.get_quant_config()
+        if not quant_config or not quant_config.get("quant_algo"):
+            return gm, TransformInfo(
+                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+            )
+
+        quant_algo = quant_config["quant_algo"]
+        excluded = quant_config.get("exclude_modules", [])
+
+        num_matches = 0
+        impl = QuantizationImpl.create(quant_algo, is_bmm=True)
+
+        for n in gm.graph.nodes:
+            if not is_bmm_op(n):
+                continue
+            # Reuse common exclusion rule (supports Node or param-name string)
+            if should_skip_quantization(n, excluded):
+                continue
+
+            if _insert_quantized_bmm(gm, n, impl, is_quantized_graph=False):
                 num_matches += 1
 
         info = TransformInfo(
             skipped=False, num_matches=num_matches, is_clean=False, has_valid_shapes=True
         )
-
         return gm, info
 
 
