@@ -1355,6 +1355,10 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                 chmod 600 ~/.ssh/authorized_keys
             """
 
+            // Write env variables to a file
+            sh "env | sort | sed 's/^/export /' > debug_env.sh"
+            sh "cat debug_env.sh"
+
             // The portConfig file is in the VM
             def portConfigFilePath = "/root/.ssh/ports_config.txt"
 
