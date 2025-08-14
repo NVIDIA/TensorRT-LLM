@@ -629,7 +629,7 @@ def test_trtllm_bench_invalid_token_pytorch(llm_root, llm_venv, model_name,
             stdout = f.read()
 
     # Check that error is reported correctly
-    assert "Error during benchmarking: Requests failed: Token ID out of range (1 requests)" in stdout
+    assert "Requests failed: Token ID out of range (1 requests)" in stdout
 
 
 def trtllm_bench_prolog(
