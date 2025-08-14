@@ -2,8 +2,9 @@ from typing import Generic
 
 from ..model_config import ModelConfig
 from ..utils import model_extra_attrs
-from .modeling_utils import (MODEL_CLASS_MAPPING, DecoderModelForCausalLM,
-                             TConfig, TModel)
+from .modeling_utils import (MODEL_CLASS_MAPPING,
+                             MODEL_CLASS_VISION_ENCODER_MAPPING,
+                             DecoderModelForCausalLM, TConfig, TModel)
 
 
 class AutoModelForCausalLM(Generic[TModel, TConfig]):
@@ -13,6 +14,16 @@ class AutoModelForCausalLM(Generic[TModel, TConfig]):
         config: ModelConfig[TConfig],
     ) -> DecoderModelForCausalLM[TModel, TConfig]:
         model_arch = config.pretrained_config.architectures[0]
+        if config.mm_encoder_only:
+            vision_encoder_info = MODEL_CLASS_VISION_ENCODER_MAPPING.get(
+                model_arch)
+            if vision_encoder_info is None:
+                raise ValueError(
+                    f"Unknown architecture for AutoModelForMultimodalEncoder: {model_arch}"
+                )
+            vision_encoder_cls, vlm_base_model = vision_encoder_info
+            return vision_encoder_cls(config, vlm_base_model)
+
         # Hack to detect eagle3 checkpoints. TODO: should we provide
         # our own checkpoints with the correct arch? It would let us
         # avoid nasty stuff like this.

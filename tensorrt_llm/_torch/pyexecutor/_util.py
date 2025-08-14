@@ -30,7 +30,8 @@ from .py_executor import PyExecutor
 from .resource_manager import (KVCacheManager, MambaHybridCacheManager,
                                PeftCacheManager, ResourceManager,
                                ResourceManagerType)
-from .sampler import EarlyStopSampler, TorchSampler, TRTLLMSampler
+from .sampler import (EarlyStopSampler, EarlyStopWithMMResult, TorchSampler,
+                      TRTLLMSampler)
 from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
                         SimpleScheduler)
 from .seq_slot_manager import SeqSlotManager
@@ -597,6 +598,9 @@ def instantiate_sampler(engine: PyTorchModelEngine,
         return get_spec_decoder(sampler_args, engine.spec_config)
     if pytorch_backend_config.use_torch_sampler or pytorch_backend_config.enable_mixed_sampler or engine.spec_config is not None:
         return TorchSampler(sampler_args)
+    if executor_config.mm_encoder_only:
+        # NOTE: handle model outputs specially for mm encoder executor/engine
+        return EarlyStopWithMMResult()
     if not engine.model.model_config.is_generation:
         # NOTE: choose sampler based on model type
         return EarlyStopSampler()
