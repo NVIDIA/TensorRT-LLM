@@ -36,36 +36,13 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
             'trust_remote_code': True,
             'kv_cache_config': {
                 'enable_block_reuse': False,
-                'max_tokens': None,
-                'max_attention_window': None,
-                'sink_token_length': None,
-                'free_gpu_memory_fraction': 0.9,
-                'host_cache_size': None,
-                'onboard_blocks': True,
-                'cross_kv_cache_fraction': None,
-                'secondary_offload_min_priority': None,
-                'event_buffer_max_size': 0,
-                'attention_dp_events_gather_period_ms': 5,
-                'enable_partial_reuse': True,
-                'copy_on_partial_reuse': True,
-                'use_uvm': False,
-                'dtype': 'auto'
-            },
-            'enable_chunked_prefill': True,
-            'scheduler_config': {
-                'capacity_scheduler_policy':
-                CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
-                'context_chunking_policy':
-                ContextChunkingPolicy.FIRST_COME_FIRST_SERVED,
-                'dynamic_batch_config': {
-                    'enable_batch_size_tuning': True,
-                    'enable_max_num_tokens_tuning': False,
-                    'dynamic_batch_moving_average_window': 128
-                }
             },
             'max_batch_size': 512,
-            'max_seq_len': 256,
-            'max_num_tokens': 3840,
+            # 131072 is the max seq len for the model
+            'max_seq_len': 8192,
+            # max num tokens is derived in the build_config, which is not used by AutoDeploy llmargs. 
+            # Set it explicitly here to 8192 which is the default in build_config.
+            'max_num_tokens': 8192,
             'skip_loading_weights': False,
             'compile_backend': 'torch-opt',
             'free_mem_ratio': 0.7,
