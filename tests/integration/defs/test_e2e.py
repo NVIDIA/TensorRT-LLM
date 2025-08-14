@@ -588,15 +588,17 @@ class BenchRunner:
                     throughput = line.split(":")[1].strip()
                     result['throughput'] = throughput
                 except (IndexError, ValueError) as e:
-                    print(f"Failed to parse throughput from line: {line}. Error: {e}")
-                    pass
+                    print(
+                        f"Failed to parse throughput from line: {line}. Error: {e}"
+                    )
             elif 'total latency' in line.lower() and 'ms' in line.lower():
                 try:
                     latency = line.split(":")[1].strip()
                     result['latency'] = latency
                 except (IndexError, ValueError) as e:
-                    print(f"Failed to parse latency from line: {line}. Error: {e}")
-                    pass
+                    print(
+                        f"Failed to parse latency from line: {line}. Error: {e}"
+                    )
 
         return result
 
@@ -661,21 +663,24 @@ def test_trtllm_bench_mig_launch(llm_root, llm_venv, model_name, model_subdir,
     print("-" * 60)
 
     for idx, val in enumerate(concurrency_list):
-    for idx, val in enumerate(concurrency_list):
         metrics = results.get(val)
         if not isinstance(metrics, dict):
-            pytest.fail(f"Unexpected benchmark result type for concurrency {val}: {type(metrics)}")
+            pytest.fail(
+                f"Unexpected benchmark result type for concurrency {val}: {type(metrics)}"
+            )
         try:
             throughput = float(metrics.get('throughput', 0))
             latency = float(metrics.get('latency', 0))
             num_requests = int(metrics.get('num_requests', 0))
         except (ValueError, TypeError) as e:
-            pytest.fail(f"Failed to parse benchmark results for concurrency {val}: {e}")
+            pytest.fail(
+                f"Failed to parse benchmark results for concurrency {val}: {e}")
         assert throughput > 0, f"Throughput is 0 for concurrency {val}"
         assert latency > 0, f"Latency is 0 for concurrency {val}"
         print(f"{val:<15} {throughput:<15} {latency:<15} {num_requests:<15}")
         if idx > 0:
-            prev_throughput = float(results[concurrency_list[idx - 1]].get('throughput', 0))
+            prev_throughput = float(results[concurrency_list[idx - 1]].get(
+                'throughput', 0))
             assert throughput > prev_throughput * 1.3, f"Throughput is not increasing for concurrency {concurrency_list[idx]}"
 
 
