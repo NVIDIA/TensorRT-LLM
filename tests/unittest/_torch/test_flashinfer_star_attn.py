@@ -13,7 +13,7 @@ from tensorrt_llm._torch.attention_backend import (StarAttention,
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
-from tensorrt_llm.mapping import Mapping
+from tensorrt_llm.mapping import CpType, Mapping
 
 
 class TestingStarAttentionMetadata(StarAttentionMetadata):
@@ -144,7 +144,7 @@ class TestStarAttention(unittest.TestCase):
         tokens_per_block = 64
         max_seq_len = tokens_per_block * num_blocks
         cp_config = {
-            "cp_type": "star_attention",
+            "cp_type": CpType.STAR,
             "cp_anchor_size": scenario.anchor_size,
             "block_size": scenario.block_size
         }
@@ -579,7 +579,7 @@ class TestStarAttention(unittest.TestCase):
         max_seq_len = tokens_per_block * num_blocks
         num_layers = 1 if isinstance(num_kv_heads, int) else len(num_kv_heads)
         cp_config = {
-            "cp_type": "star_attention",
+            "cp_type": CpType.STAR,
             "cp_anchor_size": test_scenario.anchor_size,
             "block_size": test_scenario.block_size
         }
