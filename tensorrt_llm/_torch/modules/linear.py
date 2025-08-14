@@ -559,7 +559,7 @@ class FP8BlockScalesLinearMethod(LinearMethodBase):
                                               dtype=torch.float8_e4m3fn),
                                   requires_grad=False)
 
-        if get_sm_version() == 100:
+        if get_sm_version() == 100 and not module.use_cute_dsl_blockscaling_mm:
             scale_shape = (math.ceil(in_features / 512),
                            math.ceil(out_features))
             module.weight_scale = Parameter(torch.empty(scale_shape,
@@ -595,6 +595,7 @@ class FP8BlockScalesLinearMethod(LinearMethodBase):
                 # TODO (@lmin): replace with cute_dsl gemm
                 act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
                     input)
+                print(module.weight_scale.dtype)
                 output = torch.ops.trtllm.fp8_block_scaling_gemm(
                     act_input_fp8, module.weight, act_input_sf,
                     module.weight_scale)
@@ -649,7 +650,7 @@ class FP8BlockScalesLinearMethod(LinearMethodBase):
         weight_scale = load_weight_shard(weights[0][scale_name], module.tp_size,
                                          module.tp_rank,
                                          module.tp_mode).squeeze()
-        if get_sm_version() == 100:
+        if get_sm_version() == 100 and not module.use_cute_dsl_blockscaling_mm:
             weight_scale = fp8_utils.transform_sf_into_required_layout(
                 weight_scale,
                 mn=module.weight.shape[0],
@@ -692,7 +693,7 @@ class FP8BlockScalesLinearMethod(LinearMethodBase):
                                         module.tp_rank, module.tp_mode)
         fused_scale = torch.cat([left_scale, right_scale], dim=0).squeeze()
         copy_weight(module.weight, fused_weight)
-        if get_sm_version() == 100:
+        if get_sm_version() == 100 and not module.use_cute_dsl_blockscaling_mm:
             fused_scale = fp8_utils.transform_sf_into_required_layout(
                 fused_scale,
                 mn=fused_weight.shape[0],
