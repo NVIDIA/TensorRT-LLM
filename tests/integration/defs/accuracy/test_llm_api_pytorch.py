@@ -2431,6 +2431,30 @@ class TestPhi4MiniInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
+class TestStarCoder2_7B(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "bigcode/starcoder2-7b"
+    MODEL_PATH = f"{llm_models_root()}/starcoder2-7b"
+
+    def test_auto_dtype(self):
+        with LLM(self.MODEL_PATH) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
+class TestCodestral_22B_V01(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "codestral/codestral-22b-v0.1"
+    MODEL_PATH = f"{llm_models_root()}/codestral-22b-v0.1"
+
+    def test_auto_dtype(self):
+        with LLM(self.MODEL_PATH) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
 class TestKanana_Instruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "kanana-1.5-2.1b-instruct-2505"
     MODEL_PATH = f"{llm_models_root()}/kanana-1.5-2.1b-instruct-2505"

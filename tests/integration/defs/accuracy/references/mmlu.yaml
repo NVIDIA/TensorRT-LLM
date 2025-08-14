@@ -229,6 +229,8 @@ nvidia/Nemotron-H-56B-Base-8K:
     accuracy: 83.82
 microsoft/Phi-4-mini-instruct:
   - accuracy: 68.98
+codestral/codestral-22b-v0.1:
+  - accuracy: 28.90
 # Created a dummy accuracy to track tp_size=2 for phi4-mini model.
 # TODO: update once https://nvbugs/5393849 is fixed.
 microsoft/Phi-4-mini-instruct-tp2:

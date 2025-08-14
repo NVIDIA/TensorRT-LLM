@@ -159,6 +159,8 @@ microsoft/Phi-4-multimodal-instruct-long-rope:
   - accuracy: 75.85
 microsoft/Phi-4-mini-instruct:
   - accuracy: 82.30
+codestral/codestral-22b-v0.1:
+  - accuracy: 28.90
 GPT-OSS/BF16:
   - accuracy: 90.3
 GPT-OSS/MXFP4:
