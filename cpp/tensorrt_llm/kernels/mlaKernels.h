@@ -51,7 +51,7 @@ struct MlaMetaParams
 template <typename T>
 struct MlaParams
 {
-    T const* latent_cache;  // cKV + k_pe
+    T const* latent_cache;       // cKV + k_pe
     T* q_buf;
     T* k_buf = nullptr;          // [total_kv_lens, h, d_nope + d_rope], for context MLA, contiguous
     T* v_buf = nullptr;          // [total_kv_lens, h, d_v], for context MLA, not contiguous
