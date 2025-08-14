@@ -189,10 +189,12 @@ class DeepseekV3Linear(Linear):
         reduce_output: bool = True,  # ROW parallel only
         skip_create_weights_in_init: bool = False,
         use_custom_cublas_mm: bool = False,
+        use_cute_dsl_blockscaling_mm: bool = False,
         lora: Optional[LoraLayer] = None,
     ):
-        self.use_cute_dsl_blockscaling_mm = os.getenv(
-            "USE_CUTE_DSL_BLOCKSCALING_MM", "0") == "1"
+        # self.use_cute_dsl_blockscaling_mm = os.getenv(
+        #     "USE_CUTE_DSL_BLOCKSCALING_MM", "0") == "1"
+        self.use_cute_dsl_blockscaling_mm = use_cute_dsl_blockscaling_mm
         print(
             f"limin: DeepseekV3Linear, use_cute_dsl_blockscaling_mm: {self.use_cute_dsl_blockscaling_mm}"
         )
@@ -267,6 +269,8 @@ class DeepseekV3Attention(MLA):
             skip_create_weights_in_init=model_config.
             skip_create_weights_in_init,
             use_custom_cublas_mm=True,
+            use_cute_dsl_blockscaling_mm=model_config.
+            use_cute_dsl_blockscaling_mm,
         )
 
 
@@ -437,8 +441,9 @@ class Deepseekv3MoE(nn.Module):
 
         super().__init__()
 
-        self.use_cute_dsl_blockscaling_mm = os.getenv(
-            "USE_CUTE_DSL_BLOCKSCALING_MM", "0") == "1"
+        # self.use_cute_dsl_blockscaling_mm = os.getenv(
+        #     "USE_CUTE_DSL_BLOCKSCALING_MM", "0") == "1"
+        self.use_cute_dsl_blockscaling_mm = model_config.use_cute_dsl_blockscaling_mm
         print(
             f"limin: Deepseekv3MoE, use_cute_dsl_blockscaling_mm: {self.use_cute_dsl_blockscaling_mm}"
         )
@@ -649,8 +654,9 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             model_config, layer_idx)
         self.is_nvfp4 = quant_config.layer_quant_mode.has_nvfp4()
 
-        self.use_cute_dsl_blockscaling_mm = os.getenv(
-            "USE_CUTE_DSL_BLOCKSCALING_MM", "0") == "1"
+        # self.use_cute_dsl_blockscaling_mm = os.getenv(
+        #     "USE_CUTE_DSL_BLOCKSCALING_MM", "0") == "1"
+        self.use_cute_dsl_blockscaling_mm = model_config.use_cute_dsl_blockscaling_mm
         print(
             f"limin: DeepseekV3DecoderLayer, use_cute_dsl_blockscaling_mm: {self.use_cute_dsl_blockscaling_mm}"
         )
@@ -951,8 +957,9 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
             for key in [EventType.Main, EventType.MoeShared]
         }
 
-        self.use_cute_dsl_blockscaling_mm = os.getenv(
-            "USE_CUTE_DSL_BLOCKSCALING_MM", "0") == "1"
+        # self.use_cute_dsl_blockscaling_mm = os.getenv(
+        #     "USE_CUTE_DSL_BLOCKSCALING_MM", "0") == "1"
+        self.use_cute_dsl_blockscaling_mm = model_config.use_cute_dsl_blockscaling_mm
         print(
             f"limin: DeepseekV3MTP, use_cute_dsl_blockscaling_mm: {self.use_cute_dsl_blockscaling_mm}"
         )
@@ -1153,10 +1160,12 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
             model_config._frozen = False
             model_config.quant_config_dict = quant_config_dict
             model_config._frozen = True
-        self.use_cute_dsl_blockscaling_mm = os.getenv(
-            "USE_CUTE_DSL_BLOCKSCALING_MM", "0") == "1"
-        self.use_cute_dsl_blockscaling_bmm = os.getenv(
-            "USE_CUTE_DSL_BLOCKSCALING_BMM", "0") == "1"
+        # self.use_cute_dsl_blockscaling_mm = os.getenv(
+        #     "USE_CUTE_DSL_BLOCKSCALING_MM", "0") == "1"
+        # self.use_cute_dsl_blockscaling_bmm = os.getenv(
+        #     "USE_CUTE_DSL_BLOCKSCALING_BMM", "0") == "1"
+        self.use_cute_dsl_blockscaling_mm = model_config.use_cute_dsl_blockscaling_mm
+        self.use_cute_dsl_blockscaling_bmm = model_config.use_cute_dsl_blockscaling_bmm
         super().__init__(DeepseekV3Model(model_config),
                          config=model_config,
                          hidden_size=model_config.pretrained_config.hidden_size,

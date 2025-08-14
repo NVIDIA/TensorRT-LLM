@@ -1052,9 +1052,9 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     )
     @parametrize_with_ids("mtp_nextn", [0])
     # TODO: add false case
-    @parametrize_with_ids("use_cute_dsl_mm", [True])
-    @parametrize_with_ids("use_cute_dsl_bmm", [True])
-    @parametrize_with_ids("moe_backend", ["CUTEDSL"])
+    @parametrize_with_ids("use_cute_dsl_mm", [True, False])
+    @parametrize_with_ids("use_cute_dsl_bmm", [True, False])
+    @parametrize_with_ids("moe_backend", ["CUTEDSL", "DEEPGEMM"])
     def test_cute_dsl_fp8_block_scales(
         self,
         mtp_nextn,
@@ -1079,6 +1079,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
             torch_compile_config=torch_compile_config,
             moe_config=MoeConfig(backend=moe_backend),
+            use_cute_dsl_blockscaling_mm=use_cute_dsl_mm,
+            use_cute_dsl_blockscaling_bmm=use_cute_dsl_bmm,
         )
 
         if fp8kv:
@@ -1088,15 +1090,15 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         if mtp_nextn > 0:
             mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
 
-        # TODO: it didn't work, why?
-        if use_cute_dsl_mm:
-            os.environ["USE_CUTE_DSL_BLOCKSCALING_MM"] = "1"
-        else:
-            os.environ.pop("USE_CUTE_DSL_BLOCKSCALING_MM", None)
-        if use_cute_dsl_bmm:
-            os.environ["USE_CUTE_DSL_BLOCKSCALING_BMM"] = "1"
-        else:
-            os.environ.pop("USE_CUTE_DSL_BLOCKSCALING_BMM", None)
+        # # TODO: it didn't work, why?
+        # if use_cute_dsl_mm:
+        #     os.environ["USE_CUTE_DSL_BLOCKSCALING_MM"] = "1"
+        # else:
+        #     os.environ.pop("USE_CUTE_DSL_BLOCKSCALING_MM", None)
+        # if use_cute_dsl_bmm:
+        #     os.environ["USE_CUTE_DSL_BLOCKSCALING_BMM"] = "1"
+        # else:
+        #     os.environ.pop("USE_CUTE_DSL_BLOCKSCALING_BMM", None)
 
         with LLM(
                 f"{llm_models_root()}/DeepSeek-V3-Lite/fp8",

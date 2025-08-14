@@ -1,5 +1,4 @@
 import math
-import os
 import weakref
 from typing import Optional, Union, cast
 
@@ -203,10 +202,12 @@ class Attention(nn.Module):
         self.kv_size = self.num_key_value_heads * self.head_dim
 
         # limin-todo: WARNING:
-        self.use_cute_dsl_blockscaling_bmm = os.getenv(
-            "USE_CUTE_DSL_BLOCKSCALING_BMM", "0") == "1"
-        self.use_cute_dsl_blockscaling_mm = os.getenv(
-            "USE_CUTE_DSL_BLOCKSCALING_MM", "0") == "1"
+        # self.use_cute_dsl_blockscaling_bmm = os.getenv(
+        #     "USE_CUTE_DSL_BLOCKSCALING_BMM", "0") == "1"
+        # self.use_cute_dsl_blockscaling_mm = os.getenv(
+        #     "USE_CUTE_DSL_BLOCKSCALING_MM", "0") == "1"
+        self.use_cute_dsl_blockscaling_bmm = config.use_cute_dsl_blockscaling_bmm
+        self.use_cute_dsl_blockscaling_mm = config.use_cute_dsl_blockscaling_mm
         print(
             f"limin: Attention, use_cute_dsl_blockscaling_bmm: {self.use_cute_dsl_blockscaling_bmm}, use_cute_dsl_blockscaling_mm: {self.use_cute_dsl_blockscaling_mm}"
         )
@@ -678,10 +679,12 @@ class MLA(nn.Module):
         self.quant_config = quant_config
 
         ## limin-TODO: WARNING:
-        self.use_cute_dsl_blockscaling_bmm = os.getenv(
-            "USE_CUTE_DSL_BLOCKSCALING_BMM", "0") == "1"
-        self.use_cute_dsl_blockscaling_mm = os.getenv(
-            "USE_CUTE_DSL_BLOCKSCALING_MM", "0") == "1"
+        # self.use_cute_dsl_blockscaling_bmm = os.getenv(
+        #     "USE_CUTE_DSL_BLOCKSCALING_BMM", "0") == "1"
+        # self.use_cute_dsl_blockscaling_mm = os.getenv(
+        #     "USE_CUTE_DSL_BLOCKSCALING_MM", "0") == "1"
+        self.use_cute_dsl_blockscaling_bmm = config.use_cute_dsl_blockscaling_bmm
+        self.use_cute_dsl_blockscaling_mm = config.use_cute_dsl_blockscaling_mm
         print(
             f"limin: MLA, use_cute_dsl_blockscaling_bmm: {self.use_cute_dsl_blockscaling_bmm}, use_cute_dsl_blockscaling_mm: {self.use_cute_dsl_blockscaling_mm}"
         )
