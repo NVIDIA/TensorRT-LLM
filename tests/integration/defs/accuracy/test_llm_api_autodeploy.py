@@ -17,8 +17,6 @@ import pytest
 
 from tensorrt_llm import LLM
 from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
-from tensorrt_llm.llmapi.llm_args import (CapacitySchedulerPolicy,
-                                          ContextChunkingPolicy)
 from tensorrt_llm.quantization import QuantAlgo
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -40,7 +38,7 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
             'max_batch_size': 512,
             # 131072 is the max seq len for the model
             'max_seq_len': 8192,
-            # max num tokens is derived in the build_config, which is not used by AutoDeploy llmargs. 
+            # max num tokens is derived in the build_config, which is not used by AutoDeploy llmargs.
             # Set it explicitly here to 8192 which is the default in build_config.
             'max_num_tokens': 8192,
             'skip_loading_weights': False,
