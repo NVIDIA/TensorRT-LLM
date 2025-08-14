@@ -50,7 +50,7 @@ auto listAllTactics(MoeGemmId gemm_id)
 }
 
 template <class BenchClass>
-void parseTacticToVectorID(nlohmann::json& tactic, std::vector<int>& tactic_ids)
+void parseTacticToVectorID(nlohmann::json& tactic, std::vector<int>& tactic_ids, MoeGemmId gemm_id)
 {
     if (tactic.is_number_integer())
     {
@@ -60,7 +60,7 @@ void parseTacticToVectorID(nlohmann::json& tactic, std::vector<int>& tactic_ids)
     {
         for (auto c : tactic)
         {
-            parseTacticToVectorID<BenchClass>(c, tactic_ids);
+            parseTacticToVectorID<BenchClass>(c, tactic_ids, gemm_id);
         }
     }
     else if (tactic.is_string())
@@ -69,7 +69,7 @@ void parseTacticToVectorID(nlohmann::json& tactic, std::vector<int>& tactic_ids)
         auto tactic_name = tactic.get<std::string>();
         if (tactic_name == "all")
         {
-            auto all_tactics = listAllTactics<BenchClass>();
+            auto all_tactics = listAllTactics<BenchClass>(gemm_id);
             tactic_ids.resize(all_tactics.size());
             std::iota(tactic_ids.begin(), tactic_ids.end(), 0);
         }
@@ -291,9 +291,14 @@ void argGenLoadFile(benchmark::internal::Benchmark* benchmark)
             {
                 printed = true;
                 std::cerr << __PRETTY_FUNCTION__ << ": Valid Tactics are:\n";
-                auto confs = listAllTactics<BenchClass>();
-                for (auto c : confs)
-                    std::cerr << c.toString();
+                for (auto gemm_id : {MoeGemmId::GEMM_1, MoeGemmId::GEMM_2})
+                {
+                    std::cerr << "GEMM " << (int) gemm_id << ":\n";
+                    auto confs = listAllTactics<BenchClass>(gemm_id);
+                    for (auto c : confs)
+                        std::cerr << c.toString();
+                    std::cerr << std::endl;
+                }
             }
 
             continue;

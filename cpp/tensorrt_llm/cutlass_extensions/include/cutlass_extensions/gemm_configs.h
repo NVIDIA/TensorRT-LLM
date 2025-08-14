@@ -432,7 +432,14 @@ struct CutlassGemmConfig
     bool enableCudaKernel = false;
     int sm_version = 80; // Use 80 as a catch all for <90
     bool is_tma_warp_specialized = false;
-    bool is_finalize_fusion = false;
+
+    enum class EpilogueFusionType : int
+    {
+        NONE,
+        FINALIZE
+    };
+
+    EpilogueFusionType epilogue_fusion_type = EpilogueFusionType::NONE;
 
     CutlassGemmConfig() = default;
 
@@ -504,7 +511,7 @@ struct CutlassGemmConfig
                    << "\n\tcluster shape ID: " << (int) cluster_shape
                    << "\n\tmainloop sched: " << (int) mainloop_schedule << "\n\tepi sched: " << (int) epilogue_schedule
                    << "\n\tenable cuda kernel: " << (enableCudaKernel ? "true" : "false")
-                   << "\n\tis_finalize_fusion: " << (is_finalize_fusion ? "true" : "false");
+                   << "\n\tepilogue fusion type: " << (int) epilogue_fusion_type;
         }
         else if (tile_config_sm80 != tensorrt_llm::cutlass_extensions::CutlassTileConfig::ChooseWithHeuristic)
         {
@@ -536,7 +543,8 @@ inline std::ostream& operator<<(std::ostream& out, CutlassGemmConfig const& conf
             << ", mainloop_schedule_enum: " << int(config.mainloop_schedule)
             << ", epilogue_schedule_enum: " << int(config.epilogue_schedule)
             << ", cluster_shape_enum: " << int(config.cluster_shape)
-            << ", enable_cuda_kernel: " << (config.enableCudaKernel ? "true" : "false");
+            << ", enable_cuda_kernel: " << (config.enableCudaKernel ? "true" : "false")
+            << ", epilogue_fusion_type: " << int(config.epilogue_fusion_type);
     }
     else
     {
