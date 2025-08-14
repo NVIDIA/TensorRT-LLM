@@ -162,6 +162,9 @@ public:
         [[maybe_unused]] MlaParams<T> mla_params;
         if (op.isMLAEnabled())
         {
+            TORCH_CHECK(mla_tensor_params.size() == 3,
+                "Expecting 3 tensors for custom MLA tensor params: context_paged_kv, "
+                "context_kv_cache_block_offsets, helix_position_offsets.");
             if (is_context && op.mPagedContextFMHA && op.mPagedKVCache)
             {
                 auto& mla_context_paged_kv = mla_tensor_params[0];
