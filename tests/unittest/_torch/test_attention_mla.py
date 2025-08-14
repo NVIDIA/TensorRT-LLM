@@ -388,6 +388,12 @@ def test_attention_mla(scenario: Scenario, context_sequence_lengths: List[int],
     device = torch.device('cuda')
     dtype = scenario.dtype
     kv_cache_dtype = scenario.kv_cache_dtype
+
+    FAILED_CSL = [777, 912, 431, 42, 266, 989, 524]
+    if (kv_cache_dtype is torch.float8_e4m3fn
+            and context_sequence_lengths == FAILED_CSL):
+        pytest.skip("https://nvbugs/5453806")
+
     print(
         f"--------------------------------Test for scenario: {scenario} start--------------------------------"
     )

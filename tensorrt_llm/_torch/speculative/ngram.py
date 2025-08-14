@@ -87,13 +87,13 @@ class NGramPoolManager(BaseResourceManager):
         self,
         prefix: list[int],
         request_id: int,
-        end_id: int,
+        padding_id: int,
         max_sequence_length: int,
     ):
         prefix_len = len(prefix)
         max_draft_token_length_this_step = max_sequence_length - 1 - prefix_len
         if max_draft_token_length_this_step <= 0:  # No draft token is need if the prefix is long enough
-            return [end_id]
+            return [padding_id]
         if request_id not in self.start_index:  # Extend start_index and pool for a new request
             self.start_index[request_id] = 0
             if not self.is_public_pool:
@@ -126,7 +126,7 @@ class NGramPoolManager(BaseResourceManager):
                     pool[pattern].add(new_match)
 
         # Find match
-        draft_tokens = [end_id]  # fallback value
+        draft_tokens = [padding_id]  # fallback value
         for size in range(min(self.max_matching_ngram_size, prefix_len - 1), 0,
                           -1):
             pattern = tuple(prefix[-size:])
@@ -194,11 +194,12 @@ class NGramDrafter(Drafter):
             draft_tokens = self.spec_resource_manager.get_draft_tokens(
                 prefix,
                 request.request_id,
-                request.py_end_id,
-                request.py_orig_prompt_len + request.py_max_new_tokens,
+                padding_id=0,
+                max_sequence_length=request.py_orig_prompt_len +
+                request.py_max_new_tokens,
             )
             # Pad length to `self.max_draft_len`
             if len(draft_tokens) > 0:
                 pad_length = self.max_draft_len - len(draft_tokens)
-                draft_tokens.extend([request.py_end_id] * pad_length)
+                draft_tokens.extend([0] * pad_length)
             request.py_draft_tokens = draft_tokens
