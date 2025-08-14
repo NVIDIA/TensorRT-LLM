@@ -1509,11 +1509,10 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
                         for n, p in module.named_parameters():
                             p.data.copy_(module_weights[n][:])
 
-                # limin-todo: how to set for cute dsl ops?
-                if moe_backend == "DEEPGEMM" and self.model_config.quant_config.layer_quant_mode.has_fp8_block_scales(
+                # only Linear/DeepseekV3Linear module
+                if not self.use_cute_dsl_blockscaling_mm and self.model_config.quant_config.layer_quant_mode.has_fp8_block_scales(
                 ) and get_sm_version() == 100 and hasattr(
                         module, "weight_scale"):
-                    #
                     weight, weight_scale = resmooth_to_fp8_e8m0(
                         module.weight, module.weight_scale)
                     transfromed_scale = transform_sf_into_required_layout(
