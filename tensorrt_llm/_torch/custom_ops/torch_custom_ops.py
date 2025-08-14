@@ -9,23 +9,13 @@ from cuda import cuda
 from cutlass.cute.runtime import from_dlpack
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
-# from ..attention_backend.interface import AttentionInputType
-# from ..autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
-#                          OptimizationProfile, TunableRunner, TuningConfig)
-# from ..utils import (compute_swizzled_sf_shape, fp4_scale_infer_shape,
-#                      get_last_power_of_2_num_tokens_buckets,
-#                      last_positive_power_of_2)
 from tensorrt_llm._torch.autotuner import (AutoTuner, ConstraintSpec,
                                            DynamicTensorSpec,
                                            OptimizationProfile, TunableRunner,
                                            TuningConfig)
-# from tensorrt_llm._torch.custom_ops.cute_dsl_kernels.blackwell.blockwise_gemm import \
-#     BlockwiseGemmKernel
-from tensorrt_llm._torch.custom_ops.cute_dsl_kernels.blackwell.blockwise_gemm_release import \
+from tensorrt_llm._torch.custom_ops.cute_dsl_kernels.blackwell.blockwise_gemm import \
     BlockwiseGemmKernel
-# from tensorrt_llm._torch.custom_ops.cute_dsl_kernels.blackwell.continuous_offset_grouped_gemm import \
-#     BlockwiseContiguousGroupedGemmKernel
-from tensorrt_llm._torch.custom_ops.cute_dsl_kernels.blackwell.continuous_offset_grouped_gemm_release import \
+from tensorrt_llm._torch.custom_ops.cute_dsl_kernels.blackwell.continuous_offset_grouped_gemm import \
     BlockwiseContiguousGroupedGemmKernel
 from tensorrt_llm._torch.utils import (fp4_scale_infer_shape,
                                        get_last_power_of_2_num_tokens_buckets,
