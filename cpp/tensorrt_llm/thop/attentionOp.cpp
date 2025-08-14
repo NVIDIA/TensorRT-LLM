@@ -167,6 +167,9 @@ public:
         [[maybe_unused]] MlaParams<T> mla_params;
         if (op.isMLAEnabled())
         {
+            TORCH_CHECK(mla_tensor_params.size() == 1,
+            "Expecting 3 tensors for custom MLA tensor params: context_paged_kv, "
+            "context_kv_cache_block_offsets, helix_position_offsets.");
             if (is_context)
             {
                 if (latent_cache.has_value())
@@ -212,7 +215,7 @@ public:
             mla_params.meta = op.mMLAParams;
 
             mla_params.workspace = workspace_ptr;
-            auto& mla_helix_position_offsets = mla_tensor_params[2];
+            auto& mla_helix_position_offsets = mla_tensor_params[0];
             if (mla_helix_position_offsets.has_value())
             {
                 mla_params.helix_position_offsets = mla_helix_position_offsets->data_ptr<int32_t>();
