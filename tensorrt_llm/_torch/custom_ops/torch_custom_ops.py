@@ -1001,7 +1001,7 @@ class CuteDSLFp8BlackwellLinear(TunableRunner):
         m = inputs[0].shape[0]
         n = inputs[1].shape[0]
         k = inputs[0].shape[1]
-        l = 1
+        batch_size = 1
         # m,k
         a_major = "k"
         # n, k
@@ -1018,7 +1018,7 @@ class CuteDSLFp8BlackwellLinear(TunableRunner):
             m,
             n,
             k,
-            l,
+            batch_size,
             a_major,
             b_major,
             c_major,
@@ -1208,7 +1208,8 @@ class CuteDSLFp8BlackwellBmm(TunableRunner):
             **kwargs,
     ) -> List[int]:
         # [b, m, k]
-        l, m, k = inputs[0].shape[0], inputs[0].shape[1], inputs[0].shape[2]
+        batch_size, m, k = inputs[0].shape[0], inputs[0].shape[1], inputs[
+            0].shape[2]
         # [b, n, k]
         n = inputs[1].shape[1]
         # m,k
@@ -1227,7 +1228,7 @@ class CuteDSLFp8BlackwellBmm(TunableRunner):
             m,
             n,
             k,
-            l,
+            batch_size,
             a_major,
             b_major,
             c_major,
@@ -1261,7 +1262,7 @@ class CuteDSLFp8BlackwellBmm(TunableRunner):
         :rtype: torch.Tensor, type: bf16
         """
         a, b, a_sf, b_sf, c = inputs
-        l, m, n, k = a.shape[0], a.shape[1], b.shape[1], b.shape[2]
+        batch_size, m, n, k = a.shape[0], a.shape[1], b.shape[1], b.shape[2]
         w_n, w_k = b_sf.shape[1], b_sf.shape[2]
 
         # """
@@ -1271,10 +1272,11 @@ class CuteDSLFp8BlackwellBmm(TunableRunner):
         weight_scale_tmp = b_sf.permute(1, 2, 0)
         with nvtx.annotate("bmm input_scale_tmp", color="green"):
             m_padded = pad_up(m, 4)
-            input_scale_tmp = a_sf[0:m_padded * w_k * l]
-            input_scale_tmp = input_scale_tmp.reshape(l, -1, m_padded)
+            input_scale_tmp = a_sf[0:m_padded * w_k * batch_size]
+            input_scale_tmp = input_scale_tmp.reshape(batch_size, -1, m_padded)
             input_scale_tmp = (
-                input_scale_tmp[:l, :w_k, :m].contiguous().permute(2, 1, 0))
+                input_scale_tmp[:batch_size, :w_k, :m].contiguous().permute(
+                    2, 1, 0))
         with nvtx.annotate("bmm from_dlpack", color="gray"):
             mA = from_dlpack(
                 a_tmp, assumed_align=16).mark_layout_dynamic(leading_dim=1)
@@ -1426,12 +1428,12 @@ def _(
     weight_scale: torch.Tensor,
     out: torch.Tensor,
 ) -> None:
-    l, m, k = mat_a.shape[0], mat_a.shape[1], mat_a.shape[2]
+    batch_size, m, k = mat_a.shape[0], mat_a.shape[1], mat_a.shape[2]
     n = mat_b.shape[1]
     if out.dtype != torch.bfloat16:
         assert False, "out.dtype != bf16"
-    if out.shape != (l, m, n):
-        assert False, "out.shape != (l, m, n)"
+    if out.shape != (batch_size, m, n):
+        assert False, "out.shape != (batch_size, m, n)"
 
 
 class CuteDSLFp8BlackwellGroupGemm(TunableRunner):
