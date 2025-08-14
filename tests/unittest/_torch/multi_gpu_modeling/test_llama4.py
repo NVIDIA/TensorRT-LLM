@@ -71,6 +71,7 @@ def test_llama4(model_name, backend, tp_size, use_cuda_graph,
         pipeline_parallel_size=pp_size,
         enable_attention_dp=enable_attention_dp,
         kv_cache_config=kv_cache_config,
+        use_torch_sampler=True,
         enable_chunked_prefill=True,
     )
     with llm:
