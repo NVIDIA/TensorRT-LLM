@@ -438,3 +438,58 @@ def test_mistral_3_vlm_allclose_to_hf(mistral_small_3_1_24b_config, backend, use
             )
 
         torch.testing.assert_close(logits, ref.logits[:, -1].float(), atol=0.4, rtol=0.4)
+
+
+@pytest.mark.parametrize(
+    "in_shapes, image_sizes, expected_out_shape",
+    [
+        (
+            [(2, 3, 100, 150), (1, 3, 200, 100), (3, 3, 120, 180)],
+            [
+                [[92, 150], [100, 73]],
+                [[200, 100]],
+                [[37, 130], [120, 83], [73, 180]],
+            ],
+            [6, 3, 200, 180],
+        ),
+        # Single batch, single image.
+        (
+            [(1, 3, 64, 128)],
+            [[[64, 128]]],
+            [1, 3, 64, 128],
+        ),
+        # Same max size across batches.
+        (
+            [(2, 3, 59, 59), (1, 3, 59, 59), (5, 3, 59, 59)],
+            [
+                [[13, 59], [59, 17]],
+                [[59, 59]],
+                [[19, 29], [59, 31], [17, 54], [13, 59], [11, 37]],
+            ],
+            [8, 3, 59, 59],
+        ),
+    ],
+)
+def test_batch_pixel_values(in_shapes, image_sizes, expected_out_shape):
+    # Test case 1: Basic functionality with different sized images
+    pixel_values = [torch.randn(*shape) for shape in in_shapes]
+    image_sizes = [torch.tensor(size) for size in image_sizes]
+
+    batched_pixels, batched_sizes = modeling_mistral.Mistral3VLM.batch_pixel_values(
+        pixel_values, image_sizes
+    )
+
+    # Check output shapes
+    assert list(batched_pixels.shape) == expected_out_shape
+    assert list(batched_sizes.shape) == [expected_out_shape[0], 2]
+
+    # Check that the original image data is preserved (with padding).
+    start_idx = 0
+    for original_values in pixel_values:
+        batch_size = original_values.shape[0]
+        end_idx = start_idx + batch_size
+        orig_h, orig_w = original_values.shape[-2:]
+        padded_values = batched_pixels[start_idx:end_idx, :, :orig_h, :orig_w]
+        torch.testing.assert_close(padded_values, original_values)
+
+        start_idx += batch_size
