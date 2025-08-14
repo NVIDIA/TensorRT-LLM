@@ -4,8 +4,6 @@ from typing import Any, Callable, Dict, Optional, Tuple
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._torch.utils import make_weak_ref
-
 
 def ceil_div(x: int, y: int) -> int:
     return (x + y - 1) // y
@@ -219,6 +217,7 @@ class DecodingCUDAGraphRunner:
             output = forward_fn(inputs)
         set_graph_capturing(False)
         # Mark weak ref here. The output tensor should be freed properly.
+        from tensorrt_llm._torch.utils import make_weak_ref
         self._output = make_weak_ref(output)
         return self._graph.pool()
 
