@@ -10,6 +10,9 @@ torch.manual_seed(0)
 
 scaling_vector_size = 16
 FORMAT_FP8 = 0
+FORMAT_NVFP4 = 1
+
+SCALING_VECTOR_SIZE = 16  # NVFP4 block size along K
 
 
 @pytest.mark.parametrize("bias", [torch.rand(32).to("cuda") * 10, None])
@@ -138,3 +141,62 @@ def test_quant_linear_fp8_matches_fused_op(bias):
 
     assert out_unified.shape == out_fused.shape
     torch.testing.assert_close(out_unified, out_fused, rtol=5e-4, atol=5e-4)
+
+
+@pytest.mark.parametrize(
+    "bias",
+    [
+        (torch.rand(32, device="cuda") * 10).to(torch.float16),
+        None,
+    ],
+)
+@pytest.mark.skipif(
+    not (fp4_compatible() and trtllm_ops_available()),
+    reason="Requires NVFP4 and TRT-LLM ops",
+)
+def test_quant_linear_nvfp4_matches_fused_op(bias):
+    x = torch.rand(3, 32, device="cuda", dtype=torch.half)  # [..., K]
+    W = torch.rand(32, 32, device="cuda", dtype=torch.half)  # [N, K]
+    N, K = W.shape
+    assert K % SCALING_VECTOR_SIZE == 0
+
+    # Per-tensor scale-2 (amax / (448 * 6))
+    s_in2 = fp4_global_scale(x).to(torch.float32)  # input per-tensor scale
+    s_w2 = fp4_global_scale(W).to(torch.float32)  # weight per-tensor scale
+
+    weight_fp4, weight_scale_cutlass = torch.ops.trtllm.fp4_quantize(
+        W, s_w2, SCALING_VECTOR_SIZE, False
+    )
+    assert weight_fp4.dtype == torch.uint8
+    assert weight_scale_cutlass.dtype == torch.uint8
+
+    # Fused op (expects CUTLASS uint8 scale + kernel alpha = 1/(s_in2*s_w2))
+    alpha_fused = (1.0 / (s_in2 * s_w2)).to(torch.float32)
+    if bias is not None and bias.dtype != x.dtype:
+        bias = bias.to(x.dtype)
+
+    out_fused = torch.ops.auto_deploy.torch_quant_fp4_linear(
+        x,
+        weight_fp4,
+        bias=bias,
+        input_scale=s_in2,
+        weight_scale=weight_scale_cutlass,
+        alpha=alpha_fused,
+    )
+
+    out_unified = torch.ops.auto_deploy.custom_quant_linear(
+        x,
+        weight_fp4,
+        bias,
+        [s_in2],  # input_scale list
+        [
+            weight_scale_cutlass,
+            alpha_fused,
+        ],  # weight_scale list: [per-block vector, combined alpha]
+        [],  # input_zp
+        [],  # weight_zp
+        format_type=FORMAT_NVFP4,
+    )
+
+    assert out_unified.shape == out_fused.shape
+    torch.testing.assert_close(out_unified, out_fused, rtol=1e-3, atol=5e-3)
