@@ -946,8 +946,8 @@ int MixtureOfExpertsPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
     std::optional<tensorrt_llm::cutlass_extensions::CutlassGemmConfig> gemm2;
     if (common::getEnvForceDeterministicMOE())
     {
-        gemm1 = mMOERunner->getTactics()[0];
-        gemm2 = mMOERunner->getTactics()[0];
+        gemm1 = mMOERunner->getTactics(MoeGemmId::GEMM_1)[0];
+        gemm2 = mMOERunner->getTactics(MoeGemmId::GEMM_2)[0];
     }
     else
     {
@@ -1278,7 +1278,7 @@ void MixtureOfExpertsGemmProfiler::runTactic(int m, int n, int k, MixtureOfExper
 auto MixtureOfExpertsGemmProfiler::getTactics(int m, int n, int k) const -> std::vector<Config>
 {
     assert(mRunner);
-    return mRunner->mMOERunner->getTactics();
+    return mRunner->mMOERunner->getTactics(backend.mGemmToProfile);
 }
 
 void MixtureOfExpertsGemmProfiler::initTmpData(
