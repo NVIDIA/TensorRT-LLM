@@ -10,7 +10,6 @@ import random
 import pytest
 from _torch.helpers import per_block_cast_to_fp8
 
-# from tensorrt_llm._torch.custom_ops.cute_dsl_ops import cute_dsl_fp8_group_blockwise_gemm_ref
 from tensorrt_llm._torch.custom_ops.torch_custom_ops import \
     cute_dsl_fp8_group_gemm_blackwell
 from tensorrt_llm._utils import get_sm_version
@@ -100,7 +99,6 @@ def test_cute_dsl_fp8_block_scale_group_gemm(num_experts, k, n,
     group_m = []
     for i in range(num_experts):
         group_m.append(random.randint(0, max_tokens_per_group))
-    print("limin: group_m", group_m)
     group_m = torch.tensor(group_m, dtype=torch.int32, device="cuda")
 
     offset_group = torch.cumsum(group_m, dim=0)
@@ -108,11 +106,8 @@ def test_cute_dsl_fp8_block_scale_group_gemm(num_experts, k, n,
         [torch.tensor([0], dtype=torch.int32, device="cuda"), offset_group],
         dim=0)
     offset_group = offset_group.to(torch.int32)
-    print("limin: offset_group", offset_group)
 
     m = sum(group_m)
-    print("limin: m", m)
-    # TODO: how to initialize a and b
     a = torch.empty(m, k, dtype=torch.uint8).to(torch.bfloat16).cuda().normal_(
         0, 1) * 0.1
     b = torch.empty(num_experts, n, k, dtype=torch.uint8).to(

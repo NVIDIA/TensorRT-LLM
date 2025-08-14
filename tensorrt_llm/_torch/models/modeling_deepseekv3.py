@@ -192,12 +192,6 @@ class DeepseekV3Linear(Linear):
         use_cute_dsl_blockscaling_mm: bool = False,
         lora: Optional[LoraLayer] = None,
     ):
-        # self.use_cute_dsl_blockscaling_mm = os.getenv(
-        #     "USE_CUTE_DSL_BLOCKSCALING_MM", "0") == "1"
-        self.use_cute_dsl_blockscaling_mm = use_cute_dsl_blockscaling_mm
-        print(
-            f"limin: DeepseekV3Linear, use_cute_dsl_blockscaling_mm: {self.use_cute_dsl_blockscaling_mm}"
-        )
         super().__init__(
             in_features,
             out_features,
@@ -212,7 +206,7 @@ class DeepseekV3Linear(Linear):
             skip_create_weights_in_init,
             use_custom_cublas_mm,
             lora,
-            use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm)
+            use_cute_dsl_blockscaling_mm=use_cute_dsl_blockscaling_mm)
 
     def apply_linear(self,
                      input,
@@ -441,13 +435,7 @@ class Deepseekv3MoE(nn.Module):
 
         super().__init__()
 
-        # self.use_cute_dsl_blockscaling_mm = os.getenv(
-        #     "USE_CUTE_DSL_BLOCKSCALING_MM", "0") == "1"
         self.use_cute_dsl_blockscaling_mm = model_config.use_cute_dsl_blockscaling_mm
-        print(
-            f"limin: Deepseekv3MoE, use_cute_dsl_blockscaling_mm: {self.use_cute_dsl_blockscaling_mm}"
-        )
-
         config = model_config.pretrained_config
         self.top_k = top_k
         self.use_dp = model_config.mapping.enable_attention_dp
@@ -654,13 +642,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             model_config, layer_idx)
         self.is_nvfp4 = quant_config.layer_quant_mode.has_nvfp4()
 
-        # self.use_cute_dsl_blockscaling_mm = os.getenv(
-        #     "USE_CUTE_DSL_BLOCKSCALING_MM", "0") == "1"
         self.use_cute_dsl_blockscaling_mm = model_config.use_cute_dsl_blockscaling_mm
-        print(
-            f"limin: DeepseekV3DecoderLayer, use_cute_dsl_blockscaling_mm: {self.use_cute_dsl_blockscaling_mm}"
-        )
-
         has_tp = mapping.has_tp()
 
         if (config.n_routed_experts is not None
@@ -957,13 +939,7 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
             for key in [EventType.Main, EventType.MoeShared]
         }
 
-        # self.use_cute_dsl_blockscaling_mm = os.getenv(
-        #     "USE_CUTE_DSL_BLOCKSCALING_MM", "0") == "1"
         self.use_cute_dsl_blockscaling_mm = model_config.use_cute_dsl_blockscaling_mm
-        print(
-            f"limin: DeepseekV3MTP, use_cute_dsl_blockscaling_mm: {self.use_cute_dsl_blockscaling_mm}"
-        )
-
         self.enorm = RMSNorm(hidden_size=config.hidden_size,
                              eps=config.rms_norm_eps,
                              dtype=config.torch_dtype)
@@ -1160,10 +1136,6 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
             model_config._frozen = False
             model_config.quant_config_dict = quant_config_dict
             model_config._frozen = True
-        # self.use_cute_dsl_blockscaling_mm = os.getenv(
-        #     "USE_CUTE_DSL_BLOCKSCALING_MM", "0") == "1"
-        # self.use_cute_dsl_blockscaling_bmm = os.getenv(
-        #     "USE_CUTE_DSL_BLOCKSCALING_BMM", "0") == "1"
         self.use_cute_dsl_blockscaling_mm = model_config.use_cute_dsl_blockscaling_mm
         self.use_cute_dsl_blockscaling_bmm = model_config.use_cute_dsl_blockscaling_bmm
         super().__init__(DeepseekV3Model(model_config),
@@ -1394,10 +1366,7 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
         params_map = {'gate_up_proj': ['gate_proj', 'up_proj']}
         all_named_modules = dict(self.named_modules())
 
-        moe_backend = self.model_config.moe_backend.upper()
-        print(
-            f"limin: DeepseekV3ForCausalLM load_weights, moe_backend: {moe_backend}"
-        )
+        self.model_config.moe_backend.upper()
 
         for name, module in tqdm(all_named_modules.items(),
                                  desc="Loading weights"):
@@ -1450,7 +1419,6 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
                         attn_module.v_b_proj_scale = nn.Parameter(
                             v_b_proj_scale, requires_grad=False)
 
-                        # limin-todo: check if we could keep it for cute dsl ops.
                         if attn_module.k_b_proj_trans_dequant is not None:
                             attn_module.k_b_proj_trans_dequant.data.copy_(
                                 weight_dequant(

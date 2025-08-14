@@ -201,16 +201,8 @@ class Attention(nn.Module):
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_key_value_heads * self.head_dim
 
-        # limin-todo: WARNING:
-        # self.use_cute_dsl_blockscaling_bmm = os.getenv(
-        #     "USE_CUTE_DSL_BLOCKSCALING_BMM", "0") == "1"
-        # self.use_cute_dsl_blockscaling_mm = os.getenv(
-        #     "USE_CUTE_DSL_BLOCKSCALING_MM", "0") == "1"
         self.use_cute_dsl_blockscaling_bmm = config.use_cute_dsl_blockscaling_bmm
         self.use_cute_dsl_blockscaling_mm = config.use_cute_dsl_blockscaling_mm
-        print(
-            f"limin: Attention, use_cute_dsl_blockscaling_bmm: {self.use_cute_dsl_blockscaling_bmm}, use_cute_dsl_blockscaling_mm: {self.use_cute_dsl_blockscaling_mm}"
-        )
 
         self.qkv_proj = Linear(
             self.hidden_size,
@@ -678,16 +670,8 @@ class MLA(nn.Module):
         quant_config = config.get_quant_config()
         self.quant_config = quant_config
 
-        ## limin-TODO: WARNING:
-        # self.use_cute_dsl_blockscaling_bmm = os.getenv(
-        #     "USE_CUTE_DSL_BLOCKSCALING_BMM", "0") == "1"
-        # self.use_cute_dsl_blockscaling_mm = os.getenv(
-        #     "USE_CUTE_DSL_BLOCKSCALING_MM", "0") == "1"
         self.use_cute_dsl_blockscaling_bmm = config.use_cute_dsl_blockscaling_bmm
         self.use_cute_dsl_blockscaling_mm = config.use_cute_dsl_blockscaling_mm
-        print(
-            f"limin: MLA, use_cute_dsl_blockscaling_bmm: {self.use_cute_dsl_blockscaling_bmm}, use_cute_dsl_blockscaling_mm: {self.use_cute_dsl_blockscaling_mm}"
-        )
 
         if not self.is_lite:
             self.kv_a_proj_with_mqa = Linear(

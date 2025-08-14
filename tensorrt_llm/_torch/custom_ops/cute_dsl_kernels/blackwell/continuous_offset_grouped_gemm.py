@@ -208,8 +208,6 @@ class BlockwiseContiguousGroupedGemmKernel:
 
         # Compute mma/cluster/tile shapes
         mma_inst_shape_k = cute.size(tiled_mma.shape_mnk, mode=[2])
-        # limin: mma_inst_shape_k = 32
-        # print(f"limin: mma_inst_shape_k = {mma_inst_shape_k}")
         mma_inst_tile_k = 4
         # mnk: 128, 128, 128
         self.mma_tiler = (
@@ -217,7 +215,6 @@ class BlockwiseContiguousGroupedGemmKernel:
             self.mma_tiler[1],
             mma_inst_shape_k * mma_inst_tile_k,
         )
-        # limin: mma_a_tiler = (1, 128, 128)
         self.mma_a_tiler = (1, self.mma_tiler[1], self.mma_tiler[2])
         # cta_tile_shape_mnk = 128, 128, 128
         self.cta_tile_shape_mnk = (
@@ -225,8 +222,6 @@ class BlockwiseContiguousGroupedGemmKernel:
             self.mma_tiler[1],
             self.mma_tiler[2],
         )
-        # print(f"limin: mma_a_tiler = {self.mma_a_tiler}")
-        # print(f"limin: cta_tile_shape_mnk = {self.cta_tile_shape_mnk}")
 
         # Compute cluster layout
         self.cluster_layout_vmnk = cute.tiled_divide(
@@ -240,14 +235,12 @@ class BlockwiseContiguousGroupedGemmKernel:
         self.scale_granularity_m = 1
         self.scale_granularity_n = 128
         self.scale_granularity_k = 128
-        # limin: 128, 1, 1
         self.scale_m_per_tile = self.cta_tile_shape_mnk[
             0] // self.scale_granularity_m
         self.scale_n_per_tile = self.cta_tile_shape_mnk[
             1] // self.scale_granularity_n
         self.scale_k_per_tile = self.cta_tile_shape_mnk[
             2] // self.scale_granularity_k
-        # print(f"limin: scale_m_per_tile = {self.scale_m_per_tile}, scale_n_per_tile = {self.scale_n_per_tile}, scale_k_per_tile = {self.scale_k_per_tile}")
 
         # Compute number of multicast CTAs for A/B
         self.num_mcast_ctas_a = cute.size(self.cluster_layout_vmnk.shape[2])
@@ -289,7 +282,6 @@ class BlockwiseContiguousGroupedGemmKernel:
             self.occupancy,
             self.use_tma_store,
         )
-        # print(f"limin: num_acc_stage = {self.num_acc_stage}, num_ab_stage = {self.num_ab_stage}, num_c_stage = {self.num_c_stage}, num_scale_stage = {self.num_scale_stage}, num_tile_stage = {self.num_tile_stage}")
 
         # Compute A/B/C/Scale shared memory layout
         self.a_smem_layout_staged = sm100_utils.make_smem_layout_a(
@@ -560,8 +552,6 @@ class BlockwiseContiguousGroupedGemmKernel:
 
         self.shared_storage = SharedStorage
 
-        # print(f"limin: grid = {grid}, block = {self.threads_per_cta}, cluster = {self.cluster_shape_mn}")
-        # cute.printf(f"limin: grid = {grid}")
         # Launch the kernel synchronously
         self.kernel(
             tiled_mma,
@@ -1268,19 +1258,6 @@ class BlockwiseContiguousGroupedGemmKernel:
                                                     peek_scale_empty_status)
 
                     # load scaleA/scaleB
-                    """
-                    with cute.arch.elect_one():
-                        print(f"limiN: tiled_copy_sfa = {tiled_copy_sfa}")
-                        print(f"limiN: tAgSFA_k = {tAgSFA_k}, ptr = {tAgSFA_k.iterator}")
-                        print(f"limiN: tAsSFA_pipe = {tAsSFA_pipe}, ptr = {tAsSFA_pipe.iterator}")
-                        print(f"limiN: tApSFA = {tApSFA}, ptr = {tApSFA.iterator}")
-                        # cute.printf(f"limin: tAgSFA_k.iterator = {tAgSFA_k.iterator}")
-                        # cute.printf(f"limin: tAsSFA_pipe.iterator = {tAsSFA_pipe.iterator}")
-                        # cute.printf(f"limin: tApSFA.iterator = {tApSFA.iterator}")
-                        cute.print_tensor(tApSFA, verbose=True)
-                        cute.print_tensor(tAsSFA_pipe, verbose=True)
-                        cute.print_tensor(tAgSFA_k, verbose=True)
-                    """
                     cute.copy(tiled_copy_sfa,
                               tAgSFA_k,
                               tAsSFA_pipe,
@@ -2015,12 +1992,6 @@ class BlockwiseContiguousGroupedGemmKernel:
         next_m_boundary = cutlass.Int32(0)
         if not_found:
             cur_group_idx = cur_group_idx + 1
-        # print(f"limin: not_found = {not_found}, cur_group_idx = {cur_group_idx}, group_count = {group_count}")
-        # print(f"limin: offset_mapping = {offset_mapping}")
-        # cute.printf(f"limin: not_found = {not_found}")
-        # cute.printf(f"limin: cur_group_idx = {cur_group_idx}")
-        # cute.printf(f"limin: group_count = {group_count}")
-        # cute.printf(f"limin: i am error")
         while not_found and cur_group_idx <= group_count:
             next_m_boundary = offset_mapping[cur_group_idx]
             num_m_blocks = cute.ceil_div((next_m_boundary - cur_m_boundary),

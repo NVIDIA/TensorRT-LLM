@@ -1607,12 +1607,6 @@ class CuteDSLFp8BlackwellGroupGemm(TunableRunner):
             # group_offset_cute_tensor = from_dlpack(
             #     group_offset_tmp).mark_layout_dynamic()
             group_offset_cute_tensor = from_dlpack(group_offset).mark_layout_dynamic()
-            print(f"limin: mA.shape = {mA.shape}, mA.stride = {mA.stride}")
-            print(f"limin: mB.shape = {mB.shape}, mB.stride = {mB.stride}")
-            print(f"limin: mC.shape = {mC.shape}, mC.stride = {mC.stride}")
-            print(f"limin: mSFB.shape = {mSFB.shape}, mSFB.stride = {mSFB.stride}")
-            print(f"limin: mSFA.shape = {mSFA.shape}, mSFA.stride = {mSFA.stride}")
-            print(f"limin: group_offset_cute_tensor.shape = {group_offset_cute_tensor.shape}, group_offset_cute_tensor.stride = {group_offset_cute_tensor.stride}")
         """
 
         a, b, a_sf, b_sf, group_offset = inputs
@@ -1639,12 +1633,6 @@ class CuteDSLFp8BlackwellGroupGemm(TunableRunner):
                            assumed_align=16).mark_layout_dynamic(leading_dim=1)
         group_offset_cute_tensor = from_dlpack(
             group_offset).mark_layout_dynamic()
-        # print(f"limin: mA.shape = {mA.shape}, mA.stride = {mA.stride}")
-        # print(f"limin: mB.shape = {mB.shape}, mB.stride = {mB.stride}")
-        # print(f"limin: mC.shape = {mC.shape}, mC.stride = {mC.stride}")
-        # print(f"limin: mSFB.shape = {mSFB.shape}, mSFB.stride = {mSFB.stride}")
-        # print(f"limin: mSFA.shape = {mSFA.shape}, mSFA.stride = {mSFA.stride}")
-        # print(f"limin: group_offset_cute_tensor.shape = {group_offset_cute_tensor.shape}, group_offset_cute_tensor.stride = {group_offset_cute_tensor.stride}")
 
         # get stream
         torch_stream = torch.cuda.current_stream()
@@ -1681,35 +1669,12 @@ class CuteDSLFp8BlackwellGroupGemm(TunableRunner):
                     max_active_clusters: cutlass.Constexpr,
                     stream: cuda.CUstream,
                 ):
-                    # a = cute.append_ones(a)
-                    # c = cute.append_ones(c)
                     a = append_ones_wrapper(a)
                     c = append_ones_wrapper(c)
                     b = permute(b, (1, 2, 0))
                     b_sf = permute(b_sf, (1, 2, 0))
-
                     a_sf = permute(a_sf, (1, 0))
-                    # a_sf = cute.append_ones(a_sf)
                     a_sf = append_ones_wrapper(a_sf)
-                    # print(f"limin-compile: a = {a}")
-                    # print(f"limin-compile: b = {b}")
-                    # print(f"limin-compile: c = {c}")
-                    # print(f"limin-compile: a_sf = {a_sf}")
-                    # print(f"limin-compile: b_sf = {b_sf}")
-                    # print(f"limin-compile: group_offset = {group_offset}")
-                    # cute.printf(f"limin: a = {a.shape}, a.stride = {a.stride}")
-                    # cute.printf(f"limin: b = {b.shape}, b.stride = {b.stride}")
-                    # cute.printf(f"limin: c = {c.shape}, c.stride = {c.stride}")
-                    # cute.printf(f"limin: a_sf = {a_sf.shape}, a_sf.stride = {a_sf.stride}")
-                    # cute.printf(f"limin: b_sf = {b_sf.shape}, b_sf.stride = {b_sf.stride}")
-                    # cute.printf(f"limin: group_offset = {group_offset.shape}, group_offset.stride = {group_offset.stride}")
-                    # cute.print_tensor(a)
-                    # cute.print_tensor(b)
-                    # cute.print_tensor(c)
-                    # cute.print_tensor(a_sf)
-                    # cute.print_tensor(b_sf)
-                    # cute.print_tensor(group_offset)
-
                     gemm(a, b, c, a_sf, b_sf, group_offset, max_active_clusters,
                          stream)
 

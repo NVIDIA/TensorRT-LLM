@@ -1051,7 +1051,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         [(False, False, False, False)],
     )
     @parametrize_with_ids("mtp_nextn", [0])
-    # TODO: add false case
     @parametrize_with_ids("use_cute_dsl_mm", [True, False])
     @parametrize_with_ids("use_cute_dsl_bmm", [True, False])
     @parametrize_with_ids("moe_backend", ["CUTEDSL", "DEEPGEMM"])
@@ -1089,16 +1088,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         mtp_config = None
         if mtp_nextn > 0:
             mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
-
-        # # TODO: it didn't work, why?
-        # if use_cute_dsl_mm:
-        #     os.environ["USE_CUTE_DSL_BLOCKSCALING_MM"] = "1"
-        # else:
-        #     os.environ.pop("USE_CUTE_DSL_BLOCKSCALING_MM", None)
-        # if use_cute_dsl_bmm:
-        #     os.environ["USE_CUTE_DSL_BLOCKSCALING_BMM"] = "1"
-        # else:
-        #     os.environ.pop("USE_CUTE_DSL_BLOCKSCALING_BMM", None)
 
         with LLM(
                 f"{llm_models_root()}/DeepSeek-V3-Lite/fp8",
