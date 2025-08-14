@@ -573,6 +573,8 @@ accuracy/test_llm_api_pytorch.py::TestPhi4MM::test_auto_dtype
 accuracy/test_llm_api_pytorch.py::TestPhi4MM::test_auto_dtype_long_rope
 accuracy/test_llm_api_pytorch.py::TestPhi4MiniInstruct::test_auto_dtype
 accuracy/test_llm_api_pytorch.py::TestEXAONE4::test_auto_dtype
+accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_nixl_backend
+accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_nixl_backend
 
 test_e2e.py::test_llama_e2e[use_cpp_session-remove_input_padding-]
 test_e2e.py::test_llama_e2e[use_py_session-remove_input_padding-]
