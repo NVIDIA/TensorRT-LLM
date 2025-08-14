@@ -22,6 +22,7 @@ except ImportError:
     # TODO: Remove this once we have a proper config for Exaone4
     SKIP_EXAONE4_HF_ACCURACY_TEST = True
 
+from _torch.helpers import DecodingCUDAGraphRunner
 from transformers.cache_utils import HybridCache
 from utils.util import getSMVersion
 
@@ -30,8 +31,6 @@ from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_exaone4 import Exaone4ForCausalLM
-from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import \
-    DecodingCUDAGraphRunner
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
