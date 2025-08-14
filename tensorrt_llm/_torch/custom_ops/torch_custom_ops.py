@@ -85,8 +85,9 @@ class MoERunner(TunableRunner):
         self,
         inputs: List[torch.Tensor],
         profile: OptimizationProfile,
+        gemm_idx: int,
     ) -> List[int]:
-        return range(self.fused_moe_runner.get_tactic_num())
+        return range(self.fused_moe_runner.get_tactic_num(gemm_idx))
 
     def forward(
         self,

@@ -2847,9 +2847,8 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
     expert_first_token_offset_ = getWsPtr(int64_t{}, "expert_first_token_offset");
 
     // We check if the provided config uses fused finalize and disable it if it does not
-    bool const gemm2_using_tma_ws = moe_gemm_runner_.isTmaWarpSpecialized(*gemm2_config_);
     permuted_token_final_scales_
-        = (gemm2_using_tma_ws && mayHaveFinalizeFused()) ? getWsPtr(float{}, "permuted_token_final_scales") : nullptr;
+        = gemm2_config_->using_fused_finalize ? getWsPtr(float{}, "permuted_token_final_scales") : nullptr;
 
     bool const is_gated_activation = isGatedActivation(activation_type);
     bool const gemm1_using_fused_moe
@@ -4007,7 +4006,9 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::
         bool apply_bias = parallelism_config.tp_rank == 0;
         auto* fc2_bias = apply_bias ? fc2_expert_biases : nullptr;
         bool using_fused_finalize
-            = use_fused_finalize_ && gemm2_config_->sm_version >= 90 && !use_w4_groupwise && !use_lora;
+            = use_fused_finalize_ && gemm2_config_->is_finalize_fusion && !use_w4_groupwise && !use_lora;
+        TLLM_CHECK_WITH_INFO(using_fused_finalize == gemm2_config_->using_fused_finalize,
+            "GEMM2 tactic requests finalize fusion, but the runner is not configured to use it");
         if (using_fused_finalize)
         {
             assert(min_latency_mode == false);
@@ -4652,7 +4653,6 @@ void GemmProfilerBackend::prepareTmaWsInputs(
 void GemmProfilerBackend::prepare(
     int num_tokens, char* workspace_ptr_char, void const* expert_weights, cudaStream_t stream)
 {
-    mAllTacticsSaved = mInterface->getTactics();
     mSampleIndex = 0;
 
     auto workspace_size = getWorkspaceSize(num_tokens);

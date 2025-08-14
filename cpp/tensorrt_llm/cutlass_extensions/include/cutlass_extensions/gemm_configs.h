@@ -432,6 +432,7 @@ struct CutlassGemmConfig
     bool enableCudaKernel = false;
     int sm_version = 80; // Use 80 as a catch all for <90
     bool is_tma_warp_specialized = false;
+    bool is_finalize_fusion = false;
 
     CutlassGemmConfig() = default;
 
@@ -502,7 +503,8 @@ struct CutlassGemmConfig
                    << "\n\tsm: " << sm_version << "\n\ttile shape ID: " << getTileConfigAsInt()
                    << "\n\tcluster shape ID: " << (int) cluster_shape
                    << "\n\tmainloop sched: " << (int) mainloop_schedule << "\n\tepi sched: " << (int) epilogue_schedule
-                   << "\n\tenable cuda kernel: " << (enableCudaKernel ? "true" : "false");
+                   << "\n\tenable cuda kernel: " << (enableCudaKernel ? "true" : "false")
+                   << "\n\tis_finalize_fusion: " << (is_finalize_fusion ? "true" : "false");
         }
         else if (tile_config_sm80 != tensorrt_llm::cutlass_extensions::CutlassTileConfig::ChooseWithHeuristic)
         {

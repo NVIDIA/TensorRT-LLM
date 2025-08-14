@@ -215,7 +215,8 @@ public:
         mKernelRunner->use_fused_finalize_ = mUseFusedFinalize;
 
         mProfiler = std::make_shared<kernels::GemmProfilerBackend>();
-        mAllProfiles = mKernelRunner->getTactics();
+        mGemm1Profiles = mKernelRunner->getTactics(MoeGemmId::GEMM_1);
+        mGemm2Profiles = mKernelRunner->getTactics(MoeGemmId::GEMM_2);
     }
 
     ~FusedMoeRunner()
@@ -585,10 +586,10 @@ public:
         return std::make_tuple(output, num_active_experts_per_node, experts_to_token_score, active_expert_global_ids);
     }
 
-    int64_t getTacticNum()
+    int64_t getTacticNum(int gemm_idx)
     {
         std::lock_guard<std::mutex> lock(mMutex);
-        return mAllProfiles.size();
+        return (gemm_idx == 1) ? mGemm1Profiles.size() : mGemm2Profiles.size();
     }
 
     // TODO Update this to be able to tell if we are profiling swiglu bias
@@ -624,10 +625,14 @@ public:
             : group_size_;
         int const num_experts = static_cast<int>(fc2_expert_weights.sizes()[0] * ep_size);
 
+        auto const gemm_to_profile
+            = (gemm_idx == 1) ? profiler_backend::GemmToProfile::GEMM_1 : profiler_backend::GemmToProfile::GEMM_2;
+        auto const& profiles = (gemm_idx == 1) ? mGemm1Profiles : mGemm2Profiles;
+
         // Get specific profile configs according to the profile_id.
         // Fallback tactic is set to be 0
         // TODO: use the best tactic id found offline for a better default inference perf
-        auto const& profile = profile_id == -1 ? mAllProfiles.front() : mAllProfiles[profile_id];
+        auto const& profile = profile_id == -1 ? profiles.front() : profiles[profile_id];
 
         auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
 
@@ -638,8 +643,7 @@ public:
         if (do_preparation)
         {
             // Set profiled gemm idx
-            mProfiler->mGemmToProfile
-                = (gemm_idx == 1) ? profiler_backend::GemmToProfile::GEMM_1 : profiler_backend::GemmToProfile::GEMM_2;
+            mProfiler->mGemmToProfile = gemm_to_profile;
 
             // mProfiler init
             auto parallelism_config = kernels::MOEParallelismConfig(static_cast<int>(tp_size),
@@ -704,7 +708,8 @@ private:
     bool mUseFusedFinalize = true;
 
     using Profile = tensorrt_llm::cutlass_extensions::CutlassGemmConfig;
-    std::vector<Profile> mAllProfiles;
+    std::vector<Profile> mGemm1Profiles;
+    std::vector<Profile> mGemm2Profiles;
 
     void freeProfileWorkspace()
     {
@@ -730,15 +735,15 @@ private:
             return;
         }
 
-        auto best_gemm1_profile = mAllProfiles.front();
-        auto best_gemm2_profile = mAllProfiles.front();
+        auto best_gemm1_profile = mGemm1Profiles.front();
+        auto best_gemm2_profile = mGemm2Profiles.front();
         if (profile_ids.has_value())
         {
             TORCH_CHECK(profile_ids.value().size() == 2, "Expecting 2 profile ids");
             best_gemm1_profile
-                = profile_ids.value()[0] == -1 ? best_gemm1_profile : mAllProfiles.at(profile_ids.value()[0]);
+                = profile_ids.value()[0] == -1 ? best_gemm1_profile : mGemm1Profiles.at(profile_ids.value()[0]);
             best_gemm2_profile
-                = profile_ids.value()[1] == -1 ? best_gemm2_profile : mAllProfiles.at(profile_ids.value()[1]);
+                = profile_ids.value()[1] == -1 ? best_gemm2_profile : mGemm2Profiles.at(profile_ids.value()[1]);
         }
         mKernelRunner->setTactic(best_gemm1_profile, best_gemm2_profile);
     }
