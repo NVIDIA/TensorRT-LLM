@@ -28,7 +28,7 @@ torchvision
 nvidia-modelopt[torch]~=0.33.0
 nvidia-nccl-cu12
 nvidia-cuda-nvrtc-cu12
-transformers==4.53.1
+transformers==4.53.2
 pydantic>=2.9.1
 pydantic-settings[yaml]
 omegaconf
