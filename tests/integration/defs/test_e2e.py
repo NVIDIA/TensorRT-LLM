@@ -661,19 +661,22 @@ def test_trtllm_bench_mig_launch(llm_root, llm_venv, model_name, model_subdir,
     print("-" * 60)
 
     for idx, val in enumerate(concurrency_list):
-        if hasattr(results[val], 'get'):
-            throughput = float(results[val].get('throughput', 0))
-            latency = float(results[val].get('latency', 0))
-            num_requests = int(results[val].get('num_requests', 0))
-            assert throughput > 0, f"Throughput is 0 for concurrency {concurrency}"
-            assert latency > 0, f"Latency is 0 for concurrency {concurrency}"
-            print(
-                f"{concurrency:<15} {throughput:<15} {latency:<15} {num_requests:<15}"
-            )
-            if idx > 0:
-                assert throughput > float(
-                    results[concurrency_list[idx - 1]].get('throughput', 0)
-                ) * 1.3, f"Throughput is not increasing for concurrency {concurrency_list[idx]}"
+    for idx, val in enumerate(concurrency_list):
+        metrics = results.get(val)
+        if not isinstance(metrics, dict):
+            pytest.fail(f"Unexpected benchmark result type for concurrency {val}: {type(metrics)}")
+        try:
+            throughput = float(metrics.get('throughput', 0))
+            latency = float(metrics.get('latency', 0))
+            num_requests = int(metrics.get('num_requests', 0))
+        except (ValueError, TypeError) as e:
+            pytest.fail(f"Failed to parse benchmark results for concurrency {val}: {e}")
+        assert throughput > 0, f"Throughput is 0 for concurrency {val}"
+        assert latency > 0, f"Latency is 0 for concurrency {val}"
+        print(f"{val:<15} {throughput:<15} {latency:<15} {num_requests:<15}")
+        if idx > 0:
+            prev_throughput = float(results[concurrency_list[idx - 1]].get('throughput', 0))
+            assert throughput > prev_throughput * 1.3, f"Throughput is not increasing for concurrency {concurrency_list[idx]}"
 
 
 @pytest.mark.parametrize(
