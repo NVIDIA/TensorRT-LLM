@@ -16,6 +16,7 @@
 
 #include "tensorrt_llm/runtime/decodingLayerWorkspace.h"
 #include "tensorrt_llm/common/cudaUtils.h"
+#include "tensorrt_llm/common/workspace.h"
 #include <gtest/gtest.h>
 #include <random>
 
@@ -171,7 +172,7 @@ TEST_P(MirrorInWorkspaceTest, TestMirrorInWorkspaceFunctionality)
         requiredWorkspaceSize)
         << "The calculated workspace size cannot possibly be enough to contain all the tensors.";
 
-    constexpr std::size_t addressAlignment = 128;
+    constexpr std::size_t addressAlignment = tensorrt_llm::common::kCudaMemAlign;
     constexpr std::size_t numTensors = 3;
     constexpr std::size_t maxAlignmentOverhead = numTensors * addressAlignment;
     ASSERT_GE(hostTensor1->getSizeInBytes() + hostTensor2->getSizeInBytes() + hostTensor3->getSizeInBytes()
