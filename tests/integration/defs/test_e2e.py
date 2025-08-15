@@ -619,7 +619,7 @@ def test_trtllm_bench_invalid_token_pytorch(llm_root, llm_venv, model_name,
                 f"throughput " \
                 f"--dataset {str(dataset_path)} --backend pytorch " \
                 f"--extra_llm_api_options {extra_options_path} " \
-                f"> {output_path}"
+                f"> {output_path} 2>&1"
         # Check clean shutdown (no hang)
         with pytest.raises(subprocess.CalledProcessError) as exc_info:
             check_call(benchmark_cmd, shell=True, env=llm_venv._new_env)
@@ -629,7 +629,7 @@ def test_trtllm_bench_invalid_token_pytorch(llm_root, llm_venv, model_name,
             stdout = f.read()
 
     # Check that error is reported correctly
-    assert "Error during benchmarking: Requests failed: Token ID out of range (1 requests)" in stdout
+    assert "Requests failed: Token ID out of range (1 requests)" in stdout
 
 
 def trtllm_bench_prolog(

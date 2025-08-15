@@ -144,6 +144,14 @@ class ModelConfig(Generic[TConfig]):
                 self.allreduce_strategy)
 
     @property
+    def torch_dtype(self) -> torch.dtype:
+        """Get the torch dtype of the model."""
+        # TODO: this is an assumption that a HF model is always in bfloat16
+        # We should figure out a better way to handle this if other models
+        # start to not report dtype.
+        return self.pretrained_config.torch_dtype or torch.bfloat16
+
+    @property
     def fuse_pos_embd(self):
         if self.attn_backend == 'TRTLLM':
             return True
