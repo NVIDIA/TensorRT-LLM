@@ -654,7 +654,6 @@ class DeepSeekFP8BlockScalesFusedMoEMethod(FusedMoEMethodBase):
             self, module: torch.nn.Module, weights: Dict,
             load_expert_ids: List[int], dst_w3_w1_weight_scale: torch.Tensor,
             dst_w2_weight_scale: torch.Tensor, device):
-        assert device.type == "cuda"
         for local_slot_id, expert_id in enumerate(load_expert_ids):
             if module.weight_loading_mode == MoEWeightLoadingMode.FUSED_GATE_UP_PROJ:
                 w3_scale = weights['gate_up_proj_weight_scale'][
@@ -896,7 +895,6 @@ class WInt4AFP8FusedMoEMethod(FusedMoEMethodBase):
         """
         device = dst_w3_w1_weight.device
         self.device = device
-        assert device.type == "cuda"
 
         w1_weight_shard = load_weight_shard(w1_weight,
                                             module.tp_size,
@@ -953,7 +951,6 @@ class WInt4AFP8FusedMoEMethod(FusedMoEMethodBase):
         Override this method if you need to preprocess the weights differently.
         """
         device = dst_w2_weight.device
-        assert device.type == "cuda"
         w2_weight_shard = load_weight_shard(w2_weight,
                                             module.tp_size,
                                             module.tp_rank,
@@ -1258,7 +1255,6 @@ class WFP4A16FusedMoEMethod(FusedMoEMethodBase):
         Override this method if you need to preprocess the weights differently.
         """
         device = dst_w3_w1_weight.device
-        assert device.type == "cuda"
         w1_weight_shard = load_weight_shard(w1_weight,
                                             module.tp_size,
                                             module.tp_rank,
@@ -1298,7 +1294,6 @@ class WFP4A16FusedMoEMethod(FusedMoEMethodBase):
         Override this method if you need to preprocess the weights differently.
         """
         device = dst_w2_weight.device
-        assert device.type == "cuda"
         w2_weight_shard = load_weight_shard(w2_weight,
                                             module.tp_size,
                                             module.tp_rank,
@@ -1322,7 +1317,6 @@ class WFP4A16FusedMoEMethod(FusedMoEMethodBase):
 
     def load_quant_scales(self, module: torch.nn.Module, weights: Dict):
         device = module.fc31_weight_scale.data.device
-        assert device.type == "cuda"
 
         # fc31 scales
         assert (len(module.interleave) == 2)
@@ -2175,7 +2169,6 @@ class MXFP4WeightCutlassFusedMoEMethod(MXFP4WeightFusedMoEMethod):
             w3_weight_scale: torch.Tensor,
             dst_w3_w1_weight_scale: torch.Tensor):
         device = dst_w3_w1_weight_scale.device
-        assert device.type == "cuda"
         w1_weight_scale = load_weight_shard(w1_weight_scale,
                                             module.tp_size,
                                             module.tp_rank,
@@ -2214,7 +2207,6 @@ class MXFP4WeightCutlassFusedMoEMethod(MXFP4WeightFusedMoEMethod):
                                           w2_weight_scale: torch.Tensor,
                                           dst_w2_weight_scale: torch.Tensor):
         device = dst_w2_weight_scale.device
-        assert device.type == "cuda"
         w2_weight_scale = load_weight_shard(w2_weight_scale,
                                             module.tp_size,
                                             module.tp_rank,
