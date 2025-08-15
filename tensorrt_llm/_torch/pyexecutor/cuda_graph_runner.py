@@ -229,7 +229,8 @@ class CUDAGraphRunner:
         position_ids = current_inputs["position_ids"]
         static_tensors["position_ids"][:, :seqlen].copy_(position_ids)
 
-        if "mrope_position_deltas" in static_tensors:
+        if "mrope_position_deltas" in current_inputs:
+            assert "mrope_position_deltas" in static_tensors
             static_tensors["mrope_position_deltas"][:batch_size].copy_(
                 current_inputs["mrope_position_deltas"])
 
