@@ -23,7 +23,7 @@ from tensorrt_llm.quantization.utils.fp4_utils import (
 
 
 @pytest.mark.skipif(
-    getSMVersion() != 100,
+    getSMVersion() < 100 or getSMVersion() >= 110,
     reason="The test is for Blackwell only. Current SM is %d." % getSMVersion(),
 )
 @pytest.mark.parametrize(
@@ -104,7 +104,7 @@ def test_fp8_block_scale_gemm(dtype, m, k, n, inference_mode):
 
 
 @pytest.mark.skipif(
-    getSMVersion() != 100,
+    getSMVersion() < 100 or getSMVersion() >= 110,
     reason="The test is for Blackwell only. Current SM is %d." % getSMVersion(),
 )
 @pytest.mark.parametrize(

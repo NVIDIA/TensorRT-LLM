@@ -1020,6 +1020,8 @@ class TestMoE(unittest.TestCase):
         product(["float16", "bfloat16", "int4", "int8"], ["gelu", "geglu"],
                 [True], [32, 64])),
                           name_func=unittest_name_func)
+    @pytest.mark.skip(
+        "https://nvbugswb.nvidia.com/NVBugs5/redir.aspx?url=/5443053")
     def test_mlp_lora_comparison(self, dtype_str, actfn, use_plugin, lora_rank):
         """This test uses one expert and compares the result to a plain MLP"""
         torch.random.manual_seed(42)

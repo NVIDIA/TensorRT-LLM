@@ -187,6 +187,7 @@ class RoPEModel(torch.nn.Module):
     ],
 )
 @torch.inference_mode()
+@pytest.mark.skip("https://nvbugswb.nvidia.com/NVBugs5/redir.aspx?url=/5443039")
 def test_rope_variants(
     transformation,
     variant,

@@ -25,7 +25,7 @@ from utils.util import getSMVersion
 
 
 @pytest.mark.skipif(
-    getSMVersion() != 100,
+    getSMVersion() < 100 or getSMVersion() > 109,
     reason="The test is for Blackwell only. Current SM is %d." % getSMVersion(),
 )
 @pytest.mark.parametrize(

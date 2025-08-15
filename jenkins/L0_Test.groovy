@@ -2415,6 +2415,7 @@ pipeline {
         PIP_INDEX_URL="https://urm.nvidia.com/artifactory/api/pypi/pypi-remote/simple"
         // force datasets to be offline mode, to prevent CI jobs are downloading HF dataset causing test failures
         HF_DATASETS_OFFLINE=1
+        CMAKE_POLICY_VERSION_MINIMUM="3.5"
     }
     stages {
         stage("Setup environment")

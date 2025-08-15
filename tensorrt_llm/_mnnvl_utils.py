@@ -19,7 +19,11 @@ from typing import Optional
 
 import pynvml
 import torch
-from cuda import cuda
+
+try:
+    from cuda.bindings import driver as cuda
+except ImportError:
+    from cuda import cuda
 
 from ._dlpack_utils import pack_strided_memory
 from ._utils import mpi_comm
