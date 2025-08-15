@@ -508,7 +508,7 @@ class ModelConfig(Generic[TConfig]):
         head_dim_names = ["head_size", "head_dim"]
         head_size = None
         for head_dim_name in head_dim_names:
-            if head_dim_name in self.pretrained_config:
+            if hasattr(self.pretrained_config, head_dim_name):
                 value = getattr(self.pretrained_config, head_dim_name)
                 if value is not None:
                     head_size = value
