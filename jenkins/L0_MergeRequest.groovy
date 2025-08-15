@@ -1039,7 +1039,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                             'wheelDockerImagePy312': globalVars["LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE"],
                         ]
 
-                        launchJob("L0_Test-x86_64-Single-GPU", false, enableFailFast, globalVars, "x86_64", additionalParameters)
+                        launchJob("L0_Test-x86_64-Single-GPU", reuseBuild, enableFailFast, globalVars, "x86_64", additionalParameters)
                     } catch (InterruptedException e) {
                         throw e
                     } catch (Exception e) {
@@ -1095,7 +1095,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                             'wheelDockerImagePy312': globalVars["LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE"],
                         ]
 
-                        launchJob("L0_Test-x86_64-Multi-GPU", false, enableFailFast, globalVars, "x86_64", additionalParameters)
+                        launchJob("L0_Test-x86_64-Multi-GPU", reuseBuild, enableFailFast, globalVars, "x86_64", additionalParameters)
 
                     } catch (InterruptedException e) {
                         throw e
@@ -1143,7 +1143,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                             "dockerImage": globalVars["LLM_SBSA_DOCKER_IMAGE"],
                         ]
 
-                        launchJob("L0_Test-SBSA-Single-GPU", false, enableFailFast, globalVars, "SBSA", additionalParameters)
+                        launchJob("L0_Test-SBSA-Single-GPU", reuseBuild, enableFailFast, globalVars, "SBSA", additionalParameters)
                     } catch (InterruptedException e) {
                         throw e
                     } catch (Exception e) {
@@ -1197,7 +1197,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                             "dockerImage": globalVars["LLM_SBSA_DOCKER_IMAGE"],
                         ]
 
-                        launchJob("L0_Test-SBSA-Multi-GPU", false, enableFailFast, globalVars, "SBSA", additionalParameters)
+                        launchJob("L0_Test-SBSA-Multi-GPU", reuseBuild, enableFailFast, globalVars, "SBSA", additionalParameters)
 
                     } catch (InterruptedException e) {
                         throw e
