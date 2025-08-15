@@ -2058,7 +2058,8 @@ class PyTorchModelEngine(ModelEngine):
 
                     # here we don't need to use context since cuda graph capture didn't run kernel.
                     # maybe we need a cleaner way to do this.
-                    self.cuda_graph_runner.run_graph(batch_size, inputs)
+                    outputs = self.cuda_graph_runner.run_graph(
+                        batch_size, inputs)
                 else:
                     with MoeLoadBalancerIterContext(moe_load_balancer):
                         outputs = self.cuda_graph_runner.run_graph(
