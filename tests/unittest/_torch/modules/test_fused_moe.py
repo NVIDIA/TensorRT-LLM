@@ -1757,8 +1757,10 @@ def test_fused_moe_wfp4a16(dtype, hidden_size):
 @pytest.mark.parametrize(
     "hidden_size, intermediate_size",
     [
-        (256, 256),
         (2880, 2880),
+        (2880, 1440),
+        (2880, 720),
+        (2880, 360),
     ],
 )
 @pytest.mark.parametrize("fp8_activation", [True, False])
