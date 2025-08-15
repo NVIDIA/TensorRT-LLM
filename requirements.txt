@@ -3,7 +3,7 @@
 accelerate>=0.25.0
 build
 colored
-cuda-python>=12,<13
+cuda-python
 diffusers>=0.27.0
 lark
 mpi4py
@@ -49,7 +49,7 @@ setuptools<80
 ordered-set
 peft
 einops
-flashinfer-python==0.2.5
+flashinfer-python @ git+https://github.com/VALLIS-NERIA/flashinfer.git@29e57482ad6410444aa86cf92c669dbbb506e978
 opencv-python-headless
 xgrammar==0.1.21
 backoff

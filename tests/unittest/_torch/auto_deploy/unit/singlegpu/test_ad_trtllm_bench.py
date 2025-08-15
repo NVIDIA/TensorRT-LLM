@@ -2,6 +2,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+import pytest
 import yaml
 from _model_test_utils import _hf_model_dir_or_hub_id
 from click.testing import CliRunner
@@ -64,6 +65,7 @@ def run_benchmark(model_name: str, dataset_path: str, temp_dir: str):
     assert result.exit_code == 0
 
 
+@pytest.mark.skip("https://nvbugswb.nvidia.com/NVBugs5/redir.aspx?url=/5443039")
 def test_trtllm_bench(llm_root):  # noqa: F811
     model_name = _hf_model_dir_or_hub_id(
         f"{llm_models_root()}/TinyLlama-1.1B-Chat-v1.0", "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
