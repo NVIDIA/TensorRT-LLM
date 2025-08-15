@@ -750,8 +750,10 @@ class VisionPreProcessor:
     def __init__(self,
                  vision_model_type,
                  vision_model_processor,
-                 preprocessor_model_config={},
+                 preprocessor_model_config=None,
                  hf_config=None):
+        preprocessor_model_config = preprocessor_model_config or {}
+
         # import libraries that are only relevant for multimodal models
         import torch
         from torch.utils.dlpack import from_dlpack
