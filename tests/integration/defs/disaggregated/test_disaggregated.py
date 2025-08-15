@@ -1245,8 +1245,8 @@ def get_config_for_benchmark(model_root, backend):
 def test_disaggregated_benchmark_on_diff_backends(
         disaggregated_test_root, disaggregated_example_root, llm_venv,
         benchmark_model_root, benchmark_root, shared_gpt_path):
-    nixl_config = get_config_for_benchmark(benchmark_model_root, "nixl")
-    ucx_config = get_config_for_benchmark(benchmark_model_root, "ucx")
+    nixl_config = get_config_for_benchmark(benchmark_model_root, "NIXL")
+    ucx_config = get_config_for_benchmark(benchmark_model_root, "UCX")
     temp_dir = tempfile.TemporaryDirectory()
     nixl_config_path = os.path.join(temp_dir.name, "nixl_config.yaml")
     ucx_config_path = os.path.join(temp_dir.name, "ucx_config.yaml")
