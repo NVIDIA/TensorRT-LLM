@@ -192,6 +192,7 @@ protected:
     DataType* mInputTensor{};
 
     int64_t mHiddenSize{};
+    int64_t mUnpaddedHiddenSize{}; // If 0, defaults to mHiddenSize
     int64_t mNumExperts{};
     int64_t mK{};
 
@@ -253,6 +254,7 @@ protected:
     void TearDown() override
     {
         managed_buffers.clear();
+        mUnpaddedHiddenSize = 0; // Reset for next test
         ASSERT_EQ(cudaStreamSynchronize(mStream->get()), cudaSuccess);
         ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
         ASSERT_EQ(cudaGetLastError(), cudaSuccess);
@@ -1238,15 +1240,16 @@ protected:
 #ifdef USING_OSS_CUTLASS_MOE_GEMM
         mMoERunner.runMoe(mInputTensor, nullptr, true, mSelectedExpert, mTokenFinalScales, weight1_ptr, bias1_ptr,
             ActivationParams(mActType, mSwigluAlpha, mSwigluBeta, mSwigluLimit), weight2_ptr, bias2_ptr, quant_params,
-            mTotalTokens, mHiddenSize, mInterSize / parallelism_config.tp_size, mNumExperts, mK, mWorkspace,
-            mFinalOutput, mSourceToExpandedMap, parallelism_config, enable_alltoall, mUseLora, lora_params,
-            useFp8BlockScales, minLatencyMode, min_latency_params, stream);
+            mTotalTokens, mHiddenSize, mUnpaddedHiddenSize > 0 ? mUnpaddedHiddenSize : mHiddenSize,
+            mInterSize / parallelism_config.tp_size, mNumExperts, mK, mWorkspace, mFinalOutput, mSourceToExpandedMap,
+            parallelism_config, enable_alltoall, mUseLora, lora_params, useFp8BlockScales, minLatencyMode,
+            min_latency_params, stream);
 #else
         mMoERunner.runMoe(mInputTensor, nullptr, true, mSelectedExpert, mTokenFinalScales, weight1_ptr, bias1_ptr,
             ActivationParams(mActType, mSwigluAlpha, mSwigluBeta, mSwigluLimit), weight2_ptr, bias2_ptr, quant_params,
-            mTotalTokens, mHiddenSize, mInterSize / parallelism_config.tp_size, mNumExperts, mK, mWorkspace,
-            mFinalOutput, mSourceToExpandedMap, parallelism_config, mUseLora, lora_params, useFp8BlockScales,
-            minLatencyMode, min_latency_params, stream);
+            mTotalTokens, mHiddenSize, mUnpaddedHiddenSize > 0 ? mUnpaddedHiddenSize : mHiddenSize,
+            mInterSize / parallelism_config.tp_size, mNumExperts, mK, mWorkspace, mFinalOutput, mSourceToExpandedMap,
+            parallelism_config, mUseLora, lora_params, useFp8BlockScales, minLatencyMode, min_latency_params, stream);
 #endif
 
         check_cuda_error(cudaStreamSynchronize(stream));
@@ -1472,11 +1475,14 @@ protected:
         if (final_results.empty())
             final_results = getDataFromDevice(mFinalOutput, mTotalTokens * mHiddenSize);
 
+        // Use unpadded size for validation if set
+        int64_t hidden_size_to_check = mUnpaddedHiddenSize > 0 ? mUnpaddedHiddenSize : mHiddenSize;
+
         for (int64_t token_id = 0; token_id < mTotalTokens; token_id++)
         {
             float block_max = 1.f;
             // NOTE: When mInterSize < mHiddenSize, those values get zeroed out by fc1 and lost
-            for (int64_t hidden_id = 0; hidden_id < std::min(mHiddenSize, mInterSize); hidden_id++)
+            for (int64_t hidden_id = 0; hidden_id < std::min(hidden_size_to_check, mInterSize); hidden_id++)
             {
                 if (MX_QUANT_ACT && hidden_id % FP4VecSize == 0)
                 {
@@ -2061,6 +2067,23 @@ void MixtureOfExpertsTest<TypeParam_>::ParallelismTest(
         }                                                                                                              \
                                                                                                                        \
         this->ParallelismType##Test(8, hidden_size, 256, 75, this->mInterSizeFraction);                                \
+    }                                                                                                                  \
+    TYPED_TEST(MixtureOfExpertsTest, ParallelismType##GptOss120b)                                                      \
+    {                                                                                                                  \
+        this->mIsLongTest = true;                                                                                      \
+        this->mUseBias = true;                                                                                         \
+        this->mActType = ActivationType::Swiglu;                                                                       \
+        size_t hidden_size = 2944;                                                                                     \
+        size_t inter_size = 2944;                                                                                      \
+        this->mInterSizeFraction = float(inter_size) / hidden_size;                                                    \
+        this->mUnpaddedHiddenSize = 2880;                                                                              \
+                                                                                                                       \
+        if (!this->checkSufficientTestMemory(75, hidden_size, 128, 4, true))                                           \
+        {                                                                                                              \
+            GTEST_SKIP() << "Insufficient free memory for test";                                                       \
+        }                                                                                                              \
+                                                                                                                       \
+        this->ParallelismType##Test(4, hidden_size, 128, 75, this->mInterSizeFraction);                                \
     }                                                                                                                  \
                                                                                                                        \
     TYPED_TEST(MixtureOfExpertsTest, ParallelismType##NonPowerOfTwo)                                                   \
