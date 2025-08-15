@@ -1301,7 +1301,8 @@ void MixtureOfExpertsGemmProfiler::checkInit()
     auto& plugin = *mRunner;
 #ifdef USING_OSS_CUTLASS_MOE_GEMM
     backend.init(*plugin.mMOERunner, backend.mGemmToProfile, plugin.mType, plugin.mWeightType, plugin.mOutputType,
-        plugin.mNumExperts, plugin.mExpertsPerToken, plugin.mExpertHiddenSize, plugin.mExpertInterSize,
+        plugin.mNumExperts, plugin.mExpertsPerToken, plugin.mExpertHiddenSize,
+        plugin.mExpertHiddenSize /*TRT backend does not support unpadded hidden size*/, plugin.mExpertInterSize,
         plugin.mGroupSize, plugin.mActivationType, plugin.hasBias(), plugin.hasLora(), /*min_latency_mode=*/false,
         /*need_weights=*/true, plugin.getParallelismConfig(), /*enable_alltoall=*/false);
 #else
