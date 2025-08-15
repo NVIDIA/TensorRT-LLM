@@ -179,7 +179,7 @@ def top_k_top_p_sampling_batch(logits: torch.Tensor,
 
         # set the logits who is less than first top_k logits to -inf
         logits = torch.where(logits < min_values,
-                            torch.full_like(logits, float('-inf')), logits)
+                             torch.full_like(logits, float('-inf')), logits)
 
     sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
 
