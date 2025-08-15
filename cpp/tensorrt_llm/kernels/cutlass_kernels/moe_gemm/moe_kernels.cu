@@ -3698,10 +3698,11 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
             parallelism_config.cluster_size, full_num_experts, stream);
         sync_check_cuda_error(stream);
 
-        auto [gemm1_tma_ws_input, gemm2_tma_ws_input] = setupTmaWarpSpecializedInputs(num_rows, expanded_num_rows,
-            fc1_activation_type, hidden_size, inter_size, num_experts_per_node, input_activations_void, input_sf,
-            final_output, fc1_expert_weights, fc2_expert_weights, quant_params, fc1_expert_biases, fc2_expert_biases,
-            min_latency_mode, min_latency_params, use_lora, start_expert, parallelism_config, stream);
+        auto [gemm1_tma_ws_input, gemm2_tma_ws_input]
+            = setupTmaWarpSpecializedInputs(num_rows, expanded_num_rows, fc1_activation_type, hidden_size,
+                unpadded_hidden_size, inter_size, num_experts_per_node, input_activations_void, input_sf, final_output,
+                fc1_expert_weights, fc2_expert_weights, quant_params, fc1_expert_biases, fc2_expert_biases,
+                min_latency_mode, min_latency_params, use_lora, start_expert, parallelism_config, stream);
 
         // todo: input_activations_void should be nvfp4, waiting for yuxian's mr ready
         Self::gemm1(moe_gemm_runner_, blockscale_gemm_runner, reinterpret_cast<T const*>(input_activations_void),
@@ -3775,10 +3776,11 @@ void CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enab
 
         sync_check_cuda_error(stream);
 
-        auto [gemm1_tma_ws_input, gemm2_tma_ws_input] = setupTmaWarpSpecializedInputs(num_rows, expanded_num_rows,
-            fc1_activation_type, hidden_size, inter_size, num_experts_per_node, input_activations_void, input_sf,
-            final_output, fc1_expert_weights, fc2_expert_weights, quant_params, fc1_expert_biases, fc2_expert_biases,
-            min_latency_mode, min_latency_params, use_lora, start_expert, parallelism_config, stream);
+        auto [gemm1_tma_ws_input, gemm2_tma_ws_input]
+            = setupTmaWarpSpecializedInputs(num_rows, expanded_num_rows, fc1_activation_type, hidden_size,
+                unpadded_hidden_size, inter_size, num_experts_per_node, input_activations_void, input_sf, final_output,
+                fc1_expert_weights, fc2_expert_weights, quant_params, fc1_expert_biases, fc2_expert_biases,
+                min_latency_mode, min_latency_params, use_lora, start_expert, parallelism_config, stream);
 
         if (use_lora)
         {
@@ -3971,7 +3973,7 @@ template <class T, class WeightType, class OutputType, class InputType, class Ba
 std::pair<TmaWarpSpecializedGroupedGemmInput, TmaWarpSpecializedGroupedGemmInput>
 CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::setupTmaWarpSpecializedInputs(
     int64_t num_rows, int64_t expanded_num_rows, ActivationParams fc1_activation_type, int64_t hidden_size,
-    int64_t inter_size, int64_t num_experts_per_node, void const* input_activations_void,
+    int64_t unpadded_hidden_size, int64_t inter_size, int64_t num_experts_per_node, void const* input_activations_void,
     TmaWarpSpecializedGroupedGemmInput::ElementSF const* input_sf, void* final_output,
     WeightType const* fc1_expert_weights, WeightType const* fc2_expert_weights, QuantParams quant_params,
     ScaleBiasType const* fc1_expert_biases, ScaleBiasType const* fc2_expert_biases, bool min_latency_mode,
@@ -4034,7 +4036,7 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::
             assert(min_latency_mode == false);
             bool use_reduction = expanded_num_rows > num_rows;
             gemm2_tma_ws_input.fusion = TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::FINALIZE;
-            gemm2_tma_ws_input.setFinalizeFusionParams(final_output, hidden_size, num_rows, use_reduction);
+            gemm2_tma_ws_input.setFinalizeFusionParams(final_output, unpadded_hidden_size, num_rows, use_reduction);
         }
 
         // fp8_mxfp4 memsets the scaling factors to 1.0f
@@ -4650,7 +4652,7 @@ void GemmProfilerBackend::prepareTmaWsInputs(int num_tokens, char* workspace_ptr
             {
                 assert(!mMinLatencyMode);
                 gemm2_tma_ws_input.fusion = TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::FINALIZE;
-                gemm2_tma_ws_input.setFinalizeFusionParams(output, mExpertHiddenSize, num_tokens, mK > 1);
+                gemm2_tma_ws_input.setFinalizeFusionParams(output, mExpertUnpaddedHiddenSize, num_tokens, mK > 1);
             }
 
             auto fc1_output_size = isGatedActivation(mActivationType) ? mExpertInterSize * 2 : mExpertInterSize;
@@ -4816,7 +4818,7 @@ void GemmProfilerBackend::runProfiler(int original_num_tokens, Config const& tac
             original_num_tokens,                            //
             expanded_num_tokens,                            //
             mExpertHiddenSize,                              //
-            mExpertOrigHiddenSize,                          //
+            mExpertUnpaddedHiddenSize,                      //
             mExpertInterSize,                               //
             num_experts_per_node,                           //
             mK,                                             //

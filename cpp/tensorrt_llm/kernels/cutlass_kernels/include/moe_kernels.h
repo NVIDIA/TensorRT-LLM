@@ -759,11 +759,11 @@ public:
 private:
     std::pair<TmaWarpSpecializedGroupedGemmInput, TmaWarpSpecializedGroupedGemmInput> setupTmaWarpSpecializedInputs(
         int64_t num_rows, int64_t expanded_num_rows, ActivationParams fc1_activation_type, int64_t hidden_size,
-        int64_t inter_size, int64_t num_experts_per_node, void const* input_activations_void,
-        TmaWarpSpecializedGroupedGemmInput::ElementSF const* input_sf, void* final_output,
-        WeightType const* fc1_expert_weights, WeightType const* fc2_expert_weights, QuantParams quant_params,
-        ScaleBiasType const* fc1_expert_biases, ScaleBiasType const* fc2_expert_biases, bool min_latency_mode,
-        MoeMinLatencyParams& min_latency_params, bool use_lora, int start_expert,
+        int64_t unpadded_hidden_size, int64_t inter_size, int64_t num_experts_per_node,
+        void const* input_activations_void, TmaWarpSpecializedGroupedGemmInput::ElementSF const* input_sf,
+        void* final_output, WeightType const* fc1_expert_weights, WeightType const* fc2_expert_weights,
+        QuantParams quant_params, ScaleBiasType const* fc1_expert_biases, ScaleBiasType const* fc2_expert_biases,
+        bool min_latency_mode, MoeMinLatencyParams& min_latency_params, bool use_lora, int start_expert,
         MOEParallelismConfig parallelism_config, cudaStream_t stream);
 
     static std::pair<TmaWarpSpecializedGroupedGemmInput, TmaWarpSpecializedGroupedGemmInput>
@@ -917,8 +917,9 @@ public:
 
     void init(CutlassMoeFCRunnerInterface& runner, GemmToProfile gemm_to_profile, nvinfer1::DataType dtype,
         nvinfer1::DataType wtype, nvinfer1::DataType otype, int num_experts, int k, int64_t hidden_size,
-        int64_t inter_size, int64_t group_size, ActivationType activation_type, bool bias, bool use_lora,
-        bool min_latency_mode, bool need_weights, MOEParallelismConfig parallelism_config, bool const enable_alltoall)
+        int64_t unpadded_hidden_size, int64_t inter_size, int64_t group_size, ActivationType activation_type, bool bias,
+        bool use_lora, bool min_latency_mode, bool need_weights, MOEParallelismConfig parallelism_config,
+        bool const enable_alltoall)
     {
         mInterface = &runner;
         mGemmToProfile = gemm_to_profile;
@@ -929,6 +930,7 @@ public:
         mNumExpertsPerNode = num_experts / parallelism_config.ep_size;
         mK = k;
         mExpertHiddenSize = hidden_size;
+        mExpertUnpaddedHiddenSize = unpadded_hidden_size;
         mExpertInterSize = inter_size; // Already divided by tp_size
         mGroupSize = group_size;
         mActivationType = activation_type;
@@ -969,7 +971,7 @@ public:
     int64_t mNumExpertsPerNode{};
     int64_t mK{};
     int64_t mExpertHiddenSize{};
-    int64_t mExpertOrigHiddenSize{};
+    int64_t mExpertUnpaddedHiddenSize{};
     int64_t mExpertInterSize{};
     int64_t mGroupSize{};
     ActivationType mActivationType{};

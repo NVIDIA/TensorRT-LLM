@@ -1503,7 +1503,8 @@ protected:
 
                 ASSERT_NEAR(OutputType{sum}, final_results[token_id * mHiddenSize + hidden_id], getTolerance(sum))
                     << "Incorrect final value at for token: " << token_id << " offset: " << hidden_id
-                    << " hidden_size: " << mHiddenSize << " inter_size: " << mInterSize;
+                    << " hidden_size: " << mHiddenSize << " unpadded_hidden_size: " << mUnpaddedHiddenSize
+                    << " inter_size: " << mInterSize;
             }
         }
     }
@@ -2289,8 +2290,8 @@ TYPED_TEST(MixtureOfExpertsTest, RunProfiler)
 #ifdef USING_OSS_CUTLASS_MOE_GEMM
         backend.init(this->mMoERunner, gemm_to_profile, typeToDtypeID<typename TypeParam::DataType>(),
             typeToDtypeID<typename TypeParam::WeightType>(), typeToDtypeID<typename TypeParam::OutputType>(),
-            num_experts, k, this->DEFAULT_HIDDEN_SIZE, this->DEFAULT_HIDDEN_SIZE * 4, this->mGroupSize,
-            ActivationType::Geglu, false, this->mUseLora, /*min_latency_mode=*/false,
+            num_experts, k, this->DEFAULT_HIDDEN_SIZE, this->DEFAULT_HIDDEN_SIZE, this->DEFAULT_HIDDEN_SIZE * 4,
+            this->mGroupSize, ActivationType::Geglu, false, this->mUseLora, /*min_latency_mode=*/false,
             /*need_weights=*/true, MOEParallelismConfig{}, /*enable_alltoall=*/false);
 #else
         backend.init(this->mMoERunner, gemm_to_profile, typeToDtypeID<typename TypeParam::DataType>(),
@@ -2340,8 +2341,8 @@ TEST_F(MixtureOfExpertsProfilerTest, TestGeneratedProfilerDistribution)
         {
 #ifdef USING_OSS_CUTLASS_MOE_GEMM
             backend.init(this->mMoERunner, GemmProfilerBackend::GemmToProfile::GEMM_1, nvinfer1::DataType::kHALF,
-                nvinfer1::DataType::kHALF, nvinfer1::DataType::kHALF, num_experts, k, 1024, 4096, mGroupSize, {}, false,
-                mUseLora, /*min_latency_mode=*/false, /*need_weights=*/true, MOEParallelismConfig{1, 0, ep, 0},
+                nvinfer1::DataType::kHALF, nvinfer1::DataType::kHALF, num_experts, k, 1024, 1024, 4096, mGroupSize, {},
+                false, mUseLora, /*min_latency_mode=*/false, /*need_weights=*/true, MOEParallelismConfig{1, 0, ep, 0},
                 /*enable_alltoall=*/false);
 #else
             backend.init(this->mMoERunner, GemmProfilerBackend::GemmToProfile::GEMM_1, nvinfer1::DataType::kHALF,
