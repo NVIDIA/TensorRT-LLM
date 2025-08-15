@@ -802,13 +802,16 @@ class TestGemma3_27BInstruct(LlmapiAccuracyTestHarness):
         kv_cache_config = KvCacheConfig(
             enable_block_reuse=False,
             enable_partial_reuse=False,
+            free_gpu_memory_fraction=0.5,
         )
         # We use FlashInfer as the attention backend for Gemma3 VLM to support custom mask for images.
         # So, testing with it here.
         with LLM(self.MODEL_PATH,
                  kv_cache_config=kv_cache_config,
                  attn_backend="FLASHINFER",
-                 cuda_graph_config=None) as llm:
+                 cuda_graph_config=None,
+                 max_batch_size=128,
+                 max_seq_len=4096) as llm:
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)
