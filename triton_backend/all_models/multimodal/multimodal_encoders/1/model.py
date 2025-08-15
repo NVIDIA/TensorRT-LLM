@@ -175,7 +175,6 @@ class TritonPythonModel:
                 self.image_size = hf_config.vision_config.image_size
                 self.patch_size = hf_config.vision_config.patch_size
                 self.vocab_size = hf_config.text_config.vocab_size
-                self.image_token_index = hf_config.image_token_index
                 self.spatial_merge_size = hf_config.spatial_merge_size
                 self.relevant_patch_size = self.patch_size * self.spatial_merge_size
 
