@@ -323,8 +323,8 @@ void invokeRenormMoeRouting(InputT* routerLogits, OutputT* topkValues, IdxT* top
     int64_t const numExperts, int64_t const topK, cudaStream_t const stream)
 {
 
-    const uint32_t maxNumBlocks = 1024;
-    const uint32_t numBlocks = std::min(static_cast<uint32_t>((numTokens - 1) / WARPS_PER_BLOCK + 1), maxNumBlocks);
+    uint32_t const maxNumBlocks = 1024;
+    uint32_t const numBlocks = std::min(static_cast<uint32_t>((numTokens - 1) / WARPS_PER_BLOCK + 1), maxNumBlocks);
 
     uint32_t maxNumExperts = nextPowerOfTwo(numExperts) < 32 ? 32 : nextPowerOfTwo(numExperts);
     uint32_t maxNumTopExperts = nextPowerOfTwo(topK);
