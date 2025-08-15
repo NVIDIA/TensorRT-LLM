@@ -1,11 +1,10 @@
 import os
-from typing import Dict, Optional, Tuple
+from typing import Dict, NewType, Optional, Tuple
 
 import torch
 from torch import nn
 from torch.nn.parameter import Parameter
 from tqdm import tqdm
-from transformers import GptOssConfig
 
 from tensorrt_llm.functional import PositionEmbeddingType, RotaryScalingType
 
@@ -35,6 +34,12 @@ from ..utils import Fp4QuantizedTensor
 from .modeling_speculative import SpecDecOneEngineForCausalLM
 from .modeling_utils import (DecoderModel, duplicate_kv_weight, filter_weights,
                              register_auto_model)
+
+try:
+    from transformers import GptOssConfig
+except ImportError:
+    from transformers import PretrainedConfig
+    GptOssConfig = NewType('GptOssConfig', PretrainedConfig)
 
 
 class AttentionBlock(Attention):
