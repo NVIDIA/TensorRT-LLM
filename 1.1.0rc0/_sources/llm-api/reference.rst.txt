@@ -1,0 +1,301 @@
+API Reference
+-------------
+
+.. autoclass:: tensorrt_llm.llmapi.LLM
+    :members:
+    :undoc-members:
+    :show-inheritance:
+    :special-members: __init__
+    :member-order: groupwise
+    :inherited-members:
+
+.. autoclass:: tensorrt_llm.llmapi.CompletionOutput
+    :members:
+    :undoc-members:
+    :show-inheritance:
+    :special-members: __init__
+    :member-order: groupwise
+    :inherited-members:
+
+.. autoclass:: tensorrt_llm.llmapi.RequestOutput
+    :members:
+    :undoc-members:
+    :show-inheritance:
+    :special-members: __init__
+    :member-order: groupwise
+    :inherited-members:
+
+.. autoclass:: tensorrt_llm.llmapi.GuidedDecodingParams
+    :members:
+    :undoc-members:
+    :show-inheritance:
+    :special-members: __init__
+    :member-order: groupwise
+    :inherited-members:
+
+.. autoclass:: tensorrt_llm.llmapi.SamplingParams
+    :members:
+    :undoc-members:
+    :show-inheritance:
+    :special-members: __init__
+    :member-order: groupwise
+    :inherited-members:
+
+.. autoclass:: tensorrt_llm.llmapi.DisaggregatedParams
+    :members:
+    :undoc-members:
+    :show-inheritance:
+    :special-members: __init__
+    :member-order: groupwise
+    :inherited-members:
+
+.. autoclass:: tensorrt_llm.llmapi.KvCacheConfig
+    :members:
+    :undoc-members:
+    :show-inheritance:
+    :special-members: __init__
+    :member-order: groupwise
+    :inherited-members:
+
+.. autoclass:: tensorrt_llm.llmapi.KvCacheRetentionConfig
+    :members:
+    :undoc-members:
+    :show-inheritance:
+    :special-members: __init__
+    :member-order: groupwise
+    :inherited-members:
+
+.. autoclass:: tensorrt_llm.llmapi.CudaGraphConfig
+    :members:
+    :undoc-members:
+    :show-inheritance:
+    :special-members: __init__
+    :member-order: groupwise
+    :inherited-members:
+
+.. autoclass:: tensorrt_llm.llmapi.MoeConfig
+    :members:
+    :undoc-members:
+    :show-inheritance:
+    :special-members: __init__
+    :member-order: groupwise
+    :inherited-members:
+
+.. autoclass:: tensorrt_llm.llmapi.LookaheadDecodingConfig
+    :members:
+    :undoc-members:
+    :show-inheritance:
+    :special-members: __init__
+    :member-order: groupwise
+    :inherited-members:
+
+.. autoclass:: tensorrt_llm.llmapi.MedusaDecodingConfig
+    :members:
+    :undoc-members:
+    :show-inheritance:
+    :special-members: __init__
+    :member-order: groupwise
+    :inherited-members:
+
+.. autoclass:: tensorrt_llm.llmapi.EagleDecodingConfig
+    :members:
+    :undoc-members:
+    :show-inheritance:
+    :special-members: __init__
+    :member-order: groupwise
+    :inherited-members:
+
+.. autoclass:: tensorrt_llm.llmapi.MTPDecodingConfig
+    :members:
+    :undoc-members:
+    :show-inheritance:
+    :special-members: __init__
+    :member-order: groupwise
+    :inherited-members:
+
+.. autoclass:: tensorrt_llm.llmapi.SchedulerConfig
+    :members:
+    :undoc-members:
+    :show-inheritance:
+    :special-members: __init__
+    :member-order: groupwise
+    :inherited-members:
+
+.. autoclass:: tensorrt_llm.llmapi.CapacitySchedulerPolicy
+    :members:
+    :undoc-members:
+    :show-inheritance:
+    :special-members: __init__
+    :member-order: groupwise
+    :inherited-members:
+
+.. autoclass:: tensorrt_llm.llmapi.BuildConfig
+    :members:
+    :undoc-members:
+    :show-inheritance:
+    :special-members: __init__
+    :member-order: groupwise
+    :inherited-members:
+
+.. autoclass:: tensorrt_llm.llmapi.QuantConfig
+    :members:
+    :undoc-members:
+    :show-inheritance:
+    :special-members: __init__
+    :member-order: groupwise
+    :inherited-members:
+
+.. autoclass:: tensorrt_llm.llmapi.QuantAlgo
+    :members:
+    :undoc-members:
+    :show-inheritance:
+    :special-members: __init__
+    :member-order: groupwise
+    :inherited-members:
+
+.. autoclass:: tensorrt_llm.llmapi.CalibConfig
+    :members:
+    :undoc-members:
+    :show-inheritance:
+    :special-members: __init__
+    :member-order: groupwise
+    :inherited-members:
+
+.. autoclass:: tensorrt_llm.llmapi.BuildCacheConfig
+    :members:
+    :undoc-members:
+    :show-inheritance:
+    :special-members: __init__
+    :member-order: groupwise
+    :inherited-members:
+
+.. autoclass:: tensorrt_llm.llmapi.RequestError
+    :members:
+    :undoc-members:
+    :show-inheritance:
+    :special-members: __init__
+    :member-order: groupwise
+    :inherited-members:
+
+.. autoclass:: tensorrt_llm.llmapi.MpiCommSession
+    :members:
+    :undoc-members:
+    :show-inheritance:
+    :special-members: __init__
+    :member-order: groupwise
+    :inherited-members:
+
+.. autoclass:: tensorrt_llm.llmapi.ExtendedRuntimePerfKnobConfig
+    :members:
+    :undoc-members:
+    :show-inheritance:
+    :special-members: __init__
+    :member-order: groupwise
+    :inherited-members:
+
+.. autoclass:: tensorrt_llm.llmapi.BatchingType
+    :members:
+    :undoc-members:
+    :show-inheritance:
+    :special-members: __init__
+    :member-order: groupwise
+    :inherited-members:
+
+.. autoclass:: tensorrt_llm.llmapi.ContextChunkingPolicy
+    :members:
+    :undoc-members:
+    :show-inheritance:
+    :special-members: __init__
+    :member-order: groupwise
+    :inherited-members:
+
+.. autoclass:: tensorrt_llm.llmapi.DynamicBatchConfig
+    :members:
+    :undoc-members:
+    :show-inheritance:
+    :special-members: __init__
+    :member-order: groupwise
+    :inherited-members:
+
+.. autoclass:: tensorrt_llm.llmapi.CacheTransceiverConfig
+    :members:
+    :undoc-members:
+    :show-inheritance:
+    :special-members: __init__
+    :member-order: groupwise
+    :inherited-members:
+
+.. autoclass:: tensorrt_llm.llmapi.NGramDecodingConfig
+    :members:
+    :undoc-members:
+    :show-inheritance:
+    :special-members: __init__
+    :member-order: groupwise
+    :inherited-members:
+
+.. autoclass:: tensorrt_llm.llmapi.UserProvidedDecodingConfig
+    :members:
+    :undoc-members:
+    :show-inheritance:
+    :special-members: __init__
+    :member-order: groupwise
+    :inherited-members:
+
+.. autoclass:: tensorrt_llm.llmapi.TorchCompileConfig
+    :members:
+    :undoc-members:
+    :show-inheritance:
+    :special-members: __init__
+    :member-order: groupwise
+    :inherited-members:
+
+.. autoclass:: tensorrt_llm.llmapi.DraftTargetDecodingConfig
+    :members:
+    :undoc-members:
+    :show-inheritance:
+    :special-members: __init__
+    :member-order: groupwise
+    :inherited-members:
+
+.. autoclass:: tensorrt_llm.llmapi.LlmArgs
+    :members:
+    :undoc-members:
+    :show-inheritance:
+    :special-members: __init__
+    :member-order: groupwise
+    :inherited-members:
+
+.. autoclass:: tensorrt_llm.llmapi.TorchLlmArgs
+    :members:
+    :undoc-members:
+    :show-inheritance:
+    :special-members: __init__
+    :member-order: groupwise
+    :inherited-members:
+    :exclude-members: model_computed_fields,model_fields_set,model_dump_json,model_copy,model_parametrized_name,model_validate_strings,model_rebuild,model_json_schema,from_orm,model_validate,parse_obj,validate,copy,schema,model_post_init,parse_file,model_config,schema_json,dict,model_dump,model_validate_json,model_construct,model_fields,construct,parse_raw,update_forward_refs,model_extra,json
+
+.. autoclass:: tensorrt_llm.llmapi.TrtLlmArgs
+    :members:
+    :undoc-members:
+    :show-inheritance:
+    :special-members: __init__
+    :member-order: groupwise
+    :inherited-members:
+    :exclude-members: model_computed_fields,model_fields_set,model_dump_json,model_copy,model_parametrized_name,model_validate_strings,model_rebuild,model_json_schema,from_orm,model_validate,parse_obj,validate,copy,schema,model_post_init,parse_file,model_config,schema_json,dict,model_dump,model_validate_json,model_construct,model_fields,construct,parse_raw,update_forward_refs,model_extra,json
+
+.. autoclass:: tensorrt_llm.llmapi.AutoDecodingConfig
+    :members:
+    :undoc-members:
+    :show-inheritance:
+    :special-members: __init__
+    :member-order: groupwise
+    :inherited-members:
+
+.. autoclass:: tensorrt_llm.llmapi.AttentionDpConfig
+    :members:
+    :undoc-members:
+    :show-inheritance:
+    :special-members: __init__
+    :member-order: groupwise
+    :inherited-members:
+

@@ -1,0 +1,944 @@
+
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>DeepSeek R1 MTP Implementation and Optimization &#8212; TensorRT-LLM</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../../_static/styles/theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+<link href="../../_static/styles/pydata-sphinx-theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../../_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="../../_static/styles/nvidia-sphinx-theme.css?v=df3ac72c" />
+    <link rel="stylesheet" type="text/css" href="../../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../../_static/autodoc_pydantic.css" />
+    <link rel="stylesheet" type="text/css" href="../../_static/togglebutton.css?v=13237357" />
+    <link rel="stylesheet" type="text/css" href="../../_static/custom.css?v=95073da6" />
+  
+  <!-- So that users can add custom icons -->
+  <script src="../../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf" />
+<link rel="preload" as="script" href="../../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf" />
+
+    <script src="../../_static/documentation_options.js?v=5929fcd5"></script>
+    <script src="../../_static/doctools.js?v=9a2dae69"></script>
+    <script src="../../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../../_static/copybutton.js?v=65e89d2a"></script>
+    <script>let toggleHintShow = 'Click to show';</script>
+    <script>let toggleHintHide = 'Click to hide';</script>
+    <script>let toggleOpenOnPrint = 'true';</script>
+    <script src="../../_static/togglebutton.js?v=4a39c7ea"></script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>var togglebuttonSelector = '.toggle, .admonition.dropdown';</script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'blogs/tech_blog/blog2_DeepSeek_R1_MTP_Implementation_and_Optimization';</script>
+    <script>
+        DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
+        DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.1.0rc0';
+        DOCUMENTATION_OPTIONS.show_version_warning_banner =
+            false;
+        </script>
+    <link rel="icon" href="../../_static/favicon.png"/>
+    <link rel="index" title="Index" href="../../genindex.html" />
+    <link rel="search" title="Search" href="../../search.html" />
+    <link rel="prev" title="Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs" href="blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="1.1.0rc0" />
+
+
+  </head>
+  
+  
+  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="">
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search the docs ..."
+         aria-label="Search the docs ..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-3 navbar-header-items__start">
+    
+      <div class="navbar-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
+    <img src="../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT-LLM</p>
+  
+</a></div>
+    
+  </div>
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    <div class="me-auto navbar-header-items__center">
+      
+        <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-2"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-2"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-2"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-2">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+      
+    </div>
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+        <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="TensorRT-LLM - Home"/>
+    <img src="../../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="TensorRT-LLM - Home"/>
+  
+  
+    <p class="title logo__title">TensorRT-LLM</p>
+  
+</a>
+
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+      <div class="sidebar-header-items__center">
+        
+          
+          
+            <div class="navbar-item">
+
+
+<div class="version-switcher__container dropdown pst-js-only">
+  <button id="pst-version-switcher-button-3"
+    type="button"
+    class="version-switcher__button btn btn-sm dropdown-toggle"
+    data-bs-toggle="dropdown"
+    aria-haspopup="listbox"
+    aria-controls="pst-version-switcher-list-3"
+    aria-label="Version switcher list"
+  >
+    Choose version  <!-- this text may get changed later by javascript -->
+    <span class="caret"></span>
+  </button>
+  <div id="pst-version-switcher-list-3"
+    class="version-switcher__menu dropdown-menu list-group-flush py-0"
+    role="listbox" aria-labelledby="pst-version-switcher-button-3">
+    <!-- dropdown will be populated by javascript on page load -->
+  </div>
+</div></div>
+          
+        
+      </div>
+    
+    
+    
+      <div class="sidebar-header-items__end">
+        
+          <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+        
+      </div>
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+
+
+<nav class="bd-docs-nav bd-links"
+     aria-label="Table of Contents">
+  <p class="bd-links__title" role="heading" aria-level="1">Table of Contents</p>
+  <div class="bd-toc-item navbar-nav"><p aria-level="2" class="caption" role="heading"><span class="caption-text">Getting Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../quick-start-guide.html">Quick Start Guide</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../key-features.html">Key Features</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../torch.html">PyTorch Backend</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../release-notes.html">Release Notes</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Installation</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../installation/containers.html">Pre-built release container images on NGC</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../installation/linux.html">Installing on Linux via <code class="docutils literal notranslate"><span class="pre">pip</span></code></a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Deployment Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../deployment-guide/quick-start-recipe-for-llama4-scout-on-trtllm.html">Quick Start Recipe for Llama4 Scout 17B on TensorRT-LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../deployment-guide/quick-start-recipe-for-deepseek-r1-on-trtllm.html">Quick Start Recipe for DeepSeek R1 on TensorRT-LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../deployment-guide/quick-start-recipe-for-llama3.3-70b-on-trtllm.html">Quick Start Recipe for Llama3.3 70B on TensorRT-LLM - Blackwell &amp; Hopper Hardware</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">LLM API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../llm-api/index.html">LLM API Introduction</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../llm-api/reference.html">API Reference</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Examples</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../examples/index.html">LLM Examples Introduction</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul class="simple">
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../examples/customization.html">LLM Common Customizations</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../examples/llm_api_examples.html">LLM Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference.html">Generate text</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_async.html">Generate text asynchronously</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_async_streaming.html">Generate text in streaming</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_inference_distributed.html">Distributed LLM Generation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_guided_decoding.html">Generate text with guided decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_logits_processor.html">Control generated text using logits processor</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_multilora.html">Generate text with multiple LoRA adapters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_speculative_decoding.html">Speculative Decoding</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_runtime.html">Runtime Configuration Examples</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_sampling.html">Sampling Techniques Showcase</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_llm_distributed.html">Run LLM-API with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_trtllm_bench.html">Run trtllm-bench with pytorch backend on Slurm</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/llm_mgmn_trtllm_serve.html">Run trtllm-serve with pytorch backend on Slurm</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../examples/trtllm_serve_examples.html">Online Serving Examples</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_chat_client.html">Curl Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_chat_client_for_multimodal.html">Curl Chat Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/curl_completion_client.html">Curl Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/deepseek_r1_reasoning_parser.html">Deepseek R1 Reasoning Parser</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/genai_perf_client.html">Genai Perf Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/genai_perf_client_for_multimodal.html">Genai Perf Client For Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_chat_client.html">OpenAI Chat Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_chat_client_for_multimodal.html">OpenAI Chat Client for Multimodal</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client.html">OpenAI Completion Client</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client_for_lora.html">Openai Completion Client For Lora</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../examples/openai_completion_client_json_schema.html">OpenAI Completion Client with JSON Schema</a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Model Definition API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../python-api/tensorrt_llm.layers.html">Layers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../python-api/tensorrt_llm.functional.html">Functionals</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../python-api/tensorrt_llm.models.html">Models</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../python-api/tensorrt_llm.plugin.html">Plugin</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../python-api/tensorrt_llm.quantization.html">Quantization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../python-api/tensorrt_llm.runtime.html">Runtime</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">C++ API</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../_cpp_gen/executor.html">Executor</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../_cpp_gen/runtime.html">Runtime</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Command-Line Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../commands/trtllm-bench.html">trtllm-bench</a></li>
+
+<li class="toctree-l1"><a class="reference internal" href="../../commands/trtllm-build.html">trtllm-build</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../commands/trtllm-serve/index.html">trtllm-serve</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../commands/trtllm-serve/trtllm-serve.html">trtllm-serve</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../commands/trtllm-serve/run-benchmark-with-trtllm-serve.html">Run benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></a></li>
+</ul>
+</details></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Architecture</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../architecture/overview.html">TensorRT-LLM Architecture</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../architecture/core-concepts.html">Model Definition</a></li>
+
+
+
+<li class="toctree-l1"><a class="reference internal" href="../../architecture/checkpoint.html">TensorRT-LLM Checkpoint</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../architecture/workflow.html">TensorRT-LLM Build Workflow</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../architecture/add-model.html">Adding a Model</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Advanced</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/gpt-attention.html">Multi-Head, Multi-Query, and Group-Query Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/gpt-runtime.html">C++ GPT Runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/executor.html">Executor API</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/graph-rewriting.html">Graph Rewriting Module</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/lora.html">Run gpt-2b + LoRA using Executor / cpp runtime</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/expert-parallelism.html">Expert Parallelism in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/kv-cache-management.html">KV Cache Management: Pools, Blocks, and Events</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/speculative-decoding.html">Speculative Sampling</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/disaggregated-service.html">Disaggregated-Service (Prototype)</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Performance</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../performance/perf-overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../performance/perf-benchmarking.html">Benchmarking</a></li>
+<li class="toctree-l1 has-children"><a class="reference internal" href="../../performance/performance-tuning-guide/index.html">Performance Tuning Guide</a><details><summary><span class="toctree-toggle" role="presentation"><i class="fa-solid fa-chevron-down"></i></span></summary><ul>
+<li class="toctree-l2"><a class="reference internal" href="../../performance/performance-tuning-guide/benchmarking-default-performance.html">Benchmarking Default Performance</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../performance/performance-tuning-guide/useful-build-time-flags.html">Useful Build-Time Flags</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../performance/performance-tuning-guide/tuning-max-batch-size-and-max-num-tokens.html">Tuning Max Batch Size and Max Num Tokens</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../performance/performance-tuning-guide/deciding-model-sharding-strategy.html">Deciding Model Sharding Strategy</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../performance/performance-tuning-guide/fp8-quantization.html">FP8 Quantization</a></li>
+<li class="toctree-l2"><a class="reference internal" href="../../performance/performance-tuning-guide/useful-runtime-flags.html">Useful Runtime Options</a></li>
+</ul>
+</details></li>
+<li class="toctree-l1"><a class="reference internal" href="../../performance/perf-analysis.html">Performance Analysis</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../reference/troubleshooting.html">Troubleshooting</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../reference/support-matrix.html">Support Matrix</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../reference/precision.html">Numerical Precision</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../reference/memory.html">Memory Usage of TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../reference/ci-overview.html">Continuous Integration Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../reference/dev-containers.html">Using Dev Containers</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Blogs</span></p>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../H100vsA100.html">H100 has 4.6x A100 Performance in TensorRT-LLM, achieving 10,000 tok/s at 100ms to first token</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../H200launch.html">H200 achieves nearly 12,000 tokens/sec on Llama2-13B with TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../Falcon180B-H200.html">Falcon-180B on a single H200 GPU with INT4 AWQ, and 6.7x faster Llama-70B over A100</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../quantization-in-TRT-LLM.html">Speed up inference with SOTA quantization techniques in TRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../XQA-kernel.html">New XQA-kernel provides 2.4x more Llama-70B throughput within the same latency budget</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
+<li class="toctree-l1 current active"><a class="current reference internal" href="#">DeepSeek R1 MTP Implementation and Optimization</a></li>
+</ul>
+</div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item">
+
+<nav aria-label="Breadcrumb" class="d-print-none">
+  <ul class="bd-breadcrumbs">
+    
+    <li class="breadcrumb-item breadcrumb-home">
+      <a href="../../index.html" class="nav-link" aria-label="Home">
+        <i class="fa-solid fa-home"></i>
+      </a>
+    </li>
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">DeepSeek R1 MTP Implementation and Optimization</span></li>
+  </ul>
+</nav>
+</div>
+      
+    </div>
+  
+  
+</div>
+</div>
+              
+              
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <section id="deepseek-r1-mtp-implementation-and-optimization">
+<h1>DeepSeek R1 MTP Implementation and Optimization<a class="headerlink" href="#deepseek-r1-mtp-implementation-and-optimization" title="Link to this heading">#</a></h1>
+<p>by NVIDIA TensorRT-LLM team</p>
+<section id="table-of-contents">
+<h2>Table of Contents<a class="headerlink" href="#table-of-contents" title="Link to this heading">#</a></h2>
+<ul class="simple">
+<li><p><a class="reference internal" href="#deepseek-r1-mtp-implementation-and-optimization">DeepSeek R1 MTP Implementation and Optimization</a></p>
+<ul>
+<li><p><a class="reference internal" href="#table-of-contents">Table of Contents</a></p></li>
+<li><p><a class="reference internal" href="#mtp-for-inference">MTP for inference</a></p>
+<ul>
+<li><p><a class="reference internal" href="#background">Background</a></p></li>
+<li><p><a class="reference internal" href="#mtp-vanilla">MTP Vanilla</a></p></li>
+<li><p><a class="reference internal" href="#mtp-eagle">MTP Eagle</a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#mtp-implementation-in-tensorrt-llm">MTP implementation in TensorRT-LLM</a></p>
+<ul>
+<li><p><a class="reference internal" href="#basic-implementation">Basic Implementation</a></p></li>
+<li><p><a class="reference internal" href="#mtp-modules">MTP Modules</a></p></li>
+<li><p><a class="reference internal" href="#attention-for-mtp">Attention for MTP</a></p></li>
+<li><p><a class="reference internal" href="#how-to-run-deepseek-models-with-mtp">How to run DeepSeek models with MTP</a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#mtp-optimization-relaxed-acceptance">MTP optimization - Relaxed Acceptance</a></p>
+<ul>
+<li><p><a class="reference internal" href="#relaxed-acceptance">Relaxed Acceptance</a></p></li>
+<li><p><a class="reference internal" href="#how-to-run-the-deepseek-r1-model-with-relaxed-acceptance">How to run the DeepSeek-R1 model with Relaxed Acceptance</a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#evaluation">Evaluation</a></p>
+<ul>
+<li><p><a class="reference internal" href="#achieving-speedup-with-mtp-speculative-decoding">Achieving speedup with MTP speculative decoding</a></p></li>
+<li><p><a class="reference internal" href="#accuracy-studies-for-relaxed-acceptance">Accuracy studies for Relaxed Acceptance</a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#future-works">Future Works</a></p>
+<ul>
+<li><p><a class="reference internal" href="#tree-based-speculative-decoding-support">Tree-based speculative decoding support</a></p></li>
+<li><p><a class="reference internal" href="#eagle3-support">Eagle3 support</a></p></li>
+<li><p><a class="reference internal" href="#fix-known-issues"><span class="xref myst">Fix known issues</span></a></p></li>
+</ul>
+</li>
+<li><p><a class="reference internal" href="#acknowledgment">Acknowledgment</a></p></li>
+</ul>
+</li>
+</ul>
+<p>TensorRT-LLM achieves world-record inference performance for DeepSeek-R1 on NVIDIA Blackwell GPUs, where Multi-Token Prediction (MTP) delivers a significant speedup. In our <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.md">previous blog post</a>, we discussed the key optimizations that enable the outstanding inference latency of the DeepSeek-R1 model. This article dives deeper into the implementation and optimization of MTP in TensorRT-LLM.</p>
+</section>
+<section id="mtp-for-inference">
+<h2>MTP for inference<a class="headerlink" href="#mtp-for-inference" title="Link to this heading">#</a></h2>
+<p>Inspired by a previous <a class="reference external" href="https://arxiv.org/pdf/2404.19737">research work</a>, MTP is designed to help the DeepSeek-V3 training. It adds additional MTP modules at the end of the main model and uses them to predict additional tokens. In this way, MTP can extend the prediction scope to multiple future tokens at each position to achieve better model accuracy. During inference, those MTP modules can also be used for speculative decoding to improve the generation latency further. In this section, we will introduce the MTP speculative decoding algorithm for LLM inference.</p>
+<section id="background">
+<h3>Background<a class="headerlink" href="#background" title="Link to this heading">#</a></h3>
+<p>Speculative decoding is a popular technique for faster and cost-effective LLM inference. It’s based on the premise that generating multiple future tokens(especially for decode phase which is less compute bound) is more efficient than processing a single token. Speculative decoding techniques usually divide the process into a low-cost draft stage and a parallelized verification stage. The draft stage predicts draft tokens by using a small model or a subset of layers in the main model. And the verification stage uses the main model to determine how many of these draft tokens to accept, which is far more efficient than generating one token per iteration.</p>
+<div align="center">
+<figure>
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog2_verify_and_accept.png" alt="tech_blog2_verify_and_accept" width="1280" height="auto">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 1. Verification example</em></sub></p>
+<p>Figure 1 shows an example of how to verify and accept those draft tokens. Assuming there are a total of 5 draft tokens “ABCDE”, we will extend them to the input token “G”, and input a total of 6 tokens to the main model. After sampling, we can get six different expected tokens, then compare the expected tokens with the draft tokens and accept the longest prefix matched tokens. In this example, the tokens “ABC” are matched. Because “H” is predicted by the main model and the corresponding input token “C” is already accepted, “H” will also be accepted. In this way, we can accept four tokens in a single iteration. MTP also uses this method to verify and accept draft tokens.
+For the draft stage in MTP, there are two different MTP methods, MTP vanilla and MTP eagle. They can be used for different inference cases.</p>
+</section>
+<section id="mtp-vanilla">
+<h3>MTP Vanilla<a class="headerlink" href="#mtp-vanilla" title="Link to this heading">#</a></h3>
+<div align="center">
+<figure>
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog2_mtp_vanilla.png" alt="tech_blog2_mtp_vanilla" width="640" height="auto">
+</figure>
+</div>
+<p align="left"><sub><em>Figure 2. MTP Vanilla, where t<sub>i</sub> is the input token, d<sub>i</sub> is the predicted draft token, K is the number of MTP modules, and h<sub>i</sub><sup>n</sup> is the hidden state of the n-th MTP module. Note that h<sub>0</sub> means the hidden states of the main model.  (Disclaimer: the figures adapted from the original DeepSeek V3 tech report)</em></sub></p>
+<p>MTP Vanilla method is more similar to the MTP training, and it sequentially uses different MTP modules to predict multiple draft tokens. This method can support model checkpoints with weights of multiple different MTP modules. And each MTP module will have its own KV cache.</p>
+<p>Figure 2 illustrates the MTP vanilla inference. In the context phase, assuming there are a total of four input tokens, we will get the output token $t_5$ and the hidden states after the main model forward. The output token will be appended to the input tokens, then we shift out the first token to get tokens from $t_2$ to $t_5$ as the input tokens of the first MTP module. The hidden states from the main model will be directly used as the input of the first MTP module to predict the first draft token. For the next few MTP modules, we’ll append the newly generated draft token and the hidden states corresponding to the last input token to the input tokens and hidden states. Then we’ll shift out the first token to prepare the inputs for the next MTP module. In this way, we can retain as much information as possible from the main model, which helps the draft layer make more accurate predictions.</p>
+<p>In the generation phase, there will be a little difference. The predicted token $t_5$ and the draft tokens will be used as inputs for the main model. After the main model forward, we will do the verification to get the accepted tokens. In this example, assuming $j$ draft tokens $d_6$~$d_{j+5}$ are accepted. Then prepare the MTP module inputs.  Different from the context phase, we will prepare input IDs and hidden states of a total of $K$ tokens before the last accepted token. In this example, the last accepted token is $t_{j+6}$. Then we can get the first draft token after the first MTP module forward. For the sequential MTP modules, we can prepare their inputs in a similar way to the MTP modules in the context phase, so all of those MTP modules have the same input sequence length. After predicting all of the draft tokens, we need to evict the keys/values of those rejected draft tokens from the main model’s KV cache to ensure the subsequent calculation is correct.</p>
+</section>
+<section id="mtp-eagle">
+<h3>MTP Eagle<a class="headerlink" href="#mtp-eagle" title="Link to this heading">#</a></h3>
+<div align="center">
+<figure>
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog2_mtp_eagle.png" alt="tech_blog2_mtp_eagle" width="640" height="auto">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 3. MTP Eagle, using the same notation as Figure 2</em></sub></p>
+<p>MTP Eagle can be viewed as a variant of <a class="reference external" href="https://arxiv.org/pdf/2401.15077">Eagle</a> speculative decoding method, but only supports chain decoding now. It reuses the same MTP module and repeats multiple times to predict draft tokens. MTP Eagle supports the model checkpoint with only one MTP module. The official DeepSeek-V3 and DeepSeek-R1 have only one MTP module in their checkpoints. Another difference with MTP vanilla is the KV cache. In the MTP Eagle method, the MTP module reuses the same KV cache when predicting multiple draft tokens.</p>
+<p>Figure 3 gives an MTP Eagle example. In the context phase, the inputs of the first MTP module forward are the same as the MTP Vanilla. However, for the sequential MTP module forward, the first difference is that MTP Eagle uses the same MTP module to predict draft tokens and reuses the same KV cache. Another difference is that we only need to input the token ID and the hidden state of one token. The token is the last predicted draft token, while the hidden state is the corresponding hidden state in the last MTP module forward. In this way, we can predict total K draft tokens by using only one MTP module.</p>
+<p>In the generation phase, the verification stage is the same as MTP Vanilla. Once we get the accepted tokens, we use all of them along with their corresponding hidden states as inputs for the first MTP module forward. Unlike MTP Vanilla, which needs to store past tokens and hidden states, this approach is much easier to implement. Subsequent MTP module forwards follow the same input preparation method as the context phase. After predicting all draft tokens, we need to evict the key/value pairs of any rejected draft tokens from the main model’s KV cache.</p>
+</section>
+</section>
+<section id="mtp-implementation-in-tensorrt-llm">
+<h2>MTP implementation in TensorRT-LLM<a class="headerlink" href="#mtp-implementation-in-tensorrt-llm" title="Link to this heading">#</a></h2>
+<section id="basic-implementation">
+<h3>Basic Implementation<a class="headerlink" href="#basic-implementation" title="Link to this heading">#</a></h3>
+<p>TensorRT-LLM has two different paths for MTP, one for <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/speculative/mtp.py#L1047">MTP Vanilla</a> and another for <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/speculative/mtp.py#L1047">MTP Eagle</a>. MTP Eagle is the default path for DeepSeek-V3 and DeepSeek-R1 models.</p>
+<div align="center">
+<figure>
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog2_overall_workflow.png" alt="tech_blog2_overall_workflow" width="800" height="auto">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 4. MTP workflow in TensorRT-LLM</em></sub></p>
+<p>Figure 4 shows the overall workflow of MTP in TensorRT-LLM. Both paths share the runtime workflow, and the differences are in the MTP modules forward. In the context phase, there is no draft token in the inputs. TensorRT-LLM model engine fetches the input IDs from the requests and inputs to the model engine forward to get the next token and the hidden state. Then we prepare the MTP module inputs, and the MTP modules forward the inputs to predict the draft tokens.</p>
+<p>The generation workflow is more complicated. We need to do both the verification and draft stages. The predicted new token and draft tokens are the inputs for the main model. After the main model forward, we can sample from the output logits and get the following new tokens. Then compare them with the input draft tokens to get the final accepted tokens. The verification stage will be finished here. We will use the accepted tokens and hidden states to start a new draft stage, which uses the MTP layers to predict new draft tokens for the next iteration. Finally, we need to rewind the KV cache to evict keys/values corresponding to those rejected tokens.</p>
+<p>Except for the Rewind KV Cache, all of those processes are inside the model engine forward function. In this way, we can use one model engine to support MTP inference, and it would be easier for MTP to be compatible with other features, such as CUDA graph and overlap scheduler. When enabling CUDA graph, both the verification and draft stages can be captured in one graph, significantly reducing CPU overhead.</p>
+</section>
+<section id="mtp-modules">
+<h3>MTP Modules<a class="headerlink" href="#mtp-modules" title="Link to this heading">#</a></h3>
+<div align="center">
+<figure>
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog2_mtp_modules.png" alt="tech_blog2_mtp_modules" width="640" height="auto">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 5. MTP model architecture</em></sub></p>
+<p>Figure 5 introduces the basic model architecture of <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/338744fba6a91147b739b7f02d19b37bc19aa17a/tensorrt_llm/_torch/speculative/mtp.py#L326">MTP Vanilla</a>, <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/338744fba6a91147b739b7f02d19b37bc19aa17a/tensorrt_llm/_torch/speculative/mtp.py#L1047">MTP Eagle</a>, and the basic <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/338744fba6a91147b739b7f02d19b37bc19aa17a/tensorrt_llm/_torch/models/modeling_deepseekv3.py#L829">MTP module</a> design. Because MTP vanilla needs $K$ input tokens, if the number of accepted tokens is less than the number of input tokens, i.e. $j&lt;K$, we need to use the old token IDs and hidden states as the input of the first MTP module. To avoid bringing much additional computation overhead, we add two tensors for each request to save the past $K$ input IDs and the hidden states of past $K$ tokens, and update them by using the accepted tokens and corresponding hidden states each iteration. In this way, we can read these tensors when preparing inputs for the first MTP module. MTP Eagle implementation is much easier and straightforward, just call the same MTP module forward $K$ times to get $K$ new draft tokens.</p>
+<p>The MTP module follows the design in DeepSeek-V3. The embedding layer and output head in MTP modules are shared with the main model, which can save GPU memory consumption.</p>
+</section>
+<section id="attention-for-mtp">
+<h3>Attention for MTP<a class="headerlink" href="#attention-for-mtp" title="Link to this heading">#</a></h3>
+<p>Attention is also a very important component in supporting MTP inference. The changes are mainly in the attention kernels for the generation phase. For the normal request, there will be only one input token in the generation phase, but for MTP, there will be $K+1$ input tokens. Since MTP sequentially predicts additional tokens, the predicted draft tokens are chained. Though we have an MTP Eagle path, currently, we only have the chain-based support for MTP Eagle. So, a causal mask is enough for the attention kernel to support MTP. In our implementation, TensorRT-LLM will use the fp8 flashMLA generation kernel on Hopper GPU, while using TRTLLM customized attention kernels on Blackwell for better performance.</p>
+</section>
+<section id="how-to-run-deepseek-models-with-mtp">
+<h3>How to run DeepSeek models with MTP<a class="headerlink" href="#how-to-run-deepseek-models-with-mtp" title="Link to this heading">#</a></h3>
+<p>Run DeepSeek-V3/R1 models with MTP, use <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/llm-api/quickstart_advanced.py">examples/llm-api/quickstart_advanced.py</a> with additional options:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">cd</span><span class="w"> </span>examples/llm-api
+python<span class="w"> </span>quickstart_advanced.py<span class="w"> </span>--model_dir<span class="w"> </span>&lt;YOUR_MODEL_DIR&gt;<span class="w"> </span>--spec_decode_algo<span class="w"> </span>MTP<span class="w"> </span>--spec_decode_nextn<span class="w"> </span>N
+</pre></div>
+</div>
+<p>To benchmark min-latency performance with MTP, you need to follow <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/models/core/deepseek_v3/README.md#6-dataset-preparation">this document</a> to prepare your dataset, then follow the steps below:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">YOUR_DATA_PATH</span><span class="o">=</span>&lt;your<span class="w"> </span>dataset<span class="w"> </span>file<span class="w"> </span>following<span class="w"> </span>the<span class="w"> </span>format&gt;
+
+cat<span class="w"> </span>&gt;./extra-llm-api-config.yml<span class="s">&lt;&lt;EOF</span>
+<span class="s">cuda_graph_config: {}</span>
+<span class="s">moe_config:</span>
+<span class="s">  backend: TRTLLM</span>
+<span class="s">speculative_config:</span>
+<span class="s">    decoding_type: MTP</span>
+<span class="s">    num_nextn_predict_layers: 3</span>
+<span class="s">EOF</span>
+
+<span class="nb">export</span><span class="w"> </span><span class="nv">TRTLLM_ENABLE_PDL</span><span class="o">=</span><span class="m">1</span>
+
+trtllm-bench<span class="w"> </span>--model<span class="w"> </span>nvidia/DeepSeek-R1-FP4<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>throughput<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--dataset<span class="w"> </span><span class="nv">$YOUR_DATA_PATH</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--backend<span class="w"> </span>pytorch<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--num_requests<span class="w"> </span><span class="m">10</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--concurrency<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--max_batch_size<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--tp<span class="w"> </span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--ep<span class="w"> </span><span class="m">2</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--extra_llm_api_options<span class="w"> </span>./extra-llm-api-config.yml
+</pre></div>
+</div>
+</section>
+</section>
+<section id="mtp-optimization-relaxed-acceptance">
+<h2>MTP optimization - Relaxed Acceptance<a class="headerlink" href="#mtp-optimization-relaxed-acceptance" title="Link to this heading">#</a></h2>
+<p>DeepSeek-R1 is a reasoning model that first outputs some thinking tokens, after which the user can get the actual outputs. The thinking process usually takes up a lot of tokens, and the quality of the outputs of the thinking process may have a limited impact on the final answer. So we want to use a more aggressive acceptance strategy, called <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/3865">relaxed acceptance</a>, for the thinking process to speed up the thinking decoding phase. This will be a tradeoff between speedup and output quality. From the experimental results, the impact of relaxed acceptance on output quality is limited.</p>
+<section id="relaxed-acceptance">
+<h3>Relaxed Acceptance<a class="headerlink" href="#relaxed-acceptance" title="Link to this heading">#</a></h3>
+<div align="center">
+<figure>
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog2_relaxed_acceptance.png" alt="tech_blog2_relaxed_acceptance" width="1024" height="auto">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 6. Relaxed Acceptance example. Use MTP nextn=4 and top-3 in this example.</em></sub></p>
+<p>In previous verification and acceptance, we will use a top-1 to sample from the logits the main model to get the “expected” tokens as shown in Figure 1. There will be only one choice to compare with the draft tokens, which we call “Strict Acceptance”.</p>
+<p>As for the Relaxed Acceptance, we first get the top-N tokens sampled from the logits, so more candidates will be compared with the input draft tokens. To make sure the accepted tokens are as accurate as possible, we also added a probability threshold, i.e., delta. We can get the token probabilities by applying a softmax to the logits. After getting the top-N tokens, we will remove tokens from the candidate list if their probability is smaller than the (top-1 probability - delta). In this way, we may get more than one token candidate, and all of those tokens are with a high probability. Then we can compare the input draft tokens with those candidates. If one of them matches, we can accept this draft token, so the acceptance rate will be increased. Figure 6 shows an example of a comparison between Strict Acceptance and Relaxed Acceptance.</p>
+<p>Note that the Relaxed Acceptance will only be used during the thinking phase, while the Strict Acceptance will still be used during the non-thinking phase. And the Relaxed Acceptance only supports the DeepSeek-R1 model now.</p>
+</section>
+<section id="how-to-run-the-deepseek-r1-model-with-relaxed-acceptance">
+<h3>How to run the DeepSeek-R1 model with Relaxed Acceptance<a class="headerlink" href="#how-to-run-the-deepseek-r1-model-with-relaxed-acceptance" title="Link to this heading">#</a></h3>
+<p>Run DeepSeek-R1 models with MTP Relaxed Acceptance, use <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/llm-api/quickstart_advanced.py">examples/llm-api/quickstart_advanced.py</a> with additional options:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">cd</span><span class="w"> </span>examples/llm-api
+python<span class="w"> </span>quickstart_advanced.py<span class="w"> </span>--model_dir<span class="w"> </span>&lt;YOUR_MODEL_DIR&gt;<span class="w"> </span>--spec_decode_algo<span class="w"> </span>MTP<span class="w"> </span>--spec_decode_nextn<span class="w"> </span>N<span class="w"> </span>--use_relaxed_acceptance_for_thinking<span class="w"> </span>--relaxed_topk<span class="w"> </span><span class="m">10</span><span class="w"> </span>--relaxed_delta<span class="w"> </span><span class="m">0</span>.6
+</pre></div>
+</div>
+<p>To benchmark min-latency performance with MTP Relaxed Acceptance, you need to follow <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/models/core/deepseek_v3/README.md#6-dataset-preparation">this document</a> to prepare your dataset, then follow the steps below:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nv">YOUR_DATA_PATH</span><span class="o">=</span>&lt;your<span class="w"> </span>dataset<span class="w"> </span>file<span class="w"> </span>following<span class="w"> </span>the<span class="w"> </span>format&gt;
+
+cat<span class="w"> </span>&gt;./extra-llm-api-config.yml<span class="s">&lt;&lt;EOF</span>
+<span class="s">cuda_graph_config: {}</span>
+<span class="s">moe_config:</span>
+<span class="s">  backend: TRTLLM</span>
+<span class="s">speculative_config:</span>
+<span class="s">    decoding_type: MTP</span>
+<span class="s">    num_nextn_predict_layers: 3</span>
+<span class="s">    use_relaxed_acceptance_for_thinking: true</span>
+<span class="s">    relaxed_topk: 10</span>
+<span class="s">    relaxed_delta: 0.6</span>
+<span class="s">EOF</span>
+
+<span class="nb">export</span><span class="w"> </span><span class="nv">TRTLLM_ENABLE_PDL</span><span class="o">=</span><span class="m">1</span>
+
+trtllm-bench<span class="w"> </span>--model<span class="w"> </span>nvidia/DeepSeek-R1-FP4<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>throughput<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--dataset<span class="w"> </span><span class="nv">$YOUR_DATA_PATH</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--backend<span class="w"> </span>pytorch<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--num_requests<span class="w"> </span><span class="m">10</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--concurrency<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--max_batch_size<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--tp<span class="w"> </span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--ep<span class="w"> </span><span class="m">2</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--extra_llm_api_options<span class="w"> </span>./extra-llm-api-config.yml
+</pre></div>
+</div>
+</section>
+</section>
+<section id="evaluation">
+<h2>Evaluation<a class="headerlink" href="#evaluation" title="Link to this heading">#</a></h2>
+<section id="achieving-speedup-with-mtp-speculative-decoding">
+<h3>Achieving speedup with MTP speculative decoding<a class="headerlink" href="#achieving-speedup-with-mtp-speculative-decoding" title="Link to this heading">#</a></h3>
+<div align="center">
+<figure>
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog2_perf_and_ar.png" alt="tech_blog2_perf_and_ar" width="1280" height="auto">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 7. DeepSeek-R1-FP4 671B min-latency performance with different MTP next-n</em></sub></p>
+<p>We tested the min-latency (batch size = 1) performance of the DeepSeek-R1-FP4 model with different MTP next-n on a B200 node. The MLA runs with TP=8, and the MoE runs with EP=2. And there are ten different requests with ISL/OSL=1K/2K. From Figure 7, we can see that MTP=3 can help get the best min-latency performance on 8 B200 GPUs, which can bring 2.16x speedup compared with the baseline nextn=0. And with the help of the relaxed acceptance, the min-latency performance can be further improved to achieve a 2.33x speedup. We also evaluated the CUDA graph and overlap scheduler benefits. For such a min-latency case, CUDA graph can achieve a 7.22x average speedup, while the overlap scheduler can achieve 1.03x average latency.</p>
+</section>
+<section id="accuracy-studies-for-relaxed-acceptance">
+<h3>Accuracy studies for Relaxed Acceptance<a class="headerlink" href="#accuracy-studies-for-relaxed-acceptance" title="Link to this heading">#</a></h3>
+<div align="center">
+<figure>
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog2_acc_relaxed_acceptance.png" alt="tech_blog2_acc_relaxed_acceptance" width="800" height="auto">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 8. Ablation results for the Relaxed Acceptance. Using MTP nextn=3, top-10, and delta=0.6.</em></sub></p>
+<p>We validated the Relaxed Acceptance on different datasets. In Figure 8, we show the ablation results for Relaxed Acceptance by using the DeepSeek-R1-FP4 model. Compared with Strict Acceptance, the impact of Relaxed Acceptance on output quality is limited, resulting in only a slight accuracy drop.</p>
+</section>
+</section>
+<section id="future-works">
+<h2>Future Works<a class="headerlink" href="#future-works" title="Link to this heading">#</a></h2>
+<section id="tree-based-speculative-decoding-support">
+<h3>Tree-based speculative decoding support<a class="headerlink" href="#tree-based-speculative-decoding-support" title="Link to this heading">#</a></h3>
+<div align="center">
+<figure>
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog2_tree_spec_decoding.png" alt="tech_blog2_tree_spec_decoding" width="800" height="auto">
+</figure>
+</div>
+<p align="center"><sub><em>Figure 9. Comparison between the chain-based and tree-based speculative decoding</em></sub></p>
+<p>TensorRT-LLM PyTorch backend can only support chain-based speculative decoding now, both MTP Vanilla and MTP Eagle. However, the tree-based speculative decoding technique is widely used in previous advanced methods, such as Ealge2 and Eagle3, to increase the acceptance rate. MTPs in TensorRT-LLM can also be extended to support the tree-based technique. Figure 9 compares the chain-based method with the tree-based method. Both full tree and dynamic tree methods can help expand the candidate combinations, so that we can have more choices for the draft tokens.</p>
+</section>
+<section id="eagle3-support">
+<h3>Eagle3 support<a class="headerlink" href="#eagle3-support" title="Link to this heading">#</a></h3>
+<p>Another important method is Eagle3. From the <a class="reference external" href="https://arxiv.org/pdf/2503.01840">Eagle3 paper</a>, the promising results show that it can help greatly increase the acceptance rate by leveraging different levels’ hidden states to predict draft tokens. Since TensorRT-LLM already has <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/pull/3035">Eagle-3 support</a> now, in the future, we also want to train an Eagle3 head to support DeepSeek-V3/R1+Eagle3 to achieve better speedup.</p>
+</section>
+</section>
+<section id="acknowledgment">
+<h2>Acknowledgment<a class="headerlink" href="#acknowledgment" title="Link to this heading">#</a></h2>
+<p>This was a remarkable cross-team effort to support and optimize MTP in TensorRT-LLM. We would like to extend our gratitude to everyone who contributed to making this possible, as it involved a typical system/algorithm co-design approach spanning multiple technical layers—including kernel optimization, runtime enhancements, algorithmic improvements, and performance measurement &amp; analysis. And a special thanks goes to the DeepSeek team for developing the MTP method, which lays down the foundation of this blog.</p>
+</section>
+</section>
+
+
+                </article>
+              
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+    <a class="left-prev"
+       href="blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</p>
+      </div>
+    </a>
+</div>
+                </footer>
+              
+            </div>
+            
+            
+
+
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+<div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> On this page
+  </div>
+  <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#table-of-contents">Table of Contents</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mtp-for-inference">MTP for inference</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#background">Background</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mtp-vanilla">MTP Vanilla</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mtp-eagle">MTP Eagle</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mtp-implementation-in-tensorrt-llm">MTP implementation in TensorRT-LLM</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#basic-implementation">Basic Implementation</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mtp-modules">MTP Modules</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#attention-for-mtp">Attention for MTP</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#how-to-run-deepseek-models-with-mtp">How to run DeepSeek models with MTP</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#mtp-optimization-relaxed-acceptance">MTP optimization - Relaxed Acceptance</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#relaxed-acceptance">Relaxed Acceptance</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#how-to-run-the-deepseek-r1-model-with-relaxed-acceptance">How to run the DeepSeek-R1 model with Relaxed Acceptance</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#evaluation">Evaluation</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#achieving-speedup-with-mtp-speculative-decoding">Achieving speedup with MTP speculative decoding</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#accuracy-studies-for-relaxed-acceptance">Accuracy studies for Relaxed Acceptance</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#future-works">Future Works</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tree-based-speculative-decoding-support">Tree-based speculative decoding support</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#eagle3-support">Eagle3 support</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#acknowledgment">Acknowledgment</a></li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+
+          </div>
+          <footer class="bd-footer-content">
+            
+          </footer>
+        
+      </main>
+    </div>
+  </div>
+  
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf"></script>
+<script defer src="../../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf"></script>
+
+  <footer class="bd-footer">
+<div class="bd-footer__inner bd-page-width">
+  
+    <div class="footer-items__start">
+      
+        <div class="footer-item">
+<a class="footer-brand logo" href="https://www.nvidia.com">
+  <img src="../../_static/nvidia-logo-horiz-rgb-1c-blk-for-screen.svg" class="logo__image only-light" alt="NVIDIA"/>
+  <img src="../../_static/nvidia-logo-horiz-rgb-1c-wht-for-screen.svg" class="logo__image only-dark" alt="NVIDIA"/>
+</a></div>
+      
+        <div class="footer-item">
+
+<div class="footer-links">
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/">Privacy Policy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/">Manage My Privacy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/preferences/start/">Do Not Sell or Share My Data</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/">Terms of Service</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/">Accessibility</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/">Corporate Policies</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/product-security/">Product Security</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/contact/">Contact</a>
+  
+  
+  
+</div>
+</div>
+      
+        <div class="footer-item">
+
+
+
+
+  <p class="copyright">
+    
+      Copyright © 2025, NVidia.
+      <br/>
+    
+  </p>
+</div>
+      
+        <div class="footer-item">
+<div class="extra_footer">
+  
+  <p>Last updated on August 15, 2025.</p>
+  
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/26f413a">26f413a</a>.</p>
+  
+</div></div>
+      
+    </div>
+  
+  
+  
+</div>
+
+  </footer>
+  </body>
+</html>
