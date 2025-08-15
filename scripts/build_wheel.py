@@ -19,6 +19,7 @@ import platform
 import re
 import sys
 import sysconfig
+import tempfile
 import warnings
 from argparse import ArgumentParser
 from contextlib import contextmanager
@@ -281,39 +282,51 @@ def generate_fmha_cu(project_dir, venv_python):
     os.chdir(project_dir)
 
 
-def create_cuda_stub_links(cuda_stub_dir: str, missing_libs: list[str]):
+def create_cuda_stub_links(cuda_stub_dir: str, missing_libs: list[str]) -> str:
     """
-  Creates symbolic links for CUDA stub libraries in the provided directory.
+    Creates symbolic links for CUDA stub libraries in a temporary directory.
 
-  Args:
-      cuda_stub_dir (str): Path to the directory containing CUDA stubs.
-      missing_libs: Versioned names of the missing libraries.
-  """
+    Args:
+        cuda_stub_dir (str): Path to the directory containing CUDA stubs.
+        missing_libs: Versioned names of the missing libraries.
+
+    Returns:
+        str: Path to the temporary directory where links were created.
+    """
     cuda_stub_path = Path(cuda_stub_dir)
     if not cuda_stub_path.exists():
         raise RuntimeError(
             f"CUDA stub directory '{cuda_stub_dir}' does not exist.")
 
-    version_pattern = r'\.\d+$'
+    # Create a temporary directory for the symbolic links
+    temp_dir = tempfile.mkdtemp(prefix="cuda_stub_links_")
+    temp_dir_path = Path(temp_dir)
+
+    version_pattern = r'\.\d+'
     for missing_lib in filter(lambda x: re.search(version_pattern, x),
                               missing_libs):
         # Define `so` as the first part of `missing_lib` with trailing '.' and digits removed
         so = cuda_stub_path / re.sub(version_pattern, '', missing_lib)
-        so_versioned = cuda_stub_path / missing_lib
+        so_versioned = temp_dir_path / missing_lib
 
-        # Check if the library exists and the versioned link does not.
-        if so.exists() and not so_versioned.exists():
+        # Check if the library exists in the original directory
+        if so.exists():
             try:
-                # Attempt to create the symbolic link.
+                # Create the symbolic link in the temporary directory
                 so_versioned.symlink_to(so)
-            except PermissionError:
-                # Handle permission errors by attempting to use `sudo` to create the link.
-                try:
-                    build_run(f"sudo ln -s {str(so)} {str(so_versioned)}")
-                except CalledProcessError as sudo_error:
-                    print(
-                        f"Failed to create symbolic link even with sudo: {sudo_error}"
-                    )
+            except OSError as e:
+                # Clean up the temporary directory on error
+                rmtree(temp_dir)
+                raise RuntimeError(
+                    f"Failed to create symbolic link for '{missing_lib}' in temporary directory '{temp_dir}': {e}"
+                )
+        else:
+            warnings.warn(
+                f"Warning: Source library '{so}' does not exist and was skipped."
+            )
+
+    # Return the path to the temporary directory where the links were created
+    return str(temp_dir_path)
 
 
 def check_missing_libs(so_prefix: str) -> list[str]:
@@ -345,25 +358,31 @@ def generate_python_stubs_linux(binding_type: str, venv_python: Path,
 
     if missing_libs and Path(cuda_stub_dir).exists():
         # Create symbolic links for the CUDA stubs
-        create_cuda_stub_links(cuda_stub_dir, missing_libs)
+        link_dir = create_cuda_stub_links(cuda_stub_dir, missing_libs)
         ld_library_path = env_stub_gen.get("LD_LIBRARY_PATH")
-        env_stub_gen[
-            "LD_LIBRARY_PATH"] = f"{ld_library_path}:{cuda_stub_dir}" if ld_library_path else cuda_stub_dir
-
-    if is_nanobind:
-        build_run(f"\"{venv_python}\" -m nanobind.stubgen -m bindings -O .",
-                  env=env_stub_gen)
+        env_stub_gen["LD_LIBRARY_PATH"] = ":".join(
+            filter(None, [link_dir, cuda_stub_dir, ld_library_path]))
     else:
+        link_dir = None
+
+    try:
+        if is_nanobind:
+            build_run(f"\"{venv_python}\" -m nanobind.stubgen -m bindings -O .",
+                      env=env_stub_gen)
+        else:
+            build_run(
+                f"\"{venv_python}\" -m pybind11_stubgen -o . bindings --exit-code",
+                env=env_stub_gen)
         build_run(
-            f"\"{venv_python}\" -m pybind11_stubgen -o . bindings --exit-code",
+            f"\"{venv_python}\" -m pybind11_stubgen -o . deep_gemm_cpp_tllm --exit-code",
             env=env_stub_gen)
-    build_run(
-        f"\"{venv_python}\" -m pybind11_stubgen -o . deep_gemm_cpp_tllm --exit-code",
-        env=env_stub_gen)
-    if deep_ep:
-        build_run(
-            f"\"{venv_python}\" -m pybind11_stubgen -o . deep_ep_cpp_tllm --exit-code",
-            env=env_stub_gen)
+        if deep_ep:
+            build_run(
+                f"\"{venv_python}\" -m pybind11_stubgen -o . deep_ep_cpp_tllm --exit-code",
+                env=env_stub_gen)
+    finally:
+        if link_dir:
+            rmtree(link_dir)
 
 
 def generate_python_stubs_windows(binding_type: str, venv_python: Path,
