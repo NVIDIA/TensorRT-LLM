@@ -246,6 +246,7 @@ def test_nemotron_h_correctness(mamba_ssm_cache_dtype):
         nemotron_h.shutdown()
 
 
+@pytest.mark.skip(reason="https://nvbugs/5458874")
 def test_nemotron_h_cuda_graph_overlap_scheduler():
     prompts = [
         "The sky is blue because",
