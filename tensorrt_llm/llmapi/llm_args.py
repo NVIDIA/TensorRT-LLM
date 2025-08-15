@@ -2476,13 +2476,6 @@ class TorchLlmArgs(BaseLlmArgs):
                     raise ValueError(
                         ERR_MSG_TMPL.format(feature1="speculative decoding",
                                             feature2="tllm_cpp_sampler"))
-
-        if feature_status["disaggregated_serving"] and (
-                feature_status["eagle3_one_model"]
-                or feature_status["eagle3_two_model"]):
-            raise ValueError(
-                ERR_MSG_TMPL.format(feature1="disaggregated_serving",
-                                    feature2="eagle3"))
         if feature_status["guided_decoding"]:
             if feature_status["mtp"]:
                 raise ValueError(
