@@ -1000,7 +1000,7 @@ public:
     // This will be a unique value for every iteration of warmup and actual bench
     constexpr static int64_t NUM_ROUTING_SAMPLES = 16;
 
-    std::array<TmaWarpSpecializedGroupedGemmInput, NUM_ROUTING_SAMPLES> mTmaInputCache;
+    std::array<std::array<TmaWarpSpecializedGroupedGemmInput, 2>, NUM_ROUTING_SAMPLES> mTmaInputCache;
     QuantParams mQuantParams;
 
     bool mBias{};
@@ -1013,7 +1013,8 @@ public:
 private:
     void prepareRouting(int num_tokens, char* workspace, cudaStream_t stream);
     void prepareQuantParams(int num_tokens, char* workspace, cudaStream_t stream);
-    void prepareTmaWsInputs(int num_tokens, char* workspace, void const* expert_weights, cudaStream_t stream);
+    void prepareTmaWsInputs(int num_tokens, char* workspace, void const* expert_weights,
+        TmaWarpSpecializedGroupedGemmInput::EpilogueFusion fusion, cudaStream_t stream);
 };
 
 // Populates a buffer with random values for use with MOE benchmarking
