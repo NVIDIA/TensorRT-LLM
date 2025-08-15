@@ -2037,24 +2037,28 @@ class PyTorchModelEngine(ModelEngine):
 
             self.iter_counter += 1
 
-            def capture_forward_fn(inputs: Dict[str, Any]):
-                with MoeLoadBalancerIterContext(moe_load_balancer):
-                    return self._forward_step(
-                        inputs,
-                        gather_ids=gather_ids,
-                        gather_context_logits=gather_context_logits)
-
-            if maybe_graph:
-                # Ask the runner to execute the graph
-                outputs = self.cuda_graph_runner.execute(
-                    batch=padded_requests,
-                    inputs=inputs,
-                    forward_fn=capture_forward_fn)
-            else:
+            if not maybe_graph:
                 # Fallback to eager execution if graph was not used
                 with MoeLoadBalancerIterContext(moe_load_balancer):
                     outputs = self._forward_step(inputs, gather_ids,
                                                  gather_context_logits)
+            else:
+                batch_size = len(padded_requests.generation_requests)
+                if self.cuda_graph_runner.needs_capture(batch_size):
+
+                    def capture_forward_fn(inputs: Dict[str, Any]):
+                        with MoeLoadBalancerIterContext(moe_load_balancer):
+                            return self._forward_step(
+                                inputs,
+                                gather_ids=gather_ids,
+                                gather_context_logits=gather_context_logits)
+
+                    outputs = self.cuda_graph_runner.capture_graph(
+                        batch_size, capture_forward_fn, inputs)
+                else:
+                    with MoeLoadBalancerIterContext(moe_load_balancer):
+                        outputs = self.cuda_graph_runner.run_graph(
+                            batch_size, inputs)
 
             self._execute_logit_post_processors(scheduled_requests, outputs)
 

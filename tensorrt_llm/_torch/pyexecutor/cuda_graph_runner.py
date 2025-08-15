@@ -133,31 +133,13 @@ class CUDAGraphRunner:
             spec_metadata.draft_tokens = self.draft_tokens_cuda
         else:
             spec_metadata = None
-
         return True, attn_metadata, spec_metadata
 
-    def execute(self, batch: ScheduledRequests, inputs: Dict[str, Any],
-                forward_fn: Callable) -> Optional[torch.Tensor]:
-        """
-        Runs the model via a CUDA graph or captures it if needed.
+    def needs_capture(self, batch_size: int):
+        return self.graph_outputs[(batch_size, self.draft_len)] is None
 
-        Returns the model output tensor if a graph was run, otherwise None.
-        """
-        if not self._can_run_graph(batch):
-            return None
-
-        batch_size = len(batch.generation_requests)
-
-        if batch_size not in self.graphs:
-            if batch_size in self.supported_batch_sizes:
-                self._capture_graph(batch_size, forward_fn, inputs)
-            else:
-                return None
-
-        return self._run_graph(batch_size, inputs)
-
-    def _capture_graph(self, batch_size: int, forward_fn: Callable,
-                       initial_inputs: Dict[str, Any]):
+    def capture_graph(self, batch_size: int, forward_fn: Callable,
+                      initial_inputs: Dict[str, Any]):
         """Captures the forward pass for a given batch size."""
         engine = self._get_engine()
         key = (batch_size, self.draft_len)
@@ -210,8 +192,8 @@ class CUDAGraphRunner:
         self.graph_outputs[key] = make_weak_ref(output)
         self.memory_pool = graph.pool()
 
-    def _run_graph(self, batch_size: int,
-                   current_inputs: Dict[str, Any]) -> Optional[torch.Tensor]:
+    def run_graph(self, batch_size: int,
+                  current_inputs: Dict[str, Any]) -> Optional[torch.Tensor]:
         """Replays a previously captured graph."""
         key = (batch_size, self.draft_len)
         stored_meta = self.graph_metadata[key]
