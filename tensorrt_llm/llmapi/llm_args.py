@@ -2352,7 +2352,7 @@ class TorchLlmArgs(BaseLlmArgs):
     @model_validator(mode='after')
     def validate_batch_wait_timeout(self) -> 'TorchLlmArgs':
         """Validate batch wait timeout."""
-        if self.batch_wait_timeout <= 0:
+        if self.batch_wait_timeout < 0:
             raise ValueError("batch_wait_timeout must be greater than 0")
         return self
 
