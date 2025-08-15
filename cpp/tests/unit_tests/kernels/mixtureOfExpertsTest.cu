@@ -1120,9 +1120,9 @@ protected:
     auto selectTacticsForArch(int sm)
     {
         bool is_tma_warp_specialized = sm >= 90 && !INT_QUANT;
-        bool epilogue_fusion_type = is_tma_warp_specialized && mUseFusedFinalize
-            ? cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::FINALIZE
-            : cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::NONE;
+        auto epilogue_fusion_type = (is_tma_warp_specialized && mUseFusedFinalize)
+            ? tensorrt_llm::cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::FINALIZE
+            : tensorrt_llm::cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::NONE;
         auto tactics1 = getFilteredConfigs(sm, MoeGemmId::GEMM_1);
         auto tactics2 = getFilteredConfigs(sm, MoeGemmId::GEMM_2);
         auto it1 = std::find_if(tactics1.begin(), tactics1.end(),
@@ -1639,8 +1639,8 @@ void MixtureOfExpertsTest<TypeParam_>::BasicPermuteTest(
         auto [expected_experts, token_final_scales] = populateRouting(num_experts, num_tokens, k);
 
         runMoEPermute(hidden_input, expected_experts, token_final_scales, hidden_size, num_experts, k);
-        bool is_finalize_fusion
-            = gemm2.epilogue_fusion_type == cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::FINALIZE;
+        bool is_finalize_fusion = gemm2.epilogue_fusion_type
+            == tensorrt_llm::cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::FINALIZE;
         bool should_be_deterministic = !is_finalize_fusion || mK < 3 || getSMVersion() < 90 || getSMVersion() >= 120;
         if (should_be_deterministic && !mIsLongTest)
         {
@@ -1908,7 +1908,7 @@ void MixtureOfExpertsTest<TypeParam_>::ParallelismTest(
                     runMoEPermute(hidden_input, expected_experts, token_final_scales, hidden_size, num_experts, k,
                         MOEParallelismConfig{tp_size, i, ep_size, j}, enable_alltoall);
                     bool is_finalize_fusion = gemm2.epilogue_fusion_type
-                        == cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::FINALIZE;
+                        == tensorrt_llm::cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::FINALIZE;
                     bool should_be_deterministic
                         = !is_finalize_fusion || mK < 3 || getSMVersion() < 90 || getSMVersion() >= 120;
                     if (should_be_deterministic && !mIsLongTest)
@@ -1926,7 +1926,7 @@ void MixtureOfExpertsTest<TypeParam_>::ParallelismTest(
                 {
                     runMoEPermute(MOEParallelismConfig{tp_size, i, ep_size, j}, enable_alltoall);
                     bool is_finalize_fusion = gemm2.epilogue_fusion_type
-                        == cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::FINALIZE;
+                        == tensorrt_llm::cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::FINALIZE;
                     bool should_be_deterministic
                         = !is_finalize_fusion || mK < 3 || getSMVersion() < 90 || getSMVersion() >= 120;
                     if (should_be_deterministic && !mIsLongTest)
@@ -2092,6 +2092,7 @@ PARALLEL_TEST_SUITE(MixedParallel)
 TYPED_TEST(MixtureOfExpertsTest, ConfigSweep)
 {
     this->mIsLongTest = true;
+    this->mUseFusedFinalize = true; // True for all cases because we sweep both
     auto genConfigName = [](auto conf) -> std::string
     {
         using namespace tensorrt_llm::cutlass_extensions;
@@ -2136,7 +2137,6 @@ TYPED_TEST(MixtureOfExpertsTest, ConfigSweep)
                     this->mActType = activation_type;
                     for (auto k : {2, 3})
                     {
-
                         this->mOverrideSelectedConfig1 = conf1;
                         this->mOverrideSelectedConfig2 = conf2;
                         this->BasicPermuteTest(k, this->MINIMUM_ALIGNMENT);
