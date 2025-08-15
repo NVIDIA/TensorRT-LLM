@@ -1287,7 +1287,6 @@ class PyExecutor:
 
             for resource_mgr_type in (
                     ResourceManagerType.KV_CACHE_MANAGER,
-                    ResourceManagerType.SEQ_SLOT_MANAGER,
                     ResourceManagerType.SPEC_RESOURCE_MANAGER,
                     ResourceManagerType.DRAFT_KV_CACHE_MANAGER):
                 if (resource_mgr_type in self.resource_manager.resource_managers
@@ -1307,6 +1306,9 @@ class PyExecutor:
             if req.is_disagg_generation_transmission_complete:
                 cache_trans_complete_requests.append(req)
         if len(cache_trans_complete_requests) > 0:
+            self.resource_manager.resource_managers[
+                ResourceManagerType.SEQ_SLOT_MANAGER].prepare_resources(
+                    cache_trans_complete_requests)
             self._setup_sampler_step(cache_trans_complete_requests)
 
         for req in scheduled_batch.generation_requests:
