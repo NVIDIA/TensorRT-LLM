@@ -178,7 +178,7 @@ class TritonPythonModel:
                 self.spatial_merge_size = hf_config.spatial_merge_size
                 self.relevant_patch_size = self.patch_size * self.spatial_merge_size
 
-    def get_requests(self, request: List) -> Dict[str, torch.Tensor]:
+    def get_requests(self, request) -> Dict[str, torch.Tensor]:
         """
         Processes the incoming request to extract and organize input tensors
         for different model types.
@@ -683,7 +683,7 @@ class TritonPythonModel:
         embeddings = []
         for start_idx in range(0, batch_size, self.vision_max_batch_size):
             end_idx = min(start_idx + self.vision_max_batch_size, batch_size)
-            logger.verbose(
+            logger.debug(
                 f"Running encoder (max_batch_size={self.vision_max_batch_size}) "
                 + f"with batch indices {start_idx}:{end_idx} of {batch_size}.")
 
