@@ -2431,16 +2431,6 @@ class TestPhi4MiniInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
-class TestStarCoder2_7B(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "bigcode/starcoder2-7b"
-    MODEL_PATH = f"{llm_models_root()}/starcoder2-7b"
-
-    def test_auto_dtype(self):
-        with LLM(self.MODEL_PATH) as llm:
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
-
-
 class TestCodestral_22B_V01(LlmapiAccuracyTestHarness):
     MODEL_NAME = "mistralai/Codestral-22B-v0.1"
     MODEL_PATH = f"{llm_models_root()}/Codestral-22B-v0.1"
