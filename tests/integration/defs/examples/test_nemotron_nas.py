@@ -155,7 +155,10 @@ def test_nemotron_nano_8b_lora_torch(nemotron_nas_example_root, llm_venv,
     )
 
 
-@pytest.mark.skip(reason="TODO: test on 4 GPUs locally")
+@pytest.mark.skip(
+    reason=
+    "TODO: The model has VGQA where different layers have different KV shapes, which breaks LoRA."
+)
 @pytest.mark.skip_less_device(4)
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.parametrize("nemotron_nas_model_root", [
@@ -193,7 +196,7 @@ def test_nemotron_super_49b_lora_torch(nemotron_nas_example_root, llm_venv,
     )
 
 
-@pytest.mark.skip(reason="TODO: test on 8 GPUs locally")
+# @pytest.mark.skip(reason="TODO: test on 8 GPUs locally")
 @pytest.mark.skip_less_device(8)
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.parametrize("nemotron_nas_model_root", [
