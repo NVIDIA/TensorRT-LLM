@@ -284,17 +284,3 @@ class Gemma3VLM(PreTrainedModel):
                                                attn_metadata=attn_metadata)[-1]
             image_features = self.mm_projector(image_features)
         return image_features
-
-
-def _load_weights_into_hf_module(
-    model: torch.nn.Module,
-    weights: dict,
-    prefix: str,
-    model_name: str,
-) -> None:
-    filtered_weights = filter_weights(prefix, weights)
-    missing_keys, _ = model.load_state_dict(filtered_weights)
-    if len(missing_keys) > 0:
-        raise KeyError(
-            f"Missing the following keys for the {model_name} in the checkpoint: "
-            f"[{', '.join(missing_keys)}].")
