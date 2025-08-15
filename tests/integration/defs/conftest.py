@@ -1049,10 +1049,9 @@ def llama_model_root(request):
     elif request.param == "llama-3.2-3b":
         llama_model_root = os.path.join(models_root, "llama-3.2-models",
                                         "Llama-3.2-3B")
-    # TODO: Upload the model
-    # elif request.param == "llama-3.2-3b-instruct":
-    #     llama_model_root = os.path.join(models_root, "llama-3.2-models",
-    #                             "Llama-3.2-3B-Instruct")
+    elif request.param == "llama-3.2-3b-instruct":
+        llama_model_root = os.path.join(models_root, "llama-3.2-models",
+                                        "Llama-3.2-3B-Instruct")
     elif request.param == "llama-3.3-70b-instruct":
         llama_model_root = os.path.join(models_root, "llama-3.3-models",
                                         "Llama-3.3-70B-Instruct")
@@ -1393,8 +1392,7 @@ def llm_mistral_model_root(request):
     if request.param == "mistral-7b-v0.1":
         model_root = os.path.join(models_root, "mistral-7b-v0.1")
     if request.param == "mistral-nemo-instruct-2407":
-        model_root = os.path.join(
-            "/code/tensorrt_llm/my_hf_models/Mistral-Nemo-Instruct-2407")
+        model_root = os.path.join(models_root, "Mistral-Nemo-Instruct-2407")
     if request.param == "komt-mistral-7b-v1":
         model_root = os.path.join(models_root, "komt-mistral-7b-v1")
     if request.param == "mistral-7b-v0.3":

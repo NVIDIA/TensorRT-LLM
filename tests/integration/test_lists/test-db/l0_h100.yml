@@ -107,7 +107,7 @@ l0_h100:
   - test_e2e.py::test_openai_chat_harmony
   - test_e2e.py::test_openai_responses
   - test_e2e.py::test_ptp_quickstart_multimodal[gemma-3-27b-it-gemma/gemma-3-27b-it-image-True]
-  - examples/test_llama.py::test_llama_3_x_with_bf16_lora_torch[llama-3.1-8b]
+  - examples/test_llama.py::test_llama_3_x_with_bf16_lora_torch[llama-3.2-1b-instruct]
   - examples/test_nemotron_nas.py::test_nemotron_nano_8b_lora_torch[Llama-3.1-Nemotron-Nano-8B-v1]
   # ------------- AutoDeploy tests ---------------
   - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype
@@ -175,6 +175,23 @@ l0_h100:
   - accuracy/test_cli_flow.py::TestLlama2_7B::test_fp8_gemm_swiglu_plugin
   - examples/test_multimodal.py::test_llm_multimodal_general[Llama-3.2-11B-Vision-pp:1-tp:1-bfloat16-bs:1-cpp_e2e:False-nb:1]
   - examples/test_enc_dec.py::test_llm_enc_dec_mmlu[flan-t5-small-float32-tp:1-pp:1-nb:1-disable_fp8] # 4 mins
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 8
+        lte: 8
+    wildcards:
+      gpu:
+      - '*h100*'
+      linux_distribution_name: ubuntu*
+    terms:
+      stage: pre_merge
+      backend: pytorch
+  tests:
+  # ------------- PyTorch tests ---------------
+  # TODO: TO REMOVE UPON SUCCESSFUL TESTING
+  - examples/test_llama.py::test_llama_3_x_with_bf16_lora_torch_8_gpus
+  - examples/test_nemotron_nas.py::test_nemotron_ultra_253b_lora_torch
 - condition:
     ranges:
       system_gpu_count:
