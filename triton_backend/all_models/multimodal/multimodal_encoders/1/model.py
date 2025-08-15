@@ -683,7 +683,7 @@ class TritonPythonModel:
         embeddings = []
         for start_idx in range(0, batch_size, self.vision_max_batch_size):
             end_idx = min(start_idx + self.vision_max_batch_size, batch_size)
-            logger.info(
+            logger.verbose(
                 f"Running encoder (max_batch_size={self.vision_max_batch_size}) "
                 + f"with batch indices {start_idx}:{end_idx} of {batch_size}.")
 
