@@ -191,7 +191,7 @@ void FusedMHARunnerV2::setupKernelParams(MHARunnerParams runnerParams)
                 = get_size_in_bytes(mFixedParams.numKvHeads * mFixedParams.headSize, mFixedParams.dataType);
             if (mFixedParams.headSizeQkNope > 0 && mFixedParams.dataType != DATA_TYPE_E4M3)
             {
-                // Non-FP8 context MLA: tensor V is not contiguous. The token stride is num_kv_heads * (headSizeQkNope +
+                // Non-FP8 context MLA: tensor V is not contiguous. The token stride is numKvHeads * (headSizeQkNope +
                 // headSizeV).
                 mKernelParams.v_stride_in_bytes = get_size_in_bytes(
                     mFixedParams.numKvHeads * (mFixedParams.headSizeQkNope + mFixedParams.headSizeV),
