@@ -39,6 +39,7 @@ from ..models.modeling_utils import DecoderModelForCausalLM
 from ..speculative.drafter import Drafter
 from .executor_request_queue import ExecutorRequestQueue, RequestQueueItem
 from .guided_decoder import GuidedDecoder
+from .handle_logits import HandleLogits
 from .kv_cache_transceiver import KvCacheTransceiver
 from .llm_request import (ExecutorRequest, LlmRequest, LlmRequestState,
                           LlmResponse)
@@ -1473,12 +1474,22 @@ class PyExecutor:
                       batch_outputs) -> SampleState | None:
         try:
             if batch_outputs is not None:
+                self._handle_logits(scheduled_batch, batch_outputs)
                 return self.sampler.sample_async(scheduled_batch, batch_outputs)
         except Exception as e:
             traceback.print_exc()
             error_msg = str(e)
             logger.error(f"Encountered an error in sampling: {error_msg}")
             self._handle_errors(error_msg)
+
+    @nvtx_range("_handle_logits")
+    def _handle_logits(self, scheduled_batch, batch_outputs):
+        if any(r.py_return_context_logits or r.py_return_generation_logits
+               for r in scheduled_batch.all_requests()):
+            HandleLogits()(
+                scheduled_batch.context_requests,
+                scheduled_batch.generation_requests, batch_outputs["logits"],
+                self.sampler.beam_width(scheduled_batch.all_requests()))
 
     @nvtx_range("_setup_sampler_step")
     def _setup_sampler_step(self, requests: ScheduledRequests):
