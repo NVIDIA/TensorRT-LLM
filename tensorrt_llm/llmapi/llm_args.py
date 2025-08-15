@@ -1061,7 +1061,7 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
     Configuration for the cache transceiver.
     """
 
-    backend: Optional[Literal["default", "ucx", "nixl", "mpi"]] = Field(
+    backend: Optional[Literal["DEFAULT", "UCX", "NIXL", "MPI"]] = Field(
         default=None,
         description=
         "The communication backend type to use for the cache transceiver.")

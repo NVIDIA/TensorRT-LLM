@@ -31,13 +31,11 @@ namespace kernels
 template <typename Tout>
 __global__ void reduce4ring_attention(
     // this is the accumulated results for all finished ring attention blocks
-    Tout* __restrict__ accu_output,       // b x s_block x h x d
-    float* __restrict__ accu_softmax_sum, // b x s_block x h
-    float* __restrict__ accu_max,         // b x s_block x h
+    Tout* __restrict__ accu_output,         // b x s_block x h x d
+    float* __restrict__ accu_softmax_stats, // b x s_block x h x 2 (max/sum)
     // this is the new ring attention block results
-    Tout* __restrict__ output,       // b x s_block x h x d
-    float* __restrict__ softmax_sum, // b x s_block x h
-    float* __restrict__ max,         // b x s_block x h
+    Tout* __restrict__ output,         // b x s_block x h x d
+    float* __restrict__ softmax_stats, // b x s_block x h x 2 (max/sum)
     // necessary constant parameters
     int const b, int const s_block, int const h, int const d, int const block_seq_len, int* cu_seqlens)
 {
@@ -48,7 +46,12 @@ __global__ void reduce4ring_attention(
     int block_s_end = (block_seq_idx + 1) * block_seq_len;
     block_s_end = s_block < block_s_end ? s_block : block_s_end;
     int64_t output_start_offset = batchid * s_block * d + block_s_start * d;
-    int64_t lm_start_offset = batchid * s_block + block_s_start;
+    int64_t lm_start_offset = (batchid * s_block + block_s_start) * 2;
+
+    float* accu_softmax_sum = accu_softmax_stats + 1;
+    float* accu_max = accu_softmax_stats;
+    float* softmax_sum = softmax_stats + 1;
+    float* max = softmax_stats;
 
     __shared__ cuda::barrier<cuda::thread_scope::thread_scope_block> barrier;
     if (block.thread_rank() == 0)
@@ -68,7 +71,7 @@ __global__ void reduce4ring_attention(
         float scaled_my_ss1_ = 1.0, scaled_my_ss2_ = 1.0;
         if (s_ < s_len)
         {
-            uint64_t lm_start_offset_ = lm_start_offset + s_;
+            uint64_t lm_start_offset_ = lm_start_offset + s_ * 2;
             float my_accu_ss = accu_softmax_sum[lm_start_offset_] == 0.0 ? 1.0 : accu_softmax_sum[lm_start_offset_];
             float my_ss = softmax_sum[lm_start_offset_] == 0.0 ? 1.0 : softmax_sum[lm_start_offset_];
 
@@ -123,8 +126,8 @@ void invokeRecoverFromRA(Tout* accu_output, float* accu_softmax_stats, Tout* out
     int dim_s = (s + block_seq_len - 1) / block_seq_len;
 
     dim3 block_num(b, dim_s, 1);
-    reduce4ring_attention<Tout><<<block_num, threads_per_block, 0, stream>>>(accu_output, accu_softmax_sum,
-        accu_softmax_max, output, softmax_sum, softmax_max, b, s, h, d, block_seq_len, cu_seqlens);
+    reduce4ring_attention<Tout><<<block_num, threads_per_block, 0, stream>>>(
+        accu_output, accu_softmax_stats, output, softmax_stats, b, s, h, d, block_seq_len, cu_seqlens);
 }
 
 #define INSTANTIATE_RECOVER_RA(Tout)                                                                                   \

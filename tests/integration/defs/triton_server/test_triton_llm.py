@@ -3726,6 +3726,12 @@ def test_llmapi_backend(E2E_MODEL_NAME, DECOUPLED_MODE, TRITON_MAX_BATCH_SIZE,
             output = venv_check_output(llm_backend_venv, run_cmd)
             assert 'Request is cancelled' in output
 
+            # Test request cancellation for non-existing request and completed request
+            run_cmd = [
+                f"{llm_backend_repo_root}/tools/tests/test_llmapi_cancel.py"
+            ]
+            output = venv_check_output(llm_backend_venv, run_cmd)
+
 
 @pytest.mark.parametrize("E2E_MODEL_NAME", ["ensemble", "tensorrt_llm_bls"])
 @pytest.mark.parametrize("ACCUMULATE_TOKEN", ["False"])
