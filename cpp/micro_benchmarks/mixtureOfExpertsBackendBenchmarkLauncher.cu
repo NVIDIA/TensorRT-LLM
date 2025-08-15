@@ -543,7 +543,7 @@ void help()
            "Valid tactics are:\n"
            " - An integer: corresponds to an index in the tactics array. WARNING this is not stable between data types "
            "or GPU architectures\n"
-           " - An array: of integers or objects, forms a list of tactics to sweep\n"
+           " - An array: of integers, forms a list of tactics to sweep\n"
            " - The string \"all\": This will sweep through all possible tactics\n"
            " - The string \"auto\": This runs a short benchmark to pick the fastest tactic before each benchmark case. "
            "Useful for quick perf tests, prefer a full sweep and manually setting the tactic for more accurate "
