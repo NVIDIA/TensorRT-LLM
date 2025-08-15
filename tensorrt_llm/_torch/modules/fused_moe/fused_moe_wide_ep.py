@@ -468,10 +468,6 @@ class WideEPMoE(MoE):
                     self.alltoall_prepare(all_rank_max_num_tokens,
                                           token_selected_slots,
                                           loadbalancer_local_statistic_info)
-                
-                if not use_postquant_alltoall:
-                    x, _, token_selected_slots, token_final_scales = self.alltoall_dispatch(
-                        x, None, token_selected_slots, token_final_scales, all_rank_max_num_tokens, top_k, alltoall_info)
                                           
                 if gathered_loadbalancer_local_statistic_info is not None:
                     gathered_loadbalancer_local_statistic_info = gathered_loadbalancer_local_statistic_info.view(
@@ -577,12 +573,13 @@ class WideEPMoE(MoE):
         cluster_rank = self.cluster_rank
         quant_scales = self.quant_scales
 
+        if self.alltoall_method_type == AlltoallMethodType.MNNVL:
+            top_k = self.routing_method.experts_per_token
+            x, x_sf, token_selected_slots, token_final_scales = self.alltoall_dispatch(
+                x, x_sf, token_selected_slots, token_final_scales, all_rank_max_num_tokens, top_k, alltoall_info)
+
         if use_postquant_alltoall:
-            if self.alltoall_method_type == AlltoallMethodType.MNNVL:
-                top_k = self.routing_method.experts_per_token
-                x, x_sf, token_selected_slots, token_final_scales = self.alltoall_dispatch(
-                    x, x_sf, token_selected_slots, token_final_scales, all_rank_max_num_tokens, top_k, alltoall_info)
-            elif self.alltoall_method_type == AlltoallMethodType.DeepEP:
+            if self.alltoall_method_type == AlltoallMethodType.DeepEP:
                 if x_sf is not None:
                     # Adapter between `x_sf` and DeepEP
                     # TODO: remove the adapter by adding dtype support to DeepEP
