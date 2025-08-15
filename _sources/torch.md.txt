@@ -2,10 +2,9 @@
 
 ```{note}
 Note:
-This feature is currently experimental, and the related API is subjected to change in future versions.
+This feature is currently in beta, and the related API is subjected to change in future versions.
 ```
-
-To enhance the usability of the system and improve developer efficiency, TensorRT-LLM launches a new experimental backend based on PyTorch.
+To enhance the usability of the system and improve developer efficiency, TensorRT-LLM launches a new backend based on PyTorch.
 
 The PyTorch backend of TensorRT-LLM is available in version 0.17 and later. You can try it via importing `tensorrt_llm._torch`.
 
@@ -29,7 +28,6 @@ Here is a simple example to show how to use `tensorrt_llm.LLM` API with Llama mo
 
 - [Architecture Overview](./torch/arch_overview.md)
 - [Adding a New Model](./torch/adding_new_model.md)
-- [Examples](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/pytorch/README.md)
 
 ## Key Components
 
@@ -40,3 +38,7 @@ Here is a simple example to show how to use `tensorrt_llm.LLM` API with Llama mo
 ## Known Issues
 
 - The PyTorch backend on SBSA is incompatible with bare metal environments like Ubuntu 24.04. Please use the [PyTorch NGC Container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch) for optimal support on SBSA platforms.
+
+## Prototype Features
+
+- [AutoDeploy: Seamless Model Deployment from PyTorch to TensorRT-LLM](./torch/auto_deploy/auto-deploy.md)

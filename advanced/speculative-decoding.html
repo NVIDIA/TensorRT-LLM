@@ -59,19 +59,19 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc6';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.1.0rc0';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
     <link rel="icon" href="../_static/favicon.png"/>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
-    <link rel="next" title="Disaggregated-Service (Experimental)" href="disaggregated-service.html" />
+    <link rel="next" title="Disaggregated-Service (Prototype)" href="disaggregated-service.html" />
     <link rel="prev" title="KV cache reuse" href="kv-cache-reuse.html" />
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.0.0rc6" />
+  <meta name="docsearch:version" content="1.1.0rc0" />
 
 
   </head>
@@ -330,6 +330,12 @@
 <li class="toctree-l1"><a class="reference internal" href="../installation/linux.html">Installing on Linux via <code class="docutils literal notranslate"><span class="pre">pip</span></code></a></li>
 <li class="toctree-l1"><a class="reference internal" href="../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
 </ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Deployment Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../deployment-guide/quick-start-recipe-for-llama4-scout-on-trtllm.html">Quick Start Recipe for Llama4 Scout 17B on TensorRT-LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../deployment-guide/quick-start-recipe-for-deepseek-r1-on-trtllm.html">Quick Start Recipe for DeepSeek R1 on TensorRT-LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../deployment-guide/quick-start-recipe-for-llama3.3-70b-on-trtllm.html">Quick Start Recipe for Llama3.3 70B on TensorRT-LLM - Blackwell &amp; Hopper Hardware</a></li>
+</ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">LLM API</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../llm-api/index.html">LLM API Introduction</a></li>
@@ -419,7 +425,7 @@
 <li class="toctree-l1"><a class="reference internal" href="kv-cache-management.html">KV Cache Management: Pools, Blocks, and Events</a></li>
 <li class="toctree-l1"><a class="reference internal" href="kv-cache-reuse.html">KV cache reuse</a></li>
 <li class="toctree-l1 current active"><a class="current reference internal" href="#">Speculative Sampling</a></li>
-<li class="toctree-l1"><a class="reference internal" href="disaggregated-service.html">Disaggregated-Service (Experimental)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="disaggregated-service.html">Disaggregated-Service (Prototype)</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Performance</span></p>
 <ul class="nav bd-sidenav">
@@ -576,7 +582,8 @@ These tokens are then forwarded to the Target model for verification.
 Upon verification, the Target model may return up to <code class="docutils literal notranslate"><span class="pre">K+1</span></code> tokens.
 Subsequently, the prompt, now updated with the accepted tokens, is sent back to the Draft model to initiate the generation of new draft tokens.
 This iterative process continues until a predefined stop conditions are met.
-An example of this orchestration process can be found in the <a class="reference external" href="https://github.com/triton-inference-server/tensorrtllm_backend/blob/main/inflight_batcher_llm/client/e2e_grpc_speculative_decoding_client.py">TensorRT-LLM Triton backend</a>.</p>
+An example orchestration script is available in the Triton backend repository’s
+<a class="reference external" href="https://github.com/triton-inference-server/tensorrtllm_backend/blob/main/client/python/draft_target_model_client.py">draft-target-model client example</a>.</p>
 <p>We provide two styles of running Draft-Target-Model now: using TensorRT-LLM-BLS in Triton Inference Server, or using TensorRT-LLM directly. Detailed steps of running can be found in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/draft_target_model/README.md">examples/draft_target_model/README.md</a> and the code can be found in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/ngram/run_dtm_ngram.py">examples/ngram/run_dtm_ngram.py</a>.</p>
 </section>
 <section id="ngram">
@@ -672,10 +679,10 @@ However, similar to any new model, you can follow the same approach to define yo
 <section id="eagle">
 <h2>EAGLE<a class="headerlink" href="#eagle" title="Link to this heading">#</a></h2>
 <p>The EAGLE approach enhances the single-model Medusa method by predicting and verifying tokens using the same model. Similarly to ReDrafter, it predicts draft tokens using a recurrent predictor where each draft token depends on the previous one. However, unlike ReDrafter, it uses a single-layer transformer model to predict draft tokens from previous hidden states and decoded tokens. In the EAGLE-1 decoding tree needs to be known during the decoding. In the EAGLE-2 this tree is asssembled during the execution by searching for the most probable hypothesis along the beam.</p>
-<p>Similarly to ReDrafter, TensorRT-LLM implements the EAGLE model such that logits prediction, draft tokens acceptance and draft token generation are performed inside of the TensorRT engine. EAGLE-1 and EAGLE-2 are both supported, while EAGLE-2 is currently in the experimental stage. Please, visit the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/eagle/README.md">EAGLE README</a> for information about building and running the model.</p>
+<p>Similarly to ReDrafter, TensorRT-LLM implements the EAGLE model such that logits prediction, draft tokens acceptance and draft token generation are performed inside of the TensorRT engine(EAGLE-1 and EAGLE-2 are both supported). Please, visit the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/eagle/README.md">EAGLE README</a> for information about building and running the model.</p>
 <section id="disaggregated-serving">
 <h3>Disaggregated Serving<a class="headerlink" href="#disaggregated-serving" title="Link to this heading">#</a></h3>
-<p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/advanced/disaggregated-service.md">Disaggregated Serving</a> with EAGLE3 using the two model approach is supported in the Pytorch backend. Please refer to the following <a class="reference external" href="https://github.com/ai-dynamo/dynamo/blob/main/examples/tensorrt_llm/llama4_plus_eagle.md">Dynamo example</a> on how to run EAGLE3 with Disaggregated Serving for Llama 4 Maverick.</p>
+<p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/advanced/disaggregated-service.md">Disaggregated Serving</a> with EAGLE-3 using the two-model approach is supported in the PyTorch backend.</p>
 </section>
 </section>
 <section id="lookahead-decoding">
@@ -708,7 +715,7 @@ However, similar to any new model, you can follow the same approach to define yo
        title="next page">
       <div class="prev-next-info">
         <p class="prev-next-subtitle">next</p>
-        <p class="prev-next-title">Disaggregated-Service (Experimental)</p>
+        <p class="prev-next-title">Disaggregated-Service (Prototype)</p>
       </div>
       <i class="fa-solid fa-angle-right"></i>
     </a>
@@ -845,9 +852,9 @@ However, similar to any new model, you can follow the same approach to define yo
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on August 06, 2025.</p>
+  <p>Last updated on August 15, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/a16ba64">a16ba64</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/26f413a">26f413a</a>.</p>
   
 </div></div>
       

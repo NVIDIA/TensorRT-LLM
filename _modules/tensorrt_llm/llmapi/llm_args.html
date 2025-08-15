@@ -58,7 +58,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc6';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.1.0rc0';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -68,7 +68,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.0.0rc6" />
+  <meta name="docsearch:version" content="1.1.0rc0" />
 
 
   </head>
@@ -323,6 +323,12 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../installation/linux.html">Installing on Linux via <code class="docutils literal notranslate"><span class="pre">pip</span></code></a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
 </ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Deployment Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../deployment-guide/quick-start-recipe-for-llama4-scout-on-trtllm.html">Quick Start Recipe for Llama4 Scout 17B on TensorRT-LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../deployment-guide/quick-start-recipe-for-deepseek-r1-on-trtllm.html">Quick Start Recipe for DeepSeek R1 on TensorRT-LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../deployment-guide/quick-start-recipe-for-llama3.3-70b-on-trtllm.html">Quick Start Recipe for Llama3.3 70B on TensorRT-LLM - Blackwell &amp; Hopper Hardware</a></li>
+</ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">LLM API</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../../../llm-api/index.html">LLM API Introduction</a></li>
@@ -412,7 +418,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/kv-cache-management.html">KV Cache Management: Pools, Blocks, and Events</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/speculative-decoding.html">Speculative Sampling</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../advanced/disaggregated-service.html">Disaggregated-Service (Experimental)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../advanced/disaggregated-service.html">Disaggregated-Service (Prototype)</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Performance</span></p>
 <ul class="nav bd-sidenav">
@@ -523,8 +529,8 @@
 <span class="kn">from</span><span class="w"> </span><span class="nn">strenum</span><span class="w"> </span><span class="kn">import</span> <span class="n">StrEnum</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">transformers</span><span class="w"> </span><span class="kn">import</span> <span class="n">PreTrainedTokenizerBase</span>
 
-<span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.lora_manager</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">LoraConfig</span><span class="p">,</span>
-                                       <span class="n">get_default_trtllm_modules_to_hf_modules</span><span class="p">)</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.lora_helper</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">LoraConfig</span><span class="p">,</span>
+                                      <span class="n">get_default_trtllm_modules_to_hf_modules</span><span class="p">)</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">.._utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">mpi_rank</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..auto_parallel</span><span class="w"> </span><span class="kn">import</span> <span class="n">AutoParallelConfig</span><span class="p">,</span> <span class="n">infer_cluster_config</span>
@@ -658,7 +664,7 @@
 
         <span class="c1"># Add powers of 2 up to max_batch_size</span>
         <span class="n">batch_sizes</span> <span class="o">+=</span> <span class="p">[</span>
-            <span class="mi">2</span><span class="o">**</span><span class="n">i</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">8</span><span class="p">,</span> <span class="n">math</span><span class="o">.</span><span class="n">floor</span><span class="p">(</span><span class="n">math</span><span class="o">.</span><span class="n">log</span><span class="p">(</span><span class="n">max_batch_size</span><span class="p">,</span> <span class="mi">2</span><span class="p">)))</span>
+            <span class="mi">2</span><span class="o">**</span><span class="n">i</span> <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="nb">range</span><span class="p">(</span><span class="mi">8</span><span class="p">,</span> <span class="n">math</span><span class="o">.</span><span class="n">ceil</span><span class="p">(</span><span class="n">math</span><span class="o">.</span><span class="n">log</span><span class="p">(</span><span class="n">max_batch_size</span><span class="p">,</span> <span class="mi">2</span><span class="p">)))</span>
         <span class="p">]</span>
 
         <span class="c1"># Filter and sort batch sizes</span>
@@ -680,8 +686,9 @@
 <span class="sd">    Configuration for MoE.</span>
 <span class="sd">    &quot;&quot;&quot;</span>
     <span class="n">backend</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span><span class="s2">&quot;CUTLASS&quot;</span><span class="p">,</span> <span class="s2">&quot;CUTEDSL&quot;</span><span class="p">,</span> <span class="s2">&quot;WIDEEP&quot;</span><span class="p">,</span> <span class="s2">&quot;TRTLLM&quot;</span><span class="p">,</span> <span class="s2">&quot;DEEPGEMM&quot;</span><span class="p">,</span>
-                     <span class="s2">&quot;VANILLA&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="s1">&#39;CUTLASS&#39;</span><span class="p">,</span>
-                                        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;MoE backend to use.&quot;</span><span class="p">)</span>
+                     <span class="s2">&quot;VANILLA&quot;</span><span class="p">,</span>
+                     <span class="s2">&quot;TRITON&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="s1">&#39;CUTLASS&#39;</span><span class="p">,</span>
+                                       <span class="n">description</span><span class="o">=</span><span class="s2">&quot;MoE backend to use.&quot;</span><span class="p">)</span>
 
     <span class="n">max_num_tokens</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
@@ -693,6 +700,12 @@
         <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Configuration for MoE load balancing.&quot;</span><span class="p">,</span>
         <span class="n">json_schema_extra</span><span class="o">=</span><span class="p">{</span><span class="s2">&quot;type&quot;</span><span class="p">:</span> <span class="s2">&quot;Union[MoeLoadBalancerConfig, str]&quot;</span><span class="p">})</span>
+
+    <span class="n">disable_finalize_fusion</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="s2">&quot;Disable FC2+finalize kernel fusion in CUTLASS MoE backend. Setting this to True recovers deterministic numerical behavior with top-k &gt; 2.&quot;</span>
+    <span class="p">)</span>
 
 <div class="viewcode-block" id="MoeConfig.from_dict">
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.MoeConfig.from_dict">[docs]</a>
@@ -872,6 +885,11 @@
     <span class="n">max_draft_len</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
     <span class="n">speculative_model_dir</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Union</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="n">Path</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span>
 
+    <span class="c1"># PyTorch only.</span>
+    <span class="c1"># When specified, speculation will be disabled at batch sizes above</span>
+    <span class="c1"># this value. Otherwise, speculation will always be on.</span>
+    <span class="n">max_concurrency</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span>
+
     <span class="nd">@classmethod</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">from_dict</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">data</span><span class="p">:</span> <span class="nb">dict</span><span class="p">):</span>
         <span class="c1"># dispatch to the correct decoding config</span>
@@ -1025,9 +1043,6 @@
     <span class="n">is_keep_all</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
     <span class="n">is_use_oldest</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
     <span class="n">is_public_pool</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">True</span>
-    <span class="c1"># Flag to indicate the NGramDecodingConfig is instantiated by auto heuristic.</span>
-    <span class="c1"># User should not set this flag. Use AutoDecodingConfig instead.</span>
-    <span class="n">is_auto_heuristic</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span>
 
 <div class="viewcode-block" id="NGramDecodingConfig.from_dict">
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.from_dict">[docs]</a>
@@ -1118,13 +1133,10 @@
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
 <span class="sd">    Configuration for auto speculative decoding.</span>
 
-<span class="sd">    This config is used to automatically select the best speculative decoding algorithm.</span>
+<span class="sd">    This config will automatically select a good, draft-model free</span>
+<span class="sd">    speculation algorithm with some heuristic.</span>
 
-<span class="sd">    According to benchmark results, the best algorithm in general is NGRAM with low concurrency &lt;= 32.</span>
-<span class="sd">    Default heuristic:</span>
-<span class="sd">        With concurrency &lt;= 4, max_draft_len = 5, max_matching_ngram_size = 3</span>
-<span class="sd">        With concurrency &lt;= 32, max_draft_len = 3, max_matching_ngram_size = 5</span>
-<span class="sd">        With concurrency &gt; 32, speculative decoding is disabled.</span>
+<span class="sd">    Attributes that are inherited from the base class are ignored.</span>
 <span class="sd">    &quot;&quot;&quot;</span>
 
 <div class="viewcode-block" id="AutoDecodingConfig.from_dict">
@@ -1595,6 +1607,11 @@
         <span class="n">description</span><span class="o">=</span>
         <span class="s2">&quot;Maximum size of the event buffer. If set to 0, the event buffer will not be used.&quot;</span>
     <span class="p">)</span>
+    <span class="n">attention_dp_events_gather_period_ms</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="mi">5</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="s2">&quot;The period in milliseconds to gather attention DP events across ranks.&quot;</span>
+    <span class="p">)</span>
     <span class="n">enable_partial_reuse</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span>
@@ -1611,6 +1628,14 @@
     <span class="n">dtype</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="s2">&quot;auto&quot;</span><span class="p">,</span>
                        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The data type to use for the KV cache.&quot;</span><span class="p">)</span>
 
+    <span class="c1"># This is a pure python field, not a pybind field. It is only for the Pytorch backend.</span>
+    <span class="n">mamba_ssm_cache_dtype</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span>
+        <span class="s2">&quot;auto&quot;</span><span class="p">,</span> <span class="s2">&quot;float16&quot;</span><span class="p">,</span> <span class="s2">&quot;bfloat16&quot;</span><span class="p">,</span> <span class="s2">&quot;float32&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+            <span class="n">default</span><span class="o">=</span><span class="s2">&quot;auto&quot;</span><span class="p">,</span>
+            <span class="n">description</span><span class="o">=</span>
+            <span class="s2">&quot;The data type to use for the Mamba SSM cache. If set to &#39;auto&#39;, the data type will be inferred from the model config.&quot;</span>
+        <span class="p">)</span>
+
     <span class="k">def</span><span class="w"> </span><span class="nf">_to_pybind</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">return</span> <span class="n">_KvCacheConfig</span><span class="p">(</span>
             <span class="n">enable_block_reuse</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">enable_block_reuse</span><span class="p">,</span>
@@ -1625,7 +1650,10 @@
             <span class="n">event_buffer_max_size</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">event_buffer_max_size</span><span class="p">,</span>
             <span class="n">enable_partial_reuse</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">enable_partial_reuse</span><span class="p">,</span>
             <span class="n">copy_on_partial_reuse</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">copy_on_partial_reuse</span><span class="p">,</span>
-            <span class="n">use_uvm</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">use_uvm</span><span class="p">)</span></div>
+            <span class="n">use_uvm</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">use_uvm</span><span class="p">,</span>
+            <span class="n">attention_dp_events_gather_period_ms</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span>
+            <span class="n">attention_dp_events_gather_period_ms</span><span class="p">,</span>
+        <span class="p">)</span></div>
 
 
 
@@ -1671,7 +1699,7 @@
 <span class="sd">    Configuration for the cache transceiver.</span>
 <span class="sd">    &quot;&quot;&quot;</span>
 
-    <span class="n">backend</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Literal</span><span class="p">[</span><span class="s2">&quot;default&quot;</span><span class="p">,</span> <span class="s2">&quot;ucx&quot;</span><span class="p">,</span> <span class="s2">&quot;nixl&quot;</span><span class="p">,</span> <span class="s2">&quot;mpi&quot;</span><span class="p">]]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+    <span class="n">backend</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Literal</span><span class="p">[</span><span class="s2">&quot;DEFAULT&quot;</span><span class="p">,</span> <span class="s2">&quot;UCX&quot;</span><span class="p">,</span> <span class="s2">&quot;NIXL&quot;</span><span class="p">,</span> <span class="s2">&quot;MPI&quot;</span><span class="p">]]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span>
         <span class="s2">&quot;The communication backend type to use for the cache transceiver.&quot;</span><span class="p">)</span>
@@ -1935,6 +1963,10 @@
         <span class="n">validate_default</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
         <span class="n">status</span><span class="o">=</span><span class="s2">&quot;deprecated&quot;</span><span class="p">,</span>
     <span class="p">)</span>
+
+    <span class="n">return_perf_metrics</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+                                      <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Return perf metrics.&quot;</span><span class="p">,</span>
+                                      <span class="n">status</span><span class="o">=</span><span class="s2">&quot;prototype&quot;</span><span class="p">)</span>
 
     <span class="n">_parallel_config</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">object</span><span class="p">]</span> <span class="o">=</span> <span class="n">PrivateAttr</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span>
     <span class="n">_model_format</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">_ModelFormatKind</span><span class="p">]</span> <span class="o">=</span> <span class="n">PrivateAttr</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">)</span>
@@ -2691,11 +2723,11 @@
         <span class="s2">&quot;If true, will iterate over sampling_params of each request and use the corresponding sampling strategy, e.g. top-k, top-p, etc.&quot;</span><span class="p">,</span>
         <span class="n">status</span><span class="o">=</span><span class="s2">&quot;beta&quot;</span><span class="p">)</span>
 
-    <span class="n">enable_trtllm_sampler</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+    <span class="n">use_torch_sampler</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span>
-        <span class="s2">&quot;If true, will use the TRTLLM sampler instead of the PyTorch sampler. The TRTLLM sampler has a wide coverage of sampling strategies.&quot;</span><span class="p">,</span>
-        <span class="n">status</span><span class="o">=</span><span class="s2">&quot;prototype&quot;</span><span class="p">)</span>
+        <span class="s2">&quot;If true, will use the Torch sampler instead of the TRTLLM sampler.&quot;</span><span class="p">,</span>
+        <span class="n">status</span><span class="o">=</span><span class="s2">&quot;beta&quot;</span><span class="p">)</span>
 
     <span class="n">enable_iter_perf_stats</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
@@ -2752,14 +2784,12 @@
         <span class="n">status</span><span class="o">=</span><span class="s2">&quot;prototype&quot;</span><span class="p">,</span>
     <span class="p">)</span>
 
-    <span class="n">allreduce_strategy</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span>
-        <span class="n">Literal</span><span class="p">[</span><span class="s1">&#39;AUTO&#39;</span><span class="p">,</span> <span class="s1">&#39;NCCL&#39;</span><span class="p">,</span> <span class="s1">&#39;UB&#39;</span><span class="p">,</span> <span class="s1">&#39;MINLATENCY&#39;</span><span class="p">,</span> <span class="s1">&#39;ONESHOT&#39;</span><span class="p">,</span> <span class="s1">&#39;TWOSHOT&#39;</span><span class="p">,</span>
-                <span class="s1">&#39;LOWPRECISION&#39;</span><span class="p">,</span> <span class="s1">&#39;MNNVL&#39;</span><span class="p">]]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
-                    <span class="n">default</span><span class="o">=</span><span class="s1">&#39;AUTO&#39;</span><span class="p">,</span>
-                    <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Allreduce strategy to use.&quot;</span><span class="p">,</span>
-                    <span class="n">status</span><span class="o">=</span><span class="s2">&quot;beta&quot;</span><span class="p">,</span>
-                <span class="p">)</span>
-
+    <span class="n">allreduce_strategy</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Literal</span><span class="p">[</span>
+        <span class="s1">&#39;AUTO&#39;</span><span class="p">,</span> <span class="s1">&#39;NCCL&#39;</span><span class="p">,</span> <span class="s1">&#39;UB&#39;</span><span class="p">,</span> <span class="s1">&#39;MINLATENCY&#39;</span><span class="p">,</span> <span class="s1">&#39;ONESHOT&#39;</span><span class="p">,</span> <span class="s1">&#39;TWOSHOT&#39;</span><span class="p">,</span>
+        <span class="s1">&#39;LOWPRECISION&#39;</span><span class="p">,</span> <span class="s1">&#39;MNNVL&#39;</span><span class="p">,</span>
+        <span class="s1">&#39;NCCL_SYMMETRIC&#39;</span><span class="p">]]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="s1">&#39;AUTO&#39;</span><span class="p">,</span>
+                                   <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Allreduce strategy to use.&quot;</span><span class="p">,</span>
+                                   <span class="n">status</span><span class="o">=</span><span class="s2">&quot;beta&quot;</span><span class="p">)</span>
     <span class="n">checkpoint_loader</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">object</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The checkpoint loader to use for this LLM instance.&quot;</span><span class="p">,</span>
@@ -3011,8 +3041,9 @@
             <span class="n">attn_backend</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">attn_backend</span><span class="p">,</span>
             <span class="n">moe_backend</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">moe_config</span><span class="o">.</span><span class="n">backend</span><span class="p">,</span>
             <span class="n">enable_mixed_sampler</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">enable_mixed_sampler</span><span class="p">,</span>
-            <span class="n">enable_trtllm_sampler</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">enable_trtllm_sampler</span><span class="p">,</span>
+            <span class="n">use_torch_sampler</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">use_torch_sampler</span><span class="p">,</span>
             <span class="n">kv_cache_dtype</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_config</span><span class="o">.</span><span class="n">dtype</span><span class="p">,</span>
+            <span class="n">mamba_ssm_cache_dtype</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_config</span><span class="o">.</span><span class="n">mamba_ssm_cache_dtype</span><span class="p">,</span>
             <span class="n">enable_iter_perf_stats</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">enable_iter_perf_stats</span><span class="p">,</span>
             <span class="n">enable_iter_req_stats</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">enable_iter_req_stats</span><span class="p">,</span>
             <span class="n">print_iter_log</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">print_iter_log</span><span class="p">,</span>
@@ -3037,6 +3068,7 @@
             <span class="n">enable_layerwise_nvtx_marker</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">enable_layerwise_nvtx_marker</span><span class="p">,</span>
             <span class="n">load_format</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">load_format</span><span class="p">,</span>
             <span class="n">enable_min_latency</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">enable_min_latency</span><span class="p">,</span>
+            <span class="n">moe_disable_finalize_fusion</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">moe_config</span><span class="o">.</span><span class="n">disable_finalize_fusion</span><span class="p">,</span>
             <span class="n">stream_interval</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">stream_interval</span><span class="p">,</span>
             <span class="n">force_dynamic_quantization</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">force_dynamic_quantization</span><span class="p">,</span>
             <span class="n">allreduce_strategy</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">allreduce_strategy</span><span class="p">,</span>
@@ -3243,9 +3275,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on August 06, 2025.</p>
+  <p>Last updated on August 15, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/a16ba64">a16ba64</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/26f413a">26f413a</a>.</p>
   
 </div></div>
       

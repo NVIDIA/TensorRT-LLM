@@ -59,7 +59,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc6';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.1.0rc0';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -71,7 +71,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.0.0rc6" />
+  <meta name="docsearch:version" content="1.1.0rc0" />
 
 
   </head>
@@ -330,6 +330,12 @@
 <li class="toctree-l1"><a class="reference internal" href="installation/linux.html">Installing on Linux via <code class="docutils literal notranslate"><span class="pre">pip</span></code></a></li>
 <li class="toctree-l1"><a class="reference internal" href="installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
 </ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Deployment Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="deployment-guide/quick-start-recipe-for-llama4-scout-on-trtllm.html">Quick Start Recipe for Llama4 Scout 17B on TensorRT-LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l1"><a class="reference internal" href="deployment-guide/quick-start-recipe-for-deepseek-r1-on-trtllm.html">Quick Start Recipe for DeepSeek R1 on TensorRT-LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l1"><a class="reference internal" href="deployment-guide/quick-start-recipe-for-llama3.3-70b-on-trtllm.html">Quick Start Recipe for Llama3.3 70B on TensorRT-LLM - Blackwell &amp; Hopper Hardware</a></li>
+</ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">LLM API</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="llm-api/index.html">LLM API Introduction</a></li>
@@ -419,7 +425,7 @@
 <li class="toctree-l1"><a class="reference internal" href="advanced/kv-cache-management.html">KV Cache Management: Pools, Blocks, and Events</a></li>
 <li class="toctree-l1"><a class="reference internal" href="advanced/kv-cache-reuse.html">KV cache reuse</a></li>
 <li class="toctree-l1"><a class="reference internal" href="advanced/speculative-decoding.html">Speculative Sampling</a></li>
-<li class="toctree-l1"><a class="reference internal" href="advanced/disaggregated-service.html">Disaggregated-Service (Experimental)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="advanced/disaggregated-service.html">Disaggregated-Service (Prototype)</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Performance</span></p>
 <ul class="nav bd-sidenav">
@@ -510,9 +516,9 @@
 <div class="admonition note">
 <p class="admonition-title">Note</p>
 <p>Note:
-This feature is currently experimental, and the related API is subjected to change in future versions.</p>
+This feature is currently in beta, and the related API is subjected to change in future versions.</p>
 </div>
-<p>To enhance the usability of the system and improve developer efficiency, TensorRT-LLM launches a new experimental backend based on PyTorch.</p>
+<p>To enhance the usability of the system and improve developer efficiency, TensorRT-LLM launches a new backend based on PyTorch.</p>
 <p>The PyTorch backend of TensorRT-LLM is available in version 0.17 and later. You can try it via importing <code class="docutils literal notranslate"><span class="pre">tensorrt_llm._torch</span></code>.</p>
 <section id="quick-start">
 <h2>Quick Start<a class="headerlink" href="#quick-start" title="Link to this heading">#</a></h2>
@@ -567,7 +573,6 @@ This feature is currently experimental, and the related API is subjected to chan
 <ul class="simple">
 <li><p><a class="reference internal" href="torch/arch_overview.html"><span class="std std-doc">Architecture Overview</span></a></p></li>
 <li><p><a class="reference internal" href="torch/adding_new_model.html"><span class="std std-doc">Adding a New Model</span></a></p></li>
-<li><p><a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/pytorch/README.md">Examples</a></p></li>
 </ul>
 </section>
 <section id="key-components">
@@ -582,6 +587,12 @@ This feature is currently experimental, and the related API is subjected to chan
 <h2>Known Issues<a class="headerlink" href="#known-issues" title="Link to this heading">#</a></h2>
 <ul class="simple">
 <li><p>The PyTorch backend on SBSA is incompatible with bare metal environments like Ubuntu 24.04. Please use the <a class="reference external" href="https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch">PyTorch NGC Container</a> for optimal support on SBSA platforms.</p></li>
+</ul>
+</section>
+<section id="prototype-features">
+<h2>Prototype Features<a class="headerlink" href="#prototype-features" title="Link to this heading">#</a></h2>
+<ul class="simple">
+<li><p><a class="reference internal" href="torch/auto_deploy/auto-deploy.html"><span class="std std-doc">AutoDeploy: Seamless Model Deployment from PyTorch to TensorRT-LLM</span></a></p></li>
 </ul>
 </section>
 </section>
@@ -640,6 +651,7 @@ This feature is currently experimental, and the related API is subjected to chan
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#developer-guide">Developer Guide</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#key-components">Key Components</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#known-issues">Known Issues</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#prototype-features">Prototype Features</a></li>
 </ul>
   </nav></div>
 
@@ -734,9 +746,9 @@ This feature is currently experimental, and the related API is subjected to chan
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on August 06, 2025.</p>
+  <p>Last updated on August 15, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/a16ba64">a16ba64</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/26f413a">26f413a</a>.</p>
   
 </div></div>
       

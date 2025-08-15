@@ -59,7 +59,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc6';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.1.0rc0';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -71,7 +71,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.0.0rc6" />
+  <meta name="docsearch:version" content="1.1.0rc0" />
 
 
   </head>
@@ -330,6 +330,12 @@
 <li class="toctree-l1"><a class="reference internal" href="../installation/linux.html">Installing on Linux via <code class="docutils literal notranslate"><span class="pre">pip</span></code></a></li>
 <li class="toctree-l1"><a class="reference internal" href="../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
 </ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Deployment Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../deployment-guide/quick-start-recipe-for-llama4-scout-on-trtllm.html">Quick Start Recipe for Llama4 Scout 17B on TensorRT-LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../deployment-guide/quick-start-recipe-for-deepseek-r1-on-trtllm.html">Quick Start Recipe for DeepSeek R1 on TensorRT-LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../deployment-guide/quick-start-recipe-for-llama3.3-70b-on-trtllm.html">Quick Start Recipe for Llama3.3 70B on TensorRT-LLM - Blackwell &amp; Hopper Hardware</a></li>
+</ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">LLM API</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../llm-api/index.html">LLM API Introduction</a></li>
@@ -419,7 +425,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../advanced/kv-cache-management.html">KV Cache Management: Pools, Blocks, and Events</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/speculative-decoding.html">Speculative Sampling</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../advanced/disaggregated-service.html">Disaggregated-Service (Experimental)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/disaggregated-service.html">Disaggregated-Service (Prototype)</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Performance</span></p>
 <ul class="nav bd-sidenav">
@@ -4761,6 +4767,11 @@ The dimension of the tensor to slice.</p></li>
 <span class="sig-name descname"><span class="pre">MNNVL</span></span><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">7</span></em><a class="headerlink" href="#tensorrt_llm.functional.AllReduceStrategy.MNNVL" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
+<dl class="py attribute">
+<dt class="sig sig-object py" id="tensorrt_llm.functional.AllReduceStrategy.NCCL_SYMMETRIC">
+<span class="sig-name descname"><span class="pre">NCCL_SYMMETRIC</span></span><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">8</span></em><a class="headerlink" href="#tensorrt_llm.functional.AllReduceStrategy.NCCL_SYMMETRIC" title="Link to this definition">#</a></dt>
+<dd></dd></dl>
+
 </dd></dl>
 
 <dl class="py class">
@@ -6872,6 +6883,7 @@ The index for rebuilding the sequence</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.functional.AllReduceStrategy.TWOSHOT"><code class="docutils literal notranslate"><span class="pre">TWOSHOT</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.functional.AllReduceStrategy.LOWPRECISION"><code class="docutils literal notranslate"><span class="pre">LOWPRECISION</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.functional.AllReduceStrategy.MNNVL"><code class="docutils literal notranslate"><span class="pre">MNNVL</span></code></a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.functional.AllReduceStrategy.NCCL_SYMMETRIC"><code class="docutils literal notranslate"><span class="pre">NCCL_SYMMETRIC</span></code></a></li>
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#tensorrt_llm.functional.AllReduceFusionOp"><code class="docutils literal notranslate"><span class="pre">AllReduceFusionOp</span></code></a><ul class="nav section-nav flex-column">
@@ -7046,9 +7058,9 @@ The index for rebuilding the sequence</p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on August 06, 2025.</p>
+  <p>Last updated on August 15, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/a16ba64">a16ba64</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/26f413a">26f413a</a>.</p>
   
 </div></div>
       

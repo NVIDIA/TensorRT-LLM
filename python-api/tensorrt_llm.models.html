@@ -59,7 +59,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc6';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.1.0rc0';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -71,7 +71,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.0.0rc6" />
+  <meta name="docsearch:version" content="1.1.0rc0" />
 
 
   </head>
@@ -330,6 +330,12 @@
 <li class="toctree-l1"><a class="reference internal" href="../installation/linux.html">Installing on Linux via <code class="docutils literal notranslate"><span class="pre">pip</span></code></a></li>
 <li class="toctree-l1"><a class="reference internal" href="../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
 </ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Deployment Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../deployment-guide/quick-start-recipe-for-llama4-scout-on-trtllm.html">Quick Start Recipe for Llama4 Scout 17B on TensorRT-LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../deployment-guide/quick-start-recipe-for-deepseek-r1-on-trtllm.html">Quick Start Recipe for DeepSeek R1 on TensorRT-LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../deployment-guide/quick-start-recipe-for-llama3.3-70b-on-trtllm.html">Quick Start Recipe for Llama3.3 70B on TensorRT-LLM - Blackwell &amp; Hopper Hardware</a></li>
+</ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">LLM API</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../llm-api/index.html">LLM API Introduction</a></li>
@@ -419,7 +425,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../advanced/kv-cache-management.html">KV Cache Management: Pools, Blocks, and Events</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/speculative-decoding.html">Speculative Sampling</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../advanced/disaggregated-service.html">Disaggregated-Service (Experimental)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/disaggregated-service.html">Disaggregated-Service (Prototype)</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Performance</span></p>
 <ul class="nav bd-sidenav">
@@ -2553,7 +2559,7 @@ ranges of the dimensions of when using TRT dynamic shapes.</p>
 <dd><em class="sig-param"><span class="n"><span class="pre">final_logit_softcapping</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">float</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">attn_logit_softcapping</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">float</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">mapping</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">Mapping</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">dict</span><span class="w"> </span><span class="p"><span class="pre">|</span></span><span class="w"> </span><span class="pre">None</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
-<dd><em class="sig-param"><span class="n"><span class="pre">sliding_window_pattern</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
+<dd><em class="sig-param"><span class="n"><span class="pre">_sliding_window_pattern</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">rope_local_base_freq</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="n"><span class="pre">sliding_window</span></span><span class="p"><span class="pre">:</span></span><span class="w"> </span><span class="n"><span class="pre">int</span></span><span class="w"> </span><span class="o"><span class="pre">=</span></span><span class="w"> </span><span class="default_value"><span class="pre">None</span></span></em>,</dd>
 <dd><em class="sig-param"><span class="o"><span class="pre">**</span></span><span class="n"><span class="pre">kwargs</span></span></em>,</dd>
@@ -2573,12 +2579,12 @@ ranges of the dimensions of when using TRT dynamic shapes.</p>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="tensorrt_llm.models.GemmaConfig.GEMMA3_ADDED_FIELDS">
-<span class="sig-name descname"><span class="pre">GEMMA3_ADDED_FIELDS</span></span><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">{'final_logit_softcapping',</span> <span class="pre">'query_pre_attn_scalar',</span> <span class="pre">'rope_local_base_freq',</span> <span class="pre">'sliding_window',</span> <span class="pre">'sliding_window_pattern'}</span></em><a class="headerlink" href="#tensorrt_llm.models.GemmaConfig.GEMMA3_ADDED_FIELDS" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">GEMMA3_ADDED_FIELDS</span></span><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">{'_sliding_window_pattern',</span> <span class="pre">'final_logit_softcapping',</span> <span class="pre">'query_pre_attn_scalar',</span> <span class="pre">'rope_local_base_freq',</span> <span class="pre">'sliding_window'}</span></em><a class="headerlink" href="#tensorrt_llm.models.GemmaConfig.GEMMA3_ADDED_FIELDS" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py attribute">
 <dt class="sig sig-object py" id="tensorrt_llm.models.GemmaConfig.VERBATIM">
-<span class="sig-name descname"><span class="pre">VERBATIM</span></span><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">{'attn_logit_softcapping',</span> <span class="pre">'final_logit_softcapping',</span> <span class="pre">'hidden_act',</span> <span class="pre">'hidden_size',</span> <span class="pre">'intermediate_size',</span> <span class="pre">'max_position_embeddings',</span> <span class="pre">'num_attention_heads',</span> <span class="pre">'num_hidden_layers',</span> <span class="pre">'query_pre_attn_scalar',</span> <span class="pre">'rope_local_base_freq',</span> <span class="pre">'sliding_window',</span> <span class="pre">'sliding_window_pattern',</span> <span class="pre">'use_parallel_embedding',</span> <span class="pre">'vocab_size'}</span></em><a class="headerlink" href="#tensorrt_llm.models.GemmaConfig.VERBATIM" title="Link to this definition">#</a></dt>
+<span class="sig-name descname"><span class="pre">VERBATIM</span></span><em class="property"><span class="w"> </span><span class="p"><span class="pre">=</span></span><span class="w"> </span><span class="pre">{'_sliding_window_pattern',</span> <span class="pre">'attn_logit_softcapping',</span> <span class="pre">'final_logit_softcapping',</span> <span class="pre">'hidden_act',</span> <span class="pre">'hidden_size',</span> <span class="pre">'intermediate_size',</span> <span class="pre">'max_position_embeddings',</span> <span class="pre">'num_attention_heads',</span> <span class="pre">'num_hidden_layers',</span> <span class="pre">'query_pre_attn_scalar',</span> <span class="pre">'rope_local_base_freq',</span> <span class="pre">'sliding_window',</span> <span class="pre">'use_parallel_embedding',</span> <span class="pre">'vocab_size'}</span></em><a class="headerlink" href="#tensorrt_llm.models.GemmaConfig.VERBATIM" title="Link to this definition">#</a></dt>
 <dd></dd></dl>
 
 <dl class="py property">
@@ -3652,9 +3658,9 @@ ranges of the dimensions of when using TRT dynamic shapes.</p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on August 06, 2025.</p>
+  <p>Last updated on August 15, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/a16ba64">a16ba64</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/26f413a">26f413a</a>.</p>
   
 </div></div>
       
