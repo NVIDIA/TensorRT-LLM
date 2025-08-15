@@ -8,7 +8,7 @@ import time
 import traceback
 import weakref
 from contextlib import contextmanager
-from typing import Dict, Iterable, List, Optional, Tuple, Union
+from typing import Iterable, List, Optional, Tuple, Union
 
 import torch
 
@@ -1692,8 +1692,10 @@ class PyExecutor:
                 client_id=request.py_client_id)
 
         if request_ids is not None:
-            for req_id in request_ids:
-                self.active_requests.remove(req_id)
+            req_id_set = set(request_ids)
+            for request in self.active_requests:
+                if request.py_request_id in req_id_set:
+                    self.active_requests.remove(request)
         else:
             self.active_requests.clear()
         self._enqueue_responses(error_responses)

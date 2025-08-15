@@ -194,8 +194,7 @@ private:
         catch (tensorrt_llm::common::RequestSpecificException const& e)
         {
             TLLM_LOG_ERROR("Exception in sendAndRemoveResponse: %s ", e.what());
-            auto new_exception
-                = NEW_TLLM_REQUEST_SPECIFIC_EXCEPTION_WITH_ERROR_CODE(id, e.getErrorCode(), "%s", e.what());
+            auto new_exception = TLLM_REQUEST_EXCEPTION(id, e.getErrorCode(), "%s", e.what());
             resp.mPromise.set_exception(std::make_exception_ptr(new_exception));
         }
         catch (std::exception const& e)
@@ -506,10 +505,10 @@ private:
                 }
                 catch (tensorrt_llm::common::RequestSpecificException const& err)
                 {
-                    TLLM_LOG_ERROR("Exception in DataRequester request(): request id:%ld , request context id:%ld : %s",
+                    TLLM_LOG_ERROR("Exception in DataRequester request(): request id:%zu , request context id:%zu : %s",
                         requestAndPromise.mRequest->mRequestId,
                         requestAndPromise.mRequest->getContextPhaseParams().value().getReqId(), err.what());
-                    auto new_exception = NEW_TLLM_REQUEST_SPECIFIC_EXCEPTION_WITH_ERROR_CODE(
+                    auto new_exception = TLLM_REQUEST_EXCEPTION(
                         requestAndPromise.mRequest->mRequestId, err.getErrorCode(), "%s", err.what());
                     requestAndPromise.mPromise->set_exception(std::make_exception_ptr(new_exception));
                 }
