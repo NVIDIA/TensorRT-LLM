@@ -2435,7 +2435,6 @@ class TestCodestral_22B_V01(LlmapiAccuracyTestHarness):
     MODEL_NAME = "mistralai/Codestral-22B-v0.1"
     MODEL_PATH = f"{llm_models_root()}/Codestral-22B-v0.1"
 
-    @pytest.mark.timeout(2400)
     @pytest.mark.skip_less_device_memory(80000)
     def test_auto_dtype(self):
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
