@@ -265,7 +265,8 @@ class MTPSampler(TorchSampler):
                 new_token = add_token(req, new_tokens, beam=beam_idx, step=i)
                 if self._handle_stop_criteria(req, new_token):
                     break
-            req.py_rewind_len = self.draft_len - (num_new_tokens - 1)
+            req.py_num_accepted_draft_tokens = num_new_tokens - 1
+            req.py_rewind_len = self.draft_len - req.py_num_accepted_draft_tokens
             self._request_common_handling(req, next_draft_tokens_list)
 
     def sample_async(
