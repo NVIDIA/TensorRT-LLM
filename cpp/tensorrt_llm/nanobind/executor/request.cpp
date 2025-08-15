@@ -851,7 +851,7 @@ void initRequestBindings(nb::module_& m)
 
     auto resultSetstate = [](tle::Result& self, nb::tuple const& state)
     {
-        if (state.size() != 13)
+        if (state.size() != 14)
         {
             throw std::runtime_error("Invalid Request state!");
         }
@@ -867,8 +867,9 @@ void initRequestBindings(nb::module_& m)
         result.sequenceIndex = nb::cast<SizeType32>(state[8]);
         result.isSequenceFinal = nb::cast<bool>(state[9]);
         result.decodingIter = nb::cast<SizeType32>(state[10]);
-        result.contextPhaseParams = nb::cast<std::optional<tle::ContextPhaseParams>>(state[11]);
-        result.requestPerfMetrics = nb::cast<std::optional<tle::RequestPerfMetrics>>(state[12]);
+        result.avgDecodedTokensPerIter = nb::cast<float>(state[11]);
+        result.contextPhaseParams = nb::cast<std::optional<tle::ContextPhaseParams>>(state[12]);
+        result.requestPerfMetrics = nb::cast<std::optional<tle::RequestPerfMetrics>>(state[13]);
         new (&self) tle::Result(result);
     };
 
@@ -876,7 +877,7 @@ void initRequestBindings(nb::module_& m)
     {
         return nb::make_tuple(self.isFinal, self.outputTokenIds, self.cumLogProbs, self.logProbs, self.contextLogits,
             self.generationLogits, self.encoderOutput, self.finishReasons, self.sequenceIndex, self.isSequenceFinal,
-            self.decodingIter, self.contextPhaseParams, self.requestPerfMetrics);
+            self.decodingIter, self.avgDecodedTokensPerIter, self.contextPhaseParams, self.requestPerfMetrics);
     };
 
     nb::class_<tle::Result>(m, "Result")
@@ -893,6 +894,7 @@ void initRequestBindings(nb::module_& m)
         .def_rw("sequence_index", &tle::Result::sequenceIndex)
         .def_rw("is_sequence_final", &tle::Result::isSequenceFinal)
         .def_rw("decoding_iter", &tle::Result::decodingIter)
+        .def_rw("avg_decoded_tokens_per_iter", &tle::Result::avgDecodedTokensPerIter)
         .def_rw("context_phase_params", &tle::Result::contextPhaseParams)
         .def_rw("request_perf_metrics", &tle::Result::requestPerfMetrics)
         .def_rw("additional_outputs", &tle::Result::additionalOutputs)

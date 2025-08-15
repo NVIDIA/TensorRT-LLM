@@ -860,6 +860,10 @@ struct Result
     /// one token can be generated per iteration. Used for speculative decoding statistics.
     SizeType32 decodingIter{0};
 
+    /// @brief The average number of decoded tokens per iteration. For standard model it is 1.
+    /// For speculative decoding model >= 1 -- number of draft tokens accepted per step + 1.
+    float avgDecodedTokensPerIter{0.0f};
+
     /// @brief The index of the output sequence of this result where 0 <= sequenceIndex < numReturnSequences.
     /// In beam search (beamWidth > 1), this index will be always zero because all beams to be returned are included
     /// in this result.

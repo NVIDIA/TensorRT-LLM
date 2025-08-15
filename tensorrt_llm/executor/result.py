@@ -158,6 +158,9 @@ class GenerationResultBase:
         self.postproc_params = postproc_params
         self.disaggregated_params = None
         self.decoding_iter = 0
+        # Average decoded tokens per runtime iteration; set when the first LLM response arrives.
+        # None indicates not yet available (e.g., before first step/stream).
+        self.avg_decoded_tokens_per_iter: Optional[float] = None
         self._done = False
         self.metrics_dict = {}
 
@@ -331,6 +334,7 @@ class GenerationResultBase:
             self._done = response_result.is_final
             context_phase_params = response_result.context_phase_params
             self.decoding_iter = response_result.decoding_iter
+            self.avg_decoded_tokens_per_iter = response_result.avg_decoded_tokens_per_iter
             if context_phase_params is not None:
                 self.disaggregated_params = DisaggregatedParams(
                     request_type="context_only",
