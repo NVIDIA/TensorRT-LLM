@@ -1061,7 +1061,7 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
     Configuration for the cache transceiver.
     """
 
-    backend: Optional[Literal["DEFAULT", "UCX", "NIXL", "MPI"]] = Field(
+    backend: Optional[str] = Field(
         default=None,
         description=
         "The communication backend type to use for the cache transceiver.")
@@ -1069,6 +1069,17 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
     max_tokens_in_buffer: Optional[int] = Field(
         default=None,
         description="The max number of tokens the transfer buffer can fit.")
+
+    @model_validator(mode="after")
+    def validate_backend(self) -> "CacheTransceiverConfig":
+        valid_backends = ["DEFAULT", "UCX", "MPI", "NIXL"]
+        if self.backend:
+            backend = self.backend.upper()
+            if backend not in valid_backends:
+                raise ValueError(
+                    f"Invalid backend value: {self.backend}, expected one of: {valid_backends}.\n"
+                )
+        return self
 
     def _to_pybind(self):
         return _CacheTransceiverConfig(
