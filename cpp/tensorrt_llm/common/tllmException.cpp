@@ -107,9 +107,9 @@ std::string TllmException::demangle(char const* name)
 }
 
 RequestSpecificException::RequestSpecificException(
-    char const* file, std::size_t line, char const* msg, uint64_t requestID, RequestErrorCode errorCode)
-    : std::runtime_error{fmtstr(
-        "%s (Request ID: %lu, Error Code: %u) (%s:%zu)", msg, requestID, static_cast<uint32_t>(errorCode), file, line)}
+    std::string const& file, std::size_t line, char const* msg, uint64_t requestID, RequestErrorCode errorCode)
+    : std::runtime_error{fmtstr("%s (Request ID: %lu, Error Code: %u) (%s:%zu)", msg, requestID,
+        static_cast<uint32_t>(errorCode), file.c_str(), line)}
     , mRequestID{requestID}
     , mErrorCode{errorCode}
 {

@@ -21,6 +21,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <stdexcept>
 #include <string>
 
@@ -54,7 +55,7 @@ enum class RequestErrorCode : uint32_t
 };
 
 /// @brief Constant for unknown request ID
-static constexpr uint64_t kUNKNOWN_REQUEST_ID = static_cast<uint64_t>(-1);
+static constexpr uint64_t kUNKNOWN_REQUEST_ID = std::numeric_limits<uint64_t>::max();
 
 class TllmException : public std::runtime_error
 {
@@ -87,7 +88,7 @@ class RequestSpecificException : public std::runtime_error
 {
 public:
     explicit RequestSpecificException(
-        char const* file, std::size_t line, char const* msg, uint64_t requestID, RequestErrorCode errorCode);
+        std::string const& file, std::size_t line, char const* msg, uint64_t requestID, RequestErrorCode errorCode);
 
     ~RequestSpecificException() noexcept override;
 
