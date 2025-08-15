@@ -155,11 +155,18 @@ def test_llmapi_speculative_decoding_ngram(llm_root, engine_dir, llm_venv):
                         "llm_speculative_decoding.py", "NGRAM")
 
 
-@pytest.mark.skip(reason="https://nvbugs/5365825")
+@pytest.mark.skip(reason="https://nvbugs/5365825"
+                  )  # maybe unrelated, but this test will always timeout
 def test_llmapi_sampling(llm_root, engine_dir, llm_venv):
     _run_llmapi_example(llm_root, engine_dir, llm_venv, "llm_sampling.py")
 
 
-@pytest.mark.skip(reason="https://nvbugs/5365825")
+@pytest.mark.skip(reason="https://nvbugs/5365825"
+                  )  # maybe unrelated, but this test will always timeout
 def test_llmapi_runtime(llm_root, engine_dir, llm_venv):
     _run_llmapi_example(llm_root, engine_dir, llm_venv, "llm_runtime.py")
+
+
+def test_llmapi_tensorrt_engine(llm_root, engine_dir, llm_venv):
+    _run_llmapi_example(llm_root, engine_dir, llm_venv,
+                        "_tensorrt_engine/quickstart_example.py")
