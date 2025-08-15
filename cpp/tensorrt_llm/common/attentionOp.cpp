@@ -1310,20 +1310,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
     KVCacheBuffer kv_cache_buffer;
     KVCacheBuffer kv_scale_cache_buffer;
 
-    int elemBits;
-    if (mKVCacheQuantMode.hasInt8KvCache() || mKVCacheQuantMode.hasFp8KvCache())
-    {
-        elemBits = 8;
-    }
-    else if (mKVCacheQuantMode.hasFp4KvCache())
-    {
-        elemBits = 4;
-    }
-    else
-    {
-        elemBits = sizeof(T) * 8;
-    }
-    auto sizePerToken = mNumKVHeads * headSize * elemBits / 8 /*bits*/;
+    auto sizePerToken = mNumKVHeads * headSize * mKvCacheElemSizeInBits / 8 /*bits*/;
 
     if (useKVCache())
     {
@@ -2146,21 +2133,7 @@ int AttentionOp::enqueueGeneration(EnqueueGenerationParams<T> const& params, cud
     KVCacheBuffer kv_cache_buffer;
     KVCacheBuffer kv_scale_cache_buffer;
 
-    int elemBits;
-    if (mKVCacheQuantMode.hasInt8KvCache() || mKVCacheQuantMode.hasFp8KvCache())
-    {
-        elemBits = 8;
-    }
-    else if (mKVCacheQuantMode.hasFp4KvCache())
-    {
-        elemBits = 4;
-    }
-    else
-    {
-        elemBits = sizeof(T) * 8;
-    }
-
-    auto const sizePerToken = mNumKVHeads * headSize * elemBits / 8 /*bits*/;
+    auto const sizePerToken = mNumKVHeads * headSize * mKvCacheElemSizeInBits / 8 /*bits*/;
 
     if (useKVCache())
     {
@@ -2802,6 +2775,17 @@ int AttentionOp::initialize() noexcept
         // Only FMHA supports custom mask currently.
         TLLM_CHECK_WITH_INFO(
             !useCustomMask() || mEnableContextFMHA, "Only Context FMHA supports custom mask input currently.");
+
+        // Set the KV cache element size in bits.
+        mKvCacheElemSizeInBits = 16;
+        if (mKVCacheQuantMode.hasInt8KvCache() || mKVCacheQuantMode.hasFp8KvCache())
+        {
+            mKvCacheElemSizeInBits = 8;
+        }
+        else if (mKVCacheQuantMode.hasFp4KvCache())
+        {
+            mKvCacheElemSizeInBits = 4;
+        }
     }
 
     mEnableXQA = (mEnableXQA || mIsSpecDecodingEnabled) && !mCrossAttention

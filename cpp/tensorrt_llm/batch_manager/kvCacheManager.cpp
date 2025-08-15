@@ -605,14 +605,12 @@ WindowBlockManager::WindowBlockManager(nvinfer1::DataType dtype, SizeType32 wind
         mLayerToIndexWithinPool[layerIdx] = layerIndexWithinPool;
     }
 
+    auto numEltsPerContainer = getNumEltsPerContainer();
 #ifdef ENABLE_FP4
-    SizeType32 const numEltsPerContainer = mDataType == nvinfer1::DataType::kFP4 ? 2 : 1;
     if (numEltsPerContainer == 2)
     {
         TLLM_CHECK_WITH_INFO(sizePerHead % 2 == 0, "sizePerHead must be divisible by 2 for 4-bit KV cache.");
     }
-#else
-    SizeType32 const numEltsPerContainer = 1;
 #endif
 
     size_t poolIndex = 0;
@@ -710,12 +708,7 @@ void BlockManager::storeContextBlocks(GenerationRequest& sequence, LlmRequest co
 
 void WindowBlockManager::createBlockScalePools(SizeType32 quantBlockSize)
 {
-
-#ifdef ENABLE_FP4
-    SizeType32 const numEltsPerContainer = mDataType == nvinfer1::DataType::kFP4 ? 2 : 1;
-#else
-    SizeType32 const numEltsPerContainer = 1;
-#endif
+    SizeType32 const numEltsPerContainer = getNumEltsPerContainer();
     auto num_pools = mPools.size();
     for (size_t i = 0; i < num_pools; ++i)
     {

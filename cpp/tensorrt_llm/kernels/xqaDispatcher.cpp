@@ -48,7 +48,8 @@ XqaDispatcher::XqaDispatcher(XqaFixedParams fixedParams)
 {
     if (mUseTllmGen)
     {
-        // The preprocessing kernel will convert Q from inputDataType to fp8 if the kv cache dtype is also e4m3.
+        // The preprocessing kernel will convert Q from inputDataType to fp8 if the kv cache dtype e4m3 or e2m1,
+        // as both the NVFP4 KV kernels and FP8 KV kernels uses FP8 input for Q.
         mQDataType = (mFixedParams.kvDataType == DATA_TYPE_E4M3 || mFixedParams.kvDataType == DATA_TYPE_E2M1)
             ? DATA_TYPE_E4M3
             : mFixedParams.inputDataType;

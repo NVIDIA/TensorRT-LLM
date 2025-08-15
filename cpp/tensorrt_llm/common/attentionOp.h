@@ -429,6 +429,9 @@ public:
     // Whether to fuse FP4 quant into attention kernel.
     bool mFuseFp4Quant = false;
 
+    // KV cache element size in bits.
+    int32_t mKvCacheElemSizeInBits = 16;
+
     // This is implementation details which we want to save when serializing, but not expose as
     // a plugin field or a constructor parameter
     int32_t mNbMultiBlockSemaphores = 0;

@@ -238,19 +238,7 @@ public:
                     : nullptr);
 
         // The cache element size in bits.
-        int cache_elem_bits;
-        if (op.mKVCacheQuantMode.hasInt8KvCache() || op.mKVCacheQuantMode.hasFp8KvCache())
-        {
-            cache_elem_bits = 8;
-        }
-        else if (op.mKVCacheQuantMode.hasFp4KvCache())
-        {
-            cache_elem_bits = 4;
-        }
-        else
-        {
-            cache_elem_bits = sizeof(T) * 8;
-        }
+        int cache_elem_bits = op.mKvCacheElemSizeInBits;
         auto const block_size = op.mTokensPerBlock * op.mNumKVHeads * op.mHeadSize;
         auto const bytes_per_block = block_size * cache_elem_bits / 8 /*bits*/;
         int32_t const kv_factor = op.isMLAEnabled() ? 1 : 2;
@@ -277,6 +265,7 @@ public:
                 reinterpret_cast<char*>(host_kv_cache_pool_pointers.value().index({pool_index, 1, 0}).item<int64_t>())
                 + intra_pool_offset);
             // Calculate the intra-pool offset for scaling factors.
+            // Note that NVFP4 block scaling use a fixed vector size of 16.
             auto constexpr vector_size = 16;
             auto const bytes_per_block_sf = block_size / vector_size * 1 /*bytes per E4M3 sf*/;
             auto const intra_pool_offset_sf = layer_idx_in_cache_pool * kv_factor * bytes_per_block_sf;

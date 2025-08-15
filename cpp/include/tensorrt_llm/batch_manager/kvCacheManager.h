@@ -642,6 +642,15 @@ public:
         return mPools.at(poolIdx).blockSize;
     }
 
+    [[nodiscard]] SizeType32 getNumEltsPerContainer() const
+    {
+#ifdef ENABLE_FP4
+        return mDataType == nvinfer1::DataType::kFP4 ? 2 : 1;
+#else
+        return 1;
+#endif
+    }
+
     [[nodiscard]] SizeType32 getNumPools(bool includeBlockScalePools = true) const noexcept
     {
         if (includeBlockScalePools)
