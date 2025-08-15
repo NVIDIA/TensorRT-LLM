@@ -648,6 +648,14 @@ class PyTorchModelEngine(ModelEngine):
             return
 
         with contextlib.ExitStack() as stack:
+
+            def clean_up_kv_cache():
+                # Zero the KV cache; NaNs may be introduced during warmup
+                for layer_idx in kv_cache_manager.layer_offsets.keys():
+                    kv_cache_manager.get_buffers(layer_idx).zero_()
+
+            stack.callback(clean_up_kv_cache)
+
             if self._torch_compile_enabled:
 
                 def disable_optimization(backend: Backend):
