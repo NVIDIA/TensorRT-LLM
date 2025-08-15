@@ -15,12 +15,6 @@ import torch
 import torch._dynamo.config
 
 import tensorrt_llm.bindings.internal.userbuffers as ub
-from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import \
-    BaseCheckpointLoader
-from tensorrt_llm._torch.pyexecutor.sampler import SampleStateTensors
-from tensorrt_llm._torch.speculative import (
-    get_num_extra_kv_tokens, update_spec_config_from_model_config)
-from tensorrt_llm._torch.speculative.mtp import SampleStateTensorsMTP
 from tensorrt_llm._utils import (is_trace_enabled, nvtx_range, release_gc,
                                  str_dtype_to_torch, torch_dtype_to_str,
                                  trace_func)
@@ -47,20 +41,26 @@ from ..expert_statistic import ExpertStatistic
 from ..metadata import KVCacheParams
 from ..model_config import ModelConfig, MoeLoadBalancerConfig
 from ..models import AutoModelForCausalLM
+from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
 from ..models.modeling_utils import (DecoderModelForCausalLM, MetaInitMode,
                                      timing)
 from ..modules.fused_moe.moe_load_balancer import (
     MoeLoadBalancer, MoeLoadBalancerIterContext, maybe_create_moe_load_balancer)
-from ..speculative import SpecMetadata, get_spec_metadata
+from ..speculative import (SpecMetadata, get_num_extra_kv_tokens,
+                           get_spec_metadata,
+                           update_spec_config_from_model_config)
+from ..speculative.mtp import SampleStateTensorsMTP
 from ..utils import (get_model_extra_attrs, set_torch_compiling,
                      with_model_extra_attrs)
 from .config import LoadFormat, PyTorchConfig
 from .config_utils import is_mla
 from .cuda_graph_runner import DecodingCUDAGraphRunner
+from .guided_decoder import GuidedMetadata
 from .layerwise_nvtx_marker import LayerwiseNvtxMarker
 from .llm_request import get_draft_token_length
 from .resource_manager import (BaseResourceManager, KVCacheManager,
                                ResourceManager, ResourceManagerType)
+from .sampler import SampleStateTensors
 from .scheduler import ScheduledRequests
 
 MAX_UINT64 = (1 << 64) - 1
@@ -399,6 +399,14 @@ class PyTorchModelEngine(ModelEngine):
         else:
             self.without_logits = False
             self.max_draft_len = 0
+
+        self.guided_metadata: Optional[GuidedMetadata] = None
+        self.gathered_input_ids = torch.empty(self.max_num_tokens,
+                                              dtype=torch.int,
+                                              pin_memory=True)
+        self.new_tokens_lens = torch.empty(self.batch_size,
+                                           dtype=torch.int,
+                                           pin_memory=True)
 
         # This field is initialized lazily on the first forward pass.
         # This is convenient because:
@@ -860,6 +868,11 @@ class PyTorchModelEngine(ModelEngine):
             is_draft_model=self.is_draft_model)
         return self.spec_metadata
 
+    def _set_up_guided_metadata(self):
+        if self.guided_metadata is None:
+            self.guided_metadata = GuidedMetadata()
+        return self.guided_metadata
+
     def _get_padded_batch(
             self,
             scheduled_requests: ScheduledRequests,
@@ -1205,6 +1218,7 @@ class PyTorchModelEngine(ModelEngine):
             kv_cache_manager: KVCacheManager,
             attn_metadata: AttentionMetadata,
             spec_metadata: Optional[SpecMetadata] = None,
+            guided_metadata: Optional[GuidedMetadata] = None,
             new_tensors_device: Optional[SampleStateTensors] = None,
             cache_indirection_buffer: Optional[torch.Tensor] = None):
         """
@@ -1309,6 +1323,7 @@ class PyTorchModelEngine(ModelEngine):
         previous_batch_indices = []
         previous_pos_indices = []
         for request in extend_requests:
+            request_ids.append(request.py_request_id)
             # the request has no previous tensor:
             # (1) next_draft_tokens_device is None, which means overlap scheduler is disabled; or
             # (2) a dummy request; or
@@ -1344,7 +1359,6 @@ class PyTorchModelEngine(ModelEngine):
                         range(past_seen_token_num,
                               past_seen_token_num + 1 + num_draft_tokens)))
                 num_cached_tokens_per_seq.append(past_seen_token_num)
-                request_ids.append(request.py_request_id)
                 # update batch index
                 request.py_batch_idx = request.py_seq_slot
             else:
@@ -1372,9 +1386,9 @@ class PyTorchModelEngine(ModelEngine):
                 num_cached_tokens_per_seq.append(past_seen_token_num +
                                                  self.runtime_draft_len + 1)
                 prompt_lengths.append(request.py_prompt_len)
-                request_ids.append(request.py_request_id)
 
         for request in generation_requests:
+            request_ids.append(request.py_request_id)
             beam_width = request.sampling_config.beam_width
             for beam in range(beam_width):
                 # the request has no previous tensor:
@@ -1606,6 +1620,25 @@ class PyTorchModelEngine(ModelEngine):
             spec_metadata.seq_lens = sequence_lengths
             spec_metadata.prepare()
             inputs['spec_metadata'] = spec_metadata
+
+        if guided_metadata is not None:
+            guided_metadata.scheduled_requests = scheduled_requests
+            if new_tensors_device is None:
+                guided_metadata.gathered_input_ids = None
+                guided_metadata.new_tokens_lens = None
+            else:
+                num_gathered = len(gather_ids)
+                gathered_input_ids_cuda = self.input_ids_cuda[
+                    self.gather_ids_cuda[:num_gathered]]
+                self.gathered_input_ids[:num_gathered].copy_(
+                    gathered_input_ids_cuda, non_blocking=True)
+                guided_metadata.gathered_input_ids = self.gathered_input_ids[:
+                                                                             num_gathered]
+                self.new_tokens_lens.copy_(new_tokens_lens_device,
+                                           non_blocking=True)
+                guided_metadata.new_tokens_lens = self.new_tokens_lens
+            guided_metadata.token_event.record()
+            inputs['guided_metadata'] = guided_metadata
 
         # support attention dp
         if self.enable_attention_dp:
@@ -2106,6 +2139,7 @@ class PyTorchModelEngine(ModelEngine):
             kv_cache_manager: KVCacheManager,
             attn_metadata: AttentionMetadata,
             spec_metadata: Optional[SpecMetadata] = None,
+            guided_metadata: Optional[GuidedMetadata] = None,
             new_tensors_device: Optional[SampleStateTensors] = None,
             cache_indirection_buffer: Optional[torch.Tensor] = None):
         if self.mapping is not None and 'cp_type' in self.mapping.cp_config:
@@ -2118,7 +2152,7 @@ class PyTorchModelEngine(ModelEngine):
         else:
             return self._prepare_tp_inputs(scheduled_requests, kv_cache_manager,
                                            attn_metadata, spec_metadata,
-                                           new_tensors_device,
+                                           guided_metadata, new_tensors_device,
                                            cache_indirection_buffer)
 
     @torch.inference_mode()
@@ -2151,6 +2185,10 @@ class PyTorchModelEngine(ModelEngine):
             spec_resource_manager = None
             spec_metadata = None
 
+        guided_metadata = None
+        if self.model.spec_worker.guided_decoder:
+            guided_metadata = self._set_up_guided_metadata()
+
         moe_load_balancer = None
         if hasattr(self, 'moe_load_balancer'):
             moe_load_balancer = getattr(self, 'moe_load_balancer')
@@ -2182,7 +2220,8 @@ class PyTorchModelEngine(ModelEngine):
 
             inputs, gather_ids = self._prepare_inputs(
                 scheduled_requests, kv_cache_manager, attn_metadata,
-                spec_metadata, new_tensors_device, cache_indirection_buffer)
+                spec_metadata, guided_metadata, new_tensors_device,
+                cache_indirection_buffer)
 
             self.iter_counter += 1
 

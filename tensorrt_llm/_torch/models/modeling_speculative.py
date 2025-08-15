@@ -4,10 +4,7 @@ import torch
 from torch import nn
 from transformers import LlamaConfig
 
-from tensorrt_llm._torch.models.checkpoints.base_weight_mapper import \
-    BaseWeightMapper
-from tensorrt_llm.functional import PositionEmbeddingType
-
+from ...functional import PositionEmbeddingType
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ..model_config import ModelConfig, TConfig
@@ -18,7 +15,9 @@ from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import (Linear, TensorParallelMode, WeightMode,
                               WeightsLoadingConfig)
 from ..modules.rms_norm import RMSNorm
+from ..pyexecutor.guided_decoder import GuidedMetadata
 from ..speculative import SpecMetadata, get_spec_worker
+from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM, TModel,
                              register_auto_model)
 
@@ -370,6 +369,7 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
         inputs_embeds: Optional[torch.FloatTensor] = None,
         return_context_logits: bool = False,
         spec_metadata: Optional[SpecMetadata] = None,
+        guided_metadata: Optional[GuidedMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
         hidden_states = self.model(
@@ -396,6 +396,7 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                                     logits=logits,
                                     attn_metadata=attn_metadata,
                                     spec_metadata=spec_metadata,
+                                    guided_metadata=guided_metadata,
                                     draft_model=self.draft_model)
         else:
             logits = self.logits_processor.forward(

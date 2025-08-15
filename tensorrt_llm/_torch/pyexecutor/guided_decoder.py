@@ -1,5 +1,6 @@
 import math
-from typing import List, Optional
+from dataclasses import dataclass, field
+from typing import Iterable, List, Optional, Tuple
 
 import torch
 
@@ -11,6 +12,24 @@ from .grammar_matcher import (GrammarMatcher, GrammarMatcherFactory,
                               LLGuidanceMatcherFactory, XGrammarMatcherFactory)
 from .llm_request import LlmRequest
 from .scheduler import ScheduledRequests
+
+
+@dataclass(slots=True)
+class GuidedMetadata:
+    """Metadata for guided decoding."""
+    scheduled_requests: Optional[ScheduledRequests] = field(default=None,
+                                                            init=False)
+
+    gathered_input_ids: Optional[torch.Tensor] = field(default=None, init=False)
+    # num_accepted_tokens at last iteration
+    new_tokens_lens: Optional[torch.Tensor] = field(default=None, init=False)
+
+    token_event: Optional[torch.cuda.Event] = field(default=None, init=False)
+    bitmask_event: Optional[torch.cuda.Event] = field(default=None, init=False)
+
+    def __post_init__(self):
+        self.token_event = torch.cuda.Event()
+        self.bitmask_event = torch.cuda.Event()
 
 
 class GuidedDecoder:
@@ -92,9 +111,21 @@ class GuidedDecoder:
         # The request is in a generation forward step.
         return llm_req.is_generation_in_progress_state
 
+    def _request_with_offset(
+            self,
+            llm_requests: List[LlmRequest]) -> Iterable[Tuple[LlmRequest, int]]:
+        offset: int = 0
+        for llm_req in llm_requests:
+            yield llm_req, offset
+            offset += 1
+            if llm_req.is_generation_in_progress_state:
+                offset += self.max_num_draft_tokens
+
     @torch.inference_mode()
     @nvtx_range("GuidedDecoder.build")
-    def build(self, scheduled_requests: ScheduledRequests) -> None:
+    def build(self,
+              scheduled_requests: ScheduledRequests,
+              gathered_input_ids: Optional[torch.Tensor] = None) -> None:
         """Build the bitmask for requests with guided decoding enabled.
 
         Specifically, this method:
@@ -102,10 +133,26 @@ class GuidedDecoder:
         - call the grammar matcher to fill the bitmask on CPU;
         - asynchronously copy the bitmask to GPU.
         """
-        for llm_req in scheduled_requests.all_requests():
+        if gathered_input_ids is not None:
+            gathered_input_ids = gathered_input_ids.tolist()
+
+        for llm_req, offset in self._request_with_offset(
+                scheduled_requests.all_requests()):
+            if llm_req.is_dummy:
+                continue
             slot: int = llm_req.py_target_seq_slot if llm_req.py_is_draft else llm_req.py_seq_slot
             self.num_advanced_tokens[slot] = 0
             self.num_guided_tokens[slot] = 0
+
+            if gathered_input_ids is None:
+                new_token = llm_req.get_last_tokens(0)
+                draft_tokens = llm_req.py_draft_tokens
+            else:
+                new_token = gathered_input_ids[offset]
+                draft_tokens = []
+                if llm_req.is_generation_in_progress_state:
+                    draft_tokens = gathered_input_ids[offset + 1:offset + self.
+                                                      max_num_draft_tokens + 1]
 
             matcher_init: bool = self._require_matcher_init(llm_req)
             matcher_advance: bool = self._require_matcher_advance(llm_req)
@@ -119,22 +166,22 @@ class GuidedDecoder:
 
             if matcher_advance:
                 matcher = self.grammar_matchers[slot]
-                # The last new token must be acceptable unless the matcher is terminated in a drafting loop.
-                if llm_req.py_is_draft and (matcher.is_terminated()
-                                            or self.is_draft_terminated[slot]):
+                # The last new token must be acceptable unless the matcher is terminated:
+                # 1. For the main model loop, when overlap scheduler is enabled, the matcher may have accepted the EOS token in the draft tokens at the previous iteration.
+                # 2. For the draft model loop, the matcher may have accepted the EOS token at the previous drafting iteration.
+                if matcher.is_terminated() or self.is_draft_terminated[slot]:
                     continue
-                last_new_token = llm_req.get_last_tokens(0)
-                accepted = matcher.accept_token(last_new_token)
+                accepted = matcher.accept_token(new_token)
                 if not accepted:
                     if llm_req.py_is_draft:
                         self.is_draft_terminated[slot] = True
                         logger.debug(
-                            f"Draft request {llm_req.py_request_id} failed to accept last new token: {last_new_token}."
+                            f"Draft request {llm_req.py_request_id} failed to accept last new token: {new_token}."
                         )
                         continue
                     # TODO: Make this an error response.
                     raise ValueError(
-                        f"Request {llm_req.py_request_id} failed to accept last new token: {last_new_token}."
+                        f"Request {llm_req.py_request_id} failed to accept last new token: {new_token}."
                     )
 
             self.num_advanced_tokens[slot] += 1
@@ -142,7 +189,7 @@ class GuidedDecoder:
                 matcher.fill_next_token_bitmask(self.bitmask_host[slot], 0)
                 self.num_guided_tokens[slot] += 1
                 # Process draft tokens
-                for i, tid in enumerate(llm_req.py_draft_tokens, 1):
+                for i, tid in enumerate(draft_tokens, 1):
                     accepted = matcher.accept_token(tid)
                     if not accepted:
                         break
@@ -153,7 +200,7 @@ class GuidedDecoder:
                     self.num_guided_tokens[slot] += 1
 
             if llm_req.py_is_draft:
-                assert len(llm_req.py_draft_tokens) == 0
+                assert len(draft_tokens) == 0
                 self.num_advanced_draft_tokens[
                     slot] += self.num_advanced_tokens[slot]
 
@@ -186,16 +233,14 @@ class GuidedDecoder:
             logits.index_copy_(-1, d2t_mapping, draft_logits)
 
         batched_logits, batched_bitmask = [], []
-        offset = 0
-        for llm_req in scheduled_requests.all_requests():
+        for llm_req, offset in self._request_with_offset(
+                scheduled_requests.all_requests()):
+            if llm_req.is_dummy:
+                continue
             slot: int = llm_req.py_target_seq_slot if llm_req.py_is_draft else llm_req.py_seq_slot
             for i in range(self.num_guided_tokens[slot]):
                 batched_logits.append(logits[offset + i])
                 batched_bitmask.append(self.bitmask[slot, i])
-            offset += len(llm_req.py_draft_tokens) + 1
-
-        # Dummy logits may exist for CUDA graph dummy requests.
-        assert offset <= logits.size(0)
 
         if len(batched_logits) > 0:
             torch.ops.trtllm.logits_bitmask(batched_logits, batched_bitmask)
@@ -204,8 +249,10 @@ class GuidedDecoder:
             torch.index_select(logits, -1, d2t_mapping, out=draft_logits)
 
     @nvtx_range("GuidedDecoder.rollback_rejected_tokens")
-    def rollback_rejected_tokens(self,
-                                 scheduled_requests: ScheduledRequests) -> None:
+    def rollback_rejected_tokens(
+            self,
+            scheduled_requests: ScheduledRequests,
+            new_tokens_lens: Optional[torch.Tensor] = None) -> None:
         """Rollback the grammar matcher for rejected tokens.
 
         This method should be called:
@@ -215,18 +262,27 @@ class GuidedDecoder:
         if self.max_num_draft_tokens <= 0:
             return
 
+        if new_tokens_lens is not None:
+            new_tokens_lens = new_tokens_lens.tolist()
+
         for llm_req in scheduled_requests.all_requests():
+            if llm_req.is_dummy:
+                continue
             assert not llm_req.py_is_draft
             slot: int = llm_req.py_seq_slot
             if self.num_advanced_tokens[slot] <= 0:
                 continue
+            if new_tokens_lens is None:
+                num_accepted_tokens = 1 + llm_req.py_num_accepted_draft_tokens
+            else:
+                num_accepted_tokens = new_tokens_lens[slot]
             # Rollback the grammar matcher to the last accepted token.
-            num_rollback_tokens = self.num_advanced_tokens[slot] - (
-                1 + llm_req.py_num_accepted_draft_tokens)
+            num_rollback_tokens = self.num_advanced_tokens[
+                slot] - num_accepted_tokens
             # TODO: Make this an error response.
             if num_rollback_tokens < 0:
                 raise ValueError(
-                    f"Failed to rollback: num_advanced_tokens={self.num_advanced_tokens[slot]}, num_accepted_draft_tokens={llm_req.py_num_accepted_draft_tokens}, num_rollback_tokens={num_rollback_tokens}"
+                    f"Failed to rollback: num_advanced_tokens={self.num_advanced_tokens[slot]}, num_accepted_tokens={num_accepted_tokens}, num_rollback_tokens={num_rollback_tokens}"
                 )
             self.grammar_matchers[slot].rollback(num_rollback_tokens)
 
@@ -268,6 +324,17 @@ class GuidedDecoder:
                 self.grammar_matchers[
                     slot] = self.grammar_matcher_factory.create(
                         llm_req.guided_decoding_params)
+
+    def build_v2(self, guided_metadata: GuidedMetadata):
+        self.build(guided_metadata.scheduled_requests,
+                   guided_metadata.gathered_input_ids)
+
+    def execute_v2(self, guided_metadata: GuidedMetadata, logits: torch.Tensor):
+        self.execute(guided_metadata.scheduled_requests, logits)
+
+    def rollback_rejected_tokens_v2(self, guided_metadata: GuidedMetadata):
+        self.rollback_rejected_tokens(guided_metadata.scheduled_requests,
+                                      guided_metadata.new_tokens_lens)
 
     @hostfunc
     def inc_bitmask_host(self):

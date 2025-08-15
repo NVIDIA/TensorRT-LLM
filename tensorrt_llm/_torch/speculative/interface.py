@@ -121,11 +121,11 @@ class SpecMetadata:
     # Whether CUDA graph is enabled.
     is_cuda_graph: bool = field(default=False, repr=False)
     # The mode of speculative decoding.
-    spec_dec_mode: SpeculativeDecodingMode = SpeculativeDecodingMode.NONE,
+    spec_dec_mode: SpeculativeDecodingMode = SpeculativeDecodingMode.NONE
     # Draft tokens.
-    draft_tokens: Optional[torch.Tensor] = None,
+    draft_tokens: Optional[torch.Tensor] = None
     # The length of the draft tokens.
-    draft_lens: Optional[torch.Tensor] = None,
+    draft_lens: Optional[torch.Tensor] = None
     # The request ID of each sequence in the batch.
     # The shape is (batch_size).
     request_ids: Optional[List[int]] = None
