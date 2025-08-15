@@ -1085,10 +1085,10 @@ class CuteDSLFp8BlackwellLinear(TunableRunner):
         :return: Output tensor of shape (m, n)
         :rtype: torch.Tensor, type: bf16
         """
-
         if isinstance(tactic, tuple):
             use_2cta_instrs, mma_tiler_mn, cluster_shape_mn = tactic
         else:
+            # fallback to default tactic
             use_2cta_instrs, mma_tiler_mn, cluster_shape_mn = [
                 False,
                 (128, 128),
@@ -1302,6 +1302,7 @@ class CuteDSLFp8BlackwellBmm(TunableRunner):
         if isinstance(tactic, tuple):
             use_2cta_instrs, mma_tiler_mn, cluster_shape_mn = tactic
         else:
+            # fallback to default tactic
             use_2cta_instrs, mma_tiler_mn, cluster_shape_mn = [
                 False,
                 (128, 128),
