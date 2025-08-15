@@ -9,8 +9,7 @@ from tensorrt_llm.math_utils import pad_up
 
 from ...distributed import allgather
 from ...model_config import ModelConfig
-from ...utils import (AuxStreamType, EventType, Fp4QuantizedTensor, ceil_div,
-                      swizzle_sf)
+from ...utils import AuxStreamType, EventType, Fp4QuantizedTensor, ceil_div
 from .interface import MoE
 
 # isort: off
@@ -88,6 +87,9 @@ class CutlassFusedMoE(MoE):
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit,
         )
+
+        # Store original hidden size before any potential padding
+        self.unpadded_hidden_size = self.hidden_size
 
         if model_config.quant_config and model_config.quant_config.layer_quant_mode.has_w4a16_mxfp4(
         ):
@@ -285,7 +287,6 @@ class CutlassFusedMoE(MoE):
                 weight_dtype = torch.quint4x2
             elif self.has_w4a16_mxfp4:
                 pad_size = self.hidden_size - x.shape[1]
-                original_hidden_size = x.shape[1]
                 x = torch.nn.functional.pad(x, (0, pad_size))
                 use_w4_group_scaling = True
                 weight_dtype = torch.uint8
@@ -386,8 +387,6 @@ class CutlassFusedMoE(MoE):
                 # TODO: Remove this slicing required by padding if possible
                 x_sf = x_sf[:, :x_sf_col_orig].contiguous()
 
-                x_sf = swizzle_sf(x_sf, x_row, x_col, self.scaling_vector_size)
-
         elif run_post_quant_allgather:
             # Original allgather logic
             if x_sf is not None:
@@ -403,8 +402,6 @@ class CutlassFusedMoE(MoE):
                 sizes=None if use_dp_padding else all_rank_num_tokens)
             x_row = x.shape[0]
             # Fp4 gemm has extra scaling factor
-            if x_sf is not None:
-                x_sf = swizzle_sf(x_sf, x_row, x_col, self.scaling_vector_size)
 
         final_hidden_states = torch.ops.trtllm.fused_moe(
             x,
@@ -417,7 +414,7 @@ class CutlassFusedMoE(MoE):
             output_dtype,
             quant_scales=self.quant_scales,
             input_sf=x_sf,
-            swizzled_input_sf=True,
+            swizzled_input_sf=False,
             swiglu_alpha=self.swiglu_alpha,
             swiglu_beta=self.swiglu_beta,
             swiglu_limit=self.swiglu_limit,
@@ -437,19 +434,12 @@ class CutlassFusedMoE(MoE):
             tune_max_num_tokens=self.tune_max_num_tokens,
             tuner_num_tokens=tuner_num_tokens,
             tuner_top_k=tuner_top_k,
+            unpadded_hidden_size=self.unpadded_hidden_size,
         )
         # Custom op requires all inputs are in the same type.
         # Only in cutlass_min_latency_mode, the output is a list of tensors.
         # Otherwise, the output should be unpacked as a single tensor.
         final_hidden_states = final_hidden_states[0]
-        # TODO: Fuse this for padded MXFP4.
-        final_hidden_states = final_hidden_states[:, :self.
-                                                  hidden_size].contiguous()
-
-        if self.has_w4a16_mxfp4:
-            final_hidden_states = final_hidden_states[:, :
-                                                      original_hidden_size].contiguous(
-                                                      )
 
         # Combine results if using alltoall
         if self.enable_alltoall and alltoall_info is not None:
