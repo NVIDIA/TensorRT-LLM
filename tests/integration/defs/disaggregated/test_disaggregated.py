@@ -566,7 +566,6 @@ def test_disaggregated_conditional(disaggregated_test_root, llm_venv,
                            cwd=llm_venv.get_working_directory())
 
 
-@pytest.mark.skip(reason="https://nvbugspro.nvidia.com/bug/5441714")
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
                          indirect=True)
 def test_disaggregated_ngram(disaggregated_test_root, llm_venv,
@@ -1246,8 +1245,8 @@ def get_config_for_benchmark(model_root, backend):
 def test_disaggregated_benchmark_on_diff_backends(
         disaggregated_test_root, disaggregated_example_root, llm_venv,
         benchmark_model_root, benchmark_root, shared_gpt_path):
-    nixl_config = get_config_for_benchmark(benchmark_model_root, "nixl")
-    ucx_config = get_config_for_benchmark(benchmark_model_root, "ucx")
+    nixl_config = get_config_for_benchmark(benchmark_model_root, "NIXL")
+    ucx_config = get_config_for_benchmark(benchmark_model_root, "UCX")
     temp_dir = tempfile.TemporaryDirectory()
     nixl_config_path = os.path.join(temp_dir.name, "nixl_config.yaml")
     ucx_config_path = os.path.join(temp_dir.name, "ucx_config.yaml")
