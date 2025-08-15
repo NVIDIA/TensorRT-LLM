@@ -757,9 +757,9 @@ size_t AttentionOp::getWorkspaceSizeForContext(nvinfer1::DataType type, int32_t 
     size_t fp8_v_buf_size = 0;
     if (mEnableContextFMHA && mFP8ContextMLA && mFmhaDispatcher->isSeparateQAndKvInput())
     {
-        fp8_q_buf_size = max_num_tokens * total_q_dim_all_heads;
-        fp8_k_buf_size = max_num_tokens * total_k_dim_all_heads;
-        fp8_v_buf_size = max_num_tokens * total_v_dim_all_heads;
+        fp8_q_buf_size = max_num_tokens * static_cast<size_t>(total_q_dim_all_heads);
+        fp8_k_buf_size = max_num_tokens * static_cast<size_t>(total_k_dim_all_heads);
+        fp8_v_buf_size = max_num_tokens * static_cast<size_t>(total_v_dim_all_heads);
     }
 
     size_t const padding_offset_size = mEnableContextFMHA ? 0 : sizeof(int) * max_num_tokens;
@@ -1393,9 +1393,9 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
     size_t fp8_v_buf_size = 0;
     if (mEnableContextFMHA && mFP8ContextMLA && mFmhaDispatcher->isSeparateQAndKvInput())
     {
-        fp8_q_buf_size = params.num_tokens * total_q_dim_all_heads;
-        fp8_k_buf_size = params.num_tokens * total_k_dim_all_heads;
-        fp8_v_buf_size = params.num_tokens * total_v_dim_all_heads;
+        fp8_q_buf_size = params.num_tokens * static_cast<size_t>(total_q_dim_all_heads);
+        fp8_k_buf_size = params.num_tokens * static_cast<size_t>(total_k_dim_all_heads);
+        fp8_v_buf_size = params.num_tokens * static_cast<size_t>(total_v_dim_all_heads);
     }
     size_t const padding_offset_size
         = mEnableContextFMHA ? 0 : sizeof(int) * params.batch_size * params.input_seq_length;

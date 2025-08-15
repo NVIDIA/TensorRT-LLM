@@ -182,6 +182,8 @@ void FusedMHARunnerV2::setupKernelParams(MHARunnerParams runnerParams)
         else if (mFixedParams.attentionInputLayout == AttentionInputLayout::SEPARATE_Q_K_V)
         {
             // Separate QKV input layout, [total_kv_seqlen, H_KV, D] + [total_kv_seqlen, H_KV, DV]
+            TLLM_CHECK_WITH_INFO(runnerParams.kPtr != nullptr && runnerParams.vPtr != nullptr,
+                "SEPARATE_Q_K_V requires valid K and V pointers.");
             mKernelParams.k_ptr = runnerParams.kPtr;
             mKernelParams.v_ptr = runnerParams.vPtr;
             // Tensor K is contiguous.
@@ -189,8 +191,8 @@ void FusedMHARunnerV2::setupKernelParams(MHARunnerParams runnerParams)
                 = get_size_in_bytes(mFixedParams.numKvHeads * mFixedParams.headSize, mFixedParams.dataType);
             if (mFixedParams.headSizeQkNope > 0 && mFixedParams.dataType != DATA_TYPE_E4M3)
             {
-                // Tensor V for non-fp8 context MLA is not contiguous, so we need to add the headSizeQkNope to the
-                // stride.
+                // Non-FP8 context MLA: tensor V is not contiguous. The token stride is num_kv_heads * (headSizeQkNope +
+                // headSizeV).
                 mKernelParams.v_stride_in_bytes = get_size_in_bytes(
                     mFixedParams.numKvHeads * (mFixedParams.headSizeQkNope + mFixedParams.headSizeV),
                     mFixedParams.dataType);

@@ -51,13 +51,25 @@ struct MlaMetaParams
 template <typename T>
 struct MlaParams
 {
-    T const* latent_cache;       // cKV + k_pe
+    T const* latent_cache; // cKV + k_pe
+    // Tensor Q for both context and generation MLA, contiguous. Pre-process kernel will apply RoPE and modify it
+    // in-place. For context MLA, shape: [total_q_len, h * (d_nope + d_rope)], stride: [h * (d_nope + d_rope), 1]
     T* q_buf;
-    T* k_buf = nullptr;          // [total_kv_len, h, d_nope + d_rope], for context MLA, contiguous
-    T* v_buf = nullptr;          // [total_kv_len, h, d_v], for context MLA, not contiguous
+    // Separate tensor K for context MLA, contiguous. Pre-process kernel will apply RoPE and modify it in-place.
+    // shape: [total_kv_len, h * (d_nope + d_rope)], stride: [h * (d_nope + d_rope), 1]
+    T* k_buf = nullptr;
+    // Separate tensor V for context MLA, NOT contiguous,
+    // shape: [total_kv_len, h * d_v], stride: [h * (d_nope + d_v), 1]
+    T const* v_buf = nullptr;
+    // Tensor quantized Q for both context and generation MLA.
+    // For context MLA, shape: [total_q_len, h * (d_nope + d_rope)], stride: [h * (d_nope + d_rope), 1]
     void* quant_q_buf = nullptr;
-    void* quant_k_buf = nullptr; // [total_kv_len, h, d_nope + d_rope], for fp8 context MLA, contiguous
-    void* quant_v_buf = nullptr; // [total_kv_len, h, d_v], for fp8 context MLA, contiguous
+    // Tensor quantized K for context MLA, contiguous
+    // shape: [total_kv_len, h * (d_nope + d_rope)], stride: [h * (d_nope + d_rope), 1]
+    void* quant_k_buf = nullptr;
+    // Tensor quantized V for context MLA, contiguous
+    // shape: [total_kv_len, h * d_v], stride: [h * d_v, 1]
+    void* quant_v_buf = nullptr;
     T* context_buf;
     T* q_pe;                     // [b, h, d_r], strided
 
@@ -87,7 +99,7 @@ struct MlaParams
     float const* dequant_scale_kv;
     float host_bmm1_scale;
 
-    // for FP8 context qkv quantization
+    // For FP8 context qkv quantization
     float const* quant_scale_qkv = nullptr;
 };
 
