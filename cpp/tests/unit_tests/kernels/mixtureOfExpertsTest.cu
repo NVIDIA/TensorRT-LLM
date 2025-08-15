@@ -2060,23 +2060,31 @@ void MixtureOfExpertsTest<TypeParam_>::ParallelismTest(
         this->mActType = ActivationType::Swiglu;                                                                       \
         size_t hidden_size = 7168;                                                                                     \
         size_t inter_size = 2048;                                                                                      \
-        this->mInterSizeFraction = float(inter_size) / hidden_size;                                                    \
+        float inter_size_fraction = float(inter_size) / hidden_size;                                                   \
                                                                                                                        \
         if (!this->checkSufficientTestMemory(75, hidden_size, 256, 8, true))                                           \
         {                                                                                                              \
             GTEST_SKIP() << "Insufficient free memory for test";                                                       \
         }                                                                                                              \
                                                                                                                        \
-        this->ParallelismType##Test(8, hidden_size, 256, 75, this->mInterSizeFraction);                                \
+        this->ParallelismType##Test(8, hidden_size, 256, 75, inter_size_fraction);                                     \
     }                                                                                                                  \
     TYPED_TEST(MixtureOfExpertsTest, ParallelismType##GptOss120b)                                                      \
     {                                                                                                                  \
+        if (std::string(#ParallelismType) != "ExpertParallel")                                                         \
+        {                                                                                                              \
+            GTEST_SKIP()                                                                                               \
+                << "Only ExpertParallel is supported for GptOss120b. TensorParallel and MixedParallel are "            \
+                   "not supported since the inter_size after splitting does not fulfill the alignment requirements "   \
+                   "for MXFP4 weights";                                                                                \
+        }                                                                                                              \
+                                                                                                                       \
         this->mIsLongTest = true;                                                                                      \
         this->mUseBias = true;                                                                                         \
         this->mActType = ActivationType::Swiglu;                                                                       \
         size_t hidden_size = 2944;                                                                                     \
         size_t inter_size = 2944;                                                                                      \
-        this->mInterSizeFraction = float(inter_size) / hidden_size;                                                    \
+        float inter_size_fraction = float(inter_size) / hidden_size;                                                   \
         this->mUnpaddedHiddenSize = 2880;                                                                              \
                                                                                                                        \
         if (!this->checkSufficientTestMemory(75, hidden_size, 128, 4, true))                                           \
@@ -2084,7 +2092,7 @@ void MixtureOfExpertsTest<TypeParam_>::ParallelismTest(
             GTEST_SKIP() << "Insufficient free memory for test";                                                       \
         }                                                                                                              \
                                                                                                                        \
-        this->ParallelismType##Test(4, hidden_size, 128, 75, this->mInterSizeFraction);                                \
+        this->ParallelismType##Test(4, hidden_size, 128, 75, inter_size_fraction);                                     \
     }                                                                                                                  \
                                                                                                                        \
     TYPED_TEST(MixtureOfExpertsTest, ParallelismType##NonPowerOfTwo)                                                   \
