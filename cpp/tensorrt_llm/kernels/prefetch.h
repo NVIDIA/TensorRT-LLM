@@ -24,7 +24,8 @@ namespace kernels
 {
 
 template <typename T, int CTA_M, int CTA_K>
-void cute_host_prefetch(T const* data, int M, int K, int strideM, int throttle_time, bool pdl, cudaStream_t stream);
+void cute_host_prefetch(T const* data, int M, int K, int strideM, int delay_start, int throttle_time, int throttle_mode,
+    bool pdl, cudaStream_t stream);
 
 } // namespace kernels
 } // namespace tensorrt_llm

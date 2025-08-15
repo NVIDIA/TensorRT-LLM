@@ -27,7 +27,8 @@ static constexpr int PF_TILE_K
     = 128; // TODO: determine whether we need this, or can just use a single UTMAPF for all of K
 
 // PyTorch wrapper with automatic M,K detection from tensor shape
-void cute_host_prefetch_pytorch(torch::Tensor tensor, int64_t throttle_time, bool pdl)
+void cute_host_prefetch_pytorch(
+    torch::Tensor tensor, int64_t delay_start, int64_t throttle_time, int64_t throttle_mode, bool pdl)
 {
     // Ensure tensor is 2D and on CUDA
     TORCH_CHECK(tensor.dim() == 2, "Input tensor must be 2D (M, K)");
@@ -50,32 +51,32 @@ void cute_host_prefetch_pytorch(torch::Tensor tensor, int64_t throttle_time, boo
     // Dispatch based on tensor data type
     if (tensor.dtype() == torch::kFloat32)
     {
-        tensorrt_llm::kernels::cute_host_prefetch<float, PF_TILE_M, PF_TILE_K>(
-            tensor.data_ptr<float>(), M, K, strideM, (int) throttle_time, pdl, stream);
+        tensorrt_llm::kernels::cute_host_prefetch<float, PF_TILE_M, PF_TILE_K>(tensor.data_ptr<float>(), M, K, strideM,
+            (int) delay_start, (int) throttle_time, (int) throttle_mode, pdl, stream);
     }
     else if (tensor.dtype() == torch::kFloat16)
     {
         tensorrt_llm::kernels::cute_host_prefetch<cutlass::half_t, PF_TILE_M, PF_TILE_K>(
-            reinterpret_cast<cutlass::half_t*>(tensor.data_ptr<at::Half>()), M, K, strideM, (int) throttle_time, pdl,
-            stream);
+            reinterpret_cast<cutlass::half_t*>(tensor.data_ptr<at::Half>()), M, K, strideM, (int) delay_start,
+            (int) throttle_time, (int) throttle_mode, pdl, stream);
     }
     else if (tensor.dtype() == torch::kBFloat16)
     {
         tensorrt_llm::kernels::cute_host_prefetch<cutlass::bfloat16_t, PF_TILE_M, PF_TILE_K>(
-            reinterpret_cast<cutlass::bfloat16_t*>(tensor.data_ptr<at::BFloat16>()), M, K, strideM, (int) throttle_time,
-            pdl, stream);
+            reinterpret_cast<cutlass::bfloat16_t*>(tensor.data_ptr<at::BFloat16>()), M, K, strideM, (int) delay_start,
+            (int) throttle_time, (int) throttle_mode, pdl, stream);
     }
     else if (tensor.dtype() == torch::kFloat8_e4m3fn)
     {
         tensorrt_llm::kernels::cute_host_prefetch<cutlass::float_e4m3_t, PF_TILE_M, PF_TILE_K>(
             reinterpret_cast<cutlass::float_e4m3_t*>(tensor.data_ptr<at::Float8_e4m3fn>()), M, K, strideM,
-            (int) throttle_time, pdl, stream);
+            (int) delay_start, (int) throttle_time, (int) throttle_mode, pdl, stream);
     }
     else if (tensor.dtype() == torch::kFloat8_e5m2)
     {
         tensorrt_llm::kernels::cute_host_prefetch<cutlass::float_e5m2_t, PF_TILE_M, PF_TILE_K>(
             reinterpret_cast<cutlass::float_e5m2_t*>(tensor.data_ptr<at::Float8_e5m2>()), M, K, strideM,
-            (int) throttle_time, pdl, stream);
+            (int) delay_start, (int) throttle_time, (int) throttle_mode, pdl, stream);
     }
     else
     {
@@ -88,7 +89,7 @@ void cute_host_prefetch_pytorch(torch::Tensor tensor, int64_t throttle_time, boo
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
-    m.def("cute_host_prefetch(Tensor tensor, int throttle_time, bool pdl) -> ()");
+    m.def("cute_host_prefetch(Tensor tensor, int delay_start, int throttle_time, int throttle_mode, bool pdl) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

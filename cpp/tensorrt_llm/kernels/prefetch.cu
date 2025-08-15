@@ -27,8 +27,8 @@ namespace kernels
 // assume load a [M, K] row major weight matrix
 // how to sync with DMA warp is tricky
 template <typename T, int CTA_M, int CTA_K, class TmaLoad, class GmemTensor>
-__global__ void cute_tma_prefetch_kernel(
-    __grid_constant__ TmaLoad const tma_load, GmemTensor gmem_tensor, int K, int throttle_time)
+__global__ void cute_tma_prefetch_kernel(__grid_constant__ TmaLoad const tma_load, GmemTensor gmem_tensor, int K,
+    int delay_start, int throttle_time, int throttle_mode)
 {
     using namespace cute;
 
@@ -49,6 +49,10 @@ __global__ void cute_tma_prefetch_kernel(
         auto gmem_tensor_coord = tma_load.get_tma_tensor(shape(gmem_tensor));
         auto tma_load_per_cta = tma_load.get_slice(0);
 
+        auto target_clock = clock64() + delay_start;
+        while (clock64() < target_clock)
+            ;
+
         for (int k = 0; k < K / CTA_K; k++)
         {
             auto gmem_tensor_coord_cta
@@ -56,8 +60,19 @@ __global__ void cute_tma_prefetch_kernel(
 
             prefetch(tma_load, tma_load_per_cta.partition_S(gmem_tensor_coord_cta));
 
-            auto start = clock64();
-            while (clock64() - start < throttle_time)
+            if (throttle_mode == 1)
+            {
+                target_clock = clock64() + throttle_time;
+            }
+            else if (throttle_mode == 2)
+            {
+                target_clock += throttle_time;
+            }
+            else
+            {
+                __trap();
+            }
+            while (clock64() < target_clock)
                 ;
         }
     }
@@ -71,7 +86,8 @@ __global__ void cute_tma_prefetch_kernel(
 }
 
 template <typename T, int CTA_M, int CTA_K>
-void cute_host_prefetch(T const* data, int M, int K, int strideM, int throttle_time, bool pdl, cudaStream_t stream)
+void cute_host_prefetch(T const* data, int M, int K, int strideM, int delay_start, int throttle_time, int throttle_mode,
+    bool pdl, cudaStream_t stream)
 {
     using namespace cute;
     using tensorrt_llm::common::check;
@@ -108,11 +124,12 @@ void cute_host_prefetch(T const* data, int M, int K, int strideM, int throttle_t
     // draining SM, i.e. no overlapping
     check_cuda_error(cudaFuncSetAttribute(kernel_instance, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
 
-    check_cuda_error(cudaLaunchKernelEx(&config, kernel_instance, tma_load, gmem_tensor, K, throttle_time));
+    check_cuda_error(cudaLaunchKernelEx(
+        &config, kernel_instance, tma_load, gmem_tensor, K, delay_start, throttle_time, throttle_mode));
 }
 
 #define INSTANTIATE_CUTE_HOST_PREFETCH(T, CTA_M, CTA_K)                                                                \
-    template void cute_host_prefetch<T, CTA_M, CTA_K>(T const*, int, int, int, int, bool, cudaStream_t);
+    template void cute_host_prefetch<T, CTA_M, CTA_K>(T const*, int, int, int, int, int, int, bool, cudaStream_t);
 
 // In the same order as in 3rdparty/cutlass/include/cute/arch/copy_sm90_desc.hpp
 INSTANTIATE_CUTE_HOST_PREFETCH(uint8_t, 64, 128);
