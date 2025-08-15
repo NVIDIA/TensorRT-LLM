@@ -29,7 +29,7 @@ def _insert_quantized_linear(
     quantization_impl: QuantizationImpl,
     is_quantized_graph: bool = False,
 ):
-    """Replaces the matmul node with a new quantized matmul node.
+    """Replaces the matmul node with a new custom quantized linear node.
 
     The state_dict is also updated to contain the sharded weights.
     """
@@ -72,14 +72,17 @@ def _insert_quantized_linear(
         partial(quantization_impl.load_hook, weight_name=param_name)
     )
 
-    node.target = quantization_impl.target_op()
-
     with gm.graph.inserting_before(node):
         scales = {}
         for scale_name in quantization_impl.scale_names():
             scales[scale_name] = gm.graph.create_node("get_attr", modname + "." + scale_name)
 
-    node.kwargs = {**node.kwargs, **scales}
+    custom_kwargs = quantization_impl.build_custom_kwargs_for_linear(
+        scales,
+    )
+
+    node.target = quantization_impl.custom_op()
+    node.kwargs = {**node.kwargs, **custom_kwargs}
 
 
 def _insert_quantized_bmm(

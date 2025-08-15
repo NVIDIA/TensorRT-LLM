@@ -27,6 +27,10 @@ try:
 except ImportError:
     float4_sf_dtype = None
 
+# TODO: put the ENUMs in the same place and import it
+FORMAT_FP8 = 0
+FORMAT_NVFP4 = 1
+
 
 def modelopt_fp4_scale_to_cutlass_fp4_scale(modelopt_scale: torch.Tensor) -> torch.Tensor:
     """Converts the modelopt FP4 per-block weight scale to the cutlass format (padded and swizzled)."""
@@ -81,6 +85,7 @@ class QuantizationImpl:
                 quantization_impl_map = {
                     "": None,
                     "FP8": FP8BMMQuantizationImpl,
+                    "NVFP4": None,  # BMM NVFP4 is not supported yet
                 }
             else:
                 quantization_impl_map = {
@@ -160,6 +165,18 @@ class QuantizationImpl:
     def fuse_linear_weights(weights, **kwargs) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         pass
 
+    @staticmethod
+    def custom_op():
+        """Unified custom kernel entry-point for quantized linear."""
+        return torch.ops.auto_deploy.custom_quant_linear
+
+    @staticmethod
+    def build_custom_kwargs_for_linear(
+        scale_getattrs: Dict[str, Node],
+    ) -> Dict[str, object]:
+        """Default: no extra kwargs. Each impl overrides to pass the right inputs/scales/zps/format."""
+        return {}
+
 
 class FP8QuantizationImpl(QuantizationImpl):
     @staticmethod
@@ -179,6 +196,20 @@ class FP8QuantizationImpl(QuantizationImpl):
     @staticmethod
     def default_scales(original_weight_shape: Tuple) -> Dict[str, torch.Tensor]:
         return {"input_scale": torch.tensor(1.0), "weight_scale": torch.tensor(1.0)}
+
+    @staticmethod
+    def build_custom_kwargs_for_linear(
+        scale_getattrs: Dict[str, Node],
+    ) -> Dict[str, object]:
+        # FP8 custom op contract:
+        #   input_scale=[tensor], weight_scale=[tensor], input_zp=[], weight_zp=[], format_type=FORMAT_FP8
+        return dict(
+            input_scale=[scale_getattrs["input_scale"]],
+            weight_scale=[scale_getattrs["weight_scale"]],
+            input_zp=[],
+            weight_zp=[],
+            format_type=FORMAT_FP8,
+        )
 
     @staticmethod
     def load_hook(state_dict, prefix, *args, weight_name):
@@ -263,6 +294,29 @@ class FP4QuantizationImpl(QuantizationImpl):
             "weight_scale": torch.empty((padded_m * padded_n), dtype=torch.uint8),
             "alpha": torch.tensor(1.0 / 6.0),
         }
+
+    @staticmethod
+    def build_custom_kwargs_for_linear(
+        scale_getattrs: Dict[str, Node],
+    ) -> Dict[str, object]:
+        """
+        Contract:
+          custom_quant_linear(
+              x, Wq, bias,
+              input_scale=[s_in2],
+              weight_scale=[weight_scale_cutlass_uint8, alpha_fused],
+              input_zp=[],
+              weight_zp=[],
+              format_type=FORMAT_NVFP4
+          )
+        """
+        return dict(
+            input_scale=[scale_getattrs["input_scale"]],
+            weight_scale=[scale_getattrs["weight_scale"], scale_getattrs["alpha"]],
+            input_zp=[],
+            weight_zp=[],
+            format_type=FORMAT_NVFP4,
+        )
 
     @staticmethod
     def load_hook(state_dict, prefix, *args, weight_name):
