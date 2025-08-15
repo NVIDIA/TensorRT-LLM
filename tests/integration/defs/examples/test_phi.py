@@ -450,6 +450,8 @@ def test_phi_fp8_with_bf16_lora(llm_phi_model_root,
     )
 
 
+@pytest.mark.skip(
+    reason="TODO: Resolve an import issue with transformers's LossKwargs")
 @skip_pre_ada
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.parametrize("llm_phi_model_root", ['Phi-4-mini-instruct'],
