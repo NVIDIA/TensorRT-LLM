@@ -376,4 +376,4 @@ def test_sharding_pattern_detection(
 
 
 if __name__ == "__main__":
-    _run_pattern_detection_job(MLP, False, 0, 8, False)
+    _run_pattern_detection_job(nn.Linear, False, 0, 8, False)

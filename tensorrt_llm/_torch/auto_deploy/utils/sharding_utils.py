@@ -187,8 +187,8 @@ class SplitDimension(IntEnum):
     # base_tp_plan sharding notation, but since we assume Y = W @ X^T,
     # when splitting weight matrix W^T across columns, the actual split
     # is over dimension 0
-    COLUMN = 0  # Split along columns (second dimension)
-    ROW = 1  # Split along rows (first dimension)
+    COLUMN = 0
+    ROW = 1
 
 
 class ShardingTransformInfo(BaseModel, ABC):
@@ -237,16 +237,16 @@ class TPShardingInfo(ShardingTransformInfo):
     def validate(self, gm: GraphModule = None, node: Node = None) -> bool:
         """Validate the transformation configuration."""
         if self.dist_op is not None:
-            if self.split_dim == SplitDimension.ROW:
+            if self.split_dim == SplitDimension.COLUMN:
                 if self.dist_op == "all_reduce":
                     ad_logger.warning(
-                        f"Row split is only supported for all_gather. Skipping {self}."
+                        f"Column split is only supported for all_gather. Skipping {self}."
                     )
                     return False
-            if self.split_dim == SplitDimension.COLUMN:
+            if self.split_dim == SplitDimension.ROW:
                 if self.dist_op == "all_gather":
                     ad_logger.warning(
-                        f"Column split is only supported for all_reduce. Skipping {self}."
+                        f"Row split is only supported for all_reduce. Skipping {self}."
                     )
                     return False
         return True
@@ -564,7 +564,7 @@ class ShardingConfig(BaseModel):
             return False
         return True
 
-    def getpredefined_config(self) -> Dict[str, Any]:
+    def get_predefined_config(self) -> Dict[str, Any]:
         return self.predefined_config
 
 
@@ -582,7 +582,7 @@ def _append_simple_shard(
             tp_shards.append(
                 TPShardingInfo(
                     target_node=n.name,
-                    split_dim=SplitDimension.ROW,
+                    split_dim=SplitDimension.COLUMN,
                     rank=rank,
                     world_size=world_size,
                     dist_op="all_gather",

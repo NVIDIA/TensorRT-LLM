@@ -111,7 +111,7 @@ def _append_simple_shard(
             tp_shards.append(
                 TPShardingInfo(
                     target_node=n.name,
-                    split_dim=SplitDimension.ROW,
+                    split_dim=SplitDimension.COLUMN,
                     rank=rank,
                     world_size=world_size,
                     dist_op="all_gather",
@@ -258,6 +258,8 @@ def detect_sharding_from_factory_config(
         "v_proj",
         "o_proj",
     ]
+
+    # tp_plan = {'layers': 'gather'}
 
     for lin_node in filtered_nodes(gm.graph.nodes, is_linear_op):
         # use node's weight name to get the module name
