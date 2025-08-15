@@ -418,7 +418,7 @@ struct Gmem_tile_qkv
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-// We expect the Q layout to be [B, S, H, D] with variable sequence length support.
+// We expect the Q/K/V layout to be [B, S, H, D] with variable sequence length support.
 template <
     // The instruction traits.
     typename Traits,
@@ -440,7 +440,7 @@ template <
     int NUM_MATS = 1,
     // Is sliding window attention used ?
     bool SLIDING_WINDOW_ATTENTION = false>
-struct Gmem_tile_q
+struct Gmem_tile_q_k_v
 {
 
     // The size of each LDG.
@@ -523,22 +523,38 @@ struct Gmem_tile_q
         USE_LDGSTS = USE_LDGSTS_
     };
 
-    // Ctor (keep qkv_offset for compatibility)
+    // Ctor
+    // qkv_offset: 0 for Q, 1 for K, 2 for V
     template <typename Block_info>
-    inline __device__ Gmem_tile_q(bert::Fused_multihead_attention_params_v2 const& params, int qkv_offset,
+    inline __device__ Gmem_tile_q_k_v(bert::Fused_multihead_attention_params_v2 const& params, int qkv_offset,
         Block_info const& binfo, int tidx, int cta_row_offset = 0, int cta_col_offset_in_bytes = 0)
-        : Gmem_tile_q(params, binfo, tidx, cta_row_offset, cta_col_offset_in_bytes)
     {
-    }
 
-    // Ctor.
-    template <typename Block_info>
-    inline __device__ Gmem_tile_q(bert::Fused_multihead_attention_params_v2 const& params, Block_info const& binfo,
-        int tidx, int cta_row_offset = 0, int cta_col_offset_in_bytes = 0)
-        : params_q_stride_in_bytes_(params.q_stride_in_bytes)
-        , actual_seqlen_(binfo.actual_q_seqlen)
-        , q_ptr_(reinterpret_cast<char*>(params.q_ptr))
-    {
+        int seq_offset = 0;
+        if (qkv_offset == 0)
+        {
+            // Q tensor
+            params_q_k_v_stride_in_bytes_ = params.q_stride_in_bytes;
+            q_k_v_ptr_ = reinterpret_cast<char*>(params.q_ptr);
+            actual_seqlen_ = binfo.actual_q_seqlen;
+            seq_offset = binfo.sum_s;
+        }
+        else if (qkv_offset == 1)
+        {
+            // K tensor
+            params_q_k_v_stride_in_bytes_ = params.k_stride_in_bytes;
+            q_k_v_ptr_ = reinterpret_cast<char*>(params.k_ptr);
+            actual_seqlen_ = binfo.actual_kv_seqlen;
+            seq_offset = binfo.sum_s_kv;
+        }
+        else if (qkv_offset == 2)
+        {
+            // V tensor
+            params_q_k_v_stride_in_bytes_ = params.v_stride_in_bytes;
+            q_k_v_ptr_ = reinterpret_cast<char*>(params.v_ptr);
+            actual_seqlen_ = binfo.actual_kv_seqlen;
+            seq_offset = binfo.sum_s_kv;
+        }
 
         // Compute the position in the sequence (within the CTA for the moment).
         int row = tidx / THREADS_PER_ROW;
@@ -550,17 +566,20 @@ struct Gmem_tile_q
         // Do not load/store if the thread is in the padded area
         col_in_bytes_ = cta_col_offset_in_bytes + col * BYTES_PER_LDG;
 
-        // The row offset in the batched GEMM. For each seq element, we store QKV in that order.
-        // We won't consider past_q_length when loading from gmem_q.
-        int64_t row_offset = (int64_t) (row + cta_row_offset) * params_q_stride_in_bytes_;
-        // Add the block index. (sum_s * h + hidx).
-        int64_t idx = binfo.bidx;
+        // The row offset in the batched GEMM, including the sequence offset.
+        int64_t row_offset = (int64_t) (row + cta_row_offset + seq_offset) * params_q_k_v_stride_in_bytes_;
+        // Add the head index.
+        int64_t idx = binfo.bidh;
 
         // Assemble the final pointer.
-        q_ptr_ += row_offset + idx * VALID_BYTES_PER_ROW + col_in_bytes_;
+        q_k_v_ptr_ += row_offset + idx * VALID_BYTES_PER_ROW + col_in_bytes_;
 
         // Take the CTA offset to modify the sequence length.
         actual_seqlen_ -= cta_row_offset;
+
+        // Set the initial seq_len and qkv_offset in case of reinterating
+        actual_seqlen_init_ = actual_seqlen_;
+        q_k_v_ptr_init_ = q_k_v_ptr_;
     }
 
     // Store data to shared memory.
@@ -590,7 +609,7 @@ struct Gmem_tile_q
 #pragma unroll
         for (int ii = 0; ii < LDGS; ++ii)
         {
-            ptrs[ii] = q_ptr_ + (int64_t) ii * ROWS_PER_LDG * params_q_stride_in_bytes_;
+            ptrs[ii] = q_k_v_ptr_ + (int64_t) ii * ROWS_PER_LDG * params_q_k_v_stride_in_bytes_;
         }
 
         // Trigger LDGSTS or the LDGs.
@@ -598,10 +617,24 @@ struct Gmem_tile_q
         Ldgsts_helper<USE_LDGSTS>::load(this, smem_tile, ptrs, preds);
     }
 
+    // Move the pointer to the next row location.
+    inline __device__ void move(int const steps = 1)
+    {
+        q_k_v_ptr_ += (int64_t) ROWS * params_q_k_v_stride_in_bytes_ * steps;
+        actual_seqlen_ -= (int) ROWS * steps;
+    }
+
+    // Move the pointer to the next row location by the offset (not step).
+    inline __device__ void move_by_offset(int const offset)
+    {
+        q_k_v_ptr_ = q_k_v_ptr_init_ + (int64_t) offset * params_q_k_v_stride_in_bytes_;
+        actual_seqlen_ = actual_seqlen_init_ - (int) offset;
+    }
+
     // Move the pointer to the next column location
     inline __device__ void move_col()
     {
-        q_ptr_ += (int64_t) COLS * (BITS_PER_ELEMENT / 8);
+        q_k_v_ptr_ += (int64_t) COLS * (BITS_PER_ELEMENT / 8);
         // Update col_in_bytes_ to ensure load predicates work
         col_in_bytes_ += THREADS_PER_ROW * BYTES_PER_LDG;
     }
@@ -609,15 +642,29 @@ struct Gmem_tile_q
     // Rewind the pointer back to previous column location
     inline __device__ void rewind_col(int const steps)
     {
-        q_ptr_ -= COLS * (BITS_PER_ELEMENT / 8) * steps;
+        q_k_v_ptr_ -= COLS * (BITS_PER_ELEMENT / 8) * steps;
         // Update col_in_bytes_ to ensure load predicates work
         col_in_bytes_ -= THREADS_PER_ROW * BYTES_PER_LDG * steps;
     }
 
-    // The stride between rows for the QKV matrice.
-    int64_t params_q_stride_in_bytes_;
+    // Move the pointer to the specified step.
+    inline __device__ void move_to(int const step)
+    {
+        q_k_v_ptr_ = q_k_v_ptr_init_ + (int64_t) ROWS * params_q_k_v_stride_in_bytes_ * step;
+        actual_seqlen_ = actual_seqlen_init_ - (int) ROWS * step;
+    }
+
+    inline __device__ void reset()
+    {
+        q_k_v_ptr_ = q_k_v_ptr_init_;
+        actual_seqlen_ = actual_seqlen_init_;
+    }
+
+    // The stride between rows for the Q/K/V matrice.
+    int64_t params_q_k_v_stride_in_bytes_;
     // The pointer.
-    char* q_ptr_;
+    char* q_k_v_ptr_;
+    char* q_k_v_ptr_init_;
     // The register to store predicates.
     uint32_t preds_[PRED_REGS];
     // The fetch registers.
@@ -627,6 +674,7 @@ struct Gmem_tile_q
     int64_t col_in_bytes_;
     // The sequence length.
     int actual_seqlen_;
+    int actual_seqlen_init_;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

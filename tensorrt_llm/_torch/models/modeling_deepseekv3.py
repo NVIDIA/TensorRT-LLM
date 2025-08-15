@@ -764,7 +764,6 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 enable_allreduce=not (self.disable_attn_allreduce)),
             **kwargs,
         )
-
         if isinstance(self.mlp, Deepseekv3MoE):
             return self.forward_MoE(
                 hidden_states=hidden_states,
