@@ -1491,7 +1491,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     @parametrize_with_ids(
         "quant_dtype",
         [
-            pytest.param("none", marks=skip_pre_blackwell),
+            pytest.param("none", marks=skip_pre_hopper),
             # pytest.param("fp8", marks=skip_pre_hopper),
             pytest.param("nvfp4", marks=skip_pre_blackwell)
         ])

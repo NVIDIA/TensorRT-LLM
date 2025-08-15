@@ -183,11 +183,15 @@ class WideEPMoE(MoE):
             f"{self.__class__.__name__} selects alltoall_method_type {self.alltoall_method_type!r}",
             key="alltoall_method_type")
         self.use_postquant_alltoall = False
+        self.use_low_precision_combine = False
         if self.enable_alltoall:
             qm = self.quant_config.quant_mode
             self.use_postquant_alltoall = (os.environ.get(
                 "TRTLLM_MOE_POST_QUANT_ALLTOALLV", "1")
                                            == "1") and qm.has_nvfp4()
+            self.use_low_precision_combine = (os.environ.get(
+                "TRTLLM_MOE_USE_LOW_PRECISION_COMBINE", "0")
+                                              == "1") and qm.has_nvfp4()
             # TODO: support alltoall without allgather for top_k % 4 != 0
             self.enable_alltoall_without_allgather = (
                 os.environ.get("TRTLLM_MOE_ENABLE_ALLTOALL_WITHOUT_ALLGATHER",
@@ -684,9 +688,16 @@ class WideEPMoE(MoE):
                 final_hidden_states = final_hidden_states.view(
                     self.expert_size_per_partition,
                     num_tokens_per_expert_for_fused_moe, self.hidden_size)
-                final_hidden_states = self.deep_ep_buffer.low_latency_combine(
-                    final_hidden_states, deep_ep_topk_idx, deep_ep_topk_weights,
-                    deep_ep_handle)
+                if self.use_low_precision_combine:
+                    global_scales = (448 * 6) / final_hidden_states.abs().max(
+                        dim=-1, keepdim=True).values.to(torch.float32)
+                    final_hidden_states = self.deep_ep_buffer.low_latency_combine_fp4(
+                        final_hidden_states, global_scales, deep_ep_topk_idx,
+                        deep_ep_topk_weights, deep_ep_handle)
+                else:
+                    final_hidden_states = self.deep_ep_buffer.low_latency_combine(
+                        final_hidden_states, deep_ep_topk_idx,
+                        deep_ep_topk_weights, deep_ep_handle)
             else:
                 raise NotImplementedError(
                     f"Not available alltoall method type: {self.alltoall_method_type!r}"

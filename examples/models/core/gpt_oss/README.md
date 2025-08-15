@@ -6,12 +6,16 @@ GPT-OSS is a reasoning model with MoE weights quantized with mxfp4. All the othe
 
 ## MoE Support Matrix
 
-In MoE, the weights are pre-quantized to mxfp4. The activation can be in either bf16 (Hopper) or mxfp8 (Blackwell), with similar accuracy.
+In MoE, the weights are pre-quantized to mxfp4. The activation can be in either bf16 (Hopper) or mxfp8 (Blackwell), with similar accuracy. FP8 activation with per-tensor scaling factor has limited support. Note that the per-tensor scaling factor needs to be calculated dynamically during inference with the official mxfp4 checkpoints, which may negatively impact perf. The configs in **bold** are the recommended configs for the official checkpoints.
 
-| device | Activation | Weight | Supported moe_backend |
-|----------|----------|----------|----------|
-| Hopper | bf16 | mxfp4 | **TRITON**, CUTLASS |
-| Blackwell | mxfp8 | mxfp4 | CUTLASS, TRTLLM |
+| device | Activation | Weight | Supported moe_backend | MMA|
+|----------|----------|----------|----------|----------|
+| Hopper | **bf16** | mxfp4 | **TRITON**, CUTLASS | simulated mxfp4, HGMMA |
+| Hopper | fp8 | mxfp4 | CUTLASS (not enabled) | simulated mxfp4, QGMMA |
+| Blackwell | **mxfp8** | mxfp4 | **CUTLASS, TRTLLM** | UTCQMMA |
+| Blackwell | fp8 | mxfp4 | CUTLASS, TRTLLM | UTCQMMA |
+| Blackwell | fp8 | mxfp4 | TRITON (experimental) | NA |
+| Blackwell | bf16 | mxfp4 | TRTLLM | simulated mxfp4, UTCHMMA |
 
 
 | moe_backend | TP | EP | AlltoAll |

@@ -124,10 +124,10 @@ From the `examples/cpp/executor/build` folder, you can also run the `executorExa
 ```
 ./executorExampleDisaggregated -h
 ```
-Note setting `TRTLLM_USE_MPI_KVCACHE=1` is required to run disaggregated executor.
+Note setting `TRTLLM_USE_UCX_KVCACHE=1` is required to run disaggregated executor.
 For example, you can run :
 ```
-export TRTLLM_USE_MPI_KVCACHE=1
+export TRTLLM_USE_UCX_KVCACHE=1
 
 mpirun -n <num_ranks> --allow-run-as-root --oversubscribe ./executorExampleDisaggregated --context_engine_dir <path_to_context_engine_dir> --context_rank_size <num_ranks_for_context> --generation_engine_dir <path_to_generation_engine_dir> --generation_rank_size <num_ranks_for_generation> --input_tokens ../inputTokens.csv
 

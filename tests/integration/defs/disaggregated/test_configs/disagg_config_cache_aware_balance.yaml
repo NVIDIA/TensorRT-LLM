@@ -21,7 +21,7 @@ context_servers:
     event_buffer_max_size: 1024
     free_gpu_memory_fraction: 0.1
   cache_transceiver_config:
-    backend: default
+    backend: DEFAULT
   urls:
       - "localhost:8001"
       - "localhost:8002"
@@ -35,7 +35,7 @@ generation_servers:
   tensor_parallel_size: 1
   pipeline_parallel_size: 1
   cache_transceiver_config:
-    backend: default
+    backend: DEFAULT
   kv_cache_config:
     enable_block_reuse: True
     enable_partial_reuse: False
