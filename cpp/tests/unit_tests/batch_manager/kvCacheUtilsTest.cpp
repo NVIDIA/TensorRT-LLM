@@ -84,6 +84,7 @@ TEST_F(BlockIteratorTest, CacheManagerTest)
     auto const stream = std::make_shared<tr::CudaStream>();
     auto constexpr onboardBlocks = true;
 
+    // TODO: Support and add coverage for beamWidth > 1
     auto constexpr beamWidth = 1;
     auto constexpr numBlocksPerBeam = blocksInPrimaryPool / beamWidth;
     auto constexpr maxSequenceLength = tokensPerBlock * numBlocksPerBeam;
