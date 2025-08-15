@@ -203,7 +203,7 @@ Note:
 - When using `enable_attention_dp`, `max_batch_size` describes the maximum batch size for each local rank, so to saturate the system, we need to multiply `max_batch_size` by `num_gpus` for `--concurrency`.
 - `--num_requests` is set to 3 times `--concurrency` to run enough number of requests.
 
-Currently, the best throughput **19.5k tps/gpu** is achieved with DP4EP4 using 4x B200 GPUs and over **20k tps/gpu** on GB200 GPUs due to slightly better performance of GB200, which translates to over **1.5M tps** on a GB200 NVL72 system. In theory, even better throughput could be achieved with more GPUs due to larger allowable batch size and smaller MoE weights per-GPU, but the communication implementation for >4GPUs is suboptimal and we are actively working on improving it.
+Currently, the best throughput **19.5k tps/gpu** is achieved with DP4EP4 using 4x B200 GPUs and over **20k tps/gpu** on GB200 GPUs due to slightly better performance of GB200, which translates to over **1.5M tps** on a GB200 NVL72 system. In theory, even better tps/gpu could be achieved with more GPUs due to larger allowable batch size and smaller MoE weights per-GPU, but the communication implementation for >4GPUs is suboptimal and we are actively working on improving it.
 
 
 
