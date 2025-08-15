@@ -350,7 +350,7 @@ requests. You can adjust parameters like `max_tokens`, `temperature`, and
 others according to your needs.
 
 
-## (H200 Only) Using OpenAI Triton Kernels for MoE
+## (H200/H100 Only) Using OpenAI Triton Kernels for MoE
 
 OpenAI ships a set of Triton kernels optimized for its MoE models. TensorRT-LLM can leverage these kernels for Hopper based GPUs like NVIDIA's H200 for best performance. The NGC TensorRT-LLM container image mentioned above already includes the required kernels so you do not need to build or install them. It is highly recommended to enable them with the steps below:
 
