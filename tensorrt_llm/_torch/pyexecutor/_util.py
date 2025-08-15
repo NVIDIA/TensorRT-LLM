@@ -193,12 +193,8 @@ class KvCacheCreator:
         estimating_kv_cache = False
         if 'cp_type' not in self._mapping.cp_config:
             estimating_kv_cache = True
-            max_attention_window_from_config = self._executor_config.kv_cache_config.max_attention_window
-            max_seq_len = max(
-                max_attention_window_from_config
-            ) if max_attention_window_from_config is not None else self._executor_config.max_seq_len
-            self._executor_config.kv_cache_config.max_tokens = max(
-                self._get_token_num_for_estimation(), max_seq_len)
+            self._executor_config.kv_cache_config.max_tokens = self._get_token_num_for_estimation(
+            )
         return estimating_kv_cache
 
     def configure_kv_cache_capacity(self, py_executor: PyExecutor) -> None:
