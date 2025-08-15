@@ -20,7 +20,8 @@ import tempfile
 
 import pytest
 import yaml
-from defs.conftest import llm_models_root, skip_arm, skip_no_hopper
+from defs.conftest import (get_sm_version, llm_models_root, skip_arm,
+                           skip_no_hopper)
 from defs.trt_test_alternative import check_call, check_output, popen
 
 from tensorrt_llm.logger import logger
@@ -1212,7 +1213,7 @@ def get_config_for_benchmark(model_root, backend):
             "num_instances": 1,
             "max_batch_size": 2,
             "max_num_tokens": 384,
-            "max_seq_len": 320,
+            "max_seq_len": 384,
             "tensor_parallel_size": 1,
             "pipeline_parallel_size": 1,
             "disable_overlap_scheduler": True,
@@ -1228,7 +1229,7 @@ def get_config_for_benchmark(model_root, backend):
             "pipeline_parallel_size": 1,
             "max_batch_size": 2,
             "max_num_tokens": 384,
-            "max_seq_len": 320,
+            "max_seq_len": 384,
             "cache_transceiver_config": {
                 "backend": backend,
                 "max_tokens_in_buffer": 512,
@@ -1247,6 +1248,9 @@ def get_config_for_benchmark(model_root, backend):
 def test_disaggregated_benchmark_on_diff_backends(
         disaggregated_test_root, disaggregated_example_root, llm_venv,
         benchmark_model_root, benchmark_root, shared_gpt_path):
+    if "DeepSeek-V3-Lite" in benchmark_model_root and "fp8" in benchmark_model_root and get_sm_version(
+    ) != 90:
+        pytest.skip("The test should only run on Hopper")
     nixl_config = get_config_for_benchmark(benchmark_model_root, "nixl")
     ucx_config = get_config_for_benchmark(benchmark_model_root, "ucx")
     temp_dir = tempfile.TemporaryDirectory()
