@@ -186,6 +186,9 @@ class Llama4Attention(Attention):
                                         mrope_config,
                                         attention_sinks=None)
 
+        if isinstance(attn_output, tuple):
+            attn_output = Fp4QuantizedTensor(attn_output[0], attn_output[1])
+
         attn_output = self.o_proj(attn_output,
                                   all_reduce_params=all_reduce_params)
 
