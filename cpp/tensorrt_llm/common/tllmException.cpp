@@ -17,6 +17,7 @@
 #include "tensorrt_llm/common/tllmException.h"
 #include "tensorrt_llm/common/stringUtils.h"
 
+#include <cinttypes>
 #include <cstdlib>
 #if !defined(_MSC_VER)
 #include <cxxabi.h>
@@ -108,7 +109,7 @@ std::string TllmException::demangle(char const* name)
 
 RequestSpecificException::RequestSpecificException(
     std::string const& file, std::size_t line, char const* msg, uint64_t requestID, RequestErrorCode errorCode)
-    : std::runtime_error{fmtstr("%s (Request ID: %lu, Error Code: %u) (%s:%zu)", msg, requestID,
+    : std::runtime_error{fmtstr("%s (Request ID: %" PRIu64 ", Error Code: %u) (%s:%zu)", msg, requestID,
         static_cast<uint32_t>(errorCode), file.c_str(), line)}
     , mRequestID{requestID}
     , mErrorCode{errorCode}
