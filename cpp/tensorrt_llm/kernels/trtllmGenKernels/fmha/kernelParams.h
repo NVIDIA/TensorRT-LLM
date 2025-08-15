@@ -771,8 +771,6 @@ struct KernelParams
         params.mMaxNumCtasQ = maxNumCtasQ;
         params.mMaxNumCtasKv = maxNumCtasKv;
         params.mMaxNumPagesPerSeqKv = options.mMaxNumPagesPerSeqKv;
-        // TODO: just use mMaxSeqLenQ for number of MTP tokens.
-        params.mNumMtpTokens = options.mMaxSeqLenQ;
         params.mSumOfSeqLensQ = options.mSumOfSeqLensQ;
         params.mSumOfSeqLensKv = options.mSumOfSeqLensKv;
         params.mBatchSize = options.mBatchSize;
