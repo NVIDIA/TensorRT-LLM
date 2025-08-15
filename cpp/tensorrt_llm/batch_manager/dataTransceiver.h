@@ -158,7 +158,7 @@ public:
         catch (std::exception const& e)
         {
             throw common::RequestSpecificException(
-                __FILE__, __LINE__, e.what(), common::kUNKNOWN_REQUEST_ID, common::RequestErrorCode::kNETWORK_ERROR);
+                __FILE__, __LINE__, e.what(), mRequest->mRequestId, common::RequestErrorCode::kNETWORK_ERROR);
         }
     }
 
@@ -171,7 +171,7 @@ public:
         catch (std::exception const& e)
         {
             throw common::RequestSpecificException(
-                __FILE__, __LINE__, e.what(), common::kUNKNOWN_REQUEST_ID, common::RequestErrorCode::kNETWORK_ERROR);
+                __FILE__, __LINE__, e.what(), mRequest->mRequestId, common::RequestErrorCode::kNETWORK_ERROR);
         }
     }
 
