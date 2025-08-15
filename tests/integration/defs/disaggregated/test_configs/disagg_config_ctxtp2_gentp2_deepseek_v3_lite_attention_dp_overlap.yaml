@@ -11,7 +11,7 @@ context_servers:
   enable_attention_dp: True
   disable_overlap_scheduler: True
   cache_transceiver_config:
-    backend: default
+    backend: DEFAULT
   urls:
       - "localhost:8001"
 generation_servers:
@@ -21,6 +21,6 @@ generation_servers:
   enable_attention_dp: True
   disable_overlap_scheduler: False
   cache_transceiver_config:
-    backend: default
+    backend: DEFAULT
   urls:
       - "localhost:8002"
