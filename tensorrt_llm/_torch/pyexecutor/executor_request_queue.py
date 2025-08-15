@@ -96,18 +96,18 @@ class ExecutorRequestQueue:
         if len(items) >= self.max_batch_size:
             return items
 
-        start_time = time.time()
+        deadline = time.monotonic() + self.batch_wait_timeout
         while len(items) < self.max_batch_size:
-            if time.time() - start_time >= self.batch_wait_timeout:
+            remaining_timeout = deadline - time.monotonic()
+
+            if remaining_timeout <= 0:
                 break
 
             try:
-                remaining_timeout = max(
-                    0.001, self.batch_wait_timeout - (time.time() - start_time))
-                queue_item = self.request_queue.get(timeout=remaining_timeout)
-                items.append(queue_item)
+                item = self.request_queue.get(timeout=remaining_timeout)
+                items.append(item)
             except queue.Empty:
-                continue
+                break
 
         return items
 
