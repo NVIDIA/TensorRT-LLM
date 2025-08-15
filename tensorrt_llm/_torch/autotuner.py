@@ -453,7 +453,8 @@ class AutoTuner:
                 p.name
                 for p in inspect.signature(runner.forward).parameters.values()
             }
-            valid_tactics = runner.get_valid_tactics(input_tensors, profile)
+            valid_tactics = runner.get_valid_tactics(input_tensors, profile,
+                                                     **kwargs)
             if "do_preparation" in runner_arg_names and len(valid_tactics) > 0:
                 runner(
                     input_tensors,
