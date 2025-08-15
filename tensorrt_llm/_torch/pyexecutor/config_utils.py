@@ -5,9 +5,7 @@ def is_nemotron_hybrid(config):
 
 
 def is_mla(config):
-    if hasattr(config, "kv_lora_rank"):
-        assert hasattr(
-            config, "qk_rope_head_dim"
-        ), "both of kv_lora_rank and qk_rope_head_dim are required."
+    if getattr(config, "kv_lora_rank", None) and getattr(
+            config, "qk_rope_head_dim", None):
         return True
     return False
