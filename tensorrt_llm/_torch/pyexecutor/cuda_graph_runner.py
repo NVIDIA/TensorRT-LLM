@@ -230,7 +230,7 @@ class CUDAGraphRunner:
         static_tensors["position_ids"][:, :seqlen].copy_(position_ids)
 
         if "mrope_position_deltas" in static_tensors:
-            static_tensors["mrope_position_deltas"].copy_(
+            static_tensors["mrope_position_deltas"][:batch_size].copy_(
                 current_inputs["mrope_position_deltas"])
 
         self.graphs[key].replay()
