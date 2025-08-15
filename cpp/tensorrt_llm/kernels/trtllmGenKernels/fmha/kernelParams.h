@@ -64,6 +64,8 @@ struct KernelParams
     // The output SF pointer (used for FP4 output).
     void* ptrSfO;
 
+    // The attention sinks pointer (additional value per head in the denominator of the softmax).
+    float const* ptrAttentionSinks;
     // The cumulative sequence lengths for Q.
     int32_t const* ptrCumSeqLensQ;
     // The cumulative sequence lengths for K/V.
@@ -138,9 +140,6 @@ struct KernelParams
     int32_t mNumHeadsQPerKv;
     // The hidden size of O.
     int64_t mNumHiddenEltsO;
-    // The number of MTP tokens per sequence. Assume that all requests have the same numMtpTokens
-    // without paddings.
-    int32_t mNumMtpTokens;
     // The total number of pages in the paged-kv memory pool.
     int32_t mNumPagesInMemPool;
     // The output scale for FP8 quantization.
