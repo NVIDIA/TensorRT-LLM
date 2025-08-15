@@ -45,7 +45,7 @@ class ExecutorRequestQueue:
     def __init__(self, dist: Distributed, enable_attention_dp: bool,
                  max_batch_size: int, max_beam_width: int,
                  max_num_active_requests: int, enable_iter_perf_stats: bool,
-                 is_disaggregated: bool):
+                 batch_wait_timeout: float, is_disaggregated: bool):
         self.dist = dist
         self.request_queue: queue.Queue[RequestQueueItem] = queue.Queue()
         self.waiting_queue: deque[RequestQueueItem] = deque()
@@ -59,6 +59,7 @@ class ExecutorRequestQueue:
         self.enable_iter_perf_stats = enable_iter_perf_stats
         self.start_times = {}
         self.active = True
+        self.batch_wait_timeout = batch_wait_timeout
 
         # State tracking
         self.num_fetch_requests = 0
@@ -74,6 +75,7 @@ class ExecutorRequestQueue:
 
         items = []
         timeout_secs = timeout.total_seconds() if timeout is not None else None
+
         try:
             if self.request_queue.empty() and (timeout_secs is None
                                                or timeout_secs > 0):
@@ -86,6 +88,26 @@ class ExecutorRequestQueue:
                     items.append(queue_item)
         except queue.Empty:
             pass
+
+        if self.batch_wait_timeout == 0:
+            return items
+
+        if len(items) >= self.max_batch_size:
+            return items
+
+        start_time = time.time()
+        while len(items) < self.max_batch_size:
+            if time.time() - start_time >= self.batch_wait_timeout:
+                break
+
+            try:
+                remaining_timeout = max(
+                    0.001, self.batch_wait_timeout - (time.time() - start_time))
+                queue_item = self.request_queue.get(timeout=remaining_timeout)
+                items.append(queue_item)
+            except queue.Empty:
+                continue
+
         return items
 
     @staticmethod
