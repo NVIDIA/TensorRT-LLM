@@ -499,6 +499,11 @@ class Attention(nn.Module):
             q, k = self.rotary_emb(position_ids, [q, k])
         return q, k, v
 
+    def apply_qk_norm(self, q, k):
+        raise NotImplementedError(
+            f"QK norm is not implemented for {self.__class__.__name__}."
+            "Please override the `apply_qk_norm` method in the subclass.")
+
 
 @torch.library.custom_op("trtllm::mla_custom_op_inplace",
                          mutates_args=("output", ))
