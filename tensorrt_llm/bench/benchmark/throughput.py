@@ -234,10 +234,11 @@ from tensorrt_llm.sampling_params import SamplingParams
     help="Path where per request information is written to.",
 )
 @optgroup.option(
-    "--enable_chunked_context/--disable_chunked_context",
-    default=True,
-    help=
-    "Enable/disable chunking in prefill stage for enhanced throughput benchmark. "
+    "--enable_chunked_context",
+    is_flag=True,
+    default=None,
+    help="Enable chunking in prefill stage for enhanced throughput benchmark. "
+    "Default is False for PyTorch/AutoDeploy backend, True for TensorRT backend.",
 )
 @optgroup.option(
     "--scheduler_policy",
@@ -348,8 +349,11 @@ def throughput_command(
     kv_cache_percent = params.get("kv_cache_free_gpu_mem_fraction")
     beam_width = params.get("beam_width")
     streaming: bool = params.get("streaming")
-    enable_chunked_context: bool = params.get("enable_chunked_context")
     scheduler_policy: str = params.get("scheduler_policy")
+    enable_chunked_context: bool = params.get("enable_chunked_context")
+    if enable_chunked_context is None:
+        # Set default based on backend: True for TensorRT, False for others
+        enable_chunked_context = backend.lower() == "tensorrt"
 
     # Update configuration with runtime options
     exec_settings["settings_config"]["kv_cache_percent"] = kv_cache_percent
