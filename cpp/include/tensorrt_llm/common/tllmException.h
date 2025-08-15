@@ -37,7 +37,7 @@
 #define NEW_TLLM_EXCEPTION(...)                                                                                        \
     tensorrt_llm::common::TllmException(__FILE__, __LINE__, tensorrt_llm::common::fmtstr(__VA_ARGS__).c_str())
 
-#define NEW_TLLM_REQUEST_SPECIFIC_EXCEPTION_WITH_ERROR_CODE(requestID, errorCode, ...)                                 \
+#define TLLM_REQUEST_EXCEPTION(requestID, errorCode, ...)                                                              \
     tensorrt_llm::common::RequestSpecificException(                                                                    \
         __FILE__, __LINE__, tensorrt_llm::common::fmtstr(__VA_ARGS__).c_str(), requestID, errorCode)
 
@@ -84,6 +84,7 @@ private:
 {
     throw TllmException(file, line, fmtstr("[TensorRT-LLM][ERROR] Assertion failed: %s", info.c_str()).c_str());
 }
+
 class RequestSpecificException : public std::runtime_error
 {
 public:
