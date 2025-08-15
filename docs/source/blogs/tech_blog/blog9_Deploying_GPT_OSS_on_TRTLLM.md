@@ -5,7 +5,7 @@ high-performance TensorRT-LLM server for **gpt-oss-120b** for inference.
 
 **Low-latency** use cases aim to maximize the number of tokens per second per user (tps/user) with limited concurrency.
 
-For **maximum throughput**, the goal is to maximize the tokens produced per GPU per second (tps/gpu). While tps/user indicates user experience quality, tps/gpu measures the economic efficiency of the system.
+For **max-throughput**, the goal is to maximize the tokens produced per GPU per second (tps/gpu). While tps/user indicates user experience quality, tps/gpu measures the economic efficiency of the system.
 
 ## Prerequisites
 
