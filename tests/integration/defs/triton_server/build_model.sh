@@ -699,32 +699,4 @@ if [ "$MODEL" = "qwen2_vl" ]; then
 
 fi
 
-if [ "$MODEL" = "mistral_small_3_1" ]; then
-
-    echo "Install Mistral Small 3.1 requirements"
-    pip install -r $LLM_BACKEND_ROOT/all_models/multimodal/requirements-mistral3.1.txt
-
-    pushd examples/models/core/multimodal
-
-    MODEL_DIR=${LLM_MODELS_ROOT}/Mistral-Small-3.1-24B-Instruct-2503
-
-    echo "Convert Mistral Small 3.1 from HF"
-    python3 ../llama/convert_checkpoint.py --model_dir ${MODEL_DIR} --dtype bfloat16 --output_dir ./c-model/Mistral-Small-3.1-24B-Instruct-2503/bf16
-
-    echo "Mistral Small 3.1 builder"
-    trtllm-build --checkpoint_dir ./c-model/Mistral-Small-3.1-24B-Instruct-2503/bf16 \
-                --max_batch_size=8 \
-                --max_input_len=4096 \
-                --max_seq_len=4096 \
-                --max_multimodal_len=32768 \
-                --use_paged_context_fmha=enable \
-                --output_dir trt_engines/Mistral-Small-3.1-24B-Instruct-2503/bf16/1-gpu
-
-    echo "Build Pixtral multimodal encoder"
-    python build_multimodal_engine.py --model_path ${MODEL_DIR} --model_type pixtral --max_batch_size 2 --output_dir tmp/trt_engines/Mistral-Small-3.1-24B-Instruct-2503/multimodal_encoder
-
-    popd # examples/models/core/multimodal
-
-fi
-
 popd # $LLM_ROOT
