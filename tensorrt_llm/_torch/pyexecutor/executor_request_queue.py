@@ -51,6 +51,7 @@ class ExecutorRequestQueue:
         self.waiting_queue: deque[RequestQueueItem] = deque()
         self.canceled_req_ids = []
         self.enable_attention_dp = enable_attention_dp
+        self.max_batch_size = max_batch_size
         self.max_beam_width = max_beam_width
         self.max_num_active_requests = max_num_active_requests
         self.is_disaggregated = is_disaggregated
