@@ -136,7 +136,7 @@ class CUDAGraphRunner:
         return True, attn_metadata, spec_metadata
 
     def needs_capture(self, batch_size: int):
-        return self.graph_outputs[(batch_size, self.draft_len)] is None
+        return (batch_size, self.draft_len) not in self.graph_outputs
 
     def capture_graph(self, batch_size: int, forward_fn: Callable,
                       initial_inputs: Dict[str, Any]):
