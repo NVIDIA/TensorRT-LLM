@@ -37,6 +37,7 @@
 #include "tensorrt_llm/nanobind/batch_manager/kvCacheConnector.h"
 #include "tensorrt_llm/nanobind/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/nanobind/batch_manager/llmRequest.h"
+#include "tensorrt_llm/nanobind/common/tllmExceptions.h"
 #include "tensorrt_llm/nanobind/executor/bindings.h"
 #include "tensorrt_llm/nanobind/runtime/bindings.h"
 #include "tensorrt_llm/nanobind/testing/modelSpecBinding.h"
@@ -127,9 +128,11 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
     auto mInternalTesting = mInternal.def_submodule("testing", "Testing internal bindings");
     auto mInternalBatchManager = mInternal.def_submodule("batch_manager", "Batch manager internal bindings");
     auto mInternalThop = mInternal.def_submodule("thop", "Torch op internal bindings");
+    auto mExceptions = m.def_submodule("exceptions", "Exceptions internal bindings");
 
     tensorrt_llm::nanobind::executor::initBindings(mExecutor);
     tensorrt_llm::nanobind::runtime::initBindingsEarly(mInternalRuntime);
+    tensorrt_llm::nanobind::common::initExceptionsBindings(mExceptions);
     tensorrt_llm::nanobind::thop::initBindings(mInternalThop);
 
     auto buildInfo = m.def_submodule("BuildInfo");
