@@ -899,6 +899,192 @@ class NVFP4LinearMethod(LinearMethodBase):
         copy_weight(module.alpha, alpha)
 
 
+class W4A8NVFP4FP8LinearMethod(LinearMethodBase):
+
+    def create_weights(self, module: Linear, in_features: int,
+                       out_features: int, bias: bool, dtype: torch.dtype):
+        module.epilogue_tile_m = 128
+        module.scaling_vector_size = 32
+        assert in_features % module.scaling_vector_size == 0, (
+            f"in_features {in_features} must be divisible by scaling_vector_size {module.scaling_vector_size}"
+        )
+
+        # Quantized weights
+        module.weight = Parameter(
+            torch.empty([out_features, in_features // 2],
+                        dtype=fp4_utils.float4_e2m1x2),
+            requires_grad=False,
+        )
+
+        # FP8 per-block scaling factors. dtype must be aligned with SF_DTYPE
+        # Padding is required. See computeSFSize in quantization.h
+        nrows = fp4_utils.pad_up(out_features, 128)
+        ncols = fp4_utils.pad_up(in_features // module.scaling_vector_size, 4)
+        module.weight_scale = Parameter(torch.empty(
+            [nrows * ncols], dtype=fp4_utils.float4_sf_dtype),
+                                        requires_grad=False)
+
+        # amax_input / 448
+        module.input_scale = Parameter(torch.empty([1], dtype=torch.float32),
+                                       requires_grad=False)
+        # amax_weight / 448
+        module.weight_scale_2 = Parameter(torch.empty([1], dtype=torch.float32),
+                                          requires_grad=False)
+        # (amax_input * amax_weight) / (448 * 448)
+        module.alpha = Parameter(torch.empty([1], dtype=torch.float32),
+                                 requires_grad=False)
+
+        if bias:
+            module.bias = Parameter(torch.empty((out_features), dtype=dtype),
+                                    requires_grad=False)
+        else:
+            module.register_parameter("bias", None)
+
+    def apply(self, module: Linear, input: torch.Tensor,
+              bias: Optional[torch.Tensor]):
+        alpha = module.alpha
+        if input.dtype != torch.float8_e4m3fn:
+            if module.input_scale is not None and not module.force_dynamic_quantization:
+                # Static quantization
+                fp8_input, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(
+                    input, module.input_scale)
+            else:
+                # Dynamic quantization
+                fp8_input, input_scale = torch.ops.tensorrt_llm.quantize_e4m3_per_tensor(
+                    input)
+                alpha = module.weight_scale_2 * input_scale.to(torch.float32)
+
+        else:
+            fp8_input = input
+        output = torch.ops.trtllm.fp4_fp8_gemm_trtllmgen(
+            fp8_input, module.weight,
+            module.weight_scale.view(dtype=torch.float8_e4m3fn), alpha,
+            module.dtype)
+        if bias is not None:
+            output = output + bias
+        return output
+
+    def load_weight_scales(
+        self,
+        weights: List[Dict],
+        tp_size: int = 1,
+        tp_rank: int = 0,
+        tp_mode: Optional[TensorParallelMode] = None,
+    ):
+        # For concatenated weights (qkv_proj / up_gate_proj), the global scaling factors and input scaling factors should be shared.
+        input_scale = None
+        weight_scale_2 = None
+        weight_scale = []
+
+        device = torch.device("cuda")
+
+        for w in weights:
+            if "input_scale" in w:
+                if input_scale is None:
+                    input_scale = w["input_scale"][...]
+                else:
+                    assert input_scale == w["input_scale"][
+                        ...], "The input_scale should be same for all the weights"
+            if "weight_scale" in w:
+                ws = load_weight_shard(w["weight_scale"],
+                                       tp_size,
+                                       tp_rank,
+                                       tp_mode,
+                                       device=device).contiguous()
+                assert ws.dtype == torch.float8_e4m3fn
+                # The kernel we use will convert nvfp4 to e4m3 before matmul,
+                # so the range of the scale factor can only be [0,448/6].
+                ws = (ws.to(torch.float32) / 6.0).to(torch.float8_e4m3fn)
+                weight_scale.append(ws.view(dtype=fp4_utils.float4_sf_dtype))
+            if "weight_scale_2" in w:
+                if weight_scale_2 is None:
+                    weight_scale_2 = w["weight_scale_2"][...] * 6.0
+                else:
+                    assert weight_scale_2 == w["weight_scale_2"][...] * 6.0, (
+                        f"The weight_scale_2 should be same for all the weights: {weight_scale_2} vs. {w['weight_scale_2']}*6"
+                    )
+
+        # TODO: ModelOpt's o_proj.weight_scale_2 is bfloat16, which should be float32
+        input_scale = input_scale.to(torch.float32)
+        weight_scale_2 = weight_scale_2.to(torch.float32)
+        alpha = input_scale * weight_scale_2
+        return input_scale, weight_scale, weight_scale_2, alpha
+
+    def load_weights_vanilla(self, module: Linear, weights: List[Dict]) -> None:
+        # FIXME: this depends on the kernel internals
+        load_weights_vanilla_helper(
+            module, weights,
+            lambda w: fp4_utils.shuffle_matrix_a(w, module.epilogue_tile_m))
+
+        input_scale, weight_scale, weight_scale_2, alpha = self.load_weight_scales(
+            weights,
+            tp_size=module.tp_size,
+            tp_rank=module.tp_rank,
+            tp_mode=module.tp_mode)
+
+        assert len(weights) == 1
+        weight_scale = weight_scale[0]
+        # Shuffle and Swizzle weight scale
+        weight_scale = fp4_utils.shuffle_matrix_sf_a(weight_scale,
+                                                     module.epilogue_tile_m,
+                                                     module.scaling_vector_size)
+        copy_weight(module.input_scale, input_scale)
+        copy_weight(module.weight_scale, weight_scale)
+        copy_weight(module.weight_scale_2, weight_scale_2)
+        copy_weight(module.alpha, alpha)
+
+    def load_weights_fused_qkv_linear(self, module: Linear,
+                                      weights: List[Dict]) -> None:
+        q_weight, k_weight, v_weight = load_weights_fused_qkv_helper(
+            module, weights)
+
+        input_scale, weight_scales, weight_scale_2, alpha = self.load_weight_scales(
+            weights,
+            tp_size=module.tp_size,
+            tp_rank=module.tp_rank,
+            tp_mode=module.tp_mode)
+        # Swizzle weight scales after concatenation
+        weight_scale = torch.cat(weight_scales, 0)
+        # Shuffle and Swizzle weight scale
+        weight_scale = fp4_utils.shuffle_matrix_sf_a(weight_scale,
+                                                     module.epilogue_tile_m,
+                                                     module.scaling_vector_size)
+        copy_weight(module.input_scale, input_scale)
+        copy_weight(module.weight_scale, weight_scale)
+        copy_weight(module.weight_scale_2, weight_scale_2)
+        copy_weight(module.alpha, alpha)
+
+        fused_weight = torch.cat((q_weight, k_weight, v_weight))
+        fused_weight = fp4_utils.shuffle_matrix_a(fused_weight,
+                                                  module.epilogue_tile_m)
+        copy_weight(module.weight, fused_weight)
+
+    def load_weights_fused_gate_up_linear(self, module: Linear,
+                                          weights: List[Dict]) -> None:
+        gate_weight, up_weight = load_weights_fused_gate_up_helper(
+            module, weights)
+        fused_weight = torch.cat((gate_weight, up_weight))
+        fused_weight = fp4_utils.shuffle_matrix_a(fused_weight,
+                                                  module.epilogue_tile_m)
+        copy_weight(module.weight, fused_weight)
+
+        input_scale, weight_scales, weight_scale_2, alpha = self.load_weight_scales(
+            weights,
+            tp_size=module.tp_size,
+            tp_rank=module.tp_rank,
+            tp_mode=module.tp_mode)
+        # Swizzle weight scales after concatenation
+        weight_scale = torch.cat(weight_scales, 0)
+        # Shuffle and Swizzle weight scale
+        weight_scale = fp4_utils.shuffle_matrix_sf_a(weight_scale,
+                                                     module.epilogue_tile_m,
+                                                     module.scaling_vector_size)
+        copy_weight(module.input_scale, input_scale)
+        copy_weight(module.weight_scale, weight_scale)
+        copy_weight(module.weight_scale_2, weight_scale_2)
+        copy_weight(module.alpha, alpha)
+
+
 class W4A8MXFP4FP8LinearMethod(LinearMethodBase):
 
     def create_weights(self, module: Linear, in_features: int,
@@ -1559,6 +1745,8 @@ def get_quant_method(quant_config: Optional[QuantConfig] = None):
         return FP8BlockScalesLinearMethod()
     if quant_config.layer_quant_mode.has_nvfp4():
         return NVFP4LinearMethod()
+    if quant_config.layer_quant_mode.has_w4a8_nvfp4_fp8():
+        return W4A8NVFP4FP8LinearMethod()
     if quant_config.layer_quant_mode.has_w4a8_mxfp4_fp8():
         return W4A8MXFP4FP8LinearMethod()
     if quant_config.layer_quant_mode.is_weight_only(
@@ -1712,6 +1900,12 @@ class Linear(nn.Module):
         assert self._weights_created
         return self.quant_config is not None and self.quant_config.layer_quant_mode.is_int4_weight_only_per_group(
         ) and self.quant_config.quant_algo == QuantAlgo.W4A8_AWQ
+
+    @property
+    def has_w4a8_nvfp4_fp8(self):
+        assert self._weights_created
+        return self.quant_config is not None and self.quant_config.layer_quant_mode.has_w4a8_nvfp4_fp8(
+        )
 
     @property
     def has_w4a8_mxfp4_fp8(self):
