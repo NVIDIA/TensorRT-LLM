@@ -355,7 +355,7 @@ OpenAI ships a set of Triton kernels optimized for its MoE models. TensorRT-LLM 
 
 ### Installing OpenAI Triton
 
-You will need to build and install a specific version of Triton. Please follow the instructions in this [link](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/gpt_oss#using-openai-triton-kernels-for-moe).
+The `nvcr.io/nvidia/tensorrt-llm/release:gpt-oss-dev` has Triton installed already (`echo $TRITON_ROOT` could reveal the path). In other situations, you will need to build and install a specific version of Triton. Please follow the instructions in this [link](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/gpt_oss#using-openai-triton-kernels-for-moe).
 
 
 ### Selecting Triton as the MoE backend
