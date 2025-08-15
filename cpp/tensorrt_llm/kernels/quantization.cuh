@@ -754,7 +754,8 @@ __device__ uint8_t* cvt_quant_get_sf_out_offset(std::optional<int> batchIdx, int
     return nullptr;
 }
 
-template <BlockScaleQuantizationType quantization_type, class Type, int SF_VEC_SIZE, bool UE8M0_SF>
+template <BlockScaleQuantizationType quantization_type, class Type, int SF_VEC_SIZE, bool UE8M0_SF,
+    bool PER_TOKEN_GLOBAL_SCALE = false>
 __global__ void
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
     __launch_bounds__(512, 4) quantize_with_block_size(
@@ -775,10 +776,6 @@ quantize_with_block_size(
     static constexpr int CVT_NUM_THREADS_PER_SF = SF_VEC_SIZE / ELTS_PER_THREAD; // 2 or 4
     static_assert(sizeof(PackedVec) == sizeof(Type) * ELTS_PER_THREAD, "Vec size is not matched.");
 
-    // Get the global scaling factor, which will be applied to the SF.
-    // Note SFScale is the same as next GEMM's alpha, which is (448.f / (Alpha_A / 6.f)).
-    float const SFScaleVal = SFScale == nullptr ? 1.0f : SFScale[0];
-
     // Is it swizzled layout?
     bool isSfSwizzledLayout = layout == QuantizationSFLayout::SWIZZLED;
 
@@ -798,6 +795,21 @@ quantize_with_block_size(
     {
         for (int batchIdx = 0; batchIdx < numbatches; batchIdx++)
         {
+            // Compute SFScaleVal once per row (per-token) or once per tensor
+            float SFScaleVal = 1.0f;
+            if (SFScale != nullptr)
+            {
+                if constexpr (PER_TOKEN_GLOBAL_SCALE)
+                {
+                    // Guard the padded rows
+                    SFScaleVal = (rowIdx < numRows) ? SFScale[batchIdx * numRows + rowIdx] : 1.0f;
+                }
+                else
+                {
+                    SFScaleVal = SFScale[0];
+                }
+            }
+
             for (int colIdx = threadIdx.x; colIdx < numColThreadsForSf; colIdx += blockDim.x)
             {
                 std::optional<int> optionalBatchIdx = batchIdx;

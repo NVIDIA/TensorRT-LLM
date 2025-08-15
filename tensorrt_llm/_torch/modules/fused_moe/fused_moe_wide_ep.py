@@ -228,6 +228,9 @@ class WideEPMoE(MoE):
         if not model_config.skip_create_weights_in_init:
             self.create_weights()
 
+        self.use_low_precision_alltoall_combine = os.environ.get(
+            "TRTLLM_MOE_USE_LOW_PRECISION_ALLTOALL_COMBINE", "0") == "1"
+
         # Debug function for eliminating imbalance during performance analysis.
         self.enable_dummy_allreduce = os.environ.get(
             "TRTLLM_ENABLE_DUMMY_ALLREDUCE", "0") == "1"
@@ -266,7 +269,7 @@ class WideEPMoE(MoE):
         if os.environ.get("TRTLLM_MOE_DISABLE_ALLTOALLV", "0") == "1":
             return AlltoallMethodType.NotEnabled
 
-        if mapping.moe_ep_size <= top_k:
+        if mapping.moe_ep_size < top_k:
             return AlltoallMethodType.NotEnabled
 
         if MnnvlMemory.supports_mnnvl():
@@ -939,6 +942,21 @@ class WideEPMoE(MoE):
         top_k = self.routing_method.experts_per_token
         if isinstance(final_hidden_states, list):
             final_hidden_states = final_hidden_states[0]
+
+        if self.use_low_precision_alltoall_combine:
+            # Notes: this global scale is token-wise global scale
+            low_precision_global_scale = (
+                448 * 6) / final_hidden_states.abs().max(
+                    dim=-1, keepdim=True).values.to(torch.float32)
+            final_hidden_states, final_hidden_states_sf = torch.ops.trtllm.fp4_quantize(
+                final_hidden_states, low_precision_global_scale, 16, False,
+                False)
+            final_hidden_states_sf = final_hidden_states_sf.view(
+                final_hidden_states.shape[0], -1)
+        else:
+            final_hidden_states_sf = None
+            low_precision_global_scale = None
+
         final_hidden_states = MnnvlMoe.mnnvl_moe_alltoallv_combine(
             final_hidden_states,
             alltoall_info,
@@ -946,7 +964,10 @@ class WideEPMoE(MoE):
             ep_rank=self.ep_rank,
             ep_size=self.ep_size,
             top_k=top_k,
-            token_count=token_count)
+            token_count=token_count,
+            x_sf=final_hidden_states_sf,
+            is_sf_swizzled=False,
+            low_precision_global_scale=low_precision_global_scale)
 
         return final_hidden_states
 
