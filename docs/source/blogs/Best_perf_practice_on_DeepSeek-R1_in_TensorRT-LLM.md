@@ -412,9 +412,10 @@ Generally, you should make sure that `max_batch_size` is not too low to bottlene
 
 For more details on `max_batch_size` and `max_num_tokens`, refer to [Tuning Max Batch Size and Max Num Tokens](../performance/performance-tuning-guide/tuning-max-batch-size-and-max-num-tokens.md).
 
-### Not supported: MLA chunked context support on Hopper
+### MLA chunked context
 
-MLA chunked context support has been added on Blackwell GPUs, while it's not supported on Hopper yet. On Hopper, note that `max_num_tokens` has to be at least larger than the max input sequence length of the samples in dataset.
+MLA currently supports the chunked context feature on both Hopper and Blackwell GPUs. You can use `--enable_chunked_context` to open it. This feature is primarily designed to reduce TPOT (Time Per Output Token). The default chunk size is set to `max_num_tokens`. If you want to achieve a lower TPOT, you can appropriately reduce the chunk size. However, please note that this will also decrease overall throughput. Therefore, a trade-off needs to be considered. 
+
 For more details on `max_num_tokens`, refer to [Tuning Max Batch Size and Max Num Tokens](../performance/performance-tuning-guide/tuning-max-batch-size-and-max-num-tokens.md).
 
 ### Out of memory issues
