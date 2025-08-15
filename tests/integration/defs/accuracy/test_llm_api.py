@@ -433,3 +433,55 @@ class TestEagle2Vicuna_7B_v1_3(LlmapiAccuracyTestHarness):
                 speculative_config=self.speculative_config) as llm:
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
+
+
+class TestStarCoder2_7B(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "bigcode/starcoder2-7b"
+    MODEL_PATH = f"{llm_models_root()}/starcoder2-7b"
+    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
+
+    @pytest.mark.skip_less_device_memory(70000)
+    def test_auto_dtype(self):
+        with LLM(self.MODEL_PATH, kv_cache_config=self.kv_cache_config) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_pre_ada
+    @pytest.mark.skip_less_device_memory(70000)
+    def test_fp8(self):
+        quant_config = QuantConfig(QuantAlgo.FP8)
+        with LLM(self.MODEL_PATH,
+                 quant_config=quant_config,
+                 kv_cache_config=self.kv_cache_config) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
+class TestCodestral_22B_V01(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "mistralai/Codestral-22B-v0.1"
+    MODEL_PATH = f"{llm_models_root()}/Codestral-22B-v0.1"
+    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
+
+    @pytest.mark.skip_less_device_memory(80000)
+    def test_auto_dtype(self):
+        with LLM(self.MODEL_PATH, kv_cache_config=self.kv_cache_config) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_pre_ada
+    @pytest.mark.skip_less_device_memory(80000)
+    def test_fp8(self):
+        quant_config = QuantConfig(QuantAlgo.FP8)
+        with LLM(self.MODEL_PATH,
+                 quant_config=quant_config,
+                 kv_cache_config=self.kv_cache_config) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
