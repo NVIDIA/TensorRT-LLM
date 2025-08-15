@@ -358,11 +358,6 @@ private:
                 selectKernelParams.mTileScheduler = TileScheduler::Persistent;
                 // Need to select a different kernel.
                 selectKernelParams.mSelectNewKernel = true;
-                // FIXME(perkz): use static scheduler instead as WAR for https://nvbugspro.nvidia.com/bug/5394685.
-                if (selectKernelParams.mUses2CtaMma)
-                {
-                    selectKernelParams.mTileScheduler = TileScheduler::Static;
-                }
             }
             else if (totalNumCtas < params.mMultiProcessorCount && isMlaGenKernel(params)
                 && selectKernelParams.mTileSizeKv == 128 && tensorrt_llm::common::getEnvUseTileSizeKv64ForTrtllmGen())
