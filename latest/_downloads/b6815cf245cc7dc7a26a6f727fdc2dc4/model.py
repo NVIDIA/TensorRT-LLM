@@ -26,8 +26,8 @@ from ...layers import (MOE, Attention, AttentionMaskType, ColumnLinear,
                        Embedding, GatedMLP, RmsNorm, SharedMoE)
 from ...layers.moe import MOEWeightWrapper
 from ...logger import logger
-from ...lora_manager import (LoraConfig,
-                             get_default_trtllm_modules_to_hf_modules, use_lora)
+from ...lora_helper import (LoraConfig,
+                            get_default_trtllm_modules_to_hf_modules, use_lora)
 from ...mapping import Mapping
 from ...module import Module
 from ...quantization import QuantAlgo

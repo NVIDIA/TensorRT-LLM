@@ -58,7 +58,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc6';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.1.0rc0';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -68,7 +68,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.0.0rc6" />
+  <meta name="docsearch:version" content="1.1.0rc0" />
 
 
   </head>
@@ -323,6 +323,12 @@
 <li class="toctree-l1"><a class="reference internal" href="installation/linux.html">Installing on Linux via <code class="docutils literal notranslate"><span class="pre">pip</span></code></a></li>
 <li class="toctree-l1"><a class="reference internal" href="installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
 </ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Deployment Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="deployment-guide/quick-start-recipe-for-llama4-scout-on-trtllm.html">Quick Start Recipe for Llama4 Scout 17B on TensorRT-LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l1"><a class="reference internal" href="deployment-guide/quick-start-recipe-for-deepseek-r1-on-trtllm.html">Quick Start Recipe for DeepSeek R1 on TensorRT-LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l1"><a class="reference internal" href="deployment-guide/quick-start-recipe-for-llama3.3-70b-on-trtllm.html">Quick Start Recipe for Llama3.3 70B on TensorRT-LLM - Blackwell &amp; Hopper Hardware</a></li>
+</ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">LLM API</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="llm-api/index.html">LLM API Introduction</a></li>
@@ -412,7 +418,7 @@
 <li class="toctree-l1"><a class="reference internal" href="advanced/kv-cache-management.html">KV Cache Management: Pools, Blocks, and Events</a></li>
 <li class="toctree-l1"><a class="reference internal" href="advanced/kv-cache-reuse.html">KV cache reuse</a></li>
 <li class="toctree-l1"><a class="reference internal" href="advanced/speculative-decoding.html">Speculative Sampling</a></li>
-<li class="toctree-l1"><a class="reference internal" href="advanced/disaggregated-service.html">Disaggregated-Service (Experimental)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="advanced/disaggregated-service.html">Disaggregated-Service (Prototype)</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Performance</span></p>
 <ul class="nav bd-sidenav">
@@ -558,6 +564,20 @@
 </li>
       </ul></li>
       <li>
+    --custom_module_dirs
+
+      <ul>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-throughput-custom_module_dirs">trtllm-bench-throughput command line option</a>
+</li>
+      </ul></li>
+      <li>
+    --data_device
+
+      <ul>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-throughput-data_device">trtllm-bench-throughput command line option</a>
+</li>
+      </ul></li>
+      <li>
     --dataset
 
       <ul>
@@ -645,6 +665,13 @@
 </li>
       </ul></li>
       <li>
+    --image_data_format
+
+      <ul>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-throughput-image_data_format">trtllm-bench-throughput command line option</a>
+</li>
+      </ul></li>
+      <li>
     --iteration_log
 
       <ul>
@@ -680,6 +707,17 @@
         <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-disaggregated_mpi_worker-log_level">trtllm-serve-disaggregated_mpi_worker command line option</a>
 </li>
         <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-log_level">trtllm-serve-serve command line option</a>
+</li>
+      </ul></li>
+      <li>
+    --mamba_ssm_cache_dtype
+
+      <ul>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-latency-mamba_ssm_cache_dtype">trtllm-bench-latency command line option</a>
+</li>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-throughput-mamba_ssm_cache_dtype">trtllm-bench-throughput command line option</a>
+</li>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-mamba_ssm_cache_dtype">trtllm-serve-serve command line option</a>
 </li>
       </ul></li>
       <li>
@@ -749,6 +787,8 @@
         <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-metadata_server_config_file">trtllm-serve-serve command line option</a>
 </li>
       </ul></li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li>
     --modality
 
@@ -758,8 +798,6 @@
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-throughput-modality">trtllm-bench-throughput command line option</a>
 </li>
       </ul></li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li>
     --model
 
@@ -772,6 +810,13 @@
 
       <ul>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-model_path">trtllm-bench command line option</a>
+</li>
+      </ul></li>
+      <li>
+    --no_skip_tokenizer_init
+
+      <ul>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-throughput-no_skip_tokenizer_init">trtllm-bench-throughput command line option</a>
 </li>
       </ul></li>
       <li>
@@ -1181,10 +1226,10 @@
 </li>
       <li><a href="python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.RopeEmbeddingUtils.apply_rotary_pos_emb">apply_rotary_pos_emb() (tensorrt_llm.functional.RopeEmbeddingUtils static method)</a>
 </li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.RopeEmbeddingUtils.apply_rotary_pos_emb_chatglm">apply_rotary_pos_emb_chatglm() (tensorrt_llm.functional.RopeEmbeddingUtils static method)</a>
 </li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.RopeEmbeddingUtils.apply_rotary_pos_emb_cogvlm">apply_rotary_pos_emb_cogvlm() (tensorrt_llm.functional.RopeEmbeddingUtils static method)</a>
 </li>
       <li><a href="python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.arange">arange() (in module tensorrt_llm.functional)</a>
@@ -1202,6 +1247,8 @@
       <li><a href="python-api/tensorrt_llm.layers.html#tensorrt_llm.layers.attention.Attention">Attention (class in tensorrt_llm.layers.attention)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.attention_dp_config">attention_dp_config (tensorrt_llm.llmapi.TorchLlmArgs attribute)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.KvCacheConfig.attention_dp_events_gather_period_ms">attention_dp_events_gather_period_ms (tensorrt_llm.llmapi.KvCacheConfig attribute)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AttentionDpConfig">AttentionDpConfig (class in tensorrt_llm.llmapi)</a>
 </li>
@@ -1879,6 +1926,8 @@
 </li>
       <li><a href="python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.SideStreamIDType.disable">disable (tensorrt_llm.functional.SideStreamIDType attribute)</a>
 </li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MoeConfig.disable_finalize_fusion">disable_finalize_fusion (tensorrt_llm.llmapi.MoeConfig attribute)</a>
+</li>
       <li><a href="python-api/tensorrt_llm.models.html#tensorrt_llm.models.SD3Transformer2DModel.disable_forward_chunking">disable_forward_chunking() (tensorrt_llm.models.SD3Transformer2DModel method)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.disable_overlap_scheduler">disable_overlap_scheduler (tensorrt_llm.llmapi.TorchLlmArgs attribute)</a>
@@ -2038,8 +2087,6 @@
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TrtLlmArgs.enable_prompt_adapter">enable_prompt_adapter (tensorrt_llm.llmapi.TrtLlmArgs attribute)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TrtLlmArgs.enable_tqdm">enable_tqdm (tensorrt_llm.llmapi.TrtLlmArgs attribute)</a>
-</li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.enable_trtllm_sampler">enable_trtllm_sampler (tensorrt_llm.llmapi.TorchLlmArgs attribute)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchCompileConfig.enable_userbuffers">enable_userbuffers (tensorrt_llm.llmapi.TorchCompileConfig attribute)</a>
 </li>
@@ -2987,8 +3034,6 @@
 </li>
       <li><a href="python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.PositionEmbeddingType.is_alibi">is_alibi() (tensorrt_llm.functional.PositionEmbeddingType method)</a>
 </li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.is_auto_heuristic">is_auto_heuristic (tensorrt_llm.llmapi.NGramDecodingConfig attribute)</a>
-</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MpiCommSession.is_comm_session">is_comm_session() (tensorrt_llm.llmapi.MpiCommSession method)</a>
 </li>
       <li><a href="python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.PositionEmbeddingType.is_deferred">is_deferred() (tensorrt_llm.functional.PositionEmbeddingType method)</a>
@@ -3479,6 +3524,12 @@
 </li>
       <li><a href="python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.ModelConfig.mamba_conv1d_plugin">mamba_conv1d_plugin (tensorrt_llm.runtime.ModelConfig attribute)</a>
 </li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.KvCacheConfig.mamba_ssm_cache_dtype">mamba_ssm_cache_dtype (tensorrt_llm.llmapi.KvCacheConfig attribute)</a>
+
+      <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantConfig.mamba_ssm_cache_dtype">(tensorrt_llm.llmapi.QuantConfig attribute)</a>
+</li>
+      </ul></li>
       <li><a href="python-api/tensorrt_llm.models.html#tensorrt_llm.models.MambaForCausalLM">MambaForCausalLM (class in tensorrt_llm.models)</a>
 </li>
       <li><a href="python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.GenerationSession.mapping">mapping (tensorrt_llm.runtime.GenerationSession attribute)</a>
@@ -3531,6 +3582,24 @@
 
       <ul>
         <li><a href="llm-api/reference.html#id13">(tensorrt_llm.llmapi.BuildCacheConfig property)</a>
+</li>
+      </ul></li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.max_concurrency">max_concurrency (tensorrt_llm.llmapi.AutoDecodingConfig attribute)</a>
+
+      <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.max_concurrency">(tensorrt_llm.llmapi.DraftTargetDecodingConfig attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.max_concurrency">(tensorrt_llm.llmapi.EagleDecodingConfig attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LookaheadDecodingConfig.max_concurrency">(tensorrt_llm.llmapi.LookaheadDecodingConfig attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MedusaDecodingConfig.max_concurrency">(tensorrt_llm.llmapi.MedusaDecodingConfig attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.max_concurrency">(tensorrt_llm.llmapi.MTPDecodingConfig attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.max_concurrency">(tensorrt_llm.llmapi.NGramDecodingConfig attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.max_concurrency">(tensorrt_llm.llmapi.UserProvidedDecodingConfig attribute)</a>
 </li>
       </ul></li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.max_draft_len">max_draft_len (tensorrt_llm.llmapi.AutoDecodingConfig attribute)</a>
@@ -3682,6 +3751,8 @@
       <li><a href="python-api/tensorrt_llm.models.html#tensorrt_llm.models.MedusaForCausalLm">MedusaForCausalLm (class in tensorrt_llm.models)</a>
 </li>
       <li><a href="python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.meshgrid2d">meshgrid2d() (in module tensorrt_llm.functional)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.RequestOutput.PostprocWorker.Output.metrics">metrics (tensorrt_llm.llmapi.RequestOutput.PostprocWorker.Output attribute)</a>
 </li>
       <li><a href="python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.min">min() (in module tensorrt_llm.functional)</a>
 </li>
@@ -3984,6 +4055,8 @@
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.model_dump_json">(tensorrt_llm.llmapi.UserProvidedDecodingConfig method)</a>
 </li>
       </ul></li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AttentionDpConfig.model_extra">model_extra (tensorrt_llm.llmapi.AttentionDpConfig property)</a>
 
       <ul>
@@ -4022,8 +4095,6 @@
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.model_extra">(tensorrt_llm.llmapi.UserProvidedDecodingConfig property)</a>
 </li>
       </ul></li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AttentionDpConfig.model_fields">model_fields (tensorrt_llm.llmapi.AttentionDpConfig attribute)</a>
 
       <ul>
@@ -4511,6 +4582,8 @@
 </li>
       <li><a href="python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.AllReduceStrategy.NCCL">NCCL (tensorrt_llm.functional.AllReduceStrategy attribute)</a>
 </li>
+      <li><a href="python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.AllReduceStrategy.NCCL_SYMMETRIC">NCCL_SYMMETRIC (tensorrt_llm.functional.AllReduceStrategy attribute)</a>
+</li>
       <li><a href="python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.Tensor.ndim">ndim() (tensorrt_llm.functional.Tensor method)</a>
 </li>
       <li><a href="python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.Tensor.network">network (tensorrt_llm.functional.Tensor property)</a>
@@ -4547,10 +4620,10 @@
 </li>
       <li><a href="python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.SamplingConfig.num_beams">num_beams (tensorrt_llm.runtime.SamplingConfig attribute)</a>
 </li>
-      <li><a href="python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.GenerationSession.num_draft_tokens">num_draft_tokens (tensorrt_llm.runtime.GenerationSession attribute)</a>
-</li>
   </ul></td>
   <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.GenerationSession.num_draft_tokens">num_draft_tokens (tensorrt_llm.runtime.GenerationSession attribute)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.num_eagle_layers">num_eagle_layers (tensorrt_llm.llmapi.EagleDecodingConfig attribute)</a>
 </li>
       <li><a href="python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.GenerationSession.num_heads">num_heads (tensorrt_llm.runtime.GenerationSession property)</a>
@@ -5067,6 +5140,8 @@
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TrtLlmArgs.reasoning_parser">(tensorrt_llm.llmapi.TrtLlmArgs attribute)</a>
 </li>
       </ul></li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.RequestOutput.record_stats">record_stats() (tensorrt_llm.llmapi.RequestOutput method)</a>
+</li>
       <li><a href="python-api/tensorrt_llm.models.html#tensorrt_llm.models.RecurrentGemmaForCausalLM">RecurrentGemmaForCausalLM (class in tensorrt_llm.models)</a>
 </li>
       <li><a href="python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.recv">recv() (in module tensorrt_llm.functional)</a>
@@ -5189,10 +5264,10 @@
 </li>
       <li><a href="python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_FP8">RESIDUAL_RMS_NORM_QUANT_FP8 (tensorrt_llm.functional.AllReduceFusionOp attribute)</a>
 </li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.AllReduceFusionOp.RESIDUAL_RMS_NORM_QUANT_NVFP4">RESIDUAL_RMS_NORM_QUANT_NVFP4 (tensorrt_llm.functional.AllReduceFusionOp attribute)</a>
 </li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.AllReduceFusionOp.RESIDUAL_RMS_PREPOST_NORM">RESIDUAL_RMS_PREPOST_NORM (tensorrt_llm.functional.AllReduceFusionOp attribute)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.resource_manager">resource_manager (tensorrt_llm.llmapi.UserProvidedDecodingConfig attribute)</a>
@@ -5208,7 +5283,13 @@
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SamplingParams.return_generation_logits">return_generation_logits (tensorrt_llm.llmapi.SamplingParams attribute)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SamplingParams.return_perf_metrics">return_perf_metrics (tensorrt_llm.llmapi.SamplingParams attribute)</a>
+
+      <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.return_perf_metrics">(tensorrt_llm.llmapi.TorchLlmArgs attribute)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TrtLlmArgs.return_perf_metrics">(tensorrt_llm.llmapi.TrtLlmArgs attribute)</a>
+</li>
+      </ul></li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.revision">revision (tensorrt_llm.llmapi.TorchLlmArgs attribute)</a>
 
       <ul>
@@ -7160,6 +7241,8 @@
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13KvCacheConfig34fillEmptyFieldsFromRuntimeDefaultsERKN12tensorrt_llm7runtime15RuntimeDefaultsE">tensorrt_llm::executor::KvCacheConfig::fillEmptyFieldsFromRuntimeDefaults (C++ function)</a>
 </li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4NK12tensorrt_llm8executor13KvCacheConfig34getAttentionDpEventsGatherPeriodMsEv">tensorrt_llm::executor::KvCacheConfig::getAttentionDpEventsGatherPeriodMs (C++ function)</a>
+</li>
       <li><a href="_cpp_gen/executor.html#_CPPv4NK12tensorrt_llm8executor13KvCacheConfig21getCopyOnPartialReuseEv">tensorrt_llm::executor::KvCacheConfig::getCopyOnPartialReuse (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4NK12tensorrt_llm8executor13KvCacheConfig23getCrossKvCacheFractionEv">tensorrt_llm::executor::KvCacheConfig::getCrossKvCacheFraction (C++ function)</a>
@@ -7188,7 +7271,9 @@
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13KvCacheConfig22kDefaultGpuMemFractionE">tensorrt_llm::executor::KvCacheConfig::kDefaultGpuMemFraction (C++ member)</a>
 </li>
-      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13KvCacheConfig13KvCacheConfigEbRKNSt8optionalI10SizeType32EERKNSt8optionalINSt6vectorI10SizeType32EEEERKNSt8optionalI10SizeType32EERKNSt8optionalI9FloatTypeEERKNSt8optionalI6size_tEEbRKNSt8optionalI9FloatTypeEENSt8optionalI17RetentionPriorityEE6size_tbbbRKNSt8optionalIN12tensorrt_llm7runtime15RuntimeDefaultsEEE">tensorrt_llm::executor::KvCacheConfig::KvCacheConfig (C++ function)</a>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13KvCacheConfig13KvCacheConfigEbRKNSt8optionalI10SizeType32EERKNSt8optionalINSt6vectorI10SizeType32EEEERKNSt8optionalI10SizeType32EERKNSt8optionalI9FloatTypeEERKNSt8optionalI6size_tEEbRKNSt8optionalI9FloatTypeEENSt8optionalI17RetentionPriorityEE6size_tbbb10SizeType32RKNSt8optionalIN12tensorrt_llm7runtime15RuntimeDefaultsEEE">tensorrt_llm::executor::KvCacheConfig::KvCacheConfig (C++ function)</a>
+</li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13KvCacheConfig32mAttentionDpEventsGatherPeriodMsE">tensorrt_llm::executor::KvCacheConfig::mAttentionDpEventsGatherPeriodMs (C++ member)</a>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13KvCacheConfig19mCopyOnPartialReuseE">tensorrt_llm::executor::KvCacheConfig::mCopyOnPartialReuse (C++ member)</a>
 </li>
@@ -7215,6 +7300,8 @@
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13KvCacheConfig16mSinkTokenLengthE">tensorrt_llm::executor::KvCacheConfig::mSinkTokenLength (C++ member)</a>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13KvCacheConfig7mUseUvmE">tensorrt_llm::executor::KvCacheConfig::mUseUvm (C++ member)</a>
+</li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13KvCacheConfig34setAttentionDpEventsGatherPeriodMsE10SizeType32">tensorrt_llm::executor::KvCacheConfig::setAttentionDpEventsGatherPeriodMs (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13KvCacheConfig21setCopyOnPartialReuseEb">tensorrt_llm::executor::KvCacheConfig::setCopyOnPartialReuse (C++ function)</a>
 </li>
@@ -7248,11 +7335,13 @@
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor12KVCacheEventE">tensorrt_llm::executor::KVCacheEvent (C++ struct)</a>
 </li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor12KVCacheEvent15attentionDpRankE">tensorrt_llm::executor::KVCacheEvent::attentionDpRank (C++ member)</a>
+</li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor12KVCacheEvent4dataE">tensorrt_llm::executor::KVCacheEvent::data (C++ member)</a>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor12KVCacheEvent7eventIdE">tensorrt_llm::executor::KVCacheEvent::eventId (C++ member)</a>
 </li>
-      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor12KVCacheEvent12KVCacheEventE6IdType16KVCacheEventData10SizeType32">tensorrt_llm::executor::KVCacheEvent::KVCacheEvent (C++ function)</a>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor12KVCacheEvent12KVCacheEventE6IdType16KVCacheEventData10SizeType32NSt8optionalI10SizeType32EE">tensorrt_llm::executor::KVCacheEvent::KVCacheEvent (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor12KVCacheEvent10windowSizeE">tensorrt_llm::executor::KVCacheEvent::windowSize (C++ member)</a>
 </li>
@@ -7380,7 +7469,7 @@
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor18KVCacheUpdatedData17cacheLevelUpdatedE10SizeType3210SizeType32">tensorrt_llm::executor::KVCacheUpdatedData::cacheLevelUpdated (C++ function)</a>
 </li>
-      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor18KVCacheUpdatedData18KVCacheUpdatedDataE6IdType">tensorrt_llm::executor::KVCacheUpdatedData::KVCacheUpdatedData (C++ function)</a>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor18KVCacheUpdatedData18KVCacheUpdatedDataE6IdType">tensorrt_llm::executor::KVCacheUpdatedData::KVCacheUpdatedData (C++ function)</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor18KVCacheUpdatedData18KVCacheUpdatedDataE6IdTypeNSt8optionalI16KVCacheEventDiffI10SizeType32EEENSt8optionalI16KVCacheEventDiffI10SizeType32EEE">[1]</a>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor18KVCacheUpdatedData8priorityE">tensorrt_llm::executor::KVCacheUpdatedData::priority (C++ member)</a>
 </li>
@@ -8232,9 +8321,25 @@
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization24deserializeKvCacheConfigERNSt7istreamE">tensorrt_llm::executor::Serialization::deserializeKvCacheConfig (C++ function)</a>
 </li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization29deserializeKVCacheCreatedDataERNSt7istreamE">tensorrt_llm::executor::Serialization::deserializeKVCacheCreatedData (C++ function)</a>
+</li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization23deserializeKVCacheEventERNSt7istreamE">tensorrt_llm::executor::Serialization::deserializeKVCacheEvent (C++ function)</a>
+</li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4I0EN12tensorrt_llm8executor13Serialization27deserializeKVCacheEventDiffE16KVCacheEventDiffI1TERNSt7istreamE">tensorrt_llm::executor::Serialization::deserializeKVCacheEventDiff (C++ function)</a>
+</li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization24deserializeKVCacheEventsERNSt6vectorIcEE">tensorrt_llm::executor::Serialization::deserializeKVCacheEvents (C++ function)</a>
+</li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization29deserializeKVCacheRemovedDataERNSt7istreamE">tensorrt_llm::executor::Serialization::deserializeKVCacheRemovedData (C++ function)</a>
+</li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization33deserializeKvCacheRetentionConfigERNSt7istreamE">tensorrt_llm::executor::Serialization::deserializeKvCacheRetentionConfig (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization23deserializeKvCacheStatsERNSt7istreamE">tensorrt_llm::executor::Serialization::deserializeKvCacheStats (C++ function)</a>
+</li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization33deserializeKVCacheStoredBlockDataERNSt7istreamE">tensorrt_llm::executor::Serialization::deserializeKVCacheStoredBlockData (C++ function)</a>
+</li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization28deserializeKVCacheStoredDataERNSt7istreamE">tensorrt_llm::executor::Serialization::deserializeKVCacheStoredData (C++ function)</a>
+</li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization29deserializeKVCacheUpdatedDataERNSt7istreamE">tensorrt_llm::executor::Serialization::deserializeKVCacheUpdatedData (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization34deserializeLookaheadDecodingConfigERNSt7istreamE">tensorrt_llm::executor::Serialization::deserializeLookaheadDecodingConfig (C++ function)</a>
 </li>
@@ -8296,9 +8401,11 @@
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization36deserializeTokenRangeRetentionConfigERNSt7istreamE">tensorrt_llm::executor::Serialization::deserializeTokenRangeRetentionConfig (C++ function)</a>
 </li>
-      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK10LoraConfigRNSt7ostreamE">tensorrt_llm::executor::Serialization::serialize (C++ function)</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK11DebugConfigRNSt7ostreamE">[1]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK11EagleConfigRNSt7ostreamE">[2]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK11MropeConfigRNSt7ostreamE">[3]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK12DecodingModeRNSt7ostreamE">[4]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK12KvCacheStatsRNSt7ostreamE">[5]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK12OutputConfigRNSt7ostreamE">[6]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK12RequestStageRNSt7ostreamE">[7]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK12RequestStatsRNSt7ostreamE">[8]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK13KvCacheConfigRNSt7ostreamE">[9]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK14DecodingConfigRNSt7ostreamE">[10]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK14ExecutorConfigRNSt7ostreamE">[11]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK14IterationStats">[12]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK14IterationStatsRNSt7ostreamE">[13]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK14ParallelConfigRNSt7ostreamE">[14]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK14SamplingConfigRNSt7ostreamE">[15]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK15MultimodalInputRNSt7ostreamE">[16]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK15PeftCacheConfigRNSt7ostreamE">[17]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK15SchedulerConfigRNSt7ostreamE">[18]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK16AdditionalOutputRNSt7ostreamE">[19]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK17SpecDecodingStatsRNSt7ostreamE">[20]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK18ContextPhaseParamsRNSt7ostreamE">[21]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK18DynamicBatchConfigRNSt7ostreamE">[22]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK18OrchestratorConfigRNSt7ostreamE">[23]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK18PromptTuningConfigRNSt7ostreamE">[24]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK18RequestPerfMetricsRNSt7ostreamE">[25]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK19StaticBatchingStatsRNSt7ostreamE">[26]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK20DataTransceiverState">[27]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK20DataTransceiverStateRNSt7ostreamE">[28]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK20GuidedDecodingConfigRNSt7ostreamE">[29]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK20GuidedDecodingParamsRNSt7ostreamE">[30]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK21AdditionalModelOutputRNSt7ostreamE">[31]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK21InflightBatchingStatsRNSt7ostreamE">[32]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK22CacheTransceiverConfigRNSt7ostreamE">[33]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK22DisServingRequestStatsRNSt7ostreamE">[34]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK22KvCacheRetentionConfigRNSt7ostreamE">[35]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK23LookaheadDecodingConfigRNSt7ostreamE">[36]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK24RequestStatsPerIteration">[37]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK24RequestStatsPerIterationRNSt7ostreamE">[38]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK25ExternalDraftTokensConfigRNSt7ostreamE">[39]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK25SpeculativeDecodingConfigRNSt7ostreamE">[40]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK29ExtendedRuntimePerfKnobConfigRNSt7ostreamE">[41]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK33SpeculativeDecodingFastLogitsInfoRNSt7ostreamE">[42]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK6ResultRNSt7ostreamE">[43]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK6TensorRNSt7ostreamE">[44]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK7RequestRNSt7ostreamE">[45]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK8ResponseRNSt7ostreamE">[46]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERKN18RequestPerfMetrics9TimePointERNSt7ostreamE">[47]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERKN22KvCacheRetentionConfig25TokenRangeRetentionConfigERNSt7ostreamE">[48]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERKN8kv_cache10AgentStateERNSt7ostreamE">[49]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERKN8kv_cache10CacheStateERNSt7ostreamE">[50]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERKN8kv_cache11SocketStateERNSt7ostreamE">[51]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERKN8kv_cache9CommStateERNSt7ostreamE">[52]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERKNSt6vectorI14IterationStatsEE">[53]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERKNSt6vectorI24RequestStatsPerIterationEE">[54]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERKNSt6vectorI8ResponseEE">[55]</a>
+      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization22deserializeUniqueTokenERNSt7istreamE">tensorrt_llm::executor::Serialization::deserializeUniqueToken (C++ function)</a>
 </li>
-      <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK10LoraConfig">tensorrt_llm::executor::Serialization::serializedSize (C++ function)</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK11DebugConfig">[1]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK11EagleConfig">[2]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK11MropeConfig">[3]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK12DecodingMode">[4]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK12KvCacheStats">[5]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK12OutputConfig">[6]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK12RequestStage">[7]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK12RequestStats">[8]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK13KvCacheConfig">[9]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK14DecodingConfig">[10]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK14ExecutorConfig">[11]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK14IterationStats">[12]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK14ParallelConfig">[13]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK14SamplingConfig">[14]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK15MultimodalInput">[15]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK15PeftCacheConfig">[16]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK15SchedulerConfig">[17]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK16AdditionalOutput">[18]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK17SpecDecodingStats">[19]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK18ContextPhaseParams">[20]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK18DynamicBatchConfig">[21]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK18OrchestratorConfig">[22]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK18PromptTuningConfig">[23]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK18RequestPerfMetrics">[24]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK19StaticBatchingStats">[25]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK20DataTransceiverState">[26]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK20GuidedDecodingConfig">[27]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK20GuidedDecodingParams">[28]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK21AdditionalModelOutput">[29]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK21InflightBatchingStats">[30]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK22CacheTransceiverConfig">[31]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK22DisServingRequestStats">[32]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK22KvCacheRetentionConfig">[33]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK23LookaheadDecodingConfig">[34]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK24RequestStatsPerIteration">[35]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK25ExternalDraftTokensConfig">[36]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK25SpeculativeDecodingConfig">[37]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK29ExtendedRuntimePerfKnobConfig">[38]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK33SpeculativeDecodingFastLogitsInfo">[39]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK6Result">[40]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK6Tensor">[41]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK7Request">[42]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK8Response">[43]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERKN18RequestPerfMetrics9TimePointE">[44]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERKN22KvCacheRetentionConfig25TokenRangeRetentionConfigE">[45]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERKN8kv_cache10AgentStateE">[46]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERKN8kv_cache10CacheStateE">[47]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERKN8kv_cache11SocketStateE">[48]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERKN8kv_cache9CommStateE">[49]</a>
+      <li><a href="_cpp_gen/executor.html#_CPPv4I0EN12tensorrt_llm8executor13Serialization9serializeEvRK16KVCacheEventDiffI1TERNSt7ostreamE">tensorrt_llm::executor::Serialization::serialize (C++ function)</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK10LoraConfigRNSt7ostreamE">[1]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK11DebugConfigRNSt7ostreamE">[2]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK11EagleConfigRNSt7ostreamE">[3]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK11MropeConfigRNSt7ostreamE">[4]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK12DecodingModeRNSt7ostreamE">[5]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK12KVCacheEventRNSt7ostreamE">[6]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK12KvCacheStatsRNSt7ostreamE">[7]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK12OutputConfigRNSt7ostreamE">[8]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK12RequestStageRNSt7ostreamE">[9]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK12RequestStatsRNSt7ostreamE">[10]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK13KvCacheConfigRNSt7ostreamE">[11]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK14DecodingConfigRNSt7ostreamE">[12]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK14ExecutorConfigRNSt7ostreamE">[13]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK14IterationStats">[14]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK14IterationStatsRNSt7ostreamE">[15]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK14ParallelConfigRNSt7ostreamE">[16]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK14SamplingConfigRNSt7ostreamE">[17]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK15MultimodalInputRNSt7ostreamE">[18]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK15PeftCacheConfigRNSt7ostreamE">[19]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK15SchedulerConfigRNSt7ostreamE">[20]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK16AdditionalOutputRNSt7ostreamE">[21]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK17KVCacheStoredDataRNSt7ostreamE">[22]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK17SpecDecodingStatsRNSt7ostreamE">[23]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK18ContextPhaseParamsRNSt7ostreamE">[24]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK18DynamicBatchConfigRNSt7ostreamE">[25]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK18KVCacheCreatedDataRNSt7ostreamE">[26]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK18KVCacheRemovedDataRNSt7ostreamE">[27]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK18KVCacheUpdatedDataRNSt7ostreamE">[28]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK18OrchestratorConfigRNSt7ostreamE">[29]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK18PromptTuningConfigRNSt7ostreamE">[30]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK18RequestPerfMetricsRNSt7ostreamE">[31]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK19StaticBatchingStatsRNSt7ostreamE">[32]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK20DataTransceiverState">[33]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK20DataTransceiverStateRNSt7ostreamE">[34]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK20GuidedDecodingConfigRNSt7ostreamE">[35]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK20GuidedDecodingParamsRNSt7ostreamE">[36]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK21AdditionalModelOutputRNSt7ostreamE">[37]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK21InflightBatchingStatsRNSt7ostreamE">[38]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK22CacheTransceiverConfigRNSt7ostreamE">[39]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK22DisServingRequestStatsRNSt7ostreamE">[40]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK22KVCacheStoredBlockDataRNSt7ostreamE">[41]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK22KvCacheRetentionConfigRNSt7ostreamE">[42]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK23LookaheadDecodingConfigRNSt7ostreamE">[43]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK24RequestStatsPerIteration">[44]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK24RequestStatsPerIterationRNSt7ostreamE">[45]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK25ExternalDraftTokensConfigRNSt7ostreamE">[46]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK25SpeculativeDecodingConfigRNSt7ostreamE">[47]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK29ExtendedRuntimePerfKnobConfigRNSt7ostreamE">[48]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK33SpeculativeDecodingFastLogitsInfoRNSt7ostreamE">[49]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK6ResultRNSt7ostreamE">[50]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK6TensorRNSt7ostreamE">[51]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK7RequestRNSt7ostreamE">[52]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERK8ResponseRNSt7ostreamE">[53]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERKN12tensorrt_llm7runtime11UniqueTokenERNSt7ostreamE">[54]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERKN18RequestPerfMetrics9TimePointERNSt7ostreamE">[55]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERKN22KvCacheRetentionConfig25TokenRangeRetentionConfigERNSt7ostreamE">[56]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERKN8kv_cache10AgentStateERNSt7ostreamE">[57]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERKN8kv_cache10CacheStateERNSt7ostreamE">[58]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERKN8kv_cache11SocketStateERNSt7ostreamE">[59]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERKN8kv_cache9CommStateERNSt7ostreamE">[60]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERKNSt5dequeI12KVCacheEventEE">[61]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERKNSt6vectorI14IterationStatsEE">[62]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERKNSt6vectorI24RequestStatsPerIterationEE">[63]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization9serializeERKNSt6vectorI8ResponseEE">[64]</a>
+</li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4I0EN12tensorrt_llm8executor13Serialization14serializedSizeE6size_tRK16KVCacheEventDiffI1TE">tensorrt_llm::executor::Serialization::serializedSize (C++ function)</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK10LoraConfig">[1]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK11DebugConfig">[2]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK11EagleConfig">[3]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK11MropeConfig">[4]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK12DecodingMode">[5]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK12KVCacheEvent">[6]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK12KvCacheStats">[7]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK12OutputConfig">[8]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK12RequestStage">[9]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK12RequestStats">[10]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK13KvCacheConfig">[11]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK14DecodingConfig">[12]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK14ExecutorConfig">[13]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK14IterationStats">[14]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK14ParallelConfig">[15]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK14SamplingConfig">[16]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK15MultimodalInput">[17]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK15PeftCacheConfig">[18]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK15SchedulerConfig">[19]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK16AdditionalOutput">[20]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK17KVCacheStoredData">[21]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK17SpecDecodingStats">[22]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK18ContextPhaseParams">[23]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK18DynamicBatchConfig">[24]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK18KVCacheCreatedData">[25]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK18KVCacheRemovedData">[26]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK18KVCacheUpdatedData">[27]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK18OrchestratorConfig">[28]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK18PromptTuningConfig">[29]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK18RequestPerfMetrics">[30]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK19StaticBatchingStats">[31]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK20DataTransceiverState">[32]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK20GuidedDecodingConfig">[33]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK20GuidedDecodingParams">[34]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK21AdditionalModelOutput">[35]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK21InflightBatchingStats">[36]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK22CacheTransceiverConfig">[37]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK22DisServingRequestStats">[38]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK22KVCacheStoredBlockData">[39]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK22KvCacheRetentionConfig">[40]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK23LookaheadDecodingConfig">[41]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK24RequestStatsPerIteration">[42]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK25ExternalDraftTokensConfig">[43]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK25SpeculativeDecodingConfig">[44]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK29ExtendedRuntimePerfKnobConfig">[45]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK33SpeculativeDecodingFastLogitsInfo">[46]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK6Result">[47]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK6Tensor">[48]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK7Request">[49]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERK8Response">[50]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERKN12tensorrt_llm7runtime11UniqueTokenE">[51]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERKN18RequestPerfMetrics9TimePointE">[52]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERKN22KvCacheRetentionConfig25TokenRangeRetentionConfigE">[53]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERKN8kv_cache10AgentStateE">[54]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERKN8kv_cache10CacheStateE">[55]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERKN8kv_cache11SocketStateE">[56]</a>, <a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor13Serialization14serializedSizeERKN8kv_cache9CommStateE">[57]</a>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor5ShapeE">tensorrt_llm::executor::Shape (C++ class)</a>
 </li>
@@ -8754,6 +8861,8 @@
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime22CUDAVirtualMemoryChunkD0Ev">tensorrt_llm::runtime::CUDAVirtualMemoryChunk::~CUDAVirtualMemoryChunk (C++ function)</a>
 </li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime24CudaVirtualMemoryManagerE">tensorrt_llm::runtime::CudaVirtualMemoryManager (C++ class)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4IDpEN12tensorrt_llm7runtime24CudaVirtualMemoryManager3addEv9uintptr_tNSt6stringERRN22CUDAVirtualMemoryChunk10CreatorPtrEDpRR13Configurators">tensorrt_llm::runtime::CudaVirtualMemoryManager::add (C++ function)</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime24CudaVirtualMemoryManager3addE9uintptr_tNSt6stringERR22CUDAVirtualMemoryChunk">[1]</a>, <a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime24CudaVirtualMemoryManager3addE9uintptr_tNSt6stringERRN22CUDAVirtualMemoryChunk10CreatorPtrERRN22CUDAVirtualMemoryChunk13ConfiguratorsE">[2]</a>
@@ -8766,8 +8875,6 @@
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime24CudaVirtualMemoryManager5Entry7mMemoryE">tensorrt_llm::runtime::CudaVirtualMemoryManager::Entry::mMemory (C++ member)</a>
 </li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime24CudaVirtualMemoryManager18materializeWithTagERKNSt6stringE">tensorrt_llm::runtime::CudaVirtualMemoryManager::materializeWithTag (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime24CudaVirtualMemoryManager11mBadHandlesE">tensorrt_llm::runtime::CudaVirtualMemoryManager::mBadHandles (C++ member)</a>
@@ -8932,13 +9039,13 @@
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4NK12tensorrt_llm7runtime7decoder12DecoderState19getLookaheadBuffersEv">tensorrt_llm::runtime::decoder::DecoderState::getLookaheadBuffers (C++ function)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4NK12tensorrt_llm7runtime7decoder12DecoderState15getMaxBatchSizeEv">tensorrt_llm::runtime::decoder::DecoderState::getMaxBatchSize (C++ function)</a>
-</li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4NK12tensorrt_llm7runtime7decoder12DecoderState15getMaxBeamWidthEv">tensorrt_llm::runtime::decoder::DecoderState::getMaxBeamWidth (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4NK12tensorrt_llm7runtime7decoder12DecoderState27getMaxDecodingDecoderTokensEv">tensorrt_llm::runtime::decoder::DecoderState::getMaxDecodingDecoderTokens (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4NK12tensorrt_llm7runtime7decoder12DecoderState26getMaxDecodingEngineTokensEv">tensorrt_llm::runtime::decoder::DecoderState::getMaxDecodingEngineTokens (C++ function)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4NK12tensorrt_llm7runtime7decoder12DecoderState18getMaxNumSequencesEv">tensorrt_llm::runtime::decoder::DecoderState::getMaxNumSequences (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4NK12tensorrt_llm7runtime7decoder12DecoderState20getMaxSequenceLengthEv">tensorrt_llm::runtime::decoder::DecoderState::getMaxSequenceLength (C++ function)</a>
 </li>
@@ -8964,13 +9071,13 @@
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime7decoder12DecoderState20mJointDecodingOutputE">tensorrt_llm::runtime::decoder::DecoderState::mJointDecodingOutput (C++ member)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime7decoder12DecoderState13mMaxBatchSizeE">tensorrt_llm::runtime::decoder::DecoderState::mMaxBatchSize (C++ member)</a>
-</li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime7decoder12DecoderState13mMaxBeamWidthE">tensorrt_llm::runtime::decoder::DecoderState::mMaxBeamWidth (C++ member)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime7decoder12DecoderState25mMaxDecodingDecoderTokensE">tensorrt_llm::runtime::decoder::DecoderState::mMaxDecodingDecoderTokens (C++ member)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime7decoder12DecoderState24mMaxDecodingEngineTokensE">tensorrt_llm::runtime::decoder::DecoderState::mMaxDecodingEngineTokens (C++ member)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime7decoder12DecoderState16mMaxNumSequencesE">tensorrt_llm::runtime::decoder::DecoderState::mMaxNumSequences (C++ member)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime7decoder12DecoderState18mMaxSequenceLengthE">tensorrt_llm::runtime::decoder::DecoderState::mMaxSequenceLength (C++ member)</a>
 </li>
@@ -8985,6 +9092,8 @@
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime7decoder12DecoderState30reshapeCacheIndirectionBuffersE10SizeType3210SizeType3210SizeType32">tensorrt_llm::runtime::decoder::DecoderState::reshapeCacheIndirectionBuffers (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime7decoder12DecoderState33reshapeSpeculativeDecodingBuffersERK23SpeculativeDecodingMode10SizeType32RK11ModelConfigRK11WorldConfigRK13BufferManager">tensorrt_llm::runtime::decoder::DecoderState::reshapeSpeculativeDecodingBuffers (C++ function)</a>
+</li>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime7decoder12DecoderState12setBeamWidthE10SizeType3210SizeType32">tensorrt_llm::runtime::decoder::DecoderState::setBeamWidth (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime7decoder12DecoderState18setGenerationStepsERKNSt6vectorI10SizeType32EE">tensorrt_llm::runtime::decoder::DecoderState::setGenerationSteps (C++ function)</a>
 </li>
@@ -9022,8 +9131,6 @@
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime13decoder_batch7RequestE">tensorrt_llm::runtime::decoder_batch::Request (C++ class)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime13decoder_batch7Request12badWordsListE">tensorrt_llm::runtime::decoder_batch::Request::badWordsList (C++ member)</a>
-</li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime13decoder_batch7Request9BufferPtrE">tensorrt_llm::runtime::decoder_batch::Request::BufferPtr (C++ type)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime13decoder_batch7Request11draftLogitsE">tensorrt_llm::runtime::decoder_batch::Request::draftLogits (C++ member)</a>
@@ -9032,27 +9139,17 @@
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime13decoder_batch7Request11eagleConfigE">tensorrt_llm::runtime::decoder_batch::Request::eagleConfig (C++ member)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime13decoder_batch7Request13embeddingBiasE">tensorrt_llm::runtime::decoder_batch::Request::embeddingBias (C++ member)</a>
-</li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime13decoder_batch7Request5endIdE">tensorrt_llm::runtime::decoder_batch::Request::endId (C++ member)</a>
-</li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime13decoder_batch7Request28generatedTokensPerEngineStepE">tensorrt_llm::runtime::decoder_batch::Request::generatedTokensPerEngineStep (C++ member)</a>
-</li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime13decoder_batch7Request3idsE">tensorrt_llm::runtime::decoder_batch::Request::ids (C++ member)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime13decoder_batch7Request8inputLenE">tensorrt_llm::runtime::decoder_batch::Request::inputLen (C++ member)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime13decoder_batch7Request22lookaheadRuntimeConfigE">tensorrt_llm::runtime::decoder_batch::Request::lookaheadRuntimeConfig (C++ member)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime13decoder_batch7Request12maxNewTokensE">tensorrt_llm::runtime::decoder_batch::Request::maxNewTokens (C++ member)</a>
-</li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime13decoder_batch7Request11medusaPathsE">tensorrt_llm::runtime::decoder_batch::Request::medusaPaths (C++ member)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime13decoder_batch7Request13medusaTreeIdsE">tensorrt_llm::runtime::decoder_batch::Request::medusaTreeIds (C++ member)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime13decoder_batch7Request7RequestE14TensorConstPtr10SizeType32NSt8optionalI10SizeType32EENSt8optionalI10SizeType32EE">tensorrt_llm::runtime::decoder_batch::Request::Request (C++ function)</a>
-</li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime13decoder_batch7Request13stopWordsListE">tensorrt_llm::runtime::decoder_batch::Request::stopWordsList (C++ member)</a>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime13decoder_batch7Request7RequestE10SizeType32">tensorrt_llm::runtime::decoder_batch::Request::Request (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime13decoder_batch7Request14TensorConstPtrE">tensorrt_llm::runtime::decoder_batch::Request::TensorConstPtr (C++ type)</a>
 </li>
@@ -9606,7 +9703,7 @@
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime10GptDecoder8mManagerE">tensorrt_llm::runtime::GptDecoder::mManager (C++ member)</a>
 </li>
-      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime10GptDecoder13mMaxBatchSizeE">tensorrt_llm::runtime::GptDecoder::mMaxBatchSize (C++ member)</a>
+      <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime10GptDecoder16mMaxNumSequencesE">tensorrt_llm::runtime::GptDecoder::mMaxNumSequences (C++ member)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime10GptDecoder15mSamplingConfigE">tensorrt_llm::runtime::GptDecoder::mSamplingConfig (C++ member)</a>
 </li>
@@ -11574,6 +11671,8 @@
 </li>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-latency-kv_cache_free_gpu_mem_fraction">--kv_cache_free_gpu_mem_fraction</a>
 </li>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-latency-mamba_ssm_cache_dtype">--mamba_ssm_cache_dtype</a>
+</li>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-latency-max_input_len">--max_input_len</a>
 </li>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-latency-max_seq_len">--max_seq_len</a>
@@ -11605,6 +11704,10 @@
 </li>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-throughput-concurrency">--concurrency</a>
 </li>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-throughput-custom_module_dirs">--custom_module_dirs</a>
+</li>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-throughput-data_device">--data_device</a>
+</li>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-throughput-dataset">--dataset</a>
 </li>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-throughput-enable_chunked_context">--disable_chunked_context</a>
@@ -11619,9 +11722,13 @@
 </li>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-throughput-extra_llm_api_options">--extra_llm_api_options</a>
 </li>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-throughput-image_data_format">--image_data_format</a>
+</li>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-throughput-iteration_log">--iteration_log</a>
 </li>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-throughput-kv_cache_free_gpu_mem_fraction">--kv_cache_free_gpu_mem_fraction</a>
+</li>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-throughput-mamba_ssm_cache_dtype">--mamba_ssm_cache_dtype</a>
 </li>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-throughput-max_batch_size">--max_batch_size</a>
 </li>
@@ -11632,6 +11739,8 @@
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-throughput-max_seq_len">--max_seq_len</a>
 </li>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-throughput-modality">--modality</a>
+</li>
+        <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-throughput-no_skip_tokenizer_init">--no_skip_tokenizer_init</a>
 </li>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-throughput-num_requests">--num_requests</a>
 </li>
@@ -11713,6 +11822,8 @@
         <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-kv_cache_free_gpu_memory_fraction">--kv_cache_free_gpu_memory_fraction</a>
 </li>
         <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-log_level">--log_level</a>
+</li>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-mamba_ssm_cache_dtype">--mamba_ssm_cache_dtype</a>
 </li>
         <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-max_batch_size">--max_batch_size</a>
 </li>
@@ -11900,6 +12011,8 @@
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.use_relaxed_acceptance_for_thinking">use_relaxed_acceptance_for_thinking (tensorrt_llm.llmapi.MTPDecodingConfig attribute)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.BuildConfig.use_strip_plan">use_strip_plan (tensorrt_llm.llmapi.BuildConfig attribute)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.use_torch_sampler">use_torch_sampler (tensorrt_llm.llmapi.TorchLlmArgs attribute)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.KvCacheConfig.use_uvm">use_uvm (tensorrt_llm.llmapi.KvCacheConfig attribute)</a>
 </li>
@@ -12095,9 +12208,13 @@
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantAlgo.W4A16_GPTQ">W4A16_GPTQ (tensorrt_llm.llmapi.QuantAlgo attribute)</a>
 </li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantAlgo.W4A16_MXFP4">W4A16_MXFP4 (tensorrt_llm.llmapi.QuantAlgo attribute)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantAlgo.W4A8_AWQ">W4A8_AWQ (tensorrt_llm.llmapi.QuantAlgo attribute)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantAlgo.W4A8_MXFP4_FP8">W4A8_MXFP4_FP8 (tensorrt_llm.llmapi.QuantAlgo attribute)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantAlgo.W4A8_MXFP4_MXFP8">W4A8_MXFP4_MXFP8 (tensorrt_llm.llmapi.QuantAlgo attribute)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantAlgo.W4A8_QSERVE_PER_CHANNEL">W4A8_QSERVE_PER_CHANNEL (tensorrt_llm.llmapi.QuantAlgo attribute)</a>
 </li>
@@ -12113,10 +12230,10 @@
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantAlgo.W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN">W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN (tensorrt_llm.llmapi.QuantAlgo attribute)</a>
 </li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantAlgo.W8A8_SQ_PER_TENSOR_PER_TOKEN_PLUGIN">W8A8_SQ_PER_TENSOR_PER_TOKEN_PLUGIN (tensorrt_llm.llmapi.QuantAlgo attribute)</a>
-</li>
   </ul></td>
   <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantAlgo.W8A8_SQ_PER_TENSOR_PER_TOKEN_PLUGIN">W8A8_SQ_PER_TENSOR_PER_TOKEN_PLUGIN (tensorrt_llm.llmapi.QuantAlgo attribute)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantAlgo.W8A8_SQ_PER_TENSOR_PLUGIN">W8A8_SQ_PER_TENSOR_PLUGIN (tensorrt_llm.llmapi.QuantAlgo attribute)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.warn_on_unstable_feature_usage">warn_on_unstable_feature_usage() (tensorrt_llm.llmapi.TorchLlmArgs method)</a>
@@ -12289,9 +12406,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on August 06, 2025.</p>
+  <p>Last updated on August 15, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/a16ba64">a16ba64</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/26f413a">26f413a</a>.</p>
   
 </div></div>
       

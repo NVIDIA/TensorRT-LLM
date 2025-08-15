@@ -59,7 +59,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc6';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.1.0rc0';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -71,7 +71,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.0.0rc6" />
+  <meta name="docsearch:version" content="1.1.0rc0" />
 
 
   </head>
@@ -330,6 +330,12 @@
 <li class="toctree-l1"><a class="reference internal" href="../installation/linux.html">Installing on Linux via <code class="docutils literal notranslate"><span class="pre">pip</span></code></a></li>
 <li class="toctree-l1"><a class="reference internal" href="../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
 </ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Deployment Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../deployment-guide/quick-start-recipe-for-llama4-scout-on-trtllm.html">Quick Start Recipe for Llama4 Scout 17B on TensorRT-LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../deployment-guide/quick-start-recipe-for-deepseek-r1-on-trtllm.html">Quick Start Recipe for DeepSeek R1 on TensorRT-LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../deployment-guide/quick-start-recipe-for-llama3.3-70b-on-trtllm.html">Quick Start Recipe for Llama3.3 70B on TensorRT-LLM - Blackwell &amp; Hopper Hardware</a></li>
+</ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">LLM API</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../llm-api/index.html">LLM API Introduction</a></li>
@@ -419,7 +425,7 @@
 <li class="toctree-l1"><a class="reference internal" href="kv-cache-management.html">KV Cache Management: Pools, Blocks, and Events</a></li>
 <li class="toctree-l1"><a class="reference internal" href="kv-cache-reuse.html">KV cache reuse</a></li>
 <li class="toctree-l1"><a class="reference internal" href="speculative-decoding.html">Speculative Sampling</a></li>
-<li class="toctree-l1"><a class="reference internal" href="disaggregated-service.html">Disaggregated-Service (Experimental)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="disaggregated-service.html">Disaggregated-Service (Prototype)</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Performance</span></p>
 <ul class="nav bd-sidenav">
@@ -509,7 +515,7 @@
 <span id="expert-parallelism"></span><h1>Expert Parallelism in TensorRT-LLM<a class="headerlink" href="#expert-parallelism-in-tensorrt-llm" title="Link to this heading">#</a></h1>
 <section id="mixture-of-experts-moe">
 <h2>Mixture of Experts (MoE)<a class="headerlink" href="#mixture-of-experts-moe" title="Link to this heading">#</a></h2>
-<p>Mixture of Experts (MoE) architectures have been used widely recently, such as <a class="reference external" href="https://huggingface.co/mistralai/Mixtral-8x7B-v0.1/blob/main/config.json">Mistral Mixtral 8x7B</a>. Specifically, MOE’s structure supports multiple parallel Feedforward Neural Network (FFN) layers (called experts) to replace the single FFN layer in the dense model. When tokens arrive, the router layer selects the TopK experts for each token. The corresponding hidden state of the token is then dispatched to the selected TopK experts, respectively. As a result, there are multiple tokens’ hidden states that are dispatched to each expert.</p>
+<p>Mixture of Experts (MoE) architectures have become widespread, with models such as <a class="reference external" href="https://huggingface.co/mistralai/Mixtral-8x7B-v0.1">Mistral Mixtral 8×7B</a>. Specifically, MoE’s structure supports multiple parallel feed-forward neural-network (FFN) layers (called experts) in place of the single FFN layer in a dense model. When tokens arrive, the router layer selects the top-k experts for each token, and the corresponding hidden state of each token is dispatched to those experts. As a result, there are multiple tokens’ hidden states that are dispatched to each expert.</p>
 <img src="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/media/moe_structure.png?raw=true" alt="moe_structure" width="500" height="auto">
 <p><sub>the MOE structure in Switch Transformer: <a class="reference external" href="https://arxiv.org/pdf/2101.03961.pdf">https://arxiv.org/pdf/2101.03961.pdf</a> </sub></p>
 </section>
@@ -522,10 +528,9 @@
 </section>
 <section id="how-to-enable">
 <h2>How to Enable<a class="headerlink" href="#how-to-enable" title="Link to this heading">#</a></h2>
-<p>The default parallel pattern is Tensor Parallel. You can enable Expert Parallel or hybrid parallel by setting <code class="docutils literal notranslate"><span class="pre">--moe_tp_size</span></code> and <code class="docutils literal notranslate"><span class="pre">--moe_ep_size</span></code> when calling <code class="docutils literal notranslate"><span class="pre">convert_coneckpoint.py</span></code>. If only <code class="docutils literal notranslate"><span class="pre">--moe_tp_size</span></code> is provided, TRT-LLM will use Tensor Parallel for the MoE model; if only <code class="docutils literal notranslate"><span class="pre">--moe_ep_size</span></code> is provided, TRT-LLM will use Expert Parallel; if both are provided, the hybrid parallel will be used.</p>
+<p>The default parallel pattern is Tensor Parallel. You can enable Expert Parallel or hybrid parallel by setting <code class="docutils literal notranslate"><span class="pre">--moe_tp_size</span></code> and <code class="docutils literal notranslate"><span class="pre">--moe_ep_size</span></code> when calling <code class="docutils literal notranslate"><span class="pre">convert_checkpoint.py</span></code>. If only <code class="docutils literal notranslate"><span class="pre">--moe_tp_size</span></code> is provided, TRT-LLM will use Tensor Parallel for the MoE model; if only <code class="docutils literal notranslate"><span class="pre">--moe_ep_size</span></code> is provided, TRT-LLM will use Expert Parallel; if both are provided, the hybrid parallel will be used.</p>
 <p>Ensure the product of <code class="docutils literal notranslate"><span class="pre">moe_tp_size</span></code> and <code class="docutils literal notranslate"><span class="pre">moe_ep_size</span></code> is equal to <code class="docutils literal notranslate"><span class="pre">tp_size</span></code>, since the total number of MoE parallelism across all GPUs must match the total number of parallelism in other parts of the model.</p>
-<p>The other parameters related to the MoE structure, such as <code class="docutils literal notranslate"><span class="pre">num_experts_per_tok</span></code> (TopK in previous context) and <code class="docutils literal notranslate"><span class="pre">num_local_experts,</span></code> can be found in the model’s configuration file, such as the one for <a class="reference external" href="https://huggingface.co/mistralai/Mixtral-8x7B-v0.1/blob/main/config.json">Mixtral 8x7B model</a>.
-)</p>
+<p>The other parameters related to the MoE structure, such as <code class="docutils literal notranslate"><span class="pre">num_experts_per_tok</span></code> (TopK in previous context) and <code class="docutils literal notranslate"><span class="pre">num_local_experts,</span></code> can be found in the model’s configuration file, such as the one for <a class="reference external" href="https://huggingface.co/mistralai/Mixtral-8x7B-v0.1/blob/main/config.json">Mixtral 8x7B model</a>.</p>
 </section>
 </section>
 
@@ -675,9 +680,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on August 06, 2025.</p>
+  <p>Last updated on August 15, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/a16ba64">a16ba64</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/26f413a">26f413a</a>.</p>
   
 </div></div>
       

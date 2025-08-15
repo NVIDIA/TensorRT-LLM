@@ -58,7 +58,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc6';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.1.0rc0';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -68,7 +68,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.0.0rc6" />
+  <meta name="docsearch:version" content="1.1.0rc0" />
 
 
   </head>
@@ -323,6 +323,12 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../installation/linux.html">Installing on Linux via <code class="docutils literal notranslate"><span class="pre">pip</span></code></a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
 </ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Deployment Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../deployment-guide/quick-start-recipe-for-llama4-scout-on-trtllm.html">Quick Start Recipe for Llama4 Scout 17B on TensorRT-LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../deployment-guide/quick-start-recipe-for-deepseek-r1-on-trtllm.html">Quick Start Recipe for DeepSeek R1 on TensorRT-LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../deployment-guide/quick-start-recipe-for-llama3.3-70b-on-trtllm.html">Quick Start Recipe for Llama3.3 70B on TensorRT-LLM - Blackwell &amp; Hopper Hardware</a></li>
+</ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">LLM API</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../../../llm-api/index.html">LLM API Introduction</a></li>
@@ -412,7 +418,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/kv-cache-management.html">KV Cache Management: Pools, Blocks, and Events</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/speculative-decoding.html">Speculative Sampling</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../advanced/disaggregated-service.html">Disaggregated-Service (Experimental)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../advanced/disaggregated-service.html">Disaggregated-Service (Prototype)</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Performance</span></p>
 <ul class="nav bd-sidenav">
@@ -519,6 +525,7 @@
 <span class="kn">from</span><span class="w"> </span><span class="nn">..disaggregated_params</span><span class="w"> </span><span class="kn">import</span> <span class="n">DisaggregatedParams</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..llmapi.tracer</span><span class="w"> </span><span class="kn">import</span> <span class="n">global_tracer</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..llmapi.utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">AsyncQueue</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">..metrics</span><span class="w"> </span><span class="kn">import</span> <span class="n">MetricNames</span><span class="p">,</span> <span class="n">MetricsCollector</span><span class="p">,</span> <span class="n">RequestEventTiming</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..sampling_params</span><span class="w"> </span><span class="kn">import</span> <span class="n">LogprobParams</span><span class="p">,</span> <span class="n">SamplingParams</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">.utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">ErrorResponse</span><span class="p">,</span> <span class="n">has_event_loop</span><span class="p">,</span> <span class="n">is_llm_response</span>
 
@@ -554,14 +561,18 @@
 
 
 <span class="k">class</span><span class="w"> </span><span class="nc">ResponseWrapper</span><span class="p">:</span>
-<span class="w">    </span><span class="sd">&quot;&quot;&quot;Wrapper of runtime response with optional outputs computed post runtime.</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">    1. Wrapper of runtime response with optional outputs computed post runtime.</span>
+<span class="sd">    2. A workaround to pass around RequestPerfMetrics.</span>
 <span class="sd">    &quot;&quot;&quot;</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                  <span class="n">response</span><span class="p">:</span> <span class="n">Union</span><span class="p">[</span><span class="s2">&quot;PostprocWorker.Output&quot;</span><span class="p">,</span> <span class="n">tllm</span><span class="o">.</span><span class="n">Response</span><span class="p">],</span>
-                 <span class="n">logprobs</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">LogProbsResult</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
+                 <span class="n">logprobs</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">LogProbsResult</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
+                 <span class="n">request_perf_metrics</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">float</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_response</span> <span class="o">=</span> <span class="n">response</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">logprobs</span> <span class="o">=</span> <span class="n">logprobs</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">request_perf_metrics</span> <span class="o">=</span> <span class="n">request_perf_metrics</span>
 
     <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">_is_llm_response</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
@@ -571,6 +582,14 @@
     <span class="k">def</span><span class="w"> </span><span class="fm">__getattr__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">name</span><span class="p">):</span>
         <span class="n">response</span> <span class="o">=</span> <span class="nb">object</span><span class="o">.</span><span class="fm">__getattribute__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="s1">&#39;_response&#39;</span><span class="p">)</span>
         <span class="k">return</span> <span class="nb">getattr</span><span class="p">(</span><span class="n">response</span><span class="p">,</span> <span class="n">name</span><span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">__getstate__</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="k">return</span> <span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">_response</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">logprobs</span><span class="p">,</span> <span class="bp">self</span><span class="o">.</span><span class="n">request_perf_metrics</span><span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">__setstate__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">state</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">_response</span> <span class="o">=</span> <span class="n">state</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">logprobs</span> <span class="o">=</span> <span class="n">state</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">request_perf_metrics</span> <span class="o">=</span> <span class="n">state</span><span class="p">[</span><span class="mi">2</span><span class="p">]</span>
 
 
 <div class="viewcode-block" id="CompletionOutput">
@@ -653,6 +672,7 @@
         <span class="bp">self</span><span class="o">.</span><span class="n">disaggregated_params</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">decoding_iter</span> <span class="o">=</span> <span class="mi">0</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">_done</span> <span class="o">=</span> <span class="kc">False</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">metrics_dict</span> <span class="o">=</span> <span class="p">{}</span>
 
         <span class="k">if</span> <span class="n">has_event_loop</span><span class="p">():</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">aqueue</span> <span class="o">=</span> <span class="n">AsyncQueue</span><span class="p">()</span>
@@ -708,7 +728,9 @@
                          <span class="n">finish_reasons</span><span class="p">,</span>
                          <span class="n">response_tensors</span><span class="p">,</span>
                          <span class="n">sequence_index</span><span class="p">,</span>
-                         <span class="n">logprobs_result</span><span class="o">=</span><span class="kc">None</span><span class="p">):</span>
+                         <span class="n">logprobs_result</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+                         <span class="n">req_perf_metrics_dict</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span>
+                                                              <span class="nb">float</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot; Handle a single sequence in the response. &quot;&quot;&quot;</span>
 
         <span class="n">seq_idx</span> <span class="o">=</span> <span class="n">sequence_index</span>
@@ -778,6 +800,7 @@
             <span class="k">else</span><span class="p">:</span>
                 <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
                     <span class="sa">f</span><span class="s2">&quot;Unknown finish reason: </span><span class="si">{</span><span class="n">finish_reasons</span><span class="p">[</span><span class="n">src_idx</span><span class="p">]</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">record_stats</span><span class="p">(</span><span class="n">output</span><span class="p">,</span> <span class="n">req_perf_metrics_dict</span><span class="p">)</span>
 
     <span class="nd">@nvtx_range_debug</span><span class="p">(</span><span class="s2">&quot;handle_response&quot;</span><span class="p">,</span>
                       <span class="n">color</span><span class="o">=</span><span class="s2">&quot;red&quot;</span><span class="p">,</span>
@@ -785,7 +808,9 @@
     <span class="k">def</span><span class="w"> </span><span class="nf">_handle_response</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
                          <span class="n">response</span><span class="p">:</span> <span class="n">Union</span><span class="p">[</span><span class="s2">&quot;PostprocWorker.Output&quot;</span><span class="p">,</span> <span class="n">tllm</span><span class="o">.</span><span class="n">Response</span><span class="p">,</span>
                                          <span class="n">ResponseWrapper</span><span class="p">,</span> <span class="n">ErrorResponse</span><span class="p">]):</span>
+        <span class="n">req_perf_metrics_dict</span> <span class="o">=</span> <span class="kc">None</span>
         <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">response</span><span class="p">,</span> <span class="n">ResponseWrapper</span><span class="p">):</span>
+            <span class="n">req_perf_metrics_dict</span> <span class="o">=</span> <span class="n">response</span><span class="o">.</span><span class="n">request_perf_metrics</span>
             <span class="n">logprobs_result</span> <span class="o">=</span> <span class="n">response</span><span class="o">.</span><span class="n">logprobs</span>
             <span class="n">response</span> <span class="o">=</span> <span class="n">response</span><span class="o">.</span><span class="n">_response</span>
         <span class="k">else</span><span class="p">:</span>
@@ -798,6 +823,8 @@
                 <span class="bp">self</span><span class="o">.</span><span class="n">_outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">=</span> <span class="n">response</span><span class="o">.</span><span class="n">res</span>
             <span class="k">else</span><span class="p">:</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">_outputs</span><span class="p">[</span><span class="mi">0</span><span class="p">]</span><span class="o">.</span><span class="n">_postprocess_result</span> <span class="o">=</span> <span class="n">response</span><span class="o">.</span><span class="n">res</span>
+            <span class="k">if</span> <span class="n">response</span><span class="o">.</span><span class="n">metrics</span><span class="p">:</span>
+                <span class="bp">self</span><span class="o">.</span><span class="n">metrics_dict</span> <span class="o">=</span> <span class="n">response</span><span class="o">.</span><span class="n">metrics</span>
 
             <span class="k">if</span> <span class="n">response</span><span class="o">.</span><span class="n">error</span><span class="p">:</span>
                 <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_background_error_handler</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="p">(</span>
@@ -810,7 +837,8 @@
                     <span class="n">handler</span><span class="p">(</span><span class="n">response</span><span class="o">.</span><span class="n">error_msg</span><span class="p">)</span>
 
             <span class="n">response_result</span> <span class="o">=</span> <span class="n">response</span><span class="o">.</span><span class="n">result</span>
-            <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">response_result</span><span class="p">,</span> <span class="s2">&quot;_result&quot;</span><span class="p">):</span>
+            <span class="k">if</span> <span class="nb">hasattr</span><span class="p">(</span><span class="n">response_result</span><span class="p">,</span> <span class="s2">&quot;_result&quot;</span><span class="p">)</span> <span class="ow">and</span> <span class="nb">isinstance</span><span class="p">(</span>
+                    <span class="n">response_result</span><span class="o">.</span><span class="n">_result</span><span class="p">,</span> <span class="nb">bytes</span><span class="p">):</span>
                 <span class="n">response_result</span><span class="o">.</span><span class="n">deserialize</span><span class="p">()</span>
 
             <span class="bp">self</span><span class="o">.</span><span class="n">_done</span> <span class="o">=</span> <span class="n">response_result</span><span class="o">.</span><span class="n">is_final</span>
@@ -829,11 +857,12 @@
             <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">sampling_params</span><span class="o">.</span><span class="n">use_beam_search</span><span class="p">:</span>
                 <span class="k">for</span> <span class="n">beam_idx</span><span class="p">,</span> <span class="n">_</span> <span class="ow">in</span> <span class="nb">enumerate</span><span class="p">(</span><span class="n">response_result</span><span class="o">.</span><span class="n">output_token_ids</span><span class="p">):</span>
                     <span class="bp">self</span><span class="o">.</span><span class="n">_handle_sequence</span><span class="p">(</span><span class="n">finish_reasons</span><span class="p">,</span> <span class="n">response_result</span><span class="p">,</span>
-                                          <span class="n">beam_idx</span><span class="p">,</span> <span class="n">logprobs_result</span><span class="p">)</span>
+                                          <span class="n">beam_idx</span><span class="p">,</span> <span class="n">logprobs_result</span><span class="p">,</span>
+                                          <span class="n">req_perf_metrics_dict</span><span class="p">)</span>
             <span class="k">else</span><span class="p">:</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">_handle_sequence</span><span class="p">(</span><span class="n">finish_reasons</span><span class="p">,</span> <span class="n">response_result</span><span class="p">,</span>
                                       <span class="n">response_result</span><span class="o">.</span><span class="n">sequence_index</span><span class="p">,</span>
-                                      <span class="n">logprobs_result</span><span class="p">)</span>
+                                      <span class="n">logprobs_result</span><span class="p">,</span> <span class="n">req_perf_metrics_dict</span><span class="p">)</span>
 
             <span class="k">if</span> <span class="n">response_result</span><span class="o">.</span><span class="n">context_logits</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">_context_logits</span> <span class="o">=</span> <span class="n">response_result</span><span class="o">.</span><span class="n">context_logits</span>
@@ -848,6 +877,29 @@
                 <span class="n">handler</span><span class="p">(</span><span class="n">response</span><span class="o">.</span><span class="n">error_msg</span><span class="p">)</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="sa">f</span><span class="s2">&quot;Unknown response type: </span><span class="si">{</span><span class="n">response</span><span class="si">}</span><span class="s2">&quot;</span><span class="p">)</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">record_stats</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
+                     <span class="n">output</span><span class="p">:</span> <span class="n">CompletionOutput</span><span class="p">,</span>
+                     <span class="n">stats</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">float</span><span class="p">]]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="kc">None</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Record the stats of the generation result.</span>
+
+<span class="sd">        Args:</span>
+<span class="sd">            output (CompletionOutput): The output of the generation result.</span>
+<span class="sd">            stats (Optional[dict[str, float]]): The stats of the generation result. Defaults to None.</span>
+<span class="sd">        &quot;&quot;&quot;</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="n">stats</span><span class="p">:</span>
+            <span class="k">return</span>
+        <span class="n">metrics_stats</span> <span class="o">=</span> <span class="p">{}</span>
+        <span class="k">if</span> <span class="n">output</span><span class="o">.</span><span class="n">finish_reason</span><span class="p">:</span>
+            <span class="n">metrics_stats</span><span class="o">.</span><span class="n">update</span><span class="p">({</span>
+                <span class="n">MetricsCollector</span><span class="o">.</span><span class="n">labelname_finish_reason</span><span class="p">:</span>
+                <span class="n">output</span><span class="o">.</span><span class="n">finish_reason</span>
+            <span class="p">})</span>
+        <span class="n">processed_metrics_stat</span> <span class="o">=</span> <span class="n">_process_req_perf_metrics</span><span class="p">(</span>
+            <span class="n">stats</span><span class="p">,</span> <span class="nb">len</span><span class="p">(</span><span class="n">output</span><span class="o">.</span><span class="n">token_ids</span><span class="p">),</span> <span class="bp">self</span><span class="o">.</span><span class="n">sampling_params</span><span class="o">.</span><span class="n">n</span> <span class="o">&gt;</span> <span class="mi">1</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">processed_metrics_stat</span><span class="p">:</span>
+            <span class="n">metrics_stats</span><span class="o">.</span><span class="n">update</span><span class="p">(</span><span class="n">processed_metrics_stat</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">metrics_dict</span> <span class="o">=</span> <span class="n">metrics_stats</span>
 
 
 <span class="k">class</span><span class="w"> </span><span class="nc">DetokenizedGenerationResultBase</span><span class="p">(</span><span class="n">GenerationResultBase</span><span class="p">):</span>
@@ -1195,6 +1247,33 @@
 
     <span class="k">return</span> <span class="n">LogProbsResult</span><span class="p">(</span><span class="n">prompt</span><span class="o">=</span><span class="n">prompt_logprobs</span><span class="p">,</span>
                           <span class="n">generation</span><span class="o">=</span><span class="n">generation_logprobs</span><span class="p">)</span>
+
+
+<span class="k">def</span><span class="w"> </span><span class="nf">_process_req_perf_metrics</span><span class="p">(</span>
+        <span class="n">req_perf_metrics_dict</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">float</span><span class="p">]],</span>
+        <span class="n">output_length</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
+        <span class="n">is_multiple_response</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="kc">False</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">dict</span><span class="p">[</span><span class="n">MetricNames</span><span class="p">,</span> <span class="nb">float</span><span class="p">]:</span>
+    <span class="n">stat</span> <span class="o">=</span> <span class="p">{}</span>
+    <span class="k">if</span> <span class="ow">not</span> <span class="n">req_perf_metrics_dict</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">stat</span>
+    <span class="n">ttft</span> <span class="o">=</span> <span class="n">req_perf_metrics_dict</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">RequestEventTiming</span><span class="o">.</span><span class="n">FIRST_TOKEN_TIME</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span> <span class="o">-</span> \
+           <span class="n">req_perf_metrics_dict</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">RequestEventTiming</span><span class="o">.</span><span class="n">ARRIVAL_TIME</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
+    <span class="n">e2e</span> <span class="o">=</span> <span class="n">req_perf_metrics_dict</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">RequestEventTiming</span><span class="o">.</span><span class="n">LAST_TOKEN_TIME</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span> <span class="o">-</span> \
+          <span class="n">req_perf_metrics_dict</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">RequestEventTiming</span><span class="o">.</span><span class="n">ARRIVAL_TIME</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
+    <span class="n">request_queue_time</span> <span class="o">=</span> <span class="n">req_perf_metrics_dict</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">RequestEventTiming</span><span class="o">.</span><span class="n">FIRST_SCHEDULED_TIME</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span> <span class="o">-</span> \
+                         <span class="n">req_perf_metrics_dict</span><span class="o">.</span><span class="n">get</span><span class="p">(</span><span class="n">RequestEventTiming</span><span class="o">.</span><span class="n">ARRIVAL_TIME</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
+    <span class="n">stat</span> <span class="o">=</span> <span class="p">{</span>
+        <span class="n">MetricNames</span><span class="o">.</span><span class="n">TTFT</span><span class="p">:</span> <span class="n">ttft</span><span class="p">,</span>
+        <span class="n">MetricNames</span><span class="o">.</span><span class="n">E2E</span><span class="p">:</span> <span class="n">e2e</span><span class="p">,</span>
+        <span class="n">MetricNames</span><span class="o">.</span><span class="n">REQUEST_QUEUE_TIME</span><span class="p">:</span> <span class="n">request_queue_time</span>
+    <span class="p">}</span>
+    <span class="k">if</span> <span class="n">output_length</span> <span class="o">&gt;</span> <span class="mi">1</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">is_multiple_response</span><span class="p">:</span>
+        <span class="n">tpot</span> <span class="o">=</span> <span class="p">(</span><span class="n">req_perf_metrics_dict</span><span class="o">.</span><span class="n">get</span><span class="p">(</span>
+            <span class="n">RequestEventTiming</span><span class="o">.</span><span class="n">LAST_TOKEN_TIME</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span> <span class="o">-</span> <span class="n">req_perf_metrics_dict</span><span class="o">.</span><span class="n">get</span><span class="p">(</span>
+                <span class="n">RequestEventTiming</span><span class="o">.</span><span class="n">FIRST_TOKEN_TIME</span><span class="p">,</span> <span class="mi">0</span><span class="p">))</span> <span class="o">/</span> <span class="p">(</span><span class="n">output_length</span> <span class="o">-</span> <span class="mi">1</span><span class="p">)</span>
+        <span class="n">stat</span><span class="o">.</span><span class="n">update</span><span class="p">({</span><span class="n">MetricNames</span><span class="o">.</span><span class="n">TPOT</span><span class="p">:</span> <span class="n">tpot</span><span class="p">})</span>
+    <span class="n">stat</span> <span class="o">=</span> <span class="nb">dict</span><span class="p">(</span><span class="nb">filter</span><span class="p">(</span><span class="k">lambda</span> <span class="n">item</span><span class="p">:</span> <span class="n">item</span><span class="p">[</span><span class="mi">1</span><span class="p">]</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">,</span> <span class="n">stat</span><span class="o">.</span><span class="n">items</span><span class="p">()))</span>
+    <span class="k">return</span> <span class="n">stat</span>
 </pre></div>
 
                 </article>
@@ -1306,9 +1385,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on August 06, 2025.</p>
+  <p>Last updated on August 15, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/a16ba64">a16ba64</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/26f413a">26f413a</a>.</p>
   
 </div></div>
       

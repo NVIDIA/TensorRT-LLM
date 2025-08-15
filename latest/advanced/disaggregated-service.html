@@ -9,7 +9,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
-    <title>Disaggregated-Service (Experimental) &#8212; TensorRT-LLM</title>
+    <title>Disaggregated-Service (Prototype) &#8212; TensorRT-LLM</title>
   
   
   
@@ -59,7 +59,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc6';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.1.0rc0';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -71,7 +71,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.0.0rc6" />
+  <meta name="docsearch:version" content="1.1.0rc0" />
 
 
   </head>
@@ -330,6 +330,12 @@
 <li class="toctree-l1"><a class="reference internal" href="../installation/linux.html">Installing on Linux via <code class="docutils literal notranslate"><span class="pre">pip</span></code></a></li>
 <li class="toctree-l1"><a class="reference internal" href="../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
 </ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Deployment Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../deployment-guide/quick-start-recipe-for-llama4-scout-on-trtllm.html">Quick Start Recipe for Llama4 Scout 17B on TensorRT-LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../deployment-guide/quick-start-recipe-for-deepseek-r1-on-trtllm.html">Quick Start Recipe for DeepSeek R1 on TensorRT-LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../deployment-guide/quick-start-recipe-for-llama3.3-70b-on-trtllm.html">Quick Start Recipe for Llama3.3 70B on TensorRT-LLM - Blackwell &amp; Hopper Hardware</a></li>
+</ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">LLM API</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../llm-api/index.html">LLM API Introduction</a></li>
@@ -419,7 +425,7 @@
 <li class="toctree-l1"><a class="reference internal" href="kv-cache-management.html">KV Cache Management: Pools, Blocks, and Events</a></li>
 <li class="toctree-l1"><a class="reference internal" href="kv-cache-reuse.html">KV cache reuse</a></li>
 <li class="toctree-l1"><a class="reference internal" href="speculative-decoding.html">Speculative Sampling</a></li>
-<li class="toctree-l1 current active"><a class="current reference internal" href="#">Disaggregated-Service (Experimental)</a></li>
+<li class="toctree-l1 current active"><a class="current reference internal" href="#">Disaggregated-Service (Prototype)</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Performance</span></p>
 <ul class="nav bd-sidenav">
@@ -488,7 +494,7 @@
         <i class="fa-solid fa-home"></i>
       </a>
     </li>
-    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">Disaggregated-Service (Experimental)</span></li>
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">Disaggregated-Service (Prototype)</span></li>
   </ul>
 </nav>
 </div>
@@ -505,12 +511,12 @@
 <div id="searchbox"></div>
                 <article class="bd-article">
                   
-  <section id="disaggregated-service-experimental">
-<span id="disaggregated-service"></span><h1>Disaggregated-Service (Experimental)<a class="headerlink" href="#disaggregated-service-experimental" title="Link to this heading">#</a></h1>
+  <section id="disaggregated-service-prototype">
+<span id="disaggregated-service"></span><h1>Disaggregated-Service (Prototype)<a class="headerlink" href="#disaggregated-service-prototype" title="Link to this heading">#</a></h1>
 <div class="admonition note">
 <p class="admonition-title">Note</p>
 <p>Note:
-This feature is currently experimental, and the related API is subjected to change in future versions.</p>
+This feature is currently in prototype, and the related API is subjected to change in future versions.</p>
 </div>
 <p>Currently TRT-LLM supports <code class="docutils literal notranslate"><span class="pre">disaggregated-service</span></code>, where the context and generation phases of a request can run on different executors. TRT-LLM’s disaggregated service relies on the executor API, please make sure to read the <a class="reference internal" href="executor.html"><span class="std std-doc">executor page</span></a> before reading the document.</p>
 <p>For more information on disaggregated service in LLM inference, one can refer to papers such as <a class="reference external" href="https://arxiv.org/abs/2401.09670">DistServe</a>, <a class="reference external" href="https://arxiv.org/abs/2311.18677">SplitWise</a>.</p>
@@ -552,14 +558,6 @@ This feature is currently experimental, and the related API is subjected to chan
 </section>
 <section id="debugging-faqs">
 <h3>Debugging FAQs<a class="headerlink" href="#debugging-faqs" title="Link to this heading">#</a></h3>
-<p><em>Q. How to handle error <code class="docutils literal notranslate"><span class="pre">Disaggregated</span> <span class="pre">serving</span> <span class="pre">is</span> <span class="pre">not</span> <span class="pre">enabled,</span> <span class="pre">please</span> <span class="pre">check</span> <span class="pre">the</span> <span class="pre">configuration?</span></code></em></p>
-<p>A. please set <code class="docutils literal notranslate"><span class="pre">backendType</span></code> of <code class="docutils literal notranslate"><span class="pre">CacheTransceiverConfig</span></code>.</p>
-<div class="highlight-cpp notranslate"><div class="highlight"><pre><span></span><span class="n">ExecutorConfig</span><span class="w"> </span><span class="n">executorConfig</span><span class="p">{...};</span>
-
-<span class="n">executorConfig</span><span class="p">.</span><span class="n">setCacheTransceiverConfig</span><span class="p">(</span><span class="n">texec</span><span class="o">::</span><span class="n">CacheTransceiverConfig</span><span class="p">(</span><span class="n">BackendType</span><span class="o">::</span><span class="n">DEFAULT</span><span class="p">));</span>
-</pre></div>
-</div>
-<p>When the environment variable <code class="docutils literal notranslate"><span class="pre">TRTLLM_USE_MPI_KVCACHE=1</span></code> is set, TRT-LLM will transfer the KV cache using <code class="docutils literal notranslate"><span class="pre">CUDA-aware</span> <span class="pre">MPI</span></code>. All executor processes involved must share the same MPI world communicator. Consequently, with <code class="docutils literal notranslate"><span class="pre">TRTLLM_USE_MPI_KVCACHE=1</span></code>, TRT-LLM only supports launching multiple executors via <code class="docutils literal notranslate"><span class="pre">MPI</span></code>. Additionally, the <code class="docutils literal notranslate"><span class="pre">CommunicationMode</span></code> for the executors must be set to <code class="docutils literal notranslate"><span class="pre">kLEADER</span></code> or <code class="docutils literal notranslate"><span class="pre">kORCHESTRATOR</span></code> with <code class="docutils literal notranslate"><span class="pre">SpawnProcesses=false</span></code> for the <code class="docutils literal notranslate"><span class="pre">disaggregated-service</span></code>. These restrictions do not apply when <code class="docutils literal notranslate"><span class="pre">TRTLLM_USE_UCX_KVCACHE=1</span></code> is set.</p>
 <p><em>Q. Does TRT-LLM support using GPU direct RDMA for inter-node KV Cache transfer?</em></p>
 <p>A. Yes, TRT-LLM supports using GPU direct RDMA for inter-node KV cache transfer.</p>
 <p><em>Q. What causes the substantial bandwidth fluctuations in kvCache transfers, especially during the first few requests following service initialization?</em></p>
@@ -724,9 +722,9 @@ This feature is currently experimental, and the related API is subjected to chan
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on August 06, 2025.</p>
+  <p>Last updated on August 15, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/a16ba64">a16ba64</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/26f413a">26f413a</a>.</p>
   
 </div></div>
       

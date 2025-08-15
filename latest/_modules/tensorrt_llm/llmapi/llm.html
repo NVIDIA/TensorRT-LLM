@@ -58,7 +58,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc6';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.1.0rc0';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -68,7 +68,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.0.0rc6" />
+  <meta name="docsearch:version" content="1.1.0rc0" />
 
 
   </head>
@@ -323,6 +323,12 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../installation/linux.html">Installing on Linux via <code class="docutils literal notranslate"><span class="pre">pip</span></code></a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
 </ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Deployment Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../../deployment-guide/quick-start-recipe-for-llama4-scout-on-trtllm.html">Quick Start Recipe for Llama4 Scout 17B on TensorRT-LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../deployment-guide/quick-start-recipe-for-deepseek-r1-on-trtllm.html">Quick Start Recipe for DeepSeek R1 on TensorRT-LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../deployment-guide/quick-start-recipe-for-llama3.3-70b-on-trtllm.html">Quick Start Recipe for Llama3.3 70B on TensorRT-LLM - Blackwell &amp; Hopper Hardware</a></li>
+</ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">LLM API</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../../../llm-api/index.html">LLM API Introduction</a></li>
@@ -412,7 +418,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/kv-cache-management.html">KV Cache Management: Pools, Blocks, and Events</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../advanced/speculative-decoding.html">Speculative Sampling</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../advanced/disaggregated-service.html">Disaggregated-Service (Experimental)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../advanced/disaggregated-service.html">Disaggregated-Service (Prototype)</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Performance</span></p>
 <ul class="nav bd-sidenav">
@@ -536,8 +542,8 @@
 <span class="kn">from</span><span class="w"> </span><span class="nn">..sampling_params</span><span class="w"> </span><span class="kn">import</span> <span class="n">SamplingParams</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..scheduling_params</span><span class="w"> </span><span class="kn">import</span> <span class="n">SchedulingParams</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">.llm_args</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">TORCH_LLMARGS_EXPLICIT_DOCSTRING</span><span class="p">,</span>
-                       <span class="n">TRT_LLMARGS_EXPLICIT_DOCSTRING</span><span class="p">,</span> <span class="n">NGramDecodingConfig</span><span class="p">,</span>
-                       <span class="n">PeftCacheConfig</span><span class="p">,</span> <span class="n">PybindMirror</span><span class="p">,</span> <span class="n">TorchLlmArgs</span><span class="p">,</span> <span class="n">TrtLlmArgs</span><span class="p">)</span>
+                       <span class="n">TRT_LLMARGS_EXPLICIT_DOCSTRING</span><span class="p">,</span> <span class="n">PeftCacheConfig</span><span class="p">,</span>
+                       <span class="n">PybindMirror</span><span class="p">,</span> <span class="n">TorchLlmArgs</span><span class="p">,</span> <span class="n">TrtLlmArgs</span><span class="p">)</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">.llm_utils</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">CachedModelLoader</span><span class="p">,</span> <span class="n">KvCacheRetentionConfig</span><span class="p">,</span>
                         <span class="n">LlmBuildStats</span><span class="p">,</span> <span class="n">ModelLoader</span><span class="p">,</span> <span class="n">_ModelRuntimeContext</span><span class="p">)</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">.mpi_session</span><span class="w"> </span><span class="kn">import</span> <span class="n">MpiPoolSession</span><span class="p">,</span> <span class="n">external_mpi_comm_available</span>
@@ -913,13 +919,12 @@
                         <span class="s1">&#39;multimodal_input&#39;</span><span class="p">),</span>
                     <span class="n">multimodal_data</span><span class="o">=</span><span class="n">extra_processed_inputs</span><span class="o">.</span><span class="n">get</span><span class="p">(</span>
                         <span class="s1">&#39;multimodal_data&#39;</span><span class="p">))</span>
-                <span class="c1"># Convert to shared tensor handle to reduce IPC overhead</span>
-                <span class="c1"># for values with non-selected keys, it&#39;s no-op</span>
-                <span class="n">multimodal_params</span><span class="o">.</span><span class="n">to_handle</span><span class="p">(</span><span class="s2">&quot;multimodal_data&quot;</span><span class="p">,</span>
-                                            <span class="n">key</span><span class="o">=</span><span class="s2">&quot;multimodal_embedding&quot;</span><span class="p">)</span>
                 <span class="c1"># Only pass it if it has content</span>
                 <span class="k">if</span> <span class="ow">not</span> <span class="n">multimodal_params</span><span class="o">.</span><span class="n">has_content</span><span class="p">():</span>
                     <span class="n">multimodal_params</span> <span class="o">=</span> <span class="kc">None</span>
+                <span class="k">else</span><span class="p">:</span>
+                    <span class="c1"># Convert to shared tensor handle to reduce IPC overhead</span>
+                    <span class="n">multimodal_params</span><span class="o">.</span><span class="n">to_handle</span><span class="p">(</span><span class="s2">&quot;multimodal_data&quot;</span><span class="p">)</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="k">raise</span> <span class="ne">TypeError</span><span class="p">(</span>
                 <span class="sa">f</span><span class="s2">&quot;The inputs must be type str or list of int, but got </span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="n">inputs</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span>
@@ -1058,7 +1063,7 @@
         <span class="k">if</span> <span class="n">sampling_params</span><span class="o">.</span><span class="n">_stream_interval</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
             <span class="n">sampling_params</span><span class="o">.</span><span class="n">_stream_interval</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="p">,</span>
                                                        <span class="s2">&quot;stream_interval&quot;</span><span class="p">,</span> <span class="mi">1</span><span class="p">)</span>
-
+        <span class="n">sampling_params</span><span class="o">.</span><span class="n">return_perf_metrics</span> <span class="o">=</span> <span class="n">sampling_params</span><span class="o">.</span><span class="n">return_perf_metrics</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">return_perf_metrics</span>
         <span class="k">return</span> <span class="n">sampling_params</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">_check_arguments</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">prompt_len</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span> <span class="n">query_len</span><span class="p">:</span> <span class="nb">int</span><span class="p">,</span>
@@ -1525,32 +1530,10 @@
 
         <span class="n">spec_config</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">speculative_config</span>
         <span class="n">max_batch_size</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="o">.</span><span class="n">max_batch_size</span>
-        <span class="c1"># Apply default heuristic to AutoDecodingConfig based on benchmark results</span>
-        <span class="c1"># With concurrency &lt;= 4, max_draft_len = 5, max_matching_ngram_size = 3</span>
-        <span class="c1"># With concurrency &lt;= 32, max_draft_len = 3, max_matching_ngram_size = 5</span>
-        <span class="c1"># With concurrency &gt; 32, speculative decoding is disabled.</span>
+
         <span class="k">if</span> <span class="n">spec_config</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">spec_config</span><span class="o">.</span><span class="n">decoding_type</span> <span class="o">==</span> <span class="s2">&quot;AUTO&quot;</span><span class="p">:</span>
-            <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">disable_overlap_scheduler</span><span class="p">:</span>
-                <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span>
-                    <span class="s2">&quot;Disable overlap scheduler to enable Auto speculative decoding with Ngram.&quot;</span>
-                <span class="p">)</span>
-                <span class="c1"># From benchmark results, we found that NGram speculative decoding provides better performance than overlap scheduler with low concurrency &lt;= 32.</span>
-                <span class="c1"># Therefore, we disable overlap scheduler to enable NGram speculative decoding.</span>
-                <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">disable_overlap_scheduler</span> <span class="o">=</span> <span class="kc">True</span>
-
-            <span class="n">spec_config</span> <span class="o">=</span> <span class="n">NGramDecodingConfig</span><span class="p">(</span>
-                <span class="n">max_draft_len</span><span class="o">=</span><span class="mi">5</span> <span class="k">if</span> <span class="n">max_batch_size</span> <span class="o">&lt;=</span> <span class="mi">4</span> <span class="k">else</span> <span class="mi">3</span><span class="p">,</span>
-                <span class="n">max_matching_ngram_size</span><span class="o">=</span><span class="mi">3</span> <span class="k">if</span> <span class="n">max_batch_size</span> <span class="o">&lt;=</span> <span class="mi">4</span> <span class="k">else</span> <span class="mi">5</span><span class="p">,</span>
-                <span class="n">is_keep_all</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
-                <span class="n">is_use_oldest</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
-                <span class="n">is_public_pool</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
-                <span class="c1"># Flag to indicate the NGramDecodingConfig is instantiated by auto heuristic.</span>
-                <span class="n">is_auto_heuristic</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
-            <span class="p">)</span>
-
-            <span class="n">logger</span><span class="o">.</span><span class="n">info</span><span class="p">(</span>
-                <span class="sa">f</span><span class="s2">&quot;Apply heuristic to incomplete NGramDecodingConfig: max_draft_len=</span><span class="si">{</span><span class="n">spec_config</span><span class="o">.</span><span class="n">max_draft_len</span><span class="si">}</span><span class="s2">, max_matching_ngram_size=</span><span class="si">{</span><span class="n">spec_config</span><span class="o">.</span><span class="n">max_matching_ngram_size</span><span class="si">}</span><span class="s2">&quot;</span>
-            <span class="p">)</span>
+            <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm._torch.speculative</span><span class="w"> </span><span class="kn">import</span> <span class="n">suggest_spec_config</span>
+            <span class="n">spec_config</span> <span class="o">=</span> <span class="n">suggest_spec_config</span><span class="p">(</span><span class="n">max_batch_size</span><span class="p">)</span>
 
         <span class="n">update_executor_config</span><span class="p">(</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">_executor_config</span><span class="p">,</span>
@@ -1753,9 +1736,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on August 06, 2025.</p>
+  <p>Last updated on August 15, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/a16ba64">a16ba64</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/26f413a">26f413a</a>.</p>
   
 </div></div>
       

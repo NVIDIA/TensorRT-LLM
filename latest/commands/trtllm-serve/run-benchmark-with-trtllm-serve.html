@@ -59,7 +59,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc6';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.1.0rc0';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -71,7 +71,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.0.0rc6" />
+  <meta name="docsearch:version" content="1.1.0rc0" />
 
 
   </head>
@@ -330,6 +330,12 @@
 <li class="toctree-l1"><a class="reference internal" href="../../installation/linux.html">Installing on Linux via <code class="docutils literal notranslate"><span class="pre">pip</span></code></a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
 </ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Deployment Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../../deployment-guide/quick-start-recipe-for-llama4-scout-on-trtllm.html">Quick Start Recipe for Llama4 Scout 17B on TensorRT-LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../deployment-guide/quick-start-recipe-for-deepseek-r1-on-trtllm.html">Quick Start Recipe for DeepSeek R1 on TensorRT-LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../deployment-guide/quick-start-recipe-for-llama3.3-70b-on-trtllm.html">Quick Start Recipe for Llama3.3 70B on TensorRT-LLM - Blackwell &amp; Hopper Hardware</a></li>
+</ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">LLM API</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../../llm-api/index.html">LLM API Introduction</a></li>
@@ -419,7 +425,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../advanced/kv-cache-management.html">KV Cache Management: Pools, Blocks, and Events</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../advanced/speculative-decoding.html">Speculative Sampling</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../advanced/disaggregated-service.html">Disaggregated-Service (Experimental)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../advanced/disaggregated-service.html">Disaggregated-Service (Prototype)</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Performance</span></p>
 <ul class="nav bd-sidenav">
@@ -512,12 +518,13 @@
 <h1>Run benchmarking with <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code><a class="headerlink" href="#run-benchmarking-with-trtllm-serve" title="Link to this heading">#</a></h1>
 <p>TensorRT-LLM provides the OpenAI-compatiable API via <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code> command.
 A complete reference for the API is available in the <a class="reference external" href="https://platform.openai.com/docs/api-reference">OpenAI API Reference</a>.</p>
-<p>This step-by-step tutorial covers the following topics for running online serving benchmarking with Llama 3.1 70B:</p>
+<p>This step-by-step tutorial covers the following topics for running online serving benchmarking with Llama 3.1 70B and Qwen2.5-VL-7B for multimodal models:</p>
 <ul class="simple">
 <li><p>Methodology Introduction</p></li>
 <li><p>Launch the OpenAI-Compatibale Server with NGC container</p></li>
 <li><p>Run the performance benchmark</p></li>
 <li><p>Using <code class="docutils literal notranslate"><span class="pre">extra_llm_api_options</span></code></p></li>
+<li><p>Multimodal Serving and Benchmarking</p></li>
 </ul>
 <section id="methodology-introduction">
 <h2>Methodology Introduction<a class="headerlink" href="#methodology-introduction" title="Link to this heading">#</a></h2>
@@ -728,6 +735,79 @@ e.g</p>
 <p>See the <a class="reference external" href="https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs">TorchLlmArgs class</a> for the full list of options which can be used in the extra_llm_api_options<code class="docutils literal notranslate"><span class="pre">.</span></code></p>
 </section>
 </section>
+<section id="multimodal-serving-and-benchmarking">
+<h2>Multimodal Serving and Benchmarking<a class="headerlink" href="#multimodal-serving-and-benchmarking" title="Link to this heading">#</a></h2>
+<p>TensorRT-LLM supports multimodal models for both serving and benchmarking. This section covers how to set up multimodal serving and run benchmarks for multimodal models.</p>
+<section id="setting-up-multimodal-serving">
+<h3>Setting up Multimodal Serving<a class="headerlink" href="#setting-up-multimodal-serving" title="Link to this heading">#</a></h3>
+<p>Here’s an example of setting up multimodal serving with Qwen2.5-VL:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="ch">#!/bin/bash</span>
+<span class="nv">model_path</span><span class="o">=</span>/path/to/qwen2.5vl-7B_model
+
+trtllm-serve<span class="w"> </span><span class="si">${</span><span class="nv">model_path</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--max_batch_size<span class="w"> </span><span class="m">64</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--max_num_tokens<span class="w"> </span><span class="m">8192</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--max_seq_len<span class="w"> </span><span class="m">4096</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--kv_cache_free_gpu_memory_fraction<span class="w"> </span><span class="m">0</span>.9<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--tp_size<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--ep_size<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--trust_remote_code
+</pre></div>
+</div>
+</section>
+<section id="multimodal-benchmarking">
+<h3>Multimodal Benchmarking<a class="headerlink" href="#multimodal-benchmarking" title="Link to this heading">#</a></h3>
+<p>For multimodal serving benchmarks, you can use the <code class="docutils literal notranslate"><span class="pre">benchmark_serving.py</span></code> script with multimodal datasets:</p>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>python<span class="w"> </span>-m<span class="w"> </span>tensorrt_llm.serve.scripts.benchmark_serving<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--model<span class="w"> </span><span class="si">${</span><span class="nv">model_path</span><span class="si">}</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--backend<span class="w"> </span>openai-chat<span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--dataset-name<span class="w"> </span><span class="s2">&quot;random_image&quot;</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--random-input-len<span class="w"> </span><span class="m">128</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--random-output-len<span class="w"> </span><span class="m">128</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--random-image-width<span class="w"> </span><span class="m">512</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--random-image-height<span class="w"> </span><span class="m">512</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--random-num-images<span class="w"> </span><span class="m">1</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--num-prompts<span class="w"> </span><span class="m">100</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--max-concurrency<span class="w"> </span><span class="m">8</span><span class="w"> </span><span class="se">\</span>
+<span class="w">    </span>--ignore-eos
+</pre></div>
+</div>
+<p>Below is some example TensorRT-LLM serving benchmark output. Your actual results may vary.</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="o">============</span> <span class="n">Serving</span> <span class="n">Benchmark</span> <span class="n">Result</span> <span class="o">============</span>
+<span class="n">Successful</span> <span class="n">requests</span><span class="p">:</span>                     <span class="mi">1</span>         
+<span class="n">Benchmark</span> <span class="n">duration</span> <span class="p">(</span><span class="n">s</span><span class="p">):</span>                  <span class="mf">0.83</span>      
+<span class="n">Total</span> <span class="nb">input</span> <span class="n">tokens</span><span class="p">:</span>                      <span class="mi">128</span>       
+<span class="n">Total</span> <span class="n">generated</span> <span class="n">tokens</span><span class="p">:</span>                  <span class="mi">128</span>       
+<span class="n">Request</span> <span class="n">throughput</span> <span class="p">(</span><span class="n">req</span><span class="o">/</span><span class="n">s</span><span class="p">):</span>              <span class="mf">1.20</span>      
+<span class="n">Output</span> <span class="n">token</span> <span class="n">throughput</span> <span class="p">(</span><span class="n">tok</span><span class="o">/</span><span class="n">s</span><span class="p">):</span>         <span class="mf">153.92</span>    
+<span class="n">Total</span> <span class="n">Token</span> <span class="n">throughput</span> <span class="p">(</span><span class="n">tok</span><span class="o">/</span><span class="n">s</span><span class="p">):</span>          <span class="mf">307.85</span>    
+<span class="n">User</span> <span class="n">throughput</span> <span class="p">(</span><span class="n">tok</span><span class="o">/</span><span class="n">s</span><span class="p">):</span>                 <span class="mf">154.15</span>    
+<span class="n">Mean</span> <span class="n">Request</span> <span class="n">AR</span><span class="p">:</span>                         <span class="mf">0.9845</span>    
+<span class="n">Median</span> <span class="n">Request</span> <span class="n">AR</span><span class="p">:</span>                       <span class="mf">0.9845</span>    
+<span class="o">---------------</span><span class="n">Time</span> <span class="n">to</span> <span class="n">First</span> <span class="n">Token</span><span class="o">----------------</span>
+<span class="n">Mean</span> <span class="n">TTFT</span> <span class="p">(</span><span class="n">ms</span><span class="p">):</span>                          <span class="mf">84.03</span>     
+<span class="n">Median</span> <span class="n">TTFT</span> <span class="p">(</span><span class="n">ms</span><span class="p">):</span>                        <span class="mf">84.03</span>     
+<span class="n">P99</span> <span class="n">TTFT</span> <span class="p">(</span><span class="n">ms</span><span class="p">):</span>                           <span class="mf">84.03</span>     
+<span class="o">-----</span><span class="n">Time</span> <span class="n">per</span> <span class="n">Output</span> <span class="n">Token</span> <span class="p">(</span><span class="n">excl</span><span class="o">.</span> <span class="mi">1</span><span class="n">st</span> <span class="n">token</span><span class="p">)</span><span class="o">------</span>
+<span class="n">Mean</span> <span class="n">TPOT</span> <span class="p">(</span><span class="n">ms</span><span class="p">):</span>                          <span class="mf">5.88</span>      
+<span class="n">Median</span> <span class="n">TPOT</span> <span class="p">(</span><span class="n">ms</span><span class="p">):</span>                        <span class="mf">5.88</span>      
+<span class="n">P99</span> <span class="n">TPOT</span> <span class="p">(</span><span class="n">ms</span><span class="p">):</span>                           <span class="mf">5.88</span>      
+<span class="o">---------------</span><span class="n">Inter</span><span class="o">-</span><span class="n">token</span> <span class="n">Latency</span><span class="o">----------------</span>
+<span class="n">Mean</span> <span class="n">ITL</span> <span class="p">(</span><span class="n">ms</span><span class="p">):</span>                           <span class="mf">5.83</span>      
+<span class="n">Median</span> <span class="n">ITL</span> <span class="p">(</span><span class="n">ms</span><span class="p">):</span>                         <span class="mf">5.88</span>      
+<span class="n">P99</span> <span class="n">ITL</span> <span class="p">(</span><span class="n">ms</span><span class="p">):</span>                            <span class="mf">6.14</span>      
+<span class="o">==================================================</span>
+</pre></div>
+</div>
+<p><strong>Notes for Multimodal Benchmarking:</strong></p>
+<ul class="simple">
+<li><p>Set <code class="docutils literal notranslate"><span class="pre">--backend</span></code> as <code class="docutils literal notranslate"><span class="pre">openai-chat</span></code> since multimodal models are only supported on the chat API and require a chat template</p></li>
+<li><p>Control the number of images per request with <code class="docutils literal notranslate"><span class="pre">--random-num-images</span></code></p></li>
+<li><p>Use <code class="docutils literal notranslate"><span class="pre">--random-image-width</span></code> and <code class="docutils literal notranslate"><span class="pre">--random-image-height</span></code> to specify image dimensions or <code class="docutils literal notranslate"><span class="pre">--random-image-size</span></code> for squared image dimensions.</p></li>
+<li><p>The <code class="docutils literal notranslate"><span class="pre">random_image</span></code> dataset generates synthetic images for benchmarking</p></li>
+</ul>
+</section>
+</section>
 </section>
 
 
@@ -791,6 +871,11 @@ e.g</p>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#cuda-graph-config"><code class="docutils literal notranslate"><span class="pre">cuda_graph_config</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#moe-config"><code class="docutils literal notranslate"><span class="pre">moe_config</span></code></a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#attention-backend"><code class="docutils literal notranslate"><span class="pre">attention_backend</span></code></a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#multimodal-serving-and-benchmarking">Multimodal Serving and Benchmarking</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#setting-up-multimodal-serving">Setting up Multimodal Serving</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#multimodal-benchmarking">Multimodal Benchmarking</a></li>
 </ul>
 </li>
 </ul>
@@ -887,9 +972,9 @@ e.g</p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on August 06, 2025.</p>
+  <p>Last updated on August 15, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/a16ba64">a16ba64</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/26f413a">26f413a</a>.</p>
   
 </div></div>
       

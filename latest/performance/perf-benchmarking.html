@@ -59,7 +59,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.0.0rc6';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.1.0rc0';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -71,7 +71,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.0.0rc6" />
+  <meta name="docsearch:version" content="1.1.0rc0" />
 
 
   </head>
@@ -330,6 +330,12 @@
 <li class="toctree-l1"><a class="reference internal" href="../installation/linux.html">Installing on Linux via <code class="docutils literal notranslate"><span class="pre">pip</span></code></a></li>
 <li class="toctree-l1"><a class="reference internal" href="../installation/build-from-source-linux.html">Building from Source Code on Linux</a></li>
 </ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Deployment Guide</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../deployment-guide/quick-start-recipe-for-llama4-scout-on-trtllm.html">Quick Start Recipe for Llama4 Scout 17B on TensorRT-LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../deployment-guide/quick-start-recipe-for-deepseek-r1-on-trtllm.html">Quick Start Recipe for DeepSeek R1 on TensorRT-LLM - Blackwell &amp; Hopper Hardware</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../deployment-guide/quick-start-recipe-for-llama3.3-70b-on-trtllm.html">Quick Start Recipe for Llama3.3 70B on TensorRT-LLM - Blackwell &amp; Hopper Hardware</a></li>
+</ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">LLM API</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../llm-api/index.html">LLM API Introduction</a></li>
@@ -419,7 +425,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../advanced/kv-cache-management.html">KV Cache Management: Pools, Blocks, and Events</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/kv-cache-reuse.html">KV cache reuse</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../advanced/speculative-decoding.html">Speculative Sampling</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../advanced/disaggregated-service.html">Disaggregated-Service (Experimental)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../advanced/disaggregated-service.html">Disaggregated-Service (Prototype)</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Performance</span></p>
 <ul class="current nav bd-sidenav">
@@ -586,7 +592,7 @@ that have been validated extensively and is the same listing as seen on the
 <li><p><a class="reference external" href="https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct">meta-llama/Llama-3.1-8B-Instruct</a></p></li>
 <li><p><a class="reference external" href="https://huggingface.co/meta-llama/Llama-3.1-70B-Instruct">meta-llama/Llama-3.1-70B-Instruct</a></p></li>
 <li><p><a class="reference external" href="https://huggingface.co/meta-llama/Llama-3.1-405B-Instruct">meta-llama/Llama-3.1-405B-Instruct</a></p></li>
-<li><p><a class="reference external" href="https://huggingface.co/mistralai/Mixtral-8x7B-v0.1-Instruct">mistralai/Mixtral-8x7B-v0.1-Instruct</a></p></li>
+<li><p><a class="reference external" href="https://huggingface.co/mistralai/Mixtral-8x7B-Instruct-v0.1">mistralai/Mixtral-8x7B-Instruct-v0.1</a></p></li>
 </ul>
 <div class="admonition tip">
 <p class="admonition-title">Tip</p>
@@ -761,15 +767,6 @@ If no value is specified, the default <code class="docutils literal notranslate"
 The following command builds an FP8 quantized engine by specifying the engine tuning values.</p></li>
 </ul>
 <div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>trtllm-bench<span class="w"> </span>--model<span class="w"> </span>meta-llama/Llama-3.1-8B<span class="w"> </span>build<span class="w"> </span>--quantization<span class="w"> </span>FP8<span class="w"> </span>--max_seq_len<span class="w"> </span><span class="m">4096</span><span class="w"> </span>--max_batch_size<span class="w"> </span><span class="m">1024</span><span class="w"> </span>--max_num_tokens<span class="w"> </span><span class="m">2048</span>
-</pre></div>
-</div>
-<ul class="simple">
-<li><p>[Experimental] Build engine with target ISL/OSL for optimization:
-In this experimental mode, you can provide hints to <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code>’s tuning heuristic to optimize the engine on specific ISL and OSL targets.
-Generally, the target ISL and OSL aligns with the average ISL and OSL of the dataset, but you can experiment with different values to optimize the engine using this mode.
-The following command builds an FP8 quantized engine and optimizes for ISL:OSL targets of 128:128.</p></li>
-</ul>
-<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span>trtllm-bench<span class="w"> </span>--model<span class="w"> </span>meta-llama/Llama-3.1-8B<span class="w"> </span>build<span class="w"> </span>--quantization<span class="w"> </span>FP8<span class="w"> </span>--max_seq_len<span class="w"> </span><span class="m">4096</span><span class="w"> </span>--target_isl<span class="w"> </span><span class="m">128</span><span class="w"> </span>--target_osl<span class="w"> </span><span class="m">128</span>
 </pre></div>
 </div>
 </section>
@@ -1607,9 +1604,9 @@ The choices are specified with a YAML file like the following example (<code cla
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on August 06, 2025.</p>
+  <p>Last updated on August 15, 2025.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/a16ba64">a16ba64</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/26f413a">26f413a</a>.</p>
   
 </div></div>
       
