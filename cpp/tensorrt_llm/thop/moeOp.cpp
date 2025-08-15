@@ -424,10 +424,10 @@ public:
             fc1_expert_biases.has_value() ? fc1_expert_biases.value().const_data_ptr() : nullptr, activation_params,
             fc2_expert_weights.const_data_ptr(),
             fc2_expert_biases.has_value() ? fc2_expert_biases.value().const_data_ptr() : nullptr, quant_params,
-            num_rows, hidden_size, unpadded_hidden_size_val, inter_size, num_experts_total,
-            static_cast<int>(experts_per_token), static_cast<char*>(workspace_info.workspace.data_ptr()),
-            output.data_ptr(), static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config, false,
-            lora_params, mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params, stream);
+            num_rows, hidden_size, inter_size, num_experts_total, static_cast<int>(experts_per_token),
+            static_cast<char*>(workspace_info.workspace.data_ptr()), output.data_ptr(),
+            static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config, false, lora_params,
+            mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params, stream);
 #endif
 
         return output;
@@ -584,10 +584,10 @@ public:
             fc1_expert_biases.has_value() ? fc1_expert_biases.value().const_data_ptr() : nullptr, activation_params,
             fc2_expert_weights.const_data_ptr(),
             fc2_expert_biases.has_value() ? fc2_expert_biases.value().const_data_ptr() : nullptr, quant_params,
-            num_rows, hidden_size, unpadded_hidden_size_val, inter_size, num_experts_total,
-            static_cast<int>(experts_per_token), static_cast<char*>(workspace_info.workspace.data_ptr()),
-            output.data_ptr(), static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config, false,
-            lora_params, mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params, stream);
+            num_rows, hidden_size, inter_size, num_experts_total, static_cast<int>(experts_per_token),
+            static_cast<char*>(workspace_info.workspace.data_ptr()), output.data_ptr(),
+            static_cast<int*>(workspace_info.src_to_dest_map), parallelism_config, false, lora_params,
+            mUseDeepSeekFP8BlockScaling, min_latency_mode, min_latency_params, stream);
 #endif
 
         return std::make_tuple(output, num_active_experts_per_node, experts_to_token_score, active_expert_global_ids);

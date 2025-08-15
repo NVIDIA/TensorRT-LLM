@@ -977,7 +977,6 @@ int MixtureOfExpertsPlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc,
         inputs[getExpertWeights1Index()], hasBias() ? inputs[getExpertBias1Index()] : nullptr,
         ActivationParams(mActivationType), inputs[getExpertWeights2Index()],
         hasBias() ? inputs[getExpertBias2Index()] : nullptr, quant_params, num_tokens, mExpertHiddenSize,
-        mExpertHiddenSize /*TRT does not support padding, safe to assume padded/unpadded hidden sizes are the same*/,
         mExpertInterSize, mNumExperts, mExpertsPerToken, static_cast<char*>(workspace.workspace),
         // Outputs
         outputs[getOutputTensorIndex()], static_cast<int*>(workspace.src_to_dest_map), mParallelismConfig, hasLora(),
