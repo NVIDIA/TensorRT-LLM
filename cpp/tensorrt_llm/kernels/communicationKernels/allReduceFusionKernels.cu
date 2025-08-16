@@ -505,8 +505,24 @@ __global__ void __launch_bounds__(1024) allreduce_fusion_kernel_oneshot_lamport(
                 done &= !is_neg_zero(vals[r]);
             }
         }
-        float4 sum_val = allreduce_sum<DType, NRanks, Fp32Acc>(vals);
-        fused_op(sum_val, tidx);
+
+        // Handle AllGather pattern - output gathered data before reduction
+        if constexpr (HasAllGatherOut<Pattern>)
+        {
+            // Output gathered data: [rank0_data][rank1_data][rank2_data]...[rankN_data]
+            for (int r = 0; r < NRanks; ++r)
+            {
+                int output_idx = r * tot_access + idx;
+                reinterpret_cast<float4*>(params.allgather_out)[output_idx] = vals[r];
+            }
+        }
+
+        // Handle AllReduce pattern - compute sum and apply fusion operations
+        if constexpr (HasAllReduceOut<Pattern> || HasResidual<Pattern> || HasRMSNorm<Pattern>)
+        {
+            float4 sum_val = allreduce_sum<DType, NRanks, Fp32Acc>(vals);
+            fused_op(sum_val, tidx);
+        }
     }
 
     comm.update(params.size * NRanks);
@@ -674,6 +690,7 @@ void allreduce_fusion_kernel_launcher(AllReduceFusionParams const& params)
     }
     TLLM_CHECK(oneshot || threads_per_block >= params.nranks);
     int block_size = threads_per_block;
+
     TLLM_CHECK(block_size <= 1024 && cluster_size > 0);
 
     int grid_size = (std::min(sm_count, cluster_num * cluster_size) / cluster_size) * cluster_size;
@@ -739,6 +756,10 @@ void allreduce_fusion_op(AllReduceFusionParams const& params)
     if (params.pattern == AllReduceFusionPattern::kAllReduce)                                                          \
     {                                                                                                                  \
         DISPATCH_ACC_TYPE(DType, AllReduceFusionPattern::kAllReduce, NRanks);                                          \
+    }                                                                                                                  \
+    else if (params.pattern == AllReduceFusionPattern::kAllGather)                                                     \
+    {                                                                                                                  \
+        DISPATCH_ACC_TYPE(DType, AllReduceFusionPattern::kAllGather, NRanks);                                          \
     }                                                                                                                  \
     else if (params.pattern == AllReduceFusionPattern::kARResidualRMSNorm)                                             \
     {                                                                                                                  \

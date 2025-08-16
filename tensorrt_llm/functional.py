@@ -3887,14 +3887,15 @@ class AllReduceStrategy(IntEnum):
 
 class AllReduceFusionOp(IntEnum):
     NONE = 0
-    RESIDUAL_RMS_NORM = 1
-    LAST_PROCESS_FOR_UB = 2
-    RESIDUAL_RMS_PREPOST_NORM = 3
-    RESIDUAL_RMS_NORM_QUANT_FP8 = 4
-    RESIDUAL_RMS_NORM_QUANT_NVFP4 = 5
-    RESIDUAL_RMS_NORM_OUT_QUANT_FP8 = 6
-    RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4 = 7
-    MOE_FINALIZE_ALLREDUCE_RESIDUAL_RMS_NORM = 8
+    ALLGATHER = 1
+    RESIDUAL_RMS_NORM = 2
+    LAST_PROCESS_FOR_UB = 3
+    RESIDUAL_RMS_PREPOST_NORM = 4
+    RESIDUAL_RMS_NORM_QUANT_FP8 = 5
+    RESIDUAL_RMS_NORM_QUANT_NVFP4 = 6
+    RESIDUAL_RMS_NORM_OUT_QUANT_FP8 = 7
+    RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4 = 8
+    MOE_FINALIZE_ALLREDUCE_RESIDUAL_RMS_NORM = 9
 
 
 class AllReduceParams():
@@ -3921,7 +3922,7 @@ class AllReduceParams():
         # For torch path only, has no effect on TRT path
         self.enable_allreduce = enable_allreduce
         self.trigger_completion_at_end = trigger_completion_at_end
-        assert fusion_op == AllReduceFusionOp.NONE.value or (residual
+        assert fusion_op == AllReduceFusionOp.NONE.value or fusion_op == AllReduceFusionOp.ALLGATHER.value or (residual
                                                              is not None)
 
     def has_affine(self):

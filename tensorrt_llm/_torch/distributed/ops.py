@@ -36,6 +36,24 @@ def get_allreduce_workspace(mapping: Mapping) -> torch.LongTensor:
     return allreduce_workspaces[mapping][1]
 
 
+def get_allgather_workspace(mapping: Mapping) -> torch.LongTensor:
+    if not hasattr(_thread_local, f'allgather_workspaces_{mapping.pp_rank}'):
+        setattr(_thread_local, f'allgather_workspaces_{mapping.pp_rank}', {})
+
+    allgather_workspaces = getattr(_thread_local,
+                                   f'allgather_workspaces_{mapping.pp_rank}')
+    if mapping not in allgather_workspaces:
+        # Allocate dedicated workspace for ALLGATHER operations
+        # Use a potentially larger workspace size for allgather operations
+        ipc_buffers, workspace = CustomAllReduceHelper.allocate_allreduce_fusion_workspace(
+            mapping,
+            CustomAllReduceHelper.max_workspace_size_auto(
+                mapping.tp_size, support_deterministic=False),
+        )
+        allgather_workspaces[mapping] = (ipc_buffers, workspace)
+    return allgather_workspaces[mapping][1]
+
+
 def allocate_low_presicion_allreduce_workspace(mapping: Mapping) -> None:
     if not hasattr(_thread_local, 'lowprecision_allreduce_workspaces'):
         _thread_local.lowprecision_allreduce_workspaces = {}
@@ -444,6 +462,7 @@ class AllReduce(nn.Module):
 
         self.mapping = mapping
         self.workspace = None
+        self.allgather_workspace = None
         self.strategy = strategy
         self.mnnvl_allreduce = None
 
@@ -453,6 +472,8 @@ class AllReduce(nn.Module):
                 if self.strategy == AllReduceStrategy.LOWPRECISION:
                     allocate_low_presicion_allreduce_workspace(self.mapping)
                 self.workspace = get_allreduce_workspace(self.mapping)
+                # Allocate dedicated workspace for ALLGATHER operations
+                self.allgather_workspace = get_allgather_workspace(self.mapping)
 
             # Initialize MNNVL AllReduce if needed
             if self.strategy == AllReduceStrategy.MNNVL:
@@ -521,6 +542,12 @@ class AllReduce(nn.Module):
             if mnnvl_output is not None:
                 return mnnvl_output
 
+        # Choose the appropriate workspace based on fusion operation
+        chosen_workspace = self.workspace
+        if (all_reduce_params.fusion_op == AllReduceFusionOp.ALLGATHER and 
+            self.allgather_workspace is not None):
+            chosen_workspace = self.allgather_workspace
+
         # Fall back to regular AllReduce if MNNVL is not available or not applicable
         # Make sure the strategy is AUTO since allreduceOp does not have the branch for MNNVL
         if allreduce_strategy == AllReduceStrategy.MNNVL:
@@ -531,7 +558,7 @@ class AllReduce(nn.Module):
             norm_weight=all_reduce_params.norm_weight,
             scale=all_reduce_params.scale,
             bias=all_reduce_params.bias,
-            workspace=self.workspace,
+            workspace=chosen_workspace,
             group=self.mapping.tp_group,
             strategy=allreduce_strategy,
             op=all_reduce_params.fusion_op,

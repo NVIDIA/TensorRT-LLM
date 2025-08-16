@@ -6,6 +6,7 @@ from torch import nn
 
 from ..attention_backend import AttentionMetadata
 from ..distributed.ops import allgather
+from ..distributed import AllReduce, AllReduceParams, AllReduceFusionOp
 from ..model_config import ModelConfig
 from ..pyexecutor.llm_request import LlmRequest, LlmRequestState
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
@@ -323,6 +324,13 @@ class MTPWorker(nn.Module):
         self.spec_config = spec_config
         self.model_config = model_config
         self.is_thop = False
+        
+        # Initialize AllReduce following the pattern from modeling_deepseekv3.py
+        if model_config is not None and hasattr(model_config, 'mapping'):
+            self.allreduce_op = AllReduce(mapping=model_config.mapping,
+                                        strategy=getattr(model_config, 'allreduce_strategy', 'AUTO'))
+        else:
+            self.allreduce_op = None
 
     def forward(
         self,
@@ -1054,10 +1062,61 @@ class MTPWorker(nn.Module):
         combined = torch.stack(
             [max_index_per_rank_float, local_max_values_float32],
             dim=-1).flatten(-2)
+
+        original_last_dim = combined.shape[-1]
+        
+        # Ensure the combined tensor has at least 4 elements by padding with zeros
+        # This is required by the Lamport ALLGATHER kernel implementation
+        if combined.numel() < 4:
+            padding_size = 4 - combined.numel()
+            # Create padding tensor with same shape as combined except for the last dimension
+            padding_shape = list(combined.shape)
+            padding_shape[-1] = padding_size
+            padding = torch.zeros(padding_shape, dtype=combined.dtype, device=combined.device)
+            combined = torch.cat([combined, padding], dim=-1)
+        
+        
+        return original_last_dim, combined
+
+    @torch.compile(options={"max-autotune": True})
+    def get_draft_tokens_from_gathered(self, gathered, original_last_dim):
+        
+        gathered = gathered[..., :original_last_dim]
+        num_ranks, features_per_rank = gathered.shape
+        gathered = gathered.reshape(1, num_ranks * features_per_rank)
+        gathered_indices_float = gathered[..., 0::2]  # Even positions: indices
+        gathered_values_float = gathered[..., 1::2]  # Odd positions: values
+
+        # Find the rank with maximum value
+        max_indices = torch.argmax(gathered_values_float, dim=-1, keepdim=True)
+
+        # Get the corresponding token indices and convert back to int32
+        draft_tokens = torch.gather(gathered_indices_float, -1,
+                                    max_indices).squeeze(-1).type(torch.int32)
+        return draft_tokens
+
+    @torch.compile(options={"max-autotune": True})
+    def get_local_max_and_combined_simple(self, logits):
+        """Simple version without padding for fallback allgather"""
+        local_max_values, local_argmax = torch.max(logits, dim=-1, keepdim=True)
+        # Adjust indices based on TP rank and size
+        vocab_per_rank = logits.shape[-1]
+        max_index_per_rank = local_argmax.type(
+            torch.int32) + (self.model_config.mapping.tp_rank * vocab_per_rank)
+        # Use torch.stack and flatten instead of view+cat to avoid torch.compile issues
+        # Convert both to float32 to ensure consistent dtype
+        max_index_per_rank_float = max_index_per_rank.float()
+        local_max_values_float32 = local_max_values.float()
+
+        # Stack and flatten to get interleaved layout: [idx0, val0, idx1, val1, ...]
+        combined = torch.stack(
+            [max_index_per_rank_float, local_max_values_float32],
+            dim=-1).flatten(-2)
         return combined
 
     @torch.compile(options={"max-autotune": True})
-    def get_draft_tokens_from_gathered(self, gathered):
+    def get_draft_tokens_from_gathered_simple(self, gathered):
+        """Simple version without slicing for fallback allgather"""
         gathered_indices_float = gathered[..., 0::2]  # Even positions: indices
         gathered_values_float = gathered[..., 1::2]  # Odd positions: values
 
@@ -1090,9 +1149,23 @@ class MTPWorker(nn.Module):
                 and hasattr(self.model_config, 'mapping')
                 and self.model_config.mapping.tp_size
                 > 1) and not (self.model_config.mapping.enable_attention_dp):
-            combined = self.get_local_max_and_combined(logits)
-            gathered = allgather(combined, self.model_config.mapping, dim=-1)
-            draft_tokens = self.get_draft_tokens_from_gathered(gathered)
+            
+            # Use AllReduce with ALLGATHER fusion op if available
+            if self.allreduce_op is not None:
+                original_last_dim, combined = self.get_local_max_and_combined(logits)
+                gathered = self.allreduce_op(
+                    combined,
+                    all_reduce_params=AllReduceParams(
+                        fusion_op=AllReduceFusionOp.ALLGATHER,
+                        enable_allreduce=True,
+                    ),
+                )
+                draft_tokens = self.get_draft_tokens_from_gathered(gathered, original_last_dim)
+            else:
+                # Fallback to original allgather approach (simpler, no padding)
+                combined = self.get_local_max_and_combined_simple(logits)
+                gathered = allgather(combined, self.model_config.mapping, dim=-1)
+                draft_tokens = self.get_draft_tokens_from_gathered_simple(gathered)
         else:
             # Simple argmax if no TP or no model config
             draft_tokens = torch.argmax(logits, dim=-1).type(torch.int32)

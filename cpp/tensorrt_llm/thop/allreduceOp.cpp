@@ -441,6 +441,7 @@ private:
         allreduce_fusion_params.rms_gamma = nullptr;
 
         allreduce_fusion_params.allreduce_out = nullptr;
+        allreduce_fusion_params.allgather_out = nullptr;  // Initialize AllGather output pointer
         allreduce_fusion_params.quant_out = nullptr;
         allreduce_fusion_params.scale_out = nullptr;
         allreduce_fusion_params.residual_out = nullptr;
@@ -470,6 +471,16 @@ private:
             reduce_out = torch::empty_like(input);
             allreduce_fusion_params.allreduce_out = reduce_out.mutable_data_ptr();
             allreduce_fusion_params.pattern = tensorrt_llm::kernels::ar_fusion::AllReduceFusionPattern::kAllReduce;
+        }
+        // Handle AllGather operation
+        else if (mOp == AllReduceFusionOp::ALLGATHER)
+        {
+            // For AllGather, create output tensor with expanded first dimension
+            auto output_shape = input.sizes().vec();
+            output_shape[0] = output_shape[0] * tp_size;  // Expand by group size
+            reduce_out = torch::empty(output_shape, input.options());
+            allreduce_fusion_params.allgather_out = reduce_out.mutable_data_ptr();
+            allreduce_fusion_params.pattern = tensorrt_llm::kernels::ar_fusion::AllReduceFusionPattern::kAllGather;
         }
         // Handle allreduce fusion here
         // Prepare required output tensors for each fusion pattern
@@ -555,7 +566,7 @@ private:
         allreduce_fusion_params.workspace = reinterpret_cast<void**>(workspace.value().mutable_data_ptr());
         allreduce_fusion_params.allreduce_in = input.data_ptr();
 
-        if (mOp != AllReduceFusionOp::NONE)
+        if (mOp != AllReduceFusionOp::NONE && mOp != AllReduceFusionOp::ALLGATHER)
         {
             allreduce_fusion_params.residual_in = residual.value().data_ptr();
             allreduce_fusion_params.rms_gamma = norm_weight.value().data_ptr();
@@ -578,6 +589,7 @@ private:
         switch (mOp)
         {
         case AllReduceFusionOp::NONE: return {reduce_out};
+        case AllReduceFusionOp::ALLGATHER: return {reduce_out};
         case AllReduceFusionOp::RESIDUAL_RMS_NORM: return {norm_out, residual_out};
         case AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_FP8: return {quant_out, residual_out};
         case AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_FP8: return {norm_out, quant_out, residual_out};
@@ -920,6 +932,7 @@ private:
         {
         case AllReduceFusionOp::NONE:
         case AllReduceFusionOp::RESIDUAL_RMS_NORM: break;
+        case AllReduceFusionOp::ALLGATHER:
         case AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_FP8:
         case AllReduceFusionOp::RESIDUAL_RMS_NORM_OUT_QUANT_FP8:
         case AllReduceFusionOp::RESIDUAL_RMS_NORM_QUANT_NVFP4:
