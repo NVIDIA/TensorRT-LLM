@@ -258,7 +258,7 @@ def buildImage(config, imageKeyToTag)
     // Step 2: Build the images
     stage ("Install packages") {
         sh "pwd && ls -alh"
-        sh "env"
+        sh "env | sort"
         sh "apk add make git"
         sh "git config --global --add safe.directory '*'"
 
