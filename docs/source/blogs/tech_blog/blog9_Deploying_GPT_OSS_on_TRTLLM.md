@@ -111,7 +111,7 @@ Key takeaways:
 - `moe_config.backend` is set to `TRTLLM` to use the `trtllm-gen` MoE kernels which are optimized for low concurrency.
 
 
-> Note: If you are using NVIDIA H200 GPUs please set the `moe_config.backend` to TRITON to use the OpenAI Triton MoE kernel regardless of use case. See the section [(H200/H100 Only) Using OpenAI Triton Kernels for MoE](#h200h100-only-using-openai-triton-kernels-for-moe) for more details.
+> Note: If you are using NVIDIA H200 GPUs please set the `moe_config.backend` to `TRITON` to use the OpenAI Triton MoE kernel regardless of use case. See the section [(H200/H100 Only) Using OpenAI Triton Kernels for MoE](#h200h100-only-using-openai-triton-kernels-for-moe) for more details.
 
 
 #### Run the benchmark
