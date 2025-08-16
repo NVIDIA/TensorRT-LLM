@@ -538,17 +538,36 @@ class RandomDataset(BenchmarkDataset):
                 f"Only {len(requests)} requests sampled from sharegpt dataset, {num_requests} requests are needed"
             )
         else:
-            for i in range(num_requests):
-                inner_seq = ((offsets[i] + i + np.arange(input_lens[i])) %
+            def gen_inner_sequence(input_len, idx_offset, random_offset, vocab_size):
+                return ((random_offset + idx_offset + np.arange(input_len)) %
                              vocab_size).tolist()
-                prompt = prefix_token_ids + inner_seq
+
+            for i in range(num_requests):
+                inner_seq = gen_inner_sequence(input_lens[i], i, offsets[i], vocab_size)
+                token_ids = prefix_token_ids + inner_seq
+                total_input_len_expected = prefix_len + int(input_lens[i])
+                prompt = tokenizer.decode(token_ids)
+                re_encoded_token_ids = tokenizer.encode(prompt)
+                while len(re_encoded_token_ids) < total_input_len_expected:
+                    # Append a new random sequence to the existing sequence
+                    new_random_offset = np.random.randint(0, vocab_size)
+                    new_inner_seq = gen_inner_sequence(input_lens[i], i, new_random_offset, vocab_size)
+                    re_encoded_token_ids += new_inner_seq
+                    # Re-encode the prompt
+                    new_prompt = tokenizer.decode(re_encoded_token_ids)
+                    re_encoded_token_ids = tokenizer.encode(new_prompt)
+
+                # Cut if the sequence is longer than the expected length
+                re_encoded_token_ids = re_encoded_token_ids[:total_input_len_expected]
+
+                result_prompt = re_encoded_token_ids
                 if self.return_text:
-                    prompt = tokenizer.decode(prompt)
-                total_input_len = prefix_len + int(input_lens[i])
+                    result_prompt = tokenizer.decode(result_prompt)
+
                 requests.append(
                     SampleRequest(
-                        prompt=prompt,
-                        prompt_len=total_input_len,
+                        prompt=result_prompt,
+                        prompt_len=total_input_len_expected,
                         expected_output_len=int(output_lens[i]),
                     ))
         return requests
