@@ -560,7 +560,8 @@ class TestLlama4MaverickInstruct(LlmapiAccuracyTestHarness):
                 max_seq_len=8192,
                 pipeline_parallel_size=pp_size,
                 moe_expert_parallel_size=ep_size,
-                use_cuda_graph=cuda_graph) as llm:
+                cuda_graph_config=CudaGraphConfig()
+                if cuda_graph else None) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
             assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
             task = MMLU(self.MODEL_NAME)
@@ -583,7 +584,8 @@ class TestLlama4MaverickInstruct(LlmapiAccuracyTestHarness):
                 moe_expert_parallel_size=ep_size,
                 enable_chunked_prefill=True,
                 max_num_tokens=256,
-                use_cuda_graph=cuda_graph) as llm:
+                cuda_graph_config=CudaGraphConfig()
+                if cuda_graph else None) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
             assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
             task = MMLU(self.MODEL_NAME)
@@ -706,7 +708,8 @@ class TestLlama4ScoutInstruct(LlmapiAccuracyTestHarness):
                 moe_expert_parallel_size=ep_size,
                 enable_chunked_prefill=True,
                 max_num_tokens=256,
-                use_cuda_graph=cuda_graph) as llm:
+                cuda_graph_config=CudaGraphConfig()
+                if cuda_graph else None) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
             assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
             task = MMLU(self.MODEL_NAME)
@@ -728,7 +731,8 @@ class TestLlama4ScoutInstruct(LlmapiAccuracyTestHarness):
                 max_seq_len=22000,
                 enable_chunked_prefill=True,
                 max_num_tokens=256,
-                use_cuda_graph=cuda_graph) as llm:
+                cuda_graph_config=CudaGraphConfig()
+                if cuda_graph else None) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
             assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.FP8
             task = MMLU(self.MODEL_NAME)
@@ -814,6 +818,25 @@ class TestGemma3_27BInstruct(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
+    def test_fp8_prequantized(self):
+        # Disabling kv cache reuse as a WAR to deal with gaps in kernel support for Gemma3's non-inclusive sliding window size.
+        kv_cache_config = KvCacheConfig(enable_block_reuse=False,
+                                        enable_partial_reuse=False,
+                                        dtype="fp8")
+        # Note: This has only the LLM part quantized. Vision part is in bfloat16.
+        prequantized_model_path = f"{llm_models_root()}/gemma/gemma-3-27b-it-fp8/"
+        with LLM(prequantized_model_path,
+                 kv_cache_config=kv_cache_config,
+                 attn_backend="FLASHINFER",
+                 cuda_graph_config=None) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+
 
 class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "google/gemma-3-1b-it"
@@ -846,6 +869,8 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
                  kv_cache_config=kv_cache_config) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
             task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
