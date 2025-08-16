@@ -39,23 +39,20 @@
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
 
-BlockRange getBlockRangeForSending(BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest)
+BlockRange getBlockRangeForSending(
+    BaseKVCacheManager* cacheManager, LlmRequest const& llmRequest, std::vector<size_t> const& blockHashes)
 {
-    size_t requestBlockNum = llmRequest.getRequestedBlockHashes().size();
+    size_t requestBlockNum = blockHashes.size();
     constexpr SizeType32 beam{0};
     auto blockRange = BlockRange::fromAllBlockIds(*cacheManager, llmRequest.mRequestId, beam);
     auto poolNum = cacheManager->getBlockManager().getNumPools();
-    if (poolNum > 1 || common::getEnvDisableSelectiveCacheTransfer())
+    if (poolNum > 1 || !cacheManager->isEnableBlockReuse())
     {
-        // disable selective cache transfer for poolNum > 1
         return blockRange;
     }
     if (requestBlockNum < blockRange.size() && requestBlockNum > 0)
     {
-        // handle block reuse, the prefix blocks are reused
-        // TODO(zhengd): pass the hashes directly instead of from llmRequest; use hash instead of block num
-        auto const& ids = blockRange.getBlockIds();
-        blockRange.setBlockIds({ids.end() - requestBlockNum, ids.end()});
+        blockRange.setBlockIds(blockHashes);
     }
     return blockRange;
 }
@@ -64,12 +61,15 @@ BlockRange getBlockRangeForReceiving(BaseKVCacheManager* cacheManager, LlmReques
 {
 
     auto poolNum = cacheManager->getBlockManager().getNumPools();
-    if (poolNum > 1 || common::getEnvDisableSelectiveCacheTransfer())
+    if (poolNum == 1 && cacheManager->isEnableBlockReuse())
+    {
+        return BlockRange::fromNewlyAllocatedBlockIds(*cacheManager, llmRequest.mRequestId);
+    }
+    else
     {
         constexpr SizeType32 beam{0};
         return BlockRange::fromAllBlockIds(*cacheManager, llmRequest.mRequestId, beam);
     }
-    return BlockRange::fromNewlyAllocatedBlockIds(*cacheManager, llmRequest.mRequestId);
 }
 
 bool CacheFormatter::needSendCache(
@@ -155,13 +155,14 @@ void CacheFormatter::format(TransferSession& session)
     auto const& selfConfig = session.getSelfState().getCacheState().value();
     auto const& destConfig = session.getOtherState().getCacheState().value();
     auto const selfIdx = session.getSelfState().getCommState().value().getSelfIdx();
+    auto& blockHashes = session.getBlockHashes();
     auto& bufferManager = session.getBufferManager();
     if (!needSendCache(selfConfig, destConfig, selfIdx))
     {
         return;
     }
     auto& blockManager = mCacheManager->getBlockManager();
-    auto blockRange = getBlockRangeForSending(mCacheManager, llmRequest);
+    auto blockRange = getBlockRangeForSending(mCacheManager, llmRequest, blockHashes);
 
     auto const numPools = blockManager.getNumPools();
     // TODO(oargov): are we sure the other side has the same number of pools? this might not hold for pp_size>1...

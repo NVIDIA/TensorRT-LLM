@@ -80,6 +80,19 @@ public:
         mBlockIds = std::move(blockIds);
     }
 
+    void setBlockIdsFromHashes(std::vector<size_t> blockHashes)
+    {
+        TLLM_CHECK(mManager);
+        std::vector<SizeType32> blockIds;
+        blockIds.reserve(blockHashes.size());
+        auto& blockManager = mManager->getBlockManager();
+        for (auto hash : blockHashes)
+        {
+            blockIds.emplace_back(blockManager.getBlockByHash(hash, mWindowSize)->getId());
+        }
+        mBlockIds = std::move(blockIds);
+    }
+
     [[nodiscard]] std::vector<size_t> getBlockHashes() const
     {
         TLLM_CHECK(mManager);
