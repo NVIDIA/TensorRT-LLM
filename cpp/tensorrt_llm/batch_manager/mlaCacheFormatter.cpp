@@ -105,23 +105,26 @@ void MLACacheFormatter::format(TransferSession& session)
 
     // diff end
 
-    auto const numPools = mCacheManager->getBlockManager().getNumPools();
-    auto blockRange = getBlockRangeForSending(mCacheManager, llmRequest);
-
     auto lastTokenTime = llmRequest.getPerfMetrics().timingMetrics.lastTokenTime;
     bool recordDelay = lastTokenTime != std::chrono::steady_clock::time_point();
 
     int blockNum = 0;
     std::vector<runtime::ITensor::SharedPtr> inputKvCacheBlocks;
-    for (auto poolIdx = 0; poolIdx < numPools; poolIdx++)
+    auto const numPools = mCacheManager->getBlockManager().getNumPools();
+    auto blockRange = getBlockRangeForSending(mCacheManager, llmRequest);
+    auto const& windowSizes = blockRange.getWindowSizes();
+    TLLM_CHECK_WITH_INFO(
+        static_cast<int>(windowSizes.size()) == numPools, "window sizes should be the same as numPools");
+    for (auto const& windowSize : windowSizes)
     {
-        blockRange.updatePoolIdx(poolIdx);
-        for (auto it = blockRange.begin(); it != blockRange.end(); ++it)
+        auto blockRangeForWindow = blockRange.getBlockRangeForWindow(windowSize);
+        for (auto it = blockRangeForWindow.begin(); it != blockRangeForWindow.end(); ++it)
         {
-            blockNum++;
             inputKvCacheBlocks.push_back(it);
+            blockNum++;
         }
     }
+
     TLLM_CHECK(blockNum > 0);
     int deviceId = mCacheManager->getBlockManager().getStreamDevice();
 
@@ -307,15 +310,18 @@ void MLACacheFormatter::unformat(TransferSession& session)
     std::vector<runtime::ITensor::SharedPtr> recvBufferTmps;
     std::vector<runtime::ITensor::SharedPtr> outputBuffers;
     auto const numPools = mCacheManager->getBlockManager().getNumPools();
+    auto const& windowSizes = blockRange.getWindowSizes();
+    TLLM_CHECK_WITH_INFO(
+        static_cast<int>(windowSizes.size()) == numPools, "window sizes should be the same as numPools");
     // TODO(oargov): are we sure the other side has the same number of pools? this might not hold for pp_size>1...
     size_t blockNum = 0;
-    for (auto poolIdx = 0; poolIdx < numPools; poolIdx++)
+    for (auto const& windowSize : windowSizes)
     {
-        blockRange.updatePoolIdx(poolIdx);
-        for (auto it = blockRange.begin(); it != blockRange.end(); ++it)
+        auto blockRangeForWindow = blockRange.getBlockRangeForWindow(windowSize);
+        for (auto it = blockRangeForWindow.begin(); it != blockRangeForWindow.end(); ++it)
         {
-            blockNum++;
             outputBuffers.push_back(it);
+            blockNum++;
         }
     }
 

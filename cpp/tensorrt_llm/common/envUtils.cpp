@@ -446,6 +446,12 @@ size_t getEnvMemSizeForKVCacheTransferBuffer()
     return memSizeForKVCacheTransferBuffer;
 }
 
+bool getEnvKVCacheTransferAllBlocksForWindow()
+{
+    static bool const allBlocksForWindow = getBoolEnv("TRTLLM_KVCACHE_TRANSFER_ALL_BLOCKS_FOR_WINDOW");
+    return allBlocksForWindow;
+}
+
 uint16_t getEnvNixlPort()
 {
     static uint16_t const nixlPort = getUInt64Env("TRTLLM_NIXL_PORT").value_or(0);
