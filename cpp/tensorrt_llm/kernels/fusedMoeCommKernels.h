@@ -89,6 +89,16 @@ struct MoeCommFieldInfo
     // Fill single field info, the fields that need global info is not filled here.
     __host__ void fillFieldInfo(uint8_t* dataPtr, size_t elementSize, int vectorSize, int stride);
 
+    __host__ void setUnused()
+    {
+        dataPtrBase = nullptr;
+        alignedUnitBit = 4;
+        alignedUnitCount = 0;
+        alignedUnitStride = 0;
+        unalignedFieldIndex = 0;
+        compact16BOffset = 0;
+    }
+
     template <typename T>
     __host__ void fillFieldInfo(T* dataPtr, int vectorSize, int stride)
     {
