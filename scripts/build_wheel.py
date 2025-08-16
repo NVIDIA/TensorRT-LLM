@@ -301,7 +301,7 @@ def main(*,
          install: bool = False,
          skip_building_wheel: bool = False,
          linking_install_binary: bool = False,
-         binding_type: str = "pybind",
+         binding_type: str = "nanobind",
          benchmarks: bool = False,
          micro_benchmarks: bool = False,
          nvtx: bool = False,
@@ -706,13 +706,11 @@ def main(*,
             with working_directory(project_dir):
                 if binding_type == "nanobind":
                     build_run(f"\"{venv_python}\" -m pip install nanobind")
-                else:
-                    build_run(
-                        f"\"{venv_python}\" -m pip install pybind11-stubgen")
+                build_run(f"\"{venv_python}\" -m pip install pybind11-stubgen")
             with working_directory(pkg_dir):
                 if on_windows:
                     if binding_type == "nanobind":
-                        print("Windows not yet supported for nanobind stubs")
+                        print("Windows not supported for nanobind stubs")
                         exit(1)
                     else:
                         stubgen = "stubgen.py"
@@ -771,13 +769,13 @@ def main(*,
                         build_run(
                             f"\"{venv_python}\" -m pybind11_stubgen -o . bindings --exit-code",
                             env=env_ld)
-                        if deep_ep_cuda_architectures:
-                            build_run(
-                                f"\"{venv_python}\" -m pybind11_stubgen -o . deep_ep_cpp_tllm --exit-code",
-                                env=env_ld)
+                    if deep_ep_cuda_architectures:
                         build_run(
-                            f"\"{venv_python}\" -m pybind11_stubgen -o . deep_gemm_cpp_tllm --exit-code",
+                            f"\"{venv_python}\" -m pybind11_stubgen -o . deep_ep_cpp_tllm --exit-code",
                             env=env_ld)
+                    build_run(
+                        f"\"{venv_python}\" -m pybind11_stubgen -o . deep_gemm_cpp_tllm --exit-code",
+                        env=env_ld)
 
     if not skip_building_wheel:
         if dist_dir is None:
@@ -915,8 +913,8 @@ def add_arguments(parser: ArgumentParser):
     )
     parser.add_argument("--binding_type",
                         choices=["pybind", "nanobind"],
-                        default="pybind",
-                        help="Which binding type to build: pybind or nanobind")
+                        default="nanobind",
+                        help="Which binding library to use: pybind or nanobind")
     parser.add_argument("--benchmarks",
                         action="store_true",
                         help="Build the benchmarks for the C++ runtime")

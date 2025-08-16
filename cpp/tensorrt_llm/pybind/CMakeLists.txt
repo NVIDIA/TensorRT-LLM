@@ -43,6 +43,7 @@ target_link_libraries(
          ${NO_AS_NEEDED_FLAG}
          ${Python3_LIBRARIES}
          ${TORCH_LIBRARIES}
+         CUDA::cuda_driver
          torch_python
          ${CUDA_NVML_LIB}
          th_common)
@@ -55,6 +56,6 @@ if(NOT WIN32)
     ${TRTLLM_PYBIND_MODULE}
     PROPERTIES
       LINK_FLAGS
-      "-Wl,-rpath,'$ORIGIN/libs' -Wl,-rpath,'$ORIGIN/../nvidia/nccl/lib' -Wl,-rpath,'${CUDA_TOOLKIT_ROOT_DIR}/targets/x86_64-linux/lib/stubs' ${AS_NEEDED_FLAG} ${UNDEFINED_FLAG}"
+      "-Wl,-rpath,'$ORIGIN/libs' -Wl,-rpath,'$ORIGIN/../nvidia/nccl/lib' ${AS_NEEDED_FLAG} ${UNDEFINED_FLAG}"
   )
 endif()
