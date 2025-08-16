@@ -94,7 +94,6 @@ Create a YAML configuration file, `low_latency.yaml`, as follows:
 ```bash
 cat <<EOF > low_latency.yaml
 enable_attention_dp: false
-use_torch_sampler: true
 cuda_graph_config:
     max_batch_size: ${max_batch_size}
     enable_padding: true
@@ -105,8 +104,7 @@ EOF
 
 Key takeaways:
 - `enable_attention_dp` is set to `false` to use TP instead of DP for attention.
-- `use_torch_sampler` is set to `true` to use the PyTorch sampler. While the `TRTLLM` sampler is the default, it currently has performance issues, so we use the PyTorch sampler instead.
-- `cuda_graph_config.max_batch_size` is the maximum batch size for CUDA graph.
+s- `cuda_graph_config.max_batch_size` is the maximum batch size for CUDA graph.
 - `cuda_graph_config.enable_padding` is set to `true` to enable CUDA graph padding.
 - `moe_config.backend` is set to `TRTLLM` to use the `trtllm-gen` MoE kernels which are optimized for low concurrency.
 
@@ -160,7 +158,6 @@ Like before, create a YAML configuration file, `max_throughput.yaml`, as follows
 ```bash
 cat <<EOF > max_throughput.yaml
 enable_attention_dp: true
-use_torch_sampler: true
 cuda_graph_config:
     max_batch_size: ${max_batch_size}
     enable_padding: true
