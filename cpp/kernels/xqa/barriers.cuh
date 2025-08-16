@@ -11,6 +11,7 @@
  */
 
 #pragma once
+#include <cassert>
 #include "cuda_hint.cuh"
 #include "defines.h"
 #if !USE_CUSTOM_BARRIER
