@@ -533,10 +533,10 @@ server_with_custom_sampler = make_server_with_custom_sampler_fixture('chat')
     'server_with_custom_sampler',
     [
         {
-            'use_torch_sampler': True
+            'sampler_type': "TorchSampler"
         },  # torch_sampler
         {
-            'use_torch_sampler': False
+            'sampler_type': "TRTLLMSampler"
         },  # trtllm_sampler
     ],
     indirect=True,

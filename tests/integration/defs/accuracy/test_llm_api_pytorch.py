@@ -196,7 +196,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     @skip_pre_hopper
     def test_fp8_llm_sampler(self):
         model_path = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct-FP8"
-        with LLM(model_path, use_torch_sampler=True, max_batch_size=256) as llm:
+        with LLM(model_path, max_batch_size=256) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
 
             sampling_params = SamplingParams(
@@ -229,7 +229,6 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                   max_beam_width=max_beam_width,
                   max_batch_size=16,
                   max_seq_len=1024,
-                  use_torch_sampler=False,
                   build_config=None)
 
         with llm:
@@ -604,11 +603,14 @@ class TestLlama4MaverickInstruct(LlmapiAccuracyTestHarness):
                                           speculative_model_dir=eagle_model_dir)
         kv_cache_config = KvCacheConfig(enable_block_reuse=False,
                                         free_gpu_memory_fraction=0.75)
+        torch_compile_config = TorchCompileConfig(
+            enable_fullgraph=True,
+            enable_piecewise_cuda_graph=True,
+            max_num_streams=3) if torch_compile else None
         pytorch_config = dict(
             cuda_graph_config=CudaGraphConfig(max_batch_size=8),
             enable_attention_dp=False,
-            torch_compile_config=TorchCompileConfig(
-                enable_fullgraph=torch_compile))
+            torch_compile_config=torch_compile_config)
         with LLM(model_path,
                  kv_cache_config=kv_cache_config,
                  tensor_parallel_size=tp_size,
@@ -795,13 +797,16 @@ class TestGemma3_27BInstruct(LlmapiAccuracyTestHarness):
         kv_cache_config = KvCacheConfig(
             enable_block_reuse=False,
             enable_partial_reuse=False,
+            free_gpu_memory_fraction=0.5,
         )
         # We use FlashInfer as the attention backend for Gemma3 VLM to support custom mask for images.
         # So, testing with it here.
         with LLM(self.MODEL_PATH,
                  kv_cache_config=kv_cache_config,
                  attn_backend="FLASHINFER",
-                 cuda_graph_config=None) as llm:
+                 cuda_graph_config=None,
+                 max_batch_size=128,
+                 max_seq_len=4096) as llm:
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)
@@ -2018,8 +2023,7 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
                               cuda_graph, overlap_scheduler):
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
-            cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
-            use_torch_sampler=True)
+            cuda_graph_config=CudaGraphConfig() if cuda_graph else None)
 
         with LLM(f"{llm_models_root()}/Qwen3/Qwen3-8B-FP8",
                  tensor_parallel_size=tp_size,
@@ -2041,8 +2045,7 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
                   overlap_scheduler):
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
-            cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
-            use_torch_sampler=True)
+            cuda_graph_config=CudaGraphConfig() if cuda_graph else None)
 
         with LLM(f"{llm_models_root()}/Qwen3/Qwen3-8B",
                  tensor_parallel_size=tp_size,
@@ -2544,10 +2547,6 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         if moe_backend == "TRITON":
             if not IS_TRITON_KERNELS_AVAILABLE:
                 pytest.skip("Triton kernels are not available")
-            if tp_size != ep_size:
-                pytest.skip(
-                    "TRITON moe backend currently doesn't supported mxfp4 tp for this size"
-                )
 
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,

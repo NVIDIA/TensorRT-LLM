@@ -1647,12 +1647,15 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
             // Set BMM scales for FP8 context computation
             params.mla_param->bmm1_scale = fmha_bmm1_scale_ptr;
             params.mla_param->bmm2_scale = fmha_bmm2_scale_ptr;
-            params.mla_param->host_bmm1_scale = decoder_params.fmhaHostBmm1Scale;
             params.mla_param->quant_attention_input_buf = mFP8ContextMLA ? fp8_qkv_buffer : nullptr;
             // Set additional scales for context phase
             params.mla_param->quant_scale_o = params.attention_output_orig_quant;
+            params.mla_param->quant_scale_q = params.kv_scale_orig_quant;
+            params.mla_param->quant_scale_kv = params.kv_scale_orig_quant;
             params.mla_param->dequant_scale_q = params.kv_scale_quant_orig;
             params.mla_param->dequant_scale_kv = params.kv_scale_quant_orig;
+            params.mla_param->host_bmm1_scale
+                = 1 / (mQScaling * sqrt((float) (mMLAParams.qk_nope_head_dim + mMLAParams.qk_rope_head_dim)));
             if (mPagedContextFMHA && mPagedKVCache)
             {
                 TLLM_CHECK_WITH_INFO(params.mla_param->context_paged_kv_ptr != nullptr,

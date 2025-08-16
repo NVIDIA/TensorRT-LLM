@@ -39,7 +39,7 @@ LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE = env.wheelDockerImagePy310
 LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE = env.wheelDockerImagePy312
 
 // DLFW torch image
-DLFW_IMAGE = "nvcr.io/nvidia/pytorch:25.06-py3"
+DLFW_IMAGE = "urm.nvidia.com/docker/nvidia/pytorch:25.06-py3"
 
 //Ubuntu base image
 UBUNTU_22_04_IMAGE = "urm.nvidia.com/docker/ubuntu:22.04"
@@ -2074,6 +2074,11 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
                 checkPipStage = true
             } else if (cpu_arch == AARCH64_TRIPLE) {
                 checkPipStage = true
+            }
+
+            if (cpu_arch == AARCH64_TRIPLE && values[5] != DLFW_IMAGE) {
+                checkPipStage = false
+                echo "Skip pip install sanity check due to https://nvbugs/5453827"
             }
 
             if (checkPipStage) {
