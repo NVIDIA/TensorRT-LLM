@@ -855,7 +855,8 @@ class TestLlmError:
                            match="should not exceed max_num_tokens"):
             ids = [random.randint(10, 100) for _ in range(101)]
             llm.generate([ids])
-            
+
+
 class FailingExecutorWorker(GenerationExecutorWorker):
     """Mock worker that fails during initialization to test error handling."""
 
