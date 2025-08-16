@@ -1,4 +1,4 @@
-@coderabbitai summary
+r@coderabbitai summary
 
 <!--
 Please write the PR title by following this template:
@@ -20,17 +20,20 @@ Examples:
   - [None][chore] Minor clean-up
 -->
 
-## Description
-
-<!--
-Please explain the issue and the solution in short.
--->
-
 ## Test Coverage
 
 <!--
 Please list clearly what are the relevant test(s) that can safeguard the changes in the PR. This helps us to ensure we have sufficient test coverage for the PR.
 -->
+
+## PR Checklist
+Please check the following items wherever appropriate, else strick them out if N/A. This is needed to merge the PR.
+- [ ] Have you made sure the PR description is explaining what you’re doing and why?
+- [ ] Are you following the [TRT-LLM CODING GUIDELINES](https://github.com/NVIDIA/TensorRT-LLM/blob/main/CODING_GUIDELINES.md) to the best of your knowledge?
+- [ ] Do you have test cases for new code paths? See https://github.com/NVIDIA/TensorRT-LLM/tree/main/tests#1-how-does-the-ci-work for instructions on how to add.
+- [ ] Have you introduced any new dependencies? If so, please make sure that scans have been run for license permissiveness and vulnerability issues recursively for the dependency and its dependencies.
+- [ ] Have you updated https://github.com/NVIDIA/TensorRT-LLM/blob/main/.github/CODEOWNERS to reflect any changes in ownership due to your PR?
+- [ ] Have you updated any documentation that is associated with your change?
 
 ## GitHub Bot Help
 
