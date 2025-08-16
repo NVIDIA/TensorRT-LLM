@@ -170,26 +170,22 @@ public:
         mSender->setCommState(std::move(commState));
     }
 
-    void cancelRequest(LlmRequest& llmRequest)
+    bool cancelRequest(LlmRequest& llmRequest)
     {
-        try
+        bool isCancelled = false;
+        std::unique_lock lkResp(mResponderMutex);
+        auto it = mReadyResponses.find(llmRequest.mRequestId);
+        // If the request is not the current request and already in the ready queue, we can cancel it.
+        if (it != mReadyResponses.end() && getCurrentRequestId() != llmRequest.mRequestId)
         {
-            std::unique_lock lkResp(mResponderMutex);
-            auto it = mReadyResponses.find(llmRequest.mRequestId);
-            // If the request is not the current request and already in the ready queue, we can cancel it.
-            if (it != mReadyResponses.end() && getCurrentRequestId() != llmRequest.mRequestId)
-            {
-                mCancelledRequests.insert(llmRequest.mRequestId);
-            }
-            else
-            {
-                TLLM_LOG_WARNING("Cannot cancel request %zu", llmRequest.mRequestId);
-            }
+            mCancelledRequests.insert(llmRequest.mRequestId);
+            isCancelled = true;
         }
-        catch (std::exception const& e)
+        else
         {
-            TLLM_THROW("%s", e.what());
+            TLLM_LOG_WARNING("Cannot cancel request %zu", llmRequest.mRequestId);
         }
+        return isCancelled;
     }
 
     ~Impl()
@@ -436,36 +432,33 @@ public:
         }
     }
 
-    void cancelRequest(LlmRequest& llmRequest)
+    bool cancelRequest(LlmRequest& llmRequest)
     {
-        try
-        {
-            std::string processInfo = "default";
-            if (common::getEnvRequestKVCacheConcurrent())
-            {
-                processInfo = llmRequest.getDataTransceiverState().getCommState()->toString();
-            }
 
-            auto& asyncResource = mInstanceToAsyncResource.at(processInfo);
+        std::string processInfo = "default";
+        if (common::getEnvRequestKVCacheConcurrent())
+        {
+            processInfo = llmRequest.getDataTransceiverState().getCommState()->toString();
+        }
+
+        bool isCancelled = false;
+        auto& asyncResource = mInstanceToAsyncResource.at(processInfo);
+        {
+            std::unique_lock<std::mutex> lck(asyncResource->mMtxForQueue);
+            auto it = std::find_if(asyncResource->mRequestsQueue.begin(), asyncResource->mRequestsQueue.end(),
+                [&llmRequest](RequestAndPromise const& requestAndPromise)
+                { return requestAndPromise.mRequest->mRequestId == llmRequest.mRequestId; });
+            if (it != asyncResource->mRequestsQueue.end())
             {
-                std::unique_lock<std::mutex> lck(asyncResource->mMtxForQueue);
-                auto it = std::find_if(asyncResource->mRequestsQueue.begin(), asyncResource->mRequestsQueue.end(),
-                    [&llmRequest](RequestAndPromise const& requestAndPromise)
-                    { return requestAndPromise.mRequest->mRequestId == llmRequest.mRequestId; });
-                if (it != asyncResource->mRequestsQueue.end())
-                {
-                    asyncResource->mRequestsQueue.erase(it);
-                }
-                else
-                {
-                    TLLM_LOG_WARNING("Cannot cancel request %zu", llmRequest.mRequestId);
-                }
+                asyncResource->mRequestsQueue.erase(it);
+                isCancelled = true;
+            }
+            else
+            {
+                TLLM_LOG_WARNING("Cannot cancel request %zu", llmRequest.mRequestId);
             }
         }
-        catch (std::exception const& e)
-        {
-            TLLM_THROW("%s", e.what());
-        }
+        return isCancelled;
     }
 
     ~Impl()
@@ -638,9 +631,9 @@ void DataResponder::setCommState(executor::kv_cache::CommState commState)
     mImpl->setCommState(std::move(commState));
 }
 
-void DataResponder::cancelRequest(LlmRequest& llmRequest) const
+bool DataResponder::cancelRequest(LlmRequest& llmRequest) const
 {
-    mImpl->cancelRequest(llmRequest);
+    return mImpl->cancelRequest(llmRequest);
 }
 
 DataResponder::~DataResponder() = default;
@@ -655,9 +648,9 @@ std::future<void> DataRequester::requestAndReceiveAsync(LlmRequest& llmRequest) 
     return mImpl->requestAndReceiveAsyncMultiThreads(llmRequest);
 }
 
-void DataRequester::cancelRequest(LlmRequest& llmRequest) const
+bool DataRequester::cancelRequest(LlmRequest& llmRequest) const
 {
-    mImpl->cancelRequest(llmRequest);
+    return mImpl->cancelRequest(llmRequest);
 }
 
 DataRequester::~DataRequester() = default;
