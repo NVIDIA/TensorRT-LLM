@@ -349,13 +349,15 @@ def test_disaggregated_llama_context_capacity(model, enable_cuda_graph,
 @pytest.mark.parametrize("model", ["Llama-3.1-8B-Instruct"])
 @pytest.mark.parametrize("spec_dec_model_path", ["EAGLE3-LLaMA3.1-Instruct-8B"])
 @pytest.mark.parametrize("generation_overlap", [False])
+@pytest.mark.parametrize("eagle3_one_model", [True, False])
 def test_disaggregated_spec_dec_batch_slot_limit(model, spec_dec_model_path,
-                                                 generation_overlap):
+                                                 generation_overlap,
+                                                 eagle3_one_model):
     # Test whether the batch slots are properly released when using speculative decoding
     # with disaggregated serving.
     spec_dec_config = EagleDecodingConfig(
         speculative_model_dir=model_path(spec_dec_model_path),
-        eagle3_one_model=False,
+        eagle3_one_model=eagle3_one_model,
         max_draft_len=3)
 
     worker_pytorch_configs = []
