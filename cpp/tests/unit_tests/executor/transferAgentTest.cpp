@@ -16,6 +16,10 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#include <filesystem>
+
+namespace fs = std::filesystem;
+
 using namespace tensorrt_llm::executor::kv_cache;
 
 class RegisteredHostMemory
@@ -339,3 +343,103 @@ TEST_F(TransferAgentTest, SyncMessage)
     nixlAgent0->invalidateRemoteAgent(agent1);
     nixlAgent1->invalidateRemoteAgent(agent0);
 }
+
+class LoopbackAgentTest : public ::testing::Test,
+                          public ::testing::WithParamInterface<bool> // NOLINT(cppcoreguidelines-pro-type-member-init)
+{
+public:
+    void SetUp() override
+    {
+        auto dirPath = fs::absolute("test_loopback_agent_tmp");
+        fs::create_directories(dirPath);
+        mDirectory = dirPath.string();
+    }
+
+    void TearDown() override
+    {
+        fs::remove_all(mDirectory);
+    }
+
+    [[nodiscard]] std::unique_ptr<BaseLoopbackAgent> makeLoopbackAgent(BaseAgentConfig const& config)
+    {
+        return tensorrt_llm::executor::kv_cache::makeLoopbackAgent("nixl", &config);
+    }
+
+    [[nodiscard]] std::string getDirectory() const
+    {
+        return mDirectory;
+    }
+
+private:
+    std::string mDirectory;
+};
+
+TEST_P(LoopbackAgentTest, Basic)
+{
+    std::string const agentName{"loopbackAgent"};
+    BaseAgentConfig config{agentName, true, GetParam()};
+    auto loopbackAgent = makeLoopbackAgent(config);
+
+    TLLM_CHECK(loopbackAgent);
+
+    std::vector<char> memory(100, 1);
+    char* cuda_mem;
+    cudaMalloc(&cuda_mem, 100);
+    cudaMemcpy(cuda_mem, memory.data(), 100, cudaMemcpyHostToDevice);
+
+    std::vector<FileDesc> fileDescVec;
+    fileDescVec.emplace_back(getDirectory() + "/basic_test.bin", O_CREAT | O_RDWR, 0664, 100);
+    std::vector<char> fileData(100, 10);
+    write(fileDescVec[0].getFd(), fileData.data(), fileData.size());
+
+    MemoryDescs memDescs{MemoryType::kVRAM, {MemoryDesc{cuda_mem, 100, 0}}};
+    FileDescs fileDescs{fileDescVec};
+
+    loopbackAgent->registerMemory(memDescs);
+    loopbackAgent->registerFiles(fileDescs);
+
+    auto status = loopbackAgent->submitLoopbackRequests(memDescs, fileDescs, false);
+    status->wait();
+
+    cudaMemcpy(memory.data(), cuda_mem, 100, cudaMemcpyDeviceToHost);
+
+    TLLM_CHECK(memory == fileData);
+    cudaFree(cuda_mem);
+
+    loopbackAgent->deregisterMemory(memDescs);
+    loopbackAgent->deregisterFiles(fileDescs);
+}
+
+TEST_P(LoopbackAgentTest, Basic2)
+{
+    std::string const agentName{"loopbackAgent"};
+    BaseAgentConfig config{agentName, true, GetParam()};
+    auto loopbackAgent = makeLoopbackAgent(config);
+
+    TLLM_CHECK(loopbackAgent);
+
+    std::vector<char> memory(100, 1);
+    MemoryDesc memDesc(memory);
+    MemoryDescs memDescs{MemoryType::kVRAM, {memDesc}};
+
+    std::vector<FileDesc> fileDescVec;
+    fileDescVec.emplace_back(getDirectory() + "/basic2_test.bin", O_CREAT | O_RDWR, 0664, 100);
+
+    FileDescs fileDescs{fileDescVec};
+
+    loopbackAgent->registerMemory(memDescs);
+    loopbackAgent->registerFiles(fileDescs);
+
+    auto status = loopbackAgent->submitLoopbackRequests(memDescs, fileDescs, true);
+    status->wait();
+
+    std::vector<char> fileData(100);
+    read(fileDescs.getDescs()[0].getFd(), fileData.data(), fileData.size());
+
+    TLLM_CHECK(fileData == memory);
+
+    loopbackAgent->deregisterMemory(memDescs);
+    loopbackAgent->deregisterFiles(fileDescs);
+}
+
+INSTANTIATE_TEST_SUITE_P(, LoopbackAgentTest, ::testing::Values(true, false));

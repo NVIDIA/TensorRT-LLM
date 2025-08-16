@@ -32,7 +32,7 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager
 class KVCacheTransferManager
 {
 public:
-    explicit KVCacheTransferManager(tr::BufferManager const& bufferManager);
+    explicit KVCacheTransferManager(tr::BufferManager const& bufferManager, BaseLoopbackAgent* loopbackAgent = nullptr);
 
     //! \brief Onboard a block to gpu memory.
     void onboard(BlockPtr const& offloadBlock, BlockPtr const& block, std::vector<KVCacheBlockPool> const& pools,
@@ -75,6 +75,9 @@ private:
 
     // Track the block ids offloaded in this iteration.
     std::unordered_map<int32_t, tr::CudaEvent> mPendingOffloads;
+    // Reference to parent loopback agent
+    BaseLoopbackAgent* mLoopbackAgent;
+    int mDeviceId;
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager
