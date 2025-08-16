@@ -1,4 +1,4 @@
-r@coderabbitai summary
+@coderabbitai summary
 
 <!--
 Please write the PR title by following this template:
