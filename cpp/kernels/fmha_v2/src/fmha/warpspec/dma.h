@@ -500,7 +500,7 @@ struct DMA
                 int const num_valid_kv_blocks = (actual_kv_seqlen + params.paged_kv_cache.mTokensPerBlock - 1)
                     >> params.paged_kv_cache.mTokensPerBlockLog2;
 
-                for (int q_step_idx = 0; q_step_idx < q_steps; q_step_idx += 2)
+                for (int q_step_idx = 0; q_step_idx < q_steps && actual_kv_seqlen > 0; q_step_idx += 2)
                 {
                     load_q(bidh, q_step_idx * STEP_Q + local_q_tile_offset, desc_q, shared->smem_q[0], cbw0);
                     load_q(bidh, (q_step_idx + 1) * STEP_Q + local_q_tile_offset, desc_q, shared->smem_q[1], cbw1);

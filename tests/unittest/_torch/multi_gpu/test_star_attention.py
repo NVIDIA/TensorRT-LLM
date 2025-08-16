@@ -8,6 +8,7 @@ from utils.llm_data import llm_models_root
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.llmapi.utils import get_total_gpu_memory
+from tensorrt_llm.mapping import CpType
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
 MAX_SEQ_LEN = 4096 + 1024
@@ -54,7 +55,7 @@ def test_model(backend, model_name, quant, sp_size, sa_block_size,
 
     model_dir = str(llm_models_root() / model_name)
     cp_config = {
-        "cp_type": "star_attention",
+        "cp_type": CpType.STAR,
         "cp_anchor_size": sa_anchor_size,
         "block_size": sa_block_size
     }

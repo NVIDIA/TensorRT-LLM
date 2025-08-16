@@ -1294,27 +1294,47 @@ static void print_tensor(
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-static int check_softmax_results(float const* out, float const* ref, size_t b, size_t s, size_t h,
+static std::pair<int, int> check_softmax_results(float const* out, float const* ref, size_t b, size_t s, size_t h,
     std::vector<uint32_t>& seqlens, std::vector<int>& cu_seqlens)
 {
-    int n_errors = 0;
+    int n_errors_max = 0;
+    int n_errors_sum = 0;
+
+    // Check the max
     for (int b_ = 0; b_ < b; ++b_)
     {
         for (int s_ = 0; s_ < seqlens[b_]; ++s_)
         {
             for (int h_ = 0; h_ < h; ++h_)
             {
-                uint64_t idx = cu_seqlens[b_] * h + s_ * h + h_;
+                uint64_t idx = (cu_seqlens[b_] + s_) * h * 2 + h_ * 2;
                 float sum = out[idx];
                 float sum_ref = ref[idx];
                 if (sum_ref != 1.0f && fabsf(sum - sum_ref) / (fabsf(sum) + fabsf(sum_ref)) > 0.01)
                 {
-                    n_errors++;
+                    n_errors_max++;
                 }
             }
         }
     }
-    return n_errors;
+    // Check the sum
+    for (int b_ = 0; b_ < b; ++b_)
+    {
+        for (int s_ = 0; s_ < seqlens[b_]; ++s_)
+        {
+            for (int h_ = 0; h_ < h; ++h_)
+            {
+                uint64_t idx = (cu_seqlens[b_] + s_) * h * 2 + h_ * 2 + 1;
+                float sum = out[idx];
+                float sum_ref = ref[idx];
+                if (sum_ref != 1.0f && fabsf(sum - sum_ref) / (fabsf(sum) + fabsf(sum_ref)) > 0.01)
+                {
+                    n_errors_sum++;
+                }
+            }
+        }
+    }
+    return {n_errors_max, n_errors_sum};
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

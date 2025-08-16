@@ -1904,8 +1904,7 @@ struct Softmax_saver
         , softmax_sum_ptr_(reinterpret_cast<char*>(params.softmax_stats_ptr))
         , softmax_stats_stride_in_bytes_(params.softmax_stats_stride_in_bytes)
     {
-        size_t softmax_max_off = sizeof(float) * params.b * params.s * params.h;
-        softmax_max_ptr_ = reinterpret_cast<char*>(params.softmax_stats_ptr) + softmax_max_off;
+        softmax_max_ptr_ = reinterpret_cast<char*>(params.softmax_stats_ptr);
 
         int warp = threadIdx.x / Cta_tile::THREADS_PER_WARP;
         int lane = threadIdx.x % Cta_tile::THREADS_PER_WARP;
@@ -1917,9 +1916,9 @@ struct Softmax_saver
         store_softmax_ = (lane % 4 == 0 && int(warp / WARPS_M) == 0);
 
         // assume fixed seq length for the batch
-        size_t const bh_offset = (binfo.sum_s * params.h + binfo.bidh) * sizeof(float);
-        softmax_sum_ptr_ += bh_offset + row0_ * params.softmax_stats_stride_in_bytes;
+        size_t const bh_offset = (binfo.sum_s * params.h + binfo.bidh) * sizeof(float) * 2;
         softmax_max_ptr_ += bh_offset + row0_ * params.softmax_stats_stride_in_bytes;
+        softmax_sum_ptr_ += bh_offset + row0_ * params.softmax_stats_stride_in_bytes + sizeof(float);
     };
 
     inline __device__ void store(int q_loop, float* p_sum, float* p_max)
@@ -1938,19 +1937,19 @@ struct Softmax_saver
                 int row_offset = q_loop * Cta_tile::M + mi * Mma_tile::M_PER_MMA_PER_CTA;
                 if (row0_ + row_offset < actual_q_len_)
                 {
-                    fmha::stg(softmax_sum_ptr_ + row_offset * softmax_stats_stride_in_bytes_, sum0);
                     fmha::stg(softmax_max_ptr_ + row_offset * softmax_stats_stride_in_bytes_, max0);
+                    fmha::stg(softmax_sum_ptr_ + row_offset * softmax_stats_stride_in_bytes_, sum0);
                 }
                 if (row0_ + row_offset + 8 < actual_q_len_)
                 {
-                    fmha::stg(softmax_sum_ptr_ + (row_offset + 8) * softmax_stats_stride_in_bytes_, sum1);
                     fmha::stg(softmax_max_ptr_ + (row_offset + 8) * softmax_stats_stride_in_bytes_, max1);
+                    fmha::stg(softmax_sum_ptr_ + (row_offset + 8) * softmax_stats_stride_in_bytes_, sum1);
                 }
             }
         }
     }
 
-    // ptr
+    // ptr (total_token_q, h, 2) float
     char* softmax_sum_ptr_ = nullptr;
     char* softmax_max_ptr_ = nullptr;
 

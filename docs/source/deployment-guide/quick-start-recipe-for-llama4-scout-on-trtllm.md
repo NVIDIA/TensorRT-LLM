@@ -8,15 +8,15 @@ The guide is intended for developers and practitioners seeking high-throughput o
 
 ## Access & Licensing
 
-To use Llama4 Scout 17B, you must first agree to Meta’s Llama 4 Community License ([https://github.com/meta-llama/llama-models/blob/main/models/llama4/LICENSE](https://github.com/meta-llama/llama-models/blob/main/models/llama4/LICENSE)). NVIDIA’s quantized versions (FP8 and NVFP4) are built on top of the base model and are available for research and commercial use under the same license.
+To use Llama4 Scout 17B, you must first agree to Meta’s [Llama 4 Community License](https://github.com/meta-llama/llama-models/blob/main/models/llama4/LICENSE). NVIDIA’s quantized versions (FP8 and NVFP4) are built on top of the base model and are available for research and commercial use under the same license.
 
 ## Prerequisites
 
-GPU: NVIDIA Blackwell or Hopper Architecture  
-OS: Linux  
-Drivers: CUDA Driver 575 or Later  
-Docker with NVIDIA Container Toolkit installed  
-Python3 and python3-pip (Optional, for accuracy evaluation only)
+* GPU: NVIDIA Blackwell or Hopper Architecture
+* OS: Linux
+* Drivers: CUDA Driver 575 or Later
+* Docker with NVIDIA Container Toolkit installed
+* Python3 and python3-pip (Optional, for accuracy evaluation only)
 
 ## Models
 
@@ -44,16 +44,16 @@ nvcr.io/nvidia/tensorrt-llm/release:1.0.0rc6 \
 
 Note:
 
-* You can mount additional directories and paths using the `-v <local_path>:<path>` flag if needed, such as mounting the downloaded weight paths.
-* The command mounts your user .cache directory to save the downloaded model checkpoints which are saved to `~/.cache/huggingface/hub/` by default. This prevents having to redownload the weights each time you rerun the container. If the `~/.cache` directory doesn’t exist please create it using  mkdir `~/.cache`.
-* The command also maps port 8000 from the container to your host so you can access the LLM API endpoint from your host
-* See the [https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release/tags](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release/tags) for all the available containers. The containers published in the main branch weekly have “rcN” suffix, while the monthly release with QA tests has no “rcN” suffix. Use the rc release to get the latest model and feature support.
+* The command mounts your user `.cache` directory to save the downloaded model checkpoints which are saved to `~/.cache/huggingface/hub/` by default. This prevents having to redownload the weights each time you rerun the container. If the `~/.cache` directory doesn’t exist please create it using `$ mkdir ~/.cache`.
+* You can mount additional directories and paths using the `-v <host_path>:<container_path>` flag if needed, such as mounting the downloaded weight paths.
+* The command also maps port `8000` from the container to your host so you can access the LLM API endpoint from your host
+* See the <https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release/tags> for all the available containers. The containers published in the main branch weekly have `rcN` suffix, while the monthly release with QA tests has no `rcN` suffix. Use the `rc` release to get the latest model and feature support.
 
-If you want to use latest main branch, you can choose to build from source to install TensorRT-LLM, the steps refer to [https://nvidia.github.io/TensorRT-LLM/latest/installation/build-from-source-linux.html](https://nvidia.github.io/TensorRT-LLM/latest/installation/build-from-source-linux.html)
+If you want to use latest main branch, you can choose to build from source to install TensorRT-LLM, the steps refer to <https://nvidia.github.io/TensorRT-LLM/latest/installation/build-from-source-linux.html>.
 
 ### Creating the TRT-LLM Server config
 
-We create a YAML configuration file /tmp/config.yml for the TensorRT-LLM Server and populate it with the following recommended performance settings.
+We create a YAML configuration file `/tmp/config.yml` for the TensorRT-LLM Server and populate it with the following recommended performance settings.
 
 ```shell
 EXTRA_LLM_API_FILE=/tmp/config.yml
@@ -92,92 +92,90 @@ After the server is set up, the client can now send prompt requests to the serve
 ### Configs and Parameters
 
 These options are used directly on the command line when you start the `trtllm-serve` process.
+
 #### `--tp_size`
 
-&emsp;**Description:** Sets the **tensor-parallel size**. This should typically match the number of GPUs you intend to use for a single model instance.
+* **Description:** Sets the **tensor-parallel size**. This should typically match the number of GPUs you intend to use for a single model instance.
 
 #### `--ep_size`
 
-&emsp;**Description:** Sets the **expert-parallel size** for Mixture-of-Experts (MoE) models. Like `tp_size`, this should generally match the number of GPUs you're using. This setting has no effect on non-MoE models.
+* **Description:** Sets the **expert-parallel size** for Mixture-of-Experts (MoE) models. Like `tp_size`, this should generally match the number of GPUs you're using. This setting has no effect on non-MoE models.
 
 #### `--kv_cache_free_gpu_memory_fraction`
 
-&emsp;**Description:** A value between 0.0 and 1.0 that specifies the fraction of free GPU memory to reserve for the KV cache after the model is loaded. Since memory usage can fluctuate, this buffer helps prevent out-of-memory (OOM) errors.
-
-&emsp;**Recommendation:** If you experience OOM errors, try reducing this value to **0.8** or lower.
+* **Description:** A value between `0.0` and `1.0` that specifies the fraction of free GPU memory to reserve for the KV cache after the model is loaded. Since memory usage can fluctuate, this buffer helps prevent out-of-memory (OOM) errors.
+* **Recommendation:** If you experience OOM errors, try reducing this value to `0.7` or lower.
 
 #### `--backend pytorch`
 
-&emsp;**Description:** Tells TensorRT-LLM to use the **pytorch** backend.
+* **Description:** Tells TensorRT-LLM to use the **pytorch** backend.
 
 #### `--max_batch_size`
 
-&emsp;**Description:** The maximum number of user requests that can be grouped into a single batch for processing.
+* **Description:** The maximum number of user requests that can be grouped into a single batch for processing.
 
 #### `--max_num_tokens`
 
-&emsp;**Description:** The maximum total number of tokens (across all requests) allowed inside a single scheduled batch.
+* **Description:** The maximum total number of tokens (across all requests) allowed inside a single scheduled batch.
 
 #### `--max_seq_len`
 
-&emsp;**Description:** The maximum possible sequence length for a single request, including both input and generated output tokens.
+* **Description:** The maximum possible sequence length for a single request, including both input and generated output tokens.
 
 #### `--trust_remote_code`
 
-&emsp;**Description:** Allows TensorRT-LLM to download models and tokenizers from Hugging Face. This flag is passed directly to the Hugging Face API.
+* **Description:** Allows TensorRT-LLM to download models and tokenizers from Hugging Face. This flag is passed directly to the Hugging Face API.
 
 
 #### Extra LLM API Options (YAML Configuration)
 
-These options provide finer control over performance and are set within a YAML file passed to the trtllm-serve command via the `--extra_llm_api_options` argument.
+These options provide finer control over performance and are set within a YAML file passed to the `trtllm-serve` command via the `--extra_llm_api_options` argument.
 
 #### `kv_cache_config`
 
-&emsp;**Description**: A section for configuring the Key-Value (KV) cache.
+* **Description**: A section for configuring the Key-Value (KV) cache.
 
-&emsp;**Options**:
+* **Options**:
 
-&emsp;&emsp;`dtype`: Sets the data type for the KV cache.
-
-&emsp;&emsp;**Default**: auto (uses the data type specified in the model checkpoint).
+  * `dtype`: Sets the data type for the KV cache.
+    **Default**: `"auto"` (uses the data type specified in the model checkpoint).
 
 #### `cuda_graph_config`
 
-&emsp;**Description**: A section for configuring CUDA graphs to optimize performance.
+* **Description**: A section for configuring CUDA graphs to optimize performance.
 
-&emsp;**Options**:
+* **Options**:
 
-&emsp;&emsp;`enable_padding`: If true, input batches are padded to the nearest `cuda_graph_batch_size`. This can significantly improve performance.
+  * `enable_padding`: If `"true"`, input batches are padded to the nearest `cuda_graph_batch_size`. This can significantly improve performance.
 
-&emsp;&emsp;**Default**: false
+    **Default**: `false`
 
-&emsp;&emsp;`max_batch_size`: Sets the maximum batch size for which a CUDA graph will be created.
+  * `max_batch_size`: Sets the maximum batch size for which a CUDA graph will be created.
 
-&emsp;&emsp;**Default**: 0
+    **Default**: `0`
 
-&emsp;&emsp;**Recommendation**: Set this to the same value as the `--max_batch_size` command-line option.
+    **Recommendation**: Set this to the same value as the `--max_batch_size` command-line option.
 
-&emsp;&emsp;`batch_sizes`: A specific list of batch sizes to create CUDA graphs for.
+  * `batch_sizes`: A specific list of batch sizes to create CUDA graphs for.
 
-&emsp;&emsp;**Default**: None
+     **Default**: `None`
 
 #### `moe_config`
 
-&emsp;**Description**: Configuration for Mixture-of-Experts (MoE) models.
+* **Description**: Configuration for Mixture-of-Experts (MoE) models.
 
-&emsp;**Options**:
+* **Options**:
 
-&emsp;&emsp;`backend`: The backend to use for MoE operations.
-
-&emsp;&emsp;**Default**: CUTLASS
+  * `backend`: The backend to use for MoE operations.
+    **Default**: `CUTLASS`
 
 #### `attention_backend`
 
-&emsp;**Description**: The backend to use for attention calculations.
+* **Description**: The backend to use for attention calculations.
 
-&emsp;**Default**: TRTLLM
+* **Default**: `TRTLLM`
 
-See the [TorchLlmArgs](https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs) class for the full list of options which can be used in the `extra_llm_api_options`.
+See the [`TorchLlmArgs` class](https://nvidia.github.io/TensorRT-LLM/llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs) for the full list of options which can be used in the `extra_llm_api_options`.
 
 ## Testing API Endpoint
 
@@ -216,11 +214,11 @@ Here is an example response, showing that the TRT-LLM server returns “New York
 * Ensure your model checkpoints are compatible with the expected format.
 * For performance issues, check GPU utilization with nvidia-smi while the server is running.
 * If the container fails to start, verify that the NVIDIA Container Toolkit is properly installed.
-* For connection issues, make sure port 8000 is not being used by another application.
+* For connection issues, make sure the server port (`8000` in this guide) is not being used by another application.
 
 ### Running Evaluations to Verify Accuracy (Optional)
 
-We use the lm-eval tool to test the model’s accuracy. For more information see [https://github.com/EleutherAI/lm-evaluation-harness](https://github.com/EleutherAI/lm-evaluation-harness).
+We use the lm-eval tool to test the model’s accuracy. For more information see <https://github.com/EleutherAI/lm-evaluation-harness>.
 
 To run the evaluation harness exec into the running TensorRT-LLM container and install with this command:
 
@@ -240,7 +238,7 @@ lm_eval --model local-completions  --tasks gsm8k --batch_size 256 --gen_kwargs t
 
 Sample result in Blackwell.
 
-```shell
+```
 |Tasks|Version|     Filter     |n-shot|  Metric   |   |Value |   |Stderr|
 |-----|------:|----------------|-----:|-----------|---|-----:|---|-----:|
 |gsm8k|      3|flexible-extract|     5|exact_match|↑  |0.9189|±  |0.0075|
@@ -257,7 +255,7 @@ lm_eval --model local-completions  --tasks gsm8k --batch_size 256 --gen_kwargs t
 
 Sample result in Blackwell
 
-```shell
+```
 |Tasks|Version|     Filter     |n-shot|  Metric   |   |Value |   |Stderr|
 |-----|------:|----------------|-----:|-----------|---|-----:|---|-----:|
 |gsm8k|      3|flexible-extract|     5|exact_match|↑  |0.9075|±  |0.0080|
@@ -266,7 +264,7 @@ Sample result in Blackwell
 
 ## Benchmarking Performance
 
-To benchmark the performance of your TensorRT-LLM server you can leverage the built-in `benchmark_serving.py` script. To do this first creating a wrapper [bench.sh](http://bench.sh) script.
+To benchmark the performance of your TensorRT-LLM server you can leverage the built-in `benchmark_serving.py` script. To do this first creating a wrapper `bench.sh` script.
 
 ```shell
 cat <<EOF >  bench.sh
@@ -306,7 +304,7 @@ If you want to save the results to a file add the following options.
 --result-filename "concurrency_${concurrency}.json"
 ```
 
-For more benchmarking options see. [https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt\_llm/serve/scripts/benchmark\_serving.py](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/serve/scripts/benchmark_serving.py)
+For more benchmarking options see <https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt\_llm/serve/scripts/benchmark\_serving.py>.
 
 Run bench.sh to begin a serving benchmark. This will take a long time if you run all the concurrencies mentioned in the above bench.sh script.
 

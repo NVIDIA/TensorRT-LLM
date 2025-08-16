@@ -182,8 +182,8 @@ class MLPBlock(torch.nn.Module):
         # Perfect router caching - precompute common logits if enabled
         if os.environ.get('ENABLE_PERFECT_ROUTER', '0') == '1':
             precompute_common_perfect_router_logits(
-                num_experts=pretrained_config.num_experts,
-                experts_per_token=pretrained_config.experts_per_token,
+                num_experts=pretrained_config.num_local_experts,
+                experts_per_token=pretrained_config.num_experts_per_tok,
                 moe_ep_size=config.mapping.moe_ep_size,
                 dtype=pretrained_config.torch_dtype)
 

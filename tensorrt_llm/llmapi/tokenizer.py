@@ -57,6 +57,11 @@ class TransformersTokenizer(TokenizerBase):
     def batch_encode_plus(self, texts: List[str], *args, **kwargs) -> dict:
         return self.tokenizer.batch_encode_plus(texts, *args, **kwargs)
 
+    def get_chat_template(self,
+                          chat_template: Optional[str] = None,
+                          tools: Optional[List[Dict]] = None) -> str:
+        return self.tokenizer.get_chat_template(chat_template, tools)
+
     def apply_chat_template(
             self, conversation: Union[List[Dict[str, str]],
                                       List[List[Dict[str, str]]]], *args,
@@ -353,5 +358,8 @@ def load_hf_tokenizer(model_dir: str,
             use_fast=use_fast,
             **kwargs)
 
-    except Exception:
+    except Exception as e:
+        logger.warning(
+            f"Failed to load hf tokenizer from {model_dir}, encounter error: {e}"
+        )
         return None

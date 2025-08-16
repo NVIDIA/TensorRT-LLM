@@ -9,7 +9,7 @@ context_servers:
   pipeline_parallel_size: 1
   disable_overlap_scheduler: True
   cache_transceiver_config:
-    backend: default
+    backend: DEFAULT
   urls:
       - "localhost:8001"
 generation_servers:
@@ -20,6 +20,6 @@ generation_servers:
     enable_padding: False
   disable_overlap_scheduler: False
   cache_transceiver_config:
-    backend: default
+    backend: DEFAULT
   urls:
       - "localhost:8002"
