@@ -37,7 +37,7 @@ class Backend:
         enable_inductor=True,
         enable_userbuffers=False,
         enable_piecewise_cuda_graph: bool = False,
-        cuda_graph_batch_sizes: Optional[List[int]] = None,
+        capture_num_tokens: Optional[List[int]] = None,
         max_num_streams: int = 1,
     ) -> None:
         super().__init__()
@@ -48,9 +48,7 @@ class Backend:
         self.custom_passes = Backend.get_custom_pass(enable_userbuffers)
         self.rank = tensorrt_llm.mpi_rank()
         self.enable_inductor = enable_inductor
-        self.cuda_graph_batch_sizes = (cuda_graph_batch_sizes
-                                       if cuda_graph_batch_sizes is not None
-                                       else [])
+        self.capture_num_tokens = capture_num_tokens if capture_num_tokens is not None else []
         self.piecewise_cuda_graph = enable_piecewise_cuda_graph
         self.no_optimization = False
         # We only need to create aux streams.
@@ -125,7 +123,7 @@ class Backend:
                 example_inputs,
                 self.enable_inductor,
                 self.input_num_tokens,
-                self.cuda_graph_batch_sizes,
+                self.capture_num_tokens,
                 self._graph_pool_handle,
                 len(self.aux_streams) + 1,
             )

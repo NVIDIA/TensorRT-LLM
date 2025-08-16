@@ -161,7 +161,6 @@ class PyExecutor:
         self.profile_start_iters, self.profile_stop_iters = _load_iteration_indexes(
             PROFILE_START_STOP_ENV_VAR_NAME)
         self.gc_nvtx_watcher_handle = _gc_nvtx_watcher()
-        self.is_warmup = False  # During warmup, we don't enable the profiler
 
         # related modules
         self.resource_manager = resource_manager
@@ -220,9 +219,12 @@ class PyExecutor:
 
         self.inflight_req_ids = ReqIdsSet()
 
+        self.is_warmup = True
         self.model_engine.warmup(self.resource_manager)
         if self.draft_model_engine is not None:
             self.draft_model_engine.warmup(self.resource_manager)
+        # During warmup, we don't enable the profiler
+        self.is_warmup = False
 
         self.is_shutdown = False
         self.max_batch_size = max_batch_size
@@ -279,6 +281,18 @@ class PyExecutor:
             raise e
         finally:
             self._executor_loop_cleanup()
+
+    @property
+    def is_warmup(self) -> bool:
+        return getattr(self, "_is_warmup", False)
+
+    @is_warmup.setter
+    def is_warmup(self, value: bool):
+        self._is_warmup = value
+        # Set warmup flag in model engine to trigger torch compile and avoid moe load balancer statistics update
+        self.model_engine.is_warmup = value
+        if self.draft_model_engine is not None:
+            self.draft_model_engine.is_warmup = value
 
     def start_worker(self):
         with self.worker_lock:
