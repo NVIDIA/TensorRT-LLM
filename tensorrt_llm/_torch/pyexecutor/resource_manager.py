@@ -17,6 +17,7 @@ from tensorrt_llm.sampling_params import SamplingParams
 from ..._utils import binding_dtype_size, binding_to_str_dtype, nvtx_range
 from ...logger import logger
 from ...mapping import CpType, Mapping
+from .kv_cache_connector import KvCacheConnectorManager
 from .llm_request import (LlmRequest, LlmRequestState, SamplingConfig,
                           get_draft_token_length)
 from .scheduler import ScheduledRequests
@@ -161,6 +162,7 @@ class KVCacheManager(BaseResourceManager):
         model_config: Optional[ModelConfig] = None,
         max_beam_width: int = 1,
         is_draft: bool = False,
+        kv_connector_manager: Optional[KvCacheConnectorManager] = None,
     ) -> None:
         self.mapping = mapping
         self.dtype = dtype
@@ -177,6 +179,8 @@ class KVCacheManager(BaseResourceManager):
             idx: offset
             for offset, idx in enumerate(self.pp_layers)
         }
+
+        self.kv_connector_manager = kv_connector_manager
 
         tp_size = mapping.tp_size
         if mapping.enable_attention_dp:
@@ -329,6 +333,7 @@ class KVCacheManager(BaseResourceManager):
             'cache_type': kv_cache_type,
             'enable_partial_reuse': kv_cache_config.enable_partial_reuse,
             'copy_on_partial_reuse': kv_cache_config.copy_on_partial_reuse,
+            'kv_connector_manager': self.kv_connector_manager,
         }
         if self.event_buffer_max_size > 0:
             if mapping.enable_attention_dp:
@@ -413,7 +418,8 @@ class KVCacheManager(BaseResourceManager):
                                        == self.mapping.cp_size - 1 else 0),
                             req_beam_width, req)
                 else:
-                    if req.is_first_context_chunk:
+                    if req.is_first_context_chunk and self._kv_connector_should_add_sequence(
+                            req):
                         self.impl.add_sequence(req.py_request_id,
                                                req.prompt_len, req_beam_width,
                                                req)
@@ -422,10 +428,23 @@ class KVCacheManager(BaseResourceManager):
                         for _ in range(get_draft_token_length(req)):
                             self.impl.add_token(req.py_request_id)
 
+                        if self.kv_connector_manager is not None:
+                            block_ids = self.get_cache_indices(req)
+                            self.kv_connector_manager.update_state_after_alloc(
+                                req, block_ids)
+
             for req in generation_batch:
                 self.impl.add_token(req.py_request_id)
                 for _ in range(get_draft_token_length(req)):
                     self.impl.add_token(req.py_request_id)
+
+        if self.kv_connector_manager is not None:
+            self.kv_connector_manager.build_scheduler_output(
+                scheduled_batch, self)
+
+    def _kv_connector_should_add_sequence(self, request: LlmRequest) -> bool:
+        return self.kv_connector_manager is None or self.kv_connector_manager.should_add_sequence(
+            request)
 
     def add_dummy_requests(
         self,
@@ -625,6 +644,9 @@ class KVCacheManager(BaseResourceManager):
             self.num_kv_heads_per_layer[layer_offset],
             self.head_dim,
         )
+
+    def get_unique_primary_pool(self) -> torch.Tensor:
+        return self.impl.get_unique_primary_pool()
 
     def get_block_ids_per_seq(self, request_ids: List[int]) -> torch.Tensor:
         block_ids_per_seq = self.get_batch_cache_indices(request_ids)
