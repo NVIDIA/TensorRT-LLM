@@ -16,13 +16,15 @@ jobs:
       - uses: actions/stale@v9
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
-          stale-issue-message: 'Issue has not received an update in over 14 days. Adding stale label.'
-          stale-pr-message: 'PR has not received an update in over 14 days. Adding stale label.'
-          close-issue-message: 'This issue was closed because it has been 14 days without activity since it has been marked as stale.'
-          close-pr-message: 'This PR was closed because it has been 14 days without activity since it has been marked as stale.'
-          days-before-issue-stale: 14
-          days-before-close: 14
-          only-labels: 'waiting for feedback'
+          stale-issue-message: 'Issue has not received an update in over 23 days. Adding stale label.'
+          stale-pr-message: 'PR has not received an update in over 30 days. Adding stale label.'
+          close-issue-message: 'This issue was closed because it has been 7 days without activity since it has been marked as stale.'
+          close-pr-message: 'This PR was closed because it has been 7 days without activity since it has been marked as stale.'
+          days-before-issue-stale: 23
+          days-before-close: 7
+          # TODO: enable this when we have a way to mark issues as high priority
+          #exempt-issue-labels: 'high priority,wip'
+          #exempt-pr-labels: 'high priority,wip,do not merge'
           labels-to-add-when-unstale: 'investigating'
           labels-to-remove-when-unstale: 'stale,waiting for feedback'
           stale-issue-label: 'stale'
