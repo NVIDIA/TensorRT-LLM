@@ -31,5 +31,7 @@ set(LOOKAHEAD_DECODING_TEST_SRC randomLlm.cpp lookaheadDecodingLayerTest.cpp)
 add_gtest(lookaheadDecodingLayerTest "${LOOKAHEAD_DECODING_TEST_SRC}")
 
 add_gtest(dynamicDecodeLayerTest dynamicDecodeLayerTest.cpp)
+add_gtest(eagleLayerTest eagleLayerTest.cpp)
 add_gtest(explicitDraftTokensLayerTest explicitDraftTokensLayerTest.cpp)
 add_gtest(layerUtilsTest layerUtilsTest.cpp)
+add_gtest(medusaDecodeLayerTest medusaDecodeLayerTest.cpp)

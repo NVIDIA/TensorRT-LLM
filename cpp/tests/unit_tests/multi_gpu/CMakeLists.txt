@@ -9,18 +9,8 @@
 # license agreement from NVIDIA CORPORATION or its affiliates is strictly
 # prohibited.
 
-if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/batch_manager)
-  add_subdirectory(batch_manager)
-endif()
-
-if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/executor)
-  add_subdirectory(executor)
-endif()
-
-add_subdirectory(common)
 add_subdirectory(kernels)
-add_subdirectory(multi_gpu)
-add_subdirectory(layers)
-add_subdirectory(runtime)
-add_subdirectory(thop)
-add_subdirectory(utils)
+
+add_gtest(cacheTransceiverTest cacheTransceiverTest.cpp)
+add_gtest(mpiUtilsTest mpiUtilsTest.cpp)
+add_gtest(userBufferTest userBufferTest.cpp)

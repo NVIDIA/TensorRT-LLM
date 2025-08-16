@@ -628,11 +628,8 @@ TEST(Kernel, MoEReduceAddARFuse)
     auto& comm = mpi::MpiComm::world();
     auto world_size = comm.getSize();
     auto rank = comm.getRank();
-    if (world_size % 2)
-    {
-        TLLM_LOG_WARNING("world size is not a multiple of 2, return");
-        return;
-    }
+    ASSERT_EQ(world_size % 2, 0) << "Requires even world size (got " << world_size << ")";
+
     int warmup = 100, iter = 100;
     int hidden_dim = 7168;
     std::vector<int> candidate_token_num{1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048};
