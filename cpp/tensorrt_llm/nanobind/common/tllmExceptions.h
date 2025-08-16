@@ -16,7 +16,6 @@
 
 #pragma once
 #include <nanobind/nanobind.h>
-
 namespace nb = nanobind;
 
 namespace tensorrt_llm::nanobind::common
