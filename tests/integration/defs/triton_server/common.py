@@ -247,7 +247,8 @@ def modify_ib_config_pbtxt(REPO_PATH,
                            CROSS_KV_CACHE_FRACTION="",
                            ENCODER_INPUT_FEATURES_DTYPE="TYPE_FP16",
                            GUIDED_DECODING_BACKEND="",
-                           XGRAMMAR_TOKENIZER_INFO_PATH=""):
+                           XGRAMMAR_TOKENIZER_INFO_PATH="",
+                           PROMPT_EMBEDDING_TABLE_DTYPE="TYPE_FP16"):
     fill_template_py = os.path.join(llm_backend_repo_root, "tools",
                                     "fill_template.py")
     tensorrt_llm_config = os.path.join(llm_backend_repo_root, REPO_PATH,
@@ -274,6 +275,7 @@ def modify_ib_config_pbtxt(REPO_PATH,
         check_call(
             f"python3 {fill_template_py} -i {multimodal_enc_config} triton_max_batch_size:{TRITON_MAX_BATCH_SIZE}," \
             f"multimodal_model_path:{MULTIMODAL_ENGINE_PATH},encoder_input_features_data_type:{ENCODER_INPUT_FEATURES_DTYPE}," \
+            f"prompt_embedding_table_data_type:{PROMPT_EMBEDDING_TABLE_DTYPE}," \
             f"hf_model_path:{TOKENIZER_PATH}",
             shell=True)
         check_call(
@@ -305,6 +307,7 @@ def modify_ib_config_pbtxt(REPO_PATH,
             f"lookahead_ngram_size:{EXECUTOR_LOOKAHEAD_NGRAM}," \
             f"lookahead_verification_set_size:{EXECUTOR_LOOKAHEAD_VERIFICATION_SET}," \
             f"encoder_input_features_data_type:{ENCODER_INPUT_FEATURES_DTYPE}," \
+            f"prompt_embedding_table_data_type:{PROMPT_EMBEDDING_TABLE_DTYPE}," \
             f"participant_ids:{PARTICIPANT_IDS_DRAFT}," \
             f"logits_datatype:TYPE_FP32'",
             shell=True)
@@ -329,6 +332,7 @@ def modify_ib_config_pbtxt(REPO_PATH,
             f"lookahead_ngram_size:{EXECUTOR_LOOKAHEAD_NGRAM}," \
             f"lookahead_verification_set_size:{EXECUTOR_LOOKAHEAD_VERIFICATION_SET}," \
             f"encoder_input_features_data_type:{ENCODER_INPUT_FEATURES_DTYPE}," \
+            f"prompt_embedding_table_data_type:{PROMPT_EMBEDDING_TABLE_DTYPE}," \
             f"participant_ids:{PARTICIPANT_IDS_TARGET}," \
             f"logits_datatype:TYPE_FP32'",
             shell=True)
@@ -348,7 +352,8 @@ def modify_ib_config_pbtxt(REPO_PATH,
     check_call(
         f"python3 {fill_template_py} -i {tensorrt_llm_bls_config} triton_max_batch_size:{TRITON_MAX_BATCH_SIZE}," \
         f"decoupled_mode:{DECOUPLED_MODE},accumulate_tokens:{ACCUMULATE_TOKEN},bls_instance_count:{BLS_INSTANCE_COUNT}," \
-        f"tensorrt_llm_model_name:{TENSORRT_LLM_TARGET_MODEL_NAME},tensorrt_llm_draft_model_name:{TENSORRT_LLM_DRAFT_MODEL_NAME},logits_datatype:TYPE_FP32",
+        f"tensorrt_llm_model_name:{TENSORRT_LLM_TARGET_MODEL_NAME},tensorrt_llm_draft_model_name:{TENSORRT_LLM_DRAFT_MODEL_NAME},logits_datatype:TYPE_FP32," \
+        f"prompt_embedding_table_data_type:{PROMPT_EMBEDDING_TABLE_DTYPE}",
         shell=True)
 
     check_call(
@@ -363,6 +368,7 @@ def modify_ib_config_pbtxt(REPO_PATH,
         f"gpu_weights_percent:{GPU_WEIGHTS_PERCENT},encoder_engine_dir:{ENCODER_ENGINE_PATH},max_queue_size:{MAX_QUEUE_SIZE}," \
         f"enable_context_fmha_fp32_acc:{ENABLE_CONTEXT_FMHA_FP32_ACC}," \
         f"encoder_input_features_data_type:{ENCODER_INPUT_FEATURES_DTYPE}," \
+        f"prompt_embedding_table_data_type:{PROMPT_EMBEDDING_TABLE_DTYPE}," \
         f"participant_ids:{PARTICIPANT_IDS}," \
         f"logits_datatype:TYPE_FP32,guided_decoding_backend:{GUIDED_DECODING_BACKEND},tokenizer_dir:{TOKENIZER_PATH},xgrammar_tokenizer_info_path:{XGRAMMAR_TOKENIZER_INFO_PATH}'",
         shell=True)
