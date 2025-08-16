@@ -67,7 +67,7 @@ class Gemma2ConfigGroup:
 class Gemma3ConfigGroup:
     query_pre_attn_scalar: float
     final_logit_softcapping: Optional[float]
-    sliding_window_pattern: int
+    layer_types: List[str]
     rope_local_base_freq: int
     sliding_window: int
 

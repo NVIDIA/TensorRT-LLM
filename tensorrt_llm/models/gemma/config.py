@@ -14,7 +14,7 @@
 # limitations under the License.
 from json import loads
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional, Union
+from typing import TYPE_CHECKING, List, Optional, Union
 
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.logger import logger
@@ -51,8 +51,8 @@ class GemmaConfig(PretrainedConfig):
         query_pre_attn_scalar: Optional[int] = None,
         final_logit_softcapping: Optional[float] = None,
         attn_logit_softcapping: Optional[float] = None,
+        layer_types: Optional[List[str]] = None,
         mapping: Optional[Union[Mapping, dict]] = None,
-        sliding_window_pattern: int = None,
         rope_local_base_freq: int = None,
         sliding_window: int = None,
         **kwargs,
@@ -94,7 +94,7 @@ class GemmaConfig(PretrainedConfig):
             if self.is_gemma_2:
                 self.attn_logit_softcapping = attn_logit_softcapping
             if self.is_gemma_3:
-                self.sliding_window_pattern = sliding_window_pattern
+                self.layer_types = layer_types
                 self.rope_local_base_freq = rope_local_base_freq
                 self.sliding_window = sliding_window
 
