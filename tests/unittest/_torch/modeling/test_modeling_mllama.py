@@ -3,6 +3,7 @@ import unittest
 from copy import deepcopy
 
 import torch
+from _torch.helpers import DecodingCUDAGraphRunner
 from parameterized import parameterized
 from test_modeling_llama import Scenario, reduce_llama_config
 from transformers import MllamaConfig
@@ -15,8 +16,6 @@ from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_mllama import \
     MllamaForConditionalGeneration
-from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import \
-    DecodingCUDAGraphRunner
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.mapping import Mapping

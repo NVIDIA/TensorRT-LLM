@@ -4,6 +4,7 @@ from dataclasses import dataclass
 
 import torch
 import transformers
+from _torch.helpers import DecodingCUDAGraphRunner
 from parameterized import parameterized
 from transformers import Llama4Config
 from transformers import \
@@ -20,8 +21,6 @@ from tensorrt_llm._torch.models.checkpoints.hf.llama4_weight_mapper import \
 from tensorrt_llm._torch.models.modeling_llama import \
     Llama4ForConditionalGeneration
 from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
-from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import \
-    DecodingCUDAGraphRunner
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.mapping import Mapping

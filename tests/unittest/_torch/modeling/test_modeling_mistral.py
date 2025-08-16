@@ -7,6 +7,7 @@ from unittest import mock
 import pytest
 import torch
 import transformers
+from _torch.helpers import DecodingCUDAGraphRunner
 from utils.util import getSMVersion
 
 import tensorrt_llm
@@ -15,7 +16,7 @@ from tensorrt_llm._torch import metadata as metadata_lib
 from tensorrt_llm._torch import model_config as model_config_lib
 from tensorrt_llm._torch.attention_backend import utils as attention_utils
 from tensorrt_llm._torch.models import modeling_mistral
-from tensorrt_llm._torch.pyexecutor import cuda_graph_runner, resource_manager
+from tensorrt_llm._torch.pyexecutor import resource_manager
 from tensorrt_llm.bindings import executor as executor_lib
 from tensorrt_llm.models import modeling_utils
 
@@ -405,7 +406,7 @@ def test_mistral_3_vlm_allclose_to_hf(mistral_small_3_1_24b_config, backend, use
                     input_ids=input_ids, position_ids=position_ids, attn_metadata=attn_metadata
                 )
             else:
-                graph_runner = cuda_graph_runner.DecodingCUDAGraphRunner(
+                graph_runner = DecodingCUDAGraphRunner(
                     attn_metadata.max_num_requests, "cuda", attn_metadata
                 )
                 graph_runner.capture(lambda inputs: mistral.forward(**inputs))

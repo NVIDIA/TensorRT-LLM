@@ -3,6 +3,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 
 import torch
+from _torch.helpers import DecodingCUDAGraphRunner
 from parameterized import parameterized
 from transformers import Qwen2MoeConfig
 from transformers import Qwen2MoeForCausalLM as HFQwen2MoeForCausalLM
@@ -15,8 +16,6 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.checkpoints.hf.qwen2_moe_weight_mapper import \
     Qwen2MoeHfWeightMapper
 from tensorrt_llm._torch.models.modeling_qwen_moe import Qwen2MoeForCausalLM
-from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import \
-    DecodingCUDAGraphRunner
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
