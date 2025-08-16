@@ -244,7 +244,7 @@ def run_parallel_test(model_name: str, model_path: str, ctx_pp: int,
         "disable_overlap_scheduler": True,
         "kv_cache_config": kv_cache_config,
         "cache_transceiver_config": {
-            "backend": "default"
+            "backend": "DEFAULT"
         }
     }
     gen_server_config = {
@@ -253,7 +253,7 @@ def run_parallel_test(model_name: str, model_path: str, ctx_pp: int,
         "disable_overlap_scheduler": True,
         "kv_cache_config": kv_cache_config,
         "cache_transceiver_config": {
-            "backend": "default"
+            "backend": "DEFAULT"
         }
     }
     disaggregated_server_config = {
@@ -288,8 +288,8 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
         gen_server_config = {
             "disable_overlap_scheduler": disable_overlap_scheduler
         }
-        ctx_server_config["cache_transceiver_config"] = {"backend": "default"}
-        gen_server_config["cache_transceiver_config"] = {"backend": "default"}
+        ctx_server_config["cache_transceiver_config"] = {"backend": "DEFAULT"}
+        gen_server_config["cache_transceiver_config"] = {"backend": "DEFAULT"}
         disaggregated_server_config = {
             "hostname": "localhost",
             "port": 8000,
@@ -328,7 +328,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             "disable_overlap_scheduler": True,
             "kv_cache_config": kv_cache_config,
             "cache_transceiver_config": {
-                "backend": "default"
+                "backend": "DEFAULT"
             }
         }
         gen_server_config = {
@@ -336,7 +336,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             "speculative_config": speculative_decoding_config,
             "kv_cache_config": kv_cache_config,
             "cache_transceiver_config": {
-                "backend": "default"
+                "backend": "DEFAULT"
             }
         }
         disaggregated_server_config = {
@@ -379,7 +379,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             "max_num_tokens": 13393 * 2,
             "max_batch_size": 1,
             "cache_transceiver_config": {
-                "backend": "default"
+                "backend": "DEFAULT"
             },
             "cuda_graph_config": None,
         }
@@ -393,7 +393,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             "max_num_tokens": 13393 * 2,
             "max_batch_size": 16,
             "cache_transceiver_config": {
-                "backend": "default"
+                "backend": "DEFAULT"
             },
             "cuda_graph_config": None,
         }
@@ -424,13 +424,13 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             "disable_overlap_scheduler": True,
             "guided_decoding_backend": backend,
             "cache_transceiver_config": {
-                "backend": "default"
+                "backend": "DEFAULT"
             }
         }
         gen_server_config = {
             "guided_decoding_backend": backend,
             "cache_transceiver_config": {
-                "backend": "default"
+                "backend": "DEFAULT"
             }
         }
         disaggregated_server_config = {
@@ -472,7 +472,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             },
             "guided_decoding_backend": backend,
             "cache_transceiver_config": {
-                "backend": "default"
+                "backend": "DEFAULT"
             }
         }
         gen_server_config = {
@@ -483,7 +483,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             },
             "guided_decoding_backend": backend,
             "cache_transceiver_config": {
-                "backend": "default"
+                "backend": "DEFAULT"
             }
         }
         disaggregated_server_config = {
@@ -536,8 +536,8 @@ class TestLlama4ScoutInstruct(LlmapiAccuracyTestHarness):
     def test_auto_dtype(self, overlap_scheduler):
         ctx_server_config = {"disable_overlap_scheduler": True}
         gen_server_config = {"disable_overlap_scheduler": overlap_scheduler}
-        ctx_server_config["cache_transceiver_config"] = {"backend": "default"}
-        gen_server_config["cache_transceiver_config"] = {"backend": "default"}
+        ctx_server_config["cache_transceiver_config"] = {"backend": "DEFAULT"}
+        gen_server_config["cache_transceiver_config"] = {"backend": "DEFAULT"}
         # Keep this low to avoid warmup OOM in CI
         ctx_server_config["max_seq_len"] = 8192
         gen_server_config["max_seq_len"] = 8192
@@ -574,13 +574,13 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         ctx_server_config = {
             "disable_overlap_scheduler": True,
             "cache_transceiver_config": {
-                "backend": "nixl"
+                "backend": "NIXL"
             }
         }
         gen_server_config = {
             "disable_overlap_scheduler": True,
             "cache_transceiver_config": {
-                "backend": "nixl"
+                "backend": "NIXL"
             }
         }
         disaggregated_server_config = {
@@ -611,8 +611,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     def test_auto_dtype(self, overlap_scheduler, mtp_nextn):
         ctx_server_config = {"disable_overlap_scheduler": True}
         gen_server_config = {"disable_overlap_scheduler": not overlap_scheduler}
-        ctx_server_config["cache_transceiver_config"] = {"backend": "default"}
-        gen_server_config["cache_transceiver_config"] = {"backend": "default"}
+        ctx_server_config["cache_transceiver_config"] = {"backend": "DEFAULT"}
+        gen_server_config["cache_transceiver_config"] = {"backend": "DEFAULT"}
         if mtp_nextn > 0:
             ctx_server_config["speculative_config"] = {
                 "decoding_type": "MTP",
@@ -661,14 +661,14 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             "disable_overlap_scheduler": True,
             "cuda_graph_config": None,
             "cache_transceiver_config": {
-                "backend": "default"
+                "backend": "DEFAULT"
             }
         }
         gen_server_config = {
             "disable_overlap_scheduler": overlap_scheduler,
             "cuda_graph_config": None,
             "cache_transceiver_config": {
-                "backend": "default"
+                "backend": "DEFAULT"
             }
         }
         ctx_server_config["kv_cache_config"] = {
@@ -710,13 +710,13 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
         ctx_server_config = {
             "disable_overlap_scheduler": True,
             "cache_transceiver_config": {
-                "backend": "nixl"
+                "backend": "NIXL"
             }
         }
         gen_server_config = {
             "disable_overlap_scheduler": True,
             "cache_transceiver_config": {
-                "backend": "nixl"
+                "backend": "NIXL"
             }
         }
         disaggregated_server_config = {
@@ -746,14 +746,14 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             "disable_overlap_scheduler": True,
             "cuda_graph_config": None,
             "cache_transceiver_config": {
-                "backend": "default"
+                "backend": "DEFAULT"
             }
         }
         gen_server_config = {
             "disable_overlap_scheduler": overlap_scheduler,
             "cuda_graph_config": None,
             "cache_transceiver_config": {
-                "backend": "default"
+                "backend": "DEFAULT"
             }
         }
         disaggregated_server_config = {
