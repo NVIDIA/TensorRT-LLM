@@ -459,13 +459,16 @@ class PyTorchModelEngine(ModelEngine):
     def runtime_draft_len(self):
         return self.max_draft_len if self.enable_spec_decode else 0
 
-    def set_lora_model_config(self, lora_target_modules: list[str],
-                              trtllm_modules_to_hf_modules: dict[str, str]):
+    def set_lora_model_config(self,
+                              lora_target_modules: list[str],
+                              trtllm_modules_to_hf_modules: dict[str, str],
+                              swap_gate_up_proj: bool = True):
         self.lora_model_config = LoraModelConfig(
             lora_target_modules=lora_target_modules,
             trtllm_modules_to_hf_modules=trtllm_modules_to_hf_modules,
             hidden_size=self.model.config.hidden_size,
-            dtype=torch_dtype_to_str(self.model.config.torch_dtype))
+            dtype=torch_dtype_to_str(self.model.config.torch_dtype),
+            swap_gate_up_proj=swap_gate_up_proj)
 
     @property
     def use_mrope(self):
