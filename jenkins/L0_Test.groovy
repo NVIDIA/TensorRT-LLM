@@ -1015,6 +1015,8 @@ def getMakoArgsFromStageName(stageName, parseSysinfo=false) {
     }
     if (stageName.contains("-DeepSeek-")) {
         makoArgs += ["auto_trigger=deepseek"]
+    } else if (stageName.contains("-GptOss-")) {
+        makoArgs += ["auto_trigger=gpt_oss"]
     } else {
         makoArgs += ["auto_trigger=others"]
     }
@@ -1762,6 +1764,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
     x86TestConfigs = [
         "DGX_H100-4_GPUs-PyTorch-DeepSeek-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 2, 4],
         "DGX_H100-4_GPUs-PyTorch-DeepSeek-2": ["dgx-h100-x4", "l0_dgx_h100", 2, 2, 4],
+        "DGX_H100-4_GPUs-PyTorch-GptOss-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "DGX_H100-4_GPUs-PyTorch-Others-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "DGX_H100-4_GPUs-Triton-Post-Merge-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "DGX_H100-4_GPUs-CPP-1": ["dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
