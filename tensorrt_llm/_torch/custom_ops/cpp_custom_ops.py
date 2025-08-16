@@ -531,3 +531,11 @@ def _register_fake():
         return router_logits.new_empty(
             sz, dtype=torch.int32), router_logits.new_empty(sz,
                                                             dtype=torch.float32)
+
+    @torch.library.register_fake("trtllm::default_moe_routing_op")
+    def _(router_logits, topk):
+        num_tokens = router_logits.shape[0]
+        sz = (num_tokens, topk)
+        return router_logits.new_empty(
+            sz, dtype=torch.int32), router_logits.new_empty(sz,
+                                                            dtype=torch.float32)
