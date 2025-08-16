@@ -263,7 +263,8 @@ public:
 
     /// @brief Cancel the request.
     /// @param llmRequest Request object.
-    void cancelRequest(LlmRequest& llmRequest) const;
+    /// @return Whether the request is canceled.
+    bool cancelRequest(LlmRequest& llmRequest) const;
 
     /// @brief Destructor.
     ~DataResponder();
@@ -288,7 +289,8 @@ public:
 
     /// @brief Cancel the request.
     /// @param llmRequest Request object.
-    void cancelRequest(LlmRequest& llmRequest) const;
+    /// @return Whether the request is canceled.
+    bool cancelRequest(LlmRequest& llmRequest) const;
 
     /// @brief Destructor.
     ~DataRequester();
