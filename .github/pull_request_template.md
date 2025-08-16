@@ -27,7 +27,7 @@ Please list clearly what are the relevant test(s) that can safeguard the changes
 -->
 
 ## PR Checklist
-Please check the following items wherever appropriate, else strick them out if N/A. This is needed to merge the PR.
+All items must be resolved either by either checking boxes or striking the line if N/A. This will be needed to merge the PR.
 - [ ] Have you made sure the PR description is explaining what you’re doing and why?
 - [ ] Are you following the [TRT-LLM CODING GUIDELINES](https://github.com/NVIDIA/TensorRT-LLM/blob/main/CODING_GUIDELINES.md) to the best of your knowledge?
 - [ ] Do you have test cases for new code paths? See https://github.com/NVIDIA/TensorRT-LLM/tree/main/tests#1-how-does-the-ci-work for instructions on how to add.
