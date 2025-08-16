@@ -339,10 +339,10 @@ def create_py_executor(
             _ExecutorCreationStage.GUIDED_DECODER):
         guided_decoder: Optional[GuidedDecoder] = None
         if executor_config.guided_decoding_config is not None:
-            if spec_config is not None and not has_spec_drafter:
-                raise ValueError(
-                    "Guided decoding is only supported with speculative decoding that has a dedicated drafter (two-model engine)."
-                )
+            # if spec_config is not None and not has_spec_drafter:
+            #     raise ValueError(
+            #         "Guided decoding is only supported with speculative decoding that has a dedicated drafter (two-model engine)."
+            #     )
             if mapping.is_last_pp_rank():
                 max_num_draft_tokens = 0
                 if spec_config is not None:
@@ -352,6 +352,9 @@ def create_py_executor(
                     executor_config.max_batch_size,
                     model_engine.model.vocab_size_padded,
                     max_num_draft_tokens=max_num_draft_tokens)
+            # TODO: fix it
+            model_engine.model.spec_worker.guided_decoder = guided_decoder
+            guided_decoder = None
 
     with mem_monitor.observe_creation_stage(_ExecutorCreationStage.SAMPLER):
         sampler = instantiate_sampler(model_engine, executor_config,

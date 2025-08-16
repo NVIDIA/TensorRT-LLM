@@ -7,6 +7,7 @@ from torch import nn
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
+from ..pyexecutor.guided_decoder import GuidedDecoder
 from ..pyexecutor.llm_request import LlmRequest
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
 from ..pyexecutor.sampler import TorchSampler
@@ -265,16 +266,23 @@ class Eagle3OneModelWorker(nn.Module):
         self.spec_config = spec_config
         self.max_draft_len = self.spec_config.max_draft_len
         self.mapping = mapping
+        self.guided_decoder: Optional[GuidedDecoder] = None
 
     # Skip torch.compile for now since current Torch is not compatible with Triton 3.4
     # @torch.compile(options={"max-autotune": True})
     def forward(self, input_ids, position_ids, hidden_states, logits,
-                attn_metadata, spec_metadata, draft_model):
+                attn_metadata, spec_metadata, guided_metadata, draft_model):
         batch_size = attn_metadata.num_seqs
         num_contexts = attn_metadata.num_contexts
         num_gens = batch_size - num_contexts
 
         raw_logits = logits
+
+        if self.guided_decoder is not None:
+            guided_metadata.token_event.synchronize()
+            self.guided_decoder.rollback_rejected_tokens_v2(guided_metadata)
+            self.guided_decoder.build_v2(guided_metadata)
+            self.guided_decoder.execute_v2(guided_metadata, logits)
 
         # Sample and accept tokens
         accepted_tokens, num_accepted_tokens = self.sample_and_accept_draft_tokens(
@@ -324,6 +332,7 @@ class Eagle3OneModelWorker(nn.Module):
             logits = draft_model.logits_processor(hidden_states[gather_ids],
                                                   draft_model.lm_head,
                                                   attn_metadata, True)
+            # Insert guided decoder
             new_draft_token = self.draft_decoder(logits, draft_model)
             next_draft_tokens.append(new_draft_token)
             # update inputs
