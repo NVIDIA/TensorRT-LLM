@@ -15,7 +15,7 @@
 
 import pytest
 import torch
-from _torch.helpers import calc_diff
+from _torch.helpers import calc_diff, calc_woq_tolerence
 
 
 def weight_only_quant_gemm_reference(a, b, b_scales):
@@ -27,18 +27,6 @@ def weight_only_quant_gemm_reference(a, b, b_scales):
     ref = torch.matmul(a, b * b_scales)
 
     return ref.to(dtype=a_dtype)
-
-
-def woq_tolerence_calculate(output, output_ref, b_dtype):
-    if b_dtype == torch.int8:
-        bits_in_type = 8
-    elif b_dtype == torch.quint4x2:
-        bits_in_type = 4
-    quant_range_scale = 1.0 / float(1 << (bits_in_type - 1))
-    max_val = torch.max(abs(output_ref)).item()
-    atol = (max_val * quant_range_scale) * 1.5  # allow for rounding
-
-    return atol
 
 
 @pytest.mark.parametrize(
@@ -79,5 +67,5 @@ def test_weight_only_quant_gemm(a_dtype, b_dtype, m, k, n):
     # check accuracy
     diff = calc_diff(output, output_ref)
     assert diff < 1e-3, f"Difference {diff} >= 1e-3"
-    atol = woq_tolerence_calculate(output, output_ref, b_dtype)
+    atol = calc_woq_tolerence(output_ref, b_dtype)
     torch.testing.assert_close(output_ref, output, atol=atol, rtol=1e-7)

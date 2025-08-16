@@ -32,7 +32,6 @@ def temp_extra_llm_api_options_file(request):
             "build_config": {
                 "max_num_tokens": 16384,
             },
-            "use_torch_sampler": True,
         }
 
         with open(temp_file_path, 'w') as f:

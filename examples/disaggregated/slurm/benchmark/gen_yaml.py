@@ -197,7 +197,7 @@ def gen_config_file(config_path: str,
             },
             'cache_transceiver_config': {
                 'max_tokens_in_buffer': cache_transceiver_max_num_tokens,
-                'backend': 'default',
+                'backend': 'DEFAULT',
             },
         },
         'generation_servers': {
@@ -225,7 +225,7 @@ def gen_config_file(config_path: str,
             },
             'cache_transceiver_config': {
                 'max_tokens_in_buffer': cache_transceiver_max_num_tokens,
-                'backend': 'default',
+                'backend': 'DEFAULT',
             },
             'stream_interval': 20,
         }

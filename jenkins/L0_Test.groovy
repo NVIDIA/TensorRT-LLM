@@ -2075,6 +2075,11 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
                 checkPipStage = true
             }
 
+            if (cpu_arch == AARCH64_TRIPLE && values[5] != DLFW_IMAGE) {
+                checkPipStage = false
+                echo "Skip pip install sanity check due to https://nvbugs/5453827"
+            }
+
             if (checkPipStage) {
                 stage("Run LLMAPI tests") {
                     pipInstallSanitySpec = createKubernetesPodConfig(values[5], gpu_type, k8s_arch)

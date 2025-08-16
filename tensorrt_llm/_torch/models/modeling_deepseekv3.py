@@ -53,7 +53,6 @@ from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
                            MoEAllReduce, MoEAllReduceParams, allgather)
 from ..model_config import ModelConfig
-from ..models.modeling_utils import ModelConfig, QuantConfig
 from ..modules.attention import MLA
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
@@ -66,10 +65,10 @@ from ..modules.linear import Linear, TensorParallelMode, WeightsLoadingConfig
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..peft.lora.layer import LoraLayer
-from ..speculative import MTPEagleWorker, MTPSpecMetadata, MTPWorker
+from ..speculative import MTPSpecMetadata, SpecMetadata
 from ..utils import AuxStreamType, EventType, Fp4QuantizedTensor
-from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
-                             EagerFusionConfig, filter_weights,
+from .modeling_speculative import SpecDecOneEngineForCausalLM
+from .modeling_utils import (DecoderModel, EagerFusionConfig, filter_weights,
                              register_auto_model)
 
 
@@ -541,7 +540,8 @@ class Deepseekv3MoE(nn.Module):
         router_logits = self.gate(hidden_states)
 
         routed_output = self.experts(
-            hidden_states_fp4 or hidden_states,
+            hidden_states_fp4
+            if hidden_states_fp4 is not None else hidden_states,
             router_logits,
             do_finalize=do_finalize,
             output_dtype=hidden_states.dtype,
@@ -565,8 +565,9 @@ class Deepseekv3MoE(nn.Module):
             assert not self.use_dp
 
         def _compute_shared_output():
-            shared_output = self.shared_experts(hidden_states_fp4
-                                                or hidden_states)
+            shared_output = self.shared_experts(
+                hidden_states_fp4
+                if hidden_states_fp4 is not None else hidden_states)
             if self.shared_output_scale is not None:
                 shared_output *= self.shared_output_scale
             return shared_output
@@ -750,7 +751,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         attn_metadata: AttentionMetadata,
         residual: torch.Tensor,
         **kwargs,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -782,7 +783,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         residual: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
 
         def _run_MoE(hidden_states, hidden_states_fp4, do_finalize):
             return self.mlp(
@@ -866,7 +867,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         self,
         hidden_states: torch.Tensor,
         residual: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
 
         if self.fusion_config.PRE_MLP_FUSION:
             act_fp4, act_sf, residual = self.allreduce(
@@ -970,7 +971,7 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
         all_rank_num_tokens: Optional[List[int]] = None,
         all_rank_max_num_tokens: Optional[int] = None,
         **kwargs,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
 
         def norm_embeds():
             return self.enorm(embed_tokens(input_ids))  #emdedding
@@ -1085,6 +1086,8 @@ class DeepseekV3Model(DecoderModel):
         input_ids: Optional[torch.IntTensor] = None,
         position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
+        spec_metadata: Optional[SpecMetadata] = None,
+        **kwargs,
     ) -> torch.Tensor:
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError(
@@ -1109,8 +1112,8 @@ class DeepseekV3Model(DecoderModel):
 
 
 @register_auto_model("DeepseekV3ForCausalLM")
-class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
-                                                    PretrainedConfig]):
+class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
+                                                        PretrainedConfig]):
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
         # Rename some keys of quant_config_dict to support legacy checkpoints
@@ -1125,10 +1128,9 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
             model_config._frozen = False
             model_config.quant_config_dict = quant_config_dict
             model_config._frozen = True
-        super().__init__(DeepseekV3Model(model_config),
-                         config=model_config,
-                         hidden_size=model_config.pretrained_config.hidden_size,
-                         vocab_size=model_config.pretrained_config.vocab_size)
+
+        super().__init__(model=DeepseekV3Model(model_config),
+                         model_config=model_config)
 
         self.model_nextn = 0
         if model_config.spec_config is not None:
@@ -1138,23 +1140,7 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
             assert ckpt_nextn > 0, "There is not MTP modules in the checkpoint."
             if ckpt_nextn == 1 and not model_config.spec_config.use_mtp_vanilla:
                 moe_load_balancer_set_repeated_for_next_layer(model_nextn)
-                mtp_layer = DeepseekV3MTP(model_config, self.num_hidden_layers,
-                                          self.model.aux_stream_dict)
-                self.model.layers.append(mtp_layer)
-                self.epilogue.append(mtp_layer)
-                self.mtp_worker = MTPEagleWorker(model_config.spec_config,
-                                                 model_config)
             else:
-                mtp_layers = nn.ModuleList([
-                    DeepseekV3MTP(model_config,
-                                  layer_idx + self.num_hidden_layers,
-                                  self.model.aux_stream_dict)
-                    for layer_idx in range(model_nextn)
-                ])
-                self.model.layers.extend(mtp_layers)
-                self.epilogue.extend(mtp_layers)
-                self.mtp_worker = MTPWorker(model_config.spec_config,
-                                            model_config)
                 # modify the QuantConfig to support duplicated mtp layers
                 if model_config.quant_config.exclude_modules is not None:
                     extend_exclude_modules = []
@@ -1172,7 +1158,9 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
                                         ckpt_prefix, model_prefix))
                     self.model_config.quant_config.exclude_modules.extend(
                         extend_exclude_modules)
-            self.epilogue.append(self.mtp_worker)
+            self.model.layers.extend(self.draft_model.mtp_layers)
+            self.epilogue.extend(self.draft_model.mtp_layers)
+            self.epilogue.append(self.spec_worker)
 
     def forward(
         self,
@@ -1185,40 +1173,13 @@ class DeepseekV3ForCausalLM(DecoderModelForCausalLM[DeepseekV3Model,
         **kwargs,
     ) -> torch.Tensor:
         attn_metadata.num_generations_per_batch = self.model_nextn + 1
-        hidden_states = self.model(
-            input_ids=input_ids,
-            attn_metadata=attn_metadata,
-            position_ids=position_ids,
-            inputs_embeds=inputs_embeds,
-        )
-
-        if spec_metadata and spec_metadata.spec_dec_mode.is_mtp():
-            # get logits
-            logits = self.logits_processor.forward(
-                hidden_states[spec_metadata.gather_ids],
-                self.lm_head,
-                attn_metadata,
-                True,
-            )
-            # get accepted tokens and next draft tokens
-            return self.mtp_worker(
-                input_ids=input_ids,
-                position_ids=position_ids,
-                hidden_states=hidden_states,
-                logits=logits,
-                lm_head=self.lm_head,
-                embed_tokens=self.model.embed_tokens,
-                attn_metadata=attn_metadata,
-                spec_metadata=spec_metadata,
-                mtp_layers=self.model.layers[self.num_hidden_layers:])
-        else:
-            logits = self.logits_processor.forward(
-                hidden_states,
-                self.lm_head,
-                attn_metadata,
-                return_context_logits,
-            )
-            return logits
+        return super().forward(attn_metadata=attn_metadata,
+                               input_ids=input_ids,
+                               position_ids=position_ids,
+                               inputs_embeds=inputs_embeds,
+                               spec_metadata=spec_metadata,
+                               return_context_logits=return_context_logits,
+                               **kwargs)
 
     def load_weights(self, weights: Dict):
 

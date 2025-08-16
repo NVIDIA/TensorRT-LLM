@@ -3,6 +3,7 @@ import collections
 import hashlib
 import io
 import os
+import re
 import sys
 import tempfile
 import threading
@@ -508,8 +509,10 @@ def generate_api_docs_as_docstring(model: Type[BaseModel],
             type_str = str(type_hints[field_name])
             type_str = type_str.replace("typing.", "")
             # Extract just the class name from full class path
-            if "<class '" in type_str:
-                type_str = type_str[8:-2]
+            for regex in [r"<class '([^']+)'>", r"<enum '([^']+)'>"]:
+                if (match := re.match(regex, type_str)) is not None:
+                    type_str = match.group(1)
+                    break
         else:
             type_str = field_type or 'Any'
 

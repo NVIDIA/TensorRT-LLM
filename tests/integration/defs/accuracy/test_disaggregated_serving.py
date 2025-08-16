@@ -621,13 +621,13 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         ctx_server_config = {
             "disable_overlap_scheduler": True,
             "cache_transceiver_config": {
-                "backend": "nixl"
+                "backend": "NIXL"
             }
         }
         gen_server_config = {
             "disable_overlap_scheduler": True,
             "cache_transceiver_config": {
-                "backend": "nixl"
+                "backend": "NIXL"
             }
         }
         disaggregated_server_config = {
@@ -757,13 +757,13 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
         ctx_server_config = {
             "disable_overlap_scheduler": True,
             "cache_transceiver_config": {
-                "backend": "nixl"
+                "backend": "NIXL"
             }
         }
         gen_server_config = {
             "disable_overlap_scheduler": True,
             "cache_transceiver_config": {
-                "backend": "nixl"
+                "backend": "NIXL"
             }
         }
         disaggregated_server_config = {

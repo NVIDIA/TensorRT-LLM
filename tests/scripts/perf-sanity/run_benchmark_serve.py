@@ -308,10 +308,6 @@ class BenchmarkRunner:
             "  enable_block_reuse: false",
         ]
 
-        # https://nvbugs/5437106: WAR to avoid illegal memory access in Scout
-        if "Scout" in test_case['model']:
-            config_lines.append("use_torch_sampler: true")
-
         # Add moe_config if moe_backend is specified
         if test_case['moe_backend']:
             config_lines.append("moe_config:")
