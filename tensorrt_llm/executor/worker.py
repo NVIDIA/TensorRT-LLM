@@ -902,14 +902,13 @@ class AwaitResponseHelper:
         rsp_batch = [] if not self.enable_postprocprocess_parallel else None
 
         for response in responses:
-
             if self.worker._has_background_error():
                 response = self.worker._create_error_response(response)
-            elif response.has_error():
-                # Convert to ErrorResponse, because tllm.Response cannot be
-                # serialized when it has error.
+            elif isinstance(response, tllm.Response) and response.has_error():
                 response = ErrorResponse(response.client_id, response.error_msg,
                                          response.request_id)
+            elif isinstance(response, ErrorResponse):
+                pass
             else:
                 logprobs_result = _get_logprobs(self.worker, response,
                                                 self.worker._is_pytorch_backend)

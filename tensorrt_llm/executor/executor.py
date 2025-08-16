@@ -250,8 +250,8 @@ class GenerationExecutor(ABC):
                     print_colored(
                         f"Got background error: {repr(error)}, will shutdown the LLM instance\n",
                         "red")
-                self.shutdown()
-                raise error
+                # self.shutdown()
+                raise RequestError(str(error))
             elif isinstance(error, str):
                 if enable_llm_debug():
                     print_colored(f"Got per-request error: {repr(error)}\n",
@@ -265,7 +265,7 @@ class GenerationExecutor(ABC):
         if not self._error_queue.empty():
             e = self._error_queue.get()
             self._error_queue.task_done()
-            self.shutdown()
+            # self.shutdown()
             # We can catch some exceptions here.
             raise e
 
