@@ -274,11 +274,6 @@ void computeReferenceBiasRope(QKVPreprocessingParams<fpType, KVCacheBuffer> para
 
     float kGlobalScale = 0.f;
     float vGlobalScale = 0.f;
-    if (params.kv_cache_scale_factors)
-    {
-        kGlobalScale = params.kv_cache_scale_factors[0];
-        vGlobalScale = params.kv_cache_scale_factors[1];
-    }
 
     // the size of a (Q)/K/V matrix TODO(dblanaru) separate this into q and kv sizes
 
@@ -448,7 +443,6 @@ protected:
     int32_t* q_seq_lengths{nullptr};
     int32_t* kv_seq_lengths{nullptr};
     float* kv_scale_orig_quant{nullptr};
-    float* kv_cache_scale_factors{nullptr};
 
     KVBlockArray::DataType* block_offsets{nullptr};
     void* host_primary_pool_pointer{nullptr};
@@ -687,9 +681,9 @@ protected:
 
         if (global_scale_tensor)
         {
-            kv_cache_scale_factors = bufferCast<float>(*(global_scale_tensor));
-            kv_cache_scale_factors[0] = 5.1f;
-            kv_cache_scale_factors[1] = 0.25f;
+            kv_scale_orig_quant = bufferCast<float>(*(global_scale_tensor));
+            kv_scale_orig_quant[0] = 5.1f;
+            kv_scale_orig_quant[1] = 0.25f;
         }
 
         qkv_size = num_tokens * 3 * mNumHeads * mHeadSize;
@@ -715,8 +709,7 @@ protected:
         preprocessingParams.cu_kv_seq_lens = nullptr; // Only used by cross attention.
         preprocessingParams.rotary_embedding_inv_freq = rotary_inv_freq_buf;
         preprocessingParams.rotary_coef_cache_buffer = rotary_cos_sin;
-        preprocessingParams.kvScaleOrigQuant = kv_scale_orig_quant;
-        preprocessingParams.kv_cache_scale_factors = kv_cache_scale_factors;
+        preprocessingParams.qkv_scale_orig_quant = kv_scale_orig_quant;
         preprocessingParams.spec_decoding_position_offsets = nullptr; // Cast to int* if necessary
         preprocessingParams.batch_size = batch_size;
         preprocessingParams.max_input_seq_len = input_seq_length;

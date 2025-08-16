@@ -94,6 +94,8 @@ public:
         kernels::KVBlockArray::DataType* block_offsets = nullptr;
         void* host_primary_pool_pointer = nullptr;
         void* host_secondary_pool_pointer = nullptr;
+        void* host_primary_block_scale_pool_pointer = nullptr;
+        void* host_secondary_block_scale_pool_pointer = nullptr;
         int32_t num_tokens = 0;
         int32_t max_blocks_per_sequence = 0;
         int32_t const* sequence_lengths = nullptr;
@@ -426,6 +428,9 @@ public:
 
     // Whether to fuse FP4 quant into attention kernel.
     bool mFuseFp4Quant = false;
+
+    // KV cache element size in bits.
+    int32_t mKvCacheElemSizeInBits = 16;
 
     // This is implementation details which we want to save when serializing, but not expose as
     // a plugin field or a constructor parameter
