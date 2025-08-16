@@ -36,8 +36,8 @@ void initExceptionsBindings(nb::module_& m)
     static nb::object request_specific_exc = nb::exception<tc::RequestSpecificException>(m, "RequestSpecificException");
 
     // Add attributes to the Python exception class
-    request_specific_exc.attr("request_id") = nb::none;
-    request_specific_exc.attr("error_code") = nb::none;
+    request_specific_exc.attr("request_id") = nb::none();
+    request_specific_exc.attr("error_code") = nb::none();
 
     // Register exception translator to convert C++ exceptions to Python
     nb::register_exception_translator(
