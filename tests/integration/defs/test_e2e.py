@@ -2232,7 +2232,8 @@ def test_ptp_quickstart_advanced_mixed_precision(llm_root, llm_venv):
                  marks=pytest.mark.skip_less_device_memory(80000)),
     pytest.param("gemma-3-27b-it",
                  "gemma/gemma-3-27b-it",
-                 marks=pytest.mark.skip_less_device_memory(80000)),
+                 marks=(skip_post_blackwell,
+                        pytest.mark.skip_less_device_memory(80000))),
 ])
 def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
                                    modality, use_cuda_graph):
@@ -2368,6 +2369,8 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
         cmd.append("--image_format=pil")
         cmd.append("--attention_backend=FLASHINFER")
         cmd.append("--disable_kv_cache_reuse")
+        cmd.append("--kv_cache_fraction=0.5")
+        cmd.append("--max_seq_len=1024")
 
     output = llm_venv.run_cmd(cmd, caller=check_output)
 
@@ -2528,9 +2531,10 @@ def test_ptp_quickstart_multimodal_phi4mm(llm_root, llm_venv, modality):
 @pytest.mark.skip_less_device(2)
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.parametrize("model_name,model_path", [
-    ("gemma-3-27b-it", "gemma/gemma-3-27b-it"),
     ("mistral-small-3.1-24b-instruct", "Mistral-Small-3.1-24B-Instruct-2503"),
     ("Phi-4-multimodal-instruct", "multimodals/Phi-4-multimodal-instruct"),
+    pytest.param(
+        "gemma-3-27b-it", "gemma/gemma-3-27b-it", marks=skip_post_blackwell),
 ])
 def test_ptp_quickstart_multimodal_2gpu(llm_root, llm_venv, model_name,
                                         model_path):
@@ -2602,6 +2606,8 @@ def test_ptp_quickstart_multimodal_2gpu(llm_root, llm_venv, model_name,
         cmd.append("--image_format=pil")
         cmd.append("--attention_backend=FLASHINFER")
         cmd.append("--disable_kv_cache_reuse")
+        cmd.append("--kv_cache_fraction=0.5")
+        cmd.append("--max_seq_len=1024")
     elif model_name == "Phi-4-multimodal-instruct":
         # Set max_seq_len to 4096 to use short rope factor.
         cmd.append("--max_seq_len=4096")
@@ -2630,9 +2636,10 @@ def test_ptp_quickstart_multimodal_2gpu(llm_root, llm_venv, model_name,
 
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.parametrize("model_name,model_path", [
-    ("gemma-3-27b-it", "gemma/gemma-3-27b-it"),
     ("mistral-small-3.1-24b-instruct", "Mistral-Small-3.1-24B-Instruct-2503"),
     ("Phi-4-multimodal-instruct", "multimodals/Phi-4-multimodal-instruct"),
+    pytest.param(
+        "gemma-3-27b-it", "gemma/gemma-3-27b-it", marks=skip_post_blackwell),
 ])
 def test_ptp_quickstart_multimodal_multiturn(llm_root, llm_venv, model_name,
                                              model_path):
@@ -2698,6 +2705,8 @@ def test_ptp_quickstart_multimodal_multiturn(llm_root, llm_venv, model_name,
         cmd.append("--image_format=pil")
         cmd.append("--attention_backend=FLASHINFER")
         cmd.append("--disable_kv_cache_reuse")
+        cmd.append("--kv_cache_fraction=0.5")
+        cmd.append("--max_seq_len=1024")
     elif model_name == "Phi-4-multimodal-instruct":
         # Set max_seq_len to 4096 to use short rope factor.
         cmd.append("--max_seq_len=4096")
