@@ -86,6 +86,8 @@ def get_llm_args(model: str,
                  trust_remote_code: bool = False,
                  reasoning_parser: Optional[str] = None,
                  fail_fast_on_attention_window_too_large: bool = False,
+                 use_cute_dsl_blockscaling_mm: bool = False,
+                 use_cute_dsl_blockscaling_bmm: bool = False,
                  **llm_args_extra_dict: Any):
 
     if gpus_per_node is None:
@@ -110,44 +112,28 @@ def get_llm_args(model: str,
     )
 
     llm_args = {
-        "model":
-        model,
-        "scheduler_config":
-        scheduler_config,
-        "tokenizer":
-        tokenizer,
-        "tensor_parallel_size":
-        tensor_parallel_size,
-        "pipeline_parallel_size":
-        pipeline_parallel_size,
-        "moe_expert_parallel_size":
-        moe_expert_parallel_size,
-        "gpus_per_node":
-        gpus_per_node,
-        "trust_remote_code":
-        trust_remote_code,
-        "build_config":
-        build_config,
-        "max_batch_size":
-        max_batch_size,
-        "max_num_tokens":
-        max_num_tokens,
-        "max_beam_width":
-        max_beam_width,
-        "max_seq_len":
-        max_seq_len,
-        "kv_cache_config":
-        kv_cache_config,
-        "backend":
-        backend if backend == "pytorch" else None,
-        "num_postprocess_workers":
-        num_postprocess_workers,
-        "postprocess_tokenizer_dir":
-        tokenizer or model,
-        "reasoning_parser":
-        reasoning_parser,
+        "model": model,
+        "scheduler_config": scheduler_config,
+        "tokenizer": tokenizer,
+        "tensor_parallel_size": tensor_parallel_size,
+        "pipeline_parallel_size": pipeline_parallel_size,
+        "moe_expert_parallel_size": moe_expert_parallel_size,
+        "gpus_per_node": gpus_per_node,
+        "trust_remote_code": trust_remote_code,
+        "build_config": build_config,
+        "max_batch_size": max_batch_size,
+        "max_num_tokens": max_num_tokens,
+        "max_beam_width": max_beam_width,
+        "max_seq_len": max_seq_len,
+        "kv_cache_config": kv_cache_config,
+        "backend": backend if backend == "pytorch" else None,
+        "num_postprocess_workers": num_postprocess_workers,
+        "postprocess_tokenizer_dir": tokenizer or model,
+        "reasoning_parser": reasoning_parser,
         "fail_fast_on_attention_window_too_large":
         fail_fast_on_attention_window_too_large,
+        "use_cute_dsl_blockscaling_mm": use_cute_dsl_blockscaling_mm,
+        "use_cute_dsl_blockscaling_bmm": use_cute_dsl_blockscaling_bmm,
     }
 
     return llm_args, llm_args_extra_dict

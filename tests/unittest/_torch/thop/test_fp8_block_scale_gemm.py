@@ -23,6 +23,8 @@ from _torch.helpers import (calc_diff, per_block_cast_to_fp8,
                             per_token_cast_to_fp8_e8m0)
 from utils.util import getSMVersion
 
+from tensorrt_llm._torch.autotuner import autotune
+
 
 @pytest.mark.skipif(
     getSMVersion() != 100,
@@ -97,6 +99,49 @@ def test_fp8_block_scale_gemm(dtype, m, k, n):
 
 
 @pytest.mark.skipif(
+    getSMVersion() != 100,
+    reason="The test is for Blackwell. Current SM is %d." % getSMVersion(),
+)
+@pytest.mark.parametrize(
+    "k, n",
+    [(7168, 2112), (1536, 24576), (512, 32768), (16384, 7168), (7168, 4096),
+     (2048, 7168), (1024, 1024)],
+)
+@pytest.mark.parametrize(
+    "m",
+    [7, 64, 128, 4096],
+)
+@pytest.mark.parametrize(
+    "dtype",
+    [torch.bfloat16],
+)
+def test_cute_dsl_fp8_block_scale_gemm(dtype, m, k, n):
+
+    torch.random.manual_seed(0)
+    a = torch.randn((m, k), device='cuda', dtype=dtype) / k
+    b = torch.randn((n, k), device='cuda', dtype=dtype) / k
+
+    act_a_fp8, act_a_sf = torch.ops.trtllm.fp8_quantize_1x128(a)
+    act_b_fp8, act_b_sf = per_block_cast_to_fp8(b)
+
+    output_expected = a @ b.t()
+
+    with autotune():
+        cute_dsl_output = torch.ops.trtllm.cute_dsl_fp8_gemm_blackwell(
+            act_a_fp8, act_b_fp8, act_a_sf, act_b_sf)
+
+    # test Cute DSL kernel
+    cute_dsl_output = torch.ops.trtllm.cute_dsl_fp8_gemm_blackwell(
+        act_a_fp8, act_b_fp8, act_a_sf, act_b_sf)
+    diff = calc_diff(cute_dsl_output, output_expected)
+    assert diff < 1e-3
+    torch.testing.assert_close(cute_dsl_output,
+                               output_expected,
+                               atol=1e-3,
+                               rtol=1e-3)
+
+
+@pytest.mark.skipif(
     getSMVersion() != 90 and getSMVersion() != 89,
     reason="The test is for Hopper and Ada only. Current SM is %d." %
     getSMVersion(),
@@ -140,6 +185,61 @@ def test_fp8_block_scale_bmm(dtype, m, k, n, num_groups):
 
     torch.ops.trtllm.fp8_block_scaling_bmm_out(a_fp8, b_fp8, a_scales, b_scales,
                                                output)
+    diff = calc_diff(output, output_expected)
+    assert diff < 1e-3
+    torch.testing.assert_close(output, output_expected, atol=1e-3, rtol=1e-3)
+
+
+@pytest.mark.skipif(
+    getSMVersion() != 100,
+    reason="The test is for Blackwell. Current SM is %d." % getSMVersion(),
+)
+@pytest.mark.parametrize(
+    "k, n",
+    [(7168, 2112), (512, 32768), (16384, 7168), (2048, 7168)],
+)
+@pytest.mark.parametrize(
+    "m",
+    [7, 64, 128],
+)
+@pytest.mark.parametrize(
+    "num_groups",
+    [4, 8, 16],
+)
+@pytest.mark.parametrize(
+    "dtype",
+    [torch.bfloat16],
+)
+def test_cute_dsl_fp8_block_scale_bmm(dtype, m, k, n, num_groups):
+
+    torch.random.manual_seed(0)
+    a = torch.randn((m, num_groups, k), device='cuda', dtype=dtype) / k
+
+    a_fp8, a_scales = torch.ops.trtllm.fp8_batched_quantize_1x128_permute102(a)
+
+    b = torch.randn((num_groups, n, k), device='cuda', dtype=dtype) / k
+    b_fp8 = torch.zeros_like(b, device='cuda', dtype=torch.float8_e4m3fn)
+    b_scales = torch.zeros((num_groups, (n + 127) // 128, (k + 127) // 128),
+                           device='cuda',
+                           dtype=torch.float)
+
+    for i in range(num_groups):
+        b_fp8[i], b_scales[i] = per_block_cast_to_fp8(b[i])
+
+    output_expected = torch.einsum('mgk,gnk->gmn', a, b)
+    output = torch.empty((num_groups, m, n),
+                         device='cuda',
+                         dtype=torch.bfloat16)
+    # tune
+    with autotune():
+        torch.ops.trtllm.cute_dsl_fp8_bmm_blackwell(a_fp8, b_fp8, a_scales,
+                                                    b_scales, output)
+    # from tensorrt_llm._torch.autotuner import AutoTuner
+    # for k, v in AutoTuner.get().profiling_cache.items():
+    #     print(f"Autotuner profiling cache: {k} = {v}")
+    # run the tuned kernel
+    torch.ops.trtllm.cute_dsl_fp8_bmm_blackwell(a_fp8, b_fp8, a_scales,
+                                                b_scales, output)
     diff = calc_diff(output, output_expected)
     assert diff < 1e-3
     torch.testing.assert_close(output, output_expected, atol=1e-3, rtol=1e-3)

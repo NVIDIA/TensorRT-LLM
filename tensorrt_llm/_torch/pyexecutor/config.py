@@ -102,6 +102,10 @@ class PyTorchConfig:
 
     force_dynamic_quantization: bool = False
 
+    # cute dsl op configs
+    use_cute_dsl_blockscaling_mm: bool = False
+    use_cute_dsl_blockscaling_bmm: bool = False
+
     # If true, adjust PyTorch CUDA memory fraction to correspond to the
     # total GPU memory minus the statically allocated engine memory.
     # If false, set the PyTorch CUDA memory fraction to 1.0.

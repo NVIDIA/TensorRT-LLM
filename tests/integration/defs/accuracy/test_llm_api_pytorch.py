@@ -1057,6 +1057,9 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         [(False, False, False, False)],
     )
     @parametrize_with_ids("mtp_nextn", [0])
+    @parametrize_with_ids("use_cute_dsl_mm", [True, False])
+    @parametrize_with_ids("use_cute_dsl_bmm", [True, False])
+    @parametrize_with_ids("moe_backend", ["CUTEDSL"])
     def test_cute_dsl_fp8_block_scales(
         self,
         mtp_nextn,
@@ -1065,6 +1068,9 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         cuda_graph,
         overlap_scheduler,
         torch_compile,
+        moe_backend,
+        use_cute_dsl_mm,
+        use_cute_dsl_bmm,
     ):
         if torch_compile and attention_dp:
             pytest.skip("https://nvbugs/5252559")
@@ -1077,7 +1083,9 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
             torch_compile_config=torch_compile_config,
-            moe_config=MoeConfig(backend="CUTEDSL"),
+            moe_config=MoeConfig(backend=moe_backend),
+            use_cute_dsl_blockscaling_mm=use_cute_dsl_mm,
+            use_cute_dsl_blockscaling_bmm=use_cute_dsl_bmm,
         )
 
         if fp8kv:
@@ -1212,6 +1220,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         [(4, 1, 1), (4, 1, 4), (2, 2, 1), (1, 4, 1)],
         ids=["tp4", "ep4", "tp2pp2", "pp4"],
     )
+    @parametrize_with_ids("use_cute_dsl_mm", [True, False])
+    @parametrize_with_ids("use_cute_dsl_bmm", [True, False])
     def test_cute_dsl_fp8_block_scales_4gpus(
         self,
         tp_size,
@@ -1223,6 +1233,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         cuda_graph,
         overlap_scheduler,
         torch_compile,
+        use_cute_dsl_mm,
+        use_cute_dsl_bmm,
     ):
         if torch_compile and pp_size > 1:
             pytest.skip("PP with torch.compile is not supported yet.")
@@ -1236,6 +1248,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
             torch_compile_config=torch_compile_config,
             moe_config=MoeConfig(backend="CUTEDSL"),
+            use_cute_dsl_blockscaling_mm=use_cute_dsl_mm,
+            use_cute_dsl_blockscaling_bmm=use_cute_dsl_bmm,
         )
 
         if fp8kv:

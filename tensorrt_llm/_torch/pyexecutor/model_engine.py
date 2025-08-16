@@ -1036,6 +1036,11 @@ class PyTorchModelEngine(ModelEngine):
             moe_load_balancer=moe_load_balancer,
             lora_config=lora_config,
             allreduce_strategy=self.pytorch_backend_config.allreduce_strategy,
+            # cute dsl op configs
+            use_cute_dsl_blockscaling_mm=self.pytorch_backend_config.
+            use_cute_dsl_blockscaling_mm,
+            use_cute_dsl_blockscaling_bmm=self.pytorch_backend_config.
+            use_cute_dsl_blockscaling_bmm,
             **kwargs)
 
         validate_and_set_kv_cache_quant(
