@@ -9,6 +9,7 @@ set(SRCS
     batch_manager/cacheTransceiver.cpp
     batch_manager/kvCacheManager.cpp
     batch_manager/llmRequest.cpp
+    common/tllmExceptions.cpp
     executor/bindings.cpp
     executor/executor.cpp
     executor/executorConfig.cpp
