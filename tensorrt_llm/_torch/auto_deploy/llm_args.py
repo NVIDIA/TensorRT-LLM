@@ -18,10 +18,14 @@ PathLike = Union[str, Path]
 
 
 def _get_config_dict() -> SettingsConfigDict:
+    # yaml_file = "default.yaml"
+    yaml_file = "transformers.yaml"
+    print(f"Using config file: {yaml_file}")
+
     return SettingsConfigDict(
         arbitrary_types_allowed=True,
         extra="forbid",
-        yaml_file=str(files("tensorrt_llm._torch.auto_deploy.config") / "default.yaml"),
+        yaml_file=str(files("tensorrt_llm._torch.auto_deploy.config") / yaml_file),
         nested_model_default_partial_update=True,
     )
 

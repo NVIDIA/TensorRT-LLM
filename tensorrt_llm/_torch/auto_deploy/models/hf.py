@@ -118,6 +118,13 @@ class AutoModelForCausalLMFactory(ModelFactory):
         """
         return type(model).forward(model, input_ids=input_ids, position_ids=position_ids)
 
+    @staticmethod
+    def _simple_forward_with_kwargs(
+        model: nn.Module, input_ids: torch.Tensor, position_ids: torch.Tensor, **kwargs
+    ):
+        """A simple forward pass with kwargs."""
+        return type(model).forward(model, input_ids=input_ids, position_ids=position_ids, **kwargs)
+
     def _recursive_update_config(self, config: PretrainedConfig, update_dict: Dict[str, Any]):
         """
         Deep-merge a PretrainedConfig object with values from update_dict.
@@ -169,6 +176,7 @@ class AutoModelForCausalLMFactory(ModelFactory):
 
         # patch forward method
         model.forward = types.MethodType(self._simple_forward, model)
+        model.forward_with_kwargs = types.MethodType(self._simple_forward_with_kwargs, model)
 
         model.eval()
 
