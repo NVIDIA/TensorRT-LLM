@@ -1,3 +1,4 @@
+import random
 from contextlib import contextmanager, nullcontext
 
 import pytest
@@ -6,6 +7,7 @@ from tensorrt_llm import LLM
 from tensorrt_llm.llmapi import KvCacheConfig
 from tensorrt_llm.llmapi.llm_args import PeftCacheConfig
 from tensorrt_llm.llmapi.tokenizer import TransformersTokenizer
+from tensorrt_llm.metrics import MetricNames
 from tensorrt_llm.sampling_params import SamplingParams
 
 # isort: off
@@ -24,7 +26,7 @@ from utils.util import (force_ampere, similar, skip_gpu_memory_less_than_40gb,
                         skip_gpu_memory_less_than_80gb,
                         skip_gpu_memory_less_than_138gb)
 from utils.llm_data import llm_models_root
-from tensorrt_llm.lora_manager import LoraConfig
+from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.executor.request import LoRARequest
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -195,6 +197,27 @@ def test_llm_perf_metrics():
     assert perf_metrics.last_iter == perf_metrics.iter
 
 
+def test_llm_prometheus():
+    test_prompts = [
+        "Hello, my name is",
+        "The president of the United States is",
+        "The capital of France is",
+        "The future of AI is",
+    ]
+    sampling_params = SamplingParams(max_tokens=10, temperature=0.8, top_p=0.95)
+    llm = LLM(model=llama_model_path,
+              return_perf_metrics=True,
+              kv_cache_config=global_kvcache_config)
+    for test_prompt in test_prompts:
+        request_output = llm.generate(test_prompt, sampling_params)
+        assert request_output.metrics_dict is not None
+        assert MetricNames.REQUEST_QUEUE_TIME in request_output.metrics_dict
+        assert MetricNames.TPOT in request_output.metrics_dict
+        assert MetricNames.TTFT in request_output.metrics_dict
+        assert MetricNames.E2E in request_output.metrics_dict
+        assert request_output.outputs is not None
+
+
 @pytest.mark.parametrize("streaming", [True, False])
 def test_llm_with_postprocess_parallel_and_result_handler(streaming):
     run_llm_with_postprocess_parallel_and_result_handler(streaming,
@@ -232,14 +255,11 @@ def test_embedding_bias_with_torch_sampler_strategies(enable_mixed_sampler,
 
     sampling_params = SamplingParams(**sampling_kwargs)
 
-    llm_test_harness(
-        llama_model_path,
-        prompts,
-        ["Z Z Z Z Z Z"],
-        sampling_params=sampling_params,
-        backend="pytorch",
-        use_torch_sampler=True,  # Use TorchSampler to test all 3 paths
-        enable_mixed_sampler=enable_mixed_sampler)
+    llm_test_harness(llama_model_path,
+                     prompts, ["Z Z Z Z Z Z"],
+                     sampling_params=sampling_params,
+                     backend="pytorch",
+                     enable_mixed_sampler=enable_mixed_sampler)
 
 
 def llama_7b_lora_from_dir_test_harness(**llm_kwargs) -> None:
@@ -449,6 +469,7 @@ def test_llama_7b_lora_config_overrides_peft_cache_config():
 
 # TODO smor: currently Nemotron-Super-49B-v1 with LoRA memory consumption is overly high
 # https://jirasw.nvidia.com/browse/TRTLLM-5045
+@pytest.mark.skip(reason="https://nvbugs/5448464")
 @skip_gpu_memory_less_than_138gb
 def test_nemotron_nas_lora() -> None:
     lora_config = LoraConfig(lora_dir=[
@@ -783,3 +804,17 @@ def test_gqa_nemo_lora(tmp_path):
             f"got: {base_outputs[0].outputs[0].text}"
     finally:
         llm.shutdown()
+
+
+class TestLlmError:
+
+    def test_max_num_token_check(self):
+        """ LLM should raise error when got prompt length exceed the valid range. """
+        llm = LLM(llama_model_path,
+                  kv_cache_config=global_kvcache_config,
+                  max_num_tokens=100)
+
+        with pytest.raises(ValueError,
+                           match="should not exceed max_num_tokens"):
+            ids = [random.randint(10, 100) for _ in range(101)]
+            llm.generate([ids])

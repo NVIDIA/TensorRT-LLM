@@ -27,6 +27,10 @@ methods:
         annotation: Optional[int]
         default: null
         status: prototype
+      return_perf_metrics:
+        annotation: bool
+        default: False
+        status: prototype
       # Bindings and mirrored configs
       peft_cache_config:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.PeftCacheConfig]
@@ -107,9 +111,9 @@ methods:
         annotation: bool
         default: False
         status: beta
-      use_torch_sampler:
-        annotation: bool
-        default: False
+      sampler_type:
+        annotation: Union[str, tensorrt_llm.llmapi.llm_args.SamplerType]
+        default: auto
         status: beta
       enable_iter_perf_stats:
         annotation: bool

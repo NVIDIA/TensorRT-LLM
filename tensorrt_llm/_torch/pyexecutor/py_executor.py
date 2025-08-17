@@ -17,7 +17,8 @@ try:
 except ImportError:
     from cuda import cudart
 
-from tensorrt_llm._torch.pyexecutor.resource_manager import ResourceManagerType
+from tensorrt_llm._torch.pyexecutor.resource_manager import (
+    ResourceManagerType, request_context)
 from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
 from tensorrt_llm._utils import (customized_gc_thresholds, global_mpi_rank,
                                  is_trace_enabled, nvtx_range, trace_func)
@@ -30,6 +31,7 @@ from tensorrt_llm.bindings.executor import (DisServingRequestStats,
 from tensorrt_llm.bindings.internal.batch_manager import (LlmRequestType,
                                                           ReqIdsSet)
 from tensorrt_llm.logger import logger
+from tensorrt_llm.mapping import CpType
 from tensorrt_llm.runtime.generation import CUASSERT
 
 from ..distributed import Distributed
@@ -279,15 +281,12 @@ class PyExecutor:
             self._executor_loop_cleanup()
 
     def start_worker(self):
-        self.worker_lock.acquire()
-        try:
+        with self.worker_lock:
             if self.worker_started == False:
                 self.worker_thread = threading.Thread(
                     target=self._event_loop_wrapper, daemon=True)
                 self.worker_thread.start()
                 self.worker_started = True
-        finally:
-            self.worker_lock.release()
 
     def __enter__(self):
         return self
@@ -364,13 +363,9 @@ class PyExecutor:
             return []
 
         latest_stats = (IterationStats(), None)
-        try:
-            self.stats_lock.acquire()
+        with self.stats_lock:
             latest_stats = self.stats
             self.stats = []
-        finally:
-            self.stats_lock.release()
-
         return latest_stats
 
     def get_latest_kv_cache_events(self):
@@ -450,7 +445,8 @@ class PyExecutor:
                     f"iter = {self.model_engine.iter_counter}, "
                     f"global_rank = {self.global_rank}, "
                     f"rank = {self.dist.rank}, "
-                    f"currank_total_requests = {self.num_fetch_requests_cur_rank}/{self.num_fetch_requests}, "
+                    f"currank_total_requests = {self.executor_request_queue.num_fetch_requests_cur_rank}/"
+                    f"{self.executor_request_queue.num_fetch_requests}, "
                     f"elapsed_time = {end_time - start_time}s, "
                     f"timestamp = {formatted_timestamp}, "
                     f"num_scheduled_requests: {self.num_scheduled_requests}, "
@@ -605,11 +601,8 @@ class PyExecutor:
                            stats: IterationStats,
                            req_stats: Optional[List[RequestStats]] = None):
 
-        try:
-            self.stats_lock.acquire()
+        with self.stats_lock:
             self.stats.append((stats, req_stats))
-        finally:
-            self.stats_lock.release()
 
     def _process_iter_stats(self, finished_requests: list[LlmRequest],
                             active_requests: List[LlmRequest],
@@ -947,11 +940,14 @@ class PyExecutor:
                         self.guided_decoder.init_disagg_gen_requests(
                             scheduled_batch)
                     if self.drafter is not None and self.use_spec_decode:
-                        if self.guided_decoder is not None:
-                            self.guided_decoder.rollback_rejected_tokens(
-                                scheduled_batch)
-                        self.drafter.prepare_draft_tokens(
-                            scheduled_batch, self.resource_manager)
+                        with request_context(
+                                is_draft=True,
+                                scheduled_requests=scheduled_batch):
+                            if self.guided_decoder is not None:
+                                self.guided_decoder.rollback_rejected_tokens(
+                                    scheduled_batch)
+                            self.drafter.prepare_draft_tokens(
+                                scheduled_batch, self.resource_manager)
 
                     batch_outputs = self._forward_step(scheduled_batch)
                     self._execute_guided_decoder(scheduled_batch,
@@ -1309,7 +1305,6 @@ class PyExecutor:
 
             for resource_mgr_type in (
                     ResourceManagerType.KV_CACHE_MANAGER,
-                    ResourceManagerType.SEQ_SLOT_MANAGER,
                     ResourceManagerType.SPEC_RESOURCE_MANAGER,
                     ResourceManagerType.DRAFT_KV_CACHE_MANAGER):
                 if (resource_mgr_type in self.resource_manager.resource_managers
@@ -1331,6 +1326,9 @@ class PyExecutor:
         if len(cache_trans_complete_requests) > 0:
             requests = ScheduledRequests()
             requests.context_requests = cache_trans_complete_requests
+            self.resource_manager.resource_managers[
+                ResourceManagerType.SEQ_SLOT_MANAGER].prepare_resources(
+                    requests)
             self._setup_sampler_step(requests)
 
         for req in scheduled_batch.generation_requests:
@@ -1465,7 +1463,7 @@ class PyExecutor:
         cp_config = self.dist.cp_config
         if 'cp_type' in cp_config:
             cp_type = cp_config['cp_type']
-            if cp_type == 'star_attention':
+            if cp_type == CpType.STAR:
                 self._update_request_states_star_attention(scheduled_requests)
             else:
                 assert False, f'Unsupport cp_type {cp_type}'

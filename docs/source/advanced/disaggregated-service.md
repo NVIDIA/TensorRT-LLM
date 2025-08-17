@@ -66,17 +66,6 @@ A. Yes, it's recommended that different executor use different GPUs . We support
 
 ### Debugging FAQs
 
-*Q. How to handle error `Disaggregated serving is not enabled, please check the configuration?`*
-
-A. please set `backendType` of `CacheTransceiverConfig`.
-```cpp
-ExecutorConfig executorConfig{...};
-
-executorConfig.setCacheTransceiverConfig(texec::CacheTransceiverConfig(BackendType::DEFAULT));
-```
-
-When the environment variable `TRTLLM_USE_MPI_KVCACHE=1` is set, TRT-LLM will transfer the KV cache using `CUDA-aware MPI`. All executor processes involved must share the same MPI world communicator. Consequently, with `TRTLLM_USE_MPI_KVCACHE=1`, TRT-LLM only supports launching multiple executors via `MPI`. Additionally, the `CommunicationMode` for the executors must be set to `kLEADER` or `kORCHESTRATOR` with `SpawnProcesses=false` for the `disaggregated-service`. These restrictions do not apply when `TRTLLM_USE_UCX_KVCACHE=1` is set.
-
 *Q. Does TRT-LLM support using GPU direct RDMA for inter-node KV Cache transfer?*
 
 A. Yes, TRT-LLM supports using GPU direct RDMA for inter-node KV cache transfer.

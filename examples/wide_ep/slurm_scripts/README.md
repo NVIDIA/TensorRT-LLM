@@ -17,7 +17,7 @@ Please note that:
 
 ### Core Scripts
 
-Note that, core implementation of the slurm scripts are included in `examples/disaggregated/slurm`.
+Note that, core implementation of the slurm scripts are included in `examples/disaggregated/slurm/benchmark`.
 
 1. `submit.sh` - Main entry point for submitting benchmark jobs
 2. `process_gen_iterlog.py` - Processes benchmark results and generates reports
@@ -35,8 +35,8 @@ Before running the scripts, ensure you have:
 ### Running Benchmarks
 
 ```bash
-# Refer to `examples/disaggregated/slurm/`
-# Please find the `disaggr_torch.slurm` script in the `examples/disaggregated/slurm/` directory.
+# Refer to `examples/disaggregated/slurm/benchmark/`
+# Please find the `disaggr_torch.slurm` script in the `examples/disaggregated/slurm/benchmark/` directory.
 # Make sure that SLURM parameters are correctly set in `disaggr_torch.slurm` before executing this script.
 ./submit.sh
 ```

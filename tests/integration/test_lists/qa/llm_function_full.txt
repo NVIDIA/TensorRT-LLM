@@ -519,6 +519,19 @@ accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a8_mxfp4[fp8-latency
 accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a8_mxfp4[mxfp8-latency-TRTLLM]
 accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a8_mxfp4[mxfp8-latency-CUTLASS]
 accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a16_mxfp4[latency-TRTLLM]
+accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[True-True-cutlass]
+accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[True-True-trtllm]
+accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_1gpu[True-True-triton]
+accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[tp4-CUTLASS]
+accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[tp4-TRTLLM]
+accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[tp4-TRITON]
+accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[ep4-CUTLASS]
+accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[ep4-TRTLLM]
+accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[ep4-TRITON]
+accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[dp4-CUTLASS]
+accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[dp4-TRTLLM]
+accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[dp4-TRITON]
+accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4a16[dp4]
 accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_auto_dtype[False]
 accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_auto_dtype[True]
 accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_ngram
@@ -560,6 +573,8 @@ accuracy/test_llm_api_pytorch.py::TestPhi4MM::test_auto_dtype
 accuracy/test_llm_api_pytorch.py::TestPhi4MM::test_auto_dtype_long_rope
 accuracy/test_llm_api_pytorch.py::TestPhi4MiniInstruct::test_auto_dtype
 accuracy/test_llm_api_pytorch.py::TestEXAONE4::test_auto_dtype
+accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_nixl_backend
+accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_nixl_backend
 
 test_e2e.py::test_llama_e2e[use_cpp_session-remove_input_padding-]
 test_e2e.py::test_llama_e2e[use_py_session-remove_input_padding-]
@@ -573,6 +588,8 @@ test_e2e.py::test_qwen_e2e_cpprunner_large_new_tokens[DeepSeek-R1-Distill-Qwen-1
 test_e2e.py::test_openai_multi_chat_example
 test_e2e.py::test_openai_consistent_chat
 test_e2e.py::test_trtllm_benchmark_serving
+test_e2e.py::test_trtllm_multimodal_benchmark_serving
+
 llmapi/test_llm_examples.py::test_llmapi_server_example
 # Pivot to Pytorch test cases.
 test_e2e.py::test_ptp_quickstart
@@ -672,13 +689,13 @@ disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_att
 disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_attention_dp_one_mtp[DeepSeek-V3-Lite-fp8]
 disaggregated/test_disaggregated.py::test_disaggregated_load_balance[TinyLlama-1.1B-Chat-v1.0]
 disaggregated/test_disaggregated.py::test_disaggregated_cache_aware_balance[TinyLlama-1.1B-Chat-v1.0]
-disaggregated/test_disaggregated.py::test_disaggregated_torch_sampler[TinyLlama-1.1B-Chat-v1.0]
+disaggregated/test_disaggregated.py::test_disaggregated_trtllm_sampler[TinyLlama-1.1B-Chat-v1.0]
 disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_qwen3[False-False-Qwen3-8B-FP8]
 disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_qwen3[False-True-Qwen3-8B-FP8]
 disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_qwen3[True-False-Qwen3-8B-FP8]
 disaggregated/test_disaggregated_single_gpu.py::test_disaggregated_simple_qwen3[True-True-Qwen3-8B-FP8]
 disaggregated/test_disaggregated.py::test_disaggregated_ctxtp2pp2_gentp2pp2[TinyLlama-1.1B-Chat-v1.0]
-disaggregated/test_disaggregated.py::test_disaggregated_ctxpp4_genpp4[llama-3.1-8b]
+disaggregated/test_disaggregated.py::test_disaggregated_ctxpp4_genpp4[TinyLlama-1.1B-Chat-v1.0]
 disaggregated/test_workers.py::test_workers_conditional_disaggregation[TinyLlama-1.1B-Chat-v1.0]
 disaggregated/test_workers.py::test_workers_kv_cache_events[TinyLlama-1.1B-Chat-v1.0]
 disaggregated/test_workers.py::test_workers_kv_cache_aware_router[TinyLlama-1.1B-Chat-v1.0]

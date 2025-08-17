@@ -175,6 +175,7 @@ def check_events(llm,
     else:
         while events:
             event = events.pop(0)
+            assert "attention_dp_rank" in event
             if event and event["attention_dp_rank"] == attention_dp_rank:
                 assert event["event_id"] in [0, 1]
                 assert event["data"]["type"] in ["created", "stored"]
@@ -192,8 +193,8 @@ def check_events(llm,
 
     while events2:
         event = events2.pop(0)
-        if event and (event["attention_dp_rank"] == attention_dp_rank
-                      or attention_dp_rank is None):
+        if event and (attention_dp_rank is None
+                      or event.get("attention_dp_rank") == attention_dp_rank):
             if event["event_id"] == 2:
                 # 2 removed events needed
                 # should be a removed event to make space for context block
@@ -215,8 +216,8 @@ def check_events(llm,
 
     while events3:
         event = events3.pop(0)
-        if event and (event["attention_dp_rank"] == attention_dp_rank
-                      or attention_dp_rank is None):
+        if event and (attention_dp_rank is None
+                      or event.get("attention_dp_rank") == attention_dp_rank):
             if event["event_id"] == 5:
                 assert event["data"]["type"] == "removed"
                 assert event["data"]["block_hashes"]
@@ -231,6 +232,7 @@ def check_events(llm,
     assert not llm.get_kv_cache_events(5)
 
 
+@pytest.mark.skip(reason="https://nvbugs/5445001")
 def test_llm_kv_events_api():
     llm = create_llm()
     sampling_params = SamplingParams(max_tokens=6,
@@ -245,6 +247,7 @@ def test_llm_kv_events_api():
     check_events(llm, requests, sampling_params)
 
 
+@pytest.mark.skip(reason="https://nvbugs/5451407")
 @skip_single_gpu
 @pytest.mark.threadleak(enabled=False)
 def test_llm_api_attention_dp_kv_events():

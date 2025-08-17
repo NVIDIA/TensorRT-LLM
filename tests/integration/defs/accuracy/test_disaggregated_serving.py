@@ -244,7 +244,7 @@ def run_parallel_test(model_name: str, model_path: str, ctx_pp: int,
         "disable_overlap_scheduler": True,
         "kv_cache_config": kv_cache_config,
         "cache_transceiver_config": {
-            "backend": "default"
+            "backend": "DEFAULT"
         }
     }
     gen_server_config = {
@@ -253,7 +253,7 @@ def run_parallel_test(model_name: str, model_path: str, ctx_pp: int,
         "disable_overlap_scheduler": True,
         "kv_cache_config": kv_cache_config,
         "cache_transceiver_config": {
-            "backend": "default"
+            "backend": "DEFAULT"
         }
     }
     disaggregated_server_config = {
@@ -288,8 +288,8 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
         gen_server_config = {
             "disable_overlap_scheduler": disable_overlap_scheduler
         }
-        ctx_server_config["cache_transceiver_config"] = {"backend": "default"}
-        gen_server_config["cache_transceiver_config"] = {"backend": "default"}
+        ctx_server_config["cache_transceiver_config"] = {"backend": "DEFAULT"}
+        gen_server_config["cache_transceiver_config"] = {"backend": "DEFAULT"}
         disaggregated_server_config = {
             "hostname": "localhost",
             "port": 8000,
@@ -328,7 +328,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             "disable_overlap_scheduler": True,
             "kv_cache_config": kv_cache_config,
             "cache_transceiver_config": {
-                "backend": "default"
+                "backend": "DEFAULT"
             }
         }
         gen_server_config = {
@@ -336,7 +336,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             "speculative_config": speculative_decoding_config,
             "kv_cache_config": kv_cache_config,
             "cache_transceiver_config": {
-                "backend": "default"
+                "backend": "DEFAULT"
             }
         }
         disaggregated_server_config = {
@@ -379,7 +379,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             "max_num_tokens": 13393 * 2,
             "max_batch_size": 1,
             "cache_transceiver_config": {
-                "backend": "default"
+                "backend": "DEFAULT"
             },
             "cuda_graph_config": None,
         }
@@ -393,7 +393,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             "max_num_tokens": 13393 * 2,
             "max_batch_size": 16,
             "cache_transceiver_config": {
-                "backend": "default"
+                "backend": "DEFAULT"
             },
             "cuda_graph_config": None,
         }
@@ -424,13 +424,13 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             "disable_overlap_scheduler": True,
             "guided_decoding_backend": backend,
             "cache_transceiver_config": {
-                "backend": "default"
+                "backend": "DEFAULT"
             }
         }
         gen_server_config = {
             "guided_decoding_backend": backend,
             "cache_transceiver_config": {
-                "backend": "default"
+                "backend": "DEFAULT"
             }
         }
         disaggregated_server_config = {
@@ -472,7 +472,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             },
             "guided_decoding_backend": backend,
             "cache_transceiver_config": {
-                "backend": "default"
+                "backend": "DEFAULT"
             }
         }
         gen_server_config = {
@@ -483,7 +483,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             },
             "guided_decoding_backend": backend,
             "cache_transceiver_config": {
-                "backend": "default"
+                "backend": "DEFAULT"
             }
         }
         disaggregated_server_config = {
@@ -505,11 +505,12 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task = JsonModeEval(self.MODEL_NAME)
             task.evaluate(llm)
 
-    @pytest.mark.skip_less_device(2)
     @pytest.mark.parametrize("tp,pp", [(1, 2), (2, 1), (2, 2)],
                              ids=["tp1pp2", "tp2pp1", "tp2pp2"])
     @pytest.mark.parametrize("testset", ["GSM8K", "MMLU"])
     def test_tp_pp_symmetric(self, tp, pp, testset):
+        if tp * pp * 2 > get_device_count():
+            pytest.skip(f"Not enough devices for tp={tp}*pp={pp} test")
         return run_parallel_test(self.MODEL_NAME, self.MODEL_PATH, pp, tp, pp,
                                  tp, get_accuracy_task(testset))
 
@@ -517,6 +518,9 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     @parametrize_with_ids("gen_tp", [1, 2])
     @pytest.mark.parametrize("testset", ["GSM8K", "MMLU"])
     def test_ctx_pp_gen_tp_asymmetric(self, ctx_pp, gen_tp, testset):
+        if ctx_pp * gen_tp * 2 > get_device_count():
+            pytest.skip(
+                f"Not enough devices for ctx_pp={ctx_pp}*gen_tp={gen_tp} test")
         return run_parallel_test(self.MODEL_NAME, self.MODEL_PATH, ctx_pp, 1, 1,
                                  gen_tp, get_accuracy_task(testset))
 
@@ -527,12 +531,13 @@ class TestLlama4ScoutInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "meta-llama/Llama-4-Scout-17B-16E-Instruct"
     MODEL_PATH = f"{llm_models_root()}/llama4-models/Llama-4-Scout-17B-16E-Instruct"
 
+    @pytest.mark.skip_less_device(8)
     @pytest.mark.parametrize("overlap_scheduler", [False, True])
     def test_auto_dtype(self, overlap_scheduler):
         ctx_server_config = {"disable_overlap_scheduler": True}
         gen_server_config = {"disable_overlap_scheduler": overlap_scheduler}
-        ctx_server_config["cache_transceiver_config"] = {"backend": "default"}
-        gen_server_config["cache_transceiver_config"] = {"backend": "default"}
+        ctx_server_config["cache_transceiver_config"] = {"backend": "DEFAULT"}
+        gen_server_config["cache_transceiver_config"] = {"backend": "DEFAULT"}
         # Keep this low to avoid warmup OOM in CI
         ctx_server_config["max_seq_len"] = 8192
         gen_server_config["max_seq_len"] = 8192
@@ -565,14 +570,49 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     MODEL_NAME = "deepseek-ai/DeepSeek-V3-Lite"
     MODEL_PATH = f"{llm_models_root()}/DeepSeek-V3-Lite/bf16"
 
+    def test_nixl_backend(self):
+        ctx_server_config = {
+            "disable_overlap_scheduler": True,
+            "cache_transceiver_config": {
+                "backend": "NIXL"
+            }
+        }
+        gen_server_config = {
+            "disable_overlap_scheduler": True,
+            "cache_transceiver_config": {
+                "backend": "NIXL"
+            }
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "port": 8000,
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1,
+                "urls": ["localhost:8001"]
+            },
+            "generation_servers": {
+                "num_instances": 1,
+                "urls": ["localhost:8002"]
+            }
+        }
+        with launch_disaggregated_llm(disaggregated_server_config,
+                                      ctx_server_config, gen_server_config,
+                                      self.MODEL_PATH) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @pytest.mark.skip_less_device(8)
     @parametrize_with_ids("overlap_scheduler", [True, False])
     @parametrize_with_ids("mtp_nextn",
                           [0, pytest.param(2, marks=skip_pre_hopper)])
     def test_auto_dtype(self, overlap_scheduler, mtp_nextn):
         ctx_server_config = {"disable_overlap_scheduler": True}
         gen_server_config = {"disable_overlap_scheduler": not overlap_scheduler}
-        ctx_server_config["cache_transceiver_config"] = {"backend": "default"}
-        gen_server_config["cache_transceiver_config"] = {"backend": "default"}
+        ctx_server_config["cache_transceiver_config"] = {"backend": "DEFAULT"}
+        gen_server_config["cache_transceiver_config"] = {"backend": "DEFAULT"}
         if mtp_nextn > 0:
             ctx_server_config["speculative_config"] = {
                 "decoding_type": "MTP",
@@ -621,14 +661,14 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             "disable_overlap_scheduler": True,
             "cuda_graph_config": None,
             "cache_transceiver_config": {
-                "backend": "default"
+                "backend": "DEFAULT"
             }
         }
         gen_server_config = {
             "disable_overlap_scheduler": overlap_scheduler,
             "cuda_graph_config": None,
             "cache_transceiver_config": {
-                "backend": "default"
+                "backend": "DEFAULT"
             }
         }
         ctx_server_config["kv_cache_config"] = {
@@ -666,20 +706,54 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "Qwen3/Qwen3-8B"
     MODEL_PATH = f"{llm_models_root()}/Qwen3/Qwen3-8B-FP8"
 
+    def test_nixl_backend(self):
+        ctx_server_config = {
+            "disable_overlap_scheduler": True,
+            "cache_transceiver_config": {
+                "backend": "NIXL"
+            }
+        }
+        gen_server_config = {
+            "disable_overlap_scheduler": True,
+            "cache_transceiver_config": {
+                "backend": "NIXL"
+            }
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "port": 8000,
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1,
+                "urls": ["localhost:8001"]
+            },
+            "generation_servers": {
+                "num_instances": 1,
+                "urls": ["localhost:8002"]
+            }
+        }
+        with launch_disaggregated_llm(disaggregated_server_config,
+                                      ctx_server_config, gen_server_config,
+                                      self.MODEL_PATH) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
     @pytest.mark.parametrize("overlap_scheduler", [False, True])
     def test_auto_dtype(self, overlap_scheduler):
         ctx_server_config = {
             "disable_overlap_scheduler": True,
             "cuda_graph_config": None,
             "cache_transceiver_config": {
-                "backend": "default"
+                "backend": "DEFAULT"
             }
         }
         gen_server_config = {
             "disable_overlap_scheduler": overlap_scheduler,
             "cuda_graph_config": None,
             "cache_transceiver_config": {
-                "backend": "default"
+                "backend": "DEFAULT"
             }
         }
         disaggregated_server_config = {
