@@ -1394,8 +1394,8 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
     if (mEnableContextFMHA && mFP8ContextMLA && mFmhaDispatcher->isSeparateQAndKvInput())
     {
         fp8_q_buf_size = params.num_tokens * static_cast<size_t>(total_q_dim_all_heads);
-        fp8_k_buf_size = params.num_tokens * static_cast<size_t>(total_k_dim_all_heads);
-        fp8_v_buf_size = params.num_tokens * static_cast<size_t>(total_v_dim_all_heads);
+        fp8_k_buf_size = params.total_kv_len * static_cast<size_t>(total_k_dim_all_heads);
+        fp8_v_buf_size = params.total_kv_len * static_cast<size_t>(total_v_dim_all_heads);
     }
     size_t const padding_offset_size
         = mEnableContextFMHA ? 0 : sizeof(int) * params.batch_size * params.input_seq_length;

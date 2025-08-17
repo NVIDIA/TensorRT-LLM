@@ -210,8 +210,6 @@ __global__ void applyMLARopeAndAssignQKVKernelOptContext(T* q_ptr, T* k_ptr, T c
     size_t const batch_idx = blockIdx.y;
     size_t const head_idx = blockIdx.z;
 
-
-
     if (head_idx < head_num)
     {
         size_t const head_dim_vec_idx = (threadIdx.x % VECS_PER_HEAD);
@@ -951,7 +949,7 @@ void invokeMLAContextFp8Quantize(MlaParams<T>& params, int total_kv_len, cudaStr
         dim3 grid(int(tensorrt_llm::common::divUp(total_kv_len, 48)), 1, params.head_num);
 
         TLLM_LOG_DEBUG(
-            "Launching QuantizeCopyInputToFp8Kernel with grid_size: (%d, %d, %d), threads_per_block: %d, "
+            "Launching quantizeCopyInputToFp8Kernel with grid_size: (%d, %d, %d), threads_per_block: %d, "
             "total_kv_len: %d, acc_q_len: %d",
             grid.x, grid.y, grid.z, threads_per_block, total_kv_len, params.acc_q_len);
 
