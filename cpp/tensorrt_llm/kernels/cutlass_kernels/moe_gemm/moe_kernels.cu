@@ -4563,10 +4563,14 @@ void GemmProfilerBackend::prepareTmaWsInputs(int num_tokens, char* workspace_ptr
         return;
     }
 
+    bool use_w4afp8 = (mDType == nvinfer1::DataType::kFP8 && mWType == nvinfer1::DataType::kINT4);
+    bool use_wfp4a16 = ((mDType == nvinfer1::DataType::kHALF || mDType == nvinfer1::DataType::kBF16)
+        && mWType == nvinfer1::DataType::kUINT8);
+    bool use_w4_groupwise = use_w4afp8 || use_wfp4a16;
     bool const use_finalize_fusion = fusion == TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::FINALIZE;
-    if (use_finalize_fusion
-        && (!mInterface->use_fused_finalize_ || mMinLatencyMode || use_w4_groupwise
-            || mGemmToProfile != GemmToProfile::GEMM_2))
+    bool const finalize_fusion_not_supported = !mInterface->use_fused_finalize_ || mMinLatencyMode || use_w4_groupwise
+        || mGemmToProfile != GemmToProfile::GEMM_2;
+    if (use_finalize_fusion && finalize_fusion_not_supported)
     {
         return;
     }
@@ -4624,11 +4628,6 @@ void GemmProfilerBackend::prepareTmaWsInputs(int num_tokens, char* workspace_ptr
             /* GEMM1 */
             gemm1_tma_ws_input.fusion = TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE;
             gemm2_tma_ws_input.fusion = TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE;
-
-            bool use_w4afp8 = (mDType == nvinfer1::DataType::kFP8 && mWType == nvinfer1::DataType::kINT4);
-            bool use_wfp4a16 = ((mDType == nvinfer1::DataType::kHALF || mDType == nvinfer1::DataType::kBF16)
-                && mWType == nvinfer1::DataType::kUINT8);
-            bool use_w4_groupwise = use_w4afp8 || use_wfp4a16;
             if (use_finalize_fusion)
             {
                 assert(!mMinLatencyMode);
@@ -4740,6 +4739,7 @@ void GemmProfilerBackend::runProfiler(int original_num_tokens, Config const& tac
     {
         tma_ws_input_template = mTmaInputCache[mSampleIndex][tactic.epilogue_fusion_type
             == cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::FINALIZE];
+        TLLM_CHECK_WITH_INFO(tma_ws_input_template.isValid(), "TMA WS input template is not initialized");
     }
 
     mInterface->is_profiler = true;
