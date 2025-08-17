@@ -250,6 +250,14 @@ if(${CUDAToolkit_VERSION} VERSION_GREATER_EQUAL "12.8")
   )
 endif()
 
+if(${CUDAToolkit_VERSION} VERSION_GREATER_EQUAL "13.0")
+  message(
+    STATUS
+      "CUDAToolkit_VERSION ${CUDAToolkit_VERSION_MAJOR}.${CUDAToolkit_VERSION_MINOR} is greater or equal than 13.0, setting CMAKE_CUDA_RUNTIME_LIBRARY to Shared"
+  )
+  set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --device-entity-has-hidden-visibility=false -cudart=shared")
+  set(CMAKE_CUDA_RUNTIME_LIBRARY Shared)
+endif()
 
 if(ENABLE_MULTI_DEVICE)
   # MPI MPI isn't used until tensorrt_llm/CMakeLists.txt is invoked. However, if

@@ -36,15 +36,99 @@ if(NOT DEEP_EP_CUDA_ARCHITECTURES)
   return()
 endif()
 
-# Ensure that dependent libraries are installed
-find_library(MLX5_lib NAMES mlx5 REQUIRED)
-set(NVSHMEM_INSTALL_PREFIX "${TORCH_INSTALL_PREFIX}/../nvidia/nvshmem")
-# message("Torch Install Prefix: ${TORCH_INSTALL_PREFIX}")
+# TODO: restore patched nvshmem for CUDA12
+if(${CUDAToolkit_VERSION} VERSION_GREATER_EQUAL "13.0")
+  set(NVSHMEM_INSTALL_PREFIX "${TORCH_INSTALL_PREFIX}/../nvidia/nvshmem")
+  find_path(NVSHMEM_INCLUDE_DIR nvshmem.h HINTS ${NVSHMEM_INSTALL_PREFIX}/include)
+  find_library(NVSHMEM_DEVICE_LIBRARY nvshmem_device HINTS ${NVSHMEM_INSTALL_PREFIX}/lib)
+  find_library(NVSHMEM_HOST_LIBRARY libnvshmem_host.so.3 HINTS ${NVSHMEM_INSTALL_PREFIX}/lib)
+else()
+  set(NVSHMEM_INSTALL_PREFIX "$ORIGIN/libs/nvshmem")
+  # Delete stale nvshmem on patch update
+  set(NVSHMEM_STAMP_FILE ${CMAKE_CURRENT_BINARY_DIR}/nvshmem_stamp.txt)
+  file(SHA256 ${DEEP_EP_SOURCE_DIR}/third-party/nvshmem.patch NVSHMEM_PATCH_HASH)
+  file(SHA256 ${CMAKE_CURRENT_SOURCE_DIR}/nvshmem_fast_build.patch
+       NVSHMEM_PATCH_2_HASH)
+  set(NVSHMEM_STAMP_CONTENT "${NVSHMEM_URL_HASH}")
+  string(APPEND NVSHMEM_STAMP_CONTENT " PATCH_COMMAND v1")
+  string(APPEND NVSHMEM_STAMP_CONTENT " ${NVSHMEM_PATCH_HASH}")
+  string(APPEND NVSHMEM_STAMP_CONTENT " 103")
+  string(APPEND NVSHMEM_STAMP_CONTENT " ${NVSHMEM_PATCH_2_HASH}")
+  set(OLD_NVSHMEM_STAMP_CONTENT "")
+  if(EXISTS ${NVSHMEM_STAMP_FILE})
+    file(READ ${NVSHMEM_STAMP_FILE} OLD_NVSHMEM_STAMP_CONTENT)
+  endif()
+  if(NOT OLD_NVSHMEM_STAMP_CONTENT STREQUAL NVSHMEM_STAMP_CONTENT)
+    file(REMOVE_RECURSE ${CMAKE_CURRENT_BINARY_DIR}/nvshmem_project-prefix)
+    file(WRITE ${NVSHMEM_STAMP_FILE} "${NVSHMEM_STAMP_CONTENT}")
+  endif()
+  set_property(
+    DIRECTORY APPEND
+    PROPERTY CMAKE_CONFIGURE_DEPENDS
+             ${DEEP_EP_SOURCE_DIR}/third-party/nvshmem.patch
+             ${CMAKE_CURRENT_SOURCE_DIR}/nvshmem_fast_build.patch)
+  
+  # Add NVSHMEM
+  # ===========
+  
+  # NVSHMEM only works with GCC. Building NVSHMEM with Clang results in
+  # compilation errors. Using NVSHMEM with Clang results in slow builds and device
+  # link issues.
+  if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    set(CMAKE_C_COMPILER gcc)
+    set(CMAKE_CXX_COMPILER g++)
+    set(CMAKE_CUDA_HOST_COMPILER g++)
+  endif()
+  
+  # Add nvshmem external project
+  include(ExternalProject)
+  ExternalProject_Add(
+    nvshmem_project
+    URL file://${CMAKE_CURRENT_SOURCE_DIR}/nvshmem_src_3.2.5-1.txz
+    URL_HASH ${NVSHMEM_URL_HASH}
+    PATCH_COMMAND patch -p1 --forward --batch -i
+                  ${DEEP_EP_SOURCE_DIR}/third-party/nvshmem.patch
+    COMMAND sed "s/TRANSPORT_VERSION_MAJOR 3/TRANSPORT_VERSION_MAJOR 103/" -i
+            src/CMakeLists.txt
+    COMMAND patch -p1 --forward --batch -i
+            ${CMAKE_CURRENT_SOURCE_DIR}/nvshmem_fast_build.patch
+    CMAKE_CACHE_ARGS
+      -DCMAKE_C_COMPILER:STRING=${CMAKE_C_COMPILER}
+      -DCMAKE_C_COMPILER_LAUNCHER:STRING=${CMAKE_C_COMPILER_LAUNCHER}
+      -DCMAKE_CXX_COMPILER:STRING=${CMAKE_CXX_COMPILER}
+      -DCMAKE_CXX_COMPILER_LAUNCHER:STRING=${CMAKE_CXX_COMPILER_LAUNCHER}
+      -DCMAKE_CUDA_ARCHITECTURES:STRING=${DEEP_EP_CUDA_ARCHITECTURES}
+      -DCMAKE_CUDA_HOST_COMPILER:STRING=${CMAKE_CUDA_HOST_COMPILER}
+      -DCMAKE_CUDA_COMPILER_LAUNCHER:STRING=${CMAKE_CUDA_COMPILER_LAUNCHER}
+      -DNVSHMEM_BUILD_EXAMPLES:BOOL=0
+      -DNVSHMEM_BUILD_PACKAGES:BOOL=0
+      -DNVSHMEM_BUILD_TESTS:BOOL=0
+      -DNVSHMEM_IBGDA_SUPPORT:BOOL=1
+      -DNVSHMEM_IBRC_SUPPORT:BOOL=0
+      -DNVSHMEM_MPI_SUPPORT:BOOL=0
+      -DNVSHMEM_PMIX_SUPPORT:BOOL=0
+      -DNVSHMEM_SHMEM_SUPPORT:BOOL=0
+      -DNVSHMEM_TIMEOUT_DEVICE_POLLING:BOOL=0
+      -DNVSHMEM_UCX_SUPPORT:BOOL=0
+      -DNVSHMEM_USE_GDRCOPY:BOOL=0
+      -DNVSHMEM_USE_NCCL:BOOL=0
+    INSTALL_COMMAND ""
+    BINARY_DIR ${CMAKE_CURRENT_BINARY_DIR}/nvshmem-build
+    BUILD_BYPRODUCTS
+      ${CMAKE_CURRENT_BINARY_DIR}/nvshmem-build/src/lib/libnvshmem.a)
+  add_library(nvshmem_project::nvshmem STATIC IMPORTED)
+  add_dependencies(nvshmem_project::nvshmem nvshmem_project)
+  file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/nvshmem-build/src/include)
+  set_target_properties(
+    nvshmem_project::nvshmem
+    PROPERTIES IMPORTED_LOCATION
+               ${CMAKE_CURRENT_BINARY_DIR}/nvshmem-build/src/lib/libnvshmem.a
+               INTERFACE_INCLUDE_DIRECTORIES
+               ${CMAKE_CURRENT_BINARY_DIR}/nvshmem-build/src/include)
+endif()
 
-find_path(NVSHMEM_INCLUDE_DIR nvshmem.h HINTS ${NVSHMEM_INSTALL_PREFIX}/include)
-# set(NVSHMEM_HOST_LIBRARY ${NVSHMEM_INSTALL_PREFIX}/lib/libnvshmem_host.so.3)
-find_library(NVSHMEM_DEVICE_LIBRARY nvshmem_device HINTS ${NVSHMEM_INSTALL_PREFIX}/lib)
-find_library(NVSHMEM_HOST_LIBRARY libnvshmem_host.so.3 HINTS ${NVSHMEM_INSTALL_PREFIX}/lib)
+# Ensure that dependent libraries are installed
+find_library(MLX5_lib NAMES mlx5 libmlx5.so.1 REQUIRED)
 
 
 # Prepare files
