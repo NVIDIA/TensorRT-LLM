@@ -27,17 +27,22 @@ namespace torch_ext
 // This operator applies RMS normalization and RoPE to Q and K tensors in a single CUDA kernel.
 // The OP performs operations in-place on the input qkv tensor.
 void fused_qk_norm_rope(
-    torch::Tensor& qkv,         // Combined QKV tensor [num_tokens, (num_heads_q+num_heads_k+num_heads_v)*head_dim]
-    int64_t num_heads_q,        // Number of query heads
-    int64_t num_heads_k,        // Number of key heads
-    int64_t num_heads_v,        // Number of value heads
-    int64_t head_dim,           // Dimension per head
-    double eps,                 // Epsilon for RMS normalization
-    torch::Tensor& q_weight,    // RMSNorm weights for query [head_dim]
-    torch::Tensor& k_weight,    // RMSNorm weights for key [head_dim]
-    double base,                // Base for RoPE computation
-    bool is_neox,               // Whether RoPE is applied in Neox style
-    torch::Tensor& position_ids // Position IDs for RoPE [num_tokens]
+    torch::Tensor& qkv,          // Combined QKV tensor [num_tokens, (num_heads_q+num_heads_k+num_heads_v)*head_dim]
+    int64_t num_heads_q,         // Number of query heads
+    int64_t num_heads_k,         // Number of key heads
+    int64_t num_heads_v,         // Number of value heads
+    int64_t head_dim,            // Dimension per head
+    double eps,                  // Epsilon for RMS normalization
+    torch::Tensor& q_weight,     // RMSNorm weights for query [head_dim]
+    torch::Tensor& k_weight,     // RMSNorm weights for key [head_dim]
+    double base,                 // Base for RoPE computation
+    bool is_neox,                // Whether RoPE is applied in Neox style
+    torch::Tensor& position_ids, // Position IDs for RoPE [num_tokens]
+    // parameters for yarn
+    double factor, // factor in rope_scaling in config.json. When it is not 1.0, it means the model is using yarn.
+    double low,    // threshold for high frequency
+    double high,   // threshold for low frequency
+    double attention_factor // attention_factor applied on cos and sin
 )
 {
     // Input validation
@@ -68,7 +73,8 @@ void fused_qk_norm_rope(
         reinterpret_cast<__nv_bfloat16*>(q_weight.data_ptr()), reinterpret_cast<__nv_bfloat16*>(k_weight.data_ptr()),
         static_cast<float>(base),
         !is_neox, // interleave
-        reinterpret_cast<int const*>(position_ids.data_ptr()), stream);
+        reinterpret_cast<int const*>(position_ids.data_ptr()), static_cast<float>(factor), static_cast<float>(low),
+        static_cast<float>(high), static_cast<float>(attention_factor), stream);
 }
 
 // Register the PyTorch operators
@@ -76,7 +82,8 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
         "fused_qk_norm_rope(Tensor(a!) qkv, int num_heads_q, int num_heads_k, int num_heads_v, int head_dim, float "
-        "eps, Tensor q_weight, Tensor k_weight, float base, bool is_neox, Tensor position_ids) -> ()");
+        "eps, Tensor q_weight, Tensor k_weight, float base, bool is_neox, Tensor position_ids, float factor, float "
+        "low, float high, float attention_factor) -> ()");
 }
 
 // Register the CUDA implementation
