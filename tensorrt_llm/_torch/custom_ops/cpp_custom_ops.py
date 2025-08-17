@@ -179,58 +179,6 @@ def _register_fake():
         return (input.new_empty(output_shape, dtype=torch.uint8),
                 global_scale.new_empty(scale_shape, dtype=torch.uint8))
 
-    @torch.library.register_fake("trtllm::moe_comm_prepare_indices")
-    def _(
-        gathered_target_rank_ids: torch.Tensor,
-        real_rank_token_count_cum_sum: Optional[torch.Tensor],
-        max_token_count_per_rank: int,
-        expert_count: int,
-        top_k: int,
-        ep_rank: int,
-        ep_size: int,
-    ):
-        max_send_ranks_per_token = max(ep_size, top_k)
-        local_gather_indices_shape = (max_token_count_per_rank * ep_size, )
-        rank_count_cum_sum_shape = (ep_size, )
-        send_rank_local_indices_shape = (max_token_count_per_rank *
-                                         max_send_ranks_per_token, )
-        recv_rank_local_indices_shape = (max_token_count_per_rank * ep_size, )
-        backward_recv_rank_local_indices_shape = (max_token_count_per_rank *
-                                                  max_send_ranks_per_token, )
-
-        local_gather_indices = gathered_target_rank_ids.new_empty(
-            local_gather_indices_shape, dtype=torch.int32)
-        send_rank_count_cum_sum = gathered_target_rank_ids.new_empty(
-            rank_count_cum_sum_shape, dtype=torch.int32)
-        send_rank_local_indices = gathered_target_rank_ids.new_empty(
-            send_rank_local_indices_shape, dtype=torch.int32)
-        recv_rank_count_cum_sum = gathered_target_rank_ids.new_empty(
-            rank_count_cum_sum_shape, dtype=torch.int32)
-        recv_rank_local_indices = gathered_target_rank_ids.new_empty(
-            recv_rank_local_indices_shape, dtype=torch.int32)
-        backward_recv_rank_local_indices = gathered_target_rank_ids.new_empty(
-            backward_recv_rank_local_indices_shape, dtype=torch.int32)
-
-        return (local_gather_indices, send_rank_count_cum_sum,
-                send_rank_local_indices, recv_rank_count_cum_sum,
-                recv_rank_local_indices, backward_recv_rank_local_indices)
-
-    @torch.library.register_fake("trtllm::moe_local_gather")
-    def _(
-        recv_rank_cum_sum: torch.Tensor,
-        local_gather_indices: torch.Tensor,
-        gathered_expert_ids: torch.Tensor,
-        gathered_scales: Optional[torch.Tensor],
-        local_expert_ids: torch.Tensor,
-        local_scales: Optional[torch.Tensor],
-        max_token_count_per_rank: int,
-        expert_count: int,
-        top_k: int,
-        ep_rank: int,
-        ep_size: int,
-    ):
-        pass
-
     @torch.library.register_fake("trtllm::moe_comm")
     def _(
         input: torch.Tensor,
