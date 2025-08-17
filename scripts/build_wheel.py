@@ -669,18 +669,21 @@ def main(*,
                          "deep_ep",
                          deep_ep_dir,
                          dirs_exist_ok=True)
+            
             (lib_dir / "nvshmem").mkdir(exist_ok=True)
-            install_file(
-                build_dir / "tensorrt_llm/deep_ep/nvshmem-build/License.txt",
-                lib_dir / "nvshmem")
-            install_file(
-                build_dir /
-                "tensorrt_llm/deep_ep/nvshmem-build/src/lib/nvshmem_bootstrap_uid.so.3",
-                lib_dir / "nvshmem")
-            install_file(
-                build_dir /
-                "tensorrt_llm/deep_ep/nvshmem-build/src/lib/nvshmem_transport_ibgda.so.103",
-                lib_dir / "nvshmem")
+            nvshmem_license = build_dir / "tensorrt_llm/deep_ep/nvshmem-build/License.txt"
+            if nvshmem_license.exists():
+                install_file(
+                    build_dir / "tensorrt_llm/deep_ep/nvshmem-build/License.txt",
+                    lib_dir / "nvshmem")
+                install_file(
+                    build_dir /
+                    "tensorrt_llm/deep_ep/nvshmem-build/src/lib/nvshmem_bootstrap_uid.so.3",
+                    lib_dir / "nvshmem")
+                install_file(
+                    build_dir /
+                    "tensorrt_llm/deep_ep/nvshmem-build/src/lib/nvshmem_transport_ibgda.so.103",
+                    lib_dir / "nvshmem")
         if not skip_stubs:
             with working_directory(project_dir):
                 if binding_type == "nanobind":
