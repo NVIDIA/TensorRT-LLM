@@ -4613,6 +4613,8 @@ void GemmProfilerBackend::prepareTmaWsInputs(int num_tokens, char* workspace_ptr
     size_t num_expanded_tokens = num_tokens * mK;
     for (int64_t i = 0; i < NUM_ROUTING_SAMPLES; i++)
     {
+        // Note: Even though we have separate TMA WS inputs for finalize fusion on/off we reuse the same pointers to
+        // save space.
         auto& cache_element = mTmaInputCache[i][use_finalize_fusion];
         cache_element.configureWorkspace(tma_ws_input_workspace, mNumExpertsPerNode, gemm_workspace,
             workspaces.at("gemm_workspace").first, mScalingType);
