@@ -273,35 +273,15 @@ void argGenLoadFile(benchmark::internal::Benchmark* benchmark)
         }
 
         // Do this after filtering datatypes as tactics only make sense if we know the data type
-        bool has_tactic_ids2 = false;
         std::vector<int> tactic_ids1{};
         std::vector<int> tactic_ids2{};
-        if (run_config.contains("tactic_id1") || run_config.contains("tactic_id2"))
+        if (run_config.contains("tactic_id1"))
         {
-            has_tactic_ids2 = true;
             parseTacticToVectorID<BenchClass>(run_config["tactic_id1"], tactic_ids1, MoeGemmId::GEMM_1);
-            parseTacticToVectorID<BenchClass>(run_config["tactic_id2"], tactic_ids2, MoeGemmId::GEMM_2);
         }
-
-        if (tactic_ids1.empty() || tactic_ids2.empty())
+        if (run_config.contains("tactic_id2"))
         {
-            std::cerr << "Warning: Skipping benchmark, no valid tactic found" << std::endl;
-            static bool printed = false;
-            if (!printed)
-            {
-                printed = true;
-                std::cerr << __PRETTY_FUNCTION__ << ": Valid Tactics are:\n";
-                for (auto gemm_id : {MoeGemmId::GEMM_1, MoeGemmId::GEMM_2})
-                {
-                    std::cerr << "GEMM " << (int) gemm_id << ":\n";
-                    auto confs = listAllTactics<BenchClass>(gemm_id);
-                    for (auto c : confs)
-                        std::cerr << c.toString();
-                    std::cerr << std::endl;
-                }
-            }
-
-            continue;
+            parseTacticToVectorID<BenchClass>(run_config["tactic_id2"], tactic_ids2, MoeGemmId::GEMM_2);
         }
 
         auto get_or = [&](auto name, auto def)
@@ -337,8 +317,6 @@ void argGenLoadFile(benchmark::internal::Benchmark* benchmark)
             }
             else if (gemm_to_profile == (int) GemmToProfile::GEMM_2)
             {
-                if (!has_tactic_ids2)
-                    tactic_ids2 = std::move(tactic_ids1);
                 tactic_ids1 = {-1};
             }
         }
@@ -353,14 +331,31 @@ void argGenLoadFile(benchmark::internal::Benchmark* benchmark)
             return val;
         };
 
+        if (tactic_ids1.empty() || tactic_ids2.empty())
+        {
+            std::cerr << "Warning: Skipping benchmark, no valid tactic found" << std::endl;
+            static bool printed = false;
+            if (!printed)
+            {
+                printed = true;
+                std::cerr << __PRETTY_FUNCTION__ << ": Valid Tactics are:\n";
+                for (auto gemm_id : {MoeGemmId::GEMM_1, MoeGemmId::GEMM_2})
+                {
+                    std::cerr << "GEMM " << (int) gemm_id << ":\n";
+                    auto confs = listAllTactics<BenchClass>(gemm_id);
+                    for (auto c : confs)
+                        std::cerr << c.toString();
+                    std::cerr << std::endl;
+                }
+            }
+
+            continue;
+        }
+
         for (auto t1 : tactic_ids1)
         {
-            // tactic_ids2 will have one dummy value if has_tactic_ids2 = false
             for (auto t2 : tactic_ids2)
             {
-                if (!has_tactic_ids2)
-                    t2 = t1;
-
                 benchmark->Args({num_experts,                               //
                     get_range("k"),                                         //
                     get_range("hidden_size"),                               //
