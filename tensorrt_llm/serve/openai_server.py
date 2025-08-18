@@ -27,13 +27,9 @@ from tensorrt_llm.executor.postproc_worker import PostprocParams
 from tensorrt_llm.inputs import prompt_inputs
 from tensorrt_llm.inputs.utils import ConversationMessage, apply_chat_template
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
-from tensorrt_llm.llmapi import MultimodalEncoder
+from tensorrt_llm.llmapi import MultimodalEncoder, tracing
 from tensorrt_llm.llmapi.disagg_utils import MetadataServerConfig, ServerRole
 from tensorrt_llm.llmapi.llm import RequestOutput
-from tensorrt_llm.llmapi.otel_tracing import (contains_trace_headers,
-                                              extract_trace_headers,
-                                              is_tracing_enabled,
-                                              log_tracing_disabled_warning)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.metrics.collector import MetricsCollector
 from tensorrt_llm.serve.chat_utils import (check_multiple_response,
@@ -908,8 +904,8 @@ class OpenAIServer:
         self,
         headers: Headers,
     ) -> Optional[Mapping[str, str]]:
-        if is_tracing_enabled():
-            return extract_trace_headers(headers)
-        if contains_trace_headers(headers):
-            log_tracing_disabled_warning()
+        if tracing.is_tracing_enabled():
+            return tracing.extract_trace_headers(headers)
+        if tracing.contains_trace_headers(headers):
+            tracing.log_tracing_disabled_warning()
         return None
