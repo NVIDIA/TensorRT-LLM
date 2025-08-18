@@ -911,25 +911,26 @@ class TestMistral7B(LlmapiAccuracyTestHarness):
 
 class TestMistralSmall24B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "mistralai/Mistral-Small-3.1-24B-Instruct-2503"
+    MODEL_PATH = f"{llm_models_root()}/Mistral-Small-3.1-24B-Instruct-2503"
 
     @pytest.mark.skip_less_device_memory(80000)
-    @pytest.mark.parametrize(
-        "model_path, expected_quant_algo",
-        [
-            # Original bfloat16 model.
-            (f"{llm_models_root()}/Mistral-Small-3.1-24B-Instruct-2503", None),
-            # FP8 model.
-            pytest.param(
-                f"{llm_models_root()}/Mistral-Small-3.1-24B-Instruct-2503-fp8",
-                QuantAlgo.FP8,
-                marks=skip_pre_ada,
-            ),
-        ],
-    )
-    def test_auto_dtype(self, model_path, expected_quant_algo):
+    def test_auto_dtype(self):
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
+        with LLM(self.MODEL_PATH, kv_cache_config=kv_cache_config) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_pre_ada
+    @pytest.mark.skip_less_device_memory(80000)
+    def test_fp8(self):
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
+        model_path = f"{llm_models_root()}/Mistral-Small-3.1-24B-Instruct-2503-fp8"
         with LLM(model_path, kv_cache_config=kv_cache_config) as llm:
-            assert llm.args.quant_config.quant_algo == expected_quant_algo
+            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)
