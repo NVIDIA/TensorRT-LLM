@@ -588,8 +588,10 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params)
 
     }     // Inner loop over the key/value sequence length.
 
+    // Update the sum if attention sinks are used.
+    acc_o_normalizer.update_sum(global_max, global_sum);
     // Update acc_o of flash attention
-    acc_o_normalizer.final_update(acc_o, global_max, global_sum);
+    acc_o_normalizer.final_update(acc_o, global_sum);
 
     // If kv_loop breaks prematurely in case of causal masking, make sure there is no data in-flight
     if (Kernel_traits::CAUSAL_MASK)
