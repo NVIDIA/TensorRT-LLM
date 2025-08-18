@@ -159,10 +159,22 @@ def run_disaggregated_test(example_dir,
     run_env = env.copy()
     run_env["UCX_TLS"] = "^ib"
 
+    nsys_path = os.getenv("NSYS_PATH", None)
+    nsys_file = os.getenv("NSYS_FILE", None)
+    nsys_cmd = [
+        "nsys",
+        "profile",
+        "--trace",
+        "cuda,cublas,nvtx",
+        "--output",
+        nsys_file,
+        "--force-overwrite=true",
+    ] if nsys_path and nsys_file else []
+
     num_ranks, config_file = get_test_config(test_desc, example_dir,
                                              os.path.dirname(__file__))
 
-    workers_cmd = [
+    workers_cmd = nsys_cmd + [
         'mpirun', '--allow-run-as-root', '--oversubscribe', '-n',
         str(num_ranks), 'trtllm-serve', 'disaggregated_mpi_worker', '-c',
         config_file
