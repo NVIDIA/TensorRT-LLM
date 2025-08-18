@@ -27,7 +27,7 @@ namespace kernels
 // assume load a [M, K] row major weight matrix
 // how to sync with DMA warp is tricky
 template <typename T, int CTA_M, int CTA_K, class TmaLoad, class GmemTensor>
-__global__ void cute_tma_prefetch_kernel(__grid_constant__ TmaLoad const tma_load, GmemTensor gmem_tensor, int K,
+__global__ void cute_tma_prefetch_kernel(__grid_constant__ TmaLoad const tma_load, GmemTensor gmem_tensor, int M, int K,
     int delay_start, int throttle_time, int throttle_mode)
 {
     using namespace cute;
@@ -53,10 +53,12 @@ __global__ void cute_tma_prefetch_kernel(__grid_constant__ TmaLoad const tma_loa
         while (clock64() < target_clock)
             ;
 
-        for (int k = 0; k < K / CTA_K; k++)
+        for (int i = blockIdx.x; i < (M / CTA_M) * (K / CTA_K); i += gridDim.x)
         {
+            int m = i % (M / CTA_M);
+            int k = i / (M / CTA_M);
             auto gmem_tensor_coord_cta
-                = local_tile(gmem_tensor_coord, Tile<Int<CTA_M>, Int<CTA_K>>{}, make_coord(blockIdx.x, k));
+                = local_tile(gmem_tensor_coord, Tile<Int<CTA_M>, Int<CTA_K>>{}, make_coord(m, k));
 
             prefetch(tma_load, tma_load_per_cta.partition_S(gmem_tensor_coord_cta));
 
@@ -93,7 +95,7 @@ void cute_host_prefetch(T const* data, int M, int K, int strideM, int delay_star
     using tensorrt_llm::common::check;
 
     // create the GMEM tensor, row major
-    auto gmem_layout = make_layout(make_shape(M, K), make_stride(strideM, 1));
+    auto gmem_layout = make_layout(make_shape(M, K + CTA_K), make_stride(strideM, 1)); // Added CTA_K to allow K=0
     auto gmem_tensor = make_tensor(make_gmem_ptr(data), gmem_layout);
 
     // create the SMEM layout, row major
@@ -108,7 +110,7 @@ void cute_host_prefetch(T const* data, int M, int K, int strideM, int delay_star
     // each CTA responsible for a range of M, and all kblock associated with it
     cudaLaunchConfig_t config{};
     cudaLaunchAttribute attrs[1];
-    config.gridDim = dim3{(uint32_t) (M / CTA_M), 1, 1};
+    config.gridDim = 128;
     config.blockDim = 32;
     config.stream = stream;
     if (pdl)
@@ -125,7 +127,7 @@ void cute_host_prefetch(T const* data, int M, int K, int strideM, int delay_star
     check_cuda_error(cudaFuncSetAttribute(kernel_instance, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
 
     check_cuda_error(cudaLaunchKernelEx(
-        &config, kernel_instance, tma_load, gmem_tensor, K, delay_start, throttle_time, throttle_mode));
+        &config, kernel_instance, tma_load, gmem_tensor, M, K, delay_start, throttle_time, throttle_mode));
 }
 
 #define INSTANTIATE_CUTE_HOST_PREFETCH(T, CTA_M, CTA_K)                                                                \
