@@ -11,13 +11,9 @@ class HandleLogits:
 
     @torch.inference_mode()
     @nvtx_range("handle_logits")
-    def __call__(
-        self,
-        context_requests: List[LlmRequest],
-        generation_requests: List[LlmRequest],
-        logits: torch.Tensor,
-        beam_width: int,
-    ):
+    def __call__(self, context_requests: List[LlmRequest],
+                 generation_requests: List[LlmRequest], logits: torch.Tensor,
+                 beam_width: int, num_context_logits_prefix_sum: list[int]):
         """Handles context and generation logits for a batch of requests.
 
         Args:
@@ -25,13 +21,8 @@ class HandleLogits:
             generation_requests: List of generation requests to process
             logits: Input logits tensor
             beam_width: Beam width for the generation requests
+            num_context_logits_prefix_sum: Prefix sum of the logits
         """
-        num_context_logits_prefix_sum = [0]
-        prefix_sum = 0
-        for request in context_requests:
-            prefix_sum += request.context_chunk_size if request.py_return_context_logits else 1
-            num_context_logits_prefix_sum.append(prefix_sum)
-
         # Copy logits into decoderBuffers.logits
         for batch_index, llm_req in enumerate(context_requests):
             logits_begin = num_context_logits_prefix_sum[batch_index]

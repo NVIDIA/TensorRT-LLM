@@ -56,8 +56,8 @@ class Sampler(ABC):
         return None
 
     @abstractmethod
-    def sample_async(self, scheduled_requests: ScheduledRequests,
-                     model_outputs) -> SampleState:
+    def sample_async(self, scheduled_requests: ScheduledRequests, model_outputs,
+                     num_context_logits_prefix_sum: list[int]) -> SampleState:
         raise NotImplementedError
 
     @abstractmethod
@@ -77,8 +77,8 @@ class EarlyStopSampler(Sampler):
     such as encoder-only model (e.g., BERT) or reward models that only need context phase.
     """
 
-    def sample_async(self, scheduled_requests: ScheduledRequests,
-                     model_outputs) -> SampleState:
+    def sample_async(self, scheduled_requests: ScheduledRequests, model_outputs,
+                     num_context_logits_prefix_sum: list[int]) -> SampleState:
         host = SampleStateTensors(new_tokens=torch.empty(0))
         return SampleState(scheduled_requests=scheduled_requests, host=host)
 
@@ -552,34 +552,25 @@ class TorchSampler(Sampler):
             self.handle_logprobs(req, state, beam=self.BEAM, count=processed)
             req.py_decoding_iter += 1
 
-    def log_probs_host(self, requests: Iterable[LlmRequest]):
+    def log_probs_host(self, scheduled_requests: ScheduledRequests):
         """Shape: In lockstep with TRTLLMSampler: https://github.com/NVIDIA/TensorRT-LLM/blob/cea5dd1e3883b18bf50901a7f196f50a9544c28c/cpp/include/tensorrt_llm/runtime/decoderState.h#L103"""
-        if any(req.py_return_log_probs for req in requests):
+        if any(req.py_return_log_probs
+               for req in scheduled_requests.all_requests()):
             return torch.empty(
                 (self.max_num_sequences, self.MAX_BEAM_WIDTH, self.max_tokens),
                 device="cpu",
                 pin_memory=True)
         return None
 
-    def gen_logits_host(self, requests: Iterable[LlmRequest], vocab_size: int):
-        if any(req.py_return_generation_logits for req in requests):
-            return torch.empty((self.max_tokens, self.max_num_sequences,
-                                self.MAX_BEAM_WIDTH, vocab_size),
-                               device="cpu",
-                               pin_memory=True)
-        return None
-
     def sample_async(self, scheduled_requests: ScheduledRequests,
-                     model_outputs: dict[str, torch.Tensor]) -> SampleState:
-        requests = scheduled_requests.all_requests()
+                     model_outputs: dict[str, torch.Tensor],
+                     num_context_logits_prefix_sum: list[int]) -> SampleState:
         new_tokens = self.store.new_tokens
-        vocab_size = model_outputs["logits"].shape[-1]
-        log_probs_host = self.log_probs_host(requests)
-        gen_logits_host = self.gen_logits_host(requests, vocab_size)
-        self._process_requests(requests,
+        log_probs_host = self.log_probs_host(scheduled_requests)
+        self._process_requests(scheduled_requests,
                                model_outputs,
                                new_tokens,
-                               gen_logits_host=gen_logits_host,
+                               num_context_logits_prefix_sum,
                                log_probs_host=log_probs_host)
         new_tokens_host = new_tokens.to(device="cpu", non_blocking=True)
         sampler_event = torch.cuda.Event()
@@ -649,19 +640,35 @@ class TorchSampler(Sampler):
         return logits
 
     def _process_requests(self,
-                          requests: list[LlmRequest],
+                          scheduled_requests: ScheduledRequests,
                           model_outputs: dict[str, torch.Tensor],
                           new_tokens: torch.Tensor,
+                          num_context_logits_prefix_sum: list[int],
                           *,
-                          gen_logits_host: torch.Tensor | None = None,
                           log_probs_host: torch.Tensor | None = None):
         beam_width = self.MAX_BEAM_WIDTH
         beam = self.BEAM
-        raw_logits = model_outputs["logits"]
+
+        # raw_logits should contain only the logits from the gen requests.
+        # If return context logits is requested, fetch only the logits from gen requests.
+        if any(r.py_return_context_logits
+               for r in scheduled_requests.context_requests):
+            gen_logits_indices = []
+            total_context_logits = num_context_logits_prefix_sum[-1]
+            for i in range(len(scheduled_requests.context_requests)):
+                gen_logits_indices.append(num_context_logits_prefix_sum[i + 1] -
+                                          1)
+            for i in range(len(scheduled_requests.generation_requests)):
+                gen_logits_indices.append(total_context_logits + i)
+            raw_logits = model_outputs["logits"][gen_logits_indices]
+        else:
+            raw_logits = model_outputs["logits"]
+
+        requests = scheduled_requests.all_requests()
         num_steps = [1 + get_draft_token_length(req) for req in requests]
         sum_steps = sum(num_steps)
         no_draft_tokens = len(requests) == sum_steps
-        fast_path = not self.enable_mixed_sampler and no_draft_tokens and gen_logits_host is None and log_probs_host is None
+        fast_path = not self.enable_mixed_sampler and no_draft_tokens and log_probs_host is None
 
         seq_slots_host = torch.as_tensor([r.py_seq_slot for r in requests])
         seq_slots = seq_slots_host.to(device="cuda", non_blocking=True)
@@ -717,8 +724,6 @@ class TorchSampler(Sampler):
             new_tokens[current_slice] = next_tokens
             if request.py_draft_logits is not None:
                 request.py_target_probs = softmax.clone()
-            if gen_logits_host is not None:
-                gen_logits_host[current_slice].copy_(logits, non_blocking=True)
             if log_probs_host is not None:
                 assert beam == 0, "The following call relies on beam_width to be 1 - hence the unsqueeze"
                 token_probs = torch.gather(
@@ -902,8 +907,9 @@ class TRTLLMSampler(Sampler):
 
     @torch.inference_mode()
     @nvtx_range("sample_async")
-    def sample_async(self, scheduled_requests: ScheduledRequests,
-                     model_outputs) -> SampleStateTRTLLM:
+    def sample_async(
+            self, scheduled_requests: ScheduledRequests, model_outputs,
+            num_context_logits_prefix_sum: list[int]) -> SampleStateTRTLLM:
 
         batch_size = scheduled_requests.batch_size
         beam_width = self.beam_width(scheduled_requests.all_requests())
@@ -915,12 +921,6 @@ class TRTLLMSampler(Sampler):
             )
 
         self.setup_sampler_step(scheduled_requests)
-
-        num_context_logits_prefix_sum = [0]
-        prefix_sum = 0
-        for request in scheduled_requests.context_requests:
-            prefix_sum += request.context_chunk_size if request.py_return_context_logits else 1
-            num_context_logits_prefix_sum.append(prefix_sum)
 
         # For beam search, cache indirection needs to be updated
         if beam_width > 1:
