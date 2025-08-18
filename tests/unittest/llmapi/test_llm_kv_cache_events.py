@@ -175,8 +175,10 @@ def check_events(llm,
     else:
         while events:
             event = events.pop(0)
+            if not event:
+                continue
             assert "attention_dp_rank" in event
-            if event and event["attention_dp_rank"] == attention_dp_rank:
+            if event["attention_dp_rank"] == attention_dp_rank:
                 assert event["data"]["type"] in ["created", "stored"]
                 if event["data"]["type"] == "created":
                     assert event["event_id"] == 0
