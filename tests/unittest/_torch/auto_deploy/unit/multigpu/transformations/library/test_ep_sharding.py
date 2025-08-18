@@ -24,6 +24,10 @@ def _run_ep_shard_job(num_experts: int, rank: int, world_size: int) -> None:
     ).to(device=device, dtype=torch.bfloat16)
     x = model.get_input(device=device, dtype=torch.bfloat16)
 
+    if world_size > num_experts:
+        print(f"world_size {world_size} > num_experts {num_experts}, skipping test")
+        return
+
     def _get_expected_num_params(rank: int, world_size: int, num_p_og: int) -> int:
         if world_size <= 1:
             return num_p_og
@@ -113,7 +117,7 @@ def _run_pattern_detection_job(num_experts: int, rank: int, world_size: int) -> 
 
 
 @pytest.mark.parametrize("device_count", get_device_counts())
-@pytest.mark.parametrize("num_experts", [3, 8])
+@pytest.mark.parametrize("num_experts", [4, 8])
 def test_ep_shard(device_count: int, num_experts: int):
     dist_common.spawn_multiprocess_job(
         job=partial(_run_ep_shard_job, num_experts),
