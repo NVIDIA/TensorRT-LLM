@@ -1,0 +1,27 @@
+# Additional default args for AutoDeployConfig/LlmArgs in _torch/auto_deploy/llm_args.py
+#In transformers mode are playing with gm.factory_module, which is a dead module.
+#Need to always ensure not cleaning graph.
+transforms:
+  build_model:
+    stage: factory
+    device: meta
+    run_graph_cleanup: false
+    requires_clean_graph: false
+
+  transformers_replace_cached_attn:
+    stage: factory
+    run_graph_cleanup: false
+    requires_clean_graph: false
+
+  load_weights:
+    stage: weight_load
+    run_graph_cleanup: false
+    requires_clean_graph: false
+    #We need this argument to load weights for the factory model.
+    load_factoy_model: true
+
+  initialize_cache:
+    stage: cache_init
+
+  resize_kv_cache:
+    stage: cache_init
