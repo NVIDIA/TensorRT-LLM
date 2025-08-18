@@ -11,9 +11,7 @@ from weakref import WeakMethod
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm.llmapi.otel_tracing import (
-    SpanAttributes, SpanKind, extract_trace_context, global_otlp_tracer,
-    insufficient_request_metrics_warning)
+from tensorrt_llm.llmapi import tracing
 
 from .._utils import nvtx_range_debug
 from ..bindings import executor as tllm
@@ -413,23 +411,23 @@ class GenerationResultBase:
         output: CompletionOutput,
         req_perf_metrics_dict: Optional[dict[str, float]] = None,
     ):
-        if not global_otlp_tracer():
+        if not tracing.global_otlp_tracer():
             return
 
         metrics_dict = self.metrics_dict
         if not metrics_dict or not req_perf_metrics_dict:
             # Insufficient request metrics available; trace generation aborted.
-            insufficient_request_metrics_warning()
+            tracing.insufficient_request_metrics_warning()
             return
 
-        trace_context = extract_trace_context(self.trace_headers)
+        trace_context = tracing.extract_trace_context(self.trace_headers)
         sampling_params = self.sampling_params
 
         # TODO: Add request arrival time
         arrival_time = time.time() - metrics_dict.get(MetricNames.E2E, -1)
-        with global_otlp_tracer().start_as_current_span(
+        with tracing.global_otlp_tracer().start_as_current_span(
                 "llm_request",
-                kind=SpanKind.SERVER,
+                kind=tracing.SpanKind.SERVER,
                 context=trace_context,
                 start_time=int(arrival_time * 1e9),
         ) as span:
@@ -439,42 +437,41 @@ class GenerationResultBase:
                     span.set_attribute(attr, value)
 
             e2e_time = metrics_dict.get(MetricNames.E2E, -1)
-            safe_set_attr(
-                span,
-                SpanAttributes.GEN_AI_REQUEST_TEMPERATURE,
-                sampling_params.temperature,
-            )
-            safe_set_attr(span, SpanAttributes.GEN_AI_REQUEST_TOP_P,
+            safe_set_attr(span,
+                          tracing.SpanAttributes.GEN_AI_REQUEST_TEMPERATURE,
+                          sampling_params.temperature)
+            safe_set_attr(span, tracing.SpanAttributes.GEN_AI_REQUEST_TOP_P,
                           sampling_params.top_p)
+            safe_set_attr(span, tracing.SpanAttributes.GEN_AI_REQUEST_TOP_K,
+                          sampling_params.top_k)
             safe_set_attr(
                 span,
-                SpanAttributes.GEN_AI_REQUEST_MAX_TOKENS,
+                tracing.SpanAttributes.GEN_AI_REQUEST_MAX_TOKENS,
                 sampling_params.max_tokens,
             )
-            safe_set_attr(span, SpanAttributes.GEN_AI_REQUEST_N,
+            safe_set_attr(span, tracing.SpanAttributes.GEN_AI_REQUEST_N,
                           sampling_params.n)
-            # TODO: Add prompt info in result base
-            safe_set_attr(
-                span,
-                SpanAttributes.GEN_AI_USAGE_PROMPT_TOKENS,
-                getattr(self.postproc_params.postproc_args, "num_prompt_tokens",
-                        None) if self.postproc_params
-                and self.postproc_params.postproc_args else None,
-            )
-            safe_set_attr(span, SpanAttributes.GEN_AI_USAGE_COMPLETION_TOKENS,
+            safe_set_attr(span, tracing.SpanAttributes.GEN_AI_REQUEST_ID,
+                          self.id)
+            if prompt_token_ids := getattr(self, "prompt_token_ids", None):
+                safe_set_attr(span,
+                              tracing.SpanAttributes.GEN_AI_USAGE_PROMPT_TOKENS,
+                              len(prompt_token_ids))
+            safe_set_attr(span,
+                          tracing.SpanAttributes.GEN_AI_USAGE_COMPLETION_TOKENS,
                           output.length)
             safe_set_attr(
-                span,
-                SpanAttributes.GEN_AI_LATENCY_TIME_TO_FIRST_TOKEN,
-                metrics_dict.get(MetricNames.TTFT, -1),
-            )
-            safe_set_attr(span, SpanAttributes.GEN_AI_LATENCY_E2E, e2e_time)
-            safe_set_attr(span, SpanAttributes.GEN_AI_REQUEST_ID, self.id)
+                span, tracing.SpanAttributes.GEN_AI_LATENCY_TIME_TO_FIRST_TOKEN,
+                metrics_dict.get(MetricNames.TTFT, -1))
+            safe_set_attr(span, tracing.SpanAttributes.GEN_AI_LATENCY_E2E,
+                          e2e_time)
+            safe_set_attr(span,
+                          tracing.SpanAttributes.GEN_AI_LATENCY_TIME_IN_QUEUE,
+                          metrics_dict.get(MetricNames.REQUEST_QUEUE_TIME, -1))
             safe_set_attr(
-                span,
-                SpanAttributes.GEN_AI_LATENCY_TIME_IN_QUEUE,
-                metrics_dict.get(MetricNames.REQUEST_QUEUE_TIME, -1),
-            )
+                span, tracing.SpanAttributes.GEN_AI_RESPONSE_FINISH_REASONS,
+                json.dumps([output.finish_reason])
+                if output.finish_reason else None)
 
 
 class DetokenizedGenerationResultBase(GenerationResultBase):
