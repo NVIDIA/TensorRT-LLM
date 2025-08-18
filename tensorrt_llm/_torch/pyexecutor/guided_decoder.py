@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 from typing import Iterable, List, Optional, Tuple
 
 import torch
+import xgrammar
 
 from ..._utils import nvtx_range
 from ...bindings.executor import GuidedDecodingConfig
@@ -65,16 +66,14 @@ class GuidedDecoder:
             f"Guided decoder initialized with backend: {self.guided_decoding_backend}"
         )
 
-        self.bitmask = torch.empty(self.max_num_sequences,
-                                   self.max_num_draft_tokens + 1,
+        self.bitmask = torch.empty(self.max_num_sequences *
+                                   (self.max_num_draft_tokens + 1),
                                    self.bitmask_size,
                                    dtype=self.bitmask_dtype,
                                    device='cuda')
-        self.bitmask_host = torch.empty(self.max_num_sequences,
-                                        self.max_num_draft_tokens + 1,
-                                        self.bitmask_size,
-                                        dtype=self.bitmask_dtype,
-                                        pin_memory=True)
+        self.bitmask_host = torch.empty_like(self.bitmask,
+                                             device='cpu',
+                                             pin_memory=True)
 
         # The number of tokens accepted by the grammar matcher in a build step.
         self.num_advanced_tokens: List[int] = [0] * self.max_num_sequences
@@ -119,6 +118,7 @@ class GuidedDecoder:
             yield llm_req, offset
             offset += 1
             if llm_req.is_generation_in_progress_state:
+                # Assume all extended requests have max_num_draft_tokens draft tokens.
                 offset += self.max_num_draft_tokens
 
     @torch.inference_mode()
@@ -135,6 +135,12 @@ class GuidedDecoder:
         """
         if gathered_input_ids is not None:
             gathered_input_ids = gathered_input_ids.tolist()
+
+        # Fix it.
+        num_bitmask_tokens = len(scheduled_requests.context_requests) + len(
+            scheduled_requests.generation_requests) * (
+                self.max_num_draft_tokens + 1)
+        self.bitmask_host[:num_bitmask_tokens].fill_(-1)
 
         for llm_req, offset in self._request_with_offset(
                 scheduled_requests.all_requests()):
@@ -186,7 +192,7 @@ class GuidedDecoder:
 
             self.num_advanced_tokens[slot] += 1
             if not matcher.is_terminated():
-                matcher.fill_next_token_bitmask(self.bitmask_host[slot], 0)
+                matcher.fill_next_token_bitmask(self.bitmask_host, offset)
                 self.num_guided_tokens[slot] += 1
                 # Process draft tokens
                 for i, tid in enumerate(draft_tokens, 1):
@@ -196,7 +202,8 @@ class GuidedDecoder:
                     self.num_advanced_tokens[slot] += 1
                     if matcher.is_terminated():
                         break
-                    matcher.fill_next_token_bitmask(self.bitmask_host[slot], i)
+                    matcher.fill_next_token_bitmask(self.bitmask_host,
+                                                    offset + i)
                     self.num_guided_tokens[slot] += 1
 
             if llm_req.py_is_draft:
@@ -204,11 +211,9 @@ class GuidedDecoder:
                 self.num_advanced_draft_tokens[
                     slot] += self.num_advanced_tokens[slot]
 
-            if (num_guided_tokens := self.num_guided_tokens[slot]) > 0:
-                with torch.cuda.stream(self._stream):
-                    self.bitmask[slot, :num_guided_tokens].copy_(
-                        self.bitmask_host[slot, :num_guided_tokens],
-                        non_blocking=True)
+        with torch.cuda.stream(self._stream):
+            self.bitmask[:num_bitmask_tokens].copy_(
+                self.bitmask_host[:num_bitmask_tokens], non_blocking=True)
 
     @torch.inference_mode()
     @nvtx_range("GuidedDecoder.execute")
@@ -232,18 +237,11 @@ class GuidedDecoder:
                                  device=draft_logits.device)
             logits.index_copy_(-1, d2t_mapping, draft_logits)
 
-        batched_logits, batched_bitmask = [], []
-        for llm_req, offset in self._request_with_offset(
-                scheduled_requests.all_requests()):
-            if llm_req.is_dummy:
-                continue
-            slot: int = llm_req.py_target_seq_slot if llm_req.py_is_draft else llm_req.py_seq_slot
-            for i in range(self.num_guided_tokens[slot]):
-                batched_logits.append(logits[offset + i])
-                batched_bitmask.append(self.bitmask[slot, i])
-
-        if len(batched_logits) > 0:
-            torch.ops.trtllm.logits_bitmask(batched_logits, batched_bitmask)
+        num_bitmask_tokens = len(scheduled_requests.context_requests) + len(
+            scheduled_requests.generation_requests) * (
+                self.max_num_draft_tokens + 1)
+        xgrammar.apply_token_bitmask_inplace(logits[:num_bitmask_tokens],
+                                             self.bitmask[:num_bitmask_tokens])
 
         if d2t is not None:
             torch.index_select(logits, -1, d2t_mapping, out=draft_logits)
