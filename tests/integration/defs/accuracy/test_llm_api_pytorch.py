@@ -2452,8 +2452,6 @@ class TestQwen3_235B_A22B(LlmapiAccuracyTestHarness):
     )
     def test_nvfp4(self, tp_size, pp_size, ep_size, attention_dp, cuda_graph,
                    overlap_scheduler, moe_backend, eagle3):
-        if moe_backend == "TRITON":
-            pytest.skip("Triton kernels are not available")
 
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
