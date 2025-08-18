@@ -11,6 +11,8 @@ from .model_drafter import ModelDrafter
 from .mtp import (MTPEagleWorker, MTPHiddenStatesManager, MTPSampler,
                   MTPSpecMetadata, MTPWorker)
 from .ngram import NGramDrafter, NGramPoolManager
+from .save_hidden_state import (SaveHiddenStatesResourceManager,
+                                SaveHiddenStatesSpecMetadata)
 
 
 def get_spec_metadata(spec_config,
@@ -49,6 +51,20 @@ def get_spec_metadata(spec_config,
             hidden_size=model_config.hidden_size,
             max_num_tokens=max_num_tokens,
             layers_to_capture=spec_config.eagle3_layers_to_capture,
+        )
+    if spec_config.spec_dec_mode.is_save_hidden_states():
+        return SaveHiddenStatesSpecMetadata(
+            max_draft_len=spec_config.max_draft_len,
+            spec_dec_mode=spec_config.spec_dec_mode,
+            max_num_requests=max_num_requests,
+            num_layers=model_config.num_hidden_layers,
+            hidden_size=model_config.hidden_size,
+            max_num_tokens=max_num_tokens,
+            dtype=model_config.torch_dtype,
+            is_draft_model=is_draft_model,
+            eagle3_resource_manager=spec_resource_manager,
+            num_capture_layers=spec_config.num_capture_layers,
+            save_last_layer_post_norm=spec_config.save_last_layer_post_norm,
         )
     if  spec_config.spec_dec_mode.is_draft_target() or \
         spec_config.spec_dec_mode.is_ngram() or \
@@ -90,6 +106,15 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
     if spec_dec_mode.is_eagle3():
         assert draft_model_engine is not None, "Draft model engine is required for Eagle3 two model flow."
         return Eagle3ResourceManager(
+            spec_config,
+            draft_model_engine.model.config.torch_dtype,
+            model_config.hidden_size,
+            max_num_requests,
+            max_seq_len,
+            max_num_tokens,
+        )
+    if spec_dec_mode.is_save_hidden_states():
+        return SaveHiddenStatesResourceManager(
             spec_config,
             draft_model_engine.model.config.torch_dtype,
             model_config.hidden_size,
