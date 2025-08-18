@@ -24,6 +24,7 @@ import sys
 import time
 from importlib.metadata import version
 
+import modelopt.torch.speculative as mtsp
 import numpy as np
 import torch
 from accelerate.hooks import remove_hook_from_module
@@ -647,6 +648,61 @@ def combine_medusa_weight(tp_size, pp_size, base_model_output_dir,
     logger.info("Combine medusa heads' weight, done.")
 
 
+def add_eagle_weight(model, eagle_model_dir, eagle_num_layers, torch_dtype):
+    last_device = list({param.device for param in model.parameters()})[-1]
+    eagle_weights = torch.load(os.path.join(eagle_model_dir,
+                                            "pytorch_model.bin"),
+                               map_location=last_device)
+    eagle_weights = {k: v.to(torch_dtype) for k, v in eagle_weights.items()}
+    # Adjust the parameters depending on your eagle module weight
+    eagle_config = {
+        "eagle_num_layers": eagle_num_layers,
+    }
+
+    number_eagle_weights = sum(1 for key in eagle_weights
+                               if "self_attn.q_proj.weight" in key)
+    assert number_eagle_weights == 1, "Now we only cover the case that the eagle model has only one weight"
+
+    # load in your base model
+    mtsp.convert(model, [("eagle", eagle_config)])
+    for i in range(eagle_num_layers):
+        # Replace the eagle weight in modelopt eagle model
+        # xxx.0.xxx is because we will reuse the eagle weights for all layers
+        model.eagle_module.layers[
+            i].self_attn.q_proj.weight = torch.nn.Parameter(
+                eagle_weights[f"layers.0.self_attn.q_proj.weight"].clone())
+        model.eagle_module.layers[
+            i].self_attn.k_proj.weight = torch.nn.Parameter(
+                eagle_weights[f"layers.0.self_attn.k_proj.weight"].clone())
+        model.eagle_module.layers[
+            i].self_attn.v_proj.weight = torch.nn.Parameter(
+                eagle_weights[f"layers.0.self_attn.v_proj.weight"].clone())
+        model.eagle_module.layers[
+            i].self_attn.o_proj.weight = torch.nn.Parameter(
+                eagle_weights[f"layers.0.self_attn.o_proj.weight"].clone())
+        model.eagle_module.layers[i].mlp.gate_proj.weight = torch.nn.Parameter(
+            eagle_weights[f"layers.0.mlp.gate_proj.weight"].clone())
+        model.eagle_module.layers[i].mlp.up_proj.weight = torch.nn.Parameter(
+            eagle_weights[f"layers.0.mlp.up_proj.weight"].clone())
+        model.eagle_module.layers[i].mlp.down_proj.weight = torch.nn.Parameter(
+            eagle_weights[f"layers.0.mlp.down_proj.weight"].clone())
+        model.eagle_module.layers[
+            i].post_attention_layernorm.weight = torch.nn.Parameter(
+                eagle_weights[f"layers.0.post_attention_layernorm.weight"].
+                clone())
+    model.eagle_module.fc.weight = torch.nn.Parameter(
+        eagle_weights[f"fc.weight"])
+    if "fc.bias" in eagle_weights:
+        model.eagle_module.fc.bias = torch.nn.Parameter(
+            eagle_weights[f"fc.bias"])
+    else:
+        model.eagle_module.fc.bias = torch.nn.Parameter(
+            torch.zeros(eagle_weights[f"fc.weight"].shape[0],
+                        dtype=torch_dtype,
+                        device=last_device))
+    return model
+
+
 def quantize_and_export(*,
                         model_dir,
                         device,
@@ -669,6 +725,8 @@ def quantize_and_export(*,
                         max_draft_len=None,
                         medusa_hidden_act=None,
                         medusa_model_dir=None,
+                        eagle_model_dir=None,
+                        eagle_num_layers=None,
                         quant_medusa_head=None,
                         auto_quantize_bits=None,
                         device_map="auto",
@@ -703,6 +761,7 @@ def quantize_and_export(*,
 
     hf_config = get_hf_config(model_dir)
     dtype = infer_dtype(dtype, getattr(hf_config, 'torch_dtype', None))
+    torch_dtype = str_dtype_to_torch(dtype)
 
     model = get_model(model_dir, dtype, device=device, device_map=device_map)
     model_type = get_model_type(model)
@@ -785,6 +844,12 @@ def quantize_and_export(*,
             include_labels=auto_quantize_bits is not None,
         )
 
+        if eagle_model_dir is not None:
+            assert eagle_num_layers is not None, "eagle_num_layers must be specified"
+            # Add eagle weight into the model
+            model = add_eagle_weight(model, eagle_model_dir, eagle_num_layers,
+                                     torch_dtype)
+
         model = quantize_model(model, quant_cfg, calib_dataloader, batch_size,
                                qformat, auto_quantize_bits)
 
@@ -813,6 +878,23 @@ def quantize_and_export(*,
 
         if model_type == 'mllama':
             model = model.language_model
+
+        # For eagle model, we need to export the hf checkpoint
+        if eagle_model_dir is not None:
+            from modelopt.torch.export import export_hf_checkpoint
+            export_hf_checkpoint(
+                model,
+                export_dir=output_dir,
+            )
+
+            end_time = time.time()
+            logger.info(
+                "Quantized model exported to {} \nTotal time used {:.2f} s.".
+                format(export_path, end_time - start_time))
+
+            del model
+            release_gc()
+            return
 
         export_tensorrt_llm_checkpoint(
             model.hf_model if is_enc_dec else model,

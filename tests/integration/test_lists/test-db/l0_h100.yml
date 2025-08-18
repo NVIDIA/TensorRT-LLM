@@ -254,6 +254,12 @@ l0_h100:
   - examples/test_eagle.py::test_llm_eagle_1gpu[EAGLE-Vicuna-7B-v1.3-float16-bs1-eagle2] # 5 mins
   - accuracy/test_llm_api.py::TestMistral_NeMo_Minitron_8B_Instruct::test_fp8
   - accuracy/test_llm_api.py::TestMistral_Nemo_12B_Base::test_fp8
+  - examples/test_eagle.py::test_llm_eagle_1gpu[EAGLE-LLaMA3.1-Instruct-8B-float16-bs1-eagle1] # 5 mins
+  - examples/test_eagle.py::test_llm_eagle_1gpu[EAGLE-LLaMA3.1-Instruct-8B-float16-bs1-eagle2] # 5 mins
+  - examples/test_eagle.py::test_llm_eagle_1gpu[EAGLE-LLaMA3.1-Instruct-8B-fp8-bs1-eagle1] # 5 mins
+  - examples/test_eagle.py::test_llm_eagle_1gpu[EAGLE-LLaMA3.1-Instruct-8B-fp8-bs1-eagle2] # 5 mins
+  - examples/test_mistral.py::test_llm_mistral_nemo_minitron_fp8_quantization[Mistral-NeMo-Minitron-8B-Instruct]
+  - examples/test_mistral.py::test_llm_mistral_nemo_fp8_quantization_1gpu[Mistral-Nemo-12b-Base-summarization]
   - examples/test_multimodal.py::test_llm_multimodal_general[llava-1.5-7b-hf-pp:1-tp:1-float16-bs:1-cpp_e2e:False-nb:1] # 7 mins
   - examples/test_multimodal.py::test_llm_multimodal_general[fuyu-8b-pp:1-tp:1-float16-bs:1-cpp_e2e:True-nb:1]
   - examples/test_multimodal.py::test_llm_multimodal_general[video-neva-pp:1-tp:1-bfloat16-bs:1-cpp_e2e:False-nb:1]

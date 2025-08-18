@@ -125,6 +125,16 @@ if __name__ == "__main__":
                         action='store_true',
                         help="whether to quantize the weights of medusa heads")
 
+    # Eagle
+    parser.add_argument("--eagle_model_dir",
+                        help="Specify where the EAGLE checkpoint is",
+                        default=None)
+    parser.add_argument(
+        "--eagle_num_layers",
+        help="Specify the number of layers in the EAGLE checkpoint",
+        type=int,
+        default=1)
+
     # auto quantization
     parser.add_argument(
         '--autoq_format',
@@ -180,6 +190,8 @@ if __name__ == "__main__":
             max_draft_len=args.max_draft_len,
             medusa_hidden_act=args.medusa_hidden_act,
             medusa_model_dir=args.medusa_model_dir,
+            eagle_model_dir=args.eagle_model_dir,
+            eagle_num_layers=args.eagle_num_layers,
             quant_medusa_head=args.quant_medusa_head,
             auto_quantize_bits=args.auto_quantize_bits,
             device_map=args.device_map,
