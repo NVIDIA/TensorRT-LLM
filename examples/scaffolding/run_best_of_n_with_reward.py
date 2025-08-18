@@ -12,12 +12,12 @@ def parse_arguments():
     parser.add_argument(
         '--generation_model',
         type=str,
-        default="DeepSeek-R1-Distill-Qwen-7B",
+        default="deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
     )
     parser.add_argument(
         '--reward_model',
         type=str,
-        default="Qwen2.5-Math-PRM-7B",
+        default="Qwen/Qwen2.5-Math-PRM-7B",
     )
     parser.add_argument('--sample_num', type=int, default=4)
     args = parser.parse_args()

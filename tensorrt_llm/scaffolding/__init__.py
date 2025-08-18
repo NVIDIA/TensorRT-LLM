@@ -8,6 +8,7 @@ from .scaffolding_llm import ScaffoldingLlm
 from .task import GenerationTask, RewardTask, Task, TaskStatus
 from .task_collection import (GenerationTokenCounter, TaskCollection,
                               with_task_collection)
+from .tree_controllers import MCTSController, TOTController
 from .worker import OpenaiWorker, TRTLLMWorker, TRTOpenaiWorker, Worker
 
 __all__ = [
@@ -18,6 +19,8 @@ __all__ = [
     "NativeRewardController",
     "MajorityVoteController",
     "BestOfNController",
+    "MCTSController",
+    "TOTController", 
     "Task",
     "GenerationTask",
     "RewardTask",
