@@ -454,8 +454,8 @@ accuracy/test_llm_api_pytorch.py::TestLlama3_3_70BInstruct::test_fp8_eagle3_tp8[
 accuracy/test_llm_api_pytorch.py::TestLlama3_3_70BInstruct::test_fp8_eagle3_tp8[eagle3_one_model=False]
 accuracy/test_llm_api_pytorch.py::TestMistral7B::test_auto_dtype
 accuracy/test_llm_api_pytorch.py::TestGemma3_1BInstruct::test_auto_dtype
-accuracy/test_llm_api_pytorch.py::TestMistralSmall24B::test_auto_dtype[/scratch.trt_llm_data/llm-models/Mistral-Small-3.1-24B-Instruct-2503-None]
-accuracy/test_llm_api_pytorch.py::TestMistralSmall24B::test_auto_dtype[/scratch.trt_llm_data/llm-models/Mistral-Small-3.1-24B-Instruct-2503-fp8-FP8]
+accuracy/test_llm_api_pytorch.py::TestMistralSmall24B::test_auto_dtype
+accuracy/test_llm_api_pytorch.py::TestMistralSmall24B::test_fp8
 accuracy/test_llm_api_pytorch.py::TestLlama4MaverickInstruct::test_auto_dtype[tp8-cuda_graph=False]
 accuracy/test_llm_api_pytorch.py::TestLlama4MaverickInstruct::test_auto_dtype[tp8ep4-cuda_graph=True]
 accuracy/test_llm_api_pytorch.py::TestLlama4MaverickInstruct::test_auto_dtype[tp8ep8-cuda_graph=True]

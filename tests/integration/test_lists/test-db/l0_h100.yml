@@ -205,8 +205,8 @@ l0_h100:
   - accuracy/test_llm_api_pytorch.py::TestGemma3_1BInstruct::test_fp8_prequantized
   - accuracy/test_llm_api_pytorch.py::TestGemma3_27BInstruct::test_fp8_prequantized
   - accuracy/test_llm_api_pytorch.py::TestGemma3_27BInstruct::test_auto_dtype
-  - accuracy/test_llm_api_pytorch.py::TestMistralSmall24B::test_auto_dtype[/scratch.trt_llm_data/llm-models/Mistral-Small-3.1-24B-Instruct-2503-None]
-  - accuracy/test_llm_api_pytorch.py::TestMistralSmall24B::test_auto_dtype[/scratch.trt_llm_data/llm-models/Mistral-Small-3.1-24B-Instruct-2503-fp8-FP8]
+  - accuracy/test_llm_api_pytorch.py::TestMistralSmall24B::test_auto_dtype
+  - accuracy/test_llm_api_pytorch.py::TestMistralSmall24B::test_fp8
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_fp8_block_scales[latency-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_fp8_block_scales[latency-torch_compile=True]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_guided_decoding[llguidance]
