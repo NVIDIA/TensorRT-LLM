@@ -11,6 +11,7 @@ import torch
 from tensorrt_llm.logger import logger
 from tensorrt_llm.scaffolding.controller import Controller
 from tensorrt_llm.scaffolding.task import GenerationTask, RewardTask, Task
+from tensorrt_llm.executor.result import CompletionOutput, GenerationResult
 
 
 @dataclass
@@ -147,7 +148,16 @@ class MCTSController(Controller):
                 # input_str should be the original problem, output_str should be the response to evaluate
                 reward_task = GenerationTask()
                 reward_task.input_str = initial_state
-                reward_task.output_str = node.state
+                
+                # Create a proper result with CompletionOutput before setting output_str
+                completion_output = CompletionOutput(index=0, text=node.state)
+                # Create a mock GenerationResult - we need sampling_params for the constructor
+                from tensorrt_llm.sampling_params import SamplingParams
+                mock_sampling_params = SamplingParams()
+                reward_result = GenerationResult.__new__(GenerationResult)
+                reward_result._outputs = [completion_output]
+                reward_result.sampling_params = mock_sampling_params
+                reward_task.result = reward_result
                 yield from self.reward_controller.process([reward_task])
                 # Get reward from the reward controller
                 if hasattr(self.reward_controller, 'scores') and self.reward_controller.scores:

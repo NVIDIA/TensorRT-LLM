@@ -10,12 +10,12 @@ def parse_arguments():
     parser.add_argument(
         '--model_dir',
         type=str,
-        default="deepseek-ai/DeepSeek-R1-Distill-Qwen-7B",
+        default="HuggingFaceTB/SmolLM-1.7B-Instruct",  # Much smaller default model
         help="Path to the directory containing the generation model")
     parser.add_argument(
         '--reward_model_dir',
         type=str,
-        default="Qwen/Qwen2.5-Math-PRM-7B",
+        default="HuggingFaceTB/SmolLM-360M-Instruct",  # Smaller reward model
         help="Path to the directory containing the reward model (optional)")
     parser.add_argument('--max_depth', type=int, default=4)
     parser.add_argument('--max_iterations', type=int, default=20)
