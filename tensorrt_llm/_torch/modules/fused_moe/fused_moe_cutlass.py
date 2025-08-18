@@ -5,7 +5,6 @@ from typing import Dict, List, Optional, Union
 import torch
 
 from tensorrt_llm._mnnvl_utils import MnnvlMemory, MnnvlMoe
-from tensorrt_llm.math_utils import pad_up
 
 from ...distributed import allgather
 from ...model_config import ModelConfig
@@ -368,7 +367,7 @@ class CutlassFusedMoE(MoE):
                 [x, x_sf, token_selected_experts, token_final_scales],
                 alltoall_info, self.alltoall_workspace, self.ep_rank,
                 self.ep_size)
-            
+
             torch.ops.trtllm.memset_expert_ids(
                 token_selected_experts, alltoall_info.recv_rank_count_cumsum,
                 max_num_token, top_k, self.num_experts, self.ep_size)

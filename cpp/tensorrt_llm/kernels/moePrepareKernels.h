@@ -42,9 +42,9 @@ static constexpr int THREADS_PER_PIPELINE = UNIT_PER_PIPELINE;
 
 struct ALIGN_256 MoeCommFifoConnInfo
 {
-    volatile uint64_t head;  // write position
-    volatile uint64_t tail;  // read position
-    volatile int values[512]; // for values
+    volatile uint64_t head;   // write position
+    volatile uint64_t tail;   // read position
+    int volatile values[512]; // for values
 };
 
 struct MoeCommWorkspace
@@ -69,8 +69,9 @@ struct MoeCommWorkspace
 };
 
 void computeCountAndIndice(int* experts, int* sendCounts, int* recvCounts, int* sendIndiceWorkspace,
-    int* backwardIndiceWorkspace, int* recvIndiceWorkspace, int* expertStatics, int* gatheredExpertStatics, MoeCommWorkspace workspace, int tokenCount,
-    int maxTokenCountPerRank, int topK, int slotCount, int expertCount, int rankId, int rankCount, cudaStream_t stream);
+    int* backwardIndiceWorkspace, int* recvIndiceWorkspace, int* expertStatics, int* gatheredExpertStatics,
+    MoeCommWorkspace workspace, int tokenCount, int maxTokenCountPerRank, int topK, int slotCount, int expertCount,
+    int rankId, int rankCount, cudaStream_t stream);
 
 void computeCumsum(int* sendCountsCumsum, int* recvCountsCumsum, int rankId, int rankCount, cudaStream_t stream);
 

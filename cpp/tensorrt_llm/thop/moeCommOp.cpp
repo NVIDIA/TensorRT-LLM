@@ -138,17 +138,14 @@ void initializeMoeWorkspace(torch::Tensor allWorkspaces, int64_t epRank, int64_t
     tensorrt_llm::kernels::initializeFusedMoeLocalWorkspace(&fusedMoeWorkspace, worldInfo);
 }
 
-std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
-    torch::Tensor, c10::optional<torch::Tensor>>
-moePrepareOp(torch::Tensor expertsIds, c10::optional<torch::Tensor> expertsStatics,
-    torch::Tensor allWorkspaces, int64_t maxTokenCountPerRank, int64_t epRank, int64_t epSize, int64_t expertCount,
-    int64_t slotCount, int64_t topK)
+std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, c10::optional<torch::Tensor>>
+moePrepareOp(torch::Tensor expertsIds, c10::optional<torch::Tensor> expertsStatics, torch::Tensor allWorkspaces,
+    int64_t maxTokenCountPerRank, int64_t epRank, int64_t epSize, int64_t expertCount, int64_t slotCount, int64_t topK)
 {
     CHECK_INPUT(expertsIds, torch::kInt32);
     TORCH_CHECK(expertCount % 4 == 0, "expertCount must be divisible by 4");
     TORCH_CHECK(slotCount % 4 == 0, "slotCount must be divisible by 4");
-    TORCH_CHECK(expertCount + 1 <= 512, 
-        "expertCount + 1 is larger than 512");
+    TORCH_CHECK(expertCount + 1 <= 512, "expertCount + 1 is larger than 512");
 
     int64_t maxSendRanksPerToken = std::max(epSize, topK);
     int64_t tokenCount = expertsIds.size(0);
@@ -192,8 +189,9 @@ moePrepareOp(torch::Tensor expertsIds, c10::optional<torch::Tensor> expertsStati
 
     tensorrt_llm::kernels::moe_prepare::computeCountAndIndice(expertsIds.data_ptr<int>(),
         sendRankCountCumSum.data_ptr<int>(), RecvRankCountCumSum.data_ptr<int>(), sendRankIndices.data_ptr<int>(),
-        backwardRecvRankIndices.data_ptr<int>(), recvRankIndices.data_ptr<int>(), localExpertStaticsPtr, gatheredExpertStaticsPtr, workspace, tokenCount,
-        maxTokenCountPerRank, topK, slotCount, expertCount, epRank, epSize, stream);
+        backwardRecvRankIndices.data_ptr<int>(), recvRankIndices.data_ptr<int>(), localExpertStaticsPtr,
+        gatheredExpertStaticsPtr, workspace, tokenCount, maxTokenCountPerRank, topK, slotCount, expertCount, epRank,
+        epSize, stream);
 
     tensorrt_llm::kernels::moe_prepare::computeCumsum(
         sendRankCountCumSum.data_ptr<int>(), RecvRankCountCumSum.data_ptr<int>(), epRank, epSize, stream);
@@ -204,8 +202,8 @@ moePrepareOp(torch::Tensor expertsIds, c10::optional<torch::Tensor> expertsStati
         recvRankIndices.data_ptr<int>(), gatherRecvRankIndices.data_ptr<int>(), epRank, epSize, maxTokenCountPerRank,
         stream);
 
-    return std::make_tuple(sendRankCountCumSum, gatherSendRankIndices,
-        RecvRankCountCumSum, gatherRecvRankIndices, gatherBackwardRecvRankIndices, gatheredExpertStatics);
+    return std::make_tuple(sendRankCountCumSum, gatherSendRankIndices, RecvRankCountCumSum, gatherRecvRankIndices,
+        gatherBackwardRecvRankIndices, gatheredExpertStatics);
 }
 
 void memsetExpertIds(torch::Tensor expertsIds, torch::Tensor recvRankCountCumSum, int64_t maxTokenCountPerRank,

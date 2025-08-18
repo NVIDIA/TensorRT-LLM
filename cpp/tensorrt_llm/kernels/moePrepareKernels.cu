@@ -49,7 +49,6 @@ __device__ __forceinline__ int ld_acquire_sys_global_int(int volatile* ptr)
     return ret;
 }
 
-
 class CounterCommunicator
 {
 public:
@@ -83,8 +82,9 @@ protected:
 
 template <int kThreadsGroupSize>
 __device__ __forceinline__ void computeCountAndSendStatics(int* experts, int tokenCount, int* sharedSendRecvRankCount,
-    int* sendCounts, int* sendIndiceWorkspace, int* backwardIndiceWorkspace, int* expertStatics, MoeCommWorkspace workspace,
-    int maxTokenCountPerRank, int slotCount, int expertCount, int topK, int epRank, int epSize)
+    int* sendCounts, int* sendIndiceWorkspace, int* backwardIndiceWorkspace, int* expertStatics,
+    MoeCommWorkspace workspace, int maxTokenCountPerRank, int slotCount, int expertCount, int topK, int epRank,
+    int epSize)
 {
     cg::thread_block_tile<kThreadsGroupSize> tile = cg::tiled_partition<kThreadsGroupSize>(cg::this_thread_block());
     int laneInTile = tile.thread_rank();
@@ -124,7 +124,7 @@ __device__ __forceinline__ void computeCountAndSendStatics(int* experts, int tok
     __syncthreads();
 
     CounterCommunicator counter(workspace.getFifoConnInfo(true, epRank, targetRankId, 0, epSize, 1));
-    
+
     int communicationCount = expertStatics == nullptr ? 1 : expertCount + 1;
     for (int i = threadIdx.x; i < communicationCount; i += blockDim.x)
     {
@@ -137,8 +137,9 @@ __device__ __forceinline__ void computeCountAndSendStatics(int* experts, int tok
     }
 }
 
-__device__ __forceinline__ void recvCountAndStatics(int* recvIndiceWorkspace, int* recvCounts, int* sharedCountsBase, int* gatheredExpertStatics,
-    MoeCommWorkspace workspace, int expertCount, int maxTokenCountPerRank, int rankId, int rankCount)
+__device__ __forceinline__ void recvCountAndStatics(int* recvIndiceWorkspace, int* recvCounts, int* sharedCountsBase,
+    int* gatheredExpertStatics, MoeCommWorkspace workspace, int expertCount, int maxTokenCountPerRank, int rankId,
+    int rankCount)
 {
     int rankOffset = threadIdx.x / THREADS_PER_PIPELINE;
     if (rankOffset >= PIPELINE_PER_CTA)
@@ -182,20 +183,22 @@ __device__ __forceinline__ void recvCountAndStatics(int* recvIndiceWorkspace, in
 
 template <int kThreadsGroupSize>
 __global__ void computeCountAndIndiceDevice(int* experts, int* sendCounts, int* recvCounts, int* sendIndiceWorkspace,
-    int* backwardIndiceWorkspace, int* recvIndiceWorkspace, int* expertStatics, int* gatheredExpertStatics, MoeCommWorkspace workspace, int tokenCount,
-    int maxTokenCountPerRank, int topK, int slotCount, int expertCount, int rankId, int rankCount)
+    int* backwardIndiceWorkspace, int* recvIndiceWorkspace, int* expertStatics, int* gatheredExpertStatics,
+    MoeCommWorkspace workspace, int tokenCount, int maxTokenCountPerRank, int topK, int slotCount, int expertCount,
+    int rankId, int rankCount)
 {
     __shared__ int sharedCounts[PIPELINE_PER_CTA];
     bool isSender = blockIdx.x < rankCount;
     if (isSender)
     {
-        computeCountAndSendStatics<kThreadsGroupSize>(experts, tokenCount, &sharedCounts[0], sendCounts, sendIndiceWorkspace,
-            backwardIndiceWorkspace, expertStatics, workspace, maxTokenCountPerRank, slotCount, expertCount, topK, rankId, rankCount);
+        computeCountAndSendStatics<kThreadsGroupSize>(experts, tokenCount, &sharedCounts[0], sendCounts,
+            sendIndiceWorkspace, backwardIndiceWorkspace, expertStatics, workspace, maxTokenCountPerRank, slotCount,
+            expertCount, topK, rankId, rankCount);
     }
     else
     {
-        recvCountAndStatics(
-            recvIndiceWorkspace, recvCounts, &sharedCounts[0], gatheredExpertStatics,workspace, expertCount,maxTokenCountPerRank, rankId, rankCount);
+        recvCountAndStatics(recvIndiceWorkspace, recvCounts, &sharedCounts[0], gatheredExpertStatics, workspace,
+            expertCount, maxTokenCountPerRank, rankId, rankCount);
     }
 }
 
@@ -263,8 +266,9 @@ __global__ void memsetExpertIdsDevice(
 }
 
 void computeCountAndIndice(int* experts, int* sendCounts, int* recvCounts, int* sendIndiceWorkspace,
-    int* backwardIndiceWorkspace, int* recvIndiceWorkspace, int* expertStatics, int* gatheredExpertStatics, MoeCommWorkspace workspace, int tokenCount,
-    int maxTokenCountPerRank, int topK, int slotCount, int expertCount, int rankId, int rankCount, cudaStream_t stream)
+    int* backwardIndiceWorkspace, int* recvIndiceWorkspace, int* expertStatics, int* gatheredExpertStatics,
+    MoeCommWorkspace workspace, int tokenCount, int maxTokenCountPerRank, int topK, int slotCount, int expertCount,
+    int rankId, int rankCount, cudaStream_t stream)
 {
     // first rankCount CTAs for count and send, then rankCount / PIPELINE_PER_CTA CTAs only for receive
     int grid_x = rankCount + (rankCount + PIPELINE_PER_CTA - 1) / PIPELINE_PER_CTA;
@@ -294,7 +298,8 @@ void computeCountAndIndice(int* experts, int* sendCounts, int* recvCounts, int* 
         kernelFn = computeCountAndIndiceDevice<2>;
     }
     kernelFn<<<grid, block, 0, stream>>>(experts, sendCounts, recvCounts, sendIndiceWorkspace, backwardIndiceWorkspace,
-        recvIndiceWorkspace, expertStatics, gatheredExpertStatics, workspace, tokenCount, maxTokenCountPerRank, topK, slotCount, expertCount, rankId, rankCount);
+        recvIndiceWorkspace, expertStatics, gatheredExpertStatics, workspace, tokenCount, maxTokenCountPerRank, topK,
+        slotCount, expertCount, rankId, rankCount);
 }
 
 void computeCumsum(int* sendCountsCumsum, int* recvCountsCumsum, int rankId, int rankCount, cudaStream_t stream)
