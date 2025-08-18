@@ -12,6 +12,7 @@
 
 #pragma once
 
+#include <cfloat>
 #include <fmha/traits.h>
 #include <fmha/utils.h>
 
@@ -1331,8 +1332,9 @@ struct Tile_o_normalizer
     }
 
     // Update o.
-    inline __device__ void final_update(Fragment_accu (&acc_o)[MMAS_M][MMAS_N], float const (&sum)[ROWS_PER_THREAD])
+    inline __device__ void final_update(Fragment_accu (&acc_o)[MMAS_M][MMAS_N], float (&sum)[ROWS_PER_THREAD])
     {
+
 #ifdef HALF_ACCUMULATION_FOR_FLASH_ATTENTION // Half accumulation
 #pragma unroll
         for (int mi = 0; mi < MMAS_M; ++mi)
@@ -1501,7 +1503,7 @@ struct Tile_o_normalizer_fp32
     }
 
     // Update o after P * V
-    inline __device__ void final_update(Fragment_accu (&acc_o)[MMAS_M][MMAS_N], float const (&sum)[ROWS_PER_THREAD])
+    inline __device__ void final_update(Fragment_accu (&acc_o)[MMAS_M][MMAS_N], float (&sum)[ROWS_PER_THREAD])
     {
 
 #pragma unroll
@@ -1517,9 +1519,7 @@ struct Tile_o_normalizer_fp32
                 int jj = 2 * mi + ii;
 
                 // The diviser.
-                // printf("curr_sum_[ii] %lf %lf \n", curr_sum_[ii], curr_sum_[ii]);
                 beta[ii] = (sum[jj] == 0.f || sum[jj] != sum[jj]) ? 1.f : 1.f / sum[jj];
-                // printf("beta %lf \n", beta[ii]);
             }
 
 #pragma unroll
@@ -1839,6 +1839,17 @@ struct Tile_o_normalizer<Ada_qmma_e4m3_fp32_traits, Cta_tile>
                     acc_o[mi][ni].elt(ii) = acc_o_f;
                 }
             }
+        }
+    }
+
+    // Update the sum.
+    inline __device__ void update_sum(float const (&max)[Base::ROWS_PER_THREAD], float (&sum)[Base::ROWS_PER_THREAD])
+    {
+// Take the log2f(Traits::SOFTMAX_FP_QUANT_SCALE) into account as the same scale has been applied to sum.
+#pragma unroll
+        for (int i = 0; i < Base::ROWS_PER_THREAD; ++i)
+        {
+            sum[i] += expf(this->attention_sink_value_ - max[i]) * Traits::SOFTMAX_FP_QUANT_SCALE;
         }
     }
 };

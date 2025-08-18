@@ -709,6 +709,8 @@ inline __device__ void device_flash_attention_nl(Params const& params)
         }
     } // Inner loop over the key/value sequence length.
 
+    // Update the sum if attention sinks are used.
+    acc_o_normalizer.update_sum(global_max, global_sum);
     // Update acc_o of flash attention
     acc_o_normalizer.final_update(acc_o, global_sum);
 
