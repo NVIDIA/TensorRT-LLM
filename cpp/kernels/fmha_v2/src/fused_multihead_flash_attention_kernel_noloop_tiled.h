@@ -265,7 +265,7 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params)
     fmha::Clear_accumulator<Acc_type_o, Cta_tile_o::WARPS_K>::apply(acc_o);
 
     // Flash attention updater
-    fmha::Tile_o_normalizer<Traits_o, Cta_tile_o> acc_o_normalizer;
+    fmha::Tile_o_normalizer<Traits_o, Cta_tile_o> acc_o_normalizer(params, binfo);
     float global_max[Softmax::ROWS_PER_THREAD];
     float global_sum[Softmax::ROWS_PER_THREAD];
 
@@ -589,7 +589,7 @@ inline __device__ void device_flash_attention_nl_tiled(Params const& params)
     }     // Inner loop over the key/value sequence length.
 
     // Update acc_o of flash attention
-    acc_o_normalizer.final_update(acc_o, global_sum);
+    acc_o_normalizer.final_update(acc_o, global_max, global_sum);
 
     // If kv_loop breaks prematurely in case of causal masking, make sure there is no data in-flight
     if (Kernel_traits::CAUSAL_MASK)

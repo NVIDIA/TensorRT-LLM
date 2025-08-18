@@ -14,6 +14,7 @@
 
 #include <fmha/traits.h>
 #include <fmha/utils.h>
+#include <cfloat>
 
 namespace fmha
 {
@@ -1250,6 +1251,23 @@ struct Tile_o_normalizer
         BYTES_PER_ELEMENT = sizeof(float)
     };
 
+    // Initialize the attention sinks.
+    template <typename Params, typename Block_info>
+    inline __device__ Tile_o_normalizer(Params const& params, Block_info const& binfo)
+        : attention_sink_value_(params.attention_sinks != nullptr ? params.attention_sinks[binfo.bidh] : -FLT_MAX)
+    {
+    }
+
+    // Update the sum when attention sinks are used.
+    inline __device__ void update_sum(float const (&max)[ROWS_PER_THREAD], float (&sum)[ROWS_PER_THREAD])
+    {
+#pragma unroll
+        for (int i = 0; i < ROWS_PER_THREAD; ++i)
+        {
+            sum[i] += expf(attention_sink_value_ - max[i]);
+        }
+    }
+
     // Update o.
     inline __device__ void update(Fragment_accu (&acc_o)[MMAS_M][MMAS_N], float (&curr_max)[ROWS_PER_THREAD],
         float const (&prev_max)[ROWS_PER_THREAD], float (&sum)[ROWS_PER_THREAD])
@@ -1331,8 +1349,13 @@ struct Tile_o_normalizer
     }
 
     // Update o.
-    inline __device__ void final_update(Fragment_accu (&acc_o)[MMAS_M][MMAS_N], float const (&sum)[ROWS_PER_THREAD])
+    inline __device__ void final_update(
+        Fragment_accu (&acc_o)[MMAS_M][MMAS_N], float const (&max)[ROWS_PER_THREAD], float (&sum)[ROWS_PER_THREAD])
     {
+
+        // Update the sum when attention sinks are used.
+        update_sum(max, sum);
+
 #ifdef HALF_ACCUMULATION_FOR_FLASH_ATTENTION // Half accumulation
 #pragma unroll
         for (int mi = 0; mi < MMAS_M; ++mi)
@@ -1403,6 +1426,9 @@ struct Tile_o_normalizer
         }
 #endif // defined HALF_ACCUMULATION_FOR_FLASH_ATTENTION
     }
+
+    // Attention sink value.
+    float attention_sink_value_;
 };
 
 template <typename Traits, typename Cta_tile>
@@ -1461,6 +1487,23 @@ struct Tile_o_normalizer_fp32
         BYTES_PER_ELEMENT = sizeof(float)
     };
 
+    // Initialize the attention sinks.
+    template <typename Params, typename Block_info>
+    inline __device__ Tile_o_normalizer_fp32(Params const& params, Block_info const& binfo)
+        : attention_sink_value_(params.attention_sinks != nullptr ? params.attention_sinks[binfo.bidh] : -FLT_MAX)
+    {
+    }
+
+    // Update the sum when attention sinks are used.
+    inline __device__ void update_sum(float const (&max)[ROWS_PER_THREAD], float (&sum)[ROWS_PER_THREAD])
+    {
+#pragma unroll
+        for (int i = 0; i < ROWS_PER_THREAD; ++i)
+        {
+            sum[i] += expf(attention_sink_value_ - max[i]);
+        }
+    }
+
     // Update o.
     inline __device__ void update(Fragment_accu (&acc_o)[MMAS_M][MMAS_N], float (&curr_max)[ROWS_PER_THREAD],
         float const (&prev_max)[ROWS_PER_THREAD], float (&sum)[ROWS_PER_THREAD])
@@ -1501,8 +1544,12 @@ struct Tile_o_normalizer_fp32
     }
 
     // Update o after P * V
-    inline __device__ void final_update(Fragment_accu (&acc_o)[MMAS_M][MMAS_N], float const (&sum)[ROWS_PER_THREAD])
+    inline __device__ void final_update(
+        Fragment_accu (&acc_o)[MMAS_M][MMAS_N], float const (&max)[ROWS_PER_THREAD], float (&sum)[ROWS_PER_THREAD])
     {
+
+        // Update the sum when attention sinks are used.
+        update_sum(max, sum);
 
 #pragma unroll
         for (int mi = 0; mi < MMAS_M; ++mi)
@@ -1538,6 +1585,9 @@ struct Tile_o_normalizer_fp32
             }
         }
     }
+
+    // Attention sink value.
+    float attention_sink_value_;
 };
 
 template <typename Cta_tile>
@@ -1550,8 +1600,12 @@ struct Tile_o_normalizer<Ampere_hmma_fp32_traits, Cta_tile>
     // The base class.
     using Base = Tile_o_normalizer_fp32<Traits, Cta_tile>;
 
-    // Default ctor
-    Tile_o_normalizer() = default;
+    // The ctor.
+    template <typename Params, typename Block_info>
+    inline __device__ Tile_o_normalizer(Params const& params, Block_info const& binfo)
+        : Base(params, binfo)
+    {
+    }
 };
 
 template <typename Cta_tile>
@@ -1564,10 +1618,15 @@ struct Tile_o_normalizer<Ampere_hmma_bf16_traits, Cta_tile>
     // The base class.
     using Base = Tile_o_normalizer_fp32<Traits, Cta_tile>;
 
-    // Default ctor
-    Tile_o_normalizer() = default;
+    // The ctor.
+    template <typename Params, typename Block_info>
+    inline __device__ Tile_o_normalizer(Params const& params, Block_info const& binfo)
+        : Base(params, binfo)
+    {
+    }
 };
 
+// The attention sinks are not enabled for Volta.
 template <typename Cta_tile>
 struct Tile_o_normalizer<Volta_hmma_fp16_16x16x16_traits, Cta_tile>
 {
@@ -1747,99 +1806,11 @@ struct Tile_o_normalizer<Ada_qmma_e4m3_fp32_traits, Cta_tile>
     // The base class.
     using Base = Tile_o_normalizer_fp32<Traits, Cta_tile>;
 
-    // Default ctor
-    Tile_o_normalizer() = default;
-
-    // The fragment accumulator.
-    using Fragment_accu = Fragment_accumulator<Traits>;
-
-    // The Mma tile.
-    using Mma_tile = typename Traits::template Mma_tile<Cta_tile>;
-
-    // The number of MMAs in the M dimension.
-    enum
+    // The ctor.
+    template <typename Params, typename Block_info>
+    inline __device__ Tile_o_normalizer(Params const& params, Block_info const& binfo)
+        : Base(params, binfo)
     {
-        MMAS_M = Mma_tile::MMAS_M
-    };
-
-    // The number of MMAs in the N dimension.
-    enum
-    {
-        MMAS_N = Mma_tile::VALID_MMAS_N
-    };
-
-    // The number of rows per thread.
-    enum
-    {
-        ROWS_PER_THREAD = 2 * MMAS_M
-    };
-
-    // The number of registers per thread.
-    enum
-    {
-        REGS_PER_THREAD = 8
-    };
-
-    // Warps.
-    enum
-    {
-        WARPS_M = Cta_tile::WARPS_M
-    };
-
-    enum
-    {
-        WARPS_N = Cta_tile::WARPS_N
-    };
-
-    enum
-    {
-        WARPS_K = Cta_tile::WARPS_K
-    };
-
-    // softmax data bytes
-    enum
-    {
-        BYTES_PER_ELEMENT = sizeof(float)
-    };
-
-    // Update o after P * V, the only difference from the basic class is we need to dequant the sum for softmax saver.
-    inline __device__ void final_update(Fragment_accu (&acc_o)[MMAS_M][MMAS_N], float (&sum)[ROWS_PER_THREAD])
-    {
-
-        constexpr float dequant_scale = Traits::SOFTMAX_FP_DEQUANT_SCALE;
-#pragma unroll
-        for (int mi = 0; mi < MMAS_M; ++mi)
-        {
-
-            // Precompute the scaling factors for the 2 rows.
-            float beta[2];
-#pragma unroll
-            for (int ii = 0; ii < 2; ++ii)
-            {
-                // The row.
-                int jj = 2 * mi + ii;
-
-                // The diviser.
-                beta[ii] = (sum[jj] == 0.f || sum[jj] != sum[jj]) ? 1.f : 1.f / sum[jj];
-                // softmax saver need the original sum.
-                sum[jj] = sum[jj] * dequant_scale;
-            }
-
-#pragma unroll
-            for (int ni = 0; ni < MMAS_N; ++ni)
-            {
-#pragma unroll
-                for (int ii = 0; ii < REGS_PER_THREAD; ++ii)
-                {
-                    // The register for O.
-                    float acc_o_f = acc_o[mi][ni].elt(ii);
-                    // Compute the next accumulator.
-                    acc_o_f = acc_o_f * beta[(ii & 2) / 2];
-                    // Update the accumulator.
-                    acc_o[mi][ni].elt(ii) = acc_o_f;
-                }
-            }
-        }
     }
 };
 
@@ -1878,8 +1849,12 @@ struct Tile_o_normalizer<Ada_qmma_e4m3_fp32_traits, Cta_tile, true>
         REGS_PER_THREAD = 8
     };
 
-    // Default ctor
-    Tile_o_normalizer() = default;
+    // The ctor.
+    template <typename Params, typename Block_info>
+    inline __device__ Tile_o_normalizer(Params const& params, Block_info const& binfo)
+        : Base(params, binfo)
+    {
+    }
 
     inline __device__ void merge(Fragment_accu (&acc_dst)[MMAS_M][MMAS_N], Fragment_accu (&acc_src)[MMAS_M][MMAS_N])
     {
