@@ -1306,9 +1306,11 @@ class PyExecutor:
             if req.is_disagg_generation_transmission_complete:
                 cache_trans_complete_requests.append(req)
         if len(cache_trans_complete_requests) > 0:
+            trans_complete_to_prepare = ScheduledRequests()
+            trans_complete_to_prepare.context_requests = cache_trans_complete_requests
             self.resource_manager.resource_managers[
                 ResourceManagerType.SEQ_SLOT_MANAGER].prepare_resources(
-                    cache_trans_complete_requests)
+                    trans_complete_to_prepare)
             self._setup_sampler_step(cache_trans_complete_requests)
 
         for req in scheduled_batch.generation_requests:
