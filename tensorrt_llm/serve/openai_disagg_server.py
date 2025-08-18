@@ -151,16 +151,15 @@ class OpenAIDisaggServer:
                     self.server_perf_metrics[server][ctx_request_id] = request_perf_metrics
             remain_keys = []
             for ctx_server, gen_server, ctx_request_id in self.perf_metrics_keys:
-                ctx_perf_metrics = self.server_perf_metrics[ctx_server].pop(ctx_request_id, None)
                 gen_perf_metrics = self.server_perf_metrics[gen_server].pop(ctx_request_id, None)
                 if gen_perf_metrics is None:
                     # generation not finished
                     remain_keys.append((ctx_server, gen_server, ctx_request_id))
                     continue
+                ctx_perf_metrics = self.server_perf_metrics[ctx_server].pop(ctx_request_id, None)
                 return_metrics.append({
                     "ctx_server": ctx_server,
                     "gen_server": gen_server,
-                    # "ctx_request_id": ctx_request_id,
                     "ctx_perf_metrics": ctx_perf_metrics,
                     "gen_perf_metrics": gen_perf_metrics})
             self.perf_metrics_keys = remain_keys

@@ -265,6 +265,8 @@ class OpenAIServer:
         for metrics_dict in perf_metrics:
             metrics = metrics_dict["perf_metrics"]
             timing_metrics = metrics.timing_metrics
+            kv_cache_metrics = metrics.kv_cache_metrics
+            speculative_decoding = metrics.speculative_decoding
             # TODO: other metrics
             metrics_json = {
                 "first_iter": metrics.first_iter,
@@ -273,12 +275,22 @@ class OpenAIServer:
                 "first_scheduled_time": timing_metrics.first_scheduled_time.total_seconds(),
                 "first_token_time": timing_metrics.first_token_time.total_seconds(),
                 "last_token_time": timing_metrics.last_token_time.total_seconds(),
+                "num_total_allocated_blocks": kv_cache_metrics.num_total_allocated_blocks,
+                "num_new_allocated_blocks": kv_cache_metrics.num_new_allocated_blocks,
+                "num_reused_blocks": kv_cache_metrics.num_reused_blocks,
+                "num_missed_blocks": kv_cache_metrics.num_missed_blocks,
             }
             if timing_metrics.kv_cache_size > 0:
                 metrics_json.update({
                     "kv_cache_size": timing_metrics.kv_cache_size,
                     "kv_cache_transfer_start": timing_metrics.kv_cache_transfer_start.total_seconds(),
                     "kv_cache_transfer_end": timing_metrics.kv_cache_transfer_end.total_seconds(),
+                })
+            if speculative_decoding.total_draft_tokens > 0:
+                metrics_json.update({
+                    "acceptance_rate": speculative_decoding.acceptance_rate,
+                    "total_accepted_draft_tokens": speculative_decoding.total_accepted_draft_tokens,
+                    "total_draft_tokens": speculative_decoding.total_draft_tokens,
                 })
             metrics_dict["perf_metrics"] = metrics_json
         return JSONResponse(content=perf_metrics)

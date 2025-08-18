@@ -73,6 +73,16 @@ def test_metrics_endpoint(server: RemoteOpenAIServer):
     assert "first_scheduled_time" in data
     assert "first_token_time" in data
     assert "last_token_time" in data
+    assert "num_total_allocated_blocks" in data
+    assert "num_new_allocated_blocks" in data
+    assert "num_reused_blocks" in data
+    assert "num_missed_blocks" in data
+    assert data["first_iter"] <= data["last_iter"]
+    assert data["arrival_time"] < data["first_scheduled_time"]
+    assert data["first_scheduled_time"] < data["first_token_time"]
+    assert data["first_token_time"] <= data["last_token_time"]
+    assert data["num_new_allocated_blocks"] <= data[
+        "num_total_allocated_blocks"]
 
     # exclude disagg specific metrics
     assert "ctx_request_id" not in data_list[0]

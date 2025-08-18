@@ -542,11 +542,12 @@ def test_disaggregated_perf_metrics(disaggregated_test_root, llm_venv,
 
     def extra_endpoints_test(server_url: str):
         import json
+        import urllib.request
 
-        import urllib3
-        resp = urllib3.request("GET", f"{server_url}/perf_metrics")
-        assert resp.status == 200
-        perf_metrics = json.loads(resp.data)
+        with urllib.request.urlopen(f"{server_url}/perf_metrics",
+                                    timeout=10) as resp:
+            assert resp.status == 200
+            perf_metrics = json.loads(resp.read())
         assert len(perf_metrics) > 0
         item = perf_metrics[0]
         assert "ctx_server" in item
@@ -557,9 +558,7 @@ def test_disaggregated_perf_metrics(disaggregated_test_root, llm_venv,
             "gen_perf_metrics"]["ctx_request_id"]
         ctx_metrics = item["ctx_perf_metrics"]["perf_metrics"]
         gen_metrics = item["gen_perf_metrics"]["perf_metrics"]
-        for metrics in ctx_metrics, gen_metrics:
-            assert metrics["arrival_time"] < metrics["first_scheduled_time"]
-            assert metrics["first_scheduled_time"] < metrics["first_token_time"]
+        # only one token is generated in ctx
         assert ctx_metrics["first_token_time"] == ctx_metrics["last_token_time"]
         assert ctx_metrics["last_token_time"] < gen_metrics["arrival_time"]
         assert gen_metrics["kv_cache_size"] > 0
@@ -570,13 +569,11 @@ def test_disaggregated_perf_metrics(disaggregated_test_root, llm_venv,
         assert gen_metrics["kv_cache_transfer_end"] < gen_metrics[
             "first_scheduled_time"]
 
-    run_disaggregated_test(
-        disaggregated_example_root,
-        "perf_metrics",
-        env=llm_venv._new_env,
-        cwd=llm_venv.get_working_directory(),
-        #    extra_endpoints_test=extra_endpoints_test
-    )
+    run_disaggregated_test(disaggregated_example_root,
+                           "perf_metrics",
+                           env=llm_venv._new_env,
+                           cwd=llm_venv.get_working_directory(),
+                           extra_endpoints_test=extra_endpoints_test)
 
 
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
