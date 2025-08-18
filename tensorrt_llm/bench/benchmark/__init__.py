@@ -58,6 +58,8 @@ class GeneralExecSettings(BaseModel):
     request_json: Optional[Path] = Field(
         default=None,
         description="Path where per request information is written")
+    streaming: bool = Field(default=False,
+                            description="Whether to use streaming mode")
     warmup: int = Field(default=2,
                         description="Number of requests to warm up benchmark")
 
