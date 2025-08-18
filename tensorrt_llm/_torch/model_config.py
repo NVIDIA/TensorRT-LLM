@@ -442,7 +442,20 @@ class ModelConfig(Generic[TConfig]):
 
         mlp_hidden_size = None
         if self.pretrained_config.intermediate_size is not None:
-            mlp_hidden_size = self.pretrained_config.intermediate_size // self.mapping.tp_size
+            if isinstance(self.pretrained_config.intermediate_size,
+                          (list, tuple)):
+                # Per-layer MLP dimensions (e.g., Nemotron-NAS, variable MLP models)
+                mlp_hidden_size_per_layer = [
+                    intermediate_size // self.mapping.tp_size
+                    for intermediate_size in
+                    self.pretrained_config.intermediate_size
+                ]
+                model_config_cpp.mlp_hidden_size_per_layer = mlp_hidden_size_per_layer
+                # For LoRA compatibility, use the maximum MLP dimension
+                mlp_hidden_size = max(mlp_hidden_size_per_layer)
+            else:
+                # Uniform MLP dimensions across all layers
+                mlp_hidden_size = self.pretrained_config.intermediate_size // self.mapping.tp_size
         else:
             # TODO: once tensorrt_llm._torch.AutoConfig is implemented, the following logic
             # should be moved to tensorrt_llm._torch.AutoConfig of the relevant modeling_xxx file

@@ -467,10 +467,22 @@ def create_py_executor_instance(
             # all layers have the same number of KV heads
             num_kv_attention_heads = num_kv_attention_heads_per_layer[0]
 
+        mlp_hidden_size_per_layer = model_binding_config.mlp_hidden_size_per_layer
+        if mlp_hidden_size_per_layer and max(mlp_hidden_size_per_layer) != min(
+                mlp_hidden_size_per_layer):
+            logger.warning(
+                "Defining LORA with per-layer MLP dimensions is not supported for LORA, using the max MLP hidden size per layer"
+            )
+            mlp_hidden_size = max(mlp_hidden_size_per_layer)
+        else:
+            # all layers have the same MLP hidden size
+            mlp_hidden_size = mlp_hidden_size_per_layer[0]
+
+        # THEN UPDATE THE LoraModule.create_lora_modules CALL:
         lora_modules = LoraModule.create_lora_modules(
             lora_module_names=lora_config.lora_target_modules,
             hidden_size=model_binding_config.hidden_size,
-            mlp_hidden_size=model_binding_config.mlp_hidden_size,
+            mlp_hidden_size=mlp_hidden_size,
             num_attention_heads=model_binding_config.num_heads,
             num_kv_attention_heads=num_kv_attention_heads,
             attention_head_size=model_binding_config.head_size,
