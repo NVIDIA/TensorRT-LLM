@@ -152,7 +152,9 @@ class ModelFactory(ABC):
         """
         return model_name_or_path
 
-    def load_or_random_init(self, model: nn.Module, device: DeviceLikeType):
+    def load_or_random_init(
+        self, model: nn.Module, device: DeviceLikeType, load_factoy_model: bool = False
+    ):
         """Load the checkpoint into the model or randomly initialize the model.
 
         Args:
@@ -160,6 +162,8 @@ class ModelFactory(ABC):
                 the same model that is built above but it needs to have a state dict compatible with
                 the model built above.
             device: The device to load the model on.
+            load_factoy_model: If True, will load weights for the factory model in addition to main
+                gm. This is useful for the transformers model.
 
         NOTE: we always call ``self._to_maybe_random(model, device)`` as a preprocessing step
         to ensure the model parameters already exist on the right device and have the desired dtype
@@ -190,7 +194,7 @@ class ModelFactory(ABC):
         self._to_maybe_random(model, device)
         if not self.skip_loading_weights:
             self.prefetch_checkpoint(force=True)
-            self._load_checkpoint(model, device)
+            self._load_checkpoint(model, device, load_factoy_model=load_factoy_model)
 
     @staticmethod
     def _to_maybe_random(model: nn.Module, device: DeviceLikeType):

@@ -328,7 +328,9 @@ class AutoModelForCausalLMFactory(ModelFactory):
 
         return fetched_dir
 
-    def _load_checkpoint(self, model: nn.Module, device: DeviceLikeType):
+    def _load_checkpoint(
+        self, model: nn.Module, device: DeviceLikeType, load_factoy_model: bool = False
+    ):
         """Load the checkpoint into the model."""
         # identify the most relevant checkpoint file
         ckpt_file = self._get_checkpoint_file(self.model)
@@ -341,6 +343,11 @@ class AutoModelForCausalLMFactory(ModelFactory):
             # This sync step can interfere with load_hooks by mixing raw checkpoint weights and
             # model-transformed weights,leading to unexpected key mismatches or format issues.
             load_checkpoint_in_model(model, checkpoint=ckpt_file, full_state_dict=False)
+            # In eager mode, we also load weights for the factory model.
+            if load_factoy_model:
+                load_checkpoint_in_model(
+                    model.factory_model, checkpoint=ckpt_file, full_state_dict=False
+                )
 
     def _load_quantization_config(self, fetched_dir: str):
         """Load the quantization config from the model directory if not done already."""

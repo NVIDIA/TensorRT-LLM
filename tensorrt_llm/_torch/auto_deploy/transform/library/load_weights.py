@@ -24,6 +24,9 @@ class LoadWeightsToDeviceConfig(TransformConfig):
     adconfig_checkpoint_device: Optional[str] = Field(
         default=None, description="Optional checkpoint device argument from adconfig."
     )
+    load_factoy_model: bool = Field(
+        default=False, description="Whether to load the factory model in addition to main gm."
+    )
 
 
 @TransformRegistry.register("load_weights")
@@ -43,8 +46,11 @@ class LoadWeightsToDevice(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
+        # breakpoint()
         factory.load_or_random_init(
-            gm, device=self.config.adconfig_checkpoint_device or self.config.device
+            gm,
+            device=self.config.adconfig_checkpoint_device or self.config.device,
+            load_factoy_model=self.config.load_factoy_model,
         )
         move_to_device(gm, self.config.device)
         cm.to(self.config.device)
