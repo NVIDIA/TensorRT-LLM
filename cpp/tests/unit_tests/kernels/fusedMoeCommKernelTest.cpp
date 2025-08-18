@@ -50,6 +50,7 @@ protected:
     {
         if (shouldSkip())
         {
+            skipped = true;
             GTEST_SKIP() << "Skipping due to no/unsupported GPU";
         }
         TLLM_CUDA_CHECK(cudaStreamCreate(&stream));
@@ -58,10 +59,14 @@ protected:
 
     void TearDown() override
     {
-        TLLM_CUDA_CHECK(cudaStreamDestroy(stream));
+        if (!skipped)
+        {
+            TLLM_CUDA_CHECK(cudaStreamDestroy(stream));
+        }
     }
 
-    cudaStream_t stream;
+    bool skipped = false;
+    cudaStream_t stream = nullptr;
 
     // Helper function to allocate and initialize test data
     template <typename T>

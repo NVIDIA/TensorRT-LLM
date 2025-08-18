@@ -243,7 +243,6 @@ __global__ void computeCumsumDevice(int* sendCountsCumsum, int* recvCountsCumsum
 
     int tid = threadIdx.x;
     int threadData = tid < rankCount ? inputOutputPtr[tid] : 0;
-    int count = threadData;
     __syncthreads();
 
     BlockScan(temp_storage).InclusiveSum(threadData, threadData);

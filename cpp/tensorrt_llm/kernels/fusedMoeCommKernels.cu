@@ -45,14 +45,14 @@ __device__ __forceinline__ void fence_release_sys()
 
 __device__ __forceinline__ void mbarrier_init(uint64_t* addr, uint32_t const& count)
 {
-#if defined(__CUDACC__) || __CUDA_ARCH__ >= 800
+#if defined(__CUDACC__) && __CUDA_ARCH__ >= 800
     asm("mbarrier.init.shared.b64 [%0], %1;" : : "r"(__as_ptr_smem(addr)), "r"(count) : "memory");
 #endif
 }
 
 __device__ __forceinline__ void mbarrier_expect_tx(uint64_t* addr, const uint32_t txCount)
 {
-#if defined(__CUDACC__) || __CUDA_ARCH__ >= 900
+#if defined(__CUDACC__) && __CUDA_ARCH__ >= 900
     asm("mbarrier.expect_tx.relaxed.cta.shared::cta.b64 [%0], %1;"
         :
         : "r"(__as_ptr_smem(addr)), "r"(txCount)
@@ -62,7 +62,7 @@ __device__ __forceinline__ void mbarrier_expect_tx(uint64_t* addr, const uint32_
 
 __device__ __forceinline__ uint64_t mbarrier_arrive(uint64_t* addr)
 {
-#if defined(__CUDACC__) || __CUDA_ARCH__ >= 800
+#if defined(__CUDACC__) && __CUDA_ARCH__ >= 800
     uint64_t state;
     asm("mbarrier.arrive.shared.b64 %0, [%1];" : "=l"(state) : "r"(__as_ptr_smem(addr)) : "memory");
     return state;
@@ -73,7 +73,7 @@ __device__ __forceinline__ uint64_t mbarrier_arrive(uint64_t* addr)
 
 __device__ __forceinline__ uint64_t mbarrier_arrive_expect_tx(uint64_t* addr, const uint32_t txCount)
 {
-#if defined(__CUDACC__) || __CUDA_ARCH__ >= 900
+#if defined(__CUDACC__) && __CUDA_ARCH__ >= 900
     uint64_t state;
     asm("mbarrier.arrive.expect_tx.release.cta.shared::cta.b64 %0, [%1], %2;"
         : "=l"(state)
@@ -87,7 +87,7 @@ __device__ __forceinline__ uint64_t mbarrier_arrive_expect_tx(uint64_t* addr, co
 
 __device__ __forceinline__ bool mbarrier_try_wait_parity(uint64_t* addr, uint32_t const& phaseParity)
 {
-#if defined(__CUDACC__) || __CUDA_ARCH__ >= 900
+#if defined(__CUDACC__) && __CUDA_ARCH__ >= 900
     uint32_t waitComplete;
     asm("{\n\t .reg .pred P_OUT; \n\t"
         "mbarrier.try_wait.parity.shared::cta.b64  P_OUT, [%1], %2;\n\t"
@@ -105,7 +105,7 @@ __device__ __forceinline__ bool mbarrier_try_wait_parity(uint64_t* addr, uint32_
 template <int COPY_SIZE = 4>
 __device__ __forceinline__ void ldgsts(int* dstShm, int const* srcMem, bool predGuard)
 {
-#if defined(__CUDACC__) || __CUDA_ARCH__ >= 800
+#if defined(__CUDACC__) && __CUDA_ARCH__ >= 800
     asm volatile(
         "{\n"
         "  .reg .pred p;\n"
@@ -118,7 +118,7 @@ __device__ __forceinline__ void ldgsts(int* dstShm, int const* srcMem, bool pred
 
 __device__ __forceinline__ void cp_async_commit_group()
 {
-#if defined(__CUDACC__) || __CUDA_ARCH__ >= 800
+#if defined(__CUDACC__) && __CUDA_ARCH__ >= 800
     asm volatile("cp.async.commit_group;" : : :);
 #endif
 }
@@ -126,14 +126,14 @@ __device__ __forceinline__ void cp_async_commit_group()
 template <int N = 0>
 __device__ __forceinline__ void cp_async_wait_group()
 {
-#if defined(__CUDACC__) || __CUDA_ARCH__ >= 800
+#if defined(__CUDACC__) && __CUDA_ARCH__ >= 800
     asm volatile("cp.async.wait_group %0;" : : "n"(N) : "memory");
 #endif
 }
 
 __device__ __forceinline__ void cp_async_bulk_g2s(void* dstMem, void const* srcMem, int copySize, uint64_t* smemBar)
 {
-#if defined(__CUDACC__) || __CUDA_ARCH__ >= 900
+#if defined(__CUDACC__) && __CUDA_ARCH__ >= 900
     asm("cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];"
         :
         : "r"(__as_ptr_smem(dstMem)), "l"(__as_ptr_gmem(srcMem)), "r"(copySize), "r"(__as_ptr_smem(smemBar))
@@ -143,7 +143,7 @@ __device__ __forceinline__ void cp_async_bulk_g2s(void* dstMem, void const* srcM
 
 __device__ __forceinline__ void cp_async_bulk_s2g(void* dstMem, void const* srcMem, int copySize)
 {
-#if defined(__CUDACC__) || __CUDA_ARCH__ >= 900
+#if defined(__CUDACC__) && __CUDA_ARCH__ >= 900
     asm("cp.async.bulk.global.shared::cta.bulk_group [%0], [%1], %2;"
         :
         : "l"(__as_ptr_gmem(dstMem)), "r"(__as_ptr_smem(srcMem)), "r"(copySize)
@@ -153,7 +153,7 @@ __device__ __forceinline__ void cp_async_bulk_s2g(void* dstMem, void const* srcM
 
 __device__ __forceinline__ void cp_async_bulk_commit_group()
 {
-#if defined(__CUDACC__) || __CUDA_ARCH__ >= 900
+#if defined(__CUDACC__) && __CUDA_ARCH__ >= 900
     asm volatile("cp.async.bulk.commit_group;" : : :);
 #endif
 }
@@ -161,7 +161,7 @@ __device__ __forceinline__ void cp_async_bulk_commit_group()
 template <int N = 0>
 __device__ __forceinline__ void cp_async_bulk_wait_group()
 {
-#if defined(__CUDACC__) || __CUDA_ARCH__ >= 900
+#if defined(__CUDACC__) && __CUDA_ARCH__ >= 900
     asm volatile("cp.async.bulk.wait_group %0;" : : "n"(N) : "memory");
 #endif
 }
@@ -169,7 +169,7 @@ __device__ __forceinline__ void cp_async_bulk_wait_group()
 template <int N = 0>
 __device__ __forceinline__ void cp_async_bulk_wait_group_read()
 {
-#if defined(__CUDACC__) || __CUDA_ARCH__ >= 900
+#if defined(__CUDACC__) && __CUDA_ARCH__ >= 900
     asm volatile("cp.async.bulk.wait_group.read %0;" : : "n"(N) : "memory");
 #endif
 }
