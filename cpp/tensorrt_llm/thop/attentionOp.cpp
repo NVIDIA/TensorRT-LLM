@@ -183,12 +183,10 @@ public:
                 TORCH_CHECK(k->strides()[1] == 1);
                 TORCH_CHECK(v->strides()[1] == 1);
 
-                T* k_buf = static_cast<T*>(k->slice(0, token_offset).data_ptr());
-                T* v_buf = static_cast<T*>(v->slice(0, token_offset).data_ptr());
-                mla_params.k_buf = k_buf;
-                mla_params.v_buf = v_buf;
-                k_ptr = k_buf;
-                v_ptr = v_buf;
+                k_ptr = static_cast<T*>(k->slice(0, token_offset).data_ptr());
+                v_ptr = static_cast<T*>(v->slice(0, token_offset).data_ptr());
+                mla_params.k_buf = k_ptr;
+                mla_params.v_buf = v_ptr;
             }
             else
             {
