@@ -84,17 +84,21 @@ RUN pip3 install --upgrade --no-cache-dir \
 
 # wait for new triton to be published
 # Rename pytorch_triton package to triton
-RUN cd /usr/local/lib/python3.12/dist-packages/ && \
-    ls -la | grep pytorch_triton && \
-    mv pytorch_triton-3.3.1+gitc8757738.dist-info triton-3.3.1+gitc8757738.dist-info && \
-    cd triton-3.3.1+gitc8757738.dist-info && \
-    echo "Current directory: $(pwd)" && \
-    echo "Files in directory:" && \
-    ls -la && \
-    sed -i 's/^Name: pytorch-triton/Name: triton/' METADATA && \
-    sed -i 's|pytorch_triton-3.3.1+gitc8757738.dist-info/|triton-3.3.1+gitc8757738.dist-info/|g' RECORD && \
-    echo "METADATA after update:" && \
-    grep "^Name:" METADATA
+RUN if [ -f /etc/redhat-release ]; then \
+        echo "Rocky8 detected, skipping symlink and ldconfig steps"; \
+    else \
+        cd /usr/local/lib/python3.12/dist-packages/ && \
+        ls -la | grep pytorch_triton && \
+        mv pytorch_triton-3.3.1+gitc8757738.dist-info triton-3.3.1+gitc8757738.dist-info && \
+        cd triton-3.3.1+gitc8757738.dist-info && \
+        echo "Current directory: $(pwd)" && \
+        echo "Files in directory:" && \
+        ls -la && \
+        sed -i 's/^Name: pytorch-triton/Name: triton/' METADATA && \
+        sed -i 's|pytorch_triton-3.3.1+gitc8757738.dist-info/|triton-3.3.1+gitc8757738.dist-info/|g' RECORD && \
+        echo "METADATA after update:" && \
+        grep "^Name:" METADATA; \
+    fi
 
 
 FROM ${TRITON_IMAGE}:${TRITON_BASE_TAG} AS triton

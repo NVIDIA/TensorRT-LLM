@@ -38,6 +38,9 @@ LLM_DOCKER_IMAGE = env.dockerImage
 LLM_ROCKYLINUX8_PY310_DOCKER_IMAGE = env.wheelDockerImagePy310
 LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE = env.wheelDockerImagePy312
 
+LLM_DOCKER_IMAGE_12_9 = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.06-py3-x86_64-ubuntu24.04-trt10.11.0.33-skip-tritondevel-202508051130-6090"
+LLM_SBSA_DOCKER_IMAGE_12_9 = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.06-py3-aarch64-ubuntu24.04-trt10.11.0.33-skip-tritondevel-202508051130-6090"
+
 // DLFW torch image
 DLFW_IMAGE = "nvcr.io/nvidia/pytorch:25.06-py3"
 
@@ -56,13 +59,19 @@ def TARNAME = "tarName"
 def VANILLA_CONFIG = "Vanilla"
 
 @Field
+def VANILLA_CONFIG_CU12 = "Vanilla_CU12"
+
+@Field
 def SINGLE_DEVICE_CONFIG = "SingleDevice"
 
 @Field
 def LLVM_CONFIG = "LLVM"
 
 @Field
-LINUX_AARCH64_CONFIG = "linux_aarch64"
+def LINUX_AARCH64_CONFIG = "linux_aarch64"
+
+@Field
+def LINUX_AARCH64_CONFIG_CU12 = "linux_aarch64_CU12"
 
 @Field
 def NANOBIND_CONFIG = "Nanobind"
@@ -71,9 +80,11 @@ def NANOBIND_CONFIG = "Nanobind"
 def BUILD_CONFIGS = [
   // Vanilla TARNAME is used for packaging in runLLMPackage
   (VANILLA_CONFIG) : [(TARNAME) : "TensorRT-LLM.tar.gz"],
+  (VANILLA_CONFIG_CU12) : [(TARNAME) : "TensorRT-LLM-CU12.tar.gz"],
   (SINGLE_DEVICE_CONFIG) : [(TARNAME) : "single-device-TensorRT-LLM.tar.gz"],
   (LLVM_CONFIG) : [(TARNAME) : "llvm-TensorRT-LLM.tar.gz"],
   (LINUX_AARCH64_CONFIG) : [(TARNAME) : "TensorRT-LLM-GH200.tar.gz"],
+  (LINUX_AARCH64_CONFIG_CU12) : [(TARNAME) : "TensorRT-LLM-GH200-CU12.tar.gz"],
   (NANOBIND_CONFIG) : [(TARNAME) : "nanobind-TensorRT-LLM.tar.gz"],
 ]
 
@@ -1310,6 +1321,9 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         if (env.alternativeTRT) {
             sh "cd ${llmSrc} && sed -i 's#tensorrt~=.*\$#tensorrt#g' requirements.txt && cat requirements.txt"
         }
+        if (stageName.contains("-CU12")) {
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && sed -i 's/-cu13/-cu12/g' requirements.txt && cat requirements.txt")
+        }
         trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install --retries 1 -r requirements-dev.txt")
         if (!skipInstallWheel) {
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && pip3 install --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl")
@@ -1783,7 +1797,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         "A100X-PyTorch-1": ["a100x", "l0_a100", 1, 1],
         "L40S-PyTorch-1": ["l40s", "l0_l40s", 1, 2],
         "L40S-PyTorch-2": ["l40s", "l0_l40s", 2, 2],
-        "H100_PCIe-PyTorch-1": ["h100-cr", "l0_h100", 1, 3],
+        "H100_PCIe-PyTorch-CU12-1": ["h100-cr", "l0_h100", 1, 3],
         "H100_PCIe-PyTorch-2": ["h100-cr", "l0_h100", 2, 3],
         "H100_PCIe-PyTorch-3": ["h100-cr", "l0_h100", 3, 3],
         "H100_PCIe-CPP-1": ["h100-cr", "l0_h100", 1, 2],
@@ -1842,7 +1856,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         "DGX_H200-4_GPUs-TensorRT-Post-Merge-3": ["dgx-h200-x4", "l0_dgx_h200", 3, 3, 4],
     ]
 
-    parallelJobs = x86TestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, values[0], "amd64", values[4] ?: 1, key.contains("Perf")), {
+    parallelJobs = x86TestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(key.contains("-CU12-") ? LLM_DOCKER_IMAGE_12_9 : LLM_DOCKER_IMAGE, values[0], "amd64", values[4] ?: 1, key.contains("Perf")), {
         def config = VANILLA_CONFIG
         if (key.contains("single-device")) {
             config = SINGLE_DEVICE_CONFIG
@@ -1852,6 +1866,9 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         }
         if (key.contains("Nanobind")) {
             config = NANOBIND_CONFIG
+        }
+        if (key.contains("-CU12-")) {
+            config = VANILLA_CONFIG_CU12
         }
         runLLMTestlistOnPlatform(pipeline, values[0], values[1], config, key.contains("Perf"), key, values[2], values[3])
     }]]}
@@ -1870,6 +1887,9 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         }
         if (key.contains("llvm")) {
             config = LLVM_CONFIG
+        }
+        if (key.contains("-CU12-")) {
+            config = VANILLA_CONFIG_CU12
         }
         runLLMTestlistOnSlurm(pipeline, values[0], values[1], config, key.contains("Perf"), key, values[2], values[3], values[4] ?: 1)
     }]]}
@@ -1902,7 +1922,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
     fullSet += multiNodesSBSAConfigs.keySet()
 
     if (env.targetArch == AARCH64_TRIPLE) {
-        parallelJobs = SBSATestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(LLM_DOCKER_IMAGE, values[0], "arm64"), {
+        parallelJobs = SBSATestConfigs.collectEntries{key, values -> [key, [createKubernetesPodConfig(key.contains("-CU12-") ? LLM_SBSA_DOCKER_IMAGE_12_9 : LLM_DOCKER_IMAGE, values[0], "arm64"), {
             runLLMTestlistOnPlatform(pipeline, values[0], values[1], LINUX_AARCH64_CONFIG, false, key, values[2], values[3])
         }]]}
 
@@ -1987,7 +2007,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
 
     aarch64SanityCheckConfigs = [
         "PY312-UB2404": [
-            LLM_DOCKER_IMAGE,
+            LLM_SBSA_DOCKER_IMAGE_12_9,
             "GH200",
             AARCH64_TRIPLE,
             false,
@@ -1996,7 +2016,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
             true, // Extra PyTorch CUDA 12.8 install
         ],
         "PY312-DLFW": [
-            LLM_DOCKER_IMAGE,
+            LLM_SBSA_DOCKER_IMAGE_12_9,
             "GH200",
             AARCH64_TRIPLE,
             false,
@@ -2097,9 +2117,11 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "wget https://developer.download.nvidia.com/compute/cuda/repos/${ubuntu_version}/${platform}/cuda-keyring_1.1-1_all.deb")
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "dpkg -i cuda-keyring_1.1-1_all.deb")
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update")
-                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get -y install cuda-toolkit-13-0")
-                        }
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get -y install cuda-toolkit-12-9")
 
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install 'cuda-python>=12,<13' 'nvidia-ml-py>=12,<13'")
+                        }
+                        trtllm_utils.llmExecStepWithRetry(pipeline, script: "sed -i 's/-cu13/-cu12/g' ${LLM_ROOT}/requirements.txt")
                         // Extra PyTorch CUDA 12.8 install for SBSA platform and Blackwell GPUs bare-metal environments
                         if (values[6]) {
                             echo "###### Extra PyTorch CUDA 12.8 install Start ######"
@@ -2132,9 +2154,9 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
                             checkPipInstall(pipeline, "${cpu_arch}/${wheelPath}")
                         }
                         echo "###### Run LLMAPI tests Start ######"
-                        def config = VANILLA_CONFIG
+                        def config = VANILLA_CONFIG_CU12
                         if (cpu_arch == AARCH64_TRIPLE) {
-                            config = LINUX_AARCH64_CONFIG
+                            config = LINUX_AARCH64_CONFIG_CU12
                         }
                         withEnv(libEnv) {
                             sh "env | sort"

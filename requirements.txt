@@ -3,7 +3,7 @@
 accelerate>=0.25.0
 build
 colored
-cuda-python
+cuda-python>=12
 diffusers>=0.27.0
 lark
 mpi4py
@@ -13,7 +13,7 @@ onnx_graphsurgeon>=0.5.2
 openai
 polygraphy
 psutil
-nvidia-ml-py>=12,<13
+nvidia-ml-py>=12
 # Just a wrapper since nvidia-modelopt requires pynvml
 pynvml==12.0.0
 pulp

@@ -16,6 +16,9 @@ AARCH64_TRIPLE = "aarch64-linux-gnu"
 
 LLM_DOCKER_IMAGE = env.dockerImage
 
+LLM_DOCKER_IMAGE_12_9 = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.06-py3-x86_64-ubuntu24.04-trt10.11.0.33-skip-tritondevel-202508051130-6090"
+LLM_SBSA_DOCKER_IMAGE_12_9 = "urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm:pytorch-25.06-py3-aarch64-ubuntu24.04-trt10.11.0.33-skip-tritondevel-202508051130-6090"
+
 // Always use x86_64 image for agent
 AGENT_IMAGE = env.dockerImage.replace("aarch64", "x86_64")
 
@@ -36,13 +39,19 @@ def WHEEL_ARCHS = "wheelArchs"
 def CONFIG_LINUX_X86_64_VANILLA = "linux_x86_64_Vanilla"
 
 @Field
+def CONFIG_LINUX_X86_64_VANILLA_CU12 = "linux_x86_64_Vanilla_CU12"
+
+@Field
 def CONFIG_LINUX_X86_64_SINGLE_DEVICE = "linux_x86_64_SingleDevice"
 
 @Field
 def CONFIG_LINUX_X86_64_LLVM = "linux_x86_64_LLVM"
 
 @Field
-CONFIG_LINUX_AARCH64 = "linux_aarch64"
+def CONFIG_LINUX_AARCH64 = "linux_aarch64"
+
+@Field
+def CONFIG_LINUX_AARCH64_CU12 = "linux_aarch64_CU12"
 
 @Field
 def CONFIG_LINUX_AARCH64_LLVM = "linux_aarch64_LLVM"
@@ -60,6 +69,11 @@ def BUILD_CONFIGS = [
   (CONFIG_LINUX_X86_64_VANILLA) : [
     (WHEEL_EXTRA_ARGS) : "--extra-cmake-vars ENABLE_MULTI_DEVICE=1 --extra-cmake-vars WARNING_IS_ERROR=ON --extra-cmake-vars NIXL_ROOT=/opt/nvidia/nvda_nixl --micro_benchmarks",
     (TARNAME) : "TensorRT-LLM.tar.gz",
+    (WHEEL_ARCHS): "80-real;86-real;89-real;90-real;100-real;120-real",
+  ],
+  (CONFIG_LINUX_X86_64_VANILLA_CU12) : [
+    (WHEEL_EXTRA_ARGS) : "--extra-cmake-vars ENABLE_MULTI_DEVICE=1 --extra-cmake-vars WARNING_IS_ERROR=ON --extra-cmake-vars NIXL_ROOT=/opt/nvidia/nvda_nixl --micro_benchmarks",
+    (TARNAME) : "TensorRT-LLM-CU12.tar.gz",
     (WHEEL_ARCHS): "80-real;86-real;89-real;90-real;100-real;120-real",
   ],
   (CONFIG_LINUX_X86_64_NANOBIND) : [
@@ -80,6 +94,11 @@ def BUILD_CONFIGS = [
   (CONFIG_LINUX_AARCH64): [
     (WHEEL_EXTRA_ARGS) : "--extra-cmake-vars WARNING_IS_ERROR=ON",
     (TARNAME) : "TensorRT-LLM-GH200.tar.gz",
+    (WHEEL_ARCHS): "90-real;100-real;120-real",
+  ],
+  (CONFIG_LINUX_AARCH64_CU12): [
+    (WHEEL_EXTRA_ARGS) : "--extra-cmake-vars WARNING_IS_ERROR=ON",
+    (TARNAME) : "TensorRT-LLM-GH200-CU12.tar.gz",
     (WHEEL_ARCHS): "90-real;100-real;120-real",
   ],
   (CONFIG_LINUX_AARCH64_NANOBIND): [
@@ -448,6 +467,9 @@ def runLLMBuild(pipeline, buildFlags, tarName, is_linux_x86_64)
     // TODO: Remove after the cmake version is upgraded to 3.31.8
     // Get triton tag from docker/dockerfile.multi
     def tritonShortTag = "r25.08"
+    if (tarName.contains("CU12")) {
+        tritonShortTag = "r25.06"
+    }
     sh "cd ${LLM_ROOT}/triton_backend/inflight_batcher_llm && mkdir build && cd build && cmake .. -DTRTLLM_DIR=${llmPath} -DTRITON_COMMON_REPO_TAG=${tritonShortTag} -DTRITON_CORE_REPO_TAG=${tritonShortTag} -DTRITON_THIRD_PARTY_REPO_TAG=${tritonShortTag} -DTRITON_BACKEND_REPO_TAG=${tritonShortTag} -DUSE_CXX11_ABI=ON && make -j${BUILD_JOBS} install"
 
     // Step 3: packaging wheels into tarfile
@@ -537,9 +559,13 @@ def launchStages(pipeline, cpu_arch, enableFailFast, globalVars)
         wheelDockerImage = env.dockerImage
     }
 
+    def LLM_DOCKER_IMAGE_CU12 = cpu_arch == AARCH64_TRIPLE ? LLM_SBSA_DOCKER_IMAGE_12_9 : LLM_DOCKER_IMAGE_12_9
+
     buildConfigs = [
         "Build TRT-LLM": [LLM_DOCKER_IMAGE] + prepareLLMBuild(
             pipeline, cpu_arch == AARCH64_TRIPLE ? CONFIG_LINUX_AARCH64 : CONFIG_LINUX_X86_64_VANILLA),
+        "Build TRT-LLM CUDA12": [LLM_DOCKER_IMAGE_CU12] + prepareLLMBuild(
+            pipeline, cpu_arch == AARCH64_TRIPLE ? CONFIG_LINUX_AARCH64_CU12 : CONFIG_LINUX_X86_64_VANILLA_CU12),
         "Build TRT-LLM LLVM": [LLM_DOCKER_IMAGE] + prepareLLMBuild(
             pipeline, cpu_arch == AARCH64_TRIPLE ? CONFIG_LINUX_AARCH64_LLVM : CONFIG_LINUX_X86_64_LLVM),
         "Build TRT-LLM Nanobind": [LLM_DOCKER_IMAGE] + prepareLLMBuild(
