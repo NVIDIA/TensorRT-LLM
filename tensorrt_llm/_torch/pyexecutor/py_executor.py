@@ -849,6 +849,11 @@ class PyExecutor:
                     self._process_iter_stats(finished_requests,
                                              self.active_requests,
                                              previous_batch)
+        # Unblock receiving processes. When second-last rank quits before last rank,
+        # last rank will never return from recv_object.
+        for req in self.send_handles:
+            if req is not None:
+                req.wait()
 
     def _prepare_and_schedule_batch(self):
         new_requests = self._fetch_and_activate_new_requests()
