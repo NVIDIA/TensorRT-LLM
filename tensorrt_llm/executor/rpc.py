@@ -242,30 +242,14 @@ class RPCServer:
                          traceback=traceback.format_exc()))
 
         try:
-            if self._executor is not None:
-                # Dispatch to worker thread and await result with timeout
-                loop = asyncio.get_running_loop()
+            loop = asyncio.get_running_loop()
 
-                # Create a wrapper function to handle keyword arguments
-                def call_with_kwargs():
-                    return self._functions[req.method_name](*req.args,
-                                                            **req.kwargs)
+            def call_with_kwargs():
+                return self._functions[req.method_name](*req.args, **req.kwargs)
 
-                result = await asyncio.wait_for(loop.run_in_executor(
-                    self._executor, call_with_kwargs),
-                                                timeout=req.timeout)
-            else:
-                # For synchronous execution, we need to run in executor to support timeout
-                loop = asyncio.get_running_loop()
-
-                # Create a wrapper function to handle keyword arguments
-                def call_with_kwargs():
-                    return self._functions[req.method_name](*req.args,
-                                                            **req.kwargs)
-
-                result = await asyncio.wait_for(loop.run_in_executor(
-                    None, call_with_kwargs),
-                                                timeout=req.timeout)
+            result = await asyncio.wait_for(loop.run_in_executor(
+                self._executor, call_with_kwargs),
+                                            timeout=req.timeout)
             response = RPCResponse(req.request_id, result)
 
         except asyncio.TimeoutError:

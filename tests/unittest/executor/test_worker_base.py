@@ -62,7 +62,6 @@ class TestWorkerBase:
         with self.FakeWorker(engine=model_path) as worker:
             worker.submit(request)
             worker.await_responses()
-            worker.dispatch_stats_task()
             time.sleep(10)
             stats = worker.fetch_stats()
             assert len(stats) == 1

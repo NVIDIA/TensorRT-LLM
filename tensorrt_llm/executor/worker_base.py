@@ -20,6 +20,7 @@ from ..llmapi.tracer import global_tracer
 from ..llmapi.utils import _SyncQueue, print_colored_debug
 from ..logger import logger
 from ..lora_manager import LoraConfig, LoraManager
+from ..metrics import RequestEventTiming
 from ..prompt_adapter_manager import PromptAdapterManager
 from ..runtime import ModelConfig
 from ..runtime.model_runner import _engine_config_to_model_config

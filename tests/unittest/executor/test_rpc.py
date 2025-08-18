@@ -1,3 +1,4 @@
+import threading
 import time
 
 import pytest
@@ -401,7 +402,167 @@ def test_rpc_timeout(use_async: bool):
 
         assert result == "completed"
 
+        client.close()
+
+
+class RpcServerWrapper(RPCServer):
+
+    def __init__(self, *args, addr: str, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.addr = addr
+
+    def __enter__(self):
+        self.bind(self.addr)
+        self.start()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.shutdown()
+
+
+class TestRpcShutdown:
+
+    def test_duplicate_shutdown(self):
+
+        class App:
+            pass
+
+        with RpcServerWrapper(App(),
+                              addr="ipc:///tmp/rpc_test_shutdown") as server:
+            time.sleep(0.1)
+            client = RPCClient("ipc:///tmp/rpc_test_shutdown")
+            client.quick_task(1)
+
+            # repeated shutdown should not raise an error
+            for i in range(10):
+                server.shutdown()
+
+    def test_submit_request_after_server_shutdown(self):
+
+        class App:
+
+            def foo(self):
+                return "foo"
+
+        with RpcServerWrapper(App(),
+                              addr="ipc:///tmp/rpc_test_shutdown") as server:
+            client = RPCClient("ipc:///tmp/rpc_test_shutdown")
+            assert client.foo() == "foo"
+
+            server.shutdown()
+            time.sleep(2)  # wait for the server to shutdown
+
+            with pytest.raises(RPCServerShuttingDown):
+                client.foo()
+
+    def test_submit_request_after_shutdown(self):
+
+        class App:
+
+            def __init__(self):
+                self.completed_requests = []
+                self.lock = threading.Lock()
+
+            def quick_task(self, task_id):
+                with self.lock:
+                    self.completed_requests.append(task_id)
+                return f"quick_task_{task_id}_completed"
+
+        app = App()
+        with RPCServer(app) as server:
+            server.bind("ipc:///tmp/rpc_test_shutdown")
+            server.start()
+            time.sleep(0.1)
+            client = RPCClient("ipc:///tmp/rpc_test_shutdown")
+            client.quick_task(1)
+            server.shutdown()
+            time.sleep(2)  # wait for the server to shutdown
+            with pytest.raises(RPCServerShuttingDown):
+                client.quick_task(2)
+
+
+def test_enhanced_shutdown_mechanism():
+    """Test enhanced shutdown mechanism that refuses new requests and waits for pending ones."""
+
+    class App:
+
+        def __init__(self):
+            self.completed_requests = []
+            self.lock = threading.Lock()
+
+        def quick_task(self, task_id):
+            """A quick task for testing."""
+            with self.lock:
+                self.completed_requests.append(task_id)
+            return f"quick_task_{task_id}_completed"
+
+        def slow_task(self, task_id, duration=1.0):
+            """A slow task that takes some time to complete."""
+            time.sleep(duration)
+            with self.lock:
+                self.completed_requests.append(task_id)
+            return f"slow_task_{task_id}_completed"
+
+    app = App()
+
+    with RPCServer(app) as server:
+        server.bind("ipc:///tmp/rpc_test_enhanced_shutdown")
+        server.start()
+        time.sleep(0.1)
+
+        client = RPCClient("ipc:///tmp/rpc_test_enhanced_shutdown")
+
+        # Submit some quick requests that should complete
+        quick_future1 = client.quick_task.call_future(1)
+        quick_future2 = client.quick_task.call_future(2)
+
+        # Submit a slow request that should still complete during shutdown
+        slow_future = client.slow_task.call_future(10, duration=0.5)
+
+        # Wait a bit to ensure requests are queued
+        time.sleep(0.1)
+
+        # Start shutdown in a separate thread to test concurrent behavior
+        def shutdown_server():
+            time.sleep(0.2)  # Let pending requests start processing
+            server.shutdown()
+
+        shutdown_thread = threading.Thread(target=shutdown_server)
+        shutdown_thread.start()
+
+        # Try to submit a new request after shutdown has started
+        # This should eventually fail with RPCServerShuttingDown
+        time.sleep(0.3)  # Wait for shutdown to start
+
+        try:
+            client.quick_task(999)
+            pytest.fail("Expected RPCServerShuttingDown exception")
+        except RPCServerShuttingDown as e:
+            assert "Server is shutting down" in str(e)
+            print(f"✓ New request properly refused during shutdown: {e}")
+        except Exception as e:
+            # Might get other connection errors which is also acceptable
+            print(f"✓ New request failed as expected during shutdown: {e}")
+
+        # Wait for shutdown to complete
+        shutdown_thread.join(timeout=5.0)
+
+        # Check that all pending requests completed
+        assert quick_future1.result() == "quick_task_1_completed"
+        assert quick_future2.result() == "quick_task_2_completed"
+        assert slow_future.result() == "slow_task_10_completed"
+
+        # Verify all tasks were completed
+        with app.lock:
+            assert 1 in app.completed_requests
+            assert 2 in app.completed_requests
+            assert 10 in app.completed_requests
+
+        print("✓ Enhanced shutdown mechanism test passed")
+
 
 if __name__ == "__main__":
-    TestRpcError().test_shutdown_cancelled_error()
+    #TestRpcError().test_shutdown_cancelled_error()
     #test_rpc_shutdown_server()
+    #TestRpcShutdown().test_submit_request_after_server_shutdown()
+    test_rpc_timeout(True)
