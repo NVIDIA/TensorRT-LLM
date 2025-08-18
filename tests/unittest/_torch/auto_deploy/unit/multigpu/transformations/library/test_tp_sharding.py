@@ -1,7 +1,5 @@
 """Tests for basic graph sharding."""
 
-import os
-import sys
 from functools import partial
 from typing import Type
 
@@ -9,8 +7,6 @@ import pytest
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-sys.path.append(os.path.join(os.path.dirname(__file__), "..", "..", "..", "..", "_utils_test"))
 from _dist_test_utils import get_device_counts
 from _graph_test_helpers import run_sharding_pattern_detection_test, run_test_transformed_gm
 
