@@ -711,7 +711,8 @@ class TestMistralSmall24B(LlmapiAccuracyTestHarness):
         ],
     )
     def test_auto_dtype(self, model_path, expected_quant_algo):
-        with LLM(model_path) as llm:
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
+        with LLM(model_path, kv_cache_config=kv_cache_config) as llm:
             assert llm.args.quant_config.quant_algo == expected_quant_algo
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
