@@ -69,7 +69,10 @@ from tensorrt_llm.sampling_params import SamplingParams
     "Path to a YAML file that overwrites the parameters specified by trtllm-bench."
 )
 @optgroup.option("--sampler_options",
-                 type=str,
+                 type=click.Path(exists=True,
+                     readable=True,
+                     path_type=Path,
+                     resolve_path=True),
                  default=None,
                  help="Path to a YAML file that sets sampler options.")
 @optgroup.option(
