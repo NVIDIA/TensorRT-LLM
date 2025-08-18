@@ -54,6 +54,13 @@ class OpenAIDisaggServer:
         self.gen_router = create_router(gen_router_config, gen_servers, metadata_server_cfg, self.metadata_server)
         self.conditional_disagg_config = conditional_disagg_config
 
+        # record corresponding keys of context and generation servers for perf metrics
+        self.perf_metrics_keys: list[tuple[str, str, int]] = [] # (ctx_server_key, gen_server_key, ctx_request_id)
+        self.perf_metrics_keys_lock = asyncio.Lock()
+        self.server_perf_metrics: dict[str, dict] = {} # server_key -> {ctx_request_id: perf_metrics}
+        for server in self.ctx_servers + self.gen_servers:
+            self.server_perf_metrics[server] = {}
+
         if max_retries < 0:
             raise ValueError(f"Max retries {max_retries} must be greater than or equal to 0")
         self.max_retries = max_retries
@@ -112,6 +119,7 @@ class OpenAIDisaggServer:
     def register_routes(self):
         self.app.add_api_route("/health", self.health, methods=["GET"])
         self.app.add_api_route("/version", self.version, methods=["GET"])
+        self.app.add_api_route("/perf_metrics", self.perf_metrics, methods=["GET"])
         self.app.add_api_route("/v1/completions",
                                self.openai_completion,
                                methods=["POST"])
@@ -125,6 +133,39 @@ class OpenAIDisaggServer:
     async def version(self) -> JSONResponse:
         ver = {"version": VERSION}
         return JSONResponse(content=ver)
+
+    async def perf_metrics(self) -> JSONResponse:
+        perf_metrics = {}
+        for server in self.ctx_servers + self.gen_servers:
+            async with self.session.get(f"{server}/perf_metrics") as response:
+                server_perf_metrics = await response.json()
+                perf_metrics[server] = server_perf_metrics
+
+        return_metrics = []
+        async with self.perf_metrics_keys_lock:
+            for server in perf_metrics:
+                for request_perf_metrics in perf_metrics[server]:
+                    ctx_request_id = request_perf_metrics["ctx_request_id"]
+                    if server not in self.server_perf_metrics:
+                        self.server_perf_metrics[server] = {}
+                    self.server_perf_metrics[server][ctx_request_id] = request_perf_metrics
+            remain_keys = []
+            for ctx_server, gen_server, ctx_request_id in self.perf_metrics_keys:
+                ctx_perf_metrics = self.server_perf_metrics[ctx_server].pop(ctx_request_id, None)
+                gen_perf_metrics = self.server_perf_metrics[gen_server].pop(ctx_request_id, None)
+                if gen_perf_metrics is None:
+                    # generation not finished
+                    remain_keys.append((ctx_server, gen_server, ctx_request_id))
+                    continue
+                return_metrics.append({
+                    "ctx_server": ctx_server,
+                    "gen_server": gen_server,
+                    # "ctx_request_id": ctx_request_id,
+                    "ctx_perf_metrics": ctx_perf_metrics,
+                    "gen_perf_metrics": gen_perf_metrics})
+            self.perf_metrics_keys = remain_keys
+
+        return JSONResponse(content=return_metrics)
 
     async def merge_streaming_responses(self, ctx_response,
                                         gen_server: str,
@@ -262,6 +303,10 @@ class OpenAIDisaggServer:
             if gen_server is None:
                 gen_server, _ = await self.gen_router.get_next_server(req)
             logger.debug("Sending request to gen server: %s", gen_server)
+
+            if need_ctx:
+                async with self.perf_metrics_keys_lock:
+                    self.perf_metrics_keys.append((ctx_server, gen_server, req.disaggregated_params.ctx_request_id))
 
             if not req.stream:
                 try:

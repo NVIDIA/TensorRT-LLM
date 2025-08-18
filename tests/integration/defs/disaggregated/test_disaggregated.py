@@ -17,6 +17,7 @@ import os
 import re
 import subprocess
 import tempfile
+from typing import Callable
 
 import pytest
 import yaml
@@ -33,6 +34,14 @@ def cleanup_output_files():
             os.remove(file)
         except FileNotFoundError:
             pass
+
+
+def get_disagg_server_url_from_cfg(config_file: str):
+    with open(config_file, 'r') as file:
+        config = yaml.safe_load(file)
+    server_host = config.get('hostname', 'localhost')
+    server_port = config.get('port', 8000)
+    return f"http://{server_host}:{server_port}"
 
 
 def get_test_config(test_desc, example_dir, test_root):
@@ -57,6 +66,7 @@ def get_test_config(test_desc, example_dir, test_root):
         (2, f"{test_configs_root}/disagg_config_cuda_graph_padding.yaml"),
         "mixed": (2, f"{test_configs_root}/disagg_config_mixed.yaml"),
         "overlap": (2, f"{test_configs_root}/disagg_config_overlap.yaml"),
+        "perf_metrics": (2, f"{test_configs_root}/disagg_config_metrics.yaml"),
         "trtllm_sampler":
         (2, f"{test_configs_root}/disagg_config_trtllm_sampler.yaml"),
         "load_balance":
@@ -152,7 +162,8 @@ def run_disaggregated_test(example_dir,
                            num_iters=5,
                            env=None,
                            cwd=None,
-                           prompt_file="prompts.json"):
+                           prompt_file="prompts.json",
+                           extra_endpoints_test: Callable[[str], None] = None):
     """Run disaggregated test with given configuration."""
     cleanup_output_files()
     run_env = env.copy()
@@ -231,6 +242,10 @@ def run_disaggregated_test(example_dir,
                 # Skip output verification for long prompts test
                 if prompt_file == "long_prompts.json":
                     continue
+
+                if extra_endpoints_test is not None:
+                    extra_endpoints_test(
+                        get_disagg_server_url_from_cfg(config_file))
 
                 # Verify outputs
                 not_expected_strings = ["Berlin Berlin"]
@@ -509,6 +524,59 @@ def test_disaggregated_overlap(disaggregated_test_root, llm_venv,
                            "overlap",
                            env=llm_venv._new_env,
                            cwd=llm_venv.get_working_directory())
+
+
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+def test_disaggregated_perf_metrics(disaggregated_test_root, llm_venv,
+                                    disaggregated_example_root,
+                                    llama_model_root):
+    src_dst_dict = {
+        llama_model_root:
+        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+    def extra_endpoints_test(server_url: str):
+        import json
+
+        import urllib3
+        resp = urllib3.request("GET", f"{server_url}/perf_metrics")
+        assert resp.status == 200
+        perf_metrics = json.loads(resp.data)
+        assert len(perf_metrics) > 0
+        item = perf_metrics[0]
+        assert "ctx_server" in item
+        assert "gen_server" in item
+        assert "ctx_perf_metrics" in item
+        assert "gen_perf_metrics" in item
+        assert item["ctx_perf_metrics"]["ctx_request_id"] == item[
+            "gen_perf_metrics"]["ctx_request_id"]
+        ctx_metrics = item["ctx_perf_metrics"]["perf_metrics"]
+        gen_metrics = item["gen_perf_metrics"]["perf_metrics"]
+        for metrics in ctx_metrics, gen_metrics:
+            assert metrics["arrival_time"] < metrics["first_scheduled_time"]
+            assert metrics["first_scheduled_time"] < metrics["first_token_time"]
+        assert ctx_metrics["first_token_time"] == ctx_metrics["last_token_time"]
+        assert ctx_metrics["last_token_time"] < gen_metrics["arrival_time"]
+        assert gen_metrics["kv_cache_size"] > 0
+        assert gen_metrics["arrival_time"] < gen_metrics[
+            "kv_cache_transfer_start"]
+        assert gen_metrics["kv_cache_transfer_start"] < gen_metrics[
+            "kv_cache_transfer_end"]
+        assert gen_metrics["kv_cache_transfer_end"] < gen_metrics[
+            "first_scheduled_time"]
+
+    run_disaggregated_test(
+        disaggregated_example_root,
+        "perf_metrics",
+        env=llm_venv._new_env,
+        cwd=llm_venv.get_working_directory(),
+        #    extra_endpoints_test=extra_endpoints_test
+    )
 
 
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
