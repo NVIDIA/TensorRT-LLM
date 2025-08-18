@@ -162,18 +162,32 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
         self.MULTIMODAL = True
         self.max_images = max_images
         self.model_type = self._get_model_type(llm)
+
+        # NOTE: In TRT-LLM, currently we do not support interleaved text and image. Instead, we are adding image placeholders at the end of the text or at the beginning of the text.
+        # So, until we support interleaved text and image, we set this to False.
         self.interleave = False
 
     def _get_model_type(self, llm: Union[LLM, PyTorchLLM]) -> str:
         """Extract model type from the model configuration."""
+        config_path = os.path.join(llm._hf_model_dir, 'config.json')
+
+        if not os.path.exists(config_path):
+            raise FileNotFoundError(
+                f"Model configuration file not found: {config_path}")
+
         try:
-            config_path = os.path.join(llm._hf_model_dir, 'config.json')
             with open(config_path, 'r') as f:
                 config = json.load(f)
-            return config['model_type']
-        except (KeyError, FileNotFoundError, json.JSONDecodeError) as e:
-            logger.warning(f"Could not determine model type: {e}")
-            return "unknown"
+        except json.JSONDecodeError as e:
+            raise ValueError(
+                f"Invalid JSON in model configuration file {config_path}: {e}")
+
+        if 'model_type' not in config:
+            raise KeyError(
+                f"'model_type' key not found in model configuration: {config_path}"
+            )
+
+        return config['model_type']
 
     def apply_chat_template(self,
                             chat_history: List[Dict[str, str]],
@@ -222,7 +236,9 @@ class MultimodalLmEvalWrapper(LmEvalWrapper):
             add_generation_prompt=add_generation_prompt,
             mm_placeholder_counts=mm_placeholder_counts,
             tools=None,
-        )
+            chat_template_kwargs={
+                "continue_final_message": not add_generation_prompt
+            })
         return output
 
     def generate_until(self, requests, disable_tqdm: bool = False) -> List[str]:
@@ -416,7 +432,8 @@ class LmEvalEvaluator(Evaluator):
                         is_multimodal=kwargs.pop("is_multimodal", False))
         sampling_params = SamplingParams(
             max_tokens=kwargs.pop("max_output_length"),
-            truncate_prompt_tokens=kwargs.pop("max_input_length"))
+            truncate_prompt_tokens=kwargs.pop("max_input_length"),
+            stop=kwargs.pop("stop", None))
         evaluator.evaluate(llm, sampling_params)
         llm.shutdown()
 
@@ -622,22 +639,29 @@ class MMMU(LmEvalEvaluator):
                   type=int,
                   default=0,
                   help="Random seed for dataset processing.")
-    @click.option("--system_prompt",
-                  type=str,
-                  default=None,
-                  help="System prompt.")
+    @click.option(
+        "--system_prompt",
+        type=str,
+        default=None,
+        help=
+        "The system prompt to be added on the prompt. If specified, it will add {'role': 'system', 'content': system_prompt} to the prompt."
+    )
     @click.option("--max_input_length",
                   type=int,
-                  default=16384,
+                  default=8192,
                   help="Maximum prompt length.")
-    @click.option("--max_output_length",
-                  type=int,
-                  default=16384,
-                  help="Maximum generation length.")
+    @click.option(
+        "--max_output_length",
+        type=int,
+        default=
+        512,  # NOTE: https://github.com/EleutherAI/lm-evaluation-harness/blob/main/lm_eval/tasks/mmmu/_template_yaml#L13
+        help="Maximum generation length.")
     @click.pass_context
     @staticmethod
     def command(ctx, **kwargs) -> None:
         # NOTE: MMMU is a multimodal task, so we need to set the is_multimodal and apply_chat_template flags to True
         kwargs["is_multimodal"] = True
         kwargs["apply_chat_template"] = True
+        kwargs[
+            "stop"] = "<|endoftext|>"  # NOTE: https://github.com/EleutherAI/lm-evaluation-harness/blob/main/lm_eval/tasks/mmmu/_template_yaml#L10
         MMMU.command_harness(ctx, **kwargs)
