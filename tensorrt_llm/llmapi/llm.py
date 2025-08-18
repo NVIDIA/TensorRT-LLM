@@ -16,7 +16,7 @@ from transformers import PreTrainedTokenizerBase
 from tensorrt_llm.inputs.data import TextPrompt
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.inputs.registry import DefaultInputProcessor
-from tensorrt_llm.llmapi.otel_tracing import init_tracer
+from tensorrt_llm.llmapi import tracing
 
 from .._utils import nvtx_range_debug
 from ..bindings import executor as tllm
@@ -224,7 +224,7 @@ class BaseLLM:
 
         try:
             if self.args.otlp_traces_endpoint:
-                init_tracer("trt.llm", self.args.otlp_traces_endpoint)
+                tracing.init_tracer("trt.llm", self.args.otlp_traces_endpoint)
                 logger.info(
                     f"Initialized OTLP tracer successfully, endpoint: {self.args.otlp_traces_endpoint}"
                 )
