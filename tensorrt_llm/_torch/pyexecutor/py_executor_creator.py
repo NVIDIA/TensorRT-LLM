@@ -366,9 +366,10 @@ def create_py_executor(
                     executor_config.max_batch_size,
                     model_engine.model.vocab_size_padded,
                     max_num_draft_tokens=max_num_draft_tokens)
-            # TODO: fix it
-            model_engine.model.spec_worker.guided_decoder = guided_decoder
-            guided_decoder = None
+                # TODO: fix it
+                if hasattr(model_engine.model, "spec_worker"):
+                    model_engine.model.spec_worker.guided_decoder = guided_decoder
+                    guided_decoder = None
 
     with mem_monitor.observe_creation_stage(_ExecutorCreationStage.SAMPLER):
         sampler = instantiate_sampler(model_engine, executor_config,

@@ -278,10 +278,18 @@ class Eagle3OneModelWorker(nn.Module):
 
         raw_logits = logits
 
-        if self.guided_decoder is not None:
-            guided_metadata.token_event.synchronize()
-            self.guided_decoder.rollback_rejected_tokens_v2(guided_metadata)
-            self.guided_decoder.build_v2(guided_metadata)
+        if self.guided_decoder is not None and guided_metadata is not None:
+            with torch.cuda.stream(self.guided_decoder._stream):
+                torch.cuda.current_stream().wait_event(
+                    guided_metadata.token_event)
+                self.guided_decoder.rollback_rejected_tokens_v2(guided_metadata)
+                self.guided_decoder.build_v2(guided_metadata)
+                self.guided_decoder.copy_bitmask(
+                    guided_metadata.scheduled_requests)
+                guided_metadata.bitmask_event.record()
+
+            torch.cuda.current_stream().wait_event(
+                guided_metadata.bitmask_event)
             self.guided_decoder.execute_v2(guided_metadata, logits)
 
         # Sample and accept tokens

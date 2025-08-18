@@ -117,7 +117,10 @@ class GuidedDecoder:
         for llm_req in llm_requests:
             yield llm_req, offset
             offset += 1
-            if llm_req.is_generation_in_progress_state:
+            # Fix race condition: The following host code may change the state of requests and in turn affect the result of hostfunc.
+            # Where the hostfunc is launched, but not executed yet.
+            # if llm_req.is_generation_in_progress_state:
+            if not llm_req.is_context_init_state:
                 # Assume all extended requests have max_num_draft_tokens draft tokens.
                 offset += self.max_num_draft_tokens
 
@@ -156,7 +159,8 @@ class GuidedDecoder:
             else:
                 new_token = gathered_input_ids[offset]
                 draft_tokens = []
-                if llm_req.is_generation_in_progress_state:
+                # if llm_req.is_generation_in_progress_state:
+                if not llm_req.is_context_init_state:
                     draft_tokens = gathered_input_ids[offset + 1:offset + self.
                                                       max_num_draft_tokens + 1]
 
@@ -211,9 +215,12 @@ class GuidedDecoder:
                 self.num_advanced_draft_tokens[
                     slot] += self.num_advanced_tokens[slot]
 
-        with torch.cuda.stream(self._stream):
-            self.bitmask[:num_bitmask_tokens].copy_(
-                self.bitmask_host[:num_bitmask_tokens], non_blocking=True)
+    def copy_bitmask(self, scheduled_requests: ScheduledRequests):
+        num_bitmask_tokens = len(scheduled_requests.context_requests) + len(
+            scheduled_requests.generation_requests) * (
+                self.max_num_draft_tokens + 1)
+        self.bitmask[:num_bitmask_tokens].copy_(
+            self.bitmask_host[:num_bitmask_tokens], non_blocking=True)
 
     @torch.inference_mode()
     @nvtx_range("GuidedDecoder.execute")
@@ -225,8 +232,6 @@ class GuidedDecoder:
 
         This method inplace modifies the logits tensor so that any tokens that violate the grammar constraints are masked out.
         """
-        torch.cuda.current_stream().wait_stream(self._stream)
-
         # TODO: Fuse index_copy and index_select to logits_bitmask.
         if d2t is not None:
             draft_logits = logits
@@ -323,6 +328,7 @@ class GuidedDecoder:
                     slot] = self.grammar_matcher_factory.create(
                         llm_req.guided_decoding_params)
 
+    @hostfunc
     def build_v2(self, guided_metadata: GuidedMetadata):
         self.build(guided_metadata.scheduled_requests,
                    guided_metadata.gathered_input_ids)
@@ -330,6 +336,7 @@ class GuidedDecoder:
     def execute_v2(self, guided_metadata: GuidedMetadata, logits: torch.Tensor):
         self.execute(guided_metadata.scheduled_requests, logits)
 
+    @hostfunc
     def rollback_rejected_tokens_v2(self, guided_metadata: GuidedMetadata):
         self.rollback_rejected_tokens(guided_metadata.scheduled_requests,
                                       guided_metadata.new_tokens_lens)

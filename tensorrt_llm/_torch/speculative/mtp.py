@@ -247,7 +247,7 @@ class MTPSampler(TorchSampler):
 
         state.sampler_event.synchronize()
         new_tokens = state.host.new_tokens
-        new_tokens_lens = state.host.new_tokens_lens
+        new_tokens_lens_list = state.host.new_tokens_lens.tolist()
         next_draft_tokens_list = state.host.next_draft_tokens.tolist()
         beam_idx = self.BEAM
         for req in state.scheduled_requests.context_requests:
@@ -260,7 +260,7 @@ class MTPSampler(TorchSampler):
         for req in state.scheduled_requests.generation_requests:
             if req.state == LlmRequestState.GENERATION_COMPLETE:
                 continue
-            num_new_tokens = new_tokens_lens[req.py_seq_slot]
+            num_new_tokens = new_tokens_lens_list[req.py_seq_slot]
             for i in range(num_new_tokens):
                 new_token = add_token(req, new_tokens, beam=beam_idx, step=i)
                 if self._handle_stop_criteria(req, new_token):
