@@ -46,11 +46,23 @@ class RayExecutor(GenerationExecutor):
 
         super().__init__(model_world_size, postproc_worker_config,
                          is_llm_executor)
-        # Auto-conntect an existing Ray cluster or start a new one if no cluster found.
-        # In colocate case, the driver script in RL framework might have init Ray, hence ignore_reinit_error=True.
-        ray.init(include_dashboard=False,
-                 namespace="trtllm",
-                 ignore_reinit_error=True)
+
+        self.has_start_local_cluser = False
+        ray_init_args = {
+            "include_dashboard": False,
+            "namespace": "trtllm",
+            "ignore_reinit_error": True
+        }
+        try:
+            ray.init(address="auto", **ray_init_args)
+            logger.info(f"Attached to existing Ray cluster")
+        except ConnectionError:
+            logger.info(f"Ray cluster not found, starting a new one")
+
+        if not ray.is_initialized():
+            ray.init(**ray_init_args)
+            self.has_start_local_cluser = True
+
         self.world_size = model_world_size
         self.tp_size = tp_size
         self.master_address = ray.util.get_node_ip_address()
@@ -83,7 +95,7 @@ class RayExecutor(GenerationExecutor):
             "MASTER_PORT": str(self.master_port)
         })
 
-        placement_group, bundle_indices = self._get_placement_group(
+        self.placement_group, self.bundle_indices = self._get_placement_group(
             tp_size=self.tp_size)
 
         self.workers = [
@@ -92,8 +104,8 @@ class RayExecutor(GenerationExecutor):
                 num_cpus=num_gpus * 2,
                 runtime_env=runtime_env,  # per-actor env
                 scheduling_strategy=PlacementGroupSchedulingStrategy(
-                    placement_group=placement_group,
-                    placement_group_bundle_index=bundle_indices[rank],
+                    placement_group=self.placement_group,
+                    placement_group_bundle_index=self.bundle_indices[rank],
                 )).remote(worker_cls, worker_kwargs, self.world_size, rank,
                           worker_extension_cls)
             for rank in range(self.world_size)
@@ -213,27 +225,35 @@ class RayExecutor(GenerationExecutor):
         self.proxy_executor.abort_request(request_id)
 
     def shutdown(self):
-        pass
-        #self.proxy_executor.shutdown()
+        self.workers = None
+        if self.placement_group is not None:
+            ray.util.remove_placement_group(self.placement_group)
+            self.placement_group = None
+        self.bundle_indices = None
+
+        if self.has_start_local_cluser:
+            print("Shutting down Ray cluster")
+            ray.shutdown()
 
     @property
     def enable_postprocess_parallel(self) -> bool:
-        return self.proxy_executor.enable_postprocess_parallel
+        raise NotImplementedError(
+            "enable_postprocess_parallel is not implemented")
 
     def get_stats(self, timeout: float) -> List[dict]:
-        return self.proxy_executor.get_stats(timeout)
+        raise NotImplementedError("get_stats is not implemented")
 
     def aget_stats(self, timeout: float) -> IterationResult:
-        return self.proxy_executor.aget_stats(timeout)
+        raise NotImplementedError("aget_stats is not implemented")
 
     def get_kv_events(self, timeout: float) -> List[dict]:
-        return self.proxy_executor.get_kv_events(timeout)
+        raise NotImplementedError("get_kv_events is not implemented")
 
     def aget_kv_events(self, timeout=None) -> IterationResult:
-        return self.proxy_executor.aget_kv_events(timeout)
+        raise NotImplementedError("aget_kv_events is not implemented")
 
     def wait_first_completed(self, futures: List[GenerationResult]):
-        return self.proxy_executor.wait_first_completed(futures)
+        raise NotImplementedError("wait_first_completed is not implemented")
 
     def _get_placement_group(self,
                              tp_size: int) -> Tuple[PlacementGroup, List[int]]:

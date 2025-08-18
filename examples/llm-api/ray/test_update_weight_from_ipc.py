@@ -1,6 +1,5 @@
 from typing import List
 
-import ray
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -230,7 +229,3 @@ if __name__ == "__main__":
     for i in range(len(llm_texts)):
         assert llm_texts[i] == results[0][0][
             i], f"Stage 3 texts should be the same as stage 1, while {llm_texts[i]} != {results[0][i]}"
-
-    del llm
-    # TODO: should fix ray shutdown inside LLM
-    ray.shutdown()

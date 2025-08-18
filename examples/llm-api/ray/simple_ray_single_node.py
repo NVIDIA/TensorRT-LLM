@@ -9,7 +9,6 @@ python simple_ray_single_node.py  --model_dir=/scratch/llm-models/DeepSeek-V3-Li
 import argparse
 from typing import List
 
-import ray
 import torch
 from tabulate import tabulate
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -57,7 +56,6 @@ def run_llm_with_config(config: dict, prompts: List[str]):
     llm = LLM(**config)
     llm_ret = llm.generate(prompts)
     del llm
-    ray.shutdown()
     outputs = []
     for index, r in enumerate(llm_ret):
         outputs.append(prompts[index] + " " + r.outputs[0].text)
@@ -85,6 +83,11 @@ def parse_arguments():
     parser.add_argument('--pp_size', type=int, default=1)
     parser.add_argument('--moe_ep_size', type=int, default=-1)
     parser.add_argument('--moe_tp_size', type=int, default=-1)
+    parser.add_argument(
+        '--run_hf',
+        action='store_true',
+        default=False,
+        help="Whether to run HuggingFace inference for comparison.")
 
     args = parser.parse_args()
     return args
@@ -140,9 +143,14 @@ if __name__ == "__main__":
             f"Manually add your parallel config for {model_name} in script for now."
         )
 
-    print("Running HF reference")
-    generated_text = {}
-    generated_text["hf"] = run_hf_model(model_name, prompts)
+    if args.run_hf:
+        print("Running HF reference")
+        generated_text = {}
+        generated_text["hf"] = run_hf_model(model_name, prompts)
+    else:
+        print("Skipping HF reference (use --run_hf to enable)")
+        generated_text = {}
+        generated_text["hf"] = ["HF inference skipped."] * len(prompts)
 
     gpu_count = torch.cuda.device_count()
     for base_config in test_configs:
