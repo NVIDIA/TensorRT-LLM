@@ -13,7 +13,8 @@ class HandleLogits:
     @nvtx_range("handle_logits")
     def __call__(self, context_requests: List[LlmRequest],
                  generation_requests: List[LlmRequest], logits: torch.Tensor,
-                 beam_width: int, num_context_logits_prefix_sum: list[int]):
+                 beam_width: int, num_context_logits_prefix_sum: list[int],
+                 is_generation_model: bool):
         """Handles context and generation logits for a batch of requests.
 
         Args:
@@ -22,7 +23,19 @@ class HandleLogits:
             logits: Input logits tensor
             beam_width: Beam width for the generation requests
             num_context_logits_prefix_sum: Prefix sum of the logits
+            is_generation_model: Bool containing whether the model is generation or not
         """
+        if not is_generation_model:
+            for batch_index, llm_req in enumerate(context_requests):
+                logits_temp = logits[batch_index]
+                if logits_temp.ndim == 1:
+                    # For BERT: Add axis to be compatible with LogitsStorage
+                    # (LogitsStorage will interpret this dim as the prompt_len which
+                    # is not relevant for outputting logits of encoder only model).
+                    logits_temp = logits_temp.unsqueeze(0)
+                llm_req.py_result.append_context_logits(logits_temp)
+            return
+
         # Copy logits into decoderBuffers.logits
         for batch_index, llm_req in enumerate(context_requests):
             logits_begin = num_context_logits_prefix_sum[batch_index]
