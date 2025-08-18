@@ -47,10 +47,7 @@ init_ubuntu() {
   # libibverbs-dev is installed but libmlx5.so is missing, reinstall the package
   apt-get --reinstall install -y libibverbs-dev
   apt-get install -y --no-install-recommends \
-    ccache \
-    gdb \
     git-lfs \
-    clang \
     lld \
     llvm \
     libclang-rt-dev \
