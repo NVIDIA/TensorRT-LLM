@@ -620,7 +620,14 @@ class TritonMXFP4FusedMoEQuantScales(NamedTuple):
 
 
 def swizzle_weight_and_scale(w: torch.Tensor, w_scale: torch.Tensor):
-    w = w.transpose(-1, -2).contiguous().transpose(-1, -2)
+    # (num_experts, in_dim//2, out_dim)
+    w_shape = w.shape
+    # (num_experts, in_dim//32, out_dim)
+    w_scale_shape = w_scale.shape
+    assert w_shape[0] == w_scale_shape[0]
+    assert w_shape[1] * 2 == w_scale_shape[1] * 32
+    assert w_shape[2] == w_scale_shape[2]
+    w = maybe_update_stride(w)
     #num_warps = 4 if batch <= 512 else 8
     num_warps = int(os.getenv("TRITON_MOE_MXFP4_NUM_WARPS", 4))
     assert num_warps in [4, 8], \
