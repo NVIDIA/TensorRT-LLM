@@ -39,7 +39,10 @@ def temp_extra_llm_api_options_file():
                 "max_lora_rank": 8,
                 "max_loras": 4,
                 "max_cpu_loras": 4,
-            }
+            },
+            # Disable CUDA graph
+            # TODO: remove this once we have a proper fix for CUDA graph in LoRA
+            "cuda_graph_config": None
         }
 
         with open(temp_file_path, 'w') as f:

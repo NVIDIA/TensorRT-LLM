@@ -255,14 +255,11 @@ def test_embedding_bias_with_torch_sampler_strategies(enable_mixed_sampler,
 
     sampling_params = SamplingParams(**sampling_kwargs)
 
-    llm_test_harness(
-        llama_model_path,
-        prompts,
-        ["Z Z Z Z Z Z"],
-        sampling_params=sampling_params,
-        backend="pytorch",
-        use_torch_sampler=True,  # Use TorchSampler to test all 3 paths
-        enable_mixed_sampler=enable_mixed_sampler)
+    llm_test_harness(llama_model_path,
+                     prompts, ["Z Z Z Z Z Z"],
+                     sampling_params=sampling_params,
+                     backend="pytorch",
+                     enable_mixed_sampler=enable_mixed_sampler)
 
 
 def llama_7b_lora_from_dir_test_harness(**llm_kwargs) -> None:
