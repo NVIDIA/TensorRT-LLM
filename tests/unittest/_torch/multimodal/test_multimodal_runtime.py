@@ -23,7 +23,7 @@ class TestMultimodalRuntimeData:
 
         # All tokens should be cached since past_seen_token_num (20) >= all positions + lengths
         assert runtime.num_unseen_mm_tokens == 20
-        assert runtime.num_mm_tokens == 0
+        assert runtime.num_mm_tokens_in_chunk == 0
 
     def test_no_cached_multimodal_tokens(self):
         """Test when no multimodal tokens are cached (KV cache reuse scenario)."""
@@ -36,7 +36,7 @@ class TestMultimodalRuntimeData:
 
         # No multimodal tokens should be cached
         assert runtime.num_unseen_mm_tokens == 0
-        assert runtime.num_mm_tokens == 20
+        assert runtime.num_mm_tokens_in_chunk == 20
 
     def test_partial_caching_with_chunk_boundaries(self):
         """Test partial caching with chunk boundaries (chunked prefill scenario)."""
@@ -51,7 +51,7 @@ class TestMultimodalRuntimeData:
         # Chunk 1: [18-26] - 0 tokens cached, 8 tokens in current chunk (18-26)
         # Chunk 2: [25-32] - 0 tokens cached, 5 tokens in current chunk (25-30), 2 tokens beyond chunk
         assert runtime.num_unseen_mm_tokens == 5  # 5 tokens from chunk 0
-        assert runtime.num_mm_tokens == 13  # 8 + 5 tokens in current chunk
+        assert runtime.num_mm_tokens_in_chunk == 13  # 8 + 5 tokens in current chunk
 
     def test_chunk_boundary_case1(self):
         """Test case chunk around chunk boundaries."""
@@ -66,7 +66,7 @@ class TestMultimodalRuntimeData:
         # Chunk 1: [16-20] - 0 tokens cached, 4 tokens in current chunk (16-20)
         # Chunk 2: [22-30] - 0 tokens cached, 0 tokens in current chunk (beyond chunk_end_pos)
         assert runtime.num_unseen_mm_tokens == 4  # 4 tokens from chunk 0
-        assert runtime.num_mm_tokens == 6  # 2 + 4 tokens in current chunk
+        assert runtime.num_mm_tokens_in_chunk == 6  # 2 + 4 tokens in current chunk
 
     def test_chunk_boundary_case2(self):
         """Test test chunk end is very large."""
@@ -81,7 +81,7 @@ class TestMultimodalRuntimeData:
         expected_cached = 3 + 4 + 5 + 6 + 5  # 23 tokens
         expected_current_chunk = 2 + 8  # 10 tokens
         assert runtime.num_unseen_mm_tokens == expected_cached
-        assert runtime.num_mm_tokens == expected_current_chunk
+        assert runtime.num_mm_tokens_in_chunk == expected_current_chunk
 
     def test_validation_errors(self):
         """Test validation logic for invalid inputs."""
@@ -124,21 +124,23 @@ class TestMultimodalRuntimeData:
 class TestFindInputMmEmbed:
     """Focused test cases for find_input_mm_embeds function - testing both KV cache reuse and chunked prefill."""
 
-    def create_mock_runtime(self, num_unseen_mm_tokens: int, num_mm_tokens: int,
+    def create_mock_runtime(self, num_unseen_mm_tokens: int,
+                            num_mm_tokens_in_chunk: int,
                             mm_token_lengths: List[int]):
         """Helper to create a mock MultimodalRuntimeData."""
         runtime = Mock(spec=MultimodalRuntimeData)
         runtime.num_unseen_mm_tokens = num_unseen_mm_tokens
-        runtime.num_mm_tokens = num_mm_tokens
-        runtime.total_mm_tokens = sum(mm_token_lengths)
+        runtime.num_mm_tokens_in_chunk = num_mm_tokens_in_chunk
+        runtime.total_mm_tokens_in_request = sum(mm_token_lengths)
 
         return runtime
 
     def create_multimodal_params(self, num_unseen_mm_tokens: int,
-                                 num_mm_tokens: int,
+                                 num_mm_tokens_in_chunk: int,
                                  mm_token_lengths: List[int]):
         """Helper to create MultimodalParams with runtime data."""
-        runtime = self.create_mock_runtime(num_unseen_mm_tokens, num_mm_tokens,
+        runtime = self.create_mock_runtime(num_unseen_mm_tokens,
+                                           num_mm_tokens_in_chunk,
                                            mm_token_lengths)
         return MultimodalParams(multimodal_runtime=runtime)
 
@@ -268,7 +270,8 @@ class TestFindInputMmEmbed:
         result = find_input_mm_embeds(mm_embeds, multimodal_params)
 
         # Should return the full embeddings
-        assert result == mm_embeds
+        assert len(result) == 1
+        torch.testing.assert_close(result[0], mm_embeds[0])
 
     def test_chunked_prefill_scenario(self):
         """
@@ -328,7 +331,8 @@ class TestFindInputMmEmbed:
         mm_embeds = [torch.randn(20, 512)]
         multimodal_params = [self.create_multimodal_params(0, 20, [20])]
         result = find_input_mm_embeds(mm_embeds, multimodal_params)
-        assert result == mm_embeds
+        assert len(result) == 1
+        torch.testing.assert_close(result[0], mm_embeds[0])
 
         # Single batch, partial caching
         multimodal_params = [self.create_multimodal_params(5, 15, [20])]
@@ -368,7 +372,7 @@ class TestGetMultimodalEmbeddings:
     def create_mock_runtime(self, total_mm_tokens: int):
         """Helper to create a mock MultimodalRuntimeData with total_mm_tokens."""
         runtime = Mock(spec=MultimodalRuntimeData)
-        runtime.total_mm_tokens = total_mm_tokens
+        runtime.total_mm_tokens_in_request = total_mm_tokens
         return runtime
 
     def create_multimodal_params_with_data(self,
@@ -410,8 +414,9 @@ class TestGetMultimodalEmbeddings:
             nonlocal encoder_call_count
             encoder_call_count += 1
             # Return concatenated embeddings for all params
-            total_tokens = sum(param.multimodal_runtime.total_mm_tokens
-                               for param in params)
+            total_tokens = sum(
+                param.multimodal_runtime.total_mm_tokens_in_request
+                for param in params)
             return [torch.randn(total_tokens, 512)]
 
         multimodal_params = [
@@ -489,8 +494,9 @@ class TestGetMultimodalEmbeddings:
             encoder_call_count += 1
             processed_params = params
             # Return embeddings for uncached params only
-            total_tokens = sum(param.multimodal_runtime.total_mm_tokens
-                               for param in params)
+            total_tokens = sum(
+                param.multimodal_runtime.total_mm_tokens_in_request
+                for param in params)
             return [torch.randn(total_tokens, 512)]
 
         # Mix: cached, uncached, cached
@@ -561,7 +567,7 @@ class TestGetMultimodalEmbeddings:
 
         # Create runtime without total_mm_tokens
         runtime = Mock(spec=MultimodalRuntimeData)
-        runtime.total_mm_tokens = None
+        runtime.total_mm_tokens_in_request = None
 
         param = MultimodalParams(multimodal_data={
             "image": {

@@ -1325,7 +1325,6 @@ class PyTorchModelEngine(ModelEngine):
             num_cached_tokens_per_seq.append(past_seen_token_num)
 
             # Multimodal
-            # TODO: enable chunk prefill for multimodal (maybe need to pass prompt_tokens to MultimodalRuntimeData)
             py_multimodal_runtime = MultimodalRuntimeData(
                 mm_token_lengths=request.multimodal_lengths,
                 mm_token_positions=request.multimodal_positions,
