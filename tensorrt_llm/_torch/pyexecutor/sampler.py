@@ -107,12 +107,13 @@ def top_k_sampling_batch(logits,
     batch_size, vocab_size = logits.size()
 
     # get first top_k logits of each sample and their indices
-    values, indices = torch.topk(logits, top_k, dim=-1)
-    min_values = values[:, -1].unsqueeze(-1).expand(batch_size, vocab_size)
+    if top_k > 0:
+        values, indices = torch.topk(logits, top_k, dim=-1)
+        min_values = values[:, -1].unsqueeze(-1).expand(batch_size, vocab_size)
 
-    # set the logits who is less than first top_k logits to -inf
-    logits = torch.where(logits < min_values,
-                         torch.full_like(logits, float('-inf')), logits)
+        # set the logits who is less than first top_k logits to -inf
+        logits = torch.where(logits < min_values,
+                             torch.full_like(logits, float('-inf')), logits)
 
     # compute probability distribution
     softmax = torch.softmax(logits, dim=-1)
@@ -173,12 +174,13 @@ def top_k_top_p_sampling_batch(logits: torch.Tensor,
         logits = logits / max(temperature, 1e-5)
     batch_size, vocab_size = logits.size()
     # get first top_k logits of each sample and their indices
-    values, indices = torch.topk(logits, top_k, dim=-1)
-    min_values = values[:, -1].unsqueeze(-1).expand(batch_size, vocab_size)
+    if top_k > 0:
+        values, indices = torch.topk(logits, top_k, dim=-1)
+        min_values = values[:, -1].unsqueeze(-1).expand(batch_size, vocab_size)
 
-    # set the logits who is less than first top_k logits to -inf
-    logits = torch.where(logits < min_values,
-                         torch.full_like(logits, float('-inf')), logits)
+        # set the logits who is less than first top_k logits to -inf
+        logits = torch.where(logits < min_values,
+                             torch.full_like(logits, float('-inf')), logits)
 
     sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
 
