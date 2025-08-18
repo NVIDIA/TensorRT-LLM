@@ -2098,11 +2098,11 @@ class TorchLlmArgs(BaseLlmArgs):
                                  description="Print iteration logs.",
                                  status="beta")
 
-    batch_wait_timeout: float = Field(
+    batch_wait_timeout_ms: float = Field(
         default=0,
         description=
         "If greater than 0, returns immediately when fetched requests exceed max_batch_size; "
-        "otherwise, waits up to batch_wait_timeout to gather more. If 0, no waiting occurs.",
+        "otherwise, waits up to batch_wait_timeout_ms to gather more. If 0, no waiting occurs.",
         status="prototype")
 
     torch_compile_config: Optional[TorchCompileConfig] = Field(
@@ -2352,10 +2352,10 @@ class TorchLlmArgs(BaseLlmArgs):
         return self
 
     @model_validator(mode='after')
-    def validate_batch_wait_timeout(self) -> 'TorchLlmArgs':
+    def validate_batch_wait_timeout_ms(self) -> 'TorchLlmArgs':
         """Validate batch wait timeout."""
-        if self.batch_wait_timeout < 0:
-            raise ValueError("batch_wait_timeout must be greater than 0")
+        if self.batch_wait_timeout_ms < 0:
+            raise ValueError("batch_wait_timeout_ms must be greater than 0")
         return self
 
     # TODO: Remove this after the PyTorch backend is fully migrated to TorchLlmArgs from ExecutorConfig
@@ -2424,7 +2424,7 @@ class TorchLlmArgs(BaseLlmArgs):
             attention_dp_batching_wait_iters=self.attention_dp_config.
             batching_wait_iters if self.attention_dp_config is not None else
             AttentionDpConfig.model_fields['batching_wait_iters'].default,
-            batch_wait_timeout=self.batch_wait_timeout)
+            batch_wait_timeout_ms=self.batch_wait_timeout_ms)
 
 
 def update_llm_args_with_extra_dict(

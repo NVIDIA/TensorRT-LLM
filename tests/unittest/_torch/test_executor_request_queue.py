@@ -40,7 +40,7 @@ def executor_queue(mock_dist):
                                 max_beam_width=1,
                                 max_num_active_requests=16,
                                 enable_iter_perf_stats=True,
-                                batch_wait_timeout=0.0,
+                                batch_wait_timeout_ms=0.0,
                                 is_disaggregated=False)
 
 
@@ -53,7 +53,7 @@ def integration_queue(mock_dist):
                                 max_beam_width=2,
                                 max_num_active_requests=8,
                                 enable_iter_perf_stats=True,
-                                batch_wait_timeout=0.0,
+                                batch_wait_timeout_ms=0.0,
                                 is_disaggregated=False)
 
 
@@ -228,8 +228,8 @@ def test_get_from_request_queue_async_behavior(executor_queue):
             item = RequestQueueItem(i + 10, Mock())
             executor_queue.request_queue.put(item)
 
-    # Test 1: Without batch_wait_timeout (should only get initial requests)
-    executor_queue.batch_wait_timeout = 0.0
+    # Test 1: Without batch_wait_timeout_ms (should only get initial requests)
+    executor_queue.batch_wait_timeout_ms = 0.0
 
     initial_requests = 3
     for i in range(initial_requests):
@@ -250,8 +250,8 @@ def test_get_from_request_queue_async_behavior(executor_queue):
 
     thread.join()
 
-    # Test 2: With batch_wait_timeout (should wait and get all requests)
-    executor_queue.batch_wait_timeout = 0.2
+    # Test 2: With batch_wait_timeout_ms (should wait and get all requests)
+    executor_queue.batch_wait_timeout_ms = 200.0
 
     # Clear the queue and add initial requests again
     while not executor_queue.request_queue.empty():
@@ -268,7 +268,7 @@ def test_get_from_request_queue_async_behavior(executor_queue):
     thread = threading.Thread(target=add_requests_after_delay, args=(0.05, 3))
     thread.start()
 
-    # Get requests with batch_wait_timeout - should wait and get all
+    # Get requests with batch_wait_timeout_ms - should wait and get all
     start_time = time.time()
     items = executor_queue._get_from_request_queue(None)
     elapsed = time.time() - start_time
@@ -442,7 +442,7 @@ def attention_dp_queue(mock_dist_attention_dp):
                                  max_beam_width=2,
                                  max_num_active_requests=8,
                                  enable_iter_perf_stats=True,
-                                 batch_wait_timeout=0.0,
+                                 batch_wait_timeout_ms=0.0,
                                  is_disaggregated=False)
     # Initialize all_ranks_num_active_requests
     return queue

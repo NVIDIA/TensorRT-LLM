@@ -123,7 +123,7 @@ methods:
         annotation: bool
         default: False
         status: prototype
-      batch_wait_timeout:
+      batch_wait_timeout_ms:
         annotation: float
         default: 0
         status: prototype
