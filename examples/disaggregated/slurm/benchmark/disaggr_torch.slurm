@@ -13,32 +13,34 @@ ctx_tp_size=${2}
 ctx_batch_size=${3}
 ctx_max_num_tokens=${4}
 ctx_enable_attention_dp=${5}
+ctx_gpu_memory_fraction=${6}
 
 # Generation servers arguments
-num_gen_servers=${6}
-gen_tp_size=${7}
-gen_batch_size=${8}
-gen_max_num_tokens=${9}
-gen_enable_attention_dp=${10}
-gen_gpu_memory_fraction=${11}
+num_gen_servers=${7}
+gen_tp_size=${8}
+gen_batch_size=${9}
+gen_max_num_tokens=${10}
+gen_enable_attention_dp=${11}
+gen_gpu_memory_fraction=${12}
 
 # Other arguments
-eplb_num_slots=${12}
-mtp_size=${13}
+eplb_num_slots=${13}
+mtp_size=${14}
 
 # Benchmarking arguments
-concurrency=${14}
-isl=${15}
-osl=${16}
-multi_round=${17}
-streaming=${18}
+concurrency=${15}
+isl=${16}
+osl=${17}
+multi_round=${18}
+streaming=${19}
 
 # User specific arguments
-container_image=${19}
-mounts=${20}
-workdir=${21}
-model_dir=${22}
-trtllm_repo=${23}
+container_image=${20}
+mounts=${21}
+workdir=${22}
+model_dir=${23}
+benchmark_mode=${24}
+trtllm_repo=${25}
 
 echo "================= parameters ================="
 echo "num_ctx_servers: ${num_ctx_servers}"
@@ -46,6 +48,7 @@ echo "ctx_tp_size: ${ctx_tp_size}"
 echo "ctx_batch_size: ${ctx_batch_size}"
 echo "ctx_max_num_tokens: ${ctx_max_num_tokens}"
 echo "ctx_enable_attention_dp: ${ctx_enable_attention_dp}"
+echo "ctx_gpu_memory_fraction: ${ctx_gpu_memory_fraction}"
 echo "num_gen_servers: ${num_gen_servers}"
 echo "gen_tp_size: ${gen_tp_size}"
 echo "gen_batch_size: ${gen_batch_size}"
@@ -63,13 +66,14 @@ echo "container_image: ${container_image}"
 echo "mounts: ${mounts}"
 echo "workdir: ${workdir}"
 echo "model_dir: ${model_dir}"
+echo "benchmark_mode: ${benchmark_mode}"
 echo "trtllm_repo: ${trtllm_repo}"
 echo "==========================================="
 
 
 ctx_max_seq_len=$((isl + 1))
 gen_max_seq_len=$((isl + osl))
-ctx_gpu_frac=0.75
+ctx_gpu_frac=${ctx_gpu_memory_fraction}
 cache_transceiver_max_num_tokens=8448
 
 container_name=disaggr
@@ -148,7 +152,7 @@ echo "server host name: $hostname_value"
 srun -l --container-name=${container_name} \
         --container-mounts=${mounts} \
         --mpi=pmix --overlap \
-        bash ${workdir}/start_worker.sh ${full_logdir}/config.yaml "${enable_pdl}" ${ctx_gpus} ${nsys_on} &> ${full_logdir}/output_workers.log &
+        bash ${workdir}/start_worker.sh ${full_logdir}/config.yaml "${enable_pdl}" ${ctx_gpus} ${benchmark_mode} ${concurrency} ${nsys_on} &> ${full_logdir}/output_workers.log &
 
 # start the server
 srun -l --container-name=${container_name} \
