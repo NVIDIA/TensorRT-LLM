@@ -759,7 +759,6 @@ class PyExecutor:
                             assert sample_state is not None, "Sampling failed"
                             sample_state.host.logits = logits_host
                             self._update_request_states(scheduled_batch)
-                            sample_state.sampler_event.synchronize()
 
                     if self.enable_iter_perf_stats:
                         iter_stats.inflight_batching_stats.num_ctx_tokens = self.model_engine.iter_states[
@@ -809,6 +808,7 @@ class PyExecutor:
                     if not self.dist.is_second_last_pp_rank:
                         if self.send_handles[prev_microbatch_id] is not None:
                             self.send_handles[prev_microbatch_id].wait()
+                            self.send_handles[prev_microbatch_id] = None
                         needs_logits = (
                             self._need_return_logits(scheduled_batch)
                             or (self._need_return_log_probs(scheduled_batch)
