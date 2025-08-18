@@ -345,6 +345,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     MODEL_PATH = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct"
 
     @pytest.mark.skip_less_device_memory(32000)
+    @pytest.mark.skip_less_device(2)
     @pytest.mark.parametrize("disable_overlap_scheduler", [False, True])
     def test_auto_dtype(self, disable_overlap_scheduler):
         ctx_server_config = {"disable_overlap_scheduler": True}
@@ -374,6 +375,8 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @pytest.mark.skip_less_device(2)
+    @skip_pre_hopper
     def test_ngram(self):
         speculative_decoding_config = {
             "decoding_type": "NGram",
@@ -424,6 +427,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     @skip_pre_hopper
     @parametrize_with_ids("overlap_scheduler", [True, False])
     @parametrize_with_ids("eagle3_one_model", [True, False])
+    @pytest.mark.skip_less_device(2)
     def test_eagle3(self, overlap_scheduler, eagle3_one_model):
         speculative_decoding_config = {
             "decoding_type": "Eagle",
@@ -578,7 +582,6 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
         return run_parallel_test(self.MODEL_NAME, self.MODEL_PATH, pp, tp, pp,
                                  tp, 1, 1, [get_accuracy_task(testset)])
 
-    @pytest.mark.skip_less_device(4)
     @parametrize_with_ids("ctx_pp", [2, 4])
     @parametrize_with_ids("gen_tp", [1, 2])
     @pytest.mark.parametrize("testset", ["GSM8K", "MMLU"])
@@ -589,20 +592,18 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
         return run_parallel_test(self.MODEL_NAME, self.MODEL_PATH, ctx_pp, 1, 1,
                                  gen_tp, 1, 1, [get_accuracy_task(testset)])
 
-    @pytest.mark.skip_less_device(4)
     @pytest.mark.parametrize("testset", ["GSM8K", "MMLU"])
     def test_multi_instance(self, testset):
         return run_parallel_test(self.MODEL_NAME, self.MODEL_PATH, 1, 1, 1, 1,
                                  2, 2, [get_accuracy_task(testset)])
 
 
-@pytest.mark.skip_less_device_memory(140000)
-@pytest.mark.timeout(3600)
-@pytest.mark.skip_less_device(4)
 class TestLlama4ScoutInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "meta-llama/Llama-4-Scout-17B-16E-Instruct"
     MODEL_PATH = f"{llm_models_root()}/llama4-models/Llama-4-Scout-17B-16E-Instruct"
 
+    @pytest.mark.skip_less_device_memory(140000)
+    @pytest.mark.timeout(3600)
     @pytest.mark.skip_less_device(8)
     @pytest.mark.parametrize("overlap_scheduler", [False, True])
     def test_auto_dtype(self, overlap_scheduler):
@@ -683,7 +684,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     @parametrize_with_ids("overlap_scheduler", [True, False])
     @parametrize_with_ids("mtp_nextn",
                           [0, pytest.param(2, marks=skip_pre_hopper)])
-    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_less_device(8)
     def test_auto_dtype(self, overlap_scheduler, mtp_nextn):
         ctx_server_config = {"disable_overlap_scheduler": True}
         gen_server_config = {"disable_overlap_scheduler": not overlap_scheduler}
@@ -727,6 +728,7 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "google/gemma-3-1b-it"
     MODEL_PATH = f"{llm_models_root()}/gemma/gemma-3-1b-it/"
 
+    @pytest.mark.skip_less_device(2)
     @pytest.mark.parametrize("overlap_scheduler", [False, True])
     def test_auto_dtype(self, overlap_scheduler):
         pytest.skip(
@@ -816,8 +818,9 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
-    @pytest.mark.parametrize("overlap_scheduler", [False, True])
     @skip_pre_hopper
+    @pytest.mark.skip_less_device(2)
+    @pytest.mark.parametrize("overlap_scheduler", [False, True])
     def test_auto_dtype(self, overlap_scheduler):
         ctx_server_config = {
             "disable_overlap_scheduler": True,
