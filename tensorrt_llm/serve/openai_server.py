@@ -84,6 +84,8 @@ class OpenAIServer:
         else:
             self.model = model
         self.metrics_collector = None
+        self.perf_metrics = []
+        self.perf_metrics_lock = asyncio.Lock()
         if self.llm.args.return_perf_metrics:
             set_prometheus_multiproc_dir()
             self.metrics_collector = MetricsCollector({
@@ -159,6 +161,7 @@ class OpenAIServer:
         self.app.add_api_route("/v1/models", self.get_model, methods=["GET"])
         # TODO: the metrics endpoint only reports iteration stats, not the runtime stats for now
         self.app.add_api_route("/metrics", self.get_iteration_stats, methods=["GET"])
+        self.app.add_api_route("/perf_metrics", self.get_perf_metrics, methods=["GET"])
         # TODO: workaround before ETCD support
         self.app.add_api_route("/kv_cache_events", self.get_kv_cache_events, methods=["POST"])
         self.app.add_api_route("/v1/completions",
@@ -255,6 +258,31 @@ class OpenAIServer:
             stats.append(stat)
         return JSONResponse(content=stats)
 
+    async def get_perf_metrics(self) -> JSONResponse:
+        async with self.perf_metrics_lock:
+            perf_metrics = self.perf_metrics
+            self.perf_metrics = []
+        for metrics_dict in perf_metrics:
+            metrics = metrics_dict["perf_metrics"]
+            timing_metrics = metrics.timing_metrics
+            # TODO: other metrics
+            metrics_json = {
+                "first_iter": metrics.first_iter,
+                "last_iter": metrics.last_iter,
+                "arrival_time": timing_metrics.arrival_time.total_seconds(),
+                "first_scheduled_time": timing_metrics.first_scheduled_time.total_seconds(),
+                "first_token_time": timing_metrics.first_token_time.total_seconds(),
+                "last_token_time": timing_metrics.last_token_time.total_seconds(),
+            }
+            if timing_metrics.kv_cache_size > 0:
+                metrics_json.update({
+                    "kv_cache_size": timing_metrics.kv_cache_size,
+                    "kv_cache_transfer_start": timing_metrics.kv_cache_transfer_start.total_seconds(),
+                    "kv_cache_transfer_end": timing_metrics.kv_cache_transfer_end.total_seconds(),
+                })
+            metrics_dict["perf_metrics"] = metrics_json
+        return JSONResponse(content=perf_metrics)
+
     async def get_kv_cache_events(self) -> JSONResponse:
         events = []
         try:
@@ -264,6 +292,22 @@ class OpenAIServer:
             # queue is empty, no more events
             pass
         return JSONResponse(content=events)
+
+    async def _extract_metrics(self, res: RequestOutput):
+        if not res.finished:
+            return
+        if self.metrics_collector:
+            self.metrics_collector.log_metrics_dict(res.metrics_dict)
+        if self.llm.args.return_perf_metrics:
+            output = res.outputs[0]
+            item = {
+                "request_id": res.request_id,
+                "perf_metrics": res.outputs[0].request_perf_metrics
+            }
+            if output.disaggregated_params:
+                item["ctx_request_id"] = output.disaggregated_params.ctx_request_id
+            async with self.perf_metrics_lock:
+                self.perf_metrics.append(item)
 
     async def openai_chat(self, request: ChatCompletionRequest, raw_request: Request) -> Response:
 
@@ -280,8 +324,7 @@ class OpenAIServer:
                 post_processor, args = postproc_params.post_processor, postproc_params.postproc_args
             async for res in promise:
                 pp_results = res.outputs[0]._postprocess_result if self.postproc_worker_enabled else post_processor(res, args)
-                if res.finished and self.metrics_collector:
-                    self.metrics_collector.log_metrics_dict(res.metrics_dict)
+                await self._extract_metrics(res)
                 for pp_res in pp_results:
                     yield pp_res
             yield "data: [DONE]\n\n"
@@ -299,8 +342,7 @@ class OpenAIServer:
             # Add prompt_tokens_ids to the response
             if disaggregated_params and disaggregated_params.request_type and disaggregated_params.request_type == "context_only":
                 chat_response.prompt_token_ids = promise.prompt_token_ids
-            if promise.finished and self.metrics_collector:
-                self.metrics_collector.log_metrics_dict(promise.metrics_dict)
+            await self._extract_metrics(promise)
             return chat_response
 
         try:
@@ -469,8 +511,7 @@ class OpenAIServer:
             if disaggregated_params and disaggregated_params.request_type and disaggregated_params.request_type == "context_only":
                 # Include prompt token ids for context-only requests
                 pp_result.prompt_token_ids = response.prompt_token_ids
-            if response.finished and self.metrics_collector:
-                self.metrics_collector.log_metrics_dict(response.metrics_dict)
+            await self._extract_metrics(response)
             return pp_result
 
         def merge_completion_responses(responses: List[CompletionResponse]) -> CompletionResponse:
@@ -506,8 +547,7 @@ class OpenAIServer:
                     pp_result = post_processor(output, args)
                 else:
                     pp_result = output.outputs[0]._postprocess_result
-                if output.finished and self.metrics_collector:
-                    self.metrics_collector.log_metrics_dict(output.metrics_dict)
+                await self._extract_metrics(output)
                 for pp_res in pp_result:
                     yield pp_res
 
