@@ -207,8 +207,9 @@ inline __device__ void dequantCopy(
 template <typename T, int BLOCK_SIZE, int K_DIM, int ROPE_DIM, typename KVCacheBuffer>
 __global__ void applyMLARopeAndAssignQKVKernelOptContext(T* qkv_output, T const* fuse_buf, KVCacheBuffer kv_cache,
     float2 const* cos_sin_cache, size_t head_num, int head_size, int c_k, int* cu_q_seqlens,
-    int32_t const* kv_cache_lengths, uint32_t max_input_seq_len, KvCacheDataType cache_type,
-    float const* quant_scale_kv)
+    int32_t const* kv_cache_lengths, uint32_t max_input_seq_len, KvCacheDataType cache_type, float* bmm1_scale,
+    float* bmm2_scale, float const* quant_scale_o, float const* quant_scale_kv, float const* dequant_scale_q,
+    float const* dequant_scale_kv, float host_bmm1_scale)
 {
 
     // Constants.
@@ -230,6 +231,32 @@ __global__ void applyMLARopeAndAssignQKVKernelOptContext(T* qkv_output, T const*
     // Block/Head idx.
     size_t const batch_idx = blockIdx.y;
     size_t const head_idx = blockIdx.z;
+
+    if (blockIdx.x == 0 && blockIdx.y == 0 && threadIdx.x == 0)
+    {
+
+        // Calculate bmm scale for FP8 MLA
+        if (cache_type == KvCacheDataType::FP8)
+        {
+            float dequant_scale_q_val = dequant_scale_q ? dequant_scale_q[0] : 1.f;
+            float dequant_scale_kv_val = dequant_scale_kv ? dequant_scale_kv[0] : 1.f;
+            float quant_scale_o_val = quant_scale_o ? quant_scale_o[0] : 1.f;
+            if (bmm1_scale)
+            {
+                // The scale prepared for log2 optimization.
+                constexpr float kLog2e = 1.4426950408889634074f;
+                // The scale after fmha bmm1.
+                float bmm1_scale_val = dequant_scale_q_val * dequant_scale_kv_val * host_bmm1_scale;
+                bmm1_scale[0] = bmm1_scale_val;
+                bmm1_scale[1] = bmm1_scale_val * kLog2e;
+            }
+            if (bmm2_scale)
+            {
+                // The scale after fmha bmm2.
+                bmm2_scale[0] = quant_scale_o_val * dequant_scale_kv_val;
+            }
+        }
+    }
 
     if (head_idx < head_num)
     {
@@ -919,10 +946,11 @@ void invokeMLARopeContext(MlaParams<T>& params, KVCacheBuffer kv_cache_buffer, c
 {
     dim3 grid(int(tensorrt_llm::common::divUp(params.max_input_seq_len, 32)), params.batch_size, params.head_num + 8);
     auto head_size = params.meta.qk_nope_head_dim;
-    applyMLARopeAndAssignQKVKernelOptContext<T, 256, 512, 64, KVCacheBuffer>
-        <<<grid, 256, 0, stream>>>(params.attention_input_buf, params.latent_cache, kv_cache_buffer,
-            params.cos_sin_cache, params.head_num, head_size, params.meta.kv_lora_rank, params.cu_q_seqlens,
-            params.cache_seq_lens, params.max_input_seq_len, params.cache_type, params.quant_scale_kv);
+    applyMLARopeAndAssignQKVKernelOptContext<T, 256, 512, 64, KVCacheBuffer><<<grid, 256, 0, stream>>>(
+        params.attention_input_buf, params.latent_cache, kv_cache_buffer, params.cos_sin_cache, params.head_num,
+        head_size, params.meta.kv_lora_rank, params.cu_q_seqlens, params.cache_seq_lens, params.max_input_seq_len,
+        params.cache_type, params.bmm1_scale, params.bmm2_scale, params.quant_scale_o, params.quant_scale_kv,
+        params.dequant_scale_q, params.dequant_scale_kv, params.host_bmm1_scale);
     if (params.attention_input_buf != nullptr && params.quant_attention_input_buf != nullptr
         && params.cache_type == KvCacheDataType::FP8)
     {

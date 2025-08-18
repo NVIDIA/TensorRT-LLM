@@ -1,3 +1,4 @@
+import random
 from contextlib import contextmanager, nullcontext
 
 import pytest
@@ -25,7 +26,7 @@ from utils.util import (force_ampere, similar, skip_gpu_memory_less_than_40gb,
                         skip_gpu_memory_less_than_80gb,
                         skip_gpu_memory_less_than_138gb)
 from utils.llm_data import llm_models_root
-from tensorrt_llm.lora_manager import LoraConfig
+from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.executor.request import LoRARequest
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -254,14 +255,11 @@ def test_embedding_bias_with_torch_sampler_strategies(enable_mixed_sampler,
 
     sampling_params = SamplingParams(**sampling_kwargs)
 
-    llm_test_harness(
-        llama_model_path,
-        prompts,
-        ["Z Z Z Z Z Z"],
-        sampling_params=sampling_params,
-        backend="pytorch",
-        use_torch_sampler=True,  # Use TorchSampler to test all 3 paths
-        enable_mixed_sampler=enable_mixed_sampler)
+    llm_test_harness(llama_model_path,
+                     prompts, ["Z Z Z Z Z Z"],
+                     sampling_params=sampling_params,
+                     backend="pytorch",
+                     enable_mixed_sampler=enable_mixed_sampler)
 
 
 def llama_7b_lora_from_dir_test_harness(**llm_kwargs) -> None:
@@ -806,3 +804,17 @@ def test_gqa_nemo_lora(tmp_path):
             f"got: {base_outputs[0].outputs[0].text}"
     finally:
         llm.shutdown()
+
+
+class TestLlmError:
+
+    def test_max_num_token_check(self):
+        """ LLM should raise error when got prompt length exceed the valid range. """
+        llm = LLM(llama_model_path,
+                  kv_cache_config=global_kvcache_config,
+                  max_num_tokens=100)
+
+        with pytest.raises(ValueError,
+                           match="should not exceed max_num_tokens"):
+            ids = [random.randint(10, 100) for _ in range(101)]
+            llm.generate([ids])

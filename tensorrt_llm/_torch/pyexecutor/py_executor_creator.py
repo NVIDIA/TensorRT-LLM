@@ -13,7 +13,7 @@ from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.bindings.executor import ContextChunkingPolicy, ExecutorConfig
 from tensorrt_llm.bindings.internal.batch_manager import ContextChunkingConfig
 from tensorrt_llm.logger import logger
-from tensorrt_llm.lora_manager import LoraConfig
+from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization import QuantAlgo
 
@@ -306,10 +306,10 @@ def create_py_executor(
                 f"disable enable_block_reuse for KV cache quant algorithm: {kv_cache_quant_algo}"
             )
             executor_config.kv_cache_config.enable_block_reuse = False
-        if executor_config.enable_chunked_context and not (get_sm_version()
-                                                           == 100):
+        if executor_config.enable_chunked_context and not (
+                get_sm_version() == 100 or get_sm_version() == 90):
             logger.warning(
-                "Chunked Prefill for MLA can only be enabled on SM100, "
+                "Chunked Prefill for MLA can only be enabled on SM90/100, "
                 f"disable enable_block_reuse for SM{get_sm_version()}")
             executor_config.enable_chunked_context = False
             model_engine.attn_runtime_features.chunked_prefill = False

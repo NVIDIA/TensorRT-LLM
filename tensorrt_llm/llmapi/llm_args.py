@@ -19,8 +19,8 @@ from pydantic import PrivateAttr, field_validator, model_validator
 from strenum import StrEnum
 from transformers import PreTrainedTokenizerBase
 
-from tensorrt_llm.lora_manager import (LoraConfig,
-                                       get_default_trtllm_modules_to_hf_modules)
+from tensorrt_llm.lora_helper import (LoraConfig,
+                                      get_default_trtllm_modules_to_hf_modules)
 
 from .._utils import mpi_rank
 from ..auto_parallel import AutoParallelConfig, infer_cluster_config
@@ -182,6 +182,12 @@ class MoeConfig(StrictBaseModel):
         default=None,
         description="Configuration for MoE load balancing.",
         json_schema_extra={"type": "Union[MoeLoadBalancerConfig, str]"})
+
+    disable_finalize_fusion: bool = Field(
+        default=False,
+        description=
+        "Disable FC2+finalize kernel fusion in CUTLASS MoE backend. Setting this to True recovers deterministic numerical behavior with top-k > 2."
+    )
 
     @classmethod
     def from_dict(cls, data: dict):
@@ -1055,7 +1061,7 @@ class CacheTransceiverConfig(StrictBaseModel, PybindMirror):
     Configuration for the cache transceiver.
     """
 
-    backend: Optional[Literal["default", "ucx", "nixl", "mpi"]] = Field(
+    backend: Optional[Literal["DEFAULT", "UCX", "NIXL", "MPI"]] = Field(
         default=None,
         description=
         "The communication backend type to use for the cache transceiver.")
@@ -1962,6 +1968,13 @@ class LoadFormat(Enum):
     DUMMY = 1
 
 
+class SamplerType(StrEnum):
+    """Enum for sampler type options."""
+    TRTLLMSampler = "TRTLLMSampler"
+    TorchSampler = "TorchSampler"
+    auto = "auto"
+
+
 class TorchCompileConfig(StrictBaseModel):
     """
     Configuration for torch.compile.
@@ -2049,11 +2062,11 @@ class TorchLlmArgs(BaseLlmArgs):
         "If true, will iterate over sampling_params of each request and use the corresponding sampling strategy, e.g. top-k, top-p, etc.",
         status="beta")
 
-    use_torch_sampler: bool = Field(
-        default=False,
+    sampler_type: Union[str, SamplerType] = Field(
+        default=SamplerType.auto,
         description=
-        "If true, will use the Torch sampler instead of the TRTLLM sampler.",
-        status="beta")
+        "The type of sampler to use. Options are TRTLLMSampler, TorchSampler or auto. Defaults to auto, which will use TorchSampler unless BeamSearch is requested.",
+        status="prototype")
 
     enable_iter_perf_stats: bool = Field(
         default=False,
@@ -2338,7 +2351,7 @@ class TorchLlmArgs(BaseLlmArgs):
             attn_backend=self.attn_backend,
             moe_backend=self.moe_config.backend,
             enable_mixed_sampler=self.enable_mixed_sampler,
-            use_torch_sampler=self.use_torch_sampler,
+            sampler_type=self.sampler_type,
             kv_cache_dtype=self.kv_cache_config.dtype,
             mamba_ssm_cache_dtype=self.kv_cache_config.mamba_ssm_cache_dtype,
             enable_iter_perf_stats=self.enable_iter_perf_stats,
@@ -2365,6 +2378,7 @@ class TorchLlmArgs(BaseLlmArgs):
             enable_layerwise_nvtx_marker=self.enable_layerwise_nvtx_marker,
             load_format=self.load_format,
             enable_min_latency=self.enable_min_latency,
+            moe_disable_finalize_fusion=self.moe_config.disable_finalize_fusion,
             stream_interval=self.stream_interval,
             force_dynamic_quantization=self.force_dynamic_quantization,
             allreduce_strategy=self.allreduce_strategy,

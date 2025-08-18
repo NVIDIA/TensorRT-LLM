@@ -25,6 +25,7 @@ import yaml
 import tensorrt_llm.evaluate
 from tensorrt_llm import LLM as PyTorchLLM
 from tensorrt_llm._tensorrt_engine import LLM
+from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
 from tensorrt_llm.builder import BuildConfig
 from tensorrt_llm.llmapi import SamplingParams
 from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
@@ -144,7 +145,7 @@ class AccuracyTask:
         return num_samples, threshold
 
     def evaluate(self,
-                 llm: Union[LLM, PyTorchLLM],
+                 llm: Union[LLM, PyTorchLLM, AutoDeployLLM],
                  extra_acc_spec: Optional[str] = None,
                  extra_evaluator_kwargs: Optional[dict] = None,
                  sampling_params: Optional[SamplingParams] = None,
@@ -155,6 +156,8 @@ class AccuracyTask:
             spec_dec_algo = None
         elif isinstance(llm.args.speculative_config, DecodingBaseConfig):
             spec_dec_algo = llm.args.speculative_config.decoding_type
+            if spec_dec_algo == 'AUTO':
+                spec_dec_algo = 'NGram'
         else:
             raise ValueError(
                 f"Not recognized speculative_config: {llm.args.speculative_config}."
