@@ -134,7 +134,6 @@ class GenerationExecutor(ABC):
         if postproc_params:
             postproc_params.postproc_args.num_prompt_tokens = len(
                 prompt_token_ids)
-
         request = GenerationRequest(
             prompt_token_ids,
             sampling_params=sampling_params,
