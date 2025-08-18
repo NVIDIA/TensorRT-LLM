@@ -98,8 +98,8 @@ class MultimodalRuntimeData:
         mm_token_positions: Starting positions of each multimodal token chunk
         chunk_end_pos: End position of the current chunk for chunked prefill
         num_unseen_mm_tokens: Number of multimodal tokens that are cached (computed)
-        num_mm_tokens: Number of multimodal tokens in the current chunk (computed)
-        total_mm_tokens: Total number of multimodal tokens in the request sequence (computed)
+        num_mm_tokens_in_chunk: Number of multimodal tokens in the current chunk (computed)
+        total_mm_tokens_in_request: Total number of multimodal tokens in the request sequence (computed)
     """
     past_seen_token_num: int
     mm_token_lengths: List[int]
@@ -107,15 +107,15 @@ class MultimodalRuntimeData:
     chunk_end_pos: int
 
     num_unseen_mm_tokens: Optional[int] = None
-    num_mm_tokens: Optional[int] = None
-    total_mm_tokens: Optional[int] = None
+    num_mm_tokens_in_chunk: Optional[int] = None
+    total_mm_tokens_in_request: Optional[int] = None
 
     # TODO: fine-grained control of encoder runner/cache to each mm_item
 
     def __post_init__(self):
         # Validate input data
-        if self.total_mm_tokens is None:
-            self.total_mm_tokens = sum(self.mm_token_lengths)
+        if self.total_mm_tokens_in_request is None:
+            self.total_mm_tokens_in_request = sum(self.mm_token_lengths)
         if len(self.mm_token_positions) != len(self.mm_token_lengths):
             raise ValueError(
                 f"mm_token_positions ({len(self.mm_token_positions)}) and mm_token_lengths ({len(self.mm_token_lengths)}) must have the same length"
@@ -136,10 +136,11 @@ class MultimodalRuntimeData:
                 f"All mm_token_positions must be non-negative, got {self.mm_token_positions}"
             )
 
-        if self.num_unseen_mm_tokens is None or self.num_mm_tokens is None:
+        if self.num_unseen_mm_tokens is None or self.num_mm_tokens_in_chunk is None:
             # Compute cached multimodal tokens based on positions and cached tokens
             self.num_unseen_mm_tokens = 0
-            self.num_mm_tokens = 0
+            self.num_mm_tokens_in_chunk = 0
+            remainder = 0
             for pos, length in zip(self.mm_token_positions,
                                    self.mm_token_lengths):
                 if pos + length <= self.past_seen_token_num:
@@ -147,23 +148,24 @@ class MultimodalRuntimeData:
                 elif pos < self.past_seen_token_num:
                     # Partial overlap - only count the cached portion
                     self.num_unseen_mm_tokens += self.past_seen_token_num - pos
-                    if pos + length > self.chunk_end_pos:
-                        self.num_mm_tokens += self.chunk_end_pos - self.past_seen_token_num
-                    else:
-                        self.num_mm_tokens += pos + length - self.past_seen_token_num
+                    self.num_mm_tokens_in_chunk += min(
+                        self.chunk_end_pos,
+                        pos + length) - self.past_seen_token_num
                 else:
                     if pos + length > self.chunk_end_pos:
                         # Partial overlap - only count the cached portion
                         if pos < self.chunk_end_pos:
-                            self.num_mm_tokens += self.chunk_end_pos - pos
+                            self.num_mm_tokens_in_chunk += self.chunk_end_pos - pos
+                        else:
+                            remainder += length
                     else:
                         # Full overlap - count the entire mm item chunk
-                        self.num_mm_tokens += length
+                        self.num_mm_tokens_in_chunk += length
 
-        if self.num_unseen_mm_tokens + self.num_mm_tokens > sum(
+        if self.num_unseen_mm_tokens + self.num_mm_tokens_in_chunk + remainder > sum(
                 self.mm_token_lengths):
             raise ValueError(
-                f"num_unseen_mm_tokens ({self.num_unseen_mm_tokens}) + num_mm_tokens ({self.num_mm_tokens}) must be less than or equal to sum of mm_token_lengths ({sum(self.mm_token_lengths)})"
+                f"num_unseen_mm_tokens ({self.num_unseen_mm_tokens}) + num_mm_tokens_in_chunk ({self.num_mm_tokens_in_chunk}) + remainder ({remainder}) must be less than or equal to sum of mm_token_lengths ({sum(self.mm_token_lengths)})"
             )
 
 

@@ -30,10 +30,10 @@ from tensorrt_llm.inputs.multimodal import MultimodalParams
 from tensorrt_llm.logger import logger
 
 
-def _get_active_multimodal_params(
+def _get_uncached_multimodal_params(
     multimodal_params: List[MultimodalParams], ) -> List[MultimodalParams]:
     """
-    Get active multimodal params that need encoder processing for chunk prefill.
+    Get uncached multimodal params that need encoder processing for chunk prefill.
     """
     params_to_run = []
 
@@ -63,7 +63,8 @@ def _cache_multimodal_embeddings(
 ) -> None:
     """
     Cache computed multimodal embeddings back to multimodal_data to avoid recomputation.
-    Uses torch.split for efficient tensor splitting without manual indexing.
+    Note this function only caches multimodal embeddings within the current request context,
+    mostly for chunked prefill. It does not persist embeddings across different requests or sessions.
     """
     # TODO: support multiple multimodal modalities per request
     assert len(
@@ -73,7 +74,8 @@ def _cache_multimodal_embeddings(
 
     # Collect embedding lengths for each parameter
     embed_lengths = [
-        param.multimodal_runtime.total_mm_tokens for param in multimodal_params
+        param.multimodal_runtime.total_mm_tokens_in_request
+        for param in multimodal_params
     ]
 
     # Validate total length matches
@@ -117,29 +119,31 @@ def get_multimodal_embeddings(
     if not multimodal_params:
         return []
 
-    # Step 1: Find active multimodal params that need encoder processing
-    active_multimodal_params = _get_active_multimodal_params(multimodal_params)
+    # Step 1: Find uncached multimodal params that need encoder processing
+    uncached_multimodal_params = _get_uncached_multimodal_params(
+        multimodal_params)
 
     # Step 2: Run encoder forward only on uncached parameters
-    if active_multimodal_params:
-        encoder_outputs = encoder_forward_fn(active_multimodal_params)
+    if uncached_multimodal_params:
+        encoder_outputs = encoder_forward_fn(uncached_multimodal_params)
 
         # TODO: support multiple multimodal modalities per request
         if len(encoder_outputs) > 1:
             return encoder_outputs
 
         # Validate that multimodal_runtime has required attributes for caching
-        if (not hasattr(active_multimodal_params[0], 'multimodal_runtime')
-                or active_multimodal_params[0].multimodal_runtime is None or
-                active_multimodal_params[0].multimodal_runtime.total_mm_tokens
-                is None):
+        if (not hasattr(uncached_multimodal_params[0], 'multimodal_runtime')
+                or uncached_multimodal_params[0].multimodal_runtime is None
+                or uncached_multimodal_params[0].multimodal_runtime.
+                total_mm_tokens_in_request is None):
             logger.warning(
                 "Multimodal runtime data missing or incomplete - recomputed all embeddings"
             )
             return encoder_outputs
 
         # Step 3: Cache the computed embeddings to multimodal_data["multimodal_embedding"]
-        _cache_multimodal_embeddings(active_multimodal_params, encoder_outputs)
+        _cache_multimodal_embeddings(uncached_multimodal_params,
+                                     encoder_outputs)
 
     # Step 4: Gather all embeddings for the batch
     all_embeddings = torch.cat([
@@ -186,8 +190,10 @@ def find_input_mm_embeds(
         return mm_embeds
 
     # Calculate total tokens that need processing (both cached and current chunk)
-    total_mm_tokens = sum(
-        [param.multimodal_runtime.num_mm_tokens for param in multimodal_params])
+    total_mm_tokens = sum([
+        param.multimodal_runtime.num_mm_tokens_in_chunk
+        for param in multimodal_params
+    ])
 
     if total_mm_tokens == 0:
         # No tokens need processing, return empty list
@@ -203,11 +209,12 @@ def find_input_mm_embeds(
     slices = []
     for param in multimodal_params:
         runtime = param.multimodal_runtime
-        slices.append((current_pos + runtime.num_unseen_mm_tokens, current_pos +
-                       runtime.num_unseen_mm_tokens + runtime.num_mm_tokens))
+        slices.append(
+            (current_pos + runtime.num_unseen_mm_tokens, current_pos +
+             runtime.num_unseen_mm_tokens + runtime.num_mm_tokens_in_chunk))
         if len(mm_embeds
                ) == 1:  # pre-concatenated mm_embeds, need global offset
-            current_pos += runtime.total_mm_tokens
+            current_pos += runtime.total_mm_tokens_in_request
 
     sliced_mm_embeds = []
     if len(mm_embeds) == 1:
