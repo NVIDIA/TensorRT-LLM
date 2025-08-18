@@ -137,9 +137,9 @@ from tensorrt_llm.sampling_params import SamplingParams
 )
 @optgroup.option("--sampler_options",
                  type=click.Path(exists=True,
-                     readable=True,
-                     path_type=Path,
-                     resolve_path=True),
+                                 readable=True,
+                                 path_type=Path,
+                                 resolve_path=True),
                  default=None,
                  help="Path to a YAML file that sets sampler options.")
 @optgroup.option(
