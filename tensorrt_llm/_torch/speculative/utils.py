@@ -11,6 +11,7 @@ from .model_drafter import ModelDrafter
 from .mtp import (MTPEagleWorker, MTPHiddenStatesManager, MTPSampler,
                   MTPSpecMetadata, MTPWorker)
 from .ngram import NGramDrafter, NGramPoolManager
+from .save_hidden_state import SaveHiddenStatesDrafter
 
 
 def get_spec_metadata(spec_config,
@@ -55,6 +56,19 @@ def get_spec_metadata(spec_config,
             max_num_tokens=max_num_tokens,
             layers_to_capture=spec_config.eagle3_layers_to_capture,
         )
+    if spec_config.spec_dec_mode.is_save_hidden_states():
+        return Eagle3SpecMetadata(
+            max_draft_len=spec_config.max_draft_len,
+            spec_dec_mode=spec_config.spec_dec_mode,
+            max_num_requests=max_num_requests,
+            num_layers=model_config.num_hidden_layers,
+            hidden_size=model_config.hidden_size,
+            max_num_tokens=max_num_tokens,
+            dtype=model_config.torch_dtype,
+            is_draft_model=is_draft_model,
+            eagle3_resource_manager=spec_resource_manager,
+            layers_to_capture=spec_config.eagle3_layers_to_capture,
+        )
     if  spec_config.spec_dec_mode.is_draft_target() or \
         spec_config.spec_dec_mode.is_ngram() or \
         spec_config.spec_dec_mode.is_user_provided():
@@ -97,6 +111,15 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
         return Eagle3ResourceManager(
             spec_config,
             draft_model_engine.model.config.torch_dtype,
+            model_config.hidden_size,
+            max_num_requests,
+            max_seq_len,
+            max_num_tokens,
+        )
+    if spec_dec_mode.is_save_hidden_states():
+        return Eagle3ResourceManager(
+            spec_config,
+            model_engine.model.config.torch_dtype,
             model_config.hidden_size,
             max_num_requests,
             max_seq_len,
@@ -150,6 +173,9 @@ def get_spec_drafter(model_engine,
 
     if spec_config.spec_dec_mode.is_ngram():
         return NGramDrafter(spec_config, spec_resource_manager)
+
+    if spec_config.spec_dec_mode.is_save_hidden_states():
+        return SaveHiddenStatesDrafter(spec_config, spec_resource_manager)
 
     return None
 

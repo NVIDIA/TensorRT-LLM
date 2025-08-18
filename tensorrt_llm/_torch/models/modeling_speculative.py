@@ -539,7 +539,6 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
             spec_metadata=spec_metadata,
             **kwargs,
         )
-
         if spec_metadata is not None and spec_metadata.is_layer_capture(
                 self.layer_idx):
             spec_metadata.maybe_capture_hidden_states(self.layer_idx,

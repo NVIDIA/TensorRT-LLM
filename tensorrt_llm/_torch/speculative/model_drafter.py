@@ -794,3 +794,20 @@ class ModelDrafter(Drafter):
             error_msg = str(e)
             logger.error(f"Encountered an error in decode: {error_msg}")
             raise e
+
+    @nvtx_range("prepare_draft_tokens_post")
+    def prepare_draft_tokens_post(
+        self,
+        scheduled_requests: ScheduledRequests,
+        resource_manager: Optional[ResourceManager] = None,
+        is_warmup: bool = False,
+    ) -> None:
+        """
+        If draft forward needs to be run directly after the target model forward,
+        this method can be overridden to do that.
+        Used in SaveHiddenStatesDrafter (to ensure correct input_ids)
+
+        Args:
+            scheduled_requests: The scheduled requests for this iteration
+            resource_manager: The resource manager for this iteration
+        """
