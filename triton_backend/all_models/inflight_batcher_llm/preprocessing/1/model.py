@@ -817,10 +817,11 @@ class VisionPreProcessor:
                 image_data = base64.b64decode(image_base64)
                 # Create a BytesIO object from the decoded data
                 image_buffer = io.BytesIO(image_data)
-                images.append(Image.open(image_buffer))
+                images.append(Image.open(image_buffer).convert("RGB"))
             else:
-                images.append(Image.open(
-                    requests.get(img_url, stream=True).raw))
+                images.append(
+                    Image.open(requests.get(img_url,
+                                            stream=True).raw).convert("RGB"))
         return images
 
     def mllama_process(self, queries, img_urls=None, image_bytes=None):
@@ -1054,11 +1055,33 @@ class VisionPreProcessor:
         import torch
         vision_processed_tensors = {}
         if img_urls is not None:
+            assert image_sizes is None, "IMAGE_SIZES should not be supplied together with IMAGE_URL"
             # download and read images
-            images = np.array([
+            images = [
                 self.load_images_from_urls(urls)
                 for urls in img_urls.as_numpy()
-            ])
+            ]
+            images = [[np.array(img) for img in batch] for batch in images]
+
+            # pad to the max_h, max_w dimensions to create one tensor for all images
+            shapes = [img.shape for batch in images for img in batch]
+            assert all(
+                len(s) == 3
+                for s in shapes), "All input images must have three dimensions"
+            assert all(
+                s[-1] == shapes[0][-1] for s in shapes
+            ), "All input images must have the same number of channels"
+            max_h, max_w = max(s[0] for s in shapes), max(s[1] for s in shapes)
+            for batch_idx in range(len(images)):
+                for image_idx in range(len(images[batch_idx])):
+                    images[batch_idx][image_idx] = np.pad(
+                        images[batch_idx][image_idx],
+                        ((0, max_h - images[batch_idx][image_idx].shape[0]),
+                         (0, max_w - images[batch_idx][image_idx].shape[1]),
+                         (0, 0)),
+                        mode='constant',
+                    )
+            images = np.array(images)
         elif image_bytes is not None:
             images = self.load_images_tensor(image_bytes)
         else:

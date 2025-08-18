@@ -54,7 +54,7 @@ input [
   {
     name: "image_url_input"
     data_type: TYPE_STRING
-    dims: [ 1 ]
+    dims: [ -1 ]
     optional: true
   },
   # An arbitrary number of images for pixtral
