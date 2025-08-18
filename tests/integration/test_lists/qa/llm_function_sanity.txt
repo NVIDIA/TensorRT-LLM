@@ -58,6 +58,7 @@ accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[tp4-cutlass]
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[tp4-triton]
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[tp4-trtllm]
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4a16[dp4]
+accuracy/test_llm_api_pytorch.py::TestMistralSmall24B::test_auto_dtype
 accuracy/test_llm_api_pytorch.py::TestKanana_Instruct::test_auto_dtype
 accuracy/test_llm_api_pytorch.py::TestKimiK2::test_fp8_blockscale[latency]
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B::test_nvfp4
