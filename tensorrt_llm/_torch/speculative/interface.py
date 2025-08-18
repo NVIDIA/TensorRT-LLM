@@ -12,6 +12,7 @@ from ..attention_backend.trtllm import AttentionBackend, TrtllmAttention
 class SpeculativeDecodingMode(IntEnum):
     MTP = auto()
     MTP_EAGLE = auto()
+    MTP_EAGLE_ONE_MODEL = auto()
     EAGLE3 = auto()
     EAGLE3_ONE_MODEL = auto()
     NGRAM = auto()
@@ -20,8 +21,11 @@ class SpeculativeDecodingMode(IntEnum):
     NONE = auto()
     AUTO = auto()
 
-    def is_mtp(self):
-        return self == SpeculativeDecodingMode.MTP or self == SpeculativeDecodingMode.MTP_EAGLE
+    def is_mtp_one_model(self):
+        return self == SpeculativeDecodingMode.MTP or self == SpeculativeDecodingMode.MTP_EAGLE_ONE_MODEL
+
+    def is_mtp_eagle_one_model(self):
+        return self == SpeculativeDecodingMode.MTP_EAGLE_ONE_MODEL
 
     def is_mtp_vanilla(self):
         return self == SpeculativeDecodingMode.MTP
@@ -33,7 +37,7 @@ class SpeculativeDecodingMode(IntEnum):
         return self == SpeculativeDecodingMode.EAGLE3
 
     def use_one_engine(self):
-        return self.is_mtp() or self.is_eagle3_one_model()
+        return self.is_eagle3_one_model() or self.is_mtp_one_model()
 
     def is_eagle3_one_model(self):
         return self == SpeculativeDecodingMode.EAGLE3_ONE_MODEL
@@ -51,16 +55,17 @@ class SpeculativeDecodingMode(IntEnum):
         return self == SpeculativeDecodingMode.DRAFT_TARGET
 
     def without_logits(self):
-        return self.is_mtp() or self.is_eagle3_one_model()
+        return self.is_mtp_one_model() or self.is_eagle3_one_model()
 
     def needs_kv_cache_rewind(self):
-        return self.is_mtp() or self.is_eagle3_one_model() or self.is_ngram()
+        return self.is_mtp_one_model() or self.is_eagle3_one_model(
+        ) or self.is_ngram()
 
     def support_overlap_scheduler(self):
-        return self.is_mtp() or self.is_eagle3_one_model()
+        return self.is_mtp_one_model() or self.is_eagle3_one_model()
 
     def has_draft_model(self):
-        return self.is_eagle3() or self.is_draft_target()
+        return self.is_eagle3() or self.is_draft_target() or self.is_mtp_eagle()
 
     def needs_kv_cache_recompute(self):
         """
@@ -68,7 +73,7 @@ class SpeculativeDecodingMode(IntEnum):
         If true, the 1st draft model forward will recompute the kv cache for
         the accepted draft tokens.
         """
-        return self.is_eagle3()
+        return self.is_eagle3() or self.is_mtp_eagle()
 
     def need_load_draft_weights(self):
         """
@@ -78,11 +83,12 @@ class SpeculativeDecodingMode(IntEnum):
         return self.is_eagle3_one_model()
 
     def has_spec_decoder(self):
-        return self.is_mtp() or self.is_eagle3() or self.is_eagle3_one_model()
+        return self.is_mtp_one_model() or self.is_mtp_eagle() or self.is_eagle3(
+        ) or self.is_eagle3_one_model()
 
     def has_spec_drafter(self):
         return self.is_eagle3() or self.is_draft_target() or self.is_ngram(
-        ) or self.is_user_provided()
+        ) or self.is_user_provided() or self.is_mtp_eagle()
 
     def extend_ctx(self, attention_backend: Type[AttentionBackend]):
         """
@@ -90,14 +96,16 @@ class SpeculativeDecodingMode(IntEnum):
         chunked context requests at the kernel level. Required for
         any spec dec mode that uses the SpecExecutor.
         """
+        # Fixme: only trtllm attention backend supports eagle3 generation-phase kernels on blackwell.
 
-        if self.use_one_engine():
-            # 1-model has separate logic for handling draft tokens
-            return False
-
-        # The special XQA generation kernels only exist with the TRTLLM backend on blackwell.
-        return not issubclass(attention_backend,
-                              TrtllmAttention) or get_sm_version() != 100
+        if self.is_eagle3() or self.is_draft_target() or self.is_mtp_eagle():
+            if get_sm_version() == 100 and issubclass(attention_backend,
+                                                      TrtllmAttention):
+                return False
+            else:
+                return True
+        else:
+            return self.is_ngram() or self.is_user_provided()
 
     def attention_need_spec_dec_mode(self):
         """
@@ -184,6 +192,13 @@ class SpecMetadata:
         cuda_graph_metadata.max_num_requests = max_batch_size
         cuda_graph_metadata.__post_init__()
         return cuda_graph_metadata
+
+    def is_layer_capture(self, layer_id: int):
+        """
+        Whether the layer should be captured (eg for Eagle3).
+        By default, does nothing.
+        """
+        return False
 
     def maybe_capture_hidden_states(self, layer_id: int,
                                     hidden_states: torch.Tensor,

@@ -20,6 +20,8 @@ class AutoModelForCausalLM(Generic[TModel, TConfig]):
                                         "")  # Strip the appended EAGLE3
         if hasattr(config.pretrained_config, "draft_vocab_size"):
             model_arch = "EAGLE3" + model_arch
+        if model_arch == "DeepseekV3ForCausalLM" and config.spec_config.max_draft_len == 0:
+            model_arch = "MTPDraftModelForCausalLM"
 
         cls = MODEL_CLASS_MAPPING.get(model_arch)
         if cls is None:

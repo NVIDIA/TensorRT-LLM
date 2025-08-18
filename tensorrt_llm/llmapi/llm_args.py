@@ -9,7 +9,8 @@ from dataclasses import dataclass, field
 from enum import Enum, EnumMeta
 from pathlib import Path
 from typing import (TYPE_CHECKING, Any, ClassVar, Dict, List, Literal, Optional,
-                    Type, TypeAlias, TypeVar, Union, get_args, get_origin)
+                    Tuple, Type, TypeAlias, TypeVar, Union, get_args,
+                    get_origin)
 
 import torch
 import yaml
@@ -424,6 +425,12 @@ class EagleDecodingConfig(DecodingBaseConfig):
     num_eagle_layers: Optional[int] = None
     max_non_leaves_per_layer: Optional[int] = None
     eagle3_one_model: Optional[bool] = True
+    eagle3_layers_to_capture: Optional[Tuple[int, ...]] = None
+    is_mtp_eagle: Optional[bool] = False  # which also means eagle2
+    #TODO:add the support of relaxed acceptance for thinking
+    use_relaxed_acceptance_for_thinking: Optional[bool] = False
+    relaxed_topk: Optional[int] = 10
+    relaxed_delta: Optional[float] = 0.01
 
     @classmethod
     def from_dict(cls, data: dict):
@@ -436,11 +443,21 @@ class EagleDecodingConfig(DecodingBaseConfig):
             raise ValueError("Draft model must be provided for EAGLE")
 
     @functools.cached_property
+    def num_capture_layers(self):
+        if self.eagle3_layers_to_capture is not None:
+            return len(self.eagle3_layers_to_capture)
+        elif self.is_mtp_eagle:
+            return 1
+        return 3
+
+    @functools.cached_property
     def spec_dec_mode(self):
         from tensorrt_llm._torch.speculative.interface import \
             SpeculativeDecodingMode as TorchSpeculativeDecodingMode
         if self.eagle3_one_model:
             return TorchSpeculativeDecodingMode.EAGLE3_ONE_MODEL
+        elif self.is_mtp_eagle:
+            return TorchSpeculativeDecodingMode.MTP_EAGLE
         return TorchSpeculativeDecodingMode.EAGLE3
 
 
@@ -509,6 +526,7 @@ class MTPDecodingConfig(DecodingBaseConfig):
     relaxed_topk: int = 1
     relaxed_delta: float = 0.
     use_mtp_vanilla: bool = False
+    mtp_eagle_one_model: bool = True
 
     # TODO: remove this after distinguishing `max_draft_len` and `num_nextn_predict_layers`
     # Now we need a flag when MTPDecodingConfig is updated by PyTorchModelEngine.
@@ -523,7 +541,9 @@ class MTPDecodingConfig(DecodingBaseConfig):
 
     @classmethod
     def from_dict(cls, data: dict):
-        return cls(**data)
+        out = cls(**data)
+        out.max_draft_len = out.num_nextn_predict_layers
+        return out
 
     decoding_type: ClassVar[str] = "MTP"
 
@@ -534,7 +554,9 @@ class MTPDecodingConfig(DecodingBaseConfig):
     def spec_dec_mode(self):
         from tensorrt_llm._torch.speculative.interface import \
             SpeculativeDecodingMode as TorchSpeculativeDecodingMode
-        if self.num_nextn_predict_layers_from_model_config == 1 and not self.use_mtp_vanilla:
+        if self.num_nextn_predict_layers_from_model_config == 1 and not self.use_mtp_vanilla and self.mtp_eagle_one_model:
+            return TorchSpeculativeDecodingMode.MTP_EAGLE_ONE_MODEL
+        elif self.num_nextn_predict_layers_from_model_config == 1 and not self.use_mtp_vanilla and not self.mtp_eagle_one_model:
             return TorchSpeculativeDecodingMode.MTP_EAGLE
         return TorchSpeculativeDecodingMode.MTP
 
