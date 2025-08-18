@@ -245,7 +245,7 @@ class PyExecutor:
             is_disaggregated=kv_cache_transceiver is not None,
         )
         self.executor_request_queue.set_exclude_last_generation_logits(
-            self.disable_overlap_scheduler, self.sampler)
+            self.disable_overlap_scheduler)
 
         self.stats_lock = threading.Lock()
         self.stats = []
@@ -682,24 +682,6 @@ class PyExecutor:
             self.response_cv.notify_all()
         self.shutdown_event.set()
 
-    def _need_return_logits(self, scheduled_requests: ScheduledRequests):
-        for req in scheduled_requests.context_requests:
-            if req.py_return_context_logits:
-                return True
-        for req in scheduled_requests.generation_requests:
-            if req.py_return_generation_logits:
-                return True
-        return False
-
-    def _need_return_log_probs(self, scheduled_requests: ScheduledRequests):
-        for req in scheduled_requests.context_requests:
-            if req.py_return_log_probs:
-                return True
-        for req in scheduled_requests.generation_requests:
-            if req.py_return_log_probs:
-                return True
-        return False
-
     def _executor_loop_pp(self):
         logger.debug(f"Starting executor loop for pp_rank {self.dist.pp_rank}")
         torch.cuda.set_device(self.device_id)
@@ -791,10 +773,6 @@ class PyExecutor:
                     else:
                         with torch.cuda.nvtx.range("_forward_step_last_pp"):
                             batch_outputs = self._forward_step(scheduled_batch)
-                            logits_host = None
-                            if self._need_return_logits(scheduled_batch):
-                                logits_host = batch_outputs["logits"].to(
-                                    "cpu", non_blocking=True)
                             if self.kv_cache_transceiver and self.guided_decoder:
                                 self.guided_decoder.init_disagg_gen_requests(
                                     scheduled_batch)
@@ -803,7 +781,6 @@ class PyExecutor:
 
                             sample_state = self._sample_async(
                                 scheduled_batch, batch_outputs)
-                            sample_state.host.logits = logits_host
                             self._update_request_states(scheduled_batch)
 
                     if self.enable_iter_perf_stats:
@@ -833,18 +810,10 @@ class PyExecutor:
                         torch.cuda.nvtx.range_push(
                             "_handle_new_tokens_inter_pp")
                         # Receive tokens from previous pp rank (w.r.t model forward direction)
-                        (
-                            logits,
-                            sample_state.host,
-                        ) = self.dist.recv_object(
+                        (sample_state.host, ) = self.dist.recv_object(
                             src=self.dist.prev_pp_rank,
                             tag=prev_microbatch_id,
                         )
-                        if logits is not None:
-                            logits_host = torch.from_numpy(logits)
-                            sample_state.host.logits = logits_host
-                            sample_state.device.logits = logits_host.to(
-                                self.device_id)
                     else:
                         torch.cuda.nvtx.range_push("_handle_new_tokens_last_pp")
                         sample_state.sampler_event.synchronize()
@@ -854,18 +823,9 @@ class PyExecutor:
                     if not self.dist.is_second_last_pp_rank:
                         if self.send_handles[prev_microbatch_id] is not None:
                             self.send_handles[prev_microbatch_id].wait()
-                        needs_logits = (
-                            self._need_return_logits(scheduled_batch)
-                            or (self._need_return_log_probs(scheduled_batch)
-                                and sample_state.host.log_probs is not None))
-                        serialized_logits = sample_state.host.logits.numpy(
-                        ) if needs_logits else None
                         self.send_handles[
                             prev_microbatch_id] = self.dist.isend_object(
-                                (
-                                    serialized_logits,
-                                    sample_state.host,
-                                ),
+                                (sample_state.host, ),
                                 dest=self.dist.next_pp_rank,
                                 tag=prev_microbatch_id)
                     torch.cuda.nvtx.range_pop()

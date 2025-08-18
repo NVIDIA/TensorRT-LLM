@@ -16,7 +16,6 @@ from tensorrt_llm.mapping import CpType
 from ..distributed import Distributed
 from .llm_request import (ExecutorRequest, LlmRequest,
                           executor_request_to_llm_request)
-from .sampler import Sampler
 
 SHUTDOWN_REQUEST_ID = -1
 
@@ -705,9 +704,8 @@ class ExecutorRequestQueue:
             position_blocks.append(position_block.tolist()[0])
         return ctx_blocks, position_blocks, padding
 
-    def set_exclude_last_generation_logits(self,
-                                           disable_overlap_scheduler: bool,
-                                           sampler: Sampler) -> None:
+    def set_exclude_last_generation_logits(
+            self, disable_overlap_scheduler: bool) -> None:
         # When overlap scheduler is enabled then when starting to handle a new prompt,
         # sample_async is called twice before the first call to update_requests:
         # - 1st time as a context request that handles on the 1st generated token
