@@ -122,6 +122,7 @@ class BaseLLM:
                  **kwargs: Any) -> None:
 
         self._executor_cls = kwargs.pop("executor_cls", GenerationExecutor)
+        self._executor_type = kwargs.pop("executor_type", None)
         self._llm_id = None
 
         log_level = logger.level
@@ -132,6 +133,8 @@ class BaseLLM:
             if backend == "pytorch":
                 logger.info("Using LLM with PyTorch backend")
                 llm_args_cls = TorchLlmArgs
+                if self._executor_type == "ray":
+                    os.environ["DISABLE_MPI"] = "1"
             elif backend == '_autodeploy':
                 logger.info("Using LLM with AutoDeploy backend")
                 from .._torch.auto_deploy.llm_args import \
@@ -645,6 +648,22 @@ class BaseLLM:
                                              self.llm_build_stats))
         self._engine_dir, self._hf_model_dir = model_loader()
 
+    def update_weights_from_ipc_handles_async(self, handles: dict):
+        result = self._executor.async_update_weights_from_ipc_handles(handles)
+        return result
+
+    def update_weights_from_ipc_handles(self, handles: dict):
+        result = self._executor.update_weights_from_ipc_handles(handles)
+        return result
+
+    def update_weights(self, weights: dict):
+        result = self._executor.update_weights(weights)
+        return result
+
+    def update_weights_async(self, weights: dict):
+        result = self._executor.async_update_weights(weights)
+        return result
+
     @property
     def _on_trt_backend(self) -> bool:
         return isinstance(self.args, TrtLlmArgs)
@@ -952,6 +971,31 @@ class _TorchLLM(BaseLLM):
                          backend=backend,
                          **kwargs)
 
+    def collective_rpc(self,
+                       method: str,
+                       args: tuple = (),
+                       kwargs: Optional[dict] = None,
+                       non_block: bool = False,
+                       unique_reply_rank: Optional[int] = None) -> list[Any]:
+        """
+        Execute an RPC call on all GPU workers. Currently, this is only supported for RayExecutor.
+
+        Args:
+            method: The name of the worker method to execute.
+            args: Positional arguments to pass to the worker method.
+            kwargs: Keyword arguments to pass to the worker method.
+            non_block: Whether to block until all workers have completed the RPC call.
+            unique_reply_rank: The rank of the worker that will be used to send the reply.
+
+        Returns:
+            A list of results from each worker.
+        """
+        if hasattr(self._executor, 'collective_rpc'):
+            return self._executor.collective_rpc(method, args, kwargs,
+                                                 non_block, unique_reply_rank)
+        else:
+            assert False, f"Executor type {type(self._executor)} does not support collective RPC."
+
     def _build_model(self):
         super()._build_model()
         assert self._engine_dir is None
@@ -1064,7 +1108,54 @@ class _TorchLLM(BaseLLM):
             is_llm_executor=True,
             lora_config=self.args.lora_config,
             garbage_collection_gen0_threshold=self.args.
-            garbage_collection_gen0_threshold)
+            garbage_collection_gen0_threshold,
+            executor_type=self._executor_type,
+            tp_size=self.args.tensor_parallel_size,
+            worker_extension_cls=getattr(self.args, 'worker_extension_cls',
+                                         None))
+
+    @property
+    def _on_trt_backend(self) -> bool:
+        return isinstance(self.args, TrtLlmArgs)
+
+    def _try_load_tokenizer(self) -> Optional[TokenizerBase]:
+        if self.args.skip_tokenizer_init:
+            return None
+
+        if self.args.tokenizer is not None:
+            assert isinstance(self.args.tokenizer, TokenizerBase)
+            return self.args.tokenizer
+
+        if self.runtime_context is not None:
+            return self.runtime_context.tokenizer
+
+        # TODO smor- need to refine what is the desired behavior if lora is enabled
+        # in terms of the tokenizer initialization process
+        if hasattr(
+                self.args, "backend"
+        ) and self.args.backend == "pytorch" and self.args.lora_config is not None:
+            num_lora_dirs = len(self.args.lora_config.lora_dir)
+            if num_lora_dirs == 1:
+                tokenizer_path = self.args.lora_config.lora_dir[0]
+                try:
+                    tokenizer = ModelLoader.load_hf_tokenizer(
+                        tokenizer_path,
+                        trust_remote_code=self.args.trust_remote_code,
+                        use_fast=self.args.tokenizer_mode != 'slow')
+                    if tokenizer is None:
+                        tokenizer_path = self.args.model
+                    else:
+                        return tokenizer
+                except Exception:
+                    tokenizer_path = self.args.model
+            else:
+                tokenizer_path = self.args.model
+        else:
+            tokenizer_path = self.args.model
+        return ModelLoader.load_hf_tokenizer(
+            tokenizer_path,
+            trust_remote_code=self.args.trust_remote_code,
+            use_fast=self.args.tokenizer_mode != 'slow')
 
     def _validate_args_for_torch_backend(self, kwargs: dict) -> None:
         """Validate that users don't pass TrtLlmArgs-specific arguments when using PyTorch backend.

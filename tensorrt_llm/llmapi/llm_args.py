@@ -2111,6 +2111,12 @@ class TorchLlmArgs(BaseLlmArgs):
         "If true, enables per request stats per iteration. Must also set enable_iter_perf_stats to true to get request stats.",
         status="prototype")
 
+    worker_extension_cls: Optional[str] = Field(
+        default=None,
+        description="The full worker extension class name."
+        "Allows users to dynamically extend the functionality of the RayGPUWorker class."
+    )
+
     print_iter_log: bool = Field(default=False,
                                  description="Print iteration logs.",
                                  status="beta")
@@ -2202,6 +2208,10 @@ class TorchLlmArgs(BaseLlmArgs):
         if v is None:
             return 'pytorch'
         return v
+
+    enable_sleep: bool = Field(
+        default=False,
+        description="Enable extra setup to support sleep feature.")
 
     @field_validator('load_format', mode='before')
     @classmethod
@@ -2440,7 +2450,8 @@ class TorchLlmArgs(BaseLlmArgs):
             attention_dp_batching_wait_iters=self.attention_dp_config.
             batching_wait_iters if self.attention_dp_config is not None else
             AttentionDpConfig.model_fields['batching_wait_iters'].default,
-            batch_wait_timeout_ms=self.batch_wait_timeout_ms)
+            batch_wait_timeout_ms=self.batch_wait_timeout_ms,
+            enable_sleep=self.enable_sleep)
 
 
 def update_llm_args_with_extra_dict(

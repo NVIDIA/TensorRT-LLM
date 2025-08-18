@@ -38,6 +38,7 @@ from packaging import version
 
 # isort: off
 import torch
+import torch.distributed as dist
 import tensorrt as trt
 # isort: on
 
@@ -476,7 +477,8 @@ def mpi_comm():
     return comm
 
 
-local_comm = mpi_comm().Split_type(split_type=OMPI_COMM_TYPE_HOST)
+# TODO: need cleanup
+local_comm = comm.Split_type(split_type=OMPI_COMM_TYPE_HOST)
 
 
 def local_mpi_comm():
@@ -484,10 +486,23 @@ def local_mpi_comm():
 
 
 def mpi_rank():
+    if os.environ.get("DISABLE_MPI") == "1":
+        try:
+            return torch.distributed.get_rank()
+        except ValueError:
+            # TODO WAR for controller to work in slurm pmix env
+            return 0
     return mpi_comm().Get_rank() if ENABLE_MULTI_DEVICE else 0
 
 
 def global_mpi_rank():
+    # TODO WAR for controller to work in slurm pmix env
+    if os.environ.get("DISABLE_MPI") == "1":
+        assert not (dist.is_available() and dist.is_initialized()), (
+            "Please deprceate all usages of global_mpi_rank() in Ray migration except in controller,"
+            "which will be cleaned up later.")
+        return 0
+
     return MPI.COMM_WORLD.Get_rank() if ENABLE_MULTI_DEVICE else 0
 
 
@@ -688,7 +703,10 @@ def is_trace_enabled(env_var: str):
     value = os.environ.get(env_var, "-1")
     if value == "ALL":
         return True
+    if value == "-1":
+        return False
     try:
+        # (TODO: joyang) Need to check if this is needed.
         return int(value) == global_mpi_rank()
     except ValueError:
         return False

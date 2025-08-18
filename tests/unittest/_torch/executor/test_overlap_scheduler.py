@@ -43,6 +43,7 @@ def create_llm(model_dir, disable_overlap_scheduler, sampler_type):
 
 @pytest.mark.parametrize("sampler_type", ["TorchSampler", "TRTLLMSampler"])
 @pytest.mark.high_cuda_memory
+@pytest.mark.mpi_ray_parity
 def test_overlap_scheduler_consistency(model_path, test_case, sampler_type):
     # Test configuration
     prompts = test_case["prompts"]

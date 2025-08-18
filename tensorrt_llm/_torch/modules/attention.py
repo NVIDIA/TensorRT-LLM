@@ -194,6 +194,7 @@ class Attention(nn.Module):
             gpus_per_node=config.mapping.gpus_per_node,
             enable_attention_dp=config.mapping.enable_attention_dp,
         )
+        mapping.dist = config.mapping.dist
         self.tp_size = tp_size
         self.tp_rank = mapping.tp_rank
         assert self.num_heads % tp_size == 0
@@ -684,6 +685,7 @@ class MLA(nn.Module):
             gpus_per_node=config.mapping.gpus_per_node,
             enable_attention_dp=config.mapping.enable_attention_dp,
         )
+        mapping.dist = config.mapping.dist
 
         assert self.num_heads % tp_size == 0
         self.num_heads = self.num_heads // tp_size

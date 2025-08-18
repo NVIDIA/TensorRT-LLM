@@ -186,9 +186,15 @@ def initialize_dummy_weights(
         else:
             raise NotImplementedError(f"Unknown quantized type: {dtype}.")
 
-    for param in model.state_dict().values():
+    for name, param in model.state_dict().items():
+        logger.info(f"Initializing {name} with shape {param.data.shape}")
+        import hashlib
+
+        hashobj = hashlib.sha256(name.encode('ascii'))
+        name_hash = int.from_bytes(hashobj.digest(), 'big') % 10**8
+
         generator = torch.Generator(device=param.data.device)
-        generator.manual_seed(seed)
+        generator.manual_seed(name_hash)
         dtype = param.data.dtype
 
         if param.data.element_size() < 2:
@@ -202,6 +208,9 @@ def initialize_dummy_weights(
             tmp_param = tmp_param.uniform_(quant_min,
                                            quant_max,
                                            generator=generator)
+            logger.info(
+                f"After initialization {name}: {tmp_param.mean()}, {tmp_param.std()}"
+            )
 
             param.data.copy_(tmp_param.to(dtype))
 
@@ -209,6 +218,8 @@ def initialize_dummy_weights(
         # constants and not weights.
         elif torch.is_floating_point(param):
             param.uniform_(low, high, generator=generator)
+            logger.info(
+                f"After initialization {name}: {param.mean()}, {param.std()}")
 
 
 def get_rank_model_storage(model):
@@ -1133,6 +1144,7 @@ class PyTorchModelEngine(ModelEngine):
                                             weight_mapper)
 
             elif load_format == LoadFormat.DUMMY:
+                print("Loading dummy weights", type(model))
                 initialize_dummy_weights(model)
 
             elif load_format == LoadFormat.VISION_ONLY:

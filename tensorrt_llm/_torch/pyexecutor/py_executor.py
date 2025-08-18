@@ -3,6 +3,7 @@ import datetime
 import functools
 import gc
 import os
+import pickle  # nosec B403
 import threading
 import time
 import traceback
@@ -10,6 +11,7 @@ import weakref
 from contextlib import contextmanager
 from typing import Dict, Iterable, List, Optional, Tuple, Union
 
+import numpy as np
 import torch
 
 try:
@@ -17,11 +19,13 @@ try:
 except ImportError:
     from cuda import cudart
 
+from ray.util.queue import Queue as RayQueue
+
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     ResourceManagerType, request_context)
 from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
-from tensorrt_llm._utils import (customized_gc_thresholds, global_mpi_rank,
-                                 is_trace_enabled, nvtx_range, trace_func)
+from tensorrt_llm._utils import (customized_gc_thresholds, is_trace_enabled,
+                                 nvtx_range, trace_func)
 from tensorrt_llm.bindings.executor import (DisServingRequestStats,
                                             FinishReason, InflightBatchingStats,
                                             IterationStats, KvCacheStats,
@@ -153,10 +157,10 @@ class PyExecutor:
                  kv_cache_transceiver: Optional[KvCacheTransceiver] = None,
                  guided_decoder: Optional[GuidedDecoder] = None,
                  garbage_collection_gen0_threshold: Optional[int] = None,
-                 start_worker: bool = True):
+                 start_worker: bool = True,
+                 virtual_memory_pools: Optional[dict] = None):
         super(PyExecutor, self).__init__()
         self.device_id = torch.cuda.current_device()
-        self.global_rank = global_mpi_rank()
 
         # profile config
         self.profile_start_iters, self.profile_stop_iters = _load_iteration_indexes(
@@ -175,6 +179,7 @@ class PyExecutor:
         self.guided_decoder = guided_decoder
         self.dist = dist
         self.disable_overlap_scheduler = disable_overlap_scheduler
+        self.virtual_memory_pools = virtual_memory_pools
 
         # enqueue and _fetch_new_requests used data
         self.active = True
@@ -196,6 +201,7 @@ class PyExecutor:
         self.response_lock = threading.Lock()
         self.response_cv = threading.Condition(self.response_lock)
         self.responses = {}
+        self.result_wait_queues = {}
 
         # kv cache events
         self.kv_cache_manager = self.resource_manager.resource_managers.get(
@@ -212,6 +218,7 @@ class PyExecutor:
         self.num_scheduled_requests: int = 0
         self.benchmark_req_queues_size = int(
             os.environ.get("TLLM_BENCHMARK_REQ_QUEUES_SIZE", 0))
+        self._disable_mpi = os.environ.get("DISABLE_MPI") == "1"
 
         # list of requests in each PP micro batch
         self.num_micro_batches = self.dist.pp_size
@@ -311,11 +318,17 @@ class PyExecutor:
     def __exit__(self):
         self.shutdown()
 
-    def enqueue_requests(self, requests: List[ExecutorRequest]) -> List[int]:
+    def enqueue_requests(
+            self,
+            requests: List[ExecutorRequest],
+            result_wait_queue: Optional[RayQueue] = None) -> List[int]:
         """
         Enqueue new requests
         """
         req_ids = self.executor_request_queue.enqueue_requests(requests)
+        if result_wait_queue is not None:
+            for req_id in req_ids:
+                self.result_wait_queues[req_id] = result_wait_queue
         return req_ids
 
     def await_responses(
@@ -340,6 +353,7 @@ class PyExecutor:
         for req_id in id:
             responses.append(
                 self._await_single_response(id=req_id, timeout=timeout))
+
         return responses
 
     def cancel_request(self, id: int):
@@ -364,6 +378,11 @@ class PyExecutor:
         del self.model_engine
         if self.draft_model_engine is not None:
             del self.draft_model_engine
+        if self.virtual_memory_pools is not None:
+            keys = list(self.virtual_memory_pools.keys())
+            for key in keys:
+                print("Freeing pool", key, flush=True)
+                del self.virtual_memory_pools[key]
 
     def can_enqueue_requests(self) -> bool:
         """
@@ -399,12 +418,13 @@ class PyExecutor:
 
     def enqueue_request(self,
                         request: ExecutorRequest,
-                        query: Optional[List] = None) -> int:
+                        query: Optional[List] = None,
+                        result_wait_queue: Optional[RayQueue] = None) -> int:
         """
         Enqueue a new request, query is only used in `StarAttention`.
         """
         req_id = self.executor_request_queue.enqueue_request(request, query)
-
+        self.result_wait_queues[req_id] = result_wait_queue
         return req_id
 
     def set_gather_responses(self, gather_all_responses):
@@ -487,7 +507,6 @@ class PyExecutor:
                     "%Y-%m-%d %H:%M:%S")
                 logger.info(
                     f"iter = {self.model_engine.iter_counter}, "
-                    f"global_rank = {self.global_rank}, "
                     f"rank = {self.dist.rank}, "
                     f"currank_total_requests = {self.executor_request_queue.num_fetch_requests_cur_rank}/"
                     f"{self.executor_request_queue.num_fetch_requests}, "
@@ -807,10 +826,12 @@ class PyExecutor:
                 if previous_batch is not None:
                     sample_state = previous_batch.sample_state
                     if not self.dist.is_last_pp_rank:
+                        recv_object_funct = self.dist.recv_object_from_isend if self._disable_mpi \
+                            else self.dist.recv_object
                         torch.cuda.nvtx.range_push(
                             "_handle_new_tokens_inter_pp")
                         # Receive tokens from previous pp rank (w.r.t model forward direction)
-                        sample_state.host = self.dist.recv_object(
+                        sample_state.host = recv_object_funct(
                             src=self.dist.prev_pp_rank,
                             tag=prev_microbatch_id,
                         )
@@ -822,7 +843,13 @@ class PyExecutor:
                     # Second last rank does not need to since last rank has original decoded tokens
                     if not self.dist.is_second_last_pp_rank:
                         if self.send_handles[prev_microbatch_id] is not None:
-                            self.send_handles[prev_microbatch_id].wait()
+                            # TODO: need clean up
+                            if self._disable_mpi:
+                                for work in self.send_handles[
+                                        prev_microbatch_id]:
+                                    work.wait()
+                            else:
+                                self.send_handles[prev_microbatch_id].wait()
                         self.send_handles[
                             prev_microbatch_id] = self.dist.isend_object(
                                 sample_state.host,
@@ -1056,6 +1083,48 @@ class PyExecutor:
             error_msg = str(e)
             logger.error(f"Encountered an error in decode: {error_msg}")
             self._handle_errors(error_msg)
+
+    def reset_prefix_cache(self):
+        self.kv_cache_manager.reset_reuse_state()
+
+    def update_weights(self, weights):
+        # Load weights into the model
+        self.model_engine.model.load_weights(weights)
+        torch.cuda.synchronize()
+
+        self.reset_prefix_cache()
+
+    def update_weight_from_ipc_handles(self, handles):
+        """
+        Update model weights from IPC handles.
+
+        Args:
+            ipc_handles (dict): Dictionary mapping device UUIDs to parameter IPC handles.
+                {device_uuid: all_handles}
+        """
+        from tensorrt_llm._torch.utils import get_device_uuid
+        device_uuid = get_device_uuid(self.device_id)
+
+        if device_uuid not in handles:
+            raise ValueError(
+                f"Device UUID {device_uuid} not found in ipc_handles")
+
+        try:
+            weights = {}
+            all_handles = handles[device_uuid]
+
+            for param_name, tensor_handle in all_handles:
+                func, args = tensor_handle
+                list_args = list(args)
+                list_args[6] = self.device_id  # Set target device
+                tensor = func(*list_args)
+                weights[param_name] = tensor
+
+            self.update_weights(weights)
+
+        except Exception as e:
+            logger.error(f"failed to update weights from ipc handles: {e}")
+            return False
 
     def _executor_loop_overlap(self):
         torch.cuda.set_device(self.device_id)
@@ -1653,6 +1722,23 @@ class PyExecutor:
                         self.responses[req_id].append(resp)
                     else:
                         self.responses.update({req_id: [resp]})
+                    # (TODO: joyang) There are other types of responses, we need to sort out.
+                    if type(
+                            resp
+                    ) == LlmResponse and req_id in self.result_wait_queues and self.result_wait_queues[
+                            req_id] is not None:
+                        # (TODO: joyang) TRTLLM import is pretty slow, WAR by send bytes for now.
+                        # TODO: need cleanup
+                        if hasattr(self.result_wait_queues[req_id],
+                                   "put_response"):
+                            data = np.frombuffer(
+                                pickle.dumps(resp),  # nosec B301
+                                dtype=np.uint8)
+                            self.result_wait_queues[req_id].put_response.remote(
+                                resp.client_id, data)
+                        else:
+                            self.result_wait_queues[req_id].put(
+                                pickle.dumps(resp))  # nosec B301
                 self.response_cv.notify_all()
 
     @nvtx_range("_handle_first_token_response")

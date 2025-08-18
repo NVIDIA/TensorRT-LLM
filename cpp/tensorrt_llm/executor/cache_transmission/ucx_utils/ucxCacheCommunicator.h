@@ -55,6 +55,8 @@ private:
     std::mutex mAddressToConnectionIdMutex;
     CommState mCommState;
     int mDevice;
+    int mRank;
+    int mWorldSize;
     std::atomic<UcxConnection::ConnectionIdType> mConnectionIdCounter{1};
     zmq::context_t mZmqContext;
     zmq::socket_t mZmqRepSocket;
@@ -78,6 +80,11 @@ public:
     Connection const* recvConnect(DataContext const& ctx, void* data, size_t size) override;
     std::vector<Connection const*> getConnections(CommState const& state) override;
     [[nodiscard]] CommState const& getCommState() const override;
+
+    [[nodiscard]] int getRank() const
+    {
+        return mRank;
+    }
 };
 
 #if defined(__clang__)

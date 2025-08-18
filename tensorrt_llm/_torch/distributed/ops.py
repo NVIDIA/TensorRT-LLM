@@ -182,25 +182,35 @@ def allgather(
                 if val is not None
             ])
 
+    disable_mpi = os.environ.get("DISABLE_MPI") == "1"
+
     # Inputs are reshaped in this way to pass necessary shape information to the allgather op
     if isinstance(input, torch.Tensor):
-        torch_op = torch.ops.trtllm.allgather
+        if disable_mpi:
+            torch_op = torch.ops.trtllm.allgather_pg
+        else:
+            torch_op = torch.ops.trtllm.allgather
+
         output_info = get_output_info(input, dim)
         input = input.contiguous().view(-1, output_info['numel_base'])
     else:
         input, valid = filter_valid_input(input)
-        torch_op = torch.ops.trtllm.allgather_list
+        if disable_mpi:
+            torch_op = torch.ops.trtllm.allgather_list_pg
+        else:
+            torch_op = torch.ops.trtllm.allgather_list
+
         output_info = [get_output_info(val, dim) for val in input]
         input = [
             val.contiguous().view(-1, val_info['numel_base'])
             for val, val_info in zip(input, output_info)
         ]
 
-    output = torch_op(
-        input,
-        sizes,
-        mapping.tp_group,
-    )
+    if disable_mpi:
+        output = torch_op(input, sizes, mapping.tp_group,
+                          mapping.tp_group_pg.boxed())
+    else:
+        output = torch_op(input, sizes, mapping.tp_group)
 
     def convert_output(x, x_info):
         if dim == 0:
@@ -257,24 +267,32 @@ def reducescatter(
             x = torch.cat([x.reshape(-1, x_info['numel_base']) for x in x_list])
         return x
 
+    disable_mpi = os.environ.get("DISABLE_MPI") == "1"
+
     if isinstance(input, torch.Tensor):
-        torch_op = torch.ops.trtllm.reducescatter
+        if disable_mpi:
+            torch_op = torch.ops.trtllm.reducescatter_pg
+        else:
+            torch_op = torch.ops.trtllm.reducescatter
         output_info = get_output_info(input, dim)
         input = convert_input(input, output_info)
     else:
         input, valid = filter_valid_input(input)
-        torch_op = torch.ops.trtllm.reducescatter_list
+        if disable_mpi:
+            torch_op = torch.ops.trtllm.reducescatter_list_pg
+        else:
+            torch_op = torch.ops.trtllm.reducescatter_list
         output_info = [get_output_info(val, dim) for val in input]
         input = [
             convert_input(val, val_info)
             for val, val_info in zip(input, output_info)
         ]
 
-    output = torch_op(
-        input,
-        sizes,
-        mapping.tp_group,
-    )
+    if disable_mpi:
+        output = torch_op(input, sizes, mapping.tp_group,
+                          mapping.tp_group_pg.boxed())
+    else:
+        output = torch_op(input, sizes, mapping.tp_group)
 
     if isinstance(input, torch.Tensor):
         output = output.view(output_info['output_shape'])
@@ -446,6 +464,9 @@ class AllReduce(nn.Module):
         self.workspace = None
         self.strategy = strategy
         self.mnnvl_allreduce = None
+        self._disable_mpi = os.environ.get("DISABLE_MPI") == "1"
+
+        self.all_reduce_op = torch.ops.trtllm.allreduce_pg if self._disable_mpi else torch.ops.trtllm.allreduce
 
         if self.mapping.tp_size > 1:
             # When Strategy is UB, it is guaranteed that the workspace is not used.
@@ -525,7 +546,13 @@ class AllReduce(nn.Module):
         # Make sure the strategy is AUTO since allreduceOp does not have the branch for MNNVL
         if allreduce_strategy == AllReduceStrategy.MNNVL:
             allreduce_strategy = AllReduceStrategy.AUTO
-        output = torch.ops.trtllm.allreduce(
+
+        additional_args = {
+            "rank": torch.distributed.get_rank(),  # This is global rank
+            "pg": self.mapping.tp_group_pg.boxed(),
+        } if self._disable_mpi else {}
+
+        output = self.all_reduce_op(
             input=input,
             residual=all_reduce_params.residual,
             norm_weight=all_reduce_params.norm_weight,
@@ -538,6 +565,7 @@ class AllReduce(nn.Module):
             eps=all_reduce_params.eps,
             trigger_completion_at_end=all_reduce_params.
             trigger_completion_at_end,
+            **additional_args,
         )
 
         return output if len(output) > 1 else output[0]

@@ -1,9 +1,11 @@
 import contextlib
+import os
 import threading
 from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, List
+from typing import Dict, Generator, List
 
+import pynvml
 import torch
 
 from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
@@ -266,7 +268,6 @@ def get_piecewise_cuda_graph_flag() -> bool:
     global _enable_piecewise_cuda_graph
     return _enable_piecewise_cuda_graph
 
-
 @contextlib.contextmanager
 def piecewise_cuda_graph(enable: bool):
     prev_enable = get_piecewise_cuda_graph_flag()
@@ -275,3 +276,62 @@ def piecewise_cuda_graph(enable: bool):
         yield
     finally:
         set_piecewise_cuda_graph_flag(prev_enable)
+        
+@contextlib.contextmanager
+def nvml_context() -> Generator[None, None, None]:
+    """Context manager for NVML initialization and shutdown.
+
+    Raises:
+        RuntimeError: If NVML initialization fails
+    """
+    try:
+        pynvml.nvmlInit()
+        yield
+    except pynvml.NVMLError as e:
+        raise RuntimeError(f"Failed to initialize NVML: {e}")
+    finally:
+        try:
+            pynvml.nvmlShutdown()
+        except:
+            pass
+
+
+def device_id_to_physical_device_id(device_id: int) -> int:
+    """Convert a logical device ID to a physical device ID considering CUDA_VISIBLE_DEVICES."""
+    if "CUDA_VISIBLE_DEVICES" in os.environ:
+        device_ids = os.environ["CUDA_VISIBLE_DEVICES"].split(",")
+        try:
+            physical_device_id = int(device_ids[device_id])
+            return physical_device_id
+        except ValueError:
+            raise RuntimeError(
+                f"Failed to convert logical device ID {device_id} to physical device ID. Available devices are: {device_ids}."
+            )
+    else:
+        return device_id
+
+
+def get_device_uuid(device_idx: int) -> str:
+    """Get the UUID of a CUDA device using NVML."""
+    # Convert logical device index to physical device index
+
+    global_device_idx = device_id_to_physical_device_id(device_idx)
+
+    # Get the device handle and UUID
+    with nvml_context():
+        try:
+            handle = pynvml.nvmlDeviceGetHandleByIndex(global_device_idx)
+            uuid = pynvml.nvmlDeviceGetUUID(handle)
+            # Ensure the UUID is returned as a string, not bytes
+            if isinstance(uuid, bytes):
+                return uuid.decode("utf-8")
+            elif isinstance(uuid, str):
+                return uuid
+            else:
+                raise RuntimeError(
+                    f"Unexpected UUID type: {type(uuid)} for device {device_idx} (global index: {global_device_idx})"
+                )
+        except pynvml.NVMLError as e:
+            raise RuntimeError(
+                f"Failed to get device UUID for device {device_idx} (global index: {global_device_idx}): {e}"
+            )

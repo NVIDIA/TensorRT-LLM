@@ -1,6 +1,7 @@
 import dataclasses
 import datetime
 import heapq
+import os
 import queue
 import threading
 import time
@@ -68,6 +69,8 @@ class ExecutorRequestQueue:
         self.new_active_requests_queue_latency_ms = 0
         self.is_shutdown = False
         self.should_exclude_last_generation_logits = False
+
+        self._disable_mpi = os.environ.get("DISABLE_MPI") == "1"
 
     def _get_from_request_queue(
             self,
@@ -553,13 +556,22 @@ class ExecutorRequestQueue:
 
         # Tag for communication
         tag = self.dist.pp_size  # Use pp_size as tag to avoid conflicts
+        works = []
 
         # Send payloads
         if not self.dist.is_first_pp_rank:
             payloads = self.dist.recv_object(self.dist.prev_pp_rank, tag)
 
         if not self.dist.is_last_pp_rank:
-            self.dist.send_object(payloads, self.dist.next_pp_rank, tag)
+            if self._disable_mpi:
+                works.extend(
+                    self.dist.isend_object(payloads, self.dist.next_pp_rank,
+                                           tag))
+            else:
+                self.dist.send_object(payloads, self.dist.next_pp_rank, tag)
+
+        for work in works:
+            work.wait()
 
         return payloads
 

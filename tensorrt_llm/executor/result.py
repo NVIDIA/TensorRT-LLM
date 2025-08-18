@@ -1,5 +1,7 @@
 import asyncio
 import json
+import pickle  # nosec B403
+import threading
 import weakref
 from dataclasses import dataclass, field
 from queue import Empty, Queue
@@ -7,8 +9,11 @@ from typing import (TYPE_CHECKING, Any, Callable, Dict, List, Literal,
                     NamedTuple, Optional, TypeAlias, Union)
 from weakref import WeakMethod
 
+import numpy as np
+import ray
 import torch
 import torch.nn.functional as F
+from ray.util.queue import Empty
 
 from .._utils import nvtx_range_debug
 from ..bindings import executor as tllm
@@ -145,12 +150,84 @@ class CompletionOutput:
         return self.logprobs[self._last_logprobs_len:]
 
 
+#
+# Async queue for response
+@ray.remote(max_concurrency=1000000, num_cpus=2)
+class ResponseRaySharedQueue:
+
+    def __init__(self):
+        self.data = {}
+        self.event_map = {}
+
+    def register(self, key: int):
+        assert key not in self.event_map, f"Key {key} already registered"
+        self.event_map[key] = asyncio.Event()
+
+    def unregister(self, key: int):
+        if key in self.event_map:
+            del self.event_map[key]
+
+        if key in self.data:
+            del self.data[key]
+
+    def put_response(self, key: int, item: Any):
+        assert key in self.event_map, f"Key {key} not registered"
+        self.data[key] = item
+        self.event_map[key].set()
+
+    async def get_async(self, key: int):
+        assert key in self.event_map, f"Key {key} not registered"
+        await self.event_map[key].wait()
+        self.event_map[key].clear()
+        ret = self.data[key]
+        del self.data[key]
+        return ret
+
+
+SYNC_QUEUE_MAX_CONCURRENCY = 2
+
+
+@ray.remote(max_concurrency=SYNC_QUEUE_MAX_CONCURRENCY,
+            num_cpus=SYNC_QUEUE_MAX_CONCURRENCY)
+class ResponseSyncRaySharedQueue:
+
+    def __init__(self):
+        self.data = {}
+        self.event_map = {}
+        self.semaphore = threading.Semaphore(SYNC_QUEUE_MAX_CONCURRENCY - 1)
+
+    def register(self, key: int):
+        assert key not in self.event_map, f"Key {key} already registered"
+        self.event_map[key] = threading.Event()
+        self.event_map[key]
+
+    def unregister(self, key: int):
+        if key in self.event_map:
+            del self.event_map[key]
+
+        if key in self.data:
+            del self.data[key]
+
+    def put_response(self, key: int, item: Any):
+        self.data[key] = item
+        self.event_map[key].set()
+
+    def get(self, key: int):
+        with self.semaphore:
+            self.event_map[key].wait()
+            self.event_map[key].clear()
+            ret = self.data[key]
+            del self.data[key]
+            return ret
+
+
 class GenerationResultBase:
     ''' This holds the core logic of the GenerationResult class. '''
 
     def __init__(self,
                  id: int,
                  sampling_params: SamplingParams,
+                 queue: Optional[ResponseRaySharedQueue] = None,
                  background_error_handler: Optional[Callable] = None,
                  postproc_params: "Optional[PostprocParams]" = None):
         self.id = id
@@ -164,12 +241,22 @@ class GenerationResultBase:
         self._done = False
         self.metrics_dict = {}
 
-        if has_event_loop():
-            self.aqueue = AsyncQueue()
-            self.queue = self.aqueue.sync_q
+        if queue is not None:
+            if has_event_loop():
+                self.aqueue = queue
+                self.queue = self.aqueue
+            else:
+                self.queue = queue
+                self.aqueue = None
+
+            ray.get(self.queue.register.remote(id))
         else:
-            self.queue = Queue()
-            self.aqueue = None
+            if has_event_loop():
+                self.aqueue = AsyncQueue()
+                self.queue = self.aqueue.sync_q
+            else:
+                self.queue = Queue()
+                self.aqueue = None
 
         # In Sampling mode, the Executor runtime will return best_of sequences
         # in total, which the LLM API will select the n-best sequences among
@@ -337,6 +424,7 @@ class GenerationResultBase:
                 response_result.deserialize()
 
             self._done = response_result.is_final
+
             context_phase_params = response_result.context_phase_params
             self.decoding_iter = response_result.decoding_iter
             self.avg_decoded_tokens_per_iter = response_result.avg_decoded_tokens_per_iter
@@ -377,6 +465,9 @@ class GenerationResultBase:
                 handler(response.error_msg)
         else:
             raise ValueError(f"Unknown response type: {response}")
+
+        if self._done and isinstance(self.queue, ray.actor.ActorHandle):
+            self.queue.unregister.remote(self.id)
 
     def record_stats(self,
                      output: CompletionOutput,
@@ -500,9 +591,15 @@ class GenerationResult(GenerationResultBase):
         disaggregated_params: Optional[DisaggregatedParams] = None,
         logprob_params: Optional[LogprobParams] = None,
     ) -> None:
+        use_async_queue = has_event_loop()
+        shared_queue = None
+        if executor.use_ray_queue():
+            shared_queue = executor.response_queue if use_async_queue else executor.response_sync_queue
+
         super().__init__(
             generation_request.id,
             generation_request.sampling_params,
+            shared_queue,
             background_error_handler,
             postproc_params=generation_request.postproc_params,
         )
@@ -550,13 +647,33 @@ class GenerationResult(GenerationResultBase):
         if hasattr(self, "_logprob_params"):
             del self._logprob_params
 
+    def _handle_ray_response(self, response: Any):
+        if isinstance(response, bytes):
+            response = pickle.loads(response)  # nosec B301
+        if isinstance(response, np.ndarray):
+            response = pickle.loads(response.tobytes())  # nosec B301
+        return response
+
     def _result_step(self, timeout: Optional[float] = None):
-        response = self.queue.get(timeout=timeout)
+        if isinstance(self.queue, ray.actor.ActorHandle):
+            # TODO: validate if this is efficient and has side effects.
+            # async def get_response(request_id):
+            #     return await self.queue.get_async.remote(request_id)
+            # response = asyncio.run(get_response(self.request_id))
+            response = ray.get(self.queue.get.remote(self.request_id))
+            response = self._handle_ray_response(response)
+        else:
+            response = self.queue.get()
+
         self._handle_response(response)
 
     async def _aresult_step(self):
         assert self.aqueue is not None, "The asyncio event loop was not present during initialization, so async operations are not available."
-        response = await self.aqueue.get()
+        if isinstance(self.aqueue, ray.actor.ActorHandle):
+            response = await self.aqueue.get_async.remote(self.request_id)
+            response = self._handle_ray_response(response)
+        else:
+            response = await self.aqueue.get()
         global_tracer().log_instant("result_step.get")
         self._handle_response(response)
 

@@ -21,7 +21,6 @@
 #include <limits>
 #include <sstream>
 #define UCX_WRAPPER_LIB_NAME "tensorrt_llm_ucx_wrapper"
-
 #if defined(_WIN32)
 #include <windows.h>
 #define dllOpen(name) LoadLibrary(name ".dll")

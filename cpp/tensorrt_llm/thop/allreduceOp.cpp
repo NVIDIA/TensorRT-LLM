@@ -30,6 +30,7 @@
 #include "tensorrt_llm/runtime/mcastDeviceMemory.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
+#include "tensorrt_llm/runtime/utils/pgUtils.h"
 #include "tensorrt_llm/thop/fp4Quantize.h"
 #include "tensorrt_llm/thop/fp8Op.h"
 #include "tensorrt_llm/thop/thUtils.h"
@@ -37,7 +38,13 @@
 
 #if ENABLE_MULTI_DEVICE
 #include <ATen/cuda/EmptyTensor.h>
+#include <c10/util/irange.h>
 #include <nccl.h>
+#include <torch/csrc/distributed/c10d/FileStore.hpp>
+#include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
+#include <torch/csrc/distributed/c10d/ProcessGroupNCCL.hpp>
+#include <torch/csrc/distributed/c10d/Store.hpp>
+#include <torch/csrc/distributed/c10d/TCPStore.hpp>
 #endif // ENABLE_MULTI_DEVICE
 #include <nvml.h>
 #include <torch/extension.h>
@@ -50,6 +57,9 @@
 using tensorrt_llm::kernels::AllReduceFusionOp;
 using tensorrt_llm::kernels::AllReduceStrategyType;
 using tensorrt_llm::mpi::MpiTag;
+using tensorrt_llm::pg_utils::get_world_pg;
+using tensorrt_llm::pg_utils::get_local_pg;
+using tensorrt_llm::pg_utils::PgHelper;
 
 namespace torch_ext
 {
@@ -58,6 +68,14 @@ namespace torch_ext
 
 namespace
 {
+
+template <class... Ts>
+struct overloaded : Ts...
+{
+    using Ts::operator()...;
+};
+template <class... Ts>
+overloaded(Ts...) -> overloaded<Ts...>;
 
 class NvmlManager
 {
@@ -141,6 +159,79 @@ std::set<int> getLocalGroup(std::set<int> const& group)
     return localGroup;
 }
 
+std::set<int> getLocalGroupTorch(std::set<int> const& group)
+{
+    auto const worldPg = get_world_pg();
+    auto const myRank = worldPg->getRank();
+    auto const localPg = get_local_pg();
+    auto const myLocalRank = localPg->getRank();
+    auto const localSize = static_cast<uint32_t>(localPg->getSize());
+
+    PgHelper pgh_local{localPg};
+    PgHelper pgh_world{worldPg}; // for p2p
+
+    std::vector<int32_t> ranks(localSize, -1);
+    std::vector<int32_t> localRanks(localSize, -1);
+
+    if (group.size() >= localSize)
+    {
+        PGCHECK_THROW(pgh_local.allgather(&myRank, ref(ranks), {}));
+        PGCHECK_THROW(pgh_local.allgather(&myLocalRank, ref(localRanks), {}));
+    }
+    else
+    {
+        int tag = static_cast<int>(MpiTag::kDefault);
+
+        if (myRank == *group.begin())
+        {
+            // Leader: gather from peers (world ranks), then broadcast full localSize arrays.
+            size_t cnt = 0;
+            ranks[cnt++] = myRank;
+            int tmp;
+            for (auto it = std::next(group.begin()); it != group.end(); ++it)
+            {
+                PGCHECK_THROW(pgh_world.recv(&tmp, *it, tag));
+                ranks[cnt++] = tmp;
+            }
+            for (auto it = std::next(group.begin()); it != group.end(); ++it)
+            {
+                PGCHECK_THROW(pgh_world.send(ref(ranks), *it, tag));
+            }
+
+            cnt = 0;
+            localRanks[cnt++] = myLocalRank;
+            for (auto it = std::next(group.begin()); it != group.end(); ++it)
+            {
+                PGCHECK_THROW(pgh_world.recv(&tmp, *it, tag));
+                localRanks[cnt++] = tmp;
+            }
+            for (auto it = std::next(group.begin()); it != group.end(); ++it)
+            {
+                PGCHECK_THROW(pgh_world.send(ref(localRanks), *it, tag));
+            }
+        }
+        else
+        {
+            int leader = *group.begin();
+
+            PGCHECK_THROW(pgh_world.send(&myRank, leader, tag));
+            PGCHECK_THROW(pgh_world.recv(ref(ranks), leader, tag));
+
+            PGCHECK_THROW(pgh_world.send(&myLocalRank, leader, tag));
+            PGCHECK_THROW(pgh_world.recv(ref(localRanks), leader, tag));
+        }
+    }
+
+    std::set<int> localGroup;
+    for (size_t i = 0; i < ranks.size(); ++i)
+    {
+        int world_r = ranks[i];
+        if (group.find(world_r) != group.end())
+            localGroup.insert(localRanks[i]);
+    }
+    return localGroup;
+}
+
 class AllreduceOp
 {
 public:
@@ -154,7 +245,26 @@ public:
     {
     }
 
+    AllreduceOp(std::set<int> group, c10::intrusive_ptr<c10d::ProcessGroup> const& process_group_,
+        nvinfer1::DataType type, AllReduceStrategyType strategy, AllReduceFusionOp op, float eps)
+        : mGroup(std::move(group))
+        , mType(type)
+        , mStrategy(strategy)
+        , mOp(op)
+        , mEps(eps)
+        , mNcclComm(process_group_)
+    {
+    }
+
     ~AllreduceOp() = default;
+
+    int getRank() const
+    {
+        return std::visit(
+            overloaded{[&](std::shared_ptr<ncclComm_t> const&) { return COMM_SESSION.getRank(); },
+                [&](c10::intrusive_ptr<c10d::ProcessGroup> const& torchPg) { return get_world_pg()->getRank(); }},
+            mNcclComm);
+    }
 
     std::vector<torch::Tensor> run(torch::Tensor const& input, torch::optional<torch::Tensor> const& residual,
         torch::optional<torch::Tensor> const& norm_weight, torch::optional<torch::Tensor> const& scale,
@@ -169,7 +279,7 @@ public:
         AllReduceStrategyType runtime_strategy = getRuntimeStrategy(seq_len, size);
 
         // Log runtime strategy
-        auto const rank = COMM_SESSION.getRank();
+        auto const rank = getRank();
         logRunTimeStrategy(runtime_strategy, rank);
 
         // Dispatch to different allreduce implementations
@@ -192,14 +302,18 @@ public:
 
     int initialize()
     {
-        TLLM_LOG_TRACE("%s start for rank %d", __PRETTY_FUNCTION__, COMM_SESSION.getRank());
-        mNcclComm = getComm(mGroup);
+        TLLM_LOG_TRACE("%s start for rank %d", __PRETTY_FUNCTION__, getRank());
+        if (mNcclComm.index() == 0)
+        {
+            mNcclComm = getComm(mGroup);
+        }
         if (mStrategy != AllReduceStrategyType::NCCL && mStrategy != AllReduceStrategyType::UB)
         {
+
             initGroupTopology();
         }
 
-        TLLM_LOG_TRACE("%s stop for rank %d", __PRETTY_FUNCTION__, COMM_SESSION.getRank());
+        TLLM_LOG_TRACE("%s stop for rank %d", __PRETTY_FUNCTION__, getRank());
         return 0;
     }
 
@@ -288,13 +402,25 @@ private:
         torch::optional<torch::Tensor> const& residual, torch::optional<torch::Tensor> const& norm_weight,
         torch::optional<torch::Tensor> const& scale, torch::optional<torch::Tensor> const& bias)
     {
+        torch::Tensor reduce_output;
 
-        auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
-        int size = input.numel();
-
-        torch::Tensor reduce_output = torch::empty_like(input);
-        NCCLCHECK_THROW(ncclAllReduce(input.data_ptr(), reduce_output.mutable_data_ptr(), size, (*getDtypeMap())[mType],
-            ncclSum, *mNcclComm, stream));
+        std::visit(overloaded{[&](std::shared_ptr<ncclComm_t>& rawComm)
+                       {
+                           auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
+                           int size = input.numel();
+                           reduce_output = torch::empty_like(input);
+                           NCCLCHECK_THROW(ncclAllReduce(input.data_ptr(), reduce_output.mutable_data_ptr(), size,
+                               (*getDtypeMap())[mType], ncclSum, *rawComm, stream));
+                       },
+                       [&](c10::intrusive_ptr<c10d::ProcessGroup>& torchPg)
+                       {
+                           reduce_output = input.clone();
+                           // TLLM_LOG_INFO("AllReduce Rank: %d, tensor numel: %d", torchPg->getRank(),
+                           // reduce_output.numel());
+                           std::vector tensors{reduce_output};
+                           PGCHECK_THROW(torchPg->allreduce(tensors, {c10d::ReduceOp::SUM}));
+                       }},
+            mNcclComm);
 
         if (mOp == AllReduceFusionOp::NONE)
         {
@@ -307,12 +433,13 @@ private:
 
     std::vector<torch::Tensor> runNCCLAllReduceSymmetric(torch::Tensor const& input,
         torch::optional<torch::Tensor> const& residual, torch::optional<torch::Tensor> const& norm_weight,
-        torch::optional<torch::Tensor> const& scale, torch::optional<torch::Tensor> const& bias) noexcept
+        torch::optional<torch::Tensor> const& scale, torch::optional<torch::Tensor> const& bias)
     {
 
         auto stream = at::cuda::getCurrentCUDAStream(input.get_device());
         int size = input.numel();
         auto& ub_manager = tensorrt_llm::runtime::ub::UserBuffersManager::get_instance();
+        auto ub_tensor0 = input;
         auto ub_buffer0 = ub_manager.search_buffer(input.data_ptr());
         if (ub_buffer0.invalid())
         {
@@ -321,13 +448,23 @@ private:
             cudaMemcpyAsync(symmetric_ub_buffer0.addr, input.data_ptr(), size * input.element_size(),
                 cudaMemcpyDeviceToDevice, stream);
             ub_buffer0 = symmetric_ub_buffer0;
+            ub_tensor0 = symmetric_input;
         }
 
         TLLM_CHECK(!ub_buffer0.invalid());
         auto [norm_out, ub_buffer1] = torch_ext::create_userbuffers_tensor(input.sizes(), input.scalar_type());
 
-        NCCLCHECK(ncclAllReduce(
-            ub_buffer0.addr, norm_out.mutable_data_ptr(), size, (*getDtypeMap())[mType], ncclSum, *mNcclComm, stream));
+        std::visit(overloaded{[&, norm_out_ = norm_out](std::shared_ptr<ncclComm_t>& rawComm)
+                       {
+                           NCCLCHECK_THROW(ncclAllReduce(ub_buffer0.addr, norm_out_.mutable_data_ptr(), size,
+                               (*getDtypeMap())[mType], ncclSum, *rawComm, stream));
+                       },
+                       [&, norm_out_ = norm_out](c10::intrusive_ptr<c10d::ProcessGroup>& torchPg)
+                       {
+                           PGCHECK_THROW(PgHelper{torchPg}.allreduce(ub_tensor0, {c10d::ReduceOp::SUM}));
+                           std::ignore = norm_out_.copy_(ub_tensor0, true);
+                       }},
+            mNcclComm);
 
         if (mOp == AllReduceFusionOp::NONE)
         {
@@ -348,7 +485,7 @@ private:
         int hidden_size = input.size(-1);
 
         auto const tp_size = mGroup.size();
-        auto const cur_rank = COMM_SESSION.getRank();
+        auto const cur_rank = getRank();
         int tp_rank = 0;
 
         for (auto const& currentRank : mGroup)
@@ -418,7 +555,7 @@ private:
         int seq_len = input.size(0);
 
         auto const tp_size = mGroup.size();
-        auto const cur_rank = COMM_SESSION.getRank();
+        auto const cur_rank = getRank();
         int tp_rank = 0;
 
         for (auto const& currentRank : mGroup)
@@ -737,9 +874,23 @@ private:
 
     void setGroupTopology()
     {
-        auto const rank = COMM_SESSION.getRank();
+        auto const rank = getRank();
         TLLM_LOG_INFO("Detecting local TP group for rank %d", rank);
-        std::set<int> local_group = getLocalGroup(mGroup);
+        std::set<int> local_group = std::visit(
+            overloaded{[&](std::shared_ptr<ncclComm_t>&) { return getLocalGroup(mGroup); },
+                [&](c10::intrusive_ptr<c10d::ProcessGroup>& torchPg) { return getLocalGroupTorch(mGroup); }},
+            mNcclComm);
+
+        for (auto it = local_group.begin(); it != local_group.end(); ++it)
+        {
+            std::cout << "local_group: " << *it << std::endl;
+        }
+
+        for (auto it = mGroup.begin(); it != mGroup.end(); ++it)
+        {
+            std::cout << "mGroup: " << *it << std::endl;
+        }
+
         if (mGroup.size() != local_group.size())
         {
             mIsP2PSupported = false;
@@ -750,18 +901,17 @@ private:
         TLLM_LOG_INFO("TP group is intra-node for rank %d", rank);
 
         NvmlManager nvml_manager;
-        std::unordered_set<int> visited_device;
         mIsP2PSupported = true;
         mIsNVLINKSupported = true;
 
+        // TODO(ytong): Should we provide group topology info instead of querying it here?
         // Use cudaDeviceCanAccessPeer to determine whether p2p is supported,
         // and use nvml to determine whether there are nvlink links between ranks.
         for (int first_device_id : local_group)
         {
             for (int second_device_id : local_group)
             {
-                if (first_device_id == second_device_id
-                    || visited_device.find(second_device_id) != visited_device.end())
+                if (first_device_id >= second_device_id)
                 {
                     continue;
                 }
@@ -842,7 +992,6 @@ private:
 
                 mIsNVLINKSupported &= is_NVLINK;
             }
-            visited_device.insert(first_device_id);
         }
     }
 
@@ -999,14 +1148,14 @@ private:
     AllReduceStrategyType mStrategy;
     AllReduceFusionOp mOp;
     float mEps;
-    std::shared_ptr<ncclComm_t> mNcclComm;
+    std::variant<std::shared_ptr<ncclComm_t>, c10::intrusive_ptr<c10d::ProcessGroup>> mNcclComm;
 };
 
 } // namespace
 
 #endif // ENABLE_MULTI_DEVICE
 
-std::vector<torch::Tensor> allreduce(torch::Tensor const& input, torch::optional<torch::Tensor> const& residual,
+std::vector<torch::Tensor> allreduce_raw(torch::Tensor const& input, torch::optional<torch::Tensor> const& residual,
     torch::optional<torch::Tensor> const& norm_weight, torch::optional<torch::Tensor> const& scale,
     torch::optional<torch::Tensor> const& bias, torch::optional<torch::Tensor> workspace,
     torch::List<int64_t> const& group_, int64_t const strategy_, int64_t const fusion_op_, double const eps_,
@@ -1025,6 +1174,46 @@ std::vector<torch::Tensor> allreduce(torch::Tensor const& input, torch::optional
     AllreduceOp op(group, dtype, strategy, fusion_op, eps);
     op.initialize();
     return op.run(input, residual, norm_weight, scale, bias, trigger_completion_at_end_, workspace);
+#else
+    return {input};
+#endif // ENABLE_MULTI_DEVICE
+}
+
+std::vector<torch::Tensor> allreduce_pg(torch::Tensor const& input, torch::optional<torch::Tensor> const& residual,
+    torch::optional<torch::Tensor> const& norm_weight, torch::optional<torch::Tensor> const& scale,
+    torch::optional<torch::Tensor> const& bias, torch::optional<torch::Tensor> const& workspace,
+    torch::List<int64_t> const& group_, int64_t rank, c10::intrusive_ptr<c10d::ProcessGroup> const& pg,
+    int64_t const strategy_, int64_t const fusion_op_, double const eps_, bool const trigger_completion_at_end_)
+{
+#if ENABLE_MULTI_DEVICE
+    auto const dtype = tensorrt_llm::runtime::TorchUtils::dataType(input.scalar_type());
+    auto const strategy = static_cast<AllReduceStrategyType>(int8_t(strategy_));
+    auto const fusion_op = static_cast<AllReduceFusionOp>(int8_t(fusion_op_));
+    float const eps = eps_;
+    std::set<int> group;
+
+    for (int64_t my_rank : group_)
+    {
+        group.insert(static_cast<int>(my_rank));
+    }
+
+    // Get nccl rank for this process process_group_
+    auto it = group.find(rank);
+    if (it == group.end())
+    {
+        throw std::runtime_error("Rank not found in group");
+    }
+    int nccl_rank = std::distance(group.begin(), it);
+
+    if (nccl_rank != pg->getRank())
+    {
+        throw std::runtime_error("nccl_rank != pg->getRank()");
+    }
+
+    AllreduceOp op(group, pg, dtype, strategy, fusion_op, eps);
+    op.initialize();
+    auto ret = op.run(input, residual, norm_weight, scale, bias, trigger_completion_at_end_, workspace);
+    return ret;
 #else
     return {input};
 #endif // ENABLE_MULTI_DEVICE
@@ -1208,6 +1397,27 @@ std::vector<torch::Tensor> twoShotRMSNorm(torch::Tensor const& comm_buf, torch::
 
     return {normed_output, prenorm_output};
 }
+
+void cpp_dbg(torch::Tensor const& dbg, c10::intrusive_ptr<c10d::ProcessGroup> const& process_group_)
+{
+    // # opts = dist.AllreduceOptions()
+    // # opts.reduceOp = dist.ReduceOp.SUM
+    // # cpu_test = torch.tensor([1.0])
+    // # self.tp_group.allreduce([cpu_test], opts).wait()
+    // # print(cpu_test)
+    // # gpu_test = torch.tensor([1.0]).cuda()
+    // # self.tp_group.allreduce([gpu_test], opts).wait()
+    // # print(gpu_test)
+    c10d::AllreduceOptions opts{c10d::ReduceOp::SUM};
+
+    std::vector gpu_inputs{dbg.clone()};
+
+    process_group_->allreduce(gpu_inputs, opts)->wait();
+
+    std::cout << "<cpp> gpu_test: " << flatten(gpu_inputs[0].to(torch::kFloat).cpu())[0].item().to<float>()
+              << std::endl;
+}
+
 } // namespace torch_ext
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
@@ -1227,6 +1437,21 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "Tensor? bias,"
         "Tensor? workspace,"
         "int[] group,"
+        "int strategy,"
+        "int op,"
+        "float eps,"
+        "bool trigger_completion_at_end) -> Tensor[]");
+    m.def(
+        "allreduce_pg("
+        "Tensor input,"
+        "Tensor? residual,"
+        "Tensor? norm_weight,"
+        "Tensor? scale,"
+        "Tensor? bias,"
+        "Tensor? workspace,"
+        "int[] group,"
+        "int rank,"
+        "__torch__.torch.classes.c10d.ProcessGroup pg,"
         "int strategy,"
         "int op,"
         "float eps,"
@@ -1256,13 +1481,15 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         "int rank,"
         "int nranks,"
         "float eps) -> Tensor[]");
+    // m.def("cpp_dbg(Tensor dbg, __torch__.torch.classes.c10d.ProcessGroup process_group) -> ()", &torch_ext::cpp_dbg);
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
     m.impl("mnnvl_twoshot_allreduce", &torch_ext::mnnvlTwoShotAllReduce);
     m.impl("mnnvl_twoshot_rmsnorm", &torch_ext::twoShotRMSNorm);
-    m.impl("allreduce", &torch_ext::allreduce);
+    m.impl("allreduce", &torch_ext::allreduce_raw);
+    m.impl("allreduce_pg", &torch_ext::allreduce_pg);
     m.impl("moe_allreduce", &torch_ext::moe_allreduce);
     m.impl("moe_finalize_allreduce", &torch_ext::moe_finalize_allreduce);
 }

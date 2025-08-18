@@ -1,6 +1,7 @@
 import copy
 import enum
 import math
+import os
 from abc import ABC, abstractmethod
 from collections import OrderedDict, defaultdict
 from typing import Dict, List, Optional, Set, Tuple, Union
@@ -541,7 +542,14 @@ class KVCacheManager(BaseResourceManager):
 
         if mapping.world_size > 1:
             # make sure all ranks use same value for maxTokens
-            max_tokens = mpi_comm().allreduce(max_tokens, op=MPI.MIN)
+            if os.environ.get("DISABLE_MPI") == "1":
+                max_tokens = mapping.dist.all_reduce(
+                    max_tokens, op=torch.distributed.ReduceOp.MIN)
+                print(
+                    f'max_tokens: {max_tokens}, rank: {torch.distributed.get_rank()}'
+                )
+            else:
+                max_tokens = mpi_comm().allreduce(max_tokens, op=MPI.MIN)
 
         # get number of blocks
         blocks_in_primary_pool = math.ceil(max_tokens / tokens_per_block)
@@ -647,6 +655,10 @@ class KVCacheManager(BaseResourceManager):
 
     def rewind_kv_cache(self, request: LlmRequest, rewind_len: int):
         self.impl.rewind_kv_cache(request.py_request_id, rewind_len)
+
+    def reset_reuse_state(self):
+        """Reset the reuse state of the KV cache manager."""
+        self.impl.reset_reuse_state()
 
     def _get_window_size_to_layers(self) -> dict[int, list[int]]:
         """

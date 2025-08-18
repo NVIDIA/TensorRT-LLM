@@ -7,8 +7,8 @@ import traceback
 from abc import ABC, abstractmethod
 from pathlib import Path
 from queue import Queue
-from typing import (TYPE_CHECKING, AsyncIterable, Generator, List, Optional,
-                    Union)
+from typing import (TYPE_CHECKING, AsyncIterable, Dict, Generator, List,
+                    Optional, Union)
 
 import numpy as np
 import torch
@@ -100,6 +100,9 @@ class GenerationExecutor(ABC):
         self._is_llm_executor = is_llm_executor
         self._iter_kv_events_result: IterationResult | None = None
         self._iter_stats_result: IterationResult | None = None
+
+    def use_ray_queue(self) -> bool:
+        return False
 
     @abstractmethod
     def submit(self, request: GenerationRequest) -> GenerationResult:
@@ -342,6 +345,23 @@ class GenerationExecutor(ABC):
         return self._iter_kv_events_result
 
     @staticmethod
+    def _create_ray_executor(worker_kwargs: Dict,
+                             model_world_size: int,
+                             postproc_worker_config: PostprocWorkerConfig,
+                             is_llm_executor: bool,
+                             tp_size: int,
+                             worker_extension_cls: Optional[str] = None):
+        from .ray_executor import RayExecutor
+
+        # TODO: model_world_size needs to be extended to parallel state.
+        return RayExecutor(worker_kwargs,
+                           model_world_size=model_world_size,
+                           postproc_worker_config=postproc_worker_config,
+                           is_llm_executor=is_llm_executor,
+                           tp_size=tp_size,
+                           worker_extension_cls=worker_extension_cls)
+
+    @staticmethod
     def create(
         engine: Union[Path, Engine],
         executor_config: Optional[tllm.ExecutorConfig] = None,
@@ -355,6 +375,9 @@ class GenerationExecutor(ABC):
         is_llm_executor: Optional[bool] = None,
         lora_config: Optional[LoraConfig] = None,
         garbage_collection_gen0_threshold: Optional[int] = None,
+        executor_type: Optional[str] = None,
+        worker_extension_cls: Optional[str] = None,
+        **args,
     ) -> Union["GenerationExecutorProxy", "GenerationExecutorWorker"]:
         # local imports to avoid cyclic importing
         from .proxy import GenerationExecutorProxy
@@ -385,6 +408,17 @@ class GenerationExecutor(ABC):
 
         if lora_config:
             worker_kwargs["lora_config"] = lora_config
+
+        if executor_type == "ray":
+            return GenerationExecutor._create_ray_executor(
+                worker_kwargs,
+                model_world_size,
+                postproc_worker_config,
+                is_llm_executor=is_llm_executor,
+                tp_size=args.get("tp_size", 1),
+                worker_extension_cls=worker_extension_cls)
+        elif executor_type is not None:
+            assert False, "Invalid executor type"
 
         # The case where the Python main process is launched by mpirun
         mpirun_launch = external_mpi_comm_available(model_world_size)

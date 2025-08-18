@@ -423,7 +423,8 @@ def create_py_executor_instance(
         drafter,
         guided_decoder: Optional[GuidedDecoder] = None,
         lora_config: Optional[LoraConfig] = None,
-        garbage_collection_gen0_threshold: Optional[int] = None) -> PyExecutor:
+        garbage_collection_gen0_threshold: Optional[int] = None,
+        virtual_memory_pools: Optional[dict] = None) -> PyExecutor:
     kv_cache_manager = resources.get(ResourceManagerType.KV_CACHE_MANAGER, None)
 
     spec_config = model_engine.spec_config
@@ -570,7 +571,8 @@ def create_py_executor_instance(
         kv_cache_transceiver=kv_cache_transceiver,
         guided_decoder=guided_decoder,
         start_worker=start_worker,
-        garbage_collection_gen0_threshold=garbage_collection_gen0_threshold)
+        garbage_collection_gen0_threshold=garbage_collection_gen0_threshold,
+        virtual_memory_pools=virtual_memory_pools)
 
 
 def create_torch_sampler_args(executor_config: ExecutorConfig, mapping: Mapping,

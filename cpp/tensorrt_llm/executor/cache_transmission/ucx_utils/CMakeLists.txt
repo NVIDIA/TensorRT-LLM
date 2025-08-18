@@ -3,6 +3,7 @@
 if(ENABLE_UCX)
   find_package(ucx REQUIRED)
   find_package(ucxx REQUIRED)
+  find_package(Torch REQUIRED)
 
   include_directories(${3RDPARTY_DIR}/cppzmq)
 
@@ -23,12 +24,16 @@ if(ENABLE_UCX)
   set(TOP_LEVEL_DIR "${PROJECT_SOURCE_DIR}/..")
   target_compile_definitions(${UCX_WRAPPER_TARGET}
                              PUBLIC TOP_LEVEL_DIR="${TOP_LEVEL_DIR}")
+
+  target_include_directories(${UCX_WRAPPER_TARGET}
+                             PRIVATE ${PROJECT_SOURCE_DIR}/include)
+  target_include_directories(${UCX_WRAPPER_TARGET} PRIVATE ${ZMQ_INCLUDE_DIRS})
+
   target_link_libraries(${UCX_WRAPPER_TARGET}
                         PRIVATE $<LINK_LIBRARY:WHOLE_ARCHIVE,ucxx::ucxx>)
   target_link_libraries(${UCX_WRAPPER_TARGET} PUBLIC ucxx::ucxx ucx::ucs)
   target_link_libraries(${UCX_WRAPPER_TARGET} PUBLIC ${CUDA_RT_LIB})
-
-  # Add include directories
-  target_include_directories(${UCX_WRAPPER_TARGET} PRIVATE ${ZMQ_INCLUDE_DIRS})
+  target_link_libraries(${UCX_WRAPPER_TARGET} PUBLIC ${TORCH_LIBRARIES})
   target_link_libraries(${UCX_WRAPPER_TARGET} PRIVATE ${ZMQ_LIBRARIES})
+  target_link_libraries(${UCX_WRAPPER_TARGET} PRIVATE pg_utils)
 endif()

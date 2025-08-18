@@ -1,5 +1,6 @@
 import copy
 import enum
+import os
 from contextlib import contextmanager
 from dataclasses import dataclass
 from itertools import chain
@@ -18,9 +19,10 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.quantization import QuantAlgo
 
 from ..attention_backend.interface import AttentionRuntimeFeatures
-from ..distributed import MPIDist
+from ..distributed import MPIDist, TorchDist
 from ..speculative import (get_num_extra_kv_tokens, get_spec_drafter,
                            get_spec_resource_manager)
+from ..virtual_memory import RestoreMode, maybe_scope
 from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
                     create_py_executor_instance, instantiate_sampler, is_mla)
 from .config import LoadFormat, PyTorchConfig
@@ -212,7 +214,13 @@ def create_py_executor(
 
     mapping = _get_mapping(executor_config)
 
-    dist = MPIDist(mapping=mapping)
+    if os.environ.get("DISABLE_MPI") == "1":
+        dist = TorchDist(mapping=mapping)
+    else:
+        dist = MPIDist(mapping=mapping)
+
+    vm_pools = {}
+    enable_sleep = executor_config.pytorch_backend_config.enable_sleep
 
     spec_config = executor_config.speculative_config
     has_draft_model_engine = False
@@ -231,8 +239,9 @@ def create_py_executor(
     logger.info("ATTENTION RUNTIME FEATURES: ", attn_runtime_features)
 
     mem_monitor = _ExecutorMemoryMonitor()
-    with mem_monitor.observe_creation_stage(
-            _ExecutorCreationStage.MODEL_ENGINE_MAIN):
+    with (mem_monitor.observe_creation_stage(
+            _ExecutorCreationStage.MODEL_ENGINE_MAIN),
+          maybe_scope(enable_sleep, 'model', RestoreMode.PINNED) as pool):
         model_engine = PyTorchModelEngine(
             model_path=checkpoint_dir,
             pytorch_backend_config=pytorch_backend_config,
@@ -247,10 +256,13 @@ def create_py_executor(
             lora_config=lora_config,
             checkpoint_loader=executor_config.checkpoint_loader,
         )
+        vm_pools['model'] = pool
 
     if has_draft_model_engine:
-        with mem_monitor.observe_creation_stage(
-                _ExecutorCreationStage.MODEL_ENGINE_DRAFT):
+        with (mem_monitor.observe_creation_stage(
+                _ExecutorCreationStage.MODEL_ENGINE_DRAFT),
+              maybe_scope(enable_sleep, 'draft_model', RestoreMode.PINNED) as
+              pool):
             draft_spec_config = copy.copy(spec_config)
             draft_pytorch_backend_config = copy.copy(pytorch_backend_config)
             if spec_config.load_format == "dummy":
@@ -278,6 +290,7 @@ def create_py_executor(
             draft_model_engine.kv_cache_manager_key = ResourceManagerType.DRAFT_KV_CACHE_MANAGER
             draft_model_engine.load_weights_from_target_model(
                 model_engine.model)
+            vm_pools['draft_model'] = pool
     else:
         draft_model_engine = None
 
@@ -386,10 +399,13 @@ def create_py_executor(
                                           mapping=mapping,
                                           net_max_seq_len=net_max_seq_len)
         estimating_kv_cache = kv_cache_creator.try_prepare_estimation()
-        with mem_monitor.observe_creation_stage(
+        with (mem_monitor.observe_creation_stage(
                 _ExecutorCreationStage.INIT_KV_CACHE
-                if estimating_kv_cache else _ExecutorCreationStage.KV_CACHE):
+                if estimating_kv_cache else _ExecutorCreationStage.KV_CACHE),
+              maybe_scope(enable_sleep and not estimating_kv_cache, 'kv_cache',
+                          RestoreMode.NONE) as pool):
             kv_cache_creator.build_managers(resources)
+            vm_pools['kv_cache'] = pool
 
     # Resource managers for speculative decoding
     # For user-specified drafters, use extra_resource_managers in PyTorchBackend config
@@ -397,20 +413,27 @@ def create_py_executor(
     spec_resource_manager = get_spec_resource_manager(model_engine,
                                                       draft_model_engine)
     if spec_resource_manager is not None:
-        resources[
-            ResourceManagerType.SPEC_RESOURCE_MANAGER] = spec_resource_manager
+        with maybe_scope(enable_sleep, 'spec', RestoreMode.PINNED) as pool:
+            resources[ResourceManagerType.
+                      SPEC_RESOURCE_MANAGER] = spec_resource_manager
+            vm_pools['spec'] = pool
 
     # Drafter for speculative decoding
-    with mem_monitor.observe_creation_stage(_ExecutorCreationStage.DRAFTER):
+    with (mem_monitor.observe_creation_stage(_ExecutorCreationStage.DRAFTER),
+          maybe_scope(enable_sleep, 'drafter', RestoreMode.PINNED) as pool):
         drafter = get_spec_drafter(model_engine,
                                    draft_model_engine,
                                    sampler,
                                    spec_resource_manager=spec_resource_manager,
                                    guided_decoder=guided_decoder)
+        vm_pools['drafter'] = pool
 
-    with mem_monitor.observe_creation_stage(
+    with (mem_monitor.observe_creation_stage(
             _ExecutorCreationStage.INIT_EXTRA_RESOURCES
-            if estimating_kv_cache else _ExecutorCreationStage.EXTRA_RESOURCES):
+            if estimating_kv_cache else _ExecutorCreationStage.EXTRA_RESOURCES),
+          maybe_scope(enable_sleep and not estimating_kv_cache, 'extra',
+                      RestoreMode.PINNED) as pool):
+        vm_pools['extra'] = pool
         py_executor = create_py_executor_instance(
             dist=dist,
             resources=resources,
@@ -425,7 +448,7 @@ def create_py_executor(
             guided_decoder=guided_decoder,
             lora_config=lora_config,
             garbage_collection_gen0_threshold=garbage_collection_gen0_threshold,
-        )
+            virtual_memory_pools=vm_pools if not estimating_kv_cache else None)
 
     if estimating_kv_cache:
         assert kv_cache_creator is not None
@@ -435,8 +458,9 @@ def create_py_executor(
         kv_cache_creator.teardown_managers(resources)
         del py_executor  # free before constructing new
 
-        with mem_monitor.observe_creation_stage(
-                _ExecutorCreationStage.KV_CACHE):
+        with (mem_monitor.observe_creation_stage(
+                _ExecutorCreationStage.KV_CACHE),
+              maybe_scope(enable_sleep, 'kv_cache', RestoreMode.NONE) as pool):
             # Before estimating KV cache size, a minimal KV cache has been allocated using
             # create_kv_cache_manager above, which caps executor_config.max_seq_len. Restoring
             # the original value before creating the final KV cache.
@@ -451,8 +475,14 @@ def create_py_executor(
                         eng._release_cuda_graphs()
                     eng.attn_metadata = None
 
-        with mem_monitor.observe_creation_stage(
-                _ExecutorCreationStage.EXTRA_RESOURCES):
+            del vm_pools['kv_cache']
+            vm_pools['kv_cache'] = pool
+
+        with (mem_monitor.observe_creation_stage(
+                _ExecutorCreationStage.EXTRA_RESOURCES),
+              maybe_scope(enable_sleep, 'extra', RestoreMode.PINNED) as pool):
+            del vm_pools['extra']
+            vm_pools['extra'] = pool
             py_executor = create_py_executor_instance(
                 dist=dist,
                 resources=resources,
@@ -468,7 +498,7 @@ def create_py_executor(
                 lora_config=lora_config,
                 garbage_collection_gen0_threshold=
                 garbage_collection_gen0_threshold,
-            )
+                virtual_memory_pools=vm_pools)
 
     _adjust_torch_mem_fraction(executor_config.pytorch_backend_config)
 

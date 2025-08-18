@@ -14,6 +14,7 @@
 # limitations under the License.
 # # Force resource release after test
 
+import os
 import traceback
 from typing import Any
 
@@ -78,6 +79,12 @@ def pytest_addoption(parser):
         help=
         "Prepend a prefix to the test names. Useful for distinguishing different test runs in a test report."
     )
+    parser.addoption(
+        "--run-ray",
+        action="store_true",
+        default=False,
+        help="Run Ray-marked tests (by default they are skipped).",
+    )
 
 
 @pytest.hookimpl(tryfirst=True, hookwrapper=True)
@@ -92,6 +99,17 @@ def pytest_collection_modifyitems(session, config, items):
         # it into the appropriate test suite.
         for item in items:
             item._nodeid = f"{test_prefix}/{item._nodeid}"
+
+    # Ray tests are disabled by default
+    run_ray = config.getoption("--run-ray") or os.environ.get(
+        "TLLM_RUN_RAY_TESTS") == "1"
+    if not run_ray:
+        skip_marker = pytest.mark.skip(
+            reason=
+            "Ray tests skipped; pass --run-ray or set TLLM_RUN_RAY_TESTS=1")
+        for item in items:
+            if "ray" in item.keywords:
+                item.add_marker(skip_marker)
 
 
 def pytest_sessionstart(session):
@@ -119,3 +137,70 @@ def mpi_pool_executor(request):
         # make the number of workers visible to tests
         setattr(executor, "num_workers", num_workers)
         yield executor
+
+
+def pytest_generate_tests(metafunc: pytest.Metafunc):
+    if metafunc.definition.get_closest_marker('mpi_ray_parity'):
+        run_ray = metafunc.config.getoption("--run-ray") or os.environ.get(
+            "TLLM_RUN_RAY_TESTS") == "1"
+        if metafunc.definition.get_closest_marker('mpi_ray_parity') and run_ray:
+            metafunc.parametrize(
+                'ray_mode',
+                [
+                    pytest.param('ray', id='ray', marks=pytest.mark.ray),
+                ],
+                indirect=True,
+            )
+
+
+@pytest.fixture
+def ray_mode(request):
+    return getattr(request, 'param', 'mpi')
+
+
+@pytest.fixture(autouse=True)
+def _maybe_force_ray(request, monkeypatch, ray_mode):
+    """
+    Patch the LLM class (torch only) to use Ray executor.
+    """
+    if 'mpi_ray_parity' not in request.node.keywords or ray_mode != 'ray':
+        return
+
+    def wrap_llm(cls):
+
+        class LLMProxy(cls):
+
+            def __init__(self, *args, **kwargs):
+                kwargs["executor_type"] = "ray"
+                super().__init__(*args, **kwargs)
+
+        return LLMProxy
+
+    test_mod = request.node.module
+
+    # Only patch the torch LLM class
+    if hasattr(test_mod, 'LLM'):
+        try:
+            from tensorrt_llm._tensorrt_engine import LLM as LLM_legacy
+            is_trtllm_backend = (test_mod.LLM is LLM_legacy)
+        except Exception:
+            is_trtllm_backend = False
+        if not is_trtllm_backend:
+            monkeypatch.setattr(test_mod,
+                                'LLM',
+                                wrap_llm(test_mod.LLM),
+                                raising=False)
+    if hasattr(test_mod, 'LLM_torch'):
+        monkeypatch.setattr(test_mod,
+                            'LLM_torch',
+                            wrap_llm(test_mod.LLM_torch),
+                            raising=False)
+
+    try:
+        import tensorrt_llm.llmapi.llm as llm_mod
+        monkeypatch.setattr(llm_mod,
+                            'LLM',
+                            wrap_llm(llm_mod.LLM),
+                            raising=False)
+    except Exception:
+        pass
