@@ -92,6 +92,7 @@ class Eagle3SpecMetadata(SpecMetadata):
     is_draft_model: bool = False
     is_first_draft: bool = False
     eagle3_resource_manager: Optional[Eagle3ResourceManager] = None
+    is_mtp_eagle: bool = False
 
     def __post_init__(self):
         if self.layers_to_capture is None:
@@ -101,13 +102,9 @@ class Eagle3SpecMetadata(SpecMetadata):
                 if self.num_layers <= 5:
                     raise ValueError(
                         "Not enough hidden layers for default EAGLE3 capture")
-
                 self.layers_to_capture = (1, self.num_layers // 2 - 1,
                                           self.num_layers - 4)
-        else:
-            self.layers_to_capture = sorted(list(self.layers_to_capture))
         self.num_capture_layers = len(self.layers_to_capture)
-
         # Initialize to 0 to avoid reading uninitialized memory during warmup
         self.hidden_states_read_indices = torch.zeros([self.max_num_tokens],
                                                       dtype=torch.long,
