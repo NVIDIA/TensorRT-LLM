@@ -219,11 +219,11 @@ class PyExecutor:
 
         self.inflight_req_ids = ReqIdsSet()
 
+        # During warmup, we don't enable the profiler
         self.is_warmup = True
         self.model_engine.warmup(self.resource_manager)
         if self.draft_model_engine is not None:
             self.draft_model_engine.warmup(self.resource_manager)
-        # During warmup, we don't enable the profiler
         self.is_warmup = False
 
         self.is_shutdown = False

@@ -48,12 +48,12 @@ class Backend:
         self.custom_passes = Backend.get_custom_pass(enable_userbuffers)
         self.rank = tensorrt_llm.mpi_rank()
         self.enable_inductor = enable_inductor
-        self.capture_num_tokens = capture_num_tokens if capture_num_tokens is not None else []
+        self.capture_num_tokens = capture_num_tokens or []
         self.piecewise_cuda_graph = enable_piecewise_cuda_graph
         self.no_optimization = False
         # We only need to create aux streams.
         self.aux_streams = Backend.Streams(
-            [torch.cuda.Stream() for i in range(max_num_streams - 1)])
+            [torch.cuda.Stream() for _ in range(max_num_streams - 1)])
         self.events = Backend.Events()
         inductor_config.enable_auto_functionalized_v2 = False
 

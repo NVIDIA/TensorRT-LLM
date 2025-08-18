@@ -333,15 +333,12 @@ class PyTorchModelEngine(ModelEngine):
             pytorch_backend_config.torch_compile_piecewise_cuda_graph
             and not self.enable_attention_dp)
 
-        if pytorch_backend_config.torch_compile_piecewise_cuda_graph_num_tokens:
-            self._piecewise_cuda_graph_num_tokens = pytorch_backend_config.torch_compile_piecewise_cuda_graph_num_tokens
-        elif pytorch_backend_config.cuda_graph_batch_sizes:
-            self._piecewise_cuda_graph_num_tokens = pytorch_backend_config.cuda_graph_batch_sizes
-        else:
-            self._piecewise_cuda_graph_num_tokens = []
+        piecewise_cuda_graph_num_tokens = (
+            pytorch_backend_config.torch_compile_piecewise_cuda_graph_num_tokens
+            or pytorch_backend_config.cuda_graph_batch_sizes or [])
 
         self._piecewise_cuda_graph_num_tokens = [
-            i for i in self._piecewise_cuda_graph_num_tokens
+            i for i in piecewise_cuda_graph_num_tokens
             if i <= self.max_num_tokens
         ]
 
@@ -496,11 +493,6 @@ class PyTorchModelEngine(ModelEngine):
     @is_warmup.setter
     def is_warmup(self, value: bool):
         self._is_warmup = value
-        if self._torch_compile_enabled:
-            if value:
-                self._torch_compile_backend.enable_optimization()
-            else:
-                self._torch_compile_backend.bypass_optimization()
 
         self.moe_load_balancer_iter_info = (not value, not value)
 
