@@ -20,7 +20,19 @@ The guide is intended for developers and practitioners seeking high-throughput o
 * NVFP4 model: [DeepSeek-R1-0528-FP4](https://huggingface.co/nvidia/DeepSeek-R1-0528-FP4)
 
 
-Note that NVFP4 is only supported on NVIDIA Blackwell platform.
+## MoE Backend Support Matrix
+
+There are multiple MOE backends inside TRT-LLM, not all of them supporting every  precision on every GPUs. Here are the support matrix of the MOE backends.
+
+| device | Checkpoint | Supported moe_backend |
+|----------|----------|----------|
+| H100/H200 | FP8 | CUTLASS |
+| B200/GB200 EP<=8 | NVFP4 | CUTLASS, TRTLLM |
+| B200/GB200 EP<=8 | FP8 | DEEPGEMM |
+| GB200 NVL72 EP>8 | NVFP4 |  WIDEEP |
+| GB200 NVL72 EP>8 | FP8 | N/A (WIP) |
+
+The default moe backend is `CUTLASS`, so for the combination which is not supported by `CUTLASS`, one must set the `moe_config.backend` explicitly to run the model.
 
 ## Deployment Steps
 

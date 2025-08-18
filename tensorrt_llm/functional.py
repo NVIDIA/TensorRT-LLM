@@ -4734,6 +4734,15 @@ class RopeEmbeddingUtils:
             inv_freq = 1.0 / (theta**(np.arange(0, dim, 2) / dim)).astype(dtype)
             inv_freq = RopeEmbeddingUtils.apply_llama3_scaling(
                 inv_freq, rope_scaling_config)
+        elif scale_type == RotaryScalingType.dynamic:
+            # Make sure scaling_alpha exists in rope_scaling
+            # Ref: https://huggingface.co/tencent/Hunyuan-A13B-Instruct-FP8/blob/main/modeling_hunyuan.py#L346
+            assert rope_scaling_config[
+                "alpha"] is not None, "rope_scaling_config.alpha must be provided."
+            scaling_alpha = rope_scaling_config["alpha"]
+            adjusted_base = theta * (scaling_alpha**(dim / (dim - 2)))
+            inv_freq = 1.0 / (adjusted_base**(
+                np.arange(0, dim, 2, dtype=dtype) / dim)).astype(dtype)
         else:
             inv_freq = scale / (theta
                                 **(np.arange(0, dim, 2) / dim)).astype(dtype)

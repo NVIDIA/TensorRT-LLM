@@ -3,8 +3,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Type, Union
 
 import torch
-from pydantic import Field, ValidationInfo, field_validator, model_validator
+from pydantic import Field, PrivateAttr, ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from tensorrt_llm.models.modeling_utils import QuantConfig
 
 from ...llmapi.llm_args import BaseLlmArgs, BuildConfig, _ParallelConfig
 from ...llmapi.utils import get_type_repr
@@ -258,6 +260,18 @@ class LlmArgs(AutoDeployConfig, BaseLlmArgs, BaseSettings):
         frozen=True,
     )
     garbage_collection_gen0_threshold: int = Field(default=20000, description="See TorchLlmArgs.")
+
+    _quant_config: Optional[QuantConfig] = PrivateAttr(default=None)
+
+    @property
+    def quant_config(self) -> QuantConfig:
+        if self._quant_config is None:
+            self._quant_config = QuantConfig()
+        return self._quant_config
+
+    @quant_config.setter
+    def quant_config(self, value: QuantConfig):
+        self._quant_config = value
 
     ### VALIDATION #################################################################################
     @field_validator("build_config", mode="before")
