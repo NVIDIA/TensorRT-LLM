@@ -199,7 +199,7 @@ __global__ void __launch_bounds__(NumThreadsSingleBlock) routingIndicesBlockKern
     }
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-#if !defined(FDL_PROFILE) || FDL_PROFILE == 0
+#if !defined(PDL_PROFILE) || PDL_PROFILE == 0
     // we can trigger the next kernel at this point
     if constexpr (KernelParams::UsePdl)
     {
