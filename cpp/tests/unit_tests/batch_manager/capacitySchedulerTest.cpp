@@ -134,8 +134,8 @@ protected:
 
         // init KV cache block manager
         return std::make_shared<kv_cache_manager::KVCacheManager>(numLayers, nbKvHeads, sizePerHead, tokensPerBlock,
-            blocksPerWindow, maxNumRequests, 1, std::vector<SizeType32>{maxNumTokensPerSeq}, std::nullopt, kvDtype,
-            sinkTokenLength, streamPtr, std::nullopt, enableReuse, onboardBlocks, cacheType);
+            blocksPerWindow, maxNumRequests, 1, std::vector<SizeType32>{maxNumTokensPerSeq}, kvDtype, sinkTokenLength,
+            streamPtr, maxNumTokensPerSeq, maxNumTokensPerSeq, enableReuse, onboardBlocks, cacheType);
     }
 
     static std::shared_ptr<BasePeftCacheManager> getPeftCacheManager()

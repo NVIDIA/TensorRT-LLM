@@ -41,6 +41,7 @@ protected:
         auto const stream = std::make_shared<CudaStream>();
 
         auto kvMaxNumTokens = tokensPerBlock * maxBlocksPerSeq;
+        auto maxSequenceLength = kvMaxNumTokens;
         auto maxAttentionWindow = kvMaxNumTokens;
         auto inputLength = kvMaxNumTokens - tokensPerBlock - 1;
         auto numSharedBlocks = inputLength / tokensPerBlock;
@@ -58,8 +59,8 @@ protected:
 
         mCacheManager = std::make_unique<KVCacheManager>(numLayers, numHeads, sizePerHead, tokensPerBlock,
             blocksPerWindow, maxNumSequences, maxBeamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow},
-            std::nullopt, dataType, sinkTokenLength, stream, std::nullopt, enableBlockReuse, onboardBlocks, cacheType,
-            std::nullopt, nullptr, true);
+            dataType, sinkTokenLength, stream, maxSequenceLength, maxSequenceLength, enableBlockReuse, onboardBlocks,
+            cacheType, std::nullopt, nullptr, true);
 
         mCacheManager->allocatePools(false);
 
