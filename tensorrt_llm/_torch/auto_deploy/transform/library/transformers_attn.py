@@ -144,8 +144,7 @@ class HFReplaceCachedAttn(BaseTransform):
         # Add cache
         # equivalent to attn_descriptor.get_cache_initializers()
         def _get_cache(si: SequenceInfo):
-            # use torch.empty
-            return torch.zeros(
+            return torch.empty(
                 si.num_pages,
                 si.page_size,
                 hf_config.num_key_value_heads,
