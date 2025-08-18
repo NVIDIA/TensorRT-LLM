@@ -6453,7 +6453,8 @@ def enumerate_kernels():
                   and kspec.warp_specialization == False
                   and kspec.input_layout == InputLayout.PACKED_QKV))
                   # only generate head_size = 128/256 for attn_logit_softcapping operation.
-                  and (kspec.head_size == 128 or kspec.head_size == 256 or not kspec.enable_attn_logit_softcapping)]
+                  and (kspec.head_size == 128 or kspec.head_size == 256 or not kspec.enable_attn_logit_softcapping)
+                  and kspec.sm == 89 and kspec.flash_attention]
     # yapf: enable
 
     generate_files(specs_names)
