@@ -546,6 +546,15 @@ class RandomDataset(BenchmarkDataset):
                 inner_seq = gen_inner_sequence(input_lens[i], i, offsets[i], vocab_size)
                 token_ids = prefix_token_ids + inner_seq
                 total_input_len_expected = prefix_len + int(input_lens[i])
+                
+                # Here we have to re-tokenize and decode the prompt. Because the token_ids
+                # generated randomly can not guarantee a same token_id sequence after 
+                # decode and re-tokenize, and it will get a longer sequence length in most cases. 
+                # Take Qwen2TokenizerFast as an example: 
+                # [43576] --decode-> 'Ġaqui'  --tokenize-> [43576]
+                # [43577] --decode-> 'swagen' --tokenize-> [43577]
+                # [43576, 43577] --decode-> 'Ġaquiswagen' 
+                #                --tokenize-> [264, 9202, 86, 8535] # seqlen changes
                 prompt = tokenizer.decode(token_ids)
                 re_encoded_token_ids = tokenizer.encode(prompt)
                 while len(re_encoded_token_ids) < total_input_len_expected:
