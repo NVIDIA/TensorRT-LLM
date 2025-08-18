@@ -309,7 +309,7 @@ class Qwen2VLInputProcessorBase(InputProcessor):
                                                 mm_processor_kwargs)
         if not mm_data:
             fused_input_ids = processed_inputs['input_ids']
-            return fused_input_ids.to(torch.int32).tolist(), {}
+            return fused_input_ids.flatten().to(torch.int32).tolist(), {}
 
         pixel_values = processed_inputs.get('pixel_values', None)
         pixel_values_videos = processed_inputs.get('pixel_values_videos', None)
@@ -619,7 +619,6 @@ class Qwen2VLModelBase(PreTrainedModel):
                     encoder_forward_fn=self.mm_encoder.forward,
                     multimodal_params=multimodal_params[:num_context_requests])
             else:
-                # TODO: this is a dead path for now
                 mm_embeds = [
                     multimodal_param.multimodal_data["multimodal_embedding"]
                     for multimodal_param in multimodal_params
