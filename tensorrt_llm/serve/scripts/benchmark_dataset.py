@@ -555,16 +555,16 @@ class RandomDataset(BenchmarkDataset):
                 # [43577] --decode-> 'swagen' --tokenize-> [43577]
                 # [43576, 43577] --decode-> 'Ġaquiswagen' 
                 #                --tokenize-> [264, 9202, 86, 8535] # seqlen changes
-                prompt = tokenizer.decode(token_ids)
-                re_encoded_token_ids = tokenizer.encode(prompt)
+                prompt = tokenizer.decode(token_ids, skip_special_tokens=True)
+                re_encoded_token_ids = tokenizer.encode(prompt, add_special_tokens=False)
                 while len(re_encoded_token_ids) < total_input_len_expected:
                     # Append a new random sequence to the existing sequence
                     new_random_offset = np.random.randint(0, vocab_size)
                     new_inner_seq = gen_inner_sequence(input_lens[i], i, new_random_offset, vocab_size)
                     re_encoded_token_ids += new_inner_seq
                     # Re-encode the prompt
-                    new_prompt = tokenizer.decode(re_encoded_token_ids)
-                    re_encoded_token_ids = tokenizer.encode(new_prompt)
+                    new_prompt = tokenizer.decode(re_encoded_token_ids, skip_special_tokens=True)
+                    re_encoded_token_ids = tokenizer.encode(new_prompt, add_special_tokens=False)
 
                 # Cut if the sequence is longer than the expected length
                 re_encoded_token_ids = re_encoded_token_ids[:total_input_len_expected]
