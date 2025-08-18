@@ -25,6 +25,8 @@ LLM_ROOT = "llm"
 ARTIFACT_PATH = env.artifactPath ? env.artifactPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
 UPLOAD_PATH = env.uploadPath ? env.uploadPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
 
+REUSE_ARTIFACT_PATH = env.reuseArtifactPath
+
 X86_64_TRIPLE = "x86_64-linux-gnu"
 AARCH64_TRIPLE = "aarch64-linux-gnu"
 
@@ -349,6 +351,10 @@ def runLLMTestlistOnSlurm_MultiNodes(pipeline, platform, testList, config=VANILL
                 // if the line cannot be split by "=", just ignore that line.
                 def makoOptsJson = transformMakoArgsToJson(["Mako options:"] + makoArgs)
                 def testListPath = renderTestDB(testList, llmSrcLocal, stageName, makoOptsJson)
+                // Reuse passed tests
+                if (REUSE_ARTIFACT_PATH) {
+                    reusePassedTests(pipeline, llmSrcLocal, REUSE_ARTIFACT_PATH, stageName, testListPath)
+                }
                 Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -r -p -oStrictHostKeyChecking=no ${testListPath} ${remote.user}@${remote.host}:${testListPathNode}",)
 
                 // Generate Multi Node Job Launch Script
@@ -1063,6 +1069,41 @@ def renderTestDB(testContext, llmSrc, stageName, preDefinedMakoOpts=null) {
     return testList
 }
 
+def reusePassedTests(pipeline, llmSrc, reusedArtifactPath, stageName, testListFile) {
+    def reusedPath = "${WORKSPACE}/reused"
+    sh "mkdir -p ${reusedPath}"
+    def resultsFileName = "results-${stageName}"
+    def passedTestsFile = "${reusedPath}/${stageName}/passed_tests.txt"
+    try {
+        def resultsUrl = "https://urm.nvidia.com/artifactory/${reusedArtifactPath}/test-results/${resultsFileName}.tar.gz"
+        trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${reusedPath} && wget -nv ${resultsUrl}")
+        sh "cd ${reusedPath} && tar -zxf ${resultsFileName}.tar.gz"
+        // Get passed tests
+        sh """
+            python3 ${llmSrc}/jenkins/scripts/delete_passed_tests.py \
+            get_passed_tests \
+            --input-file=${reusedPath}/${stageName}/results.xml \
+            --output-file=${passedTestsFile}
+        """
+        sh "The passed tests are: \$(cat ${passedTestsFile})"
+
+        // Copy the original test file to a new file
+        sh "cp ${testListFile} original_${testListFile}"
+        // Remove passed tests from original test file
+        sh """
+            python3 ${llmSrc}/jenkins/scripts/delete_passed_tests.py \
+            remove_passed_tests \
+            --input-file=${testListFile} \
+            --passed-tests-file=${passedTestsFile}
+        """
+        sh "The test list after removing passed tests is: \$(cat ${testListFile})"
+    } catch (InterruptedException e) {
+        throw e
+    } catch (Exception e) {
+        echo "Failed to get passed tests: ${e.message}"
+    }
+}
+
 def getSSHConnectionPorts(portConfigFile, stageName)
 {
     def type = stageName.split('-')[0]
@@ -1409,6 +1450,11 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         extraInternalEnv += " CPP_TEST_TIMEOUT_OVERRIDDEN=${pytestTestTimeout}"
 
         def testDBList = renderTestDB(testList, llmSrc, stageName)
+        // Reuse passed tests
+        if (REUSE_ARTIFACT_PATH) {
+            reusePassedTests(pipeline, llmSrc, REUSE_ARTIFACT_PATH, stageName, testDBList)
+        }
+
         testList = "${testList}_${splitId}"
         def testCmdLine = [
             "LLM_ROOT=${llmSrc}",
