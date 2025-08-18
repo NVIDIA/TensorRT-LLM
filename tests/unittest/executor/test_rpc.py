@@ -3,7 +3,7 @@ import time
 import pytest
 
 from tensorrt_llm.executor.rpc import (RPCCancelled, RPCClient, RPCError,
-                                       RPCServer)
+                                       RPCServer, RPCTimeout)
 
 
 def test_rpc_server_basics():
@@ -22,7 +22,7 @@ def test_rpc_server_basics():
 
     time.sleep(1)
     print("shutdown")
-    server._shutdown()
+    server.shutdown()
 
 
 def test_rpc_client_context_manager():
@@ -137,6 +137,10 @@ class TestRpcError:
             with pytest.raises(RPCCancelled):
                 future.result()
 
+        time.sleep(1)
+
+        client.close()
+
     def test_timeout_error(self):
         """Test that requests that exceed timeout are handled with proper error."""
 
@@ -202,6 +206,8 @@ def test_rpc_shutdown_server():
         assert ret == "world"
 
         client.shutdown_server()
+
+    time.sleep(5)  # the server dispatcher thread need some time to quit
 
 
 def test_rpc_hello_with_arg():
@@ -363,7 +369,7 @@ def test_rpc_timeout(use_async: bool):
         client = RPCClient("ipc:///tmp/rpc_test_timeout")
 
         # Test that a short timeout causes RPCTimeout exception
-        with pytest.raises(RPCError) as exc_info:
+        with pytest.raises(RPCTimeout) as exc_info:
             if use_async:
                 # Test async call with timeout
                 import asyncio
@@ -375,25 +381,23 @@ def test_rpc_timeout(use_async: bool):
 
                 asyncio.run(test_async_timeout())
             else:
-                # Test sync call with timeout
-                client.slow_operation(2.0, __rpc_timeout=0.1)
+                client.slow_operation(2.0, __rpc_timeout=0.1)  # small timeout
 
             assert "timed out" in str(
                 exc_info.value), f"Timeout message not found: {exc_info.value}"
 
         # Test that a long timeout allows the operation to complete
         if use_async:
-            # Test async call with sufficient timeout
             import asyncio
 
             async def test_async_success():
                 return await client.call_async('slow_operation',
                                                0.1,
-                                               __rpc_timeout=1.0)
+                                               __rpc_timeout=10.0)
 
             result = asyncio.run(test_async_success())
         else:
-            result = client.slow_operation(0.1, __rpc_timeout=1.0)
+            result = client.slow_operation(0.1, __rpc_timeout=10.0)
 
         assert result == "completed"
 

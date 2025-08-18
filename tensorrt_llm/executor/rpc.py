@@ -139,15 +139,14 @@ class RPCServer:
             return
         self._stop_event.set()
 
-        if self._dispatcher_thread and self._dispatcher_thread.is_alive():
-            try:
+        if self._dispatcher_thread:
+            # shutdown could be invoked by the dispatcher thread itself.
+            if threading.current_thread() is not self._dispatcher_thread:
                 self._dispatcher_thread.join()
-            except Exception:
-                pass
             self._dispatcher_thread = None
 
         if self._executor:
-            self._executor.shutdown(wait=False)
+            self._executor.shutdown(wait=True)
 
         if self._client_socket:
             self._client_socket.close()
@@ -368,7 +367,7 @@ class RPCClient:
             self._reader_task.cancel()
             self._reader_task = None
         if self._executor:
-            self._executor.shutdown(wait=False)
+            self._executor.shutdown(wait=True)
 
     async def _response_reader(self):
         """Task to read responses from the socket and set results on futures."""
