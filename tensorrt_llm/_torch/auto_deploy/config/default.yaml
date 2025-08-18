@@ -49,7 +49,7 @@ transforms:
   detect_sharding:
     stage: sharding
     simple_shard_only: false
-    use_sharding_from_factory: true
+    use_sharding_from_factory: false
   # TODO: (hg) need to ensure run_shape_prop after sharding.
   sharding_transform_executor:
     stage: sharding
