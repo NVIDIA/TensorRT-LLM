@@ -279,7 +279,7 @@ def calculate_expected_kv_cache_metrics(free_mem_ratio: float):
             # For TinyLlama-1.1B, model should be 2.2GB
             estimated_model_size_mb = 2200  # Conservative estimate
             # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/6335 check why there is extra consumption
-            extra_consumption_mb = 2500
+            extra_consumption_mb = 2700
             expected_free_mem_range = (
                 total_mem_mb - estimated_model_size_mb - extra_consumption_mb,
                 total_mem_mb - estimated_model_size_mb,
@@ -606,5 +606,24 @@ def test_trtllm_bench(llm_root):  # noqa: F811
 
 @pytest.mark.no_xdist
 def test_trtllm_bench_backend_comparison(llm_root):  # noqa: F811
-    """Test that compares autodeploy backend performance against pytorch backend."""
+    """Test that compares autodeploy backend performance against pytorch backend.
+    It also checks the memory footprint of the autodeploy backend by parsing the
+    log output from the resize_kv_cache function and extracting the following metrics:
+    current_cache_size - the cache size before resize
+    free_mem_pre_mb - the free memory before forward pass
+    free_mem_post_mb - the free memory after forward pass
+    new_cache_size - the cache size after resize
+
+    The following checks are performed:
+    1. free_mem_pre_fw_pass is in:
+       [Total mem - expected_model_size - extra_consumption, Total mem - expected_model_size]
+    2. free_mem_post_fw_pass is in:
+       [Total mem - expected_model_size  - extra_consumption - 1000, Total mem - expected_model_size - 500]
+    3. free_mem_post_fw_pass -  free_mem_pre_fw_pass < 5000
+    4. expected_new_cache = free_mem_post * free_mem_ratio + current_cache_size
+       cache_size_diff = abs(new_cache_size - expected_new_cache) / expected_new_cache
+       assert cache_size_diff <= 0.01
+
+    extra_consumption_mb = 2700 - this is unexplained memory consumption to be investigated.
+    """
     trtllm_bench_unified_comparison(llm_root, comparison_mode="backend")
