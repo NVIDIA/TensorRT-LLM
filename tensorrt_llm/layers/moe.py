@@ -777,7 +777,7 @@ class MixtureOfExperts(Module):
         self.use_int8_weight = use_int8_weight
         self.group_size = group_size
 
-        if self.use_int8_weight:
+        if self.use_int8_weight and self.group_size > 0:
             raise NotImplementedError("INT8-GPTQ is not implemented for MoE.")
 
         self.static_routing = static_routing

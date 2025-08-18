@@ -31,6 +31,7 @@ from tensorrt_llm.bindings.executor import (DisServingRequestStats,
 from tensorrt_llm.bindings.internal.batch_manager import (LlmRequestType,
                                                           ReqIdsSet)
 from tensorrt_llm.logger import logger
+from tensorrt_llm.mapping import CpType
 from tensorrt_llm.runtime.generation import CUASSERT
 
 from ..distributed import Distributed
@@ -402,6 +403,16 @@ class PyExecutor:
         it = -1
         enabled = False
         start_time = None
+
+        # These events are used to record the time of the previous batch.
+        # We need two set of the start-end events to record the time through
+        # a ping-pong way so that it works with overlap scheduler.
+        start_event_1 = None
+        end_event_1 = torch.cuda.Event(enable_timing=True)
+        start_event_2 = None
+        end_event_2 = torch.cuda.Event(enable_timing=True)
+        prev_device_step_time = None
+
         torch_trace_path = os.environ.get(PROFILE_TRACE_ENV_VAR_NAME, None)
         profile_start_stop = os.environ.get(PROFILE_START_STOP_ENV_VAR_NAME,
                                             None)
@@ -424,7 +435,7 @@ class PyExecutor:
                                                     with_modules=True)
 
         def profile_step():
-            nonlocal it, enabled, start_time
+            nonlocal it, enabled, start_time, start_event_1, end_event_1, start_event_2, end_event_2, prev_device_step_time
             if it in self.profile_stop_iters and not self.is_warmup:
                 assert enabled, "Inconsistent CUDA profiling state"
                 if enable_torch_trace:
@@ -437,7 +448,24 @@ class PyExecutor:
 
             if start_time is not None and self.print_log and self.dist.rank == 0:
                 end_time = time.time()
+                if it % 2 == 0:
+                    end_event_1.record()
+                    if start_event_2 is not None:
+                        end_event_2.synchronize()
+                        prev_device_step_time = start_event_2.elapsed_time(
+                            end_event_2)
+                else:
+                    end_event_2.record()
+                    if start_event_1 is not None:
+                        end_event_1.synchronize()
+                        prev_device_step_time = start_event_1.elapsed_time(
+                            end_event_1)
 
+                if prev_device_step_time is None:
+                    prev_device_step_time = "N/A"  # Handle first iteration
+                else:
+                    prev_device_step_time = f"{prev_device_step_time}ms"
+                host_step_time = (end_time - start_time) * 1000  # milliseconds
                 formatted_timestamp = datetime.datetime.now().strftime(
                     "%Y-%m-%d %H:%M:%S")
                 logger.info(
@@ -446,7 +474,8 @@ class PyExecutor:
                     f"rank = {self.dist.rank}, "
                     f"currank_total_requests = {self.executor_request_queue.num_fetch_requests_cur_rank}/"
                     f"{self.executor_request_queue.num_fetch_requests}, "
-                    f"elapsed_time = {end_time - start_time}s, "
+                    f"host_step_time = {host_step_time}ms, "
+                    f"prev_device_step_time = {prev_device_step_time}, "
                     f"timestamp = {formatted_timestamp}, "
                     f"num_scheduled_requests: {self.num_scheduled_requests}, "
                     f"states = {self.model_engine.iter_states}")
@@ -461,6 +490,14 @@ class PyExecutor:
                 logger.info(f"Profiling started at iteration {it}.")
                 enabled = True
             start_time = time.time()
+            if it % 2 == 0:
+                if start_event_1 is None:
+                    start_event_1 = torch.cuda.Event(enable_timing=True)
+                start_event_1.record()
+            else:
+                if start_event_2 is None:
+                    start_event_2 = torch.cuda.Event(enable_timing=True)
+                start_event_2.record()
 
         try:
             yield profile_step
@@ -1304,7 +1341,6 @@ class PyExecutor:
 
             for resource_mgr_type in (
                     ResourceManagerType.KV_CACHE_MANAGER,
-                    ResourceManagerType.SEQ_SLOT_MANAGER,
                     ResourceManagerType.SPEC_RESOURCE_MANAGER,
                     ResourceManagerType.DRAFT_KV_CACHE_MANAGER):
                 if (resource_mgr_type in self.resource_manager.resource_managers
@@ -1326,6 +1362,9 @@ class PyExecutor:
         if len(cache_trans_complete_requests) > 0:
             requests = ScheduledRequests()
             requests.context_requests = cache_trans_complete_requests
+            self.resource_manager.resource_managers[
+                ResourceManagerType.SEQ_SLOT_MANAGER].prepare_resources(
+                    requests)
             self._setup_sampler_step(requests)
 
         for req in scheduled_batch.generation_requests:
@@ -1397,7 +1436,7 @@ class PyExecutor:
                       new_tensors_device: Optional[SampleStateTensors] = None):
 
         @nvtx_range(
-            f"[Executor] _forward_step {self.model_engine.iter_counter}: {len(scheduled_requests.context_requests)} ctx reqs, {len(scheduled_requests.generation_requests)} gen reqs"
+            f"[Executor] _forward_step {self.model_engine.iter_counter + 1}: {len(scheduled_requests.context_requests)} ctx reqs, {len(scheduled_requests.generation_requests)} gen reqs"
         )
         def forward(scheduled_requests, resource_manager, new_tensors_device,
                     gather_context_logits, cache_indirection_buffer):
@@ -1460,7 +1499,7 @@ class PyExecutor:
         cp_config = self.dist.cp_config
         if 'cp_type' in cp_config:
             cp_type = cp_config['cp_type']
-            if cp_type == 'star_attention':
+            if cp_type == CpType.STAR:
                 self._update_request_states_star_attention(scheduled_requests)
             else:
                 assert False, f'Unsupport cp_type {cp_type}'

@@ -247,6 +247,7 @@ def test_llm_kv_events_api():
     check_events(llm, requests, sampling_params)
 
 
+@pytest.mark.skip(reason="https://nvbugs/5451407")
 @skip_single_gpu
 @pytest.mark.threadleak(enabled=False)
 def test_llm_api_attention_dp_kv_events():

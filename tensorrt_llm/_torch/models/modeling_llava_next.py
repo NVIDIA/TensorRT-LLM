@@ -14,7 +14,9 @@ from transformers.models.llava_next.modeling_llava_next import (
 
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 
-from ...inputs import (ExtraProcessedInputs, InputProcessor, TextPrompt,
+from ...inputs import (ExtraProcessedInputs, InputProcessor,
+                       MultimodalPlaceholderMetadata,
+                       MultimodalPlaceholderPlacement, TextPrompt,
                        register_input_processor)
 from ...llmapi.utils import download_hf_model
 from ...logger import logger
@@ -404,7 +406,13 @@ class LlavaNextVisionModel(nn.Module):
 
 @register_vision_encoder(LlavaNextVisionModel)
 @register_auto_model("LlavaNextForConditionalGeneration")
-@register_input_processor(LlavaNextInputProcessor, model_type="llava_next")
+@register_input_processor(
+    LlavaNextInputProcessor,
+    model_type="llava_next",
+    placeholder_metadata=MultimodalPlaceholderMetadata(
+        placeholder_map={"image": "<image>"},
+        placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
+    ))
 class LlavaNextModel(PreTrainedModel):
     config_class = LlavaNextConfig
 

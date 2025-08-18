@@ -148,6 +148,14 @@ class ModelConfig(Generic[TConfig]):
                 self.allreduce_strategy)
 
     @property
+    def torch_dtype(self) -> torch.dtype:
+        """Get the torch dtype of the model."""
+        # TODO: this is an assumption that a HF model is always in bfloat16
+        # We should figure out a better way to handle this if other models
+        # start to not report dtype.
+        return self.pretrained_config.torch_dtype or torch.bfloat16
+
+    @property
     def fuse_pos_embd(self):
         if self.attn_backend == 'TRTLLM':
             return True
@@ -158,8 +166,9 @@ class ModelConfig(Generic[TConfig]):
     @property
     def enable_flash_mla(self):
         if self.attn_backend == 'TRTLLM':
-            if hasattr(self.pretrained_config, "kv_lora_rank") and hasattr(
-                    self.pretrained_config, "qk_rope_head_dim"):
+            if getattr(self.pretrained_config,
+                       "kv_lora_rank", None) and getattr(
+                           self.pretrained_config, "qk_rope_head_dim", None):
                 head_dim = self.pretrained_config.kv_lora_rank + self.pretrained_config.qk_rope_head_dim
                 if head_dim == 576 and torch.cuda.get_device_capability() == (
                         9, 0):

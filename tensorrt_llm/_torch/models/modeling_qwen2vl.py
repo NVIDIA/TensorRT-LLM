@@ -13,7 +13,9 @@ from tensorrt_llm.inputs.multimodal import MultimodalParams
 
 from ..._utils import nvtx_range_debug
 from ...functional import RopeEmbeddingUtils, RotaryScalingType
-from ...inputs import (ExtraProcessedInputs, InputProcessor, TextPrompt,
+from ...inputs import (ExtraProcessedInputs, InputProcessor,
+                       MultimodalPlaceholderMetadata,
+                       MultimodalPlaceholderPlacement, TextPrompt,
                        register_input_processor)
 from ...logger import logger
 from ...sampling_params import SamplingParams
@@ -656,7 +658,16 @@ class Qwen2VLModelBase(PreTrainedModel):
 @register_vision_encoder(Qwen2VisionModelBase,
                          vlm_base_model=Qwen2VLForConditionalGeneration)
 @register_auto_model("Qwen2VLForConditionalGeneration")
-@register_input_processor(Qwen2VLInputProcessorBase, model_type="qwen2_vl")
+@register_input_processor(
+    Qwen2VLInputProcessorBase,
+    model_type="qwen2_vl",
+    placeholder_metadata=MultimodalPlaceholderMetadata(
+        placeholder_map={
+            "image": "<|vision_start|><|image_pad|><|vision_end|>",
+            "video": "<|vision_start|><|video_pad|><|vision_end|>"
+        },
+        placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
+    ))
 class Qwen2VLModel(Qwen2VLModelBase):
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args,
@@ -670,7 +681,14 @@ class Qwen2VLModel(Qwen2VLModelBase):
 @register_vision_encoder(Qwen2VisionModelBase,
                          vlm_base_model=Qwen2_5_VLForConditionalGeneration)
 @register_auto_model("Qwen2_5_VLForConditionalGeneration")
-@register_input_processor(Qwen2VLInputProcessorBase, model_type="qwen2_5_vl")
+@register_input_processor(
+    Qwen2VLInputProcessorBase,
+    model_type="qwen2_5_vl",
+    placeholder_metadata=MultimodalPlaceholderMetadata(
+        placeholder_map={
+            "image": "<|vision_start|><|image_pad|><|vision_end|>",
+            "video": "<|vision_start|><|video_pad|><|vision_end|>"
+        }))
 class Qwen2_5_VLModel(Qwen2VLModelBase):
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig], *args,

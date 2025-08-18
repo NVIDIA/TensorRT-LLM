@@ -14,7 +14,7 @@ context_servers:
   pipeline_parallel_size: 1
   enable_attention_dp: true
   cache_transceiver_config:
-    backend: default
+    backend: DEFAULT
   urls:
       - "localhost:8001"
 generation_servers:
@@ -25,4 +25,4 @@ generation_servers:
   urls:
       - "localhost:8002"
   cache_transceiver_config:
-    backend: default
+    backend: DEFAULT
