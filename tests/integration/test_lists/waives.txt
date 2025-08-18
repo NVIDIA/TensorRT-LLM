@@ -300,7 +300,7 @@ accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[latency_moe_cutl
 accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[latency_moe_cutlass-torch_compile=False] SKIP (https://nvbugs/5457489)
 accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[latency_moe_trtllm-torch_compile=True] SKIP (https://nvbugs/5457489)
 disaggregated/test_workers.py::test_workers_kv_cache_events[TinyLlama-1.1B-Chat-v1.0] SKIP (https://nvbugs/5457504)
-accuracy/test_llm_api.py::TestMistral_Nemo_12B_Base::test_fp8 SKIP (https://nvbugs/5413197)
+accuracy/test_llm_api.py::TestMistralNemo12B::test_fp8 SKIP (https://nvbugs/5413197)
 triton_server/test_triton.py::test_gpt_ib_streaming[gpt-ib-streaming] SKIP (https://nvbugs/5371349)
 triton_server/test_triton.py::test_gpt_ib_ptuning[gpt-ib-ptuning] SKIP (https://nvbugs/5445624)
 triton_server/test_triton.py::test_mistral_ib_mm[mistral-ib-mm] SKIP (https://nvbugs/5371343)
