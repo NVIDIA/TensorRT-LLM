@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import sys
+from functools import partial
 from pathlib import Path
 
 import click
@@ -10,7 +10,9 @@ from click_option_group import (MutuallyExclusiveOptionGroup, OptionGroup,
                                 optgroup)
 from huggingface_hub import snapshot_download
 
-from tensorrt_llm.bench.benchmark import GeneralExecSettings, get_general_cli_options, get_llm
+from tensorrt_llm.bench.benchmark import (GeneralExecSettings,
+                                          generate_json_report,
+                                          get_general_cli_options, get_llm)
 from tensorrt_llm.bench.benchmark.utils.asynchronous import async_benchmark
 from tensorrt_llm.tools.importlib_utils import import_custom_module_from_dir
 
@@ -466,21 +468,15 @@ def throughput_command(
 
         report_utility = ReportUtility(statistics, metadata, runtime_config,
                                        logger, kwargs, options.streaming)
-        if options.report_json:
-            logger.info(f"Writing report to '{options.report_json}'.")
-            with open(options.report_json, "w") as f:
-                f.write(
-                    json.dumps(report_utility.get_statistics_dict(), indent=4))
-        if options.output_json:
-            logger.info(f"Writing output to {options.output_json}.")
-            with open(options.output_json, "w") as f:
-                output_token_info = report_utility.get_output_tokens(tokenizer)
-                f.write(json.dumps(output_token_info, indent=4))
-        if options.request_json:
-            logger.info(
-                f"Writing request information to {options.request_json}.")
-            with open(options.request_json, "w") as f:
-                f.write(json.dumps(report_utility.get_request_info(tokenizer)))
+        # Generate reports for statistics, output tokens, and request info.
+        generate_json_report(options.report_json,
+                             report_utility.get_statistics_dict)
+        generate_json_report(
+            options.output_json,
+            partial(report_utility.get_output_tokens, tokenizer))
+        generate_json_report(
+            options.request_json,
+            partial(report_utility.get_request_info, tokenizer))
         report_utility.report_statistics()
     except KeyboardInterrupt:
         logger.info("Keyboard interrupt, exiting benchmark...")

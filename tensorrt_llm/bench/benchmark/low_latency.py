@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import os
+from functools import partial
 from pathlib import Path
 
 import click
@@ -11,10 +11,10 @@ from click_option_group import (MutuallyExclusiveOptionGroup, OptionGroup,
                                 optgroup)
 from huggingface_hub import snapshot_download
 
-from tensorrt_llm.bench.benchmark import get_general_cli_options, get_llm
+from tensorrt_llm.bench.benchmark import (generate_json_report,
+                                          get_general_cli_options, get_llm)
 from tensorrt_llm.bench.benchmark.utils.asynchronous import async_benchmark
 from tensorrt_llm.bench.benchmark.utils.general import generate_warmup_dataset
-from tensorrt_llm.bench.benchmark.utils.processes import IterationWriter
 from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
 from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
 from tensorrt_llm.bench.dataclasses.reporting import ReportUtility
@@ -205,12 +205,6 @@ def latency_command(
 
     # Speculative Decode Options
     medusa_choices = params.get("medusa_choices")
-
-    # Reporting Options
-    report_json: Path = params.pop("report_json")
-    iteration_log: Path = params.pop("iteration_log")
-    iteration_writer = IterationWriter(iteration_log)
-
     # Initialize the HF tokenizer for the specified model.
     tokenizer = initialize_tokenizer(options.checkpoint_path)
 
@@ -343,7 +337,7 @@ def latency_command(
             llm._executor._iter_stats_result = None
             logger.info("Warmup done.")
 
-        with iteration_writer.capture():
+        with options.iteration_writer.capture():
             statistics = asyncio.run(
                 async_benchmark(llm,
                                 sampling_params,
@@ -351,7 +345,7 @@ def latency_command(
                                 requests,
                                 True,
                                 options.concurrency,
-                                iteration_writer.full_address,
+                                options.iteration_writer.full_address,
                                 modality=options.modality))
 
         logger.info("Benchmark done. Reporting results...")
@@ -362,11 +356,15 @@ def latency_command(
 
         report_utility = ReportUtility(statistics, metadata, runtime_config,
                                        logger, kwargs, True)
-        if report_json:
-            logger.info(f"Writing report to '{report_json}'.")
-            with open(report_json, "w") as f:
-                f.write(
-                    json.dumps(report_utility.get_statistics_dict(), indent=4))
+        # Generate reports for statistics, output tokens, and request info.
+        generate_json_report(options.report_json,
+                             report_utility.get_statistics_dict)
+        generate_json_report(
+            options.output_json,
+            partial(report_utility.get_output_tokens, tokenizer))
+        generate_json_report(
+            options.request_json,
+            partial(report_utility.get_request_info, tokenizer))
         report_utility.report_statistics()
     except KeyboardInterrupt:
         logger.info("Keyboard interrupt, exiting benchmark...")

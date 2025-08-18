@@ -1,5 +1,6 @@
+import json
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Callable, Dict, Optional
 
 from pydantic import AliasChoices, BaseModel, Field
 
@@ -144,3 +145,15 @@ def get_general_cli_options(
 
     # Create and return the settings object, ignoring any extra fields
     return GeneralExecSettings(**settings_dict)
+
+
+def generate_json_report(report_path: Optional[Path], func: Callable):
+    if report_path is None:
+        logger.debug(
+            "No report path provided, skipping report generation for callable %s.",
+            func.__name__)
+    else:
+        logger.info(f"Writing report information to {report_path}...")
+        with open(report_path, "w") as f:
+            f.write(json.dumps(func(), indent=4))
+        logger.info(f"Report information written to {report_path}.")
