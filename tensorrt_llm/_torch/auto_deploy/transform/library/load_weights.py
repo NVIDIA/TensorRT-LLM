@@ -46,7 +46,6 @@ class LoadWeightsToDevice(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
-        # breakpoint()
         factory.load_or_random_init(
             gm,
             device=self.config.adconfig_checkpoint_device or self.config.device,
