@@ -135,8 +135,6 @@ class GenerationExecutor(ABC):
             postproc_params.postproc_args.num_prompt_tokens = len(
                 prompt_token_ids)
 
-        print(f"[CF][generate_async] sampling_params is ")
-        print(sampling_params)
         request = GenerationRequest(
             prompt_token_ids,
             sampling_params=sampling_params,
