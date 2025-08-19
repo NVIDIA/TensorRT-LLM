@@ -16,8 +16,8 @@ ntasks_per_node=4 # 4 GPUs per GB200 node, 8 GPUs per B200 node
 
 isl=1024
 osl=1024
-multi_round=1
-streaming=false
+multi_round=10
+streaming=true
 benchmark_mode=e2e
 
 # dep16 eplb0, 256, 288
