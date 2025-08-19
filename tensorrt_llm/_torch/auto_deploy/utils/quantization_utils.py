@@ -184,6 +184,11 @@ class FP8QuantizationImpl(QuantizationImpl):
         return torch.ops.auto_deploy.torch_quant_fp8_linear
 
     @staticmethod
+    def custom_op():
+        """Unified custom kernel entry-point for quantized linear."""
+        return torch.ops.auto_deploy.torch_quant_linear_fp8
+
+    @staticmethod
     def quantize_weight(original_weight: torch.Tensor) -> torch.Tensor:
         return torch.empty_like(
             original_weight, dtype=torch.float8_e4m3fn, device=original_weight.device
@@ -208,7 +213,7 @@ class FP8QuantizationImpl(QuantizationImpl):
             weight_scale=[scale_getattrs["weight_scale"]],
             input_zp=[],
             weight_zp=[],
-            format_type=FORMAT_FP8,
+            # format_type=FORMAT_FP8,
         )
 
     @staticmethod
@@ -269,6 +274,11 @@ class FP4QuantizationImpl(QuantizationImpl):
         return torch.ops.auto_deploy.torch_quant_fp4_linear
 
     @staticmethod
+    def custom_op():
+        """Unified custom kernel entry-point for quantized linear."""
+        return torch.ops.auto_deploy.torch_quant_linear_fp4
+
+    @staticmethod
     def quantize_weight(original_weight: torch.Tensor) -> torch.Tensor:
         m, n = original_weight.shape
         return torch.empty((m, n // 2), dtype=torch.uint8, device=original_weight.device)
@@ -315,7 +325,7 @@ class FP4QuantizationImpl(QuantizationImpl):
             weight_scale=[scale_getattrs["weight_scale"], scale_getattrs["alpha"]],
             input_zp=[],
             weight_zp=[],
-            format_type=FORMAT_NVFP4,
+            # format_type=FORMAT_NVFP4,
         )
 
     @staticmethod

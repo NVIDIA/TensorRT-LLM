@@ -37,13 +37,10 @@ def _from_fp8(x_fp8: torch.Tensor, scale: torch.Tensor, dtype: torch.dtype) -> t
 def _dequant_weight_fp8(
     weight_fp8: torch.Tensor,
     weight_scale: torch.Tensor,
-    weight_scale_type: int,
     out_features: int,
     dtype: torch.dtype,
 ) -> torch.Tensor:
-    if weight_scale_type == PER_TENSOR:
-        return weight_fp8.to(dtype) * weight_scale
-    raise NotImplementedError(f"Unsupported weight_scale_type={weight_scale_type} for FP8.")
+    return weight_fp8.to(dtype) * weight_scale
 
 
 # The NVFP4 helpers below are adapted from modelopt.torch.quantization.qtensor.nvfp4_tensor.NVFP4QTensor
@@ -264,6 +261,131 @@ def custom_quant_linear(
 
     else:
         raise NotImplementedError(f"Unknown format_type={format_type}")
+
+
+@torch.library.custom_op("auto_deploy::torch_quant_linear_fp8", mutates_args=())
+def torch_quant_linear_fp8(
+    input: torch.Tensor,
+    weight_quantized: torch.Tensor,
+    bias: torch.Tensor,  # Optional, no default
+    input_scale: List[torch.Tensor],  # Tensor?[]  (REQUIRED: no default)
+    weight_scale: List[torch.Tensor],  # Tensor?[]
+    input_zp: List[torch.Tensor],  # Tensor?[]
+    weight_zp: List[torch.Tensor],  # Tensor?[]
+) -> torch.Tensor:
+    """
+    Reference (eager) implementation for multiple quant formats via `format_type`.
+    For FP8:
+      - input_scale[0] and weight_scale[0] are required (amax/448 style)
+      - input_zp / weight_zp ignored
+      - supports PER_TENSOR and PER_CHANNEL_OUT for weights
+    """
+    if weight_quantized.dtype != torch.float8_e4m3fn:
+        raise TypeError("FP8 path requires weight_quantized.dtype == float8_e4m3fn")
+    s_in = _expect_single_scale(input_scale, "input_scale")
+    s_w = _expect_single_scale(weight_scale, "weight_scale")
+
+    in_dtype = input.dtype
+    out_features, in_features = weight_quantized.shape
+
+    input_fp8 = _to_fp8(input, s_in)
+    input_deq = _from_fp8(input_fp8, s_in, in_dtype)
+
+    weight_deq = _dequant_weight_fp8(weight_quantized, s_w, out_features, in_dtype)
+
+    out = torch.matmul(input_deq.reshape(-1, in_features), weight_deq.t())
+    if bias is not None:
+        out = out + bias
+    return out.reshape(*input.shape[:-1], out_features)
+
+
+@torch_quant_linear_fp8.register_fake
+def torch_quant_linear_fp8(
+    input: torch.Tensor,
+    weight_quantized: torch.Tensor,
+    bias: torch.Tensor,
+    input_scale: List[torch.Tensor],
+    weight_scale: List[torch.Tensor],
+    input_zp: List[torch.Tensor],
+    weight_zp: List[torch.Tensor],
+) -> torch.Tensor:
+    w = weight_quantized.to(input.dtype)
+    return torch.ops.aten.linear(input, w, bias)
+
+
+@torch.library.custom_op("auto_deploy::torch_quant_linear_fp4", mutates_args=())
+def torch_quant_linear_fp4(
+    input: torch.Tensor,
+    weight_quantized: torch.Tensor,
+    bias: torch.Tensor,  # Optional, no default
+    input_scale: List[torch.Tensor],  # Tensor?[]  (REQUIRED: no default)
+    weight_scale: List[torch.Tensor],  # Tensor?[]
+    input_zp: List[torch.Tensor],  # Tensor?[]
+    weight_zp: List[torch.Tensor],  # Tensor?[]
+) -> torch.Tensor:
+    """
+    Reference (eager) implementation for multiple quant formats via `format_type`.
+    For FP4:
+      - input_scale[0]  = s_in2   (scalar, amax/(448*6))
+      - weight_scale[0] = q_per_block_scale_w  (len >= N*K/16; may be padded)
+      - weight_scale[1] = alpha = s_in2 * s_w2 (combined per-tensor scales)
+    """
+    if weight_quantized.dtype != torch.uint8:
+        raise TypeError("NVFP4 path requires packed uint8 weights (2x FP4 per byte).")
+
+    inv_x = _expect_single_scale(input_scale, "input_scale")
+    if len(weight_scale) < 2 or weight_scale[0] is None or weight_scale[1] is None:
+        raise ValueError(
+            "NVFP4 needs weight_scale[0] (per-block vector) and weight_scale[1] (alpha)."
+        )
+    cutlass_qscale = weight_scale[0]
+    alpha = weight_scale[1]
+
+    if cutlass_qscale.dtype != torch.uint8:
+        raise TypeError("NVFP4 expects CUTLASS per-block scale vector in uint8 (same as fused op).")
+
+    inv_w = 1 / (inv_x * alpha)
+    s2_x = 1.0 / inv_x
+    s2_w = 1.0 / inv_w
+
+    # Shapes
+    in_dtype = input.dtype
+    input_shape = input.shape
+    N, K_packed = weight_quantized.shape[-2], weight_quantized.shape[-1]
+    K = K_packed * 2
+    assert K % 16 == 0, "NVFP4 requires K to be a multiple of 16"
+    num_blocks_w = N * (K // 16)
+
+    q_scale_w_slice = cutlass_fp4_scale_to_modelopt_fp4_scale(cutlass_qscale, (N, K))
+    # (1) Dequantize weights with scale_1 = q_scale_w (sliced), scale_2 = s_w2
+    q_scale_w_slice = q_scale_w_slice.reshape(-1)[:num_blocks_w]
+    W_deq = _dequantize_nvfp4(weight_quantized, q_scale_w_slice, s2_w, (N, K), in_dtype)  # [N, K]
+
+    # (2) Quantize+dequantize inputs with _quantize_nvfp4/_dequantize_nvfp4
+    # Flatten batch for NVFP4 block processing
+    X_2d = input.reshape(-1, K)
+
+    X_packed, X_q_scale = _quantize_nvfp4(X_2d, block_size=16, weights_scaling_factor_2=s2_x)
+    X_deq = _dequantize_nvfp4(X_packed, X_q_scale, s2_x, (X_2d.shape[0], K), in_dtype)  # [B, K]
+
+    # (3) GEMM + bias (float GEMM with codec error baked in)
+    out_2d = torch.matmul(X_deq, W_deq.t())  # [B, N]
+    if bias is not None:
+        out_2d = out_2d + bias
+    return out_2d.reshape(*input_shape[:-1], N)
+
+
+@torch_quant_linear_fp4.register_fake
+def torch_quant_linear_fp4(
+    input: torch.Tensor,
+    weight_quantized: torch.Tensor,
+    bias: torch.Tensor,
+    input_scale: List[torch.Tensor],
+    weight_scale: List[torch.Tensor],
+    input_zp: List[torch.Tensor],
+    weight_zp: List[torch.Tensor],
+) -> torch.Tensor:
+    return torch.ops.aten.linear(input, weight_quantized.repeat(1, 2).to(input.dtype), bias)
 
 
 @custom_quant_linear.register_fake
