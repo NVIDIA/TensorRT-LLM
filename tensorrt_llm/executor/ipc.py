@@ -140,7 +140,7 @@ class ZeroMqQueue:
             wait_time (float): The time to wait before retrying.
         '''
 
-        assert retry >= 0 and retry <= 2000, "Retry must be between 0 and 2000"
+        assert retry >= 0 and retry <= 10, "Retry must be between 0 and 10, adjust the wait_time if needed"
 
         self.setup_lazily()
         with nvtx_range_debug("send", color="blue", category="IPC"):
