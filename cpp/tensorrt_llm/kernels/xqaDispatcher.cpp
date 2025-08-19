@@ -79,7 +79,8 @@ QKVPreprocessingParams<T, KVCacheBuffer> makeQKVPreprocessingParams(XQAParams co
     preprocessingParms.rotary_coef_cache_buffer = params.rotary_cos_sin;
     preprocessingParms.kvScaleOrigQuant = params.kv_scale_orig_quant;
     preprocessingParms.kv_cache_scale_factors = nullptr;
-    preprocessingParms.spec_decoding_position_offsets = params.spec_decoding_position_offsets;
+    preprocessingParms.spec_decoding_position_offsets
+        = params.cross_attention ? nullptr : params.spec_decoding_position_offsets;
     preprocessingParms.mrope_position_deltas = params.mrope_position_deltas;
     // Scalar parameters.
     preprocessingParms.batch_size = int(batch_beam_size);
@@ -115,12 +116,6 @@ QKVPreprocessingParams<T, KVCacheBuffer> makeQKVPreprocessingParams(XQAParams co
 
     preprocessingParms.cu_kv_seq_lens = cu_kv_seqlens;
     preprocessingParms.encoder_seq_lens = params.encoder_input_lengths;
-    preprocessingParms.rotary_embedding_inv_freq = rotary_inv_freq_buf;
-    preprocessingParms.rotary_coef_cache_buffer = params.rotary_cos_sin;
-
-    preprocessingParms.kvScaleOrigQuant = params.kv_scale_orig_quant;
-    preprocessingParms.spec_decoding_position_offsets = nullptr;
-    preprocessingParms.logn_scaling = params.logn_scaling_ptr;
 
     // Not available in generation phase
     preprocessingParms.mrope_rotary_cos_sin = nullptr;

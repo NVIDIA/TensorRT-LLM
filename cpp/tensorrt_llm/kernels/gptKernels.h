@@ -269,6 +269,7 @@ struct BuildDecoderInfoParams
         ss << "rotaryEmbeddingInvFreqCache: " << rotaryEmbeddingInvFreqCache << std::endl;
         ss << "rotaryEmbeddingCoeffCache: " << rotaryEmbeddingCoeffCache << std::endl;
         ss << "rotaryEmbeddingMaxPositions: " << rotaryEmbeddingMaxPositions << std::endl;
+        ss << "isCrossAttention: " << isCrossAttention << std::endl;
 
         return ss.str();
     }
