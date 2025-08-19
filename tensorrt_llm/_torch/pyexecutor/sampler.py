@@ -2,6 +2,8 @@ from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Literal
+import traceback
+from tensorrt_llm.logger import logger
 
 import torch
 
@@ -36,6 +38,21 @@ class SampleStateTensors:
     def values(self):
         return vars(self).values()
 
+class DebugEvent(torch.cuda.Event):
+    counter = 0
+
+    def __init__(self):
+        super().__init__()
+        self.counter = DebugEvent.counter
+        DebugEvent.counter += 1
+
+    def __del__(self):
+        logger.info(f"DebugEvent {self.counter} destroyed")
+
+    def synchronize(self):
+        logger.info(f"DebugEvent {self.counter} synchronized")
+        super().synchronize()
+
 
 @dataclass(kw_only=True)
 class SampleState:
@@ -44,7 +61,7 @@ class SampleState:
     device: SampleStateTensors = None
     host: SampleStateTensors = None
 
-    sampler_event: torch.cuda.Event = None
+    sampler_event: DebugEvent = None
 
 
 class Sampler(ABC):
@@ -376,7 +393,7 @@ class TorchSampler(Sampler):
                                gen_logits_host=gen_logits_host,
                                log_probs_host=log_probs_host)
         new_tokens_host = new_tokens.to(device="cpu", non_blocking=True)
-        sampler_event = torch.cuda.Event()
+        sampler_event = DebugEvent()
         sampler_event.record()
         return SampleState(scheduled_requests=scheduled_requests,
                            device=SampleStateTensors(new_tokens=new_tokens),

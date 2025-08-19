@@ -40,6 +40,13 @@ from .model_engine import ModelEngine
 from .sampler import Sampler, SampleState, SampleStateTensors
 from .scheduler import RequestScheduler, ScheduledRequests
 
+torch._C._activate_gpu_trace()
+torch.cuda._gpu_trace.register_callback_for_event_synchronization(lambda event: logger.info(f"TorchEvent {event} synchronized"))
+torch.cuda._gpu_trace.register_callback_for_event_creation(lambda event: logger.info(f"TorchEvent {event} created"))
+torch.cuda._gpu_trace.register_callback_for_event_record(lambda event, t: logger.info(f"TorchEvent {event} recorded at {t}"))
+torch.cuda._gpu_trace.register_callback_for_event_wait(lambda event, t: logger.info(f"TorchEvent {event} waited at {t}"))
+torch.cuda._gpu_trace.register_callback_for_event_deletion(lambda event: logger.info(f"TorchEvent {event} destroyed"))
+
 # Environment variable to specify iteration ranges for profiling start/stop.
 # Format: "start1-stop1,start2-stop2,..." or single iterations "iter1,iter2,..."
 PROFILE_START_STOP_ENV_VAR_NAME = "TLLM_PROFILE_START_STOP"
@@ -242,8 +249,14 @@ class PyExecutor:
 
         self.kv_cache_transceiver = kv_cache_transceiver
         if self.dist.pp_size > 1:
+            logger.info(
+                f"rank {self.dist.pp_rank} _executor_loop_pp: {self.dist.pp_size}"
+            )
             self.event_loop = self._executor_loop_pp
         else:
+            logger.info(
+                f"rank {self.dist.pp_rank} _executor_loop: {disable_overlap_scheduler}"
+            )
             self.event_loop = self._executor_loop if disable_overlap_scheduler else self._executor_loop_overlap
         if is_trace_enabled("TLLM_TRACE_EXECUTOR_LOOP"):
             self.event_loop = trace_func(self.event_loop)
@@ -396,6 +409,9 @@ class PyExecutor:
 
     @property
     def should_stop_processing(self):
+        logger.info(
+            f"rank {self.dist.pp_rank} should_stop_processing: {self.is_shutdown} {len(self.active_requests)} {self.executor_request_queue.get_waiting_queue_size()} handle {len([h for h in self.send_handles if h is not None])}"
+        )
         return self.is_shutdown and len(self.active_requests) == 0 and \
             self.executor_request_queue.get_waiting_queue_size() == 0
 
@@ -627,6 +643,11 @@ class PyExecutor:
                 batch_state.sample_state.scheduled_requests), req_stats)
 
     def _executor_loop_cleanup(self):
+        # Unblock receiving processes. When second-last rank quits before last rank,
+        # last rank will never return from recv_object.
+        for req in self.send_handles:
+            if req is not None:
+                req.wait()
         with self.response_cv:
             self.is_shutdown = True
             self.response_cv.notify_all()
@@ -750,6 +771,7 @@ class PyExecutor:
 
                             sample_state = self._sample_async(
                                 scheduled_batch, batch_outputs)
+                            assert sample_state is not None, "Sampling failed"
                             sample_state.host.logits = logits_host
                             self._update_request_states(scheduled_batch)
 
@@ -775,47 +797,49 @@ class PyExecutor:
                                       offset) % self.num_micro_batches
                 previous_batch = self.micro_batches[prev_microbatch_id]
                 if previous_batch is not None:
-                    sample_state = previous_batch.sample_state
                     if not self.dist.is_last_pp_rank:
-                        torch.cuda.nvtx.range_push(
-                            "_handle_new_tokens_inter_pp")
+                        with torch.cuda.nvtx.range(
+                            f"_handle_new_tokens_inter_pp{self.dist.pp_rank}_pr{self.dist.prev_pp_rank}_mb{prev_microbatch_id}"):
                         # Receive tokens from previous pp rank (w.r.t model forward direction)
-                        (
-                            logits,
-                            sample_state.host,
-                        ) = self.dist.recv_object(
-                            src=self.dist.prev_pp_rank,
-                            tag=prev_microbatch_id,
-                        )
-                        if logits is not None:
-                            logits_host = torch.from_numpy(logits)
-                            sample_state.host.logits = logits_host
-                            sample_state.device.logits = logits_host.to(
-                                self.device_id)
+                            (
+                                logits,
+                                previous_batch.sample_state.host,
+                            ) = self.dist.recv_object(
+                                src=self.dist.prev_pp_rank,
+                                tag=prev_microbatch_id,
+                            )
+                            if logits is not None:
+                                logits_host = torch.from_numpy(logits)
+                                previous_batch.sample_state.host.logits = logits_host
+                                previous_batch.sample_state.device.logits = logits_host.to(
+                                    self.device_id)
                     else:
-                        torch.cuda.nvtx.range_push("_handle_new_tokens_last_pp")
-                        sample_state.sampler_event.synchronize()
+                        with torch.cuda.nvtx.range(
+                            f"_sync_new_tokens_last_pp_{previous_batch.sample_state.sampler_event.counter}"):
+                            previous_batch.sample_state.sampler_event.synchronize()
 
                     # Send tokens to next pp rank (w.r.t model forward direction)
                     # Second last rank does not need to since last rank has original decoded tokens
                     if not self.dist.is_second_last_pp_rank:
-                        if self.send_handles[prev_microbatch_id] is not None:
-                            self.send_handles[prev_microbatch_id].wait()
-                        needs_logits = (
-                            self._need_return_logits(scheduled_batch)
-                            or (self._need_return_log_probs(scheduled_batch)
-                                and sample_state.host.log_probs is not None))
-                        serialized_logits = sample_state.host.logits.numpy(
-                        ) if needs_logits else None
-                        self.send_handles[
-                            prev_microbatch_id] = self.dist.isend_object(
-                                (
-                                    serialized_logits,
-                                    sample_state.host,
-                                ),
-                                dest=self.dist.next_pp_rank,
-                                tag=prev_microbatch_id)
-                    torch.cuda.nvtx.range_pop()
+                        with torch.cuda.nvtx.range(
+                            f"_send_new_tokens_{self.dist.pp_rank}_pr{self.dist.next_pp_rank}_mb{prev_microbatch_id}"):
+                            if self.send_handles[prev_microbatch_id] is not None:
+                                self.send_handles[prev_microbatch_id].wait()
+                                self.send_handles[prev_microbatch_id] = None
+                            needs_logits = (
+                                self._need_return_logits(scheduled_batch)
+                                or (self._need_return_log_probs(scheduled_batch)
+                                    and sample_state.host.log_probs is not None))
+                            serialized_logits = sample_state.host.logits.numpy(
+                            ) if needs_logits else None
+                            self.send_handles[
+                                prev_microbatch_id] = self.dist.isend_object(
+                                    (
+                                        serialized_logits,
+                                        sample_state.host,
+                                    ),
+                                    dest=self.dist.next_pp_rank,
+                                    tag=prev_microbatch_id)
 
                 # Stage 3: Finalize previous batch that finished tokens communication
                 # In last pp rank, stage 2 and 3 process different previous batches
@@ -849,11 +873,6 @@ class PyExecutor:
                     self._process_iter_stats(finished_requests,
                                              self.active_requests,
                                              previous_batch)
-        # Unblock receiving processes. When second-last rank quits before last rank,
-        # last rank will never return from recv_object.
-        for req in self.send_handles:
-            if req is not None:
-                req.wait()
 
     def _prepare_and_schedule_batch(self):
         new_requests = self._fetch_and_activate_new_requests()
@@ -1625,6 +1644,9 @@ class PyExecutor:
             else:
                 new_active_requests.append(request)
         self.active_requests.clear()
+        logger.info(
+            f"rank {self.dist.pp_rank} _handle_responses: {len(self.active_requests)} {len(new_active_requests)} {len(requests_to_terminate)}"
+        )
         self.active_requests.extend(new_active_requests)
         self._enqueue_responses(new_responses)
         for request in requests_to_terminate:
