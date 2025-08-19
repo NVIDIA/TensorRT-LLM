@@ -324,6 +324,16 @@ def _grouped_attn_replacement_4(q, k, v, attn_mask, dropout_p, scale):
     )
 
 
+def _grouped_attn_pattern_5(q, k, v, n_rep, attn_mask):
+    k = torch.ops.auto_deploy.torch_attention_repeat_kv(k, n_rep)
+    v = torch.ops.auto_deploy.torch_attention_repeat_kv(v, n_rep)
+    return torch.ops.auto_deploy.torch_attention_sdpa.default(q, k, v, attn_mask)
+
+
+def _grouped_attn_replacement_5(q, k, v, n_rep, attn_mask):
+    return torch.ops.auto_deploy.torch_attention_grouped_sdpa.default(q, k, v, attn_mask)
+
+
 @TransformRegistry.register("match_repeat_kv")
 class MatchRepeatKV(BaseTransform):
     """
@@ -423,6 +433,7 @@ class MatchGroupedAttention(BaseTransform):
 
             dummy_args_1 = [q, k1, v1, n_rep, attn_mask, dropout, scale]
             dummy_args_2 = [q, k1, v1, attn_mask, dropout, scale]
+            dummy_args_3 = [q, k1, v1, n_rep, attn_mask]
 
             register_ad_pattern(
                 search_fn=_grouped_attn_pattern_1,
@@ -457,6 +468,13 @@ class MatchGroupedAttention(BaseTransform):
                     "scale": scale,
                     "dropout_p": dropout,
                 },
+            )
+            register_ad_pattern(
+                search_fn=_grouped_attn_pattern_5,
+                replace_fn=_grouped_attn_replacement_5,
+                patterns=patterns,
+                dummy_args=dummy_args_3,
+                scalar_workaround={"n_rep": n_rep},
             )
 
         num_grouped_patterns = _apply_pattern(gm, "Grouped Attention", register_grouped_attention)
