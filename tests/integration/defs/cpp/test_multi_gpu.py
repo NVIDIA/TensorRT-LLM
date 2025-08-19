@@ -370,7 +370,7 @@ def run_disagg_spawn_orchestrator_tests(build_dir: _pl.Path,
 
     comms = [
         "executor/disaggExecutorTest",
-        f"--gtest_filter=*{prefix}*DisaaggSpawnOrchestrator*",
+        f"--gtest_filter=*{prefix}*DisaggSpawnOrchestrator*",
         f"--gtest_output=xml:{xml_output_file}"
     ]
     _cpp.run_command(comms, cwd=tests_dir, env=mgpu_env, timeout=timeout)
