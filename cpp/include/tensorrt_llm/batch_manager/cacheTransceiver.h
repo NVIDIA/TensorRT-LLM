@@ -48,13 +48,10 @@ class DataRequester;
 class CacheTransceiverComm
 {
 public:
-    // Construct from a non-owning raw pointer (the pointed object must outlive this wrapper)
+    // Construct from a non-owning raw pointer, won't take ownership of the pointer
     explicit CacheTransceiverComm(mpi::MpiComm const* mpiComm)
+        : mMpiComm(std::shared_ptr<mpi::MpiComm const>(nullptr), mpiComm)
     {
-        if (mpiComm)
-        {
-            mMpiComm = std::shared_ptr<mpi::MpiComm const>(mpiComm, [](mpi::MpiComm const*) {});
-        }
     }
 
     // Construct from a shared_ptr with shared ownership
@@ -71,13 +68,13 @@ public:
 
     ~CacheTransceiverComm() = default;
 
-    bool isMpi() const noexcept { return mMpiComm.has_value() && static_cast<bool>(mMpiComm.value()); }
+    bool isMpi() const noexcept { return mMpiComm != nullptr; }
 
     int getRank() const
     {
         if (isMpi())
         {
-            return mMpiComm.value()->getRank();
+            return mMpiComm->getRank();
         }
         return mPgComm->getRank();
     }
@@ -86,14 +83,14 @@ public:
     {
         if (isMpi())
         {
-            return mMpiComm.value()->getSize();
+            return mMpiComm->getSize();
         }
         return mPgComm->getSize();
     }
 
     void allgather(void const* sendbuf, void* recvbuf, int count, mpi::MpiType dtype) const {
         if (isMpi()) {
-            mMpiComm.value()->allgather(sendbuf, recvbuf, count, dtype);
+            mMpiComm->allgather(sendbuf, recvbuf, count, dtype);
             return;
         }
         TLLM_THROW("Input arguments only supported in mpi");
@@ -123,7 +120,7 @@ public:
     bool allgatherv(void const* sendbuf, int sendcount, mpi::MpiType sendtype, void* recvbuf,
         std::vector<int> const& recvcounts, std::vector<int> const& displs, mpi::MpiType recvtype) const{
         if (isMpi()) {
-            mMpiComm.value()->allgatherv(sendbuf, sendcount, sendtype, recvbuf, recvcounts, displs, recvtype);
+            mMpiComm->allgatherv(sendbuf, sendcount, sendtype, recvbuf, recvcounts, displs, recvtype);
             return true;
         }
         TLLM_THROW("Input arguments only supported in mpi");
@@ -132,7 +129,7 @@ public:
     CacheTransceiverComm split(int color, int key) {
         if (isMpi())
         {
-            auto subgroup = mMpiComm.value()->split(color, key);
+            auto subgroup = mMpiComm->split(color, key);
             return CacheTransceiverComm(std::make_shared<mpi::MpiComm const>(std::move(subgroup)));
         }
         try {
@@ -155,8 +152,7 @@ public:
     }
 
 private:
-    // Store MPI communicator with shared ownership (or non-owning alias via custom deleter)
-    std::optional<std::shared_ptr<mpi::MpiComm const>> mMpiComm;
+    std::shared_ptr<mpi::MpiComm const> mMpiComm;
     c10::intrusive_ptr<c10d::ProcessGroup> mPgComm;
 };
 
