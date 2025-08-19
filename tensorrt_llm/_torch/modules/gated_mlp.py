@@ -5,6 +5,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from ..distributed import AllReduceParams
@@ -95,12 +96,23 @@ class GatedMLP(nn.Module):
             [LoraModuleType.MLP_GATE_UP],
             [2 * self.intermediate_size // mapping.tp_size])
 
-    def _apply_activation(self, x):
+    def _apply_activation(self, x, *, for_lora: bool = False):
         if self.activation == F.silu:
             if self.down_proj.has_fp8_qdq:
-                return swiglu(x,
-                              quant_scale=self.down_proj.input_scale,
-                              quant_type=torch.float8_e4m3fn)
+                if for_lora:
+
+                    target = torch.bfloat16 if torch.cuda.is_bf16_supported(
+                    ) else torch.float16
+                    logger.debug(
+                        f"GatedMLP._apply_activation: LoRA path active; forcing non-FP8 activation dtype {target} (keeping activations in bf16/fp16), layer_idx={self.layer_idx}"
+                    )
+                    return swiglu(x,
+                                  quant_scale=self.down_proj.input_scale,
+                                  quant_type=target)
+                else:
+                    return swiglu(x,
+                                  quant_scale=self.down_proj.input_scale,
+                                  quant_type=torch.float8_e4m3fn)
             else:
                 return swiglu(x)
         elif callable(self.activation):
@@ -152,7 +164,7 @@ class GatedMLP(nn.Module):
         if h1_lora is not None:
             h1 = h1 + h1_lora
 
-        h2 = self._apply_activation(h1)
+        h2 = self._apply_activation(h1, for_lora=True)
         output = self.down_proj(h2,
                                 all_reduce_params=final_all_reduce_params,
                                 lora_params=lora_params,

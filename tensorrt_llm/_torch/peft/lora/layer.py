@@ -3,8 +3,6 @@ from typing import Dict, List, Optional
 
 import torch
 
-from tensorrt_llm._utils import logger
-
 
 class LoraModuleType(IntEnum):
     """Enum class representing different types of modules that can have LoRA adapters.
@@ -121,15 +119,6 @@ class LoraLayer(torch.nn.Module):
             if len(active_lora_module_ids) == 0:
                 return None
             else:
-                # Guard: LoRA custom op only supports FP16/BF16 activations.
-                # If upstream produced FP8 (e.g., FP8 SwiGLU), cast here to avoid runtime failure.
-                if x.dtype not in (torch.float16, torch.bfloat16):
-                    target_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported(
-                    ) else torch.float16
-                    logger.debug(
-                        f"lora_grouped_gemm supports only FP16/BF16. Casting input from {x.dtype} to {target_dtype}."
-                    )
-                    x = x.to(target_dtype).contiguous()
                 lora_outputs = torch.ops.trtllm.lora_grouped_gemm(
                     x,
                     lora_params['host_request_types'][:num_seqs],
