@@ -3046,10 +3046,8 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
 
 class TestEXAONE4(LlmapiAccuracyTestHarness):
     MODEL_NAME = "LGAI-EXAONE/EXAONE-4.0-32B"
-    kv_cache_config = KvCacheConfig(
-        enable_block_reuse=False,
-        enable_partial_reuse=False,
-        max_attention_window=[4096, 4096, 4096, 131072])
+    kv_cache_config = KvCacheConfig(enable_block_reuse=False,
+                                    enable_partial_reuse=False)
 
     def test_auto_dtype(self):
         model_path = f"{llm_models_root()}/EXAONE-4.0-32B"
