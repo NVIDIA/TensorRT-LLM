@@ -257,7 +257,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--range",
         "-r",
-        default="256,256000000,10",  # 256 to 256M
+        default="256,256000000,4",  # 256 to 256M
         help="min_size,max_size,multiplicative_ratio")
     parser.add_argument("--explore_2d", action="store_true", default=False)
     parser.add_argument("--enable_cudagraph", action="store_true")

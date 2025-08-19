@@ -58,6 +58,7 @@ enum class AllReduceStrategyType : int8_t
     LOWPRECISION = 6,
     MNNVL = 7,
     NCCL_SYMMETRIC = 8,
+    NCCL_DEVICE = 9,
 };
 
 enum class AllReduceStrategyConfig : int8_t
