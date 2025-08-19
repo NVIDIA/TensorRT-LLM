@@ -91,7 +91,8 @@ class CUDAGraphRunner:
         engine = self._get_engine()
 
         # disable when doing statistic
-        if ExpertStatistic.set_iter(self.iter_counter):
+        if hasattr(engine, 'iter_counter') and ExpertStatistic.set_iter(
+                engine.iter_counter):
             return False, None, None
 
         can_run_cuda_graph = batch.can_run_cuda_graph
