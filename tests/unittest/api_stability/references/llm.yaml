@@ -111,9 +111,9 @@ methods:
         annotation: bool
         default: False
         status: beta
-      use_torch_sampler:
-        annotation: bool
-        default: False
+      sampler_type:
+        annotation: Union[str, tensorrt_llm.llmapi.llm_args.SamplerType]
+        default: auto
         status: beta
       enable_iter_perf_stats:
         annotation: bool
@@ -122,6 +122,10 @@ methods:
       enable_iter_req_stats:
         annotation: bool
         default: False
+        status: prototype
+      batch_wait_timeout_ms:
+        annotation: float
+        default: 0
         status: prototype
       print_iter_log:
         annotation: bool
