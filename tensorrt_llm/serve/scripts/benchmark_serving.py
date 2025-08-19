@@ -144,7 +144,11 @@ def calculate_metrics(
     e2els: list[float] = []
     tput_user: list[float] = []
     latest_avg_decoded_tokens_per_iter: float = 0.0
+    error_counts: dict[int, int] = {}
     for i in range(len(outputs)):
+        if outputs[i].exception_type:
+            error_counts[outputs[i].exception_type] = error_counts.get(
+                outputs[i].exception_type, 0) + 1
         if outputs[i].success:
             output_len = outputs[i].output_tokens
             if not output_len:
@@ -178,6 +182,16 @@ def calculate_metrics(
                     i].avg_decoded_tokens_per_iter
         else:
             actual_output_lens.append(0)
+
+    total_error_count = sum(error_counts.values())
+    for exception_type, count in error_counts.items():
+        print(f"Error type: {exception_type}, Count: {count} requests")
+    print(f"Total failed requests: {total_error_count}")
+
+    total_error_count = sum(error_counts.values())
+    for exception_type, count in error_counts.items():
+        print(f"Error type: {exception_type}, Count: {count} requests")
+    print(f"Total failed requests: {total_error_count}")
 
     if goodput_config_dict:
         valid_metrics = []
@@ -336,7 +350,8 @@ async def benchmark(
     print(f"Burstiness factor: {burstiness} ({distribution})")
     print(f"Maximum request concurrency: {max_concurrency}")
 
-    pbar = None if disable_tqdm else tqdm(total=len(input_requests))
+    pbar = None if disable_tqdm else tqdm(total=len(input_requests),
+                                          desc="Benchmarking")
 
     # This can be used once the minimum Python version is 3.10 or higher,
     # and it will simplify the code in limited_request_func.
@@ -433,7 +448,10 @@ async def benchmark(
     )
 
     print("{s:{c}^{n}}".format(s=' Serving Benchmark Result ', n=50, c='='))
+    print("{:<40} {:<10}".format("Total requests:", len(outputs)))
     print("{:<40} {:<10}".format("Successful requests:", metrics.completed))
+    print("{:<40} {:<10}".format("Failed requests:",
+                                 len(outputs) - metrics.completed))
     print("{:<40} {:<10.2f}".format("Benchmark duration (s):",
                                     benchmark_duration))
     print("{:<40} {:<10}".format("Total input tokens:", metrics.total_input))
@@ -455,6 +473,12 @@ async def benchmark(
     if metrics.avg_decoded_tokens_per_iter > 0.0:
         print("{:<40} {:<10.2f}".format("Avg Decoded Tokens per Iter:",
                                         metrics.avg_decoded_tokens_per_iter))
+    if len(outputs) - metrics.completed > 0:
+        print(
+            f"=======================!FAILED REQUESTS!=======================")
+        print(f"Total failed requests: {len(outputs) - metrics.completed}")
+        print(
+            f"=====================!CHECK LOG FOR ERRORS!====================")
 
     result = {
         "duration": benchmark_duration,
