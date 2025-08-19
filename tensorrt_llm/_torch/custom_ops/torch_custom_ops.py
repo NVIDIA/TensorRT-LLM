@@ -81,13 +81,9 @@ class MoERunner(TunableRunner):
                     use_fused_finalize)
         self.fused_moe_runner = MoERunner.runner_dict[instance_key]
 
-    def get_valid_tactics(
-        self,
-        inputs: List[torch.Tensor],
-        profile: OptimizationProfile,
-        gemm_idx: int,
-    ) -> List[int]:
-        return range(self.fused_moe_runner.get_tactic_num(gemm_idx))
+    def get_valid_tactics(self, inputs: List[torch.Tensor],
+                          profile: OptimizationProfile, **kwargs) -> List[int]:
+        return range(self.fused_moe_runner.get_tactic_num(kwargs["gemm_idx"]))
 
     def forward(
         self,
@@ -319,11 +315,8 @@ class FP8RowwiseGemmRunner(TunableRunner):
         self.fp8_rowwise_gemm_runner = FP8RowwiseGemmRunner.runner_dict[
             instance_key]
 
-    def get_valid_tactics(
-        self,
-        inputs: List[torch.Tensor],
-        profile: OptimizationProfile,
-    ) -> List[int]:
+    def get_valid_tactics(self, inputs: List[torch.Tensor],
+                          profile: OptimizationProfile, **kwargs) -> List[int]:
         return list(range(self.fp8_rowwise_gemm_runner.get_num_configs()))
 
     def forward(
@@ -404,11 +397,8 @@ class FP4GemmRunner(TunableRunner):
                     output_dtype, int(fp4_gemm_type))
         self.fp4_gemm_runner = FP4GemmRunner.runner_dict[instance_key]
 
-    def get_valid_tactics(
-        self,
-        inputs: List[torch.Tensor],
-        profile: OptimizationProfile,
-    ) -> List[int]:
+    def get_valid_tactics(self, inputs: List[torch.Tensor],
+                          profile: OptimizationProfile, **kwargs) -> List[int]:
         return list(range(self.fp4_gemm_runner.get_num_configs()))
 
     def forward(
@@ -519,11 +509,8 @@ class FP8BatchedGemmRunner(TunableRunner):
 
         return out_tensors
 
-    def get_valid_tactics(
-        self,
-        inputs: List[torch.Tensor],
-        profile: OptimizationProfile,
-    ) -> List[int]:
+    def get_valid_tactics(self, inputs: List[torch.Tensor],
+                          profile: OptimizationProfile, **kwargs) -> List[int]:
 
         mat1, mat2, _, _, _ = inputs
 
@@ -736,11 +723,8 @@ class WeightOnlyQuantGemmRunner(TunableRunner):
         self.weight_only_quant_gemm_runner = WeightOnlyQuantGemmRunner.runner_dict[
             instance_key]
 
-    def get_valid_tactics(
-        self,
-        inputs: List[torch.Tensor],
-        profile: OptimizationProfile,
-    ) -> List[int]:
+    def get_valid_tactics(self, inputs: List[torch.Tensor],
+                          profile: OptimizationProfile, **kwargs) -> List[int]:
         return list(range(self.weight_only_quant_gemm_runner.get_num_configs()))
 
     def forward(
@@ -814,11 +798,8 @@ class FinegrainedMixedDtypeGemm(TunableRunner):
         self._finegrained_mixed_dtype_gemm_runner = FinegrainedMixedDtypeGemm._runner_dict[
             instance_key]
 
-    def get_valid_tactics(
-        self,
-        inputs: List[torch.Tensor],
-        profile: OptimizationProfile,
-    ) -> List[int]:
+    def get_valid_tactics(self, inputs: List[torch.Tensor],
+                          profile: OptimizationProfile, **kwargs) -> List[int]:
         return list(
             range(self._finegrained_mixed_dtype_gemm_runner.get_num_configs()))
 
