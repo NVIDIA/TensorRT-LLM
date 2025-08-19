@@ -54,14 +54,10 @@ jobs:
           echo "  - [None][chore] Minor clean-up"
           exit 1
 
-  require-pr-checklist:
-    name: Require PR Checklist Resolution
 
+  checklist:
+    name: Validate PR Checklist
     runs-on: ubuntu-latest
     steps:
-      - name: Check if PR Description has checkboxes resolved
-        id: check-pr-descr-all-checked
-        uses: mheap/require-checklist-action@v2
-        continue-on-error: true
-        with:
-          requireChecklist: true
+      - uses: actions/checkout@v4
+      - uses: venkywonka/goggles_action/actions/pr_checklist@pr-checklist
