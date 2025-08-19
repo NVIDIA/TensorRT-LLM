@@ -844,8 +844,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 self.request_ids[self.num_contexts:], self.beam_width,
                 self.num_contexts)
             host_kv_shape = self.host_kv_cache_block_offsets.shape
-            self.kv_cache_block_offsets.view(host_kv_shape[0], -1,
-                                             host_kv_shape[2], host_kv_shape[3])
+            self.kv_cache_block_offsets = self.kv_cache_block_offsets.view(
+                host_kv_shape[0], -1, host_kv_shape[2], host_kv_shape[3])
             self.kv_cache_block_offsets[:, :self.num_seqs].copy_(
                 self.host_kv_cache_block_offsets[:, :self.num_seqs],
                 non_blocking=True)
