@@ -14,8 +14,16 @@
  * limitations under the License.
  */
 #pragma once
+#include "nccl.h"
+#include "nccl_device.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
+#include "tensorrt_llm/kernels/nccl_device/config.h"
 #include <memory>
+#include <map>
+
+// Forward declarations for NCCL device communicator types
+struct ncclDevComm;
+struct ncclDevCommRequirements;
 #if ENABLE_MULTI_DEVICE
 #include "nccl.h"
 #include "userbuffers.h"
@@ -89,12 +97,21 @@ public:
     // Dynamic loading function type definition
     using ncclCommWindowRegisterFunc = ncclResult_t (*)(ncclComm_t, void*, size_t, ncclWindow_t*, int);
     using ncclMemAllocFunc = ncclResult_t (*)(void**, size_t);
+    using ncclCommWindowDeregisterFunc = ncclResult_t (*)(ncclComm_t, ncclWindow_t);
+    using ncclMemFreeFunc = ncclResult_t (*)(void(*));
+    using ncclDevCommCreateFunc = ncclResult_t (*)(ncclComm_t, struct ncclDevCommRequirements const (*), struct ncclDevComm (*));
+    using ncclDevCommDestroyFunc = ncclResult_t (*)(ncclComm_t, ncclDevComm);
 
     // Get function pointer for ncclCommWindowRegister
     ncclCommWindowRegisterFunc getNCCLCommWindowRegister();
 
     // Get function pointer for ncclMemAlloc
     ncclMemAllocFunc getNCCLMemAlloc();
+
+    ncclCommWindowDeregisterFunc getNCCLCommWindowDeregister();
+    ncclMemFreeFunc getNCCLMemFree();
+    ncclDevCommCreateFunc getNCCLDevCommCreate();
+    ncclDevCommDestroyFunc getNCCLDevCommDestroy();
 
     // Check if NCCL library is successfully loaded
     bool isLoaded() const;
@@ -103,6 +120,10 @@ private:
     void loadNCCLLibrary();
     void* loadLibraryHandle(char const* libName);
     void* getSymbolAddress(void* handle, char const* symbolName);
+    
+    // Robust symbol resolution methods
+    ncclDevCommCreateFunc resolveNCCLDevCommCreate(void* handle);
+    ncclDevCommDestroyFunc resolveNCCLDevCommDestroy(void* handle);
 
 #ifdef _WIN32
     HMODULE mLibraryHandle;
@@ -112,6 +133,10 @@ private:
 
     ncclCommWindowRegisterFunc mNCCLCommWindowRegister;
     ncclMemAllocFunc mNCCLMemAlloc;
+    ncclCommWindowDeregisterFunc mNCCLCommWindowDeregister;
+    ncclMemFreeFunc mNCCLMemFree;
+    ncclDevCommCreateFunc mNCCLDevCommCreate;
+    ncclDevCommDestroyFunc mNCCLDevCommDestroy;
     bool mIsLoaded;
 };
 
@@ -124,9 +149,39 @@ public:
     // Get shared NCCLHelper instance
     static NCCLHelper& getNCCLHelper();
 
+  ~NCCLUserBufferAllocator();
+
+  ncclDevComm getNCCLDevComm(const int numLsaBarriers);
+  
+  // Cached NCCL device launch config functionality
+  std::shared_ptr<tensorrt_llm::kernels::nccl_device::LaunchConfig> 
+  getCachedNCCLDeviceLaunchConfig(nvinfer1::DataType dataType, const int hidden_dim, 
+                                 const int num_tokens, const int rank, const int nRanks, 
+                                 bool useResidual, bool useBias, bool unshardResidualOut);
+  
 private:
     std::shared_ptr<ncclComm_t> mComm;
     static std::unique_ptr<NCCLHelper> mNCCLHelper;
+    std::map<int, ncclDevComm> mDevCommBlockID;
+    
+    // Cache for fused allreduce launch configs
+    struct LaunchConfigKey {
+        nvinfer1::DataType dataType;
+        int hidden_dim;
+        int num_tokens;
+        int rank;
+        int nRanks;
+        bool useResidual;
+        bool useBias;
+        bool unshardResidualOut;
+        
+        bool operator<(const LaunchConfigKey& other) const {
+            return std::tie(dataType, hidden_dim, num_tokens, rank, nRanks, useResidual, useBias, unshardResidualOut) <
+                   std::tie(other.dataType, other.hidden_dim, other.num_tokens, other.rank, other.nRanks, other.useResidual, other.useBias, other.unshardResidualOut);
+        }
+    };
+    
+    std::map<LaunchConfigKey, std::shared_ptr<tensorrt_llm::kernels::nccl_device::LaunchConfig>> mLaunchConfigCache;
 };
 
 #else

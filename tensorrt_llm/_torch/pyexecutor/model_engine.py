@@ -266,7 +266,11 @@ class PyTorchModelEngine(ModelEngine):
 
         try:
             use_ub_for_nccl = (
+<<<<<<< HEAD
                 self.llm_args.allreduce_strategy == "NCCL_SYMMETRIC"
+=======
+                pytorch_backend_config.allreduce_strategy in ("NCCL_SYMMETRIC", "NCCL_DEVICE")
+>>>>>>> 42b50b1365 (Introducing a new AR strategy that makes use if NCCL symmetric memory and NEW NCCL device API to use NCCL to fuse RMS Norm with AllReduce.)
                 and self._init_userbuffers(self.model.config.hidden_size))
             if self._torch_compile_enabled:
                 set_torch_compiling(True)
@@ -2830,7 +2834,7 @@ class PyTorchModelEngine(ModelEngine):
         # Disable UB for unsupported platforms
         if not ub.ub_supported():
             return False
-        use_nccl_symmetric = self.llm_args.allreduce_strategy == "NCCL_SYMMETRIC"
+        use_nccl_symmetric = self.pytorch_backend_config.allreduce_strategy in ("NCCL_SYMMETRIC", "NCCL_DEVICE")
         ub.initialize_userbuffers_manager(
             self.mapping.tp_size, self.mapping.pp_size, self.mapping.cp_size,
             self.mapping.rank, self.mapping.gpus_per_node,
