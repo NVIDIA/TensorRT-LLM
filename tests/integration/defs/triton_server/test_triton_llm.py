@@ -4007,7 +4007,6 @@ def test_mistral_small_3_1_24b_pixtral(
         MULTIMODAL_ENGINE_PATH=MULTIMODAL_ENGINE_DIR,
         ENCODER_INPUT_FEATURES_DTYPE=ENCODER_INPUT_FEATURES_DTYPE,
         PROMPT_EMBEDDING_TABLE_DTYPE=PROMPT_EMBEDDING_TABLE_DTYPE,
-        BACKEND="python",  # Only python supported for Mistral Small 3.1
     )
 
     # Launch Triton Server
