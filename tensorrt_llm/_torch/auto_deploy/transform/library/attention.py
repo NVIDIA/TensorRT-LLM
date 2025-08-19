@@ -478,6 +478,10 @@ class MatchGroupedAttention(BaseTransform):
             )
 
         num_grouped_patterns = _apply_pattern(gm, "Grouped Attention", register_grouped_attention)
+        if num_grouped_patterns == 0:
+            ad_logger.warning(
+                "Fail to find any Group Attention Pattern, output or performance may be incorrect"
+            )
 
         info = TransformInfo(
             skipped=False,
