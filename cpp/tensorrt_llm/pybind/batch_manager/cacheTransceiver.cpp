@@ -26,6 +26,7 @@
 #include <pybind11/stl.h>
 #include <pybind11/stl_bind.h>
 #include <torch/extension.h>
+#include <torch/csrc/jit/python/pybind_utils.h>
 
 using SizeType32 = tensorrt_llm::runtime::SizeType32;
 
@@ -73,6 +74,78 @@ public:
 
 void tb::CacheTransceiverBindings::initBindings(py::module_& m)
 {
+    // To be removed, temporary for testing
+    py::classh<tb::CacheTransceiverComm>(m, "CacheTransceiverComm")
+        .def(py::init([](py::object pg_obj) {
+                 auto pg = torch::jit::toCustomClass<c10d::ProcessGroup>(pg_obj);
+                 return tb::CacheTransceiverComm(pg);
+             }),
+             py::arg("process_group"))
+        .def("is_mpi", &tb::CacheTransceiverComm::isMpi)
+        .def("get_rank", &tb::CacheTransceiverComm::getRank)
+        .def("get_size", &tb::CacheTransceiverComm::getSize)
+        .def("split", &tb::CacheTransceiverComm::split, py::arg("color"), py::arg("key"))
+        // allgather for torch tensors
+        .def(
+            "allgather",
+            [](tb::CacheTransceiverComm const& self, at::Tensor input, at::Tensor output) {
+                c10d::AllgatherOptions options;
+                return self.allgather<at::Tensor, at::Tensor>(input, output, options);
+            },
+            py::arg("input"), py::arg("output"))
+        // allgather: scalar input -> tuple(ok, vector[int64] output)
+        .def(
+            "allgather",
+            [](tb::CacheTransceiverComm const& self, int64_t input) {
+                std::vector<int64_t> out(static_cast<size_t>(self.getSize()));
+                c10d::AllgatherOptions options;
+                bool ok = self.allgather(input, std::ref(out), options);
+                return py::make_tuple(ok, out);
+            },
+            py::arg("input"))
+        // allgather: scalar(float) input -> tuple(ok, vector[float] output)
+        .def(
+            "allgather",
+            [](tb::CacheTransceiverComm const& self, double input) {
+                std::vector<double> out(static_cast<size_t>(self.getSize()));
+                c10d::AllgatherOptions options;
+                bool ok = self.allgather<double, std::vector<double>&>(input, std::ref(out), options);
+                return py::make_tuple(ok, out);
+            },
+            py::arg("input"))
+        // If advanced options are needed, expose via a separate helper later
+        // allgatherv for variable-sized lists (int64)
+        .def(
+            "allgatherv",
+            [](tb::CacheTransceiverComm const& self, std::vector<int64_t> input, std::vector<int> const& sizes) {
+                int total_size = std::accumulate(sizes.begin(), sizes.end(), 0);
+                std::vector<int64_t> output(total_size);
+                bool ok = self.allgatherv(std::ref(input), std::ref(output), std::cref(sizes));
+                return py::make_tuple(ok, output);
+            },
+            py::arg("input"), py::arg("sizes"))
+        // allgatherv: float64
+        .def(
+            "allgatherv",
+            [](tb::CacheTransceiverComm const& self, std::vector<double> input, std::vector<int> const& sizes) {
+                int total_size = std::accumulate(sizes.begin(), sizes.end(), 0);
+                std::vector<double> output(total_size);
+                bool ok = self.allgatherv(std::ref(input), std::ref(output), std::cref(sizes));
+                return py::make_tuple(ok, output);
+            },
+            py::arg("input"), py::arg("sizes"))
+        // allgatherv: char
+        .def(
+            "allgatherv",
+            [](tb::CacheTransceiverComm const& self, std::vector<char> input, std::vector<int> const& sizes) {
+                int total_size = std::accumulate(sizes.begin(), sizes.end(), 0);
+                std::vector<char> output(total_size);
+                bool ok = self.allgatherv(std::ref(input), std::ref(output), std::cref(sizes));
+                return py::make_tuple(ok, output);
+            },
+            py::arg("input"), py::arg("sizes"))
+        ;
+
     py::classh<tb::BaseCacheTransceiver, PyCacheTransceiver>(m, "BaseCacheTransceiver")
         .def("respond_and_send_async", &BaseCacheTransceiver::respondAndSendAsync)
         .def("request_and_receive_sync", &BaseCacheTransceiver::requestAndReceiveSync)

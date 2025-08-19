@@ -165,15 +165,7 @@ UcxConnectionManager::UcxConnectionManager()
 {
     try
     {
-        // TODO: move to pgUtils
-        bool useMPI = true;
-        char* val = std::getenv("DISABLE_MPI");
-        if (val != nullptr && std::string(val) == "1")
-        {
-            useMPI = false;
-        }
-
-        if (useMPI)
+        if (useMPI())
         {
             mRank = mpi::MpiComm::world().getRank();
             mWorldSize = mpi::MpiComm::session().getSize();
@@ -243,7 +235,7 @@ UcxConnectionManager::UcxConnectionManager()
             std::vector<SizeType32> sizeofBuffer(mWorldSize);
             SizeType32 bufferSize = buffer.size();
 
-            if (useMPI)
+            if (useMPI())
             {
                 mpi::MpiComm::session().barrier();
 
@@ -276,25 +268,17 @@ UcxConnectionManager::UcxConnectionManager()
                 PGCHECK_THROW(worldPg->barrier());
 
                 PGCHECK_THROW(pgh.allgather(&bufferSize, std::ref(sizeofBuffer), {}));
+                SizeType32 recvBufferSize = std::accumulate(sizeofBuffer.begin(), sizeofBuffer.end(), 0);
+                std::vector<char> recvBuffer(recvBufferSize);                       
 
-                // Zero-pad local blob to the max size as PG currently only has fixed-size all-gather
-                SizeType32 maxSize = *std::max_element(sizeofBuffer.begin(), sizeofBuffer.end());
-                std::vector<uint8_t> padded(buffer.begin(), buffer.end()); // copy the serialized bytes
-                padded.resize(maxSize, 0);                                 // zero-pad to maxSize
+                PGCHECK_THROW(pgh.allgatherv(std::ref(buffer), std::ref(recvBuffer), std::cref(sizeofBuffer), {}));
 
-                TLLM_LOG_DEBUG(
-                    mRank, "UCX init: finished zero-padding. padded: %d maxSize: %d", padded.size(), maxSize);
-
-                // Gather the fixed-width chunks
-                std::vector<uint8_t> recvBuffer(maxSize * mWorldSize);
-                PGCHECK_THROW(pgh.allgather(padded, std::ref(recvBuffer), {}));
-
-                // Slice each chunk back to its true length and deserialize
+                // deserialize
+                char * begin = reinterpret_cast<char *>(recvBuffer.data());
                 for (int r = 0; r < mWorldSize; ++r)
                 {
-                    char const* begin = reinterpret_cast<char const*>(recvBuffer.data()) + r * maxSize;
                     std::vector<char> serBuffer(begin, begin + sizeofBuffer[r]);
-
+                    begin += sizeofBuffer[r];
                     su::VectorWrapBuf<char> strbuf(serBuffer);
                     std::istream is(&strbuf);
                     socketStates[r] = su::deserialize<executor::kv_cache::SocketState>(is);
