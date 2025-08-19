@@ -23,8 +23,8 @@ namespace torch_ext
 {
 
 static constexpr int PF_TILE_M = 64;
-static constexpr int PF_TILE_K
-    = 128; // TODO: determine whether we need this, or can just use a single UTMAPF for all of K
+static constexpr int PF_TILE_K_BYTES
+    = 256; // TODO: determine whether we need this, or can just use a single UTMAPF for all of K
 
 // PyTorch wrapper with automatic M,K detection from tensor shape
 void cute_host_prefetch_pytorch(
@@ -41,7 +41,6 @@ void cute_host_prefetch_pytorch(
 
     // Check that M and K are divisible by tile sizes
     TORCH_CHECK(M % PF_TILE_M == 0, "M dimension must be divisible by PF_TILE_M (", PF_TILE_M, ")");
-    TORCH_CHECK(K % PF_TILE_K == 0, "K dimension must be divisible by PF_TILE_K (", PF_TILE_K, ")");
     TORCH_CHECK(strideM % PF_TILE_M == 0, "M dimension stride must be divisible by PF_TILE_M (", PF_TILE_M, ")");
     TORCH_CHECK(strideK == 1, "K dimension stride must be 1");
 
@@ -49,39 +48,43 @@ void cute_host_prefetch_pytorch(
     cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
     // Dispatch based on tensor data type
+#define DISPATCH_PREFETCH(cutlass_type, torch_type)                                                                    \
+    static_assert(sizeof(cutlass_type) == sizeof(torch_type), "data type mismatch");                                   \
+    constexpr int PF_TILE_K = PF_TILE_K_BYTES / sizeof(cutlass_type);                                                  \
+    TORCH_CHECK(K % PF_TILE_K == 0, "K dimension must be divisible by PF_TILE_K (", PF_TILE_K, ")");                   \
+    tensorrt_llm::kernels::cute_host_prefetch<cutlass_type, PF_TILE_M, PF_TILE_K>(                                     \
+        reinterpret_cast<cutlass_type*>(tensor.data_ptr<torch_type>()), M, K, strideM, (int) delay_start,              \
+        (int) throttle_time, (int) throttle_mode, pdl, stream);
+
     if (tensor.dtype() == torch::kFloat32)
     {
-        tensorrt_llm::kernels::cute_host_prefetch<float, PF_TILE_M, PF_TILE_K>(tensor.data_ptr<float>(), M, K, strideM,
-            (int) delay_start, (int) throttle_time, (int) throttle_mode, pdl, stream);
+        DISPATCH_PREFETCH(float, float);
     }
     else if (tensor.dtype() == torch::kFloat16)
     {
-        tensorrt_llm::kernels::cute_host_prefetch<cutlass::half_t, PF_TILE_M, PF_TILE_K>(
-            reinterpret_cast<cutlass::half_t*>(tensor.data_ptr<at::Half>()), M, K, strideM, (int) delay_start,
-            (int) throttle_time, (int) throttle_mode, pdl, stream);
+        DISPATCH_PREFETCH(cutlass::half_t, at::Half);
     }
     else if (tensor.dtype() == torch::kBFloat16)
     {
-        tensorrt_llm::kernels::cute_host_prefetch<cutlass::bfloat16_t, PF_TILE_M, PF_TILE_K>(
-            reinterpret_cast<cutlass::bfloat16_t*>(tensor.data_ptr<at::BFloat16>()), M, K, strideM, (int) delay_start,
-            (int) throttle_time, (int) throttle_mode, pdl, stream);
+        DISPATCH_PREFETCH(cutlass::bfloat16_t, at::BFloat16);
     }
     else if (tensor.dtype() == torch::kFloat8_e4m3fn)
     {
-        tensorrt_llm::kernels::cute_host_prefetch<cutlass::float_e4m3_t, PF_TILE_M, PF_TILE_K>(
-            reinterpret_cast<cutlass::float_e4m3_t*>(tensor.data_ptr<at::Float8_e4m3fn>()), M, K, strideM,
-            (int) delay_start, (int) throttle_time, (int) throttle_mode, pdl, stream);
+        DISPATCH_PREFETCH(cutlass::float_e4m3_t, at::Float8_e4m3fn);
     }
     else if (tensor.dtype() == torch::kFloat8_e5m2)
     {
-        tensorrt_llm::kernels::cute_host_prefetch<cutlass::float_e5m2_t, PF_TILE_M, PF_TILE_K>(
-            reinterpret_cast<cutlass::float_e5m2_t*>(tensor.data_ptr<at::Float8_e5m2>()), M, K, strideM,
-            (int) delay_start, (int) throttle_time, (int) throttle_mode, pdl, stream);
+        DISPATCH_PREFETCH(cutlass::float_e5m2_t, at::Float8_e5m2);
+    }
+    else if (tensor.dtype() == torch::kInt64)
+    {
+        DISPATCH_PREFETCH(int64_t, int64_t);
     }
     else
     {
         TORCH_CHECK(false,
-            "Unsupported tensor data type. Supported types: float32, float16, bfloat16, float8_e4m3fn, float8_e5m2");
+            "Unsupported tensor data type. Supported types: float32, float16, bfloat16, float8_e4m3fn, float8_e5m2, "
+            "int64");
     }
 }
 

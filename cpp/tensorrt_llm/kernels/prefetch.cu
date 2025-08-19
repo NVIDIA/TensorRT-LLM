@@ -130,16 +130,18 @@ void cute_host_prefetch(T const* data, int M, int K, int strideM, int delay_star
         &config, kernel_instance, tma_load, gmem_tensor, M, K, delay_start, throttle_time, throttle_mode));
 }
 
-#define INSTANTIATE_CUTE_HOST_PREFETCH(T, CTA_M, CTA_K)                                                                \
-    template void cute_host_prefetch<T, CTA_M, CTA_K>(T const*, int, int, int, int, int, int, bool, cudaStream_t);
+#define INSTANTIATE_CUTE_HOST_PREFETCH(T, CTA_M, CTA_K_BYTES)                                                          \
+    template void cute_host_prefetch<T, CTA_M, CTA_K_BYTES / sizeof(T)>(                                               \
+        T const*, int, int, int, int, int, int, bool, cudaStream_t);
 
 // In the same order as in 3rdparty/cutlass/include/cute/arch/copy_sm90_desc.hpp
-INSTANTIATE_CUTE_HOST_PREFETCH(uint8_t, 64, 128);
-INSTANTIATE_CUTE_HOST_PREFETCH(cute::float_e4m3_t, 64, 128);
-INSTANTIATE_CUTE_HOST_PREFETCH(cute::float_e5m2_t, 64, 128);
-INSTANTIATE_CUTE_HOST_PREFETCH(cute::half_t, 64, 128);
-INSTANTIATE_CUTE_HOST_PREFETCH(float, 64, 128);
-INSTANTIATE_CUTE_HOST_PREFETCH(cute::bfloat16_t, 64, 128);
+INSTANTIATE_CUTE_HOST_PREFETCH(uint8_t, 64, 256);
+INSTANTIATE_CUTE_HOST_PREFETCH(cute::float_e4m3_t, 64, 256);
+INSTANTIATE_CUTE_HOST_PREFETCH(cute::float_e5m2_t, 64, 256);
+INSTANTIATE_CUTE_HOST_PREFETCH(int64_t, 64, 256);
+INSTANTIATE_CUTE_HOST_PREFETCH(cute::half_t, 64, 256);
+INSTANTIATE_CUTE_HOST_PREFETCH(float, 64, 256);
+INSTANTIATE_CUTE_HOST_PREFETCH(cute::bfloat16_t, 64, 256);
 
 } // namespace kernels
 } // namespace tensorrt_llm
