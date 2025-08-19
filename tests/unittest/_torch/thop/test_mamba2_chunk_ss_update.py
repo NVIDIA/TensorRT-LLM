@@ -364,8 +364,8 @@ def test_mamba2_chunk_scan_selective_state_update(dim, headdim, ngroups, dstate,
 
 @pytest.mark.parametrize("max_seq_len, mamba_chunk_size",
                          list(product([16, 270], [8, 256])))
-def test_mamba2_chunk_scan_combined_prefix_chunking(max_seq_len,
-                                                    mamba_chunk_size):
+def test_mamba2_chunk_scan_combined_prefill_chunking(max_seq_len,
+                                                     mamba_chunk_size):
     dim = 1024
     headdim = 64
     ngroups = 1
