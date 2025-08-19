@@ -9,7 +9,7 @@ import time
 import traceback
 import weakref
 from contextlib import contextmanager
-from typing import Dict, Iterable, List, Optional, Tuple, Union
+from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -318,10 +318,9 @@ class PyExecutor:
     def __exit__(self):
         self.shutdown()
 
-    def enqueue_requests(
-            self,
-            requests: List[ExecutorRequest],
-            result_wait_queue: Optional[RayQueue] = None) -> List[int]:
+    def enqueue_requests(self,
+                         requests: List[ExecutorRequest],
+                         result_wait_queue: Optional[Any] = None) -> List[int]:
         """
         Enqueue new requests
         """

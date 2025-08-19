@@ -3,10 +3,9 @@ import importlib
 import json
 import os
 import socket
-import time
 from pathlib import Path
 from queue import Queue
-from typing import Any, Callable, Dict, List, Optional, Tuple, Type, Union
+from typing import Any, Optional, Type, Union
 
 import ray
 import torch
@@ -14,24 +13,21 @@ import torch
 from tensorrt_llm.logger import logger
 
 from .._torch.virtual_memory import materialize_with_tag, release_with_tag
-from .._utils import KVCacheEventSerializer, mpi_rank
+from .._utils import mpi_rank
 from ..bindings import executor as tllm
 from ..builder import ConfigEncoder, Engine, EngineConfig
 from ..llmapi.llm_args import PybindMirror
-from ..llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue,
-                            print_colored_debug)
+from ..llmapi.utils import print_colored_debug
 from ..lora_manager import LoraConfig, LoraManager
 from ..prompt_adapter_manager import PromptAdapterManager
 from ..runtime import ModelConfig
 from ..runtime.model_runner import _engine_config_to_model_config
 from ..sampling_params import BatchedLogitsProcessor
-from .executor import GenerationExecutor, IterationResultQueue
-from .ipc import FusedIpcQueue, IpcQueue
+from .executor import GenerationExecutor
 from .postproc_worker import PostprocWorkerConfig
 from .request import GenerationRequest, LoRARequest, PromptAdapterRequest
-from .result import GenerationResult, IterationResult
-from .utils import (ErrorResponse, IntraProcessQueue, RequestError,
-                    has_event_loop)
+from .result import GenerationResult
+from .utils import RequestError
 
 __all__ = [
     "RayGPUWorker",
@@ -197,17 +193,9 @@ class RayGPUWorker(GenerationExecutor):
         )
 
         self.engine = None
-        self.result_queue: Optional[IpcQueue] = None
-        self.postproc_queues: Optional[List[IpcQueue]] = None
         self.rank = torch.distributed.get_rank()
         self.global_rank = torch.distributed.get_world_size()
-        # mapping: client_id -> GenerationResult
-        self._results: Dict[int, GenerationResult] = {}
-        self.result_wait_queues: Dict[int, Queue] = {}
-        # mapping: client_id from Proxy -> request_id returned from runtime backend
-        self._client_id_to_request_id: Dict[int, int] = {}
-        # self._await_response_helper = AwaitResponseHelper(
-        #     self)  # TODO: make it weakref
+
         self._executor_config = executor_config
         self._is_pytorch_backend = getattr(self._executor_config, "backend",
                                            None) == "pytorch"
@@ -243,16 +231,10 @@ class RayGPUWorker(GenerationExecutor):
                     create_py_executor
                 create_executor = create_py_executor
                 args["lora_config"] = lora_config
-            elif executor_config.backend == "autodeploy":
-                from tensorrt_llm._torch.auto_deploy.shim.ad_executor import \
-                    create_autodeploy_executor
-                create_executor = create_autodeploy_executor
             else:
                 raise ValueError(
                     f"Unsupported backend config: {executor_config.backend}")
 
-            # device_id = self.global_rank % torch.cuda.device_count()
-            # torch.cuda.set_device(device_id)
             return create_executor(**args)
 
         self.engine = _create_engine()
@@ -280,67 +262,6 @@ class RayGPUWorker(GenerationExecutor):
             assert lora_model_config is not None
             self._lora_model_config = lora_model_config
 
-        # TODO: refactor for ray.
-        # self.await_response_thread = ManagedThread(
-        #     self.await_response_task,
-        #     error_queue=self._error_queue,
-        #     name="await_response_thread")
-
-        # self.dispatch_stats_thread = ManagedThread(
-        #     self.dispatch_stats_task,
-        #     error_queue=self._error_queue,
-        #     name="dispatch_stats_thread")
-
-        # self.dispatch_kv_cache_events_thread = ManagedThread(
-        #     self.dispatch_kv_cache_events_task,
-        #     error_queue=self._error_queue,
-        #     name="dispatch_kv_cache_events_thread")
-
-    def set_result_queue(self, queue):
-        """In multi-gpu mode, result_queue will be set here to communicate between the proxy and the worker 0 process."""
-        assert self.postproc_queues is None
-        self.result_queue = queue
-
-    def set_postproc_queues(self, queues: List["IpcQueue"]):
-        """ Set the IPC queues for feeding post-processing processes. """
-        assert self.result_queue is None
-        self.postproc_queues = queues
-
-    def _create_iteration_result_queue(self,
-                                       it_result_queue: IterationResultQueue):
-        if not it_result_queue.is_initialized:
-            # not yet initialized
-            it_result_queue.is_initialized = True
-            if has_event_loop():
-                _queue = AsyncQueue()
-                it_result_queue.queue = _queue.sync_q
-                it_result_queue.aqueue = _queue
-            else:
-                _queue = Queue()
-                it_result_queue.queue = _queue
-                it_result_queue.aqueue = None
-
-    def _set_iteration_result_queue(self, it_result_queue: IterationResultQueue,
-                                    queue: Union[Queue, FusedIpcQueue,
-                                                 IntraProcessQueue]):
-        assert not it_result_queue.is_initialized, "Iteration result queue should not already be initialized."
-        it_result_queue.is_initialized = True
-        it_result_queue.queue = queue
-        it_result_queue.aqueue = None
-
-    def return_queue(self, client_id: int):
-        """ If a centralized result queue is registered (used for communication with the proxy)
-            send the message there.
-            Otherwise, push the result directly in the GenerationResult queue.
-        """
-        if self.result_queue is not None:
-            return self.result_queue
-        return self._results[client_id].queue
-
-    def start_thread(self, thread: ManagedThread):
-        if self.engine.can_enqueue_requests() and not thread.is_alive():
-            thread.start()
-
     def abort_request(self, client_id: int) -> None:
         # NOTE: the request_id is the request_id generated by cpp runtime, not the client_id
         if self.engine.can_enqueue_requests():
@@ -351,115 +272,6 @@ class RayGPUWorker(GenerationExecutor):
                 )
                 return
             self.engine.cancel_request(request_id)
-
-    def _engine_response_callback(self, response: tllm.Response):
-        return response
-
-    def await_response_task(self) -> bool:
-        return self._await_response_helper()
-
-    def _has_background_error(self) -> bool:
-        return not self._error_queue.empty()
-
-    def _create_error_response(self, response: tllm.Response) -> ErrorResponse:
-        bck_error = self._error_queue.get_nowait()
-        assert isinstance(bck_error, Exception)
-        return ErrorResponse(response.client_id, str(bck_error),
-                             response.request_id)
-
-    def _iteration_result_task(self, it_result_queue: IterationResultQueue,
-                               engine_get_result_api: Callable,
-                               result_singleton: IterationResult,
-                               result_serializer: Callable):
-        time.sleep(0.2)
-        async_queues = []
-        queue = result_singleton.queue if self._is_llm_executor and result_singleton else it_result_queue.queue
-        try:
-            for results in engine_get_result_api():
-                res = result_serializer(results)
-                if self._is_llm_executor and result_singleton:
-                    # In this case, there's no ExecutorBindingProxy.
-                    # Worker needs to take care of putting to result queue.
-                    while queue.full():
-                        queue.get()
-                    if isinstance(queue, _SyncQueue):
-                        queue.put_nowait(res)
-                        async_queues.append(queue)
-                    else:
-                        queue.put(res)
-                else:
-                    # Send to ExecutorBindingProxy via IPC
-                    queue.put(res)
-
-            if async_queues:
-                _SyncQueue.notify_many(queue.loop, async_queues)
-        except AsyncQueue.EventLoopShutdownError:
-            # This happens in the last results loop while the generate workflow is stopped.
-            logger.debug("worker.py: EventLoopShutdownError")
-        except Exception as e:
-            logger.error(f"worker.py: Error in _iteration_result_task: {e}")
-            raise e
-
-        return True  # success
-
-    def dispatch_stats_task(self) -> bool:
-
-        # Define a Callable to join iteration and request stats
-        def stats_serializer(
-                stats: Tuple[tllm.IterationStats, tllm.RequestStats]) -> str:
-            iteration_stats, req_stats = stats
-            stats_dict = json.loads(iteration_stats.to_json_str())
-
-            if req_stats is not None and len(req_stats) > 0:
-                stats_dict["requestStats"] = []
-                for req_stat in req_stats:
-                    stats_dict["requestStats"].append(
-                        json.loads(req_stat.to_json_str()))
-
-            # Convert back to JSON string
-            return json.dumps(stats_dict)
-
-        def get_stats():
-            if isinstance(self.engine, tllm.Executor):
-                iter_stats = self.engine.get_latest_iteration_stats()
-                #TODO: Support req stats with TRT engine
-                #      This would require ensuring iter and req stats have same size
-                return [(iter_stat, None) for iter_stat in iter_stats]
-            else:
-                return self.engine.get_latest_iteration_stats()
-
-        return self._iteration_result_task(self.stats_queues, get_stats,
-                                           self._iter_stats_result,
-                                           stats_serializer)
-
-    def dispatch_kv_cache_events_task(self) -> bool:
-        if isinstance(self.engine, tllm.Executor):
-            # Check if the engine has a kv cache event manager
-            # If not, return an empty list for the events which will cause the thread to exit early.
-            event_manager = self.engine.get_kv_cache_event_manager()
-            if event_manager is None:
-                events_api = lambda: [None]
-            else:
-                events_api = event_manager.get_latest_events
-            return self._iteration_result_task(
-                self.kv_events_queues, events_api, self._iter_kv_events_result,
-                lambda x: json.dumps(KVCacheEventSerializer.serialize(x)))
-        else:
-            return self._iteration_result_task(
-                self.kv_events_queues, self.engine.get_latest_kv_cache_events,
-                self._iter_kv_events_result,
-                lambda x: json.dumps(KVCacheEventSerializer.serialize(x)))
-
-    def start(self):
-        # create iteration result queues
-        self._create_iteration_result_queue(self.stats_queues)
-        self._create_iteration_result_queue(self.kv_events_queues)
-
-        # start threads
-        # self.start_thread(self.await_response_thread)
-        # self.start_thread(self.dispatch_kv_cache_events_thread)
-        # if mpi_rank() == 0:
-        #     self.start_thread(self.dispatch_stats_thread)
 
     def _load_lora_adapter(self, lora_request: LoRARequest):
         self._lora_manager.load_from_ckpt(
@@ -614,10 +426,6 @@ class RayGPUWorker(GenerationExecutor):
         except Exception as e:
             raise RequestError(str(e)) from e
 
-    def _get_next_client_id(self) -> int:
-        raise NotImplementedError(
-            "Ray GPU worker does not support get_next_client_id")
-
     def update_weights(self, weights: dict):
         try:
             self.engine.update_weights(weights)
@@ -652,51 +460,6 @@ class RayGPUWorker(GenerationExecutor):
 
     def submit(self, request: GenerationRequest) -> GenerationResult:
         raise NotImplementedError("Ray GPU worker does not support submit")
-        """ Low-level API to the executor. Return a "future" GenerationResult which can be waited. """
-        self.start()
-
-        if self.rank != 0:
-            raise RuntimeError(
-                "Only rank 0 can submit requests.\n"
-                "To fix this, ensure that the llm.generate(...) method is "
-                "guarded with the `if __name__ == '__main__':` block.")
-
-        client_id = request.id if request.id is not None else self._get_next_client_id(
-        )
-        if request.id is None:
-            request.set_id(client_id)
-
-        logprob_params = self._get_logprob_params(request)
-
-        result = GenerationResult(
-            request,
-            background_error_handler=self._handle_background_error,
-            executor=self,
-            disaggregated_params=request.disaggregated_params,
-            logprob_params=logprob_params)
-
-        self._results[client_id] = result
-        print(f"submit: {request} rank: {torch.distributed.get_rank()}, l:543")
-
-        request_id = self._enqueue_request(request)
-
-        # request_id returned from backend is necessary for the abort_request method.
-        self._client_id_to_request_id[client_id] = request_id
-
-        # TODO: remove this for ray
-        # #self._handle_background_error()
-        # responses = self.engine.await_responses(request_id)
-        # for r in responses:
-        #     print(f"r.response.text: {r.result.output_token_ids}")
-
-        return result
-
-    def _pop_result(self, client_id: int):
-        self._results.pop(client_id, None)
-        self._client_id_to_request_id.pop(client_id, None)
-
-    def wait_responses(self, request_id: int):
-        return self.engine.await_responses(request_id)
 
     def shutdown(self):
 
