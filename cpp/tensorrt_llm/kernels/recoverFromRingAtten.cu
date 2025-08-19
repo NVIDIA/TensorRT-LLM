@@ -53,6 +53,7 @@ __global__ void reduce4ring_attention(
     float* softmax_sum = softmax_stats + 1;
     float* max = softmax_stats;
 
+    #pragma nv_diag_suppress static_var_with_dynamic_init
     __shared__ cuda::barrier<cuda::thread_scope::thread_scope_block> barrier;
     if (block.thread_rank() == 0)
     {
