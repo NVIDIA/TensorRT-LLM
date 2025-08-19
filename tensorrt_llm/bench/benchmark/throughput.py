@@ -21,9 +21,7 @@ from tensorrt_llm.bench.benchmark.utils.general import (
     get_settings_from_engine, get_settings, ALL_SUPPORTED_BACKENDS)
 # isort: on
 from tensorrt_llm.bench.benchmark.utils.general import (
-    generate_warmup_dataset,
-    update_sampler_args_with_extra_options
-)
+    generate_warmup_dataset, update_sampler_args_with_extra_options)
 from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
 from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
 from tensorrt_llm.bench.dataclasses.reporting import ReportUtility
