@@ -10,7 +10,6 @@ First, clone the LongBench repository which contains the datasets and evaluation
 
 ```bash
 git clone https://github.com/THUDM/LongBench.git
-cd LongBench
 ```
 
 ### 2. Install Requirements

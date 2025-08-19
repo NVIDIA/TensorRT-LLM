@@ -1,4 +1,5 @@
-from .rocket import RocketKVCacheManager, RocketVanillaAttention
+from .rocket import (RocketKVCacheManager, RocketTrtllmAttention,
+                     RocketVanillaAttention)
 
 
 def get_sparse_attn_kv_cache_manager(
@@ -23,9 +24,12 @@ def get_vanilla_sparse_attn_attention_backend(
 
 def get_trtllm_sparse_attn_attention_backend(
         sparse_attn_config: "SparseAttentionConfig"):
-    raise ValueError(
-        f"Unsupported sparse attention algorithm in trtllm attention backend: {sparse_attn_config.algorithm}"
-    )
+    if sparse_attn_config.algorithm == "rocket":
+        return RocketTrtllmAttention
+    else:
+        raise ValueError(
+            f"Unsupported sparse attention algorithm in trtllm attention backend: {sparse_attn_config.algorithm}"
+        )
 
 
 def get_flashinfer_sparse_attn_attention_backend(

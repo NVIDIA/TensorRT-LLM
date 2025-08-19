@@ -279,6 +279,9 @@ class Attention(nn.Module):
         # Whether to fuse RoPE into the attention OP.
         # If true, RoPE will be applied in self.attn.forward.
         # If false, RoPE will be applied in self.apply_rope.
+        if config.sparse_attention_config is not None:
+            logger.warning("disable rope_fusion for sparse attention.")
+            rope_fusion = False
         self.rope_fusion = rope_fusion
         if self.rope_fusion and not attn_cls.support_fused_rope():
             logger.warning(

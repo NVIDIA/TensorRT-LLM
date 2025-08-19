@@ -252,6 +252,8 @@ def create_py_executor(
         max_num_tokens = 8192
 
     tokens_per_block = kv_cache_config.tokens_per_block
+    if pytorch_backend_config.attn_backend == "VANILLA":
+        tokens_per_block = max_num_tokens
 
     if pytorch_backend_config.attn_backend in [
             "FLASHINFER", "FLASHINFER_STAR_ATTENTION"
@@ -308,7 +310,7 @@ def create_py_executor(
         has_draft_model_engine = spec_config.spec_dec_mode.has_draft_model()
         has_spec_drafter = spec_config.spec_dec_mode.has_spec_drafter()
 
-    sparse_attention_config = executor_config.sparse_attention_config
+    sparse_attention_config = llm_args.sparse_attention_config
 
     # chunk_unit_size may be changed to 64 when using flash mla
     attn_runtime_features = AttentionRuntimeFeatures(
@@ -407,11 +409,6 @@ def create_py_executor(
 
     max_seq_len = model_engine_max_seq_len
     max_num_tokens = model_engine.max_num_tokens
-
-    # Vanilla attention backend does not support paged KV cache, so we set tokens_per_block to
-    # max_num_tokens to use it as a continuous KV cache.
-    if pytorch_backend_config.attn_backend == "VANILLA":
-        executor_config.tokens_per_block = model_engine.max_num_tokens
 
     config = model_engine.model.model_config.pretrained_config
     if is_mla(config):

@@ -280,11 +280,7 @@ class KVCacheManager(BaseResourceManager):
             # Standard case: use original Python implementation
             self.blocks_in_primary_pool, self.blocks_in_secondary_pool = self.calculate_max_num_blocks(
                 kv_cache_config=kv_cache_config,
-                head_dim=head_dim,
-                tokens_per_block=tokens_per_block,
                 mapping=mapping,
-                dtype=dtype,
-                kv_factor=self.kv_factor,
             )
             blocks_per_window = {
                 self.max_attention_window_vec[0]:
@@ -544,9 +540,9 @@ class KVCacheManager(BaseResourceManager):
         return get_size_in_bytes(cache_size // quant_vector_size,
                                  scaling_factor_dtype)
 
-    def get_cache_size_per_token(model_config: ModelConfig,
-                                 executor_config: ExecutorConfig,
-                                 mapping: Mapping):
+    @staticmethod
+    def get_cache_size_per_token(model_config: ModelConfig, mapping: Mapping,
+                                 **kwargs):
         # get kv cache dtype bytes
         mem_per_token = 2
         quant_config = model_config.quant_config
@@ -584,31 +580,31 @@ class KVCacheManager(BaseResourceManager):
         mem_per_token *= kv_factor
         return mem_per_token
 
-    def calculate_max_num_blocks(self,
-                                 kv_cache_config: KvCacheConfig,
-                                 head_dim: int,
-                                 tokens_per_block: int,
-                                 mapping: Mapping,
-                                 dtype: DataType,
-                                 kv_factor: int = 2):
-        free_mem_fraction = (kv_cache_config.free_gpu_memory_fraction
-                             if kv_cache_config.free_gpu_memory_fraction
-                             is not None else 0.9)
+    def get_cache_bytes_per_token(self):
+        cache_size_per_token = self.kv_factor * sum(
+            self.num_kv_heads_per_layer) * self.head_dim
 
-        cache_size_per_token = kv_factor * sum(
-            self.num_kv_heads_per_layer) * head_dim
-
-        if dtype not in (DataType.FP8, DataType.HALF, DataType.BF16,
-                         DataType.FLOAT, DataType.NVFP4):
-            raise ValueError(f'Cannot support {dtype} KV cache.')
+        if self.dtype not in (DataType.FP8, DataType.HALF, DataType.BF16,
+                              DataType.FLOAT, DataType.NVFP4):
+            raise ValueError(f'Cannot support {self.dtype} KV cache.')
 
         cache_size_bytes_per_token = get_size_in_bytes(cache_size_per_token,
-                                                       dtype)
-        if dtype == DataType.NVFP4:
+                                                       self.dtype)
+        if self.dtype == DataType.NVFP4:
             cache_size_bytes_per_token += self.calculate_scaling_factor_size_bytes(
                 cache_size_per_token,
                 quant_vector_size=16,
                 scaling_factor_dtype=DataType.FP8)
+        return cache_size_bytes_per_token
+
+    def calculate_max_num_blocks(self, kv_cache_config: KvCacheConfig,
+                                 mapping: Mapping):
+        tokens_per_block = self.tokens_per_block
+        free_mem_fraction = (kv_cache_config.free_gpu_memory_fraction
+                             if kv_cache_config.free_gpu_memory_fraction
+                             is not None else 0.9)
+
+        cache_size_bytes_per_token = self.get_cache_bytes_per_token()
 
         free_mem, total_mem = torch.cuda.mem_get_info()
 
