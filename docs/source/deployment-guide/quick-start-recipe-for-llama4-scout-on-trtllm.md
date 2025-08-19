@@ -65,13 +65,8 @@ cuda_graph_config:
   max_batch_size: 1024
 kv_cache_config:
   dtype: fp8
-use_torch_sampler: true
 EOF
 ```
-
-> Here `use_torch_sampler: true` is added as a temporary WAR to solve illegal memory access issue when using trtllm native sampler.
->
-> TODO: Remove this after the issue is resolved
 
 ### Launch the TRT-LLM Server
 
