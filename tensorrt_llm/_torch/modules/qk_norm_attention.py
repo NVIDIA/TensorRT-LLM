@@ -134,7 +134,7 @@ def compute_yarn_parameters(
 class QKNormRoPEAttention(Attention):
     """
     QKNormRoPEAttention is a custom attention layer that applies QK norm and RoPE to the input tensor.
-    It is used in the Qwen3 model.
+    It is used in the Gemma3 and Qwen3 models.
     It is a subclass of Attention, and overrides the apply_rope method to apply QK norm and RoPE.
     """
 
@@ -152,6 +152,7 @@ class QKNormRoPEAttention(Attention):
         dtype: torch.dtype = None,
         dense_bias: Optional[bool] = None,
         config: ModelConfig,
+        q_scaling: float = 1.0,
     ):
         self.pretrained_config = config.pretrained_config
 
@@ -171,17 +172,16 @@ class QKNormRoPEAttention(Attention):
             dtype=dtype,
             dense_bias=dense_bias,
             config=config,
+            q_scaling=q_scaling,
         )
 
-        pretrained_dtype = self.pretrained_config.torch_dtype
-
         self.q_norm = RMSNorm(hidden_size=self.head_dim,
-                              eps=1e-6,
-                              dtype=pretrained_dtype,
+                              eps=self.pretrained_config.rms_norm_eps,
+                              dtype=self.pretrained_config.torch_dtype,
                               has_weights=True)
         self.k_norm = RMSNorm(hidden_size=self.head_dim,
-                              eps=1e-6,
-                              dtype=pretrained_dtype,
+                              eps=self.pretrained_config.rms_norm_eps,
+                              dtype=self.pretrained_config.torch_dtype,
                               has_weights=True)
         self.aux_stream = torch.cuda.Stream()
         self.ln_events = [torch.cuda.Event(), torch.cuda.Event()]
