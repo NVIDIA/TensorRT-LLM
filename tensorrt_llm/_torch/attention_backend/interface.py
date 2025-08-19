@@ -282,7 +282,8 @@ class AttentionMetadata:
     def create_cuda_graph_metadata(self,
                                    max_batch_size: int,
                                    sub_cross_metadata: bool = False,
-                                   max_draft_tokens: int = 0) -> Self:
+                                   max_draft_tokens: int = 0,
+                                   buffers=None) -> Self:
         """
         Creates metadata for CUDA graph execution.
         CUDA graphs require to use pre-allocated buffers for all tensors in fields.
@@ -318,7 +319,7 @@ class AttentionMetadata:
                 )
 
         cuda_graph_metadata.num_contexts = 0
-        cuda_graph_metadata.__post_init__()
+        cuda_graph_metadata.post_init_with_buffers(buffers)
         return cuda_graph_metadata
 
     def update_spec_dec_param(self, is_spec_decoding_enabled, is_spec_dec_tree,
