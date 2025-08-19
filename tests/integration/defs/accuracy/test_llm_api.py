@@ -15,7 +15,8 @@
 import pytest
 
 from tensorrt_llm._tensorrt_engine import LLM
-from tensorrt_llm.llmapi import EagleDecodingConfig, KvCacheConfig
+from tensorrt_llm.llmapi import (EagleDecodingConfig,
+                                 ExtendedRuntimePerfKnobConfig, KvCacheConfig)
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
 
@@ -74,6 +75,17 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                   pipeline_parallel_size=2)
         with llm:
             task = JsonModeEval(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    def test_gather_generation_logits_cuda_graph(self):
+        extended_runtime_perf_knob_config = ExtendedRuntimePerfKnobConfig(
+            cuda_graph_mode=True, cuda_graph_cache_size=1)
+        llm = LLM(
+            self.MODEL_PATH,
+            gather_generation_logits=True,
+            extended_runtime_perf_knob_config=extended_runtime_perf_knob_config)
+        with llm:
+            task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
 
 
