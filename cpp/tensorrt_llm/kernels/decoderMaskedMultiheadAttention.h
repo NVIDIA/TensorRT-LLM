@@ -208,6 +208,11 @@ struct Multihead_attention_params_base
     // threadblock counter to identify the complete of partial attention computations
     int* block_counter = nullptr;
 
+    // sparse indices and offsets for attention calculation
+    int32_t const* sparse_attn_indices = nullptr;
+    int32_t const* sparse_attn_offsets = nullptr;
+    int32_t num_sparse_attn_indices = 0;
+
     int const* memory_length_per_sample = nullptr;
     int32_t const* mrope_position_deltas = nullptr;
 };

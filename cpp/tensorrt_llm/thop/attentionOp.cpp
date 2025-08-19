@@ -19,6 +19,7 @@
 #include "tensorrt_llm/common/dataType.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
 #include "tensorrt_llm/kernels/mlaKernels.h"
+#include "tensorrt_llm/kernels/sparseAttentionKernels.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
 #include "tensorrt_llm/runtime/utils/debugUtils.h"
 #include "tensorrt_llm/thop/attentionOp.h"
@@ -38,6 +39,7 @@ namespace trtllm::attention
 {
 using tensorrt_llm::kernels::KVBlockArray;
 using tensorrt_llm::kernels::MlaParams;
+using tensorrt_llm::kernels::SparseAttentionParams;
 
 enum class AttentionInputType : int8_t
 {
@@ -82,7 +84,8 @@ public:
         std::vector<std::optional<torch::Tensor>> mla_tensor_params,
         torch::optional<torch::Tensor> softmax_stats_tensor,
         c10::ArrayRef<std::optional<torch::Tensor>> spec_decoding_tensor_params,
-        torch::optional<torch::Tensor> attention_sinks) const
+        torch::optional<torch::Tensor> attention_sinks, torch::optional<torch::Tensor> sparse_batch_offsets,
+        torch::optional<torch::Tensor> all_sparse_indices) const
         = 0;
 };
 
@@ -137,7 +140,8 @@ public:
         std::vector<std::optional<torch::Tensor>> mla_tensor_params,
         torch::optional<torch::Tensor> softmax_stats_tensor,
         c10::ArrayRef<std::optional<torch::Tensor>> spec_decoding_tensor_params,
-        torch::optional<torch::Tensor> attention_sinks) const override
+        torch::optional<torch::Tensor> attention_sinks, torch::optional<torch::Tensor> sparse_batch_offsets,
+        torch::optional<torch::Tensor> all_sparse_indices) const override
     {
         auto stream = at::cuda::getCurrentCUDAStream(qkv_or_q.get_device());
         T* attention_input = static_cast<T*>(qkv_or_q.slice(0, token_offset).data_ptr());
@@ -218,6 +222,29 @@ public:
             if (mla_helix_position_offsets.has_value())
             {
                 mla_params.helix_position_offsets = mla_helix_position_offsets->data_ptr<int32_t>();
+            }
+        }
+
+        if (op.useSparseAttention())
+        {
+            int num_indices_offset = sparse_batch_offsets.value().index({seq_offset}).item<int32_t>();
+            if (is_context)
+            {
+                op.mRuntimeSparseAttentionParams.sparse_kv_offsets
+                    = sparse_batch_offsets.value().slice(0, seq_offset).data_ptr<int32_t>();
+                op.mRuntimeSparseAttentionParams.sparse_kv_indices
+                    = all_sparse_indices.value().slice(0, num_indices_offset).data_ptr<int32_t>();
+                op.mRuntimeSparseAttentionParams.num_sparse_kv_indices
+                    = sparse_batch_offsets.value().index({num_seqs}).item<int32_t>();
+            }
+            else
+            {
+                op.mRuntimeSparseAttentionParams.sparse_attn_offsets
+                    = sparse_batch_offsets.value().slice(0, seq_offset + 1).data_ptr<int32_t>();
+                op.mRuntimeSparseAttentionParams.sparse_attn_indices
+                    = all_sparse_indices.value().slice(0, num_indices_offset).data_ptr<int32_t>();
+                op.mRuntimeSparseAttentionParams.num_sparse_attn_indices
+                    = sparse_batch_offsets.value().index({seq_offset + num_seqs + 1}).item<int32_t>();
             }
         }
 
@@ -492,34 +519,53 @@ using RunnerPtr = std::shared_ptr<torch_ext::trtllm::attention::RunnerBase>;
 using torch_ext::trtllm::attention::Runner;
 using torch_ext::trtllm::attention::AttentionInputType;
 
-void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<torch::Tensor> v, torch::Tensor& output,
-    std::optional<torch::Tensor> output_sf, std::optional<torch::ScalarType> out_dtype,
-    std::optional<torch::Tensor> workspace_, torch::Tensor sequence_length, torch::Tensor host_past_key_value_lengths,
+void attention(torch::Tensor q, torch::optional<torch::Tensor> k, torch::optional<torch::Tensor> v,
+    torch::Tensor& output, torch::optional<torch::Tensor> output_sf, std::optional<torch::ScalarType> out_dtype,
+    torch::optional<torch::Tensor> workspace_, torch::Tensor sequence_length, torch::Tensor host_past_key_value_lengths,
     torch::Tensor host_total_kv_lens, torch::Tensor context_lengths, torch::Tensor host_context_lengths,
-    torch::Tensor host_request_types, std::optional<torch::Tensor> kv_cache_block_offsets,
-    std::optional<torch::Tensor> host_kv_cache_block_offsets, std::optional<torch::Tensor> host_kv_cache_pool_pointers,
-    std::optional<torch::Tensor> host_kv_cache_pool_mapping, std::optional<torch::Tensor> cache_indirection,
-    std::optional<torch::Tensor> kv_scale_orig_quant, std::optional<torch::Tensor> kv_scale_quant_orig,
-    std::optional<torch::Tensor> out_scale, std::optional<torch::Tensor> rotary_inv_freq,
-    std::optional<torch::Tensor> rotary_cos_sin, std::optional<torch::Tensor> latent_cache,
-    std::optional<torch::Tensor> q_pe, std::optional<torch::Tensor> block_ids_per_seq,
-    std::optional<torch::Tensor> attention_sinks, bool const is_fused_qkv, bool const update_kv_cache,
-    int64_t const predicted_tokens_per_seq, int64_t const layer_idx, int64_t const num_heads,
-    int64_t const num_kv_heads, int64_t const head_size, std::optional<int64_t> const tokens_per_block,
-    int64_t const max_num_requests, int64_t const max_context_length, int64_t const attention_window_size,
-    int64_t const sink_token_length, int64_t const beam_width, int64_t const mask_type, int64_t const quant_mode,
-    double const q_scaling, int64_t const position_embedding_type, int64_t const rotary_embedding_dim,
-    double const rotary_embedding_base, int64_t const rotary_embedding_scale_type,
-    std::vector<double> rotary_embedding_scales, std::vector<int64_t> rotary_embedding_max_position_info,
+    torch::Tensor host_request_types, torch::optional<torch::Tensor> kv_cache_block_offsets,
+    torch::optional<torch::Tensor> host_kv_cache_block_offsets,
+    torch::optional<torch::Tensor> host_kv_cache_pool_pointers,
+    torch::optional<torch::Tensor> host_kv_cache_pool_mapping, torch::optional<torch::Tensor> cache_indirection,
+    torch::optional<torch::Tensor> kv_scale_orig_quant, torch::optional<torch::Tensor> kv_scale_quant_orig,
+    torch::optional<torch::Tensor> out_scale, torch::optional<torch::Tensor> rotary_inv_freq,
+    torch::optional<torch::Tensor> rotary_cos_sin, torch::optional<torch::Tensor> latent_cache,
+    torch::optional<torch::Tensor> q_pe, torch::optional<torch::Tensor> block_ids_per_seq,
+    torch::optional<torch::Tensor> attention_sinks, bool const is_fused_qkv, bool const update_kv_cache,
+    c10::ArrayRef<int64_t> attention_config_params, std::optional<int64_t> const tokens_per_block,
+    double const q_scaling, c10::ArrayRef<int64_t> rotary_embedding_int_params, double const rotary_embedding_base,
+    c10::ArrayRef<double> rotary_embedding_scales, c10::ArrayRef<int64_t> rotary_embedding_max_position_info,
     bool const use_paged_context_fmha, std::optional<int64_t> attention_input_type, bool is_mla_enable,
     std::optional<int64_t> chunked_prefill_buffer_batch_size, std::optional<int64_t> q_lora_rank,
     std::optional<int64_t> kv_lora_rank, std::optional<int64_t> qk_nope_head_dim,
     std::optional<int64_t> qk_rope_head_dim, std::optional<int64_t> v_head_dim,
     std::optional<torch::Tensor> mrope_rotary_cos_sin, std::optional<torch::Tensor> mrope_position_deltas,
-    std::vector<std::optional<torch::Tensor>> mla_tensor_params, std::optional<int64_t> attention_chunk_size,
-    std::optional<torch::Tensor> softmax_stats_tensor, std::vector<bool> spec_decoding_bool_params,
-    std::vector<std::optional<torch::Tensor>> spec_decoding_tensor_params)
+    std::vector<std::optional<torch::Tensor>> mla_tensor_params, 
+    std::optional<int64_t> attention_chunk_size, std::optional<torch::Tensor> softmax_stats_tensor,
+    std::vector<bool> spec_decoding_bool_params, std::vector<std::optional<torch::Tensor>> spec_decoding_tensor_params,
+    torch::optional<torch::Tensor> sparse_batch_offsets, torch::optional<torch::Tensor> all_sparse_indices)
 {
+    // Decompress attention config parameters
+    TORCH_CHECK(attention_config_params.size() == 12, "Expected 12 attention config parameters");
+    int64_t const num_heads = attention_config_params[0];
+    int64_t const num_kv_heads = attention_config_params[1];
+    int64_t const head_size = attention_config_params[2];
+    int64_t const max_num_requests = attention_config_params[3];
+    int64_t const max_context_length = attention_config_params[4];
+    int64_t const attention_window_size = attention_config_params[5];
+    int64_t const sink_token_length = attention_config_params[6];
+    int64_t const beam_width = attention_config_params[7];
+    int64_t const mask_type = attention_config_params[8];
+    int64_t const quant_mode = attention_config_params[9];
+    int64_t const predicted_tokens_per_seq = attention_config_params[10];
+    int64_t const layer_idx = attention_config_params[11];
+
+    // Decompress rotary embedding int parameters
+    TORCH_CHECK(rotary_embedding_int_params.size() == 3, "Expected 3 rotary embedding int parameters");
+    int64_t const rotary_embedding_dim = rotary_embedding_int_params[0];
+    int64_t const rotary_embedding_scale_type = rotary_embedding_int_params[1];
+    int64_t const position_embedding_type = rotary_embedding_int_params[2];
+
     TLLM_LOG_TRACE("Attention op starts at layer %d", layer_idx);
     // Use these tensors to infer if the attention is using KV cache
     bool const use_kv_cache = kv_cache_block_offsets.has_value() && host_kv_cache_block_offsets.has_value()
@@ -632,6 +678,11 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     op->mIsSpecDecodingEnabled = spec_decoding_bool_params[0]; // is_spec_decoding_enabled
     op->mUseSpecDecoding = spec_decoding_bool_params[1];       // use_spec_decoding
     op->mIsSpecDecTree = spec_decoding_bool_params[2];         // is_spec_dec_tree
+
+    if (all_sparse_indices.has_value() && all_sparse_indices.value().numel() > 0)
+    {
+        op->mUseSparseAttention = true;
+    }
 
     if (is_mla_enable)
     {
@@ -758,8 +809,8 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             kv_cache_block_offsets, host_kv_cache_block_offsets, host_kv_cache_pool_pointers,
             host_kv_cache_pool_mapping, cache_indirection, kv_scale_orig_quant, kv_scale_quant_orig, out_scale,
             rotary_inv_freq, rotary_cos_sin, latent_cache, q_pe, block_ids_per_seq, mrope_rotary_cos_sin,
-            mrope_position_deltas, mla_tensor_params, softmax_stats_tensor, spec_decoding_tensor_params,
-            attention_sinks);
+            mrope_position_deltas, mla_tensor_params, softmax_stats_tensor, spec_decoding_tensor_params, attention_sinks,
+            sparse_batch_offsets, all_sparse_indices);
     }
 
     if ((num_generations > 0) && (attn_input_type != AttentionInputType::ContextOnly))
@@ -775,8 +826,8 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
             kv_cache_block_offsets, host_kv_cache_block_offsets, host_kv_cache_pool_pointers,
             host_kv_cache_pool_mapping, cache_indirection, kv_scale_orig_quant, kv_scale_quant_orig, out_scale,
             rotary_inv_freq, rotary_cos_sin, latent_cache, q_pe, block_ids_per_seq, mrope_rotary_cos_sin,
-            mrope_position_deltas, mla_tensor_params, softmax_stats_tensor, spec_decoding_tensor_params,
-            attention_sinks);
+            mrope_position_deltas, mla_tensor_params, softmax_stats_tensor, spec_decoding_tensor_params, attention_sinks,
+            sparse_batch_offsets, all_sparse_indices);
     }
 
     TLLM_LOG_TRACE("Attention op stops at layer %d", layer_idx);

@@ -26,6 +26,7 @@
 #include "tensorrt_llm/runtime/torchView.h"
 
 #include <ATen/DLConvertor.h>
+#include <c10/util/ArrayRef.h>
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/filesystem.h>
 #include <nanobind/stl/optional.h>
@@ -315,5 +316,34 @@ struct type_caster<torch::ScalarType>
         throw std::runtime_error("from_cpp for torch::ScalarType is not implemented");
     }
 };
+// Custom type caster for c10::ArrayRef<double> to fix nanobind stubgen issue
+// PyTorch provides built-in support for c10::ArrayRef<int64_t> but not for double
+template <>
+struct type_caster<c10::ArrayRef<double>>
+{
+    using value_conv = make_caster<std::vector<double>>;
+
+    NB_TYPE_CASTER(c10::ArrayRef<double>, value_conv::Name);
+
+    bool from_python(handle src, uint8_t flags, cleanup_list* cleanup)
+    {
+        value_conv conv;
+        if (!conv.from_python(src, flags, cleanup))
+            return false;
+
+        // Store the vector in a static variable to ensure the ArrayRef remains valid
+        static thread_local std::vector<double> temp_storage;
+        temp_storage = std::move(conv);
+        value = c10::ArrayRef<double>(temp_storage);
+        return true;
+    }
+
+    static handle from_cpp(c10::ArrayRef<double> const& src, rv_policy policy, cleanup_list* cleanup)
+    {
+        std::vector<double> vec(src.begin(), src.end());
+        return value_conv::from_cpp(vec, policy, cleanup);
+    }
+};
+
 } // namespace detail
 } // namespace NB_NAMESPACE

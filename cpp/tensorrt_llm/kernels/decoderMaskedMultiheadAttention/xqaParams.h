@@ -108,6 +108,9 @@ struct XQAParams
 
     // for cross attention
     int32_t const* encoder_input_lengths = nullptr;
+    int32_t num_sparse_attn_indices = 0;
+    int32_t const* sparse_attn_indices = nullptr;
+    int32_t const* sparse_attn_offsets = nullptr;
 
     cudaStream_t stream = 0;
 
@@ -179,6 +182,9 @@ struct XQAParams
            << "is_fp8_output :" << (is_fp8_output ? "true" : "false") << std ::endl
            << "fp8_out_scale :" << fp8_out_scale << std ::endl
            << "encoder_input_lengths: " << encoder_input_lengths << std::endl
+           << "num_sparse_attn_indices :" << num_sparse_attn_indices << std ::endl
+           << "sparse_attn_indices :" << sparse_attn_indices << std ::endl
+           << "sparse_attn_offsets :" << sparse_attn_offsets << std ::endl
            << "stream :" << stream;
 
         return ss.str();

@@ -1578,6 +1578,7 @@ void invokeApplyBiasRopeUpdateKVCacheDispatch(QKVPreprocessingParams<T, KVCacheB
         && (long_seq_rotary_support || !has_rotary_cos_sin_cache || has_sink_tokens || !support_rotary_for_v2
             || use_v1_for_mrope))
     {
+        TLLM_LOG_DEBUG("Using v1 KVcache update kernel");
         kernelV1Dispatch<T, TCache, KVCacheBuffer>(params, stream);
         return;
     }
@@ -1603,6 +1604,7 @@ void invokeApplyBiasRopeUpdateKVCacheDispatch(QKVPreprocessingParams<T, KVCacheB
     default:
         // Fall back to v1 kernel.
         // GPTJ Rotary embedding needs at least two elements per thread.
+        TLLM_LOG_DEBUG("Using v1 KVcache update kernel");
         kernelV1Dispatch<T, TCache, KVCacheBuffer>(params, stream);
         break;
     }

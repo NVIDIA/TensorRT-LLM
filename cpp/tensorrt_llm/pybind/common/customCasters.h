@@ -24,6 +24,7 @@
 #include "tensorrt_llm/runtime/torch.h"
 #include "tensorrt_llm/runtime/torchView.h"
 
+#include <c10/util/ArrayRef.h>
 #include <pybind11/cast.h>
 #include <pybind11/detail/common.h>
 #include <pybind11/detail/descr.h>
@@ -258,6 +259,46 @@ public:
         }
         return THPVariable_Wrap(tensorrt_llm::runtime::Torch::tensor(
             reinterpret_cast<tensorrt_llm::runtime::ITensor::SharedPtr const&>(src)));
+    }
+};
+
+// Custom type caster for c10::ArrayRef<double> to fix pybind11_stubgen issue
+// PyTorch provides built-in support for c10::ArrayRef<int64_t> but not for double
+template <>
+struct type_caster<c10::ArrayRef<double>>
+{
+    PYBIND11_TYPE_CASTER(c10::ArrayRef<double>, _("List[float]"));
+
+    bool load(handle src, bool convert)
+    {
+        // Use pybind11's built-in sequence conversion
+        if (!isinstance<sequence>(src))
+            return false;
+
+        auto seq = reinterpret_borrow<sequence>(src);
+
+        // Store the vector in a static variable to ensure the ArrayRef remains valid
+        static thread_local std::vector<double> temp_storage;
+        temp_storage.clear();
+        temp_storage.reserve(seq.size());
+
+        for (auto item : seq)
+        {
+            temp_storage.push_back(item.cast<double>());
+        }
+
+        value = c10::ArrayRef<double>(temp_storage);
+        return true;
+    }
+
+    static handle cast(c10::ArrayRef<double> const& src, return_value_policy policy, handle parent)
+    {
+        list result;
+        for (auto const& item : src)
+        {
+            result.append(item);
+        }
+        return result.release();
     }
 };
 

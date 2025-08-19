@@ -148,6 +148,10 @@ struct QKVPreprocessingParams
     int const* cu_seq_lens{nullptr};
     // list of cumulative KV sequence lengths, of shape {batch_size + 1}, used by cross attention only.
     int const* cu_kv_seq_lens{nullptr};
+    // list of cumulative length of sparse KV indices, of shape {batch_size + 1}
+    int const* sparse_kv_offsets{nullptr};
+    // list of sparse KV indices for writing to KV cache, of shape {num_sparse_kv_indices, num_kv_heads}
+    int const* sparse_kv_indices{nullptr};
     // inverse frequencies (angle raised at various powers) from the RoPE formula
     // shape of {batch_size , rotaryEmbeddingDim / 2}
     float const* rotary_embedding_inv_freq{nullptr};
@@ -172,6 +176,8 @@ struct QKVPreprocessingParams
     int kv_head_num{0};
     int qheads_per_kv_head{0};
     int size_per_head{0};
+    // sparse kv write num
+    int num_sparse_kv_indices{0};
     // The fmha bmm1 host scale (1.0f / sqrt(headSize) by default).
     float fmha_host_bmm1_scale{1.f};
     int rotary_embedding_dim{0};
@@ -216,24 +222,54 @@ struct QKVPreprocessingParams
         ss << "kv_cache_block_scales_buffer: " << kv_cache_block_scales_buffer.data << std::endl;
         ss << "qkv_bias: " << qkv_bias << std::endl;
         ss << "tokens_info: " << tokens_info << std::endl;
-        ss << "seq_lens: "
-           << *(runtime::ITensor::wrap(
-                  (void*) seq_lens, nvinfer1::DataType::kINT32, runtime::ITensor::makeShape({batch_size})));
-        ss << "cache_seq_lens: "
-           << *(runtime::ITensor::wrap(
-                  (void*) cache_seq_lens, nvinfer1::DataType::kINT32, runtime::ITensor::makeShape({batch_size})));
-        ss << "encoder_seq_lens: "
-           << *(runtime::ITensor::wrap(
-                  (void*) encoder_seq_lens, nvinfer1::DataType::kINT32, runtime::ITensor::makeShape({batch_size})));
-        ss << "cu_seq_lens: "
-           << *(runtime::ITensor::wrap(
-                  (void*) cu_seq_lens, nvinfer1::DataType::kINT32, runtime::ITensor::makeShape({batch_size})));
-        ss << "cu_kv_seq_lens: "
-           << *(runtime::ITensor::wrap(
-                  (void*) cu_kv_seq_lens, nvinfer1::DataType::kINT32, runtime::ITensor::makeShape({batch_size})));
-        ss << "rotary_embedding_inv_freq: "
-           << *(runtime::ITensor::wrap((void*) rotary_embedding_inv_freq, nvinfer1::DataType::kFLOAT,
-                  runtime::ITensor::makeShape({batch_size, rotary_embedding_dim / 2})));
+        if (seq_lens && batch_size > 0)
+        {
+            ss << "seq_lens: "
+               << *(runtime::ITensor::wrap(
+                      (void*) seq_lens, nvinfer1::DataType::kINT32, runtime::ITensor::makeShape({batch_size})));
+        }
+        if (cache_seq_lens && batch_size > 0)
+        {
+            ss << "cache_seq_lens: "
+               << *(runtime::ITensor::wrap(
+                      (void*) cache_seq_lens, nvinfer1::DataType::kINT32, runtime::ITensor::makeShape({batch_size})));
+        }
+        if (encoder_seq_lens && batch_size > 0)
+        {
+            ss << "encoder_seq_lens: "
+               << *(runtime::ITensor::wrap(
+                      (void*) encoder_seq_lens, nvinfer1::DataType::kINT32, runtime::ITensor::makeShape({batch_size})));
+        }
+        if (cu_seq_lens && batch_size > 0)
+        {
+            ss << "cu_seq_lens: "
+               << *(runtime::ITensor::wrap(
+                      (void*) cu_seq_lens, nvinfer1::DataType::kINT32, runtime::ITensor::makeShape({batch_size})));
+        }
+        if (cu_kv_seq_lens && batch_size > 0)
+        {
+            ss << "cu_kv_seq_lens: "
+               << *(runtime::ITensor::wrap(
+                      (void*) cu_kv_seq_lens, nvinfer1::DataType::kINT32, runtime::ITensor::makeShape({batch_size})));
+        }
+        if (sparse_kv_offsets && num_sparse_kv_indices > 0)
+        {
+            ss << "sparse_kv_offsets: "
+               << *(runtime::ITensor::wrap((void*) sparse_kv_offsets, nvinfer1::DataType::kINT32,
+                      runtime::ITensor::makeShape({batch_size + 1})));
+        }
+        if (sparse_kv_indices && num_sparse_kv_indices > 0)
+        {
+            ss << "sparse_kv_indices: "
+               << *(runtime::ITensor::wrap((void*) sparse_kv_indices, nvinfer1::DataType::kINT32,
+                      runtime::ITensor::makeShape({num_sparse_kv_indices, kv_head_num}))); // NOTE
+        }
+        if (rotary_embedding_inv_freq && batch_size > 0 && rotary_embedding_dim > 0)
+        {
+            ss << "rotary_embedding_inv_freq: "
+               << *(runtime::ITensor::wrap((void*) rotary_embedding_inv_freq, nvinfer1::DataType::kFLOAT,
+                      runtime::ITensor::makeShape({batch_size, rotary_embedding_dim / 2})));
+        }
         ss << "rotary_coef_cache_buffer: " << rotary_coef_cache_buffer << std::endl;
         ss << "qkv_scale_orig_quant: " << qkv_scale_orig_quant << std::endl;
         ss << "spec_decoding_position_offsets: " << spec_decoding_position_offsets << std::endl;
@@ -261,6 +297,7 @@ struct QKVPreprocessingParams
         ss << "quantized_fp8_output: " << quantized_fp8_output << std::endl;
         ss << "generation_phase: " << generation_phase << std::endl;
         ss << "multi_processor_count: " << multi_processor_count << std::endl;
+        ss << "num_sparse_kv_indices: " << num_sparse_kv_indices << std::endl;
 
         return ss.str();
     }

@@ -120,6 +120,9 @@ struct FusedQKVMaskedAttentionDispatchParams
     bool block_sparse_attention = false;
     BlockSparseParams block_sparse_params;
     int32_t const* mrope_position_deltas;
+    int32_t const* sparse_attn_indices;
+    int32_t const* sparse_attn_offsets;
+    int32_t num_sparse_attn_indices;
 };
 
 template <typename T, typename KVCacheBuffer>
@@ -200,6 +203,10 @@ bool AttentionOp::convertMMHAParamsToXQAParams(tensorrt_llm::kernels::XQAParams&
     // Medusa mode will have multiple query tokens.
     xqaParams.multi_query_tokens = mIsSpecDecodingEnabled && mUseSpecDecoding;
     xqaParams.is_spec_dec_tree = mIsSpecDecTree;
+    // Sparse attention parameters for XQA
+    xqaParams.sparse_attn_indices = mRuntimeSparseAttentionParams.sparse_attn_indices;
+    xqaParams.sparse_attn_offsets = mRuntimeSparseAttentionParams.sparse_attn_offsets;
+    xqaParams.num_sparse_attn_indices = mRuntimeSparseAttentionParams.num_sparse_attn_indices;
 
     if (mKVCacheQuantMode.hasInt8KvCache())
     {
@@ -668,6 +675,11 @@ void fusedQKV_masked_attention_dispatch(Multihead_attention_params<T_MMHA, CROSS
     }
 
     params.multi_processor_count = input_params.multi_processor_count;
+
+    // sparse indices and offsets for attention
+    params.sparse_attn_indices = input_params.sparse_attn_indices;
+    params.sparse_attn_offsets = input_params.sparse_attn_offsets;
+    params.num_sparse_attn_indices = input_params.num_sparse_attn_indices;
 
     // cross attn
     params.memory_length_per_sample = input_params.memory_length_per_sample;
@@ -1647,6 +1659,11 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         preprocessingParams.spec_decoding_position_offsets = nullptr;
         preprocessingParams.logn_scaling = params.logn_scaling_ptr;
 
+        // Sparse KV write
+        preprocessingParams.sparse_kv_indices = mRuntimeSparseAttentionParams.sparse_kv_indices;
+        preprocessingParams.sparse_kv_offsets = mRuntimeSparseAttentionParams.sparse_kv_offsets;
+        preprocessingParams.num_sparse_kv_indices = mRuntimeSparseAttentionParams.num_sparse_kv_indices;
+
         // Scalars
         preprocessingParams.batch_size = params.batch_size;
         preprocessingParams.max_input_seq_len = params.input_seq_length;
@@ -2410,6 +2427,9 @@ int AttentionOp::enqueueGeneration(EnqueueGenerationParams<T> const& params, cud
     dispatch_params.block_sparse_attention = mMaskType == AttentionMaskType::BLOCKSPARSE;
     dispatch_params.block_sparse_params = mBlockSparseParams;
     dispatch_params.mrope_position_deltas = params.mrope_position_deltas;
+    dispatch_params.sparse_attn_indices = mRuntimeSparseAttentionParams.sparse_attn_indices;
+    dispatch_params.sparse_attn_offsets = mRuntimeSparseAttentionParams.sparse_attn_offsets;
+    dispatch_params.num_sparse_attn_indices = mRuntimeSparseAttentionParams.num_sparse_attn_indices;
 
     using DataType = typename SATypeConverter<T>::Type;
     if (!isCrossAttention())
