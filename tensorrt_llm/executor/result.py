@@ -594,7 +594,7 @@ class GenerationResult(GenerationResultBase):
         use_async_queue = has_event_loop()
         shared_queue = None
         if executor.use_ray_queue():
-            shared_queue = executor.response_queue if use_async_queue else executor.response_sync_queue
+            shared_queue = executor.async_response_queue_weakref if use_async_queue else executor.sync_response_queue_weakref
 
         super().__init__(
             generation_request.id,
