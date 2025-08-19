@@ -155,50 +155,41 @@ def test_trtllm_sage_attention_fmha(d, s):
 @pytest.mark.parametrize('dtype', ["-bf16", "-e4m3", "-e4m3 -bf16-output"],
                          ids=["bf16", "e4m3", "e4m3-bf16"])
 @pytest.mark.parametrize('s', [1024, 4096], ids=["seqlen-1024", "seqlen-4096"])
-@pytest.mark.parametrize(
-    'input_layout', ["", "-paged-kv", "-contiguous-q-kv", "-separate-q-k-v"],
-    ids=["packed-qkv", "paged-kv", "q-contiguous-kv", "separate-q-k-v"])
-def test_trtllm_context_mla_attention_fmha(dtype, s, input_layout):
+def test_trtllm_context_mla_attention_fmha(dtype, s):
+    sm_version = getSMVersion()
+    if sm_version < 90:
+        pytest.skip("MLA kernels are only tested on sm90 and above currently.")
+
     # use higher error tolerance for bf16 and s = 4096.
     epsilon = ''
     if dtype == "-bf16" and s == 4096:
         epsilon += ' -epsilon 0.03'
 
-    sm_version = getSMVersion()
-    if dtype in ["-e4m3", "-e4m3 -bf16-output"] and sm_version != 89:
-        pytest.skip("FP8 MLAs only supported on sm89 currently.")
+    if dtype in ["-e4m3", "-e4m3 -bf16-output"] and sm_version != 120:
+        pytest.skip("FP8 MLAs are only supported on sm120 currently.")
 
-    # Context phase kernels.
+    # Context phase kernels, always use separate-q-k-v layout.
     subprocess.run(
-        f"bin/fmha.exe -v 0 -runs 1 -min-s 1024 -s {s} -b 8 -h 8 -d 192 -dv 128 {dtype} \
-    -force-non-warp-specialization -causal-mask {epsilon}",
+        f"bin/fmha.exe -v 0 -runs 1 -min-s 1024 -s {s} -b 8 -h 8 -d 192 -dv 128 {dtype} "
+        f"-causal-mask {epsilon} -separate-q-k-v",
         shell=True,
         check=True)
 
-    if sm_version == 90:
-        # Now only hopper-style supports separate-q-k-v
+    # For chunked prefill, we need to enable -save-softmax (dtype: bf16, layout: separate-q-k-v).
+    # Currently fp8 kernel doesn't support saving softmax.
+    if dtype == "-bf16":
+        # padding mask
         subprocess.run(
-            f"bin/fmha.exe -v 0 -runs 1 -min-s 1024 -s {s} -b 8 -h 8 -d 192 -dv 128 {dtype} \
-            -causal-mask {epsilon} {input_layout}",
+            f"bin/fmha.exe -v 0 -runs 1 -min-s 1024 -s {s} -b 8 -h 8 -d 192 -dv 128 {dtype} "
+            f"{epsilon} -separate-q-k-v -save-softmax",
             shell=True,
             check=True)
-
-        # For chunked prefill, we need to enable -save-softmax (dtype: bf16, sm90, layout: paged-kv or separate-q-k-v).
-        if dtype == "-bf16" and input_layout in [
-                "-paged-kv", "-separate-q-k-v"
-        ]:
-            # padding mask
-            subprocess.run(
-                f"bin/fmha.exe -v 0 -runs 1 -min-s 1024 -s {s} -b 8 -h 8 -d 192 -dv 128 {dtype} \
-                {epsilon} {input_layout} -save-softmax",
-                shell=True,
-                check=True)
-            # causal mask
-            subprocess.run(
-                f"bin/fmha.exe -v 0 -runs 1 -min-s 1024 -s {s} -b 8 -h 8 -d 192 -dv 128 {dtype} \
-                -causal-mask {epsilon} {input_layout} -save-softmax",
-                shell=True,
-                check=True)
+        # causal mask
+        subprocess.run(
+            f"bin/fmha.exe -v 0 -runs 1 -min-s 1024 -s {s} -b 8 -h 8 -d 192 -dv 128 {dtype} "
+            f"-causal-mask {epsilon} -separate-q-k-v -save-softmax",
+            shell=True,
+            check=True)
 
 
 @pytest.mark.parametrize('dtype', ["-bf16", "-e4m3", "-e4m3 -bf16-output"],
@@ -210,14 +201,17 @@ def test_trtllm_context_mla_attention_fmha(dtype, s, input_layout):
                              "num-grouped-heads-64", "num-grouped-heads-128"
                          ])
 def test_trtllm_gen_mla_attention_fmha(dtype, s, num_grouped_heads):
+    sm_version = getSMVersion()
+    if sm_version < 90:
+        pytest.skip("MLA kernels are only tested on sm90 and above currently.")
+
     # use higher error tolerance for bf16 and s = 4096.
     epsilon = ''
     if dtype == "-bf16" and s == 4096:
         epsilon += ' -epsilon 0.03'
 
-    sm_version = getSMVersion()
-    if dtype in ["-e4m3", "-e4m3 -bf16-output"] and sm_version != 89:
-        pytest.skip("FP8 MLAs only supported on sm89 currently.")
+    if dtype in ["-e4m3", "-e4m3 -bf16-output"] and sm_version != 120:
+        pytest.skip("FP8 MLAs are only supported on sm120 currently.")
 
     # Generation phase kernels.
     subprocess.run(
