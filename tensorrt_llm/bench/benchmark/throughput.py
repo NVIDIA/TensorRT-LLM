@@ -419,7 +419,7 @@ def throughput_command(
 
         sampler_args = {
             "end_id": options.eos_id,
-            "pad_id": options.pad_id,
+            "pad_id": options.eos_id,
             "n": options.beam_width,
             "use_beam_search": options.beam_width > 1
         }
