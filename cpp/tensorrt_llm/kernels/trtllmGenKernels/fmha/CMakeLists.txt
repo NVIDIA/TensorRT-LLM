@@ -18,7 +18,7 @@
 file(GLOB_RECURSE SRC_CPP *.cpp)
 file(GLOB_RECURSE SRC_CU *.cu)
 
-# filter_cuda_archs("100" SRC_CPP)
+filter_cuda_archs("100" SRC_CPP)
 
 add_library(trtllm_gen_fmha OBJECT ${SRC_CPP} ${SRC_CU})
 set_property(TARGET trtllm_gen_fmha PROPERTY POSITION_INDEPENDENT_CODE ON)

@@ -17,7 +17,6 @@
 #pragma once
 
 #include <numeric>
-#include <optional>
 
 #include "GemmGatedActOptions.h"
 #include "KernelParams.h"
@@ -26,9 +25,6 @@
 #ifdef TLLM_GEN_EXPORT_INTERFACE
 #include "KernelMetaInfo.h"
 #endif // TLLM_GEN_EXPORT_INTERFACE
-
-namespace gemmGatedAct
-{
 
 namespace gemmGatedAct
 {
@@ -55,19 +51,14 @@ struct GemmGatedActData
         int32_t mK{0};
         // The rank id of the current device in the multi-gpu space.
         int32_t mRank{0};
-        // The number of devices in tensor-parallel group.
+        // The number of peer devices in tensor-parallel group.
         int32_t mWorldSize{0};
     };
 
     struct InputBuffers
     {
-        // The matrix A. The data type is controlled by options.mDtypeA.
-        //
-        // When layoutA is MatrixLayout::MajorK, the shape is [M, K].
-        // When LayoutA is MatrixLayout::MajorMn, the shape is [K, M].
-        // When LayoutA is MatrixLayout::BlockMajorK, the shape is [K / blockK, M, blockK] where blockK
-        // is 128B.
-        // The rightmost dimension is contiguous in memory.
+        // The matrix A. The data type is controlled by options.mDtypeElt.
+        // The shape is [M, K]. The rightmost dimension is contiguous in memory.
         void const* mPtrA{nullptr};
 
         // The block scaling factors to dequantize A.
@@ -100,13 +91,8 @@ struct GemmGatedActData
         // The shape is [M]
         void const* mPtrPerTokenSfA{nullptr};
 
-        // The matrix B. The data type is controlled by options.mDtypeB.
-        //
-        // When layoutB is MatrixLayout::MajorK, the shape is [N, K].
-        // When layoutB is MatrixLayout::MajorMn, the shape is [K, N].
-        // When layoutB is MatrixLayout::BlockMajorK, the shape is [K / blockK, N, blockK] where blockK
-        // is 128B.
-        // The rightmost dimension is contiguous in memory.
+        // The matrix B. The data type is controlled by options.mDtypeElt.
+        // The shape is [N, K]. The rightmost dimension is contiguous in memory.
         void const* mPtrB{nullptr};
 
         // The scaling factors to dequantize B.
@@ -146,21 +132,6 @@ struct GemmGatedActData
         // The shape is [N]
         void const* mPtrPerTokenSfB{nullptr};
 
-        // The bias applied after the GEMM and before the activation function.
-        // The bias is applied before the global scaling factor. I.e.
-        // C = act(A * B + bias') * scaleC
-        // scaleC = dequantA * dequantB * quantC
-        // Thus, the bias' = bias / (dequantA * dequantB), where the bias is the original bias.
-        //
-        // if BiasType is N, the shape is [N]
-        // The bias is broadcasted along the M dimension.
-        //
-        // if BiasType is M, the shape is [M]
-        // The bias is broadcasted along the N dimension.
-        //
-        // The dtype is float32.
-        void const* mPtrBias{nullptr};
-
         // The output tensor scaling factor for MxFp{4,8}, Fp8, NvFp4 and DeepSeek FP8 quantization.
         // TensorRT-LLM API requires a scaling factor on the device.
         // Shape is [1].
@@ -169,43 +140,6 @@ struct GemmGatedActData
         // TensorRT-LLM API requires a scaling factor on the device.
         // Shape is [1].
         void const* mPtrScaleGate{nullptr};
-        // The alpha for SwiGlu.
-        // Alpha is 1.f if nullptr.
-        // Shape is [1].
-        void const* mPtrSwiGluAlpha{nullptr};
-        // The beta for SwiGlu.
-        // Beta is 0.f if nullptr.
-        // Shape is [1].
-        void const* mPtrSwiGluBeta{nullptr};
-        // The clamp limit before the activation.
-        // Clamp limit is FLT_MAX if nullptr.
-        // When the input is FP8 or NVFP4, the clamp has to be scaled by limit' = limit / dequantAb.
-        // Shape is [1].
-        //
-        // The given clamp limit applies to the dequantized values, so the order of operations would
-        // look something like this:
-        //
-        // x0 = x0 * dqAb
-        // x0 = clamp(x0, none, limit)
-        // x0 = x0 * sigmoid(alpha * x0)
-        // x1 = dqAb * x1
-        // x1 = clamp(x1, -limit, limit)
-        // out = qC * (x1 + beta) * x0
-        //
-        // Given that the dqAb and qC are combined into scaleC, we can bring the dqAb into the clamp
-        // limit and apply the clamping prior to dequantization:
-        //
-        // x0 = clamp(x0, none, limit / dqAb)
-        // x0 = x0 * dqAb
-        // x0 = x0 * sigmoid(alpha * x0)
-        // x1 = clamp(x1, -limit / dqAb, limit / dqAb)
-        // scaleC = dqAb * qC
-        // beta' = beta / dqAb
-        // out = scaleC * (x1 + beta') * x0
-        //
-        // Note this assumes that scaleAb == scaleGate which is true in TRT-LLM MoE use-case
-        //
-        void const* mPtrClampLimit{nullptr};
     };
 
     struct OutputBuffers
@@ -256,7 +190,7 @@ public:
     // Launch the cubin from the provided config. It calls all necessary memsets for internal buffers.
     // Provided config must be validated with isValidConfig before the call.
     int32_t run(GemmGatedActConfig const& config, void* workspace, GemmGatedActData const& data, void* cudaStream,
-        int32_t multiProcessorCount, bool usePdl = true,
+        int32_t multiProcessorCount,
         std::optional<std::reference_wrapper<ModuleCache>> moduleCache = std::nullopt) const;
 
     // Initializes the buffers before the world sync. Must be called before run.
@@ -409,12 +343,8 @@ bool GemmGatedActInterface::isValidConfig(GemmGatedActConfig const& config, Gemm
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 int32_t GemmGatedActInterface::run(GemmGatedActConfig const& config, void* workspace, GemmGatedActData const& data,
-    void* cudaStream, int32_t multiProcessorCount, bool usePdl,
-    std::optional<std::reference_wrapper<ModuleCache>> moduleCache) const
+    void* cudaStream, int32_t multiProcessorCount, std::optional<std::reference_wrapper<ModuleCache>> moduleCache) const
 {
-    // Might be used.
-    (void) usePdl;
-    (void) moduleCache;
     // Get options from config and data.
     auto options = getOptionsFromConfigAndData(config, data);
 
@@ -443,12 +373,9 @@ int32_t GemmGatedActInterface::run(GemmGatedActConfig const& config, void* works
     // Create kernel params.
     auto kernelParams = gemmGatedAct::KernelParams::setKernelParams(options, data.mInputBuffers.mPtrA,
         data.mInputBuffers.mPtrSfA, data.mInputBuffers.mPtrPerTokenSfA, data.mInputBuffers.mPtrB,
-        data.mInputBuffers.mPtrSfB, data.mInputBuffers.mPtrPerTokenSfB, data.mInputBuffers.mPtrBias,
-        data.mOutputBuffers.mPtrC, reinterpret_cast<float const*>(data.mInputBuffers.mPtrScaleC),
-        data.mOutputBuffers.mPtrSfC, reinterpret_cast<float const*>(data.mInputBuffers.mPtrScaleGate),
-        reinterpret_cast<float const*>(data.mInputBuffers.mPtrClampLimit),
-        reinterpret_cast<float const*>(data.mInputBuffers.mPtrSwiGluAlpha),
-        reinterpret_cast<float const*>(data.mInputBuffers.mPtrSwiGluBeta), reinterpret_cast<float*>(dRowMax),
+        data.mInputBuffers.mPtrSfB, data.mInputBuffers.mPtrPerTokenSfB, data.mOutputBuffers.mPtrC,
+        reinterpret_cast<float const*>(data.mInputBuffers.mPtrScaleC), data.mOutputBuffers.mPtrSfC,
+        reinterpret_cast<float const*>(data.mInputBuffers.mPtrScaleGate), reinterpret_cast<float*>(dRowMax),
         reinterpret_cast<uint32_t*>(dRowMaxBars));
 
     // The size of the grid.
@@ -468,26 +395,26 @@ int32_t GemmGatedActInterface::run(GemmGatedActConfig const& config, void* works
 #ifdef TLLM_GEN_EXPORT_INTERFACE
     CUmodule cuModule;
     CUfunction cuFunction;
-
     if (moduleCache.has_value())
     {
         ModuleCache& moduleCacheRef = moduleCache.value().get();
 
-        // Modules are associated with a specific context, so the context is included in the key
+        // Modules are associated with a specific context so include the ctxId in the key
         CUcontext ctx;
         unsigned long long ctxId;
         cuCtxGetCurrent(&ctx);
         cuCtxGetId(ctx, &ctxId);
 
-        // Reinterpret the ctxId as a string to avoid needing a custom hash or converting it to a
-        // string in decimal representation.
+        // Reinterpret the ctxId as a string to avoid needing a custom hash or converting it to a string in decimal
+        // representation.
         std::string const ctxName
             = std::string(reinterpret_cast<char*>(&ctxId), sizeof(unsigned long long) / sizeof(char));
         std::string const funcName = std::string(config.mFunctionName);
+        // As the ctxName is a fixed number of bytes, the two strings can just be appended without risk of a collision
         auto const moduleKey = ctxName + funcName;
         auto module = moduleCacheRef.find(moduleKey);
 
-        // Use cache if module is found, otherwise load and insert into cache
+        // Check if module exists in cache. Otherwise, load it
         if (module != moduleCacheRef.end())
         {
             cuFunction = std::get<1>(module->second);
@@ -517,9 +444,8 @@ int32_t GemmGatedActInterface::run(GemmGatedActConfig const& config, void* works
     // Run the kernel.
     auto result = trtllm::gen::launchKernel((void*) &kernelParams, cudaStream, config.mSharedMemSize, cuFunction,
         block3, grid3, cluster3,
-        usePdl
-            && (config.mOptions.mGridWaitForPrimaryEarlyExit | config.mOptions.mGridWaitForPrimaryA
-                | config.mOptions.mGridWaitForPrimaryB));
+        config.mOptions.mGridWaitForPrimaryEarlyExit | config.mOptions.mGridWaitForPrimaryA
+            | config.mOptions.mGridWaitForPrimaryB);
     if (result != CUDA_SUCCESS)
     {
         return -1;
@@ -548,5 +474,3 @@ int32_t GemmGatedActInterface::runInitBeforeWorldSync(GemmGatedActConfig const&,
 } // namespace gemmGatedAct
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
-
-} // namespace gemmGatedAct

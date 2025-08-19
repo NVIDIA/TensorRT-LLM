@@ -181,8 +181,6 @@ inline CUtensorMap buildNdTmaDescriptor(tg::Dtype dtype, tg::MmaKind mmaKind, st
 
     if (result != CUDA_SUCCESS)
     {
-        char const* errorString;
-        cuGetErrorString(result, &errorString);
         std::stringstream ss;
         ss << "Error: Failed to initialize the TMA descriptor " << result << std::endl;
 
@@ -285,10 +283,8 @@ inline CUtensorMap buildSfTmaDescriptor(tg::Dtype dtype, std::vector<uint64_t> c
 
     if (result != CUDA_SUCCESS)
     {
-        char const* errorString;
-        cuGetErrorString(result, &errorString);
         std::stringstream ss;
-        ss << "Error: Failed to initialize the TMA descriptor for SF " << errorString << std::endl;
+        ss << "Error: Failed to initialize the TMA descriptor for SF " << result << std::endl;
 
         ss << "tmaFormat: " << static_cast<int>(tmaDataFormat) << " dim: " << dim << " gmem: " << gmemAddr << std::endl;
 

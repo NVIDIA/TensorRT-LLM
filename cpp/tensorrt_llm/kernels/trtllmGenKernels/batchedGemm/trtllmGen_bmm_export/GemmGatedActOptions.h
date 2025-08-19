@@ -179,7 +179,7 @@ inline std::string dumpOptions(GemmGatedActOptions const& options)
     ss << gemm::dumpOptions(options) << ", ";
     ss << "mActType="
        << "gemmGatedAct::ActType(" << static_cast<int32_t>(options.mActType) << ")," << std::endl;
-    ss << "mClampBeforeAct=" << options.mClampBeforeAct << "" << std::endl;
+    ss << "mClampLimit=" << options.mClampBeforeAct << "," << std::endl;
     return ss.str();
 }
 

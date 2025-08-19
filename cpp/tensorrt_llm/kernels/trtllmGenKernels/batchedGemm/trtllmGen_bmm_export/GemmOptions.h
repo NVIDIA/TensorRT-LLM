@@ -527,7 +527,6 @@ inline int32_t getShuffleBlockSize(int epilogueTileM)
 inline bool checkAndUpdateGemmOptions(
     GemmOptions& options, bool isBlackwell, int /* tpGrpSize */, bool updateOptions = true)
 {
-
     if (options.mDtypeB == tg::Dtype::Void)
     {
         if (updateOptions)
@@ -568,8 +567,7 @@ inline bool checkAndUpdateGemmOptions(
     // Currently, we only support {MxFp4, NvFp4} -> Bf16.
     TLLM_CHECK_ERROR((options.mDtypeA == options.mDtypeMmaA)
             || ((options.mDtypeA == tg::Dtype::MxE2m1 || options.mDtypeA == tg::Dtype::E2m1)
-                && options.mDtypeMmaA == tg::Dtype::Bfloat16)
-            || (options.mDtypeA == tg::Dtype::E2m1 && options.mDtypeMmaA == tg::Dtype::E4m3),
+                && options.mDtypeMmaA == tg::Dtype::Bfloat16),
         "Unsupported cast for A: ", tg::dtypeToString(options.mDtypeA), " -> ", tg::dtypeToString(options.mDtypeMmaA));
 
     // Check that the B cast is supported.

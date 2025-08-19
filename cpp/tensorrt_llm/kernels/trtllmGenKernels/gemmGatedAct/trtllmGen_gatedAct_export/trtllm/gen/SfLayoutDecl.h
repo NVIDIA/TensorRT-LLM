@@ -26,9 +26,6 @@
 //
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-namespace gemmGatedAct
-{
-
 namespace trtllm
 {
 namespace gen
@@ -92,5 +89,3 @@ inline std::string sfLayoutToString(SfLayout layout)
 
 } // namespace gen
 } // namespace trtllm
-
-} // namespace gemmGatedAct
