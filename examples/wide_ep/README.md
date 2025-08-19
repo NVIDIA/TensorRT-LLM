@@ -70,13 +70,32 @@ If `never` is highlighted, enable Transparent HugePages by the following command
 echo madvise > /sys/kernel/mm/transparent_hugepage/enabled
 ```
 
+### GB200 NUMA binding
+
+GPU memory are also on NUMA nodes on GB200 and system can also use that. Bind memory to CPU nodes to avoid GPU memory being used as host memory.
+```bash
+numactl -m 0,1 <command>
+```
+
+### Shared Memory Clean Up on EPLB
+
+To achieve online load balance, all expert weights are stored in shared host memory. 4 ranks on same GB200 node share the same expert weights to save memory. Normally, these shared host memory will be cleaned up at process exit, but they may not get chance to be cleaned if an abnormal exit happens.
+
+In that case, when seeing the following (or similar) error message:
+```
+FileExistsError: [Errno 17] File exists: '/moe_shared_l0_lr0_all'
+```
+you need to manually check `/dev/shm` directory and delete `/dev/shm/moe_shared_*` if any.
+
 ### Disaggregated serving related issues
 
 Refer to the [Troubleshooting and FAQ](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/advanced/disaggregated-service.md#troubleshooting-and-faq) section of Disaggregated-Service.
 
 ## References
 
-- [Technical Blog: Scaling Expert Parallelism in TensorRT-LLM](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog4_Scaling_Expert_Parallelism_in_TensorRT-LLM.md)
+- Technical Blog: Scaling Expert Parallelism in TensorRT-LLM
+  - [Part 1: Design and Implementation of Large-scale EP](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog4_Scaling_Expert_Parallelism_in_TensorRT-LLM.md)
+  - [Part 2: Performance Status and Optimization](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog8_Scaling_Expert_Parallelism_in_TensorRT-LLM_part2.md)
 
 For detailed implementation examples and advanced usage, see the subdirectories:
 - [`ep_load_balancer/`](ep_load_balancer/): Load balancing tools and examples
