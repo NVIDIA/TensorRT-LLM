@@ -251,7 +251,6 @@ def test_nemotron_h_correctness(mamba_ssm_cache_dtype):
         nemotron_h.shutdown()
 
 
-@pytest.mark.skip(reason="https://nvbugs/5458874")
 def test_nemotron_h_cuda_graph_overlap_scheduler():
     prompts = [
         "The sky is blue because",
@@ -321,14 +320,25 @@ def test_nemotron_h_cuda_graph_overlap_scheduler():
             f"Prompt {i}: with/without CG (no overlap) logprobs for all selected tokens {x}"
         )
 
+        # Similar comparison for with / without overlap scheduler, compare logits of first generation step (2nd generated token)
         # overlap scheduler should have no effect on all logits - low tolerance
         torch.testing.assert_close(
-            with_cg_no_overlap.outputs[0].generation_logits,
-            with_cg_with_overlap.outputs[0].generation_logits,
+            with_cg_no_overlap.outputs[0].generation_logits[1, :],
+            with_cg_with_overlap.outputs[0].generation_logits[1, :],
             atol=0.05,
             rtol=0.05,
             msg=lambda x:
-            f"Prompt {i}: with/without overlap (no CG) all generation logits {x}"
+            f"Prompt {i}: with/without overlap scheduler (with CG) logits for first generated step {x}"
+        )
+
+        # compare logprobs of all generated tokens
+        torch.testing.assert_close(
+            extract_decode_logprobs(with_cg_no_overlap),
+            extract_decode_logprobs(with_cg_with_overlap),
+            atol=0.05,
+            rtol=0.05,
+            msg=lambda x:
+            f"Prompt {i}: with/without overlap scheduler (with CG) logprobs for all selected tokens {x}"
         )
 
 

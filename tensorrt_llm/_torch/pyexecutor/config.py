@@ -50,6 +50,8 @@ class PyTorchConfig:
     attention_dp_time_out_iters: int = 50
     attention_dp_batching_wait_iters: int = 10
 
+    batch_wait_timeout_ms: float = 0
+
     attn_backend: str = 'TRTLLM'
     moe_backend: str = 'CUTLASS'
 
@@ -79,6 +81,7 @@ class PyTorchConfig:
     torch_compile_fullgraph: bool = True
     torch_compile_inductor_enabled: bool = False
     torch_compile_piecewise_cuda_graph: bool = False
+    torch_compile_piecewise_cuda_graph_num_tokens: Optional[List[int]] = None
     # When torch compile is enabled, userbuffers is enabled by default
     torch_compile_enable_userbuffers: bool = True
     torch_compile_max_num_streams: int = 1
