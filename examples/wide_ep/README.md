@@ -19,7 +19,19 @@ Wide-EP solves these challenges through:
 
 ## Quick Start
 
-### 1. Configurations
+### Prerequisites
+
+* GPU: GB200 NVL72, H20, or RTX PRO 6000 Blackwell Workstation Edition.
+* OS: Linux
+* Drivers: CUDA Driver 575 or Later
+* Docker with NVIDIA Container Toolkit installed
+* Python3 and python3-pip (Optional, for accuracy evaluation only)
+
+For GB200 NVL72, to make sure that Multi-Node NVLink (MNNVL) is correctly setup, check if the path `/dev/nvidia-caps-imex-channels` exists in the container. If the path doesn't exist, mount it when launching the Docker container.
+
+For more information on NVIDIA IMEX service for NVLink networks, refer to https://docs.nvidia.com/multi-node-nvlink-systems/imex-guide/overview.html.
+
+### Configurations
 
 An example yaml file to enable wide EP:
 ```yaml
@@ -57,7 +69,7 @@ Refer to the [Offline EP Load Balancer](https://github.com/NVIDIA/TensorRT-LLM/t
 
 *Online EP Load Balancer is more suitable for production deployment needs to react timely to the online traffic changes.*
 
-### 2. Execute Wide-EP on SLURM Clusters
+### Execute Wide-EP on SLURM Clusters
 
 Refer to the [slurm_scripts](./slurm_scripts/) directory, which reuses [disaggregated slurm scripts](../disaggregated/slurm/) to automatically generate configuration files and submit jobs to SLURM clusters.
 
