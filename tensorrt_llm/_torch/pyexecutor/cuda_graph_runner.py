@@ -1,13 +1,13 @@
 import bisect
 import contextlib
-import threading
 import weakref
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Tuple
 
 import torch
 
 from ..expert_statistic import ExpertStatistic
-from ..utils import make_weak_ref, set_piecewise_cuda_graph_flag
+from ..modules.multi_stream_utils import with_multi_stream
+from ..utils import make_weak_ref, piecewise_cuda_graph
 from .resource_manager import ResourceManager, ResourceManagerType
 from .scheduler import ScheduledRequests
 
@@ -16,35 +16,6 @@ if TYPE_CHECKING:
 
 # A large prime number used for dummy request IDs to avoid collisions
 CUDA_GRAPH_DUMMY_REQUEST_ID = (1 << 64) - 1
-
-
-class graph_capturing_local(threading.local):
-
-    def __init__(self):
-        self.is_graph_capturing = False
-
-
-_local = graph_capturing_local()
-
-
-def set_graph_capturing(enable: bool):
-    _local.is_graph_capturing = enable
-
-
-def is_graph_capturing() -> bool:
-    return _local.is_graph_capturing
-
-
-@contextlib.contextmanager
-def capturing_cuda_graph_context():
-    """A context manager to safely set and unset graph capturing flags."""
-    set_graph_capturing(True)
-    set_piecewise_cuda_graph_flag(False)
-    try:
-        yield
-    finally:
-        set_graph_capturing(False)
-        set_piecewise_cuda_graph_flag(True)
 
 
 class CUDAGraphRunner:
@@ -180,11 +151,14 @@ class CUDAGraphRunner:
             "spec_metadata": spec_metadata,
         }
 
+        # We have to do warm up runs to initialize PyTorch's
+        # internal states according to the docs:
+        # https://pytorch.org/docs/stable/notes/cuda.html#cuda-graph-semantics
+        # This also lets us initialize states in the attn_metadata.
         graph = torch.cuda.CUDAGraph()
-        with capturing_cuda_graph_context():
+        with with_multi_stream(True), piecewise_cuda_graph(False):
             for _ in range(self.WARMUP_STEPS):
                 forward_fn(capture_inputs)
-
             with torch.cuda.graph(graph, pool=self.memory_pool):
                 output = forward_fn(capture_inputs)
 

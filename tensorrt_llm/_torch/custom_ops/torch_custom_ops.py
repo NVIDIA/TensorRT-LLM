@@ -8,6 +8,7 @@ from tensorrt_llm._utils import get_sm_version
 
 from ..autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
                          OptimizationProfile, TunableRunner, TuningConfig)
+from ..modules.multi_stream_utils import do_multi_stream
 from ..utils import (fp4_scale_infer_shape,
                      get_last_power_of_2_num_tokens_buckets,
                      last_positive_power_of_2)
@@ -925,6 +926,8 @@ def get_stream(stream_id: int):
 
 @torch.library.custom_op("trtllm::set_stream", mutates_args=())
 def set_stream(stream_id: int) -> None:
+    if not do_multi_stream():
+        return
     stream = get_stream(stream_id)
     assert stream is not None
     torch.cuda.set_stream(stream)
@@ -932,18 +935,24 @@ def set_stream(stream_id: int) -> None:
 
 @torch.library.custom_op("trtllm::record_event", mutates_args=())
 def record_event(event_idx: int) -> None:
+    if not do_multi_stream():
+        return
     event = get_event(event_idx)
     event.record()
 
 
 @torch.library.custom_op("trtllm::wait_event", mutates_args=())
 def wait_event(event_idx: int) -> None:
+    if not do_multi_stream():
+        return
     event = get_event(event_idx)
     event.wait()
 
 
 @torch.library.custom_op("trtllm::record_stream", mutates_args=())
 def record_stream(tensor: torch.Tensor, stream_id: int) -> None:
+    if not do_multi_stream():
+        return
     stream = get_stream(stream_id)
     assert stream is not None
     tensor.record_stream(stream)
