@@ -16,19 +16,27 @@ def process_files(dir_prefix):
     for file in files:
         data = []
         # Extract parameter information from file path
-        # Match (tep|dep)(number)_concurrency(number)_eplb(number)
+        # Match ctx(number)_gen(number)_(tep|dep)(number)_batch(number)_eplb(number)_mtp(number)
         match = re.search(
-            r'(tep|dep)(\d+)_concurrency(\d+)_eplb(\d+)(?:_mtp(\d+))?', file)
+            r'ctx\d+_gen\d+_(tep|dep)(\d+)_batch(\d+)_eplb(\d+)(?:_mtp(\d+))?',
+            file)
         if not match:
             # print(f"No match found for file {file}")
+            continue
+
+        # Extract concurrency number from path
+        concurrency_match = re.search(r'concurrency_(\d+)', file)
+        if not concurrency_match:
+            print(f"No concurrency match found for file {file}")
             continue
 
         # Directly use the second format parsing logic
         attn_type = match.group(1)
         rank_num = int(match.group(2))
-        concurrency = int(match.group(3))
+        int(match.group(3))
         eplb_num = int(match.group(4))
         mtp_num = int(match.group(5)) if match.group(5) else 0
+        concurrency = int(concurrency_match.group(1))
 
         # Determine tp_rank and ep_rank based on folder name
         if attn_type == 'tep':

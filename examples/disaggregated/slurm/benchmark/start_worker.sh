@@ -3,7 +3,9 @@
 config_file=$1
 enable_pdl=$2
 ctx_gpus=$3
-work_dir=$4
+benchmark_mode=$4
+concurrency=$5
+work_dir=$6
 unset UCX_TLS
 echo "config_file: ${config_file}, enable_pdl: ${enable_pdl}, ctx_gpus: ${ctx_gpus}, work_dir: ${work_dir}"
 
@@ -12,6 +14,11 @@ export TRTLLM_MOE_ENABLE_ALLTOALL_WITHOUT_ALLGATHER=1
 
 if [ "${enable_pdl}" = "true" ]; then
     export TRTLLM_ENABLE_PDL=1
+fi
+
+if [ "${benchmark_mode}" = "gen_only" ]; then
+    export TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP=1
+    export TLLM_BENCHMARK_REQ_QUEUES_SIZE=${concurrency}
 fi
 
 #check if work_dir is provided
