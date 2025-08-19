@@ -75,6 +75,14 @@ l0_b200:
   - unittest/_torch/speculative/test_eagle3.py
   - unittest/_torch/speculative/test_kv_cache_reuse.py
   - unittest/_torch/speculative/test_dynamic_spec_decode.py
+  - unittest/_torch/modules/test_fused_moe.py::test_fused_moe_nvfp4[TRTLLM-dtype0]
+  - unittest/_torch/modules/test_fused_moe.py::test_fused_moe_nvfp4[TRTLLM-dtype1]
+  - unittest/_torch/modules/test_fused_moe.py::test_fused_moe_nvfp4[CUTLASS-dtype0]
+  - unittest/_torch/modules/test_fused_moe.py::test_fused_moe_nvfp4[CUTLASS-dtype1]
+  - unittest/_torch/modules/test_fused_moe.py::test_fused_moe_mxfp4_mxfp8[True-TRTLLM]
+  - unittest/_torch/modules/test_fused_moe.py::test_fused_moe_mxfp4_mxfp8[True-CUTLASS]
+  - unittest/_torch/modules/test_fused_moe.py::test_fused_moe_mxfp4_mxfp8[False-TRTLLM]
+  - unittest/_torch/modules/test_fused_moe.py::test_fused_moe_mxfp4_mxfp8[False-CUTLASS]
 - condition:
     ranges:
       system_gpu_count:
