@@ -661,7 +661,7 @@ def get_padded_size(size: int, padding: int) -> int:
 
 
 # Pad both n and k dimensions, then shard along shard_axis
-# Handles weights, scales, and, biases, which are expected to be 1D or 2D tensors.
+# Handles weights, scales, and biases, which are expected to be 1D or 2D tensors.
 def shard_and_pad_tensor(
     tensor: torch.Tensor,
     shard_axis: int,
