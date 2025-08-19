@@ -67,16 +67,21 @@ class RayExecutor(GenerationExecutor):
         self.tp_size = tp_size
         self.master_address = ray.util.get_node_ip_address()
         self.master_port = get_free_port()
-        self.response_queue = ResponseRaySharedQueue.options(
-            name="async_response_queue").remote()
-        self.response_sync_queue = ResponseSyncRaySharedQueue.options(
-            name="sync_response_queue").remote()
-        self.async_response_queue_weakref = ray.get_actor(
-            "async_response_queue")
-        self.sync_response_queue_weakref = ray.get_actor("sync_response_queue")
+        self.response_queue = ResponseRaySharedQueue.options().remote()
+        self.response_sync_queue = ResponseSyncRaySharedQueue.options().remote()
+        self.async_response_queue_weakref = self.create_actor_weak_ref(
+            self.response_queue)
+        self.sync_response_queue_weakref = self.create_actor_weak_ref(
+            self.response_sync_queue)
 
         self.create_workers(RayGPUWorker, worker_kwargs, worker_extension_cls)
         print('Ray workers created')
+
+    @staticmethod
+    def create_actor_weak_ref(actor_handle: ray.actor.ActorHandle):
+        state, _, _ = actor_handle._serialization_helper()
+        return ray.actor.ActorHandle._deserialization_helper(state,
+                                                             weak_ref=True)
 
     def use_ray_queue(self) -> bool:
         return True
@@ -236,7 +241,8 @@ class RayExecutor(GenerationExecutor):
         self.sync_response_queue_weakref = None
 
         self.workers = None
-        if self.placement_group is not None:
+        if hasattr(self,
+                   "placement_group") and self.placement_group is not None:
             ray.util.remove_placement_group(self.placement_group)
             self.placement_group = None
         self.bundle_indices = None
