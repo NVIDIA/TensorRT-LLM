@@ -8,7 +8,7 @@ import time
 import traceback
 import weakref
 from contextlib import contextmanager
-from typing import Iterable, List, Optional, Tuple, Union
+from typing import Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 
@@ -1530,8 +1530,11 @@ class PyExecutor:
             logger.error(
                 f"Encountered a request-specific error in {method_name}: {error_msg}"
             )
-            request_ids = [e.request_id]
-            self._handle_errors(error_msg, request_ids)
+            request = [
+                req for req in self.active_requests
+                if req.py_request_id == e.request_id
+            ]
+            self._handle_errors(error_msg, request)
         except Exception as e:
             error_msg = str(e)
             logger.error(
@@ -1677,12 +1680,12 @@ class PyExecutor:
 
     def _handle_errors(self,
                        error_msg: Optional[str] = None,
-                       request_ids: Optional[List[int]] = None):
-        error_responses = {}
+                       *,
+                       requests: Optional[List[LlmRequest]] = None):
+        error_responses: Dict[int, LlmResponse] = {}
         error_msg = error_msg or "error"
-        for request in self.active_requests:
-            if request_ids is not None and request.py_request_id not in request_ids:
-                continue
+        failed_requests = requests if requests is not None else self.active_requests
+        for request in failed_requests:
             req_id = request.py_request_id
             request.state = LlmRequestState.GENERATION_COMPLETE
             self._terminate_request(request)
@@ -1690,15 +1693,14 @@ class PyExecutor:
                 request_id=req_id,
                 error_msg=error_msg,
                 client_id=request.py_client_id)
-
-        if request_ids is not None:
-            req_id_set = set(request_ids)
-            for request in self.active_requests:
-                if request.py_request_id in req_id_set:
-                    self.active_requests.remove(request)
-        else:
+        if requests is None:
             self.active_requests.clear()
-        self._enqueue_responses(error_responses)
+        else:
+            self.active_requests = [
+                request for request in self.active_requests
+                if request not in requests
+            ]
+        self._enqueue_responses(error_responses.items())
 
     def _terminate_request(self, request: LlmRequest):
         if self.kv_connector_manager is None:
