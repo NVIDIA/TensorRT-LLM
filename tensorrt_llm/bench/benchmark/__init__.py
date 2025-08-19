@@ -151,9 +151,7 @@ def get_general_cli_options(
 
 def generate_json_report(report_path: Optional[Path], func: Callable):
     if report_path is None:
-        logger.debug(
-            "No report path provided, skipping report generation for callable %s.",
-            func.__name__)
+        logger.debug("No report path provided, skipping report generation.")
     else:
         logger.info(f"Writing report information to {report_path}...")
         with open(report_path, "w") as f:
