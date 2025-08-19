@@ -53,10 +53,3 @@ jobs:
           echo "  - [#1234][doc] Update documentation"
           echo "  - [None][chore] Minor clean-up"
           exit 1
-
-  checklist:
-    name: Validate PR Checklist
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: venkywonka/goggles_action/actions/pr_checklist@pr-checklist
