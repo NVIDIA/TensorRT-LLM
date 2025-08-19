@@ -26,6 +26,7 @@
 #include "tensorrt_llm/runtime/torchView.h"
 
 #include <ATen/DLConvertor.h>
+#include <c10/util/ArrayRef.h>
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/filesystem.h>
 #include <nanobind/stl/optional.h>

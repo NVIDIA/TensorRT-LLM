@@ -18,7 +18,6 @@ from tensorrt_llm._utils import (is_trace_enabled, nvtx_range, release_gc,
                                  torch_dtype_to_str, trace_func)
 from tensorrt_llm.inputs.multimodal import (MultimodalParams,
                                             MultimodalRuntimeData)
-from tensorrt_llm.llmapi.llm_args import SparseAttentionConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.lora_manager import LoraModelConfig
@@ -138,7 +137,7 @@ class PyTorchModelEngine(ModelEngine):
         attn_runtime_features: Optional[AttentionRuntimeFeatures] = None,
         dist: Optional[MPIDist] = None,
         spec_config: Optional["DecodingBaseConfig"] = None,
-        sparse_attention_config: Optional[SparseAttentionConfig] = None,
+        sparse_attention_config: Optional["SparseAttentionConfig"] = None,
         lora_config: Optional[LoraConfig] = None,
         is_draft_model: bool = False,
         drafting_loop_wrapper: Optional[Callable[[torch.nn.Module],
@@ -178,6 +177,7 @@ class PyTorchModelEngine(ModelEngine):
                 pytorch_backend_config=pytorch_backend_config,
                 mapping=self.mapping,
                 spec_config=self.spec_config,
+                sparse_attention_config=self.sparse_attention_config,
                 max_num_tokens=max_num_tokens,
                 max_seq_len=max_seq_len,
                 lora_config=lora_config,
@@ -264,7 +264,8 @@ class PyTorchModelEngine(ModelEngine):
         self.is_warmup = False
 
         self.attn_backend = get_attention_backend(
-            pytorch_backend_config.attn_backend, sparse_attn_config=sparse_attention_config)
+            pytorch_backend_config.attn_backend,
+            sparse_attn_config=sparse_attention_config)
 
         if self.is_spec_decode:
             self.spec_metadata = None
