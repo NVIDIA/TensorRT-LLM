@@ -155,6 +155,7 @@ class OpenAIServer:
         self.app.add_api_route("/metrics", self.get_iteration_stats, methods=["GET"])
         # TODO: workaround before ETCD support
         self.app.add_api_route("/kv_cache_events", self.get_kv_cache_events, methods=["POST"])
+        self.app.add_api_route("/vertex_generate", self.vertex_generate, methods=["POST"])
         self.app.add_api_route("/v1/completions",
                                self.openai_completion,
                                methods=["POST"])
@@ -248,6 +249,21 @@ class OpenAIServer:
             # queue is empty, no more events
             pass
         return JSONResponse(content=events)
+
+    async def vertex_generate(self, raw_request: Request) -> Response:
+        try:
+            request_json = await raw_request.json()
+        except Exception as e:
+            return self.create_error_response(f"Failed to parse request as json: {str(e)}")
+        if "instances" not in request_json:
+            return self.create_error_response("Request is missing required field 'instances'")
+        if len(request_json["instances"]) == 1:
+            return await self.openai_chat(ChatCompletionRequest(**request_json["instances"][0]), raw_request)
+        outputs = []
+        for instance in request_json["instances"]:
+            output = await self.openai_chat(ChatCompletionRequest(**instance), raw_request)
+            outputs.append(json.loads(output.body))
+        return JSONResponse({"predictions": outputs})
 
     async def openai_chat(self, request: ChatCompletionRequest, raw_request: Request) -> Response:
 
