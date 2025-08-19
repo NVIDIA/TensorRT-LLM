@@ -2125,7 +2125,7 @@ class PyTorchModelEngine(ModelEngine):
                                  module_id)] = {
                                      'adapter_size': [module.adapter_size],
                                      'is_dora': [scaling_vec_pointer == 0],
-                                     'weights_pointer': [
+                                     'weight_pointers': [
                                          module.weights_in_pointer,
                                          module.weights_out_pointer,
                                          scaling_vec_pointer
@@ -2160,11 +2160,13 @@ class PyTorchModelEngine(ModelEngine):
                                 'is_dora'] += current_tmp_lora_params['is_dora']
                             current_lora_params[
                                 'weight_pointers'] += current_tmp_lora_params[
-                                    'weights_pointer']
+                                    'weight_pointers']
 
         for layer_id in lora_params:
             for module_id in lora_params[layer_id]:
                 current_lora_params = lora_params[layer_id][module_id]
+                # TODO: When lora_grouped_gemm supports DoRA: convert 'is_dora' to a bool tensor.
+                #       Until it's supported, that would just slow down this function, so better not to do it.
                 current_lora_params['adapter_size'] = torch.IntTensor(
                     current_lora_params['adapter_size'])
                 current_lora_params['weight_pointers'] = torch.LongTensor(
