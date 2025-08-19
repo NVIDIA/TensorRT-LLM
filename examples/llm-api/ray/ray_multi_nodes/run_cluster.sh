@@ -31,7 +31,7 @@ MIN_WORKER_PORT=${MIN_WORKER_PORT:-54001}
 MAX_WORKER_PORT=${MAX_WORKER_PORT:-54257}
 
 COMMON_SRUN_ARGS+=" --mpi=pmix"
-COMMON_SRUN_ARGS+=" --no-container-remap-root"
+COMMON_SRUN_ARGS+=" --container-remap-root --container-writable"
 COMMON_SRUN_ARGS+=" --container-mounts=$MOUNTS"
 COMMON_SRUN_ARGS+=" --container-image=$CONTAINER"
 COMMON_SRUN_ARGS+=" --container-workdir=$SLURM_SUBMIT_DIR"
@@ -72,6 +72,7 @@ echo -e "${BLUE}[INFO] Logs      : $LOG_DIR${RESET}"
 
 # enabled dashboard only for debug
 # Add cd tekit/ and pip install -e . to head_cmd and worker_cmd if needed
+# Add apt-get install -y --no-install-recommends libzmq3-dev for multi-node disagg
 
 head_cmd=$(cat <<EOF
 # WAR: clean all slurm / MPI / PMIx env to avoid pmix mismatch error
@@ -82,6 +83,7 @@ done
 touch "$LOG_DIR/STARTED_RAY_HEAD"
 export RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1
 export RAY_DEDUP_LOGS=0
+export TRTLLM_UCX_INTERFACE=eth0
 
 ray start --head \
   --port=$RAY_PORT \
@@ -139,6 +141,7 @@ done
 
 export RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES=1
 export RAY_DEDUP_LOGS=0
+export TRTLLM_UCX_INTERFACE=eth0
 
 ray start --address="$ip_head" \
           --disable-usage-stats \
