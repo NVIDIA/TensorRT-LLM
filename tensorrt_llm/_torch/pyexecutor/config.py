@@ -6,7 +6,7 @@ from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import \
 from tensorrt_llm.bindings.executor import ExecutorConfig
 
 from ...builder import BuildConfig
-from ...llmapi.llm_args import LoadFormat
+from ...llmapi.llm_args import LoadFormat, SamplerType
 from ...logger import logger
 from ...mapping import Mapping
 from ..model_config import MoeLoadBalancerConfig
@@ -46,21 +46,29 @@ class PyTorchConfig:
     moe_max_num_tokens: Optional[int] = None
     moe_load_balancer: Optional[Union[MoeLoadBalancerConfig, dict, str]] = None
 
+    attention_dp_enable_balance: bool = False
+    attention_dp_time_out_iters: int = 50
+    attention_dp_batching_wait_iters: int = 10
+
     attn_backend: str = 'TRTLLM'
     moe_backend: str = 'CUTLASS'
+
+    moe_disable_finalize_fusion: bool = False
 
     enable_mixed_sampler: bool = False
     """
     If true, will iterate over sampling_params of each request and use the
     corresponding sampling strategy, e.g. top-k, top-p, etc.
     """
-    enable_trtllm_sampler: bool = False
+    sampler_type: SamplerType = SamplerType.auto
     """
-    If true, will use the TRTLLM sampler instead of the PyTorch sampler.
-    The TRTLLM sampler has a wide coverage of sampling strategies.
+    The type of sampler to use. Options are TRTLLMSampler, TorchSampler or auto.
+    Defaults to auto, which will use TorchSampler unless BeamSearch is requested.
     """
 
     kv_cache_dtype: str = "auto"
+    mamba_ssm_cache_dtype: str = "auto"
+
     enable_iter_perf_stats: bool = False
     # If true, enables per request stats per iteration
     # Must also set enable_iter_perf_stats to true to get request stats

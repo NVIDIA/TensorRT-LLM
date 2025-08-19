@@ -27,21 +27,21 @@ MPI_READY = MPI_TAG + 2
 MPI_REQUEST = MPI_TAG
 MPI_RESULT = MPI_TAG + 1
 
+MODEL_PATHS = {
+    "DeepSeek-V3-Lite-fp8": "DeepSeek-V3-Lite/fp8",
+    "TinyLlama-1.1B-Chat-v1.0": "llama-models-v2/TinyLlama-1.1B-Chat-v1.0",
+    "Llama-3.1-8B-Instruct": "llama-3.1-model/Llama-3.1-8B-Instruct/",
+    "EAGLE3-LLaMA3.1-Instruct-8B": "EAGLE3-LLaMA3.1-Instruct-8B",
+    "Qwen3-8B-FP8": "Qwen3/Qwen3-8B-FP8",
+}
+
 
 def model_path(model_name):
     llm_models_root = os.environ["LLM_MODELS_ROOT"]
-    if 'DeepSeek-V3-Lite-fp8' in model_name:
-        return os.path.join(llm_models_root, 'DeepSeek-V3-Lite', 'fp8')
-    elif 'TinyLlama-1.1B-Chat-v1.0' in model_name:
-        return os.path.join(llm_models_root, 'llama-models-v2',
-                            'TinyLlama-1.1B-Chat-v1.0')
-    elif 'Llama-3.1-8B-Instruct' in model_name:
-        return os.path.join(llm_models_root, 'llama-3.1-model',
-                            'Llama-3.1-8B-Instruct/')
-    elif 'EAGLE3-LLaMA3.1-Instruct-8B' in model_name:
-        return os.path.join(llm_models_root, 'EAGLE3-LLaMA3.1-Instruct-8B')
-    else:
-        raise ValueError(f"Unknown model: {model_name}")
+    for name, path in MODEL_PATHS.items():
+        if name in model_name:
+            return os.path.join(llm_models_root, path)
+    raise ValueError(f"Unknown model: {model_name}")
 
 
 async def run_worker(kv_cache_config, cache_transceiver_config, pytorch_config,
@@ -131,7 +131,7 @@ def verify_disaggregated(model, generation_overlap, enable_cuda_graph, prompt,
 
     kv_cache_configs = [KvCacheConfig(max_tokens=2048 * 8) for _ in range(2)]
     cache_transceiver_configs = [
-        CacheTransceiverConfig(backend="default") for _ in range(2)
+        CacheTransceiverConfig(backend="DEFAULT") for _ in range(2)
     ]
     model_names = [model_path(model) for _ in range(2)]
     ranks = [0, 1]
@@ -232,6 +232,22 @@ def test_disaggregated_simple_deepseek(model, generation_overlap,
         ])
 
 
+@skip_no_hopper
+@pytest.mark.parametrize("model", ["Qwen3-8B-FP8"])
+@pytest.mark.parametrize("generation_overlap", [False, True])
+@pytest.mark.parametrize("enable_cuda_graph", [False, True])
+def test_disaggregated_simple_qwen3(model, generation_overlap,
+                                    enable_cuda_graph):
+    verify_disaggregated(
+        model, generation_overlap, enable_cuda_graph,
+        " What is the capital of China?",
+        " The capital of China is Beijing. 2. What is the population of China? The population of China is about 1",
+        [
+            576, 6722, 315, 5616, 374, 26549, 13, 220, 17, 13, 3555, 374, 279,
+            7042, 315, 5616, 30, 576, 7042, 315, 5616, 374, 911, 220, 16
+        ])
+
+
 @pytest.mark.parametrize("model", ["DeepSeek-V3-Lite-fp8/fp8"])
 @pytest.mark.parametrize("enable_cuda_graph", [False])
 @pytest.mark.parametrize("generation_overlap", [False])
@@ -258,7 +274,7 @@ def test_disaggregated_llama_context_capacity(model, enable_cuda_graph,
         for _ in range(2)
     ]
     cache_transceiver_configs = [
-        CacheTransceiverConfig(backend="default") for _ in range(2)
+        CacheTransceiverConfig(backend="DEFAULT") for _ in range(2)
     ]
     model_names = [model_path(model) for _ in range(2)]
     ranks = [0, 1]
@@ -333,13 +349,15 @@ def test_disaggregated_llama_context_capacity(model, enable_cuda_graph,
 @pytest.mark.parametrize("model", ["Llama-3.1-8B-Instruct"])
 @pytest.mark.parametrize("spec_dec_model_path", ["EAGLE3-LLaMA3.1-Instruct-8B"])
 @pytest.mark.parametrize("generation_overlap", [False])
+@pytest.mark.parametrize("eagle3_one_model", [True, False])
 def test_disaggregated_spec_dec_batch_slot_limit(model, spec_dec_model_path,
-                                                 generation_overlap):
+                                                 generation_overlap,
+                                                 eagle3_one_model):
     # Test whether the batch slots are properly released when using speculative decoding
     # with disaggregated serving.
     spec_dec_config = EagleDecodingConfig(
         speculative_model_dir=model_path(spec_dec_model_path),
-        eagle3_one_model=False,
+        eagle3_one_model=eagle3_one_model,
         max_draft_len=3)
 
     worker_pytorch_configs = []
@@ -361,7 +379,7 @@ def test_disaggregated_spec_dec_batch_slot_limit(model, spec_dec_model_path,
         for _ in range(2)
     ]
     cache_transceiver_configs = [
-        CacheTransceiverConfig(backend="default") for _ in range(2)
+        CacheTransceiverConfig(backend="DEFAULT") for _ in range(2)
     ]
     model_names = [model_path(model) for _ in range(2)]
     ranks = [0, 1]

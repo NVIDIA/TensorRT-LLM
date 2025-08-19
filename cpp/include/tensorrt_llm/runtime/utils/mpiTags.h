@@ -68,6 +68,10 @@ enum class MpiTag : int
     // LogitsThread
     kSpecDecLogitsId = 129,
     kSpecDecLogitsData = 1025,
+
+    // KvCacheEventManager
+    kKvCacheEventSize = 1026,
+    kKvCacheEvent = 1027
 };
 
 } // namespace tensorrt_llm::mpi

@@ -21,6 +21,8 @@
 #include "tensorrt_llm/executor/cache_transmission/agent_utils/connection.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 
+#include <filesystem>
+
 namespace tensorrt_llm::batch_manager
 {
 
@@ -28,6 +30,21 @@ static int32_t tagFromRequestId(LlmRequest::RequestIdType requestId)
 {
     constexpr int32_t kDATA_TAG{43};
     return ((requestId & 0xFFF) << 8) | (kDATA_TAG & 0xFF);
+}
+
+namespace fs = std::filesystem;
+
+static fs::path getTransferOutputPath(char const* tag)
+{
+    auto outputPath = common::getEnvKVCacheTransferOutputPath();
+    if (!outputPath.empty())
+    {
+        auto rank = mpi::MpiComm::world().getRank();
+        auto path = fs::path(outputPath);
+        fs::create_directories(path);
+        return path / ("rank_" + std::to_string(rank) + "_" + tag + ".csv");
+    }
+    return {};
 }
 
 DataSenderImpl::DataSenderImpl(executor::kv_cache::ConnectionManager* manager,
@@ -85,7 +102,8 @@ DataSenderImpl::DataSenderImpl(executor::kv_cache::ConnectionManager* manager,
         if (it == mRequestToSession.end())
         {
             auto session = TransferSession(std::vector<Connection const*>(peerRelativeRanks.size(), nullptr),
-                DataContext{tagFromRequestId(requestId)}, mSelfState, info.getTransState(), mBufferManager);
+                DataContext{tagFromRequestId(requestId)}, mSelfState, info.getTransState(), mBufferManager, nullptr,
+                !common::getEnvKVCacheTransferOutputPath().empty());
             it = mRequestToSession.emplace(requestId, std::move(session)).first;
         }
         it->second.setConnection(peerIdx, connection);
@@ -124,6 +142,17 @@ void DataSenderImpl::release(LlmRequest::RequestIdType requestId)
     auto it = mRequestToSession.find(requestId);
     TLLM_CHECK(it != mRequestToSession.end());
     std::unique_lock<std::mutex> lk(mMtxForMap);
+    if (!common::getEnvKVCacheTransferOutputPath().empty())
+    {
+        if (!mMeasuresFile.is_open())
+        {
+            auto outputPath = getTransferOutputPath("send");
+            mMeasuresFile.open(outputPath);
+            TLLM_CHECK_WITH_INFO(
+                mMeasuresFile.is_open(), "Failed to open transfer output file: %s", outputPath.string().c_str());
+        }
+        it->second.exportMeasure(mMeasuresFile, true);
+    }
     mRequestToSession.erase(it);
 }
 
@@ -201,12 +230,24 @@ TransferSession DataReceiverImpl::sendRequestInfo(LlmRequest const& llmRequest)
     }
     auto const& resource = getReceiveCacheResource(llmRequest);
     return TransferSession(std::move(counterPartConnections), DataContext{tagFromRequestId(requestId)}, mSelfState,
-        contextState, resource->mBufferManager, &llmRequest);
+        contextState, resource->mBufferManager, &llmRequest, !common::getEnvKVCacheTransferOutputPath().empty());
 }
 
 void DataReceiverImpl::receiveSync(TransferSession& session)
 {
     mFormatter->unformat(session);
+    if (!common::getEnvKVCacheTransferOutputPath().empty())
+    {
+        std::unique_lock<std::mutex> lock(mMeasuresFileMutex);
+        if (!mMeasuresFile.is_open())
+        {
+            auto outputPath = getTransferOutputPath("recv");
+            mMeasuresFile.open(outputPath);
+            TLLM_CHECK_WITH_INFO(
+                mMeasuresFile.is_open(), "Failed to open transfer output file: %s", outputPath.string().c_str());
+        }
+        session.exportMeasure(mMeasuresFile, false);
+    }
 }
 
 void DataReceiverImpl::sendRequestInfo(executor::kv_cache::Connection const* connection, RequestInfo const& info)

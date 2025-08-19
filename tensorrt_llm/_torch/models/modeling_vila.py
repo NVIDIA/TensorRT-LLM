@@ -35,7 +35,9 @@ from transformers import (AutoConfig, AutoImageProcessor, AutoModel,
                           PreTrainedModel)
 
 from ..._utils import nvtx_range
-from ...inputs import (ExtraProcessedInputs, InputProcessor, TextPrompt,
+from ...inputs import (ExtraProcessedInputs, InputProcessor,
+                       MultimodalPlaceholderMetadata,
+                       MultimodalPlaceholderPlacement, TextPrompt,
                        register_input_processor)
 from ...logger import logger
 from ...sampling_params import SamplingParams
@@ -1102,6 +1104,9 @@ class VilaInputProcessor(InputProcessor):
         input_ids = self.tokenizer(
             text_prompt, return_tensors="pt").input_ids[0].to(self.device)
 
+        if not mm_data:
+            return input_ids.to(torch.int32).tolist(), {}
+
         mm_tensor, block_sizes = self._preprocess(
             mm_data, mm_processor_kwargs, use_fast=True
         )  # use_fast uses Pytorch GPU preprocessing, otherwise uses PIL CPU preprocessing
@@ -1115,7 +1120,16 @@ class VilaInputProcessor(InputProcessor):
 
 
 @register_auto_model(VilaConfig.model_architecture)
-@register_input_processor(VilaInputProcessor, model_type="llava_llama")
+@register_input_processor(
+    VilaInputProcessor,
+    model_type="llava_llama",
+    placeholder_metadata=MultimodalPlaceholderMetadata(
+        placeholder_map={
+            "image": "<image>",
+            "video": "<vila/video>"
+        },
+        placeholder_placement=MultimodalPlaceholderPlacement.BEFORE_TEXT,
+    ))
 class VilaModel(PreTrainedModel):
     config_class = VilaConfig
 
@@ -1164,17 +1178,15 @@ class VilaModel(PreTrainedModel):
 
         num_context_requests, num_generation_requests = attn_metadata.num_contexts, attn_metadata.num_generations
         multimodal_params = kwargs.get("multimodal_params", [])
-        mm_embed = [
-            multimodal_param.multimodal_data["multimodal_embedding"]
-            for multimodal_param in multimodal_params
-        ]
-
-        assert mm_embed == [] or len(
-            mm_embed
-        ) == num_context_requests, "Number of multimodal features (if provided) should be equal to number of context requests"
+        mm_embeds = []
+        if len(multimodal_params) > 0:
+            mm_embeds = [
+                multimodal_param.multimodal_data["multimodal_embedding"]
+                for multimodal_param in multimodal_params
+            ]
 
         input_ids, inputs_embeds = fuse_input_embeds(
-            self.llm.model.embed_tokens, input_ids, mm_embed)
+            self.llm.model.embed_tokens, input_ids, mm_embeds)
         logits = self.llm.forward(attn_metadata=attn_metadata,
                                   input_ids=input_ids,
                                   position_ids=position_ids,

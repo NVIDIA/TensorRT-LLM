@@ -31,7 +31,8 @@ from tensorrt_llm.auto_parallel.cluster_info import cluster_infos
 from tensorrt_llm.bindings import KVCacheType
 from tensorrt_llm.builder import BuildConfig, Engine, build
 from tensorrt_llm.logger import logger, severity_map
-from tensorrt_llm.lora_manager import LoraConfig, LoraManager
+from tensorrt_llm.lora_helper import LoraConfig
+from tensorrt_llm.lora_manager import LoraManager
 from tensorrt_llm.models import MODEL_MAP, PretrainedConfig
 from tensorrt_llm.models.modeling_utils import SpeculativeDecodingMode
 from tensorrt_llm.plugin import PluginConfig, add_plugin_argument
@@ -349,8 +350,8 @@ def build_model(
         model_config.logits_dtype = logits_dtype
 
     architecture = model_config.architecture
-    assert not build_config.plugin_config.streamingllm or architecture == "LlamaForCausalLM", \
-        "StreamingLLM is only supported in the llama model."
+    assert not build_config.plugin_config.streamingllm, \
+        "StreamingLLM is no longer supported because attention sink cannot work with the non-cyclic kv cache kernel & runtime changes."
     assert not build_config.plugin_config.pp_reduce_scatter or architecture == "MixtralForCausalLM", \
         "PP reduce scatter is only supported in the mixtral model."
 

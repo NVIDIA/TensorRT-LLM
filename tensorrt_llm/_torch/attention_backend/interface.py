@@ -342,6 +342,7 @@ class PositionalEmbedder(Protocol):
 class RopeParams:
     dim: int = 0
     theta: float = 10000.0
+    alpha: float = 1.0
     scale_type: RotaryScalingType = RotaryScalingType.none
     scale: float = 1.0
     low_freq_factor: float = 1.0
@@ -356,6 +357,8 @@ class RopeParams:
     mscale_all_dim: float = 0.0
     short_factor: Optional[Tuple[float]] = None
     long_factor: Optional[Tuple[float]] = None
+    max_seq_len: Optional[int] = None
+    duplicate_data: bool = True
 
     @staticmethod
     def from_config(config) -> "RopeParams":
@@ -382,6 +385,7 @@ class RopeParams:
         rope_params.scale_type = RotaryScalingType.none
         rope_params.scale = 1.0
         if rope_scaling is not None:
+            rope_params.alpha = rope_scaling.get("alpha", 1.0)
             rotary_scaling_type = rope_scaling.get(
                 "type", None) or rope_scaling.get("rope_type")
             rope_params.scale_type = RotaryScalingType.from_string(
@@ -406,6 +410,8 @@ class RopeParams:
         # Workaround for DeepSeek V3 Lite since its rope_scaling is null in config.json.
         elif config.model_type == "deepseek_v3":
             rope_params.scale_type = RotaryScalingType.yarn
+        # Other metdadata for RoPE.
+        rope_params.max_seq_len = getattr(config, 'max_seq_len', None)
 
         return rope_params
 
@@ -437,15 +443,17 @@ class RopeParams:
                 self.beta_slow,
                 self.mscale,
                 self.mscale_all_dim,
+                self.duplicate_data,
             )
         elif self.scale_type == RotaryScalingType.longrope:
-            rope_inv_freq, rope_cos_sin = RopeEmbeddingUtils.create_sinusoidal_positions_long_rope_for_attention_plugin(
+            rope_inv_freq, rope_cos_sin = RopeEmbeddingUtils.create_sinusoidal_positions_long_rope(
                 num_pos=self.max_positions,
                 dim=self.dim,
                 theta=self.theta,
                 original_max_pos=self.original_max_positions,
                 short_factor=self.short_factor,
                 long_factor=self.long_factor,
+                max_seq_len=self.max_seq_len,
             )
         else:
             rope_inv_freq, rope_cos_sin = RopeEmbeddingUtils.create_sinusoidal_positions_for_attention_plugin(
@@ -456,6 +464,7 @@ class RopeParams:
                 self.scale_type,
                 rope_scaling_config={
                     "factor": self.scale,
+                    "alpha": self.alpha,
                     "low_freq_factor": self.low_freq_factor,
                     "high_freq_factor": self.high_freq_factor,
                     "original_max_position_embeddings":

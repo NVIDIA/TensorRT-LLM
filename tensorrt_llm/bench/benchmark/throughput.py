@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import sys
 from pathlib import Path
 
 import click
@@ -12,6 +13,7 @@ from huggingface_hub import snapshot_download
 from tensorrt_llm.bench.benchmark.utils.asynchronous import async_benchmark
 from tensorrt_llm.bench.benchmark.utils.processes import IterationWriter
 from tensorrt_llm.bench.build.build import get_model_config
+from tensorrt_llm.tools.importlib_utils import import_custom_module_from_dir
 
 # isort: off
 from tensorrt_llm.bench.benchmark.utils.general import (
@@ -49,6 +51,16 @@ from tensorrt_llm.sampling_params import SamplingParams
                  default="pytorch",
                  help="The backend to use when running benchmarking.")
 @optgroup.option(
+    "--custom_module_dirs",
+    type=click.Path(exists=True,
+                    readable=True,
+                    path_type=Path,
+                    resolve_path=True),
+    default=None,
+    multiple=True,
+    help="Paths to custom module directories to import.",
+)
+@optgroup.option(
     "--extra_llm_api_options",
     type=str,
     default=None,
@@ -83,6 +95,12 @@ from tensorrt_llm.sampling_params import SamplingParams
     default=.90,
     help="The percentage of memory to use for KV Cache after model load.",
 )
+@optgroup.option(
+    "--mamba_ssm_cache_dtype",
+    type=click.Choice(["auto", "float16", "bfloat16", "float32"]),
+    default="auto",
+    help="Data type for Mamba SSM cache. If 'auto', inferred from model config.",
+)
 @optgroup.group(
     "Engine Input Configuration",
     help="Input configuration for driving the engine.",
@@ -97,6 +115,16 @@ from tensorrt_llm.sampling_params import SamplingParams
     required=False,
     help="Pass in a dataset file for parsing instead of stdin.",
 )
+# For text models, tokenizer initialization is not needed when loading the model since the dataset is already tokenized.
+# For this reason, we skip tokenizer initialization by default.
+# However, for VLM models, tokenizer initialization is needed inside the model since the dataset contains texts and
+# raw media data. We cannot skip tokenizer initialization in this case.
+@optgroup.option(
+    "--no_skip_tokenizer_init",
+    is_flag=True,
+    default=False,
+    help="Do not skip tokenizer initialization when loading the model.",
+)
 @optgroup.option(
     "--eos_id",
     type=int,
@@ -110,6 +138,18 @@ from tensorrt_llm.sampling_params import SamplingParams
     type=click.Choice(["image", "video"]),
     default=None,
     help="Modality of the multimodal requests.",
+)
+@optgroup.option(
+    "--image_data_format",
+    type=click.Choice(["pt", "pil"]),
+    default="pt",
+    help="Format of the image data for multimodal models.",
+)
+@optgroup.option(
+    "--data_device",
+    type=click.Choice(["cuda", "cpu"]),
+    default="cuda",
+    help="Device to load the multimodal data on.",
 )
 @optgroup.option(
     "--max_input_len",
@@ -233,10 +273,10 @@ from tensorrt_llm.sampling_params import SamplingParams
     help="Path where per request information is written to.",
 )
 @optgroup.option(
-    "--enable_chunked_context",
-    is_flag=True,
-    default=False,
-    help="Enable chunking in prefill stage for enhanced throughput benchmark.",
+    "--enable_chunked_context/--disable_chunked_context",
+    default=True,
+    help=
+    "Enable/disable chunking in prefill stage for enhanced throughput benchmark. "
 )
 @optgroup.option(
     "--scheduler_policy",
@@ -255,31 +295,43 @@ def throughput_command(
     logger.info("Preparing to run throughput benchmark...")
     # Parameters from CLI
     # Model, experiment, and engine params
-    dataset_path: Path = params.pop("dataset")
-    eos_id: int = params.pop("eos_id")
+    custom_module_dirs: list[Path] = params.pop("custom_module_dirs", [])
+    for custom_module_dir in custom_module_dirs:
+        try:
+            import_custom_module_from_dir(custom_module_dir)
+        except Exception as e:
+            logger.error(
+                f"Failed to import custom module from {custom_module_dir}: {e}")
+            raise e
+
+    dataset_path: Path = params.get("dataset")
+    no_skip_tokenizer_init: bool = params.get("no_skip_tokenizer_init", False)
+    eos_id: int = params.get("eos_id")
     warmup: int = params.get("warmup")
-    num_requests: int = params.pop("num_requests")
-    max_seq_len: int = params.pop("max_seq_len")
+    num_requests: int = params.get("num_requests")
+    max_seq_len: int = params.get("max_seq_len")
     model: str = bench_env.model
     checkpoint_path: Path = bench_env.checkpoint_path or bench_env.model
-    engine_dir: Path = params.pop("engine_dir")
-    concurrency: int = params.pop("concurrency")
+    engine_dir: Path = params.get("engine_dir")
+    concurrency: int = params.get("concurrency")
     backend: str = params.get("backend")
-    modality: str = params.pop("modality")
-    max_input_len: int = params.pop("max_input_len")
+    modality: str = params.get("modality")
+    max_input_len: int = params.get("max_input_len")
+    image_data_format: str = params.get("image_data_format", "pt")
+    data_device: str = params.get("data_device", "cpu")
     model_type = get_model_config(model, checkpoint_path).model_type
 
     # Reporting options
-    report_json: Path = params.pop("report_json")
-    output_json: Path = params.pop("output_json")
-    request_json: Path = params.pop("request_json")
-    iteration_log: Path = params.pop("iteration_log")
+    report_json: Path = params.get("report_json")
+    output_json: Path = params.get("output_json")
+    request_json: Path = params.get("request_json")
+    iteration_log: Path = params.get("iteration_log")
     iteration_writer = IterationWriter(iteration_log)
 
     # Runtime kwargs and option tracking.
     kwargs = {}
 
-    # Initialize the HF tokenizer for the specified model.
+    # Initialize the HF tokenizer for the specified model. This is only used for data preparation.
     tokenizer = initialize_tokenizer(checkpoint_path)
 
     # Dataset Loading and Preparation
@@ -291,6 +343,8 @@ def throughput_command(
             model_dir=checkpoint_path,
             model_type=model_type,
             modality=modality,
+            image_data_format=image_data_format,
+            data_device=data_device,
             max_input_seq_len_for_multimodal=max_input_len)
         metadata.dataset_path = dataset_path
         params["target_input_len"] = params.get(
@@ -340,15 +394,15 @@ def throughput_command(
     engine_tokens = exec_settings["settings_config"]["max_num_tokens"]
 
     # Runtime Options
-    runtime_max_bs = params.pop("max_batch_size")
-    runtime_max_tokens = params.pop("max_num_tokens")
+    runtime_max_bs = params.get("max_batch_size")
+    runtime_max_tokens = params.get("max_num_tokens")
     runtime_max_bs = runtime_max_bs or engine_bs
     runtime_max_tokens = runtime_max_tokens or engine_tokens
-    kv_cache_percent = params.pop("kv_cache_free_gpu_mem_fraction")
-    beam_width = params.pop("beam_width")
-    streaming: bool = params.pop("streaming")
-    enable_chunked_context: bool = params.pop("enable_chunked_context")
-    scheduler_policy: str = params.pop("scheduler_policy")
+    kv_cache_percent = params.get("kv_cache_free_gpu_mem_fraction")
+    beam_width = params.get("beam_width")
+    streaming: bool = params.get("streaming")
+    enable_chunked_context: bool = params.get("enable_chunked_context")
+    scheduler_policy: str = params.get("scheduler_policy")
 
     # Update configuration with runtime options
     exec_settings["settings_config"]["kv_cache_percent"] = kv_cache_percent
@@ -385,6 +439,7 @@ def throughput_command(
         logger.info("Setting up throughput benchmark.")
         kwargs = kwargs | runtime_config.get_llm_args()
         kwargs['backend'] = backend
+        kwargs['skip_tokenizer_init'] = not no_skip_tokenizer_init
 
         if backend == "pytorch" and iteration_log is not None:
             kwargs["enable_iter_perf_stats"] = True
@@ -460,6 +515,10 @@ def throughput_command(
         report_utility.report_statistics()
     except KeyboardInterrupt:
         logger.info("Keyboard interrupt, exiting benchmark...")
+    except Exception:
+        import traceback
+        logger.error(f"Error during benchmarking:\n{traceback.format_exc()}")
+        sys.exit(1)
     finally:
         if llm is not None:
             llm.shutdown()

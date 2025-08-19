@@ -8,16 +8,49 @@ from _torch_test_utils import all_close, reset_parameters
 from torch.export import export
 from torch.fx import GraphModule
 
+from tensorrt_llm._torch.auto_deploy.custom_ops.attention_interface import SequenceInfo
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
-from tensorrt_llm._torch.auto_deploy.transformations.library.sharding import ShardingTransformInfo
+from tensorrt_llm._torch.auto_deploy.models.factory import ModelFactory
+from tensorrt_llm._torch.auto_deploy.transform.library.sharding import ShardingTransformInfo
 
 
-class FakeFactory:
-    def __init__(self, model: nn.Module):
-        self.model = model
+class FakeFactory(ModelFactory):
+    """Dummy factory to pass cache_config for testing."""
 
-    def build_model(self, device: str) -> nn.Module:
-        return self.model.to(device=device)
+    def __init__(self, model=None, cache_config=None, quant_config=None):
+        self._model = model
+        self.cache_config = cache_config
+        self.quant_config = quant_config
+
+    def build_model(self, device: str):
+        return self._model.to(device=device) if self._model else None
+
+    def _build_model(self, device: str):
+        return
+
+    def _load_checkpoint(self, model, device):
+        return
+
+    def get_cache_config(self):
+        return self.cache_config
+
+    def get_quant_config(self):
+        return self.quant_config
+
+
+class SequenceEmbeddingInfo(SequenceInfo):
+    hidden_size: int
+    dtype: torch.dtype
+
+    def set_example_sequence(self) -> None:
+        super().set_example_sequence()
+        # set input ids to a 3D tensor (actually input embeddings)
+        self.input_ids = torch.rand(
+            *self.input_ids.shape,
+            self.hidden_size,
+            device=self.input_ids.device,
+            dtype=self.dtype,
+        )
 
 
 def count_parameters(model: torch.nn.Module):
@@ -30,6 +63,79 @@ def count_buffers(model: torch.nn.Module):
     for n, b in model.named_buffers():
         print(n, b.shape)
     return sum(np.prod(b.shape) for b in model.buffers())
+
+
+def run_test_transformed_gm(
+    model: nn.Module,
+    x: torch.Tensor,
+    gm_transformed: GraphModule,
+    check_transformed_graph: Callable[[GraphModule], bool],
+    _get_expected_num_params: Callable[[int], int],
+    atol: float = 1e-3,
+    rtol: float = 1e-3,
+    test_load_hook: bool = True,
+    strict_loading: bool = True,
+    dynamic_shapes: Dict = None,
+    skip_output_assert: bool = False,
+    *args,  # Additional arguments for transform
+) -> GraphModule:
+    # run model once
+    y_model = model(x)
+
+    # num params
+    num_params_model = count_parameters(model)
+    print(num_params_model)
+
+    # export + check (we clone the state dict to have a bit more freedom in testing below)
+    gm_ref = torch_export_to_gm(model, args=(x,), dynamic_shapes=(dynamic_shapes,), clone=True)
+    print(gm_ref)
+    y_gm = gm_ref(x)
+    num_params_gm = count_parameters(gm_ref)
+
+    assert num_params_model == num_params_gm
+    if not skip_output_assert:
+        torch.testing.assert_close(y_model, y_gm, atol=atol, rtol=rtol)
+
+    print(gm_transformed)
+    # in case buffers or other tensors were added during the transform
+    gm_transformed = gm_transformed.to("cuda")
+    y_transformed = gm_transformed(x)
+    n_p_transformed = count_parameters(gm_transformed)
+
+    n_p_t_expected = _get_expected_num_params(num_params_model)
+    assert n_p_transformed == n_p_t_expected, (
+        f"actual params {n_p_transformed} != expected params {n_p_t_expected}"
+    )
+
+    # check if the transformation worked
+    assert check_transformed_graph(gm_transformed)
+
+    if strict_loading and not skip_output_assert:
+        # check if output equals without loading state dict
+        torch.testing.assert_close(y_model, y_transformed, atol=atol, rtol=rtol)
+
+    if test_load_hook and not skip_output_assert:
+        # check if loading hook works from original state dict
+        reset_parameters(gm_transformed)
+        y_random = gm_transformed(x)
+        assert not all_close(y_model, y_random), f"{y_model=}, {y_random=}"
+
+        gm_transformed.load_state_dict(model.state_dict(), strict=True if strict_loading else False)
+        y_loaded_from_original = gm_transformed(x)
+        torch.testing.assert_close(y_model, y_loaded_from_original, atol=atol, rtol=rtol)
+
+        # check if loading hook works from state_dict of a transformed model
+        state_dict_sharded = copy.deepcopy(gm_transformed.state_dict())
+        reset_parameters(gm_transformed)
+        y_random2 = gm_transformed(x)
+        assert not all_close(y_model, y_random2), f"{y_model=}, {y_random2=}"
+
+        gm_transformed.load_state_dict(state_dict_sharded, strict=True if strict_loading else False)
+        y_loaded_from_transformed = gm_transformed(x)
+        torch.testing.assert_close(y_model, y_loaded_from_transformed, atol=atol, rtol=rtol)
+
+        # check if we can still export the model as expected
+        export(gm_transformed, args=(x,))
 
 
 def run_test(

@@ -1,0 +1,24 @@
+test_e2e.py::test_ptp_quickstart
+test_e2e.py::test_ptp_quickstart_advanced_mixed_precision #Llama-3_1-8B-Instruct_fp8_nvfp4_hf
+test_e2e.py::test_ptp_star_attention_example[Llama3.1-8B-BF16-llama-3.1-model/Meta-Llama-3.1-8B]
+test_e2e.py::test_ptp_quickstart_advanced[Llama3.1-8B-BF16-llama-3.1-model/Meta-Llama-3.1-8B]
+test_e2e.py::test_ptp_quickstart_advanced[Llama3.1-8B-NVFP4-nvfp4-quantized/Meta-Llama-3.1-8B]
+test_e2e.py::test_ptp_quickstart_advanced[Llama3.1-8B-FP8-llama-3.1-model/Llama-3.1-8B-Instruct-FP8]
+test_e2e.py::test_ptp_quickstart_advanced[Nemotron-Super-49B-v1-FP8-nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1-FP8]
+test_e2e.py::test_ptp_quickstart_advanced[Mixtral-8x7B-NVFP4-nvfp4-quantized/Mixtral-8x7B-Instruct-v0.1]
+test_e2e.py::test_ptp_quickstart_advanced[Mixtral-8x7B-FP8-Mixtral-8x7B-Instruct-v0.1-fp8]
+test_e2e.py::test_ptp_quickstart_advanced_eagle3[Llama-3.1-8b-Instruct-llama-3.1-model/Llama-3.1-8B-Instruct-EAGLE3-LLaMA3.1-Instruct-8B]
+test_e2e.py::test_ptp_quickstart_advanced[Llama3.3-70B-FP8-modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp8]
+test_e2e.py::test_ptp_quickstart_advanced[Llama3.3-70B-FP4-modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp4]
+test_e2e.py::test_ptp_quickstart_advanced[Nemotron-Super-49B-v1-BF16-nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1]
+test_e2e.py::test_ptp_quickstart_advanced[Mixtral-8x7B-BF16-Mixtral-8x7B-Instruct-v0.1]
+test_e2e.py::test_ptp_quickstart_advanced[Mistral-Nemo-12b-Base-Mistral-Nemo-Base-2407]
+test_e2e.py::test_ptp_quickstart_advanced[DeepSeek-R1-Distill-Qwen-32B-DeepSeek-R1/DeepSeek-R1-Distill-Qwen-32B]
+
+test_e2e.py::test_ptp_quickstart_multimodal[NVILA-15B-FP16-NVILA-15B-image-False]
+test_e2e.py::test_ptp_quickstart_multimodal[NVILA-15B-FP16-NVILA-15B-video-False]
+
+accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_llm_sampler
+accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_eagle3[eagle3_one_model=False-overlap_scheduler=False]
+accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_eagle3[eagle3_one_model=True-overlap_scheduler=True]
+accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_ngram

@@ -1,6 +1,5 @@
 """Interface to initialize and load HF models."""
 
-import json
 import os
 import types
 from contextlib import contextmanager, nullcontext
@@ -31,6 +30,7 @@ from ..custom_ops.attention_interface import CacheConfig
 from ..utils._config import deep_merge_dicts
 from ..utils.logger import ad_logger
 from .factory import ModelFactory, ModelFactoryRegistry
+from .quant_config_reader import QuantConfigReader, QuantConfigReaderRegistry
 
 
 @contextmanager
@@ -73,17 +73,17 @@ class AutoModelForCausalLMFactory(ModelFactory):
 
     _model_defaults = {
         "use_cache": False,
-        "max_position_embeddings": 1024,
     }
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-
-        self._quant_config: Optional[Dict] = None
-
+        self._quant_config_reader: QuantConfigReader | None = None
         # Ingest defaults for tokenizer and model kwargs
         self.tokenizer_kwargs = deep_merge_dicts(self._tokenizer_defaults, self.tokenizer_kwargs)
-        self.model_kwargs = deep_merge_dicts(self._model_defaults, self.model_kwargs)
+        self.model_kwargs = deep_merge_dicts(
+            self._model_defaults,
+            self.model_kwargs,
+        )
 
         # special handling for torch_dtype in model_kwargs since HF does not correctly update
         # torch_dtype string to an actual torch.dtype object (only with default)
@@ -146,9 +146,6 @@ class AutoModelForCausalLMFactory(ModelFactory):
 
     def _build_model(self, device: DeviceLikeType) -> nn.Module:
         """Build the model on the desired device."""
-        # We only support fp16 to fp4 conversion.
-        if self._quant_config and self._quant_config.get("quant_algo", None) == "NVFP4":
-            self.model_kwargs["torch_dtype"] = torch.half
 
         # NOTE (lucaslie): HF doesn't recursively update nested PreTrainedConfig objects. Instead,
         # the entire subconfig will be overwritten.
@@ -168,23 +165,27 @@ class AutoModelForCausalLMFactory(ModelFactory):
         model.forward = types.MethodType(self._simple_forward, model)
 
         model.eval()
+
         return model
 
     def get_quant_config(self) -> Dict:
-        return self._quant_config or {}
+        """Returns the quantization config for this model or an empty dict if not quantized."""
+        if self._quant_config_reader is not None:
+            return self._quant_config_reader.get_config()
+        return {}
 
     def get_cache_config(self):
-        """Setup cache information based on quantization information."""
-        if self._quant_config is not None and "kv_cache_quant_algo" in self._quant_config.keys():
-            kv_cache_format = self._quant_config.get("kv_cache_quant_algo", None)
-            if kv_cache_format is not None:
-                assert kv_cache_format == "FP8", (
-                    f"KV cache quantization format {kv_cache_format} is not supported."
-                )
-            kv_cache_dtype = torch.float8_e4m3fn if kv_cache_format is not None else None
-        else:
-            kv_cache_dtype = None
-        return CacheConfig(dtype=kv_cache_dtype)
+        """Return kv cache dtype configuration."""
+        if not self._quant_config_reader:
+            return CacheConfig(dtype=None)
+
+        kv_cache_dtype = self._quant_config_reader.get_config().get("kv_cache_dtype")
+        torch_dtype = torch.float8_e4m3fn if kv_cache_dtype == "float8_e4m3fn" else None
+        assert torch_dtype in (torch.float8_e4m3fn, None), (
+            f"Unsupported dtype: {torch_dtype}. Only torch.float8_e4m3fn is supported."
+        )
+
+        return CacheConfig(dtype=torch_dtype)
 
     def init_tokenizer(self) -> Optional[Any]:
         """Initialize the tokenizer—either a custom name or the model's default."""
@@ -295,7 +296,7 @@ class AutoModelForCausalLMFactory(ModelFactory):
         # at this point it should be a directory (either the original one or the download dir)
         assert os.path.isdir(fetched_dir), f"Checkpoint path {fetched_dir} is not a directory."
 
-        self._load_quantization_config()
+        self._load_quantization_config(fetched_dir)
 
         return fetched_dir
 
@@ -313,33 +314,27 @@ class AutoModelForCausalLMFactory(ModelFactory):
             # model-transformed weights,leading to unexpected key mismatches or format issues.
             load_checkpoint_in_model(model, checkpoint=ckpt_file, full_state_dict=False)
 
-    def _load_quantization_config(self):
+    def _load_quantization_config(self, fetched_dir: str):
         """Load the quantization config from the model directory if not done already."""
-        if self._quant_config is not None:
+        if self._quant_config_reader is not None:
             return
+        # TODO: specified by user or auto-detect
+        reader_cls = QuantConfigReaderRegistry.get("modelopt")
+        result = reader_cls.from_file(fetched_dir)
+        if result is None:
+            return
+        reader, extra_model_kwargs = result
 
-        assert self.model
-        hf_quant_config_file = os.path.join(self.model, "hf_quant_config.json")
-        if os.path.exists(hf_quant_config_file):
-            with open(hf_quant_config_file, "r") as file:
-                quantization_config = json.load(file)
-                assert quantization_config.get("producer", {}).get("name", None) == "modelopt", (
-                    "Only support modelopt quantized checkpoint"
-                )
-                self._quant_config = quantization_config.get("quantization", {})
-
-                # We do not quantize lm_head.
-                if "exclude_modules" not in self._quant_config:
-                    self._quant_config["exclude_modules"] = ["lm_head"]
+        if reader is not None:
+            self._quant_config_reader = reader
+            self.model_kwargs = deep_merge_dicts(self.model_kwargs, extra_model_kwargs)
 
 
 @ModelFactoryRegistry.register("AutoModelForImageTextToText")
 class AutoModelForImageTextToTextFactory(AutoModelForCausalLMFactory):
     _model_defaults = {
         "use_cache": False,
-        "max_position_embeddings": 1024,
         "text_config": {
-            "max_position_embeddings": 1024,
             "use_cache": False,
         },
     }

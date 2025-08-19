@@ -31,7 +31,7 @@ def temp_extra_llm_api_options_file(request):
             },
             "build_config": {
                 "max_num_tokens": 16384,
-            }
+            },
         }
 
         with open(temp_file_path, 'w') as f:
@@ -47,8 +47,8 @@ def temp_extra_llm_api_options_file(request):
 def server(model_name: str, temp_extra_llm_api_options_file: str):
     model_path = get_model_path(model_name)
     args = [
-        "--backend", "pytorch", "--extra_llm_api_options",
-        temp_extra_llm_api_options_file
+        "--extra_llm_api_options", temp_extra_llm_api_options_file,
+        "--max_batch_size", "64"
     ]
     with RemoteOpenAIServer(model_path, args) as remote_server:
         yield remote_server

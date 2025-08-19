@@ -15,6 +15,7 @@ from ..bindings import executor as tllm
 from ..disaggregated_params import DisaggregatedParams
 from ..llmapi.tracer import global_tracer
 from ..llmapi.utils import AsyncQueue
+from ..metrics import MetricNames, MetricsCollector, RequestEventTiming
 from ..sampling_params import LogprobParams, SamplingParams
 from .utils import ErrorResponse, has_event_loop, is_llm_response
 
@@ -50,14 +51,18 @@ class LogProbsResult(NamedTuple):
 
 
 class ResponseWrapper:
-    """Wrapper of runtime response with optional outputs computed post runtime.
+    """
+    1. Wrapper of runtime response with optional outputs computed post runtime.
+    2. A workaround to pass around RequestPerfMetrics.
     """
 
     def __init__(self,
                  response: Union["PostprocWorker.Output", tllm.Response],
-                 logprobs: Optional[LogProbsResult] = None):
+                 logprobs: Optional[LogProbsResult] = None,
+                 request_perf_metrics: Optional[dict[str, float]] = None):
         self._response = response
         self.logprobs = logprobs
+        self.request_perf_metrics = request_perf_metrics
 
     @property
     def _is_llm_response(self):
@@ -67,6 +72,14 @@ class ResponseWrapper:
     def __getattr__(self, name):
         response = object.__getattribute__(self, '_response')
         return getattr(response, name)
+
+    def __getstate__(self):
+        return (self._response, self.logprobs, self.request_perf_metrics)
+
+    def __setstate__(self, state):
+        self._response = state[0]
+        self.logprobs = state[1]
+        self.request_perf_metrics = state[2]
 
 
 @dataclass(slots=True)
@@ -146,6 +159,7 @@ class GenerationResultBase:
         self.disaggregated_params = None
         self.decoding_iter = 0
         self._done = False
+        self.metrics_dict = {}
 
         if has_event_loop():
             self.aqueue = AsyncQueue()
@@ -201,7 +215,9 @@ class GenerationResultBase:
                          finish_reasons,
                          response_tensors,
                          sequence_index,
-                         logprobs_result=None):
+                         logprobs_result=None,
+                         req_perf_metrics_dict: Optional[dict[str,
+                                                              float]] = None):
         """ Handle a single sequence in the response. """
 
         seq_idx = sequence_index
@@ -271,6 +287,7 @@ class GenerationResultBase:
             else:
                 raise ValueError(
                     f"Unknown finish reason: {finish_reasons[src_idx]}")
+            self.record_stats(output, req_perf_metrics_dict)
 
     @nvtx_range_debug("handle_response",
                       color="red",
@@ -278,7 +295,9 @@ class GenerationResultBase:
     def _handle_response(self,
                          response: Union["PostprocWorker.Output", tllm.Response,
                                          ResponseWrapper, ErrorResponse]):
+        req_perf_metrics_dict = None
         if isinstance(response, ResponseWrapper):
+            req_perf_metrics_dict = response.request_perf_metrics
             logprobs_result = response.logprobs
             response = response._response
         else:
@@ -291,6 +310,8 @@ class GenerationResultBase:
                 self._outputs[0] = response.res
             else:
                 self._outputs[0]._postprocess_result = response.res
+            if response.metrics:
+                self.metrics_dict = response.metrics
 
             if response.error:
                 if self._background_error_handler is not None and (
@@ -303,7 +324,8 @@ class GenerationResultBase:
                     handler(response.error_msg)
 
             response_result = response.result
-            if hasattr(response_result, "_result"):
+            if hasattr(response_result, "_result") and isinstance(
+                    response_result._result, bytes):
                 response_result.deserialize()
 
             self._done = response_result.is_final
@@ -322,11 +344,12 @@ class GenerationResultBase:
             if self.sampling_params.use_beam_search:
                 for beam_idx, _ in enumerate(response_result.output_token_ids):
                     self._handle_sequence(finish_reasons, response_result,
-                                          beam_idx, logprobs_result)
+                                          beam_idx, logprobs_result,
+                                          req_perf_metrics_dict)
             else:
                 self._handle_sequence(finish_reasons, response_result,
                                       response_result.sequence_index,
-                                      logprobs_result)
+                                      logprobs_result, req_perf_metrics_dict)
 
             if response_result.context_logits is not None:
                 self._context_logits = response_result.context_logits
@@ -341,6 +364,29 @@ class GenerationResultBase:
                 handler(response.error_msg)
         else:
             raise ValueError(f"Unknown response type: {response}")
+
+    def record_stats(self,
+                     output: CompletionOutput,
+                     stats: Optional[dict[str, float]] = None) -> None:
+        """Record the stats of the generation result.
+
+        Args:
+            output (CompletionOutput): The output of the generation result.
+            stats (Optional[dict[str, float]]): The stats of the generation result. Defaults to None.
+        """
+        if not stats:
+            return
+        metrics_stats = {}
+        if output.finish_reason:
+            metrics_stats.update({
+                MetricsCollector.labelname_finish_reason:
+                output.finish_reason
+            })
+        processed_metrics_stat = _process_req_perf_metrics(
+            stats, len(output.token_ids), self.sampling_params.n > 1)
+        if processed_metrics_stat:
+            metrics_stats.update(processed_metrics_stat)
+        self.metrics_dict = metrics_stats
 
 
 class DetokenizedGenerationResultBase(GenerationResultBase):
@@ -393,6 +439,30 @@ class DetokenizedGenerationResultBase(GenerationResultBase):
                 else:
                     beam_output.text = self.tokenizer.decode(
                         beam_output.token_ids, **kwargs)
+
+                is_generating = not self._done
+                is_finished_with_stop_or_length = (
+                    beam_output.finish_reason == 'stop'
+                    or beam_output.finish_reason == 'length')
+
+                if is_generating or is_finished_with_stop_or_length:
+                    for stop_reason, _ in self.sampling_params._get_stop_reasons_and_words(
+                    ):
+                        if isinstance(stop_reason,
+                                      str) and stop_reason in beam_output.text:
+                            stop_pos = beam_output.text.find(stop_reason)
+                            if not self.sampling_params.include_stop_str_in_output:
+                                beam_output.text = beam_output.text[:stop_pos]
+                            else:
+                                beam_output.text = beam_output.text[:stop_pos +
+                                                                    len(stop_reason
+                                                                        )]
+
+                            beam_output.finish_reason = 'stop'
+                            beam_output.stop_reason = stop_reason
+                            self.abort()
+                            self._done = True
+                            break
 
 
 # alias
@@ -664,3 +734,30 @@ def compute_logprobs(
 
     return LogProbsResult(prompt=prompt_logprobs,
                           generation=generation_logprobs)
+
+
+def _process_req_perf_metrics(
+        req_perf_metrics_dict: Optional[dict[str, float]],
+        output_length: int,
+        is_multiple_response: bool = False) -> dict[MetricNames, float]:
+    stat = {}
+    if not req_perf_metrics_dict:
+        return stat
+    ttft = req_perf_metrics_dict.get(RequestEventTiming.FIRST_TOKEN_TIME, 0) - \
+           req_perf_metrics_dict.get(RequestEventTiming.ARRIVAL_TIME, 0)
+    e2e = req_perf_metrics_dict.get(RequestEventTiming.LAST_TOKEN_TIME, 0) - \
+          req_perf_metrics_dict.get(RequestEventTiming.ARRIVAL_TIME, 0)
+    request_queue_time = req_perf_metrics_dict.get(RequestEventTiming.FIRST_SCHEDULED_TIME, 0) - \
+                         req_perf_metrics_dict.get(RequestEventTiming.ARRIVAL_TIME, 0)
+    stat = {
+        MetricNames.TTFT: ttft,
+        MetricNames.E2E: e2e,
+        MetricNames.REQUEST_QUEUE_TIME: request_queue_time
+    }
+    if output_length > 1 and not is_multiple_response:
+        tpot = (req_perf_metrics_dict.get(
+            RequestEventTiming.LAST_TOKEN_TIME, 0) - req_perf_metrics_dict.get(
+                RequestEventTiming.FIRST_TOKEN_TIME, 0)) / (output_length - 1)
+        stat.update({MetricNames.TPOT: tpot})
+    stat = dict(filter(lambda item: item[1] > 0, stat.items()))
+    return stat

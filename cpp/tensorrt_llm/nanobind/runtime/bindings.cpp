@@ -36,10 +36,10 @@
 #include "tensorrt_llm/runtime/lookaheadBuffers.h"
 #include "tensorrt_llm/runtime/loraCache.h"
 #include "tensorrt_llm/runtime/mcastGPUBuffer.h"
-#include "tensorrt_llm/runtime/request.h"
 #include "tensorrt_llm/runtime/speculativeDecodingMode.h"
 #include "tensorrt_llm/runtime/tllmRuntime.h"
 #include "tensorrt_llm/runtime/torchView.h"
+#include "tensorrt_llm/runtime/virtualMemory.h"
 
 #include <ATen/ATen.h>
 #include <c10/cuda/CUDAStream.h>
@@ -117,6 +117,10 @@ void initBindings(nb::module_& m)
         .def_rw("scaling_vec_pointer", &tr::LoraCache::TaskLayerModuleConfig::scalingVecPointer)
         .def(nb::self == nb::self);
 
+    nb::class_<tr::CudaVirtualMemoryManager>(m, "CudaVirtualMemoryManager")
+        .def("release_with_tag", &tr::CudaVirtualMemoryManager::releaseWithTag, nb::arg("tag"))
+        .def("materialize_with_tag", &tr::CudaVirtualMemoryManager::materializeWithTag, nb::arg("tag"));
+
     nb::class_<tr::BufferManager>(m, "BufferManager")
         .def(nb::init<tr::BufferManager::CudaStreamPtr, bool>(), nb::arg("stream"), nb::arg("trim_pool") = false)
         .def_prop_ro("stream", &tr::BufferManager::getStream);
@@ -157,25 +161,6 @@ void initBindings(nb::module_& m)
         .def("report_to_profiler", &tr::TllmRuntime::reportToProfiler, nb::arg("context_id"))
         .def_prop_ro("logits_dtype_from_engine",
             [](tr::TllmRuntime& self) { return self.getEngine().getTensorDataType("logits"); });
-
-    nb::class_<tr::decoder_batch::Request>(m, "Request")
-        .def(nb::init<tr::decoder_batch::Request::TensorConstPtr, tr::SizeType32, std::optional<tr::SizeType32>,
-                 std::optional<tr::SizeType32>>(),
-            nb::arg("ids"), nb::arg("input_len"), nb::arg("max_new_tokens") = std::nullopt,
-            nb::arg("end_id") = std::nullopt)
-        .def_rw("ids", &tr::decoder_batch::Request::ids)
-        .def_rw("input_len", &tr::decoder_batch::Request::inputLen)
-        .def_rw("max_new_tokens", &tr::decoder_batch::Request::maxNewTokens)
-        .def_rw("end_id", &tr::decoder_batch::Request::endId)
-        .def_rw("draft_logits", &tr::decoder_batch::Request::draftLogits)
-        .def_rw("embedding_bias", &tr::decoder_batch::Request::embeddingBias)
-        .def_rw("bad_words_list", &tr::decoder_batch::Request::badWordsList)
-        .def_rw("stop_words_list", &tr::decoder_batch::Request::stopWordsList)
-        .def_rw("generated_tokens_per_engine_step", &tr::decoder_batch::Request::generatedTokensPerEngineStep)
-        .def_rw("medusa_paths", &tr::decoder_batch::Request::medusaPaths)
-        .def_rw("medusa_tree_ids", &tr::decoder_batch::Request::medusaTreeIds)
-        .def_rw("lookahead_runtime_config", &tr::decoder_batch::Request::lookaheadRuntimeConfig);
-    nb::bind_vector<std::vector<tr::decoder_batch::Request>>(m, "RequestVector");
 
     nb::class_<tr::decoder_batch::Input>(m, "DecoderBatchInput")
         .def(nb::init<std::vector<std::vector<tr::ITensor::SharedConstPtr>>, tr::SizeType32>(), nb::arg("logits"),
@@ -235,10 +220,10 @@ void initBindings(nb::module_& m)
 
     nb::class_<tr::decoder::DecoderState>(m, "DecoderState")
         .def(nb::init<>())
-        .def("setup", &tr::decoder::DecoderState::setup, nb::arg("max_batch_size"), nb::arg("max_beam_width"),
+        .def("setup", &tr::decoder::DecoderState::setup, nb::arg("max_num_sequences"), nb::arg("max_beam_width"),
             nb::arg("max_attention_window"), nb::arg("sink_token_length"), nb::arg("max_sequence_length"),
             nb::arg("dtype"), nb::arg("model_config"), nb::arg("world_config"), nb::arg("buffer_manager"))
-        .def("setup_cache_indirection", &tr::decoder::DecoderState::setupCacheIndirection, nb::arg("max_batch_size"),
+        .def("setup_cache_indirection", &tr::decoder::DecoderState::setupCacheIndirection, nb::arg("max_num_sequences"),
             nb::arg("max_beam_width"), nb::arg("max_attention_window"), nb::arg("buffer_manager"))
         .def("setup_speculative_decoding", &tr::decoder::DecoderState::setupSpeculativeDecoding,
             nb::arg("speculative_decoding_mode"), nb::arg("max_tokens_per_engine_step"), nb::arg("dtype"),
@@ -275,7 +260,6 @@ void initBindings(nb::module_& m)
         .def_prop_ro("next_draft_tokens_lengths", &tr::decoder::DecoderState::getNextDraftTokensLengths)
         .def_prop_ro("accepted_lengths_cum_sum", &tr::decoder::DecoderState::getAcceptedLengthsCumSum)
         .def_prop_ro("accepted_packed_paths", &tr::decoder::DecoderState::getAcceptedPackedPaths)
-        .def_prop_ro("finished_steps", &tr::decoder::DecoderState::getFinishedSteps)
         .def_prop_ro("max_beam_width", &tr::decoder::DecoderState::getMaxBeamWidth)
         .def_prop_ro("max_sequence_length", &tr::decoder::DecoderState::getMaxSequenceLength)
         .def_prop_ro("max_decoding_decoder_tokens", &tr::decoder::DecoderState::getMaxDecodingDecoderTokens)
@@ -293,7 +277,7 @@ void initBindings(nb::module_& m)
 
     nb::class_<tr::GptDecoderBatched>(m, "GptDecoderBatched")
         .def(nb::init<tr::GptDecoderBatched::CudaStreamPtr>(), nb::arg("stream"))
-        .def("setup", &tr::GptDecoderBatched::setup, nb::arg("mode"), nb::arg("max_batch_size"),
+        .def("setup", &tr::GptDecoderBatched::setup, nb::arg("mode"), nb::arg("max_num_sequences"),
             nb::arg("max_beam_width"), nb::arg("dtype"), nb::arg("model_config"), nb::arg("world_config"))
         .def("forward_async", &tr::GptDecoderBatched::forwardAsync, nb::arg("output"), nb::arg("input"))
         .def("underlying_decoder", &tr::GptDecoderBatched::getUnderlyingDecoder, nb::rv_policy::reference)
@@ -331,6 +315,29 @@ void initBindings(nb::module_& m)
         "max_workspace_size_lowprecision",
         [](int32_t tp_size) { return tensorrt_llm::kernels::max_workspace_size_lowprecision(tp_size); },
         "Calculate the maximum workspace size needed for low precision all-reduce operations");
+
+    nb::enum_<tr::CudaVirtualMemoryAllocator::RestoreMode>(m, "CudaVirtualMemoryAllocatorRestoreMode")
+        .value("NONE", tr::CudaVirtualMemoryAllocator::RestoreMode::NONE)
+        .value("CPU", tr::CudaVirtualMemoryAllocator::RestoreMode::CPU)
+        .value("PINNED", tr::CudaVirtualMemoryAllocator::RestoreMode::PINNED)
+        .value("MEMSET", tr::CudaVirtualMemoryAllocator::RestoreMode::MEMSET);
+
+    m.def("get_virtual_memory_manager", &tr::getVirtualMemoryManager, "Get the virtual memory manager",
+        nb::rv_policy::reference);
+
+    m.def(
+        "set_virtual_memory_allocator",
+        [](std::string const& tag, tr::CudaVirtualMemoryAllocator::RestoreMode mode, uintptr_t stream)
+        {
+            static_assert(sizeof(uintptr_t) == sizeof(cudaStream_t));
+            tr::setVirtualMemoryAllocator(tag, mode,
+                std::make_shared<tr::CudaStream>(
+                    reinterpret_cast<cudaStream_t>(stream), tensorrt_llm::common::getDevice(), false));
+        },
+        "Set the virtual memory allocator and start allocating virtual memory for CUDA allocations");
+
+    m.def("clear_virtual_memory_allocator", &tr::clearVirtualMemoryAllocator,
+        "Reset the current virtual memory allocator and stop allocating virtual memory for CUDA allocations");
 
     nb::class_<tensorrt_llm::runtime::McastGPUBuffer>(m, "McastGPUBuffer")
         .def(nb::init<size_t, uint32_t, uint32_t, at::Device, bool>())

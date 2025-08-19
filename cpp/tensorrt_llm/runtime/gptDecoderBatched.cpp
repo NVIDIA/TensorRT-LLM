@@ -72,11 +72,11 @@ void GptDecoderBatched::disableLookahead(RequestVector const& genRequests, Tenso
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
 
-void GptDecoderBatched::setup(executor::DecodingMode const& mode, SizeType32 maxBatchSize, SizeType32 maxBeamWidth,
+void GptDecoderBatched::setup(executor::DecodingMode const& mode, SizeType32 maxNumSequences, SizeType32 maxBeamWidth,
     nvinfer1::DataType dtype, ModelConfig const& modelConfig, WorldConfig const& worldConfig)
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
-    TLLM_CHECK(maxBatchSize > 0);
+    TLLM_CHECK(maxNumSequences > 0);
     TLLM_CHECK(maxBeamWidth > 0);
 
     std::shared_ptr<SpeculativeDecodingModule const> speculativeDecodingModulePtr = nullptr;
@@ -92,8 +92,8 @@ void GptDecoderBatched::setup(executor::DecodingMode const& mode, SizeType32 max
     auto const vocabSize = modelConfig.getVocabSize();
     auto const vocabSizePadded = modelConfig.getVocabSizePadded(worldConfig.getSize());
 
-    mDecoder = IGptDecoder::create(mode, dtype, maxBatchSize, maxBeamWidth, vocabSize, vocabSizePadded, mDecoderStream,
-        speculativeDecodingModulePtr);
+    mDecoder = IGptDecoder::create(mode, dtype, maxNumSequences, maxBeamWidth, vocabSize, vocabSizePadded,
+        mDecoderStream, speculativeDecodingModulePtr);
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }
@@ -116,16 +116,6 @@ void prepareForward(decoder::DecoderState const& decoderState, SizeType32 step, 
     dInput.batchSize = static_cast<SizeType32>(dInput.batchSlots->getSize());
     dInput.logitsVec = input.logits.at(step);
 
-    TensorPtr finishedStepsInput = ITensor::slice(decoderState.getFinishedSteps(), step, 1);
-    TensorPtr finishedStepsOutput
-        = ITensor::slice(decoderState.getFinishedSteps(), std::min(input.maxDecoderSteps - 1, step + 1), 1);
-    finishedStepsInput->squeeze(0);
-    finishedStepsOutput->squeeze(0);
-    TensorPtr newTokensStepView
-        = ITensor::slice(dOutput.newTokensSteps, step, decoderState.getMaxDecodingDecoderTokens());
-
-    dInput.finishReasons = finishedStepsInput;
-
     if (speculativeDecodingMode.isDraftTokensExternal())
     {
         dInput.externalDraftTokensInputs->step = step;
@@ -136,14 +126,13 @@ void prepareForward(decoder::DecoderState const& decoderState, SizeType32 step, 
             auto batchSlotsRange = BufferRange<SizeType32 const>(*dInput.batchSlots);
             for (auto batchSlot : batchSlotsRange)
             {
-                TensorPtr finishedSteps = ITensor::slice(finishedStepsInput, batchSlot, 1);
-                bufferManager.setZero(*finishedSteps);
+                TensorPtr finishedStepsSlice = ITensor::slice(decoderState.getFinishReasons(), batchSlot, 1);
+                bufferManager.setZero(*finishedStepsSlice);
             }
         }
     }
 
-    dOutput.newTokens = newTokensStepView;
-    dOutput.finishReasons = finishedStepsOutput;
+    dOutput.newTokens = ITensor::slice(dOutput.newTokensSteps, step, decoderState.getMaxDecodingDecoderTokens());
 
     TLLM_LOG_TRACE("%s stop", __PRETTY_FUNCTION__);
 }

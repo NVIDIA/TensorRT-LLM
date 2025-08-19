@@ -51,7 +51,6 @@ srun -l \
         trtllm-llmapi-launch \
          trtllm-serve $LOCAL_MODEL \
             --tp_size 16 \
-            --backend pytorch \
             --host 0.0.0.0 \
             ${ADDITIONAL_OPTIONS}
     "

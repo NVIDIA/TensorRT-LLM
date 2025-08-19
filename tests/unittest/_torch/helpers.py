@@ -8,6 +8,14 @@ def ceil_div(x: int, y: int) -> int:
     return (x + y - 1) // y
 
 
+def align(x: int, y: int) -> int:
+    return ceil_div(x, y) * y
+
+
+def ceil_to_ue8m0(x: torch.Tensor):
+    return torch.pow(2.0, torch.ceil(torch.log2(x.abs())))
+
+
 def per_token_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     assert x.dim() == 2 and x.size(1) % 128 == 0
     m, n = x.shape
@@ -33,11 +41,51 @@ def per_block_cast_to_fp8(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
                                                                  x_view.size(2))
 
 
+def per_token_cast_to_fp8_e8m0(
+        x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    assert x.dim() == 2 and x.size(1) % 128 == 0
+    m, n = x.shape
+    x_view = x.view(m, -1, 128)
+    x_amax = x_view.abs().float().amax(dim=2).view(m, -1).clamp(1e-4)
+    sf = ceil_to_ue8m0(x_amax / 448.0)
+    return (x_view * (1.0 / sf.unsqueeze(2))).to(torch.float8_e4m3fn).view(
+        m, n), sf
+
+
+def per_block_cast_to_fp8_e8m0(
+        x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    assert x.dim() == 2
+    m, n = x.shape
+    x_padded = torch.zeros((align(m, 128), align(n, 128)),
+                           dtype=x.dtype,
+                           device=x.device)
+    x_padded[:m, :n] = x
+    x_view = x_padded.view(-1, 128, x_padded.size(1) // 128, 128)
+    x_amax = x_view.abs().float().amax(dim=(1, 3), keepdim=True).clamp(1e-4)
+    sf = ceil_to_ue8m0(x_amax / 448.0)
+    x_scaled = (x_view * (1.0 / sf)).to(torch.float8_e4m3fn)
+    return x_scaled.view_as(x_padded)[:m, :n].contiguous(), sf.view(
+        x_view.size(0), x_view.size(2))
+
+
 def calc_diff(x, y):
     x, y = x.double(), y.double()
     denominator = (x * x + y * y).sum()
     sim = 2 * (x * y).sum() / denominator
     return 1 - sim
+
+
+def calc_woq_tolerence(x: torch.Tensor, weight_dtype: torch.dtype):
+    # align with woq_assert_near_eq function in tests/unittest/trt/quantization/_utils.py
+    if weight_dtype == torch.int8:
+        bits_in_type = 8
+    elif weight_dtype == torch.quint4x2:
+        bits_in_type = 4
+    quant_range_scale = 1.0 / float(1 << (bits_in_type - 1))
+    max_val = torch.max(abs(x)).item()
+    atol = (max_val * quant_range_scale) * 1.5  # allow for rounding
+
+    return atol
 
 
 def reference_moe_torch(x: torch.Tensor, selected_experts: torch.Tensor,

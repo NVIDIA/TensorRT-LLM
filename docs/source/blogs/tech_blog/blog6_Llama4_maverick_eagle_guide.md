@@ -72,7 +72,7 @@ docker run -d --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 \
         TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL=True \
         trtllm-serve /config/models/maverick \
             --host 0.0.0.0 --port 8000 \
-            --backend pytorch --tp_size 8 --ep_size 1 \
+            --tp_size 8 --ep_size 1 \
             --trust_remote_code --extra_llm_api_options c.yaml \
             --kv_cache_free_gpu_memory_fraction 0.75"
 ```

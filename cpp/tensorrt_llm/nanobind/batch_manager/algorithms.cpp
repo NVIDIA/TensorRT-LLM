@@ -20,18 +20,13 @@
 #include "tensorrt_llm/batch_manager/assignReqSeqSlots.h"
 #include "tensorrt_llm/batch_manager/capacityScheduler.h"
 #include "tensorrt_llm/batch_manager/createNewDecoderRequests.h"
-#include "tensorrt_llm/batch_manager/handleContextLogits.h"
-#include "tensorrt_llm/batch_manager/handleGenerationLogits.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/batch_manager/logitsPostProcessor.h"
-#include "tensorrt_llm/batch_manager/makeDecodingBatchInputOutput.h"
 #include "tensorrt_llm/batch_manager/medusaBuffers.h"
 #include "tensorrt_llm/batch_manager/microBatchScheduler.h"
 #include "tensorrt_llm/batch_manager/pauseRequests.h"
 #include "tensorrt_llm/batch_manager/peftCacheManager.h"
-#include "tensorrt_llm/batch_manager/runtimeBuffers.h"
-#include "tensorrt_llm/batch_manager/updateDecoderBuffers.h"
 #include "tensorrt_llm/nanobind/common/customCasters.h"
 #include "tensorrt_llm/runtime/decoderState.h"
 #include "tensorrt_llm/runtime/torch.h"
@@ -94,48 +89,6 @@ void tensorrt_llm::nanobind::batch_manager::algorithms::initBindings(nb::module_
             nb::arg("generation_requests"), nb::arg("model_config"), nb::arg("cross_kv_cache_manager") = std::nullopt)
         .def("name", [](AllocateKvCache const&) { return AllocateKvCache::name; });
 
-    nb::class_<HandleContextLogits>(m, HandleContextLogits::name)
-        .def(nb::init<>())
-        .def(
-            "__call__",
-            [](HandleContextLogits const& self, DecoderInputBuffers& inputBuffers, RequestVector const& contextRequests,
-                at::Tensor const& logits, std::vector<tr::SizeType32> const& numContextLogitsVec,
-                tr::ModelConfig const& modelConfig, tr::BufferManager const& manager,
-                OptionalRef<MedusaBuffers> medusaBuffers = std::nullopt)
-            {
-                return self(inputBuffers, contextRequests, tr::TorchView::of(logits), numContextLogitsVec, modelConfig,
-                    manager, medusaBuffers);
-            },
-            nb::arg("decoder_input_buffers"), nb::arg("context_requests"), nb::arg("logits"),
-            nb::arg("num_context_logits"), nb::arg("model_config"), nb::arg("buffer_manager"),
-            nb::arg("medusa_buffers") = std::nullopt)
-        .def("name", [](HandleContextLogits const&) { return HandleContextLogits::name; });
-
-    nb::class_<HandleGenerationLogits>(m, HandleGenerationLogits::name)
-        .def(nb::init<>())
-        .def(
-            "__call__",
-            [](HandleGenerationLogits const& self, DecoderInputBuffers& inputBuffers,
-                RequestVector const& generationRequests, at::Tensor const& logits, tr::SizeType32 logitsIndex,
-                tr::ModelConfig const& modelConfig, tr::BufferManager const& manager,
-                OptionalRef<RuntimeBuffers> genRuntimeBuffers = std::nullopt,
-                OptionalRef<MedusaBuffers> medusaBuffers = std::nullopt)
-            {
-                self(inputBuffers, generationRequests, tr::TorchView::of(logits), logitsIndex, modelConfig, manager,
-                    genRuntimeBuffers, medusaBuffers);
-            },
-            nb::arg("decoder_input_buffers"), nb::arg("generation_requests"), nb::arg("logits"),
-            nb::arg("logits_index"), nb::arg("model_config"), nb::arg("buffer_manager"),
-            nb::arg("gen_runtime_buffers") = std::nullopt, nb::arg("medusa_buffers") = std::nullopt)
-        .def("name", [](HandleGenerationLogits const&) { return HandleGenerationLogits::name; });
-
-    nb::class_<MakeDecodingBatchInputOutput>(m, MakeDecodingBatchInputOutput::name)
-        .def(nb::init<>())
-        .def("__call__", &MakeDecodingBatchInputOutput::operator(), nb::arg("decoder_input_buffers"),
-            nb::arg("decoder_state"), nb::arg("model_config"), nb::arg("max_num_sequences"),
-            nb::arg("fused_runtime_buffers") = std::nullopt)
-        .def("name", [](MakeDecodingBatchInputOutput const&) { return MakeDecodingBatchInputOutput::name; });
-
     nb::class_<LogitsPostProcessor>(m, LogitsPostProcessor::name)
         .def(nb::init<>())
         .def("__call__", &LogitsPostProcessor::operator(), nb::arg("decoder_input_buffers"),
@@ -150,29 +103,21 @@ void tensorrt_llm::nanobind::batch_manager::algorithms::initBindings(nb::module_
             "__call__",
             [](CreateNewDecoderRequests& self, tr::ModelConfig const& modelConfig, tr::WorldConfig const& worldConfig,
                 executor::DecodingConfig const& decodingConfig, RequestVector const& contextRequests,
-                tr::BufferManager const& bufferManager, nvinfer1::DataType logitsType,
-                DecoderInputBuffers& inputBuffers, runtime::decoder::DecoderState& decoderState,
-                tensorrt_llm::runtime::CudaStream const& runtimeStream,
+                nvinfer1::DataType logitsType, DecoderInputBuffers& inputBuffers,
+                runtime::decoder::DecoderState& decoderState, tensorrt_llm::runtime::CudaStream const& runtimeStream,
                 tensorrt_llm::runtime::CudaStream const& decoderStream, SizeType32 maxSequenceLength,
-                SizeType32 beamWidth, OptionalRef<MedusaBuffers const> medusaBuffers = std::nullopt)
+                SizeType32 beamWidth)
             {
-                auto [batchSlots, samplingConfigs, lookaheadPrompt, lookaheadAlgoConfigs] = self(modelConfig,
-                    worldConfig, decodingConfig, contextRequests, bufferManager, logitsType, inputBuffers, decoderState,
-                    runtimeStream, decoderStream, maxSequenceLength, beamWidth, medusaBuffers);
+                OptionalRef<MedusaBuffers const> medusaBuffers = std::nullopt;
+                auto [batchSlots, samplingConfigs, lookaheadPrompt, lookaheadAlgoConfigs]
+                    = self(modelConfig, worldConfig, decodingConfig, contextRequests, logitsType, inputBuffers,
+                        decoderState, runtimeStream, decoderStream, maxSequenceLength, beamWidth, medusaBuffers);
 
                 return std::tuple{runtime::Torch::tensor(batchSlots), std::move(samplingConfigs),
                     std::move(lookaheadPrompt), std::move(lookaheadAlgoConfigs)};
             },
             nb::arg("model_config"), nb::arg("world_config"), nb::arg("decoding_config"), nb::arg("context_requests"),
-            nb::arg("buffer_manager"), nb::arg("logits_type"), nb::arg("decoder_input_buffers"),
-            nb::arg("decoder_state"), nb::arg("runtime_stream"), nb::arg("decoder_stream"),
-            nb::arg("max_sequence_length"), nb::arg("beam_width"), nb::arg("medusa_buffers") = std::nullopt)
+            nb::arg("logits_type"), nb::arg("decoder_input_buffers"), nb::arg("decoder_state"),
+            nb::arg("runtime_stream"), nb::arg("decoder_stream"), nb::arg("max_sequence_length"), nb::arg("beam_width"))
         .def("name", [](CreateNewDecoderRequests const&) { return CreateNewDecoderRequests::name; });
-
-    nb::class_<UpdateDecoderBuffers>(m, UpdateDecoderBuffers::name)
-        .def(nb::init<>())
-        .def("__call__", &UpdateDecoderBuffers::operator(), nb::arg("model_config"), nb::arg("decoder_output_buffers"),
-            nb::arg("copy_buffer_manager"), nb::arg("decoder_state"), nb::arg("return_log_probs"),
-            nb::arg("decoder_finish_event"))
-        .def("name", [](UpdateDecoderBuffers const&) { return UpdateDecoderBuffers::name; });
 }

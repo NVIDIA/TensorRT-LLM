@@ -18,9 +18,13 @@ class SpeculativeDecodingMode(IntEnum):
     DRAFT_TARGET = auto()
     USER_PROVIDED = auto()
     NONE = auto()
+    AUTO = auto()
 
     def is_mtp(self):
         return self == SpeculativeDecodingMode.MTP or self == SpeculativeDecodingMode.MTP_EAGLE
+
+    def is_mtp_vanilla(self):
+        return self == SpeculativeDecodingMode.MTP
 
     def is_mtp_eagle(self):
         return self == SpeculativeDecodingMode.MTP_EAGLE
@@ -87,11 +91,13 @@ class SpeculativeDecodingMode(IntEnum):
         any spec dec mode that uses the SpecExecutor.
         """
 
-        # Fixme: only trtllm attention backend supports eagle3 generation-phase kernels on blackwell.
-        return ((self.is_eagle3() or self.is_draft_target())
-                and not (isinstance(attention_backend, TrtllmAttention)
-                         and get_sm_version() == 100)
-                ) or self.is_ngram() or self.is_user_provided()
+        if self.use_one_engine():
+            # 1-model has separate logic for handling draft tokens
+            return False
+
+        # The special XQA generation kernels only exist with the TRTLLM backend on blackwell.
+        return not issubclass(attention_backend,
+                              TrtllmAttention) or get_sm_version() != 100
 
     def attention_need_spec_dec_mode(self):
         """
