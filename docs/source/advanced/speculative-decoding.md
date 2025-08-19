@@ -54,7 +54,7 @@ tuned as TensorRT-LLM, the potential time savings are more pronounced.
 The Draft-Target-Model involves the use of two distinct models (a smaller Draft model and a larger Target model) trained independently but sharing the same vocabulary. For example, GPT 125M / 6.7B models serve as the Draft / Target model.
 
 The management of Draft and Target models is facilitated through two separate `Executor` instances.
-It is essential that you to coordinate the interactions between the Draft and Target models effectively.
+It is essential to coordinate the interactions between the Draft and Target models effectively.
 Initially, the Draft model is queried to generate up to `K` draft tokens.
 These tokens are then forwarded to the Target model for verification.
 Upon verification, the Target model may return up to `K+1` tokens.
