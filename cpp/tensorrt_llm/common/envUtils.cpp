@@ -143,156 +143,98 @@ static size_t parseMemorySize(std::string const& input)
 // XQA kernels (optimized kernels for generation phase).
 bool forceXQAKernels()
 {
-    static bool const forceXQA
-        = (getIntEnv("TRTLLM_FORCE_XQA").value_or(0) != 0) || getEnvForceDeterministicAttention();
-    return forceXQA;
+    return (getIntEnv("TRTLLM_FORCE_XQA").value_or(0) != 0) || getEnvForceDeterministicAttention();
 }
 
 std::optional<bool> getEnvEnableXQAJIT()
 {
-    static std::optional<bool> val = []
+    auto const tmp = getIntEnv("TRTLLM_ENABLE_XQA_JIT");
+    if (tmp.has_value())
     {
-        std::optional<bool> val = std::nullopt;
-        auto const tmp = getIntEnv("TRTLLM_ENABLE_XQA_JIT");
-        if (tmp.has_value())
-        {
-            val = static_cast<bool>(tmp.value());
-        }
-        return val;
-    }();
-    return val;
+        return static_cast<bool>(tmp.value());
+    }
+    return std::nullopt;
 }
 
 std::optional<int> getEnvXqaBlocksPerSequence()
 {
-    static auto const xqaBlocksPerSeq = []()
-    {
-        auto const val = getIntEnv("TRTLLM_XQA_BLOCKS_PER_SEQUENCE");
-        return (val.has_value() && *val <= 0) ? std::nullopt : val;
-    }();
-    return xqaBlocksPerSeq;
+    auto const val = getIntEnv("TRTLLM_XQA_BLOCKS_PER_SEQUENCE");
+    return (val.has_value() && *val <= 0) ? std::nullopt : val;
 }
 
 // Tune the number of blocks per sequence for accuracy/performance purpose.
 bool getEnvMmhaMultiblockDebug()
 {
-    static std::once_flag flag;
-    static bool forceMmhaMaxSeqLenTile = false;
-    std::call_once(flag,
-        [&]
-        {
-            char const* enable_mmha_debug_var = std::getenv("TRTLLM_ENABLE_MMHA_MULTI_BLOCK_DEBUG");
-            if (enable_mmha_debug_var)
-            {
-                if (enable_mmha_debug_var[0] == '1' && enable_mmha_debug_var[1] == '\0')
-                {
-                    forceMmhaMaxSeqLenTile = true;
-                }
-            }
-        });
-    return forceMmhaMaxSeqLenTile;
+    char const* enable_mmha_debug_var = std::getenv("TRTLLM_ENABLE_MMHA_MULTI_BLOCK_DEBUG");
+    return enable_mmha_debug_var && enable_mmha_debug_var[0] == '1' && enable_mmha_debug_var[1] == '\0';
 }
 
 int getEnvMmhaBlocksPerSequence()
 {
-    static std::once_flag flag;
-    static int mmhaBlocksPerSequence = 0;
-    std::call_once(flag,
-        [&]()
+    char const* mmhaBlocksPerSequenceEnv = std::getenv("TRTLLM_MMHA_BLOCKS_PER_SEQUENCE");
+    if (mmhaBlocksPerSequenceEnv)
+    {
+        int mmhaBlocksPerSequence = std::atoi(mmhaBlocksPerSequenceEnv);
+        if (mmhaBlocksPerSequence <= 0)
         {
-            char const* mmhaBlocksPerSequenceEnv = std::getenv("TRTLLM_MMHA_BLOCKS_PER_SEQUENCE");
-            if (mmhaBlocksPerSequenceEnv)
-            {
-                mmhaBlocksPerSequence = std::atoi(mmhaBlocksPerSequenceEnv);
-                if (mmhaBlocksPerSequence <= 0)
-                {
-                    TLLM_LOG_WARNING(
-                        "Invalid value for TRTLLM_MMHA_BLOCKS_PER_SEQUENCE. Will use default values instead!");
-                }
-            }
-        });
-
-    return mmhaBlocksPerSequence;
+            TLLM_LOG_WARNING("Invalid value for TRTLLM_MMHA_BLOCKS_PER_SEQUENCE. Will use default values instead!");
+            return 0;
+        }
+        return mmhaBlocksPerSequence;
+    }
+    return 0;
 }
 
 int getEnvMmhaKernelBlockSize()
 {
-    static std::once_flag flag;
-    static int mmhaKernelBlockSize = 0;
-
-    std::call_once(flag,
-        [&]()
+    char const* mmhaKernelBlockSizeEnv = std::getenv("TRTLLM_MMHA_KERNEL_BLOCK_SIZE");
+    if (mmhaKernelBlockSizeEnv)
+    {
+        int mmhaKernelBlockSize = std::atoi(mmhaKernelBlockSizeEnv);
+        if (mmhaKernelBlockSize <= 0)
         {
-            char const* mmhaKernelBlockSizeEnv = std::getenv("TRTLLM_MMHA_KERNEL_BLOCK_SIZE");
-            if (mmhaKernelBlockSizeEnv)
-            {
-                mmhaKernelBlockSize = std::atoi(mmhaKernelBlockSizeEnv);
-                if (mmhaKernelBlockSize <= 0)
-                {
-                    TLLM_LOG_WARNING(
-                        "Invalid value for TRTLLM_MMHA_KERNEL_BLOCK_SIZE. Will use default values instead!");
-                }
-            }
-        });
-    return mmhaKernelBlockSize;
+            TLLM_LOG_WARNING("Invalid value for TRTLLM_MMHA_KERNEL_BLOCK_SIZE. Will use default values instead!");
+            return 0;
+        }
+        return mmhaKernelBlockSize;
+    }
+    return 0;
 }
 
 bool getEnvUseTileSizeKv64ForTrtllmGen()
 {
-    static bool const useTileSizeKv64 = getBoolEnv("TRTLLM_GEN_ENABLE_TILE_SIZE_KV64");
-    return useTileSizeKv64;
+    return getBoolEnv("TRTLLM_GEN_ENABLE_TILE_SIZE_KV64");
 }
 
 bool getEnvEnablePDL()
 {
-    static std::once_flag flag;
-    static bool enablePDL = false;
-
-    std::call_once(flag,
-        [&]()
-        {
-            if (getSMVersion() >= 90)
-            {
-                // PDL will be enabled by setting the env variables `TRTLLM_ENABLE_PDL` to `1`
-                enablePDL = getBoolEnv("TRTLLM_ENABLE_PDL");
-            }
-        });
-    return enablePDL;
+    if (getSMVersion() >= 90)
+    {
+        // PDL will be enabled by setting the env variables `TRTLLM_ENABLE_PDL` to `1`
+        return getBoolEnv("TRTLLM_ENABLE_PDL");
+    }
+    return false;
 }
 
 bool getEnvUseUCXKvCache()
 {
-    static bool const useUCXKVCache = getBoolEnv("TRTLLM_USE_UCX_KVCACHE");
-    return useUCXKVCache;
+    return getBoolEnv("TRTLLM_USE_UCX_KVCACHE");
 }
 
 bool getEnvUseMPIKvCache()
 {
-    static bool const useMPIKVCache = getBoolEnv("TRTLLM_USE_MPI_KVCACHE");
-    return useMPIKVCache;
+    return getBoolEnv("TRTLLM_USE_MPI_KVCACHE");
 }
 
 bool getEnvUseNixlKvCache()
 {
-    static bool const useNixlKvCache = getBoolEnv("TRTLLM_USE_NIXL_KVCACHE");
-    return useNixlKvCache;
+    return getBoolEnv("TRTLLM_USE_NIXL_KVCACHE");
 }
 
 std::string getEnvUCXInterface()
 {
-    static std::once_flag flag;
-    static std::string ucxInterface;
-
-    std::call_once(flag,
-        [&]()
-        {
-            char const* ucx_interface = std::getenv("TRTLLM_UCX_INTERFACE");
-            if (ucx_interface)
-            {
-                ucxInterface = ucx_interface;
-            }
-        });
-    return ucxInterface;
+    char const* ucx_interface = std::getenv("TRTLLM_UCX_INTERFACE");
+    return ucx_interface ? std::string(ucx_interface) : std::string();
 }
 
 std::string getEnvNixlInterface()
@@ -314,56 +256,47 @@ std::string getEnvNixlInterface()
 
 bool getEnvDisaggLayerwise()
 {
-    static bool const disaggLayerwise = getBoolEnv("TRTLLM_DISAGG_LAYERWISE");
-    return disaggLayerwise;
+    return getBoolEnv("TRTLLM_DISAGG_LAYERWISE");
 }
 
 bool getEnvDisableSelectiveCacheTransfer()
 {
-    static bool const disableSelectiveCacheTransfer = getBoolEnv("TRTLLM_DISABLE_SELECTIVE_CACHE_TRANSFER");
-    return disableSelectiveCacheTransfer;
+    return getBoolEnv("TRTLLM_DISABLE_SELECTIVE_CACHE_TRANSFER");
 }
 
 bool getEnvParallelCacheSend()
 {
-    static bool const parallelCacheSend = getBoolEnv("TRTLLM_PARALLEL_CACHE_SEND");
-    return parallelCacheSend;
+    return getBoolEnv("TRTLLM_PARALLEL_CACHE_SEND");
 }
 
 bool getEnvRequestKVCacheConcurrent()
 {
-    static bool const requestKVCacheConcurrent = getBoolEnv("TRTLLM_REQUEST_KV_CACHE_CONCURRENT");
-    return requestKVCacheConcurrent;
+    return getBoolEnv("TRTLLM_REQUEST_KV_CACHE_CONCURRENT");
 }
 
 bool getEnvDisableKVCacheTransferOverlap()
 {
-    static bool const disableKVCacheTransferOverlap = getBoolEnv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP");
-    return disableKVCacheTransferOverlap;
+    return getBoolEnv("TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP");
 }
 
 bool getEnvEnableReceiveKVCacheParallel()
 {
-    static bool const enableReceiveParallel = getBoolEnv("TRTLLM_ENABLE_KVCACHE_RECEIVE_PARALLEL");
-    return enableReceiveParallel;
+    return getBoolEnv("TRTLLM_ENABLE_KVCACHE_RECEIVE_PARALLEL");
 }
 
 bool getEnvTryZCopyForKVCacheTransfer()
 {
-    static bool const zcopyForSysmmetricKVCache = getBoolEnv("TRTLLM_TRY_ZCOPY_FOR_KVCACHE_TRANSFER");
-    return zcopyForSysmmetricKVCache;
+    return getBoolEnv("TRTLLM_TRY_ZCOPY_FOR_KVCACHE_TRANSFER");
 }
 
 bool getEnvForceDeterministic()
 {
-    static bool const forceDeterministic = getBoolEnv("FORCE_DETERMINISTIC");
-    return forceDeterministic;
+    return getBoolEnv("FORCE_DETERMINISTIC");
 }
 
 bool getEnvForceDeterministicMOE()
 {
-    static bool const forceDeterministic = getBoolEnv("FORCE_MOE_KERNEL_DETERMINISTIC") || getEnvForceDeterministic();
-    return forceDeterministic;
+    return getBoolEnv("FORCE_MOE_KERNEL_DETERMINISTIC") || getEnvForceDeterministic();
 }
 
 bool getEnvMOEDisableFinalizeFusion()
@@ -374,82 +307,60 @@ bool getEnvMOEDisableFinalizeFusion()
 
 bool getEnvForceDeterministicAttention()
 {
-    static bool const forceDeterministic
-        = getBoolEnv("FORCE_ATTENTION_KERNEL_DETERMINISTIC") || getEnvForceDeterministic();
-    return forceDeterministic;
+    return getBoolEnv("FORCE_ATTENTION_KERNEL_DETERMINISTIC") || getEnvForceDeterministic();
 }
 
 bool getEnvForceDeterministicAllReduce()
 {
-    static bool const forceDeterministic = getBoolEnv("FORCE_ALL_REDUCE_DETERMINISTIC") || getEnvForceDeterministic();
-    return forceDeterministic;
+    return getBoolEnv("FORCE_ALL_REDUCE_DETERMINISTIC") || getEnvForceDeterministic();
 }
 
 size_t getEnvAllReduceWorkspaceSize()
 {
-    static size_t const workspaceSize
-        = getUInt64Env("FORCE_ALLREDUCE_KERNEL_WORKSPACE_SIZE").value_or(1000 * 1000 * 1000);
-    return workspaceSize;
+    return getUInt64Env("FORCE_ALLREDUCE_KERNEL_WORKSPACE_SIZE").value_or(1000 * 1000 * 1000);
 }
 
 std::string const& getEnvKVCacheTransferOutputPath()
 {
-    static std::string outputPath = getStrEnv("TRTLLM_KVCACHE_TIME_OUTPUT_PATH").value_or("");
-    return outputPath;
+    return getStrEnv("TRTLLM_KVCACHE_TIME_OUTPUT_PATH").value_or("");
 }
 
 bool getEnvKVCacheTransferUseAsyncBuffer()
 {
-
-    static bool const useAsyncBuffer = getBoolEnv("TRTLLM_KVCACHE_TRANSFER_USE_ASYNC_BUFFER");
-    return useAsyncBuffer;
+    return getBoolEnv("TRTLLM_KVCACHE_TRANSFER_USE_ASYNC_BUFFER");
 }
 
 bool getEnvKVCacheTransferUseSyncBuffer()
 {
-    static bool const useSyncBuffer = getBoolEnv("TRTLLM_KVCACHE_TRANSFER_USE_SYNC_BUFFER");
-    return useSyncBuffer;
+    return getBoolEnv("TRTLLM_KVCACHE_TRANSFER_USE_SYNC_BUFFER");
 }
 
 size_t getEnvKVCacheSendMaxConcurrenceNum()
 {
-
-    static size_t const maxConcurrenceNum = getUInt64Env("TRTLLM_KVCACHE_SEND_MAX_CONCURRENCY_NUM").value_or(2);
-    return maxConcurrenceNum;
+    return getUInt64Env("TRTLLM_KVCACHE_SEND_MAX_CONCURRENCY_NUM").value_or(2);
 }
 
 size_t getEnvKVCacheRecvBufferCount()
 {
-    static size_t const recvBufferCount = getUInt64Env("TRTLLM_KVCACHE_RECV_BUFFER_COUNT").value_or(2);
-    return recvBufferCount;
+    return getUInt64Env("TRTLLM_KVCACHE_RECV_BUFFER_COUNT").value_or(2);
 }
 
 size_t getEnvMemSizeForKVCacheTransferBuffer()
 {
-    static std::once_flag flag;
-    static size_t memSizeForKVCacheTransferBuffer = 0;
-
-    std::call_once(flag,
-        [&]()
-        {
-            char const* memSizeForKVCacheTransferBufferEnv = std::getenv("TRTLLM_KVCACHE_TRANSFER_BUFFER_SIZE");
-            if (memSizeForKVCacheTransferBufferEnv)
-            {
-                memSizeForKVCacheTransferBuffer = parseMemorySize(memSizeForKVCacheTransferBufferEnv);
-            }
-            else
-            {
-                memSizeForKVCacheTransferBuffer = parseMemorySize("512MB");
-            }
-        });
-
-    return memSizeForKVCacheTransferBuffer;
+    char const* memSizeForKVCacheTransferBufferEnv = std::getenv("TRTLLM_KVCACHE_TRANSFER_BUFFER_SIZE");
+    if (memSizeForKVCacheTransferBufferEnv)
+    {
+        return parseMemorySize(memSizeForKVCacheTransferBufferEnv);
+    }
+    else
+    {
+        return parseMemorySize("512MB");
+    }
 }
 
 uint16_t getEnvNixlPort()
 {
-    static uint16_t const nixlPort = getUInt64Env("TRTLLM_NIXL_PORT").value_or(0);
-    return nixlPort;
+    return getUInt64Env("TRTLLM_NIXL_PORT").value_or(0);
 }
 
 bool getEnvDisaggBenchmarkGenOnly()
