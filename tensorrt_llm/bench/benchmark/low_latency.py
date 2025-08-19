@@ -25,7 +25,7 @@ from tensorrt_llm.llmapi import CapacitySchedulerPolicy
 from tensorrt_llm.models.modeling_utils import SpeculativeDecodingMode
 
 # isort: off
-from tensorrt_llm.bench.benchmark.utils.general import get_settings_from_engine, get_settings, ALL_SUPPORTED_BACKENDS
+from tensorrt_llm.bench.benchmark.utils.general import get_settings_from_engine, get_settings, update_sampler_args_with_extra_options, ALL_SUPPORTED_BACKENDS
 # isort: on
 from tensorrt_llm.bench.utils.data import (create_dataset_from_stream,
                                            initialize_tokenizer,
@@ -135,6 +135,13 @@ from tensorrt_llm.sampling_params import SamplingParams
     default=1,
     help="Number of search beams.",
 )
+@optgroup.option("--sampler_options",
+                 type=click.Path(exists=True,
+                                 readable=True,
+                                 path_type=Path,
+                                 resolve_path=True),
+                 default=None,
+                 help="Path to a YAML file that sets sampler options.")
 @optgroup.option(
     "--concurrency",
     type=int,
@@ -326,12 +333,16 @@ def latency_command(
         eos_id = tokenizer.eos_token_id if not ignore_eos else -1
         pad_id = tokenizer.pad_token_id if not ignore_eos else -1
 
-        sampling_params = SamplingParams(
-            end_id=eos_id,
-            pad_id=pad_id,
-            n=beam_width,
-            use_beam_search=beam_width > 1,
-        )
+        sampler_args = {
+            "end_id": eos_id,
+            "pad_id": pad_id,
+            "n": beam_width,
+            "use_beam_search": beam_width > 1
+        }
+        sampler_args = update_sampler_args_with_extra_options(
+            sampler_args, params.pop("sampler_options"))
+        sampling_params = SamplingParams(**sampler_args)
+
         post_proc_params = None  # No detokenization
 
         # Perform warmup if requested.

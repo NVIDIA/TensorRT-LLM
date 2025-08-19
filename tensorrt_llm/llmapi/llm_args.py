@@ -1992,6 +1992,21 @@ class TorchCompileConfig(StrictBaseModel):
         default=False,
         description="Enable piecewise CUDA graph in torch.compile.")
 
+    capture_num_tokens: Optional[List[int]] = Field(
+        default=None,
+        description=
+        "List of num of tokens to capture the piecewise CUDA graph for. If not provided, the number of tokens will be the same as cuda_graph_config.batch_sizes."
+    )
+
+    @field_validator('capture_num_tokens')
+    @classmethod
+    def validate_capture_num_tokens(cls, v):
+        if v is None:
+            return v
+        if any(t <= 0 for t in v):
+            raise ValueError("capture_num_tokens must contain positive ints.")
+        return sorted(set(v), reverse=True)
+
     enable_userbuffers: bool = Field(
         default=True,
         description=
@@ -2370,6 +2385,10 @@ class TorchLlmArgs(BaseLlmArgs):
             enable_piecewise_cuda_graph
             if self.torch_compile_config is not None else TorchCompileConfig.
             model_fields['enable_piecewise_cuda_graph'].default,
+            torch_compile_piecewise_cuda_graph_num_tokens=self.
+            torch_compile_config.capture_num_tokens
+            if self.torch_compile_config is not None else
+            TorchCompileConfig.model_fields['capture_num_tokens'].default,
             torch_compile_enable_userbuffers=self.torch_compile_config.
             enable_userbuffers if self.torch_compile_config is not None else
             TorchCompileConfig.model_fields['enable_userbuffers'].default,

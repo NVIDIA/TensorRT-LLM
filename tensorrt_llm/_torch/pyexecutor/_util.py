@@ -243,8 +243,8 @@ class KvCacheCreator:
             torch_used_bytes = torch.cuda.memory_stats(
             )["allocated_bytes.all.current"]
         finally:
-            py_executor.shutdown()
             py_executor.is_warmup = False
+            py_executor.shutdown()
             py_executor.enable_iter_perf_stats = origin_iter_stats
             py_executor.set_gather_responses(False)
 
