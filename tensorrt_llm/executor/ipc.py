@@ -125,13 +125,36 @@ class ZeroMqQueue:
                 # Send data without HMAC
                 self.socket.send_pyobj(obj)
 
-    def put_noblock(self, obj: Any):
+    def put_noblock(self,
+                    obj: Any,
+                    *,
+                    retry: int = 1,
+                    wait_time: float = 0.001):
+        '''
+        Put an object into the queue without blocking, and retry if the send fails.
+        NOTE: It won't raise any error if the send fails.
+
+        Parameters:
+            obj (Any): The object to send.
+            retry (int): The number of times to retry sending the object.
+            wait_time (float): The time to wait before retrying.
+        '''
+
+        assert retry >= 0 and retry <= 2000, "Retry must be between 0 and 2000"
+
         self.setup_lazily()
         with nvtx_range_debug("send", color="blue", category="IPC"):
             data = pickle.dumps(obj)  # nosec B301
             if self.use_hmac_encryption:
                 data = self._sign_data(data)
-            self.socket.send(data, flags=zmq.NOBLOCK)
+            try:
+                self.socket.send(data, flags=zmq.NOBLOCK)
+            except zmq.Again:
+                if retry > 0:
+                    time.sleep(wait_time)
+                    self.put_noblock(obj, retry=retry - 1, wait_time=wait_time)
+                else:
+                    logger.error(f"Failed to send object: {obj}")
 
     async def put_async(self, obj: Any):
         self.setup_lazily()
