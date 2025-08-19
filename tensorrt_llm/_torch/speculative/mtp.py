@@ -7,10 +7,11 @@ from torch import nn
 from ..attention_backend import AttentionMetadata
 from ..distributed.ops import allgather
 from ..model_config import ModelConfig
-from ..pyexecutor.llm_request import LlmRequest, LlmRequestState
+from ..pyexecutor.llm_request import FinishReason, LlmRequest, LlmRequestState
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
-from ..pyexecutor.sampler import (SampleState, SampleStateTensors, TorchSampler,
-                                  add_token, int_tensor)
+from ..pyexecutor.sampler import (Sampler, SampleState, SampleStateTensors,
+                                  TorchSampler, TorchStore, add_token,
+                                  int_tensor)
 from ..pyexecutor.scheduler import ScheduledRequests
 from .interface import SpecMetadata
 
@@ -196,7 +197,21 @@ class MTPSpecMetadata(SpecMetadata):
             manager.slot_ids[:num_seqs].copy_(mtp_slot_ids, non_blocking=True)
 
 
-class MTPSampler(TorchSampler):
+class MTPStore(TorchStore):
+
+    def __init__(self, *, max_draft_len: int, max_num_sequences: int,
+                 max_beam_width: int):
+        super().__init__(max_draft_len=max_draft_len,
+                         max_num_sequences=max_num_sequences,
+                         max_beam_width=max_beam_width)
+        self.next_new_tokens = int_tensor(
+            (self.max_tokens, self.max_num_sequences, self.MAX_BEAM_WIDTH))
+        self.next_draft_tokens = int_tensor(
+            (self.max_num_sequences, self.max_draft_len))
+        self.new_tokens_lens = int_tensor((self.max_num_sequences, ))
+
+
+class MTPSampler(Sampler):
     """
     MTP sampler.
     """
@@ -206,24 +221,28 @@ class MTPSampler(TorchSampler):
     def __init__(self, args: TorchSampler.Args, *, nextn: int):
         self.mapping = None
         self.draft_len = nextn
-        super().__init__(args)
+        self.store = MTPStore(max_draft_len=nextn,
+                              max_num_sequences=args.max_num_sequences,
+                              max_beam_width=args.max_beam_width)
+        self.BEAM = self.store.BEAM
 
-    @dataclass(frozen=True, kw_only=True)
-    class Store(TorchSampler.Store):
-        next_new_tokens: torch.Tensor
-        next_draft_tokens: torch.Tensor
-        new_tokens_lens: torch.Tensor
+    def _handle_stop_criteria(self, request: LlmRequest,
+                              new_token: int) -> bool:
+        """Handle stop criteria and set appropriate finish reasons and state.
+        Returns True if generation should stop."""
+        if new_token == request.py_end_id:
+            request.finish_by(FinishReason.END_ID, self.BEAM)
+            return True
 
-    def create_store(self) -> Store:
-        num_tokens, seq_slots, _ = self.NEW_TOKENS_SHAPE
-        draft_len = num_tokens - 1
-        assert draft_len == self.draft_len
-        return self.Store(
-            new_tokens=int_tensor(self.NEW_TOKENS_SHAPE),
-            next_new_tokens=int_tensor(self.NEW_TOKENS_SHAPE),
-            next_draft_tokens=int_tensor((seq_slots, draft_len)),
-            new_tokens_lens=int_tensor((seq_slots, )),
-        )
+        if self._meet_max_token_stop_criteria(request):
+            request.finish_by(FinishReason.LENGTH, self.BEAM)
+            return True
+
+        if self._meet_stop_token_criteria(request):
+            request.finish_by(FinishReason.STOP_WORDS, self.BEAM)
+            return True
+
+        return False
 
     def _request_common_handling(self, request: LlmRequest,
                                  next_draft_tokens: list[list[int]]):

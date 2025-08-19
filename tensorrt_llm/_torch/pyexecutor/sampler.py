@@ -303,17 +303,21 @@ def int_tensor(shape: tuple[int, ...], device: str = 'cuda') -> torch.Tensor:
     return torch.empty(shape, dtype=torch.int, device=device)
 
 
-class TorchSampler(Sampler):
+class TorchStore:
     BEAM = 0
     MAX_BEAM_WIDTH = BEAM + 1
+    new_tokens: torch.Tensor
+    """Shape: See cpp DecoderState.getAllNewTokens()"""
 
-    @dataclass(frozen=True, kw_only=True)
-    class Store:
-        new_tokens: torch.Tensor
-        """Shape: See cpp DecoderState.getAllNewTokens()"""
+    def __init__(self, *, max_draft_len: int, max_num_sequences: int,
+                 max_beam_width: int):
+        self.max_tokens = max_draft_len + 1
+        assert max_beam_width == self.MAX_BEAM_WIDTH, "TorchSampler only supports beam_width = 1"
+        self.new_tokens = int_tensor(
+            (self.max_tokens, max_num_sequences, max_beam_width))
 
-    def create_store(self) -> Store:
-        return self.Store(new_tokens=int_tensor(self.NEW_TOKENS_SHAPE))
+
+class TorchSampler(Sampler):
 
     @dataclass(frozen=True, kw_only=True)
     class Args:
@@ -326,17 +330,18 @@ class TorchSampler(Sampler):
     def __init__(self, args: Args):
         self.max_seq_len = args.max_seq_len
         self.enable_mixed_sampler = args.enable_mixed_sampler
-        self.max_tokens = args.max_draft_len + 1
-        assert args.max_beam_width == self.MAX_BEAM_WIDTH, "TorchSampler only supports beam_width = 1"
-        self.max_num_sequences = args.max_num_sequences
 
-        self.NEW_TOKENS_SHAPE = (self.max_tokens, self.max_num_sequences,
-                                 self.MAX_BEAM_WIDTH)
         # AutoDeploy build creates the sampler in inference mode,
         # which would disallow in-place mutating of new_tokens.
         # So, we temporarily exit inference mode.
         with torch.inference_mode(False):
-            self.store = self.create_store()
+            self.store = TorchStore(max_draft_len=args.max_draft_len,
+                                    max_num_sequences=args.max_num_sequences,
+                                    max_beam_width=args.max_beam_width)
+        self.max_num_sequences = args.max_num_sequences
+        self.max_tokens = self.store.max_tokens
+        self.BEAM = self.store.BEAM
+        self.MAX_BEAM_WIDTH = self.store.MAX_BEAM_WIDTH
 
         # Initialize seed for multi-GPU consistency
         self._global_seed = 42
