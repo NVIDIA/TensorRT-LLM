@@ -8,7 +8,7 @@ diffusers>=0.27.0
 lark
 mpi4py
 numpy<2
-onnx>=1.12.0
+onnx>=1.18.0
 onnx_graphsurgeon>=0.5.2
 openai
 polygraphy
@@ -28,7 +28,9 @@ torchvision
 nvidia-modelopt[torch]~=0.33.0
 nvidia-nccl-cu13
 nvidia-cuda-nvrtc-cu13
-transformers==4.53.1
+transformers==4.55.0
+prometheus_client
+prometheus_fastapi_instrumentator
 pydantic>=2.9.1
 pydantic-settings[yaml]
 omegaconf
@@ -52,6 +54,8 @@ einops
 flashinfer-python @ git+https://github.com/VALLIS-NERIA/flashinfer.git@29e57482ad6410444aa86cf92c669dbbb506e978
 opencv-python-headless
 xgrammar==0.1.21
+llguidance==0.7.29
+jsonschema
 backoff
 nvtx
 matplotlib # FIXME: this is added to make nvtx happy
@@ -59,7 +63,7 @@ meson
 ninja
 etcd3
 blake3
-llguidance==0.7.29
 soundfile
 triton==3.3.1; platform_machine == "x86_64"
+tiktoken
 blobfile

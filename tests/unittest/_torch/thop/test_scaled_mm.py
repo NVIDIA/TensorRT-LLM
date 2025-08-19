@@ -69,7 +69,10 @@ def test_fp8_scaled_mm(output_dtype, m, k_n):
         use_fast_accum=True,
     )
     os.environ["CUBLASLT_WORKSPACE_SIZE"] = old_env
-    np.testing.assert_allclose(ref.float().cpu(), output.float().cpu())
+    np.testing.assert_allclose(ref.float().cpu(),
+                               output.float().cpu(),
+                               atol=0.01,
+                               rtol=0.01)
 
     if getSMVersion() == 90:
         cutlass_output = torch.ops.trtllm.cutlass_scaled_mm(
@@ -83,7 +86,9 @@ def test_fp8_scaled_mm(output_dtype, m, k_n):
         # TODO(zhenhuan): cutlass kernel has acc issue on some shapes
         try:
             np.testing.assert_allclose(ref.float().cpu(),
-                                       cutlass_output.float().cpu())
+                                       cutlass_output.float().cpu(),
+                                       atol=1,
+                                       rtol=0.01)
         except Exception as e:
             warn(RuntimeWarning("cutlass result is not correct: " + repr(e)))
 

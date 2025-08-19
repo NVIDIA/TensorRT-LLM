@@ -132,7 +132,6 @@ void selfAttentionRef(T* output, T* const Q, T* const KV, int batch_size, int nu
         int global_q_offset = cu_seq_q_len[b] * num_heads * head_size;
         int global_kv_offset = cu_seq_kv_len[b] * 2 * num_heads * head_size;
         int global_softmax_offset = cu_seq_q_len[b] * num_heads * 2;
-        float bmm1_scale = 1.F / std::sqrt(static_cast<float>(head_size));
         if (curr_q_len == 0 || curr_kv_len == 0)
         {
             continue; // skip empty sequences
@@ -187,9 +186,8 @@ void selfAttentionRef(T* output, T* const Q, T* const KV, int batch_size, int nu
                 float sum = 0;
                 for (int s_kv = 0; s_kv < curr_kv_len; s_kv++)
                 {
-                    // P[s_q * curr_kv_len + s_kv] = std::exp(P[s_q * curr_kv_len + s_kv] * bmm1_scale);
-                    // hack for real mla kernel
-                    P[s_q * curr_kv_len + s_kv] = std::exp(P[s_q * curr_kv_len + s_kv] * 0.072168784);
+                    // P[s_q * curr_kv_len + s_kv] = std::exp(P[s_q * curr_kv_len + s_kv]);
+                    P[s_q * curr_kv_len + s_kv] = std::exp(P[s_q * curr_kv_len + s_kv]);
                     sum += P[s_q * curr_kv_len + s_kv];
                 }
                 for (int s_kv = 0; s_kv < curr_kv_len; s_kv++)

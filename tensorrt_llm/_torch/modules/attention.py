@@ -78,6 +78,7 @@ def attn_custom_op_inplace(
     mrope_position_deltas: Optional[torch.Tensor],
     attention_window_size: Optional[int],
     attention_mask_data: Optional[torch.Tensor],
+    attention_sinks: Optional[torch.Tensor],
     layer_idx: str,
     output: torch.Tensor,
 ) -> None:
@@ -92,8 +93,9 @@ def attn_custom_op_inplace(
                           mrope_position_deltas,
                           attention_window_size,
                           attention_mask_data,
-                          False,
-                          output=output)
+                          enable_attn_nvfp4_output=False,
+                          output=output,
+                          attention_sinks=attention_sinks)
 
 
 class Attention(nn.Module):
@@ -192,6 +194,8 @@ class Attention(nn.Module):
             gpus_per_node=config.mapping.gpus_per_node,
             enable_attention_dp=config.mapping.enable_attention_dp,
         )
+        self.tp_size = tp_size
+        self.tp_rank = mapping.tp_rank
         assert self.num_heads % tp_size == 0
         self.num_heads = self.num_heads // tp_size
         self.num_key_value_heads = (self.num_key_value_heads + tp_size -
@@ -331,6 +335,7 @@ class Attention(nn.Module):
         enable_attn_nvfp4_output: bool = True,
         output: Optional[torch.Tensor] = None,
         output_sf: Optional[torch.Tensor] = None,
+        attention_sinks: Optional[torch.Tensor] = None,
     ):
 
         out_scale = None
@@ -364,13 +369,72 @@ class Attention(nn.Module):
             attention_mask_data=attention_mask_data,
             enable_attn_nvfp4_output=enable_attn_nvfp4_output,
             output=output,
-            output_sf=output_sf)
+            output_sf=output_sf,
+            attention_sinks=attention_sinks)
         if isinstance(attn_output, tuple):
             assert len(
                 attn_output
             ) == 2, "attn_output should be a tuple of (output, output_sf)"
             return attn_output[0], attn_output[1]
         return attn_output, None
+
+    def forward_impl(
+        self,
+        q: torch.Tensor,
+        k: Optional[torch.Tensor],
+        v: Optional[torch.Tensor],
+        attn_metadata: AttentionMetadata,
+        attention_mask: AttentionMask,
+        attention_window_size: Optional[int],
+        attention_mask_data: Optional[torch.Tensor],
+        mrope_config: Optional[dict],
+        attention_sinks: Optional[torch.Tensor] = None,
+    ):
+        mrope_rotary_cos_sin = None
+        mrope_position_deltas = None
+        if mrope_config is not None:
+            if "mrope_rotary_cos_sin" in mrope_config:
+                mrope_rotary_cos_sin = mrope_config["mrope_rotary_cos_sin"]
+            if "mrope_position_deltas" in mrope_config:
+                mrope_position_deltas = mrope_config["mrope_position_deltas"]
+
+        # Currently only TRTLLM and FLASHINFER are torch compile compatible backends.
+        # Only enable custom inplace op when torch compiling.
+        use_custom_inplace_op = (self.register_to_config
+                                 and (self.attn_backend == "TRTLLM"
+                                      or self.attn_backend == "FLASHINFER")
+                                 and is_torch_compiling())
+
+        if use_custom_inplace_op:
+            output = self.create_output(q)
+            attn_custom_op_inplace(
+                q,
+                k,
+                v,
+                attention_mask,
+                mrope_rotary_cos_sin,
+                mrope_position_deltas,
+                attention_window_size,
+                attention_mask_data,
+                attention_sinks,
+                self.layer_idx_str,
+                output,
+            )
+        else:
+            output, output_sf = self._attn_impl(q,
+                                                k,
+                                                v,
+                                                attn_metadata,
+                                                attention_mask,
+                                                mrope_rotary_cos_sin,
+                                                mrope_position_deltas,
+                                                attention_window_size,
+                                                attention_mask_data,
+                                                attention_sinks=attention_sinks)
+            if output_sf is not None:
+                output = Fp4QuantizedTensor(output, output_sf)
+
+        return output
 
     def forward(
         self,
@@ -383,6 +447,7 @@ class Attention(nn.Module):
         lora_params: Optional[dict] = None,
         attention_window_size: Optional[int] = None,
         attention_mask_data: Optional[torch.Tensor] = None,
+        attention_sinks: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         """
@@ -414,54 +479,22 @@ class Attention(nn.Module):
             if qkv_lora is not None:
                 qkv = qkv + qkv_lora
 
-        mrope_rotary_cos_sin = None
-        mrope_position_deltas = None
-        if mrope_config is not None:
-            if "mrope_rotary_cos_sin" in mrope_config:
-                mrope_rotary_cos_sin = mrope_config["mrope_rotary_cos_sin"]
-            if "mrope_position_deltas" in mrope_config:
-                mrope_position_deltas = mrope_config["mrope_position_deltas"]
-
-        output = None
-
         q, k, v = qkv, None, None
         q, k, v = self.apply_rope(q, k, v, position_ids)
         q, k, v = self.convert_qkv(q, k, v)
 
-        # Currently only TRTLLM and FLASHINFER are torch compile compatible backends.
-        # Only enable custom inplace op when torch compiling.
-        use_custom_inplace_op = (self.register_to_config
-                                 and (self.attn_backend == "TRTLLM"
-                                      or self.attn_backend == "FLASHINFER")
-                                 and is_torch_compiling())
-        if use_custom_inplace_op:
-            output = self.create_output(q)
-            attn_custom_op_inplace(
-                q,
-                k,
-                v,
-                attention_mask,
-                mrope_rotary_cos_sin,
-                mrope_position_deltas,
-                attention_window_size,
-                attention_mask_data,
-                self.layer_idx_str,
-                output=output,
-            )
-        else:
-            output, output_sf = self._attn_impl(
-                q,
-                k,
-                v,
-                attn_metadata,
-                attention_mask,
-                mrope_rotary_cos_sin,
-                mrope_position_deltas,
-                attention_window_size,
-                attention_mask_data,
-            )
-            if output_sf is not None:
-                output = Fp4QuantizedTensor(output, output_sf)
+        if attention_sinks is not None:
+            assert self.attn_backend == "TRTLLM", "Attention sinks are only supported for TRTLLM backend."
+
+        output = self.forward_impl(q,
+                                   k,
+                                   v,
+                                   attn_metadata,
+                                   attention_mask,
+                                   attention_window_size,
+                                   attention_mask_data,
+                                   mrope_config=mrope_config,
+                                   attention_sinks=attention_sinks)
 
         attn_output = self.o_proj(output,
                                   all_reduce_params=all_reduce_params,
@@ -484,11 +517,16 @@ class Attention(nn.Module):
         Returns:
             tuple: A tuple of (q, k, v).
         """
-        q, k, v = self.split_qkv(q, k, v)
         # If RoPE is fused into the attention OP, do not apply RoPE here.
         if not self.rope_fusion and position_ids is not None:
+            q, k, v = self.split_qkv(q, k, v)
             q, k = self.rotary_emb(position_ids, [q, k])
         return q, k, v
+
+    def apply_qk_norm(self, q, k):
+        raise NotImplementedError(
+            f"QK norm is not implemented for {self.__class__.__name__}."
+            "Please override the `apply_qk_norm` method in the subclass.")
 
 
 @torch.library.custom_op("trtllm::mla_custom_op_inplace",

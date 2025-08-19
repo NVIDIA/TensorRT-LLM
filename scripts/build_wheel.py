@@ -16,8 +16,10 @@
 
 import os
 import platform
+import re
 import sys
 import sysconfig
+import tempfile
 import warnings
 from argparse import ArgumentParser
 from contextlib import contextmanager
@@ -27,7 +29,7 @@ from pathlib import Path
 from shutil import copy, copytree, rmtree
 from subprocess import DEVNULL, CalledProcessError, check_output, run
 from textwrap import dedent
-from typing import List
+from typing import Sequence
 
 try:
     from packaging.requirements import Requirement
@@ -68,13 +70,13 @@ def get_build_dir(build_dir, build_type):
 def clear_folder(folder_path):
     for item in os.listdir(folder_path):
         item_path = os.path.join(folder_path, item)
-        if os.path.isdir(item_path) and not os.path.islink(item_path):
-            rmtree(item_path)
-        else:
-            try:
+        try:
+            if os.path.isdir(item_path) and not os.path.islink(item_path):
+                rmtree(item_path)
+            else:
                 os.remove(item_path)
-            except (OSError, IOError) as e:
-                print(f"Failed to remove {item_path}: {e}", file=sys.stderr)
+        except (OSError, IOError) as e:
+            print(f"Failed to remove {item_path}: {e}", file=sys.stderr)
 
 
 def sysconfig_scheme(override_vars=None):
@@ -120,7 +122,8 @@ def create_venv(project_dir: Path):
     return venv_prefix
 
 
-def setup_venv(project_dir: Path, requirements_file: Path, no_venv: bool):
+def setup_venv(project_dir: Path, requirements_file: Path,
+               no_venv: bool) -> tuple[Path, Path]:
     """Creates/updates a venv and installs requirements.
 
     Args:
@@ -279,6 +282,139 @@ def generate_fmha_cu(project_dir, venv_python):
     os.chdir(project_dir)
 
 
+def create_cuda_stub_links(cuda_stub_dir: str, missing_libs: list[str]) -> str:
+    """
+    Creates symbolic links for CUDA stub libraries in a temporary directory.
+
+    Args:
+        cuda_stub_dir (str): Path to the directory containing CUDA stubs.
+        missing_libs: Versioned names of the missing libraries.
+
+    Returns:
+        str: Path to the temporary directory where links were created.
+    """
+    cuda_stub_path = Path(cuda_stub_dir)
+    if not cuda_stub_path.exists():
+        raise RuntimeError(
+            f"CUDA stub directory '{cuda_stub_dir}' does not exist.")
+
+    # Create a temporary directory for the symbolic links
+    temp_dir = tempfile.mkdtemp(prefix="cuda_stub_links_")
+    temp_dir_path = Path(temp_dir)
+
+    version_pattern = r'\.\d+'
+    for missing_lib in filter(lambda x: re.search(version_pattern, x),
+                              missing_libs):
+        # Define `so` as the first part of `missing_lib` with trailing '.' and digits removed
+        so = cuda_stub_path / re.sub(version_pattern, '', missing_lib)
+        so_versioned = temp_dir_path / missing_lib
+
+        # Check if the library exists in the original directory
+        if so.exists():
+            try:
+                # Create the symbolic link in the temporary directory
+                so_versioned.symlink_to(so)
+            except OSError as e:
+                # Clean up the temporary directory on error
+                rmtree(temp_dir)
+                raise RuntimeError(
+                    f"Failed to create symbolic link for '{missing_lib}' in temporary directory '{temp_dir}': {e}"
+                )
+        else:
+            warnings.warn(
+                f"Warning: Source library '{so}' does not exist and was skipped."
+            )
+
+    # Return the path to the temporary directory where the links were created
+    return str(temp_dir_path)
+
+
+def check_missing_libs(so_prefix: str) -> list[str]:
+    result = build_run(f"ldd {so_prefix}.cpython*.so",
+                       capture_output=True,
+                       text=True)
+    missing = []
+    for line in result.stdout.splitlines():
+        if "not found" in line:
+            lib_name = line.split()[
+                0]  # Extract the library name before "=> not found"
+            if lib_name not in missing:
+                missing.append(lib_name)
+    return missing
+
+
+def generate_python_stubs_linux(binding_type: str, venv_python: Path,
+                                deep_ep: bool):
+    is_nanobind = binding_type == "nanobind"
+    if is_nanobind:
+        build_run(f"\"{venv_python}\" -m pip install nanobind")
+    build_run(f"\"{venv_python}\" -m pip install pybind11-stubgen")
+
+    env_stub_gen = os.environ.copy()
+    cuda_home_dir = env_stub_gen.get("CUDA_HOME") or env_stub_gen.get(
+        "CUDA_PATH") or "/usr/local/cuda"
+    missing_libs = check_missing_libs("bindings")
+    cuda_stub_dir = f"{cuda_home_dir}/lib64/stubs"
+
+    if missing_libs and Path(cuda_stub_dir).exists():
+        # Create symbolic links for the CUDA stubs
+        link_dir = create_cuda_stub_links(cuda_stub_dir, missing_libs)
+        ld_library_path = env_stub_gen.get("LD_LIBRARY_PATH")
+        env_stub_gen["LD_LIBRARY_PATH"] = ":".join(
+            filter(None, [link_dir, cuda_stub_dir, ld_library_path]))
+    else:
+        link_dir = None
+
+    try:
+        if is_nanobind:
+            build_run(f"\"{venv_python}\" -m nanobind.stubgen -m bindings -O .",
+                      env=env_stub_gen)
+        else:
+            build_run(
+                f"\"{venv_python}\" -m pybind11_stubgen -o . bindings --exit-code",
+                env=env_stub_gen)
+        build_run(
+            f"\"{venv_python}\" -m pybind11_stubgen -o . deep_gemm_cpp_tllm --exit-code",
+            env=env_stub_gen)
+        if deep_ep:
+            build_run(
+                f"\"{venv_python}\" -m pybind11_stubgen -o . deep_ep_cpp_tllm --exit-code",
+                env=env_stub_gen)
+    finally:
+        if link_dir:
+            rmtree(link_dir)
+
+
+def generate_python_stubs_windows(binding_type: str, venv_python: Path,
+                                  pkg_dir: Path, lib_dir: Path):
+    if binding_type == "nanobind":
+        print("Windows not yet supported for nanobind stubs")
+        exit(1)
+    else:
+        build_run(f"\"{venv_python}\" -m pip install pybind11-stubgen")
+        stubgen = "stubgen.py"
+        stubgen_contents = """
+                        # Loading torch, trt before bindings is required to avoid import errors on windows.
+                        # isort: off
+                        import torch
+                        import tensorrt as trt
+                        # isort: on
+                        import os
+                        import platform
+
+                        from pybind11_stubgen import main
+
+                        if __name__ == "__main__":
+                            # Load dlls from `libs` directory before launching bindings.
+                            if platform.system() == "Windows":
+                                os.add_dll_directory(r\"{lib_dir}\")
+                            main()
+                        """.format(lib_dir=lib_dir)
+        (pkg_dir / stubgen).write_text(dedent(stubgen_contents))
+        build_run(f"\"{venv_python}\" {stubgen} -o . bindings")
+        (pkg_dir / stubgen).unlink()
+
+
 def main(*,
          build_type: str = "Release",
          generator: str = "",
@@ -286,7 +422,7 @@ def main(*,
          dist_dir: Path = None,
          cuda_architectures: str = None,
          job_count: int = None,
-         extra_cmake_vars: List[str] = list(),
+         extra_cmake_vars: Sequence[str] = tuple(),
          extra_make_targets: str = "",
          trt_root: str = '/usr/local/tensorrt',
          nccl_root: str = None,
@@ -361,7 +497,7 @@ def main(*,
 
     if on_windows:
         # Windows does not support multi-device currently.
-        extra_cmake_vars.extend(["ENABLE_MULTI_DEVICE=0"])
+        extra_cmake_vars = list(extra_cmake_vars) + ["ENABLE_MULTI_DEVICE=0"]
 
         # The Ninja CMake generator is used for our Windows build
         # (Easier than MSBuild to make compatible with our Docker image)
@@ -703,81 +839,14 @@ def main(*,
                      dirs_exist_ok=True)
 
         if not skip_stubs:
-            with working_directory(project_dir):
-                if binding_type == "nanobind":
-                    build_run(f"\"{venv_python}\" -m pip install nanobind")
-                else:
-                    build_run(
-                        f"\"{venv_python}\" -m pip install pybind11-stubgen")
             with working_directory(pkg_dir):
                 if on_windows:
-                    if binding_type == "nanobind":
-                        print("Windows not yet supported for nanobind stubs")
-                        exit(1)
-                    else:
-                        stubgen = "stubgen.py"
-                        stubgen_contents = """
-                        # Loading torch, trt before bindings is required to avoid import errors on windows.
-                        # isort: off
-                        import torch
-                        import tensorrt as trt
-                        # isort: on
-                        import os
-                        import platform
-
-                        from pybind11_stubgen import main
-
-                        if __name__ == "__main__":
-                            # Load dlls from `libs` directory before launching bindings.
-                            if platform.system() == "Windows":
-                                os.add_dll_directory(r\"{lib_dir}\")
-                            main()
-                        """.format(lib_dir=lib_dir)
-                        (pkg_dir / stubgen).write_text(dedent(stubgen_contents))
-                        build_run(f"\"{venv_python}\" {stubgen} -o . bindings")
-                        (pkg_dir / stubgen).unlink()
-                else:
-                    env_ld = os.environ.copy()
-
-                    new_library_path = "/usr/local/cuda/compat:/usr/local/cuda/compat/lib:/usr/local/cuda/compat/lib.real"
-                    if 'LD_LIBRARY_PATH' in env_ld:
-                        new_library_path += f":{env_ld['LD_LIBRARY_PATH']}"
-
-                    result = build_run("find /usr -name *libnvidia-ml.so*",
-                                       capture_output=True,
-                                       text=True)
-                    assert result.returncode == 0, f"Failed to run find *libnvidia-ml.so*: {result.stderr}"
-
-                    # Build containers only contain stub version of libnvidia-ml.so and not the real version.
-                    # If real version not in system, we need to create symbolic link to stub version to prevent import errors.
-                    if "libnvidia-ml.so.1" not in result.stdout:
-                        if "libnvidia-ml.so" in result.stdout:
-                            line = result.stdout.splitlines()[0]
-                            path = os.path.dirname(line)
-                            new_library_path += f":{path}"
-                            build_run(f"ln -s {line} {path}/libnvidia-ml.so.1")
-                        else:
-                            print(
-                                f"Failed to find libnvidia-ml.so: {result.stderr}",
-                                file=sys.stderr)
-                            exit(1)
-
-                    env_ld["LD_LIBRARY_PATH"] = new_library_path
-                    if binding_type == "nanobind":
-                        build_run(
-                            f"\"{venv_python}\" -m nanobind.stubgen -m bindings -O .",
-                            env=env_ld)
-                    else:
-                        build_run(
-                            f"\"{venv_python}\" -m pybind11_stubgen -o . bindings --exit-code",
-                            env=env_ld)
-                        if deep_ep_cuda_architectures:
-                            build_run(
-                                f"\"{venv_python}\" -m pybind11_stubgen -o . deep_ep_cpp_tllm --exit-code",
-                                env=env_ld)
-                        build_run(
-                            f"\"{venv_python}\" -m pybind11_stubgen -o . deep_gemm_cpp_tllm --exit-code",
-                            env=env_ld)
+                    generate_python_stubs_windows(binding_type, venv_python,
+                                                  pkg_dir, lib_dir)
+                else:  # on linux
+                    generate_python_stubs_linux(
+                        binding_type, venv_python,
+                        bool(deep_ep_cuda_architectures))
 
     if not skip_building_wheel:
         if dist_dir is None:

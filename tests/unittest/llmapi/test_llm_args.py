@@ -162,7 +162,8 @@ def test_KvCacheConfig_declaration():
                            secondary_offload_min_priority=1,
                            event_buffer_max_size=0,
                            enable_partial_reuse=True,
-                           copy_on_partial_reuse=True)
+                           copy_on_partial_reuse=True,
+                           attention_dp_events_gather_period_ms=10)
 
     pybind_config = config._to_pybind()
     assert pybind_config.enable_block_reuse == True
@@ -177,6 +178,7 @@ def test_KvCacheConfig_declaration():
     assert pybind_config.event_buffer_max_size == 0
     assert pybind_config.enable_partial_reuse == True
     assert pybind_config.copy_on_partial_reuse == True
+    assert pybind_config.attention_dp_events_gather_period_ms == 10
 
 
 def test_KvCacheConfig_default_values():
@@ -664,15 +666,15 @@ class TestStrictBaseModelArbitraryArgs:
     def test_cache_transceiver_config_arbitrary_args(self):
         """Test that CacheTransceiverConfig rejects arbitrary arguments."""
         # Valid arguments should work
-        config = CacheTransceiverConfig(backend="ucx",
+        config = CacheTransceiverConfig(backend="UCX",
                                         max_tokens_in_buffer=1024)
-        assert config.backend == "ucx"
+        assert config.backend == "UCX"
         assert config.max_tokens_in_buffer == 1024
 
         # Arbitrary arguments should be rejected
         with pytest.raises(
                 pydantic_core._pydantic_core.ValidationError) as exc_info:
-            CacheTransceiverConfig(backend="ucx", invalid_config="should_fail")
+            CacheTransceiverConfig(backend="UCX", invalid_config="should_fail")
         assert "invalid_config" in str(exc_info.value)
 
     def test_torch_compile_config_arbitrary_args(self):

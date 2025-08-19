@@ -1188,7 +1188,7 @@ class TestMoE(unittest.TestCase):
         moe_weight_wrapper.weights_block_scaling_factor_interleaved.value = (
             np.ascontiguousarray(
                 torch_to_numpy(
-                    torch.ops.trtllm.nvfp4_block_scale_interleave(
+                    torch.ops.trtllm.block_scale_interleave(
                         scale_factor.view(torch.uint8).contiguous()).view(
                             scale_factor.dtype).reshape(
                                 scale_factor.shape).view(torch.uint8))))

@@ -57,6 +57,11 @@ class TransformersTokenizer(TokenizerBase):
     def batch_encode_plus(self, texts: List[str], *args, **kwargs) -> dict:
         return self.tokenizer.batch_encode_plus(texts, *args, **kwargs)
 
+    def get_chat_template(self,
+                          chat_template: Optional[str] = None,
+                          tools: Optional[List[Dict]] = None) -> str:
+        return self.tokenizer.get_chat_template(chat_template, tools)
+
     def apply_chat_template(
             self, conversation: Union[List[Dict[str, str]],
                                       List[List[Dict[str, str]]]], *args,
@@ -330,7 +335,8 @@ def _llguidance_tokenizer_info(tokenizer):
 
 def load_hf_tokenizer(model_dir: str,
                       trust_remote_code: bool = True,
-                      use_fast: bool = True) -> Optional[TransformersTokenizer]:
+                      use_fast: bool = True,
+                      **kwargs) -> Optional[TransformersTokenizer]:
     ''' Load a tokenizer from a Hugging Face model directory.
 
     Args:
@@ -349,7 +355,11 @@ def load_hf_tokenizer(model_dir: str,
             padding_side='left',
             truncation_side='left',
             trust_remote_code=trust_remote_code,
-            use_fast=use_fast)
+            use_fast=use_fast,
+            **kwargs)
 
-    except Exception:
+    except Exception as e:
+        logger.warning(
+            f"Failed to load hf tokenizer from {model_dir}, encounter error: {e}"
+        )
         return None

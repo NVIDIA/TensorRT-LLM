@@ -137,8 +137,9 @@ void FusedMHARunnerV2::setupKernelParams(MHARunnerParams runnerParams)
     // Are the input sequences padded ?
     mKernelParams.is_s_padded = mFixedParams.isSPadded;
 
+    // [total_q, h, 2] (max/sum)
     mKernelParams.softmax_stats_ptr = runnerParams.softmaxStatsPtr;
-    mKernelParams.softmax_stats_stride_in_bytes = sizeof(float) * mFixedParams.numQHeads;
+    mKernelParams.softmax_stats_stride_in_bytes = sizeof(float) * 2 * mFixedParams.numQHeads;
 
     if (mFixedParams.attentionInputLayout == AttentionInputLayout::PACKED_QKV)
     {
@@ -238,6 +239,9 @@ void FusedMHARunnerV2::setupKernelParams(MHARunnerParams runnerParams)
         mKernelParams.packed_mask_ptr = runnerParams.packedMaskPtr;
         mKernelParams.cu_mask_rows = reinterpret_cast<int const*>(runnerParams.cuMaskRowsPtr);
     }
+    TLLM_CHECK_WITH_INFO(
+        runnerParams.attentionSinksPtr == nullptr || mSM == kSM_90, "The attention sinks is only supported on SM90.");
+    mKernelParams.attention_sinks_ptr = runnerParams.attentionSinksPtr;
     mKernelParams.cu_q_seqlens = reinterpret_cast<int const*>(runnerParams.cuQSeqLenPtr);
     mKernelParams.tile_id_counter_ptr = reinterpret_cast<uint32_t*>(runnerParams.tileCounterPtr);
     // TRT doesn't support host scales. Use device scales instead.
@@ -294,6 +298,11 @@ void FusedMHARunnerV2::setupLaunchParams(MHARunnerParams runnerParams)
         = mFixedParams.isSPadded ? runnerParams.b * runnerParams.qSeqLen : runnerParams.totalQSeqLen;
     mLaunchParams.total_kv_seqlen
         = mFixedParams.isSPadded ? runnerParams.b * runnerParams.kvSeqLen : runnerParams.totalKvSeqLen;
+    // Workaround for nvbug 5412456: total_kv_seqlen fallbacks to total_q_seqlen if it's zero.
+    if (mLaunchParams.total_kv_seqlen == 0)
+    {
+        mLaunchParams.total_kv_seqlen = mLaunchParams.total_q_seqlen;
+    }
 
     TLLM_CHECK_WITH_INFO(mFixedParams.headSize > 0, "Head size should be greater than 0.");
     // Pad head size to next power of 2.
@@ -453,9 +462,15 @@ void FusedMHARunnerV2::setupLaunchParams(MHARunnerParams runnerParams)
     }
     else
     {
+        bool isHopperBF16ContextMLA = (mFixedParams.headSize == mFixedParams.headSizeV + 64) && isSm90
+            && mFixedParams.dataType == DATA_TYPE_BF16 && mFixedParams.headSizeV == 128;
+        // TODO: add support for separate QKV input layout
         mLaunchParams.supportReturnSoftmaxStats = (runnerParams.softmaxStatsPtr != nullptr
             && mLaunchParams.flash_attention && mLaunchParams.warp_specialization
-            && mLaunchParams.attention_input_layout == AttentionInputLayout::Q_CONTIGUOUS_KV);
+            && ((!isHopperBF16ContextMLA
+                    && mLaunchParams.attention_input_layout == AttentionInputLayout::Q_CONTIGUOUS_KV)
+                || (isHopperBF16ContextMLA
+                    && (mLaunchParams.attention_input_layout == AttentionInputLayout::Q_PAGED_KV))));
     }
 }
 

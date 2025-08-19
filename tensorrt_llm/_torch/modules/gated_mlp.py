@@ -27,7 +27,8 @@ class GatedMLP(nn.Module):
                  config: Optional[ModelConfig] = None,
                  overridden_tp_size: Optional[int] = None,
                  reduce_output: bool = True,
-                 layer_idx: Optional[int] = None):
+                 layer_idx: Optional[int] = None,
+                 use_cute_dsl_blockscaling_mm: bool = False):
         super().__init__()
         self.layer_idx = layer_idx
         self.hidden_size = hidden_size
@@ -64,7 +65,8 @@ class GatedMLP(nn.Module):
             reduce_output=False,
             skip_create_weights_in_init=config.skip_create_weights_in_init,
             allreduce_strategy=config.allreduce_strategy,
-            force_dynamic_quantization=config.force_dynamic_quantization)
+            force_dynamic_quantization=config.force_dynamic_quantization,
+            use_cute_dsl_blockscaling_mm=use_cute_dsl_blockscaling_mm)
 
         self.down_lora = LoraLayer([LoraModuleType.MLP_4H_TO_H],
                                    [self.hidden_size])
@@ -81,7 +83,8 @@ class GatedMLP(nn.Module):
             skip_create_weights_in_init=config.skip_create_weights_in_init,
             lora=self.down_lora,
             allreduce_strategy=config.allreduce_strategy,
-            force_dynamic_quantization=config.force_dynamic_quantization)
+            force_dynamic_quantization=config.force_dynamic_quantization,
+            use_cute_dsl_blockscaling_mm=use_cute_dsl_blockscaling_mm)
 
         # These two modules are mutually exclusive - either splitted_gate_up_lora or fused_gate_up_lora will be used,
         # but never both at the same time. splitted_gate_up_lora handles gate and up separately while fused_gate_up_lora

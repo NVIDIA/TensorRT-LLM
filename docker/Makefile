@@ -1,6 +1,8 @@
 # Default base image for the docker build as defined in Dockerfile.multi
 BASE_IMAGE         ?= $(shell grep '^ARG BASE_IMAGE=' Dockerfile.multi | grep -o '=.*' | tr -d '="')
 BASE_TAG           ?= $(shell grep '^ARG BASE_TAG=' Dockerfile.multi | grep -o '=.*' | tr -d '="')
+TRITON_IMAGE       ?= $(shell grep '^ARG TRITON_IMAGE=' Dockerfile.multi | grep -o '=.*' | tr -d '="')
+TRITON_BASE_TAG    ?= $(shell grep '^ARG TRITON_BASE_TAG=' Dockerfile.multi | grep -o '=.*' | tr -d '="')
 # Name of the new image
 IMAGE_NAME         ?= tensorrt_llm
 IMAGE_TAG          ?= latest
@@ -80,6 +82,8 @@ endef
 		--progress $(DOCKER_PROGRESS) \
 		$(if $(BASE_IMAGE), --build-arg BASE_IMAGE=$(BASE_IMAGE)) \
 		$(if $(BASE_TAG), --build-arg BASE_TAG=$(BASE_TAG)) \
+		$(if $(TRITON_IMAGE), --build-arg TRITON_IMAGE=$(TRITON_IMAGE)) \
+		$(if $(TRITON_BASE_TAG), --build-arg TRITON_BASE_TAG=$(TRITON_BASE_TAG)) \
 		$(if $(BUILD_WHEEL_ARGS), --build-arg BUILD_WHEEL_ARGS="$(BUILD_WHEEL_ARGS)") \
 		$(if $(BUILD_WHEEL_SCRIPT), --build-arg BUILD_WHEEL_SCRIPT="$(BUILD_WHEEL_SCRIPT)") \
 		$(if $(TORCH_INSTALL_TYPE), --build-arg TORCH_INSTALL_TYPE="$(TORCH_INSTALL_TYPE)") \

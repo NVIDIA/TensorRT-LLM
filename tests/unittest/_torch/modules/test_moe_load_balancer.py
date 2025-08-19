@@ -222,22 +222,18 @@ class TestMoeLoadBalancer(unittest.TestCase):
 
             # wait_for_gpu_stage
             mock_wait.return_value = torch.tensor([1])
-            layer.wait_for_gpu_stage()
+            layer.start_wait_gpu_stage()
+            layer.done_wait_gpu_stage()
             result = layer.statistic_flag_tensor
             mock_wait.assert_called_once_with(
                 mock_single_layer_impl.get_pointer())
             self.assertEqual(result, mock_wait.return_value)
 
-            # set_cpu_stage
-            layer.set_cpu_stage()
-            mock_set_cpu.assert_called_once_with(
-                mock_single_layer_impl.get_pointer())
-
             # statistic
             mock_expert_ids = torch.tensor([[0, 1], [2, 3]])
             mock_enabled = torch.tensor([1])
             layer.statistic_flag_tensor = mock_enabled
-            layer.statistic(mock_expert_ids, True, False)
+            layer.update_statistic_with_global_ids(mock_expert_ids, True, False)
             mock_statistic.assert_called_once_with(
                 mock_expert_ids, mock_enabled,
                 mock_single_layer_impl.get_pointer(), True, False)
@@ -247,6 +243,12 @@ class TestMoeLoadBalancer(unittest.TestCase):
             mock_route.return_value = torch.tensor([[0, 1], [2, 3]])
             result = layer.route(mock_selected_experts)
             assert torch.equal(result, mock_route.return_value)
+
+            # set_cpu_stage
+            layer.start_set_cpu_stage()
+            layer.done_set_cpu_stage()
+            mock_set_cpu.assert_called_once_with(
+                mock_single_layer_impl.get_pointer())
 
     @patch('tensorrt_llm.bindings.internal.runtime.MoeLoadBalancer')
     def test_moe_load_balancer_lifecycle_methods(self, mock_load_balancer_impl):
@@ -267,7 +269,7 @@ class TestMoeLoadBalancer(unittest.TestCase):
         mock_load_balancer_impl.return_value.set_warm_up_iter_count.assert_called_once_with(
             10)
 
-        balancer.set_next_iter_info(True, True)
+        balancer.set_iter_info(True, True)
 
         with MoeLoadBalancerIterContext(balancer):
             mock_load_balancer_impl.return_value.start_iter.assert_called_once_with(
@@ -306,7 +308,7 @@ class TestMoeLoadBalancer(unittest.TestCase):
         balancer.finalize_model()
 
         # enable statistic, disable weight update
-        balancer.set_next_iter_info(True, False)
+        balancer.set_iter_info(True, False)
 
         # Create sample token data - each token selects 2 experts
         # 4 tokens, each selecting 2 experts
@@ -323,13 +325,16 @@ class TestMoeLoadBalancer(unittest.TestCase):
         try:
             with MoeLoadBalancerIterContext(balancer):
                 # Wait for GPU stage and get enabled flag
-                layer.wait_for_gpu_stage()
+                layer.start_wait_gpu_stage()
+                layer.done_wait_gpu_stage()
 
                 # Run statistic - just test it runs without error
-                layer.statistic(gathered_raw_expert_ids, True, True)
+                layer.update_statistic_with_global_ids(gathered_raw_expert_ids,
+                                                       True, True)
 
                 # Set CPU stage to signal completion
-                layer.set_cpu_stage()
+                layer.start_set_cpu_stage()
+                layer.done_set_cpu_stage()
 
             # Test passed if we got here without exceptions
             self.assertTrue(True, "Statistic kernel ran successfully")
@@ -368,7 +373,7 @@ class TestMoeLoadBalancer(unittest.TestCase):
         balancer.finalize_model()
 
         # enable statistic, disable weight update
-        balancer.set_next_iter_info(True, False)
+        balancer.set_iter_info(True, False)
 
         # Create sample token data - tokens selecting different experts
         token_selected_experts = torch.tensor(
@@ -384,13 +389,15 @@ class TestMoeLoadBalancer(unittest.TestCase):
         try:
             with MoeLoadBalancerIterContext(balancer):
                 # Wait for GPU stage
-                layer.wait_for_gpu_stage()
+                layer.start_wait_gpu_stage()
+                layer.done_wait_gpu_stage()
 
                 # Run routing
                 routed_slots = layer.route(token_selected_experts)
 
                 # Set CPU stage
-                layer.set_cpu_stage()
+                layer.start_set_cpu_stage()
+                layer.done_set_cpu_stage()
 
             # Verify results - with our initial assignment, expert i should map to slot i
             expected_slots = torch.tensor(

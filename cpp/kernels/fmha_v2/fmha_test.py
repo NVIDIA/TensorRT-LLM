@@ -55,7 +55,7 @@ def getSMVersion():
                          ids=["fp16", "bf16", "fp16-fp32", "e4m3"])
 @pytest.mark.parametrize('flag', [
     "-s-q 128 -paged-kv", "-s-q 63 -paged-kv", "-paged-kv",
-    "-softcapping-scale-bmm1 30", "-contiguous-q-kv"
+    "-softcapping-scale-bmm1 30", "-contiguous-q-kv", "-use-attention-sinks"
 ])
 @pytest.mark.parametrize('tiled_kernel', ["", "-force-non-tiled"])
 def test_trtllm_flash_attention_fmha(d, s, dtype, flag, tiled_kernel):
@@ -122,8 +122,8 @@ def test_trtllm_flash_attention_fmha(d, s, dtype, flag, tiled_kernel):
             f"bin/fmha.exe -d {d} -h 16 -b 8 -s {s} -min-s 128 -custom-mask -gqa 2 -v {verbose} {dtype} {epsilon} {flag} {tiled_kernel}",
             shell=True,
             check=True)
-    # alibi and softcapping-scale-bmm1 are mutually exclusive.
-    if '-softcapping-scale-bmm1' not in flag:
+    # alibi doesn't work with softcapping-scale-bmm1/use-attention-sinks.
+    if '-softcapping-scale-bmm1' not in flag and '-use-attention-sinks' not in flag:
         subprocess.run(
             f"bin/fmha.exe -d {d} -h 16 -b 8 -s {s} -min-s 128 -causal-mask -alibi -v {verbose} {dtype} {epsilon} {flag} {tiled_kernel}",
             shell=True,
@@ -182,6 +182,23 @@ def test_trtllm_context_mla_attention_fmha(dtype, s, input_layout):
             -causal-mask {epsilon} {input_layout}",
             shell=True,
             check=True)
+
+        # For chunked prefill, we need to enable -save-softmax (dtype: bf16, sm90, layout: paged-kv or separate-q-k-v).
+        if dtype == "-bf16" and input_layout in [
+                "-paged-kv", "-separate-q-k-v"
+        ]:
+            # padding mask
+            subprocess.run(
+                f"bin/fmha.exe -v 0 -runs 1 -min-s 1024 -s {s} -b 8 -h 8 -d 192 -dv 128 {dtype} \
+                {epsilon} {input_layout} -save-softmax",
+                shell=True,
+                check=True)
+            # causal mask
+            subprocess.run(
+                f"bin/fmha.exe -v 0 -runs 1 -min-s 1024 -s {s} -b 8 -h 8 -d 192 -dv 128 {dtype} \
+                -causal-mask {epsilon} {input_layout} -save-softmax",
+                shell=True,
+                check=True)
 
 
 @pytest.mark.parametrize('dtype', ["-bf16", "-e4m3", "-e4m3 -bf16-output"],

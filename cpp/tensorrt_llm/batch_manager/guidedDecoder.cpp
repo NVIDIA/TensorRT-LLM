@@ -88,8 +88,7 @@ void GuidedDecoder::build(ScheduledRequests const& scheduledRequests)
                     continue;
                 }
                 auto const seqSlot = llmReq->mSeqSlot.value();
-                if (llmReq->isContextInitState()
-                    && llmReq->getContextCurrentPosition() == llmReq->getPrepopulatedPromptLen())
+                if (llmReq->isContextInitState() && llmReq->isFirstContextChunk())
                 {
                     // The request is in the first context forward step (considering kv cache reuse).
                     auto const& guideType = guidedDecodingParams->getGuideType();

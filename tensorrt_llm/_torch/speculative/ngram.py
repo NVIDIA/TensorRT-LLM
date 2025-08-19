@@ -1,11 +1,12 @@
 from itertools import chain
+from typing import Optional
 
 from ordered_set import OrderedSet
 
 from tensorrt_llm.llmapi import NGramDecodingConfig
 from tensorrt_llm.logger import logger
 
-from ..pyexecutor.llm_request import *
+from ..pyexecutor.llm_request import LlmRequest, LlmRequestState
 from ..pyexecutor.resource_manager import BaseResourceManager, ResourceManager
 from ..pyexecutor.scheduler import ScheduledRequests
 from .drafter import Drafter
@@ -86,13 +87,13 @@ class NGramPoolManager(BaseResourceManager):
         self,
         prefix: list[int],
         request_id: int,
-        end_id: int,
+        padding_id: int,
         max_sequence_length: int,
     ):
         prefix_len = len(prefix)
         max_draft_token_length_this_step = max_sequence_length - 1 - prefix_len
         if max_draft_token_length_this_step <= 0:  # No draft token is need if the prefix is long enough
-            return [end_id]
+            return [padding_id]
         if request_id not in self.start_index:  # Extend start_index and pool for a new request
             self.start_index[request_id] = 0
             if not self.is_public_pool:
@@ -125,7 +126,7 @@ class NGramPoolManager(BaseResourceManager):
                     pool[pattern].add(new_match)
 
         # Find match
-        draft_tokens = [end_id]  # fallback value
+        draft_tokens = [padding_id]  # fallback value
         for size in range(min(self.max_matching_ngram_size, prefix_len - 1), 0,
                           -1):
             pattern = tuple(prefix[-size:])
@@ -167,6 +168,7 @@ class NGramDrafter(Drafter):
         spec_config: NGramDecodingConfig,
         ngram_pool_manager: NGramPoolManager = None,
     ):
+        super().__init__(spec_config.max_concurrency)
         assert ngram_pool_manager is not None, "NGram needs a resource manager to maintain the pool."
         self.spec_config = spec_config
         self.max_draft_len = spec_config.max_draft_len
@@ -177,10 +179,6 @@ class NGramDrafter(Drafter):
         scheduled_requests: ScheduledRequests,
         resource_manager: Optional[ResourceManager] = None,
     ) -> None:
-        # Disable NGram speculative decoding auto heuristic for batch size > 32.
-        if self.spec_config.is_auto_heuristic and len(
-                scheduled_requests.all_requests()) > 32:
-            return
         # Sort by request_id when py_batch_idx is None as a fallback.
         # This happens in the disagg case: for a set of new requests, we draft
         # before forward_step, so py_batch_idx is not assigned.
@@ -190,17 +188,18 @@ class NGramDrafter(Drafter):
             (r.py_batch_idx is None, r.py_batch_idx or r.request_id),
         ):
             # Add new token to a copy of the generated tokens to find new draft tokens
-            prefix = list(request.get_tokens()[0])  # Get a copy
+            prefix = list(request.get_tokens(0))  # Get a copy
 
             # Generate draft tokens
             draft_tokens = self.spec_resource_manager.get_draft_tokens(
                 prefix,
                 request.request_id,
-                request.py_end_id,
-                request.py_orig_prompt_len + request.py_max_new_tokens,
+                padding_id=0,
+                max_sequence_length=request.py_orig_prompt_len +
+                request.py_max_new_tokens,
             )
             # Pad length to `self.max_draft_len`
             if len(draft_tokens) > 0:
                 pad_length = self.max_draft_len - len(draft_tokens)
-                draft_tokens.extend([request.py_end_id] * pad_length)
+                draft_tokens.extend([0] * pad_length)
             request.py_draft_tokens = draft_tokens
