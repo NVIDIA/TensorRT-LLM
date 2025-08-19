@@ -52,15 +52,14 @@ void initExceptionsBindings(py::module_& m)
             catch (const tc::RequestSpecificException& e)
             {
                 // Create a Python exception with the request ID and error code information
-                py::object py_exc = py::cast(e);
-                py::object request_id = py::cast(e.getRequestId());
-                py::object error_code = py::cast(static_cast<uint32_t>(e.getErrorCode()));
+                py::object msg = py::str(e.what());
+                py::object inst = py::reinterpret_steal<py::object>(
+                    PyObject_CallFunctionObjArgs(request_specific_exc, msg.ptr(), nullptr));
 
-                // Set additional attributes on the exception
-                py_exc.attr("request_id") = request_id;
-                py_exc.attr("error_code") = error_code;
+                inst.attr("request_id") = py::cast(e.getRequestId());
+                inst.attr("error_code") = py::cast(e.getErrorCode());
 
-                PyErr_SetObject(request_specific_exc, py_exc.ptr());
+                PyErr_SetObject(request_specific_exc, inst.ptr());
             }
         });
 }
