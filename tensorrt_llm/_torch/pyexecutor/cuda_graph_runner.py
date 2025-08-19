@@ -80,10 +80,28 @@ class CUDAGraphRunner:
         return engine
 
     def maybe_get_cuda_graph(self, batch: ScheduledRequests):
-        if not self._can_run_graph(batch):
+        engine = self._get_engine()
+
+        # disable when doing statistic
+        if ExpertStatistic.set_iter(self.iter_counter):
             return False, None, None
 
-        batch_size = len(batch.generation_requests)
+        can_run_cuda_graph = batch.can_run_cuda_graph
+        batch_size = batch.batch_size
+        if self.enabled and engine.enable_attention_dp and engine.mapping.tp_size > 1:
+            all_can_graph_batch = engine.dist.tp_allgather(
+                [can_run_cuda_graph, batch_size])
+            is_all_gen_only = all(all_can_graph[0]
+                                  for all_can_graph in all_can_graph_batch)
+            all_batch_size_equal = all(
+                all_gen_only[1] == all_can_graph_batch[0][1]
+                for all_gen_only in all_can_graph_batch)
+
+            if not is_all_gen_only or not all_batch_size_equal:
+                return False, None, None
+
+        if not self.enabled or not can_run_cuda_graph:
+            return False, None, None
 
         key = (batch_size, self.draft_len)
         if key in self.graphs:
@@ -195,29 +213,61 @@ class CUDAGraphRunner:
 
         return output_ref
 
-    def _can_run_graph(self, batch: ScheduledRequests) -> bool:
-        """Checks if the current batch is eligible for CUDA graph execution."""
+    def _get_padded_batch(self, batch: ScheduledRequests,
+                          resource_manager: ResourceManager) -> int:
         engine = self._get_engine()
-        if not self.enabled or not batch.can_run_cuda_graph:
-            return False
+        kv_cache_manager = resource_manager.get_resource_manager(
+            engine.kv_cache_manager_key)
+        can_run_cuda_graph = batch.can_run_cuda_graph
+        batch_size = batch.batch_size
+        new_batch_size = batch_size
 
-        if hasattr(engine, 'iter_counter') and ExpertStatistic.set_iter(
-                engine.iter_counter):
-            return False
+        if self.enabled and engine.enable_attention_dp and engine.mapping.tp_size > 1:
+            graph_batch_size = engine.dist.tp_allgather(
+                [can_run_cuda_graph, batch_size])
+            all_can_graph = all(graph_batch[0]
+                                for graph_batch in graph_batch_size)
+            if all_can_graph:
+                new_batch_size = max(gen_only_batch[1]
+                                     for gen_only_batch in graph_batch_size)
 
-        if engine.enable_attention_dp and engine.mapping.tp_size > 1:
-            batch_size = len(batch.generation_requests)
-            all_rank_info = engine.dist.tp_allgather(
-                [batch.can_run_cuda_graph, batch_size])
+        if (not self.enabled or not self.padding_enabled
+                or not can_run_cuda_graph
+                or new_batch_size > self.max_supported_batch_size):
+            return 0
 
-            is_all_gen_only = all(info[0] for info in all_rank_info)
-            is_all_bs_equal = all(info[1] == all_rank_info[0][1]
-                                  for info in all_rank_info)
+        padded_batch_size = self._round_up_batch_size(new_batch_size)
+        if batch_size == padded_batch_size:
+            return 0
 
-            if not is_all_gen_only or not is_all_bs_equal:
-                return False
+        padding_size = padded_batch_size - batch_size
+        if padding_size + batch.batch_size > engine.batch_size:
+            return 0
 
-        return True
+        # No padding if it would create too many concurrent requests.
+        # This is not strictly required, but we should probably
+        # respect the requirement just in case that changes in the future.
+        if self.padding_dummy_request is None:
+            available_blocks = kv_cache_manager.get_num_free_blocks()
+            # No padding if not enough KV cache space
+            if available_blocks < 1:
+                return 0
+
+            self.padding_dummy_request = kv_cache_manager.add_dummy_requests(
+                [CUDA_GRAPH_DUMMY_REQUEST_ID],
+                is_gen=True,
+                max_num_draft_tokens=engine.max_draft_len,
+                use_mrope=engine.use_mrope,
+                max_beam_width=engine.max_beam_width)[0]
+            self.padding_dummy_request.is_cuda_graph_dummy = True
+            spec_res_mgr = resource_manager.get_resource_manager(
+                ResourceManagerType.SPEC_RESOURCE_MANAGER)
+            if spec_res_mgr:
+                spec_res_mgr.add_dummy_requests([CUDA_GRAPH_DUMMY_REQUEST_ID])
+
+        batch.generation_requests.extend([self.padding_dummy_request] *
+                                         padding_size)
+        return padding_size
 
     def _round_up_batch_size(self, batch_size: int) -> int:
         """Finds the smallest supported graph batch size >= the given size."""
@@ -232,50 +282,9 @@ class CUDAGraphRunner:
     def pad_batch(self, scheduled_requests: ScheduledRequests,
                   resource_manager: ResourceManager):
         """Context manager to pad a batch to a graph-compatible size."""
-        engine = self._get_engine()
-        kv_cache_manager = resource_manager.get_resource_manager(
-            engine.kv_cache_manager_key)
-        padding_size = 0
-        if self.padding_enabled and self._can_run_graph(scheduled_requests):
-            current_batch_size = len(scheduled_requests.generation_requests)
 
-            if current_batch_size >= self.max_supported_batch_size:
-                # Already at or beyond max size, no padding up
-                padded_batch_size = current_batch_size
-            else:
-                padded_batch_size = self._round_up_batch_size(
-                    current_batch_size)
-
-            if padded_batch_size > 0 and padded_batch_size != current_batch_size:
-                padding_size = padded_batch_size - current_batch_size
-
-                if current_batch_size + padding_size > engine.batch_size:
-                    padding_size = 0
-
-                if padding_size > 0:
-                    if self.padding_dummy_request is None:
-                        if kv_cache_manager.get_num_free_blocks() > 0:
-                            self.padding_dummy_request = kv_cache_manager.add_dummy_requests(
-                                [CUDA_GRAPH_DUMMY_REQUEST_ID],
-                                is_gen=True,
-                                max_num_draft_tokens=engine.max_draft_len,
-                                use_mrope=engine.use_mrope,
-                                max_beam_width=engine.max_beam_width)[0]
-                            self.padding_dummy_request.is_cuda_graph_dummy = True
-                            spec_res_mgr = resource_manager.get_resource_manager(
-                                ResourceManagerType.SPEC_RESOURCE_MANAGER)
-                            if spec_res_mgr:
-                                spec_res_mgr.add_dummy_requests(
-                                    [CUDA_GRAPH_DUMMY_REQUEST_ID])
-                        else:
-                            padding_size = 0
-
-                    if self.padding_dummy_request:
-                        scheduled_requests.generation_requests.extend(
-                            [self.padding_dummy_request] * padding_size)
-                    else:
-                        padding_size = 0
-
+        padding_size = self._get_padded_batch(scheduled_requests,
+                                              resource_manager)
         try:
             yield scheduled_requests
         finally:
