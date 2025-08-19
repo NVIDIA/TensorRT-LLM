@@ -1,0 +1,13 @@
+# latency scenarios uses TRTLLM backend and TEP
+extra_configs:
+  cuda_graph_config:
+      enable_padding: true
+      max_batch_size: 1024
+  enable_attention_dp: false
+  print_iter_log: true
+  kv_cache_config:
+      dtype: fp8
+      free_gpu_memory_fraction: 0.8
+  stream_interval: 10
+  moe_config:
+      backend: TRTLLM
