@@ -94,6 +94,9 @@ class AutoModelForCausalLMFactory(ModelFactory):
             assert isinstance(dtype, torch.dtype), f"Invalid dtype: {dtype}"
             self.model_kwargs["torch_dtype"] = dtype
 
+        # set sharding config source to huggingface
+        self._sharding_config["source"] = ShardingConfigSource.HUGGINGFACE
+
     @property
     def autoconfig_from_pretrained(self):
         return AutoConfig.from_pretrained
@@ -199,14 +202,6 @@ class AutoModelForCausalLMFactory(ModelFactory):
         )
 
         return CacheConfig(dtype=torch_dtype)
-
-    def get_sharding_config_source(self) -> ShardingConfigSource:
-        """Return the source of the model factory.
-
-        Returns:
-            The source identifier for this model factory.
-        """
-        return ShardingConfigSource.HUGGINGFACE
 
     def init_tokenizer(self) -> Optional[Any]:
         """Initialize the tokenizer—either a custom name or the model's default."""

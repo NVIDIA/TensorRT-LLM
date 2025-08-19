@@ -510,7 +510,6 @@ class ShardingConfig(BaseModel):
             use_sharding_from_factory=use_sharding_from_factory,
         )
 
-        # Pydantic does not support setting private fields directly.
         self.predefined_config = sharding_config
         # Validate the config after initialization
         if self.predefined_config is not None:
@@ -519,7 +518,7 @@ class ShardingConfig(BaseModel):
     def validate_config(self) -> bool:
         if self.factory_source != ShardingConfigSource.HUGGINGFACE:
             ad_logger.warning(
-                "Sharding config is is currently only " + "supported for HuggingFace. Skipping."
+                "Sharding config is currently only supported for HuggingFace. Skipping."
             )
             # invalidate the config
             self.predefined_config = {}

@@ -47,6 +47,7 @@ class ModelFactory(ABC):
         self._prefetched_model_path: Optional[str] = None
         self._prefetched_tokenizer_path: Optional[str] = None
         self._sharding_config: Dict[str, Any] = {}
+        self._sharding_config["source"] = ShardingConfigSource.UNKNOWN
 
     @property
     def model(self) -> Optional[str]:
@@ -116,14 +117,6 @@ class ModelFactory(ABC):
             The cache configuration for the model.
         """
         return CacheConfig()
-
-    def get_sharding_config_source(self) -> ShardingConfigSource:
-        """Return the source of the model factory.
-
-        Returns:
-            The source identifier for this model factory.
-        """
-        return ShardingConfigSource.UNKNOWN
 
     def init_tokenizer(self) -> Optional[Any]:
         """Initialize the tokenizer for the model.

@@ -171,11 +171,13 @@ class Sharding(BaseTransform):
         assert isinstance(gm, GraphModule), "Expecting GraphModule"
         shared_config.sharding_config.rank = local_rank
         shared_config.sharding_config.world_size = world_size
-        shared_config.sharding_config.factory_source = (
-            factory.get_sharding_config_source() if factory else ShardingConfigSource.UNKNOWN
-        )
         shared_config.sharding_config.predefined_config = (
             factory.get_sharding_config() if factory else {}
+        )
+        shared_config.sharding_config.factory_source = (
+            shared_config.sharding_config.predefined_config["source"]
+            if factory
+            else ShardingConfigSource.UNKNOWN
         )
         shared_config.sharding_config.simple_shard_only = self.config.simple_shard_only
         shared_config.sharding_config.use_sharding_from_factory = (
@@ -183,6 +185,7 @@ class Sharding(BaseTransform):
         )
 
         sharding_config = shared_config.sharding_config
+        sharding_config.validate_config()
 
         if (
             shared_config.sharding_config.use_sharding_from_factory
