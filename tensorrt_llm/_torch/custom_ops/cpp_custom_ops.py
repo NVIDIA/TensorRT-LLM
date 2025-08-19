@@ -235,6 +235,16 @@ def _register_fake():
           token_selected_experts: torch.Tensor, offset_by_ep_rank: bool):
         return torch.empty_like(token_selected_experts)
 
+    @torch.library.register_fake("trtllm::memset_expert_ids")
+    def _(experts_ids: torch.Tensor, recv_rank_count_cumsum: torch.Tensor,
+          max_token_count_per_rank: int, top_k: int, slot_count: int,
+          ep_size: int):
+        pass
+
+    @torch.library.register_fake("trtllm::moe_initialize_workspace")
+    def _(all_workspaces: torch.Tensor, ep_rank: int, ep_size: int):
+        pass
+
     @torch.library.custom_op("trtllm::group_rms_norm_base",
                              mutates_args=("outputs", ))
     def group_rms_norm_base(

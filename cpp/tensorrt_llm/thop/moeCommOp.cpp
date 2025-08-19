@@ -68,6 +68,8 @@ void moeCommOp(c10::List<torch::Tensor> inputs, torch::Tensor sendRankCumSum, to
     recvIndices.rankLocalIndices = recvIndiceTensor.data_ptr<int>();
 
     int fieldCount = inputs.size();
+    TORCH_CHECK(fieldCount <= tensorrt_llm::kernels::MOE_COMM_FIELD_MAX_COUNT, "Number of fields (", fieldCount,
+        ") exceeds maximum allowed (", tensorrt_llm::kernels::MOE_COMM_FIELD_MAX_COUNT, ")");
     tensorrt_llm::kernels::FusedMoeFieldInfo sendFieldInfo, recvFieldInfo;
     sendFieldInfo.isBasicInterleaved = false;
     recvFieldInfo.isBasicInterleaved = false;
@@ -242,7 +244,7 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
-    m.def("moe_initialize_workspace(Tensor all_workspaces, int ep_rank, int ep_size) -> ()");
+    m.def("moe_initialize_workspace(Tensor(a!) all_workspaces, int ep_rank, int ep_size) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
@@ -286,7 +288,8 @@ TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
-        "memset_expert_ids(Tensor experts_ids, Tensor recv_rank_count_cumsum, int max_token_count_per_rank, int top_k, "
+        "memset_expert_ids(Tensor(a!) experts_ids, Tensor recv_rank_count_cumsum, int max_token_count_per_rank, int "
+        "top_k, "
         "int slot_count, int ep_size) -> ()");
 }
 

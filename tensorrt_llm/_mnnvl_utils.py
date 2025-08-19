@@ -526,12 +526,12 @@ class MnnvlMoe:
 
     @staticmethod
     def mnnvl_moe_alltoallv(
-        x: Union[torch.Tensor, List[torch.Tensor]],
+        x: Union[torch.Tensor, List[Optional[torch.Tensor]]],
         alltoall_info: MoEAlltoallInfo,
         workspace: torch.Tensor,
         ep_rank: int,
         ep_size: int,
-    ) -> Union[torch.Tensor, List[torch.Tensor]]:
+    ) -> Union[torch.Tensor, List[Optional[torch.Tensor]]]:
         # Convert single tensor to list for unified handling
         is_single_tensor = not isinstance(x, list)
         if is_single_tensor:
@@ -594,7 +594,7 @@ class MnnvlMoe:
 
         # If input was a single tensor, return a single tensor
         if is_single_tensor:
-            result = [result[0]]
+            result = result[0]
 
         return result
 
