@@ -11,6 +11,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, Dict, List, NamedTuple, Optional, Tuple, TypeVar
 
 import zmq
+from mpi4py.futures import MPIPoolExecutor
 
 from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
 from tensorrt_llm.logger import logger
@@ -20,7 +21,7 @@ from .utils import print_colored, print_colored_debug
 
 if ENABLE_MULTI_DEVICE:
     import mpi4py
-    from mpi4py.futures import MPICommExecutor, MPIPoolExecutor
+    from mpi4py.futures import MPICommExecutor
 
     from tensorrt_llm._utils import global_mpi_size, mpi_world_size
 
