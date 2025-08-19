@@ -2079,7 +2079,7 @@ class PyTorchModelEngine(ModelEngine):
                     outputs = self.cuda_graph_runner.replay(batch_size, inputs)
                 else:
                     with MoeLoadBalancerIterContext(moe_load_balancer):
-                        outputs = self.cuda_graph_runner.run_graph(
+                        outputs = self.cuda_graph_runner.replay(
                             batch_size, inputs)
 
             self._execute_logit_post_processors(scheduled_requests, outputs)
