@@ -21,12 +21,25 @@ def download_wheel(args):
         print(f"Fail to get the result of {args.wheel_path}")
         exit(1)
     wheel_name = None
+    nightly_pkg = False
+
+    if os.environ.get("TRTLLM_INSTALL_NIGHTLY_PKG") == "1":
+        nightly_pkg = True
+        print("##########  Download tensorrt_llm nightly package  ##########")
+
     for line in res.text.split("\n"):
         if not line.startswith('<a href="'):
             continue
         name = line.split('"')[1]
         if not name.endswith(".whl"):
             continue
+        # Find nightly package, e.g. tensorrt_llm-0.20.0rc2+nightly20250507.gb6cfe08-cp312-cp312-linux_x86_64.whl
+        if "nightly" in name:
+            if not nightly_pkg:
+                continue
+        else:
+            if nightly_pkg:
+                continue
         if get_cpython_version() not in name:
             continue
         wheel_name = name
