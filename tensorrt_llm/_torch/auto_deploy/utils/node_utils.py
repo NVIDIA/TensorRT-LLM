@@ -263,6 +263,8 @@ def is_linear_op(node: Node, include_quantization: bool = False) -> bool:
 
     if include_quantization:
         lin_ops.update(QUANT_LINEAR_OPS)
+        lin_ops.update([torch.ops.auto_deploy.torch_quant_linear_fp8])
+        lin_ops.update([torch.ops.auto_deploy.torch_quant_linear_fp4])
     return is_op(node, lin_ops)
 
 
