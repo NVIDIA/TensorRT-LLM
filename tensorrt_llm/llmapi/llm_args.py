@@ -2101,8 +2101,7 @@ class TorchLlmArgs(BaseLlmArgs):
     batch_wait_timeout_ms: float = Field(
         default=0,
         description=
-        "If greater than 0, returns immediately when fetched requests exceed max_batch_size; "
-        "otherwise, waits up to batch_wait_timeout_ms to gather more. If 0, no waiting occurs.",
+        "If greater than 0, the request queue might wait up to batch_wait_timeout_ms to receive max_batch_size requests, if fewer than max_batch_size requests are currently available. If 0, no waiting occurs.",
         status="prototype")
 
     torch_compile_config: Optional[TorchCompileConfig] = Field(
