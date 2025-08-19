@@ -24,3 +24,4 @@ jobs:
         uses: ./.github/actions/goggles_action/actions/pr_checklist
         with:
           PR_BODY: ${{ github.event.pull_request.body }}
+          ENFORCE_PR_HAS_CHECKLIST: true
