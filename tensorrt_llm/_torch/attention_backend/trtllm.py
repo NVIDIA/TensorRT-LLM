@@ -669,14 +669,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     numel_buffer = buffer.numel()
 
                     # Condition for 1D tensors: buffer just needs to be large enough.
-                    if like_tensor.dim() == 1:
-                        if numel_buffer >= numel_like:
-                            return buffer  # Found a fit, return immediately.
-                    # Condition for N-D tensors: buffer size must be an exact multiple.
-                    else:
-                        # Ensure numel_like is not zero to prevent ZeroDivisionError.
-                        if numel_like > 0 and numel_buffer % numel_like == 0:
-                            return buffer  # Found a fit, return immediately.
+                    if numel_buffer >= numel_like:
+                        return buffer  # Found a fit, return immediately.
 
             # If we get here, no suitable buffer was found in the cache. Create a new one.
             return torch.empty_like(like_tensor, device='cuda')
@@ -843,9 +837,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 self.host_kv_cache_block_offsets,
                 self.request_ids[self.num_contexts:], self.beam_width,
                 self.num_contexts)
-            host_kv_shape = self.host_kv_cache_block_offsets.shape
-            self.kv_cache_block_offsets = self.kv_cache_block_offsets.view(
-                host_kv_shape[0], -1, host_kv_shape[2], host_kv_shape[3])
             self.kv_cache_block_offsets[:, :self.num_seqs].copy_(
                 self.host_kv_cache_block_offsets[:, :self.num_seqs],
                 non_blocking=True)
