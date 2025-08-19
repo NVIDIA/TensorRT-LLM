@@ -97,6 +97,12 @@ fi
 mkdir -p ${full_logdir}
 echo "Log will be saved to: ${full_logdir}"
 
+# check benchmark_mode
+if [ "${benchmark_mode}" != "gen_only" ] && [ "${benchmark_mode}" != "e2e" ]; then
+    echo "benchmark_mode: ${benchmark_mode} is not supported, change to default value: e2e"
+    benchmark_mode="e2e"
+fi
+
 if [ -z "${TRT_LLM_GIT_COMMIT}" ]; then
     export TRT_LLM_GIT_COMMIT=$(git -C ${trtllm_repo} rev-parse --short HEAD 2>/dev/null || echo "unknown")
     echo "TRT_LLM_GIT_COMMIT: ${TRT_LLM_GIT_COMMIT}"
