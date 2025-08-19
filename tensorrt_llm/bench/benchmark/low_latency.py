@@ -24,9 +24,7 @@ from tensorrt_llm.models.modeling_utils import SpeculativeDecodingMode
 # isort: off
 from tensorrt_llm.bench.benchmark.utils.general import (
     get_settings_from_engine, get_settings,
-    update_sampler_args_with_extra_options,
-    ALL_SUPPORTED_BACKENDS
-)
+    update_sampler_args_with_extra_options, ALL_SUPPORTED_BACKENDS)
 # isort: on
 from tensorrt_llm.bench.utils.data import (create_dataset_from_stream,
                                            initialize_tokenizer,
