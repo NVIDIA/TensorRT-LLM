@@ -181,17 +181,25 @@ def _register_fake():
 
     @torch.library.register_fake("trtllm::moe_comm")
     def _(
-        input: torch.Tensor,
+        inputs: List[torch.Tensor],
         send_rank_cum_sum: torch.Tensor,
         send_indices: torch.Tensor,
-        output: torch.Tensor,
         recv_rank_cum_sum: torch.Tensor,
         recv_indices: torch.Tensor,
         all_workspaces: torch.Tensor,
+        output_allocation_count: int,
         ep_rank: int,
         ep_size: int,
+        need_zero_output: Optional[List[bool]],
     ):
-        pass
+        outputs = []
+        for input_tensor in inputs:
+            output_tensor = torch.empty(
+                (output_allocation_count, input_tensor.shape[1]),
+                dtype=input_tensor.dtype,
+                device=input_tensor.device)
+            outputs.append(output_tensor)
+        return outputs
 
     @torch.library.register_fake("trtllm::get_moe_commworkspace_size_per_rank")
     def _(ep_size: int):

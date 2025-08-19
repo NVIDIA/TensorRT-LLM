@@ -35,9 +35,10 @@ void setMoeCommFieldInfo(tensorrt_llm::kernels::MoeCommFieldInfo& fieldInfo, tor
     fieldInfo.fillFieldInfo(static_cast<uint8_t*>(tensor.data_ptr()), eltSize, tensor.size(1), tensor.stride(0));
 }
 
-void moeCommOp(c10::List<torch::Tensor> inputs, torch::Tensor sendRankCumSum, torch::Tensor sendIndiceTensor,
-    c10::List<torch::Tensor> outputs, torch::Tensor recvRankCumSum, torch::Tensor recvIndiceTensor,
-    torch::Tensor allWorkspaces, int64_t epRank, int64_t epSize)
+c10::List<torch::Tensor> moeCommOp(c10::List<torch::Tensor> inputs, torch::Tensor sendRankCumSum,
+    torch::Tensor sendIndiceTensor, torch::Tensor recvRankCumSum, torch::Tensor recvIndiceTensor,
+    torch::Tensor allWorkspaces, int64_t outputAllocationCount, int64_t epRank, int64_t epSize,
+    std::optional<c10::List<bool>> needZeroOutput = std::nullopt)
 {
     CHECK_INPUT(sendRankCumSum, torch::kInt32);
     CHECK_INPUT(sendIndiceTensor, torch::kInt32);
@@ -55,7 +56,9 @@ void moeCommOp(c10::List<torch::Tensor> inputs, torch::Tensor sendRankCumSum, to
     TORCH_CHECK(allWorkspaces.size(0) == epSize, "allWorkspaces must have epSize elements");
 
     TORCH_CHECK(epRank >= 0 && epRank < epSize, "epRank must be in the range [0, epSize)");
-    TORCH_CHECK(inputs.size() == outputs.size(), "inputs and outputs must have the same number of tensors");
+    TORCH_CHECK(!needZeroOutput.has_value() || needZeroOutput.value().size() == inputs.size(),
+        "needZeroOutput should have same length as inputs");
+    c10::List<torch::Tensor> outputs;
 
     tensorrt_llm::kernels::MoeEpWorldInfo epWorldInfo = {static_cast<int>(epSize), static_cast<int>(epRank)};
     tensorrt_llm::kernels::FusedMoeWorldInfo worldInfo = {epWorldInfo};
@@ -82,7 +85,16 @@ void moeCommOp(c10::List<torch::Tensor> inputs, torch::Tensor sendRankCumSum, to
 
     for (int i = 0; i < fieldCount; i++)
     {
-        setMoeCommFieldInfo(sendFieldInfo.fieldsInfo[i], inputs[i]);
+        torch::Tensor const& t = inputs[i];
+        setMoeCommFieldInfo(sendFieldInfo.fieldsInfo[i], t);
+        if (needZeroOutput.has_value() && needZeroOutput.value()[i])
+        {
+            outputs.push_back(torch::zeros({outputAllocationCount, t.size(1)}, t.options()));
+        }
+        else
+        {
+            outputs.push_back(torch::empty({outputAllocationCount, t.size(1)}, t.options()));
+        }
         setMoeCommFieldInfo(recvFieldInfo.fieldsInfo[i], outputs[i]);
     }
     sendFieldInfo.fillFieldPlacementInfo(0, false);
@@ -106,6 +118,8 @@ void moeCommOp(c10::List<torch::Tensor> inputs, torch::Tensor sendRankCumSum, to
     auto stream = at::cuda::getCurrentCUDAStream();
 
     tensorrt_llm::kernels::moeAllToAll(params, fusedMoeWorkspace, stream);
+
+    return outputs;
 }
 
 int64_t getWorkspaceSizePerRank(int64_t epSize)
@@ -233,8 +247,9 @@ void memsetExpertIds(torch::Tensor expertsIds, torch::Tensor recvRankCountCumSum
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
-        "moe_comm(Tensor[] inputs, Tensor send_rank_cum_sum, Tensor send_indices, Tensor[] outputs, Tensor "
-        "recv_rank_cum_sum, Tensor recv_indices, Tensor all_workspaces, int ep_rank, int ep_size) -> ()");
+        "moe_comm(Tensor[] inputs, Tensor send_rank_cum_sum, Tensor send_indices, Tensor "
+        "recv_rank_cum_sum, Tensor recv_indices, Tensor all_workspaces, int output_allocation_count, int ep_rank, int "
+        "ep_size, bool[]? need_zero_output=None) -> Tensor[]");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

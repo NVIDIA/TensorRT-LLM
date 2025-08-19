@@ -548,7 +548,6 @@ class MnnvlMoe:
             # All tensors are None, return list of None
             result = [None] * len(x)
         else:
-            output_tensors = []
             first_dim = None
             for tensor in valid_tensors:
                 # Validate dimensions of valid tensors
@@ -559,25 +558,16 @@ class MnnvlMoe:
                     assert tensor.shape[0] == first_dim, (
                         f"All tensors must have the same first dimension, got {tensor.shape[0]} vs {first_dim}"
                     )
-                # Pre-allocate output tensors
-                output_tensors.append(
-                    torch.empty(
-                        alltoall_info.local_token_allocation_count,
-                        tensor.shape[1],
-                        dtype=tensor.dtype,
-                        device=tensor.device,
-                    )
-                )
 
             # Process only valid tensors
-            torch.ops.trtllm.moe_comm(
+            output_tensors = torch.ops.trtllm.moe_comm(
                 valid_tensors,
                 alltoall_info.send_rank_count_cumsum,
                 alltoall_info.send_rank_local_indices,
-                output_tensors,
                 alltoall_info.recv_rank_count_cumsum,
                 alltoall_info.recv_rank_local_indices,
                 workspace,
+                alltoall_info.local_token_allocation_count,
                 ep_rank,
                 ep_size,
             )
@@ -609,20 +599,19 @@ class MnnvlMoe:
         token_count: int,
     ):
         assert x.dim() == 2, "2D tensor supported, please reshape."
-        output_tensor = torch.zeros(
-            token_count * top_k, x.shape[1], dtype=x.dtype, device=torch.device("cuda")
-        )
-        torch.ops.trtllm.moe_comm(
+        output_tensors = torch.ops.trtllm.moe_comm(
             [x],
             alltoall_info.recv_rank_count_cumsum,
             alltoall_info.recv_rank_local_indices,
-            [output_tensor],
             alltoall_info.send_rank_count_cumsum,
             alltoall_info.backward_recv_rank_local_indices,
             workspace,
+            token_count * top_k,
             ep_rank,
             ep_size,
+            [True],
         )
+        output_tensor = output_tensors[0]
         return torch.sum(
             output_tensor.reshape(token_count, top_k, x.shape[1]), dim=1, keepdim=False
         )

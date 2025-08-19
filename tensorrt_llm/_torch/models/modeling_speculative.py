@@ -14,6 +14,7 @@ from ..model_config import ModelConfig, TConfig
 from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
+from ..modules.fused_moe import moe_load_balancer_set_repeated_for_next_layer
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import (Linear, TensorParallelMode, WeightMode,
                               WeightsLoadingConfig)
@@ -339,6 +340,9 @@ class MTPForCausalLM(nn.Module):
         assert spec_dec_mode.is_mtp()
         mtp_num_layers = 1 if spec_dec_mode.is_mtp_eagle(
         ) else model_config.spec_config.num_nextn_predict_layers
+
+        moe_load_balancer_set_repeated_for_next_layer(
+            model_config.spec_config.num_nextn_predict_layers // mtp_num_layers)
 
         self.mtp_layers = nn.ModuleList([
             DeepseekV3MTP(model_config, layer_idx + start_layer_idx,
