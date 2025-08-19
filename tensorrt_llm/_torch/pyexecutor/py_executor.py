@@ -161,7 +161,6 @@ class PyExecutor:
         self.profile_start_iters, self.profile_stop_iters = _load_iteration_indexes(
             PROFILE_START_STOP_ENV_VAR_NAME)
         self.gc_nvtx_watcher_handle = _gc_nvtx_watcher()
-        self.is_warmup = False  # During warmup, we don't enable the profiler
 
         # related modules
         self.resource_manager = resource_manager
@@ -187,6 +186,7 @@ class PyExecutor:
         self.attention_dp_enable_balance = model_engine.pytorch_backend_config.attention_dp_enable_balance
         self.attention_dp_time_out_iters = model_engine.pytorch_backend_config.attention_dp_time_out_iters
         self.attention_dp_batching_wait_iters = model_engine.pytorch_backend_config.attention_dp_batching_wait_iters
+        self.batch_wait_timeout_ms = model_engine.pytorch_backend_config.batch_wait_timeout_ms
         self.num_fetch_requests_cur_rank = 0
         self.num_fetch_requests = 0
         self.shutdown_event = threading.Event()
@@ -220,9 +220,12 @@ class PyExecutor:
 
         self.inflight_req_ids = ReqIdsSet()
 
+        # During warmup, we don't enable the profiler
+        self.is_warmup = True
         self.model_engine.warmup(self.resource_manager)
         if self.draft_model_engine is not None:
             self.draft_model_engine.warmup(self.resource_manager)
+        self.is_warmup = False
 
         self.is_shutdown = False
         self.max_batch_size = max_batch_size
@@ -237,6 +240,7 @@ class PyExecutor:
             max_beam_width=self.max_beam_width,
             max_num_active_requests=self.max_num_active_requests,
             enable_iter_perf_stats=self.enable_iter_perf_stats,
+            batch_wait_timeout_ms=self.batch_wait_timeout_ms,
             is_disaggregated=kv_cache_transceiver is not None,
         )
         self.executor_request_queue.set_exclude_last_generation_logits(
@@ -279,6 +283,18 @@ class PyExecutor:
             raise e
         finally:
             self._executor_loop_cleanup()
+
+    @property
+    def is_warmup(self) -> bool:
+        return getattr(self, "_is_warmup", False)
+
+    @is_warmup.setter
+    def is_warmup(self, value: bool):
+        self._is_warmup = value
+        # Set warmup flag in model engine to trigger torch compile and avoid moe load balancer statistics update
+        self.model_engine.is_warmup = value
+        if self.draft_model_engine is not None:
+            self.draft_model_engine.is_warmup = value
 
     def start_worker(self):
         with self.worker_lock:
@@ -403,6 +419,16 @@ class PyExecutor:
         it = -1
         enabled = False
         start_time = None
+
+        # These events are used to record the time of the previous batch.
+        # We need two set of the start-end events to record the time through
+        # a ping-pong way so that it works with overlap scheduler.
+        start_event_1 = None
+        end_event_1 = torch.cuda.Event(enable_timing=True)
+        start_event_2 = None
+        end_event_2 = torch.cuda.Event(enable_timing=True)
+        prev_device_step_time = None
+
         torch_trace_path = os.environ.get(PROFILE_TRACE_ENV_VAR_NAME, None)
         profile_start_stop = os.environ.get(PROFILE_START_STOP_ENV_VAR_NAME,
                                             None)
@@ -425,7 +451,7 @@ class PyExecutor:
                                                     with_modules=True)
 
         def profile_step():
-            nonlocal it, enabled, start_time
+            nonlocal it, enabled, start_time, start_event_1, end_event_1, start_event_2, end_event_2, prev_device_step_time
             if it in self.profile_stop_iters and not self.is_warmup:
                 assert enabled, "Inconsistent CUDA profiling state"
                 if enable_torch_trace:
@@ -438,7 +464,24 @@ class PyExecutor:
 
             if start_time is not None and self.print_log and self.dist.rank == 0:
                 end_time = time.time()
+                if it % 2 == 0:
+                    end_event_1.record()
+                    if start_event_2 is not None:
+                        end_event_2.synchronize()
+                        prev_device_step_time = start_event_2.elapsed_time(
+                            end_event_2)
+                else:
+                    end_event_2.record()
+                    if start_event_1 is not None:
+                        end_event_1.synchronize()
+                        prev_device_step_time = start_event_1.elapsed_time(
+                            end_event_1)
 
+                if prev_device_step_time is None:
+                    prev_device_step_time = "N/A"  # Handle first iteration
+                else:
+                    prev_device_step_time = f"{prev_device_step_time}ms"
+                host_step_time = (end_time - start_time) * 1000  # milliseconds
                 formatted_timestamp = datetime.datetime.now().strftime(
                     "%Y-%m-%d %H:%M:%S")
                 logger.info(
@@ -447,7 +490,8 @@ class PyExecutor:
                     f"rank = {self.dist.rank}, "
                     f"currank_total_requests = {self.executor_request_queue.num_fetch_requests_cur_rank}/"
                     f"{self.executor_request_queue.num_fetch_requests}, "
-                    f"elapsed_time = {end_time - start_time}s, "
+                    f"host_step_time = {host_step_time}ms, "
+                    f"prev_device_step_time = {prev_device_step_time}, "
                     f"timestamp = {formatted_timestamp}, "
                     f"num_scheduled_requests: {self.num_scheduled_requests}, "
                     f"states = {self.model_engine.iter_states}")
@@ -462,6 +506,14 @@ class PyExecutor:
                 logger.info(f"Profiling started at iteration {it}.")
                 enabled = True
             start_time = time.time()
+            if it % 2 == 0:
+                if start_event_1 is None:
+                    start_event_1 = torch.cuda.Event(enable_timing=True)
+                start_event_1.record()
+            else:
+                if start_event_2 is None:
+                    start_event_2 = torch.cuda.Event(enable_timing=True)
+                start_event_2.record()
 
         try:
             yield profile_step
@@ -1305,7 +1357,6 @@ class PyExecutor:
 
             for resource_mgr_type in (
                     ResourceManagerType.KV_CACHE_MANAGER,
-                    ResourceManagerType.SEQ_SLOT_MANAGER,
                     ResourceManagerType.SPEC_RESOURCE_MANAGER,
                     ResourceManagerType.DRAFT_KV_CACHE_MANAGER):
                 if (resource_mgr_type in self.resource_manager.resource_managers
@@ -1327,6 +1378,9 @@ class PyExecutor:
         if len(cache_trans_complete_requests) > 0:
             requests = ScheduledRequests()
             requests.context_requests = cache_trans_complete_requests
+            self.resource_manager.resource_managers[
+                ResourceManagerType.SEQ_SLOT_MANAGER].prepare_resources(
+                    requests)
             self._setup_sampler_step(requests)
 
         for req in scheduled_batch.generation_requests:
@@ -1398,7 +1452,7 @@ class PyExecutor:
                       new_tensors_device: Optional[SampleStateTensors] = None):
 
         @nvtx_range(
-            f"[Executor] _forward_step {self.model_engine.iter_counter}: {len(scheduled_requests.context_requests)} ctx reqs, {len(scheduled_requests.generation_requests)} gen reqs"
+            f"[Executor] _forward_step {self.model_engine.iter_counter + 1}: {len(scheduled_requests.context_requests)} ctx reqs, {len(scheduled_requests.generation_requests)} gen reqs"
         )
         def forward(scheduled_requests, resource_manager, new_tensors_device,
                     gather_context_logits, cache_indirection_buffer):
