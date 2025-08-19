@@ -322,6 +322,7 @@ class PyTorchModelEngine(ModelEngine):
             layerwise_nvtx_marker.register_hooks(self.model, module_prefix)
 
         self.enable_attention_dp = self.model.model_config.mapping.enable_attention_dp
+        self.attention_dp_cuda_graph_all_can_run = False
         self._disable_overlap_scheduler = self.pytorch_backend_config.disable_overlap_scheduler
         self._torch_compile_backend = None
         self.dtype = self.model.config.torch_dtype
@@ -939,7 +940,7 @@ class PyTorchModelEngine(ModelEngine):
 
         scheduled_requests.generation_requests.extend(
             [self.cuda_graph_dummy_request] * padding_size)
-
+        self.attention_dp_cuda_graph_all_can_run = True
         return padding_size
 
     @contextlib.contextmanager
@@ -988,17 +989,8 @@ class PyTorchModelEngine(ModelEngine):
         draft_len = self.spec_config.max_draft_len if self.enable_spec_decode else 0
         can_run_cuda_graph = batch.can_run_cuda_graph
         batch_size = len(batch.generation_requests)
-        if self._run_cuda_graphs and self.enable_attention_dp and self.mapping.tp_size > 1:
-            all_can_graph_batch = self.dist.tp_allgather(
-                [can_run_cuda_graph, batch_size])
-            is_all_gen_only = all(all_can_graph[0]
-                                  for all_can_graph in all_can_graph_batch)
-            all_batch_size_equal = all(
-                all_gen_only[1] == all_can_graph_batch[0][1]
-                for all_gen_only in all_can_graph_batch)
-
-            if not is_all_gen_only or not all_batch_size_equal:
-                return None
+        if self._run_cuda_graphs and self.enable_attention_dp and self.mapping.tp_size > 1 and not self.attention_dp_cuda_graph_all_can_run:
+            return None
 
         if not self._run_cuda_graphs or not can_run_cuda_graph:
             return None
