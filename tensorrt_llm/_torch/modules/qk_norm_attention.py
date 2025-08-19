@@ -134,7 +134,7 @@ def compute_yarn_parameters(
 class QKNormRoPEAttention(Attention):
     """
     QKNormRoPEAttention is a custom attention layer that applies QK norm and RoPE to the input tensor.
-    It is used in the Gemma3 and Qwen3 models.
+    It is used in the ExaOne4, Gemma3 and Qwen3 models.
     It is a subclass of Attention, and overrides the apply_rope method to apply QK norm and RoPE.
     """
 
@@ -147,6 +147,7 @@ class QKNormRoPEAttention(Attention):
         max_position_embeddings: int,
         bias: bool,
         pos_embd_params: Optional[PositionalEmbeddingParams] = None,
+        skip_rope: bool = False,
         fuse_qk_norm_rope: bool = True,
         layer_idx: Optional[int] = None,
         dtype: torch.dtype = None,
@@ -157,6 +158,9 @@ class QKNormRoPEAttention(Attention):
         self.pretrained_config = config.pretrained_config
 
         self.fuse_qk_norm_rope = fuse_qk_norm_rope
+        self.skip_rope = skip_rope
+        assert not (fuse_qk_norm_rope and skip_rope
+                    ), "Fusing qk norm and skipping rope is not supported"
 
         super().__init__(
             hidden_size=hidden_size,
@@ -167,7 +171,7 @@ class QKNormRoPEAttention(Attention):
             pos_embd_params=pos_embd_params,
             # If fuse_qk_norm_rope is true, do not apply fused RoPE in attention OP,
             # and self.rotary_emb will be skipped in the overridden apply_rope.
-            rope_fusion=not self.fuse_qk_norm_rope,
+            rope_fusion=not self.fuse_qk_norm_rope and not skip_rope,
             layer_idx=layer_idx,
             dtype=dtype,
             dense_bias=dense_bias,
@@ -228,7 +232,10 @@ class QKNormRoPEAttention(Attention):
         if not self.fuse_qk_norm_rope:
             q, k, v = self.split_qkv(q, k, v)
             q, k = self.apply_qk_norm(q, k)
-            return super().apply_rope(q, k, v, position_ids)
+            if not self.skip_rope:
+                return super().apply_rope(q, k, v, position_ids)
+            else:
+                return q, k, v
 
         assert k is None and v is None, "The input should be a concatenated qkv tensor to apply_qk_norm_rope"
         qkv = q
