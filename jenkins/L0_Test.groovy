@@ -665,6 +665,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
             selectors = """
                     kubernetes.io/arch: ${arch}
                     kubernetes.io/os: linux
+                    kubernetes.io/hostname: smc521ge-0081.ipp2a2.colossus
                     nvidia.com/gpu_type: ${gpuType}"""
         } else if (perfMode && !hasMultipleGPUs) {
         // Not using the "perf" node currently due to hardware resource constraint.
