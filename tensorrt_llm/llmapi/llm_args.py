@@ -2145,6 +2145,18 @@ class TorchLlmArgs(BaseLlmArgs):
         status="prototype",
     )
 
+    # cute dsl op configs
+    use_cute_dsl_blockscaling_mm: bool = Field(
+        default=False,
+        description="If true, use CuTe DSL blockscaling fp8 mm op.",
+        status="prototype",
+    )
+    use_cute_dsl_blockscaling_bmm: bool = Field(
+        default=False,
+        description="If true, use CuTe DSL blockscaling fp8 bmm op.",
+        status="prototype",
+    )
+
     # PrivateVars
     _quant_config: Optional[QuantConfig] = PrivateAttr(default=None)
 
@@ -2390,7 +2402,10 @@ class TorchLlmArgs(BaseLlmArgs):
             AttentionDpConfig.model_fields['timeout_iters'].default,
             attention_dp_batching_wait_iters=self.attention_dp_config.
             batching_wait_iters if self.attention_dp_config is not None else
-            AttentionDpConfig.model_fields['batching_wait_iters'].default)
+            AttentionDpConfig.model_fields['batching_wait_iters'].default,
+            use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm,
+            use_cute_dsl_blockscaling_bmm=self.use_cute_dsl_blockscaling_bmm,
+        )
 
 
 def update_llm_args_with_extra_dict(
