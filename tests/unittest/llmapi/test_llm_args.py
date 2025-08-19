@@ -426,23 +426,20 @@ class TestTorchLlmArgs:
 
     @print_traceback_on_error
     def test_runtime_sizes(self):
-        llm = TorchLLM(
-            llama_model_path,
-            max_beam_width=1,
-            max_num_tokens=256,
-            max_seq_len=128,
-            max_batch_size=8,
-        )
+        with TorchLLM(llama_model_path,
+                      max_beam_width=1,
+                      max_num_tokens=256,
+                      max_seq_len=128,
+                      max_batch_size=8) as llm:
+            assert llm.args.max_beam_width == 1
+            assert llm.args.max_num_tokens == 256
+            assert llm.args.max_seq_len == 128
+            assert llm.args.max_batch_size == 8
 
-        assert llm.args.max_beam_width == 1
-        assert llm.args.max_num_tokens == 256
-        assert llm.args.max_seq_len == 128
-        assert llm.args.max_batch_size == 8
-
-        assert llm._executor_config.max_beam_width == 1
-        assert llm._executor_config.max_num_tokens == 256
-        assert llm._executor_config.max_seq_len == 128
-        assert llm._executor_config.max_batch_size == 8
+            assert llm._executor_config.max_beam_width == 1
+            assert llm._executor_config.max_num_tokens == 256
+            assert llm._executor_config.max_seq_len == 128
+            assert llm._executor_config.max_batch_size == 8
 
     def test_dynamic_setattr(self):
         with pytest.raises(pydantic_core._pydantic_core.ValidationError):
