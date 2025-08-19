@@ -1357,7 +1357,8 @@ __global__ void updateKVCacheForCrossAttention(QKVPreprocessingParams<T, KVCache
     // The encoder sequence length.
     int const encoder_seq_len = params.encoder_seq_lens[batch_idx];
     // The encoder sequence offset.
-    int const encoder_seq_offset = params.cu_kv_seq_lens[batch_idx];
+    // Not needed in Gen phase
+    int const encoder_seq_offset = params.generation_phase ? -1 : params.cu_kv_seq_lens[batch_idx];
     // THe maximum sequence length of encoder and decoder.
     int const max_seq_len = max(decoder_seq_len, encoder_seq_len);
 

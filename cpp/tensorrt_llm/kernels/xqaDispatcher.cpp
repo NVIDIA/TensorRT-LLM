@@ -114,11 +114,7 @@ QKVPreprocessingParams<T, KVCacheBuffer> makeQKVPreprocessingParams(XQAParams co
 
     // Cross-attention only.
 
-    preprocessingParms.cu_kv_seq_lens = cu_kv_seqlens;
     preprocessingParms.encoder_seq_lens = params.encoder_input_lengths;
-
-    // Not available in generation phase
-    preprocessingParms.mrope_rotary_cos_sin = nullptr;
 
     return preprocessingParms;
 }
@@ -355,14 +351,6 @@ void XqaDispatcher::runImpl(XQAParams params, KVCacheBuffer const& kv_cache_buff
         decoder_params.rotaryEmbeddingInvFreq = launchParams.rotary_inv_freq_buf;
         decoder_params.rotaryEmbeddingInvFreqCache = params.rotary_embedding_inv_freq_cache;
         decoder_params.rotaryEmbeddingMaxPositions = params.rotary_embedding_max_positions;
-        decoder_params.isCrossAttention = params.cross_attention;
-
-        if (params.cross_attention)
-        {
-            // cross attention only
-            decoder_params.maxEncoderQSeqLength = params.max_past_kv_length;
-            decoder_params.encoderPaddingOffsets = nullptr;
-        }
 
         // The rotary_embedding_inv_freq_cache for QKVPreprocessing.
         // Use the params.rotary_embedding_inv_freq_cache input when the buildDecoderInfoKernel is skipped.
