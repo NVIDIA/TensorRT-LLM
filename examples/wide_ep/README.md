@@ -21,7 +21,7 @@ Wide-EP solves these challenges through:
 
 ### Prerequisites
 
-* GPU: GB200 NVL72, H20, or RTX PRO 6000 Blackwell Workstation Edition.
+* GPU: GB200 NVL72, H20, or RTX 6000D.
 * OS: Linux
 * Drivers: CUDA Driver 575 or Later
 * Docker with NVIDIA Container Toolkit installed
