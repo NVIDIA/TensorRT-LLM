@@ -600,36 +600,15 @@ public:
         gemm2_config_ = std::move(gemm2_config);
     }
 
-    static auto addFinalizeFusionConfigs(
-        std::vector<cutlass_extensions::CutlassGemmConfig>&& configs, bool use_fused_finalize)
-    {
-        if (!use_fused_finalize)
-            return configs;
-
-        size_t const num_configs = configs.size();
-        for (size_t i = 0; i < num_configs; ++i)
-        {
-            if (configs[i].is_tma_warp_specialized)
-            {
-                configs.push_back(configs[i]);
-                configs.back().epilogue_fusion_type
-                    = cutlass_extensions::CutlassGemmConfig::EpilogueFusionType::FINALIZE;
-            }
-        }
-        return configs;
-    }
-
     std::vector<cutlass_extensions::CutlassGemmConfig> getTactics(MoeGemmId gemm_id) override
     {
-        return Self::addFinalizeFusionConfigs(
-            moe_gemm_runner_.getConfigs(), gemm_id == MoeGemmId::GEMM_2 && mayHaveFinalizeFused());
+        return moe_gemm_runner_.getConfigs(gemm_id == MoeGemmId::GEMM_2 && mayHaveFinalizeFused());
     }
 
     static std::vector<cutlass_extensions::CutlassGemmConfig> getTactics(int sm, MoeGemmId gemm_id)
     {
         using RunnerType = decltype(moe_gemm_runner_);
-        return Self::addFinalizeFusionConfigs(
-            RunnerType::getConfigs(sm), gemm_id == MoeGemmId::GEMM_2 && Self::mayHaveFinalizeFused(sm));
+        return RunnerType::getConfigs(sm, gemm_id == MoeGemmId::GEMM_2 && Self::mayHaveFinalizeFused(sm));
     }
 
     void runMoe(void const* input_activations, void const* input_sf, bool const swizzled_input_sf,
