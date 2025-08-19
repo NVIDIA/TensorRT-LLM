@@ -1,0 +1,26 @@
+name: Validate PR Checklist
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize]
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  pr-checklist:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout private action repository
+        uses: actions/checkout@v4
+        with:
+          repository: poweiw/goggles_action
+          path: ./.github/actions/goggles_action
+          token: ${{ secrets.GOGGLES_ACTION_REPO_TOKEN}}
+          ref: test/pr-checklist-20250819
+
+      - name: Validate PR Checklist
+        uses: ./.github/actions/goggles_action/actions/pr_checklist
+        with:
+          PR_BODY: ${{ github.event.pull_request.body }}
