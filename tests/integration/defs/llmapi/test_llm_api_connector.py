@@ -49,7 +49,6 @@ def model_with_connector():
                 connector_config=connector_config,
                 cuda_graph_config=None,
                 kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.1),
-                use_torch_sampler=True,
             )
 
         yield model_fn, mock_scheduler, mock_worker

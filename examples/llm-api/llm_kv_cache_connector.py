@@ -1,3 +1,7 @@
+### :title KV Cache Connector
+### :order 6
+### :section Customization
+
 import os
 import sys
 from dataclasses import dataclass, field
@@ -207,8 +211,7 @@ def main(model: str):
     llm = LLM(model=model,
               backend="pytorch",
               cuda_graph_config=None,
-              connector_config=connector_config,
-              use_torch_sampler=True)
+              connector_config=connector_config)
 
     test_text = (
         "Nvidia Corporation is an American technology company headquartered in Santa Clara, California."
@@ -229,8 +232,7 @@ def main(model: str):
     llm = LLM(model=model,
               backend="pytorch",
               cuda_graph_config=None,
-              connector_config=connector_config,
-              use_torch_sampler=True)
+              connector_config=connector_config)
 
     output = llm.generate([test_text], sampling_params)
     text1 = output[0].outputs[0].text
