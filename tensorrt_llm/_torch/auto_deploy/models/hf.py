@@ -181,6 +181,10 @@ class AutoModelForCausalLMFactory(ModelFactory):
             self._sharding_config["tp_plan"] = model_config.base_model_tp_plan
         if hasattr(model_config, "head_dim"):
             self._sharding_config["head_dim"] = model_config.head_dim
+        elif hasattr(model_config, "hidden_size") and hasattr(model_config, "num_attention_heads"):
+            self._sharding_config["head_dim"] = (
+                model_config.hidden_size // model_config.num_attention_heads
+            )
         if hasattr(model_config, "num_hidden_layers"):
             self._sharding_config["num_hidden_layers"] = model_config.num_hidden_layers
 
