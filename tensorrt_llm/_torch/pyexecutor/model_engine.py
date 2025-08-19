@@ -2089,7 +2089,6 @@ class PyTorchModelEngine(ModelEngine):
                 module_id: dict
                 {
                     adapter_size: torch tensor: int
-                    is_dora: torch tensor: bool
                     weight_pointers: torch tensor: int64
                 }
             }
@@ -2114,7 +2113,6 @@ class PyTorchModelEngine(ModelEngine):
                 if module_id not in lora_params[layer_id]:
                     lora_params[layer_id][module_id] = {
                         'adapter_size': [],
-                        'is_dora': [],
                         'weight_pointers': [],
                     }
 
@@ -2124,7 +2122,6 @@ class PyTorchModelEngine(ModelEngine):
                 tmp_lora_params[(request.py_request_id, layer_id,
                                  module_id)] = {
                                      'adapter_size': [module.adapter_size],
-                                     'is_dora': [scaling_vec_pointer == 0],
                                      'weight_pointers': [
                                          module.weights_in_pointer,
                                          module.weights_out_pointer,
@@ -2139,7 +2136,6 @@ class PyTorchModelEngine(ModelEngine):
                     for module_id in lora_params[layer_id]:
                         current_lora_params = lora_params[layer_id][module_id]
                         current_lora_params['adapter_size'].append(0)
-                        current_lora_params['is_dora'].append(False)
                         current_lora_params['weight_pointers'] += [0, 0, 0]
 
             else:
@@ -2150,14 +2146,11 @@ class PyTorchModelEngine(ModelEngine):
                         current_lora_params = lora_params[layer_id][module_id]
                         if current_tmp_lora_params is None:
                             current_lora_params['adapter_size'].append(0)
-                            current_lora_params['is_dora'].append(False)
                             current_lora_params['weight_pointers'] += [0, 0, 0]
                         else:
                             current_lora_params[
                                 'adapter_size'] += current_tmp_lora_params[
                                     'adapter_size']
-                            current_lora_params[
-                                'is_dora'] += current_tmp_lora_params['is_dora']
                             current_lora_params[
                                 'weight_pointers'] += current_tmp_lora_params[
                                     'weight_pointers']
@@ -2165,8 +2158,6 @@ class PyTorchModelEngine(ModelEngine):
         for layer_id in lora_params:
             for module_id in lora_params[layer_id]:
                 current_lora_params = lora_params[layer_id][module_id]
-                # TODO: When lora_grouped_gemm supports DoRA: convert 'is_dora' to a bool tensor.
-                #       Until it's supported, that would just slow down this function, so better not to do it.
                 current_lora_params['adapter_size'] = torch.IntTensor(
                     current_lora_params['adapter_size'])
                 current_lora_params['weight_pointers'] = torch.LongTensor(
