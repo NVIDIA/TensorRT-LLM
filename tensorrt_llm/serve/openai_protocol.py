@@ -128,6 +128,7 @@ class CompletionResponseChoice(OpenAIBaseModel):
             "including encountering the EOS token"),
     )
     disaggregated_params: Optional[DisaggregatedParams] = Field(default=None)
+    avg_decoded_tokens_per_iter: Optional[float] = Field(default=None)
 
 
 class CompletionResponse(OpenAIBaseModel):
@@ -155,6 +156,7 @@ class CompletionResponseStreamChoice(OpenAIBaseModel):
             "to stop, None if the completion finished for some other reason "
             "including encountering the EOS token"),
     )
+    avg_decoded_tokens_per_iter: Optional[float] = Field(default=None)
 
 
 class CompletionStreamResponse(OpenAIBaseModel):
@@ -395,6 +397,7 @@ class ChatCompletionResponseChoice(OpenAIBaseModel):
     mm_embedding_handle: Optional[Dict[str, Any]] = None
 
     disaggregated_params: Optional[DisaggregatedParams] = Field(default=None)
+    avg_decoded_tokens_per_iter: Optional[float] = Field(default=None)
 
 
 class ChatCompletionResponse(OpenAIBaseModel):
@@ -422,6 +425,7 @@ class ChatCompletionResponseStreamChoice(OpenAIBaseModel):
     logprobs: Optional[ChatCompletionLogProbs] = None
     finish_reason: Optional[str] = None
     stop_reason: Optional[Union[int, str]] = None
+    avg_decoded_tokens_per_iter: Optional[float] = Field(default=None)
 
 
 class ChatCompletionStreamResponse(OpenAIBaseModel):
