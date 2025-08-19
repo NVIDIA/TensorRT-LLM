@@ -273,9 +273,9 @@ UcxConnectionManager::UcxConnectionManager()
             {
                 auto const worldPg = get_world_pg();
                 PgHelper pgh{worldPg};
-                worldPg->barrier();
+                PGCHECK_THROW(worldPg->barrier());
 
-                pgh.allgather(&bufferSize, std::ref(sizeofBuffer), {});
+                PGCHECK_THROW(pgh.allgather(&bufferSize, std::ref(sizeofBuffer), {}));
 
                 // Zero-pad local blob to the max size as PG currently only has fixed-size all-gather
                 SizeType32 maxSize = *std::max_element(sizeofBuffer.begin(), sizeofBuffer.end());
@@ -287,7 +287,7 @@ UcxConnectionManager::UcxConnectionManager()
 
                 // Gather the fixed-width chunks
                 std::vector<uint8_t> recvBuffer(maxSize * mWorldSize);
-                pgh.allgather(padded, std::ref(recvBuffer), {});
+                PGCHECK_THROW(pgh.allgather(padded, std::ref(recvBuffer), {}));
 
                 // Slice each chunk back to its true length and deserialize
                 for (int r = 0; r < mWorldSize; ++r)
@@ -299,6 +299,9 @@ UcxConnectionManager::UcxConnectionManager()
                     std::istream is(&strbuf);
                     socketStates[r] = su::deserialize<executor::kv_cache::SocketState>(is);
 
+                    // TODO: remove this
+                    std::cout << "mRank: " << mRank << " recv socketStates[" << r << "]: " << socketStates[r].toString()
+                              << std::endl;
                     TLLM_LOG_DEBUG(mRank, " recv socketStates[%d]: %s", r, socketStates[r].toString().c_str());
                 }
             }
