@@ -35,12 +35,15 @@ moe_config:
 | `max_num_tokens` | If set, at most max_num_tokens tokens will be sent to torch.ops.trtllm.fused_moe at the same time.  | `None` | If the number of tokens exceeds max_num_tokens, the input tensors will be split into chunks and a for loop will be used. |
 | `load_balancer` | Configuration for MoE load balancing | `None` | Set path to the yaml file |
 
-#### Load Balancer Configuration
+#### Online Load Balancer Configuration
 
-An example `moe_load_balancer.yaml` file to configure online EP balancer:
 ```yaml
-num_slots: 288
-layer_updates_per_iter: 1
+moe_config:
+    backend: WIDEEP
+    max_num_tokens: 9216
+    load_balancer:
+        num_slots: 288
+        layer_updates_per_iter: 1
 ```
 
 | Parameter | Description | Default | Notes |
@@ -48,7 +51,11 @@ layer_updates_per_iter: 1
 | `num_slots` | Total number of expert slots | `None` | Must be ≥ total experts |
 | `layer_updates_per_iter` | Number of layers updated per iteration | `0` | `0` = offline, `>0` = online |
 
-Refer to the [ep_load_balancer](./ep_load_balancer/) directory for more details on EP load balancer.
+#### Offline Load Balancer Configuration
+
+Refer to the [Offline EP Load Balancer](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/wide_ep/ep_load_balancer#offline-ep-load-balancer) documentation.
+
+*Online EP Load Balancer is more suitable for production deployment needs to react timely to the online traffic changes.*
 
 ### 2. Execute Wide-EP on SLURM Clusters
 
