@@ -82,11 +82,18 @@ def find_root_dir(start_dir: Optional[_pl.Path] = None) -> _pl.Path:
     return find_dir_containing(("scripts", "examples", "cpp"), start_dir)
 
 
-def find_build_dir(build_type):
-    root_dir = find_root_dir()
-    dir = get_trt_llm_build_dir(None, build_type)
+def find_build_dir(build_type: str) -> _pl.Path:
+    """Resolve the TRT-LLM C++ build directory for the given CMake build type.
 
-    return dir if dir.is_absolute() else root_dir / dir
+    Args:
+        build_type: CMake build type (e.g., "Release", "RelWithDebInfo", "Debug").
+
+    Returns:
+        Absolute path to the C++ build directory.
+    """
+    root_dir = find_root_dir()
+    build_dir = get_trt_llm_build_dir(None, build_type)
+    return build_dir if build_dir.is_absolute() else root_dir / build_dir
 
 
 def run_command(command: Sequence[str],

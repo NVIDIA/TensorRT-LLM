@@ -222,13 +222,15 @@ def prepare_model(
 
 
 @pytest.fixture(scope="function", autouse=True)
-def keep_log_files(llm_root, build_dir):
+def keep_log_files(build_dir):
     """Backup previous cpp test results when run multiple ctest invocations."""
     results_dir = build_dir
 
     yield
 
-    backup_dir = _pl.Path(llm_root) / "cpp" / "build_backup"
+    build_parent_dir = build_dir.parent
+    backup_dir_name = build_dir.name + "_backup"
+    backup_dir = build_parent_dir / backup_dir_name
     backup_dir.mkdir(parents=True, exist_ok=True)
     # Copy XML files from all subdirectories to backup directory
     xml_files = list(results_dir.rglob("*.xml"))
