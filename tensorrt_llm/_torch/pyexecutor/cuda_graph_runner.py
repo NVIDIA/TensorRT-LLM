@@ -80,6 +80,14 @@ class CUDAGraphRunner:
         return engine
 
     def maybe_get_cuda_graph(self, batch: ScheduledRequests):
+        """
+        Determines if the current batch can be run with a CUDA graph.
+
+        Returns a tuple containing:
+        - A boolean indicating if a graph can be used.
+        - The attn_metadata for the graph, if applicable.
+        - The spec_metadata for the graph, if applicable.
+        """
         engine = self._get_engine()
 
         # disable when doing statistic
@@ -127,8 +135,8 @@ class CUDAGraphRunner:
     def needs_capture(self, batch_size: int):
         return (batch_size, self.draft_len) not in self.graph_outputs
 
-    def capture_graph(self, batch_size: int, forward_fn: Callable,
-                      initial_inputs: Dict[str, Any]):
+    def capture(self, batch_size: int, forward_fn: Callable,
+                initial_inputs: Dict[str, Any]):
         """Captures the forward pass for a given batch size."""
         engine = self._get_engine()
         key = (batch_size, self.draft_len)
@@ -184,8 +192,8 @@ class CUDAGraphRunner:
         self.graph_outputs[key] = make_weak_ref(output)
         self.memory_pool = graph.pool()
 
-    def run_graph(self, batch_size: int,
-                  current_inputs: Dict[str, Any]) -> Optional[torch.Tensor]:
+    def replay(self, batch_size: int,
+               current_inputs: Dict[str, Any]) -> Optional[torch.Tensor]:
         """Replays a previously captured graph."""
         key = (batch_size, self.draft_len)
         stored_meta = self.graph_metadata[key]
