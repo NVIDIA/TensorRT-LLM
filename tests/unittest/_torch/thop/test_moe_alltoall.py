@@ -435,197 +435,6 @@ class TestMoeAlltoAllFP8SingleGPU(unittest.TestCase):
             raise
 
     @parameterized.expand([
-        (0, 8, 256, 4, 3, False),
-        (0, 8, 256, 4, 3, True),
-        (1, 8, 256, 4, 3, False),
-        (1, 8, 256, 4, 3, True),
-        (1, 4, 256, 8, 3, False),
-        (1, 4, 256, 8, 3, True),
-        (7, 8, 256, 8, 1025, False),
-        (7, 8, 256, 8, 1025, True),
-        (7, 64, 1024, 32, 1029, False),
-        (7, 64, 1024, 32, 1029, True),
-    ])
-    def test_moe_alltoall_prepare_indices(
-            self, ep_rank: int, ep_size: int, expert_count: int, top_k: int,
-            max_token_count_per_rank: int,
-            use_real_rank_token_count_cumsum: bool):
-        torch.cuda.set_device(0)
-        gathered_target_rank_ids = torch.randint(
-            0,
-            ep_size, (ep_size * max_token_count_per_rank, top_k),
-            dtype=torch.int32,
-            device=torch.device('cuda'))
-        real_rank_token_count_cumsum = None
-        if use_real_rank_token_count_cumsum:
-            real_rank_token_count_cumsum = torch.randint(
-                0,
-                max_token_count_per_rank + 1, (ep_size, ),
-                dtype=torch.int32,
-                device=torch.device('cuda'))
-            real_rank_token_count_cumsum = torch.cumsum(
-                real_rank_token_count_cumsum, dim=0).to(torch.int32)
-
-        def generate_references():
-            gathered_target_rank_ids_cpu_lists = gathered_target_rank_ids.cpu(
-            ).tolist()
-            if use_real_rank_token_count_cumsum:
-                real_rank_token_count_cumsum_cpu_lists = real_rank_token_count_cumsum.cpu(
-                ).tolist()
-            else:
-                real_rank_token_count_cumsum_cpu_lists = [
-                    (i + 1) * max_token_count_per_rank for i in range(ep_size)
-                ]
-            rank_token_start = 0
-            ref_local_gather_indices_cpu_lists = []
-            ref_recv_rank_count_cumsum_cpu_lists = [0] * ep_size
-            ref_recv_rank_local_indices_cpu_lists = []
-            ref_send_rank_count_cumsum_cpu_lists = [0] * ep_size
-            ref_send_rank_local_indices_cpu_lists = []
-            ref_backward_recv_rank_local_indices_cpu_lists = []
-            total_recv_count = 0
-            for rank in range(ep_size):
-                rank_token_end = real_rank_token_count_cumsum_cpu_lists[rank]
-                for token_id in range(rank_token_start, rank_token_end):
-                    if ep_rank in gathered_target_rank_ids_cpu_lists[token_id]:
-                        ref_local_gather_indices_cpu_lists.append(token_id)
-                        ref_recv_rank_local_indices_cpu_lists.append(
-                            total_recv_count)
-                        total_recv_count += 1
-                ref_recv_rank_count_cumsum_cpu_lists[rank] = total_recv_count
-                if rank == ep_rank:
-                    total_send_count = 0
-                    for target_rank in range(ep_size):
-                        for token_id in range(rank_token_start, rank_token_end):
-                            local_token_id = token_id - rank_token_start
-                            if target_rank in gathered_target_rank_ids_cpu_lists[
-                                    token_id]:
-                                pos = gathered_target_rank_ids_cpu_lists[
-                                    token_id].index(target_rank)
-                                ref_send_rank_local_indices_cpu_lists.append(
-                                    local_token_id)
-                                ref_backward_recv_rank_local_indices_cpu_lists.append(
-                                    local_token_id * top_k + pos)
-                                total_send_count += 1
-                        ref_send_rank_count_cumsum_cpu_lists[
-                            target_rank] = total_send_count
-                rank_token_start = rank_token_end
-            ref_local_gather_indices = torch.IntTensor(
-                ref_local_gather_indices_cpu_lists).cuda()
-            ref_send_rank_count_cumsum = torch.IntTensor(
-                ref_send_rank_count_cumsum_cpu_lists).cuda()
-            ref_send_rank_local_indices = torch.IntTensor(
-                ref_send_rank_local_indices_cpu_lists).cuda()
-            ref_recv_rank_count_cumsum = torch.IntTensor(
-                ref_recv_rank_count_cumsum_cpu_lists).cuda()
-            ref_recv_rank_local_indices = torch.IntTensor(
-                ref_recv_rank_local_indices_cpu_lists).cuda()
-            ref_backward_recv_rank_local_indices = torch.IntTensor(
-                ref_backward_recv_rank_local_indices_cpu_lists).cuda()
-            return ref_local_gather_indices, ref_send_rank_count_cumsum, ref_send_rank_local_indices, ref_recv_rank_count_cumsum, ref_recv_rank_local_indices, ref_backward_recv_rank_local_indices
-
-        ref_local_gather_indices, ref_send_rank_count_cumsum, ref_send_rank_local_indices, ref_recv_rank_count_cumsum, ref_recv_rank_local_indices, ref_backward_recv_rank_local_indices = generate_references(
-        )
-
-        local_gather_indices, send_rank_count_cumsum, send_rank_local_indices, recv_rank_count_cumsum, recv_rank_local_indices, backward_recv_rank_local_indices = \
-            torch.ops.trtllm.moe_comm_prepare_indices(gathered_target_rank_ids, real_rank_token_count_cumsum, max_token_count_per_rank, expert_count, top_k, ep_rank, ep_size)
-
-        assert torch.equal(
-            local_gather_indices[:torch.numel(ref_local_gather_indices)],
-            ref_local_gather_indices)
-        assert torch.equal(
-            send_rank_count_cumsum[:torch.numel(ref_send_rank_count_cumsum)],
-            ref_send_rank_count_cumsum)
-        assert torch.equal(
-            send_rank_local_indices[:torch.numel(ref_send_rank_local_indices)],
-            ref_send_rank_local_indices)
-        assert torch.equal(
-            recv_rank_count_cumsum[:torch.numel(ref_recv_rank_count_cumsum)],
-            ref_recv_rank_count_cumsum)
-        assert torch.equal(
-            recv_rank_local_indices[:torch.numel(ref_recv_rank_local_indices)],
-            ref_recv_rank_local_indices)
-        assert torch.equal(
-            backward_recv_rank_local_indices[:torch.numel(
-                ref_backward_recv_rank_local_indices)],
-            ref_backward_recv_rank_local_indices)
-
-    @parameterized.expand([
-        (0, 8, 256, 4, 3),
-        (1, 8, 256, 4, 3),
-        (7, 8, 256, 4, 3),
-        (7, 8, 256, 8, 32),
-        (7, 8, 256, 32, 10),
-        (7, 8, 1024, 32, 127),
-        (7, 64, 1024, 32, 1029),
-        (9, 64, 1024, 3, 1029),
-    ])
-    def test_moe_local_gather(self, ep_rank: int, ep_size: int,
-                              expert_count: int, top_k: int,
-                              max_token_count_per_rank: int):
-        torch.cuda.set_device(0)
-        rank_token_count_cumsum = torch.randint(0,
-                                                max_token_count_per_rank + 1,
-                                                (ep_size, ),
-                                                dtype=torch.int32,
-                                                device=torch.device('cuda'))
-        rank_token_count_cumsum = torch.cumsum(rank_token_count_cumsum,
-                                               dim=0).to(torch.int32)
-        local_token_count = rank_token_count_cumsum[ep_size - 1].cpu().item()
-        local_max_token_count = max_token_count_per_rank * ep_size
-        local_gather_indices = torch.randint(0,
-                                             max_token_count_per_rank * ep_size,
-                                             (local_max_token_count, ),
-                                             dtype=torch.int32,
-                                             device=torch.device('cuda'))
-
-        gathered_expert_ids = torch.randint(
-            0,
-            expert_count, (max_token_count_per_rank * ep_size, top_k),
-            dtype=torch.int32,
-            device=torch.device('cuda'))
-        gathered_scales = torch.rand(
-            (max_token_count_per_rank * ep_size, top_k),
-            dtype=torch.float32,
-            device=torch.device('cuda'))
-
-        ref_local_expert_ids = torch.zeros(local_max_token_count,
-                                           top_k,
-                                           dtype=torch.int32,
-                                           device=torch.device('cuda'))
-        ref_local_scales = torch.zeros(local_max_token_count,
-                                       top_k,
-                                       dtype=torch.float32,
-                                       device=torch.device('cuda'))
-
-        # compute reference
-        ref_local_expert_ids += expert_count
-        valid_local_gather_indices = local_gather_indices[:local_token_count]
-        ref_local_expert_ids[:local_token_count] = gathered_expert_ids[
-            valid_local_gather_indices]
-        ref_local_scales[:local_token_count] = gathered_scales[
-            valid_local_gather_indices]
-
-        local_expert_ids = torch.empty(local_max_token_count,
-                                       top_k,
-                                       dtype=torch.int32,
-                                       device=torch.device('cuda'))
-        local_scales = torch.empty(local_max_token_count,
-                                   top_k,
-                                   dtype=torch.float32,
-                                   device=torch.device('cuda'))
-
-        torch.ops.trtllm.moe_local_gather(rank_token_count_cumsum,
-                                          local_gather_indices,
-                                          gathered_expert_ids, gathered_scales,
-                                          local_expert_ids, local_scales,
-                                          max_token_count_per_rank,
-                                          expert_count, top_k, ep_rank, ep_size)
-
-        assert torch.equal(local_expert_ids, ref_local_expert_ids)
-        assert torch.equal(local_scales, ref_local_scales)
-
-    @parameterized.expand([
         (0, 2, 16, 20, 8, 512),
         (0, 2, 16, 16, 3, 300),
         (0, 4, 20, 24, 8, 4000),
@@ -645,7 +454,6 @@ class TestMoeAlltoAllFP8SingleGPU(unittest.TestCase):
 
         cpu_expert_ids_all_ranks_lists = []
         cpu_token_count_lists = []
-        cpu_scales_all_ranks_lists = []
         for _ in range(ep_size):
             token_count = torch.randint(max_token_count_per_rank // 2,
                                         max_token_count_per_rank + 1, (1, ),
@@ -661,12 +469,6 @@ class TestMoeAlltoAllFP8SingleGPU(unittest.TestCase):
                               dtype=torch.int32,
                               device=torch.device('cpu')))
 
-            cpu_scales_all_ranks_lists.append(
-                torch.zeros(token_count,
-                            top_k,
-                            dtype=torch.float32,
-                            device=torch.device('cpu')) + 0.5)
-
             cpu_token_count_lists.append(token_count)
 
         def compute_target_rank(expert_id):
@@ -675,7 +477,6 @@ class TestMoeAlltoAllFP8SingleGPU(unittest.TestCase):
 
         def generate_references():
             ref_prepared_local_expert_ids = []
-            ref_prepared_local_scales = []
             ref_local_send_rank_count_cumsum = [0] * ep_size
             ref_local_recv_rank_count_cumsum = [0] * ep_size
             ref_local_recv_rank_indices = []
@@ -736,16 +537,13 @@ class TestMoeAlltoAllFP8SingleGPU(unittest.TestCase):
                     for pos in range(top_k):
                         expert_id = int(
                             cpu_expert_ids_all_ranks_lists[rank][token_id][pos])
-                        sf = cpu_scales_all_ranks_lists[rank][token_id][pos]
                         target_rank_id = compute_target_rank(expert_id)
                         if target_rank_id == ep_rank:
                             if not token_is_received:
                                 token_is_received = True
                                 ref_prepared_local_expert_ids.append(
                                     [slot_count] * top_k)
-                                ref_prepared_local_scales.append([0.0] * top_k)
                             ref_prepared_local_expert_ids[-1][pos] = expert_id
-                            ref_prepared_local_scales[-1][pos] = sf
                     if token_is_received:
                         ref_local_recv_rank_indices.append(
                             total_recv_token_count)
@@ -755,9 +553,9 @@ class TestMoeAlltoAllFP8SingleGPU(unittest.TestCase):
                     rank] = current_recv_token_count if rank == 0 else ref_local_recv_rank_count_cumsum[
                         rank - 1] + current_recv_token_count
 
-            return ref_prepared_local_expert_ids, ref_prepared_local_scales, ref_local_send_rank_count_cumsum, ref_local_send_rank_indices, ref_local_recv_rank_count_cumsum, ref_local_recv_rank_indices, ref_local_backward_send_rank_indices, total_recv_token_count
+            return ref_prepared_local_expert_ids, ref_local_send_rank_count_cumsum, ref_local_send_rank_indices, ref_local_recv_rank_count_cumsum, ref_local_recv_rank_indices, ref_local_backward_send_rank_indices, total_recv_token_count
 
-        ref_prepared_local_expert_ids, ref_prepared_local_scales, ref_local_send_rank_count_cumsum, ref_local_send_rank_indices, ref_local_recv_rank_count_cumsum, ref_local_recv_rank_indices, ref_local_backward_send_rank_indices, total_recv_token_count = generate_references(
+        ref_prepared_local_expert_ids, ref_local_send_rank_count_cumsum, ref_local_send_rank_indices, ref_local_recv_rank_count_cumsum, ref_local_recv_rank_indices, ref_local_backward_send_rank_indices, total_recv_token_count = generate_references(
         )
 
         cpu_experter_count_lists = []
@@ -770,10 +568,6 @@ class TestMoeAlltoAllFP8SingleGPU(unittest.TestCase):
         #expert_ids_all_ranks = torch.tensor(cpu_expert_ids_all_ranks_lists).cuda()
         expert_ids_all_ranks = [
             cpu_expert_ids_all_ranks_lists[i].cuda() for i in range(ep_size)
-        ]
-        #scales_all_ranks = torch.FloatTensor(cpu_scales_all_ranks_lists).cuda()
-        scales_all_ranks = [
-            cpu_scales_all_ranks_lists[i].cuda() for i in range(ep_size)
         ]
 
         experter_count_lists = [
@@ -793,30 +587,18 @@ class TestMoeAlltoAllFP8SingleGPU(unittest.TestCase):
         stream = torch.cuda.Stream()
         with torch.cuda.stream(stream):
             torch.ops.trtllm.mnnvl_moe_alltoallv_prepare_without_allgather(
-                expert_ids_all_ranks[0], scales_all_ranks[0],
-                experter_count_lists[0], all_workspaces,
-                max_token_count_per_rank, 0, 1, expert_count, slot_count, top_k)
+                expert_ids_all_ranks[0], experter_count_lists[0],
+                all_workspaces, max_token_count_per_rank, 0, 1, expert_count,
+                slot_count, top_k)
         stream.wait_stream(torch.cuda.current_stream())
 
         # Make torch alloc tensor to avoid cuda sync
-        prepared_local_experts = []
-        prepared_local_scales = []
         local_send_rank_count_cumsum = []
         local_send_rank_indices = []
         local_recv_rank_count_cumsum = []
         local_recv_rank_indices = []
         backward_local_recv_rank_indices = []
         for _ in range(ep_size):
-            prepared_local_experts.append(
-                torch.empty(max_token_count_per_rank * ep_size,
-                            top_k,
-                            dtype=torch.int32,
-                            device=torch.device('cuda')))
-            prepared_local_scales.append(
-                torch.empty(max_token_count_per_rank * ep_size,
-                            top_k,
-                            dtype=torch.float32,
-                            device=torch.device('cuda')))
             local_send_rank_count_cumsum.append(
                 torch.empty(ep_size,
                             dtype=torch.int32,
@@ -832,8 +614,6 @@ class TestMoeAlltoAllFP8SingleGPU(unittest.TestCase):
             backward_local_recv_rank_indices.append(
                 torch.empty(0, dtype=torch.int32, device=torch.device('cuda')))
 
-        prepared_local_experts = []
-        prepared_local_scales = []
         local_send_rank_count_cumsum = []
         local_send_rank_indices = []
         local_recv_rank_count_cumsum = []
@@ -850,34 +630,18 @@ class TestMoeAlltoAllFP8SingleGPU(unittest.TestCase):
         for rank in range(ep_size):
             with torch.cuda.stream(cuda_streams_all_ranks[rank]):
                 if rank == ep_rank:
-                    prepared_local_experts, prepared_local_scales, local_send_rank_count_cumsum, \
+                    local_send_rank_count_cumsum, \
                     local_send_rank_indices, local_recv_rank_count_cumsum, local_recv_rank_indices, \
                     backward_local_recv_rank_indices, gathered_expert_statics\
-                        = torch.ops.trtllm.mnnvl_moe_alltoallv_prepare_without_allgather(expert_ids_all_ranks[rank], scales_all_ranks[rank], experter_count_lists[rank], all_workspaces, max_token_count_per_rank,
+                        = torch.ops.trtllm.mnnvl_moe_alltoallv_prepare_without_allgather(expert_ids_all_ranks[rank], experter_count_lists[rank], all_workspaces, max_token_count_per_rank,
                                                                                          rank, ep_size, expert_count, slot_count, top_k)
                 else:
                     torch.ops.trtllm.mnnvl_moe_alltoallv_prepare_without_allgather(
-                        expert_ids_all_ranks[rank], scales_all_ranks[rank],
-                        experter_count_lists[rank], all_workspaces,
-                        max_token_count_per_rank, rank, ep_size, expert_count,
-                        slot_count, top_k)
+                        expert_ids_all_ranks[rank], experter_count_lists[rank],
+                        all_workspaces, max_token_count_per_rank, rank, ep_size,
+                        expert_count, slot_count, top_k)
         for rank in range(ep_size):
             cuda_streams_all_ranks[rank].synchronize()
-
-        prepared_local_experts_cpu = prepared_local_experts[:
-                                                            total_recv_token_count].cpu(
-                                                            )
-        prepared_local_scales_cpu = prepared_local_scales[:
-                                                          total_recv_token_count].cpu(
-                                                          )
-        for i in range(total_recv_token_count):
-            for j in range(top_k):
-                expert_id = int(prepared_local_experts_cpu[i][j])
-                assert 0 <= expert_id and expert_id <= slot_count
-                if expert_id < slot_count:
-                    assert compute_target_rank(expert_id) == ep_rank
-                    scale = float(prepared_local_scales_cpu[i][j])
-                    assert scale > 1e-6
 
         gathered_expert_statics_cpu = gathered_expert_statics.cpu()
         for rank in range(ep_size):
