@@ -199,7 +199,7 @@ l0_a10:
   tests:
   - stress_test/stress_test.py::test_run_stress_test[llama-v3-8b-instruct-hf_tp1-stress_time_300s_timeout_450s-MAX_UTILIZATION-pytorch-stress-test]
   - stress_test/stress_test.py::test_run_stress_test[llama-v3-8b-instruct-hf_tp1-stress_time_300s_timeout_450s-GUARANTEED_NO_EVICT-pytorch-stress-test]
-l0_a10_nanobind:
+l0_a10_pybind:
 - condition:
     ranges:
       system_gpu_count:
