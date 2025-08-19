@@ -101,7 +101,6 @@ class RayExecutor(GenerationExecutor):
         self.workers = [
             RayWorkerWrapper.options(
                 num_gpus=num_gpus,
-                num_cpus=num_gpus * 2,
                 runtime_env=runtime_env,  # per-actor env
                 scheduling_strategy=PlacementGroupSchedulingStrategy(
                     placement_group=self.placement_group,
@@ -299,8 +298,9 @@ class RayExecutor(GenerationExecutor):
         nodes = ray.nodes()
         gpus_per_node = int(nodes[0]["Resources"].get(
             "GPU", 0))  # assume symmetric across nodes
-        bundle_gpu = min(tp_size, gpus_per_node)
-        bundle_cpu = bundle_gpu * 2  # TODO: not sure how much cpu to specify
+        # Don't set bundle_cpu to be bundle_gpu * 2, because ResponseRaySharedQueue
+        # currently requires 2 CPUs.
+        bundle_cpu = bundle_gpu = min(tp_size, gpus_per_node)
 
         bundles, bundle_indices = [], []
         current = 0
