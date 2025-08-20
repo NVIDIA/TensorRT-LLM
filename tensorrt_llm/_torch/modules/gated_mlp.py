@@ -96,19 +96,17 @@ class GatedMLP(nn.Module):
             [LoraModuleType.MLP_GATE_UP],
             [2 * self.intermediate_size // mapping.tp_size])
 
-    def _apply_activation(self, x, *, for_lora: bool = False):
+    def _apply_activation(self, x, *, has_lora: bool = False):
         if self.activation == F.silu:
             if self.down_proj.has_fp8_qdq:
-                if for_lora:
-
-                    target = torch.bfloat16 if torch.cuda.is_bf16_supported(
-                    ) else torch.float16
-                    logger.debug(
-                        f"GatedMLP._apply_activation: LoRA path active; forcing non-FP8 activation dtype {target} (keeping activations in bf16/fp16), layer_idx={self.layer_idx}"
+                if has_lora:
+                    # NOTE: This is a WAR, since LoRA grouped_gemm does not support FP8 yet.
+                    # TODO: Remove this path when LoRA grouped_gemm supports FP8
+                    # see: cpp/tensorrt_llm/thop/loraOp.cpp::lora_grouped_gemm
+                    logger.warning(
+                        f"GatedMLP._apply_activation: LoRA path active; forcing non-FP8 activation dtype bf16/fp16, layer_idx={self.layer_idx}"
                     )
-                    return swiglu(x,
-                                  quant_scale=self.down_proj.input_scale,
-                                  quant_type=target)
+                    return swiglu(x)
                 else:
                     return swiglu(x,
                                   quant_scale=self.down_proj.input_scale,
@@ -164,7 +162,7 @@ class GatedMLP(nn.Module):
         if h1_lora is not None:
             h1 = h1 + h1_lora
 
-        h2 = self._apply_activation(h1, for_lora=True)
+        h2 = self._apply_activation(h1, has_lora=True)
         output = self.down_proj(h2,
                                 all_reduce_params=final_all_reduce_params,
                                 lora_params=lora_params,
