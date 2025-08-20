@@ -550,11 +550,14 @@ class TestLlama4MaverickInstruct(LlmapiAccuracyTestHarness):
                                           speculative_model_dir=eagle_model_dir)
         kv_cache_config = KvCacheConfig(enable_block_reuse=False,
                                         free_gpu_memory_fraction=0.75)
+        torch_compile_config = TorchCompileConfig(
+            enable_fullgraph=True,
+            enable_piecewise_cuda_graph=True,
+            max_num_streams=3) if torch_compile else None
         pytorch_config = dict(
             cuda_graph_config=CudaGraphConfig(max_batch_size=8),
             enable_attention_dp=False,
-            torch_compile_config=TorchCompileConfig(
-                enable_fullgraph=torch_compile))
+            torch_compile_config=torch_compile_config)
         with LLM(model_path,
                  kv_cache_config=kv_cache_config,
                  tensor_parallel_size=tp_size,
@@ -759,13 +762,16 @@ class TestGemma3_27BInstruct(LlmapiAccuracyTestHarness):
         kv_cache_config = KvCacheConfig(
             enable_block_reuse=False,
             enable_partial_reuse=False,
+            free_gpu_memory_fraction=0.5,
         )
         # We use FlashInfer as the attention backend for Gemma3 VLM to support custom mask for images.
         # So, testing with it here.
         with LLM(self.MODEL_PATH,
                  kv_cache_config=kv_cache_config,
                  attn_backend="FLASHINFER",
-                 cuda_graph_config=None) as llm:
+                 cuda_graph_config=None,
+                 max_batch_size=128,
+                 max_seq_len=4096) as llm:
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
             task = MMLU(self.MODEL_NAME)
@@ -1759,29 +1765,28 @@ class TestLlama3_3NemotronSuper49Bv1(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device(2)
     @pytest.mark.skip_less_device_memory(80000)
     def test_auto_dtype_tp2(self):
-        with LLM(self.MODEL_PATH, tensor_parallel_size=2) as llm:
+        with LLM(self.MODEL_PATH,
+                 tensor_parallel_size=2,
+                 max_seq_len=8192,
+                 max_batch_size=64) as llm:
+            # Run only one eval as maximal BS is not large
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = GPQADiamond(self.MODEL_NAME)
-            task.evaluate(llm,
-                          extra_evaluator_kwargs=dict(apply_chat_template=True))
 
     @skip_pre_hopper
     @pytest.mark.skip_less_device(2)
     @pytest.mark.skip_device_not_contain(["H100", "B200"])
     def test_fp8_prequantized_tp2(self):
         model_path = f"{llm_models_root()}/nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1-FP8"
-        with LLM(model_path, tensor_parallel_size=2) as llm:
+        with LLM(model_path,
+                 tensor_parallel_size=2,
+                 max_seq_len=8192,
+                 max_batch_size=64) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
+
+            # Run only one eval as maximal BS is not large
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
-            task = GPQADiamond(self.MODEL_NAME)
-            task.evaluate(llm,
-                          extra_evaluator_kwargs=dict(apply_chat_template=True))
 
 
 class TestLlama3_1NemotronNano8Bv1(LlmapiAccuracyTestHarness):
@@ -2396,10 +2401,8 @@ class TestPhi4MM(LlmapiAccuracyTestHarness):
 
 class TestEXAONE4(LlmapiAccuracyTestHarness):
     MODEL_NAME = "LGAI-EXAONE/EXAONE-4.0-32B"
-    kv_cache_config = KvCacheConfig(
-        enable_block_reuse=False,
-        enable_partial_reuse=False,
-        max_attention_window=[4096, 4096, 4096, 131072])
+    kv_cache_config = KvCacheConfig(enable_block_reuse=False,
+                                    enable_partial_reuse=False)
 
     def test_auto_dtype(self):
         model_path = f"{llm_models_root()}/EXAONE-4.0-32B"

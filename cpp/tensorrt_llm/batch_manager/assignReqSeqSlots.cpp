@@ -30,6 +30,11 @@ void tensorrt_llm::batch_manager::AssignReqSeqSlots::operator()(SequenceSlotMana
     {
         for (auto const& llmReq : requests)
         {
+            if (llmReq->isDisaggGenerationInitState())
+            {
+                // Skip assigning sequence slot for DISAGG_GENERATION_INIT request
+                continue;
+            }
             auto const isReqNew = (llmReq->isContextInitState() && !llmReq->mSeqSlot)
                 || (llmReq->isDisaggGenerationTransmissionComplete());
             if (isReqNew && llmReq->getReturnPerfMetrics())
