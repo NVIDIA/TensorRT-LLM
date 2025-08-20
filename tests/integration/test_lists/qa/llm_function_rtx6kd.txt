@@ -26,6 +26,7 @@ accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[latency_moe_cutl
 accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[latency_moe_cutlass-torch_compile=True]
 accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[latency_moe_trtllm-torch_compile=False]
 accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[latency_moe_trtllm-torch_compile=True]
+accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_nvfp4_multi_gpus[throughput_tp8]
 test_e2e.py::test_ptp_quickstart_advanced_mixed_precision
 test_e2e.py::test_ptp_quickstart_advanced[Llama3.1-8B-BF16-llama-3.1-model/Meta-Llama-3.1-8B]
 test_e2e.py::test_ptp_quickstart_advanced[Llama3.1-8B-FP8-llama-3.1-model/Llama-3.1-8B-Instruct-FP8]
@@ -39,3 +40,4 @@ test_e2e.py::test_ptp_quickstart_advanced[Mixtral-8x7B-FP8-Mixtral-8x7B-Instruct
 test_e2e.py::test_ptp_quickstart_advanced_2gpus_sm120[Llama3.1-70B-BF16-llama-3.1-model/Meta-Llama-3.1-70B]
 test_e2e.py::test_ptp_quickstart_advanced_2gpus_sm120[Nemotron-Super-49B-v1-BF16-nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1]
 test_e2e.py::test_ptp_quickstart_advanced_2gpus_sm120[Mixtral-8x7B-BF16-Mixtral-8x7B-Instruct-v0.1]
+test_e2e.py::test_ptp_quickstart_advanced_deepseek_r1_8gpus[DeepSeek-R1-DeepSeek-R1/DeepSeek-R1]
