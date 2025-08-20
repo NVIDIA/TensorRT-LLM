@@ -3,6 +3,7 @@
 import os
 import subprocess
 import sys
+import tempfile
 import time
 from typing import List
 
@@ -20,8 +21,9 @@ class RemoteOpenAIServer:
                  model: str,
                  cli_args: List[str] = None,
                  llmapi_launch: bool = False,
-                 port: int = None) -> None:
-        self.host = "localhost"
+                 port: int = None,
+                 host: str = "localhost") -> None:
+        self.host = host
         self.port = port if port is not None else find_free_port()
         self.rank = os.environ.get("SLURM_PROCID", 0)
 
@@ -87,3 +89,46 @@ class RemoteOpenAIServer:
         return openai.AsyncOpenAI(base_url=self.url_for("v1"),
                                   api_key=self.DUMMY_API_KEY,
                                   **kwargs)
+
+
+class RemoteDisaggOpenAIServer(RemoteOpenAIServer):
+
+    def __init__(self,
+                 ctx_servers: List[str],
+                 gen_servers: List[str],
+                 port: int = None,
+                 llmapi_launch: bool = False) -> None:
+        self.ctx_servers = ctx_servers
+        self.gen_servers = gen_servers
+        self.host = "localhost"
+        self.port = port if port is not None else find_free_port()
+        self.extra_config_file = self._get_extra_config_file()
+
+        launch_cmd = [
+            "trtllm-serve", "disaggregated", "--host", f"{self.host}", "--port",
+            f"{self.port}", "--extra-config", self.extra_config_file.name
+        ]
+        if llmapi_launch:
+            # start server with llmapi-launch on multi nodes
+            launch_cmd = ["trtllm-llmapi-launch"] + launch_cmd
+        with tempfile.NamedTemporaryFile() as f:
+            f.write(self._get_extra_config())
+            self.proc = subprocess.Popen(launch_cmd,
+                                         stdout=sys.stdout,
+                                         stderr=sys.stderr)
+        self._wait_for_server(url=self.url_for("health"),
+                              timeout=self.MAX_SERVER_START_WAIT_S)
+
+    def _get_extra_config(self):
+        return yaml.dump({
+            "ctx_servers": {
+                "num_instances": len(self.ctx_servers),
+                "urls": self.ctx_servers
+            },
+            "gen_servers": {
+                "num_instances": len(self.gen_servers),
+                "urls": self.gen_servers
+            },
+            "port": self.port,
+            "hostname": self.host,
+        })
