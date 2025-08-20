@@ -2159,7 +2159,7 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
         parallelJobsFiltered += multiGpuJobs
     }
 
-    if (testFilter[(AUTO_TRIGGER_TAG_LIST)] != null) {
+    if (testFilter[(AUTO_TRIGGER_TAG_LIST)] != null && testFilter[(AUTO_TRIGGER_TAG_LIST)].size() > 0) {
         echo "AUTO_TRIGGER_TAG_LIST mode is true. Auto trigger tags: ${testFilter[(AUTO_TRIGGER_TAG_LIST)].join(', ')}."
         def autoTriggerTagStages = [:]
         for (tag in testFilter[(AUTO_TRIGGER_TAG_LIST)]) {
