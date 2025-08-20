@@ -5,7 +5,6 @@
 #   * use TRTLLM-attention to replace original pytorch attention in vision/audio encoders.
 #   * use data parallel to accelerate inference.
 
-import copy
 import importlib
 import os
 import sys
@@ -500,7 +499,7 @@ class Phi4MMForCausalLM(transformers.PreTrainedModel):
             self.phi4mm_wte = self.hf_phi4mm_model.embed_tokens
 
         # We use Phi3ForCausalLM as the language model.
-        llm_model_config = copy.deepcopy(model_config)
+        llm_model_config = model_config.clone()
         llm_model_config.pretrained_config.architectures = ["Phi3ForCausalLM"]
         # Only build the language model architecture without loading weights.
         self.llm = AutoModelForCausalLM.from_config(llm_model_config)

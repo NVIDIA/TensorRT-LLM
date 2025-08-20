@@ -1,4 +1,3 @@
-import copy
 import math
 import os
 from functools import partial
@@ -991,7 +990,7 @@ class HCXVisionForCausalLM(PreTrainedModel):
             return
         if not DISAGG:
             self.mm_encoder = HCXVisionModel(model_config)
-        llm_model_config = copy.deepcopy(model_config)
+        llm_model_config = model_config.clone()
         llm_model_config.pretrained_config = PretrainedConfig.from_dict(
             llm_model_config.pretrained_config.language_config)
         self.llm = AutoModelForCausalLM.from_config(llm_model_config)

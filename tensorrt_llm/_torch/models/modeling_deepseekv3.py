@@ -25,7 +25,6 @@
 # SOFTWARE.
 # --------------------------------------------------
 
-import copy
 import math
 import os
 import warnings
@@ -1136,7 +1135,7 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
         # Rename some keys of quant_config_dict to support legacy checkpoints
         if model_config.quant_config_dict is not None:
-            model_config = copy.deepcopy(model_config)
+            model_config = model_config.clone()
             quant_config_dict = {}
             for key, val in model_config.quant_config_dict.items():
                 key_split = key.split(".")

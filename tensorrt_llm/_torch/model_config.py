@@ -1,3 +1,5 @@
+import copy
+import dataclasses
 import json
 import os
 from dataclasses import dataclass, field
@@ -527,3 +529,17 @@ class ModelConfig(Generic[TConfig]):
             return self.pretrained_config.hybrid_override_pattern.count("*")
         else:
             return self.pretrained_config.num_hidden_layers
+
+    def clone(self) -> "ModelConfig[TConfig]":
+        """
+        Create a clone of the config.
+        """
+        shallow_fields = ["mapping"]
+
+        clone = dataclasses.replace(self,
+                                    **{field: None
+                                       for field in shallow_fields})
+        clone = copy.deepcopy(clone)
+        for field in shallow_fields:
+            setattr(clone, field, getattr(self, field))
+        return clone
