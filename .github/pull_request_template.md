@@ -28,12 +28,6 @@ For more info, see /.coderabbit.yaml.
 
 -->
 
-## Description
-
-<!--
-Please explain the issue and the solution in short.
--->
-
 ## Test Coverage
 
 <!--
