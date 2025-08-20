@@ -25,10 +25,19 @@ def cu_seqlens_to_chunk_indices_offsets(
         cu_seqlens: torch.Tensor,
         chunk_size: int) -> Tuple[torch.Tensor, torch.Tensor]:
     """
+    Args:
+        cu_seqlens (torch.Tensor): 1D tensor of cumulative sequence lengths, shape (num_seqs + 1,). The first element should be 0. Each entry represents the starting index of a sequence in the flattened token array.
+        chunk_size (int): The size of each physical mamba chunk (number of tokens per chunk).
+
+    Returns:
+        Tuple[torch.Tensor, torch.Tensor]: A tuple containing:
+            - chunk_indices (torch.Tensor): 1D tensor of indices indicating the physical chunk for each logical chunk.
+            - chunk_offsets (torch.Tensor): 1D tensor of offsets indicating the starting index of each logical chunk within its physical chunk.
+
     This function computes the chunk indices and offsets for the given cu_seqlens and chunk_size.
     Both are tensors of integers with length N, where N is the number of logical (pseudo) chunks.
-    A logical chunk is a sequence of tokens that are all part of the same sequence and are all in the same pyshical chunk.
-    In other words, a logical chunk changes every time we cross a sequence boundary or a pyshical chunk boundary.
+    A logical chunk is a sequence of tokens that are all part of the same sequence and are all in the same physical mamba chunk.
+    In other words, a logical chunk changes every time we cross a sequence boundary or a physical mamba chunk boundary.
     Logical chunks are needed to handle batched requests with initial states (see _state_passing_fwd and _chunk_scan_fwd).
     The chunk_indices tensor contains the index of the physical chunk for each logical chunk.
     The chunk_offsets tensor contains the offset (AKA starting index) of the logical chunk in the physical chunk.
