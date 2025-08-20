@@ -427,10 +427,6 @@ class EagleDecodingConfig(DecodingBaseConfig):
     eagle3_one_model: Optional[bool] = True
     eagle3_layers_to_capture: Optional[Tuple[int, ...]] = None
     is_mtp_eagle: Optional[bool] = False  # which also means eagle2
-    #TODO:add the support of relaxed acceptance for thinking
-    use_relaxed_acceptance_for_thinking: Optional[bool] = False
-    relaxed_topk: Optional[int] = 10
-    relaxed_delta: Optional[float] = 0.01
 
     @classmethod
     def from_dict(cls, data: dict):
