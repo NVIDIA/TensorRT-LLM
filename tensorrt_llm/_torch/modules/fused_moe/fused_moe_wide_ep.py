@@ -464,7 +464,7 @@ class WideEPMoE(MoE):
                     self.dummy_allreduce()
                 token_count = x.shape[0]
                 alltoall_info = None
-                if is_last_call:
+                if self.layer_load_balancer and is_last_call:
                     loadbalancer_local_statistic_info = self.layer_load_balancer.get_local_statistic_tensor(
                     )
                 else:
