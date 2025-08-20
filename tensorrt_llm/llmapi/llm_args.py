@@ -2181,9 +2181,10 @@ class TorchLlmArgs(BaseLlmArgs):
         status="prototype",
     )
 
-    connector_config: Optional[KvCacheConnectorConfig] = Field(
+    kv_connector_config: Optional[KvCacheConnectorConfig] = Field(
         default=None,
         description="The config for KV cache connector.",
+        status="prototype",
     )
 
     # PrivateVars

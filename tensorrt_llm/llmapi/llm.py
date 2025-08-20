@@ -1054,8 +1054,8 @@ class _TorchLLM(BaseLLM):
             lora_config=self.args.lora_config,
             garbage_collection_gen0_threshold=self.args.
             garbage_collection_gen0_threshold,
-            # Autodeploy does not support connector_config
-            kv_connector_config=getattr(self.args, "connector_config", None),
+            # Autodeploy does not support kv_connector_config
+            kv_connector_config=getattr(self.args, "kv_connector_config", None),
         )
 
     def _validate_args_for_torch_backend(self, kwargs: dict) -> None:

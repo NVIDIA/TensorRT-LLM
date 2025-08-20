@@ -34,7 +34,7 @@ def model_with_connector():
         importlib_mock.import_module.return_value.KvConnectorScheduler.return_value = mock_scheduler
         importlib_mock.import_module.return_value.KvConnectorWorker.return_value = mock_worker
 
-        connector_config = KvCacheConnectorConfig(
+        kv_connector_config = KvCacheConnectorConfig(
             connector_module="",
             connector_scheduler_class="KvConnectorScheduler",
             connector_worker_class="KvConnectorWorker",
@@ -46,7 +46,7 @@ def model_with_connector():
                 **kwargs,
                 model=f"{llm_models_root()}/Qwen2-0.5B",
                 backend="pytorch",
-                connector_config=connector_config,
+                kv_connector_config=kv_connector_config,
                 cuda_graph_config=None,
                 kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.1),
             )

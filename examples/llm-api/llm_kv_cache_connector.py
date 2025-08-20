@@ -199,7 +199,7 @@ def main(model: str):
 
     this_module = __file__[__file__.rfind("/") + 1:__file__.rfind(".py")]
 
-    connector_config = KvCacheConnectorConfig(
+    kv_connector_config = KvCacheConnectorConfig(
         connector_module=this_module,
         connector_scheduler_class="PersistentKvCacheConnectorLeader",
         connector_worker_class="PersistentKvCacheConnectorWorker",
@@ -211,7 +211,7 @@ def main(model: str):
     llm = LLM(model=model,
               backend="pytorch",
               cuda_graph_config=None,
-              connector_config=connector_config)
+              kv_connector_config=kv_connector_config)
 
     test_text = (
         "Nvidia Corporation is an American technology company headquartered in Santa Clara, California."
@@ -232,7 +232,7 @@ def main(model: str):
     llm = LLM(model=model,
               backend="pytorch",
               cuda_graph_config=None,
-              connector_config=connector_config)
+              kv_connector_config=kv_connector_config)
 
     output = llm.generate([test_text], sampling_params)
     text1 = output[0].outputs[0].text
