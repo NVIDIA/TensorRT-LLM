@@ -58,6 +58,9 @@ namespace kernels
 namespace cutlass_kernels
 {
 
+namespace oss
+{
+
 template <typename T, typename arch, typename ThreadblockShape, typename WarpShape, int Stages>
 void genericInt8GemmKernelLauncher(int8_t const* A, int8_t const* B, tk::QuantMode quantOption, float const* alphaCol,
     float const* alphaRow, T* C, int m, int n, int k, tkc::CutlassGemmConfig gemmConfig, char* workspace,
@@ -301,6 +304,7 @@ void dispatchGemmToCutlass(int8_t const* A, int8_t const* B, tk::QuantMode quant
         break;
     }
 }
+} // namespace oss
 
 template <typename T>
 CutlassInt8GemmRunner<T>::CutlassInt8GemmRunner()
@@ -326,18 +330,18 @@ void CutlassInt8GemmRunner<T>::dispatchToArch(int8_t const* A, int8_t const* B, 
     TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
     if (mSm >= 72 && mSm < 75)
     {
-        dispatchGemmToCutlass<T, cutlass::arch::Sm72>(A, B, quantOption, alphaCol, alphaRow, C, m, n, k, workspacePtr,
-            workspaceBytes, gemmConfig, stream, occupancy);
+        oss::dispatchGemmToCutlass<T, cutlass::arch::Sm72>(A, B, quantOption, alphaCol, alphaRow, C, m, n, k,
+            workspacePtr, workspaceBytes, gemmConfig, stream, occupancy);
     }
     else if (mSm >= 75 && mSm < 80)
     {
-        dispatchGemmToCutlass<T, cutlass::arch::Sm75>(A, B, quantOption, alphaCol, alphaRow, C, m, n, k, workspacePtr,
-            workspaceBytes, gemmConfig, stream, occupancy);
+        oss::dispatchGemmToCutlass<T, cutlass::arch::Sm75>(A, B, quantOption, alphaCol, alphaRow, C, m, n, k,
+            workspacePtr, workspaceBytes, gemmConfig, stream, occupancy);
     }
     else if (mSm >= 80 && mSm <= 90 || mSm >= 120)
     {
-        dispatchGemmToCutlass<T, cutlass::arch::Sm80>(A, B, quantOption, alphaCol, alphaRow, C, m, n, k, workspacePtr,
-            workspaceBytes, gemmConfig, stream, occupancy);
+        oss::dispatchGemmToCutlass<T, cutlass::arch::Sm80>(A, B, quantOption, alphaCol, alphaRow, C, m, n, k,
+            workspacePtr, workspaceBytes, gemmConfig, stream, occupancy);
     }
     else
     {
