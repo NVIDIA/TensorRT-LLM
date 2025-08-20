@@ -176,12 +176,7 @@ def setup_llm(args, **kwargs):
                 max_draft_len=args.spec_decode_max_draft_len,
                 speculative_model_dir=args.model_dir,
                 eagle3_one_model=args.use_one_model,
-                is_mtp_eagle=True,
-                use_relaxed_acceptance_for_thinking=args.
-                use_relaxed_acceptance_for_thinking,
-                relaxed_topk=args.relaxed_topk,
-                relaxed_delta=args.relaxed_delta,
-            )
+                is_mtp_eagle=True)
         else:
             spec_config = MTPDecodingConfig(
                 num_nextn_predict_layers=args.spec_decode_max_draft_len,
