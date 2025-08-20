@@ -306,8 +306,11 @@ class ReportUtility:
                                               KvCacheConfig())
             if isinstance(kv_cache_config, KvCacheConfig):
                 kv_cache_dtype = kv_cache_config.dtype
+                kv_cache_mem_percent = kv_cache_config.free_gpu_memory_fraction
             elif isinstance(kv_cache_config, dict):
                 kv_cache_dtype = kv_cache_config.get("dtype", "auto")
+                kv_cache_mem_percent = kv_cache_config.get(
+                    "free_gpu_memory_fraction")
             else:
                 raise ValueError(
                     f"Invalid kv_cache_config type: {type(kv_cache_config)}.")
@@ -336,8 +339,7 @@ class ReportUtility:
             "max_batch_size": self.rt_cfg.settings_config.max_batch_size,
             "max_num_tokens": self.rt_cfg.settings_config.max_num_tokens,
             "scheduling_policy": self.rt_cfg.settings_config.scheduler_policy,
-            "kv_cache_percentage":
-            self.rt_cfg.settings_config.kv_cache_percent * 100.0,
+            "kv_cache_percentage": kv_cache_mem_percent * 100.0,
             "issue_rate": self.convert_rate_to_s(self.statistics.issue_rate_ns)
         }
 
