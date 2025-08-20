@@ -8,6 +8,7 @@ Help()
    echo "h     Print this Help."
    echo "t     Location of tensorrt library"
    echo "u     Option to build unit tests"
+   echo "s     Triton short tag, e.g. 'r25.06'"
    echo
 }
 
@@ -37,7 +38,7 @@ done
 echo "Using TRT_ROOT=${TRT_ROOT}"
 echo "Using BUILD_UNIT_TESTS=${BUILD_UNIT_TESTS}"
 
-DIRNAME="$(dirname "$(realpath $0)")"
+DIRNAME="$(dirname "$(realpath "$0")")"
 if [ -z "$TRITON_SHORT_TAG" ]; then
   # Get TRITON_SHORT_TAG from docker/Dockerfile.multi
   LLM_ROOT="${DIRNAME}/../../.."
@@ -50,10 +51,9 @@ apt-get update
 apt-get install -y --no-install-recommends rapidjson-dev
 
 
-BUILD_DIR="$DIRNAME/../build"
-mkdir $BUILD_DIR
-BUILD_DIR=$(cd -- "$BUILD_DIR" && pwd)
-cd $BUILD_DIR
+BUILD_DIR=$(realpath "$DIRNAME/../build")
+mkdir -p "$BUILD_DIR"
+cd "$BUILD_DIR" || exit 1
 
 export LD_LIBRARY_PATH="/usr/local/cuda/compat/lib.real:${LD_LIBRARY_PATH}"
 
@@ -62,7 +62,13 @@ if [[ "$BUILD_UNIT_TESTS" == "true" ]]; then
   BUILD_TESTS_ARG="-DBUILD_TESTS=ON -DUSE_CXX11_ABI=ON"
 fi
 
-cmake -DCMAKE_INSTALL_PREFIX:PATH=`pwd`/install ${BUILD_TESTS_ARG} -DTRITON_COMMON_REPO_TAG=${TRITON_SHORT_TAG} -DTRITON_CORE_REPO_TAG=${TRITON_SHORT_TAG} -DTRITON_THIRD_PARTY_REPO_TAG=${TRITON_SHORT_TAG} -DTRITON_BACKEND_REPO_TAG=${TRITON_SHORT_TAG} ..
+cmake -DCMAKE_INSTALL_PREFIX:PATH="$(pwd)/install" \
+   ${BUILD_TESTS_ARG} \
+   -DTRITON_COMMON_REPO_TAG="${TRITON_SHORT_TAG}" \
+   -DTRITON_CORE_REPO_TAG="${TRITON_SHORT_TAG}" \
+   -DTRITON_THIRD_PARTY_REPO_TAG="${TRITON_SHORT_TAG}" \
+   -DTRITON_BACKEND_REPO_TAG="${TRITON_SHORT_TAG}" \
+   ..
 make install
 
 mkdir -p /opt/tritonserver/backends/tensorrtllm
