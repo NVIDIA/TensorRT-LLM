@@ -28,7 +28,6 @@ def get_free_port():
         s.bind(("", 0))  # Bind to port 0 to get a random free port
         s.listen(1)
         port = s.getsockname()[1]
-    print(f"port: {port} on node: {ray.util.get_node_ip_address()}")
     return port
 
 
@@ -75,7 +74,6 @@ class RayExecutor(GenerationExecutor):
             self.response_sync_queue)
 
         self.create_workers(RayGPUWorker, worker_kwargs, worker_extension_cls)
-        print('Ray workers created')
 
     @staticmethod
     def create_actor_weak_ref(actor_handle: ray.actor.ActorHandle):
@@ -90,8 +88,6 @@ class RayExecutor(GenerationExecutor):
                        worker_cls,
                        worker_kwargs,
                        worker_extension_cls: Optional[str] = None):
-        print("Creating workers...")
-
         # If this is set to be a fraction, it allows Ray to schedule
         # multiple actors on a single GPU for colocate use cases.
         num_gpus = float(os.getenv("TRTLLM_RAY_PER_WORKER_GPUS", "1.0"))
@@ -231,7 +227,10 @@ class RayExecutor(GenerationExecutor):
         return sorted(gpu_ids)
 
     def abort_request(self, request_id: int) -> None:
-        self.proxy_executor.abort_request(request_id)
+        self.call_all_ray_workers("abort_request",
+                                  leader_only=True,
+                                  async_call=False,
+                                  request_id=request_id)
 
     def shutdown(self):
         # Release actors

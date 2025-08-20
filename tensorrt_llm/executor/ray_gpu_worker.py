@@ -5,7 +5,7 @@ import os
 import socket
 from pathlib import Path
 from queue import Queue
-from typing import Any, Optional, Type, Union
+from typing import Any, Optional, Type, Union, Dict
 
 import ray
 import torch
@@ -242,6 +242,8 @@ class RayGPUWorker(GenerationExecutor):
         self._lora_manager: Optional[LoraManager] = None
         self._prompt_adapter_manager: Optional[PromptAdapterManager] = None
         self._runtime_model_config: Optional[ModelConfig] = None
+        # mapping: client_id -> request_id returned from runtime backend
+        self._client_id_to_request_id: Dict[int, int] = {}
         if self.rank == 0 and isinstance(self.engine, tllm.Executor):
             if isinstance(engine, Engine):
                 engine_config = engine.config
@@ -422,6 +424,7 @@ class RayGPUWorker(GenerationExecutor):
             else:
                 req_id = self.engine.enqueue_request(
                     executor_request, result_wait_queue=result_wait_queue)
+            self._client_id_to_request_id[request.id] = req_id
             return req_id
         except Exception as e:
             raise RequestError(str(e)) from e
