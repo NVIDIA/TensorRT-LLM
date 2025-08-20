@@ -352,6 +352,7 @@ class DecodingBaseConfig(StrictBaseModel):
     # When specified, speculation will be disabled at batch sizes above
     # this value. Otherwise, speculation will always be on.
     max_concurrency: Optional[int] = None
+    load_format: Optional[str] = None
 
     @classmethod
     def from_dict(cls, data: dict):

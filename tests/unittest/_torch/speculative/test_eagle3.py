@@ -201,7 +201,6 @@ def test_deepseek_eagle3():
             cuda_graph_config=cuda_graph_config,
             max_batch_size=max_batch_size,
             kv_cache_config=kv_cache_config,
-            load_format="dummy",
             # This max_seq_len is larger than the one specified
             # in the llama 3 8B eagle's config. We want to make sure
             # that the draft model won't go above its max in warmup
@@ -218,7 +217,8 @@ def test_deepseek_eagle3():
             speculative_model_dir=eagle_model_dir,
             # Llama 3 does not support one model eagle.
             eagle3_one_model=use_one_model,
-            eagle3_layers_to_capture={29})
+            eagle3_layers_to_capture={29},
+            load_format="DUMMY")
 
         llm_spec = LLM(**llm_common_config, speculative_config=spec_config)
 
