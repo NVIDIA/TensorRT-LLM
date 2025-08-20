@@ -5,7 +5,7 @@ import os
 import socket
 from pathlib import Path
 from queue import Queue
-from typing import Any, Optional, Type, Union, Dict
+from typing import Any, Dict, Optional, Type, Union
 
 import ray
 import torch

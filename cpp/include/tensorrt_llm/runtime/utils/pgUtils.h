@@ -16,16 +16,16 @@
 
 #pragma once
 
+#include <algorithm>
 #include <functional>
 #include <memory>
-#include <algorithm>
 #include <numeric>
 #include <torch/csrc/distributed/c10d/ProcessGroup.hpp>
 #include <torch/torch.h>
 #include <vector>
 
-#include "tensorrt_llm/common/tllmException.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/tllmException.h"
 
 // Check async op.
 inline c10::intrusive_ptr<c10d::Work> pgCheckHelper(
@@ -59,7 +59,8 @@ inline void pgCheckHelper(bool success, char const* const file, int const line, 
 
 #define PGCHECK_THROW(op) pgCheckHelper(op, __FILE__, __LINE__, #op)
 
-inline bool useMPI(){
+inline bool useMPI()
+{
     bool useMPI = true;
     char* val = std::getenv("DISABLE_MPI");
     if (val != nullptr && std::string(val) == "1")
@@ -100,20 +101,18 @@ torch::Tensor wrap_tensor(T* data, size_t size)
     {
         // `char` does not have a guaranteed specialization in CppTypeToScalarType
         // across PyTorch builds. Treat `char` as kChar (int8) explicitly.
-        return at::from_blob(
-            data, {static_cast<int64_t>(size)}, c10::TensorOptions{}.dtype(torch::kChar));
+        return at::from_blob(data, {static_cast<int64_t>(size)}, c10::TensorOptions{}.dtype(torch::kChar));
     }
     else if constexpr (std::is_same_v<std::decay_t<T>, uint64_t>)
     {
         // `uint64_t` may not have a guaranteed specialization in CppTypeToScalarType
         // across PyTorch builds. Treat `uint64_t` as kLong (int64) explicitly.
-        return at::from_blob(
-            data, {static_cast<int64_t>(size)}, c10::TensorOptions{}.dtype(torch::kLong));
+        return at::from_blob(data, {static_cast<int64_t>(size)}, c10::TensorOptions{}.dtype(torch::kLong));
     }
     else
     {
-        return at::from_blob(data, {static_cast<int64_t>(size)}, c10::TensorOptions{}
-                                                        .dtype(torch::CppTypeToScalarType<std::decay_t<T>>::value));
+        return at::from_blob(data, {static_cast<int64_t>(size)},
+            c10::TensorOptions{}.dtype(torch::CppTypeToScalarType<std::decay_t<T>>::value));
     }
 }
 
@@ -230,13 +229,13 @@ struct PgHelper
     {
         auto const worldSize = pg->getSize();
 
-        TLLM_CHECK_WITH_INFO(static_cast<int>(sizes.size()) == worldSize,
-            "sizes.size() must equal worldSize in allgatherv");
+        TLLM_CHECK_WITH_INFO(
+            static_cast<int>(sizes.size()) == worldSize, "sizes.size() must equal worldSize in allgatherv");
 
         at::Tensor inputTensor = wrap_tensor(input);
         SizeT const localSize = static_cast<SizeT>(inputTensor.numel());
-        TLLM_CHECK_WITH_INFO(sizes[pg->getRank()] == localSize,
-            "sizes[rank] must equal local input size in allgatherv");
+        TLLM_CHECK_WITH_INFO(
+            sizes[pg->getRank()] == localSize, "sizes[rank] must equal local input size in allgatherv");
 
         SizeT const maxSize = *std::max_element(sizes.begin(), sizes.end());
         auto tensorOptions = inputTensor.options();
@@ -247,7 +246,8 @@ struct PgHelper
             paddedInput.narrow(0, 0, static_cast<int64_t>(localSize)).copy_(inputTensor);
         }
 
-        at::Tensor paddedOutput = at::empty({static_cast<int64_t>(maxSize) * static_cast<int64_t>(worldSize)}, tensorOptions);
+        at::Tensor paddedOutput
+            = at::empty({static_cast<int64_t>(maxSize) * static_cast<int64_t>(worldSize)}, tensorOptions);
 
         PGCHECK_THROW(pg->_allgather_base(paddedOutput, paddedInput, options)->wait());
 

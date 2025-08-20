@@ -24,14 +24,14 @@
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
 #include "tensorrt_llm/runtime/utils/pgUtils.h"
-#include <torch/custom_class.h>
-#include <torch/python.h>
-#include <torch/csrc/jit/python/pybind_utils.h>
-#include <pybind11/pybind11.h>
 #include <future>
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <pybind11/pybind11.h>
+#include <torch/csrc/jit/python/pybind_utils.h>
+#include <torch/custom_class.h>
+#include <torch/python.h>
 #include <type_traits>
 #include <vector>
 
@@ -68,7 +68,10 @@ public:
 
     ~CacheTransceiverComm() = default;
 
-    bool isMpi() const noexcept { return mMpiComm != nullptr; }
+    bool isMpi() const noexcept
+    {
+        return mMpiComm != nullptr;
+    }
 
     int getRank() const
     {
@@ -88,8 +91,10 @@ public:
         return mPgComm->getSize();
     }
 
-    void allgather(void const* sendbuf, void* recvbuf, int count, mpi::MpiType dtype) const {
-        if (isMpi()) {
+    void allgather(void const* sendbuf, void* recvbuf, int count, mpi::MpiType dtype) const
+    {
+        if (isMpi())
+        {
             mMpiComm->allgather(sendbuf, recvbuf, count, dtype);
             return;
         }
@@ -97,8 +102,10 @@ public:
     }
 
     template <typename Input, typename Output>
-    bool allgather(Input input, Output output, c10d::AllgatherOptions options = c10d::AllgatherOptions()) const{
-        if (isMpi()) {
+    bool allgather(Input input, Output output, c10d::AllgatherOptions options = c10d::AllgatherOptions()) const
+    {
+        if (isMpi())
+        {
             TLLM_THROW("Input arguments only supported in pg");
         }
         tensorrt_llm::pg_utils::PgHelper pgh{mPgComm};
@@ -108,8 +115,11 @@ public:
     }
 
     template <typename Input, typename Output>
-    bool allgatherv(Input input, Output output, std::vector<int> const& sizes, c10d::AllgatherOptions options = c10d::AllgatherOptions()) const{
-        if (isMpi()) {
+    bool allgatherv(Input input, Output output, std::vector<int> const& sizes,
+        c10d::AllgatherOptions options = c10d::AllgatherOptions()) const
+    {
+        if (isMpi())
+        {
             TLLM_THROW("Input arguments only supported in pg");
         }
         tensorrt_llm::pg_utils::PgHelper pgh{mPgComm};
@@ -118,23 +128,28 @@ public:
     }
 
     bool allgatherv(void const* sendbuf, int sendcount, mpi::MpiType sendtype, void* recvbuf,
-        std::vector<int> const& recvcounts, std::vector<int> const& displs, mpi::MpiType recvtype) const{
-        if (isMpi()) {
+        std::vector<int> const& recvcounts, std::vector<int> const& displs, mpi::MpiType recvtype) const
+    {
+        if (isMpi())
+        {
             mMpiComm->allgatherv(sendbuf, sendcount, sendtype, recvbuf, recvcounts, displs, recvtype);
             return true;
         }
         TLLM_THROW("Input arguments only supported in mpi");
     }
 
-    CacheTransceiverComm split(int color, int key) {
+    CacheTransceiverComm split(int color, int key)
+    {
         if (isMpi())
         {
             auto subgroup = mMpiComm->split(color, key);
             return CacheTransceiverComm(std::make_shared<mpi::MpiComm const>(std::move(subgroup)));
         }
-        try {
+        try
+        {
             pybind11::gil_scoped_acquire gil;
-            if (!Py_IsInitialized()) {
+            if (!Py_IsInitialized())
+            {
                 Py_Initialize();
             }
             pybind11::module m = pybind11::module::import("tensorrt_llm._torch.distributed.pg_utils");
@@ -146,7 +161,9 @@ public:
             pybind11::object py_sub_pg = m.attr("split")(color, key, py_pg);
             auto pgSub = torch::jit::toCustomClass<c10d::ProcessGroup>(py_sub_pg);
             return CacheTransceiverComm(pgSub);
-        } catch (...) {
+        }
+        catch (...)
+        {
             TLLM_THROW("Failed to split process group");
         }
     }
@@ -235,7 +252,7 @@ private:
     std::vector<std::pair<LlmRequest*, std::future<void>>> mRequesterFutures;
     // only for mpi backend, don't need it for ucx backend
     mpi::MpiComm const* mMpiWorldComm{nullptr};
-    
+
     std::shared_ptr<CacheTransceiverComm> mGroupComm;
     std::shared_ptr<CacheTransceiverComm> mGroupTensorParaComm, mGroupPipeParaComm, mGroupDataComm, mGroupTPInDPComm;
 

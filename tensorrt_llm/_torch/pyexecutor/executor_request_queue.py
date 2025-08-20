@@ -270,8 +270,13 @@ class ExecutorRequestQueue:
     ) -> List[RequestQueueItem]:
         """Common logic for fetching and processing requests from the queue."""
         # Calculate timeout
-        timeout = None if (total_num_active_requests == 0) and len(
-            self.waiting_queue) == 0 else datetime.timedelta(0)
+        timeout = None
+        if (total_num_active_requests == 0) and len(self.waiting_queue) == 0:
+            # In Ray path (DISABLE_MPI=1), use a periodic heartbeat timeout so rank 0
+            # reaches the broadcast path regularly to prevent trtllm-serve timeout when idle.
+            timeout = datetime.timedelta(
+                0) if not self._disable_mpi else datetime.timedelta(
+                    seconds=1200)
 
         # Fetch requests from rank 0
         new_requests = []

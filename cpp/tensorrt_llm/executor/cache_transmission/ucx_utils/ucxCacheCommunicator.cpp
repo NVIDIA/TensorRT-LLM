@@ -269,12 +269,12 @@ UcxConnectionManager::UcxConnectionManager()
 
                 PGCHECK_THROW(pgh.allgather(&bufferSize, std::ref(sizeofBuffer), {}));
                 SizeType32 recvBufferSize = std::accumulate(sizeofBuffer.begin(), sizeofBuffer.end(), 0);
-                std::vector<char> recvBuffer(recvBufferSize);                       
+                std::vector<char> recvBuffer(recvBufferSize);
 
                 PGCHECK_THROW(pgh.allgatherv(std::ref(buffer), std::ref(recvBuffer), std::cref(sizeofBuffer), {}));
 
                 // deserialize
-                char * begin = reinterpret_cast<char *>(recvBuffer.data());
+                char* begin = reinterpret_cast<char*>(recvBuffer.data());
                 for (int r = 0; r < mWorldSize; ++r)
                 {
                     std::vector<char> serBuffer(begin, begin + sizeofBuffer[r]);

@@ -30,11 +30,12 @@ def split(color: int, key: int, pg_boxed: torch.ScriptObject):
     members.sort()  # sort by key
     ranks = [r for _, r in members]  # global ranks in subgroup
     assert len(ranks) > 0, "split produced empty subgroup"
-    assert dist.get_rank() in ranks, "current rank not in the requested color subgroup"
+    assert dist.get_rank(
+    ) in ranks, "current rank not in the requested color subgroup"
 
     # Create subgroup under the provided pg; ranks are global ranks
-    sub_pg = dist.new_group(ranks=ranks, use_local_synchronization=True, backend='gloo')
+    sub_pg = dist.new_group(ranks=ranks,
+                            use_local_synchronization=True,
+                            backend='gloo')
     # Return TorchScript boxed ProcessGroup so C++ can unwrap it
     return sub_pg.boxed()
-
-

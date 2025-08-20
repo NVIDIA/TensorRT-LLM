@@ -4,7 +4,6 @@ import time
 
 import torch
 import torch.distributed as dist
-from datetime import timedelta
 
 
 def _run_distributed_worker():
@@ -22,7 +21,8 @@ def _run_distributed_worker():
         except AttributeError:
             # In current bindings, CacheTransceiverComm is registered under
             # tensorrt_llm.bindings.internal.batch_manager
-            bm = importlib.import_module("tensorrt_llm.bindings.internal.batch_manager")
+            bm = importlib.import_module(
+                "tensorrt_llm.bindings.internal.batch_manager")
             cacheComm = getattr(bm, "CacheTransceiverComm")
         comm = cacheComm(world_pg.boxed())
 
@@ -41,8 +41,12 @@ def _run_distributed_worker():
         # allgather scalar: gather world ranks in subgroup order (sorted by key)
         ok, gathered_ranks = sub.allgather(rank)
         assert ok is True
-        expected_world_ranks = [r for r in range(world_size) if (r // 2) == color]
-        print(f"[rank {rank}: gathered_ranks: {gathered_ranks}, expected_world_ranks: {expected_world_ranks}]")
+        expected_world_ranks = [
+            r for r in range(world_size) if (r // 2) == color
+        ]
+        print(
+            f"[rank {rank}: gathered_ranks: {gathered_ranks}, expected_world_ranks: {expected_world_ranks}]"
+        )
         assert gathered_ranks == expected_world_ranks
 
         # allgatherv: variable-sized vectors per rank
@@ -66,14 +70,17 @@ def _run_distributed_worker():
         assert out == expected_concat
 
         # Test allgatherv with char: use ASCII characters (A=65, B=66, etc.)
-        char_payload = [chr(65 + rank)] * local_len  # Convert rank to ASCII char
+        char_payload = [chr(65 + rank)
+                        ] * local_len  # Convert rank to ASCII char
         ok_char, char_out = sub.allgatherv(char_payload, sizes)
         assert ok_char is True
 
         expected_char_concat = []
         for r in expected_world_ranks:
             expected_char_concat.extend([chr(65 + r)] * (r + 1))
-        print(f"[rank {rank}: char_out: {char_out}, expected_char_concat: {expected_char_concat}]")
+        print(
+            f"[rank {rank}: char_out: {char_out}, expected_char_concat: {expected_char_concat}]"
+        )
         assert char_out == expected_char_concat
 
     finally:
@@ -88,12 +95,15 @@ def _run_distributed_worker():
 def _main():
     # Ensure torch.distributed and Gloo backend are available
     if not dist.is_available():
-        print("ERROR: torch.distributed is not available in this PyTorch build.", file=sys.stderr)
+        print(
+            "ERROR: torch.distributed is not available in this PyTorch build.",
+            file=sys.stderr)
         sys.exit(1)
 
     backends = getattr(torch.distributed, "is_gloo_available", None)
     if callable(backends) and not torch.distributed.is_gloo_available():
-        print("ERROR: Gloo backend is not available in this PyTorch build.", file=sys.stderr)
+        print("ERROR: Gloo backend is not available in this PyTorch build.",
+              file=sys.stderr)
         sys.exit(1)
 
     # Ensure TRT-LLM Python bindings are importable before running workers
@@ -117,7 +127,8 @@ def _main():
 
     world_size = int(world_size_env)
     if world_size < 2 or (world_size % 2) != 0:
-        print("ERROR: WORLD_SIZE must be an even number >= 2 for this test.", file=sys.stderr)
+        print("ERROR: WORLD_SIZE must be an even number >= 2 for this test.",
+              file=sys.stderr)
         sys.exit(2)
 
     _run_distributed_worker()
@@ -132,4 +143,3 @@ def _main():
 
 if __name__ == "__main__":
     _main()
-

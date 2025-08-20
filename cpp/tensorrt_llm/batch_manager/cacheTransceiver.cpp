@@ -109,19 +109,21 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
     if (useMPI())
     {
         mGroupComm = std::make_shared<CacheTransceiverComm>(std::addressof(tensorrt_llm::mpi::MpiComm::session()));
-    }else{
+    }
+    else
+    {
         mGroupComm = std::make_shared<CacheTransceiverComm>(tensorrt_llm::pg_utils::get_world_pg());
     }
     using tensorrt_llm::batch_manager::kv_cache_manager::CacheFormatter;
     if (worldConfig.isPipelineParallel())
     {
-        mGroupPipeParaComm = 
-            std::make_shared<CacheTransceiverComm>(mGroupComm->split(worldConfig.getTensorParallelRank(), worldConfig.getPipelineParallelRank()));
+        mGroupPipeParaComm = std::make_shared<CacheTransceiverComm>(
+            mGroupComm->split(worldConfig.getTensorParallelRank(), worldConfig.getPipelineParallelRank()));
     }
     if (worldConfig.isTensorParallel())
     {
-        mGroupTensorParaComm = 
-            std::make_shared<CacheTransceiverComm>(mGroupComm->split(worldConfig.getPipelineParallelRank(), worldConfig.getTensorParallelRank()));
+        mGroupTensorParaComm = std::make_shared<CacheTransceiverComm>(
+            mGroupComm->split(worldConfig.getPipelineParallelRank(), worldConfig.getTensorParallelRank()));
     }
     int kvFactor = 2;
     if (cacheManager->getCacheType() == kv_cache_manager::CacheType::kSELFKONLY)
@@ -145,7 +147,8 @@ CacheTransceiver::CacheTransceiver(kv_cache_manager::BaseKVCacheManager* cacheMa
         mGroupDataComm = std::make_shared<CacheTransceiverComm>(mGroupComm->split(DPRank, worldConfig.getRank()));
         if (worldConfig.isTensorParallel())
         {
-            mGroupTPInDPComm = std::make_shared<CacheTransceiverComm>(mGroupComm->split(worldConfig.getRank() / TPSizeInDPGroup, worldConfig.getRank()));
+            mGroupTPInDPComm = std::make_shared<CacheTransceiverComm>(
+                mGroupComm->split(worldConfig.getRank() / TPSizeInDPGroup, worldConfig.getRank()));
         }
     }
     bool isMLA = attentionType == executor::kv_cache::CacheState::AttentionType::kMLA;
@@ -307,7 +310,8 @@ std::vector<LlmRequest::RequestIdType> gatherRequestIds(
     int localSize = static_cast<int>(requestIds.size());
     std::vector<int> sizes(mComm->getSize());
     std::vector<LlmRequest::RequestIdType> retData;
-    if (useMPI()){
+    if (useMPI())
+    {
         mComm->allgather(&localSize, sizes.data(), 1, mpi::MpiType::kINT32);
         std::vector<int> displs(mComm->getSize());
         int totalSize = 0;
@@ -319,7 +323,9 @@ std::vector<LlmRequest::RequestIdType> gatherRequestIds(
         retData.resize(totalSize);
         mComm->allgatherv(requestIds.data(), static_cast<int>(requestIds.size()), mpi::MpiType::kUINT64, retData.data(),
             sizes, displs, mpi::MpiType::kUINT64);
-    }else{
+    }
+    else
+    {
         mComm->allgather(&localSize, std::ref(sizes), {});
         int totalSize = std::accumulate(sizes.begin(), sizes.end(), 0);
         retData.resize(totalSize);
@@ -343,9 +349,12 @@ void updateKVCacheTransferBW(std::shared_ptr<CacheTransceiverComm> const& mComm,
     auto recvBufferSize = sendBufferSize * worldSize;
     std::vector<char> recvBuffer(recvBufferSize);
 
-    if (useMPI()){
+    if (useMPI())
+    {
         mComm->allgather(sendBuffer.data(), recvBuffer.data(), sendBufferSize, mpi::MpiType::kCHAR);
-    }else{
+    }
+    else
+    {
         mComm->allgather(std::ref(sendBuffer), std::ref(recvBuffer), {});
     }
 
@@ -365,9 +374,12 @@ void updateKVCacheTransferBW(std::shared_ptr<CacheTransceiverComm> const& mComm,
     std::size_t localKVCacheSize = request->getKvCacheSize();
     std::vector<std::size_t> allKVCacheSizes(worldSize, 0);
 
-    if (useMPI()){
+    if (useMPI())
+    {
         mComm->allgather(&localKVCacheSize, allKVCacheSizes.data(), 1, mpi::MpiType::kUINT64);
-    }else{
+    }
+    else
+    {
         mComm->allgather(&localKVCacheSize, std::ref(allKVCacheSizes), {});
     }
 
@@ -501,12 +513,15 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
             break;
         }
         toCompleteIdSet.insert(freqVec.at(idx).first);
-        if (useMPI()){
-            TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " checkGenTransferStatus at least from freqVec requestId: %zu ",
-                freqVec.at(idx).first);
-        }else{
-            TLLM_LOG_DEBUG(tensorrt_llm::pg_utils::get_world_pg()->getRank(), " checkGenTransferStatus at least from freqVec requestId: %zu ",
-                freqVec.at(idx).first);
+        if (useMPI())
+        {
+            TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
+                " checkGenTransferStatus at least from freqVec requestId: %zu ", freqVec.at(idx).first);
+        }
+        else
+        {
+            TLLM_LOG_DEBUG(tensorrt_llm::pg_utils::get_world_pg()->getRank(),
+                " checkGenTransferStatus at least from freqVec requestId: %zu ", freqVec.at(idx).first);
         }
         idx++;
     }
@@ -522,11 +537,14 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
         if (toCompleteIdSet.find(mRequesterFutures.at(idx).first->mRequestId) == toCompleteIdSet.end())
         {
             toCompleteIdSet.insert(mRequesterFutures.at(idx).first->mRequestId);
-            if (useMPI()){
+            if (useMPI())
+            {
                 TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
                     " checkGenTransferStatus at least from RequesterFuture requestId: %zu atLeastRequestNum:%d",
                     mRequesterFutures.at(idx).first->mRequestId, atLeastRequestNum.value_or(0));
-            }else{
+            }
+            else
+            {
                 TLLM_LOG_DEBUG(tensorrt_llm::pg_utils::get_world_pg()->getRank(),
                     " checkGenTransferStatus at least from RequesterFuture requestId: %zu atLeastRequestNum:%d",
                     mRequesterFutures.at(idx).first->mRequestId, atLeastRequestNum.value_or(0));
@@ -540,19 +558,25 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
         {
             toCompleteIdSet.insert(requestId);
         }
-        if (useMPI()){
+        if (useMPI())
+        {
             TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(), " checkGenTransferStatus freqVec requestId: %zu,freq:%d  ",
                 requestId, freq);
-        }else{
-            TLLM_LOG_DEBUG(tensorrt_llm::pg_utils::get_world_pg()->getRank(), " checkGenTransferStatus freqVec requestId: %zu,freq:%d  ",
-                requestId, freq);
+        }
+        else
+        {
+            TLLM_LOG_DEBUG(tensorrt_llm::pg_utils::get_world_pg()->getRank(),
+                " checkGenTransferStatus freqVec requestId: %zu,freq:%d  ", requestId, freq);
         }
     }
-    if (useMPI()){
+    if (useMPI())
+    {
         TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
             " checkGenTransferStatus toCompleteIdSet size: %zu, atLeastRequestNum: %d ", toCompleteIdSet.size(),
             atLeastRequestNum.value_or(0));
-    }else{
+    }
+    else
+    {
         TLLM_LOG_DEBUG(tensorrt_llm::pg_utils::get_world_pg()->getRank(),
             " checkGenTransferStatus toCompleteIdSet size: %zu, atLeastRequestNum: %d ", toCompleteIdSet.size(),
             atLeastRequestNum.value_or(0));
@@ -566,15 +590,17 @@ void CacheTransceiver::checkGenTransferStatus(std::optional<int> const& atLeastR
             // Gather the kv cache transfer time from all workers and update to leader rank
             if (!common::getEnvKVCacheTransferOutputPath().empty())
             {
-                auto syncComm
-                    = mCacheState->getParallelConfig().mEnableAttentionDP ? mGroupDataComm : mGroupComm;
+                auto syncComm = mCacheState->getParallelConfig().mEnableAttentionDP ? mGroupDataComm : mGroupComm;
                 updateKVCacheTransferBW(syncComm, it->first);
             }
-            if (useMPI()){
-            TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
+            if (useMPI())
+            {
+                TLLM_LOG_DEBUG(mpi::MpiComm::world().getRank(),
                     "**** it->first->mRequestId: %ld, context request ID: %ld ******** get feature ***",
                     it->first->mRequestId, it->first->getContextPhaseParams().value().getReqId());
-            }else{
+            }
+            else
+            {
                 TLLM_LOG_DEBUG(tensorrt_llm::pg_utils::get_world_pg()->getRank(),
                     "**** it->first->mRequestId: %ld, context request ID: %ld ******** get feature ***",
                     it->first->mRequestId, it->first->getContextPhaseParams().value().getReqId());
