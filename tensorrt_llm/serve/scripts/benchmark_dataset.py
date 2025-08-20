@@ -538,36 +538,45 @@ class RandomDataset(BenchmarkDataset):
                 f"Only {len(requests)} requests sampled from sharegpt dataset, {num_requests} requests are needed"
             )
         else:
-            def gen_inner_sequence(input_len, idx_offset, random_offset, vocab_size):
+
+            def gen_inner_sequence(input_len, idx_offset, random_offset,
+                                   vocab_size):
                 return ((random_offset + idx_offset + np.arange(input_len)) %
-                             vocab_size).tolist()
+                        vocab_size).tolist()
 
             for i in range(num_requests):
-                inner_seq = gen_inner_sequence(input_lens[i], i, offsets[i], vocab_size)
+                inner_seq = gen_inner_sequence(input_lens[i], i, offsets[i],
+                                               vocab_size)
                 token_ids = prefix_token_ids + inner_seq
                 total_input_len_expected = prefix_len + int(input_lens[i])
-                
+
                 # Here we have to re-tokenize and decode the prompt. Because the token_ids
-                # generated randomly can not guarantee a same token_id sequence after 
-                # decode and re-tokenize, and it will get a longer sequence length in most cases. 
-                # Take Qwen2TokenizerFast as an example: 
+                # generated randomly can not guarantee a same token_id sequence after
+                # decode and re-tokenize, and it will get a longer sequence length in most cases.
+                # Take Qwen2TokenizerFast as an example:
                 # [43576] --decode-> 'Ġaqui'  --tokenize-> [43576]
                 # [43577] --decode-> 'swagen' --tokenize-> [43577]
-                # [43576, 43577] --decode-> 'Ġaquiswagen' 
+                # [43576, 43577] --decode-> 'Ġaquiswagen'
                 #                --tokenize-> [264, 9202, 86, 8535] # seqlen changes
                 prompt = tokenizer.decode(token_ids, skip_special_tokens=True)
-                re_encoded_token_ids = tokenizer.encode(prompt, add_special_tokens=False)
+                re_encoded_token_ids = tokenizer.encode(
+                    prompt, add_special_tokens=False)
                 while len(re_encoded_token_ids) < total_input_len_expected:
                     # Append a new random sequence to the existing sequence
                     new_random_offset = np.random.randint(0, vocab_size)
-                    new_inner_seq = gen_inner_sequence(input_lens[i], i, new_random_offset, vocab_size)
+                    new_inner_seq = gen_inner_sequence(input_lens[i], i,
+                                                       new_random_offset,
+                                                       vocab_size)
                     re_encoded_token_ids += new_inner_seq
                     # Re-encode the prompt
-                    new_prompt = tokenizer.decode(re_encoded_token_ids, skip_special_tokens=True)
-                    re_encoded_token_ids = tokenizer.encode(new_prompt, add_special_tokens=False)
+                    new_prompt = tokenizer.decode(re_encoded_token_ids,
+                                                  skip_special_tokens=True)
+                    re_encoded_token_ids = tokenizer.encode(
+                        new_prompt, add_special_tokens=False)
 
                 # Cut if the sequence is longer than the expected length
-                re_encoded_token_ids = re_encoded_token_ids[:total_input_len_expected]
+                re_encoded_token_ids = re_encoded_token_ids[:
+                                                            total_input_len_expected]
 
                 result_prompt = re_encoded_token_ids
                 if self.return_text:
