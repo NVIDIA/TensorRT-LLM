@@ -524,8 +524,14 @@ def create_py_executor_instance(
         resource_manager.resource_managers.move_to_end(
             ResourceManagerType.KV_CACHE_MANAGER, last=True)
 
+    # When scheduler_capacity == 1, attention dp dummy request will prevent the scheduling of DISAGG_GENERATION_INIT.
+    # Enlarge scheduler capacity to avoid DISAGG_GENERATION_INIT stuck in the scheduler.
+    scheduler_capacity = max_num_sequences
+    if scheduler_capacity == 1 and mapping.enable_attention_dp and kv_cache_manager:
+        scheduler_capacity += 1
+
     capacity_scheduler = BindCapacityScheduler(
-        max_num_sequences,
+        scheduler_capacity,
         kv_cache_manager.impl if kv_cache_manager is not None else None,
         peft_cache_manager.impl if peft_cache_manager is not None else None,
         executor_config.scheduler_config.capacity_scheduler_policy,
