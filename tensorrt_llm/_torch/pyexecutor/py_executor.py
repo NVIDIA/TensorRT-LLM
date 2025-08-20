@@ -810,7 +810,7 @@ class PyExecutor:
                         torch.cuda.nvtx.range_push(
                             "_handle_new_tokens_inter_pp")
                         # Receive tokens from previous pp rank (w.r.t model forward direction)
-                        (sample_state.host, ) = self.dist.recv_object(
+                        sample_state.host = self.dist.recv_object(
                             src=self.dist.prev_pp_rank,
                             tag=prev_microbatch_id,
                         )
@@ -825,7 +825,7 @@ class PyExecutor:
                             self.send_handles[prev_microbatch_id].wait()
                         self.send_handles[
                             prev_microbatch_id] = self.dist.isend_object(
-                                (sample_state.host, ),
+                                sample_state.host,
                                 dest=self.dist.next_pp_rank,
                                 tag=prev_microbatch_id)
                     torch.cuda.nvtx.range_pop()
@@ -861,11 +861,10 @@ class PyExecutor:
                             finished_reqs_py_results = [
                                 r.py_result for r in finished_reqs
                             ]
-                            (finished_reqs_py_results,
-                             ) = self.dist.recv_object(
-                                 src=self.dist.prev_pp_rank,
-                                 tag=prev_microbatch_id,
-                             )
+                            finished_reqs_py_results = self.dist.recv_object(
+                                src=self.dist.prev_pp_rank,
+                                tag=prev_microbatch_id,
+                            )
                             for req, py_result in zip(finished_reqs,
                                                       finished_reqs_py_results):
                                 req.py_result = py_result
@@ -876,7 +875,7 @@ class PyExecutor:
                                 self.send_handles[prev_microbatch_id].wait()
                             self.send_handles[
                                 prev_microbatch_id] = self.dist.isend_object(
-                                    ([r.py_result for r in finished_reqs], ),
+                                    [r.py_result for r in finished_reqs],
                                     dest=self.dist.next_pp_rank,
                                     tag=prev_microbatch_id)
 
