@@ -23,7 +23,7 @@ DataType = tensorrt_llm.bindings.DataType
 LoraModule = tensorrt_llm.bindings.LoraModule
 LoraModuleType = tensorrt_llm.bindings.LoraModuleType
 current_dir = pathlib.Path(__file__).parent.resolve()
-root_dir = current_dir.parent.parent.parent
+root_dir = current_dir.parent.parent.parent.parent
 
 sys.path.append(str(root_dir / "tests" / "integration"))
 
@@ -44,6 +44,8 @@ class TestResourceManager(unittest.TestCase):
         """
         cpp_script_dir = os.path.join(cls.CPP_RESOURCES_DIR, "scripts")
 
+        # No reason to run this script for each test.
+        # TODO: move this to a fixture that runs once.
         generate_lora_data_args_tp1 = [
             sys.executable,
             f"{cpp_script_dir}/generate_test_lora_weights.py",
