@@ -1861,7 +1861,14 @@ def launchTestJobs(pipeline, testFilter, dockerNode=null)
 
     x86SlurmTestConfigs = [
         "RTXPro6000-PyTorch-Post-Merge-1": ["rtx-pro-6000", "l0_rtx_pro_6000", 1, 1],
-        "DGX_B200-4_GPUs-PyTorch-Post-Merge-1": ["b200-x4", "l0_dgx_b200", 1, 1, 4],
+        "DGX_B200-4_GPUs-PyTorch-Post-Merge-1": ["b200-x4", "l0_dgx_b200", 1, 8, 4],
+        "DGX_B200-4_GPUs-PyTorch-Post-Merge-2": ["b200-x4", "l0_dgx_b200", 2, 8, 4],
+        "DGX_B200-4_GPUs-PyTorch-Post-Merge-3": ["b200-x4", "l0_dgx_b200", 3, 8, 4],
+        "DGX_B200-4_GPUs-PyTorch-Post-Merge-4": ["b200-x4", "l0_dgx_b200", 4, 8, 4],
+        "DGX_B200-4_GPUs-PyTorch-Post-Merge-5": ["b200-x4", "l0_dgx_b200", 5, 8, 4],
+        "DGX_B200-4_GPUs-PyTorch-Post-Merge-6": ["b200-x4", "l0_dgx_b200", 6, 8, 4],
+        "DGX_B200-4_GPUs-PyTorch-Post-Merge-7": ["b200-x4", "l0_dgx_b200", 7, 8, 4],
+        "DGX_B200-4_GPUs-PyTorch-Post-Merge-8": ["b200-x4", "l0_dgx_b200", 8, 8, 4],
     ]
     fullSet += x86SlurmTestConfigs.keySet()
 
