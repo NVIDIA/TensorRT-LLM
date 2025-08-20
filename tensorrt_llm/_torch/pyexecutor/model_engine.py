@@ -420,7 +420,6 @@ class PyTorchModelEngine(ModelEngine):
         self.iter_states = {}
         self._cuda_graphs = {}
         self._cuda_graph_mem_pool = self._torch_compile_backend._graph_pool_handle if self._torch_compile_enabled else None
-        self._run_cuda_graphs = pytorch_backend_config.use_cuda_graph
 
         self._cuda_graph_padding_enabled = pytorch_backend_config.cuda_graph_padding_enabled
 
@@ -536,13 +535,11 @@ class PyTorchModelEngine(ModelEngine):
 
     @contextlib.contextmanager
     def no_cuda_graph(self):
-        _run_cuda_graphs = self._run_cuda_graphs
-        self._run_cuda_graphs = False
+        _run_cuda_graphs = self.cuda_graph_runner.enabled
         self.cuda_graph_runner.enabled = False
         try:
             yield
         finally:
-            self._run_cuda_graphs = _run_cuda_graphs
             self.cuda_graph_runner.enabled = _run_cuda_graphs
 
     @with_warmup_flag
@@ -753,7 +750,7 @@ class PyTorchModelEngine(ModelEngine):
 
             AutoTuner.get().print_profiling_cache()
 
-        if not (self._run_cuda_graphs
+        if not (self.cuda_graph_runner.enabled
                 or self._torch_compile_piecewise_cuda_graph):
             return
 

@@ -141,11 +141,6 @@ class CUDAGraphRunner:
         """Captures the forward pass for a given batch size."""
         engine = self._get_engine()
         key = (batch_size, self.draft_len)
-
-        max_tokens_per_req = 1
-        if engine.is_spec_decode:
-            max_tokens_per_req += engine.spec_config.max_draft_len
-
         spec_metadata = initial_inputs.get("spec_metadata", None)
         # [CUDA graph spec decode padding]
         # We pad input IDs/position IDs to the maximum draft length (token per request).
