@@ -50,8 +50,8 @@
 /tests/unittest/_torch/compilation @NVIDIA/trt-llm-torch-graph-compiler
 /tests/unittest/_torch/multi_gpu/test_ar_residual_norm.py @NVIDIA/trt-llm-torch-graph-compiler
 /tests/unittest/_torch/multi_gpu/test_user_buffers.py @NVIDIA/trt-llm-torch-graph-compiler
-/tests/unittest/_torch/test_custom_ops.py @NVIDIA/trt-llm-torch-graph-compiler
-/tests/unittest/_torch/test_autotuner.py @NVIDIA/trt-llm-torch-graph-compiler
+/tests/unittest/_torch/thop/test_custom_ops.py @NVIDIA/trt-llm-torch-graph-compiler
+/tests/unittest/_torch/misc/test_autotuner.py @NVIDIA/trt-llm-torch-graph-compiler
 
 ## TensorRT-LLM Pytorch - Attention
 /tensorrt_llm/_torch/attention_backend @NVIDIA/trt-llm-torch-attention-devs

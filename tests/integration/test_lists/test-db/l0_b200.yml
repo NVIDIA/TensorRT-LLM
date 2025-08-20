@@ -66,15 +66,21 @@ l0_b200:
   - test_e2e.py::test_ptp_quickstart_advanced_eagle3[Llama-3.1-8b-Instruct-llama-3.1-model/Llama-3.1-8B-Instruct-EAGLE3-LLaMA3.1-Instruct-8B]
   - test_e2e.py::test_ptp_quickstart_advanced_ngram[Llama-3.1-8B-Instruct-llama-3.1-model/Llama-3.1-8B-Instruct]
   - test_e2e.py::test_trtllm_bench_pytorch_backend_sanity[meta-llama/Llama-3.1-8B-llama-3.1-8b-False-False]
-  - unittest/_torch -k "not (modeling or multi_gpu or auto_deploy)" TIMEOUT (120)
-  - unittest/_torch -k "modeling_llama"
+  - unittest/_torch/attention
+  - unittest/_torch/compilation
+  - unittest/_torch/debugger
+  - unittest/_torch/executor
+  - unittest/_torch/misc
+  - unittest/_torch/modules
+  - unittest/_torch/multimodal
+  - unittest/_torch/sampler
+  - unittest/_torch/speculative
+  - unittest/_torch/thop
+  - unittest/_torch/modeling -k "modeling_llama"
   - unittest/_torch/modeling -k "modeling_mixtral"
   - unittest/_torch/modeling -k "modeling_deepseek"
   - unittest/_torch/modeling -k "modeling_gpt_oss"
   - unittest/_torch/auto_deploy/unit/singlegpu -k "not test_trtllm_bench_backend_comparison"
-  - unittest/_torch/speculative/test_eagle3.py
-  - unittest/_torch/speculative/test_kv_cache_reuse.py
-  - unittest/_torch/speculative/test_dynamic_spec_decode.py
 - condition:
     ranges:
       system_gpu_count:
