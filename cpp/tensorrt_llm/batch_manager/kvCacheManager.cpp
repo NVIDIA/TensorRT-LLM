@@ -501,6 +501,19 @@ bool KVCacheBlock::isLeaf() const
     return mNextBlocks.empty();
 }
 
+// This function calculates the number of block a layer should have, given
+// the total free memory and the window size of each layer.
+// For example, if we have 1 layer of window size 1024, and 2 layer of window
+// size 2048, and 3 layers of 4096.
+// Each layer of window size 1024 should have
+//     1024 / (1024 + 2048 * 2 + 4096 * 3) proportion of the total blocks.
+// Each layer of window size 2048 should have
+//     2048 / (1024 + 2048 * 2 + 4096 * 3) proportion of the total blocks.
+// Each layer of window size 4096 should have
+//     4096 / (1024 + 2048 * 2 + 4096 * 3) proportion of the total blocks.
+// NOTE: Currently the use of this function is not used for
+// BaseKVCacheManager::calculateMaxNumBlocks because the we want to first
+// achieve identical performance as assuming all layers as full attention.
 std::map<SizeType32, float> BlockManager::calculateWindowSizeToShare(
     std::map<SizeType32, std::vector<SizeType32>> const& windowSizeToLayers,
     std::map<SizeType32, SizeType32> const& windowSizeToCacheSizePerToken)
@@ -2436,8 +2449,14 @@ BlocksPerWindow BaseKVCacheManager::calculateMaxNumBlocks(executor::KvCacheConfi
         return blocksInSecondaryPool;
     };
 
-    auto const windowSizeToShare
-        = BlockManager::calculateWindowSizeToShare(windowSizeToLayers, cacheSizeBytesPerTokenPerWindow);
+    std::map<SizeType32, float> windowSizeToShare;
+    // NOTE: Righteously, blocks allocated should be proportional with
+    // regard to window size. Currently, we are first allocating identical
+    // number of blocks for all layers to achieve identical performance.
+    for (auto const& [windowSize, _] : windowSizeToLayers)
+    {
+        windowSizeToShare[windowSize] = 1.0f / windowSizeToLayers.size();
+    }
 
     std::vector<SizeType32> blocksPrimary;
     std::vector<SizeType32> blocksSecondary;
