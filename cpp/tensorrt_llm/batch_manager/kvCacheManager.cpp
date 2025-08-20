@@ -1914,6 +1914,15 @@ void KVCacheManager::offloadSequence(RequestIdType requestId, std::optional<Size
 {
 }
 
+void KVCacheManager::evictAllSequences(void)
+{
+    for (auto pair: mSequences) {
+        mSeqCacheStartPos.erase(pair.first);
+        mBlockManager.evictSequence(pair.second);
+    }
+    mSequences.clear();
+}
+
 SizeType32 KVCacheManager::getNumTokensCached(RequestIdType requestId) const
 {
     auto const seq_it = mSequences.find(requestId);

@@ -917,6 +917,8 @@ public:
     virtual void offloadSequence(
         LlmRequest::RequestIdType requestId, std::optional<SizeType32> numTokens = std::nullopt) = 0;
 
+    virtual void evictAllSequences(void) = 0;
+
     virtual SizeType32 getNumTokensCached(LlmRequest::RequestIdType requestId) const = 0;
     virtual SizeType32 getCacheStartPos(LlmRequest::RequestIdType requestId) const = 0;
     // ===== hstu modification end =====
@@ -1183,6 +1185,8 @@ public:
 
     void offloadSequence(
         LlmRequest::RequestIdType requestId, std::optional<SizeType32> numTokens = std::nullopt) override;
+
+    void evictAllSequences(void) override;
 
     SizeType32 getNumTokensCached(LlmRequest::RequestIdType requestId) const override;
     SizeType32 getCacheStartPos(LlmRequest::RequestIdType requestId) const override;

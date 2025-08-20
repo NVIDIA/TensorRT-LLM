@@ -348,6 +348,7 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
         .def("offload_sequence", &BaseKVCacheManager::offloadSequence)
         .def("get_num_tokens_cached", &BaseKVCacheManager::getNumTokensCached)
         .def("get_cached_start_position", &BaseKVCacheManager::getCacheStartPos)
+        .def("evict_all_sequences", &BaseKVCacheManager::evictAllSequences)
         // ===== hstu modification end =====
         .def("get_block_pool_pointers",
             [](tbk::BaseKVCacheManager& self)
