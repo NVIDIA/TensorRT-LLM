@@ -269,7 +269,7 @@ class TestMoeLoadBalancer(unittest.TestCase):
         mock_load_balancer_impl.return_value.set_warm_up_iter_count.assert_called_once_with(
             10)
 
-        balancer.set_next_iter_info(True, True)
+        balancer.set_iter_info(True, True)
 
         with MoeLoadBalancerIterContext(balancer):
             mock_load_balancer_impl.return_value.start_iter.assert_called_once_with(
@@ -308,7 +308,7 @@ class TestMoeLoadBalancer(unittest.TestCase):
         balancer.finalize_model()
 
         # enable statistic, disable weight update
-        balancer.set_next_iter_info(True, False)
+        balancer.set_iter_info(True, False)
 
         # Create sample token data - each token selects 2 experts
         # 4 tokens, each selecting 2 experts
@@ -373,7 +373,7 @@ class TestMoeLoadBalancer(unittest.TestCase):
         balancer.finalize_model()
 
         # enable statistic, disable weight update
-        balancer.set_next_iter_info(True, False)
+        balancer.set_iter_info(True, False)
 
         # Create sample token data - tokens selecting different experts
         token_selected_experts = torch.tensor(

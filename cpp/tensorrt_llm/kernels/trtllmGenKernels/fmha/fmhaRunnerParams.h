@@ -238,6 +238,8 @@ struct TllmGenFmhaRunnerParams
     int mHeadDimQk;
     // Head dimension for V.
     int mHeadDimV;
+    // Head dimension for Q/K non-RoPE part, only used for MLA now.
+    int mHeadDimQkNope;
     // Number of heads for Q and K/V.
     int mNumHeadsQ, mNumHeadsKv, mNumHeadsQPerKv;
     // The batch size.

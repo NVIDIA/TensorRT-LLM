@@ -163,6 +163,9 @@ deepseek-ai/DeepSeek-R1:
   - quant_algo: FP8_BLOCK_SCALES
     spec_dec_algo: MTP
     accuracy: 87.573
+  - quant_algo: FP8_BLOCK_SCALES
+    kv_cache_quant_algo: FP8
+    accuracy: 87.573
 Qwen3/Qwen3-8B:
   - quant_algo: W4A8_MXFP4_FP8
     accuracy: 72.70
@@ -229,6 +232,16 @@ nvidia/Nemotron-H-56B-Base-8K:
     accuracy: 83.82
 microsoft/Phi-4-mini-instruct:
   - accuracy: 68.98
+  - quant_algo: FP8
+    accuracy: 68.30
+bigcode/starcoder2-7b:
+  - accuracy: 41.35
+  - quant_algo: FP8
+    accuracy: 41.35
+mistralai/Codestral-22B-v0.1:
+  - accuracy: 61.72
+  - quant_algo: FP8
+    accuracy: 61.72
 # Created a dummy accuracy to track tp_size=2 for phi4-mini model.
 # TODO: update once https://nvbugs/5393849 is fixed.
 microsoft/Phi-4-mini-instruct-tp2:
@@ -264,3 +277,7 @@ GPT-OSS/MXFP4:
     accuracy: 75.50
   - quant_algo: W4A8_MXFP4_FP8
     accuracy: 75.50
+mistralai/Mistral-Nemo-12b-Base:
+  - accuracy: 69.66
+  - quant_algo: FP8
+    accuracy: 69.66
