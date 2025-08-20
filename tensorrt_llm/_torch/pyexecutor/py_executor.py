@@ -850,31 +850,29 @@ class PyExecutor:
                         # logits of the requests that have finished.
                         # NOTE: If the rank processing the logits ever becomes the same as
                         # the rank sending the responses, this code can be removed.
-                        if any(r.py_return_context_logits
-                               or r.py_return_generation_logits
-                               for r in scheduled_batch.all_requests()):
-                            finished_requests_results = [
-                                r.py_result
-                                for r in scheduled_batch.all_requests() if
-                                r.state == LlmRequestState.GENERATION_COMPLETE
-                            ]
-                            if self.dist.is_first_pp_rank and len(
-                                    finished_requests_results):
-                                (finished_requests_results,
-                                 ) = self.dist.recv_object(
-                                     src=self.dist.last_pp_rank,
-                                     tag=prev_microbatch_id,
-                                 )
-                            elif self.dist.is_last_pp_rank and len(
-                                    finished_requests_results):
-                                if self.send_handles[
-                                        prev_microbatch_id] is not None:
-                                    self.send_handles[prev_microbatch_id].wait()
-                                self.send_handles[
-                                    prev_microbatch_id] = self.dist.isend_object(
-                                        (finished_requests_results, ),
-                                        dest=self.dist.first_pp_rank,
-                                        tag=prev_microbatch_id)
+                        finished_requests_results = [
+                            r.py_result
+                            for r in scheduled_batch.all_requests() if
+                            r.state == LlmRequestState.GENERATION_COMPLETE
+                            and (r.py_return_context_logits or r.py_return_generation_logits)
+                        ]
+                        if self.dist.is_first_pp_rank and len(
+                                finished_requests_results):
+                            (finished_requests_results,
+                                ) = self.dist.recv_object(
+                                    src=self.dist.last_pp_rank,
+                                    tag=prev_microbatch_id,
+                                )
+                        elif self.dist.is_last_pp_rank and len(
+                                finished_requests_results):
+                            if self.send_handles[
+                                    prev_microbatch_id] is not None:
+                                self.send_handles[prev_microbatch_id].wait()
+                            self.send_handles[
+                                prev_microbatch_id] = self.dist.isend_object(
+                                    (finished_requests_results, ),
+                                    dest=self.dist.first_pp_rank,
+                                    tag=prev_microbatch_id)
 
                         finished_requests = self._handle_responses()
                         previous_scheduled_batch = previous_batch.sample_state.scheduled_requests
