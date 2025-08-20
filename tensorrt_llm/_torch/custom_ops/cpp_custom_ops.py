@@ -249,10 +249,6 @@ def _register_fake():
           ep_size: int):
         pass
 
-    @torch.library.register_fake("trtllm::moe_initialize_workspace")
-    def _(all_workspaces: torch.Tensor, ep_rank: int, ep_size: int):
-        pass
-
     @torch.library.custom_op("trtllm::group_rms_norm_base",
                              mutates_args=("outputs", ))
     def group_rms_norm_base(
