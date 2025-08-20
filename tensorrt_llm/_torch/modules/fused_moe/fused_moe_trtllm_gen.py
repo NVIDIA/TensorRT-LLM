@@ -2,9 +2,11 @@ from typing import Dict, List, Optional, Union
 
 import torch
 
+from tensorrt_llm._utils import get_sm_version
+
 from ...distributed.ops import reducescatter
 from ...model_config import ModelConfig
-from ...utils import Fp4QuantizedTensor, get_sm_version
+from ...utils import Fp4QuantizedTensor
 from .interface import MoE, MoEWeightLoadingMode
 from .quantization import (DeepSeekFP8BlockScalesFusedMoEMethod,
                            NVFP4TRTLLMGenFusedMoEMethod)
