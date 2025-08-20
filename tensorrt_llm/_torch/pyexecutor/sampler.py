@@ -112,8 +112,10 @@ class EarlyStopWithMMResult(Sampler):
     Use for skipping decoding step for non generation model, and return the batch_output (such as mm_embeddings)
     """
 
-    def sample_async(self, scheduled_requests: ScheduledRequests,
-                     model_outputs) -> SampleStateWithMMResult:
+    def sample_async(
+            self, scheduled_requests: ScheduledRequests, model_outputs,
+            num_context_logits_prefix_sum: list[int]
+    ) -> SampleStateWithMMResult:
         # from model_outputs to MultimodalResult
         data = MultimodalResult(mm_embeddings=model_outputs['mm_embeddings'])
         return SampleStateWithMMResult(scheduled_requests=scheduled_requests,
