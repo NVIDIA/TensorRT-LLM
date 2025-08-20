@@ -14,7 +14,7 @@
 # limitations under the License.
 """
     This generates gpu kernel analysis output from nsys rep. Will call nsys
-    stats  -r cuda_gpu_kern_trace, get non-overlapped gpu cycles, then generate
+    stats  -r cuda_gpu_trace, get non-overlapped gpu cycles, then generate
     csv and html output for analysis
 """
 
