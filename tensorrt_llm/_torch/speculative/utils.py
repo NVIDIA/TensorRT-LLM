@@ -11,7 +11,8 @@ from .model_drafter import ModelDrafter
 from .mtp import (MTPEagleWorker, MTPHiddenStatesManager, MTPSampler,
                   MTPSpecMetadata, MTPWorker)
 from .ngram import NGramDrafter, NGramPoolManager
-from .save_hidden_state import (SaveHiddenStatesResourceManager,
+from .save_hidden_state import (SaveHiddenStatesDrafter,
+                                SaveHiddenStatesResourceManager,
                                 SaveHiddenStatesSpecMetadata)
 
 
@@ -168,6 +169,9 @@ def get_spec_drafter(model_engine,
 
     if spec_config.spec_dec_mode.is_ngram():
         return NGramDrafter(spec_config, spec_resource_manager)
+
+    if spec_config.spec_dec_mode.is_save_hidden_states():
+        return SaveHiddenStatesDrafter(spec_config, spec_resource_manager)
 
     return None
 

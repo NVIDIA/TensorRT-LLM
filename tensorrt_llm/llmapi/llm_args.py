@@ -362,7 +362,6 @@ class DecodingBaseConfig(StrictBaseModel):
             "MTP": MTPDecodingConfig,
             "Medusa": MedusaDecodingConfig,
             "Eagle": EagleDecodingConfig,
-            "SaveState": SaveHiddenStatesDecodingConfig,
             "Lookahead": LookaheadDecodingConfig,
             "NGram": NGramDecodingConfig,
             "DraftTarget": DraftTargetDecodingConfig,
