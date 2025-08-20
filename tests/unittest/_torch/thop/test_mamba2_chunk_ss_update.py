@@ -362,10 +362,13 @@ def test_mamba2_chunk_scan_selective_state_update(dim, headdim, ngroups, dstate,
                                atol=atol[dtype])
 
 
-@pytest.mark.parametrize("max_seq_len, mamba_chunk_size",
-                         list(product([16, 270], [8, 256])))
-def test_mamba2_chunk_scan_combined_prefill_chunking(max_seq_len,
-                                                     mamba_chunk_size):
+@pytest.mark.parametrize("mamba_chunk_size", [8, 256])
+@pytest.mark.parametrize("seqlens", [
+    (16, 2, 8, 13),
+    (270, 88, 212, 203),
+    (16, 20),
+])
+def test_mamba2_chunk_scan_combined_prefill_chunking(mamba_chunk_size, seqlens):
     dim = 1024
     headdim = 64
     ngroups = 1
@@ -374,7 +377,7 @@ def test_mamba2_chunk_scan_combined_prefill_chunking(max_seq_len,
     # test in high precision to distinguish between numeric instabilities and actual errors
     dtype = 'float32'
 
-    batch_size = 4
+    num_sequences = len(seqlens)
     has_z = True
 
     device = "cuda"
@@ -385,26 +388,22 @@ def test_mamba2_chunk_scan_combined_prefill_chunking(max_seq_len,
 
     torch_dtype = str_dtype_to_torch(dtype)
 
-    # test data
-    torch.random.manual_seed(0)
-    last_token_ids = torch.randint(1,
-                                   max_seq_len + 1, (batch_size, ),
-                                   dtype=torch.int32,
-                                   device=device)
-    last_token_ids[0] = max_seq_len
+    seqlens = torch.tensor(seqlens, dtype=torch.int32, device=device)
     cu_seqlens = torch.cat([
         torch.tensor([0], dtype=torch.int32, device=device),
-        torch.cumsum(last_token_ids, dim=0, dtype=torch.int32)
+        torch.cumsum(seqlens, dim=0, dtype=torch.int32)
     ],
                            dim=0)
-    seq_idx = torch.repeat_interleave(torch.arange(len(last_token_ids),
+    seq_idx = torch.repeat_interleave(torch.arange(len(seqlens),
                                                    dtype=torch.int32,
                                                    device=device),
-                                      last_token_ids,
+                                      seqlens,
                                       output_size=cu_seqlens[-1]).unsqueeze(0)
     input_batch_size = 1
     input_seq_len = cu_seqlens[-1]
 
+    # test data
+    torch.random.manual_seed(0)
     x = torch.empty(input_batch_size,
                     input_seq_len,
                     nheads,
@@ -450,7 +449,7 @@ def test_mamba2_chunk_scan_combined_prefill_chunking(max_seq_len,
 
     ## chunked seqlen computation
     # first chunk
-    chunked_seqlens = last_token_ids // 2
+    chunked_seqlens = seqlens // 2
     chunked_cu_seqlens = torch.cat([
         torch.tensor([0], dtype=torch.int32, device=device),
         torch.cumsum(chunked_seqlens, dim=0, dtype=torch.int32)
@@ -466,7 +465,7 @@ def test_mamba2_chunk_scan_combined_prefill_chunking(max_seq_len,
     B_chunked = torch.zeros_like(B)[:, :chunked_input_seq_len, ...]
     C_chunked = torch.zeros_like(C)[:, :chunked_input_seq_len, ...]
     z_chunked = torch.zeros_like(z)[:, :chunked_input_seq_len, ...]
-    for i in range(batch_size):
+    for i in range(num_sequences):
         # yapf: disable
         chunk_f = lambda x, i: x[:, cu_seqlens[i]:cu_seqlens[i] + chunked_seqlens[i], ...]
 
@@ -495,7 +494,7 @@ def test_mamba2_chunk_scan_combined_prefill_chunking(max_seq_len,
     )
 
     # remaining chunk
-    remaining_chunked_seqlens = last_token_ids - chunked_seqlens
+    remaining_chunked_seqlens = seqlens - chunked_seqlens
     remaining_chunked_cu_seqlens = torch.cat([
         torch.tensor([0], dtype=torch.int32, device=device),
         torch.cumsum(remaining_chunked_seqlens, dim=0, dtype=torch.int32)
@@ -514,7 +513,7 @@ def test_mamba2_chunk_scan_combined_prefill_chunking(max_seq_len,
     remaining_B_chunked = torch.zeros_like(B)[:, :remaining_chunked_input_seq_len, ...]
     remaining_C_chunked = torch.zeros_like(C)[:, :remaining_chunked_input_seq_len, ...]
     remaining_z_chunked = torch.zeros_like(z)[:, :remaining_chunked_input_seq_len, ...]
-    for i in range(batch_size):
+    for i in range(num_sequences):
         remaining_chunk_f = lambda x, i: x[:, cu_seqlens[i] + chunked_seqlens[i]:cu_seqlens[i+1], ...]
 
         remaining_x_chunked[:, remaining_chunked_cu_seqlens[i]:remaining_chunked_cu_seqlens[i+1], ...] = remaining_chunk_f(x, i)
@@ -529,7 +528,7 @@ def test_mamba2_chunk_scan_combined_prefill_chunking(max_seq_len,
         pt2[:,remaining_chunked_cu_seqlens[i]:remaining_chunked_cu_seqlens[i+1],...],
         ],
         dim=1)
-    concat_batch_f = lambda pt1, pt2: torch.cat([concat_chunk_f(pt1, pt2, i) for i in range(batch_size)], dim=1)
+    concat_batch_f = lambda pt1, pt2: torch.cat([concat_chunk_f(pt1, pt2, i) for i in range(num_sequences)], dim=1)
 
     assert concat_batch_f(x_chunked, remaining_x_chunked).equal(x)
     assert concat_batch_f(dt_chunked, remaining_dt_chunked).equal(dt)
@@ -566,7 +565,7 @@ def test_mamba2_chunk_scan_combined_prefill_chunking(max_seq_len,
     # tight tolerance to find subtle correctness issues
     rtol = 1e-2
     atol = 2e-3
-    for i in range(batch_size):
+    for i in range(num_sequences):
         out_seq = out[:, cu_seqlens[i]:cu_seqlens[i + 1], ...]
         out_seq_ref = out_ref[:, cu_seqlens[i]:cu_seqlens[i + 1], ...]
         torch.testing.assert_close(out_seq[:, :chunked_seqlens[i], ...],
