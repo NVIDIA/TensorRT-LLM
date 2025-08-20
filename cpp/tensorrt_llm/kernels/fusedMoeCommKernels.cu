@@ -214,118 +214,6 @@ __host__ void MoeCommFieldInfo::fillFieldInfo(uint8_t* dataPtr, size_t elementSi
     alignedUnitStride = stride;
 }
 
-// #define DEBUG_PRINT
-
-class LamportProto
-{
-public:
-    // Here we use fixed INVALID_VALUE, which is -0.0 for all kinds of float types and -INT_MAX for all signed integers
-    // Real data should not use these values.
-    static constexpr uint32_t INVALID_VALUE = 1U << 31U;
-    static constexpr uint32_t FIXED_VALUE = 0U; // if raw data has INVALID_VALUE, fix it to FIXED_VALUE
-    static constexpr uint32_t INITIALIZED_VALUE = LamportProto::INVALID_VALUE;
-
-    template <bool USE_FINISH>
-    static __device__ __forceinline__ int checkDataReceivedInShm(uint8_t* sharedMemoryBase, uint64_t step,
-        int countIn128Bytes, int fifoEntry128ByteIndexBase, int loaded128ByteCount, int warpId, int laneId)
-    {
-        // return value should be how many package already been received.
-        // 0 means no data received, -1 means has received finish package(should be the very first 128 Byte).
-
-        int* aligned128BytesShm = reinterpret_cast<int*>(sharedMemoryBase);
-        int totalValidCount = 0;
-        for (int idxBase = loaded128ByteCount; idxBase < countIn128Bytes; idxBase += WARP_SIZE)
-        {
-            int idx = idxBase + laneId;
-            bool valid = false;
-            bool finish = false;
-            if (idx < countIn128Bytes)
-            {
-                int indexInFifoEntry = fifoEntry128ByteIndexBase + idx;
-                int value0
-                    = aligned128BytesShm[idx * MoeCommFieldInfo::INTS_PER_128B_BLOCK + indexInFifoEntry % WARP_SIZE];
-                int value1 = aligned128BytesShm[idx * MoeCommFieldInfo::INTS_PER_128B_BLOCK
-                    + (indexInFifoEntry + 1) % WARP_SIZE];
-                valid = (value0 != LamportProto::INVALID_VALUE) && (value1 != LamportProto::INVALID_VALUE);
-                if (USE_FINISH)
-                {
-                    finish = (idx == 0) && (value0 != LamportProto::INVALID_VALUE)
-                        && (value1 == LamportProto::INVALID_VALUE);
-                }
-            }
-            __syncwarp();
-            unsigned validMask = __ballot_sync(WARP_MASK, valid);
-            // here we check valid in order, if previous valid is not true, we ignore the current valid.
-            int validCount = (validMask == WARP_MASK) ? WARP_SIZE : (__ffs(~validMask) - 1);
-            if (USE_FINISH)
-            {
-                unsigned finishedMask = __ballot_sync(WARP_MASK, finish);
-                // finish should be the very first 128 Byte.
-                if (finishedMask & 0x1)
-                {
-                    return -1;
-                }
-            }
-            totalValidCount += validCount;
-
-            if (validCount != WARP_SIZE)
-            {
-                break;
-            }
-        }
-        return totalValidCount;
-    }
-
-    static __device__ __forceinline__ void protoPack(uint8_t* sharedMemoryBase, uint64_t step, int countIn128Bytes,
-        int fifoEntry128ByteIndexBase, int warpId, int laneId)
-    {
-        int* aligned128BytesShm = reinterpret_cast<int*>(sharedMemoryBase);
-        for (int idx = laneId; idx < countIn128Bytes; idx += WARP_SIZE)
-        {
-            int indexInFifoEntry = fifoEntry128ByteIndexBase + idx;
-            int value0 = aligned128BytesShm[idx * MoeCommFieldInfo::INTS_PER_128B_BLOCK + indexInFifoEntry % WARP_SIZE];
-            int value1
-                = aligned128BytesShm[idx * MoeCommFieldInfo::INTS_PER_128B_BLOCK + (indexInFifoEntry + 1) % WARP_SIZE];
-            if (value0 == LamportProto::INVALID_VALUE)
-            {
-                aligned128BytesShm[idx * MoeCommFieldInfo::INTS_PER_128B_BLOCK + indexInFifoEntry % WARP_SIZE]
-                    = LamportProto::FIXED_VALUE;
-            }
-            if (value1 == LamportProto::INVALID_VALUE)
-            {
-                aligned128BytesShm[idx * MoeCommFieldInfo::INTS_PER_128B_BLOCK + (indexInFifoEntry + 1) % WARP_SIZE]
-                    = LamportProto::FIXED_VALUE;
-            }
-        }
-        __syncwarp();
-    }
-
-    static __device__ __forceinline__ void protoUnpack(uint8_t* sharedMemoryBase, uint64_t step, int countIn128Bytes,
-        int fifoEntry128ByteIndexBase, int loaded128ByteCount, int warpId, int laneId)
-    {
-        // Lamport don't need unpack
-    }
-
-    static __device__ __forceinline__ void rearm(
-        uint32_t* u32FifoPtr, uint64_t step, int countIn128Bytes, int fifoEntry128ByteIndexBase, int warpId, int laneId)
-    {
-        constexpr int kUint32CountPer128Byte = 128 / sizeof(uint32_t);
-        for (int i = laneId; i < countIn128Bytes; i += WARP_SIZE)
-        {
-            int checkValue0Position = (fifoEntry128ByteIndexBase + i) % kUint32CountPer128Byte;
-            u32FifoPtr[i * kUint32CountPer128Byte + checkValue0Position] = LamportProto::INVALID_VALUE;
-        }
-        __syncwarp();
-    }
-
-    static __device__ __host__ __forceinline__ int computeProtoTransfer128ByteAlignedSize(
-        int compact128ByteSizeBeforeProto)
-    {
-        // Lamport is fully in place
-        return compact128ByteSizeBeforeProto;
-    }
-};
-
 class Ll128Proto
 {
 public:
@@ -409,13 +297,6 @@ public:
                     + idxFromFifoEntry % MoeCommFieldInfo::UINT64_PER_128B_BLOCK;
                 tailValue = aligned128BytesShm[flagIndex];
                 aligned128BytesShm[flagIndex] = step;
-#ifdef DEBUG_PRINT
-                printf(
-                    "[!!protoPack] blockIdx=(%d, %d, %d), warpId=%d, laneId=%d, moving tailValue=%lx from index=%d to "
-                    "targetTailIndex=%d, fifoEntry128ByteIndexBase=%d, countIn128Bytes=%d\n",
-                    blockIdx.x, blockIdx.y, blockIdx.z, warpId, laneId, tailValue, flagIndex, targetTailIndex,
-                    fifoEntry128ByteIndexBase, countIn128Bytes);
-#endif
             }
             aligned128BytesShm[targetTailIndex] = tailValue;
             tailOffsetIn128Bytes += 2;
@@ -448,13 +329,6 @@ public:
                 int flagIndex = idxIn128Bytes * MoeCommFieldInfo::UINT64_PER_128B_BLOCK
                     + idxFromFifoEntry % MoeCommFieldInfo::UINT64_PER_128B_BLOCK;
                 aligned128BytesShm[flagIndex] = tailValue;
-#ifdef DEBUG_PRINT
-                printf(
-                    "[!!protoUnpack] blockIdx=(%d, %d, %d), warpId=%d, laneId=%d, moving tailValue=%lx from "
-                    "targetTailIndex=%d to index=%d, fifoEntry128ByteIndexBase=%d, countIn128Bytes=%d\n",
-                    blockIdx.x, blockIdx.y, blockIdx.z, warpId, laneId, tailValue, targetTailIndex, flagIndex,
-                    fifoEntry128ByteIndexBase, countIn128Bytes);
-#endif
             }
             tailOffsetIn128Bytes += 2;
         }
@@ -494,10 +368,6 @@ __device__ __forceinline__ int startFieldG2S(MoeCommFieldInfo const& fieldInfo, 
     uint8_t* loadPtr = fieldInfo.get16BAlignedLoadCopyRange(dataIndex, &copyByteCount);
     if (laneId == 0 && copyByteCount > 0)
     {
-#ifdef DEBUG_PRINT
-        printf("warpId=%d, blockIdx.x=%d, in startFieldG2S alignedShmLoadOffset=%d, copyByteCount=%d\n", warpId,
-            blockIdx.x, alignedShmLoadOffset, copyByteCount);
-#endif
         cp_async_bulk_g2s(sharedMemoryLoadPtr, loadPtr, copyByteCount, smemBar);
     }
     return copyByteCount;
@@ -515,32 +385,10 @@ __device__ __forceinline__ void startFieldS2G(
         = fieldInfo.get16BAlignedStoreCopyRange(dataIndex, &copyByteCount, laneId, &headTailShmIdx, &headTailGlobalIdx);
     if (copyByteCount > 0 && laneId == 0)
     {
-#ifdef DEBUG_PRINT
-#if 0
-        printf(
-            "startFieldS2G, alignedShmStoreOffset=%d, blockIdx.x=%d, warpId=%d, laneId=%d, copy aligned "
-            "copyByteCount=%d bytes.\n",
-            alignedShmStoreOffset, blockIdx.x, warpId, laneId, copyByteCount);
-#endif
-#endif
         cp_async_bulk_s2g(storePtr, sharedMemoryStorePtr + MoeCommFieldInfo::BYTES_PER_16B_BLOCK, copyByteCount);
     }
-#ifdef DEBUG_PRINT
-#if 0
-    printf("startFieldS2G, blockIdx.x=%d, warpId=%d, laneId=%d, headTailShmIdx=%d to headTailGlobalIdx=%d\n",
-        blockIdx.x, warpId, laneId, headTailShmIdx, headTailGlobalIdx);
-#endif
-#endif
     if (headTailGlobalIdx >= 0)
     {
-#ifdef DEBUG_PRINT
-#if 0
-        printf(
-            "startFieldS2G, blockIdx.x=%d, warpId=%d, laneId=%d, copy headtail from headTailShmIdx=%d to "
-            "headTailGlobalIdx=%d\n",
-            blockIdx.x, warpId, laneId, headTailShmIdx, headTailGlobalIdx);
-#endif
-#endif
         // copy head and tail
         fieldInfo.getRawPtr(dataIndex, nullptr)[headTailGlobalIdx] = sharedMemoryStorePtr[headTailShmIdx];
     }
@@ -578,12 +426,6 @@ __device__ __forceinline__ void memmoveFieldOnSharedMemory(
     MoeCommFieldInfo const& fieldInfo, int dataIndex, uint8_t* sharedMemoryBase, int laneId)
 {
     int movOffset = fieldInfo.getMemmoveOffsets(dataIndex);
-#ifdef DEBUG_PRINT
-    if (laneId == 0)
-    {
-        printf("pack=%d, dataIndex=%d, movOffset=%d\n", IS_PACK ? 1 : 0, dataIndex, movOffset);
-    }
-#endif
     if (movOffset == 0)
     {
         // if movOffset is 0, src and dst are the same, don't need memmove.
@@ -706,12 +548,6 @@ __device__ __forceinline__ uint64_t g2sAllFields(FusedMoeFieldInfo const& sendFi
 {
     if (HAS_BASIC_FIELDS)
     {
-#ifdef DEBUG_PRINT
-        if (laneId == 0)
-        {
-            printf("warpId=%d, blockIdx.x=%d, in g2sAllFields before g2sBasicFields\n", warpId, blockIdx.x);
-        }
-#endif
         g2sBasicFields(sendFieldInfo, expertParallelInfo, dataIndex, sharedMemoryBase, laneId);
         cp_async_commit_group();
     }
@@ -719,22 +555,8 @@ __device__ __forceinline__ uint64_t g2sAllFields(FusedMoeFieldInfo const& sendFi
 #pragma unroll
     for (int i = 0; i < FIELD_COUNT; i++)
     {
-#ifdef DEBUG_PRINT
-        if (laneId == 0)
-        {
-            printf("warpId=%d, blockIdx.x=%d, in g2sAllFields before startFieldG2S for field %d, asyncLoadSize=%d\n",
-                warpId, blockIdx.x, i, asyncLoadSize);
-        }
-#endif
         asyncLoadSize
             += startFieldG2S(sendFieldInfo.fieldsInfo[i], dataIndex, sharedMemoryBase, warpId, laneId, smemBar);
-#ifdef DEBUG_PRINT
-        if (laneId == 0)
-        {
-            printf("warpId=%d, blockIdx.x=%d, in g2sAllFields after startFieldG2S for field %d,  asyncLoadSize=%d\n",
-                warpId, blockIdx.x, i, asyncLoadSize);
-        }
-#endif
     }
     return mbarrier_arrive_expect_tx(smemBar, laneId == 0 ? asyncLoadSize : 0);
 }
@@ -891,11 +713,6 @@ public:
 
     __device__ __forceinline__ void updateReadEntry()
     {
-        // need this fence to be sure lamport flags are updated.
-        if constexpr (std::is_same<FusedMoeProto, LamportProto>::value)
-        {
-            fence_release_sys();
-        }
         mReceiverSideFifoInfo->tail = mTail;
         mSenderSideFifoInfo->tail = mTail;
     }
@@ -922,25 +739,9 @@ public:
 
         int sendIndex = mPairInfo.channel;
         uint32_t phaseParity = 0;
-#ifdef DEBUG_PRINT
-        if (mLaneId == 0)
-        {
-            printf("[Send] warpId=%d, blockIdx=(%d, %d, %d), in doSend head=%lu, tail=%lu\n", mWarpId, blockIdx.x,
-                blockIdx.y, blockIdx.z, mHead, mTail);
-        }
-        __syncwarp();
-#endif
         for (; sendIndex < tokenCount; sendIndex += mPairInfo.runChannelCount)
         {
             int tokenIndex = sendIndexMapping == nullptr ? sendIndex : sendIndexMapping[sendIndex];
-#ifdef DEBUG_PRINT
-            if (mLaneId == 0)
-            {
-                printf("[Send] warpId=%d, blockIdx=(%d, %d, %d), tokenIndex=%d, head=%lu, tail=%lu, starting G2S\n",
-                    mWarpId, blockIdx.x, blockIdx.y, blockIdx.z, tokenIndex, mHead, mTail);
-            }
-            __syncwarp();
-#endif
             tensorrt_llm::kernels::fused_moe_impl::g2sAllFields<HAS_BASIC_FIELD, FIELD_COUNT>(
                 mFieldInfo, mExpertParallelInfo, tokenIndex, mShmemBase, mWarpId, mLaneId, mSmemBar);
             if (needNewEntry())
@@ -954,14 +755,6 @@ public:
                 newSendEntry();
             }
             tensorrt_llm::kernels::fused_moe_impl::waitG2SAllFields<HAS_BASIC_FIELD>(mSmemBar, &phaseParity);
-#ifdef DEBUG_PRINT
-            if (mLaneId == 0)
-            {
-                printf("[Send] warpId=%d, blockIdx=(%d, %d, %d), tokenIndex=%d, head=%lu, tail=%lu, done G2S\n",
-                    mWarpId, blockIdx.x, blockIdx.y, blockIdx.z, tokenIndex, mHead, mTail);
-            }
-            __syncwarp();
-#endif
             tensorrt_llm::kernels::fused_moe_impl::packAllFields<FIELD_COUNT>(
                 mFieldInfo, tokenIndex, mShmemBase, mLaneId);
 
@@ -971,28 +764,8 @@ public:
             tensorrt_llm::kernels::fused_moe_impl::startWorkspaceS2G(getFifoEntryPtr(), mShmemBase,
                 mSingleTransfer128ByteCount, mFifoEntry128ByteIndexBase, mWarpId, mLaneId);
 
-#ifdef DEBUG_PRINT
-            if (mLaneId == 0)
-            {
-                printf(
-                    "[Send] warpId=%d, blockIdx=(%d, %d, %d), tokenIndex=%d, head=%lu, tail=%lu, started S2G, "
-                    "mFifoEntry128ByteIndexBase=%d \n",
-                    mWarpId, blockIdx.x, blockIdx.y, blockIdx.z, tokenIndex, mHead, mTail, mFifoEntry128ByteIndexBase);
-            }
-            __syncwarp();
-#endif
             tensorrt_llm::kernels::fused_moe_impl::waitS2GBulkRead();
 
-#ifdef DEBUG_PRINT
-            if (mLaneId == 0)
-            {
-                printf(
-                    "[Send] warpId=%d, blockIdx=(%d, %d, %d), tokenIndex=%d, head=%lu, tail=%lu, done S2G read, "
-                    "mFifoEntry128ByteIndexBase=%d \n",
-                    mWarpId, blockIdx.x, blockIdx.y, blockIdx.z, tokenIndex, mHead, mTail, mFifoEntry128ByteIndexBase);
-            }
-            __syncwarp();
-#endif
             nextToken();
         }
         if (mFifoEntry128ByteIndexBase > 0)
@@ -1015,14 +788,6 @@ public:
     __device__ __forceinline__ void doReceive(int tokenCount, int* recvIndexMapping)
     {
         receiverInitFifo();
-#ifdef DEBUG_PRINT
-        if (mLaneId == 0)
-        {
-            printf("[Receive] warpId=%d, blockIdx=(%d, %d, %d), in doReceive head=%lu, tail=%lu\n", mWarpId, blockIdx.x,
-                blockIdx.y, blockIdx.z, mHead, mTail);
-        }
-        __syncwarp();
-#endif
         int recvIndex = mPairInfo.channel;
         uint32_t phaseParity = 0;
         bool needRelease = false;
@@ -1030,16 +795,6 @@ public:
         {
             int tokenIndex = recvIndexMapping == nullptr ? recvIndex : recvIndexMapping[recvIndex];
             int loaded128ByteCount = 0;
-#ifdef DEBUG_PRINT
-            if (mLaneId == 0)
-            {
-                printf(
-                    "[Receive] warpId=%d, blockIdx=(%d, %d, %d), recvIndex=%d, tokenIndex=%d, head=%lu, tail=%lu, "
-                    "start G2S\n",
-                    mWarpId, blockIdx.x, blockIdx.y, blockIdx.z, recvIndex, tokenIndex, mHead, mTail);
-            }
-            __syncwarp();
-#endif
             if (needNewEntry())
             {
                 if (mFifoEntryIndex >= 0)
@@ -1049,16 +804,6 @@ public:
                     needRelease = true;
                 }
                 newReceiveEntry();
-#ifdef DEBUG_PRINT
-                if (mLaneId == 0)
-                {
-                    printf(
-                        "[Receive] warpId=%d, blockIdx=(%d, %d, %d), recvIndex=%d, tokenIndex=%d, head=%lu, "
-                        "tail=%lu, new receive entry done\n",
-                        mWarpId, blockIdx.x, blockIdx.y, blockIdx.z, recvIndex, tokenIndex, mHead, mTail);
-                }
-                __syncwarp();
-#endif
             }
             while (loaded128ByteCount < mSingleTransfer128ByteCount)
             {
@@ -1075,17 +820,6 @@ public:
                     mSingleTransfer128ByteCount, mFifoEntry128ByteIndexBase, loaded128ByteCount, mWarpId, mLaneId);
             }
 
-#ifdef DEBUG_PRINT
-            if (mLaneId == 0)
-            {
-                printf(
-                    "[Receive] warpId=%d, blockIdx=(%d, %d, %d), recvIndex=%d, tokenIndex=%d, head=%lu, tail=%lu, G2S "
-                    "done\n",
-                    mWarpId, blockIdx.x, blockIdx.y, blockIdx.z, recvIndex, tokenIndex, mHead, mTail);
-            }
-            __syncwarp();
-#endif
-
             FusedMoeProto::protoUnpack(mShmemBase, mTail, mSingleCompactData128ByteCount, mFifoEntry128ByteIndexBase,
                 loaded128ByteCount, mWarpId, mLaneId);
             tensorrt_llm::kernels::fused_moe_impl::unpackAllFields<FIELD_COUNT>(
@@ -1094,28 +828,7 @@ public:
                 mFieldInfo, mExpertParallelInfo, tokenIndex, mShmemBase, mWarpId, mLaneId);
             tensorrt_llm::kernels::fused_moe_impl::waitS2GBulkRead();
 
-#ifdef DEBUG_PRINT
-            if (mLaneId == 0)
-            {
-                printf(
-                    "[Receive] warpId=%d, blockIdx=(%d, %d, %d), recvIndex=%d, tokenIndex=%d, head=%lu, tail=%lu, "
-                    "after S2G read\n",
-                    mWarpId, blockIdx.x, blockIdx.y, blockIdx.z, recvIndex, tokenIndex, mHead, mTail);
-            }
-            __syncwarp();
-#endif
             rearmFifoBuffer();
-
-#ifdef DEBUG_PRINT
-            if (mLaneId == 0)
-            {
-                printf(
-                    "[Receive] warpId=%d, blockIdx=(%d, %d, %d), recvIndex=%d, tokenIndex=%d, head=%lu, tail=%lu, "
-                    "after rearmFifoBuffer\n",
-                    mWarpId, blockIdx.x, blockIdx.y, blockIdx.z, recvIndex, tokenIndex, mHead, mTail);
-            }
-            __syncwarp();
-#endif
             nextToken();
         }
         if (mFifoEntry128ByteIndexBase > 0)
@@ -1395,14 +1108,6 @@ __global__ void g2sKernel(FusedMoeFieldInfo allFieldInfo, MoeExpertParallelInfo 
         return;
     }
 
-#ifdef DEBUG_PRINT
-    if (laneId == 0)
-    {
-        printf("warpId=%d, blockIdx.x=%d, topK=%d, starting g2sKernel for token=%d\n", warpId, blockIdx.x,
-            expertParallelInfo.topK, tokenIndex);
-    }
-#endif
-
     int singleShmSize = singleCommMeta.singleUncompactAlignedSize;
 
     tensorrt_llm::kernels::fused_moe_impl::initSmemBar(&allWarpSmemBar[warpId], laneId);
@@ -1422,13 +1127,6 @@ __global__ void g2sKernel(FusedMoeFieldInfo allFieldInfo, MoeExpertParallelInfo 
             allFieldInfo, expertParallelInfo, tokenIndex, sharedMemoryBase, warpId, laneId, &allWarpSmemBar[warpId]);
         tensorrt_llm::kernels::fused_moe_impl::waitG2SAllFields<false>(&allWarpSmemBar[warpId], &phaseParity);
     }
-
-#ifdef DEBUG_PRINT
-    if (laneId == 0)
-    {
-        printf("warpId=%d, blockIdx.x=%d, after smemBarWait phaseParity=%u\n", warpId, blockIdx.x, phaseParity);
-    }
-#endif
 
     for (int offset = laneId; offset < singleShmSize / sizeof(int); offset += WARP_SIZE)
     {
@@ -1523,14 +1221,6 @@ __global__ void loopbackKernel(FusedMoeFieldInfo sendFieldInfo, FusedMoeFieldInf
 
     int recvTokenIndex = recvIndexMapping[tokenIndex];
 
-#ifdef DEBUG_PRINT
-    if (laneId == 0)
-    {
-        printf("warpId=%d, blockIdx.x=%d, topK=%d, starting loopbackKernel for token=%d\n", warpId, blockIdx.x,
-            expertParallelInfo.topK, tokenIndex);
-    }
-#endif
-
     tensorrt_llm::kernels::fused_moe_impl::initSmemBar(&allWarpSmemBar[warpId], laneId);
     uint32_t phaseParity = 0;
 
@@ -1560,25 +1250,9 @@ __global__ void loopbackKernel(FusedMoeFieldInfo sendFieldInfo, FusedMoeFieldInf
 
     tensorrt_llm::kernels::fused_moe_impl::packAllFields(sendFieldInfo, tokenIndex, sharedMemoryBase, laneId);
 
-#ifdef DEBUG_PRINT
-    for (int i = laneId; i < sendCommMeta.singleCompactAlignedSize / sizeof(int); i += WARP_SIZE)
-    {
-        printf("blockIdx.x=%d, warpId=%d, compact[%d] = %x\n", blockIdx.x, warpId, i,
-            reinterpret_cast<int*>(&sharedMemoryBase[0])[i]);
-    }
-#endif
-
     tokenIndex = recvTokenIndex; // switch to recvTokenIndex;
 
     tensorrt_llm::kernels::fused_moe_impl::unpackAllFields(recvFieldInfo, tokenIndex, sharedMemoryBase, laneId);
-
-#ifdef DEBUG_PRINT
-    for (int i = laneId; i < recvCommMeta.singleUncompactAlignedSize / sizeof(int); i += WARP_SIZE)
-    {
-        printf("blockIdx.x=%d, warpId=%d, uncompact[%d] = %x\n", blockIdx.x, warpId, i,
-            reinterpret_cast<int*>(&sharedMemoryBase[0])[i]);
-    }
-#endif
 
     if (hasBasicFields)
     {
