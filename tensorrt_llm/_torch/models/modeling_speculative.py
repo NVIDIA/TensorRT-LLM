@@ -290,18 +290,6 @@ class Eagle3ForCausalLM(DecoderModelForCausalLM[Eagle3DraftModel, LlamaConfig]):
         if self.load_lm_head_from_target:
             self.lm_head = target_model.lm_head
 
-    # TODO: should input/position IDs be included in this? Keeping it implicit
-    # for now since the shapes/dtypes are the same across all models we have.
-    def get_warmup_extra_inputs(self, batch_size: int,
-                                num_tokens: int) -> Dict[str, Any]:
-
-        hidden_states = torch.empty(batch_size * num_tokens,
-                                    self.model.hidden_size,
-                                    dtype=self.model.dtype,
-                                    device='cuda')
-
-        return {'hidden_states': hidden_states}
-
     def apply_eagle3_fc(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """
         Hack for eagle3. We might need to run a matmul to reduce

@@ -400,6 +400,9 @@ class DecodingBaseConfig(StrictBaseModel):
         return TorchSpeculativeDecodingMode.from_string(
             self.decoding_type.upper())
 
+    def get_draft_model_wrapper(self, model):
+        return None
+
 
 class MedusaDecodingConfig(DecodingBaseConfig):
     medusa_choices: Optional[List[List[int]]] = None
@@ -442,6 +445,11 @@ class EagleDecodingConfig(DecodingBaseConfig):
         if self.eagle3_one_model:
             return TorchSpeculativeDecodingMode.EAGLE3_ONE_MODEL
         return TorchSpeculativeDecodingMode.EAGLE3
+
+    def get_draft_model_wrapper(self, model):
+        from tensorrt_llm._torch.speculative.eagle3 import ChainDrafter
+
+        return ChainDrafter(self.max_draft_len, model)
 
 
 class UserProvidedDecodingConfig(DecodingBaseConfig):
