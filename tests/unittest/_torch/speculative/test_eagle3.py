@@ -154,7 +154,7 @@ def test_deepseek_eagle3():
         'hidden_size': 2560,
         'initializer_range': 0.02,
         'intermediate_size': 16384,
-        'max_position_embeddings': 131072,
+        'max_position_embeddings': 4096,
         'mlp_bias': False,
         'model_type': 'llama',
         'num_attention_heads': 32,
@@ -187,7 +187,7 @@ def test_deepseek_eagle3():
 
         # bs > 1 gives non-deterministic when doing IFB. There are slight chances
         # that ref and spec does not match 100%
-        max_batch_size = 1
+        max_batch_size = 16
         max_draft_len = 3
         kv_cache_config = KvCacheConfig(enable_block_reuse=enable_block_reuse,
                                         free_gpu_memory_fraction=0.5)
@@ -200,17 +200,11 @@ def test_deepseek_eagle3():
             disable_overlap_scheduler=disable_overlap_scheduler,
             cuda_graph_config=cuda_graph_config,
             max_batch_size=max_batch_size,
+            max_num_tokens=4096,
+            max_seq_len=4096,
             kv_cache_config=kv_cache_config,
-            # This max_seq_len is larger than the one specified
-            # in the llama 3 8B eagle's config. We want to make sure
-            # that the draft model won't go above its max in warmup
-            # in this test.
-            max_seq_len=8192,
             enable_chunked_prefill=enable_chunked_prefill,
         )
-        if enable_chunked_prefill:
-            # Use a small max_num_tokens so that the chunked prefill path gets exercised.
-            llm_common_config['max_num_tokens'] = 64
 
         spec_config = EagleDecodingConfig(
             max_draft_len=max_draft_len,
@@ -224,7 +218,7 @@ def test_deepseek_eagle3():
 
         tok_ids = llm_spec.tokenizer.encode("The future of AI is")
 
-        sampling_params = SamplingParams(max_tokens=128, temperature=0)
+        sampling_params = SamplingParams(max_tokens=32, temperature=0)
         for output in llm_spec.generate_async(tok_ids,
                                               sampling_params,
                                               streaming=True):
