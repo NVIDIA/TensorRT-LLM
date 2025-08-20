@@ -23,7 +23,7 @@ In this section, we introduce several ways to install TensorRT-LLM.
 
 Visit the [NGC TensorRT-LLM Release page](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release) to find the most up-to-date NGC container image to use. You can also check the latest [release notes](https://github.com/NVIDIA/TensorRT-LLM/releases) to keep track of the support status of latest releases.
 
-Run the following docker command to start the TensorRT-LLM container in interactive mode (change image tag to matach latest release):
+Run the following docker command to start the TensorRT-LLM container in interactive mode (change image tag to match latest release):
 
 ```bash
 docker run --rm --ipc=host -it \
