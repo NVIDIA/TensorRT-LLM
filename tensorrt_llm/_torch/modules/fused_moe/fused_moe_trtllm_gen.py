@@ -4,7 +4,7 @@ import torch
 
 from ...distributed.ops import reducescatter
 from ...model_config import ModelConfig
-from ...utils import Fp4QuantizedTensor
+from ...utils import Fp4QuantizedTensor, get_sm_version
 from .interface import MoE, MoEWeightLoadingMode
 from .quantization import (DeepSeekFP8BlockScalesFusedMoEMethod,
                            NVFP4TRTLLMGenFusedMoEMethod)
@@ -67,6 +67,11 @@ class TRTLLMGenFusedMoE(MoE):
             model_config=model_config,
             weight_loading_mode=weight_loading_mode,
         )
+
+        sm_version = get_sm_version()
+        if sm_version >= 120:
+            raise NotImplementedError(
+                "TRTLLMGenFusedMoE does not support SM120 and above.")
 
         assert not self.smart_router, "Smart router is not supported in TRTLLMGenFusedMoE."
 
