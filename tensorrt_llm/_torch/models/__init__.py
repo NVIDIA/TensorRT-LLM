@@ -7,6 +7,7 @@ from .modeling_deepseekv3 import DeepseekV3ForCausalLM
 from .modeling_exaone4 import Exaone4ForCausalLM
 from .modeling_gemma3 import Gemma3ForCausalLM
 from .modeling_gemma3vl import Gemma3VLM
+from .modeling_gpt_oss import GptOssForCausalLM
 from .modeling_hunyuan_dense import HunYuanDenseV1ForCausalLM
 from .modeling_hunyuan_moe import HunYuanMoEV1ForCausalLM
 from .modeling_hyperclovax import HCXVisionForCausalLM
@@ -62,6 +63,7 @@ __all__ = [
     "Qwen2_5_VLModel",
     "Qwen3ForCausalLM",
     "Qwen3MoeForCausalLM",
+    "GptOssForCausalLM",
 ]
 
 if transformers.__version__ >= "4.45.1":
