@@ -73,6 +73,9 @@ meta-llama/Llama-4-Maverick-17B-128E-Instruct:
   - accuracy: 86.40
   - quant_algo: FP8
     kv_cache_quant_algo: FP8
+    accuracy: 86.40
+  - quant_algo: FP8
+    kv_cache_quant_algo: FP8
     spec_dec_algo: Eagle
     accuracy: 86.40
 meta-llama/Llama-4-Scout-17B-16E-Instruct:
@@ -232,6 +235,8 @@ nvidia/Nemotron-H-56B-Base-8K:
     accuracy: 83.82
 microsoft/Phi-4-mini-instruct:
   - accuracy: 68.98
+  - quant_algo: FP8
+    accuracy: 68.30
 bigcode/starcoder2-7b:
   - accuracy: 41.35
   - quant_algo: FP8
@@ -275,3 +280,7 @@ GPT-OSS/MXFP4:
     accuracy: 75.50
   - quant_algo: W4A8_MXFP4_FP8
     accuracy: 75.50
+mistralai/Mistral-Nemo-12b-Base:
+  - accuracy: 69.66
+  - quant_algo: FP8
+    accuracy: 69.66
