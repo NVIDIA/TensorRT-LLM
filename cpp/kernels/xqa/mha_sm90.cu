@@ -2380,6 +2380,10 @@ __device__ inline void warpGrpApplyMask(Gemm0Acc& acc, SpecDec const& specDec,
                 {
                     uint32_t const col = GmmaAccCoreMat::cols * (4 * n + idxInQuad) + j;
                     assert((col < nbValidCols) == bool(endMask & (1ULL << col)));
+                    if ((mask == uint64_t{0}) && col == 0 && blockIdx.y > 0)
+                    {
+                        continue;
+                    }
                     if (((mask >> col) & 1) == 0)
                     {
                         acc(m, n)(i, j) = mha::numeric_limits<float>::lowest();
