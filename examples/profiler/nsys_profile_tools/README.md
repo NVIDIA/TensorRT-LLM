@@ -17,9 +17,7 @@ profiling and analyzing nsys profile output.
   - `engine`: Engine name (e.g., `trtllm`).
   - `model`: Model name (e.g., `llama`, `gpt-oss`, `ds`).
   - `elapsed_nonprofiled_sec`: Wall-clock runtime (in seconds) without
-    profiling. Specify `0` to use the elapsed time from the nsys-rep file
-    (this may inflate non-GPU time if actual runtime without profiling is
-    less). Multiple entries can be provided, separated by spaces.
+    profiling. Specify `0` to use the elapsed GPU time calculated from the nsys-rep file (this may inflate non-GPU time if actual runtime without profiling is less). Multiple entries can be provided, separated by spaces.
 
 - `--out_dir`
   Output directory for the generated CSV and HTML files.
@@ -35,7 +33,7 @@ profiling and analyzing nsys profile output.
 
 ## Notes
 
-- Make sure you have pandas installed.
+- Make sure you have pandas and plotly python packages installed.
 - Make sure [nsys](https://developer.nvidia.com/nsight-systems/get-started) is
 installed, and specify the path to the `nsys` command with `--nsys_cmd` if it
  is not in your PATH.

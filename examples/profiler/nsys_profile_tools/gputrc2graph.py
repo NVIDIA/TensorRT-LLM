@@ -57,9 +57,10 @@ class GPUTrace2Graph:
     # helper functions for generating trace->summary csvs
     def gen_nonoverlapped_sum_from_gputrace(self, in_file, out_file):
         logger.info("loading %s", in_file)
-        df = self.pd.read_csv(
-            in_file,
-            usecols=["Start (ns)", "Duration (ns)", "Device", "Strm", "Name"])
+        df = self.pd.read_csv(in_file,
+                              usecols=["Start (ns)", "Duration (ns)", "Name"])
+        if df.empty:
+            return
         df["End (ns)"] = df["Start (ns)"] + df["Duration (ns)"]
         df = self.sum_non_overlapping_intervals(df)
         # get ready to print table with elapsed times per kernel
@@ -83,7 +84,7 @@ class GPUTrace2Graph:
         vectorized operations
         """
         logger.info("sorting %s trace records by start time", str(df.shape))
-
+        assert not df.empty, 'empty nsys records'
         # Sort by start time and reset index
         df = df.sort_values(by="Start (ns)").reset_index(drop=True)
 
