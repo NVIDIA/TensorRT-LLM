@@ -245,7 +245,7 @@ class PyExecutor:
             is_disaggregated=kv_cache_transceiver is not None,
         )
         self.executor_request_queue.set_exclude_last_generation_logits(
-            self.disable_overlap_scheduler)
+            self.disable_overlap_scheduler, self.dist.pp_size)
 
         self.stats_lock = threading.Lock()
         self.stats = []

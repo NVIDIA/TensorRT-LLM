@@ -704,8 +704,9 @@ class ExecutorRequestQueue:
             position_blocks.append(position_block.tolist()[0])
         return ctx_blocks, position_blocks, padding
 
-    def set_exclude_last_generation_logits(
-            self, disable_overlap_scheduler: bool) -> None:
+    def set_exclude_last_generation_logits(self,
+                                           disable_overlap_scheduler: bool,
+                                           pp_size: int) -> None:
         # When overlap scheduler is enabled then when starting to handle a new prompt,
         # sample_async is called twice before the first call to update_requests:
         # - 1st time as a context request that handles on the 1st generated token
@@ -717,7 +718,7 @@ class ExecutorRequestQueue:
         # logits storage contains the logits of both the token update_requests should work
         # on, and also its next token. Thus, excluding the last generation logits from any
         # getter is required.
-        self.should_exclude_last_generation_logits = not disable_overlap_scheduler
+        self.should_exclude_last_generation_logits = not disable_overlap_scheduler and pp_size == 1
 
     def _should_exclude_last_generation_logits(self) -> bool:
         return self.should_exclude_last_generation_logits

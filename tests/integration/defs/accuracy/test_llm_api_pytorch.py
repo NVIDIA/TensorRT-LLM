@@ -15,6 +15,7 @@
 import os
 
 import pytest
+import torch
 from defs.conftest import get_sm_version
 
 from tensorrt_llm import LLM
@@ -397,6 +398,40 @@ class TestLlama3_2_1B(LlmapiAccuracyTestHarness):
             assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
+
+    @skip_pre_hopper
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.parametrize("disable_overlap_scheduler", [True, False])
+    @pytest.mark.parametrize("pp_size", [2, 4], ids=["pp2", "pp4"])
+    def test_return_logits_pp(self, pp_size, disable_overlap_scheduler):
+        prompts = ["A B C"]
+
+        llm = LLM(model=self.MODEL_PATH,
+                  pipeline_parallel_size=pp_size,
+                  disable_overlap_scheduler=disable_overlap_scheduler)
+
+        sampling_params = SamplingParams(max_tokens=8,
+                                         return_context_logits=True,
+                                         return_generation_logits=True,
+                                         logprobs=True)
+
+        with llm:
+            for output in llm.generate(prompts,
+                                       sampling_params=sampling_params):
+                assert output.context_logits is not None
+                # NOTE: prompt_token_ids of "A B C" becomes [1, 319, 350, 315]
+                expected_len = len(prompts[0].split()) + 1
+                assert expected_len == output.context_logits.shape[0]
+
+                gen_logits = output.outputs[0].generation_logits
+                assert gen_logits is not None
+                assert gen_logits.ndim == 2
+                assert gen_logits.shape[0] == sampling_params.max_tokens
+                assert torch.argmax(
+                    gen_logits, dim=1).tolist() == output.outputs[0].token_ids
+
+                assert len(
+                    output.outputs[0].logprobs) == sampling_params.max_tokens
 
 
 class TestLlama3_2_3B(LlmapiAccuracyTestHarness):
