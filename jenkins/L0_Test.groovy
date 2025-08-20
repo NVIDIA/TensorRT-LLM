@@ -647,7 +647,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64", gpuCount = 1, perfMod
         def cpuCount = "${TESTER_CORES}"
 
         // Multi-GPU only supports DGX-H100 and DGX-H200 due to the hardware stability.
-        if ((type.contains("dgx-h100") || type.contains("dgx-h200")) && hasMultipleGPUs)
+        if (hasMultipleGPUs)
         {
             // Not a hard requirement, but based on empirical values.
             memorySize = "${gpuCount * 150}" + "Gi"
