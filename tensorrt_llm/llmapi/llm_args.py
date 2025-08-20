@@ -1966,6 +1966,8 @@ class LoadFormat(Enum):
     AUTO = 0
     # Initialize all weights randomly.
     DUMMY = 1
+    # Only load the multimodal(vision) encoder weights
+    VISION_ONLY = 2
 
 
 class SamplerType(StrEnum):
@@ -2097,6 +2099,12 @@ class TorchLlmArgs(BaseLlmArgs):
     print_iter_log: bool = Field(default=False,
                                  description="Print iteration logs.",
                                  status="beta")
+
+    batch_wait_timeout_ms: float = Field(
+        default=0,
+        description=
+        "If greater than 0, the request queue might wait up to batch_wait_timeout_ms to receive max_batch_size requests, if fewer than max_batch_size requests are currently available. If 0, no waiting occurs.",
+        status="prototype")
 
     torch_compile_config: Optional[TorchCompileConfig] = Field(
         default=None, description="Torch compile config.", status="prototype")
@@ -2344,6 +2352,13 @@ class TorchLlmArgs(BaseLlmArgs):
                 )
         return self
 
+    @model_validator(mode='after')
+    def validate_batch_wait_timeout_ms(self) -> 'TorchLlmArgs':
+        """Validate batch wait timeout."""
+        if self.batch_wait_timeout_ms < 0:
+            raise ValueError("batch_wait_timeout_ms must be greater than 0")
+        return self
+
     # TODO: Remove this after the PyTorch backend is fully migrated to TorchLlmArgs from ExecutorConfig
     def get_pytorch_backend_config(self) -> "PyTorchConfig":
         from tensorrt_llm._torch.pyexecutor.config import PyTorchConfig
@@ -2409,7 +2424,8 @@ class TorchLlmArgs(BaseLlmArgs):
             AttentionDpConfig.model_fields['timeout_iters'].default,
             attention_dp_batching_wait_iters=self.attention_dp_config.
             batching_wait_iters if self.attention_dp_config is not None else
-            AttentionDpConfig.model_fields['batching_wait_iters'].default)
+            AttentionDpConfig.model_fields['batching_wait_iters'].default,
+            batch_wait_timeout_ms=self.batch_wait_timeout_ms)
 
 
 def update_llm_args_with_extra_dict(

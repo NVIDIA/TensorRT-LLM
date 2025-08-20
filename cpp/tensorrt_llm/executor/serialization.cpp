@@ -895,6 +895,7 @@ Result Serialization::deserializeResult(std::istream& is)
     result.finishReasons = su::deserialize<std::vector<FinishReason>>(is);
     result.contextPhaseParams = su::deserialize<std::optional<ContextPhaseParams>>(is);
     result.decodingIter = su::deserialize<SizeType32>(is);
+    result.avgDecodedTokensPerIter = su::deserialize<float>(is);
     result.sequenceIndex = su::deserialize<SizeType32>(is);
     result.isSequenceFinal = su::deserialize<bool>(is);
     result.requestPerfMetrics = su::deserialize<std::optional<RequestPerfMetrics>>(is);
@@ -915,6 +916,7 @@ void Serialization::serialize(Result const& result, std::ostream& os)
     su::serialize(result.finishReasons, os);
     su::serialize(result.contextPhaseParams, os);
     su::serialize(result.decodingIter, os);
+    su::serialize(result.avgDecodedTokensPerIter, os);
     su::serialize(result.sequenceIndex, os);
     su::serialize(result.isSequenceFinal, os);
     su::serialize(result.requestPerfMetrics, os);
@@ -935,6 +937,7 @@ size_t Serialization::serializedSize(Result const& result)
     totalSize += su::serializedSize(result.finishReasons);
     totalSize += su::serializedSize(result.contextPhaseParams);
     totalSize += su::serializedSize(result.decodingIter);
+    totalSize += su::serializedSize(result.avgDecodedTokensPerIter);
     totalSize += su::serializedSize(result.sequenceIndex);
     totalSize += su::serializedSize(result.isSequenceFinal);
     totalSize += su::serializedSize(result.requestPerfMetrics);

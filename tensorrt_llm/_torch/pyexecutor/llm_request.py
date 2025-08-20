@@ -1,10 +1,11 @@
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 import torch
 
 import tensorrt_llm.bindings
+from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm.bindings import executor as tllm_executor
 from tensorrt_llm.executor.result import TokenLogprobs
 
@@ -172,6 +173,7 @@ class PyResult:
             max_new_tokens, use_device_memory, exclude_last_generation_logits
         ) if return_generation_logits else None
         self._log_probs = LogProbStorage() if return_log_probs else None
+        self._mm_embeddings = None
 
     def append_context_logits(self, context_logits: torch.Tensor):
         if self._context_logits:
@@ -186,6 +188,10 @@ class PyResult:
                          cum_log_probs: Optional[list[float]] = None):
         if self._log_probs:
             self._log_probs.append(log_probs, cum_log_probs)
+
+    def append_mm_embeddings(self, mm_embeddings: torch.Tensor):
+        self._mm_embeddings = SharedTensorContainer.from_tensor(
+            mm_embeddings).dump_to_dict()
 
     def set_log_probs(self, log_probs: list[TokenLogprobs],
                       cum_log_probs: list[float]):
@@ -224,11 +230,16 @@ class PyResult:
     def cum_log_probs(self) -> list[float] | None:
         return self._log_probs and self._log_probs.cum_log_probs
 
+    @property
+    def mm_embedding_handle(self) -> Dict[str, Any] | None:
+        return self._mm_embeddings
+
 
 class LlmResult:
     """LlmResult wraps `bindings.executor.Result` but detour some features to Python implementation"""
     py_result_properties = frozenset(
-        ('context_logits', 'generation_logits', 'log_probs', 'cum_log_probs'))
+        ('context_logits', 'generation_logits', 'log_probs', 'cum_log_probs',
+         'mm_embedding_handle'))
 
     def __init__(self,
                  result: Union[bytes, tensorrt_llm.bindings.executor.Result],
