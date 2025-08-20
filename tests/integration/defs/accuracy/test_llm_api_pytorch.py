@@ -2669,7 +2669,9 @@ class TestQwen2_VL_7B(LlmapiAccuracyTestHarness):
     MODEL_PATH = f"{llm_models_root()}/Qwen2-VL-7B-Instruct"
 
     # NOTE: MMMU adds <|endoftext|> to the stop token.
-    sampling_params = SamplingParams(stop="<|endoftext|>")
+    sampling_params = SamplingParams(max_tokens=MMMU.MAX_OUTPUT_LEN,
+                                     truncate_prompt_tokens=MMMU.MAX_INPUT_LEN,
+                                     stop="<|endoftext|>")
 
     kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
 

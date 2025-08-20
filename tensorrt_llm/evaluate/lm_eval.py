@@ -343,7 +343,6 @@ class LmEvalEvaluator(Evaluator):
                     }
                 else:
                     # NOTE: Few-shot random seed
-                    task_obj.set_config(key="num_fewshot", value=0)
                     task_obj.set_fewshot_seed(seed=random_seed)
                     adjusted_task_dict[task_name] = task_obj
 
