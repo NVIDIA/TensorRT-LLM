@@ -335,7 +335,8 @@ def latency_command(
             llm._executor._iter_stats_result = None
             logger.info("Warmup done.")
 
-        with options.iteration_writer.capture():
+        iteration_writer = options.iteration_writer
+        with iteration_writer.capture():
             statistics = asyncio.run(
                 async_benchmark(llm,
                                 sampling_params,
@@ -343,7 +344,7 @@ def latency_command(
                                 requests,
                                 True,
                                 options.concurrency,
-                                options.iteration_writer.full_address,
+                                iteration_writer.full_address,
                                 modality=options.modality))
 
         logger.info("Benchmark done. Reporting results...")
