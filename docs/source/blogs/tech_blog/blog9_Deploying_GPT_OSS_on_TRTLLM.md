@@ -19,11 +19,11 @@ We have a forthcoming guide for achieving great performance on H100; however, th
 
 In this section, we introduce several ways to install TensorRT-LLM.
 
-###  NGC Docker Image of dev branch
+###  NGC Docker Image
 
-Day-0 support for gpt-oss is provided via the NGC container image `nvcr.io/nvidia/tensorrt-llm/release:gpt-oss-dev`. This image was built on top of the pre-day-0 **dev branch**. This container is multi-platform and will run on both x64 and arm64 architectures.
+Visit the [NGC TensorRT-LLM Release page](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release) to find the most up-to-date NGC container image to use. You can also check the latest [release notes](https://github.com/NVIDIA/TensorRT-LLM/releases) to keep track of the support status of latest releases.
 
-Run the following docker command to start the TensorRT-LLM container in interactive mode:
+Run the following docker command to start the TensorRT-LLM container in interactive mode (change image tag to matach latest release):
 
 ```bash
 docker run --rm --ipc=host -it \
@@ -33,7 +33,7 @@ docker run --rm --ipc=host -it \
   -p 8000:8000 \
   -e TRTLLM_ENABLE_PDL=1 \
   -v ~/.cache:/root/.cache:rw \
-  nvcr.io/nvidia/tensorrt-llm/release:gpt-oss-dev \
+  nvcr.io/nvidia/tensorrt-llm/release:1.1.0rc0 \
   /bin/bash
 ```
 
@@ -53,9 +53,9 @@ Additionally, the container mounts your user `.cache` directory to save the down
 Support for gpt-oss has been [merged](https://github.com/NVIDIA/TensorRT-LLM/pull/6645) into the **main branch** of TensorRT-LLM. As we continue to optimize gpt-oss performance, you can build TensorRT-LLM from source to get the latest features and support. Please refer to the [doc](https://nvidia.github.io/TensorRT-LLM/latest/installation/build-from-source-linux.html) if you want to build from source yourself.
 
 
-### Regular Release of TensorRT-LLM
+### TensorRT-LLM PIP Wheel Install
 
-Since gpt-oss has been supported on the main branch, you can get TensorRT-LLM out of the box through its regular release in the future. Please check the latest [release notes](https://github.com/NVIDIA/TensorRT-LLM/releases) to keep track of the support status. The release is provided as [NGC Container Image](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release/tags) or [pip Python wheel](https://pypi.org/project/tensorrt-llm/#history). You can find instructions on pip install [here](https://nvidia.github.io/TensorRT-LLM/installation/linux.html).
+Regular releases of TensorRT-LLM are also provided as [pip Python wheels](https://pypi.org/project/tensorrt-llm/#history). You can find instructions on pip install [here](https://nvidia.github.io/TensorRT-LLM/installation/linux.html).
 
 
 ## Performance Benchmarking and Model Serving
@@ -210,7 +210,7 @@ We can use `trtllm-serve` to serve the model by translating the benchmark comman
 
 ```bash
 trtllm-serve \
-  gpt-oss-120b \  # Or ${local_model_path}
+  openai/gpt-oss-120b \  # Or ${local_model_path}
   --host 0.0.0.0 \
   --port 8000 \
   --backend pytorch \
@@ -228,7 +228,7 @@ For max-throughput configuration, run:
 
 ```bash
 trtllm-serve \
-  gpt-oss-120b \  # Or ${local_model_path}
+  openai/gpt-oss-120b \  # Or ${local_model_path}
   --host 0.0.0.0 \
   --port 8000 \
   --backend pytorch \
@@ -262,7 +262,7 @@ curl localhost:8000/v1/chat/completions -H "Content-Type: application/json" -d '
     "messages": [
         {
             "role": "user",
-            "content": "What is NVIDIA's advantage for inference?"
+            "content": "What is NVIDIAs advantage for inference?"
         }
     ],
     "max_tokens": 1024,
@@ -348,12 +348,7 @@ others according to your needs.
 
 ## (H200/H100 Only) Using OpenAI Triton Kernels for MoE
 
-OpenAI ships a set of Triton kernels optimized for its MoE models. TensorRT-LLM can leverage these kernels for Hopper-based GPUs like NVIDIA's H200 for optimal performance. `TRTLLM` MoE backend is not supported on Hopper, and `CUTLASS` backend support is still ongoing.  Please enable `TRITON` backend with the steps below if you are running on Hopper GPUs.
-
-### Installing OpenAI Triton
-
-The `nvcr.io/nvidia/tensorrt-llm/release:gpt-oss-dev` has prepared Triton already (`echo $TRITON_ROOT` could reveal the path). In other situations, you will need to build and install a specific version of Triton. Please follow the instructions in this [link](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/gpt_oss#using-openai-triton-kernels-for-moe).
-
+OpenAI ships a set of Triton kernels optimized for its MoE models. TensorRT-LLM can leverage these kernels for Hopper-based GPUs like NVIDIA's H200 for optimal performance. `TRTLLM` MoE backend is not supported on Hopper, and `CUTLASS` backend support is still ongoing. Please follow the instructions in this [link](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/models/core/gpt_oss#using-openai-triton-kernels-for-moe) to install and enable the `TRITON` MoE kernels on Hopper GPUs.
 
 ### Selecting Triton as the MoE backend
 
