@@ -184,6 +184,17 @@ def _mangle_executor_config(executor_config: ExecutorConfig):
             )
             executor_config.pytorch_backend_config.disable_overlap_scheduler = True
 
+    if executor_config.mm_encoder_only:
+        from tensorrt_llm.llmapi.llm_args import LoadFormat
+        pytorch_backend_config.mm_encoder_only = True
+        pytorch_backend_config.load_format = LoadFormat.VISION_ONLY
+        # Disable overlap scheduler for multimodal encoder-only mode
+        logger.warning(
+            "Disabling overlap scheduler for multimodal encoder-only mode. "
+            "The overlap scheduler is designed for generation models and is not needed "
+            "when only processing vision encoder inputs.")
+        pytorch_backend_config.disable_overlap_scheduler = True
+
 
 def _get_mapping(executor_config: ExecutorConfig) -> Mapping:
     if executor_config.mapping is None:
