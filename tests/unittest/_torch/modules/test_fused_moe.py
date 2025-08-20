@@ -289,6 +289,7 @@ def test_fused_moe_alltoall(alltoall_method_type):
             assert r is None
 
 
+@pytest.mark.skip(reason="https://nvbugs/5467531")
 @pytest.mark.skipif(torch.cuda.device_count() < 4,
                     reason="needs 4 GPUs to run this test")
 @pytest.mark.parametrize("alltoall_method_type", [

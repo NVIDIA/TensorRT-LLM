@@ -161,7 +161,6 @@ class PyExecutor:
         self.profile_start_iters, self.profile_stop_iters = _load_iteration_indexes(
             PROFILE_START_STOP_ENV_VAR_NAME)
         self.gc_nvtx_watcher_handle = _gc_nvtx_watcher()
-        self.is_warmup = False  # During warmup, we don't enable the profiler
 
         # related modules
         self.resource_manager = resource_manager
@@ -187,6 +186,7 @@ class PyExecutor:
         self.attention_dp_enable_balance = model_engine.pytorch_backend_config.attention_dp_enable_balance
         self.attention_dp_time_out_iters = model_engine.pytorch_backend_config.attention_dp_time_out_iters
         self.attention_dp_batching_wait_iters = model_engine.pytorch_backend_config.attention_dp_batching_wait_iters
+        self.batch_wait_timeout_ms = model_engine.pytorch_backend_config.batch_wait_timeout_ms
         self.num_fetch_requests_cur_rank = 0
         self.num_fetch_requests = 0
         self.shutdown_event = threading.Event()
@@ -220,9 +220,12 @@ class PyExecutor:
 
         self.inflight_req_ids = ReqIdsSet()
 
+        # During warmup, we don't enable the profiler
+        self.is_warmup = True
         self.model_engine.warmup(self.resource_manager)
         if self.draft_model_engine is not None:
             self.draft_model_engine.warmup(self.resource_manager)
+        self.is_warmup = False
 
         self.is_shutdown = False
         self.max_batch_size = max_batch_size
@@ -237,6 +240,7 @@ class PyExecutor:
             max_beam_width=self.max_beam_width,
             max_num_active_requests=self.max_num_active_requests,
             enable_iter_perf_stats=self.enable_iter_perf_stats,
+            batch_wait_timeout_ms=self.batch_wait_timeout_ms,
             is_disaggregated=kv_cache_transceiver is not None,
         )
         self.executor_request_queue.set_exclude_last_generation_logits(
@@ -279,6 +283,18 @@ class PyExecutor:
             raise e
         finally:
             self._executor_loop_cleanup()
+
+    @property
+    def is_warmup(self) -> bool:
+        return getattr(self, "_is_warmup", False)
+
+    @is_warmup.setter
+    def is_warmup(self, value: bool):
+        self._is_warmup = value
+        # Set warmup flag in model engine to trigger torch compile and avoid moe load balancer statistics update
+        self.model_engine.is_warmup = value
+        if self.draft_model_engine is not None:
+            self.draft_model_engine.is_warmup = value
 
     def start_worker(self):
         with self.worker_lock:

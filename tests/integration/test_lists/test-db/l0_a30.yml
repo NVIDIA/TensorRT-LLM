@@ -19,7 +19,7 @@ l0_a30:
   - unittest/_torch/modeling -k "modeling_qwen"
   - unittest/_torch/modeling -k "modeling_qwen_moe"
   - unittest/_torch/auto_deploy/unit/singlegpu -k "not test_trtllm_bench_backend_comparison"
-  - unittest/_torch/test_beam_search.py
+  - unittest/_torch/sampler/test_beam_search.py
 - condition:
     ranges:
       system_gpu_count:
