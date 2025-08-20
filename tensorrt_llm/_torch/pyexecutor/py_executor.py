@@ -1528,10 +1528,9 @@ class PyExecutor:
                     prefix_sum += request.context_chunk_size if request.py_return_context_logits else 1
                     num_context_logits_prefix_sum.append(prefix_sum)
 
-                self._handle_logits(
-                    scheduled_batch, batch_outputs,
-                    num_context_logits_prefix_sum,
-                    self.model_engine.model.model_config.is_generation)
+                self._handle_logits(scheduled_batch, batch_outputs,
+                                    num_context_logits_prefix_sum,
+                                    self.sampler.is_generation_model())
                 return self.sampler.sample_async(scheduled_batch, batch_outputs,
                                                  num_context_logits_prefix_sum)
         except Exception as e:

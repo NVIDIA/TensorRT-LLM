@@ -70,6 +70,10 @@ class Sampler(ABC):
             return req.sampling_config.beam_width
         return 0
 
+    @abstractmethod
+    def is_generation_model(self) -> bool:
+        raise NotImplementedError
+
 
 class EarlyStopSampler(Sampler):
     """
@@ -90,6 +94,9 @@ class EarlyStopSampler(Sampler):
             request.state = LlmRequestState.GENERATION_COMPLETE
             # NOTE: This is a hack: set finish reason manually and set the beam 0
             request.set_finished_reason(FinishReason.LENGTH, 0)
+
+    def is_generation_model(self) -> bool:
+        return False
 
 
 @dataclass(kw_only=True)
@@ -137,6 +144,9 @@ class EarlyStopWithMMResult(Sampler):
                 )
 
             request.py_result.append_mm_embeddings(mm_embedding)
+
+    def is_generation_model(self) -> bool:
+        return False
 
 
 def top_k_sampling_batch(logits,
@@ -348,6 +358,9 @@ def int_tensor(shape: tuple[int, ...], device: str = 'cuda') -> torch.Tensor:
 class TorchSampler(Sampler):
     BEAM = 0
     MAX_BEAM_WIDTH = BEAM + 1
+
+    def is_generation_model(self) -> bool:
+        return True
 
     @dataclass(frozen=True, kw_only=True)
     class Store:
@@ -765,6 +778,9 @@ class SampleStateTRTLLM(SampleState):
 class TRTLLMSampler(Sampler):
     MAX_DECODING_TOKENS = 1  # It must be 1 when not in speculative decoding
     SampleState = SampleStateTRTLLM
+
+    def is_generation_model(self) -> bool:
+        return True
 
     def __init__(
         self,
