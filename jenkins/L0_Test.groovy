@@ -1520,7 +1520,6 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                 } catch (Exception e) {
                     throw new Exception("Infrastructure error")
                 }
-                
             }
         }
 
