@@ -1,4 +1,4 @@
-@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
+@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@user/yiqingy/retry_stage']) _
 
 import java.lang.InterruptedException
 import groovy.transform.Field
@@ -1550,8 +1550,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         }
     }
 
-    stage ("[${stageName}] Run Pytest")
-    {
+    trtllm_utils.llmStageWithRetry(pipeline, "[${stageName}] Run Pytest", {
         echoNodeAndGpuInfo(pipeline, stageName)
         sh 'if [ "$(id -u)" -eq 0 ]; then dmesg -C || true; fi'
 
@@ -1640,14 +1639,11 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                         cd ${llmSrc}/tests/integration/defs && \
                         ${testCmdLine.join(" ")}
                     """
-                } catch (InterruptedException e) {
-                    throw e
+                    throw new Exception("Infrastructure error")
                 } catch (Exception e) {
-                    isRerunFailed = rerunFailedTests(stageName, llmSrc, testCmdLine)
-                    if (isRerunFailed) {
-                        error "The tests still failed after rerun attempt."
-                    }
+                    throw new Exception("Infrastructure error")
                 }
+                
             }
         }
 
@@ -1670,7 +1666,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                 """
             }
         }
-    }
+    })
 }
 
 
