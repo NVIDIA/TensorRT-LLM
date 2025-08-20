@@ -518,6 +518,8 @@ def generate_api_docs_as_docstring(model: Type[BaseModel],
 
         # Format the argument documentation with 12 spaces indent for args
         arg_line = f"{indent}    {field_name} ({type_str}): "
+        if status := field_info.get("status", None):
+            arg_line += f":tag:`{status}` "
         if field_description:
             arg_line += field_description.split('\n')[0]  # First line with type
 
@@ -557,20 +559,21 @@ class ApiParamTagger:
     '''
 
     def __call__(self, cls: Type[BaseModel]) -> None:
-        self.process_pydantic_model(cls)
+        """ The main entry point to tag the api doc. """
+        self._process_pydantic_model(cls)
 
-    def process_pydantic_model(self, cls: Type[BaseModel]) -> None:
+    def _process_pydantic_model(self, cls: Type[BaseModel]) -> None:
         """Process the Pydantic model to add tags to the fields.
         """
         for field_name, field_info in cls.model_fields.items():
             if field_info.json_schema_extra and 'status' in field_info.json_schema_extra:
                 status = field_info.json_schema_extra['status']
-                self.amend_pydantic_field_description_with_tags(
+                self._amend_pydantic_field_description_with_tags(
                     cls, [field_name], status)
 
-    def amend_pydantic_field_description_with_tags(self, cls: Type[BaseModel],
-                                                   field_names: list[str],
-                                                   tag: str) -> None:
+    def _amend_pydantic_field_description_with_tags(self, cls: Type[BaseModel],
+                                                    field_names: list[str],
+                                                    tag: str) -> None:
         """Amend the description of the fields with tags.
         e.g. :tag:`beta` or :tag:`prototype`
         Args:
