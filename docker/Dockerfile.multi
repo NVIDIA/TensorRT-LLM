@@ -118,12 +118,24 @@ COPY .gitmodules setup.py requirements.txt requirements-dev.txt constraints.txt 
 # Create cache directories for pip and ccache
 RUN mkdir -p /root/.cache/pip /root/.cache/ccache
 ENV CCACHE_DIR=/root/.cache/ccache
-# Build the TRT-LLM wheel
+# Build or download the TRT-LLM wheel
 ARG GITHUB_MIRROR=""
 ARG BUILD_WHEEL_ARGS="--clean --benchmarks"
 ARG BUILD_WHEEL_SCRIPT="scripts/build_wheel.py"
+ARG DOWNLOAD_WHEEL
+ARG TRT_LLM_VER
 RUN --mount=type=cache,target=/root/.cache/pip --mount=type=cache,target=${CCACHE_DIR} \
-    GITHUB_MIRROR=$GITHUB_MIRROR python3 ${BUILD_WHEEL_SCRIPT} ${BUILD_WHEEL_ARGS}
+    if [ -n "${DOWNLOAD_WHEEL}" -a -n "${TRT_LLM_VER}" ]; then \
+        pip download \
+            --extra-index-url https://pypi.nvidia.com \
+            --only-binary=:all: \
+            --no-deps \
+            --dest build \
+            tensorrt_llm=="${TRT_LLM_VER//rc/-rc}" && \
+        mkdir -p cpp/build/benchmarks ;\
+    else \
+        GITHUB_MIRROR=$GITHUB_MIRROR python3 ${BUILD_WHEEL_SCRIPT} ${BUILD_WHEEL_ARGS} ;\
+    fi
 
 FROM ${DEVEL_IMAGE} AS release
 
@@ -153,9 +165,7 @@ ARG SRC_DIR=/src/tensorrt_llm
 COPY --from=wheel ${SRC_DIR}/benchmarks benchmarks
 ARG CPP_BUILD_DIR=${SRC_DIR}/cpp/build
 COPY --from=wheel \
-     ${CPP_BUILD_DIR}/benchmarks/bertBenchmark \
-     ${CPP_BUILD_DIR}/benchmarks/gptManagerBenchmark \
-     ${CPP_BUILD_DIR}/benchmarks/disaggServerBenchmark \
+     ${CPP_BUILD_DIR}/benchmarks/*Benchmark \
      benchmarks/cpp/
 
 COPY examples examples

@@ -56,6 +56,7 @@ NGC_STAGING_REPO   ?= nvcr.io/nvstaging/tensorrt-llm
 NGC_REPO           ?= nvcr.io/nvidia/tensorrt-llm
 NGC_USE_STAGING    ?= 0
 NGC_AUTO_REPO      ?= $(if $(filter 1,$(NGC_USE_STAGING)),$(NGC_STAGING_REPO),$(NGC_REPO))
+DOWNLOAD_WHEEL     ?=
 
 define add_local_user
 	docker build \
@@ -93,6 +94,7 @@ endef
 		$(if $(CUBLAS_VERSION), --build-arg CUBLAS_VER="$(CUBLAS_VERSION)") \
 		$(if $(TRT_VERSION), --build-arg TRT_VER="$(TRT_VERSION)") \
 		$(if $(TRT_LLM_VERSION), --build-arg TRT_LLM_VER="$(TRT_LLM_VERSION)") \
+		$(if $(DOWNLOAD_WHEEL), --build-arg DOWNLOAD_WHEEL="$(DOWNLOAD_WHEEL)") \
 		$(if $(DEVEL_IMAGE), --build-arg DEVEL_IMAGE="$(DEVEL_IMAGE)") \
 		$(if $(GIT_COMMIT), --build-arg GIT_COMMIT="$(GIT_COMMIT)") \
 		$(if $(GITHUB_MIRROR), --build-arg GITHUB_MIRROR="$(GITHUB_MIRROR)") \
