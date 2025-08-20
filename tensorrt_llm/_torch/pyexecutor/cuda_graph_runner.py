@@ -16,6 +16,7 @@ class DecodingCUDAGraphRunner:
         device: str,
         attn_metadata: AttentionMetadata,
         spec_metadata: Optional[SpecMetadata] = None,
+        guided_metadata=None,
         use_mrope: bool = False,
         max_beam_width: int = 1,
     ) -> None:
@@ -54,6 +55,7 @@ class DecodingCUDAGraphRunner:
 
         self.attn_metadata = attn_metadata
         self.spec_metadata = spec_metadata
+        self.guided_metadata = guided_metadata
         self._output = None
         self._graph = None
         self.optional_extra_model_inputs = ["mrope_position_deltas"]
@@ -73,6 +75,7 @@ class DecodingCUDAGraphRunner:
             "position_ids": self.position_ids,
             "inputs_embeds": None,
             "spec_metadata": self.spec_metadata,
+            "guided_metadata": self.guided_metadata,
             "mrope_position_deltas": self.mrope_position_deltas,
         }
 

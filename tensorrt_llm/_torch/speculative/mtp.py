@@ -100,7 +100,7 @@ class MTPSpecMetadata(SpecMetadata):
     Metadata for MTP.
     """
     # The number of MTP modules in the model
-    mtp_num_modules: int = 1,
+    mtp_num_modules: int = 1
     # The hidden states manager for MTP
     mtp_hidden_states_manager: Optional[MTPHiddenStatesManager] = None
     # The slot ids for each request.

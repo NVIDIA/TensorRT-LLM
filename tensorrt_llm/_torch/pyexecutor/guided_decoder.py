@@ -1,36 +1,143 @@
 import math
 from dataclasses import dataclass, field
+from queue import Queue
 from typing import Iterable, List, Optional, Tuple
 
 import torch
 import xgrammar
 
 from ..._utils import nvtx_range
-from ...bindings.executor import GuidedDecodingConfig
+from ...bindings.executor import GuidedDecodingConfig, GuidedDecodingParams
 from ...logger import logger
 from ..hostfunc import hostfunc
-from .grammar_matcher import (GrammarMatcher, GrammarMatcherFactory,
-                              LLGuidanceMatcherFactory, XGrammarMatcherFactory)
+from .grammar_matcher import (GrammarMatcher, LLGuidanceMatcherFactory,
+                              XGrammarMatcherFactory)
 from .llm_request import LlmRequest
 from .scheduler import ScheduledRequests
 
 
 @dataclass(slots=True)
+class GuidedRequest:
+    """A snapshot of an LlmRequest that contains relevant fields for guided decoding.
+
+    The instances of this class should be produced on the host and consumed on the device (by hostfunc).
+    """
+    guided_decoding_params: Optional[GuidedDecodingParams] = field(default=None)
+
+    request_id: Optional[int] = field(default=None)
+    seq_slot: Optional[int] = field(default=None)
+    is_context_init_state: bool = field(default=False)
+    is_last_context_chunk: bool = field(default=False)
+    is_generation_in_progress_state: bool = field(default=False)
+
+    new_token: Optional[int] = field(default=None)
+    is_draft: bool = field(default=False)
+    draft_tokens: Optional[List[int]] = field(default=None)
+    num_accepted_draft_tokens: Optional[int] = field(default=None)
+
+    def require_matcher_init(self) -> bool:
+        if self.guided_decoding_params is None:
+            return False
+        if self.is_draft:
+            return False
+        # The request is in the last chunk of a context forward step.
+        return self.is_context_init_state and self.is_last_context_chunk
+
+    def require_matcher_advance(self) -> bool:
+        if self.guided_decoding_params is None:
+            return False
+        if self.is_draft:
+            if self.is_context_init_state and self.is_last_context_chunk:
+                return True
+            if self.is_generation_in_progress_state:
+                return True
+            return False
+        # The request is in a generation forward step.
+        return self.is_generation_in_progress_state
+
+    @classmethod
+    def from_request(cls, request: LlmRequest):
+        seq_slot = request.py_target_seq_slot if request.py_is_draft else request.py_seq_slot
+        return cls(
+            guided_decoding_params=request.guided_decoding_params,
+            request_id=request.py_request_id,
+            seq_slot=seq_slot,
+            is_context_init_state=request.is_context_init_state,
+            is_last_context_chunk=request.is_context_init_state
+            and request.is_last_context_chunk,
+            is_generation_in_progress_state=request.
+            is_generation_in_progress_state,
+            new_token=request.get_last_tokens(0),
+            is_draft=request.py_is_draft,
+            draft_tokens=request.py_draft_tokens,
+            num_accepted_draft_tokens=request.py_num_accepted_draft_tokens)
+
+
+class GuidedRequestBatch:
+
+    def __init__(self,
+                 scheduled_requests: ScheduledRequests,
+                 max_num_draft_tokens: int = 0):
+        self.guided_requests = [
+            GuidedRequest.from_request(req)
+            for req in scheduled_requests.all_requests()
+        ]
+        self.num_contexts = len(scheduled_requests.context_requests)
+        self.num_generations = len(scheduled_requests.generation_requests)
+        self.max_num_draft_tokens = max_num_draft_tokens
+
+    @property
+    def num_bitmask_tokens(self) -> int:
+        return self.num_contexts + self.num_generations * (
+            self.max_num_draft_tokens + 1)
+
+    def guided_request_with_offset(self) -> Iterable[Tuple[GuidedRequest, int]]:
+        offset: int = 0
+        for req in self.guided_requests:
+            yield req, offset
+            offset += 1
+            if req.is_generation_in_progress_state:
+                offset += self.max_num_draft_tokens
+
+
+@dataclass(slots=True)
 class GuidedMetadata:
     """Metadata for guided decoding."""
-    scheduled_requests: Optional[ScheduledRequests] = field(default=None,
-                                                            init=False)
+    # No race condition
+    # 1. Overlap scheduler disabled: sample_state is synced to host, so the last-iteration hostfunc has finished.
+    # 2. Overlap scheduler enabled: D2H copy depends on new_tensors_device, which depends on the last-iteration hostfunc results.
+    max_num_draft_tokens: int = field(default=0)
 
+    queue: Optional[Queue] = field(default=None, init=False)
+    guided_requests_device: Optional[GuidedRequestBatch] = field(default=None,
+                                                                 init=False)
+    guided_requests_host: Optional[GuidedRequestBatch] = field(default=None,
+                                                               init=False)
+
+    # gathered input_ids at the current iteration.
     gathered_input_ids: Optional[torch.Tensor] = field(default=None, init=False)
-    # num_accepted_tokens at last iteration
+    # num_accepted_tokens at the last iteration.
     new_tokens_lens: Optional[torch.Tensor] = field(default=None, init=False)
 
     token_event: Optional[torch.cuda.Event] = field(default=None, init=False)
     bitmask_event: Optional[torch.cuda.Event] = field(default=None, init=False)
 
     def __post_init__(self):
+        self.queue = Queue()
         self.token_event = torch.cuda.Event()
         self.bitmask_event = torch.cuda.Event()
+
+    def add_batch(self, scheduled_requests: ScheduledRequests):
+        self.guided_requests_host = GuidedRequestBatch(
+            scheduled_requests, self.max_num_draft_tokens)
+        self.queue.put(self.guided_requests_host)
+
+    @hostfunc
+    def next_batch_hostfunc(self):
+        # Fix it.
+        if self.queue.empty():
+            return
+        self.guided_requests_device = self.queue.get()
 
 
 class GuidedDecoder:
@@ -45,10 +152,6 @@ class GuidedDecoder:
         self.max_num_sequences = max_num_sequences
         self.vocab_size_padded = vocab_size_padded
         self.max_num_draft_tokens = max_num_draft_tokens
-
-        self.grammar_matcher_factory: Optional[GrammarMatcherFactory] = None
-        self.grammar_matchers: List[
-            Optional[GrammarMatcher]] = [None] * self.max_num_sequences
 
         if self.guided_decoding_backend == GuidedDecodingConfig.GuidedDecodingBackend.XGRAMMAR:
             self.grammar_matcher_factory = XGrammarMatcherFactory(
@@ -65,6 +168,8 @@ class GuidedDecoder:
         logger.info(
             f"Guided decoder initialized with backend: {self.guided_decoding_backend}"
         )
+        self.grammar_matchers: List[
+            Optional[GrammarMatcher]] = [None] * self.max_num_sequences
 
         self.bitmask = torch.empty(self.max_num_sequences *
                                    (self.max_num_draft_tokens + 1),
@@ -90,45 +195,9 @@ class GuidedDecoder:
     def bitmask_size(self) -> int:
         return math.ceil(self.vocab_size_padded / 32)
 
-    def _require_matcher_init(self, llm_req: LlmRequest) -> bool:
-        if llm_req.guided_decoding_params is None:
-            return False
-        if llm_req.py_is_draft:
-            return False
-        # The request is in the last chunk of a context forward step.
-        return llm_req.is_context_init_state and llm_req.is_last_context_chunk
-
-    def _require_matcher_advance(self, llm_req: LlmRequest) -> bool:
-        if llm_req.guided_decoding_params is None:
-            return False
-        if llm_req.py_is_draft:
-            if llm_req.is_context_init_state and llm_req.is_last_context_chunk:
-                return True
-            if llm_req.is_generation_in_progress_state:
-                return True
-            return False
-        # The request is in a generation forward step.
-        return llm_req.is_generation_in_progress_state
-
-    def _request_with_offset(
-            self,
-            llm_requests: List[LlmRequest]) -> Iterable[Tuple[LlmRequest, int]]:
-        offset: int = 0
-        for llm_req in llm_requests:
-            yield llm_req, offset
-            offset += 1
-            # Fix race condition: The following host code may change the state of requests and in turn affect the result of hostfunc.
-            # Where the hostfunc is launched, but not executed yet.
-            # if llm_req.is_generation_in_progress_state:
-            if not llm_req.is_context_init_state:
-                # Assume all extended requests have max_num_draft_tokens draft tokens.
-                offset += self.max_num_draft_tokens
-
     @torch.inference_mode()
     @nvtx_range("GuidedDecoder.build")
-    def build(self,
-              scheduled_requests: ScheduledRequests,
-              gathered_input_ids: Optional[torch.Tensor] = None) -> None:
+    def build(self, guided_metadata: GuidedMetadata) -> None:
         """Build the bitmask for requests with guided decoding enabled.
 
         Specifically, this method:
@@ -136,42 +205,39 @@ class GuidedDecoder:
         - call the grammar matcher to fill the bitmask on CPU;
         - asynchronously copy the bitmask to GPU.
         """
+        gathered_input_ids = guided_metadata.gathered_input_ids
         if gathered_input_ids is not None:
             gathered_input_ids = gathered_input_ids.tolist()
 
         # Fix it.
-        num_bitmask_tokens = len(scheduled_requests.context_requests) + len(
-            scheduled_requests.generation_requests) * (
-                self.max_num_draft_tokens + 1)
+        num_bitmask_tokens = guided_metadata.guided_requests_device.num_bitmask_tokens
         self.bitmask_host[:num_bitmask_tokens].fill_(-1)
 
-        for llm_req, offset in self._request_with_offset(
-                scheduled_requests.all_requests()):
-            if llm_req.is_dummy:
+        for req, offset in guided_metadata.guided_requests_device.guided_request_with_offset(
+        ):
+            if (slot := req.seq_slot) is None:
                 continue
-            slot: int = llm_req.py_target_seq_slot if llm_req.py_is_draft else llm_req.py_seq_slot
             self.num_advanced_tokens[slot] = 0
             self.num_guided_tokens[slot] = 0
 
             if gathered_input_ids is None:
-                new_token = llm_req.get_last_tokens(0)
-                draft_tokens = llm_req.py_draft_tokens
+                new_token = req.new_token
+                draft_tokens = req.draft_tokens
             else:
                 new_token = gathered_input_ids[offset]
                 draft_tokens = []
-                # if llm_req.is_generation_in_progress_state:
-                if not llm_req.is_context_init_state:
+                if req.is_generation_in_progress_state:
                     draft_tokens = gathered_input_ids[offset + 1:offset + self.
                                                       max_num_draft_tokens + 1]
 
-            matcher_init: bool = self._require_matcher_init(llm_req)
-            matcher_advance: bool = self._require_matcher_advance(llm_req)
+            matcher_init: bool = req.require_matcher_init()
+            matcher_advance: bool = req.require_matcher_advance()
             if not (matcher_init or matcher_advance):
                 continue
 
             if matcher_init:
                 matcher = self.grammar_matcher_factory.create(
-                    llm_req.guided_decoding_params)
+                    req.guided_decoding_params)
                 self.grammar_matchers[slot] = matcher
 
             if matcher_advance:
@@ -183,15 +249,15 @@ class GuidedDecoder:
                     continue
                 accepted = matcher.accept_token(new_token)
                 if not accepted:
-                    if llm_req.py_is_draft:
+                    if req.is_draft:
                         self.is_draft_terminated[slot] = True
                         logger.debug(
-                            f"Draft request {llm_req.py_request_id} failed to accept last new token: {new_token}."
+                            f"Draft request {req.request_id} at slot {slot} failed to accept last new token: {new_token}."
                         )
                         continue
                     # TODO: Make this an error response.
                     raise ValueError(
-                        f"Request {llm_req.py_request_id} failed to accept last new token: {new_token}."
+                        f"Request {req.request_id} at slot {slot} failed to accept last new token: {new_token}."
                     )
 
             self.num_advanced_tokens[slot] += 1
@@ -210,22 +276,21 @@ class GuidedDecoder:
                                                     offset + i)
                     self.num_guided_tokens[slot] += 1
 
-            if llm_req.py_is_draft:
+            if req.is_draft:
                 assert len(draft_tokens) == 0
                 self.num_advanced_draft_tokens[
                     slot] += self.num_advanced_tokens[slot]
 
-    def copy_bitmask(self, scheduled_requests: ScheduledRequests):
-        num_bitmask_tokens = len(scheduled_requests.context_requests) + len(
-            scheduled_requests.generation_requests) * (
-                self.max_num_draft_tokens + 1)
+    def bitmask_copy(self, guided_metadata: GuidedMetadata) -> None:
+        # Fix it.
+        num_bitmask_tokens = guided_metadata.guided_requests_host.num_bitmask_tokens
         self.bitmask[:num_bitmask_tokens].copy_(
             self.bitmask_host[:num_bitmask_tokens], non_blocking=True)
 
     @torch.inference_mode()
     @nvtx_range("GuidedDecoder.execute")
     def execute(self,
-                scheduled_requests: ScheduledRequests,
+                guided_metadata: GuidedMetadata,
                 logits: torch.Tensor,
                 d2t: Optional[torch.Tensor] = None) -> None:
         """Apply the bitmask to the corresponding logits for requests with guided decoding enabled.
@@ -242,9 +307,7 @@ class GuidedDecoder:
                                  device=draft_logits.device)
             logits.index_copy_(-1, d2t_mapping, draft_logits)
 
-        num_bitmask_tokens = len(scheduled_requests.context_requests) + len(
-            scheduled_requests.generation_requests) * (
-                self.max_num_draft_tokens + 1)
+        num_bitmask_tokens = guided_metadata.guided_requests_host.num_bitmask_tokens
         xgrammar.apply_token_bitmask_inplace(logits[:num_bitmask_tokens],
                                              self.bitmask[:num_bitmask_tokens])
 
@@ -252,10 +315,7 @@ class GuidedDecoder:
             torch.index_select(logits, -1, d2t_mapping, out=draft_logits)
 
     @nvtx_range("GuidedDecoder.rollback_rejected_tokens")
-    def rollback_rejected_tokens(
-            self,
-            scheduled_requests: ScheduledRequests,
-            new_tokens_lens: Optional[torch.Tensor] = None) -> None:
+    def rollback_rejected_tokens(self, guided_metadata: GuidedMetadata) -> None:
         """Rollback the grammar matcher for rejected tokens.
 
         This method should be called:
@@ -265,18 +325,18 @@ class GuidedDecoder:
         if self.max_num_draft_tokens <= 0:
             return
 
+        new_tokens_lens = guided_metadata.new_tokens_lens
         if new_tokens_lens is not None:
             new_tokens_lens = new_tokens_lens.tolist()
 
-        for llm_req in scheduled_requests.all_requests():
-            if llm_req.is_dummy:
+        for req in guided_metadata.guided_requests_device.guided_requests:
+            assert not req.is_draft
+            if (slot := req.seq_slot) is None:
                 continue
-            assert not llm_req.py_is_draft
-            slot: int = llm_req.py_seq_slot
             if self.num_advanced_tokens[slot] <= 0:
                 continue
             if new_tokens_lens is None:
-                num_accepted_tokens = 1 + llm_req.py_num_accepted_draft_tokens
+                num_accepted_tokens = 1 + req.num_accepted_draft_tokens
             else:
                 num_accepted_tokens = new_tokens_lens[slot]
             # Rollback the grammar matcher to the last accepted token.
@@ -329,17 +389,13 @@ class GuidedDecoder:
                         llm_req.guided_decoding_params)
 
     @hostfunc
-    def build_v2(self, guided_metadata: GuidedMetadata):
-        self.build(guided_metadata.scheduled_requests,
-                   guided_metadata.gathered_input_ids)
-
-    def execute_v2(self, guided_metadata: GuidedMetadata, logits: torch.Tensor):
-        self.execute(guided_metadata.scheduled_requests, logits)
+    def build_hostfunc(self, guided_metadata: GuidedMetadata):
+        self.build(guided_metadata)
 
     @hostfunc
-    def rollback_rejected_tokens_v2(self, guided_metadata: GuidedMetadata):
-        self.rollback_rejected_tokens(guided_metadata.scheduled_requests,
-                                      guided_metadata.new_tokens_lens)
+    def rollback_rejected_tokens_hostfunc(self,
+                                          guided_metadata: GuidedMetadata):
+        self.rollback_rejected_tokens(guided_metadata)
 
     @hostfunc
     def inc_bitmask_host(self):

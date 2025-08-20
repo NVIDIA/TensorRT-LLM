@@ -278,19 +278,21 @@ class Eagle3OneModelWorker(nn.Module):
 
         raw_logits = logits
 
-        if self.guided_decoder is not None and guided_metadata is not None:
+        if self.guided_decoder is not None:
             with torch.cuda.stream(self.guided_decoder._stream):
                 torch.cuda.current_stream().wait_event(
                     guided_metadata.token_event)
-                self.guided_decoder.rollback_rejected_tokens_v2(guided_metadata)
-                self.guided_decoder.build_v2(guided_metadata)
-                self.guided_decoder.copy_bitmask(
-                    guided_metadata.scheduled_requests)
+                # Fix it.
+                guided_metadata.next_batch_hostfunc()
+                self.guided_decoder.rollback_rejected_tokens_hostfunc(
+                    guided_metadata)
+                self.guided_decoder.build_hostfunc(guided_metadata)
+                self.guided_decoder.bitmask_copy(guided_metadata)
                 guided_metadata.bitmask_event.record()
 
             torch.cuda.current_stream().wait_event(
                 guided_metadata.bitmask_event)
-            self.guided_decoder.execute_v2(guided_metadata, logits)
+            self.guided_decoder.execute(guided_metadata, logits)
 
         # Sample and accept tokens
         accepted_tokens, num_accepted_tokens = self.sample_and_accept_draft_tokens(
@@ -459,9 +461,8 @@ class Eagle3OneModelWorker(nn.Module):
         draft_tokens = torch.argmax(logits, dim=-1)
 
         # Apply d2t (offsets between draft model dictionary and main model dictionary).
-        if hasattr(draft_model.model,
-                   "d2t") and draft_model.model.d2t is not None:
-            draft_tokens = draft_model.model.d2t[draft_tokens] + draft_tokens
+        if (d2t := getattr(draft_model.model, 'dt2', None)):
+            draft_tokens = d2t[draft_tokens] + draft_tokens
 
         draft_tokens = draft_tokens.type(torch.int32)
 

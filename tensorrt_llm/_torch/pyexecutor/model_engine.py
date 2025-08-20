@@ -899,7 +899,8 @@ class PyTorchModelEngine(ModelEngine):
 
     def _set_up_guided_metadata(self):
         if self.guided_metadata is None:
-            self.guided_metadata = GuidedMetadata()
+            self.guided_metadata = GuidedMetadata(
+                self.spec_config.max_draft_len)
         return self.guided_metadata
 
     def _get_padded_batch(
@@ -1044,8 +1045,8 @@ class PyTorchModelEngine(ModelEngine):
             self._cuda_graphs[batch_size] = {}
 
         self._cuda_graphs[batch_size][draft_len] = DecodingCUDAGraphRunner(
-            batch_size, "cuda", attn_metadata, spec_metadata, self.use_mrope,
-            self.max_beam_width)
+            batch_size, "cuda", attn_metadata, spec_metadata,
+            self.guided_metadata, self.use_mrope, self.max_beam_width)
         return self._cuda_graphs[batch_size][draft_len]
 
     def __del__(self) -> None:
@@ -1295,6 +1296,10 @@ class PyTorchModelEngine(ModelEngine):
                 inputs['attn_metadata'].kv_lens_cuda[
                     num_ctx_requests:num_seqs] += (
                         self.previous_kv_lens_offsets_cuda[:num_gen_requests])
+
+        if (guided_metadata := inputs.get('guided_metadata')) is not None:
+            guided_metadata.token_event.record()
+
         return inputs
 
     def _prepare_tp_inputs(
@@ -1707,7 +1712,7 @@ class PyTorchModelEngine(ModelEngine):
             inputs['spec_metadata'] = spec_metadata
 
         if guided_metadata is not None:
-            guided_metadata.scheduled_requests = scheduled_requests
+            guided_metadata.add_batch(scheduled_requests)
             if new_tensors_device is None:
                 guided_metadata.gathered_input_ids = None
                 guided_metadata.new_tokens_lens = None
@@ -1717,12 +1722,11 @@ class PyTorchModelEngine(ModelEngine):
                     self.gather_ids_cuda[:num_gathered]]
                 self.gathered_input_ids[:num_gathered].copy_(
                     gathered_input_ids_cuda, non_blocking=True)
-                guided_metadata.gathered_input_ids = self.gathered_input_ids[:
-                                                                             num_gathered]
+                # Fix it.
+                guided_metadata.gathered_input_ids = self.gathered_input_ids
                 self.new_tokens_lens.copy_(new_tokens_lens_device,
                                            non_blocking=True)
                 guided_metadata.new_tokens_lens = self.new_tokens_lens
-            guided_metadata.token_event.record()
             inputs['guided_metadata'] = guided_metadata
 
         # support attention dp
@@ -1759,7 +1763,8 @@ class PyTorchModelEngine(ModelEngine):
             self,
             scheduled_requests: ScheduledRequests,
             attn_metadata: AttentionMetadata,
-            spec_metadata: Optional[SpecMetadata] = None):
+            spec_metadata: Optional[SpecMetadata] = None,
+            guided_metadata: Optional[GuidedMetadata] = None):
         """
         Prepare inputs for Pytorch Model.
         """
@@ -1867,6 +1872,10 @@ class PyTorchModelEngine(ModelEngine):
             spec_metadata.seq_lens = sequence_lengths
             spec_metadata.prepare()
             inputs['spec_metadata'] = spec_metadata
+
+        if guided_metadata is not None:
+            guided_metadata.add_batch(scheduled_requests)
+            inputs['guided_metadata'] = guided_metadata
 
         # support attention dp
         if self.enable_attention_dp:
@@ -2291,7 +2300,8 @@ class PyTorchModelEngine(ModelEngine):
 
         if kv_cache_manager is None:
             inputs, gather_ids = self._prepare_tp_inputs_no_cache(
-                scheduled_requests, attn_metadata, spec_metadata)
+                scheduled_requests, attn_metadata, spec_metadata,
+                guided_metadata)
 
             with MoeLoadBalancerIterContext(moe_load_balancer):
                 # Special handling for multimodal encoder only mode
