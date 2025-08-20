@@ -40,4 +40,4 @@ test_e2e.py::test_ptp_quickstart_advanced[Mixtral-8x7B-FP8-Mixtral-8x7B-Instruct
 test_e2e.py::test_ptp_quickstart_advanced_2gpus_sm120[Llama3.1-70B-BF16-llama-3.1-model/Meta-Llama-3.1-70B]
 test_e2e.py::test_ptp_quickstart_advanced_2gpus_sm120[Nemotron-Super-49B-v1-BF16-nemotron-nas/Llama-3_3-Nemotron-Super-49B-v1]
 test_e2e.py::test_ptp_quickstart_advanced_2gpus_sm120[Mixtral-8x7B-BF16-Mixtral-8x7B-Instruct-v0.1]
-test_e2e.py::test_ptp_quickstart_advanced_deepseek_r1_8gpus[DeepSeek-R1-DeepSeek-R1/DeepSeek-R1]
+test_e2e.py::test_ptp_quickstart_advanced_deepseek_r1_8gpus[DeepSeek-R1-0528-FP4-DeepSeek-R1/DeepSeek-R1-0528-FP4]
