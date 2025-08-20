@@ -273,6 +273,19 @@ class ReportUtility:
             },
         }
 
+        # Retrieve KV cache information.
+        kv_cache_config = self.kwargs.get("kv_cache_config", KvCacheConfig())
+        if isinstance(kv_cache_config, KvCacheConfig):
+            kv_cache_dtype = kv_cache_config.dtype
+            kv_cache_mem_percent = kv_cache_config.free_gpu_memory_fraction
+        elif isinstance(kv_cache_config, dict):
+            kv_cache_dtype = kv_cache_config.get("dtype", "auto")
+            kv_cache_mem_percent = kv_cache_config.get(
+                "free_gpu_memory_fraction")
+        else:
+            raise ValueError(
+                f"Invalid kv_cache_config type: {type(kv_cache_config)}.")
+
         # Engine/Backend details
         if self.rt_cfg.backend not in ('pytorch', '_autodeploy'):
             config_path = self.rt_cfg.engine_dir / "config.json"
@@ -302,18 +315,6 @@ class ReportUtility:
             model = self.rt_cfg.model_path or self.rt_cfg.model
             model_config = ModelConfig.from_pretrained(model,
                                                        trust_remote_code=True)
-            kv_cache_config = self.kwargs.get("kv_cache_config",
-                                              KvCacheConfig())
-            if isinstance(kv_cache_config, KvCacheConfig):
-                kv_cache_dtype = kv_cache_config.dtype
-                kv_cache_mem_percent = kv_cache_config.free_gpu_memory_fraction
-            elif isinstance(kv_cache_config, dict):
-                kv_cache_dtype = kv_cache_config.get("dtype", "auto")
-                kv_cache_mem_percent = kv_cache_config.get(
-                    "free_gpu_memory_fraction")
-            else:
-                raise ValueError(
-                    f"Invalid kv_cache_config type: {type(kv_cache_config)}.")
 
             validate_and_set_kv_cache_quant(model_config, kv_cache_dtype)
 
