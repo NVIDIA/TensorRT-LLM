@@ -362,6 +362,12 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                                                model_config,
                                                model_config.mapping)
 
+            if draft_config is not None:
+                for key, value in draft_config.extra_attrs.items():
+                    assert key in ('attn_layers', 'mla_layers')
+                    assert key in model_config.extra_attrs
+                    model_config.extra_attrs[key].update(value)
+
     def forward(
         self,
         attn_metadata: AttentionMetadata,
