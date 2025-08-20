@@ -821,7 +821,7 @@ class PyTorchModelEngine(ModelEngine):
         self.enable_spec_decode = self.is_spec_decode
 
     def _set_up_attn_metadata(self, kv_cache_manager: KVCacheManager):
-        enable_paged_context_mla = is_mla(
+        enable_context_mla_with_cached_kv = is_mla(
             self.model.model_config.pretrained_config) and (
                 self.attn_runtime_features.cache_reuse
                 or self.attn_runtime_features.chunked_prefill)
@@ -835,7 +835,8 @@ class PyTorchModelEngine(ModelEngine):
                 mapping=self.mapping,
                 runtime_features=self.attn_runtime_features,
                 enable_flash_mla=self.model.model_config.enable_flash_mla,
-                enable_paged_context_mla=enable_paged_context_mla,
+                enable_context_mla_with_cached_kv=
+                enable_context_mla_with_cached_kv,
                 cache_indirection=cache_indirection)
 
         if self.attn_metadata is not None:
@@ -852,7 +853,7 @@ class PyTorchModelEngine(ModelEngine):
             mapping=self.mapping,
             runtime_features=self.attn_runtime_features,
             enable_flash_mla=self.model.model_config.enable_flash_mla,
-            enable_paged_context_mla=enable_paged_context_mla,
+            enable_context_mla_with_cached_kv=enable_context_mla_with_cached_kv,
             cache_indirection=cache_indirection)
 
         return self.attn_metadata

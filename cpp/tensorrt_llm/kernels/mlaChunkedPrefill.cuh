@@ -37,14 +37,5 @@ template <typename T, typename TCache>
 void invokeMLALoadChunkedKV(T* output_kv_ptr, T* output_k_pe_ptr, KVBlockArray const& kv_cache, int const num_contexts,
     int64_t const* cu_ctx_chunked_len, int lora_size, int rope_size, int chunked_size, int chunked_idx,
     float const* kv_scale_quant_orig_ptr, cudaStream_t stream);
-
-// output_kv {B, 2, ceil(chunked_size / kv_cache_tokens_per_block), h, kv_cache_tokens_per_block, d}, padding with
-// zero
-// kv {total_token, 2, H, uncompressed_h=128} 0 for k and 1 for v, k_pe {total_token, h=1, rope_h}
-// input kv and k_pe can be cached tokens or uncached tokens
-template <typename T>
-void invokeMLASetChunkedKV(T* output_kv, T const* kv, T const* k_pe, int const batch_size, int const max_seq_len,
-    int const num_heads, int uncompressed_head_size, int rope_size, int64_t const* cu_seq_lens,
-    int const kv_cache_tokens_per_block, cudaStream_t stream);
 } // namespace kernels
 } // namespace tensorrt_llm
