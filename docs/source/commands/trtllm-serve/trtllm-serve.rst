@@ -222,7 +222,8 @@ Start the server and specify the ``--extra_llm_api_options`` argument with the p
 
    trtllm-serve "TinyLlama/TinyLlama-1.1B-Chat-v1.0" --extra_llm_api_options extra_llm_config.yaml
 
-After sending at least one inference request to the server, you can fetch runtime iteration statistics by polling the ``/metrics`` endpoint:
+After sending at least one inference request to the server, you can fetch runtime iteration statistics by polling the ``/metrics`` endpoint.
+Since the statistics are stored in an internal queue and removed once retrieved, it's recommended to poll the endpoint shortly after each request and store the results if needed.
 
 .. code-block:: bash
 
