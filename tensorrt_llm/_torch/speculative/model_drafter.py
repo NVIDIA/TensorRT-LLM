@@ -72,6 +72,8 @@ class ModelDrafter(Drafter):
             self._request_draft_logits = sampler.enable_mixed_sampler
         self.guided_decoder = guided_decoder
 
+        self.use_static_draft_loop = True
+
     def _create_draft_request(self, request: LlmRequest,
                               input_tokens: Optional[List]) -> LlmRequest:
         """Create a draft request with common parameters."""
@@ -257,8 +259,8 @@ class ModelDrafter(Drafter):
                 new_tensors_device=new_tensors_device)
 
         # Handle d2t data if available
-        if hasattr(self.draft_model_engine.model.model, 'd2t'):
-            outputs['d2t'] = self.draft_model_engine.model.model.d2t.data
+        # if hasattr(self.draft_model_engine.model.model, 'd2t'):
+        #     outputs['d2t'] = self.draft_model_engine.model.model.d2t.data
 
         return outputs
 
@@ -377,6 +379,17 @@ class ModelDrafter(Drafter):
 
             # Initial forward pass
             outputs = self._forward_draft_model(draft_batch, resource_manager)
+
+            if self.use_static_draft_loop:
+                outputs_host = outputs.cpu()
+                for token_idx in range(self.max_draft_tokens):
+                    for req_idx, req in enumerate(draft_batch.all_requests()):
+                        target_req = req_id_to_old_request[req.py_request_id]
+                        target_req.py_draft_tokens.append(
+                            outputs_host[token_idx][req_idx])
+
+                return
+
             self._execute_guided_decoder(draft_batch,
                                          outputs['logits'],
                                          d2t=outputs.get('d2t'))
