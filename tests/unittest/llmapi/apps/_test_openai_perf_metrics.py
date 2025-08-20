@@ -25,7 +25,10 @@ def temp_extra_llm_api_options_file(request):
     temp_dir = tempfile.gettempdir()
     temp_file_path = os.path.join(temp_dir, "extra_llm_api_options.yaml")
     try:
-        extra_llm_api_options_dict = {"return_perf_metrics": True}
+        extra_llm_api_options_dict = {
+            "return_perf_metrics": True,
+            "perf_metrics_max_requests": 10
+        }
 
         with open(temp_file_path, 'w') as f:
             yaml.dump(extra_llm_api_options_dict, f)
@@ -69,23 +72,30 @@ def test_metrics_endpoint(server: RemoteOpenAIServer):
     data = data_list[0]["perf_metrics"]
     assert "first_iter" in data
     assert "last_iter" in data
-    assert "arrival_time" in data
-    assert "first_scheduled_time" in data
-    assert "first_token_time" in data
-    assert "last_token_time" in data
-    assert "num_total_allocated_blocks" in data
-    assert "num_new_allocated_blocks" in data
-    assert "num_reused_blocks" in data
-    assert "num_missed_blocks" in data
     assert data["first_iter"] <= data["last_iter"]
-    assert data["arrival_time"] < data["first_scheduled_time"]
-    assert data["first_scheduled_time"] < data["first_token_time"]
-    assert data["first_token_time"] <= data["last_token_time"]
-    assert data["num_new_allocated_blocks"] <= data[
+
+    timing_metrics = data["timing_metrics"]
+    assert "arrival_time" in timing_metrics
+    assert "first_scheduled_time" in timing_metrics
+    assert "first_token_time" in timing_metrics
+    assert "last_token_time" in timing_metrics
+    assert timing_metrics["arrival_time"] < timing_metrics[
+        "first_scheduled_time"]
+    assert timing_metrics["first_scheduled_time"] < timing_metrics[
+        "first_token_time"]
+    assert timing_metrics["first_token_time"] <= timing_metrics[
+        "last_token_time"]
+
+    kv_cache_metrics = data["kv_cache_metrics"]
+    assert "num_total_allocated_blocks" in kv_cache_metrics
+    assert "num_new_allocated_blocks" in kv_cache_metrics
+    assert "num_reused_blocks" in kv_cache_metrics
+    assert "num_missed_blocks" in kv_cache_metrics
+    assert kv_cache_metrics["num_new_allocated_blocks"] <= kv_cache_metrics[
         "num_total_allocated_blocks"]
 
     # exclude disagg specific metrics
     assert "ctx_request_id" not in data_list[0]
-    assert "kv_cache_size" not in data
-    assert "kv_cache_transfer_start" not in data
-    assert "kv_cache_transfer_end" not in data
+    assert "kv_cache_size" not in timing_metrics
+    assert "kv_cache_transfer_start" not in timing_metrics
+    assert "kv_cache_transfer_end" not in timing_metrics

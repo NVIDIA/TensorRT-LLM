@@ -1,12 +1,14 @@
 #!/usr/bin/env python
 import asyncio
 import copy
+import itertools
 import os
 import signal
 import traceback
+from collections import deque
 from contextlib import asynccontextmanager
 from http import HTTPStatus
-from typing import List, Optional, Type, Union
+from typing import Optional, Type, Union
 
 import aiohttp
 import uvicorn
@@ -17,9 +19,9 @@ from starlette.status import HTTP_429_TOO_MANY_REQUESTS
 
 # yapf: disable
 from tensorrt_llm.executor import CppExecutorError
-from tensorrt_llm.llmapi.disagg_utils import (ConditionalDisaggConfig,
+from tensorrt_llm.llmapi.disagg_utils import (DisaggServerConfig,
                                               MetadataServerConfig,
-                                              RouterConfig)
+                                              get_ctx_gen_server_urls)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.serve.metadata_server import create_metadata_server
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
@@ -37,42 +39,45 @@ TIMEOUT_KEEP_ALIVE = 10  # seconds.
 class OpenAIDisaggServer:
 
     def __init__(self,
-                 ctx_servers: List[str],
-                 gen_servers: List[str],
+                 config: DisaggServerConfig,
                  req_timeout_secs: int = 180,
                  server_start_timeout_secs: int = 180,
-                 max_retries: int = 3,
-                 ctx_router_config: Optional[RouterConfig] = None,
-                 gen_router_config: Optional[RouterConfig] = None,
-                 conditional_disagg_config: Optional[ConditionalDisaggConfig] = None,
                  metadata_server_cfg: Optional[MetadataServerConfig] = None):
 
-        self.ctx_servers = ctx_servers
-        self.gen_servers = gen_servers
+        self.ctx_servers, self.gen_servers = get_ctx_gen_server_urls(config.server_configs)
         self.metadata_server = create_metadata_server(metadata_server_cfg)
-        self.ctx_router = create_router(ctx_router_config, ctx_servers, metadata_server_cfg, self.metadata_server)
-        self.gen_router = create_router(gen_router_config, gen_servers, metadata_server_cfg, self.metadata_server)
-        self.conditional_disagg_config = conditional_disagg_config
+        self.ctx_router = create_router(
+            config.ctx_router_config, self.ctx_servers, metadata_server_cfg, self.metadata_server)
+        self.gen_router = create_router(
+            config.gen_router_config, self.gen_servers, metadata_server_cfg, self.metadata_server)
+        self.conditional_disagg_config = config.conditional_disagg_config
 
-        # record corresponding keys of context and generation servers for perf metrics
-        self.perf_metrics_keys: list[tuple[str, str, int]] = [] # (ctx_server_key, gen_server_key, ctx_request_id)
-        self.perf_metrics_keys_lock = asyncio.Lock()
-        self.server_perf_metrics: dict[str, dict] = {} # server_key -> {ctx_request_id: perf_metrics}
-        for server in self.ctx_servers + self.gen_servers:
-            self.server_perf_metrics[server] = {}
+        self.perf_metrics_max_requests = config.perf_metrics_max_requests
+        if self.perf_metrics_max_requests > 0:
+            # record corresponding keys of context and generation servers for perf metrics
+            # (ctx_server, gen_server, ctx_request_id)
+            self.perf_metrics_keys = deque(maxlen=self.perf_metrics_max_requests)
+            self.perf_metrics_keys_lock = asyncio.Lock()
+            # server_key -> {ctx_request_id: perf_metrics}
+            self.server_perf_metrics: dict[str, dict[int, dict]] = {}
+        else:
+            self.perf_metrics_keys = None
+            self.perf_metrics_keys_lock = None
+            self.server_perf_metrics = None
 
-        if max_retries < 0:
-            raise ValueError(f"Max retries {max_retries} must be greater than or equal to 0")
-        self.max_retries = max_retries
+        if config.max_retries < 0:
+            raise ValueError(f"Max retries {config.max_retries} must be greater than or equal to 0")
+        self.max_retries = config.max_retries
         logger.info(f"Server max retries: {self.max_retries}")
 
         if (len(self.gen_servers) == 0):
             raise ValueError("At least one generation server must be provided")
 
-        if os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") != "1" and len(ctx_servers) == 0:
+        if os.getenv("TRTLLM_DISAGG_BENCHMARK_GEN_ONLY") != "1" and len(self.ctx_servers) == 0:
             raise ValueError("At least one context server must be provided")
 
-        if self.conditional_disagg_config is not None and not isinstance(self.gen_router, KvCacheAwareRouter):
+        if self.conditional_disagg_config is not None and \
+                not isinstance(self.gen_router, KvCacheAwareRouter):
             raise ValueError("Generation router must be a KvCacheAwareRouter to enable conditional disaggregation")
 
         # Session will be initialized in lifespan
@@ -134,21 +139,44 @@ class OpenAIDisaggServer:
         ver = {"version": VERSION}
         return JSONResponse(content=ver)
 
+    async def _add_perf_metrics_keys(self, ctx_server: str, gen_server: str, ctx_request_id: int):
+        async with self.perf_metrics_keys_lock:
+            self.perf_metrics_keys.append((ctx_server, gen_server, ctx_request_id))
+
     async def perf_metrics(self) -> JSONResponse:
+        if self.perf_metrics_keys is None:
+            return JSONResponse(content=[])
+
         perf_metrics = {}
-        for server in self.ctx_servers + self.gen_servers:
-            async with self.session.get(f"{server}/perf_metrics") as response:
-                server_perf_metrics = await response.json()
-                perf_metrics[server] = server_perf_metrics
+        exc = None
+        try:
+            for server in self.ctx_servers + self.gen_servers:
+                async with self.session.get(f"{server}/perf_metrics") as response:
+                    server_perf_metrics = await response.json()
+                    perf_metrics[server] = server_perf_metrics
+        except Exception as e:
+            # Keep the exception to raise it after saving perf metrics
+            exc = e
 
         return_metrics = []
         async with self.perf_metrics_keys_lock:
             for server in perf_metrics:
+                server_metrics = self.server_perf_metrics.setdefault(server, {})
                 for request_perf_metrics in perf_metrics[server]:
-                    ctx_request_id = request_perf_metrics["ctx_request_id"]
-                    if server not in self.server_perf_metrics:
-                        self.server_perf_metrics[server] = {}
-                    self.server_perf_metrics[server][ctx_request_id] = request_perf_metrics
+                    ctx_request_id = request_perf_metrics.get("ctx_request_id", None)
+                    if ctx_request_id is None:
+                        continue
+                    server_metrics[ctx_request_id] = request_perf_metrics
+
+                if len(server_metrics) > self.perf_metrics_max_requests:
+                    # Remove oldest requests and keep at most perf_metrics_max_requests
+                    num_remove = len(server_metrics) - self.perf_metrics_max_requests
+                    removed_keys = list(itertools.islice(server_metrics.keys(), num_remove))
+                    for ctx_request_id in removed_keys:
+                        server_metrics.pop(ctx_request_id)
+            if exc is not None:
+                raise exc
+
             remain_keys = []
             for ctx_server, gen_server, ctx_request_id in self.perf_metrics_keys:
                 gen_perf_metrics = self.server_perf_metrics[gen_server].pop(ctx_request_id, None)
@@ -162,7 +190,7 @@ class OpenAIDisaggServer:
                     "gen_server": gen_server,
                     "ctx_perf_metrics": ctx_perf_metrics,
                     "gen_perf_metrics": gen_perf_metrics})
-            self.perf_metrics_keys = remain_keys
+            self.perf_metrics_keys = deque(remain_keys, maxlen=self.perf_metrics_max_requests)
 
         return JSONResponse(content=return_metrics)
 
@@ -303,9 +331,9 @@ class OpenAIDisaggServer:
                 gen_server, _ = await self.gen_router.get_next_server(req)
             logger.debug("Sending request to gen server: %s", gen_server)
 
-            if need_ctx:
-                async with self.perf_metrics_keys_lock:
-                    self.perf_metrics_keys.append((ctx_server, gen_server, req.disaggregated_params.ctx_request_id))
+            if need_ctx and self.perf_metrics_keys is not None:
+                asyncio.create_task(self._add_perf_metrics_keys(
+                    ctx_server, gen_server, req.disaggregated_params.ctx_request_id))
 
             if not req.stream:
                 try:

@@ -3,7 +3,7 @@ import os
 import signal  # Added import
 import subprocess  # nosec B404
 import sys
-from typing import Any, List, Optional
+from typing import Any, Optional
 
 import click
 import torch
@@ -20,8 +20,7 @@ from tensorrt_llm.executor.utils import LlmLauncherEnvs
 from tensorrt_llm.llmapi import (BuildConfig, CapacitySchedulerPolicy,
                                  DynamicBatchConfig, KvCacheConfig,
                                  SchedulerConfig)
-from tensorrt_llm.llmapi.disagg_utils import (CtxGenServerConfig,
-                                              MetadataServerConfig, ServerRole,
+from tensorrt_llm.llmapi.disagg_utils import (MetadataServerConfig, ServerRole,
                                               parse_disagg_config_file,
                                               parse_metadata_server_config_file)
 from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_dict
@@ -442,19 +441,6 @@ def serve_encoder(model: str, host: str, port: int, log_level: str,
     launch_mm_encoder_server(host, port, encoder_args, metadata_server_cfg)
 
 
-def get_ctx_gen_server_urls(
-        server_configs: List[CtxGenServerConfig]) -> List[str]:
-    ctx_server_urls = []
-    gen_server_urls = []
-    for cfg in server_configs:
-        if cfg.type == "ctx":
-            ctx_server_urls.append(f"http://{cfg.hostname}:{cfg.port}")
-        else:
-            gen_server_urls.append(f"http://{cfg.hostname}:{cfg.port}")
-
-    return ctx_server_urls, gen_server_urls
-
-
 @click.command("disaggregated")
 @click.option("-c",
               "--config_file",
@@ -491,22 +477,13 @@ def disaggregated(config_file: Optional[str],
 
     disagg_cfg = parse_disagg_config_file(config_file)
 
-    ctx_server_urls, gen_server_urls = get_ctx_gen_server_urls(
-        disagg_cfg.server_configs)
-
     metadata_server_cfg = parse_metadata_server_config_file(
         metadata_server_config_file)
 
-    server = OpenAIDisaggServer(
-        ctx_servers=ctx_server_urls,
-        gen_servers=gen_server_urls,
-        req_timeout_secs=request_timeout,
-        server_start_timeout_secs=server_start_timeout,
-        max_retries=disagg_cfg.max_retries,
-        ctx_router_config=disagg_cfg.ctx_router_config,
-        gen_router_config=disagg_cfg.gen_router_config,
-        conditional_disagg_config=disagg_cfg.conditional_disagg_config,
-        metadata_server_cfg=metadata_server_cfg)
+    server = OpenAIDisaggServer(config=disagg_cfg,
+                                req_timeout_secs=request_timeout,
+                                server_start_timeout_secs=server_start_timeout,
+                                metadata_server_cfg=metadata_server_cfg)
 
     asyncio.run(server(disagg_cfg.hostname, disagg_cfg.port))
 

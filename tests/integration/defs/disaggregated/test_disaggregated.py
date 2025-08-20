@@ -547,7 +547,7 @@ def test_disaggregated_perf_metrics(disaggregated_test_root, llm_venv,
         with urllib.request.urlopen(f"{server_url}/perf_metrics",
                                     timeout=10) as resp:
             assert resp.status == 200
-            perf_metrics = json.loads(resp.read())
+            perf_metrics = json.load(resp)
         assert len(perf_metrics) > 0
         item = perf_metrics[0]
         assert "ctx_server" in item
@@ -556,8 +556,8 @@ def test_disaggregated_perf_metrics(disaggregated_test_root, llm_venv,
         assert "gen_perf_metrics" in item
         assert item["ctx_perf_metrics"]["ctx_request_id"] == item[
             "gen_perf_metrics"]["ctx_request_id"]
-        ctx_metrics = item["ctx_perf_metrics"]["perf_metrics"]
-        gen_metrics = item["gen_perf_metrics"]["perf_metrics"]
+        ctx_metrics = item["ctx_perf_metrics"]["perf_metrics"]["timing_metrics"]
+        gen_metrics = item["gen_perf_metrics"]["perf_metrics"]["timing_metrics"]
         # only one token is generated in ctx
         assert ctx_metrics["first_token_time"] == ctx_metrics["last_token_time"]
         assert ctx_metrics["last_token_time"] < gen_metrics["arrival_time"]
