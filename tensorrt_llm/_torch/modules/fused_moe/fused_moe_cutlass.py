@@ -342,6 +342,7 @@ class CutlassFusedMoE(MoE):
         # Alltoall or allgather for attention DP
         token_count = x.shape[0]
         alltoall_info = None  # Store for later combine
+        is_sf_swizzled = True  # In case of post-quant communication, scaling factors will not be swizzled before communication, and swizzling after communication is merged into MoE.
         if self.enable_alltoall:
             assert all_rank_num_tokens is not None, "all_rank_num_tokens required for alltoall"
             # Prepare alltoall indices
@@ -387,6 +388,8 @@ class CutlassFusedMoE(MoE):
                 # TODO: Remove this slicing required by padding if possible
                 x_sf = x_sf[:, :x_sf_col_orig].contiguous()
 
+                is_sf_swizzled = False
+
         elif run_post_quant_allgather:
             # Original allgather logic
             if x_sf is not None:
@@ -395,13 +398,14 @@ class CutlassFusedMoE(MoE):
                 assert len(
                     x_sf.shape
                 ) == 2, "The hidden states scaling factor should be 2D tensor before allgather"
+                is_sf_swizzled = False
+
             x, x_sf, token_selected_experts, token_final_scales = allgather(
                 [x, x_sf, token_selected_experts, token_final_scales],
                 self.mapping,
                 dim=0,
                 sizes=None if use_dp_padding else all_rank_num_tokens)
             x_row = x.shape[0]
-            # Fp4 gemm has extra scaling factor
 
         final_hidden_states = torch.ops.trtllm.fused_moe(
             x,
@@ -414,7 +418,7 @@ class CutlassFusedMoE(MoE):
             output_dtype,
             quant_scales=self.quant_scales,
             input_sf=x_sf,
-            swizzled_input_sf=False,
+            swizzled_input_sf=is_sf_swizzled,
             swiglu_alpha=self.swiglu_alpha,
             swiglu_beta=self.swiglu_beta,
             swiglu_limit=self.swiglu_limit,
