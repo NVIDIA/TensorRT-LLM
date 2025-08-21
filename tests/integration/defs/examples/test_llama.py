@@ -4135,7 +4135,8 @@ def test_llm_api_lookahead_decoding_1gpu(model_name, model_path):
     """
     from defs.conftest import llm_models_root
 
-    from tensorrt_llm.llmapi import (LLM, BuildConfig, KvCacheConfig,
+    from tensorrt_llm._tensorrt_engine import LLM
+    from tensorrt_llm.llmapi import (BuildConfig, KvCacheConfig,
                                      LookaheadDecodingConfig, SamplingParams)
     build_config = BuildConfig(max_batch_size=128,
                                max_input_len=2048,

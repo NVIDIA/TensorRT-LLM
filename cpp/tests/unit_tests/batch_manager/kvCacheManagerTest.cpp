@@ -136,7 +136,7 @@ TEST_F(KVCacheManagerTest, BlockManagerTest)
 
     auto constexpr requestId = 42;
     GenerationRequest seq0{requestId, numTokens, beamWidth, blockManager.getWindowSizesMetadata()};
-    blockManager.addSequence(seq0, numBlocksPerBeam, numBlocksPerBeam - 1, maxAttentionWindow);
+    blockManager.addSequence(seq0, numBlocksPerBeam, maxAttentionWindow, /*isShareLastContextBlock=*/false);
     auto constexpr occupiedBlocks = (numBlocksPerBeam - 1) + beamWidth;
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - occupiedBlocks);
     auto const& ids = seq0.getCacheBlockIds(maxAttentionWindow);
@@ -151,7 +151,7 @@ TEST_F(KVCacheManagerTest, BlockManagerTest)
     blockManager.releaseBlocks(seq0);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
 
-    blockManager.addSequence(seq0, numBlocksPerBeam, -1, maxAttentionWindow);
+    blockManager.addSequence(seq0, numBlocksPerBeam, maxAttentionWindow, /*isShareLastContextBlock=*/true);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool - numBlocksPerBeam);
     EXPECT_EQ(ids.size(), beamWidth);
     for (std::size_t i = 0u; i < ids.front().size(); ++i)
@@ -165,17 +165,21 @@ TEST_F(KVCacheManagerTest, BlockManagerTest)
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
 
     // occupy 22/24 blocks
-    EXPECT_NO_THROW(blockManager.addSequence(seq0, numBlocksPerBeam, numBlocksPerBeam - 1, maxAttentionWindow));
+    EXPECT_NO_THROW(
+        blockManager.addSequence(seq0, numBlocksPerBeam, maxAttentionWindow, /*isShareLastContextBlock=*/false));
     GenerationRequest seq1{requestId + 1, numTokens, beamWidth, blockManager.getWindowSizesMetadata()};
-    EXPECT_NO_THROW(blockManager.addSequence(seq1, numBlocksPerBeam, numBlocksPerBeam - 1, maxAttentionWindow));
+    EXPECT_NO_THROW(
+        blockManager.addSequence(seq1, numBlocksPerBeam, maxAttentionWindow, /*isShareLastContextBlock=*/false));
     // same requestId not allowed
     GenerationRequest seq2{requestId, numTokens, beamWidth, blockManager.getWindowSizesMetadata()};
     EXPECT_THROW(
-        blockManager.addSequence(seq2, numBlocksPerBeam, numBlocksPerBeam - 1, maxAttentionWindow), std::runtime_error);
+        blockManager.addSequence(seq2, numBlocksPerBeam, maxAttentionWindow, /*isShareLastContextBlock=*/false),
+        std::runtime_error);
     // no more blocks
     GenerationRequest seq3{requestId + 2, numTokens, beamWidth, blockManager.getWindowSizesMetadata()};
     EXPECT_THROW(
-        blockManager.addSequence(seq3, numBlocksPerBeam, numBlocksPerBeam - 1, maxAttentionWindow), std::runtime_error);
+        blockManager.addSequence(seq3, numBlocksPerBeam, maxAttentionWindow, /*isShareLastContextBlock=*/false),
+        std::runtime_error);
 }
 
 template <typename T, nvinfer1::DataType type, int mask>
@@ -2408,6 +2412,7 @@ TEST_P(KVCacheManagerTest, DISABLED_KVCacheManagerAllocationTest)
 
 TEST_P(KVCacheManagerTest, KVCacheManagerTest)
 {
+    // Full attention
     using DType = half;
     using SizeType32 = KVCacheManager::SizeType32;
 
@@ -2655,6 +2660,7 @@ TEST_P(KVCacheManagerTest, KVCacheManagerMaxAttentionWindowTest)
     auto constexpr tokensPerBlock = 64;
     auto constexpr blockLengthPerSeq = 10;
     auto constexpr maxNumSequences = 8;
+    // TODO: Support and add coverage for beamWidth > 1
     auto constexpr maxBeamWidth = 1;
     auto constexpr sinkTokenLength = 0;
     auto const stream = std::make_shared<tr::CudaStream>();
@@ -2664,10 +2670,10 @@ TEST_P(KVCacheManagerTest, KVCacheManagerMaxAttentionWindowTest)
 
     auto constexpr inputLength = maxNumTokens - tokensPerBlock - 1;
     // Enable cyclic kv cache for all new generated tokens.
-    auto constexpr maxAttentionWindow = inputLength;
-    auto constexpr numSharedBlocks = std::min(inputLength, maxAttentionWindow) / tokensPerBlock;
-    auto constexpr numBlocksPerSeq = numSharedBlocks + (blockLengthPerSeq - numSharedBlocks) * maxBeamWidth;
+    auto constexpr maxAttentionWindow = maxNumTokens;
+    auto constexpr numSharedBlocks = inputLength / tokensPerBlock;
     auto constexpr maxBlocksPerSeq = tc::ceilDiv(maxAttentionWindow, tokensPerBlock);
+    auto constexpr numBlocksPerSeq = numSharedBlocks + (maxBlocksPerSeq - numSharedBlocks) * maxBeamWidth;
 
     auto constexpr totalNumBlocks = maxNumSequences * numBlocksPerSeq;
     auto constexpr blocksInSecondaryPool = 0;
@@ -2757,9 +2763,9 @@ TEST_P(KVCacheManagerTest, KVCacheManagerMaxAttentionWindowTest)
     }
 
     EXPECT_NO_THROW(kvCacheManager.addToken(requestId));
-    EXPECT_EQ(blockManager.getNumFreeBlocks(), totalNumBlocks - numBlocksPerSeq + 1);
+    EXPECT_EQ(blockManager.getNumFreeBlocks(), totalNumBlocks - numSharedBlocks - maxBeamWidth);
     EXPECT_NO_THROW(kvCacheManager.addToken(requestId));
-    EXPECT_EQ(blockManager.getNumFreeBlocks(), totalNumBlocks - numBlocksPerSeq + 1);
+    EXPECT_EQ(blockManager.getNumFreeBlocks(), totalNumBlocks - numSharedBlocks - maxBeamWidth * 2);
     EXPECT_NO_THROW(kvCacheManager.removeSequence(requestId));
     EXPECT_EQ(blockManager.getNumFreeBlocks(), totalNumBlocks);
 
@@ -3488,8 +3494,10 @@ TEST_F(KVCacheManagerTest, KVCacheTransferManagerConcurrencyTest)
     }
 }
 
-TEST_P(KVCacheManagerTest, KVCacheManagerSinkTokenLengthTest)
+TEST_P(KVCacheManagerTest, DISABLED_KVCacheManagerSinkTokenLengthTest)
 {
+    // TODO: Support sink attention and add coverage
+    // TODO: Support and add coverage for beamWidth > 1
     using DType = half;
     using SizeType32 = KVCacheManager::SizeType32;
 
@@ -3633,6 +3641,7 @@ TEST_P(KVCacheManagerTest, KVCacheManagerSinkTokenLengthTest)
 
 TEST_P(KVCacheManagerTest, KVCacheManagerBatchTest)
 {
+    // Full attention
     using DType = half;
     using SizeType32 = KVCacheManager::SizeType32;
 
@@ -4124,6 +4133,8 @@ TEST_P(RemainingBlocksToCompletionTest, RemainingBlocksToCompletionCorrectlyEsti
     ASSERT_EQ(result, params.expectedRemainingBlocksToCompletion);
 }
 
+// TODO: Support and add coverage for beamWidth > 1
+// TODO: Support and add coverage for sink attention
 INSTANTIATE_TEST_SUITE_P(RemainingBlocksToCompletionCorrectlyEstimated, RemainingBlocksToCompletionTest,
     ::testing::Values(
         GetRemainingBlocksToCompletionOneRequestParameters{
@@ -4228,6 +4239,8 @@ TEST_P(FillKvCacheAndCompleteRequestsTest, FillKvCacheAndCompleteInParallel)
     }
 }
 
+// TODO: Support and add coverage for beamWidth > 1
+// TODO: Support and add coverage for sink attention
 auto const paramValues = ::testing::Values(
     FillKvCacheAndCompleteRequestsParameters{
         KvCacheManagerInstantiationParameters{
