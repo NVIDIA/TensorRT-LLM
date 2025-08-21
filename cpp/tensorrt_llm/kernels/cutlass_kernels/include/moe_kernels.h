@@ -228,6 +228,13 @@ struct MOEParallelismConfig
     }
 };
 
+enum class MoeGemmId : int
+{
+    Undefined = 0,
+    GEMM_1,
+    GEMM_2
+};
+
 struct QuantParams
 {
     // Int weight only quantization params
@@ -446,7 +453,7 @@ public:
     virtual void setTactic(std::optional<cutlass_extensions::CutlassGemmConfig> gemm1_config,
         std::optional<cutlass_extensions::CutlassGemmConfig> gemm2_config)
         = 0;
-    virtual std::vector<cutlass_extensions::CutlassGemmConfig> getTactics() = 0;
+    virtual std::vector<cutlass_extensions::CutlassGemmConfig> getTactics(MoeGemmId gemm_id) = 0;
 
     virtual void runMoe(void const* input_activations, void const* input_sf, bool const swizzled_input_sf,
         int const* token_selected_experts, float const* token_final_scales, void const* fc1_expert_weights,
@@ -593,15 +600,15 @@ public:
         gemm2_config_ = std::move(gemm2_config);
     }
 
-    std::vector<cutlass_extensions::CutlassGemmConfig> getTactics() override
+    std::vector<cutlass_extensions::CutlassGemmConfig> getTactics(MoeGemmId gemm_id) override
     {
-        return moe_gemm_runner_.getConfigs();
+        return moe_gemm_runner_.getConfigs(gemm_id == MoeGemmId::GEMM_2 && mayHaveFinalizeFused());
     }
 
-    static std::vector<cutlass_extensions::CutlassGemmConfig> getTactics(int sm)
+    static std::vector<cutlass_extensions::CutlassGemmConfig> getTactics(int sm, MoeGemmId gemm_id)
     {
         using RunnerType = decltype(moe_gemm_runner_);
-        return RunnerType::getConfigs(sm);
+        return RunnerType::getConfigs(sm, gemm_id == MoeGemmId::GEMM_2 && Self::mayHaveFinalizeFused(sm));
     }
 
     void runMoe(void const* input_activations, void const* input_sf, bool const swizzled_input_sf,
@@ -798,6 +805,12 @@ private:
             && !use_w4_groupwise;
     }
 
+    static bool mayHaveFinalizeFused(int sm)
+    {
+        using RunnerType = decltype(moe_gemm_runner_);
+        return RunnerType::supportsTmaWarpSpecialized(sm) && sm >= 90 && !use_w4_groupwise;
+    }
+
     // TODO: This should eventually take the quant params to give more flexibility
     static auto getScalingType()
     {
@@ -895,12 +908,7 @@ struct GemmProfilerBackend
 {
 public:
     using Config = cutlass_extensions::CutlassGemmConfig;
-    enum class GemmToProfile
-    {
-        Undefined = 0,
-        GEMM_1,
-        GEMM_2
-    };
+    using GemmToProfile = MoeGemmId;
 
     void init(CutlassMoeFCRunnerInterface& runner, GemmToProfile gemm_to_profile, nvinfer1::DataType dtype,
         nvinfer1::DataType wtype, nvinfer1::DataType otype, int num_experts, int k, int64_t hidden_size,
@@ -951,7 +959,6 @@ public:
     CutlassMoeFCRunnerInterface* mInterface;
 
     GemmToProfile mGemmToProfile = GemmToProfile::Undefined;
-    std::vector<Config> mAllTacticsSaved;
     int mSM{};
     int64_t mNumExperts{};
     int64_t mNumExpertsPerNode{};
@@ -972,7 +979,7 @@ public:
     // This will be a unique value for every iteration of warmup and actual bench
     constexpr static int64_t NUM_ROUTING_SAMPLES = 16;
 
-    std::array<TmaWarpSpecializedGroupedGemmInput, NUM_ROUTING_SAMPLES> mTmaInputCache;
+    std::array<std::array<TmaWarpSpecializedGroupedGemmInput, 2>, NUM_ROUTING_SAMPLES> mTmaInputCache;
     QuantParams mQuantParams;
 
     bool mBias{};
@@ -985,7 +992,8 @@ public:
 private:
     void prepareRouting(int num_tokens, char* workspace, cudaStream_t stream);
     void prepareQuantParams(int num_tokens, char* workspace, cudaStream_t stream);
-    void prepareTmaWsInputs(int num_tokens, char* workspace, void const* expert_weights, cudaStream_t stream);
+    void prepareTmaWsInputs(int num_tokens, char* workspace, void const* expert_weights,
+        TmaWarpSpecializedGroupedGemmInput::EpilogueFusion fusion, cudaStream_t stream);
 };
 
 // Populates a buffer with random values for use with MOE benchmarking
