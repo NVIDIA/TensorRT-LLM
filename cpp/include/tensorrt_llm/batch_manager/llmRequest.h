@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -29,6 +29,8 @@
 #include <cassert>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
+#include <list>
 #include <memory>
 #include <optional>
 #include <utility>
@@ -1074,7 +1076,6 @@ public:
         TLLM_CHECK_WITH_INFO(prepopulatedPromptLen < promptLen,
             "Invalid state: prepopulatedPromptLen (%d) >= promptLen (%d) for request %lu", prepopulatedPromptLen,
             promptLen, mRequestId);
-        TLLM_CHECK(prepopulatedPromptLen < promptLen);
 
         auto& prePromptLen = mUseDraftModel ? mPrepopulatedPromptLenDraft : mPrepopulatedPromptLenTarget;
         auto& contextCurrentPosition = mUseDraftModel ? mContextCurrentPositionDraft : mContextCurrentPositionTarget;
@@ -1115,9 +1116,9 @@ public:
         mDraftLogits = draftLogits;
     }
 
-    [[nodiscard]] SizeType32 getNumDraftTokens() const
+    [[nodiscard]] SizeType32 getNumDraftTokens() const noexcept
     {
-        return hasDraftTokens() ? mDraftTokens->size() : 0;
+        return hasDraftTokens() ? static_cast<SizeType32>(mDraftTokens->size()) : 0;
     }
 
     void discardDraftTokens(SizeType32 numTokensToDiscard)
@@ -1378,17 +1379,17 @@ public:
         mGenerationLogitsFragments.push_back(genLogits);
     }
 
-    SizeType32 getGenerationLogitsFragmentsSize()
+    [[nodiscard]] SizeType32 getGenerationLogitsFragmentsSize() const noexcept
     {
-        return mGenerationLogitsFragments.size();
+        return static_cast<SizeType32>(mGenerationLogitsFragments.size());
     }
 
-    void clearGenerationLogitsFragments()
+    void clearGenerationLogitsFragments() noexcept
     {
         mGenerationLogitsFragments.clear();
     }
 
-    bool hasAdditionalOutputs()
+    [[nodiscard]] bool hasAdditionalOutputs() const noexcept
     {
         return !mAdditionalContextOutputTensors.empty() || !mAdditionalGenerationOutputTensors.empty();
     }
