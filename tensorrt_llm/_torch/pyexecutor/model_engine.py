@@ -1502,7 +1502,6 @@ class PyTorchModelEngine(ModelEngine):
                 sequence_lengths.append(1)
                 gather_ids.append(len(position_ids) - 1)
 
-            request_ids.append(request.py_request_id)
             request.py_batch_idx = request.py_seq_slot
             # Do not add a gen_request_seq_slot for CUDA graph dummy requests
             # to prevent access errors due to None values

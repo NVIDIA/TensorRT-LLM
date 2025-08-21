@@ -947,7 +947,6 @@ class PyExecutor:
     def _execute_guided_decoder(self, scheduled_batch: ScheduledRequests,
                                 logits: torch.Tensor):
         if self.guided_decoder is not None:
-            self.guided_decoder.build(scheduled_batch)
             self.guided_decoder.execute(scheduled_batch, logits)
 
     def _executor_loop(self):
