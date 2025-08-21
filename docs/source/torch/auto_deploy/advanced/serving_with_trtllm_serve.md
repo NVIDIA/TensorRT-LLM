@@ -9,7 +9,7 @@ Launch `trtllm-serve` with the AutoDeploy backend by setting `--backend _autodep
 ```bash
 trtllm-serve \
   meta-llama/Llama-3.1-8B-Instruct \
-  --backend _autodeploy \
+  --backend _autodeploy
 ```
 
 - `model`: HF name or local path
