@@ -114,7 +114,8 @@ class DecodingCUDAGraphRunner:
         self.input_ids[:seqlen].copy_(input_ids)
         self.position_ids[:, :seqlen].copy_(position_ids)
         if "mrope_position_deltas" in inputs:
-            self.mrope_position_deltas[:self.batch_size].copy_(
+            mrope_num = inputs["mrope_position_deltas"].shape[0]
+            self.mrope_position_deltas[:mrope_num].copy_(
                 inputs["mrope_position_deltas"])
 
         assert self._output is not None and self._graph is not None
