@@ -22,7 +22,8 @@ from tensorrt_llm.bench.benchmark.utils.general import (
 from tensorrt_llm import LLM as PyTorchLLM
 from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm._torch.auto_deploy import LLM as AutoDeployLLM
-from tensorrt_llm.bench.benchmark.utils.general import generate_warmup_dataset
+from tensorrt_llm.bench.benchmark.utils.general import (
+    generate_warmup_dataset, update_sampler_args_with_extra_options)
 from tensorrt_llm.bench.dataclasses.configuration import RuntimeConfig
 from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
 from tensorrt_llm.bench.dataclasses.reporting import ReportUtility
@@ -67,6 +68,13 @@ from tensorrt_llm.sampling_params import SamplingParams
     help=
     "Path to a YAML file that overwrites the parameters specified by trtllm-bench."
 )
+@optgroup.option("--sampler_options",
+                 type=click.Path(exists=True,
+                                 readable=True,
+                                 path_type=Path,
+                                 resolve_path=True),
+                 default=None,
+                 help="Path to a YAML file that sets sampler options.")
 @optgroup.option(
     "--max_batch_size",
     type=int,
@@ -455,10 +463,16 @@ def throughput_command(
         else:
             llm = LLM(**kwargs)
 
-        sampling_params = SamplingParams(end_id=eos_id,
-                                         pad_id=eos_id,
-                                         n=beam_width,
-                                         use_beam_search=beam_width > 1)
+        sampler_args = {
+            "end_id": eos_id,
+            "pad_id": eos_id,
+            "n": beam_width,
+            "use_beam_search": beam_width > 1
+        }
+        sampler_args = update_sampler_args_with_extra_options(
+            sampler_args, params.pop("sampler_options"))
+        sampling_params = SamplingParams(**sampler_args)
+
         post_proc_params = None  # No detokenization
 
         # Perform warmup if requested.

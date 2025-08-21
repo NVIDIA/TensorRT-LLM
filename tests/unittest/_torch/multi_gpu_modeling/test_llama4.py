@@ -1,6 +1,7 @@
 from difflib import SequenceMatcher
 
 import pytest
+import torch
 from utils.llm_data import llm_models_root
 
 from tensorrt_llm import LLM, SamplingParams
@@ -43,19 +44,17 @@ def test_llama4(model_name, backend, tp_size, use_cuda_graph,
             "This is a very long prompt to exercise long context. Count up to 10000 from 1, 2, 3,"
             + ", ".join(str(i) for i in range(4, 9000))
         },
-        # TODO: Fix multimodal test.
-        # {
-        #     "prompt": "<|image|>This image is of color",
-        #     "multi_modal_data": {
-        #         "image": [torch.ones(3, 1024, 1024)]
-        #     }
-        # },
+        {
+            "prompt": "<|image|>This image is of color",
+            "multi_modal_data": {
+                "image": [torch.ones(3, 1024, 1024)]
+            }
+        },
     ]
 
     expected_outputs = [
-        " the head of state and head of government of the",
-        ", 9000, 9001, ",
-        # " white. What is the color of the background of"  # TODO: Fix multimodal test.
+        " the head of state and head of government of the", ", 9000, 9001, ",
+        " white. What is the color of the background of"
     ]
 
     pytorch_config = dict(attn_backend=backend)
@@ -72,7 +71,6 @@ def test_llama4(model_name, backend, tp_size, use_cuda_graph,
         pipeline_parallel_size=pp_size,
         enable_attention_dp=enable_attention_dp,
         kv_cache_config=kv_cache_config,
-        use_torch_sampler=True,
         enable_chunked_prefill=True,
     )
     with llm:

@@ -339,7 +339,7 @@ scenarios = [
 
 accuracy_dict = {
     torch.bfloat16: (3e-2, 3e-3),
-    torch.float8_e4m3fn: (4.075e-1, 4.075e-2),
+    torch.float8_e4m3fn: (4e-1, 4e-2),
 }
 
 
@@ -442,20 +442,25 @@ def _run_test_for_backend(backend_name, num_heads, num_kv_heads, num_layers,
                 device=device,
             ).uniform_(-1, 1) for ctx_len in context_sequence_lengths
         ])
+        ctx_kv = torch.cat([
+            torch.empty(
+                [ctx_len, num_kv_heads * (qk_nope_head_dim + v_head_dim)],
+                dtype=dtype,
+                device=device,
+            ).uniform_(-1, 1) for ctx_len in context_sequence_lengths
+        ])
+        # ctx_v.stride(0) == num_kv_heads * (qk_nope_head_dim + v_head_dim)
+        ctx_k_nope, ctx_v = ctx_kv.split(
+            [num_kv_heads * qk_nope_head_dim, num_kv_heads * v_head_dim],
+            dim=-1)
+        ctx_k_nope = ctx_k_nope.view(-1, num_kv_heads, qk_nope_head_dim)
         ctx_k = torch.cat([
-            torch.empty(
-                [ctx_len, num_kv_heads * qk_head_dim],
-                dtype=dtype,
-                device=device,
-            ).uniform_(-1, 1) for ctx_len in context_sequence_lengths
-        ])
-        ctx_v = torch.cat([
-            torch.empty(
-                [ctx_len, num_kv_heads * v_head_dim],
-                dtype=dtype,
-                device=device,
-            ).uniform_(-1, 1) for ctx_len in context_sequence_lengths
-        ])
+            ctx_k_nope,
+            ctx_k_pe.view(-1, 1, qk_rope_head_dim).expand(-1, num_kv_heads, -1)
+        ],
+                          dim=-1)
+        ctx_k = ctx_k.view(-1, num_kv_heads * qk_head_dim)
+
         gen_compressed_kv_list = [
             torch.cat([
                 torch.empty(
@@ -676,12 +681,13 @@ def _run_test_for_backend(backend_name, num_heads, num_kv_heads, num_layers,
                 v = inputs_per_layer[layer_idx]["ctx_v"]
                 compressed_kv = inputs_per_layer[layer_idx]["ctx_compressed_kv"]
                 k_pe = inputs_per_layer[layer_idx]["ctx_k_pe"]
-                qkv = torch.cat([q, k, v], dim=-1)
                 latent_cache = torch.cat([compressed_kv, k_pe], dim=-1)
+                # q/k will be modified in the forward pass, so we need to clone them
+                # we should not clone v because we need to keep the stride of v
                 result = ctx_layers[layer_idx].forward(
-                    qkv,
-                    None,
-                    None,
+                    q.clone(),
+                    k.clone(),
+                    v,
                     attn_metadata,
                     attention_input_type=AttentionInputType.context_only,
                     latent_cache=latent_cache,
@@ -740,10 +746,15 @@ def _run_test_for_backend(backend_name, num_heads, num_kv_heads, num_layers,
                 )
                 latent_cache_ref_all_list[layer_idx] = latent_cache_ref
             # Compare results
-            print(f"{backend_name} output mean: {result.abs().mean().item()}")
-            print(f"Reference output mean: {ref_result.abs().mean().item()}")
             print(
-                f"Difference mean: {(result - ref_result).abs().mean().item()}")
+                f"{backend_name} output mean: {result.abs().mean().item()}, max: {result.abs().max().item()}"
+            )
+            print(
+                f"Reference output mean: {ref_result.abs().mean().item()}, max: {ref_result.abs().max().item()}"
+            )
+            print(
+                f"Difference mean: {(result - ref_result).abs().mean().item()}, max: {(result - ref_result).abs().max().item()}"
+            )
 
             # Assert results are close
             atol, rtol = accuracy_dict[kv_cache_dtype]

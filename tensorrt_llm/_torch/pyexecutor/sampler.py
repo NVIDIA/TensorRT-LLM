@@ -1,7 +1,7 @@
 from abc import ABC, abstractmethod
 from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Literal, Optional
+from typing import List, Literal, Optional
 
 import torch
 
@@ -97,6 +97,51 @@ class EarlyStopSampler(Sampler):
                 request.py_result.append_context_logits(logits)
 
 
+@dataclass(kw_only=True)
+class MultimodalResult:
+    mm_embeddings: List[torch.Tensor] = None
+
+    def values(self):
+        return vars(self).values()
+
+
+@dataclass(kw_only=True)
+class SampleStateWithMMResult:
+    scheduled_requests: ScheduledRequests
+
+    data: MultimodalResult = None
+
+
+class EarlyStopWithMMResult(Sampler):
+    """
+    Use for skipping decoding step for non generation model, and return the batch_output (such as mm_embeddings)
+    """
+
+    def sample_async(self, scheduled_requests: ScheduledRequests,
+                     model_outputs) -> SampleStateWithMMResult:
+        # from model_outputs to MultimodalResult
+        data = MultimodalResult(mm_embeddings=model_outputs['mm_embeddings'])
+        return SampleStateWithMMResult(scheduled_requests=scheduled_requests,
+                                       data=data)
+
+    def update_requests(self, state: SampleStateWithMMResult) -> None:
+        assert isinstance(state, SampleStateWithMMResult)
+        scheduled_requests = state.scheduled_requests
+        assert (not scheduled_requests.generation_requests)
+        mm_embeddings = state.data.mm_embeddings
+        for request, mm_embedding in zip(scheduled_requests.context_requests,
+                                         mm_embeddings):
+            request.state = LlmRequestState.GENERATION_COMPLETE
+            # NOTE: This is a hack: set finish reason manually and set the beam 0
+            request.set_finished_reason(FinishReason.LENGTH, 0)
+            if len(mm_embedding) != sum(request.multimodal_lengths):
+                raise ValueError(
+                    f"mm_embedding shape mismatch: {len(mm_embedding)} != {sum(request.multimodal_lengths)}"
+                )
+
+            request.py_result.append_mm_embeddings(mm_embedding)
+
+
 def top_k_sampling_batch(logits,
                          top_k=50,
                          generator: Optional[torch.Generator] = None):
@@ -107,12 +152,13 @@ def top_k_sampling_batch(logits,
     batch_size, vocab_size = logits.size()
 
     # get first top_k logits of each sample and their indices
-    values, indices = torch.topk(logits, top_k, dim=-1)
-    min_values = values[:, -1].unsqueeze(-1).expand(batch_size, vocab_size)
+    if top_k > 0:
+        values, indices = torch.topk(logits, top_k, dim=-1)
+        min_values = values[:, -1].unsqueeze(-1).expand(batch_size, vocab_size)
 
-    # set the logits who is less than first top_k logits to -inf
-    logits = torch.where(logits < min_values,
-                         torch.full_like(logits, float('-inf')), logits)
+        # set the logits who is less than first top_k logits to -inf
+        logits = torch.where(logits < min_values,
+                             torch.full_like(logits, float('-inf')), logits)
 
     # compute probability distribution
     softmax = torch.softmax(logits, dim=-1)
@@ -173,12 +219,13 @@ def top_k_top_p_sampling_batch(logits: torch.Tensor,
         logits = logits / max(temperature, 1e-5)
     batch_size, vocab_size = logits.size()
     # get first top_k logits of each sample and their indices
-    values, indices = torch.topk(logits, top_k, dim=-1)
-    min_values = values[:, -1].unsqueeze(-1).expand(batch_size, vocab_size)
+    if top_k > 0:
+        values, indices = torch.topk(logits, top_k, dim=-1)
+        min_values = values[:, -1].unsqueeze(-1).expand(batch_size, vocab_size)
 
-    # set the logits who is less than first top_k logits to -inf
-    logits = torch.where(logits < min_values,
-                         torch.full_like(logits, float('-inf')), logits)
+        # set the logits who is less than first top_k logits to -inf
+        logits = torch.where(logits < min_values,
+                             torch.full_like(logits, float('-inf')), logits)
 
     sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
 

@@ -1516,6 +1516,13 @@ def test_openai_chat_multimodal_example(llm_root, llm_venv):
          str(test_root / "_test_openai_chat_multimodal.py")])
 
 
+def test_openai_mmencoder_example(llm_root, llm_venv):
+    test_root = unittest_path() / "llmapi" / "apps"
+    llm_venv.run_cmd(
+        ["-m", "pytest",
+         str(test_root / "_test_openai_mmencoder.py")])
+
+
 def test_openai_chat_structural_tag_example(llm_venv):
     test_root = unittest_path() / "llmapi" / "apps"
     llm_venv.run_cmd([
@@ -2280,6 +2287,8 @@ def test_ptp_quickstart_multimodal(llm_root, llm_venv, model_name, model_path,
         cmd.append("--image_format=pil")
         cmd.append("--attention_backend=FLASHINFER")
         cmd.append("--disable_kv_cache_reuse")
+        cmd.append("--kv_cache_fraction=0.5")
+        cmd.append("--max_seq_len=1024")
 
     output = llm_venv.run_cmd(cmd, caller=check_output)
 
