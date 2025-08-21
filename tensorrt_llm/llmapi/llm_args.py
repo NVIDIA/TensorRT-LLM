@@ -225,6 +225,7 @@ class _ParallelConfig:
     moe_ep_size: int = 1
     cp_config: dict = field(default_factory=dict)
     enable_attention_dp: bool = False
+    enable_lm_tp_in_adp: bool = False
     auto_parallel: bool = False
 
     _world_size: int = field(default=1, init=False)
@@ -288,6 +289,7 @@ class _ParallelConfig:
                        cp_size=self.cp_size,
                        cp_config=self.cp_config,
                        enable_attention_dp=self.enable_attention_dp,
+                       enable_lm_tp_in_adp=self.enable_lm_tp_in_adp,
                        moe_cluster_size=self.moe_cluster_size,
                        moe_tp_size=self.moe_tp_size,
                        moe_ep_size=self.moe_ep_size,
@@ -1246,6 +1248,11 @@ class BaseLlmArgs(StrictBaseModel):
         description="Enable attention data parallel.",
         status="beta")
 
+    enable_lm_tp_in_adp: bool = Field(
+        default=False,
+        description="Enable lm tp in attention dp.",
+        status="beta")
+
     cp_config: Optional[dict] = Field(default_factory=dict,
                                       description="Context parallel config.",
                                       status="prototype")
@@ -1493,6 +1500,7 @@ class BaseLlmArgs(StrictBaseModel):
             moe_tp_size=self.moe_tensor_parallel_size,
             moe_ep_size=self.moe_expert_parallel_size,
             enable_attention_dp=self.enable_attention_dp,
+            enable_lm_tp_in_adp=self.enable_lm_tp_in_adp,
             cp_config=self.cp_config)
         return self
 

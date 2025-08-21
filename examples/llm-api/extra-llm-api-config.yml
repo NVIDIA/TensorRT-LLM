@@ -1,0 +1,6 @@
+cuda_graph_config: {}
+moe_config:
+  backend: TRTLLM
+speculative_config:
+    decoding_type: MTP
+    num_nextn_predict_layers: 3
