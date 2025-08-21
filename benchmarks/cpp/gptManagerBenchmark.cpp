@@ -837,7 +837,8 @@ texec::Request makeExecutorRequest(Sample const& sample, SizeType32 const& beamW
         std::nullopt,    // kvCacheRetentionConfig
         std::nullopt,    // logitsPostProcessorName
         std::nullopt,    // logitsPostProcessor
-        encoderInputTokenIds.has_value() ? encoderInputTokenIds : std::nullopt);
+        encoderInputTokenIds.has_value() ? encoderInputTokenIds : std::nullopt,
+        std::nullopt);   // cacheSaltID
 }
 
 void benchmarkExecutor(std::optional<std::filesystem::path> const& decoderEngineDir,

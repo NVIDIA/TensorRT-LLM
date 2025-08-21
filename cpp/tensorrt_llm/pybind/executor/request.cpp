@@ -590,7 +590,8 @@ void initRequestBindings(pybind11::module_& m)
                  std::optional<tle::Tensor>,                    // skipCrossAttnBlocks
                  std::optional<tle::GuidedDecodingParams>,      // guidedDecodingParams
                  std::optional<tle::SizeType32>,                // languageAdapterUid
-                 std::optional<tle::MillisecondsType>           // allottedTimeMs
+                 std::optional<tle::MillisecondsType>,          // allottedTimeMs
+                 std::optional<tle::CacheSaltIDType>            // cacheSaltID
                  >(),
             // clang-format off
         py::arg("input_token_ids"),
@@ -630,8 +631,9 @@ void initRequestBindings(pybind11::module_& m)
         py::arg("skip_cross_attn_blocks") = py::none(),
         py::arg("guided_decoding_params") = py::none(),
         py::arg("language_adapter_uid") = py::none(),
-        py::arg("allotted_time_ms") = py::none()
-    )          // clang-format on
+        py::arg("allotted_time_ms") = py::none(),
+        py::arg("cache_salt_id") = py::none()
+    )             // clang-format on
         .def_property_readonly("input_token_ids", &tle::Request::getInputTokenIds)
         .def_property_readonly("max_tokens", &tle::Request::getMaxTokens)
         .def_property("streaming", &tle::Request::getStreaming, &tle::Request::setStreaming)
@@ -675,6 +677,7 @@ void initRequestBindings(pybind11::module_& m)
         .def_property(
             "guided_decoding_params", &tle::Request::getGuidedDecodingParams, &tle::Request::setGuidedDecodingParams)
         .def_property("allotted_time_ms", &tle::Request::getAllottedTimeMs, &tle::Request::setAllottedTimeMs)
+        .def_property("cache_salt_id", &tle::Request::getCacheSaltID, &tle::Request::setCacheSaltID)
         .def_property(
             "context_phase_params", &tle::Request::getContextPhaseParams, &tle::Request::setContextPhaseParams)
         .def(py::pickle(requestGetstate, requestSetstate));

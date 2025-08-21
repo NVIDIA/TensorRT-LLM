@@ -17,6 +17,7 @@ from torchvision.transforms import ToTensor
 from transformers import AutoProcessor, ProcessorMixin
 from transformers.utils import logging
 
+from tensorrt_llm.inputs.multimodal import default_hasher
 from tensorrt_llm.inputs.registry import (MULTIMODAL_PLACEHOLDER_REGISTRY,
                                           MultimodalPlaceholderPlacement)
 from tensorrt_llm.llmapi.llm_utils import ModelLoader
@@ -610,3 +611,9 @@ def default_multimodal_input_loader(
         inputs.append(input)
 
     return inputs
+
+
+def get_cache_salt_id(cache_salt: str) -> int:
+    b = cache_salt.encode("utf-8")
+    h = default_hasher(b).digest(length=8)
+    return int.from_bytes(h, "little", signed=False)
