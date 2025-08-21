@@ -161,7 +161,7 @@ def launch_server(host: str,
                   server_role: Optional[ServerRole] = None):
 
     backend = llm_args["backend"]
-    model = llm_args["model"]
+    served_model_name = llm_args["served_model_name"] if llm_args["served_model_name"] is not None else llm_args["model"]
 
     if backend == 'pytorch':
         llm = PyTorchLLM(**llm_args)
@@ -169,7 +169,7 @@ def launch_server(host: str,
         llm = LLM(**llm_args)
 
     server = OpenAIServer(llm=llm,
-                          model=model,
+                          model=served_model_name,
                           server_role=server_role,
                           metadata_server_cfg=metadata_server_cfg)
 
@@ -194,6 +194,10 @@ def launch_mm_encoder_server(
 
 @click.command("serve")
 @click.argument("model", type=str)
+@click.option("--served_model_name",
+              type=str,
+              default=None,
+              help="Model name of the OpenAI server.")
 @click.option("--tokenizer",
               type=str,
               default=None,
