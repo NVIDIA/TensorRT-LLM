@@ -7,7 +7,7 @@ from torch import nn
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
-from ..pyexecutor.guided_decoder import GuidedDecoder
+from ..pyexecutor.guided_decoder import GuidedWorker
 from ..pyexecutor.llm_request import LlmRequest
 from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
 from ..pyexecutor.sampler import TorchSampler
@@ -266,33 +266,20 @@ class Eagle3OneModelWorker(nn.Module):
         self.spec_config = spec_config
         self.max_draft_len = self.spec_config.max_draft_len
         self.mapping = mapping
-        self.guided_decoder: Optional[GuidedDecoder] = None
+        self.guided_worker: Optional[GuidedWorker] = None
 
     # Skip torch.compile for now since current Torch is not compatible with Triton 3.4
     # @torch.compile(options={"max-autotune": True})
     def forward(self, input_ids, position_ids, hidden_states, logits,
-                attn_metadata, spec_metadata, guided_metadata, draft_model):
+                attn_metadata, spec_metadata, draft_model):
         batch_size = attn_metadata.num_seqs
         num_contexts = attn_metadata.num_contexts
         num_gens = batch_size - num_contexts
 
         raw_logits = logits
 
-        if self.guided_decoder is not None:
-            with torch.cuda.stream(self.guided_decoder._stream):
-                torch.cuda.current_stream().wait_event(
-                    guided_metadata.token_event)
-                # Fix it.
-                guided_metadata.next_batch_hostfunc()
-                self.guided_decoder.rollback_rejected_tokens_hostfunc(
-                    guided_metadata)
-                self.guided_decoder.build_hostfunc(guided_metadata)
-                self.guided_decoder.bitmask_copy(guided_metadata)
-                guided_metadata.bitmask_event.record()
-
-            torch.cuda.current_stream().wait_event(
-                guided_metadata.bitmask_event)
-            self.guided_decoder.execute(guided_metadata, logits)
+        if self.guided_worker is not None:
+            self.guided_worker.execute(logits)
 
         # Sample and accept tokens
         accepted_tokens, num_accepted_tokens = self.sample_and_accept_draft_tokens(
@@ -511,3 +498,7 @@ class Eagle3OneModelWorker(nn.Module):
             "attn_metadata": attn_metadata,
             "spec_metadata": spec_metadata,
         }
+
+    def set_guided_worker(self, guided_worker: GuidedWorker) -> bool:
+        self.guided_worker = guided_worker
+        return True

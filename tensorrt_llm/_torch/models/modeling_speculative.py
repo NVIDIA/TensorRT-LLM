@@ -15,7 +15,7 @@ from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import (Linear, TensorParallelMode, WeightMode,
                               WeightsLoadingConfig)
 from ..modules.rms_norm import RMSNorm
-from ..pyexecutor.guided_decoder import GuidedMetadata
+from ..pyexecutor.guided_decoder import GuidedWorker
 from ..speculative import SpecMetadata, get_spec_worker
 from .checkpoints.base_weight_mapper import BaseWeightMapper
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM, TModel,
@@ -407,7 +407,6 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
         inputs_embeds: Optional[torch.FloatTensor] = None,
         return_context_logits: bool = False,
         spec_metadata: Optional[SpecMetadata] = None,
-        guided_metadata: Optional[GuidedMetadata] = None,
         **kwargs,
     ) -> torch.Tensor:
         hidden_states = self.model(
@@ -434,7 +433,6 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                                     logits=logits,
                                     attn_metadata=attn_metadata,
                                     spec_metadata=spec_metadata,
-                                    guided_metadata=guided_metadata,
                                     draft_model=self.draft_model)
         else:
             logits = self.logits_processor.forward(
@@ -459,3 +457,8 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
         self.draft_model.load_weights(weights=weights,
                                       weight_mapper=weight_mapper)
         self.draft_model.load_weights_from_target_model(self)
+
+    def set_guided_worker(self, guided_worker: GuidedWorker) -> bool:
+        if hasattr(self.spec_worker, "set_guided_worker"):
+            return self.spec_worker.set_guided_worker(guided_worker)
+        return False

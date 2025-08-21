@@ -1,7 +1,7 @@
 import math
 from dataclasses import dataclass, field
 from queue import Queue
-from typing import Iterable, List, Optional, Tuple
+from typing import Iterable, List, Optional, Protocol, Tuple
 
 import torch
 import xgrammar
@@ -57,11 +57,11 @@ class GuidedRequest:
 
     @classmethod
     def from_request(cls, request: LlmRequest):
-        seq_slot = request.py_target_seq_slot if request.py_is_draft else request.py_seq_slot
         return cls(
             guided_decoding_params=request.guided_decoding_params,
             request_id=request.py_request_id,
-            seq_slot=seq_slot,
+            seq_slot=request.py_target_seq_slot
+            if request.py_is_draft else request.py_seq_slot,
             is_context_init_state=request.is_context_init_state,
             is_last_context_chunk=request.is_context_init_state
             and request.is_last_context_chunk,
@@ -73,71 +73,41 @@ class GuidedRequest:
             num_accepted_draft_tokens=request.py_num_accepted_draft_tokens)
 
 
-class GuidedRequestBatch:
+@dataclass(slots=True)
+class GuidedRequests:
+    requests: List[GuidedRequest]
+    num_contexts: int
+    num_generations: int
+    max_num_draft_tokens: int
 
-    def __init__(self,
-                 scheduled_requests: ScheduledRequests,
-                 max_num_draft_tokens: int = 0):
-        self.guided_requests = [
+    @classmethod
+    def from_scheduled_requests(cls,
+                                scheduled_requests: ScheduledRequests,
+                                max_num_draft_tokens: int = 0):
+        batch = [
             GuidedRequest.from_request(req)
             for req in scheduled_requests.all_requests()
         ]
-        self.num_contexts = len(scheduled_requests.context_requests)
-        self.num_generations = len(scheduled_requests.generation_requests)
-        self.max_num_draft_tokens = max_num_draft_tokens
+        return cls(batch,
+                   num_contexts=len(scheduled_requests.context_requests),
+                   num_generations=len(scheduled_requests.generation_requests),
+                   max_num_draft_tokens=max_num_draft_tokens)
 
     @property
     def num_bitmask_tokens(self) -> int:
         return self.num_contexts + self.num_generations * (
             self.max_num_draft_tokens + 1)
 
-    def guided_request_with_offset(self) -> Iterable[Tuple[GuidedRequest, int]]:
+    def request_with_offset(self) -> Iterable[Tuple[GuidedRequest, int]]:
         offset: int = 0
-        for req in self.guided_requests:
+        for req in self.requests:
             yield req, offset
             offset += 1
             if req.is_generation_in_progress_state:
                 offset += self.max_num_draft_tokens
 
-
-@dataclass(slots=True)
-class GuidedMetadata:
-    """Metadata for guided decoding."""
-    # No race condition
-    # 1. Overlap scheduler disabled: sample_state is synced to host, so the last-iteration hostfunc has finished.
-    # 2. Overlap scheduler enabled: D2H copy depends on new_tensors_device, which depends on the last-iteration hostfunc results.
-    max_num_draft_tokens: int = field(default=0)
-
-    queue: Optional[Queue] = field(default=None, init=False)
-    guided_requests_device: Optional[GuidedRequestBatch] = field(default=None,
-                                                                 init=False)
-    guided_requests_host: Optional[GuidedRequestBatch] = field(default=None,
-                                                               init=False)
-
-    # gathered input_ids at the current iteration.
-    gathered_input_ids: Optional[torch.Tensor] = field(default=None, init=False)
-    # num_accepted_tokens at the last iteration.
-    new_tokens_lens: Optional[torch.Tensor] = field(default=None, init=False)
-
-    token_event: Optional[torch.cuda.Event] = field(default=None, init=False)
-    bitmask_event: Optional[torch.cuda.Event] = field(default=None, init=False)
-
-    def __post_init__(self):
-        self.queue = Queue()
-        self.token_event = torch.cuda.Event()
-        self.bitmask_event = torch.cuda.Event()
-
-    def add_batch(self, scheduled_requests: ScheduledRequests):
-        self.guided_requests_host = GuidedRequestBatch(
-            scheduled_requests, self.max_num_draft_tokens)
-        self.queue.put(self.guided_requests_host)
-
-    @hostfunc
-    def next_batch_hostfunc(self):
-        # Fix it.
-        if self.queue.empty():
-            return
-        self.guided_requests_device = self.queue.get()
+    def __iter__(self) -> Iterable[GuidedRequest]:
+        return iter(self.requests)
 
 
 class GuidedDecoder:
@@ -195,9 +165,7 @@ class GuidedDecoder:
     def bitmask_size(self) -> int:
         return math.ceil(self.vocab_size_padded / 32)
 
-    @torch.inference_mode()
-    @nvtx_range("GuidedDecoder.build")
-    def build(self, guided_metadata: GuidedMetadata) -> None:
+    def _build(self, requests: GuidedRequests) -> None:
         """Build the bitmask for requests with guided decoding enabled.
 
         Specifically, this method:
@@ -205,30 +173,14 @@ class GuidedDecoder:
         - call the grammar matcher to fill the bitmask on CPU;
         - asynchronously copy the bitmask to GPU.
         """
-        gathered_input_ids = guided_metadata.gathered_input_ids
-        if gathered_input_ids is not None:
-            gathered_input_ids = gathered_input_ids.tolist()
-
         # Fix it.
-        num_bitmask_tokens = guided_metadata.guided_requests_device.num_bitmask_tokens
-        self.bitmask_host[:num_bitmask_tokens].fill_(-1)
+        self.bitmask_host[:requests.num_bitmask_tokens].fill_(-1)
 
-        for req, offset in guided_metadata.guided_requests_device.guided_request_with_offset(
-        ):
+        for req, offset in requests.request_with_offset():
             if (slot := req.seq_slot) is None:
                 continue
             self.num_advanced_tokens[slot] = 0
             self.num_guided_tokens[slot] = 0
-
-            if gathered_input_ids is None:
-                new_token = req.new_token
-                draft_tokens = req.draft_tokens
-            else:
-                new_token = gathered_input_ids[offset]
-                draft_tokens = []
-                if req.is_generation_in_progress_state:
-                    draft_tokens = gathered_input_ids[offset + 1:offset + self.
-                                                      max_num_draft_tokens + 1]
 
             matcher_init: bool = req.require_matcher_init()
             matcher_advance: bool = req.require_matcher_advance()
@@ -247,17 +199,17 @@ class GuidedDecoder:
                 # 2. For the draft model loop, the matcher may have accepted the EOS token at the previous drafting iteration.
                 if matcher.is_terminated() or self.is_draft_terminated[slot]:
                     continue
-                accepted = matcher.accept_token(new_token)
+                accepted = matcher.accept_token(req.new_token)
                 if not accepted:
                     if req.is_draft:
                         self.is_draft_terminated[slot] = True
                         logger.debug(
-                            f"Draft request {req.request_id} at slot {slot} failed to accept last new token: {new_token}."
+                            f"Draft request {req.request_id} at slot {slot} failed to accept last new token: {req.new_token}."
                         )
                         continue
                     # TODO: Make this an error response.
                     raise ValueError(
-                        f"Request {req.request_id} at slot {slot} failed to accept last new token: {new_token}."
+                        f"Request {req.request_id} at slot {slot} failed to accept last new token: {req.new_token}."
                     )
 
             self.num_advanced_tokens[slot] += 1
@@ -265,7 +217,7 @@ class GuidedDecoder:
                 matcher.fill_next_token_bitmask(self.bitmask_host, offset)
                 self.num_guided_tokens[slot] += 1
                 # Process draft tokens
-                for i, tid in enumerate(draft_tokens, 1):
+                for i, tid in enumerate(req.draft_tokens, 1):
                     accepted = matcher.accept_token(tid)
                     if not accepted:
                         break
@@ -277,26 +229,19 @@ class GuidedDecoder:
                     self.num_guided_tokens[slot] += 1
 
             if req.is_draft:
-                assert len(draft_tokens) == 0
+                assert len(req.draft_tokens) == 0
                 self.num_advanced_draft_tokens[
                     slot] += self.num_advanced_tokens[slot]
 
-    def bitmask_copy(self, guided_metadata: GuidedMetadata) -> None:
-        # Fix it.
-        num_bitmask_tokens = guided_metadata.guided_requests_host.num_bitmask_tokens
-        self.bitmask[:num_bitmask_tokens].copy_(
-            self.bitmask_host[:num_bitmask_tokens], non_blocking=True)
+    def copy_bitmask(self, requests: GuidedRequests) -> None:
+        self.bitmask[:requests.num_bitmask_tokens].copy_(
+            self.bitmask_host[:requests.num_bitmask_tokens], non_blocking=True)
 
     @torch.inference_mode()
-    @nvtx_range("GuidedDecoder.execute")
-    def execute(self,
-                guided_metadata: GuidedMetadata,
-                logits: torch.Tensor,
-                d2t: Optional[torch.Tensor] = None) -> None:
-        """Apply the bitmask to the corresponding logits for requests with guided decoding enabled.
-
-        This method inplace modifies the logits tensor so that any tokens that violate the grammar constraints are masked out.
-        """
+    def apply_bitmask(self,
+                      requests: GuidedRequests,
+                      logits: torch.Tensor,
+                      d2t: Optional[torch.Tensor] = None) -> None:
         # TODO: Fuse index_copy and index_select to logits_bitmask.
         if d2t is not None:
             draft_logits = logits
@@ -307,38 +252,40 @@ class GuidedDecoder:
                                  device=draft_logits.device)
             logits.index_copy_(-1, d2t_mapping, draft_logits)
 
-        num_bitmask_tokens = guided_metadata.guided_requests_host.num_bitmask_tokens
-        xgrammar.apply_token_bitmask_inplace(logits[:num_bitmask_tokens],
-                                             self.bitmask[:num_bitmask_tokens])
+        xgrammar.apply_token_bitmask_inplace(
+            logits[:requests.num_bitmask_tokens],
+            self.bitmask[:requests.num_bitmask_tokens])
 
         if d2t is not None:
             torch.index_select(logits, -1, d2t_mapping, out=draft_logits)
 
-    @nvtx_range("GuidedDecoder.rollback_rejected_tokens")
-    def rollback_rejected_tokens(self, guided_metadata: GuidedMetadata) -> None:
-        """Rollback the grammar matcher for rejected tokens.
+    @nvtx_range("GuidedDecoder.execute")
+    def execute(self,
+                scheduled_requests: ScheduledRequests,
+                logits: torch.Tensor,
+                d2t: Optional[torch.Tensor] = None) -> None:
+        """Apply the bitmask to the corresponding logits for requests with guided decoding enabled.
 
-        This method should be called:
-        - after the verification (so that the accepted tokens are ready) and
-        - before the first guided decoding build of the next drafting loop.
+        This method inplace modifies the logits tensor so that any tokens that violate the grammar constraints are masked out.
         """
-        if self.max_num_draft_tokens <= 0:
-            return
+        requests = GuidedRequests.from_scheduled_requests(
+            scheduled_requests, self.max_num_draft_tokens)
+        self._build(requests)
 
-        new_tokens_lens = guided_metadata.new_tokens_lens
-        if new_tokens_lens is not None:
-            new_tokens_lens = new_tokens_lens.tolist()
+        with torch.cuda.stream(self._stream):
+            self.copy_bitmask(requests)
 
-        for req in guided_metadata.guided_requests_device.guided_requests:
+        torch.cuda.current_stream().wait_stream(self._stream)
+        self.apply_bitmask(requests, logits, d2t=d2t)
+
+    def _rollback_rejected_tokens(self, requests: GuidedRequests) -> None:
+        for req in requests:
             assert not req.is_draft
             if (slot := req.seq_slot) is None:
                 continue
             if self.num_advanced_tokens[slot] <= 0:
                 continue
-            if new_tokens_lens is None:
-                num_accepted_tokens = 1 + req.num_accepted_draft_tokens
-            else:
-                num_accepted_tokens = new_tokens_lens[slot]
+            num_accepted_tokens = 1 + req.num_accepted_draft_tokens
             # Rollback the grammar matcher to the last accepted token.
             num_rollback_tokens = self.num_advanced_tokens[
                 slot] - num_accepted_tokens
@@ -348,6 +295,21 @@ class GuidedDecoder:
                     f"Failed to rollback: num_advanced_tokens={self.num_advanced_tokens[slot]}, num_accepted_tokens={num_accepted_tokens}, num_rollback_tokens={num_rollback_tokens}"
                 )
             self.grammar_matchers[slot].rollback(num_rollback_tokens)
+
+    @nvtx_range("GuidedDecoder.rollback_rejected_tokens")
+    def rollback_rejected_tokens(self,
+                                 scheduled_requests: ScheduledRequests) -> None:
+        """Rollback the grammar matcher for rejected tokens.
+
+        This method should be called:
+        - after the verification (so that the accepted tokens are ready) and
+        - before the first guided decoding build of the next drafting loop.
+        """
+        if self.max_num_draft_tokens <= 0:
+            return
+        requests = GuidedRequests.from_scheduled_requests(
+            scheduled_requests, self.max_num_draft_tokens)
+        self._rollback_rejected_tokens(requests)
 
     @nvtx_range("GuidedDecoder.rollback_draft_tokens")
     def rollback_draft_tokens(self,
@@ -389,15 +351,6 @@ class GuidedDecoder:
                         llm_req.guided_decoding_params)
 
     @hostfunc
-    def build_hostfunc(self, guided_metadata: GuidedMetadata):
-        self.build(guided_metadata)
-
-    @hostfunc
-    def rollback_rejected_tokens_hostfunc(self,
-                                          guided_metadata: GuidedMetadata):
-        self.rollback_rejected_tokens(guided_metadata)
-
-    @hostfunc
     def inc_bitmask_host(self):
         self.bitmask_host.add_(1)
 
@@ -408,3 +361,85 @@ class GuidedDecoder:
         if not hasattr(self, "token_ids"):
             self.token_ids = []
         self.token_ids.append(token_ids[0].item())
+
+
+class SampleStateTensors(Protocol):
+    new_tokens: torch.Tensor
+    new_tokens_lens: torch.Tensor
+
+
+class GuidedWorker(GuidedDecoder):
+
+    def __init__(self,
+                 guided_decoding_config: GuidedDecodingConfig,
+                 max_num_sequences: int,
+                 vocab_size_padded: int,
+                 max_num_draft_tokens: int = 0):
+        super().__init__(guided_decoding_config, max_num_sequences,
+                         vocab_size_padded, max_num_draft_tokens)
+        self.requests: Optional[GuidedRequests] = None
+        self.requests_hostfunc: Optional[GuidedRequests] = None
+        self.queue = Queue()
+
+        self.new_tokens = torch.empty(self.max_num_sequences,
+                                      self.max_num_draft_tokens + 1,
+                                      dtype=torch.int32,
+                                      pin_memory=True)
+        self.new_tokens_lens = torch.empty(self.max_num_sequences,
+                                           dtype=torch.int32,
+                                           pin_memory=True)
+
+        self.token_event = torch.cuda.Event()
+        self.bitmask_event = torch.cuda.Event()
+
+    def add_batch(self,
+                  scheduled_requests: ScheduledRequests,
+                  new_tensors: Optional[SampleStateTensors] = None) -> None:
+        self.requests = GuidedRequests.from_scheduled_requests(
+            scheduled_requests, self.max_num_draft_tokens)
+        if new_tensors is not None:
+            self.new_tokens.copy_(new_tensors.new_tokens.squeeze(-1).permute(
+                1, 0),
+                                  non_blocking=True)
+            self.new_tokens_lens.copy_(new_tensors.new_tokens_lens,
+                                       non_blocking=True)
+        self.queue.put((self.requests, new_tensors is not None))
+
+    @hostfunc
+    def next_batch(self) -> None:
+        # Fix it.
+        if self.queue.empty():
+            return
+        self.requests_hostfunc, has_new_tensors = self.queue.get()
+        if not has_new_tensors:
+            return
+
+        new_tokens_list = self.new_tokens.tolist()
+        new_tokens_lens_list = self.new_tokens_lens.tolist()
+        for req in self.requests_hostfunc:
+            if (slot := req.seq_slot) is None:
+                continue
+            req.new_token, *req.draft_tokens = new_tokens_list[slot]
+            req.num_accepted_draft_tokens = new_tokens_lens_list[slot] - 1
+
+    @hostfunc
+    def build(self) -> None:
+        self._build(self.requests_hostfunc)
+
+    @hostfunc
+    def rollback_rejected_tokens(self) -> None:
+        self._rollback_rejected_tokens(self.requests_hostfunc)
+
+    def execute(self,
+                logits: torch.Tensor,
+                d2t: Optional[torch.Tensor] = None) -> None:
+        with torch.cuda.stream(self._stream):
+            torch.cuda.current_stream().wait_event(self.token_event)
+            self.next_batch()
+            self.rollback_rejected_tokens()
+            self.build()
+            self.copy_bitmask(self.requests)
+            self.bitmask_event.record()
+
+        torch.cuda.current_stream().wait_event(self.bitmask_event)
+        self.apply_bitmask(self.requests, logits, d2t=d2t)

@@ -56,7 +56,7 @@ from ..utils import (get_model_extra_attrs, set_torch_compiling,
 from .config import LoadFormat, PyTorchConfig
 from .config_utils import is_mla
 from .cuda_graph_runner import DecodingCUDAGraphRunner
-from .guided_decoder import GuidedMetadata
+from .guided_decoder import GuidedWorker
 from .layerwise_nvtx_marker import LayerwiseNvtxMarker
 from .llm_request import get_draft_token_length
 from .resource_manager import (BaseResourceManager, KVCacheManager,
@@ -409,13 +409,7 @@ class PyTorchModelEngine(ModelEngine):
             self.without_logits = False
             self.max_draft_len = 0
 
-        self.guided_metadata: Optional[GuidedMetadata] = None
-        self.gathered_input_ids = torch.empty(self.max_num_tokens,
-                                              dtype=torch.int,
-                                              pin_memory=True)
-        self.new_tokens_lens = torch.empty(self.batch_size,
-                                           dtype=torch.int,
-                                           pin_memory=True)
+        self.guided_worker: Optional[GuidedWorker] = None
 
         # This field is initialized lazily on the first forward pass.
         # This is convenient because:
@@ -486,6 +480,14 @@ class PyTorchModelEngine(ModelEngine):
             hidden_size=self.model.config.hidden_size,
             dtype=torch_dtype_to_str(self.model.config.torch_dtype),
             swap_gate_up_proj_lora_b_weight=swap_gate_up_proj_lora_b_weight)
+
+    def set_guided_worker(self, guided_worker: GuidedWorker) -> bool:
+        if hasattr(self.model, "set_guided_worker"):
+            success = self.model.set_guided_worker(guided_worker)
+            if success:
+                self.guided_worker = guided_worker
+            return success
+        return False
 
     @property
     def use_mrope(self):
@@ -897,12 +899,6 @@ class PyTorchModelEngine(ModelEngine):
             is_draft_model=self.is_draft_model)
         return self.spec_metadata
 
-    def _set_up_guided_metadata(self):
-        if self.guided_metadata is None:
-            self.guided_metadata = GuidedMetadata(
-                self.spec_config.max_draft_len)
-        return self.guided_metadata
-
     def _get_padded_batch(
             self,
             scheduled_requests: ScheduledRequests,
@@ -1045,8 +1041,8 @@ class PyTorchModelEngine(ModelEngine):
             self._cuda_graphs[batch_size] = {}
 
         self._cuda_graphs[batch_size][draft_len] = DecodingCUDAGraphRunner(
-            batch_size, "cuda", attn_metadata, spec_metadata,
-            self.guided_metadata, self.use_mrope, self.max_beam_width)
+            batch_size, "cuda", attn_metadata, spec_metadata, self.use_mrope,
+            self.max_beam_width)
         return self._cuda_graphs[batch_size][draft_len]
 
     def __del__(self) -> None:
@@ -1297,8 +1293,8 @@ class PyTorchModelEngine(ModelEngine):
                     num_ctx_requests:num_seqs] += (
                         self.previous_kv_lens_offsets_cuda[:num_gen_requests])
 
-        if (guided_metadata := inputs.get('guided_metadata')) is not None:
-            guided_metadata.token_event.record()
+        if self.guided_worker is not None:
+            self.guided_worker.token_event.record()
 
         return inputs
 
@@ -1308,7 +1304,6 @@ class PyTorchModelEngine(ModelEngine):
             kv_cache_manager: KVCacheManager,
             attn_metadata: AttentionMetadata,
             spec_metadata: Optional[SpecMetadata] = None,
-            guided_metadata: Optional[GuidedMetadata] = None,
             new_tensors_device: Optional[SampleStateTensors] = None,
             cache_indirection_buffer: Optional[torch.Tensor] = None):
         """
@@ -1711,23 +1706,9 @@ class PyTorchModelEngine(ModelEngine):
             spec_metadata.prepare()
             inputs['spec_metadata'] = spec_metadata
 
-        if guided_metadata is not None:
-            guided_metadata.add_batch(scheduled_requests)
-            if new_tensors_device is None:
-                guided_metadata.gathered_input_ids = None
-                guided_metadata.new_tokens_lens = None
-            else:
-                num_gathered = len(gather_ids)
-                gathered_input_ids_cuda = self.input_ids_cuda[
-                    self.gather_ids_cuda[:num_gathered]]
-                self.gathered_input_ids[:num_gathered].copy_(
-                    gathered_input_ids_cuda, non_blocking=True)
-                # Fix it.
-                guided_metadata.gathered_input_ids = self.gathered_input_ids
-                self.new_tokens_lens.copy_(new_tokens_lens_device,
-                                           non_blocking=True)
-                guided_metadata.new_tokens_lens = self.new_tokens_lens
-            inputs['guided_metadata'] = guided_metadata
+        if self.guided_worker is not None:
+            self.guided_worker.add_batch(scheduled_requests,
+                                         new_tensors=new_tensors_device)
 
         # support attention dp
         if self.enable_attention_dp:
@@ -1763,8 +1744,7 @@ class PyTorchModelEngine(ModelEngine):
             self,
             scheduled_requests: ScheduledRequests,
             attn_metadata: AttentionMetadata,
-            spec_metadata: Optional[SpecMetadata] = None,
-            guided_metadata: Optional[GuidedMetadata] = None):
+            spec_metadata: Optional[SpecMetadata] = None):
         """
         Prepare inputs for Pytorch Model.
         """
@@ -1872,10 +1852,6 @@ class PyTorchModelEngine(ModelEngine):
             spec_metadata.seq_lens = sequence_lengths
             spec_metadata.prepare()
             inputs['spec_metadata'] = spec_metadata
-
-        if guided_metadata is not None:
-            guided_metadata.add_batch(scheduled_requests)
-            inputs['guided_metadata'] = guided_metadata
 
         # support attention dp
         if self.enable_attention_dp:
@@ -2245,7 +2221,6 @@ class PyTorchModelEngine(ModelEngine):
             kv_cache_manager: KVCacheManager,
             attn_metadata: AttentionMetadata,
             spec_metadata: Optional[SpecMetadata] = None,
-            guided_metadata: Optional[GuidedMetadata] = None,
             new_tensors_device: Optional[SampleStateTensors] = None,
             cache_indirection_buffer: Optional[torch.Tensor] = None):
         if self.mapping is not None and 'cp_type' in self.mapping.cp_config:
@@ -2258,7 +2233,7 @@ class PyTorchModelEngine(ModelEngine):
         else:
             return self._prepare_tp_inputs(scheduled_requests, kv_cache_manager,
                                            attn_metadata, spec_metadata,
-                                           guided_metadata, new_tensors_device,
+                                           new_tensors_device,
                                            cache_indirection_buffer)
 
     @torch.inference_mode()
@@ -2291,17 +2266,12 @@ class PyTorchModelEngine(ModelEngine):
             spec_resource_manager = None
             spec_metadata = None
 
-        guided_metadata = None
-        if self.model.spec_worker.guided_decoder:
-            guided_metadata = self._set_up_guided_metadata()
-
         moe_load_balancer: MoeLoadBalancer = getattr(self, 'moe_load_balancer',
                                                      None)
 
         if kv_cache_manager is None:
             inputs, gather_ids = self._prepare_tp_inputs_no_cache(
-                scheduled_requests, attn_metadata, spec_metadata,
-                guided_metadata)
+                scheduled_requests, attn_metadata, spec_metadata)
 
             with MoeLoadBalancerIterContext(moe_load_balancer):
                 # Special handling for multimodal encoder only mode
@@ -2326,8 +2296,7 @@ class PyTorchModelEngine(ModelEngine):
 
             inputs, gather_ids = self._prepare_inputs(
                 scheduled_requests, kv_cache_manager, attn_metadata,
-                spec_metadata, guided_metadata, new_tensors_device,
-                cache_indirection_buffer)
+                spec_metadata, new_tensors_device, cache_indirection_buffer)
 
             self.iter_counter += 1
 
