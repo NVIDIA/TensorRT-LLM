@@ -10,7 +10,7 @@ l0_rtx_pro_6000:
       - '*6000*'
       linux_distribution_name: ubuntu*
     terms:
-      stage: pre_merge
+      stage: post_merge
       backend: pytorch
   tests:
   # ------------- PyTorch tests ---------------
