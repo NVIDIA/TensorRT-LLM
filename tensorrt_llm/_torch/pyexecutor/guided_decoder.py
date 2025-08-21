@@ -1,7 +1,7 @@
 import math
 from dataclasses import dataclass, field
 from queue import Queue
-from typing import Iterable, List, Optional, Protocol, Tuple
+from typing import Iterable, List, Optional, Tuple
 
 import torch
 import xgrammar
@@ -72,6 +72,10 @@ class GuidedRequest:
             draft_tokens=request.py_draft_tokens,
             num_accepted_draft_tokens=request.py_num_accepted_draft_tokens)
 
+    def cast_to_draft(self) -> None:
+        self.is_draft = True
+        self.draft_tokens = []
+
 
 @dataclass(slots=True)
 class GuidedRequests:
@@ -95,19 +99,25 @@ class GuidedRequests:
 
     @property
     def num_bitmask_tokens(self) -> int:
-        return self.num_contexts + self.num_generations * (
-            self.max_num_draft_tokens + 1)
+        if self.requests[0].is_draft:
+            return len(self.requests)
+        else:
+            return self.num_contexts + self.num_generations * (
+                self.max_num_draft_tokens + 1)
 
     def request_with_offset(self) -> Iterable[Tuple[GuidedRequest, int]]:
         offset: int = 0
         for req in self.requests:
             yield req, offset
             offset += 1
-            if req.is_generation_in_progress_state:
+            if not req.is_draft and req.is_generation_in_progress_state:
                 offset += self.max_num_draft_tokens
 
     def __iter__(self) -> Iterable[GuidedRequest]:
         return iter(self.requests)
+
+    def __len__(self) -> int:
+        return len(self.requests)
 
 
 class GuidedDecoder:
@@ -280,7 +290,6 @@ class GuidedDecoder:
 
     def _rollback_rejected_tokens(self, requests: GuidedRequests) -> None:
         for req in requests:
-            assert not req.is_draft
             if (slot := req.seq_slot) is None:
                 continue
             if self.num_advanced_tokens[slot] <= 0:
@@ -295,6 +304,18 @@ class GuidedDecoder:
                     f"Failed to rollback: num_advanced_tokens={self.num_advanced_tokens[slot]}, num_accepted_tokens={num_accepted_tokens}, num_rollback_tokens={num_rollback_tokens}"
                 )
             self.grammar_matchers[slot].rollback(num_rollback_tokens)
+
+    def _rollback_draft_tokens(self, requests: GuidedRequests) -> None:
+        for req in requests:
+            if (slot := req.seq_slot) is None:
+                continue
+            if self.num_advanced_draft_tokens[slot] <= 0:
+                continue
+            self.grammar_matchers[slot].rollback(
+                self.num_advanced_draft_tokens[slot])
+            # Reset the drafting states.
+            self.num_advanced_draft_tokens[slot] = 0
+            self.is_draft_terminated[slot] = False
 
     @nvtx_range("GuidedDecoder.rollback_rejected_tokens")
     def rollback_rejected_tokens(self,
@@ -322,17 +343,9 @@ class GuidedDecoder:
         """
         if self.max_num_draft_tokens <= 0:
             return
-
-        for llm_req in scheduled_requests.all_requests():
-            assert not llm_req.py_is_draft
-            slot: int = llm_req.py_seq_slot
-            if self.num_advanced_draft_tokens[slot] <= 0:
-                continue
-            self.grammar_matchers[slot].rollback(
-                self.num_advanced_draft_tokens[slot])
-            # Reset the drafting states.
-            self.num_advanced_draft_tokens[slot] = 0
-            self.is_draft_terminated[slot] = False
+        requests = GuidedRequests.from_scheduled_requests(
+            scheduled_requests, self.max_num_draft_tokens)
+        self._rollback_rejected_tokens(requests)
 
     @nvtx_range("GuidedDecoder.init_disagg_gen_requests")
     def init_disagg_gen_requests(self,
@@ -363,11 +376,6 @@ class GuidedDecoder:
         self.token_ids.append(token_ids[0].item())
 
 
-class SampleStateTensors(Protocol):
-    new_tokens: torch.Tensor
-    new_tokens_lens: torch.Tensor
-
-
 class GuidedWorker(GuidedDecoder):
 
     def __init__(self,
@@ -381,29 +389,26 @@ class GuidedWorker(GuidedDecoder):
         self.requests_hostfunc: Optional[GuidedRequests] = None
         self.queue = Queue()
 
-        self.new_tokens = torch.empty(self.max_num_sequences,
-                                      self.max_num_draft_tokens + 1,
+        self.new_tokens = torch.empty(self.max_num_draft_tokens + 1,
+                                      self.max_num_sequences,
                                       dtype=torch.int32,
                                       pin_memory=True)
-        self.new_tokens_lens = torch.empty(self.max_num_sequences,
-                                           dtype=torch.int32,
-                                           pin_memory=True)
+        self.num_accepted_tokens = torch.empty(self.max_num_sequences,
+                                               dtype=torch.int32,
+                                               pin_memory=True)
 
         self.token_event = torch.cuda.Event()
         self.bitmask_event = torch.cuda.Event()
 
     def add_batch(self,
                   scheduled_requests: ScheduledRequests,
-                  new_tensors: Optional[SampleStateTensors] = None) -> None:
+                  new_tokens: Optional[torch.Tensor] = None) -> None:
         self.requests = GuidedRequests.from_scheduled_requests(
             scheduled_requests, self.max_num_draft_tokens)
-        if new_tensors is not None:
-            self.new_tokens.copy_(new_tensors.new_tokens.squeeze(-1).permute(
-                1, 0),
-                                  non_blocking=True)
-            self.new_tokens_lens.copy_(new_tensors.new_tokens_lens,
-                                       non_blocking=True)
-        self.queue.put((self.requests, new_tensors is not None))
+        if new_tokens is not None:
+            self.new_tokens.copy_(new_tokens.squeeze(-1), non_blocking=True)
+        self.queue.put((self.requests, new_tokens is not None))
+        # self.token_event.record() should be called in PyTorchModelEngine._preprocess_inputs
 
     @hostfunc
     def next_batch(self) -> None:
@@ -414,21 +419,14 @@ class GuidedWorker(GuidedDecoder):
         if not has_new_tensors:
             return
 
-        new_tokens_list = self.new_tokens.tolist()
-        new_tokens_lens_list = self.new_tokens_lens.tolist()
         for req in self.requests_hostfunc:
             if (slot := req.seq_slot) is None:
                 continue
-            req.new_token, *req.draft_tokens = new_tokens_list[slot]
-            req.num_accepted_draft_tokens = new_tokens_lens_list[slot] - 1
+            req.new_token, *req.draft_tokens = self.new_tokens[:, slot].tolist()
 
     @hostfunc
     def build(self) -> None:
         self._build(self.requests_hostfunc)
-
-    @hostfunc
-    def rollback_rejected_tokens(self) -> None:
-        self._rollback_rejected_tokens(self.requests_hostfunc)
 
     def execute(self,
                 logits: torch.Tensor,
@@ -436,8 +434,70 @@ class GuidedWorker(GuidedDecoder):
         with torch.cuda.stream(self._stream):
             torch.cuda.current_stream().wait_event(self.token_event)
             self.next_batch()
-            self.rollback_rejected_tokens()
             self.build()
+            self.copy_bitmask(self.requests)
+            self.bitmask_event.record()
+
+        torch.cuda.current_stream().wait_event(self.bitmask_event)
+        self.apply_bitmask(self.requests, logits, d2t=d2t)
+
+    @hostfunc
+    def rollback_rejected_tokens(self) -> None:
+        if self.max_num_draft_tokens <= 0:
+            return
+        self._rollback_rejected_tokens(self.requests_hostfunc)
+
+    @hostfunc
+    def rollback_draft_tokens(self) -> None:
+        if self.max_num_draft_tokens <= 0:
+            return
+        self._rollback_draft_tokens(self.requests_hostfunc)
+
+    def add_draft_batch(self,
+                        new_tokens: torch.Tensor,
+                        num_accepted_tokens: torch.Tensor,
+                        is_first_step: bool = False) -> None:
+        batch_size = len(self.requests)
+        assert new_tokens.size(0) == batch_size
+        self.new_tokens[0, :batch_size].copy_(new_tokens, non_blocking=True)
+        if is_first_step:
+            assert num_accepted_tokens.size(0) == batch_size
+            self.num_accepted_tokens[:batch_size].copy_(num_accepted_tokens,
+                                                        non_blocking=True)
+        self.token_event.record()
+
+    @hostfunc
+    def next_draft_batch(self, is_first_step: bool = False) -> None:
+        batch_size = len(self.requests_hostfunc)
+        new_tokens_list = self.new_tokens[0, :batch_size].tolist()
+        if is_first_step:
+            num_accepted_tokens_list = self.num_accepted_tokens[:
+                                                                batch_size].tolist(
+                                                                )
+        for i, req in enumerate(self.requests_hostfunc):
+            if req.seq_slot is None:
+                continue
+            req.new_token = new_tokens_list[i]
+            if is_first_step:
+                assert not req.is_draft
+                req.cast_to_draft()
+                req.num_accepted_draft_tokens = num_accepted_tokens_list[i] - 1
+            else:
+                assert req.is_draft
+
+    def execute_draft_batch(self,
+                            logits: torch.Tensor,
+                            d2t: Optional[torch.Tensor] = None,
+                            is_first_step: bool = False,
+                            is_last_step: bool = False) -> None:
+        with torch.cuda.stream(self._stream):
+            torch.cuda.current_stream().wait_event(self.token_event)
+            self.next_draft_batch(is_first_step=is_first_step)
+            if is_first_step:
+                self.rollback_rejected_tokens()
+            self.build()
+            if is_last_step:
+                self.rollback_draft_tokens()
             self.copy_bitmask(self.requests)
             self.bitmask_event.record()
 

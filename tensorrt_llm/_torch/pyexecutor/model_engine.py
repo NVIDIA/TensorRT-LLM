@@ -1708,7 +1708,7 @@ class PyTorchModelEngine(ModelEngine):
 
         if self.guided_worker is not None:
             self.guided_worker.add_batch(scheduled_requests,
-                                         new_tensors=new_tensors_device)
+                                         new_tokens=new_tokens_device)
 
         # support attention dp
         if self.enable_attention_dp:

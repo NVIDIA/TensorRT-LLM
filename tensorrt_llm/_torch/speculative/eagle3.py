@@ -307,14 +307,6 @@ class Eagle3OneModelWorker(nn.Module):
         # Predict draft tokens
         next_draft_tokens = []
         for i in range(self.max_draft_len):
-            hidden_states, hidden_states_to_save = draft_model.model(**inputs)
-
-            # FIXME (jhaotingc): Currently we disable use_spec_decoding mode for Eagle engine nth steps except 1st step.
-            # Eagle engine takes in draft_len tokens from the previous step, run spec-dec mode with those tokens,
-            # then the following step can use regular decoding mode to generate 1 tokens per step.
-            # Currently the spec-dec mask for chained tree is not implemented yet.
-            # When token tree is supported, this can be removed and all steps may use spec-dec mode as well.
-            attn_metadata.use_spec_decoding = False
             if i == 0:
                 start_ids_gen = (spec_metadata.batch_indices_cuda[:num_gens] *
                                  (self.max_draft_len + 1)).long()
@@ -326,10 +318,33 @@ class Eagle3OneModelWorker(nn.Module):
             else:
                 # All of the seq_len are 1, use batch_indices_cuda as gather_ids
                 gather_ids = spec_metadata.batch_indices_cuda[:batch_size]
+
+            if self.guided_worker is not None:
+                new_tokens = inputs["input_ids"][gather_ids]
+                self.guided_worker.add_draft_batch(new_tokens,
+                                                   num_accepted_tokens,
+                                                   is_first_step=(i == 0))
+
+            hidden_states, hidden_states_to_save = draft_model.model(**inputs)
+
+            # FIXME (jhaotingc): Currently we disable use_spec_decoding mode for Eagle engine nth steps except 1st step.
+            # Eagle engine takes in draft_len tokens from the previous step, run spec-dec mode with those tokens,
+            # then the following step can use regular decoding mode to generate 1 tokens per step.
+            # Currently the spec-dec mask for chained tree is not implemented yet.
+            # When token tree is supported, this can be removed and all steps may use spec-dec mode as well.
+            attn_metadata.use_spec_decoding = False
+
             logits = draft_model.logits_processor(hidden_states[gather_ids],
                                                   draft_model.lm_head,
                                                   attn_metadata, True)
-            # Insert guided decoder
+            if self.guided_worker is not None:
+                d2t = getattr(draft_model.model, 'dt2', None)
+                self.guided_worker.execute_draft_batch(
+                    logits,
+                    d2t,
+                    is_first_step=(i == 0),
+                    is_last_step=(i == self.max_draft_len - 1))
+
             new_draft_token = self.draft_decoder(logits, draft_model)
             next_draft_tokens.append(new_draft_token)
             # update inputs
