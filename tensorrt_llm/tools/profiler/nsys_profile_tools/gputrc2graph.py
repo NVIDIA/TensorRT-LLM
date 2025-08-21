@@ -213,7 +213,7 @@ class GPUTrace2Graph:
         generates sum file from nsys trace with times per kernel and
         returns the name of the sum file
         """
-        import subprocess
+        import subprocess  # nosec B404
 
         file_dir = os.path.dirname(file)
         file_name = os.path.basename(file)
