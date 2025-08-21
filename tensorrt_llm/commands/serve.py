@@ -12,6 +12,7 @@ from strenum import StrEnum
 from torch.cuda import device_count
 
 from tensorrt_llm import LLM as PyTorchLLM
+from tensorrt_llm._torch.auto_deploy.llm import LLM as AutoDeployLLM
 from tensorrt_llm import MultimodalEncoder
 from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm._utils import mpi_rank
@@ -109,7 +110,7 @@ def get_llm_args(model: str,
         capacity_scheduler_policy=CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
         dynamic_batch_config=dynamic_batch_config,
     )
-
+    backend = backend if backend in ["pytorch", "_autodeploy"] else None
     llm_args = {
         "model":
         model,
@@ -140,7 +141,7 @@ def get_llm_args(model: str,
         "kv_cache_config":
         kv_cache_config,
         "backend":
-        backend if backend == "pytorch" else None,
+        backend,
         "num_postprocess_workers":
         num_postprocess_workers,
         "postprocess_tokenizer_dir":
@@ -162,9 +163,12 @@ def launch_server(host: str,
 
     backend = llm_args["backend"]
     model = llm_args["model"]
-
     if backend == 'pytorch':
         llm = PyTorchLLM(**llm_args)
+    elif backend == '_autodeploy':
+        print(f"Using AutoDeploy backend with args: {llm_args}")
+        del llm_args["build_config"]
+        llm = AutoDeployLLM(**llm_args)
     else:
         llm = LLM(**llm_args)
 
@@ -205,9 +209,9 @@ def launch_mm_encoder_server(
               help="Hostname of the server.")
 @click.option("--port", type=int, default=8000, help="Port of the server.")
 @click.option("--backend",
-              type=click.Choice(["pytorch", "trt"]),
+              type=click.Choice(["pytorch", "trt", "_autodeploy"]),
               default="pytorch",
-              help="Set to 'pytorch' for pytorch path. Default is cpp path.")
+              help="Set to 'pytorch' for pytorch path and '_autodeploy' for autodeploy path. Default is pytorch path.")
 @click.option('--log_level',
               type=click.Choice(severity_map.keys()),
               default='info',
