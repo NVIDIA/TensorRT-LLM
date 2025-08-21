@@ -1528,9 +1528,14 @@ class PyExecutor:
                     prefix_sum += request.context_chunk_size if request.py_return_context_logits else 1
                     num_context_logits_prefix_sum.append(prefix_sum)
 
-                self._handle_logits(scheduled_batch, batch_outputs,
-                                    num_context_logits_prefix_sum,
-                                    self.sampler.is_generation_model())
+                HandleLogits()(scheduled_batch.context_requests,
+                               scheduled_batch.generation_requests,
+                               batch_outputs["logits"],
+                               self.sampler.beam_width(
+                                   scheduled_batch.all_requests()),
+                               num_context_logits_prefix_sum,
+                               self.sampler.is_generation_model())
+
                 return self.sampler.sample_async(scheduled_batch, batch_outputs,
                                                  num_context_logits_prefix_sum)
         except Exception as e:
@@ -1538,17 +1543,6 @@ class PyExecutor:
             error_msg = str(e)
             logger.error(f"Encountered an error in sampling: {error_msg}")
             self._handle_errors(error_msg)
-
-    @nvtx_range("_handle_logits")
-    def _handle_logits(self, scheduled_batch, batch_outputs,
-                       num_context_logits_prefix_sum, is_generation_model):
-        if any(r.py_return_context_logits or r.py_return_generation_logits
-               for r in scheduled_batch.all_requests()):
-            HandleLogits()(
-                scheduled_batch.context_requests,
-                scheduled_batch.generation_requests, batch_outputs["logits"],
-                self.sampler.beam_width(scheduled_batch.all_requests()),
-                num_context_logits_prefix_sum, is_generation_model)
 
     @nvtx_range("_setup_sampler_step")
     def _setup_sampler_step(self, requests: ScheduledRequests):
