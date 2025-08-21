@@ -329,10 +329,8 @@ def create_cuda_stub_links(cuda_stub_dir: str, missing_libs: list[str]) -> str:
     return str(temp_dir_path)
 
 
-def check_missing_libs(so_prefix: str) -> list[str]:
-    result = build_run(f"ldd {so_prefix}.cpython*.so",
-                       capture_output=True,
-                       text=True)
+def check_missing_libs(lib_name: str) -> list[str]:
+    result = build_run(f"ldd {lib_name}", capture_output=True, text=True)
     missing = []
     for line in result.stdout.splitlines():
         if "not found" in line:
@@ -344,7 +342,7 @@ def check_missing_libs(so_prefix: str) -> list[str]:
 
 
 def generate_python_stubs_linux(binding_type: str, venv_python: Path,
-                                deep_ep: bool):
+                                deep_ep: bool, binding_lib_name: str):
     is_nanobind = binding_type == "nanobind"
     if is_nanobind:
         build_run(f"\"{venv_python}\" -m pip install nanobind")
@@ -353,7 +351,7 @@ def generate_python_stubs_linux(binding_type: str, venv_python: Path,
     env_stub_gen = os.environ.copy()
     cuda_home_dir = env_stub_gen.get("CUDA_HOME") or env_stub_gen.get(
         "CUDA_PATH") or "/usr/local/cuda"
-    missing_libs = check_missing_libs("bindings")
+    missing_libs = check_missing_libs(binding_lib_name)
     cuda_stub_dir = f"{cuda_home_dir}/lib64/stubs"
 
     if missing_libs and Path(cuda_stub_dir).exists():
@@ -806,7 +804,9 @@ def main(*,
             ) == 1, f"Exactly one binding library should be present: {binding_lib}"
             return binding_lib[0]
 
-        install_file(get_binding_lib(binding_type, "bindings"), pkg_dir)
+        binding_lib_dir = get_binding_lib(binding_type, "bindings")
+        binding_lib_file_name = binding_lib_dir.name
+        install_file(binding_lib_dir, pkg_dir)
 
         with (build_dir / "tensorrt_llm" / "deep_ep" /
               "cuda_architectures.txt").open() as f:
@@ -846,7 +846,7 @@ def main(*,
                 else:  # on linux
                     generate_python_stubs_linux(
                         binding_type, venv_python,
-                        bool(deep_ep_cuda_architectures))
+                        bool(deep_ep_cuda_architectures), binding_lib_file_name)
 
     if not skip_building_wheel:
         if dist_dir is None:
