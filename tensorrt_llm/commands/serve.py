@@ -12,9 +12,9 @@ from strenum import StrEnum
 from torch.cuda import device_count
 
 from tensorrt_llm import LLM as PyTorchLLM
-from tensorrt_llm._torch.auto_deploy.llm import LLM as AutoDeployLLM
 from tensorrt_llm import MultimodalEncoder
 from tensorrt_llm._tensorrt_engine import LLM
+from tensorrt_llm._torch.auto_deploy.llm import LLM as AutoDeployLLM
 from tensorrt_llm._utils import mpi_rank
 from tensorrt_llm.executor.utils import LlmLauncherEnvs
 from tensorrt_llm.llmapi import (BuildConfig, CapacitySchedulerPolicy,
@@ -211,10 +211,13 @@ def launch_mm_encoder_server(
               default="localhost",
               help="Hostname of the server.")
 @click.option("--port", type=int, default=8000, help="Port of the server.")
-@click.option("--backend",
-              type=click.Choice(["pytorch", "trt", "_autodeploy"]),
-              default="pytorch",
-              help="Set to 'pytorch' for pytorch path and '_autodeploy' for autodeploy path. Default is pytorch path.")
+@click.option(
+    "--backend",
+    type=click.Choice(["pytorch", "trt", "_autodeploy"]),
+    default="pytorch",
+    help=
+    "Set to 'pytorch' for pytorch path and '_autodeploy' for autodeploy path. Default is pytorch path."
+)
 @click.option('--log_level',
               type=click.Choice(severity_map.keys()),
               default='info',
