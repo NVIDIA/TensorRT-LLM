@@ -31,7 +31,7 @@ from ..conftest import (get_device_count, get_device_memory, llm_models_root,
                         parametrize_with_ids, skip_no_hopper,
                         skip_post_blackwell, skip_pre_ada, skip_pre_blackwell,
                         skip_pre_hopper)
-from .accuracy_core import (GSM8K, MMLU, CnnDailymail, GPQADiamond,
+from .accuracy_core import (GSM8K, MMLU, MMMU, CnnDailymail, GPQADiamond,
                             JsonModeEval, LlmapiAccuracyTestHarness)
 
 
@@ -2693,3 +2693,22 @@ class TestEXAONE4(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
+
+
+class TestQwen2_VL_7B(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "Qwen/Qwen2-VL-7B-Instruct"
+    MODEL_PATH = f"{llm_models_root()}/Qwen2-VL-7B-Instruct"
+
+    # NOTE: MMMU adds <|endoftext|> to the stop token.
+    sampling_params = SamplingParams(max_tokens=MMMU.MAX_OUTPUT_LEN,
+                                     truncate_prompt_tokens=MMMU.MAX_INPUT_LEN,
+                                     stop="<|endoftext|>")
+
+    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
+
+    def test_auto_dtype(self):
+        with LLM(self.MODEL_PATH,
+                 max_num_tokens=16384,
+                 kv_cache_config=self.kv_cache_config) as llm:
+            task = MMMU(self.MODEL_NAME)
+            task.evaluate(llm, sampling_params=self.sampling_params)
