@@ -80,6 +80,8 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher(GroupedGemmInput<T, WeightType, 
 {
     TLLM_LOG_DEBUG(__PRETTY_FUNCTION__);
 
+    TLLM_CHECK_WITH_INFO(hopper_inputs.swap_ab, "swap_ab must be true for mixed dtype WS grouped GEMM");
+
     /////////////////////////////////////////////////////////////////////////////////////////////////
     /// GEMM kernel configurations
     /////////////////////////////////////////////////////////////////////////////////////////////////
@@ -192,8 +194,8 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher(GroupedGemmInput<T, WeightType, 
     {
         const Args args{cutlass::gemm::GemmUniversalMode::kGrouped,
             {inputs.num_experts, hopper_inputs.int4_groupwise_params.shape.problem_shapes, nullptr},
-            {reinterpret_cast<ElementB const**>(hopper_inputs.ptr_b), hopper_inputs.stride_b,
-                reinterpret_cast<ElementA const**>(hopper_inputs.ptr_a), hopper_inputs.stride_a,
+            {reinterpret_cast<ElementB const**>(hopper_inputs.ptr_weight), hopper_inputs.stride_weight,
+                reinterpret_cast<ElementA const**>(hopper_inputs.ptr_act), hopper_inputs.stride_act,
                 reinterpret_cast<ElementScalePacked const**>(hopper_inputs.int4_groupwise_params.ptr_s_a),
                 hopper_inputs.int4_groupwise_params.stride_s_a, group_size},
             {fusion_args, reinterpret_cast<ElementC const**>(hopper_inputs.ptr_c), hopper_inputs.stride_c,
@@ -205,8 +207,8 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher(GroupedGemmInput<T, WeightType, 
 
     arguments = Args{cutlass::gemm::GemmUniversalMode::kGrouped,
         {inputs.num_experts, hopper_inputs.int4_groupwise_params.shape.problem_shapes, nullptr},
-        {reinterpret_cast<ElementB const**>(hopper_inputs.ptr_b), hopper_inputs.stride_b,
-            reinterpret_cast<ElementA const**>(hopper_inputs.ptr_a), hopper_inputs.stride_a,
+        {reinterpret_cast<ElementB const**>(hopper_inputs.ptr_weight), hopper_inputs.stride_weight,
+            reinterpret_cast<ElementA const**>(hopper_inputs.ptr_act), hopper_inputs.stride_act,
             reinterpret_cast<ElementScalePacked const**>(hopper_inputs.int4_groupwise_params.ptr_s_a),
             hopper_inputs.int4_groupwise_params.stride_s_a, group_size},
         {fusion_args, reinterpret_cast<ElementC const**>(hopper_inputs.ptr_c), hopper_inputs.stride_c,

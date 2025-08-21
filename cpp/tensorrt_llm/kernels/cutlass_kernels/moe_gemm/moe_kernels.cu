@@ -4056,8 +4056,8 @@ CutlassMoeFCRunner<T, WeightType, OutputType, InputType, BackBoneType, Enable>::
         int total_experts = num_experts_per_node * parallelism_config.ep_size;
         int estimated_tokens_per_expert = expanded_num_rows / total_experts;
 
-        gemm1_tma_ws_input.swap_ab = estimated_tokens_per_expert < fc1_out_size;
-        gemm2_tma_ws_input.swap_ab = estimated_tokens_per_expert < hidden_size;
+        gemm1_tma_ws_input.swap_ab = estimated_tokens_per_expert < fc1_out_size || use_w4_groupwise;
+        gemm2_tma_ws_input.swap_ab = estimated_tokens_per_expert < hidden_size || use_w4_groupwise;
 
         bool apply_bias = parallelism_config.tp_rank == 0;
         auto* fc2_bias = apply_bias ? fc2_expert_biases : nullptr;
@@ -4686,10 +4686,11 @@ void GemmProfilerBackend::prepareTmaWsInputs(int num_tokens, char* workspace_ptr
             /* GEMM1 */
             gemm1_tma_ws_input.fusion = TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE;
             gemm2_tma_ws_input.fusion = TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE;
-            bool use_w4afp8 = (mDType == nvinfer1::DataType::kFP8 && mWType == nvinfer1::DataType::kINT4);
-            bool use_wfp4a16 = ((mDType == nvinfer1::DataType::kHALF || mDType == nvinfer1::DataType::kBF16)
+
+            bool const use_w4afp8 = (mDType == nvinfer1::DataType::kFP8 && mWType == nvinfer1::DataType::kINT4);
+            bool const use_wfp4a16 = ((mDType == nvinfer1::DataType::kHALF || mDType == nvinfer1::DataType::kBF16)
                 && mWType == nvinfer1::DataType::kUINT8);
-            bool use_w4_groupwise = use_w4afp8 || use_wfp4a16;
+            bool const use_w4_groupwise = use_w4afp8 || use_wfp4a16;
 
             int estimated_tokens_per_expert = num_expanded_tokens / mNumExperts;
             gemm1_tma_ws_input.swap_ab = estimated_tokens_per_expert < fc1_output_size || use_w4_groupwise;

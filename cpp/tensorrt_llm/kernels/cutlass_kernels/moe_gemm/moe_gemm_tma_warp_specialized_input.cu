@@ -50,15 +50,15 @@ std::array<size_t, 20> TmaWarpSpecializedGroupedGemmInput::workspaceBuffers(
 
     size_t int4_groupwise_problem_shape_size
         = sizeof(INT4GroupwiseParams::ProblemShapeInt::UnderlyingProblemShape) * num_experts;
-    size_t int4_groupwise_sf_act_size = sizeof(INT4GroupwiseParams::SFA*) * num_experts;
-    size_t int4_groupwise_stride_sf_act_size = sizeof(INT4GroupwiseParams::StrideSFA) * num_experts;
+    size_t int4_groupwise_sf_a_size = sizeof(INT4GroupwiseParams::SFA*) * num_experts;
+    size_t int4_groupwise_stride_sf_a_size = sizeof(INT4GroupwiseParams::StrideSFA) * num_experts;
 
     size_t ptr_token_map_size = sizeof(int**) * num_experts;
 
     return std::array{problem_shape_size, stride_act_size, stride_weight_size, stride_c_size, stride_d_size,
         ptr_buf_size, ptr_buf_size, ptr_buf_size, ptr_buf_size, scale_buf_size, sf_act_size, sf_weight_size,
-        stride_sf_act_size, stride_sf_weight_size, int4_groupwise_problem_shape_size, int4_groupwise_sf_act_size,
-        int4_groupwise_stride_sf_act_size, ptr_buf_size, scale_buf_size, ptr_token_map_size};
+        stride_sf_act_size, stride_sf_weight_size, int4_groupwise_problem_shape_size, int4_groupwise_sf_a_size,
+        int4_groupwise_stride_sf_a_size, ptr_buf_size, scale_buf_size, ptr_token_map_size};
 }
 
 size_t TmaWarpSpecializedGroupedGemmInput::workspaceSize(int num_experts, FpXBlockScalingType scaling_type)
