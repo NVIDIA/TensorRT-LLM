@@ -186,6 +186,7 @@ class PyExecutor:
         self.attention_dp_enable_balance = model_engine.pytorch_backend_config.attention_dp_enable_balance
         self.attention_dp_time_out_iters = model_engine.pytorch_backend_config.attention_dp_time_out_iters
         self.attention_dp_batching_wait_iters = model_engine.pytorch_backend_config.attention_dp_batching_wait_iters
+        self.batch_wait_timeout_ms = model_engine.pytorch_backend_config.batch_wait_timeout_ms
         self.num_fetch_requests_cur_rank = 0
         self.num_fetch_requests = 0
         self.shutdown_event = threading.Event()
@@ -239,6 +240,7 @@ class PyExecutor:
             max_beam_width=self.max_beam_width,
             max_num_active_requests=self.max_num_active_requests,
             enable_iter_perf_stats=self.enable_iter_perf_stats,
+            batch_wait_timeout_ms=self.batch_wait_timeout_ms,
             is_disaggregated=kv_cache_transceiver is not None,
         )
         self.executor_request_queue.set_exclude_last_generation_logits(
@@ -1179,6 +1181,17 @@ class PyExecutor:
 
     def _validate_request(self, request: LlmRequest):
         if isinstance(self.model_engine.model, DecoderModelForCausalLM):
+            # Only skip token‐range checks for Llama4 when the request has multimodal data
+            from ..models.modeling_llama import Llama4ForConditionalGeneration
+            if isinstance(self.model_engine.model,
+                          Llama4ForConditionalGeneration):
+                has_mm = bool(request.py_multimodal_data)
+                if has_mm:
+                    logger.debug(
+                        f"Skipping token-range validation for {type(self.model_engine.model).__name__} "
+                        "(multimodal request)")
+                    return
+
             # FIXME: This check is necessary because of how Qwen2ForProcessRewardModel
             #        subclasses DecoderModelForCausalLM. Perhaps the functionality
             #        of DecoderModelForCausalLM reused by Qwen2ForProcessRewardModel
