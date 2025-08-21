@@ -87,6 +87,8 @@ def get_test_config(test_desc, example_dir, test_root):
         (8, f"{test_configs_root}/disagg_config_ctxtp2pp2_gentp2pp2.yaml"),
         "ctxpp4_genpp4":
         (8, f"{test_configs_root}/disagg_config_ctxpp4_genpp4.yaml"),
+        "ctxpp4_gentp4":
+        (8, f"{test_configs_root}/disagg_config_ctxpp4_gentp4.yaml"),
         "deepseek_v3_lite_fp8_mpi":
         (4,
          f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_mpi.yaml"
@@ -772,6 +774,26 @@ def test_disaggregated_ctxpp4_genpp4(disaggregated_test_root, llm_venv,
             os.symlink(src, dst, target_is_directory=True)
     run_disaggregated_test(disaggregated_example_root,
                            "ctxpp4_genpp4",
+                           env=llm_venv._new_env,
+                           cwd=llm_venv.get_working_directory())
+
+
+@pytest.mark.skip_less_device(4)
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+def test_disaggregated_ctxpp4_gentp4(disaggregated_test_root, llm_venv,
+                                     disaggregated_example_root,
+                                     llama_model_root):
+    src_dst_dict = {
+        llama_model_root:
+        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+    run_disaggregated_test(disaggregated_example_root,
+                           "ctxpp4_gentp4",
                            env=llm_venv._new_env,
                            cwd=llm_venv.get_working_directory())
 
