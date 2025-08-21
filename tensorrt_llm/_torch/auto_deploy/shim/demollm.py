@@ -293,8 +293,6 @@ class DemoGenerationExecutor(GenerationExecutor):
             del inputs, request_list, outs
 
         del engine
-        breakpoint()
-        print("in _run_engine, after del engine")
         gc.collect()
 
     def shutdown(self):
