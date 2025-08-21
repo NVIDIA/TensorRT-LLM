@@ -1664,11 +1664,16 @@ class PyExecutor:
         if self.kv_connector_manager is None:
             self.resource_manager.free_resources(request)
         else:
-            cache_block_ids = self.kv_cache_manager.get_cache_indices(request)
-
-            if not self.kv_connector_manager.request_finished(
-                    request, cache_block_ids):
-                self.resource_manager.free_resources(request)
+            # Only call request_finished on the connector if the request has already been added to the kv cache manager.
+            try:
+                cache_block_ids = self.kv_cache_manager.get_cache_indices(
+                    request)
+            except IndexError:
+                pass
+            else:
+                if not self.kv_connector_manager.request_finished(
+                        request, cache_block_ids):
+                    self.resource_manager.free_resources(request)
 
     @nvtx_range("_handle_canceled_requests")
     def _handle_canceled_requests(self):
