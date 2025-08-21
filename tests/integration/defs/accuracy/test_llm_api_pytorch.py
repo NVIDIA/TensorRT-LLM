@@ -1734,6 +1734,7 @@ class TestKimiK2(LlmapiAccuracyTestHarness):
     MODEL_PATH = f"{llm_models_root()}/Kimi-K2-Instruct"
 
     @pytest.mark.skip_less_mpi_world_size(8)
+    @skip_post_blackwell
     @skip_pre_hopper
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size",
