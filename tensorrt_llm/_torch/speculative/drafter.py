@@ -27,12 +27,18 @@ class Drafter(ABC):
         raise NotImplementedError
 
     @final
-    def should_use_spec_decode(self, requests: List[LlmRequest]) -> bool:
+    def should_use_spec_decode(self, requests: List[LlmRequest],
+                               max_batch_size: int, max_num_tokens: int,
+                               max_draft_len: int) -> bool:
         """
         You probably don't want to override this. ModelEngine
         assumes that speculation is always on if max_concurrency
         is not specified by the user's spec config.
         """
-        if self.max_concurrency is not None:
-            return len(requests) <= self.max_concurrency
-        return True
+        if self.max_concurrency is None:
+            return True
+
+        tokens_per_request = 1 + max_draft_len
+        token_cap = max_num_tokens // tokens_per_request
+        num_effective_requests = min(max_batch_size, len(requests), token_cap)
+        return num_effective_requests <= self.max_concurrency
