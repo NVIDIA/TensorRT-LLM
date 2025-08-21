@@ -286,6 +286,9 @@ class ReportUtility:
             raise ValueError(
                 f"Invalid kv_cache_config type: {type(kv_cache_config)}.")
 
+        kv_cache_mem_percent = kv_cache_mem_percent * 100.0 \
+             if kv_cache_mem_percent is not None else "None"
+
         # Engine/Backend details
         if self.rt_cfg.backend not in ('pytorch', '_autodeploy'):
             config_path = self.rt_cfg.engine_dir / "config.json"
