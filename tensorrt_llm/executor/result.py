@@ -166,7 +166,7 @@ class GenerationResultBase:
         self.avg_decoded_tokens_per_iter: Optional[float] = None
         self._done = False
         self.metrics_dict = {}
-        self.trace_headers = None
+        self.trace_headers: Optional[dict[str, str]] = None
 
         if has_event_loop():
             self.aqueue = AsyncQueue()
@@ -324,7 +324,7 @@ class GenerationResultBase:
             else:
                 self._outputs[0]._postprocess_result = response.res
             if response.metrics:
-                self.metrics_dict = response.metrics
+                self.metrics_dict.update(response.metrics)
 
             if response.error:
                 if self._background_error_handler is not None and (
@@ -404,7 +404,7 @@ class GenerationResultBase:
             stats, len(output.token_ids), self.sampling_params.n > 1)
         if processed_metrics_stat:
             metrics_stats.update(processed_metrics_stat)
-        self.metrics_dict = metrics_stats
+        self.metrics_dict.update(metrics_stats)
 
     def do_tracing(
         self,
@@ -423,20 +423,29 @@ class GenerationResultBase:
         trace_context = tracing.extract_trace_context(self.trace_headers)
         sampling_params = self.sampling_params
 
-        # TODO: Add request arrival time
-        arrival_time = time.time() - metrics_dict.get(MetricNames.E2E, -1)
+        # Since arrival_time and other timing metrics are based on different time origins,
+        # we need to apply corrections to align them with absolute timestamps
+        time_correction = 0
+        arrival_timestamp = metrics_dict.get(MetricNames.ARRIVAL_TIMESTAMP, 0)
+        arrival_time = req_perf_metrics_dict.get(
+            RequestEventTiming.ARRIVAL_TIME, 0)
+        if arrival_timestamp > 0:
+            time_correction = arrival_timestamp - arrival_time
+        else:
+            time_correction = time.time() - metrics_dict.get(
+                MetricNames.E2E, -1) - arrival_time
+
         with tracing.global_otlp_tracer().start_as_current_span(
                 "llm_request",
                 kind=tracing.SpanKind.SERVER,
                 context=trace_context,
-                start_time=int(arrival_time * 1e9),
+                start_time=int((arrival_time + time_correction) * 1e9),
         ) as span:
 
             def safe_set_attr(span, attr, value):
                 if value is not None:
                     span.set_attribute(attr, value)
 
-            e2e_time = metrics_dict.get(MetricNames.E2E, -1)
             safe_set_attr(span,
                           tracing.SpanAttributes.GEN_AI_REQUEST_TEMPERATURE,
                           sampling_params.temperature)
@@ -464,7 +473,7 @@ class GenerationResultBase:
                 span, tracing.SpanAttributes.GEN_AI_LATENCY_TIME_TO_FIRST_TOKEN,
                 metrics_dict.get(MetricNames.TTFT, -1))
             safe_set_attr(span, tracing.SpanAttributes.GEN_AI_LATENCY_E2E,
-                          e2e_time)
+                          metrics_dict.get(MetricNames.E2E, -1))
             safe_set_attr(span,
                           tracing.SpanAttributes.GEN_AI_LATENCY_TIME_IN_QUEUE,
                           metrics_dict.get(MetricNames.REQUEST_QUEUE_TIME, -1))
@@ -472,6 +481,33 @@ class GenerationResultBase:
                 span, tracing.SpanAttributes.GEN_AI_RESPONSE_FINISH_REASONS,
                 json.dumps([output.finish_reason])
                 if output.finish_reason else None)
+            safe_set_attr(
+                span,
+                tracing.SpanAttributes.GEN_AI_LATENCY_KV_CACHE_TRANSFER_TIME,
+                req_perf_metrics_dict.get(
+                    RequestEventTiming.KV_CACHE_TRANSFER_END, 0.0) -
+                req_perf_metrics_dict.get(
+                    RequestEventTiming.KV_CACHE_TRANSFER_START, 0.0))
+
+            if req_perf_metrics_dict.get(
+                    RequestEventTiming.KV_CACHE_TRANSFER_START,
+                    0) and req_perf_metrics_dict.get(
+                        RequestEventTiming.KV_CACHE_TRANSFER_END, 0):
+                tracing.add_event(
+                    tracing.SpanEvents.KV_CACHE_TRANSFER_START,
+                    timestamp=int((req_perf_metrics_dict.get(
+                        RequestEventTiming.KV_CACHE_TRANSFER_START, 0.0) +
+                                   time_correction) * 1e9))
+                tracing.add_event(
+                    tracing.SpanEvents.KV_CACHE_TRANSFER_END,
+                    attributes={
+                        "kv_cache_size":
+                        req_perf_metrics_dict.get(
+                            RequestEventTiming.KV_CACHE_SIZE, 0)
+                    },
+                    timestamp=int((req_perf_metrics_dict.get(
+                        RequestEventTiming.KV_CACHE_TRANSFER_END, 0.0) +
+                                   time_correction) * 1e9))
 
 
 class DetokenizedGenerationResultBase(GenerationResultBase):

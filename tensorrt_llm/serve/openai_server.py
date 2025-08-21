@@ -5,7 +5,6 @@ import re
 import signal
 import traceback
 from collections import deque
-from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from datetime import datetime
 from http import HTTPStatus
@@ -16,7 +15,6 @@ import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response, StreamingResponse
-from starlette.datastructures import Headers
 from starlette.routing import Mount
 from transformers import AutoConfig, AutoProcessor
 
@@ -462,7 +460,7 @@ class OpenAIServer:
                 postproc_args=postproc_args,
             )
 
-            trace_headers = (None if raw_request is None else await self._get_trace_headers(raw_request.headers))
+            trace_headers = (None if raw_request is None else tracing.extract_trace_headers(raw_request.headers))
 
             promise = self.llm.generate_async(
                 inputs=prompt,
@@ -674,7 +672,7 @@ class OpenAIServer:
                     if request.stream else completion_response_post_processor,
                     postproc_args=postproc_args,
                 )
-                trace_headers = (None if raw_request is None else await self._get_trace_headers(raw_request.headers))
+                trace_headers = (None if raw_request is None else tracing.extract_trace_headers(raw_request.headers))
                 promise = self.llm.generate_async(
                     inputs=prompt,
                     sampling_params=sampling_params,
@@ -899,13 +897,3 @@ class OpenAIServer:
                                 log_level="info",
                                 timeout_keep_alive=TIMEOUT_KEEP_ALIVE)
         await uvicorn.Server(config).serve()
-
-    async def _get_trace_headers(
-        self,
-        headers: Headers,
-    ) -> Optional[Mapping[str, str]]:
-        if tracing.is_tracing_enabled():
-            return tracing.extract_trace_headers(headers)
-        if tracing.contains_trace_headers(headers):
-            tracing.log_tracing_disabled_warning()
-        return None
