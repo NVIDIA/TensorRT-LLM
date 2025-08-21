@@ -18,7 +18,7 @@ from .._utils import (KVCacheEventSerializer, global_mpi_rank, global_mpi_size,
                       mpi_comm, mpi_rank, nvtx_range_debug)
 from ..bindings import executor as tllm
 from ..builder import ConfigEncoder, Engine, EngineConfig
-from ..llmapi.llm_args import PybindMirror
+from ..llmapi.llm_args import PybindMirror, TorchLlmArgs
 from ..llmapi.mpi_session import set_mpi_session_cpp
 from ..llmapi.tracer import VizTracer, global_tracer, set_global_tracer
 from ..llmapi.utils import (AsyncQueue, ManagedThread, _SyncQueue,
@@ -60,7 +60,8 @@ class GenerationExecutorWorker(GenerationExecutor):
         postproc_worker_config: Optional[PostprocWorkerConfig] = None,
         is_llm_executor: Optional[bool] = None,
         lora_config: Optional[LoraConfig] = None,
-        garbage_collection_gen0_threshold: Optional[int] = None,
+        hf_model_dir: Optional[Path] = None,
+        llm_args: Optional[TorchLlmArgs] = None,
     ) -> None:
         postproc_config = postproc_worker_config or PostprocWorkerConfig()
         super().__init__(
@@ -81,8 +82,8 @@ class GenerationExecutorWorker(GenerationExecutor):
         self._await_response_helper = AwaitResponseHelper(
             self)  # TODO: make it weakref
         self._executor_config = executor_config
-        self._is_pytorch_backend = getattr(self._executor_config, "backend",
-                                           None) == "pytorch"
+        self._is_pytorch_backend = llm_args is not None and llm_args.backend == "pytorch"
+        self.llm_args = llm_args
 
         if global_mpi_size() > 1:
             logger.set_rank(self.global_rank)
@@ -90,20 +91,42 @@ class GenerationExecutorWorker(GenerationExecutor):
         if isinstance(engine, list):
             engine = engine[self.rank]
 
-        if executor_config is None:
-            executor_config = tllm.ExecutorConfig(1)
+        def _create_py_executor(comm_ranks, device_ids):
 
-        executor_config.logits_post_processor_config = tllm.LogitsPostProcessorConfig(
-            processor_batched=batched_logits_processor, replicate=False)
+            executor_config = llm_args.get_executor_config(hf_model_dir)
+            # Persist so downstream code (e.g., default max_tokens deduction) has access
+            self._executor_config = executor_config
 
-        def _create_engine():
-            device_id = self.global_rank % torch.cuda.device_count()
-            torch.cuda.set_device(device_id)
+            executor_config.logits_post_processor_config = tllm.LogitsPostProcessorConfig(
+                processor_batched=batched_logits_processor, replicate=False)
+            executor_config.parallel_config = tllm.ParallelConfig(
+                participant_ids=comm_ranks, device_ids=device_ids)
+            args = {
+                "executor_config": executor_config,
+                "checkpoint_dir": executor_config.hf_model_dir,
+            }
+            assert hasattr(
+                executor_config, "backend"
+            ), "executor_config should be with backend in _create_py_executor"
+            if executor_config.backend == "pytorch":
+                from tensorrt_llm._torch.pyexecutor.py_executor_creator import \
+                    create_py_executor
+                create_executor = create_py_executor
+                args["lora_config"] = lora_config
+                args[
+                    "garbage_collection_gen0_threshold"] = llm_args.garbage_collection_gen0_threshold
+            else:
+                raise ValueError(
+                    f"Unsupported backend config: {executor_config.backend}")
+            return create_executor(**args)
 
-            # Make sure C++ executor would use same devices/ranks as py_executor
-            global_rank = global_mpi_rank()
-            comm_ranks = mpi_comm().allgather(global_rank)
-            device_ids = mpi_comm().allgather(device_id)
+        def _create_engine(comm_ranks, device_ids):
+            if executor_config is None:
+                executor_config = tllm.ExecutorConfig(1)
+
+            executor_config.logits_post_processor_config = tllm.LogitsPostProcessorConfig(
+                processor_batched=batched_logits_processor, replicate=False)
+
             executor_config.parallel_config = tllm.ParallelConfig(
                 participant_ids=comm_ranks, device_ids=device_ids)
 
@@ -122,14 +145,7 @@ class GenerationExecutorWorker(GenerationExecutor):
                 "executor_config": executor_config,
                 "checkpoint_dir": executor_config.hf_model_dir,
             }
-            if executor_config.backend == "pytorch":
-                from tensorrt_llm._torch.pyexecutor.py_executor_creator import \
-                    create_py_executor
-                create_executor = create_py_executor
-                args["lora_config"] = lora_config
-                args[
-                    "garbage_collection_gen0_threshold"] = garbage_collection_gen0_threshold
-            elif executor_config.backend == "_autodeploy":
+            if executor_config.backend == "_autodeploy":
                 from tensorrt_llm._torch.auto_deploy.shim.ad_executor import \
                     create_autodeploy_executor
                 create_executor = create_autodeploy_executor
@@ -138,7 +154,17 @@ class GenerationExecutorWorker(GenerationExecutor):
                     f"Unsupported backend config: {executor_config.backend}")
             return create_executor(**args)
 
-        self.engine = _create_engine()
+        device_id = self.global_rank % torch.cuda.device_count()
+        torch.cuda.set_device(device_id)
+
+        # Make sure C++ executor would use same devices/ranks as py_executor
+        global_rank = global_mpi_rank()
+        comm_ranks = mpi_comm().allgather(global_rank)
+        device_ids = mpi_comm().allgather(device_id)
+
+        self.engine = _create_py_executor(
+            comm_ranks, device_ids) if llm_args is not None else _create_engine(
+                comm_ranks, device_ids)
 
         self._lora_manager: Optional[LoraManager] = None
         self._prompt_adapter_manager: Optional[PromptAdapterManager] = None
@@ -430,14 +456,16 @@ class GenerationExecutorWorker(GenerationExecutor):
                 context_phase_params = request.disaggregated_params.get_context_phase_params(
                 )
 
-        is_overlap_enabled = self._is_pytorch_backend and not self._executor_config.pytorch_backend_config.disable_overlap_scheduler
-        if is_overlap_enabled:
-            is_disaggregated = self.engine.kv_cache_transceiver is not None
-            if is_disaggregated and (
-                    request_type == tllm.RequestType.REQUEST_TYPE_CONTEXT_ONLY):
-                raise ValueError(
-                    "Context only requests are not supported in pytorch backend when overlap is enabled."
-                )
+        if self._is_pytorch_backend:
+            assert isinstance(self.llm_args, TorchLlmArgs)
+            if not self.llm_args.disable_overlap_scheduler:
+                is_disaggregated = self.engine.kv_cache_transceiver is not None
+                if is_disaggregated and (
+                        request_type
+                        == tllm.RequestType.REQUEST_TYPE_CONTEXT_ONLY):
+                    raise ValueError(
+                        "Context only requests are not supported in pytorch backend when overlap is enabled."
+                    )
 
         assert request.id is not None
 
@@ -641,7 +669,8 @@ def worker_main(
     is_llm_executor: Optional[
         bool] = True,  # whether it's the main executor instance
     lora_config: Optional[LoraConfig] = None,
-    garbage_collection_gen0_threshold: Optional[int] = None,
+    hf_model_dir: Optional[Path] = None,
+    llm_args: Optional[TorchLlmArgs] = None,
 ) -> None:
     mpi_comm().barrier()
     print_colored_debug(f"Worker {mpi_rank()} entering worker_main...\n",
@@ -768,7 +797,8 @@ def worker_main(
             postproc_worker_config=postproc_worker_config,
             is_llm_executor=is_llm_executor,
             lora_config=lora_config,
-            garbage_collection_gen0_threshold=garbage_collection_gen0_threshold)
+            hf_model_dir=hf_model_dir,
+            llm_args=llm_args)
     except Exception as e:
         logger.error(f"Failed to initialize executor on rank {mpi_rank()}: {e}")
         logger.error(traceback.format_exc())
