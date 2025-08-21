@@ -262,7 +262,9 @@ def detect_sharding_from_factory_config(
         "o_proj",
     ]
 
-    # tp_plan = {'layers': 'gather'}
+    num_shards = 0
+    num_simple_shards = 0
+    num_row_col_shards = 0
 
     for lin_node in filtered_nodes(gm.graph.nodes, is_linear_op):
         # use node's weight name to get the module name
@@ -282,6 +284,7 @@ def detect_sharding_from_factory_config(
             pattern_string = pattern_string.replace("*", "@")
             pattern_regex = re.escape(pattern_string).replace("@", ".*")
             if re.match(pattern_regex, module_name):
+                num_shards += 1
                 # we have a match. Get the config for this layer
                 config = tp_plan[key]
                 if config == "colwise":
@@ -306,6 +309,7 @@ def detect_sharding_from_factory_config(
                             min_local_shape=min_local_shape,
                         )
                     )
+                    num_row_col_shards += 1
                 elif "sequence" in config:
                     # TODO: Sequence parallelism is not supported yet.
                     ad_logger.warning("Sequence parallelism is not supported yet. Skipping.")
@@ -324,11 +328,16 @@ def detect_sharding_from_factory_config(
                             min_local_shape=1,
                         )
                     )
+                    num_simple_shards += 1
                 else:
                     ad_logger.warning("Invalid sharding config. Skipping.")
                 # after successful match, break the loop
                 break
 
+    ad_logger.info(
+        f"Applied {num_shards} TP shards (simple: {num_simple_shards}, "
+        f"row-col pattern: {num_row_col_shards})"
+    )
     return TransformInfo(
         skipped=False,
         num_matches=len(sharding_config.tp_transforms),
@@ -412,6 +421,8 @@ def detect_column_row_shard(
     # 3. Linear nodes that are not in two groups or we cannot account for all nodes:
     #       --> row_split (dim 0 of weight) + all_gather (dim -1 of output) output
     num_shards = 0
+    num_simple_shards = 0
+    num_row_col_shards = 0
     for n_start, n_end in zip(boundary_nodes[:-1], boundary_nodes[1:]):
         # we iterate through all nodes between the two boundary nodes and store linear nodes
         # sorted by their input activation node. We also store remaining nodes.
@@ -441,12 +452,14 @@ def detect_column_row_shard(
         if sharding_config.simple_shard_only:
             ad_logger.debug(f"Forcing Simple Shard: Linear groups: {nodes_linear}")
             _append_simple_shard(nodes_linear, rank, world_size, sharding_config)
+            num_simple_shards += 1
             continue
 
         # simple shard when we have != 2 groups of linear nodes
         if len(nodes_linear) != 2:
             ad_logger.debug(f"Linear groups: {nodes_linear}")
             _append_simple_shard(nodes_linear, rank, world_size, sharding_config)
+            num_simple_shards += 1
             continue
 
         # let's look at the unnacounted nodes. They are okay as long as they fall before the
@@ -477,6 +490,7 @@ def detect_column_row_shard(
         if unaccounted_nodes or attention_related_nodes:
             ad_logger.debug(f"Unaccounted nodes: {unaccounted_nodes}")
             _append_simple_shard(nodes_linear, rank, world_size, sharding_config)
+            num_simple_shards += 1
             continue
 
         # If we can account for all sharded nodes, we can do a two-way shard
@@ -489,6 +503,7 @@ def detect_column_row_shard(
                 # only one attention operation. Fall back to simple shard.
                 ad_logger.debug(f"More than one attention node: {unaccounted_nodes}")
                 _append_simple_shard(nodes_linear, rank, world_size, sharding_config)
+                num_simple_shards += 1
                 continue
             # Extract head dimension. We cannot shard below the head_dim size.
             # Assume that head_dim is the last (innermost) dimension of the tensor
@@ -511,8 +526,11 @@ def detect_column_row_shard(
                         min_local_shape=min_local_shape,
                     )
                 )
+        num_row_col_shards += 1
 
-    ad_logger.info(f"Found {num_shards} TP shards")
+    ad_logger.info(
+        f"Found {num_shards} TP shards (simple: {num_simple_shards}, row-col: {num_row_col_shards})"
+    )
     return TransformInfo(
         skipped=False, num_matches=num_shards, is_clean=False, has_valid_shapes=False
     )
